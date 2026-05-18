@@ -1,0 +1,48 @@
+# engenho-types — vendored Kubernetes OpenAPI v3 manifest
+#
+# Per theory/ENGENHO.md §VI.1 ("Determinism contract — generated source"),
+# every byte the forge-gen → engenho-types pipeline consumes is
+# BLAKE3-attested. Any drift between this manifest and the on-disk file
+# contents is caught by `cargo test --features openapi-roundtrip` in CI.
+#
+# This is the load-bearing primitive: if the input changes, the generated
+# output changes deterministically. If the input is tampered with off-chain,
+# the manifest mismatch surfaces immediately.
+#
+# Upstream source: https://github.com/kubernetes/kubernetes
+# Branch:          release-1.32
+# Path:            api/openapi-spec/v3/
+#
+# Update protocol:
+#   1. Bump `upstream_ref` and re-curl the schemas under v<NEW>/.
+#   2. Recompute BLAKE3 via `b3sum --no-names <file>`.
+#   3. Update this manifest.
+#   4. `cargo test --features openapi-roundtrip` must pass — proves every
+#      kind still serializes round-trip against the new schema.
+#   5. `cargo run -p forge-gen -- engenho-types --check` (M0.0.3+) must
+#      regenerate source bit-for-bit (theory/ENGENHO.md §VI.1).
+---
+schema_version: v3
+kubernetes_version: 1.32
+upstream_ref: release-1.32
+fetched_at: "2026-05-18T19:00:00Z"
+attestation: blake3
+files:
+  - path: api__v1_openapi.json
+    group: ""
+    version: v1
+    description: "Core API — Pod, Service, Namespace, Secret, ConfigMap, ServiceAccount, Endpoints, EndpointSlice, Node, PersistentVolume, PersistentVolumeClaim, ResourceQuota, LimitRange, Event"
+    blake3: "76277084bbc76138db763faa470eeb6d6374f81752f9babb0669f44794324e6e"
+    bytes: 1970487
+  - path: apis__apps__v1_openapi.json
+    group: apps
+    version: v1
+    description: "Apps API — Deployment, ReplicaSet, StatefulSet, DaemonSet, ControllerRevision"
+    blake3: "ba6e66bc7f9c76070193e35622bbc1df76f8d765d08d41b3b5b6a8a849b4cfb9"
+    bytes: 878400
+  - path: apis__rbac.authorization.k8s.io__v1_openapi.json
+    group: rbac.authorization.k8s.io
+    version: v1
+    description: "RBAC API — Role, ClusterRole, RoleBinding, ClusterRoleBinding"
+    blake3: "f59bf1bbb511aaa1058fe79351fa6d50e7e119ae3b035adc047a4c2005aa831c"
+    bytes: 384975
