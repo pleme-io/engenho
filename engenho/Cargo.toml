@@ -1,0 +1,19 @@
+[package]
+name = "engenho"
+description = "Typed, attested, Rust-native Kubernetes runtime. The engine that runs the land (terreno). Pillar 7 runtime half; sibling to magma. Spec: theory/ENGENHO.md."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "engenho"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+engenho-types = { workspace = true }
