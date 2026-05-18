@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2689f10fab09236382e4ca268490323bd17863fbcde2a60e62b567ed2c66e733 # shrinks to meta = ObjectMeta { name: "", namespace: None, resource_version: "", uid: None, labels: {"0": ",", "\u{fffe}": ""}, annotations: {}, creation_timestamp: None, deletion_timestamp: None, deletion_grace_period_seconds: None, finalizers: [], generation: None }
