@@ -1,0 +1,24 @@
+[package]
+name = "engenho-cluster-config-render"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "CLI binary: read a YAML ClusterConfig, validate, emit k3s config.yaml + cmdline args + auto-apply manifests. Consumed by nixos-k3s-vm at NixOS build time."
+
+[[bin]]
+name = "engenho-cluster-config-render"
+path = "src/main.rs"
+
+[dependencies]
+engenho-cluster-config = { workspace = true }
+serde                  = { workspace = true }
+serde_yaml             = { workspace = true }
+serde_json             = { workspace = true }
+clap                   = { version = "4.5", features = ["derive"] }
+anyhow                 = "1.0"
+
+[lints]
+workspace = true

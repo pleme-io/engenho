@@ -4,7 +4,7 @@
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
-use crate::network::{CniChoice, FlannelBackend, NetworkPolicyEnforce};
+use crate::network::{CniChoice, NetworkPolicyEnforce};
 use crate::ClusterConfig;
 
 /// Possible errors deserializing or validating a [`ClusterConfig`].

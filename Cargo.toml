@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["engenho", "engenho-types", "engenho-cluster-config"]
+members = [
+  "engenho",
+  "engenho-types",
+  "engenho-cluster-config",
+  "engenho-cluster-config-render",
+]
 
 [workspace.package]
 version = "0.1.0"
