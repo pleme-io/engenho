@@ -12,12 +12,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-schemars   = { version = "0.8", features = ["chrono"] }
-chrono     = { version = "0.4", features = ["serde"] }
-thiserror  = "2"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+serde_yaml  = "0.9"
+schemars    = { version = "0.8", features = ["chrono"] }
+chrono      = { version = "0.4", features = ["serde"] }
+thiserror   = "2"
+async-trait = "0.1"
+futures-core = "0.3"
+bytes       = "1"
 
 [dev-dependencies]
 insta    = { version = "1", features = ["json", "yaml"] }

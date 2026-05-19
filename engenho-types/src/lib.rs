@@ -54,8 +54,15 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod api;
+pub mod auth;
+pub mod client;
+pub mod error;
+pub mod informer;
 pub mod kind;
 pub mod meta;
+pub mod patch;
+pub mod reconciler;
+pub mod watch;
 
 // Generated kind modules land below this line. M0.0.1 introduces core_v1::Pod
 // as the proof-of-pipeline; M0.0.3 replaces it with generator output; M0.0.4
