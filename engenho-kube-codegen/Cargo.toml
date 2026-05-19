@@ -1,0 +1,23 @@
+[package]
+name = "engenho-kube-codegen"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "OpenAPI v3 → typed Rust source generator for engenho-types. Reads BLAKE3-attested vendored K8s schemas + emits one Rust struct per kind with `impl KubeResource`. Per theory/ENGENHO.md §IV — generation over composition (Pillar 12)."
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+serde_yaml  = { workspace = true }
+anyhow      = "1.0"
+clap        = { version = "4.5", features = ["derive"] }
+
+[[bin]]
+name = "engenho-kube-codegen"
+path = "src/bin/codegen.rs"
+
+[lints]
+workspace = true

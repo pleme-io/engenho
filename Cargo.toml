@@ -6,6 +6,7 @@ members = [
   "engenho-cluster-config",
   "engenho-cluster-config-render",
   "engenho-kube-client",
+  "engenho-kube-codegen",
 ]
 
 [workspace.package]

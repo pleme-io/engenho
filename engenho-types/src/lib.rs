@@ -57,6 +57,7 @@ pub mod api;
 pub mod auth;
 pub mod client;
 pub mod error;
+pub mod generated_v1_34;
 pub mod informer;
 pub mod kind;
 pub mod meta;
