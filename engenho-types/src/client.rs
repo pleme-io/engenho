@@ -34,7 +34,7 @@ pub trait KubeClient: Send + Sync {
     /// [`KubeError::NotFound`] if the resource doesn't exist;
     /// [`KubeError::ApiStatus`] for other apiserver responses;
     /// [`KubeError::Network`] for connection failures.
-    async fn get<R: KubeResource>(
+    async fn get<R: KubeResource + Send + Sync + 'static>(
         &self,
         namespace: Option<&str>,
         name: &str,
@@ -48,7 +48,7 @@ pub trait KubeClient: Send + Sync {
     /// # Errors
     ///
     /// Same shape as [`Self::get`].
-    async fn list<R: KubeResource>(
+    async fn list<R: KubeResource + Send + Sync + 'static>(
         &self,
         namespace: Option<&str>,
         opts: &ListOptions,
@@ -64,7 +64,7 @@ pub trait KubeClient: Send + Sync {
     /// Forbidden surface the same way.
     ///
     /// [`ApiStatusKind::AlreadyExists`]: crate::error::ApiStatusKind::AlreadyExists
-    async fn create<R: KubeResource>(&self, resource: &R) -> Result<R, KubeError>;
+    async fn create<R: KubeResource + Send + Sync + 'static>(&self, resource: &R) -> Result<R, KubeError>;
 
     /// REPLACE (PUT) an entire resource — must include current
     /// `resourceVersion` for optimistic concurrency.
@@ -76,7 +76,7 @@ pub trait KubeClient: Send + Sync {
     ///
     /// [`KubeError::ApiStatus`] with `Conflict` on resourceVersion
     /// mismatch.
-    async fn replace<R: KubeResource>(&self, resource: &R) -> Result<R, KubeError>;
+    async fn replace<R: KubeResource + Send + Sync + 'static>(&self, resource: &R) -> Result<R, KubeError>;
 
     /// PATCH an existing resource. The patch type is encoded in
     /// [`Patch`].
@@ -89,7 +89,7 @@ pub trait KubeClient: Send + Sync {
     ///
     /// Same shape as [`Self::get`]; SSA can also fail with
     /// `Conflict` carrying a typed FieldManagerConflict body.
-    async fn patch<R: KubeResource>(
+    async fn patch<R: KubeResource + Send + Sync + 'static>(
         &self,
         namespace: Option<&str>,
         name: &str,
@@ -105,7 +105,7 @@ pub trait KubeClient: Send + Sync {
     /// [`KubeError::NotFound`] is intentionally exposed — many
     /// controllers reconcile by attempting to delete + treating
     /// NotFound as success ("already gone").
-    async fn delete<R: KubeResource>(
+    async fn delete<R: KubeResource + Send + Sync + 'static>(
         &self,
         namespace: Option<&str>,
         name: &str,
@@ -115,7 +115,7 @@ pub trait KubeClient: Send + Sync {
     /// Hand back the typed [`Watcher`] for `R`. The watcher itself
     /// is what drives a streaming watch loop; this method just
     /// constructs it bound to this client's connection state.
-    fn watcher<R: KubeResource>(&self) -> Box<dyn Watcher<R>>;
+    fn watcher<R: KubeResource + Send + Sync + 'static>(&self) -> Box<dyn Watcher<R>>;
 }
 
 /// Result of a LIST operation.

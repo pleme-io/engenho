@@ -1,0 +1,32 @@
+[package]
+name = "engenho-kube-client"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Reqwest-backed implementation of engenho-types' KubeClient + Watcher traits. Speaks the upstream Kubernetes REST API over HTTPS with rustls + the four standard auth methods (anonymous, bearer token, client cert, exec plugin)."
+
+[dependencies]
+engenho-types = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+serde_yaml    = { workspace = true }
+thiserror     = { workspace = true }
+async-trait   = "0.1"
+async-stream  = "0.3"
+futures-core  = "0.3"
+futures-util  = "0.3"
+bytes         = "1"
+url           = "2"
+tokio         = { version = "1", features = ["rt", "macros", "io-util"] }
+reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+base64        = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "io-util"] }
+proptest = "1"
+
+[lints]
+workspace = true
