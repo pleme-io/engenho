@@ -166,12 +166,19 @@ fn render_yaml_extra_tls_sans_appended_and_deduped() {
 }
 
 #[test]
-fn render_yaml_custom_cluster_cidr() {
+fn render_yaml_omits_cluster_and_service_cidrs() {
+    // CIDRs are owned by the nixos consumer (blackmatter's
+    // services.blackmatter.k3s.{clusterCIDR,serviceCIDR}) — emitting
+    // them HERE too would result in k3s parsing them as dual-stack
+    // (config.yaml + cmdline both set → list of 2 entries → "must be
+    // of different IP family" failure). Verified empirically on
+    // engenho-local: dropping these from YAML lets k3s come up.
     let mut c = base();
     c.network.cluster_cidr = "10.100.0.0/16".into();
-    c.network.cluster_dns = Ipv4Addr::new(10, 43, 0, 10);
     let yaml = c.render_k3s_config_yaml();
-    assert!(yaml.contains("cluster-cidr: 10.100.0.0/16"));
+    assert!(!yaml.contains("cluster-cidr:"), "YAML must not emit cluster-cidr: {yaml}");
+    assert!(!yaml.contains("service-cidr:"), "YAML must not emit service-cidr: {yaml}");
+    assert!(!yaml.contains("cluster-dns:"),  "YAML must not emit cluster-dns: {yaml}");
 }
 
 #[test]
@@ -213,7 +220,13 @@ fn render_yaml_bind_address() {
 }
 
 #[test]
-fn render_yaml_dual_stack_cidrs() {
+fn render_yaml_dual_stack_cidrs_not_in_yaml() {
+    // Same reasoning as render_yaml_omits_cluster_and_service_cidrs:
+    // CIDRs (including dual-stack) are consumer-owned via blackmatter's
+    // k3s clusterCIDR/serviceCIDR options. Dual-stack propagation needs
+    // the consumer to be aware of cfg.clusterConfig.network.ipv6 and
+    // override its clusterCIDR/serviceCIDR to a comma-separated list.
+    // Tracked as a follow-up (consumer-side mkForce wiring).
     let mut c = base();
     c.network.ipv6 = Ipv6Config {
         dual_stack: true,
@@ -221,8 +234,8 @@ fn render_yaml_dual_stack_cidrs() {
         service_cidr_v6: Some("fd00:10:43::/112".into()),
     };
     let yaml = c.render_k3s_config_yaml();
-    assert!(yaml.contains("cluster-cidr: 10.42.0.0/16,fd00:10:42::/56"));
-    assert!(yaml.contains("service-cidr: 10.43.0.0/16,fd00:10:43::/112"));
+    assert!(!yaml.contains("cluster-cidr:"));
+    assert!(!yaml.contains("service-cidr:"));
 }
 
 // ─────────────────────────────────────────────────────────────────────
