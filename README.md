@@ -49,7 +49,7 @@ After `nix run .#rebuild`:
 ```bash
 $ kubectl --context engenho-local get nodes
 NAME            STATUS   ROLES                  AGE   VERSION
-engenho-local   Ready    control-plane,master   2m    v1.32.0+k3s1
+engenho-local   Ready    control-plane,master   2m    v1.34.5+k3s1
 ```
 
 ## Build the binary itself
@@ -99,7 +99,7 @@ engenho (workspace root)
 
 | Surface | Format | Source of truth |
 |---|---|---|
-| Kubernetes REST API | HTTPS :6443; JSON / protobuf; v1.32 schema | upstream `kubernetes/api/openapi-spec/v3/` |
+| Kubernetes REST API | HTTPS :6443; JSON / protobuf; v1.34 schema | upstream `kubernetes/api/openapi-spec/v3/` |
 | etcd v3 gRPC | Range/Put/Txn/Watch/Lease over UDS | upstream `etcd-io/etcd@v3.5/api/etcdserverpb/` |
 | CRI v1 | gRPC client to containerd / youki | upstream `kubernetes/cri-api/v1` |
 | CNI v1 | stdin JSON + ADD/DEL/CHECK/VERSION | `containernetworking/cni` spec |

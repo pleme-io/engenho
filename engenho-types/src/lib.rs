@@ -27,7 +27,7 @@
 //! │   ├── apiextensions_v1/      (generated — CustomResourceDefinition)
 //! │   └── …                      (~16 generated kind groups total)
 //! ├── vendor/
-//! │   └── openapi/v1.32.0/       (BLAKE3-attested upstream schemas)
+//! │   └── openapi/v1.34.0/       (BLAKE3-attested upstream schemas)
 //! └── tests/
 //!     ├── openapi_roundtrip.rs   (each kind ↔ openapi-spec/v3/*.json)
 //!     ├── bit_repro.rs           (forge-gen regenerate == tree source)
@@ -38,10 +38,17 @@
 //!
 //! Crate scaffold only. The first kind (Pod) lands in M0.0.1 as a
 //! hand-authored target shape, validated by `tests/openapi_roundtrip.rs`
-//! against `vendor/openapi/v1.32.0/api__v1_openapi.json` — that hand-author
+//! against `vendor/openapi/v1.34.0/api__v1_openapi.json` — that hand-author
 //! is **the generator's bullseye**, the byte-for-byte target that
 //! `forge-gen --backend kube-resource` must emit by M0.0.3. The kind itself
 //! is then deleted from the tree and replaced by the generator's output.
+//!
+//! ## Ship gate (theory/ENGENHO.md §XIII)
+//!
+//! Engenho ships ONLY when Sonobuoy `--mode=certified-conformance`
+//! passes on Kubernetes 1.34 with zero skips. Until M4 lands, the kasou
+//! + kikai bridge runs k3s v1.34 in production locally and supplies the
+//! operator kubectl experience while engenho catches up.
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]

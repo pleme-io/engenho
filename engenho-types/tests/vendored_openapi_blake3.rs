@@ -17,7 +17,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-const VENDOR_DIR: &str = "vendor/openapi/v1.32.0";
+const VENDOR_DIR: &str = "vendor/openapi/v1.34.0";
 
 #[derive(Debug, serde::Deserialize)]
 struct Manifest {
@@ -93,15 +93,21 @@ fn every_vendored_file_blake3_matches_manifest() {
 }
 
 #[test]
-fn manifest_declares_kubernetes_1_32() {
-    // Tightening invariant: M0 ships against v1.32 surface (theory/ENGENHO.md
-    // §III.1 — kubectl conformance target). A manifest bump to a newer
-    // minor must be a deliberate edit reviewed alongside the corresponding
-    // generated-source diff.
+fn manifest_declares_kubernetes_1_34() {
+    // Tightening invariant: engenho ships ONLY when Sonobuoy
+    // --mode=certified-conformance passes on the 1.34 surface with
+    // zero skips (theory/ENGENHO.md §III.1 + §XIII Ship Gate). A
+    // manifest bump to a different minor must be a deliberate edit
+    // reviewed alongside the corresponding conformance-pass evidence.
+    //
+    // History: M0.0 vendored 1.32 (the N-2 at session start on
+    // 2026-05-18); bumped to 1.34 on 2026-05-19 once we proved the
+    // k3s-bridge runs 1.34 in production locally + decided engenho
+    // chases the current stable surface rather than N-2.
     let raw = fs::read_to_string(manifest_path()).expect("read MANIFEST.yaml");
     assert!(
-        raw.contains("kubernetes_version: 1.32"),
-        "vendored manifest must target k8s 1.32 per ENGENHO.md §III.1"
+        raw.contains("kubernetes_version: 1.34"),
+        "vendored manifest must target k8s 1.34 per ENGENHO.md §III.1"
     );
 }
 

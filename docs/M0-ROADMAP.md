@@ -16,7 +16,7 @@
 - `meta/v1` types — ObjectMeta, TypeMeta, ListMeta. BTreeMap-everywhere
   for byte-deterministic serialization (theory/ENGENHO.md §VI.4).
 - API path helpers (`api.rs`).
-- Vendored Kubernetes v1.32 OpenAPI v3 schemas (core/v1, apps/v1, rbac/v1).
+- Vendored Kubernetes v1.34 OpenAPI v3 schemas (core/v1, apps/v1, rbac/v1).
 - BLAKE3-attested `MANIFEST.yaml` + verification test.
 - 16/16 tests green.
 
