@@ -1,0 +1,19 @@
+[package]
+name = "engenho-cluster-config"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Typed schema for engenho/k3s cluster configuration: every network knob + GitOps bootstrap, validated at construction and renderable to k3s config.yaml + cmdline flags + bootstrap manifests."
+
+[dependencies]
+serde       = { workspace = true }
+serde_yaml  = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+indoc       = { workspace = true }
+
+[lints]
+workspace = true
