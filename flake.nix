@@ -28,16 +28,14 @@
     };
 
     # Per-system slim package for the cluster-config renderer. Built
-    # via the same Cargo.nix the workspace uses; consumers (nixos-k3s-vm
-    # in pleme-io/nix) invoke this at NixOS build time inside a
-    # `runCommand` to turn typed nix module options into k3s
-    # config.yaml + extra cmdline args + auto-apply manifests.
+    # via the COMMITTED Cargo.nix (no crate2nix IFD) so consumers
+    # (nixos-k3s-vm in pleme-io/nix) can evaluate the renderer
+    # derivation without first triggering an IFD chain on the
+    # linux-builder. Crate2nix-of-the-tree is regenerated explicitly
+    # via `nix run .#regenerate-cargo-nix` whenever Cargo.lock changes.
     renderBinFor = system: let
       pkgs = import nixpkgs { inherit system; };
-      generated = import (crate2nix.tools.${system}.generatedCargoNix {
-        name = "engenho-cluster-config-render";
-        src  = self;
-      }) {
+      generated = import ./Cargo.nix {
         inherit pkgs;
         defaultCrateOverrides = pkgs.defaultCrateOverrides // {};
       };
