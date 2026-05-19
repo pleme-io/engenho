@@ -21,12 +21,42 @@ destination doc —
 - [`CLAUDE.md`](./CLAUDE.md) — agent-facing repo guide (architecture, build, anti-patterns)
 - [`docs/M0-ROADMAP.md`](./docs/M0-ROADMAP.md) — local M0.0.1 → M0.0.4 path-down
 - [`theory/ENGENHO.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO.md) — destination, typed surface, compatibility contract, phases
+- [`theory/ENGENHO-LOCAL.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO-LOCAL.md) — the canonical operator local-dev path: kasou + kikai → working k8s cluster on every `nix run .#rebuild`
 
-## Quick start
+## Quick start — the canonical path
+
+The default first way to run engenho is via the kasou + kikai
+substrate: a typed kasou-managed Linux VM on macOS, running k3s
+today as a 1:1 wire-compat bridge → engenho once M0.4 ships. Full
+spec at [`theory/ENGENHO-LOCAL.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO-LOCAL.md).
+
+One Nix declaration on the operator's `nodes/<host>/engenho-local.nix`:
+
+```nix
+blackmatter.components.kubernetes.clusters.engenho-local = {
+  enable    = true;
+  vmMode    = "engenho";      # → routes to k3s today; native engenho M0.4+
+  autoStart = true;
+  cpus      = 4;
+  memory    = 8192;
+  diskSize  = "50G";
+  apiPort   = 6443;
+};
+```
+
+After `nix run .#rebuild`:
+
+```bash
+$ kubectl --context engenho-local get nodes
+NAME            STATUS   ROLES                  AGE   VERSION
+engenho-local   Ready    control-plane,master   2m    v1.32.0+k3s1
+```
+
+## Build the binary itself
 
 ```bash
 cargo build --workspace
-cargo test  --workspace      # 16 unit + 5 manifest + 3 proptests (768 cases)
+cargo test  --workspace      # 12 unit + 5 manifest + 3 proptests (768 cases)
 
 nix build                    # hermetic release build via substrate's
                              # rust-workspace-release-flake.nix
