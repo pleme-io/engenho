@@ -46,7 +46,10 @@ pub mod bootstrap;
 pub mod manifest;
 pub mod network;
 pub mod render;
+pub mod renderer;
 pub mod validate;
+
+pub use renderer::{ClusterConfigRenderer, EngenhoNativeRenderer, K3sRenderer};
 
 use serde::{Deserialize, Serialize};
 
