@@ -15,10 +15,8 @@ use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
 
 /// StatefulSet represents a set of pods with consistent identities. Identities are defined as:
-///   - Network: A single stable DNS and hostname.
-///   - Storage: As many VolumeClaims as requested.
-/// 
-/// The StatefulSet guarantees that a given network identity will always map to the same storage identity.
+/// - Network: A single stable DNS and hostname.
+/// - Storage: As many VolumeClaims as requested.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatefulSet {
 /// Standard object metadata.
