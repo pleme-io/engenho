@@ -385,9 +385,14 @@ fn fluxcd_source_manifest(cluster_name: &str, cfg: &FluxcdBootstrap) -> Manifest
     } else {
         String::new()
     };
+    // FluxCD v2.3.0's community helm chart ships CRDs at v1beta2
+    // (v1 is GA in the project but the chart bundle lags). Emit
+    // v1beta2 which is universally available on every flux2 chart
+    // release since 2023. Newer chart versions still serve this
+    // apiVersion via conversion. Schema is identical.
     let body = formatdoc! {"
         ---
-        apiVersion: source.toolkit.fluxcd.io/v1
+        apiVersion: source.toolkit.fluxcd.io/v1beta2
         kind: GitRepository
         metadata:
           name: {name}
@@ -398,7 +403,7 @@ fn fluxcd_source_manifest(cluster_name: &str, cfg: &FluxcdBootstrap) -> Manifest
           ref:
             branch: {branch}
         {secret_ref}---
-        apiVersion: kustomize.toolkit.fluxcd.io/v1
+        apiVersion: kustomize.toolkit.fluxcd.io/v1beta2
         kind: Kustomization
         metadata:
           name: {name}
