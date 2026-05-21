@@ -26,6 +26,7 @@ use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
 
+use crate::attestation::{AttestationChain, NodeIdentity};
 use crate::consensus::network::{InProcessRouter, RpcRequest};
 use crate::consensus::store::InMemoryStore;
 use crate::consensus::type_config::{ApplyResult, RaftNodeId, TypeConfig};
@@ -51,15 +52,46 @@ pub struct RaftMesh {
     listen_addr: String,
     router: InProcessRouter,
     rpc_task: tokio::task::JoinHandle<()>,
+    /// Attestation chain — every successful `propose` from this
+    /// node appends a signed block. Followers receive blocks via
+    /// gossip / a dedicated chain-sync channel at R4.5.
+    chain: AttestationChain,
+    /// Ed25519 keypair used to sign attestation blocks. The
+    /// corresponding public key IS this node's NodeId in
+    /// gossip.
+    identity: NodeIdentity,
 }
 
 impl RaftMesh {
     /// Boot a Raft node + register with the shared in-process router.
+    ///
+    /// Uses a freshly-generated [`NodeIdentity`] for attestation
+    /// signing. Use [`start_with_identity`] to supply your own
+    /// keypair (the common case in production where the identity
+    /// is persisted via cofre).
     pub async fn start(
         node_id: RaftNodeId,
         listen_addr: String,
         router: InProcessRouter,
         config: Arc<Config>,
+    ) -> Result<Self, RaftError> {
+        Self::start_with_identity(
+            node_id,
+            listen_addr,
+            router,
+            config,
+            NodeIdentity::generate(),
+        )
+        .await
+    }
+
+    /// Boot a Raft node with an operator-supplied identity.
+    pub async fn start_with_identity(
+        node_id: RaftNodeId,
+        listen_addr: String,
+        router: InProcessRouter,
+        config: Arc<Config>,
+        identity: NodeIdentity,
     ) -> Result<Self, RaftError> {
         let store = InMemoryStore::new();
         let log_store = store.clone();
@@ -111,6 +143,8 @@ impl RaftMesh {
             listen_addr,
             router,
             rpc_task,
+            chain: AttestationChain::new(),
+            identity,
         })
     }
 
@@ -149,16 +183,46 @@ impl RaftMesh {
     }
 
     /// Submit a typed `RoleAssignment` to be committed.
+    ///
+    /// On success, this node also appends a signed
+    /// [`RoleAttestationBlock`] to its local [`AttestationChain`].
+    /// The chain entry is linked to the prior head (BLAKE3) +
+    /// signed with this node's [`NodeIdentity`] — providing the
+    /// audit trail Layer D promises.
     pub async fn propose(
         &self,
         cmd: RoleAssignment,
     ) -> Result<ApplyResult, RaftError> {
+        let cmd_for_chain = cmd.clone();
         let resp: ClientWriteResponse<TypeConfig> = self
             .raft
             .client_write(cmd)
             .await
             .map_err(|e| RaftError::ClientWriteFailed(e.to_string()))?;
+        // Atomically append the signed attestation block.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.chain.append(
+            &self.identity,
+            cmd_for_chain,
+            now_ms,
+            resp.data.applied_term,
+            resp.data.applied_index,
+        );
         Ok(resp.data)
+    }
+
+    /// Snapshot of this node's local attestation chain.
+    pub fn attestation_chain(&self) -> &AttestationChain {
+        &self.chain
+    }
+
+    /// This node's identity (public key only is exposed via
+    /// `node_identity_public`).
+    pub fn node_identity(&self) -> &NodeIdentity {
+        &self.identity
     }
 
     /// Read-only snapshot of the typed mesh state.
