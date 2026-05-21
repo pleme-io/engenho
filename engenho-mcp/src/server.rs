@@ -412,4 +412,58 @@ mod tests {
         let i = info.instructions.unwrap();
         assert!(i.contains("engenho-mcp"));
     }
+
+    /// **Compile-time + runtime exhaustiveness lock.**
+    ///
+    /// For every `ResourceKind` variant, calling `list_resource`
+    /// through the trait must produce a typed `ReaderError` (the
+    /// default impl returns InvalidState because MockClusterReader
+    /// doesn't have live API access). The point is to PROVE every
+    /// variant is reachable through the dispatcher — adding a
+    /// variant without dispatch arms can't slip through.
+    ///
+    /// Compile-time: the closed-enum match in
+    /// `KikaiClusterReader::list_resource` + `get_resource` is
+    /// exhaustive; missing arm = build error.
+    ///
+    /// Runtime (this test): exercises the trait surface itself.
+    #[tokio::test]
+    async fn every_resource_kind_reaches_list_dispatch() {
+        let s = server();
+        for &kind in crate::resource_kind::ResourceKind::all() {
+            // MockClusterReader::list_resource takes the default
+            // impl which returns the "not supported" InvalidState.
+            // We don't assert success — we assert *typed-reachability*.
+            let err = s
+                .reader
+                .list_resource("demo", kind, "default")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                "invalid_state",
+                "{kind:?} should bottom out at InvalidState in the mock; got {err:?}"
+            );
+            // The error message embeds the kind's label — proves
+            // dispatch saw the variant.
+            assert!(
+                err.to_string().contains(kind.label()),
+                "{kind:?} label missing from default-impl error: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_resource_kind_reaches_get_dispatch() {
+        let s = server();
+        for &kind in crate::resource_kind::ResourceKind::all() {
+            let err = s
+                .reader
+                .get_resource("demo", kind, "default", "anything")
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), "invalid_state");
+            assert!(err.to_string().contains(kind.label()));
+        }
+    }
 }

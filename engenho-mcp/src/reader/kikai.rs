@@ -24,8 +24,9 @@ use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{KubeClient, ListOptions};
 use engenho_types::generated_v1_34::apps_v1::Deployment;
 use engenho_types::generated_v1_34::core_v1::{
-    ConfigMap, Namespace, Pod, PodPhase, Service,
+    ConfigMap, Namespace, Node, Pod, PodPhase, Secret, Service,
 };
+use crate::redaction::redact_secret;
 
 use crate::reader::{ClusterReader, ReaderError};
 use crate::resource_kind::ResourceKind;
@@ -181,11 +182,18 @@ impl ClusterReader for KikaiClusterReader {
         //   2. Match arm here (3 lines)
         //   3. Match arm in get_resource below
         // No new views, no new MCP tools, no new traits.
+        //
+        // Secret routes through a redaction transform — engenho-mcp
+        // never serializes Secret values. Future secret-bearing kinds
+        // follow the same pattern via `carries_secret_material()` +
+        // a typed view in `crate::redaction`.
         let json = match kind {
             ResourceKind::Pod => list_to_json::<Pod>(&client, ns_arg, "pods").await?,
             ResourceKind::Service => list_to_json::<Service>(&client, ns_arg, "services").await?,
             ResourceKind::ConfigMap => list_to_json::<ConfigMap>(&client, ns_arg, "configmaps").await?,
+            ResourceKind::Secret => list_secrets_redacted(&client, ns_arg).await?,
             ResourceKind::Namespace => list_to_json::<Namespace>(&client, ns_arg, "namespaces").await?,
+            ResourceKind::Node => list_to_json::<Node>(&client, ns_arg, "nodes").await?,
             ResourceKind::Deployment => list_to_json::<Deployment>(&client, ns_arg, "deployments").await?,
         };
         Ok(json)
@@ -208,11 +216,69 @@ impl ClusterReader for KikaiClusterReader {
             ResourceKind::Pod => get_to_json::<Pod>(&client, ns_arg, name, "pod").await?,
             ResourceKind::Service => get_to_json::<Service>(&client, ns_arg, name, "service").await?,
             ResourceKind::ConfigMap => get_to_json::<ConfigMap>(&client, ns_arg, name, "configmap").await?,
+            ResourceKind::Secret => get_secret_redacted(&client, ns_arg, name).await?,
             ResourceKind::Namespace => get_to_json::<Namespace>(&client, ns_arg, name, "namespace").await?,
+            ResourceKind::Node => get_to_json::<Node>(&client, ns_arg, name, "node").await?,
             ResourceKind::Deployment => get_to_json::<Deployment>(&client, ns_arg, name, "deployment").await?,
         };
         Ok(json)
     }
+}
+
+/// Secret-aware list — routes through `redact_secret` so values
+/// never reach the MCP wire. The Engenho-kube-client typed pipe
+/// still parses the full Secret server-side; redaction is the
+/// boundary transform mandated by LEAN.md.
+async fn list_secrets_redacted(
+    client: &ReqwestKubeClient,
+    namespace: Option<&str>,
+) -> Result<serde_json::Value, ReaderError> {
+    let list = client
+        .list::<Secret>(namespace, &ListOptions::default())
+        .await
+        .map_err(|e| {
+            let where_str = namespace.unwrap_or("<cluster-scope>");
+            ReaderError::InvalidState(format!("LIST secrets in {where_str} failed: {e}"))
+        })?;
+    let redacted_items: Vec<serde_json::Value> =
+        list.items.iter().map(redact_secret).collect();
+    Ok(serde_json::json!({
+        "kind": "SecretList",
+        "apiVersion": gvk_to_api_version::<Secret>(),
+        "items": redacted_items,
+        "metadata": {
+            "resourceVersion": list.resource_version,
+        },
+    }))
+}
+
+/// Secret-aware get — same redaction transform.
+async fn get_secret_redacted(
+    client: &ReqwestKubeClient,
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<serde_json::Value, ReaderError> {
+    let secret = client
+        .get::<Secret>(namespace, name)
+        .await
+        .map_err(|e| {
+            let where_str = namespace.unwrap_or("<cluster-scope>");
+            ReaderError::InvalidState(format!(
+                "GET secret/{name} in {where_str} failed: {e}"
+            ))
+        })?;
+    let mut redacted = redact_secret(&secret);
+    if let Some(map) = redacted.as_object_mut() {
+        map.insert(
+            "kind".into(),
+            serde_json::Value::String("Secret".to_string()),
+        );
+        map.insert(
+            "apiVersion".into(),
+            serde_json::Value::String(gvk_to_api_version::<Secret>()),
+        );
+    }
+    Ok(redacted)
 }
 
 impl KikaiClusterReader {
