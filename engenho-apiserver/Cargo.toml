@@ -1,0 +1,27 @@
+[package]
+name = "engenho-apiserver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "engenho-apiserver — HTTP K8s API wrapping engenho-store. Translates kubectl REST operations into typed ResourceCommand proposals via the distributed substrate. Layer R7 of the engenho K8s base layer."
+
+[dependencies]
+async-trait        = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+anyhow             = { workspace = true }
+axum               = { workspace = true }
+tower              = { workspace = true }
+
+engenho-types      = { workspace = true }
+engenho-store      = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
+reqwest = { workspace = true }

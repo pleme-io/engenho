@@ -10,6 +10,7 @@ members = [
   "engenho-mcp",
   "engenho-revoada",
   "engenho-store",
+  "engenho-apiserver",
 ]
 
 [workspace.package]
@@ -25,6 +26,10 @@ engenho-types          = { path = "engenho-types" }
 engenho-cluster-config = { path = "engenho-cluster-config" }
 engenho-kube-client    = { path = "engenho-kube-client" }
 engenho-store          = { path = "engenho-store" }
+axum                   = "0.7"
+hyper                  = "1"
+tower                  = "0.5"
+reqwest                = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde                  = { version = "1.0", features = ["derive"] }
 serde_yaml             = "0.9"
 serde_json             = "1.0"
