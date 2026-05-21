@@ -7,7 +7,9 @@
 
 use async_trait::async_trait;
 
-use crate::views::{ClusterConfigView, ClusterStatus, KubeAuthDescriptor, SnapshotMetaView};
+use crate::views::{
+    ClusterConfigView, ClusterStatus, KubeAuthDescriptor, PodListView, SnapshotMetaView,
+};
 
 pub mod kikai;
 #[cfg(test)]
@@ -75,6 +77,23 @@ pub trait ClusterReader: Send + Sync {
         &self,
         cluster: &str,
     ) -> Result<Option<SnapshotMetaView>, ReaderError>;
+
+    /// List pods in the given namespace. First reader method that
+    /// goes BEYOND on-disk state — talks to the live cluster's API
+    /// via `engenho-kube-client` and parses responses through
+    /// `engenho-types::Pod` (typed PodSpec / PodStatus).
+    ///
+    /// Default impl returns Unsupported so non-live readers (mock)
+    /// don't have to implement.
+    async fn list_pods(
+        &self,
+        cluster: &str,
+        _namespace: &str,
+    ) -> Result<PodListView, ReaderError> {
+        Err(ReaderError::InvalidState(format!(
+            "list_pods not supported for cluster '{cluster}' (reader does not implement live API access)"
+        )))
+    }
 }
 
 #[cfg(test)]

@@ -23,6 +23,22 @@ use serde::{Deserialize, Serialize};
 use crate::reader::{ClusterReader, ReaderError};
 use crate::views::SnapshotMetaView;
 
+/// Input for `cluster_pods` — cluster + namespace.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClusterPodsInput {
+    /// Cluster name as registered in kikai's clusters.yaml.
+    #[schemars(description = "Cluster name as registered in kikai's clusters.yaml")]
+    pub cluster: String,
+    /// Namespace to list pods in. Defaults to `default` if omitted.
+    #[serde(default = "default_namespace")]
+    #[schemars(description = "Namespace to list pods in. Default 'default'.")]
+    pub namespace: String,
+}
+
+fn default_namespace() -> String {
+    "default".to_string()
+}
+
 /// Single typed input for every tool — the cluster name. Reusing
 /// one struct keeps the JSON Schema clients see uniform.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -107,6 +123,23 @@ impl EngenhoMcp {
     pub async fn cluster_snapshot_meta(&self, Parameters(p): Parameters<ClusterRef>) -> String {
         match self.reader.snapshot_meta(&p.cluster).await {
             Ok(snapshot) => to_pretty_json(&SnapshotMetaResponse { snapshot }),
+            Err(e) => to_pretty_error(&e),
+        }
+    }
+
+    /// List pods in a namespace. FIRST tool that goes beyond
+    /// on-disk state — talks to the live cluster's API via
+    /// `engenho-kube-client` and parses responses through
+    /// `engenho-types::Pod` (typed `PodSpec` + `PodStatus`).
+    /// Secret-material-free by type: every container summary
+    /// carries name/image/ready/restart_count, no token/env-from-secret
+    /// payloads make it into the wire.
+    #[tool(
+        description = "List pods in a namespace via the live cluster API. Returns typed name/namespace/phase/podIP/hostIP/containers/conditions per pod. Live API call through engenho-kube-client + engenho-types::Pod — NOT a kubectl shellout, NOT on-disk-only data."
+    )]
+    pub async fn cluster_pods(&self, Parameters(p): Parameters<ClusterPodsInput>) -> String {
+        match self.reader.list_pods(&p.cluster, &p.namespace).await {
+            Ok(v) => to_pretty_json(&v),
             Err(e) => to_pretty_error(&e),
         }
     }
