@@ -45,6 +45,12 @@ pub enum RaftError {
 }
 
 /// Wrapping handle for a single engenho-revoada Raft node.
+///
+/// At R4.5 the attestation chain LIVES in the [`InMemoryStore`]
+/// (the state machine), so every node — leader and follower —
+/// builds its own auditor-verifiable chain by signing each
+/// committed entry on apply. Per-node M-of-N attestation emerges
+/// naturally from the parallel chains.
 pub struct RaftMesh {
     raft: Raft<TypeConfig>,
     store: InMemoryStore,
@@ -52,13 +58,9 @@ pub struct RaftMesh {
     listen_addr: String,
     router: InProcessRouter,
     rpc_task: tokio::task::JoinHandle<()>,
-    /// Attestation chain — every successful `propose` from this
-    /// node appends a signed block. Followers receive blocks via
-    /// gossip / a dedicated chain-sync channel at R4.5.
-    chain: AttestationChain,
-    /// Ed25519 keypair used to sign attestation blocks. The
-    /// corresponding public key IS this node's NodeId in
-    /// gossip.
+    /// Ed25519 keypair (clone — store owns the canonical copy).
+    /// Exposed via `node_identity()` so external callers can sign
+    /// detached payloads (e.g. saguão passport requests).
     identity: NodeIdentity,
 }
 
@@ -93,7 +95,9 @@ impl RaftMesh {
         config: Arc<Config>,
         identity: NodeIdentity,
     ) -> Result<Self, RaftError> {
-        let store = InMemoryStore::new();
+        // The store owns the identity now (R4.5) — apply() signs
+        // every committed entry to this node's chain.
+        let store = InMemoryStore::new(identity.clone());
         let log_store = store.clone();
         let state_machine = store.clone();
 
@@ -143,7 +147,6 @@ impl RaftMesh {
             listen_addr,
             router,
             rpc_task,
-            chain: AttestationChain::new(),
             identity,
         })
     }
@@ -184,39 +187,27 @@ impl RaftMesh {
 
     /// Submit a typed `RoleAssignment` to be committed.
     ///
-    /// On success, this node also appends a signed
-    /// [`RoleAttestationBlock`] to its local [`AttestationChain`].
-    /// The chain entry is linked to the prior head (BLAKE3) +
-    /// signed with this node's [`NodeIdentity`] — providing the
-    /// audit trail Layer D promises.
+    /// At R4.5 chain-signing happens in the state machine's
+    /// `apply()` on every node — leader AND followers. So whoever
+    /// is leader at submit time, EVERY node's local chain grows
+    /// when the commit applies. The auditor can verify ANY node's
+    /// chain offline (each block signed by THAT node's identity).
     pub async fn propose(
         &self,
         cmd: RoleAssignment,
     ) -> Result<ApplyResult, RaftError> {
-        let cmd_for_chain = cmd.clone();
         let resp: ClientWriteResponse<TypeConfig> = self
             .raft
             .client_write(cmd)
             .await
             .map_err(|e| RaftError::ClientWriteFailed(e.to_string()))?;
-        // Atomically append the signed attestation block.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        self.chain.append(
-            &self.identity,
-            cmd_for_chain,
-            now_ms,
-            resp.data.applied_term,
-            resp.data.applied_index,
-        );
         Ok(resp.data)
     }
 
-    /// Snapshot of this node's local attestation chain.
+    /// Snapshot of this node's local attestation chain. The chain
+    /// is now owned by the state machine — RaftMesh forwards.
     pub fn attestation_chain(&self) -> &AttestationChain {
-        &self.chain
+        self.store.attestation_chain()
     }
 
     /// This node's identity (public key only is exposed via
