@@ -15,6 +15,21 @@ pub mod kikai;
 #[cfg(test)]
 pub mod mock;
 
+/// Operator-facing filter spec for `list_resource`. Every field is
+/// optional — empty `ListSpec::default()` is equivalent to "no
+/// filtering, no pagination, all items". Mirrors the typed shape
+/// of `engenho_types::client::ListOptions` but kept here so the
+/// MCP wire schema stays stable across engenho-types' churn.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ListSpec {
+    /// Kubernetes label selector (e.g. `app=podinfo,tier=backend`).
+    pub label_selector: String,
+    /// Kubernetes field selector (e.g. `status.phase=Running`).
+    pub field_selector: String,
+    /// Maximum items to return. `None` = no limit.
+    pub limit: Option<u32>,
+}
+
 /// Strict typed error surface — every variant carries enough
 /// context for the MCP client to render a useful failure.
 /// Never wraps `anyhow::Error`; concrete I/O / parse causes go
@@ -111,6 +126,7 @@ pub trait ClusterReader: Send + Sync {
         cluster: &str,
         kind: crate::resource_kind::ResourceKind,
         _namespace: &str,
+        _spec: &ListSpec,
     ) -> Result<serde_json::Value, ReaderError> {
         Err(ReaderError::InvalidState(format!(
             "list_resource({}) not supported for cluster '{cluster}' (reader does not implement live API access)",

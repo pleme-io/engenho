@@ -38,7 +38,7 @@ pub use node::Node;
 pub use node_spec::{
     NodeAddress, NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo, Taint,
 };
-pub use serviceaccount::ServiceAccount;
+pub use serviceaccount::{LocalObjectReference, ServiceAccount};
 pub use persistentvolume::PersistentVolume;
 pub use persistentvolumeclaim::PersistentVolumeClaim;
 pub use endpoints::Endpoints;

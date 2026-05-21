@@ -8,6 +8,7 @@
 mod deployment;
 mod deployment_spec;
 mod replicaset;
+mod replicaset_spec;
 mod statefulset;
 mod daemonset;
 
@@ -16,5 +17,6 @@ pub use deployment_spec::{
     DeploymentCondition, DeploymentSpec, DeploymentStatus, LabelSelector, PodTemplateSpec,
 };
 pub use replicaset::ReplicaSet;
+pub use replicaset_spec::{ReplicaSetCondition, ReplicaSetSpec, ReplicaSetStatus};
 pub use statefulset::StatefulSet;
 pub use daemonset::DaemonSet;

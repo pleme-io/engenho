@@ -48,9 +48,9 @@ pub struct ClusterResourceListInput {
     /// Cluster name as registered in kikai's clusters.yaml.
     #[schemars(description = "Cluster name as registered in kikai's clusters.yaml")]
     pub cluster: String,
-    /// Resource kind to list. One of: pod, service, config_map, namespace, deployment.
+    /// Resource kind to list.
     #[schemars(
-        description = "Resource kind to list. One of: pod, service, config_map, namespace, deployment. Cluster-scoped kinds (namespace) ignore the namespace input. Dispatches to the typed engenho-types catalog + engenho-kube-client.list<R>()."
+        description = "Resource kind to list. One of: pod, service, config_map, secret, service_account, namespace, node, deployment, replica_set. Cluster-scoped kinds (namespace, node) ignore the namespace input. Dispatches to the typed engenho-types catalog + engenho-kube-client.list<R>()."
     )]
     pub kind: ResourceKind,
     /// Namespace to list resources in. Defaults to `default`. Ignored
@@ -58,6 +58,20 @@ pub struct ClusterResourceListInput {
     #[serde(default = "default_namespace")]
     #[schemars(description = "Namespace to list resources in. Default 'default'. Ignored for cluster-scoped kinds.")]
     pub namespace: String,
+    /// Kubernetes label selector. e.g. `app=podinfo` or
+    /// `app=podinfo,tier=backend`. Empty = no filter.
+    #[serde(default)]
+    #[schemars(description = "Kubernetes label selector. e.g. 'app=podinfo' or 'app=podinfo,tier=backend'. Empty = no filter.")]
+    pub label_selector: String,
+    /// Kubernetes field selector. e.g. `status.phase=Running`.
+    /// Empty = no filter.
+    #[serde(default)]
+    #[schemars(description = "Kubernetes field selector. e.g. 'status.phase=Running'. Empty = no filter.")]
+    pub field_selector: String,
+    /// Maximum number of items to return. None = no limit.
+    #[serde(default)]
+    #[schemars(description = "Maximum number of items to return. Omitted/null = no limit.")]
+    pub limit: Option<u32>,
 }
 
 /// Input for `cluster_resource_get` — single resource fetch.
@@ -207,9 +221,14 @@ impl EngenhoMcp {
         &self,
         Parameters(p): Parameters<ClusterResourceListInput>,
     ) -> String {
+        let spec = crate::reader::ListSpec {
+            label_selector: p.label_selector,
+            field_selector: p.field_selector,
+            limit: p.limit,
+        };
         match self
             .reader
-            .list_resource(&p.cluster, p.kind, &p.namespace)
+            .list_resource(&p.cluster, p.kind, &p.namespace, &spec)
             .await
         {
             Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|e| {
@@ -430,13 +449,14 @@ mod tests {
     #[tokio::test]
     async fn every_resource_kind_reaches_list_dispatch() {
         let s = server();
+        let spec = crate::reader::ListSpec::default();
         for &kind in crate::resource_kind::ResourceKind::all() {
             // MockClusterReader::list_resource takes the default
             // impl which returns the "not supported" InvalidState.
             // We don't assert success — we assert *typed-reachability*.
             let err = s
                 .reader
-                .list_resource("demo", kind, "default")
+                .list_resource("demo", kind, "default", &spec)
                 .await
                 .unwrap_err();
             assert_eq!(

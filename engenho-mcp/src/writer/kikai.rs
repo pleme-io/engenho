@@ -16,9 +16,9 @@ use std::path::PathBuf;
 
 use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{DeleteOptions, KubeClient};
-use engenho_types::generated_v1_34::apps_v1::Deployment;
+use engenho_types::generated_v1_34::apps_v1::{Deployment, ReplicaSet};
 use engenho_types::generated_v1_34::core_v1::{
-    ConfigMap, Namespace, Node, Pod, Secret, Service,
+    ConfigMap, Namespace, Node, Pod, Secret, Service, ServiceAccount,
 };
 use engenho_types::patch::Patch;
 
@@ -94,27 +94,15 @@ impl ClusterWriter for KikaiClusterWriter {
         // Compiler-exhaustive: adding a ResourceKind variant without
         // an arm here breaks the build (closed enum + exhaustive match).
         let result_json = match kind {
-            ResourceKind::Pod => {
-                apply_typed::<Pod>(&client, ns_arg, name, &patch, "pod").await?
-            }
-            ResourceKind::Service => {
-                apply_typed::<Service>(&client, ns_arg, name, &patch, "service").await?
-            }
-            ResourceKind::ConfigMap => {
-                apply_typed::<ConfigMap>(&client, ns_arg, name, &patch, "configmap").await?
-            }
-            ResourceKind::Secret => {
-                apply_typed::<Secret>(&client, ns_arg, name, &patch, "secret").await?
-            }
-            ResourceKind::Namespace => {
-                apply_typed::<Namespace>(&client, ns_arg, name, &patch, "namespace").await?
-            }
-            ResourceKind::Node => {
-                apply_typed::<Node>(&client, ns_arg, name, &patch, "node").await?
-            }
-            ResourceKind::Deployment => {
-                apply_typed::<Deployment>(&client, ns_arg, name, &patch, "deployment").await?
-            }
+            ResourceKind::Pod => apply_typed::<Pod>(&client, ns_arg, name, &patch, "pod").await?,
+            ResourceKind::Service => apply_typed::<Service>(&client, ns_arg, name, &patch, "service").await?,
+            ResourceKind::ConfigMap => apply_typed::<ConfigMap>(&client, ns_arg, name, &patch, "configmap").await?,
+            ResourceKind::Secret => apply_typed::<Secret>(&client, ns_arg, name, &patch, "secret").await?,
+            ResourceKind::ServiceAccount => apply_typed::<ServiceAccount>(&client, ns_arg, name, &patch, "serviceaccount").await?,
+            ResourceKind::Namespace => apply_typed::<Namespace>(&client, ns_arg, name, &patch, "namespace").await?,
+            ResourceKind::Node => apply_typed::<Node>(&client, ns_arg, name, &patch, "node").await?,
+            ResourceKind::Deployment => apply_typed::<Deployment>(&client, ns_arg, name, &patch, "deployment").await?,
+            ResourceKind::ReplicaSet => apply_typed::<ReplicaSet>(&client, ns_arg, name, &patch, "replicaset").await?,
         };
         Ok(result_json)
     }
@@ -142,9 +130,11 @@ impl ClusterWriter for KikaiClusterWriter {
             ResourceKind::Service => delete_typed::<Service>(&client, ns_arg, name, &opts, "service").await,
             ResourceKind::ConfigMap => delete_typed::<ConfigMap>(&client, ns_arg, name, &opts, "configmap").await,
             ResourceKind::Secret => delete_typed::<Secret>(&client, ns_arg, name, &opts, "secret").await,
+            ResourceKind::ServiceAccount => delete_typed::<ServiceAccount>(&client, ns_arg, name, &opts, "serviceaccount").await,
             ResourceKind::Namespace => delete_typed::<Namespace>(&client, ns_arg, name, &opts, "namespace").await,
             ResourceKind::Node => delete_typed::<Node>(&client, ns_arg, name, &opts, "node").await,
             ResourceKind::Deployment => delete_typed::<Deployment>(&client, ns_arg, name, &opts, "deployment").await,
+            ResourceKind::ReplicaSet => delete_typed::<ReplicaSet>(&client, ns_arg, name, &opts, "replicaset").await,
         }
     }
 }

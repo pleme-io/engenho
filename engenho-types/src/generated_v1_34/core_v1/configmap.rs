@@ -105,4 +105,33 @@ mod tests {
         let s = serde_json::to_string(&ConfigMap::default()).unwrap();
         assert_eq!(s, "{}");
     }
+
+    use proptest::prelude::*;
+
+    /// Property-based round-trip: any ConfigMap with arbitrary
+    /// data keys + values must JSON-identity. Catches a future
+    /// rename or skip_serializing regression on the data map.
+    proptest! {
+        #[test]
+        fn arb_configmap_round_trips(
+            name in "[a-z][a-z0-9-]{0,30}",
+            ns in "[a-z][a-z0-9-]{0,30}",
+            key in "[a-z][a-z0-9.-]{0,30}",
+            value in ".{0,200}",
+            immutable in any::<bool>(),
+        ) {
+            let mut cm = ConfigMap::default();
+            cm.metadata.name = name.clone();
+            cm.metadata.namespace = Some(ns.clone());
+            cm.data.insert(key.clone(), value.clone());
+            cm.immutable = Some(immutable);
+            let json = serde_json::to_string(&cm).unwrap();
+            // Wire-clean invariant — no spurious spec/status on
+            // ConfigMap regardless of input.
+            prop_assert!(!json.contains("\"spec\""));
+            prop_assert!(!json.contains("\"status\""));
+            let back: ConfigMap = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back, cm);
+        }
+    }
 }

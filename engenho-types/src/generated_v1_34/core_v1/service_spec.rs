@@ -198,4 +198,42 @@ mod tests {
         let s = serde_json::to_string(&ServiceSpec::default()).unwrap();
         assert_eq!(s, "{}");
     }
+
+    use proptest::prelude::*;
+
+    /// Property-based round-trip: any randomly generated ServiceSpec
+    /// with port + selector survives JSON identity.
+    proptest! {
+        #[test]
+        fn arb_service_spec_round_trips(
+            port in 1i32..65535,
+            port_name in "[a-z][a-z0-9-]{0,14}",
+            selector_key in "[a-z][a-z0-9-]{0,14}",
+            selector_value in "[a-z0-9][a-z0-9-]{0,30}",
+            kind_idx in 0usize..4,
+            cluster_ip in "10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
+        ) {
+            let kinds = [
+                ServiceType::ClusterIP,
+                ServiceType::NodePort,
+                ServiceType::LoadBalancer,
+                ServiceType::ExternalName,
+            ];
+            let mut spec = ServiceSpec {
+                r#type: Some(kinds[kind_idx]),
+                cluster_ip: Some(cluster_ip.clone()),
+                ports: vec![ServicePort {
+                    name: Some(port_name.clone()),
+                    port,
+                    protocol: Some("TCP".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            spec.selector.insert(selector_key.clone(), selector_value.clone());
+            let json = serde_json::to_string(&spec).unwrap();
+            let back: ServiceSpec = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back, spec);
+        }
+    }
 }
