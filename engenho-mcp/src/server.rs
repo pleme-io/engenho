@@ -48,14 +48,36 @@ pub struct ClusterResourceListInput {
     /// Cluster name as registered in kikai's clusters.yaml.
     #[schemars(description = "Cluster name as registered in kikai's clusters.yaml")]
     pub cluster: String,
-    /// Resource kind to list. One of: pod, service, config_map, deployment.
+    /// Resource kind to list. One of: pod, service, config_map, namespace, deployment.
     #[schemars(
-        description = "Resource kind to list. One of: pod, service, config_map, deployment. Dispatches to the typed engenho-types catalog + engenho-kube-client.list<R>()."
+        description = "Resource kind to list. One of: pod, service, config_map, namespace, deployment. Cluster-scoped kinds (namespace) ignore the namespace input. Dispatches to the typed engenho-types catalog + engenho-kube-client.list<R>()."
     )]
     pub kind: ResourceKind,
-    /// Namespace to list resources in. Defaults to `default`.
+    /// Namespace to list resources in. Defaults to `default`. Ignored
+    /// for cluster-scoped kinds.
     #[serde(default = "default_namespace")]
-    #[schemars(description = "Namespace to list resources in. Default 'default'.")]
+    #[schemars(description = "Namespace to list resources in. Default 'default'. Ignored for cluster-scoped kinds.")]
+    pub namespace: String,
+}
+
+/// Input for `cluster_resource_get` — single resource fetch.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClusterResourceGetInput {
+    /// Cluster name as registered in kikai's clusters.yaml.
+    #[schemars(description = "Cluster name as registered in kikai's clusters.yaml")]
+    pub cluster: String,
+    /// Resource kind. One of: pod, service, config_map, namespace, deployment.
+    #[schemars(
+        description = "Resource kind. One of: pod, service, config_map, namespace, deployment."
+    )]
+    pub kind: ResourceKind,
+    /// Resource name (metadata.name).
+    #[schemars(description = "Resource name (metadata.name)")]
+    pub name: String,
+    /// Namespace to fetch from. Defaults to `default`. Ignored for
+    /// cluster-scoped kinds.
+    #[serde(default = "default_namespace")]
+    #[schemars(description = "Namespace to fetch from. Default 'default'. Ignored for cluster-scoped kinds.")]
     pub namespace: String,
 }
 
@@ -179,7 +201,7 @@ impl EngenhoMcp {
     /// + one variant + one match arm = it shows up in this tool.
     /// No new MCP tool needed. The whole catalog rides one wire.
     #[tool(
-        description = "Generic resource listing across the engenho-types catalog. Takes (cluster, kind, namespace) where kind is one of pod, service, config_map, deployment. Returns the K8s list shape; items parsed through typed Rust structs (not JSON-traversed)."
+        description = "Generic resource listing across the engenho-types catalog. Takes (cluster, kind, namespace) where kind is one of pod, service, config_map, namespace, deployment. Returns the K8s list shape; items parsed through typed Rust structs (not JSON-traversed). Cluster-scoped kinds (namespace) ignore the namespace argument."
     )]
     pub async fn cluster_resource_list(
         &self,
@@ -188,6 +210,36 @@ impl EngenhoMcp {
         match self
             .reader
             .list_resource(&p.cluster, p.kind, &p.namespace)
+            .await
+        {
+            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|e| {
+                format!(
+                    "{{\"error\":\"serialize\",\"detail\":\"{}\"}}",
+                    e
+                )
+            }),
+            Err(e) => to_pretty_error(&e),
+        }
+    }
+
+    /// **Symmetric single-resource fetch via the typed catalog.**
+    ///
+    /// Same dispatch shape as `cluster_resource_list` but returns
+    /// one resource by name. The result is the K8s canonical
+    /// resource shape `{kind, apiVersion, metadata, spec, status}`
+    /// — kubectl-style but parsed through typed Rust structs.
+    /// Cluster-scoped kinds (`namespace`) ignore the namespace
+    /// argument.
+    #[tool(
+        description = "Generic single-resource fetch via the typed catalog. Takes (cluster, kind, name, namespace) — returns the K8s canonical resource shape parsed through typed Rust structs. Symmetric to cluster_resource_list."
+    )]
+    pub async fn cluster_resource_get(
+        &self,
+        Parameters(p): Parameters<ClusterResourceGetInput>,
+    ) -> String {
+        match self
+            .reader
+            .get_resource(&p.cluster, p.kind, &p.namespace, &p.name)
             .await
         {
             Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|e| {

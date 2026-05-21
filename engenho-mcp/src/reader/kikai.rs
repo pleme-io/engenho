@@ -23,7 +23,9 @@ use std::path::PathBuf;
 use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{KubeClient, ListOptions};
 use engenho_types::generated_v1_34::apps_v1::Deployment;
-use engenho_types::generated_v1_34::core_v1::{ConfigMap, Pod, PodPhase, Service};
+use engenho_types::generated_v1_34::core_v1::{
+    ConfigMap, Namespace, Pod, PodPhase, Service,
+};
 
 use crate::reader::{ClusterReader, ReaderError};
 use crate::resource_kind::ResourceKind;
@@ -166,24 +168,48 @@ impl ClusterReader for KikaiClusterReader {
         namespace: &str,
     ) -> Result<serde_json::Value, ReaderError> {
         let client = self.build_kube_client(cluster)?;
+        // Cluster-scoped kinds ignore the input namespace; engenho-
+        // kube-client routes them to the bare collection URL.
+        let ns_arg: Option<&str> = if kind.is_cluster_scoped() {
+            None
+        } else {
+            Some(namespace)
+        };
         // Static dispatch — each arm calls the typed client.list<R>()
         // through engenho-types' typed catalog. Adding a kind:
         //   1. ResourceKind variant
         //   2. Match arm here (3 lines)
+        //   3. Match arm in get_resource below
         // No new views, no new MCP tools, no new traits.
         let json = match kind {
-            ResourceKind::Pod => {
-                list_to_json::<Pod>(&client, namespace, "pods").await?
-            }
-            ResourceKind::Service => {
-                list_to_json::<Service>(&client, namespace, "services").await?
-            }
-            ResourceKind::ConfigMap => {
-                list_to_json::<ConfigMap>(&client, namespace, "configmaps").await?
-            }
-            ResourceKind::Deployment => {
-                list_to_json::<Deployment>(&client, namespace, "deployments").await?
-            }
+            ResourceKind::Pod => list_to_json::<Pod>(&client, ns_arg, "pods").await?,
+            ResourceKind::Service => list_to_json::<Service>(&client, ns_arg, "services").await?,
+            ResourceKind::ConfigMap => list_to_json::<ConfigMap>(&client, ns_arg, "configmaps").await?,
+            ResourceKind::Namespace => list_to_json::<Namespace>(&client, ns_arg, "namespaces").await?,
+            ResourceKind::Deployment => list_to_json::<Deployment>(&client, ns_arg, "deployments").await?,
+        };
+        Ok(json)
+    }
+
+    async fn get_resource(
+        &self,
+        cluster: &str,
+        kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, ReaderError> {
+        let client = self.build_kube_client(cluster)?;
+        let ns_arg: Option<&str> = if kind.is_cluster_scoped() {
+            None
+        } else {
+            Some(namespace)
+        };
+        let json = match kind {
+            ResourceKind::Pod => get_to_json::<Pod>(&client, ns_arg, name, "pod").await?,
+            ResourceKind::Service => get_to_json::<Service>(&client, ns_arg, name, "service").await?,
+            ResourceKind::ConfigMap => get_to_json::<ConfigMap>(&client, ns_arg, name, "configmap").await?,
+            ResourceKind::Namespace => get_to_json::<Namespace>(&client, ns_arg, name, "namespace").await?,
+            ResourceKind::Deployment => get_to_json::<Deployment>(&client, ns_arg, name, "deployment").await?,
         };
         Ok(json)
     }
@@ -214,21 +240,23 @@ impl KikaiClusterReader {
 
 /// Typed list helper — every list_resource arm goes through this.
 /// Returns the items array as `serde_json::Value` so the trait
-/// boundary stays object-safe.
+/// boundary stays object-safe. Accepts `Option<&str>` for namespace
+/// so cluster-scoped kinds (Namespace, Node) can pass `None`.
 async fn list_to_json<R>(
     client: &ReqwestKubeClient,
-    namespace: &str,
+    namespace: Option<&str>,
     plural: &str,
 ) -> Result<serde_json::Value, ReaderError>
 where
     R: engenho_types::kind::KubeResource + Send + Sync + 'static,
 {
     let list = client
-        .list::<R>(Some(namespace), &ListOptions::default())
+        .list::<R>(namespace, &ListOptions::default())
         .await
         .map_err(|e| {
+            let where_str = namespace.unwrap_or("<cluster-scope>");
             ReaderError::InvalidState(format!(
-                "LIST {plural} in {namespace} failed: {e}"
+                "LIST {plural} in {where_str} failed: {e}"
             ))
         })?;
     // Re-serialize as a JSON list-shape that mirrors what kubectl
@@ -238,16 +266,60 @@ where
     })?;
     Ok(serde_json::json!({
         "kind": format!("{}List", R::GVK.kind),
-        "apiVersion": if R::GVK.group.is_empty() {
-            R::GVK.version.to_string()
-        } else {
-            format!("{}/{}", R::GVK.group, R::GVK.version)
-        },
+        "apiVersion": gvk_to_api_version::<R>(),
         "items": items_json,
         "metadata": {
             "resourceVersion": list.resource_version,
         },
     }))
+}
+
+/// Typed get helper — symmetric to `list_to_json`. Single resource
+/// by name. Wraps in K8s canonical resource shape for the wire.
+async fn get_to_json<R>(
+    client: &ReqwestKubeClient,
+    namespace: Option<&str>,
+    name: &str,
+    label: &str,
+) -> Result<serde_json::Value, ReaderError>
+where
+    R: engenho_types::kind::KubeResource + Send + Sync + 'static,
+{
+    let item = client
+        .get::<R>(namespace, name)
+        .await
+        .map_err(|e| {
+            let where_str = namespace.unwrap_or("<cluster-scope>");
+            ReaderError::InvalidState(format!(
+                "GET {label}/{name} in {where_str} failed: {e}"
+            ))
+        })?;
+    let mut item_json = serde_json::to_value(&item).map_err(|e| {
+        ReaderError::InvalidState(format!("serialize {label}: {e}"))
+    })?;
+    // Inject kind + apiVersion at the top of the serialized form
+    // so the wire matches what kubectl-style consumers expect.
+    if let Some(map) = item_json.as_object_mut() {
+        map.insert(
+            "kind".into(),
+            serde_json::Value::String(R::GVK.kind.to_string()),
+        );
+        map.insert(
+            "apiVersion".into(),
+            serde_json::Value::String(gvk_to_api_version::<R>()),
+        );
+    }
+    Ok(item_json)
+}
+
+/// "" + "v1" → "v1"; "apps" + "v1" → "apps/v1". One place this
+/// lives so list + get can't drift.
+fn gvk_to_api_version<R: engenho_types::kind::KubeResource>() -> String {
+    if R::GVK.group.is_empty() {
+        R::GVK.version.to_string()
+    } else {
+        format!("{}/{}", R::GVK.group, R::GVK.version)
+    }
 }
 
 /// Flatten an engenho-types Pod into the wire view. Pure function;
