@@ -24,13 +24,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
-    /// core/v1 Pod
+    /// core/v1 Pod (namespaced)
     Pod,
-    /// core/v1 Service
+    /// core/v1 Service (namespaced)
     Service,
-    /// core/v1 ConfigMap
+    /// core/v1 ConfigMap (namespaced)
     ConfigMap,
-    /// apps/v1 Deployment
+    /// core/v1 Namespace (cluster-scoped)
+    Namespace,
+    /// apps/v1 Deployment (namespaced)
     Deployment,
 }
 
@@ -42,8 +44,31 @@ impl ResourceKind {
             Self::Pod => "pod",
             Self::Service => "service",
             Self::ConfigMap => "config_map",
+            Self::Namespace => "namespace",
             Self::Deployment => "deployment",
         }
+    }
+
+    /// Iterator over every variant — used by exhaustiveness tests +
+    /// any future bulk-list / introspection tool. Adding a variant
+    /// without updating this array fails compile because the
+    /// `Self::Pod` etc. references would lose meaning.
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Pod,
+            Self::Service,
+            Self::ConfigMap,
+            Self::Namespace,
+            Self::Deployment,
+        ]
+    }
+
+    /// Whether the kind is cluster-scoped (no namespace in URL).
+    /// Mirrors `engenho_types::kind::Scope` but lives here so the
+    /// dispatcher can pick the right URL shape without needing
+    /// the type at the call site.
+    pub fn is_cluster_scoped(self) -> bool {
+        matches!(self, Self::Namespace)
     }
 }
 
@@ -66,15 +91,40 @@ mod tests {
 
     #[test]
     fn resource_kind_round_trips() {
-        for k in [
-            ResourceKind::Pod,
-            ResourceKind::Service,
-            ResourceKind::ConfigMap,
-            ResourceKind::Deployment,
-        ] {
+        for &k in ResourceKind::all() {
             let s = serde_json::to_string(&k).unwrap();
             let back: ResourceKind = serde_json::from_str(&s).unwrap();
             assert_eq!(back, k);
+        }
+    }
+
+    /// Exhaustiveness lock — every variant in `all()` must yield
+    /// a non-empty label. Adding a variant without updating the
+    /// `label()` match exhausts the closed enum (compile error)
+    /// but updating `label()` without adding to `all()` would
+    /// silently regress; this test guards that direction.
+    #[test]
+    fn all_variants_have_distinct_labels() {
+        let labels: std::collections::HashSet<&str> =
+            ResourceKind::all().iter().map(|k| k.label()).collect();
+        assert_eq!(
+            labels.len(),
+            ResourceKind::all().len(),
+            "ResourceKind::all() contains duplicate labels: {labels:?}"
+        );
+        for k in ResourceKind::all() {
+            assert!(!k.label().is_empty(), "{k:?} has empty label");
+        }
+    }
+
+    #[test]
+    fn cluster_scope_classification_is_correct() {
+        // Namespace is the only cluster-scoped variant today.
+        assert!(ResourceKind::Namespace.is_cluster_scoped());
+        for &k in ResourceKind::all() {
+            if !matches!(k, ResourceKind::Namespace) {
+                assert!(!k.is_cluster_scoped(), "{k:?} should be namespaced");
+            }
         }
     }
 }

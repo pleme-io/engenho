@@ -12,6 +12,7 @@ mod service_spec;
 mod configmap;
 mod secret;
 mod namespace;
+mod namespace_spec;
 mod serviceaccount;
 mod node;
 mod persistentvolume;
@@ -31,6 +32,7 @@ pub use service_spec::{
 pub use configmap::ConfigMap;
 pub use secret::Secret;
 pub use namespace::Namespace;
+pub use namespace_spec::{NamespaceCondition, NamespacePhase, NamespaceSpec, NamespaceStatus};
 pub use serviceaccount::ServiceAccount;
 pub use node::Node;
 pub use persistentvolume::PersistentVolume;

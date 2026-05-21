@@ -117,6 +117,25 @@ pub trait ClusterReader: Send + Sync {
             kind.label()
         )))
     }
+
+    /// Generic typed resource fetch. Symmetric to [`list_resource`]
+    /// but returns a single resource by name. For cluster-scoped
+    /// kinds (e.g. Namespace) the `namespace` argument is ignored.
+    ///
+    /// Same compounding contract — adding a kind means one variant
+    /// + one match arm (list) + one match arm (get).
+    async fn get_resource(
+        &self,
+        cluster: &str,
+        kind: crate::resource_kind::ResourceKind,
+        _namespace: &str,
+        _name: &str,
+    ) -> Result<serde_json::Value, ReaderError> {
+        Err(ReaderError::InvalidState(format!(
+            "get_resource({}) not supported for cluster '{cluster}' (reader does not implement live API access)",
+            kind.label()
+        )))
+    }
 }
 
 #[cfg(test)]
