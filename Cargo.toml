@@ -9,6 +9,7 @@ members = [
   "engenho-kube-codegen",
   "engenho-mcp",
   "engenho-revoada",
+  "engenho-store",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ authors = ["pleme-io"]
 engenho-types          = { path = "engenho-types" }
 engenho-cluster-config = { path = "engenho-cluster-config" }
 engenho-kube-client    = { path = "engenho-kube-client" }
+engenho-store          = { path = "engenho-store" }
 serde                  = { version = "1.0", features = ["derive"] }
 serde_yaml             = "0.9"
 serde_json             = "1.0"
