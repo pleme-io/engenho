@@ -1,0 +1,39 @@
+[package]
+name = "engenho-revoada"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "engenho's distribution layer — dynamic K8s control-plane / worker role shifting via Raft consensus + gossip membership + P2P content sync + BLAKE3 attested transitions. Read docs/DISTRIBUTED.md."
+
+[dependencies]
+async-trait        = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+
+# Engenho-types: shared Quantity primitive (used in NodeCapacity).
+engenho-types      = { workspace = true }
+
+# Layer A (membership + failure detection) — chitchat gossip.
+# Pinned via workspace at R1; placeholder dep below at R0.
+# chitchat = { version = "0.x", optional = true }
+
+# Layer B (consensus) — openraft Raft.
+# Pinned at R2.
+# openraft = { version = "0.9", optional = true }
+
+# Layer C (content-addressed P2P) — iroh.
+# Pinned at R5.
+# iroh = { version = "0.x", optional = true }
+
+# Layer D (attestation) — tameshi via pleme-io workspace.
+# Pinned at R4 once we wire the BLAKE3 chain types.
+# tameshi-types = { git = "https://github.com/pleme-io/tameshi" }
+
+[dev-dependencies]
+proptest = "1"

@@ -8,6 +8,7 @@ members = [
   "engenho-kube-client",
   "engenho-kube-codegen",
   "engenho-mcp",
+  "engenho-revoada",
 ]
 
 [workspace.package]
