@@ -44,6 +44,7 @@ pub mod resource;
 pub mod state;
 pub mod store;
 pub mod type_config;
+pub mod watch;
 
 pub use command::{Reason, ResourceCommand, ResourceOp};
 pub use mesh::{default_config, StoreError, StoreMesh};
@@ -52,3 +53,4 @@ pub use resource::{ResourceKey, ResourceValue};
 pub use state::{ResourceCatalog, ResourceCatalogSnapshot};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
+pub use watch::{WatchEvent, WatchEventKind};
