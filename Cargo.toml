@@ -35,6 +35,11 @@ tracing                = "0.1"
 tracing-subscriber     = { version = "0.3", features = ["env-filter"] }
 rmcp                   = { version = "0.15", features = ["server", "transport-io", "macros"] }
 
+# Distribution-layer deps (used by engenho-revoada). Pinned to the
+# same versions tatara-engine ships in production so we stay in sync.
+chitchat               = "0.10"
+openraft               = { version = "0.9", features = ["serde"] }
+
 [workspace.lints]
 
 [workspace.lints.clippy]
