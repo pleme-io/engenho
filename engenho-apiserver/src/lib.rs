@@ -32,9 +32,11 @@
 
 pub mod error;
 pub mod handler;
+pub mod openapi;
 pub mod router;
 pub mod server;
 
 pub use error::{ApiError, ErrorKind};
 pub use handler::{ResourceHandler, StoreBackedHandler};
+pub use openapi::ApiDoc;
 pub use server::ApiServer;

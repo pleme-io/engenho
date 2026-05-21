@@ -287,6 +287,51 @@ async fn cluster_scoped_namespace_kind_round_trips() {
 }
 
 #[tokio::test]
+async fn openapi_spec_is_served_at_canonical_paths() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    // Both /openapi.json and /openapi/v3 must serve the spec.
+    for path in ["/openapi.json", "/openapi/v3"] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let spec: serde_json::Value = resp.json().await.unwrap();
+        // openapi version 3.x
+        let v = spec.get("openapi").unwrap().as_str().unwrap();
+        assert!(v.starts_with("3."), "{path} returned non-v3 spec: {v}");
+        // info.title is our title
+        assert_eq!(
+            spec.get("info").unwrap().get("title").unwrap(),
+            "engenho-apiserver — K8s REST API"
+        );
+        // The 10 K8s REST paths are documented
+        let paths = spec.get("paths").unwrap().as_object().unwrap();
+        assert!(paths.contains_key("/api/v1/namespaces/{ns}/{plural}/{name}"));
+        assert!(paths.contains_key("/api/v1/namespaces/{ns}/{plural}"));
+        assert!(paths.contains_key("/api/v1/{plural}/{name}"));
+        assert!(paths.contains_key("/api/v1/{plural}"));
+        // The 4 typed schemas are exported
+        let schemas = spec
+            .get("components")
+            .unwrap()
+            .get("schemas")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        for name in ["K8sResource", "K8sResourceList", "K8sStatus", "K8sPatch"] {
+            assert!(schemas.contains_key(name), "missing schema {name} at {path}");
+        }
+    }
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn unknown_kind_returns_404() {
     let (_store, server) = boot_store_and_server().await;
     let addr = server.local_addr();
