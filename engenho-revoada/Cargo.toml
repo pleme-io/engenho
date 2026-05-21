@@ -30,9 +30,10 @@ openraft           = { workspace = true }
 # Pinned at R5.
 # iroh = { version = "0.x", optional = true }
 
-# Layer D (attestation) — tameshi via pleme-io workspace.
-# Pinned at R4 once we wire the BLAKE3 chain types.
-# tameshi-types = { git = "https://github.com/pleme-io/tameshi" }
+# Layer D — real BLAKE3 + ed25519 attestation chain (R4).
+blake3             = "1"
+ed25519-dalek      = { version = "2", features = ["rand_core", "serde"] }
+rand               = "0.8"
 
 [dev-dependencies]
 proptest = "1"
