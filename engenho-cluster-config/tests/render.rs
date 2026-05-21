@@ -125,18 +125,35 @@ fn kubeproxy_disabled_with_cilium_accepted() {
     c.validate().unwrap();
 }
 
+/// Install-only mode: enable=true with no source is now valid —
+/// the NixOS image bakes the flux2 HelmChart (controllers + CRDs)
+/// but no GitRepository / Kustomization CR. A downstream operator
+/// primitive (kikai's `gitops::bootstrap`) owns the source-CR
+/// lifecycle from the fleet registry, avoiding the rio.cattle.io
+/// vs operator patch fight over spec.url.
 #[test]
-fn flux_enable_without_source_rejected() {
+fn flux_enable_without_source_is_install_only() {
     let mut c = base();
     c.bootstrap.fluxcd.enable = true;
-    assert!(c.validate().is_err());
+    c.validate().expect("install-only mode accepted");
+    // Render must emit the install manifest but NOT the source CR.
+    let manifests = c.render_manifests();
+    let install = manifests.iter().find(|m| m.name == "flux-system-install.yaml");
+    assert!(install.is_some(), "install manifest still emitted");
+    let source = manifests.iter().find(|m| m.name == "flux-system-source.yaml");
+    assert!(source.is_none(), "source manifest must NOT be emitted in install-only mode");
 }
 
 #[test]
-fn argo_enable_without_source_rejected() {
+fn argo_enable_without_source_is_install_only() {
     let mut c = base();
     c.bootstrap.argocd.enable = true;
-    assert!(c.validate().is_err());
+    c.validate().expect("install-only mode accepted");
+    let manifests = c.render_manifests();
+    let install = manifests.iter().find(|m| m.name == "argocd-install.yaml");
+    assert!(install.is_some(), "install manifest still emitted");
+    let app = manifests.iter().find(|m| m.name.contains("application"));
+    assert!(app.is_none(), "application CR must NOT be emitted in install-only mode");
 }
 
 // ─────────────────────────────────────────────────────────────────────
