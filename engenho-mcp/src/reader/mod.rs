@@ -94,6 +94,29 @@ pub trait ClusterReader: Send + Sync {
             "list_pods not supported for cluster '{cluster}' (reader does not implement live API access)"
         )))
     }
+
+    /// Generic typed resource listing. Dispatches on `kind` to the
+    /// engenho-types catalog + engenho-kube-client. Returns the
+    /// resource list as a JSON `serde_json::Value` so the trait
+    /// surface remains object-safe (a generic method would NOT be).
+    /// Inside the impl, dispatch is static — each kind calls the
+    /// typed `client.list::<R>()`.
+    ///
+    /// **Compounding contract**: adding a new resource kind means
+    /// (a) one variant in `ResourceKind`, (b) one match arm here,
+    /// (c) typed expansion in engenho-types if needed. No new
+    /// MCP tool, no new view type, no trait widening.
+    async fn list_resource(
+        &self,
+        cluster: &str,
+        kind: crate::resource_kind::ResourceKind,
+        _namespace: &str,
+    ) -> Result<serde_json::Value, ReaderError> {
+        Err(ReaderError::InvalidState(format!(
+            "list_resource({}) not supported for cluster '{cluster}' (reader does not implement live API access)",
+            kind.label()
+        )))
+    }
 }
 
 #[cfg(test)]

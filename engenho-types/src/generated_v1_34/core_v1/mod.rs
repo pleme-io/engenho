@@ -8,6 +8,7 @@
 mod pod;
 mod pod_spec;
 mod service;
+mod service_spec;
 mod configmap;
 mod secret;
 mod namespace;
@@ -23,6 +24,10 @@ pub use pod_spec::{
     PodSpec, PodStatus,
 };
 pub use service::Service;
+pub use service_spec::{
+    LoadBalancerIngress, LoadBalancerStatus, ServiceCondition, ServicePort,
+    ServiceSpec, ServiceStatus, ServiceType,
+};
 pub use configmap::ConfigMap;
 pub use secret::Secret;
 pub use namespace::Namespace;

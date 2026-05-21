@@ -21,6 +21,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::reader::{ClusterReader, ReaderError};
+use crate::resource_kind::ResourceKind;
 use crate::views::SnapshotMetaView;
 
 /// Input for `cluster_pods` — cluster + namespace.
@@ -37,6 +38,25 @@ pub struct ClusterPodsInput {
 
 fn default_namespace() -> String {
     "default".to_string()
+}
+
+/// Input for `cluster_resource_list` — generic resource listing
+/// across the engenho-types catalog. ResourceKind is closed
+/// enum; adding a kind is a single PR to engenho-mcp.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClusterResourceListInput {
+    /// Cluster name as registered in kikai's clusters.yaml.
+    #[schemars(description = "Cluster name as registered in kikai's clusters.yaml")]
+    pub cluster: String,
+    /// Resource kind to list. One of: pod, service, config_map, deployment.
+    #[schemars(
+        description = "Resource kind to list. One of: pod, service, config_map, deployment. Dispatches to the typed engenho-types catalog + engenho-kube-client.list<R>()."
+    )]
+    pub kind: ResourceKind,
+    /// Namespace to list resources in. Defaults to `default`.
+    #[serde(default = "default_namespace")]
+    #[schemars(description = "Namespace to list resources in. Default 'default'.")]
+    pub namespace: String,
 }
 
 /// Single typed input for every tool — the cluster name. Reusing
@@ -140,6 +160,42 @@ impl EngenhoMcp {
     pub async fn cluster_pods(&self, Parameters(p): Parameters<ClusterPodsInput>) -> String {
         match self.reader.list_pods(&p.cluster, &p.namespace).await {
             Ok(v) => to_pretty_json(&v),
+            Err(e) => to_pretty_error(&e),
+        }
+    }
+
+    /// **Generic resource list across the engenho-types catalog.**
+    ///
+    /// Takes a cluster + ResourceKind + namespace, dispatches to
+    /// the typed `engenho-kube-client::list<R>()` through the
+    /// engenho-types KubeResource impl for that kind. Returns the
+    /// raw K8s list-shape `{kind, apiVersion, items, metadata}`
+    /// — same shape as `kubectl get <kind> -o json`, but the
+    /// `items` payload was parsed through typed Rust structs
+    /// (PodSpec / ServiceSpec / DeploymentSpec / ConfigMap data)
+    /// not JSON-traversed.
+    ///
+    /// Compounding: adding a new kind to engenho-types' catalog
+    /// + one variant + one match arm = it shows up in this tool.
+    /// No new MCP tool needed. The whole catalog rides one wire.
+    #[tool(
+        description = "Generic resource listing across the engenho-types catalog. Takes (cluster, kind, namespace) where kind is one of pod, service, config_map, deployment. Returns the K8s list shape; items parsed through typed Rust structs (not JSON-traversed)."
+    )]
+    pub async fn cluster_resource_list(
+        &self,
+        Parameters(p): Parameters<ClusterResourceListInput>,
+    ) -> String {
+        match self
+            .reader
+            .list_resource(&p.cluster, p.kind, &p.namespace)
+            .await
+        {
+            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|e| {
+                format!(
+                    "{{\"error\":\"serialize\",\"detail\":\"{}\"}}",
+                    e
+                )
+            }),
             Err(e) => to_pretty_error(&e),
         }
     }
