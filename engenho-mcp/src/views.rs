@@ -156,6 +156,48 @@ pub struct SnapshotMetaView {
     pub all_paths_exist: bool,
 }
 
+// ── Pod listing ───────────────────────────────────────────────────
+
+/// One pod's typed-but-flattened view for the MCP wire. Mirrors
+/// `engenho-types::Pod` but pre-flattened so MCP clients don't
+/// have to nest-traverse spec.containers etc. Secret-free by type
+/// (no Secret-volumeMount or token-projected-volume payloads).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PodSummary {
+    pub name: String,
+    pub namespace: String,
+    /// Phase as a string (Pending / Running / Succeeded / Failed
+    /// / Unknown). Sourced from typed `PodPhase` enum.
+    pub phase: String,
+    /// PodIP if scheduled; `None` if pending.
+    pub pod_ip: Option<String>,
+    /// HostIP — the node IP.
+    pub host_ip: Option<String>,
+    /// Container summaries (name + image + ready + restart count).
+    pub containers: Vec<ContainerSummary>,
+    /// Pod-level conditions (Ready / PodScheduled / ContainersReady
+    /// / Initialized) flattened to a string→string map for the
+    /// MCP wire.
+    pub conditions: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContainerSummary {
+    pub name: String,
+    pub image: String,
+    pub ready: bool,
+    pub restart_count: i32,
+    pub started: Option<bool>,
+}
+
+/// Aggregate response for the `cluster_pods` MCP tool.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PodListView {
+    pub cluster: String,
+    pub namespace: String,
+    pub pods: Vec<PodSummary>,
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]

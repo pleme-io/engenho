@@ -20,10 +20,15 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
+use engenho_types::client::{KubeClient, ListOptions};
+use engenho_types::generated_v1_34::core_v1::{Pod, PodPhase};
+
 use crate::reader::{ClusterReader, ReaderError};
 use crate::views::{
-    ArgocdView, AuthMethod, ClusterConfigView, ClusterStatus, FluxcdView, GitopsBackendView,
-    KubeAuthDescriptor, SnapshotMetaView, StatusOutcome, StatusRow,
+    ArgocdView, AuthMethod, ClusterConfigView, ClusterStatus, ContainerSummary, FluxcdView,
+    GitopsBackendView, KubeAuthDescriptor, PodListView, PodSummary, SnapshotMetaView,
+    StatusOutcome, StatusRow,
 };
 
 pub struct KikaiClusterReader {
@@ -129,6 +134,104 @@ impl ClusterReader for KikaiClusterReader {
     ) -> Result<Option<SnapshotMetaView>, ReaderError> {
         let _ = self.load_cluster_entry(cluster)?;
         read_snapshot_meta(cluster, &self.data_dir(cluster))
+    }
+
+    async fn list_pods(
+        &self,
+        cluster: &str,
+        namespace: &str,
+    ) -> Result<PodListView, ReaderError> {
+        // Verify cluster registered + kubeconfig exists.
+        let _ = self.load_cluster_entry(cluster)?;
+        let kc_path = self.kubeconfig_path(cluster);
+        if !kc_path.exists() {
+            return Err(ReaderError::InvalidState(format!(
+                "kubeconfig missing at {} — cluster API not yet bootstrapped",
+                kc_path.display()
+            )));
+        }
+
+        // engenho-kube-client load → resolve → REST.
+        let kc = Kubeconfig::load(&kc_path).map_err(|e| {
+            ReaderError::InvalidState(format!("kubeconfig parse for '{cluster}': {e}"))
+        })?;
+        let conn = kc.resolve_connection().map_err(|e| {
+            ReaderError::InvalidState(format!("kubeconfig resolve for '{cluster}': {e}"))
+        })?;
+        let client = ReqwestKubeClient::new(conn);
+
+        let list = client
+            .list::<Pod>(Some(namespace), &ListOptions::default())
+            .await
+            .map_err(|e| {
+                ReaderError::InvalidState(format!(
+                    "LIST pods in {cluster}/{namespace} failed: {e}"
+                ))
+            })?;
+
+        Ok(PodListView {
+            cluster: cluster.to_string(),
+            namespace: namespace.to_string(),
+            pods: list.items.iter().map(pod_summary_from_typed).collect(),
+        })
+    }
+}
+
+/// Flatten an engenho-types Pod into the wire view. Pure function;
+/// no allocation beyond cloning the strings the MCP client gets.
+fn pod_summary_from_typed(p: &Pod) -> PodSummary {
+    let phase_str = p
+        .status
+        .as_ref()
+        .and_then(|s| s.phase)
+        .map(phase_as_str)
+        .unwrap_or("Unknown")
+        .to_string();
+    let (pod_ip, host_ip) = p
+        .status
+        .as_ref()
+        .map(|s| (s.pod_ip.clone(), s.host_ip.clone()))
+        .unwrap_or((None, None));
+    let containers = p
+        .status
+        .as_ref()
+        .map(|s| {
+            s.container_statuses
+                .iter()
+                .map(|cs| ContainerSummary {
+                    name: cs.name.clone(),
+                    image: cs.image.clone(),
+                    ready: cs.ready,
+                    restart_count: cs.restart_count,
+                    started: cs.started,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut conditions = BTreeMap::new();
+    if let Some(s) = &p.status {
+        for cond in &s.conditions {
+            conditions.insert(cond.r#type.clone(), cond.status.clone());
+        }
+    }
+    PodSummary {
+        name: p.metadata.name.clone(),
+        namespace: p.metadata.namespace.clone().unwrap_or_default(),
+        phase: phase_str,
+        pod_ip,
+        host_ip,
+        containers,
+        conditions,
+    }
+}
+
+fn phase_as_str(p: PodPhase) -> &'static str {
+    match p {
+        PodPhase::Pending => "Pending",
+        PodPhase::Running => "Running",
+        PodPhase::Succeeded => "Succeeded",
+        PodPhase::Failed => "Failed",
+        PodPhase::Unknown => "Unknown",
     }
 }
 
