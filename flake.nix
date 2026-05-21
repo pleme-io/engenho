@@ -70,5 +70,15 @@
             engenho-mcp = mcpBinFor system;
           })
       );
+
+      # Overlay so downstream consumers (pleme-io/nix/parts/overlays.nix)
+      # can drop in `inputs.engenho.overlays.default` and get
+      # `pkgs.engenho-mcp` (+ the cluster-config renderer) on every
+      # system. Mirrors the zoekt-mcp / amimori / kurage pattern.
+      overlays.default = final: _prev: {
+        engenho-mcp = mcpBinFor final.stdenv.hostPlatform.system;
+        engenho-cluster-config-render =
+          renderBinFor final.stdenv.hostPlatform.system;
+      };
     };
 }
