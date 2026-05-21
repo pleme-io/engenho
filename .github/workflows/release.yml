@@ -12,9 +12,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        bin:
-          - engenho-mcp
-          - engenho-cluster-config-render
+        bin: [engenho-mcp, engenho-cluster-config-render]
+        slug: [darwin-arm64, linux-x86_64, linux-arm64]
         include:
           - slug: darwin-arm64
             runner: macos-14
