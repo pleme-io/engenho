@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::generated_v1_34::apps_v1::LabelSelector;
+use crate::primitives::Quantity;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistentVolumeClaimSpec {
@@ -50,9 +51,9 @@ pub struct PersistentVolumeClaimSpec {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceRequirements {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub requests: BTreeMap<String, String>,
+    pub requests: BTreeMap<String, Quantity>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub limits: BTreeMap<String, String>,
+    pub limits: BTreeMap<String, Quantity>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -67,7 +68,7 @@ pub struct PersistentVolumeClaimStatus {
 
     /// Actual capacity once bound.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub capacity: BTreeMap<String, String>,
+    pub capacity: BTreeMap<String, Quantity>,
 
     /// Conditions detail the PVC state changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -100,13 +101,16 @@ mod tests {
 
     #[test]
     fn pvc_spec_round_trips_with_storage_request() {
+        use std::str::FromStr;
         let mut spec = PersistentVolumeClaimSpec {
             access_modes: vec!["ReadWriteOnce".into()],
             storage_class_name: Some("local-path".into()),
             ..Default::default()
         };
         let mut resources = ResourceRequirements::default();
-        resources.requests.insert("storage".into(), "1Gi".into());
+        resources
+            .requests
+            .insert("storage".into(), Quantity::from_str("1Gi").unwrap());
         spec.resources = Some(resources);
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"storage\":\"1Gi\""), "got: {json}");
@@ -117,12 +121,15 @@ mod tests {
 
     #[test]
     fn pvc_status_bound_round_trips() {
+        use std::str::FromStr;
         let mut status = PersistentVolumeClaimStatus {
             phase: Some(PvcPhase::Bound),
             access_modes: vec!["ReadWriteOnce".into()],
             ..Default::default()
         };
-        status.capacity.insert("storage".into(), "1Gi".into());
+        status
+            .capacity
+            .insert("storage".into(), Quantity::from_str("1Gi").unwrap());
         let s = serde_json::to_string(&status).unwrap();
         assert!(s.contains("\"Bound\""));
         let back: PersistentVolumeClaimStatus = serde_json::from_str(&s).unwrap();
