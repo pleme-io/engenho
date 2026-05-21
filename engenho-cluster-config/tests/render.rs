@@ -138,9 +138,9 @@ fn flux_enable_without_source_is_install_only() {
     c.validate().expect("install-only mode accepted");
     // Render must emit the install manifest but NOT the source CR.
     let manifests = c.render_bootstrap_manifests();
-    let install = manifests.iter().find(|m| m.name == "flux-system-install.yaml");
+    let install = manifests.iter().find(|m| m.filename == "flux-system-install.yaml");
     assert!(install.is_some(), "install manifest still emitted");
-    let source = manifests.iter().find(|m| m.name == "flux-system-source.yaml");
+    let source = manifests.iter().find(|m| m.filename == "flux-system-source.yaml");
     assert!(source.is_none(), "source manifest must NOT be emitted in install-only mode");
 }
 
@@ -150,9 +150,9 @@ fn argo_enable_without_source_is_install_only() {
     c.bootstrap.argocd.enable = true;
     c.validate().expect("install-only mode accepted");
     let manifests = c.render_bootstrap_manifests();
-    let install = manifests.iter().find(|m| m.name == "argocd-install.yaml");
+    let install = manifests.iter().find(|m| m.filename == "argocd-install.yaml");
     assert!(install.is_some(), "install manifest still emitted");
-    let app = manifests.iter().find(|m| m.name.contains("application"));
+    let app = manifests.iter().find(|m| m.filename.contains("application"));
     assert!(app.is_none(), "application CR must NOT be emitted in install-only mode");
 }
 
