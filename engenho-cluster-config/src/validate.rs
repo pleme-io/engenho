@@ -115,17 +115,18 @@ pub(crate) fn validate(cfg: &ClusterConfig) -> Result<(), ConfigError> {
     }
 
     // ── FluxCD bootstrap consistency ───────────────────────────────
-    if cfg.bootstrap.fluxcd.enable && cfg.bootstrap.fluxcd.source.is_none() {
-        return Err(ConfigError::Invalid(
-            "bootstrap.fluxcd.enable=true requires bootstrap.fluxcd.source".into(),
-        ));
-    }
+    // enable=true with source=None is now a valid "install-only" mode:
+    // the NixOS image bakes the flux2 HelmChart (so the controllers +
+    // CRDs install at boot) but no GitRepository / Kustomization CR
+    // is created by the addon manager. This lets a downstream
+    // operator-side primitive (e.g. kikai's `gitops::bootstrap`)
+    // own the source-CR lifecycle as the single source of truth,
+    // avoiding the rio.cattle.io-vs-kikai patch fight over spec.url.
+    //
     // ── ArgoCD bootstrap consistency ───────────────────────────────
-    if cfg.bootstrap.argocd.enable && cfg.bootstrap.argocd.source.is_none() {
-        return Err(ConfigError::Invalid(
-            "bootstrap.argocd.enable=true requires bootstrap.argocd.source".into(),
-        ));
-    }
+    // Same install-only mode applies to ArgoCD: enable=true emits
+    // only the install manifest; an operator primitive creates the
+    // Application CR with the actual source pointer.
 
     Ok(())
 }
