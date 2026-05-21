@@ -136,6 +136,39 @@ pub struct NodeSystemInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Random NodeSpec with taints + pod_cidrs round-trips
+        /// through JSON identity.
+        #[test]
+        fn arb_node_spec_round_trips(
+            cidr_octet in 0u8..32,
+            taint_key in "[a-z][a-z0-9-]{0,30}",
+            taint_value in "[a-z0-9-]{0,30}",
+            effect_idx in 0usize..3,
+            unsched in any::<bool>(),
+        ) {
+            let effects = ["NoSchedule", "PreferNoSchedule", "NoExecute"];
+            let mut spec = NodeSpec {
+                pod_cidr: Some(format!("10.42.{cidr_octet}.0/24")),
+                pod_cidrs: vec![format!("10.42.{cidr_octet}.0/24")],
+                provider_id: Some("k3s://engenho-local".into()),
+                unschedulable: Some(unsched),
+                ..Default::default()
+            };
+            spec.taints.push(Taint {
+                key: taint_key,
+                value: Some(taint_value),
+                effect: effects[effect_idx].into(),
+                ..Default::default()
+            });
+            let s = serde_json::to_string(&spec).unwrap();
+            let back: NodeSpec = serde_json::from_str(&s).unwrap();
+            prop_assert_eq!(back, spec);
+        }
+    }
+
 
     #[test]
     fn node_spec_round_trips_with_pod_cidrs_and_taints() {

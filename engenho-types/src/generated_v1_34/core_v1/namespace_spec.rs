@@ -88,6 +88,20 @@ mod tests {
         assert_eq!(back, status);
     }
 
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Any NamespacePhase round-trips identity.
+        #[test]
+        fn arb_namespace_phase_round_trips(idx in 0usize..2) {
+            let phases = [NamespacePhase::Active, NamespacePhase::Terminating];
+            let phase = phases[idx];
+            let s = serde_json::to_string(&phase).unwrap();
+            let back: NamespacePhase = serde_json::from_str(&s).unwrap();
+            prop_assert_eq!(back, phase);
+        }
+    }
+
     #[test]
     fn empty_namespace_spec_serializes_to_empty_object() {
         let s = serde_json::to_string(&NamespaceSpec::default()).unwrap();
