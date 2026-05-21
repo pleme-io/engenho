@@ -14,6 +14,11 @@
 > integration in §VIII, tatara integration in §IX, phases in §X,
 > open questions in §XII, anti-patterns + risks in Appendix B.
 >
+> **Lean engineering rationale:** [`docs/LEAN.md`](./docs/LEAN.md) —
+> the decision matrix for every K8s subsystem (what engenho owns, what
+> it composes from Rust OSS, what it consumes from pleme-io shared
+> libs). Read after ENGENHO.md.
+>
 > **Local roadmap:** [`docs/M0-ROADMAP.md`](./docs/M0-ROADMAP.md) — the
 > M0.0.1 → M0.0.4 step-by-step inside this repo.
 
@@ -25,8 +30,28 @@ see theory/ENGENHO.md §XI.1.a for the explicit boundary table.
 ## Architecture
 
 See [`README.md`](./README.md) for the target workspace shape. Today
-(M0.0): `engenho-types` (the typed K8s resource catalog seed) + `engenho`
-(placeholder binary).
+(M0.0 + M0.0.2):
+
+  - `engenho-types` — typed K8s resource catalog. 18 kinds scaffolded;
+    Pod has the **M0.0.2 typed bullseye** (PodSpec + PodStatus +
+    Container + ContainerPort + EnvVar + PodCondition + ContainerStatus
+    + PodPhase). Other kinds carry opaque spec/status pending M0.0.3
+    codegen catching up.
+  - `engenho-cluster-config` + `engenho-cluster-config-render` —
+    typed k3s/engenho cluster bootstrap config. Renders config.yaml +
+    server-args.txt + manifests.
+  - `engenho-kube-client` — reqwest+rustls impl of the KubeClient
+    trait. **Live-validated against the engenho-local cluster's
+    podinfo replicas via `tests/live_engenho_local.rs`.**
+  - `engenho-kube-codegen` — codegen scaffold for M0.0.3 typed
+    spec/status expansion across the catalog.
+  - `engenho-mcp` — MCP server (5 tools: cluster_status, cluster_config,
+    cluster_kubeconfig, cluster_snapshot_meta, **cluster_pods** — the
+    last goes through the typed Pod catalog + engenho-kube-client to
+    the live cluster). Operator surface exposed to Claude Code /
+    Cursor / OpenCode / Gemini via anvil.
+  - `engenho` — placeholder binary; composes apiserver + datastore at
+    M0.1.
 
 ## The non-negotiable rule
 
