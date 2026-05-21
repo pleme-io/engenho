@@ -12,6 +12,7 @@
 //! * [`server`] — the rmcp `ServerHandler` impl wiring the trait to tools
 
 pub mod reader;
+pub mod redaction;
 pub mod resource_kind;
 pub mod server;
 pub mod views;

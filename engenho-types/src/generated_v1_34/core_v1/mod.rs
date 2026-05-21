@@ -15,6 +15,7 @@ mod namespace;
 mod namespace_spec;
 mod serviceaccount;
 mod node;
+mod node_spec;
 mod persistentvolume;
 mod persistentvolumeclaim;
 mod endpoints;
@@ -30,11 +31,14 @@ pub use service_spec::{
     ServiceSpec, ServiceStatus, ServiceType,
 };
 pub use configmap::ConfigMap;
-pub use secret::Secret;
+pub use secret::{KnownSecretType, Secret, SecretType};
 pub use namespace::Namespace;
 pub use namespace_spec::{NamespaceCondition, NamespacePhase, NamespaceSpec, NamespaceStatus};
-pub use serviceaccount::ServiceAccount;
 pub use node::Node;
+pub use node_spec::{
+    NodeAddress, NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo, Taint,
+};
+pub use serviceaccount::ServiceAccount;
 pub use persistentvolume::PersistentVolume;
 pub use persistentvolumeclaim::PersistentVolumeClaim;
 pub use endpoints::Endpoints;

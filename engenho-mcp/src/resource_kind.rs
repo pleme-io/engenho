@@ -30,8 +30,12 @@ pub enum ResourceKind {
     Service,
     /// core/v1 ConfigMap (namespaced)
     ConfigMap,
+    /// core/v1 Secret (namespaced — REDACTED at the MCP boundary)
+    Secret,
     /// core/v1 Namespace (cluster-scoped)
     Namespace,
+    /// core/v1 Node (cluster-scoped)
+    Node,
     /// apps/v1 Deployment (namespaced)
     Deployment,
 }
@@ -44,7 +48,9 @@ impl ResourceKind {
             Self::Pod => "pod",
             Self::Service => "service",
             Self::ConfigMap => "config_map",
+            Self::Secret => "secret",
             Self::Namespace => "namespace",
+            Self::Node => "node",
             Self::Deployment => "deployment",
         }
     }
@@ -58,7 +64,9 @@ impl ResourceKind {
             Self::Pod,
             Self::Service,
             Self::ConfigMap,
+            Self::Secret,
             Self::Namespace,
+            Self::Node,
             Self::Deployment,
         ]
     }
@@ -68,7 +76,14 @@ impl ResourceKind {
     /// dispatcher can pick the right URL shape without needing
     /// the type at the call site.
     pub fn is_cluster_scoped(self) -> bool {
-        matches!(self, Self::Namespace)
+        matches!(self, Self::Namespace | Self::Node)
+    }
+
+    /// Whether the kind carries secret material at the wire.
+    /// True kinds route through a redacted view at the MCP
+    /// boundary — engenho-mcp never serializes their values.
+    pub fn carries_secret_material(self) -> bool {
+        matches!(self, Self::Secret)
     }
 }
 
@@ -119,11 +134,28 @@ mod tests {
 
     #[test]
     fn cluster_scope_classification_is_correct() {
-        // Namespace is the only cluster-scoped variant today.
+        // Cluster-scoped today: Namespace + Node.
         assert!(ResourceKind::Namespace.is_cluster_scoped());
+        assert!(ResourceKind::Node.is_cluster_scoped());
         for &k in ResourceKind::all() {
-            if !matches!(k, ResourceKind::Namespace) {
+            if !matches!(k, ResourceKind::Namespace | ResourceKind::Node) {
                 assert!(!k.is_cluster_scoped(), "{k:?} should be namespaced");
+            }
+        }
+    }
+
+    /// The "carries secret material" gate routes Secret-like kinds
+    /// through redaction. Currently only Secret; future TLS-typed
+    /// resources or token-projected volumes would join.
+    #[test]
+    fn secret_material_classification_is_correct() {
+        assert!(ResourceKind::Secret.carries_secret_material());
+        for &k in ResourceKind::all() {
+            if !matches!(k, ResourceKind::Secret) {
+                assert!(
+                    !k.carries_secret_material(),
+                    "{k:?} should not carry secret material"
+                );
             }
         }
     }
