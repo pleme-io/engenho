@@ -34,6 +34,10 @@ pub enum ResourceKind {
     Secret,
     /// core/v1 ServiceAccount (namespaced)
     ServiceAccount,
+    /// core/v1 Endpoints (namespaced)
+    Endpoints,
+    /// core/v1 PersistentVolumeClaim (namespaced)
+    PersistentVolumeClaim,
     /// core/v1 Namespace (cluster-scoped)
     Namespace,
     /// core/v1 Node (cluster-scoped)
@@ -42,6 +46,10 @@ pub enum ResourceKind {
     Deployment,
     /// apps/v1 ReplicaSet (namespaced)
     ReplicaSet,
+    /// rbac.authorization.k8s.io/v1 Role (namespaced)
+    Role,
+    /// rbac.authorization.k8s.io/v1 RoleBinding (namespaced)
+    RoleBinding,
 }
 
 impl ResourceKind {
@@ -54,10 +62,14 @@ impl ResourceKind {
             Self::ConfigMap => "config_map",
             Self::Secret => "secret",
             Self::ServiceAccount => "service_account",
+            Self::Endpoints => "endpoints",
+            Self::PersistentVolumeClaim => "persistent_volume_claim",
             Self::Namespace => "namespace",
             Self::Node => "node",
             Self::Deployment => "deployment",
             Self::ReplicaSet => "replica_set",
+            Self::Role => "role",
+            Self::RoleBinding => "role_binding",
         }
     }
 
@@ -72,10 +84,14 @@ impl ResourceKind {
             Self::ConfigMap,
             Self::Secret,
             Self::ServiceAccount,
+            Self::Endpoints,
+            Self::PersistentVolumeClaim,
             Self::Namespace,
             Self::Node,
             Self::Deployment,
             Self::ReplicaSet,
+            Self::Role,
+            Self::RoleBinding,
         ]
     }
 
@@ -94,8 +110,12 @@ impl ResourceKind {
             | Self::ConfigMap
             | Self::Secret
             | Self::ServiceAccount
+            | Self::Endpoints
+            | Self::PersistentVolumeClaim
             | Self::Deployment
-            | Self::ReplicaSet => false,
+            | Self::ReplicaSet
+            | Self::Role
+            | Self::RoleBinding => false,
         }
     }
 
@@ -112,10 +132,14 @@ impl ResourceKind {
             | Self::Service
             | Self::ConfigMap
             | Self::ServiceAccount
+            | Self::Endpoints
+            | Self::PersistentVolumeClaim
             | Self::Namespace
             | Self::Node
             | Self::Deployment
-            | Self::ReplicaSet => false,
+            | Self::ReplicaSet
+            | Self::Role
+            | Self::RoleBinding => false,
         }
     }
 }

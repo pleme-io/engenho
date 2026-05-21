@@ -18,8 +18,10 @@ use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{DeleteOptions, KubeClient};
 use engenho_types::generated_v1_34::apps_v1::{Deployment, ReplicaSet};
 use engenho_types::generated_v1_34::core_v1::{
-    ConfigMap, Namespace, Node, Pod, Secret, Service, ServiceAccount,
+    ConfigMap, Endpoints, Namespace, Node, PersistentVolumeClaim, Pod, Secret, Service,
+    ServiceAccount,
 };
+use engenho_types::generated_v1_34::rbac_v1::{Role, RoleBinding};
 use engenho_types::patch::Patch;
 
 use crate::resource_kind::ResourceKind;
@@ -99,10 +101,14 @@ impl ClusterWriter for KikaiClusterWriter {
             ResourceKind::ConfigMap => apply_typed::<ConfigMap>(&client, ns_arg, name, &patch, "configmap").await?,
             ResourceKind::Secret => apply_typed::<Secret>(&client, ns_arg, name, &patch, "secret").await?,
             ResourceKind::ServiceAccount => apply_typed::<ServiceAccount>(&client, ns_arg, name, &patch, "serviceaccount").await?,
+            ResourceKind::Endpoints => apply_typed::<Endpoints>(&client, ns_arg, name, &patch, "endpoints").await?,
+            ResourceKind::PersistentVolumeClaim => apply_typed::<PersistentVolumeClaim>(&client, ns_arg, name, &patch, "persistentvolumeclaim").await?,
             ResourceKind::Namespace => apply_typed::<Namespace>(&client, ns_arg, name, &patch, "namespace").await?,
             ResourceKind::Node => apply_typed::<Node>(&client, ns_arg, name, &patch, "node").await?,
             ResourceKind::Deployment => apply_typed::<Deployment>(&client, ns_arg, name, &patch, "deployment").await?,
             ResourceKind::ReplicaSet => apply_typed::<ReplicaSet>(&client, ns_arg, name, &patch, "replicaset").await?,
+            ResourceKind::Role => apply_typed::<Role>(&client, ns_arg, name, &patch, "role").await?,
+            ResourceKind::RoleBinding => apply_typed::<RoleBinding>(&client, ns_arg, name, &patch, "rolebinding").await?,
         };
         Ok(result_json)
     }
@@ -131,10 +137,14 @@ impl ClusterWriter for KikaiClusterWriter {
             ResourceKind::ConfigMap => delete_typed::<ConfigMap>(&client, ns_arg, name, &opts, "configmap").await,
             ResourceKind::Secret => delete_typed::<Secret>(&client, ns_arg, name, &opts, "secret").await,
             ResourceKind::ServiceAccount => delete_typed::<ServiceAccount>(&client, ns_arg, name, &opts, "serviceaccount").await,
+            ResourceKind::Endpoints => delete_typed::<Endpoints>(&client, ns_arg, name, &opts, "endpoints").await,
+            ResourceKind::PersistentVolumeClaim => delete_typed::<PersistentVolumeClaim>(&client, ns_arg, name, &opts, "persistentvolumeclaim").await,
             ResourceKind::Namespace => delete_typed::<Namespace>(&client, ns_arg, name, &opts, "namespace").await,
             ResourceKind::Node => delete_typed::<Node>(&client, ns_arg, name, &opts, "node").await,
             ResourceKind::Deployment => delete_typed::<Deployment>(&client, ns_arg, name, &opts, "deployment").await,
             ResourceKind::ReplicaSet => delete_typed::<ReplicaSet>(&client, ns_arg, name, &opts, "replicaset").await,
+            ResourceKind::Role => delete_typed::<Role>(&client, ns_arg, name, &opts, "role").await,
+            ResourceKind::RoleBinding => delete_typed::<RoleBinding>(&client, ns_arg, name, &opts, "rolebinding").await,
         }
     }
 }

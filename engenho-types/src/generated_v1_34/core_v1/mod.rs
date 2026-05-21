@@ -18,6 +18,7 @@ mod node;
 mod node_spec;
 mod persistentvolume;
 mod persistentvolumeclaim;
+mod pvc_spec;
 mod endpoints;
 
 pub use pod::Pod;
@@ -39,6 +40,12 @@ pub use node_spec::{
     NodeAddress, NodeCondition, NodeSpec, NodeStatus, NodeSystemInfo, Taint,
 };
 pub use serviceaccount::{LocalObjectReference, ServiceAccount};
+pub use pvc_spec::{
+    PersistentVolumeClaimCondition, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimStatus, PvcPhase, ResourceRequirements,
+};
+pub use endpoints::{
+    EndpointAddress, EndpointPort, EndpointSubset, Endpoints, ObjectReference,
+};
 pub use persistentvolume::PersistentVolume;
 pub use persistentvolumeclaim::PersistentVolumeClaim;
-pub use endpoints::Endpoints;

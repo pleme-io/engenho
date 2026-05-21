@@ -24,8 +24,10 @@ use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{KubeClient, ListOptions};
 use engenho_types::generated_v1_34::apps_v1::{Deployment, ReplicaSet};
 use engenho_types::generated_v1_34::core_v1::{
-    ConfigMap, Namespace, Node, Pod, PodPhase, Secret, Service, ServiceAccount,
+    ConfigMap, Endpoints, Namespace, Node, PersistentVolumeClaim, Pod, PodPhase, Secret,
+    Service, ServiceAccount,
 };
+use engenho_types::generated_v1_34::rbac_v1::{Role, RoleBinding};
 use crate::reader::ListSpec;
 use crate::redaction::redact_secret;
 
@@ -207,10 +209,14 @@ impl ClusterReader for KikaiClusterReader {
             ResourceKind::ConfigMap => list_to_json::<ConfigMap>(&client, ns_arg, &opts, "configmaps").await?,
             ResourceKind::Secret => list_secrets_redacted(&client, ns_arg, &opts).await?,
             ResourceKind::ServiceAccount => list_to_json::<ServiceAccount>(&client, ns_arg, &opts, "serviceaccounts").await?,
+            ResourceKind::Endpoints => list_to_json::<Endpoints>(&client, ns_arg, &opts, "endpoints").await?,
+            ResourceKind::PersistentVolumeClaim => list_to_json::<PersistentVolumeClaim>(&client, ns_arg, &opts, "persistentvolumeclaims").await?,
             ResourceKind::Namespace => list_to_json::<Namespace>(&client, ns_arg, &opts, "namespaces").await?,
             ResourceKind::Node => list_to_json::<Node>(&client, ns_arg, &opts, "nodes").await?,
             ResourceKind::Deployment => list_to_json::<Deployment>(&client, ns_arg, &opts, "deployments").await?,
             ResourceKind::ReplicaSet => list_to_json::<ReplicaSet>(&client, ns_arg, &opts, "replicasets").await?,
+            ResourceKind::Role => list_to_json::<Role>(&client, ns_arg, &opts, "roles").await?,
+            ResourceKind::RoleBinding => list_to_json::<RoleBinding>(&client, ns_arg, &opts, "rolebindings").await?,
         };
         Ok(json)
     }
@@ -234,10 +240,14 @@ impl ClusterReader for KikaiClusterReader {
             ResourceKind::ConfigMap => get_to_json::<ConfigMap>(&client, ns_arg, name, "configmap").await?,
             ResourceKind::Secret => get_secret_redacted(&client, ns_arg, name).await?,
             ResourceKind::ServiceAccount => get_to_json::<ServiceAccount>(&client, ns_arg, name, "serviceaccount").await?,
+            ResourceKind::Endpoints => get_to_json::<Endpoints>(&client, ns_arg, name, "endpoints").await?,
+            ResourceKind::PersistentVolumeClaim => get_to_json::<PersistentVolumeClaim>(&client, ns_arg, name, "persistentvolumeclaim").await?,
             ResourceKind::Namespace => get_to_json::<Namespace>(&client, ns_arg, name, "namespace").await?,
             ResourceKind::Node => get_to_json::<Node>(&client, ns_arg, name, "node").await?,
             ResourceKind::Deployment => get_to_json::<Deployment>(&client, ns_arg, name, "deployment").await?,
             ResourceKind::ReplicaSet => get_to_json::<ReplicaSet>(&client, ns_arg, name, "replicaset").await?,
+            ResourceKind::Role => get_to_json::<Role>(&client, ns_arg, name, "role").await?,
+            ResourceKind::RoleBinding => get_to_json::<RoleBinding>(&client, ns_arg, name, "rolebinding").await?,
         };
         Ok(json)
     }
