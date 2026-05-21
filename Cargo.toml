@@ -38,7 +38,7 @@ rmcp                   = { version = "0.15", features = ["server", "transport-io
 # Distribution-layer deps (used by engenho-revoada). Pinned to the
 # same versions tatara-engine ships in production so we stay in sync.
 chitchat               = "0.10"
-openraft               = { version = "0.9", features = ["serde"] }
+openraft               = { version = "0.9", features = ["serde", "storage-v2"] }
 
 [workspace.lints]
 

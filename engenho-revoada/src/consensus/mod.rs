@@ -5,17 +5,31 @@
 //! them in log order to a deterministic state machine that owns
 //! the canonical "who-runs-what" view.
 //!
-//! Joint consensus (openraft's native dynamic-membership protocol)
-//! makes shifts atomic — a single Raft commit transitions the mesh
-//! from "old shape" to "new shape" without an intermediate state.
+//! ## R2 status
 //!
-//! R0: typed surface + state machine model only. R2 wires
-//! `databendlabs/openraft` (already a tatara-engine dep) and runs
-//! a real Raft group over a chitchat-discovered peer set.
+//! Wired against [`openraft`] 0.9. The state machine, in-memory
+//! log store, snapshot builder, and in-process network router
+//! are all implemented; tests in `tests/r2_consensus.rs` prove
+//! single-node + multi-node convergence on a typed [`MeshShape`]
+//! via the real openraft `client_write` path.
+//!
+//! Modules:
+//!   * `role_assignment` — the typed command set (R0)
+//!   * `type_config` — openraft TypeConfig declaration
+//!   * `store` — InMemoryStore (RaftLogStorage + RaftStateMachine)
+//!   * `network` — InProcessRouter / InProcessNetwork
 
+pub mod mesh;
+pub mod network;
 pub mod role_assignment;
+pub mod store;
+pub mod type_config;
 
+pub use mesh::{default_config, RaftError, RaftMesh};
+pub use network::InProcessRouter;
 pub use role_assignment::{Reason, RoleAssignment};
+pub use store::InMemoryStore;
+pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
