@@ -39,6 +39,7 @@ pub mod attestation;
 pub mod consensus;
 pub mod content;
 pub mod membership;
+pub mod policy;
 
 use serde::{Deserialize, Serialize};
 
