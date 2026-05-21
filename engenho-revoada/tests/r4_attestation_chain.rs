@@ -197,6 +197,126 @@ async fn three_node_raft_each_leader_signs_blocks_with_its_identity() {
     Arc::try_unwrap(mesh_3).ok().unwrap().terminate().await.unwrap();
 }
 
+/// R4.5: per-node chain. Every node — leader and follower — must
+/// build its own signed chain by signing every applied entry. This
+/// is the convergence test: after the leader proposes N commands,
+/// ALL three nodes' chains have N blocks AND each chain verifies
+/// independently with its own node's public key.
+#[tokio::test]
+async fn r4_5_all_nodes_build_independent_chains_on_apply() {
+    let router = InProcessRouter::new();
+    let cfg = default_config("revoada-test-r4-5-converge").unwrap();
+    let id_1 = NodeIdentity::from_seed([0x21; 32]);
+    let id_2 = NodeIdentity::from_seed([0x22; 32]);
+    let id_3 = NodeIdentity::from_seed([0x23; 32]);
+
+    let mesh_1 = Arc::new(
+        RaftMesh::start_with_identity(
+            1,
+            "in-process://r45-1".into(),
+            router.clone(),
+            cfg.clone(),
+            id_1.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let mesh_2 = Arc::new(
+        RaftMesh::start_with_identity(
+            2,
+            "in-process://r45-2".into(),
+            router.clone(),
+            cfg.clone(),
+            id_2.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let mesh_3 = Arc::new(
+        RaftMesh::start_with_identity(
+            3,
+            "in-process://r45-3".into(),
+            router.clone(),
+            cfg.clone(),
+            id_3.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    mesh_1
+        .initialize_with_voters(vec![
+            (1, "in-process://r45-1".into()),
+            (2, "in-process://r45-2".into()),
+            (3, "in-process://r45-3".into()),
+        ])
+        .await
+        .expect("3-node init");
+
+    // Wait for a leader.
+    let mut leader_found = false;
+    for _ in 0..40 {
+        if mesh_1.is_leader().await || mesh_2.is_leader().await || mesh_3.is_leader().await {
+            leader_found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(leader_found, "no leader elected in 4s");
+
+    let leader = if mesh_1.is_leader().await {
+        &mesh_1
+    } else if mesh_2.is_leader().await {
+        &mesh_2
+    } else {
+        &mesh_3
+    };
+
+    // Propose 4 commands.
+    for i in 1..=4 {
+        leader.propose(promote_cmd(i as u8)).await.expect("propose");
+    }
+
+    // Wait for all 3 nodes to reach apply index 4.
+    assert!(mesh_1.wait_for_applied(4, Duration::from_secs(5)).await);
+    assert!(mesh_2.wait_for_applied(4, Duration::from_secs(5)).await);
+    assert!(mesh_3.wait_for_applied(4, Duration::from_secs(5)).await);
+
+    // Every node's chain has 4 blocks.
+    assert_eq!(mesh_1.attestation_chain().len(), 4);
+    assert_eq!(mesh_2.attestation_chain().len(), 4);
+    assert_eq!(mesh_3.attestation_chain().len(), 4);
+
+    // Each block is signed by THAT NODE'S identity (each node signs
+    // its own apply log — independent attestation).
+    for (mesh, identity) in [(&mesh_1, &id_1), (&mesh_2, &id_2), (&mesh_3, &id_3)] {
+        let blocks = mesh.attestation_chain().snapshot();
+        for b in &blocks {
+            assert_eq!(
+                b.leader, identity.node_id(),
+                "every block on node{} must be signed by node{}'s identity",
+                mesh.node_id(),
+                mesh.node_id()
+            );
+        }
+        verify_chain(&blocks).expect("each node's chain verifies independently");
+    }
+
+    // M-of-N audit: serialize ALL three chains; auditor verifies
+    // each independently. Three signatures over the same Raft
+    // commit log = strong distributed proof-of-state.
+    for mesh in [&mesh_1, &mesh_2, &mesh_3] {
+        let wire = serde_json::to_string(&mesh.attestation_chain().snapshot()).unwrap();
+        let recovered: Vec<engenho_revoada::attestation::RoleAttestationBlock> =
+            serde_json::from_str(&wire).unwrap();
+        verify_chain(&recovered).expect("serialized chain verifies offline");
+    }
+
+    Arc::try_unwrap(mesh_1).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh_2).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh_3).ok().unwrap().terminate().await.unwrap();
+}
+
 /// Audit scenario: an external auditor receives the chain bytes
 /// + the leader's public key (via gossip's NodeId field) and
 /// verifies independently. Proves the chain is portable + the

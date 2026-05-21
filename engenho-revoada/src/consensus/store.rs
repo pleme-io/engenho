@@ -24,15 +24,24 @@ use openraft::{
 };
 use tokio::sync::Mutex;
 
+use crate::attestation::{AttestationChain, NodeIdentity};
 use crate::consensus::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 use crate::consensus::MeshShape;
 
 /// Combined in-memory store. Both [`RaftLogStorage`] and
 /// [`RaftStateMachine`] share the same Arc<Mutex<Inner>> so a
 /// single owner can clone the handle and drive both traits.
-#[derive(Clone, Default)]
+///
+/// At R4.5 the store also owns this node's [`NodeIdentity`] +
+/// [`AttestationChain`]. Every committed entry that flows through
+/// `apply()` is signed by the local identity + appended to the
+/// chain — so EVERY node (leader and follower) maintains its own
+/// auditor-verifiable chain. Leader changes preserve history.
+#[derive(Clone)]
 pub struct InMemoryStore {
     inner: Arc<Mutex<Inner>>,
+    identity: NodeIdentity,
+    chain: AttestationChain,
 }
 
 #[derive(Default)]
@@ -58,14 +67,24 @@ struct Inner {
 }
 
 impl InMemoryStore {
-    pub fn new() -> Self {
-        Self::default()
+    /// Construct with this node's identity + a fresh attestation chain.
+    pub fn new(identity: NodeIdentity) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            identity,
+            chain: AttestationChain::new(),
+        }
     }
 
     /// Read-only snapshot of the typed MeshShape (the application
     /// state). Used by the wrapper layer's `RaftMesh::current_shape`.
     pub async fn current_shape(&self) -> MeshShape {
         self.inner.lock().await.shape.clone()
+    }
+
+    /// Reference to this node's local attestation chain.
+    pub fn attestation_chain(&self) -> &AttestationChain {
+        &self.chain
     }
 }
 
@@ -260,12 +279,18 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
     {
         let mut guard = self.inner.lock().await;
         let mut results = Vec::new();
+        // Collect (cmd, log_id) pairs to sign AFTER releasing the
+        // shape lock — signing is CPU-bound + AttestationChain has
+        // its own mutex; we don't want to hold the state-machine
+        // lock across signing.
+        let mut to_sign: Vec<(crate::consensus::RoleAssignment, u64, u64)> = Vec::new();
         for entry in entries {
             let log_id = entry.log_id;
             match entry.payload {
                 EntryPayload::Blank => {}
                 EntryPayload::Normal(cmd) => {
                     guard.shape.apply(&cmd, log_id.leader_id.term, log_id.index);
+                    to_sign.push((cmd, log_id.leader_id.term, log_id.index));
                 }
                 EntryPayload::Membership(m) => {
                     guard.last_membership = StoredMembership::new(Some(log_id), m);
@@ -276,6 +301,19 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
                 applied_index: log_id.index,
                 applied_term: log_id.leader_id.term,
             });
+        }
+        drop(guard);
+        // Sign every applied RoleAssignment + append to this node's
+        // chain. Each node's chain reflects its own apply log; the
+        // auditor can verify ANY node's chain independently because
+        // each block is signed with that node's identity (whose
+        // pubkey is its NodeId in gossip).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        for (cmd, term, index) in to_sign {
+            self.chain.append(&self.identity, cmd, now_ms, term, index);
         }
         Ok(results)
     }
@@ -321,6 +359,7 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attestation::NodeIdentity;
     use crate::consensus::{Reason, RoleAssignment};
     use crate::membership::NodeRole;
     use crate::NodeId;
@@ -346,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_store_reports_no_log_state() {
-        let mut s = InMemoryStore::new();
+        let mut s = InMemoryStore::new(NodeIdentity::from_seed([0xee; 32]));
         let state = s.get_log_state().await.unwrap();
         assert!(state.last_log_id.is_none());
         assert!(state.last_purged_log_id.is_none());
@@ -354,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_promote_mutates_mesh_shape() {
-        let mut s = InMemoryStore::new();
+        let mut s = InMemoryStore::new(NodeIdentity::from_seed([0xee; 32]));
         let entry = promote_entry(1);
         let results = s.apply(vec![entry]).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -367,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn vote_round_trips() {
-        let mut s = InMemoryStore::new();
+        let mut s = InMemoryStore::new(NodeIdentity::from_seed([0xee; 32]));
         assert!(s.read_vote().await.unwrap().is_none());
         let vote = Vote::new(1, 42);
         s.save_vote(&vote).await.unwrap();
