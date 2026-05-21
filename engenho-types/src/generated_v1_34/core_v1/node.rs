@@ -63,6 +63,8 @@ fn is_empty_spec(s: &NodeSpec) -> bool {
 mod tests {
     use super::*;
     use super::super::node_spec::{NodeAddress, NodeCondition, NodeSystemInfo};
+    use crate::primitives::Quantity;
+    use std::str::FromStr;
 
     #[test]
     fn node_round_trips_with_typed_status() {
@@ -70,7 +72,9 @@ mod tests {
         n.metadata.name = "engenho-local".into();
         n.spec.pod_cidr = Some("10.42.0.0/24".into());
         let mut status = NodeStatus::default();
-        status.capacity.insert("cpu".into(), "4".into());
+        status
+            .capacity
+            .insert("cpu".into(), Quantity::from_str("4").unwrap());
         status.conditions.push(NodeCondition {
             r#type: "Ready".into(),
             status: "True".into(),

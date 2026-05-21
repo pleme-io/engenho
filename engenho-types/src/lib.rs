@@ -62,6 +62,7 @@ pub mod informer;
 pub mod kind;
 pub mod meta;
 pub mod patch;
+pub mod primitives;
 pub mod reconciler;
 pub mod watch;
 

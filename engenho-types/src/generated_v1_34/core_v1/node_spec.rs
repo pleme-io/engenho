@@ -15,6 +15,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::primitives::Quantity;
+
 /// `NodeSpec` describes the attributes that a node is created with.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSpec {
@@ -57,15 +59,16 @@ pub struct Taint {
 pub struct NodeStatus {
     /// `Capacity` — total resources of the node.
     /// Keys: "cpu", "memory", "pods", "ephemeral-storage", plus
-    /// extended resources. Values are Quantity strings (e.g. "4",
-    /// "8Gi"). Deferred to a full typed `Quantity` at M0.0.3 codegen.
+    /// extended resources. Values are typed `Quantity` (wire shape
+    /// still string, e.g. "4", "8Gi"; parser at the engenho-types
+    /// boundary so consumers see typed numerics).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub capacity: BTreeMap<String, String>,
+    pub capacity: BTreeMap<String, Quantity>,
 
     /// `Allocatable` — resources allocatable to pods (capacity
     /// minus system reservations).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub allocatable: BTreeMap<String, String>,
+    pub allocatable: BTreeMap<String, Quantity>,
 
     /// Conditions describe the current state of the node.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -157,10 +160,17 @@ mod tests {
 
     #[test]
     fn node_status_round_trips_with_capacity_and_conditions() {
+        use std::str::FromStr;
         let mut status = NodeStatus::default();
-        status.capacity.insert("cpu".into(), "4".into());
-        status.capacity.insert("memory".into(), "8Gi".into());
-        status.allocatable.insert("cpu".into(), "4".into());
+        status
+            .capacity
+            .insert("cpu".into(), Quantity::from_str("4").unwrap());
+        status
+            .capacity
+            .insert("memory".into(), Quantity::from_str("8Gi").unwrap());
+        status
+            .allocatable
+            .insert("cpu".into(), Quantity::from_str("4").unwrap());
         status.conditions.push(NodeCondition {
             r#type: "Ready".into(),
             status: "True".into(),

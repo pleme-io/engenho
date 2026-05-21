@@ -64,6 +64,8 @@ fn is_empty_spec(s: &PersistentVolumeClaimSpec) -> bool {
 mod tests {
     use super::*;
     use super::super::pvc_spec::{PvcPhase, ResourceRequirements};
+    use crate::primitives::Quantity;
+    use std::str::FromStr;
 
     #[test]
     fn pvc_round_trips_with_typed_spec_and_status() {
@@ -73,7 +75,8 @@ mod tests {
         pvc.spec.access_modes = vec!["ReadWriteOnce".into()];
         pvc.spec.storage_class_name = Some("local-path".into());
         let mut req = ResourceRequirements::default();
-        req.requests.insert("storage".into(), "1Gi".into());
+        req.requests
+            .insert("storage".into(), Quantity::from_str("1Gi").unwrap());
         pvc.spec.resources = Some(req);
         pvc.status = Some(PersistentVolumeClaimStatus {
             phase: Some(PvcPhase::Bound),
