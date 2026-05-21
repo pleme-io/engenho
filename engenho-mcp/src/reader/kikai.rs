@@ -22,9 +22,11 @@ use std::path::PathBuf;
 
 use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{KubeClient, ListOptions};
-use engenho_types::generated_v1_34::core_v1::{Pod, PodPhase};
+use engenho_types::generated_v1_34::apps_v1::Deployment;
+use engenho_types::generated_v1_34::core_v1::{ConfigMap, Pod, PodPhase, Service};
 
 use crate::reader::{ClusterReader, ReaderError};
+use crate::resource_kind::ResourceKind;
 use crate::views::{
     ArgocdView, AuthMethod, ClusterConfigView, ClusterStatus, ContainerSummary, FluxcdView,
     GitopsBackendView, KubeAuthDescriptor, PodListView, PodSummary, SnapshotMetaView,
@@ -141,25 +143,7 @@ impl ClusterReader for KikaiClusterReader {
         cluster: &str,
         namespace: &str,
     ) -> Result<PodListView, ReaderError> {
-        // Verify cluster registered + kubeconfig exists.
-        let _ = self.load_cluster_entry(cluster)?;
-        let kc_path = self.kubeconfig_path(cluster);
-        if !kc_path.exists() {
-            return Err(ReaderError::InvalidState(format!(
-                "kubeconfig missing at {} — cluster API not yet bootstrapped",
-                kc_path.display()
-            )));
-        }
-
-        // engenho-kube-client load → resolve → REST.
-        let kc = Kubeconfig::load(&kc_path).map_err(|e| {
-            ReaderError::InvalidState(format!("kubeconfig parse for '{cluster}': {e}"))
-        })?;
-        let conn = kc.resolve_connection().map_err(|e| {
-            ReaderError::InvalidState(format!("kubeconfig resolve for '{cluster}': {e}"))
-        })?;
-        let client = ReqwestKubeClient::new(conn);
-
+        let client = self.build_kube_client(cluster)?;
         let list = client
             .list::<Pod>(Some(namespace), &ListOptions::default())
             .await
@@ -168,13 +152,102 @@ impl ClusterReader for KikaiClusterReader {
                     "LIST pods in {cluster}/{namespace} failed: {e}"
                 ))
             })?;
-
         Ok(PodListView {
             cluster: cluster.to_string(),
             namespace: namespace.to_string(),
             pods: list.items.iter().map(pod_summary_from_typed).collect(),
         })
     }
+
+    async fn list_resource(
+        &self,
+        cluster: &str,
+        kind: ResourceKind,
+        namespace: &str,
+    ) -> Result<serde_json::Value, ReaderError> {
+        let client = self.build_kube_client(cluster)?;
+        // Static dispatch — each arm calls the typed client.list<R>()
+        // through engenho-types' typed catalog. Adding a kind:
+        //   1. ResourceKind variant
+        //   2. Match arm here (3 lines)
+        // No new views, no new MCP tools, no new traits.
+        let json = match kind {
+            ResourceKind::Pod => {
+                list_to_json::<Pod>(&client, namespace, "pods").await?
+            }
+            ResourceKind::Service => {
+                list_to_json::<Service>(&client, namespace, "services").await?
+            }
+            ResourceKind::ConfigMap => {
+                list_to_json::<ConfigMap>(&client, namespace, "configmaps").await?
+            }
+            ResourceKind::Deployment => {
+                list_to_json::<Deployment>(&client, namespace, "deployments").await?
+            }
+        };
+        Ok(json)
+    }
+}
+
+impl KikaiClusterReader {
+    /// Build a `ReqwestKubeClient` for the given cluster. Returns
+    /// typed errors when kubeconfig is missing or unparseable.
+    /// Shared by every list_* method on this reader.
+    fn build_kube_client(&self, cluster: &str) -> Result<ReqwestKubeClient, ReaderError> {
+        let _ = self.load_cluster_entry(cluster)?;
+        let kc_path = self.kubeconfig_path(cluster);
+        if !kc_path.exists() {
+            return Err(ReaderError::InvalidState(format!(
+                "kubeconfig missing at {} — cluster API not yet bootstrapped",
+                kc_path.display()
+            )));
+        }
+        let kc = Kubeconfig::load(&kc_path).map_err(|e| {
+            ReaderError::InvalidState(format!("kubeconfig parse for '{cluster}': {e}"))
+        })?;
+        let conn = kc.resolve_connection().map_err(|e| {
+            ReaderError::InvalidState(format!("kubeconfig resolve for '{cluster}': {e}"))
+        })?;
+        Ok(ReqwestKubeClient::new(conn))
+    }
+}
+
+/// Typed list helper — every list_resource arm goes through this.
+/// Returns the items array as `serde_json::Value` so the trait
+/// boundary stays object-safe.
+async fn list_to_json<R>(
+    client: &ReqwestKubeClient,
+    namespace: &str,
+    plural: &str,
+) -> Result<serde_json::Value, ReaderError>
+where
+    R: engenho_types::kind::KubeResource + Send + Sync + 'static,
+{
+    let list = client
+        .list::<R>(Some(namespace), &ListOptions::default())
+        .await
+        .map_err(|e| {
+            ReaderError::InvalidState(format!(
+                "LIST {plural} in {namespace} failed: {e}"
+            ))
+        })?;
+    // Re-serialize as a JSON list-shape that mirrors what kubectl
+    // -o json would emit: {kind, apiVersion, items, metadata}.
+    let items_json = serde_json::to_value(&list.items).map_err(|e| {
+        ReaderError::InvalidState(format!("serialize {plural} list: {e}"))
+    })?;
+    Ok(serde_json::json!({
+        "kind": format!("{}List", R::GVK.kind),
+        "apiVersion": if R::GVK.group.is_empty() {
+            R::GVK.version.to_string()
+        } else {
+            format!("{}/{}", R::GVK.group, R::GVK.version)
+        },
+        "items": items_json,
+        "metadata": {
+            "resourceVersion": list.resource_version,
+        },
+    }))
 }
 
 /// Flatten an engenho-types Pod into the wire view. Pure function;

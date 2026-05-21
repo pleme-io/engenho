@@ -12,9 +12,11 @@
 //! * [`server`] — the rmcp `ServerHandler` impl wiring the trait to tools
 
 pub mod reader;
+pub mod resource_kind;
 pub mod server;
 pub mod views;
 
 pub use reader::{ClusterReader, ReaderError};
 pub use reader::kikai::KikaiClusterReader;
+pub use resource_kind::ResourceKind;
 pub use server::EngenhoMcp;
