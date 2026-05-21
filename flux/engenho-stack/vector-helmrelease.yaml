@@ -1,0 +1,47 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: vector
+  namespace: engenho
+spec:
+  interval: 5m
+  dependsOn:
+    - name: nats
+  chart:
+    spec:
+      chart: vector
+      version: "0.40.x"
+      sourceRef:
+        kind: HelmRepository
+        name: vector
+        namespace: engenho
+  values:
+    role: Agent
+    customConfig:
+      data_dir: /vector-data-dir
+      api:
+        enabled: true
+        address: 0.0.0.0:8686
+      sources:
+        kubernetes_logs:
+          type: kubernetes_logs
+        engenho_health:
+          type: nats
+          url: "nats://nats:4222"
+          subject: "engenho.>.health.>"
+          queue: "vector-health"
+        engenho_attestation:
+          type: nats
+          url: "nats://nats:4222"
+          subject: "engenho.>.attestation.>"
+          queue: "vector-attestation"
+      sinks:
+        prometheus_exporter:
+          type: prometheus_exporter
+          inputs: ["kubernetes_logs"]
+          address: 0.0.0.0:9090
+        console:
+          type: console
+          inputs: ["engenho_health", "engenho_attestation"]
+          encoding:
+            codec: json

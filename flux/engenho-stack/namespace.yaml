@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: engenho
+  labels:
+    name: engenho
+    engenho.io/managed-by: fluxcd

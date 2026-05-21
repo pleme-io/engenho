@@ -1,0 +1,33 @@
+engenho {{ .Chart.AppVersion }} deployed to namespace {{ .Release.Namespace }}.
+
+The distributed substrate is coming up in dependency order. Check
+each layer:
+
+  Layer 1 — Fabric carrier (NATS)
+    kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name=nats
+
+  Layer 2 — Observability (Vector)
+    kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name=vector
+
+  Layer 3 — Store (3-replica openraft StatefulSet)
+    kubectl -n {{ .Release.Namespace }} get statefulset {{ include "engenho.fullname" . }}-store
+
+  Layer 4 — Revoada (per-node DaemonSet)
+    kubectl -n {{ .Release.Namespace }} get daemonset {{ include "engenho.fullname" . }}-revoada
+
+  Layer 5 — Apiserver (HTTP K8s API)
+    kubectl -n {{ .Release.Namespace }} get deployment {{ include "engenho.fullname" . }}-apiserver
+
+Once the apiserver is ready, point kubectl at it:
+
+  kubectl --server=http://{{ include "engenho.fullname" . }}-apiserver.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.apiserver.http.port }} get pods
+
+Or query the OpenAPI spec:
+
+  curl http://{{ include "engenho.fullname" . }}-apiserver.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.apiserver.http.port }}/openapi.json | jq .info
+
+Multi-cluster federation (see docs/FABRIC.md):
+
+  Set nats.config.leafnodes.enabled = true + populate remotes to
+  dial into a regional NATS hub. The engenho cluster joins the
+  global mesh; events ride NATS subjects across regions.

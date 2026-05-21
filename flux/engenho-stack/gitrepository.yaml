@@ -1,0 +1,14 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: engenho
+  namespace: flux-system
+spec:
+  interval: 5m
+  url: https://github.com/pleme-io/engenho
+  ref:
+    branch: main
+  ignore: |
+    /*
+    !/charts
+    !/flux

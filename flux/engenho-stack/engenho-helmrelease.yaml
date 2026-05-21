@@ -1,0 +1,56 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: engenho
+  namespace: engenho
+spec:
+  interval: 5m
+  dependsOn:
+    - name: nats
+    - name: vector
+  chart:
+    spec:
+      chart: ./charts/engenho
+      sourceRef:
+        kind: GitRepository
+        name: engenho
+        namespace: flux-system
+      reconcileStrategy: ChartVersion
+  values:
+    # Disable subchart NATS/Vector — managed by the
+    # separate HelmReleases above.
+    nats:
+      enabled: false
+    vector:
+      enabled: false
+    global:
+      cluster:
+        name: "engenho-local"
+        region: "default"
+      image:
+        registry: ghcr.io
+        repository: pleme-io
+        tag: "v0.6.0"
+    store:
+      enabled: true
+      replicas: 3
+    revoada:
+      enabled: true
+      policy:
+        targetTopology: "ha_three"
+    apiserver:
+      enabled: true
+      replicas: 2
+      openapi:
+        enabled: true
+    mcp:
+      enabled: false
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+      remediateLastFailure: true
