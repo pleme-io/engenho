@@ -32,12 +32,16 @@ pub enum ResourceKind {
     ConfigMap,
     /// core/v1 Secret (namespaced — REDACTED at the MCP boundary)
     Secret,
+    /// core/v1 ServiceAccount (namespaced)
+    ServiceAccount,
     /// core/v1 Namespace (cluster-scoped)
     Namespace,
     /// core/v1 Node (cluster-scoped)
     Node,
     /// apps/v1 Deployment (namespaced)
     Deployment,
+    /// apps/v1 ReplicaSet (namespaced)
+    ReplicaSet,
 }
 
 impl ResourceKind {
@@ -49,9 +53,11 @@ impl ResourceKind {
             Self::Service => "service",
             Self::ConfigMap => "config_map",
             Self::Secret => "secret",
+            Self::ServiceAccount => "service_account",
             Self::Namespace => "namespace",
             Self::Node => "node",
             Self::Deployment => "deployment",
+            Self::ReplicaSet => "replica_set",
         }
     }
 
@@ -65,9 +71,11 @@ impl ResourceKind {
             Self::Service,
             Self::ConfigMap,
             Self::Secret,
+            Self::ServiceAccount,
             Self::Namespace,
             Self::Node,
             Self::Deployment,
+            Self::ReplicaSet,
         ]
     }
 
@@ -75,15 +83,40 @@ impl ResourceKind {
     /// Mirrors `engenho_types::kind::Scope` but lives here so the
     /// dispatcher can pick the right URL shape without needing
     /// the type at the call site.
+    ///
+    /// Closed match: adding a `ResourceKind` variant without
+    /// classifying it here is a compile error.
     pub fn is_cluster_scoped(self) -> bool {
-        matches!(self, Self::Namespace | Self::Node)
+        match self {
+            Self::Namespace | Self::Node => true,
+            Self::Pod
+            | Self::Service
+            | Self::ConfigMap
+            | Self::Secret
+            | Self::ServiceAccount
+            | Self::Deployment
+            | Self::ReplicaSet => false,
+        }
     }
 
     /// Whether the kind carries secret material at the wire.
     /// True kinds route through a redacted view at the MCP
     /// boundary — engenho-mcp never serializes their values.
+    ///
+    /// Closed match: adding a `ResourceKind` variant without
+    /// classifying it here is a compile error.
     pub fn carries_secret_material(self) -> bool {
-        matches!(self, Self::Secret)
+        match self {
+            Self::Secret => true,
+            Self::Pod
+            | Self::Service
+            | Self::ConfigMap
+            | Self::ServiceAccount
+            | Self::Namespace
+            | Self::Node
+            | Self::Deployment
+            | Self::ReplicaSet => false,
+        }
     }
 }
 

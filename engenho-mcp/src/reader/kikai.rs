@@ -22,10 +22,11 @@ use std::path::PathBuf;
 
 use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{KubeClient, ListOptions};
-use engenho_types::generated_v1_34::apps_v1::Deployment;
+use engenho_types::generated_v1_34::apps_v1::{Deployment, ReplicaSet};
 use engenho_types::generated_v1_34::core_v1::{
-    ConfigMap, Namespace, Node, Pod, PodPhase, Secret, Service,
+    ConfigMap, Namespace, Node, Pod, PodPhase, Secret, Service, ServiceAccount,
 };
+use crate::reader::ListSpec;
 use crate::redaction::redact_secret;
 
 use crate::reader::{ClusterReader, ReaderError};
@@ -167,6 +168,7 @@ impl ClusterReader for KikaiClusterReader {
         cluster: &str,
         kind: ResourceKind,
         namespace: &str,
+        spec: &ListSpec,
     ) -> Result<serde_json::Value, ReaderError> {
         let client = self.build_kube_client(cluster)?;
         // Cluster-scoped kinds ignore the input namespace; engenho-
@@ -176,11 +178,23 @@ impl ClusterReader for KikaiClusterReader {
         } else {
             Some(namespace)
         };
+        // Build the typed ListOptions from the operator-facing
+        // ListSpec. Single place that bridges MCP wire shape to
+        // engenho-kube-client; future selectors (resource_version,
+        // continue token) get added here once.
+        let opts = ListOptions {
+            label_selector: spec.label_selector.clone(),
+            field_selector: spec.field_selector.clone(),
+            limit: spec.limit,
+            continue_token: None,
+            resource_version: String::new(),
+        };
         // Static dispatch — each arm calls the typed client.list<R>()
         // through engenho-types' typed catalog. Adding a kind:
         //   1. ResourceKind variant
         //   2. Match arm here (3 lines)
         //   3. Match arm in get_resource below
+        //   4. Match arm in apply_resource + delete_resource (writer)
         // No new views, no new MCP tools, no new traits.
         //
         // Secret routes through a redaction transform — engenho-mcp
@@ -188,13 +202,15 @@ impl ClusterReader for KikaiClusterReader {
         // follow the same pattern via `carries_secret_material()` +
         // a typed view in `crate::redaction`.
         let json = match kind {
-            ResourceKind::Pod => list_to_json::<Pod>(&client, ns_arg, "pods").await?,
-            ResourceKind::Service => list_to_json::<Service>(&client, ns_arg, "services").await?,
-            ResourceKind::ConfigMap => list_to_json::<ConfigMap>(&client, ns_arg, "configmaps").await?,
-            ResourceKind::Secret => list_secrets_redacted(&client, ns_arg).await?,
-            ResourceKind::Namespace => list_to_json::<Namespace>(&client, ns_arg, "namespaces").await?,
-            ResourceKind::Node => list_to_json::<Node>(&client, ns_arg, "nodes").await?,
-            ResourceKind::Deployment => list_to_json::<Deployment>(&client, ns_arg, "deployments").await?,
+            ResourceKind::Pod => list_to_json::<Pod>(&client, ns_arg, &opts, "pods").await?,
+            ResourceKind::Service => list_to_json::<Service>(&client, ns_arg, &opts, "services").await?,
+            ResourceKind::ConfigMap => list_to_json::<ConfigMap>(&client, ns_arg, &opts, "configmaps").await?,
+            ResourceKind::Secret => list_secrets_redacted(&client, ns_arg, &opts).await?,
+            ResourceKind::ServiceAccount => list_to_json::<ServiceAccount>(&client, ns_arg, &opts, "serviceaccounts").await?,
+            ResourceKind::Namespace => list_to_json::<Namespace>(&client, ns_arg, &opts, "namespaces").await?,
+            ResourceKind::Node => list_to_json::<Node>(&client, ns_arg, &opts, "nodes").await?,
+            ResourceKind::Deployment => list_to_json::<Deployment>(&client, ns_arg, &opts, "deployments").await?,
+            ResourceKind::ReplicaSet => list_to_json::<ReplicaSet>(&client, ns_arg, &opts, "replicasets").await?,
         };
         Ok(json)
     }
@@ -217,9 +233,11 @@ impl ClusterReader for KikaiClusterReader {
             ResourceKind::Service => get_to_json::<Service>(&client, ns_arg, name, "service").await?,
             ResourceKind::ConfigMap => get_to_json::<ConfigMap>(&client, ns_arg, name, "configmap").await?,
             ResourceKind::Secret => get_secret_redacted(&client, ns_arg, name).await?,
+            ResourceKind::ServiceAccount => get_to_json::<ServiceAccount>(&client, ns_arg, name, "serviceaccount").await?,
             ResourceKind::Namespace => get_to_json::<Namespace>(&client, ns_arg, name, "namespace").await?,
             ResourceKind::Node => get_to_json::<Node>(&client, ns_arg, name, "node").await?,
             ResourceKind::Deployment => get_to_json::<Deployment>(&client, ns_arg, name, "deployment").await?,
+            ResourceKind::ReplicaSet => get_to_json::<ReplicaSet>(&client, ns_arg, name, "replicaset").await?,
         };
         Ok(json)
     }
@@ -232,9 +250,10 @@ impl ClusterReader for KikaiClusterReader {
 async fn list_secrets_redacted(
     client: &ReqwestKubeClient,
     namespace: Option<&str>,
+    opts: &ListOptions,
 ) -> Result<serde_json::Value, ReaderError> {
     let list = client
-        .list::<Secret>(namespace, &ListOptions::default())
+        .list::<Secret>(namespace, opts)
         .await
         .map_err(|e| {
             let where_str = namespace.unwrap_or("<cluster-scope>");
@@ -308,16 +327,19 @@ impl KikaiClusterReader {
 /// Returns the items array as `serde_json::Value` so the trait
 /// boundary stays object-safe. Accepts `Option<&str>` for namespace
 /// so cluster-scoped kinds (Namespace, Node) can pass `None`.
+/// Accepts the typed `&ListOptions` directly so selectors flow
+/// through to the apiserver wire.
 async fn list_to_json<R>(
     client: &ReqwestKubeClient,
     namespace: Option<&str>,
+    opts: &ListOptions,
     plural: &str,
 ) -> Result<serde_json::Value, ReaderError>
 where
     R: engenho_types::kind::KubeResource + Send + Sync + 'static,
 {
     let list = client
-        .list::<R>(namespace, &ListOptions::default())
+        .list::<R>(namespace, opts)
         .await
         .map_err(|e| {
             let where_str = namespace.unwrap_or("<cluster-scope>");

@@ -389,6 +389,58 @@ mod tests {
         assert_eq!(s, "{}");
     }
 
+    use proptest::prelude::*;
+
+    /// Property-based round-trip: any randomly generated Container
+    /// must survive JSON serialize → deserialize identity. Catches
+    /// regressions like a field rename or a `skip_serializing_if`
+    /// that drops a populated field. 256 random cases per test run.
+    proptest! {
+        #[test]
+        fn arb_container_round_trips(
+            name in "[a-z][a-z0-9-]{0,30}",
+            image in "[a-z][a-z0-9./-]{0,50}",
+            port in 1i32..65535,
+            port_name in "[a-z][a-z0-9-]{0,14}",
+            protocol in prop_oneof!["TCP", "UDP", "SCTP"],
+            arg_count in 0usize..5,
+        ) {
+            let mut c = Container {
+                name: name.clone(),
+                image: image.clone(),
+                ports: vec![ContainerPort {
+                    container_port: port,
+                    name: Some(port_name.clone()),
+                    protocol: Some(protocol.to_string()),
+                    ..Default::default()
+                }],
+                args: (0..arg_count).map(|i| format!("--arg-{i}")).collect(),
+                ..Default::default()
+            };
+            // env vars with no value (None) must also round-trip.
+            c.env.push(EnvVar { name: "PATH".into(), value: None });
+            c.env.push(EnvVar { name: "HOME".into(), value: Some("/root".into()) });
+            let json = serde_json::to_string(&c).unwrap();
+            let back: Container = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(back, c);
+        }
+
+        #[test]
+        fn arb_pod_phase_round_trips(idx in 0usize..5) {
+            let phases = [
+                PodPhase::Pending,
+                PodPhase::Running,
+                PodPhase::Succeeded,
+                PodPhase::Failed,
+                PodPhase::Unknown,
+            ];
+            let phase = phases[idx];
+            let s = serde_json::to_string(&phase).unwrap();
+            let back: PodPhase = serde_json::from_str(&s).unwrap();
+            prop_assert_eq!(back, phase);
+        }
+    }
+
     /// Parsing a live podinfo Pod's status from the cluster's
     /// `kubectl get -o json` output (captured 2026-05-21):
     /// `podinfo-8df8b84cd-6lb4k` after a stable Running state.
