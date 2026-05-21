@@ -19,11 +19,13 @@ use std::sync::Arc;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::get;
 use axum::Router;
+use utoipa::OpenApi;
 
 use crate::error::ApiError;
 use crate::handler::ResourceHandler;
+use crate::openapi::ApiDoc;
 
 #[derive(Clone)]
 pub struct RouterState {
@@ -68,7 +70,16 @@ pub fn build(state: RouterState) -> Router {
                 .patch(patch_cluster_scoped)
                 .delete(delete_cluster_scoped),
         )
+        .route("/openapi.json", get(openapi_spec))
+        .route("/openapi/v3", get(openapi_spec))
         .with_state(state)
+}
+
+/// The OpenAPI v3 spec — the central machine-readable description
+/// from which gRPC, GraphQL, and downstream SDKs derive. Per the
+/// multi-face plan in docs/API-SURFACE.md.
+async fn openapi_spec() -> impl IntoResponse {
+    Json(ApiDoc::openapi())
 }
 
 async fn get_namespaced(
