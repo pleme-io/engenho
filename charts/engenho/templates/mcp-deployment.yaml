@@ -1,0 +1,31 @@
+{{- if .Values.mcp.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "engenho.fullname" . }}-mcp
+  labels:
+    {{- include "engenho.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engenho
+      app.kubernetes.io/component: mcp
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "engenho.labels" . | nindent 8 }}
+        app.kubernetes.io/component: mcp
+    spec:
+      containers:
+        - name: mcp
+          image: {{ list .Values.mcp.image.repository . | include "engenho.image" }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          env:
+            - name: ENGENHO_APISERVER_URL
+              value: "http://{{ include "engenho.fullname" . }}-apiserver:{{ .Values.apiserver.http.port }}"
+          resources:
+            {{- toYaml .Values.mcp.resources | nindent 12 }}
+{{- end }}

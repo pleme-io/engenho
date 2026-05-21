@@ -1,0 +1,125 @@
+{{- if .Values.apiserver.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "engenho.fullname" . }}-apiserver
+  labels:
+    {{- include "engenho.labels" . | nindent 4 }}
+    app.kubernetes.io/component: apiserver
+spec:
+  replicas: {{ .Values.apiserver.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engenho
+      app.kubernetes.io/component: apiserver
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "engenho.labels" . | nindent 8 }}
+        app.kubernetes.io/component: apiserver
+    spec:
+      containers:
+        - name: apiserver
+          image: {{ list .Values.apiserver.image.repository . | include "engenho.image" }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          env:
+            - name: ENGENHO_CLUSTER
+              value: {{ .Values.global.cluster.name | quote }}
+            - name: ENGENHO_NATS_URL
+              value: {{ include "engenho.natsURL" . | quote }}
+            - name: ENGENHO_STORE_PEERS
+              value: "{{ include "engenho.fullname" . }}-store.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.store.raft.port }}"
+            - name: ENGENHO_HTTP_PORT
+              value: {{ .Values.apiserver.http.port | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.apiserver.http.port }}
+              protocol: TCP
+            {{- if .Values.apiserver.grpc.enabled }}
+            - name: grpc
+              containerPort: {{ .Values.apiserver.grpc.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.apiserver.graphql.enabled }}
+            - name: graphql
+              containerPort: {{ .Values.apiserver.graphql.port }}
+              protocol: TCP
+            {{- end }}
+          resources:
+            {{- toYaml .Values.apiserver.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /openapi.json
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /openapi.json
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "engenho.fullname" . }}-apiserver
+  labels:
+    {{- include "engenho.labels" . | nindent 4 }}
+    app.kubernetes.io/component: apiserver
+  {{- with .Values.apiserver.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.apiserver.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.apiserver.http.port }}
+      targetPort: http
+    {{- if .Values.apiserver.grpc.enabled }}
+    - name: grpc
+      port: {{ .Values.apiserver.grpc.port }}
+      targetPort: grpc
+    {{- end }}
+    {{- if .Values.apiserver.graphql.enabled }}
+    - name: graphql
+      port: {{ .Values.apiserver.graphql.port }}
+      targetPort: graphql
+    {{- end }}
+  selector:
+    app.kubernetes.io/name: engenho
+    app.kubernetes.io/component: apiserver
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- if .Values.apiserver.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "engenho.fullname" . }}-apiserver
+  labels:
+    {{- include "engenho.labels" . | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.apiserver.ingress.className }}
+  rules:
+    {{- range .Values.apiserver.ingress.hosts }}
+    - host: {{ .host }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ include "engenho.fullname" $ }}-apiserver
+                port:
+                  name: http
+          {{- end }}
+    {{- end }}
+  {{- with .Values.apiserver.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

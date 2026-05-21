@@ -1,0 +1,54 @@
+{{- if .Values.revoada.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "engenho.fullname" . }}-revoada
+  labels:
+    {{- include "engenho.labels" . | nindent 4 }}
+    app.kubernetes.io/component: revoada
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engenho
+      app.kubernetes.io/component: revoada
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "engenho.labels" . | nindent 8 }}
+        app.kubernetes.io/component: revoada
+    spec:
+      hostNetwork: false
+      containers:
+        - name: revoada
+          image: {{ list .Values.revoada.image.repository . | include "engenho.image" }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          env:
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: ENGENHO_CLUSTER
+              value: {{ .Values.global.cluster.name | quote }}
+            - name: ENGENHO_NATS_URL
+              value: {{ include "engenho.natsURL" . | quote }}
+            - name: ENGENHO_GOSSIP_PORT
+              value: {{ .Values.revoada.gossip.port | quote }}
+            - name: ENGENHO_PHI_THRESHOLD
+              value: {{ .Values.revoada.gossip.phiThreshold | quote }}
+            - name: ENGENHO_TARGET_TOPOLOGY
+              value: {{ .Values.revoada.policy.targetTopology | quote }}
+            - name: ENGENHO_AUDIT_INTERVAL
+              value: {{ .Values.revoada.policy.auditInterval | quote }}
+          ports:
+            - name: gossip
+              containerPort: {{ .Values.revoada.gossip.port }}
+              protocol: UDP
+          resources:
+            {{- toYaml .Values.revoada.resources | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/revoadactl", "ready"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+{{- end }}

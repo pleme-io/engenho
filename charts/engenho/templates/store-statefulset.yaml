@@ -1,0 +1,82 @@
+{{- if .Values.store.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "engenho.fullname" . }}-store
+  labels:
+    {{- include "engenho.labels" . | nindent 4 }}
+    app.kubernetes.io/component: store
+spec:
+  serviceName: {{ include "engenho.fullname" . }}-store
+  replicas: {{ .Values.store.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engenho
+      app.kubernetes.io/component: store
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "engenho.labels" . | nindent 8 }}
+        app.kubernetes.io/component: store
+    spec:
+      containers:
+        - name: store
+          image: {{ list .Values.store.image.repository . | include "engenho.image" }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          env:
+            - name: NODE_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: ENGENHO_CLUSTER
+              value: {{ .Values.global.cluster.name | quote }}
+            - name: ENGENHO_NATS_URL
+              value: {{ include "engenho.natsURL" . | quote }}
+            - name: ENGENHO_RAFT_PORT
+              value: {{ .Values.store.raft.port | quote }}
+          ports:
+            - name: raft
+              containerPort: {{ .Values.store.raft.port }}
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/engenho-store
+          resources:
+            {{- toYaml .Values.store.resources | nindent 12 }}
+          readinessProbe:
+            tcpSocket: { port: {{ .Values.store.raft.port }} }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: {{ .Values.store.raft.port }} }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.store.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "engenho.fullname" . }}-store
+  labels:
+    {{- include "engenho.labels" . | nindent 4 }}
+    app.kubernetes.io/component: store
+spec:
+  clusterIP: None
+  ports:
+    - name: raft
+      port: {{ .Values.store.raft.port }}
+      targetPort: raft
+  selector:
+    app.kubernetes.io/name: engenho
+    app.kubernetes.io/component: store
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

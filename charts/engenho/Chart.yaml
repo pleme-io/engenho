@@ -1,0 +1,43 @@
+apiVersion: v2
+name: engenho
+description: |
+  Engenho — typed, attested, Rust-native Kubernetes runtime + distributed
+  substrate. This umbrella chart deploys the full engenho stack with
+  intelligent orchestrated bring-up:
+
+    1. nats          — fabric carrier (engenho-teia rides this)
+    2. vector        — observability pipeline
+    3. engenho-store — etcd-equivalent (3-replica openraft StatefulSet)
+    4. engenho-revoada — per-node gossip + role policy (DaemonSet)
+    5. engenho-apiserver — HTTP/gRPC/GraphQL K8s API (Deployment)
+
+  Designed for FluxCD orchestration — components declare their
+  dependencies via Helm chart subchart deps + FluxCD HelmRelease
+  dependsOn fields. See flux/engenho-stack/ for the rollout manifest.
+
+  Companion docs: docs/FABRIC.md, docs/DISTRIBUTED.md, docs/API-SURFACE.md
+type: application
+version: 0.6.0
+appVersion: "0.6.0"
+keywords:
+  - kubernetes
+  - distributed
+  - raft
+  - nats
+  - attestation
+home: https://github.com/pleme-io/engenho
+sources:
+  - https://github.com/pleme-io/engenho
+maintainers:
+  - name: pleme-io
+    url: https://github.com/pleme-io
+
+dependencies:
+  - name: nats
+    version: "1.2.x"
+    repository: https://nats-io.github.io/k8s/helm/charts/
+    condition: nats.enabled
+  - name: vector
+    version: "0.40.x"
+    repository: https://helm.vector.dev
+    condition: vector.enabled

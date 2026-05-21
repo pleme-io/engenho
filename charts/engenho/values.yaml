@@ -1,0 +1,170 @@
+# engenho umbrella chart values
+#
+# Configure each component. The defaults are tuned for a 3-node
+# Kubernetes cluster running the full engenho stack end-to-end.
+# For homelab / single-node, set min_voters: 1 + replicas: 1 on
+# store + revoada.
+
+# ============================================================
+#   Global settings (shared across all engenho components)
+# ============================================================
+global:
+  image:
+    registry: ghcr.io
+    repository: pleme-io
+    pullPolicy: IfNotPresent
+    tag: "v0.6.0"
+  cluster:
+    # Logical cluster identifier — used in NATS subject prefix
+    # (engenho.{cluster}.*) so multiple engenho clusters can share
+    # one NATS supercluster.
+    name: "engenho-local"
+    # Region identifier — used by Vector + NATS leaf-node routing
+    # for locality + observability tagging.
+    region: "default"
+
+# ============================================================
+#   NATS — fabric carrier (engenho-teia rides this)
+# ============================================================
+nats:
+  enabled: true
+  config:
+    cluster:
+      enabled: true
+      replicas: 3
+    jetstream:
+      enabled: true
+      fileStore:
+        enabled: true
+        pvc:
+          enabled: true
+          size: 20Gi
+    leafnodes:
+      enabled: false
+      # Set to true + populate remotes for cross-region federation.
+      # remotes:
+      #   - url: nats://hub.engenho.global:7422
+      #     credentials: /etc/nats/leaf.creds
+  service:
+    enabled: true
+    ports:
+      nats: { enabled: true, port: 4222 }
+      leafnodes: { enabled: false, port: 7422 }
+      gateways: { enabled: false, port: 7522 }
+      monitor: { enabled: true, port: 8222 }
+
+# ============================================================
+#   Vector — observability pipeline (consumes NATS engenho.*)
+# ============================================================
+vector:
+  enabled: true
+  role: Agent
+  customConfig:
+    data_dir: /vector-data-dir
+    api:
+      enabled: true
+      address: 0.0.0.0:8686
+    sources:
+      kubernetes_logs:
+        type: kubernetes_logs
+      engenho_health:
+        type: nats
+        url: "nats://engenho-nats:4222"
+        subject: "engenho.>.health.>"
+        queue: "vector-health"
+      engenho_attestation:
+        type: nats
+        url: "nats://engenho-nats:4222"
+        subject: "engenho.>.attestation.>"
+        queue: "vector-attestation"
+    sinks:
+      # Default: VictoriaLogs in cluster. Override to ship to Datadog
+      # / Splunk for SaaS-tier observability.
+      victorialogs:
+        type: loki
+        inputs: ["kubernetes_logs", "engenho_health"]
+        endpoint: "http://victorialogs:9428"
+        encoding: { codec: json }
+        labels: { source: vector, cluster: "{{ .Values.global.cluster.name }}" }
+
+# ============================================================
+#   engenho-store — etcd-equivalent (3-replica openraft)
+# ============================================================
+store:
+  enabled: true
+  replicas: 3
+  image:
+    repository: engenho-store
+  raft:
+    # Port the in-cluster Raft RPC carrier listens on. At F2 (NATS
+    # transport) this becomes irrelevant — RPC flows via NATS
+    # subjects. Until then it's the tonic-based fallback.
+    port: 7777
+  storage:
+    size: 50Gi
+  resources:
+    requests: { cpu: "500m", memory: "1Gi" }
+    limits:   { cpu: "2", memory: "4Gi" }
+
+# ============================================================
+#   engenho-revoada — per-node gossip + policy (DaemonSet)
+# ============================================================
+revoada:
+  enabled: true
+  image:
+    repository: engenho-revoada
+  gossip:
+    port: 7800
+    seedNodes: []  # auto-derived from DaemonSet endpoints
+    phiThreshold: 8.0
+  policy:
+    enabled: true
+    targetTopology: "ha_three"   # or "homelab"
+    auditInterval: 30s
+  resources:
+    requests: { cpu: "200m", memory: "256Mi" }
+    limits:   { cpu: "1", memory: "1Gi" }
+
+# ============================================================
+#   engenho-apiserver — HTTP/gRPC/GraphQL K8s API
+# ============================================================
+apiserver:
+  enabled: true
+  replicas: 2
+  image:
+    repository: engenho-apiserver
+  http:
+    port: 6443
+  grpc:
+    enabled: false   # R7.6
+    port: 6444
+  graphql:
+    enabled: false   # R7.7
+    port: 6445
+  openapi:
+    enabled: true
+    path: /openapi.json
+  service:
+    type: ClusterIP
+    annotations: {}
+  ingress:
+    enabled: false
+    className: nginx
+    hosts:
+      - host: engenho-api.local
+        paths: [{ path: /, pathType: Prefix }]
+    tls: []
+  resources:
+    requests: { cpu: "200m", memory: "256Mi" }
+    limits:   { cpu: "2", memory: "2Gi" }
+
+# ============================================================
+#   engenho-mcp — MCP server for operator + LLM access
+# ============================================================
+mcp:
+  enabled: false   # opt-in; typical use is local CLI not in-cluster
+  image:
+    repository: engenho-mcp
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
