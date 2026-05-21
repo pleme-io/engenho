@@ -125,6 +125,26 @@ pub struct DeploymentCondition {
 mod tests {
     use super::*;
     use crate::generated_v1_34::core_v1::Container;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Random DeploymentSpec with replicas + selector round-trips.
+        #[test]
+        fn arb_deployment_spec_round_trips(
+            replicas in 0i32..1000,
+            match_key in "[a-z][a-z0-9-]{0,14}",
+            match_value in "[a-z0-9][a-z0-9-]{0,30}",
+        ) {
+            let mut spec = DeploymentSpec {
+                replicas: Some(replicas),
+                ..Default::default()
+            };
+            spec.selector.match_labels.insert(match_key, match_value);
+            let s = serde_json::to_string(&spec).unwrap();
+            let back: DeploymentSpec = serde_json::from_str(&s).unwrap();
+            prop_assert_eq!(back, spec);
+        }
+    }
 
     #[test]
     fn deployment_spec_with_replicas_and_template_round_trips() {
