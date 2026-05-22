@@ -22,10 +22,33 @@ use tokio::sync::Mutex;
 
 use crate::state::ResourceCatalog;
 use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
+use crate::watch::{WatchEvent, WatchEventKind};
 
-#[derive(Clone, Default)]
+/// Watch channel capacity — how many events buffer per consumer
+/// before the slow-consumer detection (broadcast::Receiver::recv
+/// returns Err(Lagged(n))). 1024 is a reasonable default; large
+/// enough to absorb burst applies, small enough to detect a stuck
+/// consumer.
+const WATCH_CHANNEL_CAPACITY: usize = 1024;
+
+#[derive(Clone)]
 pub struct InMemoryStore {
     inner: Arc<Mutex<Inner>>,
+    /// Broadcast channel for watch events emitted on every apply.
+    /// Subscribers via [`InMemoryStore::watch_subscribe`] get a
+    /// `broadcast::Receiver` they can `.recv().await` for each
+    /// committed mutation.
+    watch_tx: tokio::sync::broadcast::Sender<WatchEvent>,
+}
+
+impl Default for InMemoryStore {
+    fn default() -> Self {
+        let (watch_tx, _) = tokio::sync::broadcast::channel(WATCH_CHANNEL_CAPACITY);
+        Self {
+            inner: Arc::new(Mutex::new(Inner::default())),
+            watch_tx,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -57,6 +80,23 @@ impl InMemoryStore {
         key: &crate::resource::ResourceKey,
     ) -> Option<crate::resource::ResourceValue> {
         self.inner.lock().await.catalog.get(key).cloned()
+    }
+
+    /// Subscribe to the watch stream. Each subscriber sees every
+    /// committed [`WatchEvent`] from this node from subscription
+    /// time onward. Late subscribers do NOT see history — that's
+    /// what the JetStream tier (C2/F3) provides via durable
+    /// streams + cursor replay.
+    #[must_use]
+    pub fn watch_subscribe(&self) -> tokio::sync::broadcast::Receiver<WatchEvent> {
+        self.watch_tx.subscribe()
+    }
+
+    /// Active subscriber count. Useful for telemetry + test
+    /// instrumentation.
+    #[must_use]
+    pub fn watch_subscriber_count(&self) -> usize {
+        self.watch_tx.receiver_count()
     }
 }
 
@@ -231,12 +271,47 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
     {
         let mut guard = self.inner.lock().await;
         let mut results = Vec::new();
+        // Collect watch events to publish AFTER releasing the
+        // catalog lock — broadcast::Sender::send is sync but the
+        // receivers may be on other tasks; we don't want to hold
+        // the apply lock across event delivery.
+        let mut watch_events: Vec<WatchEvent> = Vec::new();
         for entry in entries {
             let log_id = entry.log_id;
             let op = match entry.payload {
                 EntryPayload::Blank => crate::command::ResourceOp::NoOp,
-                EntryPayload::Normal(cmd) => {
-                    guard.catalog.apply(&cmd, log_id.leader_id.term, log_id.index)
+                EntryPayload::Normal(ref cmd) => {
+                    let key_for_event = match cmd {
+                        crate::command::ResourceCommand::Put { key, .. }
+                        | crate::command::ResourceCommand::Patch { key, .. }
+                        | crate::command::ResourceCommand::Delete { key, .. } => key.clone(),
+                    };
+                    let outcome = guard.catalog.apply(cmd, log_id.leader_id.term, log_id.index);
+                    // Emit a typed WatchEvent for every committed mutation.
+                    let event_kind = match outcome {
+                        crate::command::ResourceOp::Created => Some(WatchEventKind::Added),
+                        crate::command::ResourceOp::Replaced
+                        | crate::command::ResourceOp::Patched => Some(WatchEventKind::Modified),
+                        crate::command::ResourceOp::Deleted => Some(WatchEventKind::Deleted),
+                        crate::command::ResourceOp::NoOp => None,
+                    };
+                    if let Some(kind) = event_kind {
+                        // For Deleted events, use the last-known
+                        // value (which catalog.apply just removed
+                        // from its map but we kept the key).
+                        let object = guard
+                            .catalog
+                            .get(&key_for_event)
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::Value::Null);
+                        watch_events.push(WatchEvent {
+                            kind,
+                            object,
+                            key: key_for_event,
+                            resource_version: log_id.index,
+                        });
+                    }
+                    outcome
                 }
                 EntryPayload::Membership(m) => {
                     guard.last_membership = StoredMembership::new(Some(log_id), m);
@@ -249,6 +324,15 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
                 applied_term: log_id.leader_id.term,
                 op,
             });
+        }
+        drop(guard);
+        // Broadcast watch events. Send is sync but won't block
+        // even if all receivers have lagged — broadcast::Sender
+        // drops oldest in slow consumers' queues. We ignore
+        // SendError (no subscribers) because watch is optional;
+        // controllers can poll if they don't subscribe.
+        for ev in watch_events {
+            let _ = self.watch_tx.send(ev);
         }
         Ok(results)
     }

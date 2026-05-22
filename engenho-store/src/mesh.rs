@@ -168,6 +168,24 @@ impl StoreMesh {
         self.store.current_catalog().await
     }
 
+    /// Subscribe to the watch stream — every committed mutation
+    /// emits a typed [`engenho_store::WatchEvent`] (Added /
+    /// Modified / Deleted with the resource value + Raft log index).
+    ///
+    /// Late subscribers do NOT see history. R7.5b's JetStream
+    /// tier provides durable replay from a cursor; this is the
+    /// fast in-process path consumed by local controllers.
+    #[must_use]
+    pub fn watch(&self) -> tokio::sync::broadcast::Receiver<crate::watch::WatchEvent> {
+        self.store.watch_subscribe()
+    }
+
+    /// Active watch subscriber count (telemetry + test helper).
+    #[must_use]
+    pub fn watch_subscriber_count(&self) -> usize {
+        self.store.watch_subscriber_count()
+    }
+
     pub async fn is_leader(&self) -> bool {
         let metrics = self.raft.metrics().borrow().clone();
         metrics.current_leader == Some(self.node_id)
