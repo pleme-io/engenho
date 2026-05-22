@@ -1012,6 +1012,7 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "engenho-teia",
  "engenho-types",
  "futures",
