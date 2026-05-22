@@ -1,116 +1,146 @@
 name: release
 
+# Tag-triggered (v*). EVERY job is a thin caller of a substrate
+# reusable workflow — per the org's prime directive (any pattern ≥2
+# sites → extract to substrate). Engenho ships:
+#
+#   * 2 Rust binaries  →  rust-binary-release.yml (one job per binary)
+#   * 4 OCI images     →  image-push.yml (one job per binary × arch)
+#   * 1 Helm chart     →  helm-chart-release.yml
+#
+# Total: hand-authored composite steps = 0. All workflows are
+# reusable substrate primitives; this file is just edge config.
+#
+# `secrets: inherit` is required — reusable workflows don't
+# auto-inherit GITHUB_TOKEN unless we propagate it explicitly.
+
 on:
   push:
-    tags: ["v*"]
-  workflow_dispatch: {}
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version informational; Cargo.toml is source of truth'
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
 
 jobs:
-  build:
-    name: ${{ matrix.bin }}-${{ matrix.slug }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        bin: [engenho-mcp, engenho-cluster-config-render]
-        slug: [darwin-arm64, linux-x86_64, linux-arm64]
-        include:
-          - slug: darwin-arm64
-            runner: macos-14
-            rust_target: aarch64-apple-darwin
-          - slug: linux-x86_64
-            runner: ubuntu-24.04
-            rust_target: x86_64-unknown-linux-gnu
-          - slug: linux-arm64
-            runner: ubuntu-24.04-arm
-            rust_target: aarch64-unknown-linux-gnu
-    steps:
-      - uses: actions/checkout@v4
+  # ============================================================
+  #   Cross-arch Rust binaries → GitHub Release
+  # ============================================================
+  binary-engenho-mcp:
+    name: binary engenho-mcp → GH Release
+    uses: pleme-io/substrate/.github/workflows/rust-binary-release.yml@main
+    with:
+      binary-name: engenho-mcp
+    secrets: inherit
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
+  binary-engenho-cluster-config-render:
+    name: binary engenho-cluster-config-render → GH Release
+    uses: pleme-io/substrate/.github/workflows/rust-binary-release.yml@main
+    with:
+      binary-name: engenho-cluster-config-render
+    secrets: inherit
 
-      - name: Build release binary
-        run: |
-          cargo build --release --bin ${{ matrix.bin }} --target ${{ matrix.rust_target }}
-          cp target/${{ matrix.rust_target }}/release/${{ matrix.bin }} ${{ matrix.bin }}-${{ matrix.slug }}
-          shasum -a 256 ${{ matrix.bin }}-${{ matrix.slug }} > ${{ matrix.bin }}-${{ matrix.slug }}.sha256
+  # ============================================================
+  #   Multi-arch OCI images → ghcr.io/pleme-io/*
+  #
+  #   Each substrate image-push.yml call publishes ONE arch via
+  #   nix build + forge/skopeo. We publish both amd64 + arm64 per
+  #   binary; the multi-arch manifest is created by a tiny
+  #   manifest-create job after all arches are pushed.
+  # ============================================================
+  image-engenho-mcp-amd64:
+    name: image engenho-mcp/amd64 → ghcr.io
+    uses: pleme-io/substrate/.github/workflows/image-push.yml@main
+    with:
+      imageAttr: engenho-mcp-image-amd64
+      imageName: pleme-io/engenho-mcp
+      tag: ${{ github.ref_name }}-amd64
+    secrets: inherit
 
-      - name: Upload artefact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.bin }}-${{ matrix.slug }}
-          path: |
-            ${{ matrix.bin }}-${{ matrix.slug }}
-            ${{ matrix.bin }}-${{ matrix.slug }}.sha256
+  image-engenho-mcp-arm64:
+    name: image engenho-mcp/arm64 → ghcr.io
+    uses: pleme-io/substrate/.github/workflows/image-push.yml@main
+    with:
+      imageAttr: engenho-mcp-image-arm64
+      imageName: pleme-io/engenho-mcp
+      tag: ${{ github.ref_name }}-arm64
+    secrets: inherit
 
-  publish-release:
-    name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+  image-engenho-cluster-config-render-amd64:
+    name: image engenho-cluster-config-render/amd64 → ghcr.io
+    uses: pleme-io/substrate/.github/workflows/image-push.yml@main
+    with:
+      imageAttr: engenho-cluster-config-render-image-amd64
+      imageName: pleme-io/engenho-cluster-config-render
+      tag: ${{ github.ref_name }}-amd64
+    secrets: inherit
+
+  image-engenho-cluster-config-render-arm64:
+    name: image engenho-cluster-config-render/arm64 → ghcr.io
+    uses: pleme-io/substrate/.github/workflows/image-push.yml@main
+    with:
+      imageAttr: engenho-cluster-config-render-image-arm64
+      imageName: pleme-io/engenho-cluster-config-render
+      tag: ${{ github.ref_name }}-arm64
+    secrets: inherit
+
+  # ============================================================
+  #   Multi-arch manifest creation
+  #
+  #   Combines the per-arch tags above into a single
+  #   {tag} manifest that auto-selects the right arch on docker pull.
+  #   The arch-suffixed tags remain available for explicit pulls.
+  #
+  #   This step uses `docker buildx imagetools create` — minimal +
+  #   stateless. A future substrate enhancement may extract this to
+  #   image-manifest.yml as a reusable workflow.
+  # ============================================================
+  image-manifest:
+    name: multi-arch manifests → ghcr.io
+    needs:
+      - image-engenho-mcp-amd64
+      - image-engenho-mcp-arm64
+      - image-engenho-cluster-config-render-amd64
+      - image-engenho-cluster-config-render-arm64
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artefacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-
-      - name: Flatten artefact tree
-        run: |
-          mkdir -p release
-          find dist -type f \
-            \( -name 'engenho-mcp-*' \
-            -o -name 'engenho-mcp-*.sha256' \
-            -o -name 'engenho-cluster-config-render-*' \
-            -o -name 'engenho-cluster-config-render-*.sha256' \) \
-            -exec cp {} release/ \;
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release/*
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-
-  docker-publish:
-    name: docker-publish-${{ matrix.bin }}
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    # Linux runner required — substrate's rust-tool-image-flake.nix
-    # builds Linux containers via crate2nix + nixpkgs.dockerTools.
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
         bin: [engenho-mcp, engenho-cluster-config-render]
-    env:
-      # forge consumes these for ghcr.io push. GITHUB_TOKEN has
-      # packages:write on the workflow scope; no PAT needed.
-      GHCR_USER: ${{ github.actor }}
-      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Run substrate-driven release app
-        # `nix run .#release-${{ matrix.bin }}` is generated by the
-        # substrate's rust-tool-image-flake.nix function. It builds
-        # multi-arch (amd64+arm64) container images via crate2nix +
-        # nixpkgs.dockerTools and pushes to
-        # ghcr.io/pleme-io/${matrix.bin}:{:version, :latest} via forge.
-        # Zero Dockerfiles in the repo — substrate functions take
-        # care of entire layers; single images are just edge
-        # configurations of those functions.
-        run: nix run .#release-${{ matrix.bin }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Combine arch tags into a single manifest
+        run: |
+          docker buildx imagetools create \
+            --tag ghcr.io/pleme-io/${{ matrix.bin }}:${{ github.ref_name }} \
+            --tag ghcr.io/pleme-io/${{ matrix.bin }}:latest \
+            ghcr.io/pleme-io/${{ matrix.bin }}:${{ github.ref_name }}-amd64 \
+            ghcr.io/pleme-io/${{ matrix.bin }}:${{ github.ref_name }}-arm64
+
+  # ============================================================
+  #   Helm chart → ghcr.io/pleme-io/engenho/charts (OCI)
+  # ============================================================
+  chart:
+    name: Helm chart → ghcr.io OCI
+    uses: pleme-io/substrate/.github/workflows/helm-chart-release.yml@main
+    with:
+      chart-path: ./charts/engenho
+      oci-registry: oci://ghcr.io/pleme-io/engenho/charts
+    secrets: inherit
