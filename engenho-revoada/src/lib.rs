@@ -38,8 +38,15 @@
 pub mod attestation;
 pub mod consensus;
 pub mod content;
+pub mod fabric;
 pub mod membership;
 pub mod policy;
+
+pub use fabric::{
+    AttestationConfig, ConsensusConfig, ConsensusKind, ContentConfig, FabricFace,
+    FabricStrategy, FabricStrategyError, FaceKind, MembershipConfig, PlacementPolicy,
+    ReconciliationCadence,
+};
 
 use serde::{Deserialize, Serialize};
 

@@ -37,6 +37,7 @@ pub mod owner;
 pub mod replicaset;
 pub mod runtime;
 pub mod selector;
+pub mod watch_driver;
 
 pub use controller::{Controller, ReconcileReport};
 pub use deployment::DeploymentController;
@@ -47,3 +48,4 @@ pub use owner::{controlling_owner, is_owned_by, set_owner_reference, OwnerRefere
 pub use replicaset::ReplicaSetController;
 pub use runtime::{ControllerRuntime, RuntimeConfig};
 pub use selector::{matches_labels, selector_match_labels, service_selector};
+pub use watch_driver::{KindFilter, WatchDriver, WatchDriverConfig};
