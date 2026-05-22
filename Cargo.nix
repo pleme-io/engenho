@@ -3319,6 +3319,10 @@ rec {
             name = "proptest";
             packageId = "proptest";
           }
+          {
+            name = "tempfile";
+            packageId = "tempfile";
+          }
         ];
 
       };
