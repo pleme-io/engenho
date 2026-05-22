@@ -1,0 +1,55 @@
+{{- if .Values.controllers.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "engenho.fullname" . }}-controllers
+  labels:
+    {{- include "engenho.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controllers
+spec:
+  # Active-passive: one controllers instance owns reconciliation
+  # of the registered controller suite (ReplicaSet, Deployment,
+  # Endpoints, GC). Each controller runs its own watch_driver
+  # tick loop; collectively they share the StoreMesh subscription.
+  replicas: {{ .Values.controllers.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engenho
+      app.kubernetes.io/component: controllers
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "engenho.labels" . | nindent 8 }}
+        app.kubernetes.io/component: controllers
+    spec:
+      containers:
+        - name: controllers
+          image: {{ list .Values.controllers.image.repository . | include "engenho.image" }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          env:
+            - name: ENGENHO_CLUSTER
+              value: {{ .Values.global.cluster.name | quote }}
+            - name: ENGENHO_STORE_URL
+              value: "http://{{ include "engenho.fullname" . }}-apiserver:{{ .Values.apiserver.http.port }}"
+            - name: ENGENHO_NATS_URL
+              value: {{ include "engenho.natsURL" . | quote }}
+            - name: ENGENHO_NAMESPACE
+              value: {{ .Values.controllers.namespace | quote }}
+            - name: ENGENHO_FALLBACK_INTERVAL
+              value: {{ .Values.controllers.fallbackInterval | quote }}
+            - name: ENGENHO_DEBOUNCE
+              value: {{ .Values.controllers.debounce | quote }}
+            - name: ENGENHO_ENABLE_REPLICASET
+              value: {{ .Values.controllers.enable.replicaset | quote }}
+            - name: ENGENHO_ENABLE_DEPLOYMENT
+              value: {{ .Values.controllers.enable.deployment | quote }}
+            - name: ENGENHO_ENABLE_ENDPOINTS
+              value: {{ .Values.controllers.enable.endpoints | quote }}
+            - name: ENGENHO_ENABLE_GC
+              value: {{ .Values.controllers.enable.gc | quote }}
+          resources:
+            {{- toYaml .Values.controllers.resources | nindent 12 }}
+{{- end }}

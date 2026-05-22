@@ -18,6 +18,12 @@ each layer:
   Layer 5 — Apiserver (HTTP K8s API)
     kubectl -n {{ .Release.Namespace }} get deployment {{ include "engenho.fullname" . }}-apiserver
 
+  Layer 6 — Scheduler (R8 — binds Pods to Nodes)
+    kubectl -n {{ .Release.Namespace }} get deployment {{ include "engenho.fullname" . }}-scheduler
+
+  Layer 7 — Controllers (R9 suite — ReplicaSet + Deployment + Endpoints + GC)
+    kubectl -n {{ .Release.Namespace }} get deployment {{ include "engenho.fullname" . }}-controllers
+
 Once the apiserver is ready, point kubectl at it:
 
   kubectl --server=http://{{ include "engenho.fullname" . }}-apiserver.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.apiserver.http.port }} get pods

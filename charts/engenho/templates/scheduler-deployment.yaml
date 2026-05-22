@@ -1,0 +1,46 @@
+{{- if .Values.scheduler.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "engenho.fullname" . }}-scheduler
+  labels:
+    {{- include "engenho.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+spec:
+  # Active-passive: only one scheduler instance ticks at a time.
+  # R10 wires leader election; until then keep replicas: 1 to
+  # avoid duplicate bindings.
+  replicas: {{ .Values.scheduler.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: engenho
+      app.kubernetes.io/component: scheduler
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "engenho.labels" . | nindent 8 }}
+        app.kubernetes.io/component: scheduler
+    spec:
+      containers:
+        - name: scheduler
+          image: {{ list .Values.scheduler.image.repository . | include "engenho.image" }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          env:
+            - name: ENGENHO_CLUSTER
+              value: {{ .Values.global.cluster.name | quote }}
+            - name: ENGENHO_STORE_URL
+              value: "http://{{ include "engenho.fullname" . }}-apiserver:{{ .Values.apiserver.http.port }}"
+            - name: ENGENHO_NATS_URL
+              value: {{ include "engenho.natsURL" . | quote }}
+            - name: ENGENHO_SCHEDULER_STRATEGY
+              value: {{ .Values.scheduler.strategy | quote }}
+            - name: ENGENHO_SCHEDULER_NAMESPACE
+              value: {{ .Values.scheduler.namespace | quote }}
+            - name: ENGENHO_TICK_INTERVAL
+              value: {{ .Values.scheduler.tickInterval | quote }}
+          resources:
+            {{- toYaml .Values.scheduler.resources | nindent 12 }}
+{{- end }}

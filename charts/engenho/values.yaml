@@ -159,6 +159,44 @@ apiserver:
     limits:   { cpu: "2", memory: "2Gi" }
 
 # ============================================================
+#   engenho-scheduler — R8 controller binding Pods to Nodes
+# ============================================================
+scheduler:
+  enabled: true
+  replicas: 1   # active-passive at R8; leader election lands at R10
+  image:
+    repository: engenho-scheduler
+  strategy: "round_robin"   # or "bin_pack", "affinity" (future)
+  namespace: ""             # empty = all namespaces
+  tickInterval: 5s          # poll fallback; primary path is WatchDriver
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits:   { cpu: "500m", memory: "512Mi" }
+
+# ============================================================
+#   engenho-controllers — R9/R9.5/R9.6/R9.7 controller suite
+#   (ReplicaSet + Deployment + Endpoints + GC)
+# ============================================================
+controllers:
+  enabled: true
+  replicas: 1   # active-passive; leader election lands at R10
+  image:
+    repository: engenho-controllers
+  # Enable/disable individual controllers in the suite.
+  enable:
+    replicaset: true
+    deployment: true
+    endpoints: true
+    gc: true
+  namespace: ""              # empty = all namespaces
+  fallbackInterval: 30s      # WatchDriver fallback tick (covers
+                             # Lagged events)
+  debounce: 50ms             # WatchDriver coalesce window
+  resources:
+    requests: { cpu: "200m", memory: "256Mi" }
+    limits:   { cpu: "1", memory: "1Gi" }
+
+# ============================================================
 #   engenho-mcp — MCP server for operator + LLM access
 # ============================================================
 mcp:
