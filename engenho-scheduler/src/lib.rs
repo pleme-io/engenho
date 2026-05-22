@@ -37,10 +37,12 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod config_bridge;
 pub mod error;
 pub mod scheduler;
 pub mod strategy;
 
+pub use config_bridge::make_scheduling_strategy;
 pub use error::SchedulerError;
 pub use scheduler::{Scheduler, TickReport};
 pub use strategy::{RoundRobinStrategy, SchedulingStrategy};
