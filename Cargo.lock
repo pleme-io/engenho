@@ -926,6 +926,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-kubelet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "engenho-config",
+ "engenho-controllers",
+ "engenho-store",
+ "engenho-types",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "engenho-mcp"
 version = "0.1.0"
 dependencies = [

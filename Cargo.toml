@@ -15,6 +15,7 @@ members = [
   "engenho-scheduler",
   "engenho-controllers",
   "engenho-config",
+  "engenho-kubelet",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ engenho-store          = { path = "engenho-store" }
 engenho-scheduler      = { path = "engenho-scheduler" }
 engenho-controllers    = { path = "engenho-controllers" }
 engenho-config         = { path = "engenho-config" }
+engenho-kubelet        = { path = "engenho-kubelet" }
 axum                   = "0.7"
 hyper                  = "1"
 tower                  = "0.5"
