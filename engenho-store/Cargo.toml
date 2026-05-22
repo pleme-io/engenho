@@ -23,6 +23,7 @@ anyhow             = { workspace = true }
 
 engenho-types      = { workspace = true }
 engenho-teia       = { workspace = true }
+futures            = { workspace = true }
 openraft           = { workspace = true }
 
 [dev-dependencies]
