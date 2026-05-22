@@ -57,7 +57,7 @@ pub use fabric::{
     ReconciliationCadence,
 };
 pub use face::{Face, FaceError, KubernetesFace, NomadFace, PureRaftFace, instantiate as instantiate_face};
-pub use cluster::{ClusterCoherenceError, ClusterDeclaration};
+pub use cluster::{Cluster, ClusterCoherenceError, ClusterDeclaration, ClusterRuntimeError};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +83,27 @@ impl NodeId {
             out.push_str(&format!("{b:02x}"));
         }
         out
+    }
+
+    /// Parse a NodeId from its hex representation. Accepts any
+    /// length 1..=64; shorter values left-zero-pad so test-friendly
+    /// shorthand like "ab" round-trips through translation layers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the input contains non-hex characters or
+    /// exceeds 64 chars.
+    pub fn from_hex(s: &str) -> Result<Self, String> {
+        if s.is_empty() || s.len() > 64 {
+            return Err(format!("hex must be 1..=64 chars, got {}", s.len()));
+        }
+        let padded = format!("{s:0>64}");
+        let mut bytes = [0u8; 32];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            let pair = &padded[i * 2..i * 2 + 2];
+            *byte = u8::from_str_radix(pair, 16).map_err(|e| e.to_string())?;
+        }
+        Ok(Self(bytes))
     }
 }
 

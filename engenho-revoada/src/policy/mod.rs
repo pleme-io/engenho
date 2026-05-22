@@ -33,6 +33,14 @@
 //!     would amplify into oscillation.
 //!   * Bounded — emit at most a few proposals per tick. The Raft
 //!     log shouldn't grow without bound from policy thrashing.
+//!
+//! See also: [`formation::FormationPolicy`] — R-TOPO.1b — wraps a
+//! [`crate::topology::TopologyReactor`] + implements [`Policy`] so
+//! formation-shift logic flows through the same commit path.
+
+pub mod formation;
+
+pub use formation::FormationPolicy;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
