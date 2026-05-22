@@ -35,6 +35,8 @@
 //! land as additional `FormatAdapter` impls. The trait stays
 //! stable.
 
+use std::sync::Arc;
+
 use crate::face::{ResourceFormat, ResourceRef};
 
 /// Errors a [`FormatAdapter`] can surface during conversion.
@@ -322,6 +324,103 @@ impl FormatAdapter for K8sYamlAdapter {
         }
         let (_, payload) = decode_envelope(native)?;
         Ok(payload)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// AdapterRegistry — face-side adapter dispatch
+// ─────────────────────────────────────────────────────────────────
+
+/// Maps each [`ResourceFormat`] an operator can request to the
+/// adapter that handles it. Faces hold one of these and route
+/// verb calls through it; the format the operator asks for
+/// selects the adapter, the adapter does the byte ↔ Native
+/// conversion.
+///
+/// Built via [`AdapterRegistry::default`] (ships the three
+/// standard adapters: `NativePassthroughAdapter` for `Native`,
+/// `K8sJsonAdapter` for `Json`, `K8sYamlAdapter` for `Yaml`).
+/// Operators with custom format families register additional
+/// adapters via [`AdapterRegistry::register`].
+pub struct AdapterRegistry {
+    by_format: std::collections::HashMap<ResourceFormat, Arc<dyn FormatAdapter>>,
+}
+
+impl AdapterRegistry {
+    /// Empty registry — every `select` returns
+    /// `AdapterError::UnsupportedFormat`. Useful for tests that
+    /// want to assert "no adapter is reachable for X."
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            by_format: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register an adapter for every format it claims to support.
+    /// If multiple adapters claim the same format, the last
+    /// registered wins (last-writer-wins is the standard registry
+    /// semantic; operators who care about ordering register
+    /// explicitly in priority order).
+    pub fn register(&mut self, adapter: Arc<dyn FormatAdapter>) -> &mut Self {
+        for format in adapter.supported_formats() {
+            self.by_format.insert(*format, Arc::clone(&adapter));
+        }
+        self
+    }
+
+    /// Resolve the adapter for `format`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError::UnsupportedFormat`] when no adapter
+    /// in the registry claims this format.
+    pub fn select(
+        &self,
+        format: ResourceFormat,
+    ) -> Result<Arc<dyn FormatAdapter>, AdapterError> {
+        self.by_format
+            .get(&format)
+            .cloned()
+            .ok_or(AdapterError::UnsupportedFormat { format })
+    }
+
+    /// True iff the registry has an adapter for `format`.
+    #[must_use]
+    pub fn handles(&self, format: ResourceFormat) -> bool {
+        self.by_format.contains_key(&format)
+    }
+}
+
+impl Default for AdapterRegistry {
+    /// Ships the three standard adapters:
+    /// - `Native` → `NativePassthroughAdapter`
+    /// - `Json` → `K8sJsonAdapter`
+    /// - `Yaml` → `K8sYamlAdapter`
+    ///
+    /// Faces that want only Native (e.g. an early prototype face)
+    /// build a custom registry; faces that want HCL register an
+    /// additional adapter later.
+    fn default() -> Self {
+        let mut r = Self::empty();
+        r.register(Arc::new(NativePassthroughAdapter));
+        r.register(Arc::new(K8sJsonAdapter));
+        r.register(Arc::new(K8sYamlAdapter));
+        r
+    }
+}
+
+impl std::fmt::Debug for AdapterRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<(ResourceFormat, &str)> = self
+            .by_format
+            .iter()
+            .map(|(k, v)| (*k, v.name()))
+            .collect();
+        names.sort_by_key(|(_, n)| *n);
+        f.debug_struct("AdapterRegistry")
+            .field("formats", &names)
+            .finish()
     }
 }
 
