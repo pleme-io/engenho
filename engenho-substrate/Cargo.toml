@@ -1,0 +1,19 @@
+[package]
+name = "engenho-substrate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+authors.workspace = true
+description = "engenho-substrate — shared helpers extracted to the third-site rule. atomic_write (fsync-anchored tmp+rename), magic-headered blob encoding, file-format versioning. The substrate building blocks that compose under engenho-store::persistence, kasou's machine-identifier, and tend's daemon state."
+
+[dependencies]
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+blake3             = "1"
