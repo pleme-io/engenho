@@ -955,6 +955,7 @@ dependencies = [
  "chitchat",
  "ciborium",
  "ed25519-dalek",
+ "engenho-config",
  "engenho-types",
  "hcl-rs",
  "openraft",
@@ -975,6 +976,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "engenho-config",
  "engenho-controllers",
  "engenho-store",
  "engenho-types",

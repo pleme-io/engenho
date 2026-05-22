@@ -20,6 +20,7 @@ anyhow             = { workspace = true }
 engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }
 engenho-controllers = { workspace = true }   # for the shared Controller trait
+engenho-config      = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

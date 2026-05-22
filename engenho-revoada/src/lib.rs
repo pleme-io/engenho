@@ -41,6 +41,7 @@ pub mod backend;
 pub mod backend_fs;
 pub mod backends;
 pub mod cluster;
+pub mod config_bridge;
 pub mod consensus;
 pub mod content;
 pub mod fabric;
