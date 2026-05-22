@@ -297,6 +297,11 @@ impl TopologyStrategy for Solo {
         }
         let mut a = RoleAssignment::new();
         a.set(eligible[0].clone(), NodeState::Active(Role::Master));
+        // Extras parked as Standby so they're eligible for promotion
+        // if the master dies — never silently dropped.
+        for id in &eligible[1..] {
+            a.set(id.clone(), NodeState::Standby);
+        }
         Ok(a)
     }
     fn react_to_loss(
@@ -304,18 +309,33 @@ impl TopologyStrategy for Solo {
         current: &RoleAssignment,
         lost: &[NodeId],
     ) -> Vec<Transition> {
-        // Solo: if the single master is lost, the cluster is down.
-        // Any new node joins as Master (the strategy promotes
-        // automatically).
-        lost.iter()
-            .filter_map(|id| {
-                if current.get(id).map(NodeState::is_serving).unwrap_or(false) {
-                    Some(Transition::Evict(id.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        let lost_set: HashSet<&NodeId> = lost.iter().collect();
+        let master_lost = current
+            .nodes_with_role(Role::Master)
+            .into_iter()
+            .any(|n| lost_set.contains(n));
+        let mut tx = Vec::new();
+        if master_lost {
+            // Promote the first surviving Standby (or Worker) to
+            // Master. Without this, a multi-node Solo cluster
+            // would lose its only voter when the master died —
+            // violating the "never stuck" invariant.
+            let candidate = current
+                .assignments
+                .iter()
+                .find(|(id, state)| {
+                    !lost_set.contains(id)
+                        && matches!(state, NodeState::Standby | NodeState::Active(Role::Worker))
+                })
+                .map(|(id, _)| id.clone());
+            if let Some(id) = candidate {
+                tx.push(Transition::Promote(id, Role::Master));
+            }
+        }
+        for id in lost {
+            tx.push(Transition::Evict(id.clone()));
+        }
+        tx
     }
     fn validate(&self, assignment: &RoleAssignment) -> Result<(), TopologyError> {
         let masters = assignment.nodes_with_role(Role::Master).len();
