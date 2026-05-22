@@ -17,8 +17,9 @@ tokio              = { workspace = true }
 tracing            = { workspace = true }
 anyhow             = { workspace = true }
 
-engenho-types      = { workspace = true }
-engenho-store      = { workspace = true }
+engenho-types       = { workspace = true }
+engenho-store       = { workspace = true }
+engenho-controllers = { workspace = true }   # for the shared Controller trait
 
 [dev-dependencies]
 proptest = "1"

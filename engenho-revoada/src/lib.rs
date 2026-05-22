@@ -39,6 +39,7 @@ pub mod attestation;
 pub mod consensus;
 pub mod content;
 pub mod fabric;
+pub mod face;
 pub mod membership;
 pub mod policy;
 
@@ -47,6 +48,7 @@ pub use fabric::{
     FabricStrategy, FabricStrategyError, FaceKind, MembershipConfig, PlacementPolicy,
     ReconciliationCadence,
 };
+pub use face::{Face, FaceError, KubernetesFace, PureRaftFace, instantiate as instantiate_face};
 
 use serde::{Deserialize, Serialize};
 

@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use engenho_controllers::{Controller, ControllerError, ReconcileReport};
 use engenho_store::{
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
@@ -106,6 +108,50 @@ impl Scheduler {
     #[must_use]
     pub fn strategy_name(&self) -> &'static str {
         self.strategy.name()
+    }
+}
+
+/// Third-site extraction: Scheduler is the FIRST `Controller`
+/// site (R8); ReplicaSet/Deployment/Endpoints/GC are sites 2-5
+/// in engenho-controllers (R9 onward). This impl unifies them
+/// under one trait so a [`engenho_controllers::ControllerRuntime`]
+/// or [`engenho_controllers::WatchDriver`] can host the Scheduler
+/// alongside the other controllers — same trait, same runtime,
+/// same event-driven wake.
+#[async_trait]
+impl Controller for Scheduler {
+    fn name(&self) -> &'static str {
+        "scheduler"
+    }
+
+    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+        let report = Scheduler::tick(self)
+            .await
+            .map_err(|e| match e {
+                SchedulerError::Store(s) => ControllerError::Store(s),
+                SchedulerError::NoSchedulableNodes => {
+                    ControllerError::Internal("no schedulable nodes".into())
+                }
+                SchedulerError::InvalidPodMetadata => {
+                    ControllerError::InvalidResource("invalid pod metadata".into())
+                }
+                SchedulerError::Internal(s) => ControllerError::Internal(s),
+            })?;
+        Ok(ReconcileReport {
+            objects_examined: report.pods_examined,
+            objects_changed: report.bound.len(),
+            objects_skipped: report.skipped_no_node,
+            note: if report.pending_pods > 0 {
+                Some(format!(
+                    "{} pending → {} bound, {} skipped",
+                    report.pending_pods,
+                    report.bound.len(),
+                    report.skipped_no_node
+                ))
+            } else {
+                None
+            },
+        })
     }
 }
 
