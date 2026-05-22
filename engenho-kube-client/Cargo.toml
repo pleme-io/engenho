@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
+homepage.workspace     = true
+readme.workspace       = true
+categories.workspace   = true
+keywords.workspace     = true
 description = "Reqwest-backed implementation of engenho-types' KubeClient + Watcher traits. Speaks the upstream Kubernetes REST API over HTTPS with rustls + the four standard auth methods (anonymous, bearer token, client cert, exec plugin)."
 
 [dependencies]

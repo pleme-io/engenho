@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 description = "MCP server exposing the engenho cluster operator surface — typed reader catalog (P0) and writer catalog (P2+)."
 
 [[bin]]

@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
+homepage.workspace     = true
+readme.workspace       = true
+categories.workspace   = true
+keywords.workspace     = true
 description = "Typed schema for engenho/k3s cluster configuration: every network knob + GitOps bootstrap, validated at construction and renderable to k3s config.yaml + cmdline flags + bootstrap manifests."
 
 [dependencies]

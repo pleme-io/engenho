@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
+homepage.workspace     = true
+readme.workspace       = true
+categories.workspace   = true
+keywords.workspace     = true
 description = "CLI binary: read a YAML ClusterConfig, validate, emit k3s config.yaml + cmdline args + auto-apply manifests. Consumed by nixos-k3s-vm at NixOS build time."
 
 [[bin]]

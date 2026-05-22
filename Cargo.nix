@@ -123,6 +123,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "engenho-kubelet" = rec {
+      packageId = "engenho-kubelet";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "engenho-kubelet";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "engenho-mcp" = rec {
       packageId = "engenho-mcp";
       build = internal.buildRustCrateWithFeatures {
@@ -3157,6 +3167,71 @@ rec {
         ];
 
       };
+      "engenho-kubelet" = rec {
+        crateName = "engenho-kubelet";
+        version = "0.1.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-kubelet; };
+        libName = "engenho_kubelet";
+        authors = [
+          "pleme-io"
+        ];
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "async-trait";
+            packageId = "async-trait";
+          }
+          {
+            name = "engenho-config";
+            packageId = "engenho-config";
+          }
+          {
+            name = "engenho-controllers";
+            packageId = "engenho-controllers";
+          }
+          {
+            name = "engenho-store";
+            packageId = "engenho-store";
+          }
+          {
+            name = "engenho-types";
+            packageId = "engenho-types";
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
+          }
+          {
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 2.0.18";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "full" ];
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "proptest";
+            packageId = "proptest";
+          }
+        ];
+
+      };
       "engenho-mcp" = rec {
         crateName = "engenho-mcp";
         version = "0.1.0";
@@ -3275,6 +3350,10 @@ rec {
             features = [ "rand_core" "serde" ];
           }
           {
+            name = "engenho-config";
+            packageId = "engenho-config";
+          }
+          {
             name = "engenho-types";
             packageId = "engenho-types";
           }
@@ -3349,6 +3428,10 @@ rec {
             packageId = "async-trait";
           }
           {
+            name = "engenho-config";
+            packageId = "engenho-config";
+          }
+          {
             name = "engenho-controllers";
             packageId = "engenho-controllers";
           }
@@ -3408,6 +3491,10 @@ rec {
           {
             name = "async-trait";
             packageId = "async-trait";
+          }
+          {
+            name = "engenho-teia";
+            packageId = "engenho-teia";
           }
           {
             name = "engenho-types";

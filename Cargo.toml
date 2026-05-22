@@ -24,18 +24,29 @@ edition = "2024"
 rust-version = "1.89.0"
 license = "MIT"
 repository = "https://github.com/pleme-io/engenho"
+homepage = "https://github.com/pleme-io/engenho"
+readme = "README.md"
 authors = ["pleme-io"]
+# Inherited via `.workspace = true` in each crate. Per-crate
+# Cargo.toml can override `keywords` with crate-specific terms.
+categories = ["api-bindings", "network-programming"]
+keywords = ["kubernetes", "engenho", "pleme-io"]
 
 [workspace.dependencies]
-engenho-types          = { path = "engenho-types" }
-engenho-cluster-config = { path = "engenho-cluster-config" }
-engenho-kube-client    = { path = "engenho-kube-client" }
-engenho-store          = { path = "engenho-store" }
-engenho-scheduler      = { path = "engenho-scheduler" }
-engenho-controllers    = { path = "engenho-controllers" }
-engenho-config         = { path = "engenho-config" }
-engenho-kubelet        = { path = "engenho-kubelet" }
-engenho-teia           = { path = "engenho-teia" }
+# Internal workspace deps. The `version` field is required for
+# crates.io publish — when publishing, cargo strips the `path`
+# entry and resolves the dep against the registry. Operators
+# building locally always use `path`; downstream crates pulling
+# us from crates.io use `version`.
+engenho-types          = { path = "engenho-types",          version = "0.1.0" }
+engenho-cluster-config = { path = "engenho-cluster-config", version = "0.1.0" }
+engenho-kube-client    = { path = "engenho-kube-client",    version = "0.1.0" }
+engenho-store          = { path = "engenho-store",          version = "0.1.0" }
+engenho-scheduler      = { path = "engenho-scheduler",      version = "0.1.0" }
+engenho-controllers    = { path = "engenho-controllers",    version = "0.1.0" }
+engenho-config         = { path = "engenho-config",         version = "0.1.0" }
+engenho-kubelet        = { path = "engenho-kubelet",        version = "0.1.0" }
+engenho-teia           = { path = "engenho-teia",           version = "0.1.0" }
 axum                   = "0.7"
 hyper                  = "1"
 tower                  = "0.5"

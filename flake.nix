@@ -125,10 +125,22 @@
       # `nix run .#release-engenho-mcp` pushes the multi-arch image
       # to ghcr.io/pleme-io/engenho-mcp via forge. Same for the
       # renderer. forge consumes GITHUB_TOKEN automatically.
+      #
+      # Plus operator-side equivalents of the GH-Actions auto-bump-
+      # and-publish flow (.github/workflows/{auto-bump,crates-publish}.yml):
+      #
+      #   nix run .#bump-workspace -- patch   ← cargo set-version --workspace --bump
+      #                                         + regenerate Cargo.nix + git
+      #                                         commit + tag (does NOT push)
+      #   nix run .#publish-crates            ← cargo publish --workspace
+      #                                         (requires CARGO_REGISTRY_TOKEN)
+      #   nix run .#publish-crates -- --dry-run
       apps = nixpkgs.lib.recursiveUpdate (standardFlake.apps or {}) (
         nixpkgs.lib.genAttrs
           [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ]
-          (system: {
+          (system: let
+            pkgs = import nixpkgs { inherit system; };
+          in {
             release-engenho-mcp =
               (mcpImageOutputs.apps.${system} or {}).release or {
                 type = "app";
@@ -139,6 +151,52 @@
                 type = "app";
                 program = "${nixpkgs.legacyPackages.${system}.coreutils}/bin/echo 'release-engenho-cluster-config-render not available on ${system}'";
               };
+
+            # Workspace patch bump — mirrors auto-bump.yml's behavior
+            # so operators can preview a release locally before pushing.
+            bump-workspace = {
+              type = "app";
+              program = toString (pkgs.writeShellScript "engenho-bump-workspace" ''
+                set -euo pipefail
+                export PATH="${pkgs.cargo}/bin:${pkgs.cargo-edit}/bin:${pkgs.jq}/bin:${pkgs.git}/bin:$PATH"
+                BUMP_TYPE="''${1:-patch}"
+                case "$BUMP_TYPE" in major|minor|patch) ;;
+                  *) echo "Usage: nix run .#bump-workspace -- {patch|minor|major}"; exit 1 ;;
+                esac
+                OLD=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+                echo "Bumping $BUMP_TYPE from $OLD..."
+                cargo set-version --workspace --bump "$BUMP_TYPE"
+                NEW=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+                echo "==> regenerating Cargo.nix..."
+                ${crate2nix.packages.${system}.default}/bin/crate2nix generate
+                cargo update --workspace --offline 2>/dev/null || cargo update --workspace 2>/dev/null || true
+                git add Cargo.toml Cargo.lock Cargo.nix engenho-*/Cargo.toml engenho/Cargo.toml
+                git commit -m "release: workspace v$NEW"
+                git tag "v$NEW"
+                echo ""
+                echo "Bumped $OLD -> $NEW + tagged v$NEW."
+                echo "Push with:  git push origin main && git push origin v$NEW"
+              '');
+            };
+
+            # Publish every workspace member to crates.io. Cargo 1.84+
+            # `--workspace` flag handles topological order + waits
+            # for each crate to land before publishing dependents.
+            publish-crates = {
+              type = "app";
+              program = toString (pkgs.writeShellScript "engenho-publish-crates" ''
+                set -euo pipefail
+                export PATH="${pkgs.cargo}/bin:$PATH"
+                if [ -z "''${CARGO_REGISTRY_TOKEN:-}" ] \
+                   && [ "''${1:-}" != "--dry-run" ]; then
+                  echo "Error: CARGO_REGISTRY_TOKEN is not set."
+                  echo "  export CARGO_REGISTRY_TOKEN=<token>   (or pass --dry-run)"
+                  exit 1
+                fi
+                echo "==> cargo publish --workspace $@"
+                cargo publish --workspace --no-verify "$@"
+              '');
+            };
           })
       );
 

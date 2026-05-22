@@ -1,0 +1,144 @@
+name: crates-publish
+
+# Tag-triggered (v*). Publishes every workspace member to the
+# Rust registry in topological dependency order, AUTO-RENAMING
+# any crate whose name collides on first publish to
+# `pleme-io-<original-name>`.
+#
+# The auto-rename loop:
+#   1. Try to ship the crate under its current name.
+#   2. On "name is already used by another user" / "crate name is
+#      not allowed", rename:
+#        - <crate>/Cargo.toml package.name → pleme-io-<original>
+#        - workspace.dependencies <original> gains
+#          `package = "pleme-io-<original>"` so Rust code keeps
+#          using the short name (cargo's rename-via-package field).
+#   3. Retry. On second failure, fail loud and surface the error.
+#
+# Renames are committed back to main so subsequent runs find the
+# crates already correctly named.
+#
+# Requires repo secret CARGO_REGISTRY_TOKEN with publish scope.
+# Optional BOT_PAT for cross-workflow tag triggering on the
+# rename-back-to-main commit.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Run dry-run only (no actual upload)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Verify tag matches workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          workspace_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$tag_version" != "$workspace_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (= $tag_version) does not match workspace version $workspace_version"
+            exit 1
+          fi
+          echo "Tag and workspace version match: $workspace_version"
+
+      - name: Ship workspace to registry (auto-rename on conflict)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ inputs.dry-run || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DRY_FLAG=""
+          if [ "$DRY_RUN" = "true" ]; then
+            DRY_FLAG="--dry-run"
+            echo "DRY RUN — no actual ship."
+          elif [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is required for ship."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Conflict-renaming loop: try the workspace-level ship;
+          # on a name-conflict error, rename the offending crate
+          # to pleme-io-<name>, commit, push, and retry.
+          attempt=0
+          max_attempts=20  # 15 crates + safety margin
+          while [ $attempt -lt $max_attempts ]; do
+            attempt=$((attempt + 1))
+            echo "==> Attempt $attempt"
+            out_log=$(mktemp)
+            if cargo publish --workspace $DRY_FLAG --no-verify 2>&1 | tee "$out_log"; then
+              echo "All workspace members shipped successfully on attempt $attempt."
+              exit 0
+            fi
+
+            # Parse the failure log for a conflict signature.
+            offending=$(grep -oE 'crate name [`"]([^`"]+)[`"] is already (in use|taken|registered)' "$out_log" | head -1 | grep -oE '[`"][^`"]+[`"]' | tr -d '`"' || true)
+            if [ -z "$offending" ]; then
+              offending=$(grep -oE 'the crate `([^`]+)` (was already published|exists in the registry)' "$out_log" | head -1 | grep -oE '`[^`]+`' | tr -d '`' || true)
+            fi
+            if [ -z "$offending" ]; then
+              offending=$(grep -oE 'crate `([^`]+)` is already on the registry' "$out_log" | head -1 | grep -oE '`[^`]+`' | tr -d '`' || true)
+            fi
+
+            if [ -z "$offending" ]; then
+              echo "::error::Ship failed but no recognizable name-conflict; bailing."
+              cat "$out_log"
+              exit 1
+            fi
+
+            new_name="pleme-io-${offending}"
+            echo "Conflict: '${offending}' is taken. Renaming to '${new_name}'."
+
+            crate_dir="${offending}"
+            if [ ! -d "$crate_dir" ]; then
+              echo "::error::Conflicting name '${offending}' has no matching crate dir; bailing."
+              exit 1
+            fi
+
+            # 1. Rewrite the crate's package.name.
+            sed -i "s/^name = \"${offending}\"\$/name = \"${new_name}\"/" "${crate_dir}/Cargo.toml"
+            # 2. Add a `package = "pleme-io-<original>"` rename to the
+            #    workspace.dependencies entry so other crates can keep
+            #    using the short name in their `[dependencies]` blocks.
+            #    Skip if no workspace.dependencies entry exists for this
+            #    crate (e.g. the main binary crate isn't a workspace dep).
+            if grep -qE "^${offending}\s*=\s*\{ path = \"${offending}\"" Cargo.toml; then
+              sed -i "s|^\(${offending}\s*=\s*\{ path = \"${offending}\",\s*version = \"\([^\"]*\)\" \}\)|${offending} = { path = \"${offending}\", version = \"\\2\", package = \"${new_name}\" }|" Cargo.toml
+            fi
+
+            git add "${crate_dir}/Cargo.toml" Cargo.toml
+            git commit -m "rename: ${offending} → ${new_name} (registry name conflict)"
+            git push origin main || git push origin HEAD:main
+
+            cargo update --workspace 2>/dev/null || true
+            echo "Retrying ship after rename..."
+          done
+
+          echo "::error::Exceeded max conflict-rename attempts ($max_attempts). Inspect the log."
+          exit 1
