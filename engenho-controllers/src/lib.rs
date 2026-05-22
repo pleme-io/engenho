@@ -30,16 +30,20 @@
 
 pub mod controller;
 pub mod deployment;
+pub mod endpoints;
 pub mod error;
 pub mod gc;
 pub mod owner;
 pub mod replicaset;
 pub mod runtime;
+pub mod selector;
 
 pub use controller::{Controller, ReconcileReport};
 pub use deployment::DeploymentController;
+pub use endpoints::EndpointsController;
 pub use error::ControllerError;
 pub use gc::GcController;
 pub use owner::{controlling_owner, is_owned_by, set_owner_reference, OwnerReference};
 pub use replicaset::ReplicaSetController;
 pub use runtime::{ControllerRuntime, RuntimeConfig};
+pub use selector::{matches_labels, selector_match_labels, service_selector};
