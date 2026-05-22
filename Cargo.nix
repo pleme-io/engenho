@@ -173,6 +173,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "engenho-substrate" = rec {
+      packageId = "engenho-substrate";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "engenho-substrate";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "engenho-teia" = rec {
       packageId = "engenho-teia";
       build = internal.buildRustCrateWithFeatures {
@@ -2764,7 +2774,7 @@ rec {
       };
       "engenho" = rec {
         crateName = "engenho";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         crateBin = [
           {
@@ -2787,7 +2797,7 @@ rec {
       };
       "engenho-apiserver" = rec {
         crateName = "engenho-apiserver";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-apiserver; };
         libName = "engenho_apiserver";
@@ -2863,7 +2873,7 @@ rec {
       };
       "engenho-cluster-config" = rec {
         crateName = "engenho-cluster-config";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-cluster-config; };
         libName = "engenho_cluster_config";
@@ -2897,7 +2907,7 @@ rec {
       };
       "engenho-cluster-config-render" = rec {
         crateName = "engenho-cluster-config-render";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         crateBin = [
           {
@@ -2942,7 +2952,7 @@ rec {
       };
       "engenho-config" = rec {
         crateName = "engenho-config";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-config; };
         libName = "engenho_config";
@@ -2982,7 +2992,7 @@ rec {
       };
       "engenho-controllers" = rec {
         crateName = "engenho-controllers";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-controllers; };
         libName = "engenho_controllers";
@@ -3043,7 +3053,7 @@ rec {
       };
       "engenho-kube-client" = rec {
         crateName = "engenho-kube-client";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-kube-client; };
         libName = "engenho_kube_client";
@@ -3127,7 +3137,7 @@ rec {
       };
       "engenho-kube-codegen" = rec {
         crateName = "engenho-kube-codegen";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         crateBin = [
           {
@@ -3169,7 +3179,7 @@ rec {
       };
       "engenho-kubelet" = rec {
         crateName = "engenho-kubelet";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-kubelet; };
         libName = "engenho_kubelet";
@@ -3234,7 +3244,7 @@ rec {
       };
       "engenho-mcp" = rec {
         crateName = "engenho-mcp";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         crateBin = [
           {
@@ -3316,7 +3326,7 @@ rec {
       };
       "engenho-revoada" = rec {
         crateName = "engenho-revoada";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-revoada; };
         libName = "engenho_revoada";
@@ -3411,7 +3421,7 @@ rec {
       };
       "engenho-scheduler" = rec {
         crateName = "engenho-scheduler";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-scheduler; };
         libName = "engenho_scheduler";
@@ -3476,7 +3486,7 @@ rec {
       };
       "engenho-store" = rec {
         crateName = "engenho-store";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-store; };
         libName = "engenho_store";
@@ -3493,12 +3503,20 @@ rec {
             packageId = "async-trait";
           }
           {
+            name = "blake3";
+            packageId = "blake3";
+          }
+          {
             name = "engenho-teia";
             packageId = "engenho-teia";
           }
           {
             name = "engenho-types";
             packageId = "engenho-types";
+          }
+          {
+            name = "futures";
+            packageId = "futures";
           }
           {
             name = "openraft";
@@ -3536,9 +3554,39 @@ rec {
         ];
 
       };
+      "engenho-substrate" = rec {
+        crateName = "engenho-substrate";
+        version = "0.1.4";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-substrate; };
+        libName = "engenho_substrate";
+        authors = [
+          "pleme-io"
+        ];
+        dependencies = [
+          {
+            name = "blake3";
+            packageId = "blake3";
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
+          }
+          {
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 2.0.18";
+          }
+        ];
+
+      };
       "engenho-teia" = rec {
         crateName = "engenho-teia";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-teia; };
         libName = "engenho_teia";
@@ -3603,7 +3651,7 @@ rec {
       };
       "engenho-types" = rec {
         crateName = "engenho-types";
-        version = "0.1.3";
+        version = "0.1.4";
         edition = "2024";
         src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-types; };
         libName = "engenho_types";
