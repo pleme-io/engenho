@@ -334,6 +334,44 @@ impl Cluster {
         self.declaration.id()
     }
 
+    /// Aggregated typed status across the running cluster — the
+    /// single observability surface every operator needs. Reaches
+    /// into face + store to assemble in one allocation.
+    #[must_use]
+    pub fn health(&self) -> ClusterHealth {
+        ClusterHealth {
+            name: self.declaration.face().name.clone(),
+            kind: self.declaration.face().kind.clone(),
+            face_running: self.face.is_running(),
+            cluster_running: self.is_running(),
+            resource_count: self.face.resource_count(),
+            subscriber_count: self.face.subscriber_count(),
+            strategy_name: self.declaration.strategy().name.clone(),
+            topology_name: self.declaration.topology().name().to_string(),
+        }
+    }
+
+    /// Capture a typed snapshot of the face's resource state.
+    /// Delegates to [`Face::snapshot`]; returns CBOR bytes the
+    /// operator can persist + later feed back to [`Self::restore`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FaceError`] from the face's snapshot impl
+    /// (e.g. `Unsupported` for faces without a backing store).
+    pub fn snapshot(&self) -> Result<Vec<u8>, FaceError> {
+        self.face.snapshot()
+    }
+
+    /// Replay a snapshot into the face. Replaces all face state.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FaceError`] from the face's restore impl.
+    pub fn restore(&self, snapshot_bytes: &[u8]) -> Result<(), FaceError> {
+        self.face.restore(snapshot_bytes)
+    }
+
     // ── One-shot construction + auto-start ────────────────────────
 
     /// Build + start in one call: equivalent to
@@ -423,6 +461,44 @@ impl Cluster {
         format: ResourceFormat,
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.face.watch_resources(kind, namespace, format)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ClusterHealth — aggregated typed status
+// ─────────────────────────────────────────────────────────────────
+
+/// Aggregated status for a running [`Cluster`]. Composed from the
+/// declaration (identity), face (lifecycle + resource counts), and
+/// runtime (lifecycle). One value, all observability surfaces.
+///
+/// Suitable for serializing into operator-facing telemetry, health-
+/// check endpoints, log fields, etc.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ClusterHealth {
+    pub name: String,
+    pub kind: FaceKind,
+    pub face_running: bool,
+    pub cluster_running: bool,
+    pub resource_count: usize,
+    pub subscriber_count: usize,
+    pub strategy_name: String,
+    pub topology_name: String,
+}
+
+impl ClusterHealth {
+    /// `Ok` iff both `cluster_running` and `face_running` are true
+    /// AND the resource count is non-negative (always true; this
+    /// is a typed sanity check). Returns the first failed
+    /// invariant on `Err` so health checks can log specifically.
+    pub fn check(&self) -> Result<(), &'static str> {
+        if !self.cluster_running {
+            return Err("cluster not running");
+        }
+        if !self.face_running {
+            return Err("face not running");
+        }
+        Ok(())
     }
 }
 

@@ -75,7 +75,7 @@ pub use face::{
 };
 pub use cluster::{
     Cluster, ClusterBuilder, ClusterBuilderError, ClusterCoherenceError, ClusterDeclaration,
-    ClusterRuntimeError,
+    ClusterHealth, ClusterRuntimeError,
 };
 
 use serde::{Deserialize, Serialize};
