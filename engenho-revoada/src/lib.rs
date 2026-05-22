@@ -36,6 +36,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod attestation;
+pub mod cluster;
 pub mod consensus;
 pub mod content;
 pub mod fabric;
@@ -46,7 +47,8 @@ pub mod topology;
 
 pub use topology::{
     Cluster3MNW, MeshAllPeers, NodeId as TopologyNodeId, NodeState, Pair, Phalanx,
-    Quorum3M, Role, RoleAssignment, Solo, TopologyError, TopologyStrategy, Transition,
+    Quorum3M, Role, RoleAssignment, Solo, TopologyError, TopologyReactor,
+    TopologyStrategy, Transition,
 };
 
 pub use fabric::{
@@ -55,6 +57,7 @@ pub use fabric::{
     ReconciliationCadence,
 };
 pub use face::{Face, FaceError, KubernetesFace, NomadFace, PureRaftFace, instantiate as instantiate_face};
+pub use cluster::{ClusterCoherenceError, ClusterDeclaration};
 
 use serde::{Deserialize, Serialize};
 
