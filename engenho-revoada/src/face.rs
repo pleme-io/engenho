@@ -251,7 +251,7 @@ pub trait Face: Send + Sync + 'static {
 /// Format the face speaks for its resource verbs. Each face owns
 /// the set of formats it supports; passing an unsupported format
 /// is `Err(FaceError::Unsupported)` from the verb.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ResourceFormat {
     /// Kubernetes-style YAML.
     Yaml,

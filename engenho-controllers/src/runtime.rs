@@ -33,6 +33,23 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Wire engenho-config's top-level ControllersConfig into the runtime.
+/// The single fallback_interval_seconds becomes default_interval —
+/// individual controllers can still override per-registration.
+impl From<&engenho_config::ControllersConfig> for RuntimeConfig {
+    fn from(top: &engenho_config::ControllersConfig) -> Self {
+        Self {
+            default_interval: Duration::from_secs(u64::from(top.fallback_interval_seconds)),
+        }
+    }
+}
+
+impl From<engenho_config::ControllersConfig> for RuntimeConfig {
+    fn from(top: engenho_config::ControllersConfig) -> Self {
+        (&top).into()
+    }
+}
+
 pub struct ControllerRuntime {
     config: RuntimeConfig,
     controllers: Vec<(Arc<dyn Controller>, Duration)>,
@@ -130,6 +147,27 @@ mod tests {
         let rt = ControllerRuntime::new(RuntimeConfig::default());
         assert!(rt.is_empty());
         assert_eq!(rt.len(), 0);
+    }
+
+    #[test]
+    fn runtime_config_from_engenho_config_carries_fallback_interval() {
+        use engenho_config::{ControllerEnable, ControllersConfig};
+        let top = ControllersConfig {
+            enable: ControllerEnable {
+                replicaset: true,
+                deployment: true,
+                endpoints: true,
+                gc: true,
+            },
+            namespace: String::new(),
+            fallback_interval_seconds: 45,
+            debounce_milliseconds: 100,
+        };
+        let runtime: RuntimeConfig = (&top).into();
+        assert_eq!(runtime.default_interval, Duration::from_secs(45));
+        // From-owned variant works too.
+        let runtime_owned: RuntimeConfig = top.into();
+        assert_eq!(runtime_owned.default_interval, Duration::from_secs(45));
     }
 
     #[test]

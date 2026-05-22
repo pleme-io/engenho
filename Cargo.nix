@@ -2989,6 +2989,10 @@ rec {
             packageId = "async-trait";
           }
           {
+            name = "engenho-config";
+            packageId = "engenho-config";
+          }
+          {
             name = "engenho-store";
             packageId = "engenho-store";
           }
@@ -3466,6 +3470,10 @@ rec {
           {
             name = "async-trait";
             packageId = "async-trait";
+          }
+          {
+            name = "engenho-config";
+            packageId = "engenho-config";
           }
           {
             name = "engenho-types";

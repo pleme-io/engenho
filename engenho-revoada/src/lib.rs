@@ -36,6 +36,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod attestation;
+pub mod audit;
 pub mod backend;
 pub mod backend_fs;
 pub mod backends;
@@ -51,6 +52,10 @@ pub mod membership;
 pub mod policy;
 pub mod topology;
 
+pub use audit::{
+    AuditEvent, AuditLog, AuditingBackend, FileAuditLog, InMemoryAuditLog, NoopAuditLog,
+    VerbKind,
+};
 pub use backend::{
     StoreBackend, StubBackend, kube_apiserver_stub, nomad_http_stub, raft_stub,
     supervised_systemd_stub, systemd_dbus_stub,
