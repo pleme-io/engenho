@@ -33,7 +33,7 @@ jobs:
           ref: main
           token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
 
-      - uses: pleme-io/actions/rust-workspace-publish@v1
+      - uses: pleme-io/actions/rust-workspace-publish@main
         with:
           dry-run: ${{ inputs.dry-run || 'false' }}
           no-verify: "true"
