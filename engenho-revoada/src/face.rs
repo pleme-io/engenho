@@ -314,12 +314,33 @@ pub enum FaceWatchEventKind {
 pub struct PureRaftFace {
     name: String,
     state: Mutex<FaceState>,
+    /// In-memory store backing the verb impls. Each resource is
+    /// addressed by `ResourceRef` and stored as the raw bytes the
+    /// operator supplied in `ResourceFormat::Native`. Per-ref
+    /// last-writer-wins (apply is idempotent + replaces).
+    ///
+    /// R5+ swaps this for the actual raft-replicated store
+    /// (engenho-store / engenho-revoada::consensus). The verb
+    /// signatures stay byte-identical — the swap is internal.
+    store: Mutex<std::collections::HashMap<ResourceRef, Vec<u8>>>,
+    /// Watch subscribers. Each `watch_resources` call appends a
+    /// channel; apply/delete fan out events to every subscriber
+    /// whose filter matches.
+    subscribers: Mutex<Vec<WatchSubscriber>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FaceState {
     Stopped,
     Running,
+}
+
+struct WatchSubscriber {
+    /// `Some` while the consumer holds the stream; `None` when
+    /// dropped — fan-out loop GCs dead subscribers lazily.
+    sender: Option<std::sync::mpsc::Sender<FaceWatchEvent>>,
+    kind_filter: String,
+    namespace_filter: Option<String>,
 }
 
 impl PureRaftFace {
@@ -334,7 +355,45 @@ impl PureRaftFace {
         Some(Self {
             name: decl.name.clone(),
             state: Mutex::new(FaceState::Stopped),
+            store: Mutex::new(std::collections::HashMap::new()),
+            subscribers: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Fan an event to every subscriber whose filter matches.
+    /// Lazily drops senders that have disconnected (consumer
+    /// dropped the stream).
+    fn broadcast(&self, reference: &ResourceRef, event_kind: FaceWatchEventKind, body: Vec<u8>) {
+        let mut subs = self.subscribers.lock().expect("subscribers mutex poisoned");
+        subs.retain_mut(|sub| {
+            if sub.kind_filter != reference.kind {
+                return true;
+            }
+            if let Some(ns) = &sub.namespace_filter
+                && reference.namespace.as_deref() != Some(ns.as_str())
+            {
+                return true;
+            }
+            let Some(sender) = &sub.sender else { return false };
+            let event = FaceWatchEvent {
+                kind: event_kind,
+                body: body.clone(),
+            };
+            sender.send(event).is_ok()
+        });
+    }
+
+    /// Native format is the only format PureRaft natively speaks.
+    /// Other formats land at R6+ (CBOR ↔ YAML/JSON adapter via
+    /// engenho-types' serde).
+    fn check_native(format: ResourceFormat, verb: &str) -> Result<(), FaceError> {
+        if format == ResourceFormat::Native {
+            Ok(())
+        } else {
+            Err(FaceError::Unsupported(format!(
+                "{verb} on PureRaftFace currently only supports ResourceFormat::Native (got {format:?})"
+            )))
+        }
     }
 }
 
@@ -372,6 +431,190 @@ impl Face for PureRaftFace {
         let state = self.state.lock().expect("face state mutex poisoned");
         *state == FaceState::Running
     }
+
+    // ── Resource verbs — first concrete impl ──────────────────────
+    //
+    // PureRaftFace stores raw native-format bytes in an in-memory
+    // HashMap keyed by ResourceRef. This is the proof-of-concept
+    // contract impl — every other face follows the same shape but
+    // routes through its own backend (kube-apiserver, nomad HTTP,
+    // systemd dbus, bare-metal supervisor).
+
+    fn apply_resource(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
+        Self::check_native(format, "apply_resource")?;
+        // The body must encode a ResourceRef preamble so the face
+        // knows where to store it. For this first impl we use a
+        // simple CBOR wire: { ref: ResourceRef, payload: bytes }.
+        let envelope: NativeEnvelope = ciborium::from_reader(body).map_err(|e| {
+            FaceError::Unsupported(format!("apply_resource: native envelope decode failed: {e}"))
+        })?;
+        let mut store = self.store.lock().expect("store mutex poisoned");
+        let event_kind = if store.contains_key(&envelope.reference) {
+            FaceWatchEventKind::Modified
+        } else {
+            FaceWatchEventKind::Added
+        };
+        store.insert(envelope.reference.clone(), envelope.payload.clone());
+        drop(store);
+        self.broadcast(&envelope.reference, event_kind, envelope.payload);
+        Ok(())
+    }
+
+    fn get_resource(
+        &self,
+        reference: &ResourceRef,
+        format: ResourceFormat,
+    ) -> Result<Vec<u8>, FaceError> {
+        Self::check_native(format, "get_resource")?;
+        let store = self.store.lock().expect("store mutex poisoned");
+        store
+            .get(reference)
+            .cloned()
+            .ok_or_else(|| FaceError::Unsupported(format!(
+                "get_resource: no resource at {reference:?}"
+            )))
+    }
+
+    fn list_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Vec<Vec<u8>>, FaceError> {
+        Self::check_native(format, "list_resources")?;
+        let store = self.store.lock().expect("store mutex poisoned");
+        let out: Vec<Vec<u8>> = store
+            .iter()
+            .filter(|(r, _)| {
+                r.kind == kind && r.namespace.as_deref() == namespace.or(r.namespace.as_deref())
+            })
+            .filter(|(r, _)| match namespace {
+                Some(ns) => r.namespace.as_deref() == Some(ns),
+                None => true,
+            })
+            .map(|(_, bytes)| bytes.clone())
+            .collect();
+        Ok(out)
+    }
+
+    fn delete_resource(&self, reference: &ResourceRef) -> Result<(), FaceError> {
+        let mut store = self.store.lock().expect("store mutex poisoned");
+        let body = store
+            .remove(reference)
+            .ok_or_else(|| FaceError::Unsupported(format!(
+                "delete_resource: no resource at {reference:?}"
+            )))?;
+        drop(store);
+        self.broadcast(reference, FaceWatchEventKind::Deleted, body);
+        Ok(())
+    }
+
+    fn watch_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
+        Self::check_native(format, "watch_resources")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Replay current matching state as `Added` events so
+        // consumers always start with a complete snapshot.
+        let store = self.store.lock().expect("store mutex poisoned");
+        for (r, body) in store.iter() {
+            if r.kind != kind {
+                continue;
+            }
+            if let Some(ns) = namespace
+                && r.namespace.as_deref() != Some(ns)
+            {
+                continue;
+            }
+            let _ = tx.send(FaceWatchEvent {
+                kind: FaceWatchEventKind::Added,
+                body: body.clone(),
+            });
+        }
+        drop(store);
+        let mut subs = self.subscribers.lock().expect("subscribers mutex poisoned");
+        subs.push(WatchSubscriber {
+            sender: Some(tx),
+            kind_filter: kind.to_string(),
+            namespace_filter: namespace.map(str::to_string),
+        });
+        Ok(Box::new(MpscWatchStream { rx }))
+    }
+}
+
+/// CBOR-encoded envelope used by `PureRaftFace::apply_resource` —
+/// carries the reference + payload in one wire shape. This is the
+/// `ResourceFormat::Native` for PureRaftFace; other faces define
+/// their own native shape.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct NativeEnvelope {
+    #[serde(rename = "ref")]
+    reference: ResourceRef,
+    payload: Vec<u8>,
+}
+
+impl serde::Serialize for ResourceRef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = s.serialize_struct("ResourceRef", 3)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("namespace", &self.namespace)?;
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ResourceRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            kind: String,
+            name: String,
+            namespace: Option<String>,
+        }
+        let w = Wire::deserialize(d)?;
+        Ok(Self {
+            kind: w.kind,
+            name: w.name,
+            namespace: w.namespace,
+        })
+    }
+}
+
+/// `Sync` `mpsc::Receiver`-backed watch stream. PureRaftFace
+/// fans events to channels; this stream pulls from one channel.
+struct MpscWatchStream {
+    rx: std::sync::mpsc::Receiver<FaceWatchEvent>,
+}
+
+impl FaceWatchStream for MpscWatchStream {
+    fn next_event(&mut self) -> Result<Option<FaceWatchEvent>, FaceError> {
+        match self.rx.recv() {
+            Ok(event) => Ok(Some(event)),
+            // Sender side dropped (face shutdown / GC) — stream end.
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+/// Construct a `NativeEnvelope`-encoded body for use with
+/// `PureRaftFace::apply_resource`. Convenience for callers that
+/// don't want to depend on ciborium directly.
+///
+/// # Errors
+///
+/// Returns the underlying serialization error if encoding fails.
+pub fn encode_native_envelope(reference: &ResourceRef, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let env = NativeEnvelope {
+        reference: reference.clone(),
+        payload: payload.to_vec(),
+    };
+    let mut out = Vec::new();
+    ciborium::into_writer(&env, &mut out).map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1083,9 +1326,16 @@ mod tests {
 
     // ── Resource verbs — default Unsupported behavior ─────────────
 
+    // NOTE: PureRaftFace now overrides apply_resource (first
+    // concrete impl). The Yaml-format-Unsupported case is covered
+    // by `pure_raft_apply_yaml_format_unsupported` further down.
+    // Default-unsupported coverage shifts to faces that haven't
+    // yet overridden — KubernetesFace / NomadFace / SystemdFace /
+    // BareMetalSupervisorFace.
+
     #[test]
-    fn apply_resource_default_unsupported_for_pure_raft() {
-        let face = PureRaftFace::from_declaration(&raft_decl()).unwrap();
+    fn apply_resource_default_unsupported_for_kubernetes() {
+        let face = KubernetesFace::from_declaration(&k8s_decl()).unwrap();
         match face.apply_resource(ResourceFormat::Yaml, b"---\nkind: Pod\n") {
             Err(FaceError::Unsupported(msg)) => {
                 assert!(msg.contains("apply_resource"), "msg: {msg}");
@@ -1142,6 +1392,260 @@ mod tests {
             Err(other) => panic!("expected Unsupported, got {other:?}"),
             Ok(_) => panic!("expected Err, got Ok"),
         }
+    }
+
+    // ── PureRaftFace verb impls — first concrete face ─────────────
+
+    fn raft_face() -> PureRaftFace {
+        PureRaftFace::from_declaration(&raft_decl()).unwrap()
+    }
+
+    fn pod_ref(name: &str, ns: &str) -> ResourceRef {
+        ResourceRef::namespaced("Pod", name, ns)
+    }
+
+    fn envelope(reference: &ResourceRef, payload: &[u8]) -> Vec<u8> {
+        encode_native_envelope(reference, payload).expect("envelope encode")
+    }
+
+    #[test]
+    fn pure_raft_apply_then_get_round_trips() {
+        let face = raft_face();
+        let r = pod_ref("nginx", "default");
+        let body = b"my-payload";
+        face.apply_resource(ResourceFormat::Native, &envelope(&r, body))
+            .unwrap();
+        let got = face
+            .get_resource(&r, ResourceFormat::Native)
+            .expect("get after apply");
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn pure_raft_apply_yaml_format_unsupported() {
+        let face = raft_face();
+        let r = pod_ref("nginx", "default");
+        match face.apply_resource(ResourceFormat::Yaml, &envelope(&r, b"x")) {
+            Err(FaceError::Unsupported(msg)) => {
+                assert!(msg.contains("Native"), "msg: {msg}");
+            }
+            other => panic!("expected Unsupported on Yaml format, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pure_raft_get_missing_resource_errors() {
+        let face = raft_face();
+        let r = pod_ref("does-not-exist", "default");
+        match face.get_resource(&r, ResourceFormat::Native) {
+            Err(FaceError::Unsupported(msg)) => {
+                assert!(msg.contains("no resource"), "msg: {msg}");
+            }
+            other => panic!("expected Unsupported (no resource), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pure_raft_apply_updates_existing_with_modified_event() {
+        let face = raft_face();
+        let r = pod_ref("nginx", "default");
+        face.apply_resource(ResourceFormat::Native, &envelope(&r, b"v1"))
+            .unwrap();
+        face.apply_resource(ResourceFormat::Native, &envelope(&r, b"v2"))
+            .unwrap();
+        let got = face.get_resource(&r, ResourceFormat::Native).unwrap();
+        assert_eq!(got, b"v2");
+    }
+
+    #[test]
+    fn pure_raft_list_returns_all_of_kind_in_namespace() {
+        let face = raft_face();
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(&pod_ref("a", "default"), b"A"),
+        )
+        .unwrap();
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(&pod_ref("b", "default"), b"B"),
+        )
+        .unwrap();
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(&pod_ref("c", "other"), b"C"),
+        )
+        .unwrap();
+        let in_default = face
+            .list_resources("Pod", Some("default"), ResourceFormat::Native)
+            .unwrap();
+        assert_eq!(in_default.len(), 2);
+        let mut got: Vec<&[u8]> = in_default.iter().map(Vec::as_slice).collect();
+        got.sort();
+        assert_eq!(got, vec![b"A".as_slice(), b"B".as_slice()]);
+    }
+
+    #[test]
+    fn pure_raft_delete_removes_then_get_errors() {
+        let face = raft_face();
+        let r = pod_ref("nginx", "default");
+        face.apply_resource(ResourceFormat::Native, &envelope(&r, b"x"))
+            .unwrap();
+        face.delete_resource(&r).unwrap();
+        match face.get_resource(&r, ResourceFormat::Native) {
+            Err(FaceError::Unsupported(msg)) => {
+                assert!(msg.contains("no resource"), "msg: {msg}");
+            }
+            other => panic!("expected Unsupported after delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pure_raft_delete_missing_resource_errors() {
+        let face = raft_face();
+        let r = pod_ref("missing", "default");
+        match face.delete_resource(&r) {
+            Err(FaceError::Unsupported(msg)) => {
+                assert!(msg.contains("no resource"), "msg: {msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pure_raft_watch_replays_existing_state_as_added() {
+        let face = raft_face();
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(&pod_ref("a", "default"), b"A"),
+        )
+        .unwrap();
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(&pod_ref("b", "default"), b"B"),
+        )
+        .unwrap();
+        let mut watch = face
+            .watch_resources("Pod", Some("default"), ResourceFormat::Native)
+            .unwrap();
+        // Drain two Added events (replay of existing state).
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..2 {
+            let ev = watch.next_event().unwrap().expect("event");
+            assert_eq!(ev.kind, FaceWatchEventKind::Added);
+            got.push(ev.body);
+        }
+        got.sort();
+        assert_eq!(got, vec![b"A".to_vec(), b"B".to_vec()]);
+    }
+
+    #[test]
+    fn pure_raft_watch_streams_modified_then_deleted() {
+        use std::sync::Arc;
+        use std::thread;
+        let face = Arc::new(raft_face());
+        let r = pod_ref("nginx", "default");
+        face.apply_resource(ResourceFormat::Native, &envelope(&r, b"v1"))
+            .unwrap();
+        let mut watch = face
+            .watch_resources("Pod", Some("default"), ResourceFormat::Native)
+            .unwrap();
+        // Drain the replay of v1 (Added).
+        let replay = watch.next_event().unwrap().expect("replay");
+        assert_eq!(replay.kind, FaceWatchEventKind::Added);
+        assert_eq!(replay.body, b"v1");
+        // Mutate on another thread to exercise the cross-thread fan-out.
+        let face2 = Arc::clone(&face);
+        let r2 = r.clone();
+        let writer = thread::spawn(move || {
+            face2
+                .apply_resource(ResourceFormat::Native, &envelope(&r2, b"v2"))
+                .unwrap();
+            face2.delete_resource(&r2).unwrap();
+        });
+        let mod_ev = watch.next_event().unwrap().expect("mod");
+        assert_eq!(mod_ev.kind, FaceWatchEventKind::Modified);
+        assert_eq!(mod_ev.body, b"v2");
+        let del_ev = watch.next_event().unwrap().expect("del");
+        assert_eq!(del_ev.kind, FaceWatchEventKind::Deleted);
+        assert_eq!(del_ev.body, b"v2");
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn pure_raft_watch_filters_by_kind() {
+        let face = raft_face();
+        let mut pod_watch = face
+            .watch_resources("Pod", None, ResourceFormat::Native)
+            .unwrap();
+        // Apply a Service — should NOT reach the Pod watch.
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(
+                &ResourceRef::namespaced("Service", "frontend", "default"),
+                b"S",
+            ),
+        )
+        .unwrap();
+        // Apply a Pod — SHOULD reach the watch.
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(&pod_ref("nginx", "default"), b"P"),
+        )
+        .unwrap();
+        let ev = pod_watch.next_event().unwrap().expect("pod event");
+        assert_eq!(ev.body, b"P");
+    }
+
+    #[test]
+    fn pure_raft_watch_filters_by_namespace() {
+        let face = raft_face();
+        let mut watch = face
+            .watch_resources("Pod", Some("default"), ResourceFormat::Native)
+            .unwrap();
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(&pod_ref("a", "other"), b"O"),
+        )
+        .unwrap();
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(&pod_ref("b", "default"), b"D"),
+        )
+        .unwrap();
+        let ev = watch.next_event().unwrap().expect("event");
+        // Only the "default" namespace event arrives.
+        assert_eq!(ev.body, b"D");
+    }
+
+    #[test]
+    fn pure_raft_watch_multiple_subscribers_all_receive_events() {
+        let face = raft_face();
+        let mut w1 = face
+            .watch_resources("Pod", None, ResourceFormat::Native)
+            .unwrap();
+        let mut w2 = face
+            .watch_resources("Pod", None, ResourceFormat::Native)
+            .unwrap();
+        face.apply_resource(
+            ResourceFormat::Native,
+            &envelope(&pod_ref("nginx", "default"), b"x"),
+        )
+        .unwrap();
+        let e1 = w1.next_event().unwrap().expect("w1 event");
+        let e2 = w2.next_event().unwrap().expect("w2 event");
+        assert_eq!(e1.body, b"x");
+        assert_eq!(e2.body, b"x");
+    }
+
+    #[test]
+    fn encode_native_envelope_round_trips_through_apply() {
+        // Operator-facing helper produces bytes that apply accepts.
+        let face = raft_face();
+        let r = pod_ref("nginx", "default");
+        let env = encode_native_envelope(&r, b"payload").unwrap();
+        face.apply_resource(ResourceFormat::Native, &env).unwrap();
+        let got = face.get_resource(&r, ResourceFormat::Native).unwrap();
+        assert_eq!(got, b"payload");
     }
 
     // ── ResourceRef typed constructors ───────────────────────────
