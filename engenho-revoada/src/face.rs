@@ -94,6 +94,205 @@ pub trait Face: Send + Sync + 'static {
     /// each face's internal state; faces that need richer status
     /// override this.
     fn is_running(&self) -> bool;
+
+    // ── Resource verbs — operator-facing CRUDW contract ─────────
+    //
+    // Every face exposes the same five verbs over the fabric
+    // vocabulary. The default impl is `Err(FaceError::Unsupported)`
+    // so faces opt in as they ship their renderer (R6+ for most
+    // faces today). Naming the contract uniformly now means
+    // operators get a single mental model regardless of which face
+    // is active, and the runtime can dispatch generically without
+    // peeking at concrete types.
+    //
+    // The verbs are byte-buffer-oriented at the trait level: each
+    // face owns the format negotiation (yaml/json/hcl/native).
+    // ResourceFormat + ResourceRef are the typed protocol shapes
+    // every face speaks; concrete content stays in the buffer.
+
+    /// Apply (create-or-update) a resource. The body bytes are in
+    /// `format` — the face translates to its native protocol.
+    ///
+    /// # Errors
+    ///
+    /// Default: `Err(FaceError::Unsupported)`. Faces override as
+    /// they ship.
+    fn apply_resource(&self, _format: ResourceFormat, _body: &[u8]) -> Result<(), FaceError> {
+        Err(FaceError::Unsupported(format!(
+            "apply_resource not yet implemented for {}",
+            self.name()
+        )))
+    }
+
+    /// Get a single resource by typed reference. Returns the
+    /// resource serialized in `format`.
+    ///
+    /// # Errors
+    ///
+    /// Default: `Err(FaceError::Unsupported)`. Faces override as
+    /// they ship.
+    fn get_resource(
+        &self,
+        _reference: &ResourceRef,
+        _format: ResourceFormat,
+    ) -> Result<Vec<u8>, FaceError> {
+        Err(FaceError::Unsupported(format!(
+            "get_resource not yet implemented for {}",
+            self.name()
+        )))
+    }
+
+    /// List all resources of `kind` in `namespace` (or cluster-wide
+    /// when `None`). Each entry is serialized in `format`.
+    ///
+    /// # Errors
+    ///
+    /// Default: `Err(FaceError::Unsupported)`. Faces override as
+    /// they ship.
+    fn list_resources(
+        &self,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _format: ResourceFormat,
+    ) -> Result<Vec<Vec<u8>>, FaceError> {
+        Err(FaceError::Unsupported(format!(
+            "list_resources not yet implemented for {}",
+            self.name()
+        )))
+    }
+
+    /// Delete a resource by typed reference.
+    ///
+    /// # Errors
+    ///
+    /// Default: `Err(FaceError::Unsupported)`. Faces override as
+    /// they ship.
+    fn delete_resource(&self, _reference: &ResourceRef) -> Result<(), FaceError> {
+        Err(FaceError::Unsupported(format!(
+            "delete_resource not yet implemented for {}",
+            self.name()
+        )))
+    }
+
+    /// Open a watch on `kind` (in `namespace` or cluster-wide).
+    /// Returns a stream of byte-encoded events in `format`.
+    ///
+    /// The returned trait object owns the watch lifecycle —
+    /// dropping it cancels the subscription.
+    ///
+    /// # Errors
+    ///
+    /// Default: `Err(FaceError::Unsupported)`. Faces override as
+    /// they ship.
+    fn watch_resources(
+        &self,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _format: ResourceFormat,
+    ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
+        Err(FaceError::Unsupported(format!(
+            "watch_resources not yet implemented for {}",
+            self.name()
+        )))
+    }
+}
+
+/// Format the face speaks for its resource verbs. Each face owns
+/// the set of formats it supports; passing an unsupported format
+/// is `Err(FaceError::Unsupported)` from the verb.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceFormat {
+    /// Kubernetes-style YAML.
+    Yaml,
+    /// JSON — universal.
+    Json,
+    /// HashiCorp Nomad HCL.
+    Hcl,
+    /// engenho-types native (CBOR-encoded TypedResource — internal).
+    Native,
+}
+
+/// Typed reference to a single resource. Faces translate this to
+/// their native addressing scheme:
+///   * K8s: `/api/v1/namespaces/{ns}/{kind}/{name}`
+///   * Nomad: `/v1/job/{name}` (namespace mapped to job namespace)
+///   * PureRaft: raft key `{kind}/{ns}/{name}`
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ResourceRef {
+    /// Kind name (e.g. "Pod", "Service", "Job"). Face-specific
+    /// catalog resolves to the typed engenho-types kind.
+    pub kind: String,
+    /// Resource name within the namespace.
+    pub name: String,
+    /// Namespace (e.g. "default" for K8s, "" for cluster-scoped,
+    /// `None` for faces that don't model namespaces — Nomad uses
+    /// `namespace` for region, PureRaft uses it as a prefix).
+    pub namespace: Option<String>,
+}
+
+impl ResourceRef {
+    /// Convenience constructor for cluster-scoped resources (no
+    /// namespace, e.g. K8s Namespace / Node / ClusterRole).
+    #[must_use]
+    pub fn cluster_scoped(kind: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            name: name.into(),
+            namespace: None,
+        }
+    }
+
+    /// Convenience constructor for namespaced resources (e.g. Pod,
+    /// Service, Deployment).
+    #[must_use]
+    pub fn namespaced(
+        kind: impl Into<String>,
+        name: impl Into<String>,
+        namespace: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            name: name.into(),
+            namespace: Some(namespace.into()),
+        }
+    }
+}
+
+/// The cancellable handle returned by `Face::watch_resources`.
+/// Dropping cancels the subscription.
+pub trait FaceWatchStream: Send + 'static {
+    /// Pull the next event from the stream. Returns `Ok(None)` on
+    /// stream end (face shutdown, network drop, etc.); `Ok(Some)`
+    /// on each delivered event; `Err` on transient failures.
+    ///
+    /// Sync API for now — async lands once the runtime picks an
+    /// async story for face dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport errors from the underlying watch
+    /// connection (network failure, decode failure, etc.).
+    fn next_event(&mut self) -> Result<Option<FaceWatchEvent>, FaceError>;
+}
+
+/// Single event delivered through a face watch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaceWatchEvent {
+    pub kind: FaceWatchEventKind,
+    /// Resource body in the requested format from `watch_resources`.
+    pub body: Vec<u8>,
+}
+
+/// Event taxonomy — every face emits events in these categories.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceWatchEventKind {
+    Added,
+    Modified,
+    Deleted,
+    /// The watch was reset — the consumer should re-fetch state
+    /// from scratch. K8s emits this on bookmark gap; Nomad on
+    /// index reset; PureRaft on raft snapshot install.
+    Reset,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -448,6 +647,83 @@ impl Face for SystemdFace {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// BareMetalSupervisorFace — the fifth impl, completes the enum
+// ─────────────────────────────────────────────────────────────────
+
+/// Bare-metal supervisor face — systemd-orchestrated containers
+/// without a Kubernetes apiserver.
+///
+/// **Why this face matters for the abstraction:** with four impls
+/// already (PureRaft / Kubernetes / Nomad / Systemd) the Face
+/// trait generalizes across interaction shapes + ontology. The
+/// fifth impl completes the FaceKind enumeration so
+/// `instantiate()` has no `Unsupported` arm — every typed face
+/// declaration is now constructible. The "what if someone declares
+/// X?" question is gone; the type system has answers for the full
+/// surface.
+///
+/// Skeleton in this release: lifecycle hooks land here; the actual
+/// supervised-container renderer (drop systemd units onto a host;
+/// supervise via the host's existing systemd; no apiserver, no
+/// raft cluster) lands at engenho-revoada R6.
+pub struct BareMetalSupervisorFace {
+    name: String,
+    state: Mutex<FaceState>,
+}
+
+impl BareMetalSupervisorFace {
+    /// Construct from a [`FabricFace`] declaration. Returns `None`
+    /// for non-BareMetalSupervisor kinds.
+    #[must_use]
+    pub fn from_declaration(decl: &FabricFace) -> Option<Self> {
+        if decl.kind != FaceKind::BareMetalSupervisor {
+            return None;
+        }
+        Some(Self {
+            name: decl.name.clone(),
+            state: Mutex::new(FaceState::Stopped),
+        })
+    }
+}
+
+impl Face for BareMetalSupervisorFace {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn kind(&self) -> FaceKind {
+        FaceKind::BareMetalSupervisor
+    }
+
+    fn start(&self) -> Result<(), FaceError> {
+        let mut state = self.state.lock().expect("face state mutex poisoned");
+        if *state == FaceState::Running {
+            return Err(FaceError::AlreadyStarted);
+        }
+        // R6 wiring lands here: render systemd units; supervise via
+        // the host's existing systemd; expose status via a small
+        // local HTTP socket. Current release: lifecycle bookkeeping
+        // only.
+        *state = FaceState::Running;
+        Ok(())
+    }
+
+    fn shutdown(&self) -> Result<(), FaceError> {
+        let mut state = self.state.lock().expect("face state mutex poisoned");
+        if *state == FaceState::Stopped {
+            return Err(FaceError::NotStarted);
+        }
+        *state = FaceState::Stopped;
+        Ok(())
+    }
+
+    fn is_running(&self) -> bool {
+        let state = self.state.lock().expect("face state mutex poisoned");
+        *state == FaceState::Running
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Construct any face from a typed declaration
 // ─────────────────────────────────────────────────────────────────
 
@@ -478,8 +754,9 @@ pub fn instantiate(decl: &FabricFace) -> Result<Box<dyn Face>, FaceError> {
             SystemdFace::from_declaration(decl)
                 .expect("kind matched, declaration must construct"),
         )),
-        FaceKind::BareMetalSupervisor => Err(FaceError::Unsupported(
-            "BareMetalSupervisorFace impl lands at engenho-revoada R6+".into(),
+        FaceKind::BareMetalSupervisor => Ok(Box::new(
+            BareMetalSupervisorFace::from_declaration(decl)
+                .expect("kind matched, declaration must construct"),
         )),
     }
 }
@@ -714,20 +991,187 @@ mod tests {
         }
     }
 
-    #[test]
-    fn instantiate_bare_metal_supervisor_still_unsupported_until_r6() {
-        // Now the last remaining unsupported face — BareMetalSupervisor.
-        let decl = FabricFace {
+    fn bms_decl() -> FabricFace {
+        FabricFace {
             name: "bms-test".into(),
             kind: FaceKind::BareMetalSupervisor,
-        };
-        match instantiate(&decl) {
+        }
+    }
+
+    // ── BareMetalSupervisorFace ───────────────────────────────────
+
+    #[test]
+    fn bms_constructs_from_matching_declaration() {
+        let face = BareMetalSupervisorFace::from_declaration(&bms_decl()).unwrap();
+        assert_eq!(face.name(), "bms-test");
+        assert_eq!(face.kind(), FaceKind::BareMetalSupervisor);
+    }
+
+    #[test]
+    fn bms_rejects_non_matching_declaration() {
+        assert!(BareMetalSupervisorFace::from_declaration(&k8s_decl()).is_none());
+        assert!(BareMetalSupervisorFace::from_declaration(&raft_decl()).is_none());
+        assert!(BareMetalSupervisorFace::from_declaration(&nomad_decl()).is_none());
+    }
+
+    #[test]
+    fn bms_lifecycle_starts_then_stops() {
+        let face = BareMetalSupervisorFace::from_declaration(&bms_decl()).unwrap();
+        face.start().unwrap();
+        assert!(face.is_running());
+        face.shutdown().unwrap();
+        assert!(!face.is_running());
+    }
+
+    #[test]
+    fn instantiate_bare_metal_supervisor_now_returns_running_face() {
+        match instantiate(&bms_decl()) {
+            Ok(face) => {
+                assert_eq!(face.name(), "bms-test");
+                assert_eq!(face.kind(), FaceKind::BareMetalSupervisor);
+            }
+            Err(e) => panic!("BMS face should construct, got error {e}"),
+        }
+    }
+
+    #[test]
+    fn instantiate_covers_every_face_kind_with_no_unsupported_arm() {
+        // The full enumeration: every FaceKind variant is now
+        // constructible through instantiate(). The "what if someone
+        // declares X?" question is gone — the type system has
+        // answers for the full surface.
+        let kinds = vec![
+            FaceKind::PureRaft,
+            FaceKind::Kubernetes {
+                version: "1.34".into(),
+                certified_cncf: true,
+            },
+            FaceKind::Nomad { version: "1.7".into() },
+            FaceKind::Systemd { user_units: false },
+            FaceKind::BareMetalSupervisor,
+        ];
+        for kind in kinds {
+            let decl = FabricFace {
+                name: format!("{kind:?}"),
+                kind,
+            };
+            match instantiate(&decl) {
+                Ok(_) => {}
+                Err(e) => panic!("FaceKind {:?} failed to instantiate: {e}", decl.kind),
+            }
+        }
+    }
+
+    #[test]
+    fn five_faces_compose_in_a_single_vec() {
+        // FIVE impls now — the complete enumeration of the
+        // FabricFace::FaceKind variants. Vec<Box<dyn Face>>
+        // composes all of them; each is a renderer extension
+        // around the SAME engenho-types vocabulary.
+        let faces: Vec<Box<dyn Face>> = vec![
+            Box::new(PureRaftFace::from_declaration(&raft_decl()).unwrap()),
+            Box::new(KubernetesFace::from_declaration(&k8s_decl()).unwrap()),
+            Box::new(NomadFace::from_declaration(&nomad_decl()).unwrap()),
+            Box::new(SystemdFace::from_declaration(&systemd_decl(false)).unwrap()),
+            Box::new(BareMetalSupervisorFace::from_declaration(&bms_decl()).unwrap()),
+        ];
+        assert_eq!(faces.len(), 5);
+        for face in &faces {
+            assert!(!face.is_running());
+        }
+    }
+
+    // ── Resource verbs — default Unsupported behavior ─────────────
+
+    #[test]
+    fn apply_resource_default_unsupported_for_pure_raft() {
+        let face = PureRaftFace::from_declaration(&raft_decl()).unwrap();
+        match face.apply_resource(ResourceFormat::Yaml, b"---\nkind: Pod\n") {
             Err(FaceError::Unsupported(msg)) => {
-                assert!(msg.contains("R6"), "msg: {msg}");
+                assert!(msg.contains("apply_resource"), "msg: {msg}");
+                assert!(msg.contains(face.name()), "msg: {msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_resource_default_unsupported_for_kubernetes() {
+        let face = KubernetesFace::from_declaration(&k8s_decl()).unwrap();
+        let r = ResourceRef::namespaced("Pod", "nginx", "default");
+        match face.get_resource(&r, ResourceFormat::Yaml) {
+            Err(FaceError::Unsupported(msg)) => {
+                assert!(msg.contains("get_resource"), "msg: {msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_resources_default_unsupported_for_nomad() {
+        let face = NomadFace::from_declaration(&nomad_decl()).unwrap();
+        match face.list_resources("Job", Some("global"), ResourceFormat::Hcl) {
+            Err(FaceError::Unsupported(msg)) => {
+                assert!(msg.contains("list_resources"), "msg: {msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_resource_default_unsupported_for_systemd() {
+        let face = SystemdFace::from_declaration(&systemd_decl(false)).unwrap();
+        let r = ResourceRef::cluster_scoped("Unit", "engenho.service");
+        match face.delete_resource(&r) {
+            Err(FaceError::Unsupported(msg)) => {
+                assert!(msg.contains("delete_resource"), "msg: {msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_resources_default_unsupported_for_bms() {
+        let face = BareMetalSupervisorFace::from_declaration(&bms_decl()).unwrap();
+        // Box<dyn FaceWatchStream> doesn't impl Debug — pattern-match
+        // the Result rather than `.unwrap_err()`.
+        match face.watch_resources("Pod", None, ResourceFormat::Json) {
+            Err(FaceError::Unsupported(msg)) => {
+                assert!(msg.contains("watch_resources"), "msg: {msg}");
             }
             Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Err for BareMetalSupervisor face, got Ok"),
+            Ok(_) => panic!("expected Err, got Ok"),
         }
+    }
+
+    // ── ResourceRef typed constructors ───────────────────────────
+
+    #[test]
+    fn resource_ref_cluster_scoped_has_no_namespace() {
+        let r = ResourceRef::cluster_scoped("Namespace", "default");
+        assert_eq!(r.kind, "Namespace");
+        assert_eq!(r.name, "default");
+        assert_eq!(r.namespace, None);
+    }
+
+    #[test]
+    fn resource_ref_namespaced_carries_namespace() {
+        let r = ResourceRef::namespaced("Pod", "nginx", "default");
+        assert_eq!(r.kind, "Pod");
+        assert_eq!(r.name, "nginx");
+        assert_eq!(r.namespace, Some("default".into()));
+    }
+
+    #[test]
+    fn resource_ref_is_hashable() {
+        // Faces will use ResourceRef as HashMap keys for in-memory
+        // caches; verify the hash impl exists.
+        use std::collections::HashSet;
+        let mut s: HashSet<ResourceRef> = HashSet::new();
+        s.insert(ResourceRef::namespaced("Pod", "a", "default"));
+        s.insert(ResourceRef::namespaced("Pod", "a", "default"));
+        s.insert(ResourceRef::namespaced("Pod", "b", "default"));
+        assert_eq!(s.len(), 2);
     }
 
     #[test]

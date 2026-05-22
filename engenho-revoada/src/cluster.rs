@@ -403,30 +403,27 @@ mod runtime_tests {
     }
 
     #[test]
-    fn unsupported_face_propagates_through_runtime_construction() {
-        // Build a declaration with a BareMetalSupervisor face — the
-        // last remaining unsupported face. The runtime construction
-        // must surface the FaceError rather than silently accepting
-        // an unbuilt face.
-        //
-        // (Strategy + topology coherence still holds; only the
-        // face instantiation fails.)
-        let decl_result = ClusterDeclaration::new(
+    fn bare_metal_supervisor_now_lifecycles_through_runtime() {
+        // BareMetalSupervisor was the LAST Unsupported face. Now
+        // that BareMetalSupervisorFace ships, every FaceKind
+        // variant constructs through the runtime cleanly. The
+        // type system covers the full surface — no Unsupported
+        // arm in instantiate(), no runtime panic path for
+        // declared-but-unimplemented faces.
+        let decl = ClusterDeclaration::new(
             FabricStrategy::prescribed_homelab(),
             FabricFace {
                 name: "bms-test".into(),
                 kind: FaceKind::BareMetalSupervisor,
             },
             Box::new(Quorum3M),
-        );
-        let decl = decl_result.expect("declaration coherence is unaffected by face support");
-        // `Cluster` carries `Box<dyn Face>` which doesn't impl Debug,
-        // so we pattern-match the Result rather than `.unwrap_err()`.
-        match Cluster::from_declaration(decl) {
-            Err(ClusterRuntimeError::Face(FaceError::Unsupported(_))) => {}
-            Err(other) => panic!("expected Face(Unsupported), got {other:?}"),
-            Ok(_) => panic!("expected Err for BareMetalSupervisor face, got Ok"),
-        }
+        )
+        .expect("declaration coherent");
+        let cluster = Cluster::from_declaration(decl)
+            .expect("BMS face is now supported via BareMetalSupervisorFace impl");
+        cluster.start().unwrap();
+        assert!(cluster.is_running());
+        cluster.shutdown().unwrap();
     }
 
     #[test]
