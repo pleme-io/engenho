@@ -42,6 +42,12 @@ pub mod fabric;
 pub mod face;
 pub mod membership;
 pub mod policy;
+pub mod topology;
+
+pub use topology::{
+    Cluster3MNW, MeshAllPeers, NodeId as TopologyNodeId, NodeState, Pair, Phalanx,
+    Quorum3M, Role, RoleAssignment, Solo, TopologyError, TopologyStrategy, Transition,
+};
 
 pub use fabric::{
     AttestationConfig, ConsensusConfig, ConsensusKind, ContentConfig, FabricFace,
