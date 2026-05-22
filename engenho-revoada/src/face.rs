@@ -359,6 +359,95 @@ impl Face for NomadFace {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// SystemdFace — the fourth impl (single-node or supervised-VM)
+// ─────────────────────────────────────────────────────────────────
+
+/// systemd face — renders the fabric vocabulary to systemd unit
+/// files for non-clustered single-node or supervised-VM deployments.
+///
+/// **Why this face matters for the abstraction:** with three impls
+/// already proving generalization (PureRaft / Kubernetes / Nomad),
+/// SystemdFace strengthens the proof in a fourth dimension —
+/// generating *files* (unit files on disk) instead of issuing *API
+/// calls* (kube-apiserver / nomad-http / raft RPC). The Face trait
+/// abstracts equally over both interaction shapes; if it had hidden
+/// API-call assumptions, the file-emitting case wouldn't fit. The
+/// clean fit IS the structural proof for the second axis.
+///
+/// `user_units = true` emits units under `~/.config/systemd/user/`
+/// (rootless); `false` emits under `/etc/systemd/system/` (system).
+/// Skeleton in this release: lifecycle hooks land here; the actual
+/// unit-file renderer + dbus-API client land at engenho-revoada R6.
+pub struct SystemdFace {
+    name: String,
+    user_units: bool,
+    state: Mutex<FaceState>,
+}
+
+impl SystemdFace {
+    /// Construct from a [`FabricFace`] declaration. Returns `None`
+    /// for non-Systemd kinds.
+    #[must_use]
+    pub fn from_declaration(decl: &FabricFace) -> Option<Self> {
+        let user_units = match &decl.kind {
+            FaceKind::Systemd { user_units } => *user_units,
+            _ => return None,
+        };
+        Some(Self {
+            name: decl.name.clone(),
+            user_units,
+            state: Mutex::new(FaceState::Stopped),
+        })
+    }
+
+    /// True iff units are emitted to the user-systemd path
+    /// (`~/.config/systemd/user/`) rather than the system path
+    /// (`/etc/systemd/system/`).
+    #[must_use]
+    pub fn is_user_units(&self) -> bool {
+        self.user_units
+    }
+}
+
+impl Face for SystemdFace {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn kind(&self) -> FaceKind {
+        FaceKind::Systemd {
+            user_units: self.user_units,
+        }
+    }
+
+    fn start(&self) -> Result<(), FaceError> {
+        let mut state = self.state.lock().expect("face state mutex poisoned");
+        if *state == FaceState::Running {
+            return Err(FaceError::AlreadyStarted);
+        }
+        // R6 wiring lands here: render unit files; daemon-reload via
+        // dbus; subscribe to unit state-change events. Current
+        // release: lifecycle bookkeeping only.
+        *state = FaceState::Running;
+        Ok(())
+    }
+
+    fn shutdown(&self) -> Result<(), FaceError> {
+        let mut state = self.state.lock().expect("face state mutex poisoned");
+        if *state == FaceState::Stopped {
+            return Err(FaceError::NotStarted);
+        }
+        *state = FaceState::Stopped;
+        Ok(())
+    }
+
+    fn is_running(&self) -> bool {
+        let state = self.state.lock().expect("face state mutex poisoned");
+        *state == FaceState::Running
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Construct any face from a typed declaration
 // ─────────────────────────────────────────────────────────────────
 

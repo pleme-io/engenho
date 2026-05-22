@@ -35,6 +35,7 @@
 //! a strictly earlier moment.
 
 use crate::fabric::{ConsensusKind, FabricFace, FabricStrategy, FaceKind};
+use crate::face::{self, Face, FaceError};
 use crate::topology::TopologyStrategy;
 
 /// Errors that surface when a [`ClusterDeclaration`] is constructed
@@ -182,6 +183,264 @@ fn face_kind_str(kind: &FaceKind) -> &'static str {
         FaceKind::Systemd { .. } => "Systemd",
         FaceKind::PureRaft => "PureRaft",
         FaceKind::BareMetalSupervisor => "BareMetalSupervisor",
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Cluster — the running composition (consumes ClusterDeclaration)
+// ─────────────────────────────────────────────────────────────────
+
+/// Errors a [`Cluster`] surfaces during construction or lifecycle.
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterRuntimeError {
+    #[error("face instantiation failed: {0}")]
+    Face(#[from] FaceError),
+    #[error("cluster already started")]
+    AlreadyStarted,
+    #[error("cluster not started")]
+    NotStarted,
+}
+
+/// The **running** composition of strategy + face + topology.
+///
+/// Where [`ClusterDeclaration`] is the typed *authored* witness
+/// (declared but no resources allocated), `Cluster` is the typed
+/// *running* witness (face started, layers initialized).
+///
+/// **The load-bearing wire:** `Cluster` can only be constructed
+/// from a `ClusterDeclaration`. The runtime cannot exist without
+/// the typed coherence proof. Misconfigured clusters never reach
+/// the `Cluster::start` call site because the declaration never
+/// constructed in the first place.
+///
+/// **What ships today:** the face lifecycle is wired through
+/// (start propagates to `face.start()`, shutdown to
+/// `face.shutdown()`). The other four layers (membership /
+/// consensus / content / attestation) are reserved for R3+
+/// wiring as each module's runtime entry stabilizes. The skeleton
+/// is in place; consumers can already pass `Cluster` around as
+/// "the running fabric handle" and trust the typed witness chain.
+#[must_use = "Cluster is the runtime handle — start it via .start()"]
+pub struct Cluster {
+    declaration: ClusterDeclaration,
+    face: Box<dyn Face>,
+    state: std::sync::Mutex<ClusterState>,
+}
+
+impl std::fmt::Debug for Cluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cluster")
+            .field("declaration", &self.declaration)
+            .field("face_kind", &self.face.kind())
+            .field("state", &self.state.lock().ok())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClusterState {
+    Constructed,
+    Running,
+    Stopped,
+}
+
+impl Cluster {
+    /// Construct from a [`ClusterDeclaration`]. Instantiates the
+    /// face via [`face::instantiate`]; the face starts in its
+    /// stopped state and is brought online via [`Cluster::start`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterRuntimeError::Face`] if the face couldn't
+    /// be instantiated (e.g. Systemd / BareMetalSupervisor today
+    /// — those return `Unsupported`).
+    pub fn from_declaration(declaration: ClusterDeclaration) -> Result<Self, ClusterRuntimeError> {
+        let face = face::instantiate(declaration.face())?;
+        Ok(Self {
+            declaration,
+            face,
+            state: std::sync::Mutex::new(ClusterState::Constructed),
+        })
+    }
+
+    /// Borrow the declaration this cluster was constructed from.
+    /// The declaration carries the typed coherence witness; the
+    /// runtime trusts it without re-verifying.
+    #[must_use]
+    pub fn declaration(&self) -> &ClusterDeclaration {
+        &self.declaration
+    }
+
+    /// Borrow the face the runtime is using.
+    #[must_use]
+    pub fn face(&self) -> &dyn Face {
+        self.face.as_ref()
+    }
+
+    /// Bring the cluster online: face → start; future layers wire
+    /// in as they stabilize.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterRuntimeError::AlreadyStarted`] if called
+    /// twice without an intervening shutdown; propagates any
+    /// underlying [`FaceError`] from the face's own start.
+    pub fn start(&self) -> Result<(), ClusterRuntimeError> {
+        let mut state = self.state.lock().expect("cluster state mutex poisoned");
+        if *state == ClusterState::Running {
+            return Err(ClusterRuntimeError::AlreadyStarted);
+        }
+        self.face.start()?;
+        // Future R3+ layer starts land here:
+        //   - membership: start chitchat gossip
+        //   - consensus: start openraft + join cluster
+        //   - content: start iroh content sync
+        //   - attestation: start tameshi chain sealer
+        *state = ClusterState::Running;
+        Ok(())
+    }
+
+    /// Bring the cluster offline gracefully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterRuntimeError::NotStarted`] if shutdown is
+    /// called before start.
+    pub fn shutdown(&self) -> Result<(), ClusterRuntimeError> {
+        let mut state = self.state.lock().expect("cluster state mutex poisoned");
+        if *state != ClusterState::Running {
+            return Err(ClusterRuntimeError::NotStarted);
+        }
+        // Reverse order of start: layers down first, face last.
+        // Future R3+ shutdowns land here in reverse start order.
+        self.face.shutdown()?;
+        *state = ClusterState::Stopped;
+        Ok(())
+    }
+
+    /// True iff [`Cluster::start`] succeeded and the cluster hasn't
+    /// been shut down yet.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        let state = self.state.lock().expect("cluster state mutex poisoned");
+        *state == ClusterState::Running
+    }
+
+    /// Stable identifier — delegates to the declaration so the
+    /// running cluster has the same telemetry identity as its
+    /// declaration.
+    #[must_use]
+    pub fn id(&self) -> String {
+        self.declaration.id()
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use crate::fabric::{FabricStrategy, FaceKind};
+    use crate::topology::Quorum3M;
+
+    fn ok_cluster() -> Cluster {
+        let decl = ClusterDeclaration::new(
+            FabricStrategy::prescribed_homelab(),
+            FabricFace {
+                name: "pure-raft".into(),
+                kind: FaceKind::PureRaft,
+            },
+            Box::new(Quorum3M),
+        )
+        .unwrap();
+        Cluster::from_declaration(decl).unwrap()
+    }
+
+    #[test]
+    fn constructed_cluster_starts_in_stopped_state() {
+        let cluster = ok_cluster();
+        assert!(!cluster.is_running());
+    }
+
+    #[test]
+    fn start_brings_face_to_running() {
+        let cluster = ok_cluster();
+        cluster.start().unwrap();
+        assert!(cluster.is_running());
+        assert!(cluster.face().is_running());
+    }
+
+    #[test]
+    fn shutdown_returns_face_to_stopped() {
+        let cluster = ok_cluster();
+        cluster.start().unwrap();
+        cluster.shutdown().unwrap();
+        assert!(!cluster.is_running());
+        assert!(!cluster.face().is_running());
+    }
+
+    #[test]
+    fn double_start_errors() {
+        let cluster = ok_cluster();
+        cluster.start().unwrap();
+        match cluster.start() {
+            Err(ClusterRuntimeError::AlreadyStarted) => {}
+            other => panic!("expected AlreadyStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shutdown_without_start_errors() {
+        let cluster = ok_cluster();
+        match cluster.shutdown() {
+            Err(ClusterRuntimeError::NotStarted) => {}
+            other => panic!("expected NotStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn id_delegates_to_declaration() {
+        let cluster = ok_cluster();
+        assert_eq!(cluster.id(), cluster.declaration().id());
+    }
+
+    #[test]
+    fn unsupported_face_propagates_through_runtime_construction() {
+        // Build a declaration with a Systemd face → today
+        // unsupported. The runtime construction must surface the
+        // FaceError rather than silently accepting an unbuilt face.
+        //
+        // (Strategy + topology coherence still holds; only the
+        // face instantiation fails.)
+        let decl_result = ClusterDeclaration::new(
+            FabricStrategy::prescribed_homelab(),
+            FabricFace {
+                name: "systemd-test".into(),
+                kind: FaceKind::Systemd { user_units: false },
+            },
+            Box::new(Quorum3M),
+        );
+        let decl = decl_result.expect("declaration coherence is unaffected by face support");
+        // `Cluster` carries `Box<dyn Face>` which doesn't impl Debug,
+        // so we pattern-match the Result rather than `.unwrap_err()`.
+        match Cluster::from_declaration(decl) {
+            Err(ClusterRuntimeError::Face(FaceError::Unsupported(_))) => {}
+            Err(other) => panic!("expected Face(Unsupported), got {other:?}"),
+            Ok(_) => panic!("expected Err for Systemd face, got Ok"),
+        }
+    }
+
+    #[test]
+    fn cluster_carries_typed_witness_across_lifecycle() {
+        // The declaration is borrowed identically before + after
+        // start, so any consumer that holds a &Cluster gets the
+        // typed witness for free at any point in the lifecycle.
+        let cluster = ok_cluster();
+        let id_before = cluster.id();
+        cluster.start().unwrap();
+        let id_after_start = cluster.id();
+        cluster.shutdown().unwrap();
+        let id_after_shutdown = cluster.id();
+        assert_eq!(id_before, id_after_start);
+        assert_eq!(id_after_start, id_after_shutdown);
     }
 }
 
