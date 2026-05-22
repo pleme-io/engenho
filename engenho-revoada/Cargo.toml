@@ -40,7 +40,10 @@ rand               = "0.8"
 # native format (yaml/json/hcl via serde_yaml / serde_json already
 # in workspace).
 ciborium           = "0.2"
+# FormatAdapter — YAML/JSON parsing for K8s-style manifests on the
+# operator-facing verb surface (extracts metadata.name/namespace
+# to build typed ResourceRef before storing).
+serde_yaml         = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
-serde_yaml = { workspace = true }

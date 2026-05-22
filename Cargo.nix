@@ -3179,6 +3179,10 @@ rec {
             packageId = "serde_json";
           }
           {
+            name = "serde_yaml";
+            packageId = "serde_yaml";
+          }
+          {
             name = "thiserror";
             packageId = "thiserror 2.0.18";
           }
@@ -3196,10 +3200,6 @@ rec {
           {
             name = "proptest";
             packageId = "proptest";
-          }
-          {
-            name = "serde_yaml";
-            packageId = "serde_yaml";
           }
         ];
 

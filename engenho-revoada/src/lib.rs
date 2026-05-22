@@ -42,9 +42,15 @@ pub mod content;
 pub mod fabric;
 pub mod face;
 pub mod federation;
+pub mod format;
 pub mod membership;
 pub mod policy;
 pub mod topology;
+
+pub use format::{
+    AdapterError, FormatAdapter, K8sJsonAdapter, K8sYamlAdapter, NativePassthroughAdapter,
+    encode_envelope,
+};
 
 pub use federation::{
     FederatedEventKind, FederatedFabric, FederationError, RoutingPolicy,

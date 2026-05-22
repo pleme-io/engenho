@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c509c11b30f7ff1074137c5bde5e66f70138fc4a2e1dd88bf3507106fe5ee699 # shrinks to intent = WorkloadIntent { name: "a", namespace: "a", image: "a", replicas: 1, env: {}, cpu_millicores: Some(1), memory_mib: None, ports: [], service_name: None }
+cc 5636bfc0babadfa63bd45416c90b0ec06a1000d444a730cf8ec1aa76ab93caf4 # shrinks to intent = WorkloadIntent { name: "a", namespace: "a", image: "a", replicas: 1, env: {}, cpu_millicores: None, memory_mib: Some(1), ports: [], service_name: None }
+cc a4e01fbc63ef9fecdd1e1e7b246fe4714ad391177045e89eaa6fc7cba30b062d # shrinks to intent = WorkloadIntent { name: "a", namespace: "a", image: "a", replicas: 1, env: {}, cpu_millicores: None, memory_mib: Some(1), ports: [], service_name: None }
+cc 9c8761d589e1e59552bc1ff88b71fb58f91f244a77a131438ad8145d34e6f2c8 # shrinks to intent = WorkloadIntent { name: "a", namespace: "a", image: "a", replicas: 1, env: {}, cpu_millicores: Some(1), memory_mib: None, ports: [], service_name: None }

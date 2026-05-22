@@ -51,14 +51,25 @@ pub struct WorkloadIntent {
     pub replicas: u32,
     /// Environment variables in deterministic order (BTreeMap).
     pub env: BTreeMap<String, String>,
-    /// Requested CPU in millicores (matches K8s convention).
-    pub cpu_millicores: Option<u32>,
-    /// Requested memory in MiB.
-    pub memory_mib: Option<u32>,
+    /// Resource requests (CPU + memory). Coupled because Nomad's
+    /// Resources struct requires both fields, so we must either
+    /// set both or skip the block entirely. Property tests caught
+    /// the round-trip asymmetry of independent Options here.
+    pub resources: Option<ResourceIntent>,
     /// Ports exposed (label + port number pairs).
     pub ports: Vec<PortIntent>,
     /// Optional service-discovery name.
     pub service_name: Option<String>,
+}
+
+/// Coupled CPU + memory request. Either both are present or both
+/// are absent (across the WorkloadIntent's `resources` Option).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceIntent {
+    /// CPU in millicores (matches K8s convention; 1 core = 1000m).
+    pub cpu_millicores: u32,
+    /// Memory in MiB.
+    pub memory_mib: u32,
 }
 
 /// Port intent — matches both K8s containerPort + Nomad dynamic_ports.
@@ -175,15 +186,17 @@ impl WorkloadTranslator for K8sDeploymentTranslator {
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        let resources = first.get("resources").and_then(|r| r.get("requests"));
-        let cpu_millicores = resources
-            .and_then(|r| r.get("cpu"))
-            .and_then(|c| c.as_str())
-            .and_then(parse_k8s_cpu);
-        let memory_mib = resources
-            .and_then(|r| r.get("memory"))
-            .and_then(|m| m.as_str())
-            .and_then(parse_k8s_memory_mib);
+        let req_block = first.get("resources").and_then(|r| r.get("requests"));
+        let resources = match (
+            req_block.and_then(|r| r.get("cpu")).and_then(|c| c.as_str()).and_then(parse_k8s_cpu),
+            req_block.and_then(|r| r.get("memory")).and_then(|m| m.as_str()).and_then(parse_k8s_memory_mib),
+        ) {
+            (Some(cpu_millicores), Some(memory_mib)) => Some(ResourceIntent {
+                cpu_millicores,
+                memory_mib,
+            }),
+            _ => None,
+        };
         let ports = first
             .get("ports")
             .and_then(|v| v.as_array())
@@ -211,8 +224,7 @@ impl WorkloadTranslator for K8sDeploymentTranslator {
             image,
             replicas,
             env,
-            cpu_millicores,
-            memory_mib,
+            resources,
             ports,
             service_name: None,
         })
@@ -230,14 +242,16 @@ impl WorkloadTranslator for K8sDeploymentTranslator {
             })
             .collect();
         let mut resources = serde_json::Map::new();
-        let mut requests = serde_json::Map::new();
-        if let Some(cpu) = intent.cpu_millicores {
-            requests.insert("cpu".into(), Value::String(format!("{cpu}m")));
-        }
-        if let Some(mem) = intent.memory_mib {
-            requests.insert("memory".into(), Value::String(format!("{mem}Mi")));
-        }
-        if !requests.is_empty() {
+        if let Some(r) = &intent.resources {
+            let mut requests = serde_json::Map::new();
+            requests.insert(
+                "cpu".into(),
+                Value::String(format!("{}m", r.cpu_millicores)),
+            );
+            requests.insert(
+                "memory".into(),
+                Value::String(format!("{}Mi", r.memory_mib)),
+            );
             resources.insert("requests".into(), Value::Object(requests));
         }
         let ports_array: Vec<Value> = intent
@@ -341,12 +355,17 @@ impl WorkloadTranslator for NomadJobTranslator {
                     .collect()
             })
             .unwrap_or_default();
-        let resources = task.get("Resources");
-        let cpu_millicores = resources.and_then(|r| r.get("CPU")).and_then(|c| c.as_u64()).map(|n| n as u32);
-        let memory_mib = resources
-            .and_then(|r| r.get("MemoryMB"))
-            .and_then(|m| m.as_u64())
-            .map(|n| n as u32);
+        let res_block = task.get("Resources");
+        let resources = match (
+            res_block.and_then(|r| r.get("CPU")).and_then(|c| c.as_u64()).map(|n| n as u32),
+            res_block.and_then(|r| r.get("MemoryMB")).and_then(|m| m.as_u64()).map(|n| n as u32),
+        ) {
+            (Some(cpu_millicores), Some(memory_mib)) => Some(ResourceIntent {
+                cpu_millicores,
+                memory_mib,
+            }),
+            _ => None,
+        };
         let ports = group
             .get("Networks")
             .and_then(|n| n.as_array())
@@ -376,8 +395,7 @@ impl WorkloadTranslator for NomadJobTranslator {
             image,
             replicas,
             env,
-            cpu_millicores,
-            memory_mib,
+            resources,
             ports,
             service_name,
         })
@@ -387,15 +405,11 @@ impl WorkloadTranslator for NomadJobTranslator {
         let mut config = BTreeMap::new();
         config.insert("image".to_string(), Value::String(intent.image.clone()));
 
-        let resources = if intent.cpu_millicores.is_some() || intent.memory_mib.is_some() {
-            Some(Resources {
-                cpu: intent.cpu_millicores.unwrap_or(100),
-                memory_mb: intent.memory_mib.unwrap_or(128),
-                disk_mb: None,
-            })
-        } else {
-            None
-        };
+        let resources = intent.resources.as_ref().map(|r| Resources {
+            cpu: r.cpu_millicores,
+            memory_mb: r.memory_mib,
+            disk_mb: None,
+        });
 
         let dynamic_ports: Vec<Port> = intent
             .ports
@@ -488,6 +502,221 @@ fn parse_k8s_memory_mib(s: &str) -> Option<u32> {
     }
 }
 
+// =================================================================
+// Systemd service translator — R-NOMAD.4b
+// =================================================================
+
+/// Translator for systemd `.service` unit files. The unit-file
+/// shape is encoded as a `Value::Object` with `Unit`, `Service`,
+/// `Install` keys mirroring INI sections — operators serialize
+/// with [`SystemdServiceTranslator::to_unit_file`] which produces
+/// canonical INI bytes.
+pub struct SystemdServiceTranslator;
+
+impl SystemdServiceTranslator {
+    /// Render the typed manifest Value into canonical systemd
+    /// INI bytes (the `[Unit]` / `[Service]` / `[Install]` shape).
+    #[must_use]
+    pub fn to_unit_file(intent: &WorkloadIntent) -> String {
+        let manifest = SystemdServiceTranslator.write(intent);
+        let mut out = String::new();
+        for section in ["Unit", "Service", "Install"] {
+            let Some(s) = manifest.get(section) else { continue };
+            let Some(map) = s.as_object() else { continue };
+            out.push_str(&format!("[{section}]\n"));
+            for (key, value) in map {
+                match value {
+                    Value::String(s) => {
+                        out.push_str(&format!("{key}={s}\n"));
+                    }
+                    Value::Number(n) => {
+                        out.push_str(&format!("{key}={n}\n"));
+                    }
+                    Value::Array(arr) => {
+                        for item in arr {
+                            if let Some(s) = item.as_str() {
+                                out.push_str(&format!("{key}={s}\n"));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
+
+impl WorkloadTranslator for SystemdServiceTranslator {
+    fn architecture(&self) -> &'static str {
+        "systemd"
+    }
+
+    fn read(&self, manifest: &Value) -> Result<WorkloadIntent, TranslateError> {
+        let unit = manifest
+            .get("Unit")
+            .ok_or_else(|| TranslateError::MissingField("Unit".into()))?;
+        let service = manifest
+            .get("Service")
+            .ok_or_else(|| TranslateError::MissingField("Service".into()))?;
+        let name = unit
+            .get("Description")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| TranslateError::MissingField("Unit.Description".into()))?
+            .to_string();
+        let namespace = unit
+            .get("X-EngenhoNamespace")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string();
+        let image = service
+            .get("X-EngenhoImage")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                TranslateError::MissingField("Service.X-EngenhoImage".into())
+            })?
+            .to_string();
+        let replicas = service
+            .get("X-EngenhoReplicas")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        // CPU: from CPUQuota="50%" → 500 millicores. Format is "{pct}%".
+        // Memory: from MemoryMax="512M" → 512 MiB.
+        let cpu_opt = service
+            .get("CPUQuota")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.strip_suffix('%'))
+            .and_then(|n| n.parse::<u32>().ok())
+            .map(|pct| pct * 10);
+        let mem_opt = service
+            .get("MemoryMax")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.strip_suffix('M'))
+            .and_then(|n| n.parse::<u32>().ok());
+        let resources = match (cpu_opt, mem_opt) {
+            (Some(cpu_millicores), Some(memory_mib)) => Some(ResourceIntent {
+                cpu_millicores,
+                memory_mib,
+            }),
+            _ => None,
+        };
+        // Env vars: "Environment" lines stored as array.
+        let env = service
+            .get("Environment")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        let s = item.as_str()?;
+                        let (k, v) = s.split_once('=')?;
+                        Some((k.to_string(), v.to_string()))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let ports = service
+            .get("X-EngenhoPorts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        let s = item.as_str()?;
+                        let (label, port) = s.split_once(':')?;
+                        Some(PortIntent {
+                            label: label.to_string(),
+                            container_port: port.parse().ok()?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let service_name = unit
+            .get("X-EngenhoService")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Ok(WorkloadIntent {
+            name,
+            namespace,
+            image,
+            replicas,
+            env,
+            resources,
+            ports,
+            service_name,
+        })
+    }
+
+    fn write(&self, intent: &WorkloadIntent) -> Value {
+        let mut unit = serde_json::Map::new();
+        unit.insert("Description".into(), Value::String(intent.name.clone()));
+        unit.insert(
+            "X-EngenhoNamespace".into(),
+            Value::String(intent.namespace.clone()),
+        );
+        if let Some(sn) = &intent.service_name {
+            unit.insert("X-EngenhoService".into(), Value::String(sn.clone()));
+        }
+        unit.insert("After".into(), Value::String("network.target".into()));
+
+        let mut service = serde_json::Map::new();
+        service.insert("Type".into(), Value::String("notify".into()));
+        service.insert(
+            "ExecStart".into(),
+            Value::String(format!(
+                "/usr/bin/podman run --name {} {}",
+                intent.name, intent.image
+            )),
+        );
+        service.insert("X-EngenhoImage".into(), Value::String(intent.image.clone()));
+        service.insert(
+            "X-EngenhoReplicas".into(),
+            Value::String(intent.replicas.to_string()),
+        );
+        if let Some(r) = &intent.resources {
+            // CPUQuota is a percentage (1 core = 100%).
+            let pct = r.cpu_millicores / 10;
+            service.insert("CPUQuota".into(), Value::String(format!("{pct}%")));
+            service.insert(
+                "MemoryMax".into(),
+                Value::String(format!("{}M", r.memory_mib)),
+            );
+        }
+        if !intent.env.is_empty() {
+            let env_lines: Vec<Value> = intent
+                .env
+                .iter()
+                .map(|(k, v)| Value::String(format!("{k}={v}")))
+                .collect();
+            service.insert("Environment".into(), Value::Array(env_lines));
+        }
+        if !intent.ports.is_empty() {
+            let port_lines: Vec<Value> = intent
+                .ports
+                .iter()
+                .map(|p| Value::String(format!("{}:{}", p.label, p.container_port)))
+                .collect();
+            service.insert("X-EngenhoPorts".into(), Value::Array(port_lines));
+        }
+        service.insert("Restart".into(), Value::String("on-failure".into()));
+
+        let mut install = serde_json::Map::new();
+        install.insert(
+            "WantedBy".into(),
+            Value::String("multi-user.target".into()),
+        );
+
+        Value::Object({
+            let mut top = serde_json::Map::new();
+            top.insert("Unit".into(), Value::Object(unit));
+            top.insert("Service".into(), Value::Object(service));
+            top.insert("Install".into(), Value::Object(install));
+            top
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,8 +731,10 @@ mod tests {
             image: "stefanprodan/podinfo:6.5.4".into(),
             replicas: 3,
             env,
-            cpu_millicores: Some(100),
-            memory_mib: Some(128),
+            resources: Some(ResourceIntent {
+                cpu_millicores: 100,
+                memory_mib: 128,
+            }),
             ports: vec![PortIntent {
                 label: "http".into(),
                 container_port: 9898,
@@ -555,8 +786,9 @@ mod tests {
         assert_eq!(intent.replicas, 5);
         assert_eq!(intent.image, "nginx:1.27");
         assert_eq!(intent.env.get("A").map(String::as_str), Some("1"));
-        assert_eq!(intent.cpu_millicores, Some(250));
-        assert_eq!(intent.memory_mib, Some(512));
+        let r = intent.resources.unwrap();
+        assert_eq!(r.cpu_millicores, 250);
+        assert_eq!(r.memory_mib, 512);
         assert_eq!(intent.ports[0].container_port, 80);
     }
 
@@ -592,8 +824,9 @@ mod tests {
         assert_eq!(back.replicas, 3);
         assert_eq!(back.image, "stefanprodan/podinfo:6.5.4");
         assert_eq!(back.env.len(), 2);
-        assert_eq!(back.cpu_millicores, Some(100));
-        assert_eq!(back.memory_mib, Some(128));
+        let r = back.resources.unwrap();
+        assert_eq!(r.cpu_millicores, 100);
+        assert_eq!(r.memory_mib, 128);
         assert_eq!(back.ports.len(), 1);
     }
 
@@ -675,5 +908,207 @@ mod tests {
         assert_eq!(e.kind(), "missing_field");
         let e2 = TranslateError::InvalidType("a".into(), "b".into());
         assert_eq!(e2.kind(), "invalid_type");
+    }
+
+    // ── Systemd translator — third concrete site ────────────────
+
+    #[test]
+    fn systemd_round_trip_preserves_intent() {
+        let original = sample_intent();
+        let translator = SystemdServiceTranslator;
+        let manifest = translator.write(&original);
+        let back = translator.read(&manifest).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn systemd_unit_file_has_three_sections() {
+        let intent = sample_intent();
+        let file = SystemdServiceTranslator::to_unit_file(&intent);
+        assert!(file.contains("[Unit]"));
+        assert!(file.contains("[Service]"));
+        assert!(file.contains("[Install]"));
+        // Image is captured.
+        assert!(file.contains("X-EngenhoImage=stefanprodan/podinfo:6.5.4"));
+        // CPU quota: 100 millicores = 10%.
+        assert!(file.contains("CPUQuota=10%"));
+        // Memory: 128 MiB.
+        assert!(file.contains("MemoryMax=128M"));
+        // Env vars in canonical order.
+        assert!(file.contains("Environment=CACHE_TTL=60"));
+        assert!(file.contains("Environment=LOG_LEVEL=info"));
+    }
+
+    #[test]
+    fn shift_k8s_to_systemd_preserves_intent() {
+        let intent = sample_intent();
+        let k8s = K8sDeploymentTranslator;
+        let systemd = SystemdServiceTranslator;
+        let k8s_manifest = k8s.write(&intent);
+        let intent_from_k8s = k8s.read(&k8s_manifest).unwrap();
+        let systemd_manifest = systemd.write(&intent_from_k8s);
+        let mut intent_via_systemd = systemd.read(&systemd_manifest).unwrap();
+        intent_via_systemd.service_name = intent.service_name.clone();
+        assert_eq!(intent_via_systemd, intent);
+    }
+
+    #[test]
+    fn shift_systemd_to_nomad_preserves_intent() {
+        let intent = sample_intent();
+        let nomad = NomadJobTranslator;
+        let systemd = SystemdServiceTranslator;
+        let systemd_manifest = systemd.write(&intent);
+        let intent_from_systemd = systemd.read(&systemd_manifest).unwrap();
+        let nomad_manifest = nomad.write(&intent_from_systemd);
+        let back = nomad.read(&nomad_manifest).unwrap();
+        assert_eq!(back, intent);
+    }
+
+    #[test]
+    fn three_arch_chain_preserves_intent() {
+        // K8s → Nomad → Systemd → K8s. The 6 invariants survive
+        // a full triangle traverse.
+        let intent = sample_intent();
+        let k8s = K8sDeploymentTranslator;
+        let nomad = NomadJobTranslator;
+        let systemd = SystemdServiceTranslator;
+
+        let m1 = k8s.write(&intent);
+        let i1 = k8s.read(&m1).unwrap();
+        let m2 = nomad.write(&i1);
+        let mut i2 = nomad.read(&m2).unwrap();
+        i2.service_name = intent.service_name.clone();
+        let m3 = systemd.write(&i2);
+        let i3 = systemd.read(&m3).unwrap();
+        let m4 = k8s.write(&i3);
+        let mut i4 = k8s.read(&m4).unwrap();
+        i4.service_name = intent.service_name.clone();
+        assert_eq!(i4, intent);
+    }
+
+    #[test]
+    fn systemd_architecture_name_is_stable() {
+        assert_eq!(SystemdServiceTranslator.architecture(), "systemd");
+    }
+
+    // ── Property tests — randomized intent inputs ──────────────
+
+    use proptest::prelude::*;
+
+    fn arb_intent() -> impl Strategy<Value = WorkloadIntent> {
+        let arb_resources = prop::option::of(
+            (10u32..=64000, 1u32..=16384)
+                .prop_map(|(cpu_millicores, memory_mib)| ResourceIntent {
+                    // CPUQuota emits CPU/10 as integer percent — preserve
+                    // round-trip-ability by snapping cpu_millicores to
+                    // multiples of 10.
+                    cpu_millicores: (cpu_millicores / 10) * 10,
+                    memory_mib,
+                }),
+        );
+        (
+            "[a-z][a-z0-9-]{0,30}",     // name
+            "[a-z][a-z0-9-]{0,20}",     // namespace
+            "[a-z][a-z0-9./:-]{0,40}",  // image
+            1u32..=100,                 // replicas
+            prop::collection::btree_map(
+                "[A-Z][A-Z0-9_]{0,15}",
+                "[a-z0-9.-]{0,30}",
+                0..5,
+            ),
+            arb_resources,
+        )
+            .prop_map(
+                |(name, namespace, image, replicas, env, resources)| WorkloadIntent {
+                    name,
+                    namespace,
+                    image,
+                    replicas,
+                    env,
+                    resources,
+                    ports: vec![],
+                    service_name: None,
+                },
+            )
+    }
+
+    proptest! {
+        /// Property INV-1: K8s round-trip preserves every intent the
+        /// proptest generator can produce.
+        #[test]
+        fn prop_k8s_round_trip(intent in arb_intent()) {
+            let translator = K8sDeploymentTranslator;
+            let manifest = translator.write(&intent);
+            let back = translator.read(&manifest).unwrap();
+            prop_assert_eq!(back, intent);
+        }
+
+        /// Property INV-2: Nomad round-trip preserves every intent.
+        #[test]
+        fn prop_nomad_round_trip(intent in arb_intent()) {
+            let translator = NomadJobTranslator;
+            let manifest = translator.write(&intent);
+            let back = translator.read(&manifest).unwrap();
+            prop_assert_eq!(back, intent);
+        }
+
+        /// Property INV-3: Systemd round-trip preserves every intent.
+        #[test]
+        fn prop_systemd_round_trip(intent in arb_intent()) {
+            let translator = SystemdServiceTranslator;
+            let manifest = translator.write(&intent);
+            let back = translator.read(&manifest).unwrap();
+            prop_assert_eq!(back, intent);
+        }
+
+        /// Property INV-4: K8s → Nomad → K8s preserves intent.
+        /// The substrate's eventual-consistency promise: if both
+        /// faces emit the same intent's view, an app can shift
+        /// architectures without losing identity.
+        #[test]
+        fn prop_shift_k8s_nomad_k8s(intent in arb_intent()) {
+            let k8s = K8sDeploymentTranslator;
+            let nomad = NomadJobTranslator;
+            let m1 = k8s.write(&intent);
+            let i1 = k8s.read(&m1).unwrap();
+            let m2 = nomad.write(&i1);
+            let i2 = nomad.read(&m2).unwrap();
+            let m3 = k8s.write(&i2);
+            let back = k8s.read(&m3).unwrap();
+            prop_assert_eq!(back, intent);
+        }
+
+        /// Property INV-5: K8s → Systemd → Nomad preserves intent
+        /// across all three architectures.
+        #[test]
+        fn prop_shift_k8s_systemd_nomad(intent in arb_intent()) {
+            let k8s = K8sDeploymentTranslator;
+            let systemd = SystemdServiceTranslator;
+            let nomad = NomadJobTranslator;
+            let m1 = k8s.write(&intent);
+            let i1 = k8s.read(&m1).unwrap();
+            let m2 = systemd.write(&i1);
+            let i2 = systemd.read(&m2).unwrap();
+            let m3 = nomad.write(&i2);
+            let back = nomad.read(&m3).unwrap();
+            prop_assert_eq!(back, intent);
+        }
+
+        /// Property INV-6: Idempotency — translating the same intent
+        /// twice produces byte-identical manifests. Critical for
+        /// Raft replay safety: applying the same write twice doesn't
+        /// produce a "new" manifest that controllers would react to.
+        #[test]
+        fn prop_write_is_idempotent(intent in arb_intent()) {
+            for translator in [
+                &K8sDeploymentTranslator as &dyn WorkloadTranslator,
+                &NomadJobTranslator,
+                &SystemdServiceTranslator,
+            ] {
+                let m1 = translator.write(&intent);
+                let m2 = translator.write(&intent);
+                prop_assert_eq!(m1, m2);
+            }
+        }
     }
 }
