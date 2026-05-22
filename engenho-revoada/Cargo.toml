@@ -35,6 +35,12 @@ blake3             = "1"
 ed25519-dalek      = { version = "2", features = ["rand_core", "serde"] }
 rand               = "0.8"
 
+# Face-level resource verbs: NativeEnvelope CBOR for PureRaftFace's
+# apply/get/list/delete byte protocol. Other faces use their own
+# native format (yaml/json/hcl via serde_yaml / serde_json already
+# in workspace).
+ciborium           = "0.2"
+
 [dev-dependencies]
 proptest = "1"
 serde_yaml = { workspace = true }
