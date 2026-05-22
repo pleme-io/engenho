@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.89.0"
 license = "MIT"
@@ -38,15 +38,15 @@ keywords = ["kubernetes", "engenho", "pleme-io"]
 # entry and resolves the dep against the registry. Operators
 # building locally always use `path`; downstream crates pulling
 # us from crates.io use `version`.
-engenho-types          = { path = "engenho-types", version = "0.1.2" }
-engenho-cluster-config = { path = "engenho-cluster-config", version = "0.1.2" }
-engenho-kube-client    = { path = "engenho-kube-client", version = "0.1.2" }
-engenho-store          = { path = "engenho-store", version = "0.1.2" }
-engenho-scheduler      = { path = "engenho-scheduler", version = "0.1.2" }
-engenho-controllers    = { path = "engenho-controllers", version = "0.1.2" }
-engenho-config         = { path = "engenho-config", version = "0.1.2" }
-engenho-kubelet        = { path = "engenho-kubelet", version = "0.1.2" }
-engenho-teia           = { path = "engenho-teia", version = "0.1.2" }
+engenho-types          = { path = "engenho-types", version = "0.1.3" }
+engenho-cluster-config = { path = "engenho-cluster-config", version = "0.1.3" }
+engenho-kube-client    = { path = "engenho-kube-client", version = "0.1.3" }
+engenho-store          = { path = "engenho-store", version = "0.1.3" }
+engenho-scheduler      = { path = "engenho-scheduler", version = "0.1.3" }
+engenho-controllers    = { path = "engenho-controllers", version = "0.1.3" }
+engenho-config         = { path = "engenho-config", version = "0.1.3" }
+engenho-kubelet        = { path = "engenho-kubelet", version = "0.1.3" }
+engenho-teia           = { path = "engenho-teia", version = "0.1.3" }
 axum                   = "0.7"
 hyper                  = "1"
 tower                  = "0.5"
