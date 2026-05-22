@@ -1664,30 +1664,32 @@ mod tests {
         use std::thread;
         let face = Arc::new(raft_face());
         let r = pod_ref("nginx", "default");
-        face.apply_resource(ResourceFormat::Native, &envelope(&r, b"v1"))
-            .unwrap();
+        let v1 = envelope(&r, b"v1");
+        let v2 = envelope(&r, b"v2");
+        face.apply_resource(ResourceFormat::Native, &v1).unwrap();
         let mut watch = face
             .watch_resources("Pod", Some("default"), ResourceFormat::Native)
             .unwrap();
         // Drain the replay of v1 (Added).
         let replay = watch.next_event().unwrap().expect("replay");
         assert_eq!(replay.kind, FaceWatchEventKind::Added);
-        assert_eq!(replay.body, b"v1");
+        assert_eq!(replay.body, v1);
         // Mutate on another thread to exercise the cross-thread fan-out.
         let face2 = Arc::clone(&face);
         let r2 = r.clone();
+        let v2_clone = v2.clone();
         let writer = thread::spawn(move || {
             face2
-                .apply_resource(ResourceFormat::Native, &envelope(&r2, b"v2"))
+                .apply_resource(ResourceFormat::Native, &v2_clone)
                 .unwrap();
             face2.delete_resource(&r2).unwrap();
         });
         let mod_ev = watch.next_event().unwrap().expect("mod");
         assert_eq!(mod_ev.kind, FaceWatchEventKind::Modified);
-        assert_eq!(mod_ev.body, b"v2");
+        assert_eq!(mod_ev.body, v2);
         let del_ev = watch.next_event().unwrap().expect("del");
         assert_eq!(del_ev.kind, FaceWatchEventKind::Deleted);
-        assert_eq!(del_ev.body, b"v2");
+        assert_eq!(del_ev.body, v2);
         writer.join().unwrap();
     }
 
@@ -1707,13 +1709,10 @@ mod tests {
         )
         .unwrap();
         // Apply a Pod — SHOULD reach the watch.
-        face.apply_resource(
-            ResourceFormat::Native,
-            &envelope(&pod_ref("nginx", "default"), b"P"),
-        )
-        .unwrap();
+        let pod_env = envelope(&pod_ref("nginx", "default"), b"P");
+        face.apply_resource(ResourceFormat::Native, &pod_env).unwrap();
         let ev = pod_watch.next_event().unwrap().expect("pod event");
-        assert_eq!(ev.body, b"P");
+        assert_eq!(ev.body, pod_env);
     }
 
     #[test]
@@ -1727,14 +1726,11 @@ mod tests {
             &envelope(&pod_ref("a", "other"), b"O"),
         )
         .unwrap();
-        face.apply_resource(
-            ResourceFormat::Native,
-            &envelope(&pod_ref("b", "default"), b"D"),
-        )
-        .unwrap();
+        let default_env = envelope(&pod_ref("b", "default"), b"D");
+        face.apply_resource(ResourceFormat::Native, &default_env).unwrap();
         let ev = watch.next_event().unwrap().expect("event");
         // Only the "default" namespace event arrives.
-        assert_eq!(ev.body, b"D");
+        assert_eq!(ev.body, default_env);
     }
 
     #[test]
@@ -1746,15 +1742,12 @@ mod tests {
         let mut w2 = face
             .watch_resources("Pod", None, ResourceFormat::Native)
             .unwrap();
-        face.apply_resource(
-            ResourceFormat::Native,
-            &envelope(&pod_ref("nginx", "default"), b"x"),
-        )
-        .unwrap();
+        let pod_env = envelope(&pod_ref("nginx", "default"), b"x");
+        face.apply_resource(ResourceFormat::Native, &pod_env).unwrap();
         let e1 = w1.next_event().unwrap().expect("w1 event");
         let e2 = w2.next_event().unwrap().expect("w2 event");
-        assert_eq!(e1.body, b"x");
-        assert_eq!(e2.body, b"x");
+        assert_eq!(e1.body, pod_env);
+        assert_eq!(e2.body, pod_env);
     }
 
     #[test]
@@ -1765,7 +1758,9 @@ mod tests {
         let env = encode_native_envelope(&r, b"payload").unwrap();
         face.apply_resource(ResourceFormat::Native, &env).unwrap();
         let got = face.get_resource(&r, ResourceFormat::Native).unwrap();
-        assert_eq!(got, b"payload");
+        // get returns the full envelope under the new adapter
+        // contract (Native is symmetric pass-through).
+        assert_eq!(got, env);
     }
 
     // ── ResourceRef typed constructors ───────────────────────────

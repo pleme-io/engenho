@@ -495,14 +495,15 @@ mod tests {
         )
         .unwrap();
         let r = pod_ref("nginx", "default");
-        fab.apply(&r, ResourceFormat::Native, &envelope(&r, b"x"))
-            .unwrap();
-        // Member 0 has it, member 1 doesn't.
+        let env = envelope(&r, b"x");
+        fab.apply(&r, ResourceFormat::Native, &env).unwrap();
+        // Member 0 has it, member 1 doesn't. Native get returns
+        // the full envelope (adapter contract is symmetric).
         assert_eq!(
             fab.members()[0]
                 .get(&r, ResourceFormat::Native)
                 .unwrap(),
-            b"x"
+            env
         );
         assert!(fab.members()[1]
             .get(&r, ResourceFormat::Native)
@@ -527,22 +528,23 @@ mod tests {
         .unwrap();
         let ra = pod_ref("pod-a", "team-a");
         let rb = pod_ref("pod-b", "team-b");
-        fab.apply(&ra, ResourceFormat::Native, &envelope(&ra, b"A"))
-            .unwrap();
-        fab.apply(&rb, ResourceFormat::Native, &envelope(&rb, b"B"))
-            .unwrap();
-        // Each member has only its routed resource.
+        let env_a = envelope(&ra, b"A");
+        let env_b = envelope(&rb, b"B");
+        fab.apply(&ra, ResourceFormat::Native, &env_a).unwrap();
+        fab.apply(&rb, ResourceFormat::Native, &env_b).unwrap();
+        // Each member has only its routed resource. Native get
+        // returns the full envelope.
         assert_eq!(
             fab.members()[0]
                 .get(&ra, ResourceFormat::Native)
                 .unwrap(),
-            b"A"
+            env_a
         );
         assert_eq!(
             fab.members()[1]
                 .get(&rb, ResourceFormat::Native)
                 .unwrap(),
-            b"B"
+            env_b
         );
         assert!(fab.members()[0]
             .get(&rb, ResourceFormat::Native)
@@ -573,13 +575,13 @@ mod tests {
         };
         let fab = FederatedFabric::new(vec![cluster("a")], policy).unwrap();
         let r = pod_ref("nginx", "wild");
-        fab.apply(&r, ResourceFormat::Native, &envelope(&r, b"x"))
-            .unwrap();
+        let env = envelope(&r, b"x");
+        fab.apply(&r, ResourceFormat::Native, &env).unwrap();
         assert_eq!(
             fab.members()[0]
                 .get(&r, ResourceFormat::Native)
                 .unwrap(),
-            b"x"
+            env
         );
     }
 
@@ -596,19 +598,23 @@ mod tests {
         // so list has something to aggregate.
         let ra = pod_ref("pod-a", "default");
         let rb = pod_ref("pod-b", "default");
+        let env_a = envelope(&ra, b"A");
+        let env_b = envelope(&rb, b"B");
         fab.members()[0]
-            .apply(ResourceFormat::Native, &envelope(&ra, b"A"))
+            .apply(ResourceFormat::Native, &env_a)
             .unwrap();
         fab.members()[1]
-            .apply(ResourceFormat::Native, &envelope(&rb, b"B"))
+            .apply(ResourceFormat::Native, &env_b)
             .unwrap();
         let all = fab
             .list("Pod", Some("default"), ResourceFormat::Native)
             .unwrap();
         assert_eq!(all.len(), 2);
-        let mut sorted: Vec<&[u8]> = all.iter().map(Vec::as_slice).collect();
+        let mut sorted: Vec<Vec<u8>> = all;
         sorted.sort();
-        assert_eq!(sorted, vec![b"A".as_slice(), b"B".as_slice()]);
+        let mut want = vec![env_a, env_b];
+        want.sort();
+        assert_eq!(sorted, want);
     }
 
     #[test]
@@ -626,15 +632,16 @@ mod tests {
         )
         .unwrap();
         let rb = pod_ref("pod-b", "team-b");
+        let env_b = envelope(&rb, b"B");
         // Bypass routing for setup: write to member 1 directly.
         fab.members()[1]
-            .apply(ResourceFormat::Native, &envelope(&rb, b"B"))
+            .apply(ResourceFormat::Native, &env_b)
             .unwrap();
         // List for team-b should route to member 1 and find pod-b.
         let listed = fab
             .list("Pod", Some("team-b"), ResourceFormat::Native)
             .unwrap();
-        assert_eq!(listed, vec![b"B".to_vec()]);
+        assert_eq!(listed, vec![env_b]);
     }
 
     // ── delete routing ──────────────────────────────────────────
@@ -677,11 +684,13 @@ mod tests {
         // federated stream.
         let ra = pod_ref("pod-a", "default");
         let rb = pod_ref("pod-b", "default");
+        let env_a = envelope(&ra, b"A");
+        let env_b = envelope(&rb, b"B");
         fab.members()[0]
-            .apply(ResourceFormat::Native, &envelope(&ra, b"A"))
+            .apply(ResourceFormat::Native, &env_a)
             .unwrap();
         fab.members()[1]
-            .apply(ResourceFormat::Native, &envelope(&rb, b"B"))
+            .apply(ResourceFormat::Native, &env_b)
             .unwrap();
         let mut got: Vec<Vec<u8>> = Vec::new();
         for _ in 0..2 {
@@ -689,7 +698,9 @@ mod tests {
             got.push(ev.body);
         }
         got.sort();
-        assert_eq!(got, vec![b"A".to_vec(), b"B".to_vec()]);
+        let mut want = vec![env_a, env_b];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -711,13 +722,13 @@ mod tests {
             .unwrap();
         let ra = pod_ref("only-a", "team-a");
         let rb = pod_ref("not-here", "team-b");
-        fab.apply(&ra, ResourceFormat::Native, &envelope(&ra, b"A"))
-            .unwrap();
-        fab.apply(&rb, ResourceFormat::Native, &envelope(&rb, b"B"))
-            .unwrap();
+        let env_a = envelope(&ra, b"A");
+        let env_b = envelope(&rb, b"B");
+        fab.apply(&ra, ResourceFormat::Native, &env_a).unwrap();
+        fab.apply(&rb, ResourceFormat::Native, &env_b).unwrap();
         // Only the team-a event reaches the watch.
         let ev = watch.next_event().unwrap().expect("a event");
-        assert_eq!(ev.body, b"A");
+        assert_eq!(ev.body, env_a);
     }
 
     // ── Member errors propagate ──────────────────────────────────
