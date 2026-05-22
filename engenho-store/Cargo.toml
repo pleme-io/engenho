@@ -18,6 +18,7 @@ tracing            = { workspace = true }
 anyhow             = { workspace = true }
 
 engenho-types      = { workspace = true }
+engenho-teia       = { workspace = true }
 openraft           = { workspace = true }
 
 [dev-dependencies]

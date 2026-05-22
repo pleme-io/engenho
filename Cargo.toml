@@ -35,6 +35,7 @@ engenho-scheduler      = { path = "engenho-scheduler" }
 engenho-controllers    = { path = "engenho-controllers" }
 engenho-config         = { path = "engenho-config" }
 engenho-kubelet        = { path = "engenho-kubelet" }
+engenho-teia           = { path = "engenho-teia" }
 axum                   = "0.7"
 hyper                  = "1"
 tower                  = "0.5"
