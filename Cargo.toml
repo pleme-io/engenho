@@ -12,6 +12,7 @@ members = [
   "engenho-store",
   "engenho-apiserver",
   "engenho-teia",
+  "engenho-scheduler",
 ]
 
 [workspace.package]
