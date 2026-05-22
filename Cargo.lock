@@ -816,14 +816,14 @@ checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
 name = "engenho"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "engenho-types",
 ]
 
 [[package]]
 name = "engenho-apiserver"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-cluster-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "indoc",
  "serde",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-cluster-config-render"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-controllers"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-kube-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-kube-codegen"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -927,7 +927,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-kubelet"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-revoada"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-scheduler"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-teia"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "blake3",
