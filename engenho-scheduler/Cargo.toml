@@ -1,0 +1,24 @@
+[package]
+name = "engenho-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "engenho-scheduler — the first real K8s controller on the engenho substrate. Reconciles pending Pods (no spec.nodeName) by picking a Node via a pluggable SchedulingStrategy trait + patching the Pod through StoreMesh. R8 of the engenho K8s base layer."
+
+[dependencies]
+async-trait        = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+anyhow             = { workspace = true }
+
+engenho-types      = { workspace = true }
+engenho-store      = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
