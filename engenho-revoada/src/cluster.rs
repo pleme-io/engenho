@@ -404,17 +404,18 @@ mod runtime_tests {
 
     #[test]
     fn unsupported_face_propagates_through_runtime_construction() {
-        // Build a declaration with a Systemd face → today
-        // unsupported. The runtime construction must surface the
-        // FaceError rather than silently accepting an unbuilt face.
+        // Build a declaration with a BareMetalSupervisor face — the
+        // last remaining unsupported face. The runtime construction
+        // must surface the FaceError rather than silently accepting
+        // an unbuilt face.
         //
         // (Strategy + topology coherence still holds; only the
         // face instantiation fails.)
         let decl_result = ClusterDeclaration::new(
             FabricStrategy::prescribed_homelab(),
             FabricFace {
-                name: "systemd-test".into(),
-                kind: FaceKind::Systemd { user_units: false },
+                name: "bms-test".into(),
+                kind: FaceKind::BareMetalSupervisor,
             },
             Box::new(Quorum3M),
         );
@@ -424,8 +425,29 @@ mod runtime_tests {
         match Cluster::from_declaration(decl) {
             Err(ClusterRuntimeError::Face(FaceError::Unsupported(_))) => {}
             Err(other) => panic!("expected Face(Unsupported), got {other:?}"),
-            Ok(_) => panic!("expected Err for Systemd face, got Ok"),
+            Ok(_) => panic!("expected Err for BareMetalSupervisor face, got Ok"),
         }
+    }
+
+    #[test]
+    fn systemd_face_now_lifecycles_through_runtime() {
+        // Systemd is now supported (4th impl); the runtime should
+        // construct cleanly and start without surfacing an
+        // Unsupported error.
+        let decl = ClusterDeclaration::new(
+            FabricStrategy::prescribed_homelab(),
+            FabricFace {
+                name: "systemd-test".into(),
+                kind: FaceKind::Systemd { user_units: false },
+            },
+            Box::new(Quorum3M),
+        )
+        .expect("declaration coherent");
+        let cluster = Cluster::from_declaration(decl)
+            .expect("Systemd face is now supported via SystemdFace impl");
+        cluster.start().unwrap();
+        assert!(cluster.is_running());
+        cluster.shutdown().unwrap();
     }
 
     #[test]
