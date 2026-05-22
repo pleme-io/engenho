@@ -39,6 +39,7 @@
 
 pub mod command;
 pub mod mesh;
+pub mod nats_listener;
 pub mod nats_network;
 pub mod network;
 pub mod resource;
@@ -49,6 +50,7 @@ pub mod watch;
 
 pub use command::{Reason, ResourceCommand, ResourceOp};
 pub use mesh::{default_config, StoreError, StoreMesh};
+pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
 pub use network::InProcessRouter;
 pub use resource::{ResourceKey, ResourceValue};
