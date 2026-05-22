@@ -77,6 +77,16 @@ rec {
       # File a bug if you depend on any for non-debug work!
       debug = internal.debugCrate { inherit packageId; };
     };
+    "engenho-controllers" = rec {
+      packageId = "engenho-controllers";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "engenho-controllers";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
     "engenho-kube-client" = rec {
       packageId = "engenho-kube-client";
       build = internal.buildRustCrateWithFeatures {
@@ -111,6 +121,16 @@ rec {
       packageId = "engenho-revoada";
       build = internal.buildRustCrateWithFeatures {
         packageId = "engenho-revoada";
+      };
+
+      # Debug support which might change between releases.
+      # File a bug if you depend on any for non-debug work!
+      debug = internal.debugCrate { inherit packageId; };
+    };
+    "engenho-scheduler" = rec {
+      packageId = "engenho-scheduler";
+      build = internal.buildRustCrateWithFeatures {
+        packageId = "engenho-scheduler";
       };
 
       # Debug support which might change between releases.
@@ -2746,6 +2766,63 @@ rec {
         ];
 
       };
+      "engenho-controllers" = rec {
+        crateName = "engenho-controllers";
+        version = "0.1.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-controllers; };
+        libName = "engenho_controllers";
+        authors = [
+          "pleme-io"
+        ];
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "async-trait";
+            packageId = "async-trait";
+          }
+          {
+            name = "engenho-store";
+            packageId = "engenho-store";
+          }
+          {
+            name = "engenho-types";
+            packageId = "engenho-types";
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
+          }
+          {
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 2.0.18";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "full" ];
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "proptest";
+            packageId = "proptest";
+          }
+        ];
+
+      };
       "engenho-kube-client" = rec {
         crateName = "engenho-kube-client";
         version = "0.1.0";
@@ -2997,6 +3074,67 @@ rec {
           {
             name = "rand";
             packageId = "rand 0.8.6";
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
+          }
+          {
+            name = "serde_json";
+            packageId = "serde_json";
+          }
+          {
+            name = "thiserror";
+            packageId = "thiserror 2.0.18";
+          }
+          {
+            name = "tokio";
+            packageId = "tokio";
+            features = [ "full" ];
+          }
+          {
+            name = "tracing";
+            packageId = "tracing";
+          }
+        ];
+        devDependencies = [
+          {
+            name = "proptest";
+            packageId = "proptest";
+          }
+          {
+            name = "serde_yaml";
+            packageId = "serde_yaml";
+          }
+        ];
+
+      };
+      "engenho-scheduler" = rec {
+        crateName = "engenho-scheduler";
+        version = "0.1.0";
+        edition = "2024";
+        src = lib.cleanSourceWith { filter = sourceFilter;  src = ./engenho-scheduler; };
+        libName = "engenho_scheduler";
+        authors = [
+          "pleme-io"
+        ];
+        dependencies = [
+          {
+            name = "anyhow";
+            packageId = "anyhow";
+          }
+          {
+            name = "async-trait";
+            packageId = "async-trait";
+          }
+          {
+            name = "engenho-store";
+            packageId = "engenho-store";
+          }
+          {
+            name = "engenho-types";
+            packageId = "engenho-types";
           }
           {
             name = "serde";
