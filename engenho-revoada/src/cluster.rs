@@ -811,14 +811,17 @@ mod runtime_tests {
     #[test]
     fn cluster_apply_delegates_to_face_apply_resource() {
         let cluster = Cluster::start_with(ok_decl()).unwrap();
+        let env = pod_envelope("nginx", b"x");
         cluster
-            .apply(ResourceFormat::Native, &pod_envelope("nginx", b"x"))
+            .apply(ResourceFormat::Native, &env)
             .expect("apply through cluster");
         let r = ResourceRef::namespaced("Pod", "nginx", "default");
         let got = cluster
             .get(&r, ResourceFormat::Native)
             .expect("get through cluster");
-        assert_eq!(got, b"x");
+        // Native is now symmetric pass-through — get returns the
+        // full envelope (the same shape apply received).
+        assert_eq!(got, env);
     }
 
     #[test]
@@ -850,9 +853,11 @@ mod runtime_tests {
         let mut watch = cluster
             .watch("Pod", Some("default"), ResourceFormat::Native)
             .expect("watch through cluster");
-        cluster.apply(ResourceFormat::Native, &pod_envelope("nginx", b"x")).unwrap();
+        let env = pod_envelope("nginx", b"x");
+        cluster.apply(ResourceFormat::Native, &env).unwrap();
         let ev = watch.next_event().unwrap().expect("event");
-        assert_eq!(ev.body, b"x");
+        // Watch emits envelope bytes (Native shape).
+        assert_eq!(ev.body, env);
     }
 
     #[test]
