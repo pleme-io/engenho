@@ -54,7 +54,7 @@ pub use fabric::{
     FabricStrategy, FabricStrategyError, FaceKind, MembershipConfig, PlacementPolicy,
     ReconciliationCadence,
 };
-pub use face::{Face, FaceError, KubernetesFace, PureRaftFace, instantiate as instantiate_face};
+pub use face::{Face, FaceError, KubernetesFace, NomadFace, PureRaftFace, instantiate as instantiate_face};
 
 use serde::{Deserialize, Serialize};
 
