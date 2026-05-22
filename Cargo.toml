@@ -11,6 +11,7 @@ members = [
   "engenho-revoada",
   "engenho-store",
   "engenho-apiserver",
+  "engenho-teia",
 ]
 
 [workspace.package]
@@ -31,6 +32,8 @@ hyper                  = "1"
 tower                  = "0.5"
 reqwest                = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 utoipa                 = { version = "5", features = ["axum_extras"] }
+async-nats             = "0.38"
+futures                = "0.3"
 serde                  = { version = "1.0", features = ["derive"] }
 serde_yaml             = "0.9"
 serde_json             = "1.0"

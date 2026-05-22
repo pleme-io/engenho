@@ -78,3 +78,53 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+
+  docker-publish:
+    name: docker-publish-${{ matrix.bin }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        bin: [engenho-mcp, engenho-cluster-config-render]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Build + push multi-arch image (amd64 + arm64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.bin }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/pleme-io/${{ matrix.bin }}:${{ steps.version.outputs.version }}
+            ghcr.io/pleme-io/${{ matrix.bin }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/pleme-io/engenho
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          cache-from: type=gha,scope=${{ matrix.bin }}
+          cache-to: type=gha,scope=${{ matrix.bin }},mode=max

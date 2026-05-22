@@ -1,0 +1,25 @@
+[package]
+name = "engenho-teia"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "engenho-teia — the NATS fabric layer for engenho. Carries Raft RPC, watch streams, content sync, attestation receipts, and observability events across one typed transport. See docs/FABRIC.md."
+
+[dependencies]
+async-nats         = { workspace = true }
+async-trait        = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+futures            = { workspace = true }
+anyhow             = { workspace = true }
+
+engenho-types      = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"
