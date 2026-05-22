@@ -1,0 +1,12 @@
+target/
+.git/
+*.iml
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+node_modules/
+__pycache__/
+result
+result-*
