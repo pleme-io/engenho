@@ -36,6 +36,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod attestation;
+pub mod backend;
 pub mod cluster;
 pub mod consensus;
 pub mod content;
@@ -47,6 +48,11 @@ pub mod format;
 pub mod membership;
 pub mod policy;
 pub mod topology;
+
+pub use backend::{
+    StoreBackend, StubBackend, kube_apiserver_stub, nomad_http_stub, raft_stub,
+    supervised_systemd_stub, systemd_dbus_stub,
+};
 
 pub use format::{
     AdapterError, FormatAdapter, HclAdapter, K8sJsonAdapter, K8sYamlAdapter,
