@@ -35,7 +35,7 @@
 //! a strictly earlier moment.
 
 use crate::fabric::{ConsensusKind, FabricFace, FabricStrategy, FaceKind};
-use crate::face::{self, Face, FaceError};
+use crate::face::{self, Face, FaceError, FaceWatchStream, ResourceFormat, ResourceRef};
 use crate::topology::TopologyStrategy;
 
 /// Errors that surface when a [`ClusterDeclaration`] is constructed
@@ -333,6 +333,250 @@ impl Cluster {
     pub fn id(&self) -> String {
         self.declaration.id()
     }
+
+    // ── One-shot construction + auto-start ────────────────────────
+
+    /// Build + start in one call: equivalent to
+    /// `let c = Cluster::from_declaration(d)?; c.start()?;`. The
+    /// most operator-ergonomic entry path — `let cluster =
+    /// Cluster::start(decl)?;` is all you need.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterRuntimeError::Face`] on face instantiation
+    /// failure (currently only legacy unsupported variants — all 5
+    /// face kinds construct as of e8e67af). Propagates start
+    /// failures from the face.
+    pub fn start_with(declaration: ClusterDeclaration) -> Result<Self, ClusterRuntimeError> {
+        let cluster = Self::from_declaration(declaration)?;
+        cluster.start()?;
+        Ok(cluster)
+    }
+
+    // ── Operator-facing verb delegates ────────────────────────────
+    //
+    // The operator-facing API: cluster.apply / cluster.get /
+    // cluster.list / cluster.delete / cluster.watch. Each delegates
+    // to the underlying face via the Face trait verbs — operators
+    // never need to reach in to `cluster.face()` for the common
+    // CRUDW path. The cluster handle IS the verb surface.
+
+    /// Apply (create-or-update) a resource through the face.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FaceError`] from the face's
+    /// [`Face::apply_resource`].
+    pub fn apply(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
+        self.face.apply_resource(format, body)
+    }
+
+    /// Get a single resource through the face.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FaceError`] from the face's
+    /// [`Face::get_resource`].
+    pub fn get(
+        &self,
+        reference: &ResourceRef,
+        format: ResourceFormat,
+    ) -> Result<Vec<u8>, FaceError> {
+        self.face.get_resource(reference, format)
+    }
+
+    /// List resources through the face.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FaceError`] from the face's
+    /// [`Face::list_resources`].
+    pub fn list(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Vec<Vec<u8>>, FaceError> {
+        self.face.list_resources(kind, namespace, format)
+    }
+
+    /// Delete a resource through the face.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FaceError`] from the face's
+    /// [`Face::delete_resource`].
+    pub fn delete(&self, reference: &ResourceRef) -> Result<(), FaceError> {
+        self.face.delete_resource(reference)
+    }
+
+    /// Watch resources through the face.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FaceError`] from the face's
+    /// [`Face::watch_resources`].
+    pub fn watch(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
+        self.face.watch_resources(kind, namespace, format)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// RAII — leak-free lifecycle
+// ─────────────────────────────────────────────────────────────────
+
+impl Drop for Cluster {
+    /// If the cluster is still running when it's dropped, shut it
+    /// down. Resources allocated through the face (network
+    /// listeners, watch channels, raft handles) are released.
+    /// Errors during the implicit shutdown are swallowed — Drop
+    /// can't return — but the lifecycle transitions through the
+    /// shutdown path correctly.
+    ///
+    /// Operators who want explicit shutdown for error handling
+    /// should call [`Cluster::shutdown`] before the cluster drops.
+    fn drop(&mut self) {
+        let state_snapshot = self.state.lock().ok().map(|g| *g);
+        if state_snapshot == Some(ClusterState::Running) {
+            // Best-effort: shutdown the face. Errors here would
+            // typically be transient (a watch channel that was
+            // already closed); we swallow them since Drop can't
+            // propagate.
+            let _ = self.face.shutdown();
+            if let Ok(mut state) = self.state.lock() {
+                *state = ClusterState::Stopped;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ClusterBuilder — fluent typed construction
+// ─────────────────────────────────────────────────────────────────
+
+/// Fluent builder for [`Cluster`]. Collects the three surfaces +
+/// face declaration over a chain of typed calls, then dispatches
+/// through [`ClusterDeclaration::new`] + [`Cluster::start_with`]
+/// in one terminal call.
+///
+/// Operator-facing pattern:
+///
+/// ```rust,ignore
+/// use engenho_revoada::{Cluster, FabricStrategy};
+/// use engenho_revoada::topology::Quorum3M;
+///
+/// let cluster = Cluster::builder()
+///     .strategy(FabricStrategy::prescribed_homelab())
+///     .face_pure_raft("homelab")
+///     .topology(Quorum3M)
+///     .start()?;
+///
+/// // Verbs work directly on the cluster handle.
+/// cluster.apply(ResourceFormat::Native, &envelope)?;
+///
+/// // Auto-shutdown when `cluster` drops — no manual cleanup.
+/// ```
+///
+/// Each field starts as `None`; [`Self::start`] errors with
+/// [`ClusterBuilderError::Missing`] for the first unset field.
+#[derive(Default)]
+#[must_use = "ClusterBuilder does nothing until .start() (or .build()) is called"]
+pub struct ClusterBuilder {
+    strategy: Option<FabricStrategy>,
+    face: Option<FabricFace>,
+    topology: Option<Box<dyn TopologyStrategy>>,
+}
+
+/// Errors a [`ClusterBuilder`] surfaces when terminal construction
+/// fails — missing field or downstream declaration/runtime error.
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterBuilderError {
+    #[error("ClusterBuilder missing required field: {0}")]
+    Missing(&'static str),
+    #[error("declaration coherence failed: {0}")]
+    Coherence(#[from] ClusterCoherenceError),
+    #[error("runtime construction failed: {0}")]
+    Runtime(#[from] ClusterRuntimeError),
+}
+
+impl ClusterBuilder {
+    /// Set the [`FabricStrategy`].
+    pub fn strategy(mut self, s: FabricStrategy) -> Self {
+        self.strategy = Some(s);
+        self
+    }
+
+    /// Set the [`FabricFace`] directly.
+    pub fn face(mut self, f: FabricFace) -> Self {
+        self.face = Some(f);
+        self
+    }
+
+    /// Convenience: declare a PureRaft face with the given name.
+    pub fn face_pure_raft(mut self, name: impl Into<String>) -> Self {
+        self.face = Some(FabricFace {
+            name: name.into(),
+            kind: FaceKind::PureRaft,
+        });
+        self
+    }
+
+    /// Convenience: declare the prescribed CNCF-certified K8s v1.34
+    /// face.
+    pub fn face_kubernetes_prescribed(mut self) -> Self {
+        self.face = Some(FabricFace::prescribed_kubernetes_v1_34());
+        self
+    }
+
+    /// Set the topology strategy (boxed so any TopologyStrategy
+    /// impl works).
+    pub fn topology<T: TopologyStrategy + 'static>(mut self, t: T) -> Self {
+        self.topology = Some(Box::new(t));
+        self
+    }
+
+    /// Build the typed [`ClusterDeclaration`] without starting.
+    /// Useful for tests that want to inspect the witness before
+    /// allocating runtime resources.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterBuilderError::Missing`] if any of the three
+    /// surfaces wasn't set; [`ClusterBuilderError::Coherence`] on
+    /// cross-surface check failure.
+    pub fn build(self) -> Result<ClusterDeclaration, ClusterBuilderError> {
+        let strategy = self.strategy.ok_or(ClusterBuilderError::Missing("strategy"))?;
+        let face = self.face.ok_or(ClusterBuilderError::Missing("face"))?;
+        let topology = self
+            .topology
+            .ok_or(ClusterBuilderError::Missing("topology"))?;
+        let decl = ClusterDeclaration::new(strategy, face, topology)?;
+        Ok(decl)
+    }
+
+    /// Build + start in one call. The operator-ergonomic path.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::build`] + propagates runtime errors from
+    /// [`Cluster::start_with`].
+    pub fn start(self) -> Result<Cluster, ClusterBuilderError> {
+        let decl = self.build()?;
+        Ok(Cluster::start_with(decl)?)
+    }
+}
+
+impl Cluster {
+    /// Start a fluent [`ClusterBuilder`] chain.
+    #[must_use]
+    pub fn builder() -> ClusterBuilder {
+        ClusterBuilder::default()
+    }
 }
 
 #[cfg(test)]
@@ -400,6 +644,243 @@ mod runtime_tests {
     fn id_delegates_to_declaration() {
         let cluster = ok_cluster();
         assert_eq!(cluster.id(), cluster.declaration().id());
+    }
+
+    // ── ClusterBuilder fluent surface ─────────────────────────────
+
+    #[test]
+    fn builder_fluent_chain_yields_running_cluster() {
+        let cluster = Cluster::builder()
+            .strategy(FabricStrategy::prescribed_homelab())
+            .face_pure_raft("homelab")
+            .topology(Quorum3M)
+            .start()
+            .expect("builder.start() should produce a running cluster");
+        assert!(cluster.is_running());
+        assert_eq!(cluster.face().kind(), FaceKind::PureRaft);
+    }
+
+    #[test]
+    fn builder_face_kubernetes_prescribed_convenience() {
+        let cluster = Cluster::builder()
+            .strategy(FabricStrategy::prescribed_homelab())
+            .face_kubernetes_prescribed()
+            .topology(Quorum3M)
+            .start()
+            .expect("k8s prescribed builder");
+        match cluster.face().kind() {
+            FaceKind::Kubernetes { version, certified_cncf } => {
+                assert_eq!(version, "1.34");
+                assert!(certified_cncf);
+            }
+            other => panic!("expected Kubernetes face, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_missing_strategy_errors_with_named_field() {
+        let err = Cluster::builder()
+            .face_pure_raft("x")
+            .topology(Quorum3M)
+            .start()
+            .expect_err("missing strategy must error");
+        match err {
+            ClusterBuilderError::Missing("strategy") => {}
+            other => panic!("expected Missing(\"strategy\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_missing_face_errors_with_named_field() {
+        let err = Cluster::builder()
+            .strategy(FabricStrategy::prescribed_homelab())
+            .topology(Quorum3M)
+            .start()
+            .expect_err("missing face must error");
+        match err {
+            ClusterBuilderError::Missing("face") => {}
+            other => panic!("expected Missing(\"face\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_missing_topology_errors_with_named_field() {
+        let err = Cluster::builder()
+            .strategy(FabricStrategy::prescribed_homelab())
+            .face_pure_raft("x")
+            .start()
+            .expect_err("missing topology must error");
+        match err {
+            ClusterBuilderError::Missing("topology") => {}
+            other => panic!("expected Missing(\"topology\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_propagates_coherence_failure() {
+        // Solo topology + 3-quorum consensus = incoherent. The
+        // builder surfaces the coherence error rather than panicking.
+        use crate::topology::Solo;
+        let err = Cluster::builder()
+            .strategy(FabricStrategy::prescribed_homelab())
+            .face_pure_raft("x")
+            .topology(Solo)
+            .build()
+            .expect_err("Solo + 3-quorum must fail coherence");
+        match err {
+            ClusterBuilderError::Coherence(ClusterCoherenceError::TopologyTooSmallForQuorum { .. }) => {}
+            other => panic!("expected TopologyTooSmallForQuorum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_build_returns_declaration_without_starting() {
+        // Operators that want to inspect the declaration without
+        // allocating runtime resources use .build() instead of
+        // .start(). The declaration is the typed witness; no face
+        // gets started.
+        let decl = Cluster::builder()
+            .strategy(FabricStrategy::prescribed_homelab())
+            .face_pure_raft("inspect-only")
+            .topology(Quorum3M)
+            .build()
+            .expect("build coherent decl");
+        assert_eq!(decl.strategy().name, "homelab-3node");
+        assert_eq!(decl.face().name, "inspect-only");
+    }
+
+    // ── Cluster::start_with one-shot constructor ─────────────────
+
+    #[test]
+    fn start_with_constructs_and_starts_in_one_call() {
+        let decl = ok_decl();
+        let cluster = Cluster::start_with(decl).expect("one-shot start");
+        assert!(cluster.is_running());
+        assert!(cluster.face().is_running());
+    }
+
+    // ── Drop / RAII — leak-free lifecycle ─────────────────────────
+
+    #[test]
+    fn dropping_running_cluster_shuts_face_down() {
+        // Capture a reference to the face's lifecycle state via a
+        // separate cluster handle that wraps the same face — we
+        // can't (and shouldn't) capture the inner Box<dyn Face>
+        // directly. Instead: build a cluster, start it, drop it,
+        // then build a NEW cluster and verify its face starts
+        // cleanly (would fail if a prior cluster left state lingering
+        // in a way that affects new construction).
+        //
+        // The more direct assertion: the Drop impl runs without
+        // panicking + without double-shutdown errors. This test
+        // verifies that path executes.
+        let cluster = Cluster::start_with(ok_decl()).unwrap();
+        assert!(cluster.is_running());
+        drop(cluster); // Drop runs face.shutdown(); should not panic.
+                       // If shutdown ran twice or on a stopped face,
+                       // FaceError::NotStarted would surface — but
+                       // Drop swallows errors. We confirm no panic.
+    }
+
+    #[test]
+    fn dropping_stopped_cluster_is_safe() {
+        // Explicit shutdown before drop — the Drop impl should
+        // detect non-running state and skip the shutdown call.
+        let cluster = Cluster::start_with(ok_decl()).unwrap();
+        cluster.shutdown().unwrap();
+        assert!(!cluster.is_running());
+        drop(cluster); // Drop sees Stopped, no-ops.
+    }
+
+    #[test]
+    fn dropping_never_started_cluster_is_safe() {
+        // Drop before start — should not call face.shutdown.
+        let cluster = Cluster::from_declaration(ok_decl()).unwrap();
+        assert!(!cluster.is_running());
+        drop(cluster);
+    }
+
+    // ── Verb delegates — cluster IS the verb surface ──────────────
+
+    fn pod_envelope(name: &str, payload: &[u8]) -> Vec<u8> {
+        use crate::face::encode_native_envelope;
+        let r = ResourceRef::namespaced("Pod", name, "default");
+        encode_native_envelope(&r, payload).unwrap()
+    }
+
+    #[test]
+    fn cluster_apply_delegates_to_face_apply_resource() {
+        let cluster = Cluster::start_with(ok_decl()).unwrap();
+        cluster
+            .apply(ResourceFormat::Native, &pod_envelope("nginx", b"x"))
+            .expect("apply through cluster");
+        let r = ResourceRef::namespaced("Pod", "nginx", "default");
+        let got = cluster
+            .get(&r, ResourceFormat::Native)
+            .expect("get through cluster");
+        assert_eq!(got, b"x");
+    }
+
+    #[test]
+    fn cluster_list_delegates_to_face_list_resources() {
+        let cluster = Cluster::start_with(ok_decl()).unwrap();
+        cluster.apply(ResourceFormat::Native, &pod_envelope("a", b"A")).unwrap();
+        cluster.apply(ResourceFormat::Native, &pod_envelope("b", b"B")).unwrap();
+        let listed = cluster
+            .list("Pod", Some("default"), ResourceFormat::Native)
+            .expect("list through cluster");
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[test]
+    fn cluster_delete_delegates_to_face_delete_resource() {
+        let cluster = Cluster::start_with(ok_decl()).unwrap();
+        cluster.apply(ResourceFormat::Native, &pod_envelope("nginx", b"x")).unwrap();
+        let r = ResourceRef::namespaced("Pod", "nginx", "default");
+        cluster.delete(&r).expect("delete through cluster");
+        match cluster.get(&r, ResourceFormat::Native) {
+            Err(FaceError::Unsupported(msg)) => assert!(msg.contains("no resource"), "msg: {msg}"),
+            other => panic!("expected Unsupported after delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cluster_watch_delegates_to_face_watch_resources() {
+        let cluster = Cluster::start_with(ok_decl()).unwrap();
+        let mut watch = cluster
+            .watch("Pod", Some("default"), ResourceFormat::Native)
+            .expect("watch through cluster");
+        cluster.apply(ResourceFormat::Native, &pod_envelope("nginx", b"x")).unwrap();
+        let ev = watch.next_event().unwrap().expect("event");
+        assert_eq!(ev.body, b"x");
+    }
+
+    #[test]
+    fn cluster_apply_propagates_face_unsupported_format() {
+        let cluster = Cluster::start_with(ok_decl()).unwrap();
+        let r = ResourceRef::namespaced("Pod", "nginx", "default");
+        let env = {
+            use crate::face::encode_native_envelope;
+            encode_native_envelope(&r, b"x").unwrap()
+        };
+        match cluster.apply(ResourceFormat::Yaml, &env) {
+            Err(FaceError::Unsupported(_)) => {}
+            other => panic!("expected face's format-unsupported, got {other:?}"),
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────
+
+    fn ok_decl() -> ClusterDeclaration {
+        ClusterDeclaration::new(
+            FabricStrategy::prescribed_homelab(),
+            FabricFace {
+                name: "pure-raft".into(),
+                kind: FaceKind::PureRaft,
+            },
+            Box::new(Quorum3M),
+        )
+        .unwrap()
     }
 
     #[test]

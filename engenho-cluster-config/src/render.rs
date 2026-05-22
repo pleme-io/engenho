@@ -223,18 +223,18 @@ fn kube_proxy_mode(m: KubeProxyMode) -> &'static str {
 // ─────────────────────────────────────────────────────────────────────
 
 fn calico_manifest() -> Manifest {
-    Manifest::new("calico.yaml", formatdoc! {"
-        apiVersion: helm.cattle.io/v1
-        kind: HelmChart
-        metadata:
-          name: calico
-          namespace: kube-system
-        spec:
-          repo: https://docs.tigera.io/calico/charts
-          chart: tigera-operator
-          targetNamespace: tigera-operator
-          createNamespace: true
-    "})
+    Manifest::new(
+        "calico.yaml",
+        crate::helm_chart::simple_chart(
+            "calico",
+            "kube-system",
+            "https://docs.tigera.io/calico/charts",
+            "tigera-operator",
+            "tigera-operator",
+            true,
+        )
+        .to_yaml(),
+    )
 }
 
 fn cilium_manifest(replace_kube_proxy: bool) -> Manifest {
@@ -257,33 +257,33 @@ fn cilium_manifest(replace_kube_proxy: bool) -> Manifest {
 }
 
 fn nginx_ingress_manifest() -> Manifest {
-    Manifest::new("ingress-nginx.yaml", formatdoc! {"
-        apiVersion: helm.cattle.io/v1
-        kind: HelmChart
-        metadata:
-          name: ingress-nginx
-          namespace: kube-system
-        spec:
-          repo: https://kubernetes.github.io/ingress-nginx
-          chart: ingress-nginx
-          targetNamespace: ingress-nginx
-          createNamespace: true
-    "})
+    Manifest::new(
+        "ingress-nginx.yaml",
+        crate::helm_chart::simple_chart(
+            "ingress-nginx",
+            "kube-system",
+            "https://kubernetes.github.io/ingress-nginx",
+            "ingress-nginx",
+            "ingress-nginx",
+            true,
+        )
+        .to_yaml(),
+    )
 }
 
 fn contour_manifest() -> Manifest {
-    Manifest::new("contour.yaml", formatdoc! {"
-        apiVersion: helm.cattle.io/v1
-        kind: HelmChart
-        metadata:
-          name: contour
-          namespace: kube-system
-        spec:
-          repo: https://charts.bitnami.com/bitnami
-          chart: contour
-          targetNamespace: projectcontour
-          createNamespace: true
-    "})
+    Manifest::new(
+        "contour.yaml",
+        crate::helm_chart::simple_chart(
+            "contour",
+            "kube-system",
+            "https://charts.bitnami.com/bitnami",
+            "contour",
+            "projectcontour",
+            true,
+        )
+        .to_yaml(),
+    )
 }
 
 fn gateway_api_manifest() -> Manifest {

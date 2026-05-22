@@ -43,6 +43,7 @@
 #![warn(missing_docs)]
 
 pub mod bootstrap;
+pub mod helm_chart;
 pub mod k3s_yaml;
 pub mod manifest;
 pub mod network;
@@ -50,6 +51,7 @@ pub mod render;
 pub mod renderer;
 pub mod validate;
 
+pub use helm_chart::{chart_with_values, simple_chart, HelmChart, HelmChartSpec};
 pub use k3s_yaml::K3sServerConfig;
 pub use renderer::{ClusterConfigRenderer, EngenhoNativeRenderer, K3sRenderer};
 

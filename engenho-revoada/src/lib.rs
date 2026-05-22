@@ -61,7 +61,10 @@ pub use face::{
     FaceWatchStream, KubernetesFace, NomadFace, PureRaftFace, ResourceFormat, ResourceRef,
     SystemdFace, instantiate as instantiate_face,
 };
-pub use cluster::{Cluster, ClusterCoherenceError, ClusterDeclaration, ClusterRuntimeError};
+pub use cluster::{
+    Cluster, ClusterBuilder, ClusterBuilderError, ClusterCoherenceError, ClusterDeclaration,
+    ClusterRuntimeError,
+};
 
 use serde::{Deserialize, Serialize};
 

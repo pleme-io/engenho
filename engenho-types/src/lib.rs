@@ -64,6 +64,7 @@ pub mod kind;
 pub mod meta;
 pub mod nomad_v1;
 pub mod patch;
+pub mod translator;
 pub mod primitives;
 pub mod reconciler;
 pub mod watch;
