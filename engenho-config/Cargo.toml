@@ -1,0 +1,19 @@
+[package]
+name = "engenho-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "engenho-config — the top-level shikumi-back typed configuration surface for the whole engenho substrate. EngenhoConfig owns cluster + revoada + teia + scheduler + controllers + consistency sub-structs; each provides shikumi::TieredConfig with reasonable prescribed_default()s so 90% of operators get a working substrate from cargo run."
+
+[dependencies]
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+serde_yaml         = { workspace = true }
+thiserror          = { workspace = true }
+shikumi            = { git = "https://github.com/pleme-io/shikumi" }
+
+[dev-dependencies]
+tempfile = "3"

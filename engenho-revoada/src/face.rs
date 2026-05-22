@@ -315,9 +315,11 @@ pub struct PureRaftFace {
     name: String,
     state: Mutex<FaceState>,
     /// In-memory store backing the verb impls. Each resource is
-    /// addressed by `ResourceRef` and stored as the raw bytes the
-    /// operator supplied in `ResourceFormat::Native`. Per-ref
-    /// last-writer-wins (apply is idempotent + replaces).
+    /// addressed by `ResourceRef` and stored as the CBOR
+    /// NativeEnvelope bytes (so the store is always in one
+    /// canonical shape regardless of what format the operator
+    /// applied in). Per-ref last-writer-wins (apply is idempotent
+    /// + replaces).
     ///
     /// R5+ swaps this for the actual raft-replicated store
     /// (engenho-store / engenho-revoada::consensus). The verb
@@ -327,6 +329,11 @@ pub struct PureRaftFace {
     /// channel; apply/delete fan out events to every subscriber
     /// whose filter matches.
     subscribers: Mutex<Vec<WatchSubscriber>>,
+    /// Format adapters this face accepts. Defaults to the
+    /// three-adapter standard set (Native / Json / Yaml) via
+    /// `AdapterRegistry::default()`; custom registries land via
+    /// `with_adapters`.
+    adapters: crate::format::AdapterRegistry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,6 +354,12 @@ impl PureRaftFace {
     /// Construct from a [`FabricFace`] declaration. Returns `None`
     /// if the declaration's kind isn't `PureRaft` (the typed shape
     /// owns dispatch — wrong-kind declarations don't construct).
+    ///
+    /// The default [`crate::format::AdapterRegistry`] ships with
+    /// Native + Json + Yaml adapters — operators can immediately
+    /// call `face.apply_resource(Yaml, k8s_manifest)`. To use a
+    /// custom registry (e.g. registering an HCL adapter), use
+    /// [`Self::with_adapters`] after construction.
     #[must_use]
     pub fn from_declaration(decl: &FabricFace) -> Option<Self> {
         if decl.kind != FaceKind::PureRaft {
@@ -357,7 +370,17 @@ impl PureRaftFace {
             state: Mutex::new(FaceState::Stopped),
             store: Mutex::new(std::collections::HashMap::new()),
             subscribers: Mutex::new(Vec::new()),
+            adapters: crate::format::AdapterRegistry::default(),
         })
+    }
+
+    /// Replace the format adapter registry. Useful for tests that
+    /// want to inject a stub adapter, or operators registering
+    /// custom format families.
+    #[must_use]
+    pub fn with_adapters(mut self, adapters: crate::format::AdapterRegistry) -> Self {
+        self.adapters = adapters;
+        self
     }
 
     /// Fan an event to every subscriber whose filter matches.
@@ -383,17 +406,17 @@ impl PureRaftFace {
         });
     }
 
-    /// Native format is the only format PureRaft natively speaks.
-    /// Other formats land at R6+ (CBOR ↔ YAML/JSON adapter via
-    /// engenho-types' serde).
-    fn check_native(format: ResourceFormat, verb: &str) -> Result<(), FaceError> {
-        if format == ResourceFormat::Native {
-            Ok(())
-        } else {
-            Err(FaceError::Unsupported(format!(
-                "{verb} on PureRaftFace currently only supports ResourceFormat::Native (got {format:?})"
-            )))
-        }
+    /// Lookup the registered adapter for `format` and translate
+    /// AdapterError → FaceError so callers stay on the Face trait
+    /// error surface.
+    fn select_adapter(
+        &self,
+        format: ResourceFormat,
+        verb: &'static str,
+    ) -> Result<std::sync::Arc<dyn crate::format::FormatAdapter>, FaceError> {
+        self.adapters
+            .select(format)
+            .map_err(|e| FaceError::Unsupported(format!("{verb}: {e}")))
     }
 }
 
@@ -441,22 +464,26 @@ impl Face for PureRaftFace {
     // systemd dbus, bare-metal supervisor).
 
     fn apply_resource(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
-        Self::check_native(format, "apply_resource")?;
-        // The body must encode a ResourceRef preamble so the face
-        // knows where to store it. For this first impl we use a
-        // simple CBOR wire: { ref: ResourceRef, payload: bytes }.
-        let envelope: NativeEnvelope = ciborium::from_reader(body).map_err(|e| {
-            FaceError::Unsupported(format!("apply_resource: native envelope decode failed: {e}"))
-        })?;
+        // Route through the adapter registry: operator's format →
+        // typed ResourceRef + Native envelope. Operators send YAML
+        // (or JSON, or Native) directly; the face stores the
+        // envelope regardless of input format.
+        let adapter = self.select_adapter(format, "apply_resource")?;
+        let reference = adapter
+            .extract_ref(format, body)
+            .map_err(|e| FaceError::Unsupported(format!("apply_resource: {e}")))?;
+        let envelope = adapter
+            .to_native(format, body)
+            .map_err(|e| FaceError::Unsupported(format!("apply_resource: {e}")))?;
         let mut store = self.store.lock().expect("store mutex poisoned");
-        let event_kind = if store.contains_key(&envelope.reference) {
+        let event_kind = if store.contains_key(&reference) {
             FaceWatchEventKind::Modified
         } else {
             FaceWatchEventKind::Added
         };
-        store.insert(envelope.reference.clone(), envelope.payload.clone());
+        store.insert(reference.clone(), envelope.clone());
         drop(store);
-        self.broadcast(&envelope.reference, event_kind, envelope.payload);
+        self.broadcast(&reference, event_kind, envelope);
         Ok(())
     }
 
@@ -465,14 +492,15 @@ impl Face for PureRaftFace {
         reference: &ResourceRef,
         format: ResourceFormat,
     ) -> Result<Vec<u8>, FaceError> {
-        Self::check_native(format, "get_resource")?;
+        let adapter = self.select_adapter(format, "get_resource")?;
         let store = self.store.lock().expect("store mutex poisoned");
-        store
-            .get(reference)
-            .cloned()
-            .ok_or_else(|| FaceError::Unsupported(format!(
-                "get_resource: no resource at {reference:?}"
-            )))
+        let envelope = store.get(reference).cloned().ok_or_else(|| {
+            FaceError::Unsupported(format!("get_resource: no resource at {reference:?}"))
+        })?;
+        drop(store);
+        adapter
+            .from_native(format, &envelope)
+            .map_err(|e| FaceError::Unsupported(format!("get_resource: {e}")))
     }
 
     fn list_resources(
@@ -481,29 +509,34 @@ impl Face for PureRaftFace {
         namespace: Option<&str>,
         format: ResourceFormat,
     ) -> Result<Vec<Vec<u8>>, FaceError> {
-        Self::check_native(format, "list_resources")?;
+        let adapter = self.select_adapter(format, "list_resources")?;
         let store = self.store.lock().expect("store mutex poisoned");
-        let out: Vec<Vec<u8>> = store
+        let envelopes: Vec<Vec<u8>> = store
             .iter()
-            .filter(|(r, _)| {
-                r.kind == kind && r.namespace.as_deref() == namespace.or(r.namespace.as_deref())
-            })
+            .filter(|(r, _)| r.kind == kind)
             .filter(|(r, _)| match namespace {
                 Some(ns) => r.namespace.as_deref() == Some(ns),
                 None => true,
             })
             .map(|(_, bytes)| bytes.clone())
             .collect();
+        drop(store);
+        let mut out = Vec::with_capacity(envelopes.len());
+        for env in envelopes {
+            out.push(
+                adapter
+                    .from_native(format, &env)
+                    .map_err(|e| FaceError::Unsupported(format!("list_resources: {e}")))?,
+            );
+        }
         Ok(out)
     }
 
     fn delete_resource(&self, reference: &ResourceRef) -> Result<(), FaceError> {
         let mut store = self.store.lock().expect("store mutex poisoned");
-        let body = store
-            .remove(reference)
-            .ok_or_else(|| FaceError::Unsupported(format!(
-                "delete_resource: no resource at {reference:?}"
-            )))?;
+        let body = store.remove(reference).ok_or_else(|| {
+            FaceError::Unsupported(format!("delete_resource: no resource at {reference:?}"))
+        })?;
         drop(store);
         self.broadcast(reference, FaceWatchEventKind::Deleted, body);
         Ok(())
@@ -515,7 +548,14 @@ impl Face for PureRaftFace {
         namespace: Option<&str>,
         format: ResourceFormat,
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
-        Self::check_native(format, "watch_resources")?;
+        // Watch verifies the format is supported by checking the
+        // registry. Events ARE emitted in raw Native envelope bytes
+        // (subscribers can adapt on read) — wrapping every event
+        // in adapter.from_native at fan-out time would amplify
+        // every write into N format conversions for N subscribers.
+        // Operators who want format-specific watch streams build
+        // their own thin adapter layer over the Native stream.
+        let _ = self.select_adapter(format, "watch_resources")?;
         let (tx, rx) = std::sync::mpsc::channel();
         // Replay current matching state as `Added` events so
         // consumers always start with a complete snapshot.
@@ -1409,28 +1449,116 @@ mod tests {
     }
 
     #[test]
-    fn pure_raft_apply_then_get_round_trips() {
+    fn pure_raft_apply_then_get_round_trips_envelope() {
+        // New adapter contract: Native is symmetric pass-through.
+        // Apply takes a CBOR envelope; get returns the same CBOR
+        // envelope. Operators who want the payload-only shape use
+        // a YAML/JSON adapter (those round-trip via the operator's
+        // chosen format).
         let face = raft_face();
         let r = pod_ref("nginx", "default");
-        let body = b"my-payload";
-        face.apply_resource(ResourceFormat::Native, &envelope(&r, body))
-            .unwrap();
+        let env = envelope(&r, b"my-payload");
+        face.apply_resource(ResourceFormat::Native, &env).unwrap();
         let got = face
             .get_resource(&r, ResourceFormat::Native)
             .expect("get after apply");
-        assert_eq!(got, body);
+        assert_eq!(got, env);
     }
 
     #[test]
-    fn pure_raft_apply_yaml_format_unsupported() {
+    fn pure_raft_apply_yaml_now_works_via_adapter_registry() {
+        // The default AdapterRegistry includes K8sYamlAdapter, so
+        // operators can apply real K8s YAML manifests directly.
+        // The face extracts metadata.name/namespace and stores
+        // the envelope; get with format=Yaml returns the original
+        // operator bytes.
         let face = raft_face();
+        let yaml = b"apiVersion: v1\nkind: Pod\nmetadata:\n  name: nginx\n  namespace: default\nspec:\n  containers:\n    - name: c\n      image: nginx\n";
+        face.apply_resource(ResourceFormat::Yaml, yaml)
+            .expect("YAML apply should succeed via K8sYamlAdapter");
+        let r = ResourceRef::namespaced("Pod", "nginx", "default");
+        let back = face
+            .get_resource(&r, ResourceFormat::Yaml)
+            .expect("YAML get should succeed");
+        assert_eq!(back, yaml);
+    }
+
+    #[test]
+    fn pure_raft_apply_json_works_via_adapter_registry() {
+        let face = raft_face();
+        let json = serde_json::to_vec(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "nginx", "namespace": "default" },
+            "spec": { "containers": [{"name": "c", "image": "nginx"}] }
+        }))
+        .unwrap();
+        face.apply_resource(ResourceFormat::Json, &json)
+            .expect("JSON apply should succeed");
+        let r = ResourceRef::namespaced("Pod", "nginx", "default");
+        let back = face
+            .get_resource(&r, ResourceFormat::Json)
+            .expect("JSON get should succeed");
+        assert_eq!(back, json);
+    }
+
+    #[test]
+    fn pure_raft_with_custom_adapter_registry_overrides_default() {
+        // Build a face that ONLY accepts Native (custom registry
+        // explicitly without YAML/JSON adapters). Confirms the
+        // builder hook works + the unsupported-format error
+        // surfaces cleanly.
+        let face = PureRaftFace::from_declaration(&raft_decl())
+            .unwrap()
+            .with_adapters({
+                let mut r = crate::format::AdapterRegistry::empty();
+                r.register(std::sync::Arc::new(
+                    crate::format::NativePassthroughAdapter,
+                ));
+                r
+            });
         let r = pod_ref("nginx", "default");
-        match face.apply_resource(ResourceFormat::Yaml, &envelope(&r, b"x")) {
+        // YAML now rejected because no YAML adapter is registered.
+        match face.apply_resource(ResourceFormat::Yaml, b"apiVersion: v1\nkind: Pod\nmetadata: {name: x}\n") {
             Err(FaceError::Unsupported(msg)) => {
-                assert!(msg.contains("Native"), "msg: {msg}");
+                assert!(msg.contains("Yaml") || msg.contains("UnsupportedFormat"), "msg: {msg}");
             }
-            other => panic!("expected Unsupported on Yaml format, got {other:?}"),
+            other => panic!("expected Unsupported, got {other:?}"),
         }
+        // Native still works.
+        face.apply_resource(ResourceFormat::Native, &envelope(&r, b"x"))
+            .expect("Native still works");
+    }
+
+    #[test]
+    fn pure_raft_invalid_yaml_apply_returns_clear_parse_error() {
+        let face = raft_face();
+        // Missing required kind field.
+        let yaml = b"apiVersion: v1\nmetadata:\n  name: nginx\n";
+        match face.apply_resource(ResourceFormat::Yaml, yaml) {
+            Err(FaceError::Unsupported(msg)) => {
+                assert!(msg.contains("kind"), "msg should mention missing kind: {msg}");
+            }
+            other => panic!("expected Unsupported (MissingField kind), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pure_raft_list_yaml_returns_each_envelope_as_yaml() {
+        let face = raft_face();
+        let yaml_a = b"apiVersion: v1\nkind: Pod\nmetadata:\n  name: a\n  namespace: default\n";
+        let yaml_b = b"apiVersion: v1\nkind: Pod\nmetadata:\n  name: b\n  namespace: default\n";
+        face.apply_resource(ResourceFormat::Yaml, yaml_a).unwrap();
+        face.apply_resource(ResourceFormat::Yaml, yaml_b).unwrap();
+        let listed = face
+            .list_resources("Pod", Some("default"), ResourceFormat::Yaml)
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        let mut got: Vec<&[u8]> = listed.iter().map(Vec::as_slice).collect();
+        got.sort();
+        let mut want = vec![yaml_a.as_slice(), yaml_b.as_slice()];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -1449,39 +1577,32 @@ mod tests {
     fn pure_raft_apply_updates_existing_with_modified_event() {
         let face = raft_face();
         let r = pod_ref("nginx", "default");
-        face.apply_resource(ResourceFormat::Native, &envelope(&r, b"v1"))
-            .unwrap();
-        face.apply_resource(ResourceFormat::Native, &envelope(&r, b"v2"))
-            .unwrap();
+        let v1 = envelope(&r, b"v1");
+        let v2 = envelope(&r, b"v2");
+        face.apply_resource(ResourceFormat::Native, &v1).unwrap();
+        face.apply_resource(ResourceFormat::Native, &v2).unwrap();
         let got = face.get_resource(&r, ResourceFormat::Native).unwrap();
-        assert_eq!(got, b"v2");
+        assert_eq!(got, v2);
     }
 
     #[test]
     fn pure_raft_list_returns_all_of_kind_in_namespace() {
         let face = raft_face();
-        face.apply_resource(
-            ResourceFormat::Native,
-            &envelope(&pod_ref("a", "default"), b"A"),
-        )
-        .unwrap();
-        face.apply_resource(
-            ResourceFormat::Native,
-            &envelope(&pod_ref("b", "default"), b"B"),
-        )
-        .unwrap();
-        face.apply_resource(
-            ResourceFormat::Native,
-            &envelope(&pod_ref("c", "other"), b"C"),
-        )
-        .unwrap();
+        let env_a = envelope(&pod_ref("a", "default"), b"A");
+        let env_b = envelope(&pod_ref("b", "default"), b"B");
+        let env_c = envelope(&pod_ref("c", "other"), b"C");
+        face.apply_resource(ResourceFormat::Native, &env_a).unwrap();
+        face.apply_resource(ResourceFormat::Native, &env_b).unwrap();
+        face.apply_resource(ResourceFormat::Native, &env_c).unwrap();
         let in_default = face
             .list_resources("Pod", Some("default"), ResourceFormat::Native)
             .unwrap();
         assert_eq!(in_default.len(), 2);
-        let mut got: Vec<&[u8]> = in_default.iter().map(Vec::as_slice).collect();
+        let mut got: Vec<Vec<u8>> = in_default;
         got.sort();
-        assert_eq!(got, vec![b"A".as_slice(), b"B".as_slice()]);
+        let mut want = vec![env_a, env_b];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -1514,20 +1635,17 @@ mod tests {
     #[test]
     fn pure_raft_watch_replays_existing_state_as_added() {
         let face = raft_face();
-        face.apply_resource(
-            ResourceFormat::Native,
-            &envelope(&pod_ref("a", "default"), b"A"),
-        )
-        .unwrap();
-        face.apply_resource(
-            ResourceFormat::Native,
-            &envelope(&pod_ref("b", "default"), b"B"),
-        )
-        .unwrap();
+        let env_a = envelope(&pod_ref("a", "default"), b"A");
+        let env_b = envelope(&pod_ref("b", "default"), b"B");
+        face.apply_resource(ResourceFormat::Native, &env_a).unwrap();
+        face.apply_resource(ResourceFormat::Native, &env_b).unwrap();
         let mut watch = face
             .watch_resources("Pod", Some("default"), ResourceFormat::Native)
             .unwrap();
         // Drain two Added events (replay of existing state).
+        // Watch emits raw envelope bytes (Native shape) — see
+        // the watch_resources comment in face.rs explaining why
+        // watch doesn't run from_native at fan-out time.
         let mut got: Vec<Vec<u8>> = Vec::new();
         for _ in 0..2 {
             let ev = watch.next_event().unwrap().expect("event");
@@ -1535,7 +1653,9 @@ mod tests {
             got.push(ev.body);
         }
         got.sort();
-        assert_eq!(got, vec![b"A".to_vec(), b"B".to_vec()]);
+        let mut want = vec![env_a, env_b];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]

@@ -14,6 +14,7 @@ members = [
   "engenho-teia",
   "engenho-scheduler",
   "engenho-controllers",
+  "engenho-config",
 ]
 
 [workspace.package]
@@ -31,6 +32,7 @@ engenho-kube-client    = { path = "engenho-kube-client" }
 engenho-store          = { path = "engenho-store" }
 engenho-scheduler      = { path = "engenho-scheduler" }
 engenho-controllers    = { path = "engenho-controllers" }
+engenho-config         = { path = "engenho-config" }
 axum                   = "0.7"
 hyper                  = "1"
 tower                  = "0.5"
