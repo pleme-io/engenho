@@ -39,4 +39,7 @@ jobs:
           no-verify: "true"
           rename-prefix: "pleme-io-"
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # Org secret is CRATES_API_TOKEN; cargo reads
+          # CARGO_REGISTRY_TOKEN. Bridge the names here so the
+          # workflow stays explicit about which env var cargo wants.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
