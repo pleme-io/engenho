@@ -314,40 +314,16 @@ pub enum FaceWatchEventKind {
 pub struct PureRaftFace {
     name: String,
     state: Mutex<FaceState>,
-    /// In-memory store backing the verb impls. Each resource is
-    /// addressed by `ResourceRef` and stored as the CBOR
-    /// NativeEnvelope bytes (so the store is always in one
-    /// canonical shape regardless of what format the operator
-    /// applied in). Per-ref last-writer-wins (apply is idempotent
-    /// + replaces).
-    ///
-    /// R5+ swaps this for the actual raft-replicated store
-    /// (engenho-store / engenho-revoada::consensus). The verb
+    /// Shared verb-impl backend. R5+ replaces this with a raft-
+    /// backed store; today it's an in-memory HashMap. The verb
     /// signatures stay byte-identical — the swap is internal.
-    store: Mutex<std::collections::HashMap<ResourceRef, Vec<u8>>>,
-    /// Watch subscribers. Each `watch_resources` call appends a
-    /// channel; apply/delete fan out events to every subscriber
-    /// whose filter matches.
-    subscribers: Mutex<Vec<WatchSubscriber>>,
-    /// Format adapters this face accepts. Defaults to the
-    /// three-adapter standard set (Native / Json / Yaml) via
-    /// `AdapterRegistry::default()`; custom registries land via
-    /// `with_adapters`.
-    adapters: crate::format::AdapterRegistry,
+    store: crate::face_store::InMemoryStore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FaceState {
     Stopped,
     Running,
-}
-
-struct WatchSubscriber {
-    /// `Some` while the consumer holds the stream; `None` when
-    /// dropped — fan-out loop GCs dead subscribers lazily.
-    sender: Option<std::sync::mpsc::Sender<FaceWatchEvent>>,
-    kind_filter: String,
-    namespace_filter: Option<String>,
 }
 
 impl PureRaftFace {
@@ -368,9 +344,7 @@ impl PureRaftFace {
         Some(Self {
             name: decl.name.clone(),
             state: Mutex::new(FaceState::Stopped),
-            store: Mutex::new(std::collections::HashMap::new()),
-            subscribers: Mutex::new(Vec::new()),
-            adapters: crate::format::AdapterRegistry::default(),
+            store: crate::face_store::InMemoryStore::new(decl.name.clone()),
         })
     }
 
@@ -379,44 +353,8 @@ impl PureRaftFace {
     /// custom format families.
     #[must_use]
     pub fn with_adapters(mut self, adapters: crate::format::AdapterRegistry) -> Self {
-        self.adapters = adapters;
+        self.store.set_adapters(adapters);
         self
-    }
-
-    /// Fan an event to every subscriber whose filter matches.
-    /// Lazily drops senders that have disconnected (consumer
-    /// dropped the stream).
-    fn broadcast(&self, reference: &ResourceRef, event_kind: FaceWatchEventKind, body: Vec<u8>) {
-        let mut subs = self.subscribers.lock().expect("subscribers mutex poisoned");
-        subs.retain_mut(|sub| {
-            if sub.kind_filter != reference.kind {
-                return true;
-            }
-            if let Some(ns) = &sub.namespace_filter
-                && reference.namespace.as_deref() != Some(ns.as_str())
-            {
-                return true;
-            }
-            let Some(sender) = &sub.sender else { return false };
-            let event = FaceWatchEvent {
-                kind: event_kind,
-                body: body.clone(),
-            };
-            sender.send(event).is_ok()
-        });
-    }
-
-    /// Lookup the registered adapter for `format` and translate
-    /// AdapterError → FaceError so callers stay on the Face trait
-    /// error surface.
-    fn select_adapter(
-        &self,
-        format: ResourceFormat,
-        verb: &'static str,
-    ) -> Result<std::sync::Arc<dyn crate::format::FormatAdapter>, FaceError> {
-        self.adapters
-            .select(format)
-            .map_err(|e| FaceError::Unsupported(format!("{verb}: {e}")))
     }
 }
 
@@ -464,27 +402,7 @@ impl Face for PureRaftFace {
     // systemd dbus, bare-metal supervisor).
 
     fn apply_resource(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
-        // Route through the adapter registry: operator's format →
-        // typed ResourceRef + Native envelope. Operators send YAML
-        // (or JSON, or Native) directly; the face stores the
-        // envelope regardless of input format.
-        let adapter = self.select_adapter(format, "apply_resource")?;
-        let reference = adapter
-            .extract_ref(format, body)
-            .map_err(|e| FaceError::Unsupported(format!("apply_resource: {e}")))?;
-        let envelope = adapter
-            .to_native(format, body)
-            .map_err(|e| FaceError::Unsupported(format!("apply_resource: {e}")))?;
-        let mut store = self.store.lock().expect("store mutex poisoned");
-        let event_kind = if store.contains_key(&reference) {
-            FaceWatchEventKind::Modified
-        } else {
-            FaceWatchEventKind::Added
-        };
-        store.insert(reference.clone(), envelope.clone());
-        drop(store);
-        self.broadcast(&reference, event_kind, envelope);
-        Ok(())
+        self.store.apply(format, body)
     }
 
     fn get_resource(
@@ -492,15 +410,7 @@ impl Face for PureRaftFace {
         reference: &ResourceRef,
         format: ResourceFormat,
     ) -> Result<Vec<u8>, FaceError> {
-        let adapter = self.select_adapter(format, "get_resource")?;
-        let store = self.store.lock().expect("store mutex poisoned");
-        let envelope = store.get(reference).cloned().ok_or_else(|| {
-            FaceError::Unsupported(format!("get_resource: no resource at {reference:?}"))
-        })?;
-        drop(store);
-        adapter
-            .from_native(format, &envelope)
-            .map_err(|e| FaceError::Unsupported(format!("get_resource: {e}")))
+        self.store.get(reference, format)
     }
 
     fn list_resources(
@@ -509,37 +419,11 @@ impl Face for PureRaftFace {
         namespace: Option<&str>,
         format: ResourceFormat,
     ) -> Result<Vec<Vec<u8>>, FaceError> {
-        let adapter = self.select_adapter(format, "list_resources")?;
-        let store = self.store.lock().expect("store mutex poisoned");
-        let envelopes: Vec<Vec<u8>> = store
-            .iter()
-            .filter(|(r, _)| r.kind == kind)
-            .filter(|(r, _)| match namespace {
-                Some(ns) => r.namespace.as_deref() == Some(ns),
-                None => true,
-            })
-            .map(|(_, bytes)| bytes.clone())
-            .collect();
-        drop(store);
-        let mut out = Vec::with_capacity(envelopes.len());
-        for env in envelopes {
-            out.push(
-                adapter
-                    .from_native(format, &env)
-                    .map_err(|e| FaceError::Unsupported(format!("list_resources: {e}")))?,
-            );
-        }
-        Ok(out)
+        self.store.list(kind, namespace, format)
     }
 
     fn delete_resource(&self, reference: &ResourceRef) -> Result<(), FaceError> {
-        let mut store = self.store.lock().expect("store mutex poisoned");
-        let body = store.remove(reference).ok_or_else(|| {
-            FaceError::Unsupported(format!("delete_resource: no resource at {reference:?}"))
-        })?;
-        drop(store);
-        self.broadcast(reference, FaceWatchEventKind::Deleted, body);
-        Ok(())
+        self.store.delete(reference)
     }
 
     fn watch_resources(
@@ -548,40 +432,7 @@ impl Face for PureRaftFace {
         namespace: Option<&str>,
         format: ResourceFormat,
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
-        // Watch verifies the format is supported by checking the
-        // registry. Events ARE emitted in raw Native envelope bytes
-        // (subscribers can adapt on read) — wrapping every event
-        // in adapter.from_native at fan-out time would amplify
-        // every write into N format conversions for N subscribers.
-        // Operators who want format-specific watch streams build
-        // their own thin adapter layer over the Native stream.
-        let _ = self.select_adapter(format, "watch_resources")?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        // Replay current matching state as `Added` events so
-        // consumers always start with a complete snapshot.
-        let store = self.store.lock().expect("store mutex poisoned");
-        for (r, body) in store.iter() {
-            if r.kind != kind {
-                continue;
-            }
-            if let Some(ns) = namespace
-                && r.namespace.as_deref() != Some(ns)
-            {
-                continue;
-            }
-            let _ = tx.send(FaceWatchEvent {
-                kind: FaceWatchEventKind::Added,
-                body: body.clone(),
-            });
-        }
-        drop(store);
-        let mut subs = self.subscribers.lock().expect("subscribers mutex poisoned");
-        subs.push(WatchSubscriber {
-            sender: Some(tx),
-            kind_filter: kind.to_string(),
-            namespace_filter: namespace.map(str::to_string),
-        });
-        Ok(Box::new(MpscWatchStream { rx }))
+        self.store.watch(kind, namespace, format)
     }
 }
 
@@ -676,6 +527,10 @@ pub struct KubernetesFace {
     version: String,
     certified_cncf: bool,
     state: Mutex<FaceState>,
+    /// Shared verb-impl backend. R6 swaps this for an actual
+    /// kube-apiserver bridge; today the in-memory store covers
+    /// the contract end-to-end.
+    store: crate::face_store::InMemoryStore,
 }
 
 impl KubernetesFace {
@@ -695,6 +550,7 @@ impl KubernetesFace {
             version,
             certified_cncf,
             state: Mutex::new(FaceState::Stopped),
+            store: crate::face_store::InMemoryStore::new(decl.name.clone()),
         })
     }
 
@@ -709,6 +565,13 @@ impl KubernetesFace {
     #[must_use]
     pub fn is_cncf_certified(&self) -> bool {
         self.certified_cncf
+    }
+
+    /// Replace the format adapter registry.
+    #[must_use]
+    pub fn with_adapters(mut self, adapters: crate::format::AdapterRegistry) -> Self {
+        self.store.set_adapters(adapters);
+        self
     }
 }
 
@@ -749,6 +612,38 @@ impl Face for KubernetesFace {
         let state = self.state.lock().expect("face state mutex poisoned");
         *state == FaceState::Running
     }
+
+    // Verb delegates — shared in-memory backend (R6 swaps for the
+    // real kube-apiserver bridge).
+    fn apply_resource(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
+        self.store.apply(format, body)
+    }
+    fn get_resource(
+        &self,
+        reference: &ResourceRef,
+        format: ResourceFormat,
+    ) -> Result<Vec<u8>, FaceError> {
+        self.store.get(reference, format)
+    }
+    fn list_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Vec<Vec<u8>>, FaceError> {
+        self.store.list(kind, namespace, format)
+    }
+    fn delete_resource(&self, reference: &ResourceRef) -> Result<(), FaceError> {
+        self.store.delete(reference)
+    }
+    fn watch_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
+        self.store.watch(kind, namespace, format)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -776,6 +671,9 @@ pub struct NomadFace {
     name: String,
     version: String,
     state: Mutex<FaceState>,
+    /// Shared verb-impl backend; R6 swaps for the real nomad HTTP
+    /// client.
+    store: crate::face_store::InMemoryStore,
 }
 
 impl NomadFace {
@@ -791,6 +689,7 @@ impl NomadFace {
             name: decl.name.clone(),
             version,
             state: Mutex::new(FaceState::Stopped),
+            store: crate::face_store::InMemoryStore::new(decl.name.clone()),
         })
     }
 
@@ -798,6 +697,13 @@ impl NomadFace {
     #[must_use]
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Replace the format adapter registry.
+    #[must_use]
+    pub fn with_adapters(mut self, adapters: crate::format::AdapterRegistry) -> Self {
+        self.store.set_adapters(adapters);
+        self
     }
 }
 
@@ -838,6 +744,37 @@ impl Face for NomadFace {
         let state = self.state.lock().expect("face state mutex poisoned");
         *state == FaceState::Running
     }
+
+    // Verb delegates — shared in-memory backend (R6 swaps for nomad HTTP).
+    fn apply_resource(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
+        self.store.apply(format, body)
+    }
+    fn get_resource(
+        &self,
+        reference: &ResourceRef,
+        format: ResourceFormat,
+    ) -> Result<Vec<u8>, FaceError> {
+        self.store.get(reference, format)
+    }
+    fn list_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Vec<Vec<u8>>, FaceError> {
+        self.store.list(kind, namespace, format)
+    }
+    fn delete_resource(&self, reference: &ResourceRef) -> Result<(), FaceError> {
+        self.store.delete(reference)
+    }
+    fn watch_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
+        self.store.watch(kind, namespace, format)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -864,6 +801,9 @@ pub struct SystemdFace {
     name: String,
     user_units: bool,
     state: Mutex<FaceState>,
+    /// Shared verb-impl backend; R6 swaps for unit-file render +
+    /// dbus daemon-reload.
+    store: crate::face_store::InMemoryStore,
 }
 
 impl SystemdFace {
@@ -879,6 +819,7 @@ impl SystemdFace {
             name: decl.name.clone(),
             user_units,
             state: Mutex::new(FaceState::Stopped),
+            store: crate::face_store::InMemoryStore::new(decl.name.clone()),
         })
     }
 
@@ -888,6 +829,13 @@ impl SystemdFace {
     #[must_use]
     pub fn is_user_units(&self) -> bool {
         self.user_units
+    }
+
+    /// Replace the format adapter registry.
+    #[must_use]
+    pub fn with_adapters(mut self, adapters: crate::format::AdapterRegistry) -> Self {
+        self.store.set_adapters(adapters);
+        self
     }
 }
 
@@ -927,6 +875,37 @@ impl Face for SystemdFace {
         let state = self.state.lock().expect("face state mutex poisoned");
         *state == FaceState::Running
     }
+
+    // Verb delegates — shared in-memory backend (R6 swaps for unit-file render + dbus).
+    fn apply_resource(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
+        self.store.apply(format, body)
+    }
+    fn get_resource(
+        &self,
+        reference: &ResourceRef,
+        format: ResourceFormat,
+    ) -> Result<Vec<u8>, FaceError> {
+        self.store.get(reference, format)
+    }
+    fn list_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Vec<Vec<u8>>, FaceError> {
+        self.store.list(kind, namespace, format)
+    }
+    fn delete_resource(&self, reference: &ResourceRef) -> Result<(), FaceError> {
+        self.store.delete(reference)
+    }
+    fn watch_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
+        self.store.watch(kind, namespace, format)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -952,6 +931,9 @@ impl Face for SystemdFace {
 pub struct BareMetalSupervisorFace {
     name: String,
     state: Mutex<FaceState>,
+    /// Shared verb-impl backend; R6 swaps for systemd-orchestrated
+    /// container supervision.
+    store: crate::face_store::InMemoryStore,
 }
 
 impl BareMetalSupervisorFace {
@@ -965,7 +947,15 @@ impl BareMetalSupervisorFace {
         Some(Self {
             name: decl.name.clone(),
             state: Mutex::new(FaceState::Stopped),
+            store: crate::face_store::InMemoryStore::new(decl.name.clone()),
         })
+    }
+
+    /// Replace the format adapter registry.
+    #[must_use]
+    pub fn with_adapters(mut self, adapters: crate::format::AdapterRegistry) -> Self {
+        self.store.set_adapters(adapters);
+        self
     }
 }
 
@@ -1003,6 +993,37 @@ impl Face for BareMetalSupervisorFace {
     fn is_running(&self) -> bool {
         let state = self.state.lock().expect("face state mutex poisoned");
         *state == FaceState::Running
+    }
+
+    // Verb delegates — shared in-memory backend (R6 swaps for supervised containers).
+    fn apply_resource(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
+        self.store.apply(format, body)
+    }
+    fn get_resource(
+        &self,
+        reference: &ResourceRef,
+        format: ResourceFormat,
+    ) -> Result<Vec<u8>, FaceError> {
+        self.store.get(reference, format)
+    }
+    fn list_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Vec<Vec<u8>>, FaceError> {
+        self.store.list(kind, namespace, format)
+    }
+    fn delete_resource(&self, reference: &ResourceRef) -> Result<(), FaceError> {
+        self.store.delete(reference)
+    }
+    fn watch_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        format: ResourceFormat,
+    ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
+        self.store.watch(kind, namespace, format)
     }
 }
 
@@ -1366,71 +1387,110 @@ mod tests {
 
     // ── Resource verbs — default Unsupported behavior ─────────────
 
-    // NOTE: PureRaftFace now overrides apply_resource (first
-    // concrete impl). The Yaml-format-Unsupported case is covered
-    // by `pure_raft_apply_yaml_format_unsupported` further down.
-    // Default-unsupported coverage shifts to faces that haven't
-    // yet overridden — KubernetesFace / NomadFace / SystemdFace /
-    // BareMetalSupervisorFace.
+    // NOTE: All 5 faces now share the InMemoryStore verb backend
+    // (face_store::InMemoryStore). The verbs work uniformly on
+    // every face today; per-face R6 backends replace the store
+    // without changing the operator-facing contract.
 
-    #[test]
-    fn apply_resource_default_unsupported_for_kubernetes() {
-        let face = KubernetesFace::from_declaration(&k8s_decl()).unwrap();
-        match face.apply_resource(ResourceFormat::Yaml, b"---\nkind: Pod\n") {
-            Err(FaceError::Unsupported(msg)) => {
-                assert!(msg.contains("apply_resource"), "msg: {msg}");
-                assert!(msg.contains(face.name()), "msg: {msg}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+    fn yaml_manifest(name: &str, ns: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec:\n  containers:\n    - name: c\n      image: nginx\n"
+        )
+        .into_bytes()
     }
 
     #[test]
-    fn get_resource_default_unsupported_for_kubernetes() {
+    fn kubernetes_face_apply_get_yaml_round_trips() {
         let face = KubernetesFace::from_declaration(&k8s_decl()).unwrap();
+        let yaml = yaml_manifest("nginx", "default");
+        face.apply_resource(ResourceFormat::Yaml, &yaml).unwrap();
         let r = ResourceRef::namespaced("Pod", "nginx", "default");
-        match face.get_resource(&r, ResourceFormat::Yaml) {
-            Err(FaceError::Unsupported(msg)) => {
-                assert!(msg.contains("get_resource"), "msg: {msg}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        let back = face.get_resource(&r, ResourceFormat::Yaml).unwrap();
+        assert_eq!(back, yaml);
     }
 
     #[test]
-    fn list_resources_default_unsupported_for_nomad() {
+    fn nomad_face_apply_get_json_round_trips() {
         let face = NomadFace::from_declaration(&nomad_decl()).unwrap();
-        match face.list_resources("Job", Some("global"), ResourceFormat::Hcl) {
-            Err(FaceError::Unsupported(msg)) => {
-                assert!(msg.contains("list_resources"), "msg: {msg}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        let json = serde_json::to_vec(&serde_json::json!({
+            "apiVersion": "nomad.io/v1",
+            "kind": "Job",
+            "metadata": { "name": "web", "namespace": "global" }
+        }))
+        .unwrap();
+        face.apply_resource(ResourceFormat::Json, &json).unwrap();
+        let r = ResourceRef::namespaced("Job", "web", "global");
+        let back = face.get_resource(&r, ResourceFormat::Json).unwrap();
+        assert_eq!(back, json);
     }
 
     #[test]
-    fn delete_resource_default_unsupported_for_systemd() {
+    fn systemd_face_list_aggregates_applied_resources() {
         let face = SystemdFace::from_declaration(&systemd_decl(false)).unwrap();
-        let r = ResourceRef::cluster_scoped("Unit", "engenho.service");
-        match face.delete_resource(&r) {
-            Err(FaceError::Unsupported(msg)) => {
-                assert!(msg.contains("delete_resource"), "msg: {msg}");
+        let y1 = yaml_manifest("a", "default");
+        let y2 = yaml_manifest("b", "default");
+        face.apply_resource(ResourceFormat::Yaml, &y1).unwrap();
+        face.apply_resource(ResourceFormat::Yaml, &y2).unwrap();
+        let listed = face
+            .list_resources("Pod", Some("default"), ResourceFormat::Yaml)
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[test]
+    fn bms_face_watch_streams_events() {
+        let face = BareMetalSupervisorFace::from_declaration(&bms_decl()).unwrap();
+        let mut watch = face
+            .watch_resources("Pod", Some("default"), ResourceFormat::Yaml)
+            .unwrap();
+        let yaml = yaml_manifest("nginx", "default");
+        face.apply_resource(ResourceFormat::Yaml, &yaml).unwrap();
+        let ev = watch.next_event().unwrap().expect("event");
+        assert_eq!(ev.kind, FaceWatchEventKind::Added);
+    }
+
+    #[test]
+    fn delete_resource_missing_errors_uniformly_across_faces() {
+        let r = ResourceRef::namespaced("Pod", "missing", "default");
+        let k = KubernetesFace::from_declaration(&k8s_decl()).unwrap();
+        let n = NomadFace::from_declaration(&nomad_decl()).unwrap();
+        let s = SystemdFace::from_declaration(&systemd_decl(false)).unwrap();
+        let b = BareMetalSupervisorFace::from_declaration(&bms_decl()).unwrap();
+        let p = PureRaftFace::from_declaration(&raft_decl()).unwrap();
+        for (label, result) in [
+            ("k8s", k.delete_resource(&r)),
+            ("nomad", n.delete_resource(&r)),
+            ("systemd", s.delete_resource(&r)),
+            ("bms", b.delete_resource(&r)),
+            ("pure-raft", p.delete_resource(&r)),
+        ] {
+            match result {
+                Err(FaceError::Unsupported(msg)) => {
+                    assert!(msg.contains("no resource"), "{label}: msg: {msg}");
+                }
+                other => panic!("{label}: expected Unsupported, got {other:?}"),
             }
-            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 
     #[test]
-    fn watch_resources_default_unsupported_for_bms() {
-        let face = BareMetalSupervisorFace::from_declaration(&bms_decl()).unwrap();
-        // Box<dyn FaceWatchStream> doesn't impl Debug — pattern-match
-        // the Result rather than `.unwrap_err()`.
-        match face.watch_resources("Pod", None, ResourceFormat::Json) {
-            Err(FaceError::Unsupported(msg)) => {
-                assert!(msg.contains("watch_resources"), "msg: {msg}");
-            }
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Err, got Ok"),
+    fn all_five_faces_apply_get_uniform_across_yaml() {
+        // The canonical "across all 5 faces" cross-face test —
+        // operator semantics are identical regardless of which
+        // face is active.
+        let faces: Vec<Box<dyn Face>> = vec![
+            Box::new(PureRaftFace::from_declaration(&raft_decl()).unwrap()),
+            Box::new(KubernetesFace::from_declaration(&k8s_decl()).unwrap()),
+            Box::new(NomadFace::from_declaration(&nomad_decl()).unwrap()),
+            Box::new(SystemdFace::from_declaration(&systemd_decl(false)).unwrap()),
+            Box::new(BareMetalSupervisorFace::from_declaration(&bms_decl()).unwrap()),
+        ];
+        let yaml = yaml_manifest("nginx", "default");
+        let r = ResourceRef::namespaced("Pod", "nginx", "default");
+        for face in &faces {
+            face.apply_resource(ResourceFormat::Yaml, &yaml).unwrap();
+            let back = face.get_resource(&r, ResourceFormat::Yaml).unwrap();
+            assert_eq!(back, yaml, "face {} should round-trip YAML", face.name());
         }
     }
 
