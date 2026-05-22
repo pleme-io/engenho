@@ -20,6 +20,7 @@ futures            = { workspace = true }
 anyhow             = { workspace = true }
 
 engenho-types      = { workspace = true }
+engenho-config     = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

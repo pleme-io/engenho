@@ -11,6 +11,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TeiaError;
 
+/// Wire engenho-config's top-level TeiaConfig into this runtime
+/// TeiaConfig. Operators set one yaml file; this conversion gives
+/// the teia runtime its exact slice. Server-name list and cluster
+/// name are passed through verbatim; the runtime applies per-attempt
+/// + total timeouts derived from the single `connect_timeout_seconds`
+/// (per-attempt is 1/3 of total, capped at 3s).
+impl From<&engenho_config::TeiaConfig> for TeiaConfig {
+    fn from(top: &engenho_config::TeiaConfig) -> Self {
+        let total = Duration::from_secs(u64::from(top.connect_timeout_seconds));
+        let per_attempt = total
+            .checked_div(3)
+            .unwrap_or(Duration::from_secs(3))
+            .min(Duration::from_secs(3));
+        Self {
+            servers: top.servers.clone(),
+            cluster: top.cluster.clone(),
+            credentials_path: top.credentials_path.clone(),
+            connect_timeout: total,
+            server_timeout: per_attempt,
+            client_name: Some("engenho-teia".to_string()),
+            leaf_remotes: Vec::new(),
+        }
+    }
+}
+
+impl From<engenho_config::TeiaConfig> for TeiaConfig {
+    fn from(top: engenho_config::TeiaConfig) -> Self {
+        (&top).into()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TeiaConfig {
     /// NATS server URLs (any of: `nats://host:port`, `tls://host:port`,
@@ -170,6 +201,36 @@ mod tests {
         let cfg = TeiaConfig::default().with_cluster("eng.eho");
         let err = cfg.validate().unwrap_err();
         assert_eq!(err.kind(), "invalid_config");
+    }
+
+    #[test]
+    fn from_engenho_config_carries_servers_and_cluster() {
+        use engenho_config::TeiaConfig as TopTeia;
+        let top = TopTeia {
+            servers: vec!["nats://nats:4222".into()],
+            cluster: "rio".into(),
+            credentials_path: Some("/etc/creds".into()),
+            connect_timeout_seconds: 15,
+        };
+        let runtime: TeiaConfig = (&top).into();
+        assert_eq!(runtime.servers, vec!["nats://nats:4222"]);
+        assert_eq!(runtime.cluster, "rio");
+        assert_eq!(runtime.credentials_path.as_deref(), Some("/etc/creds"));
+        assert_eq!(runtime.connect_timeout, std::time::Duration::from_secs(15));
+        runtime.validate().unwrap();
+    }
+
+    #[test]
+    fn from_owned_engenho_config_works_too() {
+        use engenho_config::TeiaConfig as TopTeia;
+        let top = TopTeia {
+            servers: vec!["nats://a:4222".into(), "nats://b:4222".into()],
+            cluster: "test".into(),
+            credentials_path: None,
+            connect_timeout_seconds: 10,
+        };
+        let runtime: TeiaConfig = top.into();
+        assert_eq!(runtime.servers.len(), 2);
     }
 
     #[test]

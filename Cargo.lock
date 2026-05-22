@@ -882,6 +882,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "engenho-config",
  "engenho-store",
  "engenho-types",
  "proptest",
@@ -1008,6 +1009,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "async-trait",
+ "engenho-config",
  "engenho-types",
  "futures",
  "proptest",
