@@ -1012,6 +1012,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "engenho-teia",
  "engenho-types",
  "openraft",
  "proptest",
