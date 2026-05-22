@@ -38,6 +38,7 @@
 pub mod attestation;
 pub mod backend;
 pub mod backend_fs;
+pub mod backends;
 pub mod cluster;
 pub mod consensus;
 pub mod content;
@@ -55,6 +56,11 @@ pub use backend::{
     supervised_systemd_stub, systemd_dbus_stub,
 };
 pub use backend_fs::FileSystemBackend;
+pub use backends::{
+    KubeApiServerBackend, KubeApiServerConfig, NomadHttpBackend, NomadHttpConfig,
+    RaftBackend, RaftConfig, SupervisedSystemdBackend, SupervisedSystemdConfig,
+    SystemdDbusBackend, SystemdDbusConfig,
+};
 
 pub use format::{
     AdapterError, FormatAdapter, HclAdapter, K8sJsonAdapter, K8sYamlAdapter,
