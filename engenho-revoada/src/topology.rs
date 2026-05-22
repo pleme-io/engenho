@@ -458,17 +458,32 @@ impl TopologyStrategy for Quorum3M {
         if masters_lost.is_empty() {
             return Vec::new();
         }
-        // Promote workers to fill the gaps; keep total masters at 3.
+        // Promote any non-lost eligible non-master to fill the
+        // gap. Order: Workers first (they were active), then
+        // Standbys (just-rejoined nodes). This keeps Quorum3M
+        // resilient through cycles of loss + rejoin.
         let need = masters_lost.len();
-        let workers: Vec<NodeId> = current
-            .nodes_with_role(Role::Worker)
-            .into_iter()
-            .filter(|n| !lost_set.contains(n))
-            .cloned()
+        let mut prioritised: Vec<(u8, NodeId)> = current
+            .assignments
+            .iter()
+            .filter(|(id, state)| {
+                !lost_set.contains(id)
+                    && state.is_eligible()
+                    && !matches!(state, NodeState::Active(Role::Master))
+            })
+            .map(|(id, state)| {
+                let priority = match state {
+                    NodeState::Active(Role::Worker) => 0u8,
+                    NodeState::Standby => 1,
+                    _ => 2,
+                };
+                (priority, id.clone())
+            })
             .collect();
+        prioritised.sort_by_key(|(p, _)| *p);
         let mut tx = Vec::new();
-        for w in workers.into_iter().take(need) {
-            tx.push(Transition::Reassign(w, Role::Master));
+        for (_, id) in prioritised.into_iter().take(need) {
+            tx.push(Transition::Promote(id, Role::Master));
         }
         for n in lost {
             tx.push(Transition::Evict(n.clone()));
@@ -751,14 +766,18 @@ mod tests {
         let mut current = s.assign(&ids(5)).unwrap();
         let lost = vec![NodeId::new("node-1")];
         let tx = s.react_to_loss(&current, &lost);
+        // Quorum3M now uses Promote (semantically: a non-master
+        // becomes master), prioritising Workers then Standbys.
         let promotes: Vec<&Transition> = tx
             .iter()
-            .filter(|t| matches!(t, Transition::Reassign(_, Role::Master)))
+            .filter(|t| matches!(t, Transition::Promote(_, Role::Master)))
             .collect();
         assert_eq!(promotes.len(), 1);
         for t in tx {
             match t {
-                Transition::Reassign(id, r) => current.set(id, NodeState::Active(r)),
+                Transition::Promote(id, r) | Transition::Reassign(id, r) => {
+                    current.set(id, NodeState::Active(r))
+                }
                 Transition::Evict(id) => current.set(id, NodeState::Failed),
                 _ => {}
             }
@@ -774,12 +793,14 @@ mod tests {
         let tx = s.react_to_loss(&current, &lost);
         let promotes: Vec<&Transition> = tx
             .iter()
-            .filter(|t| matches!(t, Transition::Reassign(_, Role::Master)))
+            .filter(|t| matches!(t, Transition::Promote(_, Role::Master)))
             .collect();
         assert_eq!(promotes.len(), 2);
         for t in tx {
             match t {
-                Transition::Reassign(id, r) => current.set(id, NodeState::Active(r)),
+                Transition::Promote(id, r) | Transition::Reassign(id, r) => {
+                    current.set(id, NodeState::Active(r))
+                }
                 Transition::Evict(id) => current.set(id, NodeState::Failed),
                 _ => {}
             }
