@@ -667,6 +667,191 @@ impl TopologyStrategy for Phalanx {
 }
 
 // =================================================================
+// TopologyReactor — R-TOPO.1
+// =================================================================
+
+/// `TopologyReactor` — the runtime that closes the loop between
+/// membership observations and topology transitions.
+///
+/// Pure typed primitive — no I/O, no Raft coupling. The integration
+/// path:
+///
+///   1. The membership layer (chitchat / phi-accrual) calls
+///      [`TopologyReactor::observe_membership`] when it sees an
+///      eligible-set change.
+///   2. The reactor computes the [`Transition`] list (admit new,
+///      react to losses).
+///   3. The caller commits those transitions through Raft.
+///   4. After commit, the caller calls [`TopologyReactor::apply_transition`]
+///      to update the reactor's local view.
+///   5. The reactor's [`current`](TopologyReactor::current) is
+///      always the last committed snapshot.
+///
+/// This separation lets the reactor be tested in pure unit form
+/// (no Raft, no async) while still being the load-bearing piece
+/// of the policy engine's formation-shift logic.
+pub struct TopologyReactor {
+    strategy: Box<dyn TopologyStrategy>,
+    current: std::sync::Mutex<RoleAssignment>,
+}
+
+impl std::fmt::Debug for TopologyReactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopologyReactor")
+            .field("strategy", &self.strategy.name())
+            .field("current", &self.current.lock().unwrap())
+            .finish()
+    }
+}
+
+impl TopologyReactor {
+    /// Construct with a strategy + empty initial assignment.
+    #[must_use]
+    pub fn new(strategy: Box<dyn TopologyStrategy>) -> Self {
+        Self {
+            strategy,
+            current: std::sync::Mutex::new(RoleAssignment::new()),
+        }
+    }
+
+    /// Construct with a strategy + an existing assignment (used
+    /// at process restart to recover from the Raft log replay).
+    #[must_use]
+    pub fn with_initial(
+        strategy: Box<dyn TopologyStrategy>,
+        initial: RoleAssignment,
+    ) -> Self {
+        Self {
+            strategy,
+            current: std::sync::Mutex::new(initial),
+        }
+    }
+
+    /// Strategy name (telemetry).
+    #[must_use]
+    pub fn strategy_name(&self) -> &'static str {
+        self.strategy.name()
+    }
+
+    /// The current committed assignment snapshot.
+    #[must_use]
+    pub fn current(&self) -> RoleAssignment {
+        self.current.lock().unwrap().clone()
+    }
+
+    /// Compute the transitions to apply given a membership snapshot.
+    ///
+    /// - `eligible_now`: every node the membership layer considers
+    ///    alive + healthy right now.
+    /// - `failed_now`: every node the membership layer just flagged
+    ///    as failed (phi-accrual fired). These should be a subset of
+    ///    the current assignment.
+    ///
+    /// Returns transitions in commit order:
+    ///   1. `Admit(new)` for every node in `eligible_now` not yet
+    ///      tracked.
+    ///   2. The strategy's `react_to_loss(...)` for `failed_now`.
+    ///
+    /// The reactor does NOT mutate its internal state — that
+    /// happens via [`apply_transition`](Self::apply_transition)
+    /// once the caller has Raft-committed each transition.
+    pub fn observe_membership(
+        &self,
+        eligible_now: &[NodeId],
+        failed_now: &[NodeId],
+    ) -> Vec<Transition> {
+        let current = self.current.lock().unwrap().clone();
+        let mut tx = Vec::new();
+
+        // 1. Admit new eligible nodes.
+        for id in eligible_now {
+            if current.get(id).is_none() {
+                tx.push(Transition::Admit(id.clone()));
+            }
+        }
+
+        // 1b. Bootstrap: if there are no active masters yet AND
+        // the strategy can satisfy its min_nodes from the
+        // newly-admitted population, run assign() to materialize
+        // the initial shape. This lets a cold cluster transition
+        // from {N standby nodes} to {target shape} in a single
+        // observe_membership call.
+        let no_active_masters = current.nodes_with_role(Role::Master).is_empty();
+        if no_active_masters && eligible_now.len() >= self.strategy.min_nodes() {
+            if let Ok(target) = self.strategy.assign(eligible_now) {
+                for (id, state) in &target.assignments {
+                    if let Some(role) = state.role() {
+                        // Skip nodes that already hold this role
+                        // (idempotency); admit ones the loop above
+                        // already queued.
+                        if current.get(id).and_then(NodeState::role) != Some(role) {
+                            tx.push(Transition::Promote(id.clone(), role));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. React to losses.
+        if !failed_now.is_empty() {
+            let mut effective = current.clone();
+            for id in eligible_now {
+                if effective.get(id).is_none() {
+                    effective.set(id.clone(), NodeState::Standby);
+                }
+            }
+            let strategy_tx = self.strategy.react_to_loss(&effective, failed_now);
+            // Strategy may skip evicting nodes that weren't holding
+            // a role. The reactor always emits an Evict for every
+            // failed node so its local view reflects reality —
+            // failed Standbys are tracked + cleaned up.
+            let mut emitted_evicts: std::collections::HashSet<NodeId> =
+                std::collections::HashSet::new();
+            for t in &strategy_tx {
+                if let Transition::Evict(id) = t {
+                    emitted_evicts.insert(id.clone());
+                }
+            }
+            tx.extend(strategy_tx);
+            for id in failed_now {
+                if !emitted_evicts.contains(id) {
+                    tx.push(Transition::Evict(id.clone()));
+                }
+            }
+        }
+        tx
+    }
+
+    /// Apply a committed transition to the local view. Called by
+    /// the Raft state-machine apply path after the transition has
+    /// been durably committed.
+    pub fn apply_transition(&self, t: &Transition) {
+        let mut current = self.current.lock().unwrap();
+        match t.clone() {
+            Transition::Admit(id) => current.set(id, NodeState::Standby),
+            Transition::Promote(id, r) => current.set(id, NodeState::Active(r)),
+            Transition::Demote(id) => current.set(id, NodeState::Demoting),
+            Transition::Reassign(id, r) => current.set(id, NodeState::Active(r)),
+            Transition::Evict(id) => current.set(id, NodeState::Failed),
+        }
+    }
+
+    /// Apply many transitions atomically (single lock acquisition).
+    pub fn apply_transitions(&self, transitions: &[Transition]) {
+        let mut current = self.current.lock().unwrap();
+        for t in transitions {
+            match t.clone() {
+                Transition::Admit(id) => current.set(id, NodeState::Standby),
+                Transition::Promote(id, r) => current.set(id, NodeState::Active(r)),
+                Transition::Demote(id) => current.set(id, NodeState::Demoting),
+                Transition::Reassign(id, r) => current.set(id, NodeState::Active(r)),
+                Transition::Evict(id) => current.set(id, NodeState::Failed),
+            }
+        }
+    }
+}
+
+// =================================================================
 // Tests
 // =================================================================
 
