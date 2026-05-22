@@ -808,6 +808,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-controllers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "engenho-store",
+ "engenho-types",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "engenho-kube-client"
 version = "0.1.0"
 dependencies = [
