@@ -1,0 +1,103 @@
+name: auto-bump
+
+# On every push to main: bump workspace patch version, regenerate
+# Cargo.nix, commit + tag `v<X.Y.Z>`, and push. The tag push then
+# triggers `crates-publish.yml` which fans out `cargo publish` to
+# every workspace member in topological order.
+#
+# Skips when the bot itself pushed (avoids loops) and when nothing
+# under engenho-*/ or Cargo.toml changed since the previous tag.
+#
+# BOT_PAT (optional): a PAT with `repo` scope. If present, the tag
+# push triggers downstream workflows. Without it, GITHUB_TOKEN
+# pushes but the recursive trigger is suppressed by GH security
+# policy and the operator must run `gh workflow run crates-publish.yml
+# --ref v<X.Y.Z>` manually.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump-type:
+        description: "patch | minor | major"
+        required: false
+        default: patch
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Skip if no real changes since last tag
+        id: changes
+        shell: bash
+        run: |
+          last=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$last" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "No prior tag — will publish v0.1.0 (initial release)."
+            exit 0
+          fi
+          # Real changes = anything under engenho-* OR root Cargo.toml.
+          # Skip when only docs/ci/scripts changed (no publishable diff).
+          if git diff --quiet "$last" HEAD -- 'engenho*' Cargo.toml Cargo.lock; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No source changes since $last; skipping bump."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Source changes detected since $last; bumping."
+          fi
+
+      - name: Install Rust + cargo-edit
+        if: steps.changes.outputs.skip == 'false'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-edit (provides cargo set-version)
+        if: steps.changes.outputs.skip == 'false'
+        run: cargo install --locked cargo-edit
+
+      - name: Install Nix (for crate2nix regen)
+        if: steps.changes.outputs.skip == 'false'
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Bump workspace version + regen Cargo.nix
+        if: steps.changes.outputs.skip == 'false'
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUMP_TYPE="${{ inputs.bump-type || 'patch' }}"
+          OLD_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "Bumping $BUMP_TYPE from $OLD_VERSION..."
+          cargo set-version --workspace --bump "$BUMP_TYPE"
+          NEW_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "New version: $NEW_VERSION"
+          echo "new-version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          # Regenerate Cargo.nix so nix builds stay reproducible.
+          nix run github:nix-community/crate2nix -- generate
+          # Refresh Cargo.lock to match new versions.
+          cargo update --workspace || true
+
+      - name: Commit + tag + push
+        if: steps.changes.outputs.skip == 'false'
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.new-version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock Cargo.nix engenho-*/Cargo.toml
+          git commit -m "release: workspace v${NEW_VERSION}"
+          git tag "v${NEW_VERSION}"
+          git push origin main
+          git push origin "v${NEW_VERSION}"
+          echo "Pushed v${NEW_VERSION}. Tag push triggers crates-publish.yml."

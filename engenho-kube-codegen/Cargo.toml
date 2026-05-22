@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
+homepage.workspace     = true
+readme.workspace       = true
+categories.workspace   = true
+keywords.workspace     = true
 description = "OpenAPI v3 → typed Rust source generator for engenho-types. Reads BLAKE3-attested vendored K8s schemas + emits one Rust struct per kind with `impl KubeResource`. Per theory/ENGENHO.md §IV — generation over composition (Pillar 12)."
 
 [dependencies]

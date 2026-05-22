@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 description = "engenho-teia — the NATS fabric layer for engenho. Carries Raft RPC, watch streams, content sync, attestation receipts, and observability events across one typed transport. See docs/FABRIC.md."
 
 [dependencies]

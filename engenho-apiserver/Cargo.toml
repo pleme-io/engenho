@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 description = "engenho-apiserver — HTTP K8s API wrapping engenho-store. Translates kubectl REST operations into typed ResourceCommand proposals via the distributed substrate. Layer R7 of the engenho K8s base layer."
 
 [dependencies]

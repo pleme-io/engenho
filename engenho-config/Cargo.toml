@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 description = "engenho-config — the top-level shikumi-back typed configuration surface for the whole engenho substrate. EngenhoConfig owns cluster + revoada + teia + scheduler + controllers + consistency sub-structs; each provides shikumi::TieredConfig with reasonable prescribed_default()s so 90% of operators get a working substrate from cargo run."
 
 [dependencies]

@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
 description = "engenho-kubelet — the missing piece between 'Pod object in the store' and 'container running on host'. Per-node controller that watches Pods bound to its node + materializes containers via a pluggable ContainerRuntime backend (PodmanBackend / CriBackend / RunwasiBackend / FakeBackend for tests)."
 
 [dependencies]
