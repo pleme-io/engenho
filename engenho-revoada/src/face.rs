@@ -474,8 +474,9 @@ pub fn instantiate(decl: &FabricFace) -> Result<Box<dyn Face>, FaceError> {
             NomadFace::from_declaration(decl)
                 .expect("kind matched, declaration must construct"),
         )),
-        FaceKind::Systemd { .. } => Err(FaceError::Unsupported(
-            "SystemdFace impl lands at engenho-revoada R6+".into(),
+        FaceKind::Systemd { .. } => Ok(Box::new(
+            SystemdFace::from_declaration(decl)
+                .expect("kind matched, declaration must construct"),
         )),
         FaceKind::BareMetalSupervisor => Err(FaceError::Unsupported(
             "BareMetalSupervisorFace impl lands at engenho-revoada R6+".into(),
@@ -659,19 +660,105 @@ mod tests {
         }
     }
 
+    fn systemd_decl(user_units: bool) -> FabricFace {
+        FabricFace {
+            name: if user_units { "systemd-user" } else { "systemd-system" }.into(),
+            kind: FaceKind::Systemd { user_units },
+        }
+    }
+
+    // ── SystemdFace ───────────────────────────────────────────────
+
     #[test]
-    fn instantiate_systemd_still_unsupported_until_r6() {
+    fn systemd_constructs_from_matching_declaration() {
+        let face = SystemdFace::from_declaration(&systemd_decl(true)).unwrap();
+        assert_eq!(face.name(), "systemd-user");
+        assert!(face.is_user_units());
+    }
+
+    #[test]
+    fn systemd_carries_user_vs_system_distinction() {
+        let user = SystemdFace::from_declaration(&systemd_decl(true)).unwrap();
+        let system = SystemdFace::from_declaration(&systemd_decl(false)).unwrap();
+        assert!(user.is_user_units());
+        assert!(!system.is_user_units());
+    }
+
+    #[test]
+    fn systemd_rejects_non_matching_declaration() {
+        assert!(SystemdFace::from_declaration(&k8s_decl()).is_none());
+        assert!(SystemdFace::from_declaration(&raft_decl()).is_none());
+        assert!(SystemdFace::from_declaration(&nomad_decl()).is_none());
+    }
+
+    #[test]
+    fn systemd_lifecycle_starts_then_stops() {
+        let face = SystemdFace::from_declaration(&systemd_decl(false)).unwrap();
+        face.start().unwrap();
+        assert!(face.is_running());
+        face.shutdown().unwrap();
+        assert!(!face.is_running());
+    }
+
+    #[test]
+    fn instantiate_systemd_returns_running_face() {
+        match instantiate(&systemd_decl(false)) {
+            Ok(face) => {
+                assert_eq!(face.name(), "systemd-system");
+                match face.kind() {
+                    FaceKind::Systemd { user_units } => assert!(!user_units),
+                    other => panic!("expected Systemd face, got {other:?}"),
+                }
+            }
+            Err(e) => panic!("Systemd face should construct, got error {e}"),
+        }
+    }
+
+    #[test]
+    fn instantiate_bare_metal_supervisor_still_unsupported_until_r6() {
+        // Now the last remaining unsupported face — BareMetalSupervisor.
         let decl = FabricFace {
-            name: "systemd-test".into(),
-            kind: FaceKind::Systemd { user_units: false },
+            name: "bms-test".into(),
+            kind: FaceKind::BareMetalSupervisor,
         };
         match instantiate(&decl) {
             Err(FaceError::Unsupported(msg)) => {
                 assert!(msg.contains("R6"), "msg: {msg}");
             }
             Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Err for Systemd face, got Ok"),
+            Ok(_) => panic!("expected Err for BareMetalSupervisor face, got Ok"),
         }
+    }
+
+    #[test]
+    fn four_faces_compose_in_a_single_vec() {
+        // FOUR impls now in a single Vec<Box<dyn Face>>:
+        //   PureRaft  — no rendering at all
+        //   Kubernetes — kube-apiserver API calls
+        //   Nomad      — nomad HTTP API calls
+        //   Systemd    — unit-file emission (file-based, not API!)
+        // The fourth impl proves generalization across a SECOND
+        // axis: the trait abstracts over both "API call" and "file
+        // emission" interaction shapes. If it had hidden API-call
+        // assumptions, SystemdFace wouldn't fit cleanly.
+        let faces: Vec<Box<dyn Face>> = vec![
+            Box::new(PureRaftFace::from_declaration(&raft_decl()).unwrap()),
+            Box::new(KubernetesFace::from_declaration(&k8s_decl()).unwrap()),
+            Box::new(NomadFace::from_declaration(&nomad_decl()).unwrap()),
+            Box::new(SystemdFace::from_declaration(&systemd_decl(false)).unwrap()),
+        ];
+        assert_eq!(faces.len(), 4);
+        let kinds: Vec<&'static str> = faces.iter().map(|f| match f.kind() {
+            FaceKind::PureRaft => "PureRaft",
+            FaceKind::Kubernetes { .. } => "Kubernetes",
+            FaceKind::Nomad { .. } => "Nomad",
+            FaceKind::Systemd { .. } => "Systemd",
+            FaceKind::BareMetalSupervisor => "BareMetalSupervisor",
+        }).collect();
+        assert_eq!(
+            kinds,
+            vec!["PureRaft", "Kubernetes", "Nomad", "Systemd"],
+        );
     }
 
     #[test]
