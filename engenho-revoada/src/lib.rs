@@ -49,8 +49,8 @@ pub mod policy;
 pub mod topology;
 
 pub use format::{
-    AdapterError, FormatAdapter, K8sJsonAdapter, K8sYamlAdapter, NativePassthroughAdapter,
-    encode_envelope,
+    AdapterError, FormatAdapter, HclAdapter, K8sJsonAdapter, K8sYamlAdapter,
+    NativePassthroughAdapter, encode_envelope,
 };
 
 pub use federation::{

@@ -3275,6 +3275,10 @@ rec {
             packageId = "engenho-types";
           }
           {
+            name = "hcl-rs";
+            packageId = "hcl-rs";
+          }
+          {
             name = "openraft";
             packageId = "openraft";
             features = [ "serde" "storage-v2" ];
@@ -4506,6 +4510,126 @@ rec {
           "rustc-dep-of-std" = [ "nightly" "core" "alloc" "rustc-internal-api" ];
           "serde" = [ "dep:serde_core" "dep:serde" ];
         };
+      };
+      "hcl-edit" = rec {
+        crateName = "hcl-edit";
+        version = "0.8.8";
+        edition = "2021";
+        sha256 = "077wkasaj67nal81bic21rr2pp3gq7974gs0k1vlqfvkvxy9yj48";
+        libName = "hcl_edit";
+        authors = [
+          "Martin Ohmann <martinohmann@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "fnv";
+            packageId = "fnv";
+          }
+          {
+            name = "hcl-primitives";
+            packageId = "hcl-primitives";
+          }
+          {
+            name = "vecmap-rs";
+            packageId = "vecmap-rs";
+          }
+          {
+            name = "winnow";
+            packageId = "winnow 0.7.15";
+          }
+        ];
+        features = {
+          "perf" = [ "hcl-primitives/perf" ];
+        };
+        resolvedDefaultFeatures = [ "default" ];
+      };
+      "hcl-primitives" = rec {
+        crateName = "hcl-primitives";
+        version = "0.1.11";
+        edition = "2021";
+        sha256 = "1xih8sm08ywms4ncc1bpw6nlhaxyddl4ljdv1pz2r7n80k9i36l2";
+        libName = "hcl_primitives";
+        authors = [
+          "Martin Ohmann <martinohmann@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "itoa";
+            packageId = "itoa";
+          }
+          {
+            name = "kstring";
+            packageId = "kstring";
+            optional = true;
+            features = [ "max_inline" ];
+          }
+          {
+            name = "ryu";
+            packageId = "ryu";
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            optional = true;
+            usesDefaultFeatures = false;
+            features = [ "alloc" "derive" ];
+          }
+          {
+            name = "unicode-ident";
+            packageId = "unicode-ident";
+          }
+        ];
+        features = {
+          "default" = [ "std" ];
+          "perf" = [ "std" "dep:kstring" ];
+          "serde" = [ "dep:serde" "kstring?/serde" ];
+          "std" = [ "serde?/std" ];
+        };
+        resolvedDefaultFeatures = [ "default" "serde" "std" ];
+      };
+      "hcl-rs" = rec {
+        crateName = "hcl-rs";
+        version = "0.18.7";
+        edition = "2021";
+        sha256 = "1x0zsr23vsqyzkmaavrzlyild971f3a0rl59x1lvk3csqi273bs8";
+        libName = "hcl";
+        authors = [
+          "Martin Ohmann <martinohmann@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "hcl-edit";
+            packageId = "hcl-edit";
+          }
+          {
+            name = "hcl-primitives";
+            packageId = "hcl-primitives";
+            features = [ "serde" ];
+          }
+          {
+            name = "indexmap";
+            packageId = "indexmap";
+            features = [ "serde" ];
+          }
+          {
+            name = "itoa";
+            packageId = "itoa";
+          }
+          {
+            name = "serde";
+            packageId = "serde";
+            features = [ "derive" ];
+          }
+          {
+            name = "vecmap-rs";
+            packageId = "vecmap-rs";
+            features = [ "serde" ];
+          }
+        ];
+        features = {
+          "perf" = [ "hcl-edit/perf" "hcl-primitives/perf" ];
+        };
+        resolvedDefaultFeatures = [ "default" ];
       };
       "heck" = rec {
         crateName = "heck";
@@ -5742,6 +5866,32 @@ rec {
           }
         ];
 
+      };
+      "kstring" = rec {
+        crateName = "kstring";
+        version = "2.0.2";
+        edition = "2021";
+        sha256 = "1lfvqlqkg2x23nglznb7ah6fk3vv3y5i759h5l2151ami98gk2sm";
+        authors = [
+          "Ed Page <eopage@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "serde";
+            packageId = "serde";
+            optional = true;
+          }
+          {
+            name = "static_assertions";
+            packageId = "static_assertions";
+          }
+        ];
+        features = {
+          "default" = [ "std" "unsafe" ];
+          "document-features" = [ "dep:document-features" ];
+          "serde" = [ "dep:serde" ];
+        };
+        resolvedDefaultFeatures = [ "default" "max_inline" "serde" "std" "unsafe" ];
       };
       "lazy_static" = rec {
         crateName = "lazy_static";
@@ -10116,6 +10266,17 @@ rec {
           "std" = [ "alloc" ];
         };
       };
+      "static_assertions" = rec {
+        crateName = "static_assertions";
+        version = "1.1.0";
+        edition = "2015";
+        sha256 = "0gsl6xmw10gvn3zs1rv99laj5ig7ylffnh71f9l34js4nr4r7sx2";
+        authors = [
+          "Nikolai Vazquez"
+        ];
+        features = {
+        };
+      };
       "strsim" = rec {
         crateName = "strsim";
         version = "0.11.1";
@@ -12138,6 +12299,28 @@ rec {
         };
         resolvedDefaultFeatures = [ "alloc" "std" ];
       };
+      "vecmap-rs" = rec {
+        crateName = "vecmap-rs";
+        version = "0.2.4";
+        edition = "2021";
+        sha256 = "0yr9y4zdhp8rgd2crm5acqbwmaq57z142vv6120am0qhnm4qcxgr";
+        libName = "vecmap";
+        authors = [
+          "Martin Ohmann <martinohmann@gmail.com>"
+        ];
+        dependencies = [
+          {
+            name = "serde";
+            packageId = "serde";
+            optional = true;
+            usesDefaultFeatures = false;
+          }
+        ];
+        features = {
+          "serde" = [ "dep:serde" ];
+        };
+        resolvedDefaultFeatures = [ "default" "serde" ];
+      };
       "version_check" = rec {
         crateName = "version_check";
         version = "0.9.5";
@@ -13122,7 +13305,7 @@ rec {
         dependencies = [
           {
             name = "windows-sys";
-            packageId = "windows-sys 0.52.0";
+            packageId = "windows-sys 0.61.2";
             target = { target, features }: (target."windows" or false);
             features = [ "Win32_Foundation" "Win32_Storage_FileSystem" "Win32_System_Console" "Win32_System_SystemInformation" ];
           }
@@ -13512,7 +13695,7 @@ rec {
           "Win32_Web" = [ "Win32" ];
           "Win32_Web_InternetExplorer" = [ "Win32_Web" ];
         };
-        resolvedDefaultFeatures = [ "Win32" "Win32_Foundation" "Win32_Storage" "Win32_Storage_FileSystem" "Win32_System" "Win32_System_Console" "Win32_System_SystemInformation" "Win32_System_Threading" "default" ];
+        resolvedDefaultFeatures = [ "Win32" "Win32_Foundation" "Win32_System" "Win32_System_Threading" "default" ];
       };
       "windows-sys 0.60.2" = rec {
         crateName = "windows-sys";

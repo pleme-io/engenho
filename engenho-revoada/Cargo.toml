@@ -44,6 +44,8 @@ ciborium           = "0.2"
 # operator-facing verb surface (extracts metadata.name/namespace
 # to build typed ResourceRef before storing).
 serde_yaml         = { workspace = true }
+# HclAdapter — Nomad HCL parsing.
+hcl-rs             = "0.18"
 
 [dev-dependencies]
 proptest = "1"
