@@ -56,6 +56,7 @@
 pub mod api;
 pub mod auth;
 pub mod client;
+pub mod consistency_tier;
 pub mod error;
 pub mod generated_v1_34;
 pub mod informer;
@@ -65,6 +66,10 @@ pub mod patch;
 pub mod primitives;
 pub mod reconciler;
 pub mod watch;
+
+pub use consistency_tier::{
+    tier_from_metadata, ConsistencyTier, CONSISTENCY_TIER_ANNOTATION,
+};
 
 // Generated kind modules land below this line. M0.0.1 introduces core_v1::Pod
 // as the proof-of-pipeline; M0.0.3 replaces it with generator output; M0.0.4
