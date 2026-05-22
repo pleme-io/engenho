@@ -62,6 +62,7 @@ pub mod generated_v1_34;
 pub mod informer;
 pub mod kind;
 pub mod meta;
+pub mod nomad_v1;
 pub mod patch;
 pub mod primitives;
 pub mod reconciler;
