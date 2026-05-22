@@ -880,6 +880,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-scheduler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "engenho-store",
+ "engenho-types",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "engenho-store"
 version = "0.1.0"
 dependencies = [

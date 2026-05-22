@@ -28,6 +28,7 @@ engenho-types          = { path = "engenho-types" }
 engenho-cluster-config = { path = "engenho-cluster-config" }
 engenho-kube-client    = { path = "engenho-kube-client" }
 engenho-store          = { path = "engenho-store" }
+engenho-scheduler      = { path = "engenho-scheduler" }
 axum                   = "0.7"
 hyper                  = "1"
 tower                  = "0.5"
