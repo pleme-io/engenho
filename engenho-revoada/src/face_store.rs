@@ -196,6 +196,88 @@ impl InMemoryStore {
         Ok(())
     }
 
+    // ── Snapshot / Restore ────────────────────────────────────────
+    //
+    // Deterministic state capture: emit a single CBOR-serialized
+    // payload that holds every `ResourceRef` + envelope bytes the
+    // store currently owns. Restore replays into a fresh store.
+    // Foundation for: backup-on-shutdown, restore-on-startup,
+    // in-memory cluster cloning, federation member migration.
+    //
+    // Pure-data primitive — no I/O. Operators wire to disk / object
+    // store / network via the bytes the snapshot returns.
+
+    /// Serialize every (ResourceRef, envelope) pair the store
+    /// currently holds into a CBOR-encoded byte buffer. Stable
+    /// ordering: entries are sorted by (kind, namespace, name) so
+    /// two snapshots of the same logical state produce byte-
+    /// identical output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FaceError::Unsupported`] on CBOR encode failure
+    /// (effectively unreachable — `Vec<(ResourceRef, Vec<u8>)>` is
+    /// always serializable).
+    pub fn snapshot(&self) -> Result<Vec<u8>, FaceError> {
+        let store = self.store.lock().expect("store mutex poisoned");
+        let mut entries: Vec<(ResourceRef, Vec<u8>)> = store
+            .iter()
+            .map(|(r, body)| (r.clone(), body.clone()))
+            .collect();
+        drop(store);
+        entries.sort_by(|a, b| {
+            a.0.kind
+                .cmp(&b.0.kind)
+                .then(a.0.namespace.cmp(&b.0.namespace))
+                .then(a.0.name.cmp(&b.0.name))
+        });
+        let mut out = Vec::new();
+        ciborium::into_writer(&entries, &mut out).map_err(|e| {
+            FaceError::Unsupported(format!("snapshot: cbor encode failed: {e}"))
+        })?;
+        Ok(out)
+    }
+
+    /// Replay a snapshot into this store. **Replaces** the entire
+    /// store contents (any existing entries are dropped). Emits no
+    /// watch events — restore is a state-resync, not a sequence of
+    /// applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FaceError::Unsupported`] on CBOR decode failure
+    /// (malformed snapshot bytes).
+    pub fn restore(&self, snapshot_bytes: &[u8]) -> Result<(), FaceError> {
+        let entries: Vec<(ResourceRef, Vec<u8>)> =
+            ciborium::from_reader(snapshot_bytes).map_err(|e| {
+                FaceError::Unsupported(format!("restore: cbor decode failed: {e}"))
+            })?;
+        let mut store = self.store.lock().expect("store mutex poisoned");
+        store.clear();
+        for (r, body) in entries {
+            store.insert(r, body);
+        }
+        Ok(())
+    }
+
+    /// Number of resources currently stored. Used by ClusterHealth.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.store.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// True iff the store has no resources.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of active watch subscribers. Used by ClusterHealth.
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
     /// Watch: register subscriber, replay current state as Added.
     /// Events emit raw envelope bytes (subscribers adapt as needed).
     pub fn watch(

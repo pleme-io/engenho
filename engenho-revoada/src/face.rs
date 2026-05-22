@@ -95,6 +95,57 @@ pub trait Face: Send + Sync + 'static {
     /// override this.
     fn is_running(&self) -> bool;
 
+    // ── Observability + state capture ─────────────────────────────
+    //
+    // Default impls return zero / Unsupported so faces with
+    // non-InMemoryStore backends (e.g. R6 kube-apiserver bridge)
+    // can override with backend-specific metrics. Faces that
+    // compose with the standard InMemoryStore delegate to it.
+
+    /// Resources currently held by this face's backend. Default
+    /// impl returns 0 (faces that don't have a notion of "stored
+    /// resources" — e.g. a face that proxies to an external API
+    /// without local cache — opt out by leaving the default).
+    fn resource_count(&self) -> usize {
+        0
+    }
+
+    /// Active watch subscribers. Default impl returns 0 (faces
+    /// without local fan-out leave the default).
+    fn subscriber_count(&self) -> usize {
+        0
+    }
+
+    /// Emit a CBOR snapshot of every resource this face holds.
+    /// Default impl is `Err(FaceError::Unsupported)` — faces with
+    /// a backing store override.
+    ///
+    /// # Errors
+    ///
+    /// Default: `Err(FaceError::Unsupported)`. Faces with an
+    /// addressable store override.
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> {
+        Err(FaceError::Unsupported(format!(
+            "snapshot not supported by {}",
+            self.name()
+        )))
+    }
+
+    /// Restore the face's resources from a snapshot. **Replaces**
+    /// all existing state. Default impl is
+    /// `Err(FaceError::Unsupported)`.
+    ///
+    /// # Errors
+    ///
+    /// Default: `Err(FaceError::Unsupported)`. Faces with an
+    /// addressable store override.
+    fn restore(&self, _snapshot_bytes: &[u8]) -> Result<(), FaceError> {
+        Err(FaceError::Unsupported(format!(
+            "restore not supported by {}",
+            self.name()
+        )))
+    }
+
     // ── Resource verbs — operator-facing CRUDW contract ─────────
     //
     // Every face exposes the same five verbs over the fabric
@@ -434,6 +485,22 @@ impl Face for PureRaftFace {
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.store.watch(kind, namespace, format)
     }
+
+    fn resource_count(&self) -> usize {
+        self.store.len()
+    }
+
+    fn subscriber_count(&self) -> usize {
+        self.store.subscriber_count()
+    }
+
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> {
+        self.store.snapshot()
+    }
+
+    fn restore(&self, snapshot_bytes: &[u8]) -> Result<(), FaceError> {
+        self.store.restore(snapshot_bytes)
+    }
 }
 
 /// CBOR-encoded envelope used by `PureRaftFace::apply_resource` —
@@ -644,6 +711,10 @@ impl Face for KubernetesFace {
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.store.watch(kind, namespace, format)
     }
+    fn resource_count(&self) -> usize { self.store.len() }
+    fn subscriber_count(&self) -> usize { self.store.subscriber_count() }
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> { self.store.snapshot() }
+    fn restore(&self, b: &[u8]) -> Result<(), FaceError> { self.store.restore(b) }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -775,6 +846,10 @@ impl Face for NomadFace {
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.store.watch(kind, namespace, format)
     }
+    fn resource_count(&self) -> usize { self.store.len() }
+    fn subscriber_count(&self) -> usize { self.store.subscriber_count() }
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> { self.store.snapshot() }
+    fn restore(&self, b: &[u8]) -> Result<(), FaceError> { self.store.restore(b) }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -906,6 +981,10 @@ impl Face for SystemdFace {
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.store.watch(kind, namespace, format)
     }
+    fn resource_count(&self) -> usize { self.store.len() }
+    fn subscriber_count(&self) -> usize { self.store.subscriber_count() }
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> { self.store.snapshot() }
+    fn restore(&self, b: &[u8]) -> Result<(), FaceError> { self.store.restore(b) }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1025,6 +1104,10 @@ impl Face for BareMetalSupervisorFace {
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.store.watch(kind, namespace, format)
     }
+    fn resource_count(&self) -> usize { self.store.len() }
+    fn subscriber_count(&self) -> usize { self.store.subscriber_count() }
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> { self.store.snapshot() }
+    fn restore(&self, b: &[u8]) -> Result<(), FaceError> { self.store.restore(b) }
 }
 
 // ─────────────────────────────────────────────────────────────────
