@@ -41,6 +41,7 @@ pub mod consensus;
 pub mod content;
 pub mod fabric;
 pub mod face;
+pub mod face_store;
 pub mod federation;
 pub mod format;
 pub mod membership;
