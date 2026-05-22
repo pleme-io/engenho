@@ -268,6 +268,120 @@ impl FormatAdapter for K8sJsonAdapter {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// HclAdapter — Nomad-style HCL job manifests
+// ─────────────────────────────────────────────────────────────────
+
+/// Adapter for HashiCorp HCL job manifests (Nomad's authoring
+/// format). Parses the top-level `job "<name>" {}` block to extract
+/// the resource reference; stores the HCL body verbatim in a
+/// `NativeEnvelope`.
+///
+/// **What this proves about the trait abstraction:** YAML + JSON
+/// are sibling formats (both serde-driven, both K8s-style). HCL is
+/// a genuinely different family (HashiCorp's, block-oriented). The
+/// fact that it fits the FormatAdapter trait with the same shape
+/// is the structural proof that the trait abstracts over arbitrary
+/// authoring formats, not just YAML-shaped ones.
+///
+/// **Resource shape:** Nomad jobs are typed as `kind = "Job"`,
+/// `name = <block label>`, `namespace = <job namespace stanza, or
+/// "default" if absent>`. This matches the `nomad job run` mental
+/// model.
+pub struct HclAdapter;
+
+impl FormatAdapter for HclAdapter {
+    fn name(&self) -> &'static str {
+        "nomad-hcl"
+    }
+
+    fn supported_formats(&self) -> &'static [ResourceFormat] {
+        &[ResourceFormat::Hcl]
+    }
+
+    fn extract_ref(
+        &self,
+        format: ResourceFormat,
+        body: &[u8],
+    ) -> Result<ResourceRef, AdapterError> {
+        if format != ResourceFormat::Hcl {
+            return Err(AdapterError::UnsupportedFormat { format });
+        }
+        let source = std::str::from_utf8(body).map_err(|e| AdapterError::Parse {
+            format,
+            reason: format!("hcl body is not utf-8: {e}"),
+        })?;
+        let body_value: hcl::Body =
+            hcl::from_str(source).map_err(|e| AdapterError::Parse {
+                format,
+                reason: e.to_string(),
+            })?;
+        extract_nomad_job_ref(&body_value)
+    }
+
+    fn to_native(&self, format: ResourceFormat, body: &[u8]) -> Result<Vec<u8>, AdapterError> {
+        let reference = self.extract_ref(format, body)?;
+        encode_envelope(&reference, body)
+    }
+
+    fn from_native(
+        &self,
+        format: ResourceFormat,
+        native: &[u8],
+    ) -> Result<Vec<u8>, AdapterError> {
+        if format != ResourceFormat::Hcl {
+            return Err(AdapterError::UnsupportedFormat { format });
+        }
+        let (_, payload) = decode_envelope(native)?;
+        Ok(payload)
+    }
+}
+
+/// Walk an `hcl::Body` looking for `job "<name>" {}` with an
+/// optional `namespace = "<ns>"` attribute; emit the typed
+/// `ResourceRef`.
+fn extract_nomad_job_ref(body: &hcl::Body) -> Result<ResourceRef, AdapterError> {
+    use hcl::Structure;
+    for structure in body.iter() {
+        let Structure::Block(block) = structure else {
+            continue;
+        };
+        if block.identifier.as_str() != "job" {
+            continue;
+        }
+        let name = block
+            .labels
+            .first()
+            .ok_or(AdapterError::MissingField {
+                field: "job.<name>",
+            })?
+            .as_str()
+            .to_string();
+        // Look for an inner `namespace = "<ns>"` attribute.
+        let namespace = block
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Structure::Attribute(attr) if attr.key.as_str() == "namespace" => {
+                    if let hcl::Expression::String(ns) = &attr.expr {
+                        Some(ns.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+        return Ok(ResourceRef {
+            kind: "Job".to_string(),
+            name,
+            namespace,
+        });
+    }
+    Err(AdapterError::MissingField {
+        field: "job block",
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────
 // K8sYamlAdapter — Kubernetes-style YAML manifests
 // ─────────────────────────────────────────────────────────────────
 
@@ -406,6 +520,7 @@ impl Default for AdapterRegistry {
         r.register(Arc::new(NativePassthroughAdapter));
         r.register(Arc::new(K8sJsonAdapter));
         r.register(Arc::new(K8sYamlAdapter));
+        r.register(Arc::new(HclAdapter));
         r
     }
 }
@@ -750,5 +865,85 @@ mod tests {
         // Same logical resource → identical typed ref regardless
         // of which format the operator authored in.
         assert_eq!(json_ref, yaml_ref);
+    }
+
+    // ── HclAdapter ────────────────────────────────────────────────
+
+    fn nomad_job_hcl(name: &str, ns: Option<&str>) -> Vec<u8> {
+        let mut s = format!("job \"{name}\" {{\n");
+        if let Some(n) = ns {
+            s.push_str(&format!("  namespace = \"{n}\"\n"));
+        }
+        s.push_str("  group \"web\" {\n    count = 3\n  }\n}\n");
+        s.into_bytes()
+    }
+
+    #[test]
+    fn hcl_adapter_extracts_ref_from_namespaced_job() {
+        let body = nomad_job_hcl("web", Some("team-a"));
+        let r = HclAdapter
+            .extract_ref(ResourceFormat::Hcl, &body)
+            .unwrap();
+        assert_eq!(r.kind, "Job");
+        assert_eq!(r.name, "web");
+        assert_eq!(r.namespace.as_deref(), Some("team-a"));
+    }
+
+    #[test]
+    fn hcl_adapter_extracts_ref_from_no_namespace_job() {
+        let body = nomad_job_hcl("web", None);
+        let r = HclAdapter
+            .extract_ref(ResourceFormat::Hcl, &body)
+            .unwrap();
+        assert_eq!(r.kind, "Job");
+        assert_eq!(r.name, "web");
+        assert!(r.namespace.is_none());
+    }
+
+    #[test]
+    fn hcl_adapter_round_trips_body_through_native() {
+        let body = nomad_job_hcl("web", Some("default"));
+        let env = HclAdapter.to_native(ResourceFormat::Hcl, &body).unwrap();
+        let back = HclAdapter
+            .from_native(ResourceFormat::Hcl, &env)
+            .unwrap();
+        assert_eq!(back, body);
+    }
+
+    #[test]
+    fn hcl_adapter_missing_job_block_errors() {
+        let body = b"variable \"x\" {\n  default = 1\n}\n";
+        match HclAdapter.extract_ref(ResourceFormat::Hcl, body) {
+            Err(AdapterError::MissingField { field: "job block" }) => {}
+            other => panic!("expected MissingField(\"job block\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hcl_adapter_rejects_non_hcl_formats() {
+        let body = nomad_job_hcl("web", None);
+        match HclAdapter.extract_ref(ResourceFormat::Yaml, &body) {
+            Err(AdapterError::UnsupportedFormat { .. }) => {}
+            other => panic!("expected UnsupportedFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hcl_adapter_parse_error_surfaces_clearly() {
+        let body = b"job \"unclosed {\n";
+        match HclAdapter.extract_ref(ResourceFormat::Hcl, body) {
+            Err(AdapterError::Parse { format, .. }) => {
+                assert_eq!(format, ResourceFormat::Hcl);
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_registry_now_handles_hcl() {
+        let reg = AdapterRegistry::default();
+        assert!(reg.handles(ResourceFormat::Hcl));
+        let adapter = reg.select(ResourceFormat::Hcl).unwrap();
+        assert_eq!(adapter.name(), "nomad-hcl");
     }
 }
