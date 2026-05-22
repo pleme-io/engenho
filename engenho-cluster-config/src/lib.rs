@@ -43,12 +43,14 @@
 #![warn(missing_docs)]
 
 pub mod bootstrap;
+pub mod k3s_yaml;
 pub mod manifest;
 pub mod network;
 pub mod render;
 pub mod renderer;
 pub mod validate;
 
+pub use k3s_yaml::K3sServerConfig;
 pub use renderer::{ClusterConfigRenderer, EngenhoNativeRenderer, K3sRenderer};
 
 use serde::{Deserialize, Serialize};
