@@ -88,6 +88,8 @@ mod remediation;
 mod revoada;
 #[cfg(feature = "with-promessa")]
 mod security_controller;
+#[cfg(feature = "with-shigoto")]
+mod shigoto_provisioning;
 #[cfg(feature = "with-shikumi")]
 mod shikumi;
 mod sistema;
@@ -158,6 +160,10 @@ pub use remediation::{
 pub use revoada::{FaceGossipBroker, RevoadaProposer};
 #[cfg(feature = "with-promessa")]
 pub use security_controller::{SecurityController, SecurityDrift, SecuritySnapshot, SecuritySpec};
+#[cfg(feature = "with-shigoto")]
+pub use shigoto_provisioning::{
+    ShigotoProvisioningController, StageDag, StageDagBuilder, stage_kind_to_job_id,
+};
 #[cfg(feature = "with-shikumi")]
 pub use shikumi::ShikumiWatcher;
 pub use sistema::{

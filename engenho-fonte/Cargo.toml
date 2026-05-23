@@ -45,6 +45,9 @@ with-tatara-lisp = ["dep:tatara-lisp"]
 # caixa-helm's chart renderer. Cross-workspace path deps to
 # pleme-io/caixa.
 with-caixa = ["dep:caixa-core", "dep:caixa-helm", "dep:serde_yaml"]
+# shigoto DAG integration — ShigotoProvisioningController uses
+# shigoto-dag for typed topological ordering + parallel waves.
+with-shigoto = ["dep:shigoto-dag", "dep:shigoto-types"]
 
 [dependencies]
 async-trait            = { workspace = true }
@@ -79,6 +82,8 @@ tatara-lisp            = { path = "../../tatara/tatara-lisp", optional = true }
 caixa-core             = { path = "../../caixa/caixa-core", optional = true }
 caixa-helm             = { path = "../../caixa/caixa-helm", optional = true }
 serde_yaml             = { workspace = true, optional = true }
+shigoto-dag            = { path = "../../shigoto/shigoto-dag", optional = true }
+shigoto-types          = { path = "../../shigoto/shigoto-types", optional = true }
 # Optional — enabled by `with-revoada`.
 engenho-revoada        = { workspace = true, optional = true }
 # Optional — enabled by `with-shikumi`. Cross-workspace path dep
