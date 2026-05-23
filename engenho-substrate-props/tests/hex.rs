@@ -1,17 +1,10 @@
 //! Property: Hex trait — lowercase round-trip + length invariant.
 
 use engenho_substrate::{Hex, hex_encode};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// hex_encode is always 2× input length.
     #[test]
     fn hex_doubles_input_length(

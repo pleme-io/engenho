@@ -1,21 +1,14 @@
 //! Property: Linhagem fingerprint determinism + chain divergence.
 
 use engenho_substrate::{GeracaoId, Linhagem, SearchId};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
 fn gen_id_strategy() -> impl Strategy<Value = GeracaoId> {
     any::<[u8; 32]>().prop_map(GeracaoId)
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Same search_id + same generation chain → identical fingerprint.
     #[test]
     fn fingerprint_deterministic(

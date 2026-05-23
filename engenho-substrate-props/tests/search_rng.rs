@@ -5,17 +5,10 @@
 //! replay-verifiability anchor for every search.
 
 use engenho_substrate::SearchRng;
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Same (seed, stream_tag) → identical N-element u64 output.
     #[test]
     fn same_seed_same_stream_identical_output(

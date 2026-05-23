@@ -4,17 +4,10 @@ use engenho_substrate::{
     Fingerprint, Linhagem, NodeId, Placement, Plantio, SearchId, Stage, StageId, WorkloadShape,
     fingerprint_blake3,
 };
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// fingerprint_blake3() helper is deterministic for any serde value.
     #[test]
     fn helper_is_deterministic_for_serde_value(

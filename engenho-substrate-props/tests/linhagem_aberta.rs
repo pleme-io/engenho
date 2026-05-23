@@ -1,6 +1,7 @@
 //! Property: linhagem-aberta DAG invariants.
 
 use engenho_substrate::{Fingerprint, LineageGraph, impl_fingerprint};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -32,15 +33,7 @@ fn chain(len: usize) -> (LineageGraph<Sample>, Vec<[u8; 32]>) {
     (g, fps)
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Same value → same fingerprint (deterministic content addressing).
     #[test]
     fn fingerprint_is_deterministic(id in 0u64..1000) {

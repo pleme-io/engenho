@@ -1,17 +1,10 @@
 //! Property: risca Risca<T> + redaction helpers.
 
 use engenho_substrate::{REDACTED, Risca, redact_credit_card, redact_email, redact_token};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Risca<String> Debug output is exactly the framing template — it
     /// never inspects the inner value at all (so it CAN'T leak).
     /// Constant-output is a stronger contract than "doesn't contain":

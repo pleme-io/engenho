@@ -1,6 +1,7 @@
 //! Property: provação Provacao injector invariants.
 
 use engenho_substrate::{Clock, FrozenClock, Policy, Provacao, impl_error_kind};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use std::sync::Arc;
 use thiserror::Error;
@@ -24,15 +25,7 @@ fn clock(t: u64) -> Arc<dyn Clock> {
     Arc::new(FrozenClock::at(t))
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Empty provacao never produces a fault.
     #[test]
     fn empty_never_faults(seed in any::<u64>(), calls in 1usize..50) {

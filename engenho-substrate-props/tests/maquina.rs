@@ -1,6 +1,7 @@
 //! Property: máquina StateMachine + MachineRunner invariants.
 
 use engenho_substrate::{FrozenClock, MachineRunner, StateMachine, define_named, impl_error_kind};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -75,15 +76,7 @@ fn make_runner() -> MachineRunner<CounterMachine> {
     MachineRunner::new(Arc::new(FrozenClock::at(0)))
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Pure step: same (state, event) → same (state', effect).
     #[test]
     fn step_is_pure_and_deterministic(

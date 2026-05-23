@@ -1,21 +1,14 @@
 //! Property: selo Selo + SeloIssuer invariants.
 
 use engenho_substrate::{Instant, Selo, SeloError, SeloIssuer};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
 fn at(ms: u64) -> Instant {
     Instant::from_ms(ms)
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Issue + verify with matching params + same issuer always succeeds
     /// (when not yet expired).
     #[test]

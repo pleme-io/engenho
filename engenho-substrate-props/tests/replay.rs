@@ -1,17 +1,10 @@
 //! Property: replay ReplayCursor invariants.
 
 use engenho_substrate::ReplayCursor;
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// New cursor has position 0, len matches input, remaining == len.
     #[test]
     fn new_cursor_invariants(events in proptest::collection::vec(any::<u32>(), 0..50)) {

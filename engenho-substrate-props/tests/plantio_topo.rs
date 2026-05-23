@@ -3,6 +3,7 @@
 
 use engenho_substrate::{NodeId, Placement, Plantio, Stage, StageId, WorkloadShape};
 use proptest::prelude::*;
+// plantio_topo.rs uses unwrap_or(128) — keeps its own ProptestConfig.
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Generate a Plantio with N stages where stage `i` may depend on

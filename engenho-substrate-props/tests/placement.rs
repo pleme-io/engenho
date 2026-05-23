@@ -3,6 +3,8 @@
 
 use engenho_substrate::{JobTarget, NodeId, Placement, Plantio, Stage, WorkloadShape};
 use proptest::prelude::*;
+// placement.rs uses unwrap_or(128) (not 256) for its default cases so
+// it doesn't migrate to the standard proptest_with_env! macro.
 
 fn placement_strategy() -> impl Strategy<Value = Placement> {
     prop_oneof![

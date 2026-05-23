@@ -50,8 +50,66 @@
 //! The deep-test workflow (`/.github/workflows/deep-test.yml`)
 //! runs at 4096 cases on every PR + nightly cron.
 
-// No public API — pure-test crate. The `proptest!` macros live
-// in `src/lib.rs`'s `#[cfg(test)]` block + the per-file test
-// modules in `tests/`.
+// One small public API for the test files in `tests/`: the
+// `proptest_with_env!` macro and the `proptest_cases()` env helper.
+// They collapse the 6-line ProptestConfig ceremony that was
+// duplicated in every property-test file (14+ sites — third-site
+// rule fired three times over).
 
 #![allow(missing_docs)]
+
+/// Read the `PROPTEST_CASES` environment variable as the proptest
+/// case-count budget. Defaults to 256 (fast loop). Deep-test CI
+/// sets `PROPTEST_CASES=4096`.
+///
+/// Extracted from a copy-paste block that appeared verbatim in
+/// every test file's `proptest! { #![proptest_config(...)] }`.
+#[must_use]
+pub fn proptest_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
+
+/// Wraps `proptest::proptest!` with the env-driven `ProptestConfig`
+/// applied automatically. Saves the 5-line ceremony in every
+/// property-test file.
+///
+/// ## Before
+///
+/// ```ignore
+/// use proptest::prelude::*;
+/// proptest! {
+///     #![proptest_config(ProptestConfig {
+///         cases: std::env::var("PROPTEST_CASES").ok()
+///             .and_then(|s| s.parse().ok()).unwrap_or(256),
+///         ..ProptestConfig::default()
+///     })]
+///     #[test]
+///     fn my_invariant(...) { ... }
+/// }
+/// ```
+///
+/// ## After
+///
+/// ```ignore
+/// use engenho_substrate_props::proptest_with_env;
+/// use proptest::prelude::*;
+/// proptest_with_env! {
+///     #[test]
+///     fn my_invariant(...) { ... }
+/// }
+/// ```
+#[macro_export]
+macro_rules! proptest_with_env {
+    ($($body:tt)*) => {
+        ::proptest::proptest! {
+            #![proptest_config(::proptest::test_runner::Config {
+                cases: $crate::proptest_cases(),
+                ..::proptest::test_runner::Config::default()
+            })]
+            $($body)*
+        }
+    };
+}

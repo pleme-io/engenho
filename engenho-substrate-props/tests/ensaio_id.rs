@@ -2,17 +2,10 @@
 //! across every input field.
 
 use engenho_substrate::{EnsaioId, SearchId};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Same inputs → byte-identical EnsaioId.
     #[test]
     fn derive_is_deterministic(
