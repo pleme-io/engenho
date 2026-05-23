@@ -38,6 +38,7 @@ pub mod replicaset;
 pub mod runtime;
 pub mod admission;
 pub mod attestation;
+pub mod build_backend_roceiro;
 pub mod crd;
 pub mod crd_validator;
 pub mod dns;
@@ -95,6 +96,7 @@ pub use drv_build::{
     BuildBackend, BuildError, BuildResult, DrvBuildController, FakeBuildBackend,
 };
 pub use event_driven::EventDrivenController;
+pub use build_backend_roceiro::BuildBackendRoceiro;
 pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};
 pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};
 pub use tiered_build::TieredBuildBackend;
