@@ -23,6 +23,8 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod atomic_write;
+pub mod broadcast_ledger;
+pub mod chained_verifier;
 pub mod derivation;
 pub mod drv_disk;
 pub mod ledger;
@@ -44,6 +46,8 @@ pub use derivation::{
 };
 pub use drv_disk::DiskDerivationCache;
 pub use magic_blob::{MagicBlob, MagicBlobError};
+pub use broadcast_ledger::{BroadcastLedger, LedgerEvent};
+pub use chained_verifier::ChainedVerifier;
 pub use ledger::{LedgerError, LedgerKey, MaterializationLedger, MemoryLedger};
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
 pub use quorum::{QuorumOutcome, QuorumTracker};
