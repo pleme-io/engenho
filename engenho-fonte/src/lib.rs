@@ -75,6 +75,8 @@ mod revoada;
 #[cfg(feature = "with-shikumi")]
 mod shikumi;
 mod sistema;
+#[cfg(feature = "with-promessa")]
+mod sla_controller;
 #[cfg(feature = "with-sui-eval")]
 mod sui_evaluator;
 #[cfg(feature = "with-tameshi")]
@@ -115,6 +117,8 @@ pub use shikumi::ShikumiWatcher;
 pub use sistema::{
     AppRef, InfraBackend, InfraRef, PromessaKind, PromessaRef, Sistema, TopologyRef,
 };
+#[cfg(feature = "with-promessa")]
+pub use sla_controller::{SlaController, SlaDrift, SlaSnapshot, SlaSpec};
 #[cfg(feature = "with-sui-eval")]
 pub use sui_evaluator::SuiEvaluator;
 #[cfg(feature = "with-tameshi")]
