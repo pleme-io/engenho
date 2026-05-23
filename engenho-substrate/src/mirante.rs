@@ -214,6 +214,33 @@ impl<S: Clone + Send + Sync + 'static> ObservationChannel<S> {
     }
 }
 
+/// ObservationChannel impl Named + Observable (v1.04 SSC) —
+/// completes the SubscriberSnapshot family by exposing the
+/// channel itself as observable. Joins BroadcastLedger +
+/// WatchedCache + FakeGossipTransport as the 4th SubscriberSnapshot
+/// consumer.
+///
+/// Hand-rolled (not `define_named!` / `impl_observable_subscriber!`)
+/// because S has multi-bound generic shape (`Clone + Send + Sync +
+/// '`static`) that the existing macros don't fit. 2nd site of
+/// "literal-name multi-bound generic" — TSR clock at 2/3.
+impl<S: Clone + Send + Sync + 'static> Named for ObservationChannel<S> {
+    fn name(&self) -> &'static str {
+        "observation-channel"
+    }
+}
+
+impl<S: Clone + Send + Sync + 'static> Observable for ObservationChannel<S> {
+    type Snapshot = SubscriberSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        SubscriberSnapshot {
+            name: "observation-channel",
+            subscriber_count: self.subscriber_count(),
+        }
+    }
+}
+
 /// Type-erased view onto an `ObservationChannel<S>` for the
 /// `Mirante` registry. Operators reach for the concrete channel
 /// when they know the type; the registry exposes the universal
