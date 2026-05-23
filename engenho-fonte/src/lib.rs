@@ -89,6 +89,7 @@ mod shikumi;
 mod sistema;
 #[cfg(feature = "with-promessa")]
 mod sla_controller;
+mod subprocess_stage;
 #[cfg(feature = "with-sui-eval")]
 mod sui_evaluator;
 #[cfg(feature = "with-tameshi")]
@@ -154,6 +155,9 @@ pub use sistema::{
 };
 #[cfg(feature = "with-promessa")]
 pub use sla_controller::{SlaController, SlaDrift, SlaSnapshot, SlaSpec};
+pub use subprocess_stage::{
+    SubprocessInvocation, SubprocessStage, magma_cloud_stage, pangea_networking_stage,
+};
 #[cfg(feature = "with-sui-eval")]
 pub use sui_evaluator::SuiEvaluator;
 #[cfg(feature = "with-tameshi")]
