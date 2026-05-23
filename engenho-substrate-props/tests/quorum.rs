@@ -3,7 +3,7 @@
 //! always reports Dissent.
 
 use engenho_substrate::{
-    MaterializationReceipt, NodeId, QuorumOutcome, QuorumTracker, ReceiptKind,
+    MaterializationReceipt, NodeId, QuorumTracker, ReceiptKind,
 };
 use proptest::prelude::*;
 
