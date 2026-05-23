@@ -73,6 +73,8 @@ mod shikumi;
 mod sistema;
 #[cfg(feature = "with-sui-eval")]
 mod sui_evaluator;
+#[cfg(feature = "with-tameshi")]
+mod tameshi_attester;
 mod watcher;
 
 pub use anomaly::{AnomalyChain, AnomalyEntry, AnomalyEvent, MockAnomalyChain};
@@ -104,4 +106,6 @@ pub use sistema::{
 };
 #[cfg(feature = "with-sui-eval")]
 pub use sui_evaluator::SuiEvaluator;
+#[cfg(feature = "with-tameshi")]
+pub use tameshi_attester::TameshiAttester;
 pub use watcher::{MockWatcher, Watcher};
