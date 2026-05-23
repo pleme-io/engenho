@@ -23,6 +23,7 @@ anyhow             = { workspace = true }
 
 engenho-types      = { workspace = true }
 engenho-teia       = { workspace = true }
+engenho-substrate  = { workspace = true }
 futures            = { workspace = true }
 openraft           = { workspace = true }
 blake3             = "1"
