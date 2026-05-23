@@ -5,10 +5,6 @@ use engenho_substrate::{NodeId, Placement, Plantio, Stage, StageId, WorkloadShap
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-fn stage_id_strategy(n: usize) -> impl Strategy<Value = StageId> {
-    (0..n).prop_map(|i| StageId::new(format!("stage-{i:03}")))
-}
-
 /// Generate a Plantio with N stages where stage `i` may depend on
 /// any subset of stages `0..i` — this guarantees DAG (no cycles).
 fn acyclic_plantio_strategy(
@@ -28,7 +24,7 @@ fn acyclic_plantio_strategy(
             .collect::<Vec<_>>();
         (Just(n), dep_maps)
     })
-    .prop_map(|(n, dep_sets)| {
+    .prop_map(|(_n, dep_sets)| {
         let mut plantio = Plantio::new();
         let node = NodeId::new([0u8; 32]);
         for (i, deps) in dep_sets.into_iter().enumerate() {
