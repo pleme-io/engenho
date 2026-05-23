@@ -59,6 +59,7 @@ mod conduit;
 mod controller;
 mod error;
 mod evaluator;
+mod federation;
 mod mirante_publisher;
 mod proposer;
 mod publisher;
@@ -83,6 +84,7 @@ pub use controller::{
 };
 pub use error::{FonteError, FonteResult};
 pub use evaluator::{Evaluator, MockEvaluator};
+pub use federation::{FederatedWatcher, FederationBroker};
 pub use mirante_publisher::MirantePublisher;
 pub use proposer::{MockProposer, ProposalId, Proposer};
 pub use publisher::{MockPublisher, Publisher};
