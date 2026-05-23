@@ -25,11 +25,13 @@
 pub mod atomic_write;
 pub mod broadcast_ledger;
 pub mod chained_verifier;
+pub mod command_runner;
 pub mod derivation;
 pub mod drv_disk;
 pub mod gossip_ledger;
 pub mod ledger;
 pub mod magic_blob;
+pub mod oci_renderer;
 pub mod promotion;
 pub mod quorum;
 pub mod receipt;
@@ -51,11 +53,15 @@ pub use drv_disk::DiskDerivationCache;
 pub use magic_blob::{MagicBlob, MagicBlobError};
 pub use broadcast_ledger::{BroadcastLedger, LedgerEvent};
 pub use chained_verifier::ChainedVerifier;
+pub use command_runner::{
+    CommandError, CommandRequest, CommandResponse, CommandRunner, FakeCommandRunner,
+};
 pub use gossip_ledger::{
     FakeGossipTransport, GossipBroadcast, GossipBroadcaster, GossipChannel,
     GossipDelivery, GossipError, GossipLedger,
 };
 pub use ledger::{LedgerError, LedgerKey, MaterializationLedger, MemoryLedger};
+pub use oci_renderer::{OciDestReader, OciDestRef, OciImageRenderer, OciSourceRef};
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
 pub use quorum::{QuorumOutcome, QuorumTracker};
 pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};

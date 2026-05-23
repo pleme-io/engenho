@@ -51,6 +51,7 @@ pub mod job;
 pub mod network_policy;
 pub mod pdb;
 pub mod plantio;
+pub mod plantio_pipeline;
 pub mod roceiro;
 pub mod selector;
 pub mod service_router;
@@ -100,6 +101,10 @@ pub use drv_build::{
 pub use event_driven::EventDrivenController;
 pub use build_backend_roceiro::BuildBackendRoceiro;
 pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};
+pub use plantio_pipeline::{
+    bootstrap_pipeline, LedgerChoice, LedgerWrappers, NodeResolverChoice,
+    PipelineConfig, PlantioPipeline, RoceiroChoice,
+};
 pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};
 pub use store_ledger::{StoreBackedLedger, DEFAULT_RECEIPT_NAMESPACE};
 pub use store_resolver::StoreBackedNodeResolver;
