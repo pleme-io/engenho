@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::maquina::{MachineError, MachineRunner, StateMachine};
-use crate::named::Named;
 
 /// Typed cursor over an event stream.
 ///
@@ -118,11 +117,7 @@ impl<E: Clone> ReplayCursor<E> {
     }
 }
 
-impl<E: Clone> Named for ReplayCursor<E> {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
+crate::impl_named_field_generic!(ReplayCursor, E: Clone);
 
 /// Drive a `MachineRunner<M>` through every remaining event in
 /// `cursor`. Stops on first machine error OR when cursor is
@@ -184,6 +179,7 @@ mod tests {
     use super::*;
     use crate::impl_error_kind;
     use crate::maquina::{MachineRunner, StateMachine};
+    use crate::named::Named;
     use crate::relogio::FrozenClock;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;

@@ -201,11 +201,7 @@ pub struct MachineSnapshot<S> {
     pub is_terminal: bool,
 }
 
-impl<M: StateMachine> crate::named::Named for MachineRunner<M> {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
+crate::impl_named_field_generic!(MachineRunner, M: StateMachine);
 
 /// Pattern #2 (substrate self-consumption) — `MachineRunner<M>`
 /// is `Observable` so any FSM plugs directly into a mirante
