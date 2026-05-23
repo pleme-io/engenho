@@ -39,6 +39,7 @@ pub mod hex;
 pub mod ledger;
 pub mod magic_blob;
 pub mod maquina;
+pub mod mirante;
 pub mod named;
 pub mod oci_renderer;
 pub mod pesquisa;
@@ -81,6 +82,7 @@ pub use gossip_ledger::{
 };
 pub use ledger::{LedgerError, LedgerKey, MaterializationLedger, MemoryLedger};
 pub use maquina::{MachineError, MachineRunner, StateMachine, TransitionRecord};
+pub use mirante::{AnyChannel, Mirante, Observable, ObservationChannel};
 pub use oci_renderer::{OciDestReader, OciDestRef, OciImageRenderer, OciSourceRef};
 pub use pesquisa::{
     aptidao_to_receipt, score_ensaio, Aptidao, Arquivo, Ensaio, EnsaioId, Evidence,
