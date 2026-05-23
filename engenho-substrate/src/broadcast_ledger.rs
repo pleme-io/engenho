@@ -81,6 +81,35 @@ impl BroadcastLedger {
     }
 }
 
+/// Observable snapshot for a `BroadcastLedger` — what an ops
+/// dashboard sees. Pattern #2 (substrate self-consumption v0.86):
+/// makes the wrapper plug into any mirante channel without
+/// per-consumer adapter.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BroadcastLedgerSnapshot {
+    /// Telemetry name ("broadcast").
+    pub name: &'static str,
+    /// Currently-active subscribers on the broadcast channel.
+    pub subscriber_count: usize,
+}
+
+impl crate::named::Named for BroadcastLedger {
+    fn name(&self) -> &'static str {
+        "broadcast"
+    }
+}
+
+impl crate::mirante::Observable for BroadcastLedger {
+    type Snapshot = BroadcastLedgerSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        BroadcastLedgerSnapshot {
+            name: "broadcast",
+            subscriber_count: self.subscriber_count(),
+        }
+    }
+}
+
 #[async_trait]
 impl MaterializationLedger for BroadcastLedger {
     fn name(&self) -> &'static str {

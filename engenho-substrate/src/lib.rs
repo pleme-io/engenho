@@ -63,7 +63,7 @@ pub mod verifier_impls;
 pub mod watched_cache;
 
 pub use atomic_write::{AtomicWriteError, tmp_path_for, write_atomic};
-pub use broadcast_ledger::{BroadcastLedger, LedgerEvent};
+pub use broadcast_ledger::{BroadcastLedger, BroadcastLedgerSnapshot, LedgerEvent};
 pub use chained_verifier::ChainedVerifier;
 pub use command_runner::{
     CommandError, CommandRequest, CommandResponse, CommandRunner, FakeCommandRunner,
@@ -118,4 +118,4 @@ pub use verifier_impls::{
     BytesAccessor, HashEqualityVerifier, IndependentRebuild, IndependentVerifier, SignerCheck,
     SmokeBuilder, SmokeTestVerifier, TameshiVerifier,
 };
-pub use watched_cache::{CacheEvent, WatchedCache};
+pub use watched_cache::{CacheEvent, WatchedCache, WatchedCacheSnapshot};
