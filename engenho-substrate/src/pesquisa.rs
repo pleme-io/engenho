@@ -418,14 +418,10 @@ pub enum FitnessError {
     InvalidGenotype(String),
 }
 
-impl FitnessError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::InvalidGenotype(_) => "invalid_genotype",
-        }
+crate::impl_error_kind! {
+    FitnessError {
+        (Backend(_)) => "backend",
+        (InvalidGenotype(_)) => "invalid_genotype",
     }
 }
 
@@ -475,15 +471,11 @@ pub enum PesquisaError {
     Diverged(u64),
 }
 
-impl PesquisaError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Fitness(_) => "fitness",
-            Self::Engine(_) => "engine",
-            Self::Diverged(_) => "diverged",
-        }
+crate::impl_error_kind! {
+    PesquisaError {
+        (Fitness(_)) => "fitness",
+        (Engine(_)) => "engine",
+        (Diverged(_)) => "diverged",
     }
 }
 

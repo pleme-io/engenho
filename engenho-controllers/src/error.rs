@@ -12,14 +12,11 @@ pub enum ControllerError {
     Internal(String),
 }
 
-impl ControllerError {
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Store(_) => "store",
-            Self::InvalidResource(_) => "invalid_resource",
-            Self::Internal(_) => "internal",
-        }
+engenho_substrate::impl_error_kind! {
+    ControllerError {
+        (Store(_)) => "store",
+        (InvalidResource(_)) => "invalid_resource",
+        (Internal(_)) => "internal",
     }
 }
 

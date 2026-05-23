@@ -54,14 +54,10 @@ pub enum BuildError {
     InvalidDrv(String),
 }
 
-impl BuildError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::InvalidDrv(_) => "invalid_drv",
-        }
+engenho_substrate::impl_error_kind! {
+    BuildError {
+        (Backend(_)) => "backend",
+        (InvalidDrv(_)) => "invalid_drv",
     }
 }
 

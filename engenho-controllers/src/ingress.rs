@@ -74,14 +74,10 @@ pub enum IngressError {
     InvalidRoute(String),
 }
 
-impl IngressError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::InvalidRoute(_) => "invalid_route",
-        }
+engenho_substrate::impl_error_kind! {
+    IngressError {
+        (Backend(_)) => "backend",
+        (InvalidRoute(_)) => "invalid_route",
     }
 }
 

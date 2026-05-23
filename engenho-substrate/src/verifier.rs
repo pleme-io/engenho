@@ -109,15 +109,11 @@ pub enum VerifyError {
     Failed(String),
 }
 
-impl VerifyError {
-    /// Stable identifier for telemetry / SDK dispatch.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::Unsupported(_) => "unsupported",
-            Self::Failed(_) => "failed",
-        }
+crate::impl_error_kind! {
+    VerifyError {
+        (Backend(_)) => "backend",
+        (Unsupported(_)) => "unsupported",
+        (Failed(_)) => "failed",
     }
 }
 

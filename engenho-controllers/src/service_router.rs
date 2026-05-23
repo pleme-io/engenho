@@ -76,14 +76,10 @@ pub enum RouterError {
     InvalidRoute(String),
 }
 
-impl RouterError {
-    /// Stable identifier for telemetry / SDK dispatch.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::InvalidRoute(_) => "invalid_route",
-        }
+engenho_substrate::impl_error_kind! {
+    RouterError {
+        (Backend(_)) => "backend",
+        (InvalidRoute(_)) => "invalid_route",
     }
 }
 

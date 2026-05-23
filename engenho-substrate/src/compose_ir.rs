@@ -174,15 +174,11 @@ pub enum ComposeError {
     Io(String),
 }
 
-impl ComposeError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::InvalidIr(_) => "invalid_ir",
-            Self::Io(_) => "io",
-        }
+crate::impl_error_kind! {
+    ComposeError {
+        (Backend(_)) => "backend",
+        (InvalidIr(_)) => "invalid_ir",
+        (Io(_)) => "io",
     }
 }
 

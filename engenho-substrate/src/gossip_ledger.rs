@@ -69,14 +69,10 @@ pub enum GossipError {
     NotConnected,
 }
 
-impl GossipError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::NotConnected => "not_connected",
-        }
+crate::impl_error_kind! {
+    GossipError {
+        (Backend(_)) => "backend",
+        NotConnected => "not_connected",
     }
 }
 

@@ -34,6 +34,7 @@ pub mod error_kind;
 pub mod gossip_ledger;
 pub mod ledger;
 pub mod magic_blob;
+pub mod named;
 pub mod oci_renderer;
 pub mod pesquisa;
 pub mod promotion;
@@ -65,6 +66,7 @@ pub use compose_ir::{
 };
 pub use disposable::{Disposable, DisposableError, Transient};
 pub use error_kind::ErrorKind;
+pub use named::Named;
 pub use gossip_ledger::{
     FakeGossipTransport, GossipBroadcast, GossipBroadcaster, GossipChannel,
     GossipDelivery, GossipError, GossipLedger,

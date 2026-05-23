@@ -102,14 +102,10 @@ pub enum CommandError {
     Io(String),
 }
 
-impl CommandError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Spawn(_) => "spawn",
-            Self::Io(_) => "io",
-        }
+crate::impl_error_kind! {
+    CommandError {
+        (Spawn(_)) => "spawn",
+        (Io(_)) => "io",
     }
 }
 

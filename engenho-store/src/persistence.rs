@@ -211,18 +211,14 @@ pub enum SnapshotError {
     Decode(String),
 }
 
-impl SnapshotError {
-    /// Stable identifier for telemetry / SDK dispatch.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Io(_) => "io",
-            Self::BadMagic => "bad_magic",
-            Self::Truncated => "truncated",
-            Self::HashMismatch => "hash_mismatch",
-            Self::Encode(_) => "encode",
-            Self::Decode(_) => "decode",
-        }
+engenho_substrate::impl_error_kind! {
+    SnapshotError {
+        (Io(_)) => "io",
+        BadMagic => "bad_magic",
+        Truncated => "truncated",
+        HashMismatch => "hash_mismatch",
+        (Encode(_)) => "encode",
+        (Decode(_)) => "decode",
     }
 }
 

@@ -69,17 +69,13 @@ pub enum DisposableError {
     Ledger(String),
 }
 
-impl DisposableError {
-    /// Stable identifier for telemetry / SDK dispatch.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Materialize(_) => "materialize",
-            Self::Dispose(_) => "dispose",
-            Self::Body(_) => "body",
-            Self::BodyAndDispose { .. } => "body_and_dispose",
-            Self::Ledger(_) => "ledger",
-        }
+crate::impl_error_kind! {
+    DisposableError {
+        (Materialize(_)) => "materialize",
+        (Dispose(_)) => "dispose",
+        (Body(_)) => "body",
+        { BodyAndDispose { .. } } => "body_and_dispose",
+        (Ledger(_)) => "ledger",
     }
 }
 

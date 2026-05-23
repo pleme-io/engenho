@@ -188,15 +188,11 @@ pub enum PlantioError {
     DuplicateId(StageId),
 }
 
-impl PlantioError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::UnknownDependency { .. } => "unknown_dependency",
-            Self::Cycle { .. } => "cycle",
-            Self::DuplicateId(_) => "duplicate_id",
-        }
+crate::impl_error_kind! {
+    PlantioError {
+        { UnknownDependency { .. } } => "unknown_dependency",
+        { Cycle { .. } } => "cycle",
+        (DuplicateId(_)) => "duplicate_id",
     }
 }
 

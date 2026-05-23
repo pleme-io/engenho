@@ -25,6 +25,7 @@ engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }
 engenho-controllers = { workspace = true }
 engenho-config      = { workspace = true }
+engenho-substrate   = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

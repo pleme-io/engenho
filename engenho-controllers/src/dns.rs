@@ -83,14 +83,10 @@ pub enum DnsError {
     InvalidRecord(String),
 }
 
-impl DnsError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::InvalidRecord(_) => "invalid_record",
-        }
+engenho_substrate::impl_error_kind! {
+    DnsError {
+        (Backend(_)) => "backend",
+        (InvalidRecord(_)) => "invalid_record",
     }
 }
 

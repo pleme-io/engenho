@@ -936,6 +936,7 @@ dependencies = [
  "engenho-config",
  "engenho-controllers",
  "engenho-store",
+ "engenho-substrate",
  "engenho-types",
  "proptest",
  "serde",
