@@ -200,13 +200,7 @@ impl crate::named::Named for CompositeShapeRenderer {
     }
 }
 
-impl crate::mirante::Observable for CompositeShapeRenderer {
-    type Snapshot = crate::mirante::ChildCountSnapshot;
-
-    fn snapshot(&self) -> Self::Snapshot {
-        Self::snapshot(self)
-    }
-}
+crate::impl_observable!(CompositeShapeRenderer, crate::mirante::ChildCountSnapshot);
 
 #[async_trait]
 impl ShapeRenderer for CompositeShapeRenderer {

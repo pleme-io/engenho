@@ -247,18 +247,10 @@ impl Named for Budget {
     }
 }
 
-/// `Budget` is `Observable` — its `BudgetSnapshot` plugs directly
-/// into a `mirante::ObservationChannel` without a per-consumer
-/// adapter. Pattern #2 (substrate self-consumption): the inventive
-/// `Observable` trait (mirante v0.53) now has its first cross-primitive
-/// consumer.
-impl crate::mirante::Observable for Budget {
-    type Snapshot = BudgetSnapshot;
-
-    fn snapshot(&self) -> BudgetSnapshot {
-        Self::snapshot(self)
-    }
-}
+// `Budget` is `Observable` — `BudgetSnapshot` plugs directly into
+// a `mirante::ObservationChannel`. v0.92: routed through canonical
+// `impl_observable!` macro (TSR extraction).
+crate::impl_observable!(Budget, BudgetSnapshot);
 
 #[cfg(test)]
 mod tests {

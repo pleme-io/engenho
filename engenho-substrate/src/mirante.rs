@@ -63,6 +63,52 @@ pub struct ChildCountSnapshot {
     pub child_count: usize,
 }
 
+/// Generate an `impl Observable for $Type` that delegates to the
+/// type's inherent `snapshot()` method. Pattern #1 (TSR) extraction
+/// v0.92 — `Budget`, `TieredCache`, `CompositeShapeRenderer`,
+/// `ChainedVerifier` all shared the exact same 5-line delegation
+/// shape.
+///
+/// ## Usage
+///
+/// ```ignore
+/// use engenho_substrate::impl_observable;
+///
+/// impl Foo {
+///     pub fn snapshot(&self) -> FooSnapshot { ... }
+/// }
+///
+/// impl_observable!(Foo, FooSnapshot);
+/// ```
+///
+/// Expands to:
+///
+/// ```ignore
+/// impl engenho_substrate::mirante::Observable for Foo {
+///     type Snapshot = FooSnapshot;
+///     fn snapshot(&self) -> Self::Snapshot {
+///         Self::snapshot(self)
+///     }
+/// }
+/// ```
+///
+/// Requires the type to already impl `Named` + have an inherent
+/// `snapshot()` method. Generic types (e.g. `MachineRunner<M>`) +
+/// types that build the snapshot inline (e.g. `Mirante`,
+/// `SubscriberSnapshot`-returning wrappers) keep their hand-rolled
+/// impls.
+#[macro_export]
+macro_rules! impl_observable {
+    ($type:ty, $snapshot:ty) => {
+        impl $crate::mirante::Observable for $type {
+            type Snapshot = $snapshot;
+            fn snapshot(&self) -> Self::Snapshot {
+                Self::snapshot(self)
+            }
+        }
+    };
+}
+
 /// Universal observable surface. Every substrate primitive that
 /// has live state worth observing implements this trait.
 pub trait Observable: Named + Send + Sync {
