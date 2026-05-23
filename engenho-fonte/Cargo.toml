@@ -12,6 +12,13 @@ keywords.workspace = true
 authors.workspace = true
 description = "engenho-fonte — the live source-of-truth reconciler. shikumi-notify watches a (defsistema …) tlisp form; sui evaluates it; engenho-revoada Raft-proposes the new desired state; tameshi+sekiban attest the transition; engenho controllers reconcile; mirante publishes; orçamento budgets the change rate; provação chaos-tests the budgeted convergence. Five typed traits (Watcher, Evaluator, Proposer, Attester, Publisher) compose under a single Conduit. Mocks for every trait ship by default so consumers can wire end-to-end before any real subsystem is plugged in."
 
+[features]
+default = []
+# Real revoada FabricFace-backed Proposer. Pulls in engenho-revoada
+# (already in the workspace). Operator gets to compose: mock proposer
+# for unit tests, real revoada proposer for integration/cluster runs.
+with-revoada = ["dep:engenho-revoada"]
+
 [dependencies]
 async-trait            = { workspace = true }
 futures                = { workspace = true }
@@ -25,6 +32,8 @@ tokio                  = { workspace = true, features = ["sync", "macros", "rt",
 blake3                 = "1"
 engenho-substrate      = { workspace = true }
 engenho-sui-typescape  = { workspace = true }
+# Optional — enabled by `with-revoada`.
+engenho-revoada        = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio                  = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
