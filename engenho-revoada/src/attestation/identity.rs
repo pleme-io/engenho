@@ -11,6 +11,7 @@
 //! via cofre so it survives restarts.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use engenho_substrate::Risca;
 use rand::rngs::OsRng;
 
 use crate::NodeId;
@@ -53,11 +54,15 @@ impl NodeIdentity {
         self.signing.sign(bytes).to_bytes()
     }
 
-    /// Raw signing-key bytes — used by tests + persistence.
-    /// Production callers must keep this secret.
+    /// Raw signing-key bytes wrapped in [`Risca`] so accidental
+    /// leakage via `Debug` / `Display` / `Serialize` is impossible
+    /// at the type level. Production callers must reach for
+    /// `.expose_secret()` only at the single point where the bytes
+    /// hand off to cofre persistence — every exposure becomes a
+    /// grep-able, code-review-visible deliberate act.
     #[must_use]
-    pub fn signing_key_bytes(&self) -> [u8; 32] {
-        self.signing.to_bytes()
+    pub fn signing_key_bytes(&self) -> Risca<[u8; 32]> {
+        Risca::new(self.signing.to_bytes())
     }
 }
 
@@ -106,7 +111,26 @@ mod tests {
         let a = NodeIdentity::from_seed(seed);
         let b = NodeIdentity::from_seed(seed);
         assert_eq!(a.node_id(), b.node_id());
-        assert_eq!(a.signing_key_bytes(), b.signing_key_bytes());
+        // Compare via expose_secret — Risca's inner bytes are the
+        // canonical equality basis when both sides intentionally
+        // exposed the secret in test context.
+        assert_eq!(
+            a.signing_key_bytes().expose_secret(),
+            b.signing_key_bytes().expose_secret()
+        );
+    }
+
+    #[test]
+    fn signing_key_bytes_debug_does_not_leak() {
+        // The Risca wrapper makes leakage via Debug impossible at the
+        // type level — even when the operator accidentally formats the
+        // returned bytes for logging.
+        let id = NodeIdentity::from_seed([0x42; 32]);
+        let bytes = id.signing_key_bytes();
+        let dbg = format!("{bytes:?}");
+        assert!(!dbg.contains("0x42"), "Debug leaked the signing key: {dbg}");
+        assert!(!dbg.contains("66"), "Debug leaked the signing key: {dbg}");
+        assert!(dbg.contains("RISCA"));
     }
 
     #[test]
