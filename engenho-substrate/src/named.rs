@@ -173,6 +173,31 @@ mod tests {
     pub struct BoundedGeneric<T: Send>(pub T);
     define_named!(BoundedGeneric<T: Send>, "bounded-generic");
 
+    // v1.06: contract tests for `impl_named_field!` (v0.93) +
+    // `impl_named_field_generic!` (v0.94). Synthetic types prove
+    // each macro generates the expected Named impl.
+
+    pub struct FieldNonGeneric {
+        name: &'static str,
+        #[allow(dead_code)]
+        payload: u32,
+    }
+    crate::impl_named_field!(FieldNonGeneric);
+
+    pub struct FieldGenericSimple<T: Clone> {
+        name: &'static str,
+        #[allow(dead_code)]
+        payload: T,
+    }
+    crate::impl_named_field_generic!(FieldGenericSimple, T: Clone);
+
+    pub struct FieldGenericMultiBound<T: Clone + Send + Sync + 'static> {
+        name: &'static str,
+        #[allow(dead_code)]
+        payload: T,
+    }
+    crate::impl_named_field_generic!(FieldGenericMultiBound, T: Clone + Send + Sync + 'static);
+
     #[test]
     fn plain_type_named() {
         let p = PlainType;
@@ -200,6 +225,33 @@ mod tests {
     // Polymorphic dispatch test — generic over any Named.
     fn telemetry<N: Named>(n: &N) -> &'static str {
         n.name()
+    }
+
+    #[test]
+    fn impl_named_field_macro_reads_self_name() {
+        let f = FieldNonGeneric {
+            name: "non-generic-field",
+            payload: 0,
+        };
+        assert_eq!(f.name(), "non-generic-field");
+    }
+
+    #[test]
+    fn impl_named_field_generic_simple_bound() {
+        let f: FieldGenericSimple<u32> = FieldGenericSimple {
+            name: "simple-bound",
+            payload: 42,
+        };
+        assert_eq!(f.name(), "simple-bound");
+    }
+
+    #[test]
+    fn impl_named_field_generic_multi_bound() {
+        let f: FieldGenericMultiBound<String> = FieldGenericMultiBound {
+            name: "multi-bound",
+            payload: "x".into(),
+        };
+        assert_eq!(f.name(), "multi-bound");
     }
 
     #[test]
