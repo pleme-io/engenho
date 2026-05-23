@@ -42,14 +42,34 @@ use engenho_types::generated_v1_34::core_v1::{Container, PodSpec};
 use engenho_types::meta::ObjectMeta;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+#[cfg(feature = "with-engenho-kube-client")]
+use {engenho_kube_client::ReqwestKubeClient, engenho_types::client::KubeClient, std::sync::Arc};
 
 /// `AppReconciler` that produces typed K8s Deployment manifests for
 /// each AppRef. Dry-run by default — records emitted manifests in
-/// memory.
-#[derive(Debug, Default)]
+/// memory. With `with-engenho-kube-client`, optionally applies via
+/// a real KubeClient.
+#[derive(Default)]
 pub struct KubeAppReconciler {
     namespace: String,
     emitted: Mutex<Vec<Deployment>>,
+    // KubeClient has generic-method bounds → not dyn-compatible.
+    // Store the concrete ReqwestKubeClient. Operators using a custom
+    // client adapter can subclass via composition.
+    #[cfg(feature = "with-engenho-kube-client")]
+    client: Option<Arc<ReqwestKubeClient>>,
+}
+
+impl std::fmt::Debug for KubeAppReconciler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubeAppReconciler")
+            .field("namespace", &self.namespace)
+            .field(
+                "emitted_count",
+                &self.emitted.lock().map(|v| v.len()).unwrap_or(0),
+            )
+            .finish()
+    }
 }
 
 impl KubeAppReconciler {
@@ -65,7 +85,20 @@ impl KubeAppReconciler {
         Self {
             namespace: namespace.into(),
             emitted: Mutex::new(Vec::new()),
+            #[cfg(feature = "with-engenho-kube-client")]
+            client: None,
         }
+    }
+
+    /// Attach a real KubeClient — every reconcile_app() now BOTH
+    /// records the manifest in audit log AND applies it against the
+    /// cluster the client points at. Only available with
+    /// `with-engenho-kube-client`.
+    #[cfg(feature = "with-engenho-kube-client")]
+    #[must_use]
+    pub fn with_client(mut self, client: Arc<ReqwestKubeClient>) -> Self {
+        self.client = Some(client);
+        self
     }
 
     /// Translate an AppRef to a typed Deployment manifest. Pure
@@ -137,9 +170,31 @@ impl AppReconciler for KubeAppReconciler {
         self.emitted
             .lock()
             .expect("kube reconciler poisoned")
-            .push(dep);
-        // M3.5+ wiring: pipe `dep` to engenho_kube_client::KubeClient::apply
-        // behind `with-engenho-kube-client` feature flag.
+            .push(dep.clone());
+
+        // Live apply (only when the feature + client are present).
+        #[cfg(feature = "with-engenho-kube-client")]
+        if let Some(client) = &self.client {
+            // Try create; on AlreadyExists, swap to replace.
+            // KubeError::ApiStatus { kind, .. } carries the typed
+            // status reason.
+            use engenho_types::error::{ApiStatusKind, KubeError};
+            match client.create(&dep).await {
+                Ok(_) => {}
+                Err(KubeError::ApiStatus {
+                    kind: ApiStatusKind::AlreadyExists,
+                    ..
+                }) => {
+                    client
+                        .replace(&dep)
+                        .await
+                        .map_err(|e| crate::FonteError::Propose(format!("kube replace: {e}")))?;
+                }
+                Err(e) => {
+                    return Err(crate::FonteError::Propose(format!("kube create: {e}")));
+                }
+            }
+        }
         Ok(())
     }
 }
