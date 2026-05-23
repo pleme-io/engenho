@@ -55,6 +55,8 @@ pub mod roceiro;
 pub mod selector;
 pub mod service_router;
 pub mod statefulset;
+pub mod store_ledger;
+pub mod store_resolver;
 pub mod tiered_build;
 pub mod tiered_reconciler;
 pub mod watch_driver;
@@ -99,6 +101,8 @@ pub use event_driven::EventDrivenController;
 pub use build_backend_roceiro::BuildBackendRoceiro;
 pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};
 pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};
+pub use store_ledger::{StoreBackedLedger, DEFAULT_RECEIPT_NAMESPACE};
+pub use store_resolver::StoreBackedNodeResolver;
 pub use tiered_build::TieredBuildBackend;
 pub use tiered_reconciler::{PromotionScope, StaticPromotionScope, TieredCacheReconciler};
 pub use hpa::{

@@ -37,6 +37,7 @@ pub mod roca;
 pub mod shape;
 pub mod tiered_cache;
 pub mod verifier;
+pub mod verifier_impls;
 pub mod watched_cache;
 
 pub use atomic_write::{AtomicWriteError, write_atomic};
@@ -60,4 +61,8 @@ pub use roca::{
 pub use shape::{RenderedArtifact, ShapeError, ShapeRenderer, WorkloadShape};
 pub use tiered_cache::TieredCache;
 pub use verifier::{FakeVerifier, Verificacao, VerificationReceipt, VerifierId, Verifier, VerifyError};
+pub use verifier_impls::{
+    BytesAccessor, HashEqualityVerifier, IndependentRebuild, IndependentVerifier,
+    SmokeBuilder, SmokeTestVerifier,
+};
 pub use watched_cache::{CacheEvent, WatchedCache};
