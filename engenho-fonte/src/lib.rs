@@ -81,6 +81,9 @@ mod sla_controller;
 mod sui_evaluator;
 #[cfg(feature = "with-tameshi")]
 mod tameshi_attester;
+mod typed_config_stage;
+#[cfg(feature = "with-sui-eval")]
+mod typed_nix_stage;
 mod watcher;
 
 pub use anomaly::{AnomalyChain, AnomalyEntry, AnomalyEvent, MockAnomalyChain};
@@ -123,4 +126,7 @@ pub use sla_controller::{SlaController, SlaDrift, SlaSnapshot, SlaSpec};
 pub use sui_evaluator::SuiEvaluator;
 #[cfg(feature = "with-tameshi")]
 pub use tameshi_attester::TameshiAttester;
+pub use typed_config_stage::TypedConfigStage;
+#[cfg(feature = "with-sui-eval")]
+pub use typed_nix_stage::TypedNixStage;
 pub use watcher::{MockWatcher, Watcher};
