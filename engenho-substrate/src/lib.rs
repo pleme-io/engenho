@@ -28,6 +28,7 @@ pub mod chained_verifier;
 pub mod command_runner;
 pub mod compose_ir;
 pub mod derivation;
+pub mod disposable;
 pub mod drv_disk;
 pub mod gossip_ledger;
 pub mod ledger;
@@ -60,6 +61,7 @@ pub use command_runner::{
 pub use compose_ir::{
     ComposeError, ComposeHealthcheck, ComposeIr, ComposeService, ComposeStack,
 };
+pub use disposable::{Disposable, DisposableError, Transient};
 pub use gossip_ledger::{
     FakeGossipTransport, GossipBroadcast, GossipBroadcaster, GossipChannel,
     GossipDelivery, GossipError, GossipLedger,
