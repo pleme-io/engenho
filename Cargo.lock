@@ -722,6 +722,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cofre-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_yaml",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1252,6 +1261,7 @@ dependencies = [
  "engenho-types",
  "futures",
  "notify",
+ "promessa-types",
  "proptest",
  "serde",
  "serde_json",
@@ -4278,6 +4288,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "promessa-types"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "cofre-types",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "proptest"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6679,6 +6704,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

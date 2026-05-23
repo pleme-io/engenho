@@ -33,6 +33,10 @@ with-engenho-kube-client = ["dep:engenho-kube-client"]
 # path dep to pleme-io/tameshi. Off by default; integration sites
 # enable when they need cryptographic chain attestation.
 with-tameshi = ["dep:tameshi"]
+# Real PromessaReconciler bridging fonte's PromessaRef to
+# promessa-types' TargetController + PromessaTargetKind enum.
+# Cross-workspace path dep to pleme-io/promessa.
+with-promessa = ["dep:promessa-types"]
 
 [dependencies]
 async-trait            = { workspace = true }
@@ -56,6 +60,9 @@ engenho-kube-client    = { workspace = true, optional = true }
 # Optional — enabled by `with-tameshi`. Cross-workspace path dep
 # to pleme-io/tameshi for cryptographic chain attestation.
 tameshi                = { path = "../../tameshi", optional = true }
+# Optional — enabled by `with-promessa`. Cross-workspace path dep
+# to pleme-io/promessa for typed promise reconciliation.
+promessa-types         = { path = "../../promessa/promessa-types", optional = true }
 # Optional — enabled by `with-revoada`.
 engenho-revoada        = { workspace = true, optional = true }
 # Optional — enabled by `with-shikumi`. Cross-workspace path dep
