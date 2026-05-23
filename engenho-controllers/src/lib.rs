@@ -37,6 +37,7 @@ pub mod owner;
 pub mod replicaset;
 pub mod runtime;
 pub mod dns;
+pub mod ingress;
 pub mod selector;
 pub mod service_router;
 pub mod watch_driver;
@@ -53,6 +54,10 @@ pub use selector::{matches_labels, selector_match_labels, service_selector};
 pub use dns::{
     srv_fqdn, DnsBackend, DnsController, DnsError, DnsEvent, DnsRecord,
     InMemoryDnsZone, SrvRecord, DEFAULT_CLUSTER_DOMAIN,
+};
+pub use ingress::{
+    FakeIngressBackend, FakeIngressEvent, IngressBackend, IngressController,
+    IngressError, IngressRoute, PathType, TraefikIngressBackend,
 };
 pub use service_router::{
     FakeRouter, FakeRouterEvent, IptablesRouter, IpvsRouter, PortMap, RouterError,
