@@ -28,6 +28,7 @@ pub mod drv_disk;
 pub mod magic_blob;
 pub mod promotion;
 pub mod tiered_cache;
+pub mod watched_cache;
 
 pub use atomic_write::{AtomicWriteError, write_atomic};
 pub use derivation::{
@@ -38,3 +39,4 @@ pub use drv_disk::DiskDerivationCache;
 pub use magic_blob::{MagicBlob, MagicBlobError};
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
 pub use tiered_cache::TieredCache;
+pub use watched_cache::{CacheEvent, WatchedCache};
