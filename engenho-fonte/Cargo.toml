@@ -39,6 +39,9 @@ tokio                  = { workspace = true, features = ["sync", "macros", "rt",
 blake3                 = "1"
 engenho-substrate      = { workspace = true }
 engenho-sui-typescape  = { workspace = true }
+# Typed K8s catalog — used by KubeAppReconciler to translate an
+# AppRef into a typed Deployment.
+engenho-types          = { workspace = true }
 # Optional — enabled by `with-revoada`.
 engenho-revoada        = { workspace = true, optional = true }
 # Optional — enabled by `with-shikumi`. Cross-workspace path dep
