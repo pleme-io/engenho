@@ -1,16 +1,13 @@
 //! Property: verifier_impls invariants (HashEqualityVerifier + SmokeTestVerifier).
 
 use engenho_substrate::{
-    BytesAccessor, HashEqualityVerifier, NarHash, NodeId, SmokeBuilder, SmokeTestVerifier,
-    Verificacao, Verifier, VerifyError,
+    BytesAccessor, HashEqualityVerifier, NarHash, SmokeBuilder, SmokeTestVerifier, Verificacao,
+    Verifier, VerifyError,
 };
+use engenho_substrate_props::helpers::sample_emitter as emitter;
 use engenho_substrate_props::{block_on, proptest_with_env};
 use proptest::prelude::*;
 use std::sync::Arc;
-
-fn emitter(b: u8) -> NodeId {
-    NodeId::from_bytes(&[b; 32])
-}
 
 proptest_with_env! {
     /// HashEqualityVerifier: returns Failed when accessor returns no bytes.

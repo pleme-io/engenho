@@ -1,26 +1,16 @@
 //! Property: MemoryLedger invariants.
 
 use engenho_substrate::{
-    LedgerKey, MaterializationLedger, MaterializationReceipt, MemoryLedger, NodeId, QuorumOutcome,
-    ReceiptKind, StageId,
+    LedgerKey, MaterializationLedger, MemoryLedger, QuorumOutcome, ReceiptKind, StageId,
 };
+use engenho_substrate_props::helpers::sample_receipt as receipt;
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
-
-fn receipt(subject: [u8; 32], node_bytes: u8, emitted_at: u64) -> MaterializationReceipt {
-    MaterializationReceipt::new(
-        ReceiptKind::Shape("test/shape".into()),
-        subject,
-        NodeId::from_bytes(&[node_bytes; 32]),
-        emitted_at,
-        subject, // evidence = subject
-    )
-}
 
 fn key(stage: &str, subject: [u8; 32]) -> LedgerKey {
     LedgerKey {
         stage_id: StageId::new(stage),
-        kind: ReceiptKind::Shape("test/shape".into()),
+        kind: ReceiptKind::Shape("test".into()),
         subject,
     }
 }
@@ -31,7 +21,7 @@ proptest_with_env! {
     fn ingest_then_outcome_is_some(subject in any::<[u8; 32]>(), node in any::<u8>()) {
         engenho_substrate_props::block_on(async {
             let ledger = MemoryLedger::new();
-            let r = receipt(subject, node, 100);
+            let r = receipt(subject, node);
             ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
             let out = ledger.outcome(&key("s", subject)).await.unwrap();
             assert!(out.is_some());
@@ -44,7 +34,7 @@ proptest_with_env! {
     fn double_ingest_same_node_is_idempotent(subject in any::<[u8; 32]>(), node in any::<u8>()) {
         engenho_substrate_props::block_on(async {
             let ledger = MemoryLedger::new();
-            let r = receipt(subject, node, 100);
+            let r = receipt(subject, node);
             ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
             let out2 = ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
             // Second ingest succeeds; outcome is Reached (threshold=1 met by single node).
@@ -57,7 +47,7 @@ proptest_with_env! {
     fn threshold_one_single_ingest_reaches(subject in any::<[u8; 32]>(), node in any::<u8>()) {
         engenho_substrate_props::block_on(async {
             let ledger = MemoryLedger::new();
-            let r = receipt(subject, node, 100);
+            let r = receipt(subject, node);
             let out = ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
             assert!(matches!(out, QuorumOutcome::Reached { .. }));
     });
@@ -68,7 +58,7 @@ proptest_with_env! {
     fn forget_stage_removes_outcome(subject in any::<[u8; 32]>(), node in any::<u8>()) {
         engenho_substrate_props::block_on(async {
             let ledger = MemoryLedger::new();
-            let r = receipt(subject, node, 100);
+            let r = receipt(subject, node);
             ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
             assert!(ledger.outcome(&key("s", subject)).await.unwrap().is_some());
             ledger.forget_stage(&StageId::new("s")).await.unwrap();
@@ -84,7 +74,7 @@ proptest_with_env! {
         engenho_substrate_props::block_on(async {
             let ledger = MemoryLedger::new();
             for (i, s) in subjects.iter().enumerate() {
-                let r = receipt(*s, i as u8, 100);
+                let r = receipt(*s, i as u8);
                 ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
             }
             let len = ledger.len().await;

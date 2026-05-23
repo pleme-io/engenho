@@ -51,12 +51,15 @@
 //! runs at 4096 cases on every PR + nightly cron.
 
 // One small public API for the test files in `tests/`: the
-// `proptest_with_env!` macro and the `proptest_cases()` env helper.
-// They collapse the 6-line ProptestConfig ceremony that was
-// duplicated in every property-test file (14+ sites — third-site
-// rule fired three times over).
+// `proptest_with_env!` macro, the `proptest_cases()` env helper,
+// the `block_on()` async-test wrapper, and the `helpers` module
+// for sample fixtures (sample_drv / sample_receipt / sample_emitter
+// / sample_nar). They collapse the duplicated ceremony that was
+// hand-rolled in every property-test file before extraction.
 
 #![allow(missing_docs)]
+
+pub mod helpers;
 
 /// Read the `PROPTEST_CASES` environment variable as the proptest
 /// case-count budget. Defaults to 256 (fast loop). Deep-test CI

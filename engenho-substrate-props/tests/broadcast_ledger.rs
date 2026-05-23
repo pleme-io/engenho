@@ -1,22 +1,12 @@
 //! Property: BroadcastLedger event emission + subscriber semantics.
 
 use engenho_substrate::{
-    BroadcastLedger, LedgerEvent, MaterializationLedger, MaterializationReceipt, MemoryLedger,
-    NodeId, ReceiptKind, StageId,
+    BroadcastLedger, LedgerEvent, MaterializationLedger, MemoryLedger, ReceiptKind, StageId,
 };
+use engenho_substrate_props::helpers::sample_receipt as receipt;
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use std::sync::Arc;
-
-fn receipt(subject: [u8; 32], node_bytes: u8) -> MaterializationReceipt {
-    MaterializationReceipt::new(
-        ReceiptKind::Shape("test".into()),
-        subject,
-        NodeId::from_bytes(&[node_bytes; 32]),
-        0,
-        subject,
-    )
-}
 
 proptest_with_env! {
     /// Every successful ingest emits exactly one ReceiptIngested event
