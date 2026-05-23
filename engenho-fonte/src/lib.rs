@@ -52,6 +52,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod anomaly;
 mod attester;
 mod change;
 mod conduit;
@@ -63,6 +64,7 @@ mod publisher;
 mod sistema;
 mod watcher;
 
+pub use anomaly::{AnomalyChain, AnomalyEntry, AnomalyEvent, MockAnomalyChain};
 pub use attester::{Attester, MockAttester, Receipt};
 pub use change::{Change, ChangeKind, Decision, Outcome};
 pub use conduit::Conduit;

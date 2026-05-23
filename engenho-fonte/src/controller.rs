@@ -28,8 +28,8 @@
 //! as `Arc<dyn Trait>`.
 
 use crate::{
-    AppRef, Decision, FonteError, FonteResult, InfraRef, PromessaRef, ProposalId, Proposer,
-    Sistema, TopologyRef,
+    AnomalyChain, AnomalyEvent, AppRef, Decision, FonteError, FonteResult, InfraRef, PromessaRef,
+    ProposalId, Proposer, Sistema, TopologyRef,
 };
 use async_trait::async_trait;
 use engenho_sui_typescape::Typescape;
@@ -81,12 +81,14 @@ pub struct SystemController {
     infra: Arc<dyn InfraReconciler>,
     promises: Arc<dyn PromessaReconciler>,
     topology: Arc<dyn TopologyReconciler>,
+    anomalies: Option<Arc<dyn AnomalyChain>>,
     next_id: AtomicU64,
     last_applied: Mutex<Option<Sistema>>,
 }
 
 impl SystemController {
-    /// Build from four typed sub-reconcilers.
+    /// Build from four typed sub-reconcilers. Anomaly detection is
+    /// opt-in via [`Self::with_anomaly_chain`].
     #[must_use]
     pub fn new(
         apps: Arc<dyn AppReconciler>,
@@ -99,9 +101,21 @@ impl SystemController {
             infra,
             promises,
             topology,
+            anomalies: None,
             next_id: AtomicU64::new(0),
             last_applied: Mutex::new(None),
         }
+    }
+
+    /// Enable typed drift detection. After every reconcile, the diff
+    /// against `last_applied` (or an empty Sistema for the first
+    /// reconcile) is recorded into the chain as a sequence of typed
+    /// [`AnomalyEvent`]s. Real wiring to viggy's AnomalyController
+    /// ships behind feature flags later.
+    #[must_use]
+    pub fn with_anomaly_chain(mut self, chain: Arc<dyn AnomalyChain>) -> Self {
+        self.anomalies = Some(chain);
+        self
     }
 
     /// Read-only snapshot of the last applied Sistema. Returns
@@ -155,8 +169,41 @@ impl Proposer for SystemController {
         topo_res?;
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+
+        // Diff + record anomalies BEFORE swapping last_applied so the
+        // chain sees the transition from prev → next, not next → next.
+        let prev = self
+            .last_applied
+            .lock()
+            .expect("controller poisoned")
+            .clone();
+        if let Some(chain) = &self.anomalies {
+            let events = match &prev {
+                Some(p) => AnomalyEvent::diff(p, &sistema),
+                None => AnomalyEvent::diff(&empty_sistema(&sistema.name), &sistema),
+            };
+            if !events.is_empty() {
+                chain.record(decision.change.revision, events).await?;
+            }
+        }
         *self.last_applied.lock().expect("controller poisoned") = Some(sistema);
         Ok(id)
+    }
+}
+
+/// An empty Sistema with the given name — used as the synthetic
+/// `prev` for the first reconcile so AnomalyEvent::diff treats every
+/// declared sub-primitive as an addition (not a noop).
+fn empty_sistema(name: &Arc<str>) -> Sistema {
+    Sistema {
+        name: name.clone(),
+        apps: Vec::new(),
+        infra: Vec::new(),
+        promises: Vec::new(),
+        topology: TopologyRef {
+            strategy: "solo".into(),
+            nodes: 0,
+        },
     }
 }
 
