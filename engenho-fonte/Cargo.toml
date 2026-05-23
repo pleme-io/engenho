@@ -25,6 +25,10 @@ with-shikumi = ["dep:shikumi", "dep:notify"]
 # Real sui_eval-backed Evaluator. Pulls in engenho-sui-typescape's
 # with-sui-eval feature (which pulls in sui-eval cross-workspace).
 with-sui-eval = ["engenho-sui-typescape/with-sui-eval"]
+# Real KubeClient apply for KubeAppReconciler. Pulls in
+# engenho-kube-client (already workspace dep). Default off — the
+# dry-run shape stays the always-on default.
+with-engenho-kube-client = ["dep:engenho-kube-client"]
 
 [dependencies]
 async-trait            = { workspace = true }
@@ -42,6 +46,9 @@ engenho-sui-typescape  = { workspace = true }
 # Typed K8s catalog — used by KubeAppReconciler to translate an
 # AppRef into a typed Deployment.
 engenho-types          = { workspace = true }
+# Optional — enabled by `with-engenho-kube-client`. Real K8s apply
+# for KubeAppReconciler.
+engenho-kube-client    = { workspace = true, optional = true }
 # Optional — enabled by `with-revoada`.
 engenho-revoada        = { workspace = true, optional = true }
 # Optional — enabled by `with-shikumi`. Cross-workspace path dep
