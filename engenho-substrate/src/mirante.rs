@@ -31,6 +31,23 @@ use tokio::sync::{RwLock, watch};
 use crate::named::Named;
 use crate::relogio::{Clock, Instant};
 
+/// Canonical snapshot shape for substrate wrappers that own a
+/// broadcast channel — captures the operator-facing observability
+/// (name + currently-active subscribers). Third-site extraction
+/// (v0.87 TSR): `BroadcastLedger`, `WatchedCache`, `FakeGossipTransport`
+/// all return this from their `Observable::snapshot()`.
+///
+/// If a future subscriber-having primitive needs more fields, add
+/// them here (every consumer benefits) rather than forking a new
+/// shape.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubscriberSnapshot {
+    /// Telemetry name of the underlying wrapper.
+    pub name: &'static str,
+    /// Currently-active subscribers on the broadcast channel.
+    pub subscriber_count: usize,
+}
+
 /// Universal observable surface. Every substrate primitive that
 /// has live state worth observing implements this trait.
 pub trait Observable: Named + Send + Sync {

@@ -81,17 +81,15 @@ impl BroadcastLedger {
     }
 }
 
-/// Observable snapshot for a `BroadcastLedger` — what an ops
-/// dashboard sees. Pattern #2 (substrate self-consumption v0.86):
-/// makes the wrapper plug into any mirante channel without
-/// per-consumer adapter.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct BroadcastLedgerSnapshot {
-    /// Telemetry name ("broadcast").
-    pub name: &'static str,
-    /// Currently-active subscribers on the broadcast channel.
-    pub subscriber_count: usize,
-}
+/// Backwards-compat alias for the per-wrapper snapshot type that
+/// shipped in v0.86. Migrated to the canonical
+/// [`crate::mirante::SubscriberSnapshot`] in v0.87 per the TSR
+/// extraction. Pattern #6 (deprecation alias) — zero-churn rename.
+#[deprecated(
+    since = "0.1.4",
+    note = "use engenho_substrate::SubscriberSnapshot directly (v0.87)"
+)]
+pub type BroadcastLedgerSnapshot = crate::mirante::SubscriberSnapshot;
 
 impl crate::named::Named for BroadcastLedger {
     fn name(&self) -> &'static str {
@@ -100,10 +98,10 @@ impl crate::named::Named for BroadcastLedger {
 }
 
 impl crate::mirante::Observable for BroadcastLedger {
-    type Snapshot = BroadcastLedgerSnapshot;
+    type Snapshot = crate::mirante::SubscriberSnapshot;
 
     fn snapshot(&self) -> Self::Snapshot {
-        BroadcastLedgerSnapshot {
+        crate::mirante::SubscriberSnapshot {
             name: "broadcast",
             subscriber_count: self.subscriber_count(),
         }

@@ -88,15 +88,15 @@ impl WatchedCache {
     }
 }
 
-/// Observable snapshot for a `WatchedCache` — what an ops dashboard
-/// sees. Pattern #2 (substrate self-consumption v0.86).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct WatchedCacheSnapshot {
-    /// Telemetry name ("watched").
-    pub name: &'static str,
-    /// Currently-active subscribers on the broadcast channel.
-    pub subscriber_count: usize,
-}
+/// Backwards-compat alias for the per-wrapper snapshot type that
+/// shipped in v0.86. Migrated to the canonical
+/// [`crate::mirante::SubscriberSnapshot`] in v0.87 per the TSR
+/// extraction. Pattern #6 (deprecation alias).
+#[deprecated(
+    since = "0.1.4",
+    note = "use engenho_substrate::SubscriberSnapshot directly (v0.87)"
+)]
+pub type WatchedCacheSnapshot = crate::mirante::SubscriberSnapshot;
 
 impl crate::named::Named for WatchedCache {
     fn name(&self) -> &'static str {
@@ -105,10 +105,10 @@ impl crate::named::Named for WatchedCache {
 }
 
 impl crate::mirante::Observable for WatchedCache {
-    type Snapshot = WatchedCacheSnapshot;
+    type Snapshot = crate::mirante::SubscriberSnapshot;
 
     fn snapshot(&self) -> Self::Snapshot {
-        WatchedCacheSnapshot {
+        crate::mirante::SubscriberSnapshot {
             name: "watched",
             subscriber_count: self.subscriber_count(),
         }
