@@ -37,6 +37,38 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v1.11 algebra: selo + orçamento compose into "rate-limited
+    /// authorized API call" — a canonical real-consumer pattern.
+    /// Selo gates the call (authz check); Budget rate-limits
+    /// (token-bucket consumption). Both must succeed for the call
+    /// to proceed.
+    #[test]
+    fn selo_plus_budget_rate_limited_authorized_call(
+        secret in any::<[u8; 32]>(),
+        subj in "[a-zA-Z]{1,16}",
+        cap in 100u64..1000,
+        tokens in 1u64..50,
+    ) {
+        use engenho_substrate::{Budget, SeloIssuer};
+        let iss = SeloIssuer::new(secret);
+        let selo = iss.issue(&subj, "read:foo", Instant::from_ms(1_000_000));
+        let budget = Budget::new("rate-limited-api", cap, 0, frozen_clock(0));
+        // Step 1: verify selo (authz).
+        let authz_ok = iss
+            .verify(&selo, &subj, "read:foo", Instant::from_ms(0))
+            .is_ok();
+        prop_assert!(authz_ok, "selo should verify on its own params");
+        // Step 2: try-consume from the budget (rate limit).
+        if tokens <= cap {
+            let res = budget.try_consume(tokens);
+            prop_assert!(res.is_ok(), "tokens within capacity should consume");
+            prop_assert_eq!(res.unwrap(), cap - tokens);
+        }
+        // Substrate composition guarantee: authz + rate-limit are
+        // independent typed primitives; both can be checked in
+        // sequence without coupling.
+    }
+
     /// v1.04 SSC composition test (added v1.09): ObservationChannel<S>
     /// is itself Observable + publishes SubscriberSnapshot through
     /// another mirante channel. Closes the v1.08-noted gap — 14 of 14
