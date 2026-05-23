@@ -41,6 +41,10 @@ with-promessa = ["dep:promessa-types"]
 # (defsistema …) keyword via #[derive(TataraDomain)]. Cross-
 # workspace path dep to pleme-io/tatara.
 with-tatara-lisp = ["dep:tatara-lisp"]
+# caixa renderer integration — CaixaAppReconciler wraps
+# caixa-helm's chart renderer. Cross-workspace path deps to
+# pleme-io/caixa.
+with-caixa = ["dep:caixa-core", "dep:caixa-helm", "dep:serde_yaml"]
 
 [dependencies]
 async-trait            = { workspace = true }
@@ -70,6 +74,11 @@ promessa-types         = { path = "../../promessa/promessa-types", optional = tr
 # Optional — enabled by `with-tatara-lisp`. Cross-workspace path
 # dep to pleme-io/tatara for the `(defsistema …)` Lisp keyword.
 tatara-lisp            = { path = "../../tatara/tatara-lisp", optional = true }
+# Optional — enabled by `with-caixa`. Cross-workspace path deps
+# to pleme-io/caixa for typed Servico chart rendering.
+caixa-core             = { path = "../../caixa/caixa-core", optional = true }
+caixa-helm             = { path = "../../caixa/caixa-helm", optional = true }
+serde_yaml             = { workspace = true, optional = true }
 # Optional — enabled by `with-revoada`.
 engenho-revoada        = { workspace = true, optional = true }
 # Optional — enabled by `with-shikumi`. Cross-workspace path dep

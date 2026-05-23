@@ -563,6 +563,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "caixa-core"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tatara-lisp 0.2.0",
+ "tatara-lisp-derive 0.2.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "caixa-helm"
+version = "0.1.0"
+dependencies = [
+ "caixa-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "camino"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1253,6 +1277,8 @@ version = "0.1.4"
 dependencies = [
  "async-trait",
  "blake3",
+ "caixa-core",
+ "caixa-helm",
  "engenho-kube-client",
  "engenho-revoada",
  "engenho-substrate",
@@ -1265,6 +1291,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "shikumi 0.1.0",
  "tameshi",
  "tatara-lisp 0.2.0",
@@ -5313,6 +5340,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"
