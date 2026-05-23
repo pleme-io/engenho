@@ -23,6 +23,23 @@ use crate::{TypescapeError, TypescapeValue};
 use std::sync::Arc;
 use sui_eval::Value;
 
+/// Re-export `sui_eval::eval` so cross-crate consumers don't need
+/// their own `sui-eval` dep. The Nix string → `Value` parse is the
+/// pair of `from_sui_value`; together they're the full
+/// source-text-to-TypescapeValue path.
+///
+/// # Errors
+///
+/// Returns the underlying `sui_eval::EvalError` (Debug-formatted)
+/// folded into a `TypescapeError::Invariant`.
+pub fn eval_nix_str(source: &str) -> Result<TypescapeValue, TypescapeError> {
+    let val = sui_eval::eval(source).map_err(|e| TypescapeError::Invariant {
+        location: "eval_nix_str".into(),
+        reason: format!("sui_eval::eval failed: {e:?}"),
+    })?;
+    from_sui_value(&val)
+}
+
 /// Convert a sui-evaluated [`Value`] into a Send+Sync
 /// [`TypescapeValue`]. Forces thunks via `demand()`. Returns typed
 /// errors for variants the bridge intentionally rejects.
