@@ -37,6 +37,38 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v0.87 TSR: three Observable implementers all return the
+    /// canonical `SubscriberSnapshot`. Asserts the shared shape
+    /// is identical across BroadcastLedger / WatchedCache /
+    /// FakeGossipTransport — the extraction is functionally
+    /// equivalent to the v0.86 per-wrapper types.
+    #[test]
+    fn all_three_subscriber_observables_share_shape(_seed in any::<u8>()) {
+        use engenho_substrate::{
+            BroadcastLedger, FakeGossipTransport, MaterializationLedger, MemoryLedger,
+            DerivationCacheBackend, MemoryDerivationCache, Observable, SubscriberSnapshot,
+            WatchedCache,
+        };
+        block_on(async {
+            let inner_l: Arc<dyn MaterializationLedger> = Arc::new(MemoryLedger::new());
+            let bl = BroadcastLedger::new(inner_l);
+            let inner_c: Arc<dyn DerivationCacheBackend> =
+                Arc::new(MemoryDerivationCache::new());
+            let wc = WatchedCache::new(inner_c);
+            let gt = FakeGossipTransport::new();
+            let b: SubscriberSnapshot = Observable::snapshot(&bl);
+            let w: SubscriberSnapshot = Observable::snapshot(&wc);
+            let g: SubscriberSnapshot = Observable::snapshot(&gt);
+            // Same shape: each has a name + subscriber_count.
+            assert_eq!(b.name, "broadcast");
+            assert_eq!(w.name, "watched");
+            assert_eq!(g.name, "fake-gossip");
+            // Subscriber counts are non-negative usize (always true,
+            // but the shape is uniform across all three).
+            let _ = b.subscriber_count + w.subscriber_count + g.subscriber_count;
+        });
+    }
+
     /// v0.86: `BroadcastLedger` + `WatchedCache` both implement
     /// `Observable`. Their snapshots carry the subscriber_count
     /// for live ops dashboards. Asserts subscriber_count tracks

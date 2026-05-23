@@ -148,6 +148,40 @@ impl FakeGossipTransport {
         self.outbound_sender.subscribe()
     }
 
+    /// Currently-active outbound subscribers (for the SubscriberSnapshot
+    /// observable). Sync — reads broadcast::Sender::receiver_count.
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
+        self.outbound_sender.receiver_count()
+    }
+}
+
+impl crate::named::Named for FakeGossipTransport {
+    fn name(&self) -> &'static str {
+        "fake-gossip"
+    }
+}
+
+/// Third site (v0.87 TSR completion): `FakeGossipTransport` joins
+/// `BroadcastLedger` + `WatchedCache` as Observable wrappers all
+/// returning the canonical `SubscriberSnapshot`.
+impl crate::mirante::Observable for FakeGossipTransport {
+    type Snapshot = crate::mirante::SubscriberSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        crate::mirante::SubscriberSnapshot {
+            name: "fake-gossip",
+            subscriber_count: self.subscriber_count(),
+        }
+    }
+}
+
+impl FakeGossipTransport {
+    // Implementation continuation — kept inside an inherent impl so the
+    // Named / Observable impls above can be readily diffed.
+    #[allow(dead_code)]
+    fn _v087_marker() {}
+
     /// Inject the next broadcast call to fail.
     pub async fn fail_next(&self, err: GossipError) {
         self.inner.lock().await.fail_next = Some(err);

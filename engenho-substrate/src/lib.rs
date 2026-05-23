@@ -63,7 +63,9 @@ pub mod verifier_impls;
 pub mod watched_cache;
 
 pub use atomic_write::{AtomicWriteError, tmp_path_for, write_atomic};
-pub use broadcast_ledger::{BroadcastLedger, BroadcastLedgerSnapshot, LedgerEvent};
+#[allow(deprecated)]
+pub use broadcast_ledger::BroadcastLedgerSnapshot;
+pub use broadcast_ledger::{BroadcastLedger, LedgerEvent};
 pub use chained_verifier::ChainedVerifier;
 pub use command_runner::{
     CommandError, CommandRequest, CommandResponse, CommandRunner, FakeCommandRunner,
@@ -86,7 +88,7 @@ pub use ledger::{LedgerError, LedgerKey, MaterializationLedger, MemoryLedger};
 pub use linhagem_aberta::{LineageError, LineageGraph, LineageNode, LineageProof};
 pub use magic_blob::{MagicBlob, MagicBlobError};
 pub use maquina::{MachineError, MachineRunner, MachineSnapshot, StateMachine, TransitionRecord};
-pub use mirante::{AnyChannel, Mirante, Observable, ObservationChannel};
+pub use mirante::{AnyChannel, Mirante, Observable, ObservationChannel, SubscriberSnapshot};
 pub use named::Named;
 pub use oci_renderer::{OciDestReader, OciDestRef, OciImageRenderer, OciSourceRef};
 pub use orcamento::{Budget, BudgetError, BudgetSnapshot};
@@ -118,4 +120,6 @@ pub use verifier_impls::{
     BytesAccessor, HashEqualityVerifier, IndependentRebuild, IndependentVerifier, SignerCheck,
     SmokeBuilder, SmokeTestVerifier, TameshiVerifier,
 };
-pub use watched_cache::{CacheEvent, WatchedCache, WatchedCacheSnapshot};
+#[allow(deprecated)]
+pub use watched_cache::WatchedCacheSnapshot;
+pub use watched_cache::{CacheEvent, WatchedCache};
