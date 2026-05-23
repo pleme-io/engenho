@@ -199,13 +199,34 @@ impl GossipMesh {
     /// Construct + spawn the gossip server. Returns once chitchat
     /// has bound its UDP socket and the bridge task is running.
     ///
+    /// Defaults to `WallClock` for the ChitchatId generation timestamp.
+    /// Tests pinning the timestamp should use [`Self::start_with_clock`].
+    ///
     /// # Errors
     ///
     /// Returns [`MembershipError::StartFailed`] if chitchat can't
     /// bind the socket or if any other startup step fails.
     pub async fn start(config: GossipConfig) -> Result<Self, MembershipError> {
-        let chitchat_id =
-            ChitchatId::new(config.node_id.to_hex(), unix_seconds(), config.gossip_addr);
+        Self::start_with_clock(config, std::sync::Arc::new(engenho_substrate::WallClock)).await
+    }
+
+    /// Construct + spawn with an explicit typed `Clock` for the
+    /// ChitchatId generation timestamp. Pattern #7 (concrete-first,
+    /// trait-back) — production unchanged via `start()`; tests get
+    /// determinism via `FrozenClock`. Closes the v0.62/v0.74
+    /// membership backlog.
+    ///
+    /// # Errors
+    /// Same as [`Self::start`].
+    pub async fn start_with_clock(
+        config: GossipConfig,
+        clock: std::sync::Arc<dyn engenho_substrate::Clock>,
+    ) -> Result<Self, MembershipError> {
+        let chitchat_id = ChitchatId::new(
+            config.node_id.to_hex(),
+            clock.unix_secs(),
+            config.gossip_addr,
+        );
 
         let cc_config = ChitchatConfig {
             chitchat_id: chitchat_id.clone(),
@@ -402,12 +423,9 @@ fn build_view(
     MembershipView { members }
 }
 
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// `unix_seconds()` helper deleted in v0.88 — replaced by
+// `engenho_substrate::Clock::unix_secs()` plumbed through
+// `GossipMesh::start_with_clock`.
 
 #[cfg(test)]
 mod tests {
