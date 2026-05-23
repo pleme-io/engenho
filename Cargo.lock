@@ -901,6 +901,7 @@ version = "0.1.4"
 dependencies = [
  "async-trait",
  "blake3",
+ "engenho-revoada",
  "engenho-substrate",
  "engenho-substrate-props",
  "engenho-sui-typescape",

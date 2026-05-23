@@ -61,6 +61,8 @@ mod error;
 mod evaluator;
 mod proposer;
 mod publisher;
+#[cfg(feature = "with-revoada")]
+mod revoada;
 mod sistema;
 mod watcher;
 
@@ -77,6 +79,8 @@ pub use error::{FonteError, FonteResult};
 pub use evaluator::{Evaluator, MockEvaluator};
 pub use proposer::{MockProposer, ProposalId, Proposer};
 pub use publisher::{MockPublisher, Publisher};
+#[cfg(feature = "with-revoada")]
+pub use revoada::RevoadaProposer;
 pub use sistema::{
     AppRef, InfraBackend, InfraRef, PromessaKind, PromessaRef, Sistema, TopologyRef,
 };
