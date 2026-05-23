@@ -1,0 +1,34 @@
+name: auto-release
+
+# Three-line consumer shim. Every push to main runs the
+# pleme-io substrate auto-release pipeline:
+#
+#   bump workspace patch  →  commit  →  tag  →  push  →  publish
+#
+# All logic lives in pleme-io/actions/* (Rust + tatara-lisp) +
+# pleme-io/substrate/.github/workflows/rust-auto-release.yml. The
+# whole architecture is documented at:
+#
+#   github.com/pleme-io/substrate/blob/main/docs/AUTO-RELEASE.md
+#
+# Operators only manage this 3-line file; everything else is
+# the substrate's reusable primitive.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump-type:
+        description: "patch | minor | major"
+        required: false
+        default: patch
+
+jobs:
+  release:
+    uses: pleme-io/substrate/.github/workflows/rust-auto-release.yml@main
+    with:
+      bump-type: ${{ inputs.bump-type || 'patch' }}
+      add-paths: "Cargo.toml Cargo.lock Cargo.nix engenho-*/Cargo.toml engenho/Cargo.toml"
+      source-paths: "engenho* Cargo.toml Cargo.lock"
+    secrets: inherit
