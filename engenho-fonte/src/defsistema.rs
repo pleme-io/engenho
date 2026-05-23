@@ -177,10 +177,10 @@ pub fn to_authoring_form(sistema: &Sistema) -> String {
     let _ = write!(&mut out, "(defsistema {:?}", sistema.name.as_ref());
 
     if !sistema.apps.is_empty() {
-        out.push_str("\n  :apps     [");
+        out.push_str("\n  :apps     (");
         for (i, app) in sistema.apps.iter().enumerate() {
             if i > 0 {
-                out.push_str(" ");
+                out.push(' ');
             }
             match &app.version {
                 Some(v) => {
@@ -196,11 +196,11 @@ pub fn to_authoring_form(sistema: &Sistema) -> String {
                 }
             }
         }
-        out.push(']');
+        out.push(')');
     }
 
     if !sistema.infra.is_empty() {
-        out.push_str("\n  :infra    [");
+        out.push_str("\n  :infra    (");
         for (i, inf) in sistema.infra.iter().enumerate() {
             if i > 0 {
                 out.push(' ');
@@ -212,11 +212,11 @@ pub fn to_authoring_form(sistema: &Sistema) -> String {
             };
             let _ = write!(&mut out, "({} {:?})", backend_slug, inf.name.as_ref());
         }
-        out.push(']');
+        out.push(')');
     }
 
     if !sistema.promises.is_empty() {
-        out.push_str("\n  :promises [");
+        out.push_str("\n  :promises (");
         for (i, p) in sistema.promises.iter().enumerate() {
             if i > 0 {
                 out.push(' ');
@@ -236,7 +236,7 @@ pub fn to_authoring_form(sistema: &Sistema) -> String {
                 p.target
             );
         }
-        out.push(']');
+        out.push(')');
     }
 
     let _ = write!(

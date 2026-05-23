@@ -94,6 +94,8 @@ mod subprocess_stage;
 mod sui_evaluator;
 #[cfg(feature = "with-tameshi")]
 mod tameshi_attester;
+#[cfg(feature = "with-tatara-lisp")]
+mod tatara_lisp_domain;
 mod typed_config_stage;
 #[cfg(feature = "with-sui-eval")]
 mod typed_nix_stage;
@@ -162,6 +164,8 @@ pub use subprocess_stage::{
 pub use sui_evaluator::SuiEvaluator;
 #[cfg(feature = "with-tameshi")]
 pub use tameshi_attester::TameshiAttester;
+#[cfg(feature = "with-tatara-lisp")]
+pub use tatara_lisp_domain::parse_tlisp;
 pub use typed_config_stage::TypedConfigStage;
 #[cfg(feature = "with-sui-eval")]
 pub use typed_nix_stage::TypedNixStage;
