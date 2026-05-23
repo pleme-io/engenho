@@ -43,6 +43,7 @@ pub mod maquina;
 pub mod mirante;
 pub mod named;
 pub mod oci_renderer;
+pub mod orcamento;
 pub mod pesquisa;
 pub mod promotion;
 pub mod quorum;
@@ -84,6 +85,7 @@ pub use maquina::{MachineError, MachineRunner, StateMachine, TransitionRecord};
 pub use mirante::{AnyChannel, Mirante, Observable, ObservationChannel};
 pub use named::Named;
 pub use oci_renderer::{OciDestReader, OciDestRef, OciImageRenderer, OciSourceRef};
+pub use orcamento::{Budget, BudgetError, BudgetSnapshot};
 pub use pesquisa::{
     Aptidao, Arquivo, Ensaio, EnsaioId, Evidence, FakeFitness, FakeSearchSpace, Fitness,
     FitnessError, Geracao, GeracaoId, Linhagem, NicheKey, PesquisaError, SearchEngine, SearchId,
