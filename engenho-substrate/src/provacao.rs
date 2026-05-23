@@ -33,7 +33,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error_kind::ErrorKind;
-use crate::named::Named;
 use crate::relogio::Clock;
 
 /// One injection policy. Operators compose many via `with_policy`.
@@ -193,15 +192,12 @@ impl<F: ErrorKind + Clone> Provacao<F> {
     }
 }
 
-impl<F: ErrorKind + Clone> Named for Provacao<F> {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
+crate::impl_named_field_generic!(Provacao, F: ErrorKind + Clone);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::named::Named;
     use crate::relogio::FrozenClock;
     use std::sync::Arc;
     use thiserror::Error;

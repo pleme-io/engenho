@@ -85,10 +85,9 @@ macro_rules! define_named {
 /// `Budget`, `CompositeShapeRenderer`, `ChainedVerifier` all had
 /// hand-rolled `impl Named { fn name(&self) -> self.name }` blocks.
 ///
-/// Generic types (e.g. `MachineRunner<M>`, `Provacao<F>`,
-/// `ReplayCursor<E>`) keep hand-rolled impls — their bound shapes
-/// (`M: StateMachine`, `F: ErrorKind + Clone`, `E: Clone`) don't
-/// fit a uniform macro template.
+/// For generic types with a single type parameter + bound (or sum
+/// of bounds), use the [`impl_named_field_generic!`] variant
+/// instead (v0.94 — completes the Named macro family).
 ///
 /// ## Usage
 ///
@@ -114,6 +113,43 @@ macro_rules! define_named {
 macro_rules! impl_named_field {
     ($type:ident) => {
         impl $crate::named::Named for $type {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+        }
+    };
+}
+
+/// Generic single-parameter variant of [`impl_named_field!`] —
+/// generates `impl<P: $bounds> Named for $type<P>` reading `self.name`.
+/// Third-site extraction (v0.94 TSR): `MachineRunner<M: StateMachine>`,
+/// `Provacao<F: ErrorKind + Clone>`, `ReplayCursor<E: Clone>` all
+/// shared this exact shape.
+///
+/// ## Usage
+///
+/// ```ignore
+/// use engenho_substrate::impl_named_field_generic;
+///
+/// pub struct Foo<T: SomeTrait + Clone> {
+///     name: &'static str,
+///     // ...
+/// }
+///
+/// impl_named_field_generic!(Foo, T: SomeTrait + Clone);
+/// ```
+///
+/// Expands to:
+///
+/// ```ignore
+/// impl<T: SomeTrait + Clone> engenho_substrate::Named for Foo<T> {
+///     fn name(&self) -> &'static str { self.name }
+/// }
+/// ```
+#[macro_export]
+macro_rules! impl_named_field_generic {
+    ($type:ident, $param:ident: $($bound:tt)+) => {
+        impl<$param: $($bound)+> $crate::named::Named for $type<$param> {
             fn name(&self) -> &'static str {
                 self.name
             }
