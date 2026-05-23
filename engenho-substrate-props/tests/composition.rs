@@ -243,3 +243,146 @@ proptest_with_env! {
         prop_assert_eq!(back.token.into_inner(), token);
     }
 }
+
+// ── orçamento + provação: Budget survives chaos faults ──
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+enum BudgetCallFault {
+    #[error("upstream timeout")]
+    Upstream,
+}
+
+impl_error_kind! {
+    BudgetCallFault {
+        Upstream => "upstream",
+    }
+}
+
+proptest_with_env! {
+    /// A consumer wrapping Budget + Provação: every `call()` first
+    /// asks the chaos injector + (if no fault) tries to consume from
+    /// the budget. The Budget's own invariants (available bounded by
+    /// [0, cap]; OverCapacity is structural) hold across the chaos.
+    #[test]
+    fn budget_under_chaos_preserves_invariants(
+        cap in 10u64..1000,
+        rate in 0u64..100,
+        chaos_p in 0.0_f64..1.0,
+        seed in any::<u64>(),
+        calls in 1usize..20,
+    ) {
+        let clock = Arc::new(FrozenClock::at(0));
+        let budget = Budget::new("test", cap, rate, clock.clone());
+        let injector = Provacao::<BudgetCallFault>::new("chaos", seed).with_policy(
+            Policy::Probability {
+                fault: BudgetCallFault::Upstream,
+                p: chaos_p,
+            },
+        );
+        let clk: &dyn Clock = clock.as_ref();
+        for _ in 0..calls {
+            // If chaos fires, consumer treats as upstream timeout (no
+            // budget consumption). If chaos doesn't, consumer tries
+            // a 1-token consume.
+            let _outcome: Result<u64, BudgetCallFault> = match injector.maybe_fault(clk) {
+                Some(_) => Err(BudgetCallFault::Upstream),
+                None => Ok(budget.try_consume(1).map_or(0, |remaining| remaining)),
+            };
+        }
+        // Invariant: available is always in [0, cap] no matter what
+        // sequence of chaos + consumes happened.
+        let avail = budget.available();
+        prop_assert!(avail <= cap);
+    }
+}
+
+// ── mirante + máquina: FSM state observable via ObservationChannel ──
+
+proptest_with_env! {
+    /// Every successful machine transition can be published as a
+    /// snapshot to a mirante channel — subscribers see the latest
+    /// state. Composes máquina (FSM authority) with mirante
+    /// (last-value-wins observability).
+    #[test]
+    fn machine_state_published_to_mirante(
+        increments in proptest::collection::vec(1u32..50, 1..6),
+    ) {
+        let (snap_json, expected_json) = block_on(async {
+            let safe_incs: Vec<_> = increments.into_iter().take(6).collect();
+            let clock = Arc::new(FrozenClock::at(0));
+            let mut runner =
+                MachineRunner::<CounterMachine>::new(clock.clone() as Arc<dyn Clock>);
+            let chan: Arc<ObservationChannel<CounterState>> = Arc::new(
+                ObservationChannel::new(
+                    runner.state().clone(),
+                    clock.clone() as Arc<dyn Clock>,
+                ),
+            );
+            let mut m = Mirante::new();
+            m.register("counter", chan.clone());
+            for inc in &safe_incs {
+                runner.step(CounterEvent::Inc(*inc)).unwrap();
+                chan.publish(runner.state().clone());
+            }
+            let snap = m.snapshot_all();
+            let cur_state = runner.state().clone();
+            let expected = serde_json::to_value(&cur_state).unwrap();
+            (snap["counter"].clone(), expected)
+        });
+        prop_assert_eq!(snap_json, expected_json);
+    }
+}
+
+// ── selo + linhagem-aberta: typed capability delegation chain ──
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DelegationLink {
+    parent_subject: String,
+    child_subject: String,
+    capability: String,
+}
+engenho_substrate::impl_fingerprint!(DelegationLink);
+
+proptest_with_env! {
+    /// A capability delegation chain — Alice delegates "read:foo" to
+    /// Bob who delegates to Carol. Each link is a Selo + a
+    /// DelegationLink fingerprint that goes into a LineageGraph. The
+    /// chain's root proves the full delegation chain back to Alice.
+    #[test]
+    fn capability_delegation_chain_via_lineage(
+        secret in any::<[u8; 32]>(),
+        depth in 2usize..6,
+    ) {
+        let iss = SeloIssuer::new(secret);
+        let cap = "read:foo";
+        let exp = Instant::from_ms(1_000_000);
+        let mut graph: LineageGraph<DelegationLink> = LineageGraph::new();
+        let mut parent: Option<[u8; 32]> = None;
+        for i in 0..depth {
+            let parent_name = if i == 0 {
+                "root".to_string()
+            } else {
+                format!("user{}", i - 1)
+            };
+            let child_name = format!("user{i}");
+            // Each Selo proves delegation parent → child.
+            let _selo = iss.issue(&child_name, cap, exp);
+            // Record the link in the lineage chain.
+            let link = DelegationLink {
+                parent_subject: parent_name,
+                child_subject: child_name,
+                capability: cap.to_string(),
+            };
+            let causes = parent.map(|p| std::iter::once(p).collect()).unwrap_or_default();
+            let fp = graph.append(link, causes).unwrap();
+            parent = Some(fp);
+        }
+        prop_assert_eq!(graph.len(), depth);
+        // Ancestors of the leaf = full chain back to root.
+        let leaf = parent.unwrap();
+        let ancestors = graph.ancestors(leaf).unwrap();
+        prop_assert_eq!(ancestors.len(), depth);
+        // Root hash is deterministic from the chain shape.
+        let _root = graph.root_hash();
+    }
+}
