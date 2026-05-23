@@ -62,7 +62,7 @@ pub mod verifier;
 pub mod verifier_impls;
 pub mod watched_cache;
 
-pub use atomic_write::{AtomicWriteError, write_atomic};
+pub use atomic_write::{AtomicWriteError, tmp_path_for, write_atomic};
 pub use broadcast_ledger::{BroadcastLedger, LedgerEvent};
 pub use chained_verifier::ChainedVerifier;
 pub use command_runner::{
