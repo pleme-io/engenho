@@ -93,7 +93,15 @@ pub use ingress::{
     FakeIngressBackend, FakeIngressEvent, IngressBackend, IngressController, IngressError,
     IngressRoute, NginxIngressBackend, PathType, TraefikIngressBackend,
 };
-pub use job::{Clock, CronJobController, FixedClock, JobController, SystemClock};
+pub use job::{Clock, CronJobController, JobController, SystemClock, WallClock, fixed_clock};
+// Backwards-compat alias for any external consumer that referenced the
+// old name. Substrate's FrozenClock is the canonical replacement.
+pub use engenho_substrate::FrozenClock;
+#[deprecated(
+    since = "0.1.4",
+    note = "use engenho_substrate::FrozenClock directly (ms precision)"
+)]
+pub type FixedClock = engenho_substrate::FrozenClock;
 pub use network_policy::{
     CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,
     NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,

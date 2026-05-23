@@ -172,6 +172,19 @@ pub trait Clock: Named + Send + Sync {
         let now = self.now();
         Instant::tick(now.max(observed), observed)
     }
+
+    /// Unix timestamp in seconds (`now().physical_ms / 1000`). Provided
+    /// as a default method so the dozens of `SystemTime::now().duration_since(UNIX_EPOCH)`
+    /// idiom sites across the fleet migrate to one typed surface.
+    fn unix_secs(&self) -> u64 {
+        self.now().physical_ms / 1000
+    }
+
+    /// Unix timestamp in milliseconds (`now().physical_ms`). Synonym
+    /// of `now().physical_ms`; exists for symmetry with `unix_secs`.
+    fn unix_ms(&self) -> u64 {
+        self.now().physical_ms
+    }
 }
 
 // =================================================================
