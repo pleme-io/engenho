@@ -124,11 +124,17 @@ impl ComposeIr {
     /// BLAKE3 fingerprint over the canonical-JSON encoding.
     /// Deterministic across nodes for the same IR — fits the
     /// receipt evidence_hash + cache key contract.
+    ///
+    /// Generated via [`crate::Fingerprint`] / [`crate::impl_fingerprint!`].
     #[must_use]
     pub fn fingerprint(&self) -> [u8; 32] {
-        let bytes = serde_json::to_vec(self).expect("ComposeIr serializes");
-        *blake3::hash(&bytes).as_bytes()
+        <Self as crate::Fingerprint>::fingerprint(self)
     }
+}
+
+crate::impl_fingerprint!(ComposeIr);
+
+impl ComposeIr {
 
     /// Render the IR as a docker-compose v3-shape YAML string.
     /// Pure helper — no I/O, no validation against docker.

@@ -196,6 +196,8 @@ crate::impl_error_kind! {
     }
 }
 
+crate::impl_fingerprint!(Plantio);
+
 /// Typed materialization DAG. Pure value — no runtime state.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plantio {
@@ -233,6 +235,17 @@ impl Plantio {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.stages.is_empty()
+    }
+
+    /// BLAKE3 fingerprint over canonical JSON. Operators commit
+    /// this to attest a particular Plantio was deployed.
+    /// Same Plantio (down to stage insertion order via BTreeMap)
+    /// always produces the same fingerprint.
+    ///
+    /// Generated via [`crate::Fingerprint`].
+    #[must_use]
+    pub fn fingerprint(&self) -> [u8; 32] {
+        <Self as crate::Fingerprint>::fingerprint(self)
     }
 
     /// Validate topology: every depends_on resolves + the DAG is
