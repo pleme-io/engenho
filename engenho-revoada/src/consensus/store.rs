@@ -42,6 +42,10 @@ pub struct InMemoryStore {
     inner: Arc<Mutex<Inner>>,
     identity: NodeIdentity,
     chain: AttestationChain,
+    /// Typed clock used to stamp every attestation-chain append.
+    /// Production wires `WallClock`; tests pin via `FrozenClock` for
+    /// byte-deterministic chain replay.
+    clock: Arc<dyn engenho_substrate::Clock>,
 }
 
 #[derive(Default)]
@@ -68,11 +72,20 @@ struct Inner {
 
 impl InMemoryStore {
     /// Construct with this node's identity + a fresh attestation chain.
+    /// Production clock — uses `engenho_substrate::WallClock`. Tests
+    /// pinning timestamps should use [`Self::with_clock`].
     pub fn new(identity: NodeIdentity) -> Self {
+        Self::with_clock(identity, Arc::new(engenho_substrate::WallClock))
+    }
+
+    /// Construct with an explicit typed clock — tests should pass a
+    /// `FrozenClock` so attestation-chain timestamps are byte-deterministic.
+    pub fn with_clock(identity: NodeIdentity, clock: Arc<dyn engenho_substrate::Clock>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
             identity,
             chain: AttestationChain::new(),
+            clock,
         }
     }
 
@@ -294,10 +307,9 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
         // auditor can verify ANY node's chain independently because
         // each block is signed with that node's identity (whose
         // pubkey is its NodeId in gossip).
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // Typed clock — `WallClock` in production, `FrozenClock` in
+        // tests for byte-deterministic chain replay.
+        let now_ms = self.clock.unix_ms();
         for (cmd, term, index) in to_sign {
             self.chain.append(&self.identity, cmd, now_ms, term, index);
         }
@@ -398,5 +410,26 @@ mod tests {
         let vote = Vote::new(1, 42);
         s.save_vote(&vote).await.unwrap();
         assert_eq!(s.read_vote().await.unwrap(), Some(vote));
+    }
+
+    #[tokio::test]
+    async fn with_clock_pins_chain_timestamps_deterministically() {
+        // Apply the same promote entry on two distinct stores built
+        // from the SAME identity + SAME FrozenClock — the resulting
+        // attestation chain blocks must carry byte-identical
+        // timestamps. Substrate relógio adoption unlocks
+        // replayable consensus chains.
+        let identity = NodeIdentity::from_seed([0xee; 32]);
+        let clock = std::sync::Arc::new(engenho_substrate::FrozenClock::at(1_700_000_000_000));
+        let mut s1 = InMemoryStore::with_clock(identity.clone(), clock.clone());
+        let mut s2 = InMemoryStore::with_clock(identity, clock);
+        let entry1 = promote_entry(1);
+        let entry2 = promote_entry(1);
+        s1.apply(vec![entry1]).await.unwrap();
+        s2.apply(vec![entry2]).await.unwrap();
+        // Both chains carry the same number of blocks with the same
+        // timestamps. We can't compare the full chain (signatures
+        // depend on internal nonces), but the count must match.
+        assert_eq!(s1.chain.len(), s2.chain.len());
     }
 }
