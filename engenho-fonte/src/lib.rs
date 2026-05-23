@@ -67,6 +67,7 @@ mod mirante_publisher;
 #[cfg(feature = "with-promessa")]
 mod promessa_reconciler;
 mod proposer;
+mod provisioning;
 mod publisher;
 mod remediation;
 #[cfg(feature = "with-revoada")]
@@ -99,6 +100,10 @@ pub use mirante_publisher::MirantePublisher;
 #[cfg(feature = "with-promessa")]
 pub use promessa_reconciler::{PromessaIntent, PromessaTargetReconciler, promessa_kind_to_target};
 pub use proposer::{MockProposer, ProposalId, Proposer};
+pub use provisioning::{
+    MockProvisioningStage, ProvisioningController, ProvisioningReport, ProvisioningStage,
+    StageKind, mock_provisioning_controller,
+};
 pub use publisher::{MockPublisher, Publisher};
 pub use remediation::{
     AnomalyHandler, AnomalyRouter, MockAnomalyHandler, RemediationPolicy, mock_anomaly_router,
