@@ -122,15 +122,13 @@ mod tests {
 
     #[test]
     fn signing_key_bytes_debug_does_not_leak() {
-        // The Risca wrapper makes leakage via Debug impossible at the
-        // type level — even when the operator accidentally formats the
-        // returned bytes for logging.
+        // Routed through the substrate's canonical assert_risca_no_leak!
+        // macro — same shape every leak-proof test ships fleet-wide.
         let id = NodeIdentity::from_seed([0x42; 32]);
         let bytes = id.signing_key_bytes();
-        let dbg = format!("{bytes:?}");
-        assert!(!dbg.contains("0x42"), "Debug leaked the signing key: {dbg}");
-        assert!(!dbg.contains("66"), "Debug leaked the signing key: {dbg}");
-        assert!(dbg.contains("RISCA"));
+        // Decimal form of 0x42 = 66 — both representations excluded.
+        engenho_substrate::assert_risca_no_leak!(bytes, "0x42");
+        engenho_substrate::assert_risca_no_leak!(id.signing_key_bytes(), "66");
     }
 
     #[test]

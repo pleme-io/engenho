@@ -183,8 +183,8 @@ mod tests {
     #[test]
     fn bearer_token_debug_output_does_not_leak_inner() {
         // The Risca<String> wrapper makes leakage via Debug impossible
-        // at the type level — proves the substrate guarantee at the
-        // kube-client layer.
+        // at the type level. Routed through assert_risca_no_leak! from
+        // engenho-substrate — the canonical fleet-wide leak-proof check.
         let secret = "super-secret-bearer-9f3a";
         let c = Connection::new(
             "https://api.example.com",
@@ -195,13 +195,7 @@ mod tests {
         )
         .unwrap();
         let t = c.bearer_token().unwrap();
-        let dbg = format!("{t:?}");
-        assert!(
-            !dbg.contains(secret),
-            "Debug output leaked the bearer secret: {dbg}"
-        );
-        // Sanity: the wrapper IS present in the Debug output.
-        assert!(dbg.contains("RISCA"));
+        engenho_substrate::assert_risca_no_leak!(t, secret);
     }
 
     #[test]

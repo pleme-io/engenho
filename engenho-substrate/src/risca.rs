@@ -40,6 +40,54 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// The redaction placeholder string written by all default emission paths.
 pub const REDACTED: &str = "<REDACTED>";
 
+/// The substring every `Risca<T>`'s `Debug` impl emits — used by
+/// [`assert_risca_no_leak!`] to confirm the framing is in place.
+pub const RISCA_FRAMING: &str = "RISCA";
+
+/// Assert at test time that a value's `Debug` output does NOT leak
+/// the given secret + DOES carry the `Risca` framing. Extracted per
+/// the third-site rule (substrate's own risca tests + kube-client
+/// bearer_token + revoada NodeIdentity signing_key_bytes).
+///
+/// ## Usage
+///
+/// ```ignore
+/// use engenho_substrate::assert_risca_no_leak;
+///
+/// #[test]
+/// fn bearer_token_does_not_leak() {
+///     let secret = "super-secret-bearer-9f3a";
+///     let conn = make_connection_with(secret);
+///     let token = conn.bearer_token().unwrap().unwrap();
+///     assert_risca_no_leak!(token, secret);
+/// }
+/// ```
+///
+/// Equivalent to:
+///
+/// ```ignore
+/// let dbg = format!("{token:?}");
+/// assert!(!dbg.contains(secret), "leaked: {dbg}");
+/// assert!(dbg.contains("RISCA"));
+/// ```
+#[macro_export]
+macro_rules! assert_risca_no_leak {
+    ($risca:expr, $secret:expr $(,)?) => {{
+        let __dbg = ::std::format!("{:?}", $risca);
+        ::std::assert!(
+            !__dbg.contains($secret),
+            "Risca leaked secret '{}' in Debug output: {}",
+            $secret,
+            __dbg
+        );
+        ::std::assert!(
+            __dbg.contains($crate::risca::RISCA_FRAMING),
+            "Risca framing string not found in Debug output: {}",
+            __dbg
+        );
+    }};
+}
+
 /// Typed redaction wrapper. `Debug`, `Display`, `Serialize` all
 /// produce a redacted form — the inner value is reachable only via
 /// the explicit `into_inner()` / `expose_secret()` methods.
@@ -161,9 +209,31 @@ mod tests {
     #[test]
     fn risca_debug_does_not_leak() {
         let r = Risca::new(String::from("super-secret"));
-        let debug = format!("{r:?}");
-        assert!(!debug.contains("super-secret"));
-        assert!(debug.contains("RISCA"));
+        // Consume the assert_risca_no_leak! macro — substrate eats its own dogfood.
+        crate::assert_risca_no_leak!(r, "super-secret");
+    }
+
+    #[test]
+    fn assert_risca_no_leak_macro_passes_on_clean_wrapper() {
+        let r = Risca::new(String::from("xyzzy-secret-123"));
+        crate::assert_risca_no_leak!(r, "xyzzy-secret-123");
+    }
+
+    #[test]
+    #[should_panic(expected = "Risca leaked secret")]
+    fn assert_risca_no_leak_macro_panics_when_secret_leaks() {
+        // Construct a synthetic value whose Debug DOES contain the
+        // "secret" — proves the macro fires correctly when the
+        // wrapper is bypassed (e.g. operator forgets to use Risca).
+        #[derive(Debug)]
+        struct NotRisca {
+            #[allow(dead_code)]
+            value: String,
+        }
+        let exposed = NotRisca {
+            value: "leaked-token-abc".into(),
+        };
+        crate::assert_risca_no_leak!(exposed, "leaked-token-abc");
     }
 
     #[test]
