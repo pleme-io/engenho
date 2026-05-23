@@ -38,6 +38,7 @@ pub mod replicaset;
 pub mod runtime;
 pub mod admission;
 pub mod crd;
+pub mod crd_validator;
 pub mod dns;
 pub mod drv;
 pub mod drv_build;
@@ -49,6 +50,7 @@ pub mod pdb;
 pub mod selector;
 pub mod service_router;
 pub mod statefulset;
+pub mod tiered_build;
 pub mod watch_driver;
 
 pub use controller::{Controller, ReconcileReport};
@@ -78,10 +80,12 @@ pub use admission::{
     AdmissionRequest, AdmissionWebhook, FakeAdmissionWebhook,
 };
 pub use crd::{CrdController, CrdEntry, CrdError, CrdRegistry, CrdScope};
+pub use crd_validator::{crd_validation_webhook, CrdValidationWebhook};
 pub use drv::DrvController;
 pub use drv_build::{
     BuildBackend, BuildError, BuildResult, DrvBuildController, FakeBuildBackend,
 };
+pub use tiered_build::TieredBuildBackend;
 pub use hpa::{
     FakeMetricsProvider, HorizontalPodAutoscalerController, MetricsError,
     MetricsProvider, ScaleTarget,
