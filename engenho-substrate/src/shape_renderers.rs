@@ -150,6 +150,17 @@ impl CompositeShapeRenderer {
         self.renderers.is_empty()
     }
 
+    /// Observable snapshot — name + renderer count. Pattern #2
+    /// (SSC v0.91) — returns canonical
+    /// [`crate::mirante::ChildCountSnapshot`].
+    #[must_use]
+    pub fn snapshot(&self) -> crate::mirante::ChildCountSnapshot {
+        crate::mirante::ChildCountSnapshot {
+            name: self.name,
+            child_count: self.len(),
+        }
+    }
+
     /// Set of distinct shapes this composite knows how to render.
     #[must_use]
     pub fn supported_shapes(&self) -> Vec<WorkloadShape> {
@@ -180,6 +191,20 @@ impl CompositeShapeRenderer {
             "no renderer registered for {}",
             target.tag()
         )))
+    }
+}
+
+impl crate::named::Named for CompositeShapeRenderer {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+impl crate::mirante::Observable for CompositeShapeRenderer {
+    type Snapshot = crate::mirante::ChildCountSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        Self::snapshot(self)
     }
 }
 
