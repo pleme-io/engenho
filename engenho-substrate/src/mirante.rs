@@ -63,6 +63,40 @@ pub struct ChildCountSnapshot {
     pub child_count: usize,
 }
 
+/// Generate an `impl Observable for $Type` that builds a
+/// [`SubscriberSnapshot`] inline by calling `self.subscriber_count()`.
+/// Third-site extraction (v0.95 TSR): `BroadcastLedger`,
+/// `WatchedCache`, `FakeGossipTransport` all shared this exact shape.
+///
+/// Required: `$type` already impls `Named` + has an inherent
+/// `subscriber_count(&self) -> usize` method.
+///
+/// ## Usage
+///
+/// ```ignore
+/// use engenho_substrate::impl_observable_subscriber;
+///
+/// impl Foo {
+///     pub fn subscriber_count(&self) -> usize { ... }
+/// }
+///
+/// impl_observable_subscriber!(Foo, "foo");
+/// ```
+#[macro_export]
+macro_rules! impl_observable_subscriber {
+    ($type:ty, $name:literal) => {
+        impl $crate::mirante::Observable for $type {
+            type Snapshot = $crate::mirante::SubscriberSnapshot;
+            fn snapshot(&self) -> Self::Snapshot {
+                $crate::mirante::SubscriberSnapshot {
+                    name: $name,
+                    subscriber_count: self.subscriber_count(),
+                }
+            }
+        }
+    };
+}
+
 /// Generate an `impl Observable for $Type` that delegates to the
 /// type's inherent `snapshot()` method. Pattern #1 (TSR) extraction
 /// v0.92 — `Budget`, `TieredCache`, `CompositeShapeRenderer`,
