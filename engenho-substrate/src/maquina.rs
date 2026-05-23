@@ -185,6 +185,47 @@ impl<M: StateMachine> MachineRunner<M> {
     }
 }
 
+/// Observable snapshot of a `MachineRunner<M>` — current state +
+/// step count + telemetry name. Plug into a
+/// `mirante::ObservationChannel<MachineSnapshot<M::State>>` for
+/// live dashboards of FSM progress.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MachineSnapshot<S> {
+    /// Machine telemetry name.
+    pub name: &'static str,
+    /// Current FSM state.
+    pub state: S,
+    /// Number of successful transitions to date.
+    pub step_count: usize,
+    /// Whether the current state is terminal.
+    pub is_terminal: bool,
+}
+
+impl<M: StateMachine> crate::named::Named for MachineRunner<M> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// Pattern #2 (substrate self-consumption) — `MachineRunner<M>`
+/// is `Observable` so any FSM plugs directly into a mirante
+/// channel without a per-consumer adapter. v0.85 round.
+impl<M: StateMachine> crate::mirante::Observable for MachineRunner<M>
+where
+    M::State: Clone + serde::Serialize + Send + Sync + 'static,
+{
+    type Snapshot = MachineSnapshot<M::State>;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        MachineSnapshot {
+            name: self.name,
+            state: self.state.clone(),
+            step_count: self.history.len(),
+            is_terminal: M::is_terminal(&self.state),
+        }
+    }
+}
+
 /// Errors a machine runner can surface.
 #[derive(Debug, thiserror::Error)]
 pub enum MachineError<E: crate::error_kind::ErrorKind + std::fmt::Debug> {
