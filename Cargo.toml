@@ -17,6 +17,7 @@ members = [
   "engenho-config",
   "engenho-kubelet",
   "engenho-substrate",
+  "engenho-substrate-props",
 ]
 
 [workspace.package]
@@ -66,6 +67,7 @@ async-trait            = "0.1"
 tokio                  = { version = "1", features = ["full"] }
 tracing                = "0.1"
 tracing-subscriber     = { version = "0.3", features = ["env-filter"] }
+proptest               = "1"
 rmcp                   = { version = "0.15", features = ["server", "transport-io", "macros"] }
 
 # Distribution-layer deps (used by engenho-revoada). Pinned to the

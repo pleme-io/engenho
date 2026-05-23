@@ -1,0 +1,26 @@
+[package]
+name = "engenho-substrate-props"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+authors.workspace = true
+description = "engenho-substrate-props — proptest property tests for engenho-substrate's typed primitives. Runs the full invariant suite (Plantio topo-sort acyclicity, WorkloadShape hash determinism, EnsaioId derivation determinism, QuorumTracker convergence, MagicBlob round-trip) at PROPTEST_CASES=1024 by default; deep-test workflow runs at 4096."
+
+[lib]
+name = "engenho_substrate_props"
+path = "src/lib.rs"
+
+[dependencies]
+engenho-substrate = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
