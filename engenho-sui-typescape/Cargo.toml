@@ -12,6 +12,14 @@ keywords.workspace = true
 authors.workspace = true
 description = "Bidirectional bridge between sui's Nix-value tree and engenho's typescape primitives. TypescapeValue: a Send+Sync, thread-portable mirror of sui::Value (Null/Bool/Int/Float/String/Path/List/Attrs). Typescape trait: every typed primitive's to_typescape_value() / from_typescape_value() round-trip. Real sui evaluator integration ships behind the `with-sui-eval` feature once sui's public Value surface stabilizes."
 
+[features]
+default = []
+# Real sui_eval::Value → TypescapeValue adapter. Pulls in sui-eval
+# (cross-workspace path dep). Only consumers that need to ingest
+# sui-evaluated Nix expressions enable this; the rest of the
+# substrate stays sui-independent.
+with-sui-eval = ["dep:sui-eval"]
+
 [dependencies]
 thiserror          = { workspace = true }
 # `rc` feature: enables Serialize+Deserialize for Arc<T> / Arc<str> /
@@ -20,6 +28,10 @@ thiserror          = { workspace = true }
 serde              = { version = "1.0", features = ["derive", "rc"] }
 serde_json         = { workspace = true }
 engenho-substrate  = { workspace = true }
+# Optional — enabled by `with-sui-eval`. Cross-workspace path dep
+# to pleme-io/sui. The adapter is the only file that touches sui's
+# types.
+sui-eval           = { path = "../../sui/sui-eval", optional = true }
 
 [dev-dependencies]
 proptest                = "1"

@@ -84,8 +84,12 @@
 
 mod error;
 mod ext;
+#[cfg(feature = "with-sui-eval")]
+mod sui_adapter;
 mod value;
 
 pub use error::TypescapeError;
 pub use ext::Typescape;
+#[cfg(feature = "with-sui-eval")]
+pub use sui_adapter::from_sui_value;
 pub use value::{TypescapeAttrs, TypescapeList, TypescapeString, TypescapeValue};
