@@ -54,6 +54,7 @@ pub mod replay;
 pub mod retrying_cache;
 pub mod risca;
 pub mod roca;
+pub mod selo;
 pub mod shape;
 pub mod shape_renderers;
 pub mod tiered_cache;
@@ -106,6 +107,7 @@ pub use roca::{
     ConfirmacaoPolicy, JobTarget, MaterializationJob, Placement, Plantio, PlantioError, Stage,
     StageId,
 };
+pub use selo::{Selo, SeloError, SeloIssuer};
 pub use shape::{RenderedArtifact, ShapeError, ShapeRenderer, WorkloadShape};
 pub use shape_renderers::{CompositeShapeRenderer, FakeShapeRenderer};
 pub use tiered_cache::TieredCache;
