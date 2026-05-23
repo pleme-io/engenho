@@ -6,10 +6,11 @@
 //! algebra of their interactions. These tests guard the algebra.
 
 use engenho_substrate::{
-    Budget, BudgetSnapshot, Clock, FrozenClock, Instant, LineageGraph, MachineRunner, Mirante,
+    Budget, BudgetSnapshot, Clock, Instant, LineageGraph, MachineRunner, Mirante,
     ObservationChannel, Policy, Provacao, ReplayCursor, Risca, SeloIssuer, StateMachine,
     define_named, impl_error_kind, replay_into,
 };
+use engenho_substrate_props::helpers::frozen_clock;
 use engenho_substrate_props::{block_on, proptest_with_env};
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,7 @@ proptest_with_env! {
         consume in 0u64..10,
     ) {
         block_on(async {
-            let clock = Arc::new(FrozenClock::at(0));
+            let clock = frozen_clock(0);
             let budget = Budget::new("test-budget", cap, rate, clock.clone());
             // Take an initial snapshot.
             let snap0 = budget.snapshot();
@@ -88,7 +89,7 @@ proptest_with_env! {
                 p: chaos_p,
             },
         );
-        let clock: Arc<dyn Clock> = Arc::new(FrozenClock::at(0));
+        let clock: Arc<dyn Clock> = frozen_clock(0);
         // Single call: if chaos fires, AuthFault::RateLimited; else verify ok.
         let outcome: Result<(), AuthFault> = match injector.maybe_fault(clock.as_ref()) {
             Some(fault) => Err(fault),
@@ -171,7 +172,7 @@ proptest_with_env! {
             safe_incs.iter().map(|n| CounterEvent::Inc(*n)).collect::<Vec<_>>(),
         );
         let mut runner =
-            MachineRunner::<CounterMachine>::new(Arc::new(FrozenClock::at(0)));
+            MachineRunner::<CounterMachine>::new(frozen_clock(0));
         let applied = replay_into(&mut runner, &cursor).unwrap();
         prop_assert_eq!(applied, safe_incs.len());
         // Each transition's resulting state becomes a lineage node.
@@ -271,7 +272,7 @@ proptest_with_env! {
         seed in any::<u64>(),
         calls in 1usize..20,
     ) {
-        let clock = Arc::new(FrozenClock::at(0));
+        let clock = frozen_clock(0);
         let budget = Budget::new("test", cap, rate, clock.clone());
         let injector = Provacao::<BudgetCallFault>::new("chaos", seed).with_policy(
             Policy::Probability {
@@ -309,7 +310,7 @@ proptest_with_env! {
     ) {
         let (snap_json, expected_json) = block_on(async {
             let safe_incs: Vec<_> = increments.into_iter().take(6).collect();
-            let clock = Arc::new(FrozenClock::at(0));
+            let clock = frozen_clock(0);
             let mut runner =
                 MachineRunner::<CounterMachine>::new(clock.clone() as Arc<dyn Clock>);
             let chan: Arc<ObservationChannel<CounterState>> = Arc::new(

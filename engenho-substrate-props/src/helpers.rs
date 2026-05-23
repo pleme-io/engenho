@@ -29,7 +29,10 @@
 //! }
 //! ```
 
-use engenho_substrate::{Drv, DrvHash, MaterializationReceipt, NarBlob, NodeId, ReceiptKind};
+use engenho_substrate::{
+    Drv, DrvHash, FrozenClock, MaterializationReceipt, NarBlob, NodeId, ReceiptKind,
+};
+use std::sync::Arc;
 
 /// Sample synthetic `Drv` with `drv_hash = [b; 32]` and the default
 /// `x86_64-linux` system tag.
@@ -62,4 +65,17 @@ pub fn sample_receipt(subject: [u8; 32], node_byte: u8) -> MaterializationReceip
         0,
         subject,
     )
+}
+
+/// Construct an `Arc<FrozenClock>` pinned at `t_ms` ms-since-epoch.
+/// Extracted per the third-site rule — the `Arc::new(FrozenClock::at(t))`
+/// pattern appeared in 11+ test files.
+///
+/// Returns the concrete `Arc<FrozenClock>` (not `Arc<dyn Clock>`) so
+/// callers can still reach `.advance()` / `.tick_logical()` via Deref.
+/// Pass to APIs expecting `Arc<dyn Clock>` via `clock.clone() as
+/// Arc<dyn Clock>`.
+#[must_use]
+pub fn frozen_clock(t_ms: u64) -> Arc<FrozenClock> {
+    Arc::new(FrozenClock::at(t_ms))
 }
