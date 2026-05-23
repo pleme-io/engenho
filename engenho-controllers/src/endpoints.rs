@@ -17,16 +17,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
+    StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
-    StoreMesh,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{set_owner_reference, OwnerReference};
+use crate::owner::{OwnerReference, set_owner_reference};
 use crate::selector::{matches_labels, service_selector};
 
 pub struct EndpointsController {
@@ -90,10 +90,7 @@ impl EndpointsController {
 
     /// Build the Endpoints object body. `addresses` is a typed
     /// list of (ip, target_pod_name) pairs.
-    fn build_endpoints(
-        svc: &Value,
-        addresses: Vec<(String, String)>,
-    ) -> Value {
+    fn build_endpoints(svc: &Value, addresses: Vec<(String, String)>) -> Value {
         let name = Self::service_name(svc).unwrap_or("");
         let ports = svc
             .get("spec")
@@ -272,7 +269,10 @@ mod tests {
             "metadata": {"name": "podinfo"},
             "spec": {"selector": {"app": "podinfo"}, "ports": [{"port": 80}]}
         });
-        let addrs = vec![("10.0.0.1".into(), "p1".into()), ("10.0.0.2".into(), "p2".into())];
+        let addrs = vec![
+            ("10.0.0.1".into(), "p1".into()),
+            ("10.0.0.2".into(), "p2".into()),
+        ];
         let ep = EndpointsController::build_endpoints(&svc, addrs);
         assert_eq!(ep.get("kind").unwrap(), "Endpoints");
         let subsets = ep.get("subsets").unwrap().as_array().unwrap();
@@ -280,7 +280,10 @@ mod tests {
         let addresses = subsets[0].get("addresses").unwrap().as_array().unwrap();
         assert_eq!(addresses.len(), 2);
         assert_eq!(addresses[0].get("ip").unwrap(), "10.0.0.1");
-        assert_eq!(addresses[0].get("targetRef").unwrap().get("kind").unwrap(), "Pod");
+        assert_eq!(
+            addresses[0].get("targetRef").unwrap().get("kind").unwrap(),
+            "Pod"
+        );
         // Ports carried through from service.
         let ports = subsets[0].get("ports").unwrap().as_array().unwrap();
         assert_eq!(ports.len(), 1);
@@ -301,7 +304,9 @@ mod tests {
         struct Fake;
         #[async_trait]
         impl Controller for Fake {
-            fn name(&self) -> &'static str { "endpoints" }
+            fn name(&self) -> &'static str {
+                "endpoints"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

@@ -10,10 +10,8 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use engenho_revoada::membership::{
-    GossipConfig, GossipMesh, NodeCapacity, NodeRole, NodeState,
-};
 use engenho_revoada::NodeId;
+use engenho_revoada::membership::{GossipConfig, GossipMesh, NodeCapacity, NodeRole, NodeState};
 use engenho_types::primitives::Quantity;
 use tokio::time::timeout;
 

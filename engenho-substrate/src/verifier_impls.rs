@@ -24,7 +24,7 @@ use async_trait::async_trait;
 
 use crate::derivation::NarHash;
 use crate::receipt::{MaterializationReceipt, NodeId, ReceiptKind};
-use crate::verifier::{Verificacao, VerificationReceipt, VerifyError, Verifier};
+use crate::verifier::{Verificacao, VerificationReceipt, Verifier, VerifyError};
 
 // =================================================================
 // HashEqualityVerifier
@@ -376,7 +376,9 @@ mod tests {
         let v = HashEqualityVerifier::default_named(bytes_accessor_returning(bytes));
         let r = v
             .verify(
-                &Verificacao::HashEquality { expected: expected.clone() },
+                &Verificacao::HashEquality {
+                    expected: expected.clone(),
+                },
                 subj(),
                 emit(),
                 42,
@@ -439,10 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn hash_equality_name_is_configurable() {
-        let v = HashEqualityVerifier::new(
-            "custom",
-            bytes_accessor_returning(vec![]),
-        );
+        let v = HashEqualityVerifier::new("custom", bytes_accessor_returning(vec![]));
         assert_eq!(v.name(), "custom");
     }
 
@@ -534,7 +533,7 @@ mod tests {
                 },
                 subj(),
                 NodeId::from_bytes(b"different-node"),
-                100,  // different timestamp
+                100, // different timestamp
             )
             .await
             .unwrap();
@@ -648,7 +647,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.verifier, "tameshi");
-        assert_eq!(r.receipt.evidence_hash, *blake3::hash(b"sig-bytes").as_bytes());
+        assert_eq!(
+            r.receipt.evidence_hash,
+            *blake3::hash(b"sig-bytes").as_bytes()
+        );
     }
 
     #[tokio::test]
@@ -763,7 +765,8 @@ mod tests {
         // If the alt path produces DIFFERENT bytes than the primary
         // materializer's claim, downstream QuorumTracker would
         // observe two distinct evidence hashes → Dissent.
-        let v_primary_matching = IndependentVerifier::default_named(rebuild_returning(b"X".to_vec()));
+        let v_primary_matching =
+            IndependentVerifier::default_named(rebuild_returning(b"X".to_vec()));
         let v_primary_diff = IndependentVerifier::default_named(rebuild_returning(b"Y".to_vec()));
         let r1 = v_primary_matching
             .verify(

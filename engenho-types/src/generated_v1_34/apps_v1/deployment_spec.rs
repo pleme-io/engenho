@@ -32,7 +32,11 @@ pub struct DeploymentSpec {
     /// `MinReadySeconds` — minimum seconds a newly created pod
     /// should be ready without any container crashing before it
     /// is considered available.
-    #[serde(default, rename = "minReadySeconds", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "minReadySeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub min_ready_seconds: Option<i32>,
 
     /// `Paused` indicates that the deployment is paused.
@@ -41,12 +45,20 @@ pub struct DeploymentSpec {
 
     /// `RevisionHistoryLimit` — number of old ReplicaSets to retain.
     /// Default 10.
-    #[serde(default, rename = "revisionHistoryLimit", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "revisionHistoryLimit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub revision_history_limit: Option<i32>,
 
     /// `ProgressDeadlineSeconds` — max time in seconds for a
     /// deployment to make progress before it's considered failed.
-    #[serde(default, rename = "progressDeadlineSeconds", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "progressDeadlineSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub progress_deadline_seconds: Option<i32>,
 }
 
@@ -55,7 +67,11 @@ pub struct DeploymentSpec {
 /// `serde_json::Value` pending M0.0.3.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LabelSelector {
-    #[serde(default, rename = "matchLabels", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        rename = "matchLabels",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub match_labels: BTreeMap<String, String>,
 }
 
@@ -80,7 +96,11 @@ fn is_empty_pod_spec(s: &PodSpec) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeploymentStatus {
     /// `ObservedGeneration` — the generation observed by the deployment controller.
-    #[serde(default, rename = "observedGeneration", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub observed_generation: Option<i64>,
 
     /// Total number of non-terminated pods targeted by this deployment.
@@ -88,19 +108,35 @@ pub struct DeploymentStatus {
     pub replicas: Option<i32>,
 
     /// Total number of non-terminated pods with the desired template spec.
-    #[serde(default, rename = "updatedReplicas", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "updatedReplicas",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub updated_replicas: Option<i32>,
 
     /// Total number of ready pods.
-    #[serde(default, rename = "readyReplicas", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "readyReplicas",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ready_replicas: Option<i32>,
 
     /// Total number of available pods (ready for at least minReadySeconds).
-    #[serde(default, rename = "availableReplicas", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "availableReplicas",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub available_replicas: Option<i32>,
 
     /// Total number of unavailable pods.
-    #[serde(default, rename = "unavailableReplicas", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "unavailableReplicas",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub unavailable_replicas: Option<i32>,
 
     /// Current conditions.
@@ -113,7 +149,11 @@ pub struct DeploymentCondition {
     #[serde(rename = "type")]
     pub r#type: String,
     pub status: String,
-    #[serde(default, rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastTransitionTime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_transition_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

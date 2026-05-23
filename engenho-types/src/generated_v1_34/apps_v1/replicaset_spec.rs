@@ -26,7 +26,11 @@ pub struct ReplicaSetSpec {
 
     /// `MinReadySeconds` — newly created pods must be ready
     /// without crashing for this many seconds before counted.
-    #[serde(default, rename = "minReadySeconds", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "minReadySeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub min_ready_seconds: Option<i32>,
 }
 
@@ -35,7 +39,11 @@ pub struct ReplicaSetSpec {
 pub struct ReplicaSetStatus {
     /// `ObservedGeneration` — the generation observed by the
     /// replicaset controller.
-    #[serde(default, rename = "observedGeneration", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub observed_generation: Option<i64>,
 
     /// `Replicas` — most recently observed number of replicas.
@@ -43,15 +51,27 @@ pub struct ReplicaSetStatus {
 
     /// `FullyLabeledReplicas` — number of pods matching the
     /// pod template's labels.
-    #[serde(default, rename = "fullyLabeledReplicas", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "fullyLabeledReplicas",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub fully_labeled_replicas: Option<i32>,
 
     /// `ReadyReplicas` — number of ready pods.
-    #[serde(default, rename = "readyReplicas", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "readyReplicas",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ready_replicas: Option<i32>,
 
     /// `AvailableReplicas` — number of available pods.
-    #[serde(default, rename = "availableReplicas", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "availableReplicas",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub available_replicas: Option<i32>,
 
     /// Conditions describe the current state.
@@ -64,7 +84,11 @@ pub struct ReplicaSetCondition {
     #[serde(rename = "type")]
     pub r#type: String,
     pub status: String,
-    #[serde(default, rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastTransitionTime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_transition_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

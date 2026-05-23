@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_store::{
+    InProcessRouter, ResourceKey, StoreMesh, WatchEventKind,
     command::{Reason, ResourceCommand},
-    default_config, InProcessRouter, ResourceKey, StoreMesh, WatchEventKind,
+    default_config,
 };
 use serde_json::json;
 

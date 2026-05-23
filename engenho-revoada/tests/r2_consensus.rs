@@ -9,11 +9,11 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use engenho_revoada::NodeId;
 use engenho_revoada::consensus::{
-    default_config, InProcessRouter, RaftMesh, Reason, RoleAssignment,
+    InProcessRouter, RaftMesh, Reason, RoleAssignment, default_config,
 };
 use engenho_revoada::membership::NodeRole;
-use engenho_revoada::NodeId;
 
 #[tokio::test]
 async fn single_node_raft_initializes_and_commits_promote() {
@@ -46,7 +46,10 @@ async fn single_node_raft_initializes_and_commits_promote() {
     assert!(result.applied_index >= 1);
 
     // Wait for the apply to land in the state machine.
-    assert!(mesh.wait_for_applied(result.applied_index, Duration::from_secs(3)).await);
+    assert!(
+        mesh.wait_for_applied(result.applied_index, Duration::from_secs(3))
+            .await
+    );
 
     let shape = mesh.current_shape().await;
     assert_eq!(shape.holders(NodeRole::ApiServer).len(), 1);
@@ -89,7 +92,10 @@ async fn promote_then_demote_state_machine_idempotent() {
         .await
         .unwrap();
 
-    assert!(mesh.wait_for_applied(demote_result.applied_index, Duration::from_secs(3)).await);
+    assert!(
+        mesh.wait_for_applied(demote_result.applied_index, Duration::from_secs(3))
+            .await
+    );
     let shape = mesh.current_shape().await;
     // ApiServer survives the demote; Etcd was relinquished.
     assert_eq!(shape.holders(NodeRole::ApiServer).len(), 1);
@@ -128,7 +134,10 @@ async fn quarantine_then_restore_cycle() {
         .propose(RoleAssignment::Restore { node_id: target })
         .await
         .unwrap();
-    assert!(mesh.wait_for_applied(restore_result.applied_index, Duration::from_secs(3)).await);
+    assert!(
+        mesh.wait_for_applied(restore_result.applied_index, Duration::from_secs(3))
+            .await
+    );
 
     let shape = mesh.current_shape().await;
     assert!(shape.assignments[&target].contains(&NodeRole::Worker));
@@ -166,10 +175,7 @@ async fn three_node_raft_replicates_promote_to_followers() {
     // We don't know which one; assert at least one of them wins.
     let leader_wait = async {
         for _ in 0..40 {
-            if mesh_1.is_leader().await
-                || mesh_2.is_leader().await
-                || mesh_3.is_leader().await
-            {
+            if mesh_1.is_leader().await || mesh_2.is_leader().await || mesh_3.is_leader().await {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -201,9 +207,21 @@ async fn three_node_raft_replicates_promote_to_followers() {
         .expect("propose to leader");
 
     // All three nodes must converge on the same applied state.
-    assert!(mesh_1.wait_for_applied(result.applied_index, Duration::from_secs(5)).await);
-    assert!(mesh_2.wait_for_applied(result.applied_index, Duration::from_secs(5)).await);
-    assert!(mesh_3.wait_for_applied(result.applied_index, Duration::from_secs(5)).await);
+    assert!(
+        mesh_1
+            .wait_for_applied(result.applied_index, Duration::from_secs(5))
+            .await
+    );
+    assert!(
+        mesh_2
+            .wait_for_applied(result.applied_index, Duration::from_secs(5))
+            .await
+    );
+    assert!(
+        mesh_3
+            .wait_for_applied(result.applied_index, Duration::from_secs(5))
+            .await
+    );
 
     let shape_1 = mesh_1.current_shape().await;
     let shape_2 = mesh_2.current_shape().await;

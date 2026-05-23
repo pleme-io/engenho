@@ -6,8 +6,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -66,8 +66,8 @@ fn is_empty_spec(s: &ServiceSpec) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::service_spec::{ServicePort, ServiceType};
+    use super::*;
 
     #[test]
     fn service_round_trips_with_typed_spec() {

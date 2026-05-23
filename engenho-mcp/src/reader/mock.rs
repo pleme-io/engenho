@@ -7,9 +7,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::reader::{ClusterReader, ReaderError};
-use crate::views::{
-    ClusterConfigView, ClusterStatus, KubeAuthDescriptor, SnapshotMetaView,
-};
+use crate::views::{ClusterConfigView, ClusterStatus, KubeAuthDescriptor, SnapshotMetaView};
 
 #[derive(Default)]
 pub struct MockClusterReader {
@@ -67,10 +65,7 @@ impl ClusterReader for MockClusterReader {
             .ok_or_else(|| ReaderError::UnknownCluster(cluster.to_string()))
     }
 
-    async fn snapshot_meta(
-        &self,
-        cluster: &str,
-    ) -> Result<Option<SnapshotMetaView>, ReaderError> {
+    async fn snapshot_meta(&self, cluster: &str) -> Result<Option<SnapshotMetaView>, ReaderError> {
         self.state
             .lock()
             .unwrap()

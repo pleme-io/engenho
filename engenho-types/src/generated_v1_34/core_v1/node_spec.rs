@@ -30,7 +30,11 @@ pub struct NodeSpec {
 
     /// `ProviderID` — typed identifier assigned by the cloud
     /// provider (`<ProviderName>://<ProviderSpecificNodeID>`).
-    #[serde(default, rename = "providerID", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "providerID",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub provider_id: Option<String>,
 
     /// `Unschedulable` — if true, the node should NOT be considered
@@ -89,9 +93,17 @@ pub struct NodeCondition {
     #[serde(rename = "type")]
     pub r#type: String,
     pub status: String,
-    #[serde(default, rename = "lastHeartbeatTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastHeartbeatTime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_heartbeat_time: Option<String>,
-    #[serde(default, rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastTransitionTime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_transition_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -111,23 +123,51 @@ pub struct NodeAddress {
 /// Identifying info reported by the kubelet.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSystemInfo {
-    #[serde(default, rename = "machineID", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "machineID",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub machine_id: String,
-    #[serde(default, rename = "systemUUID", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "systemUUID",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub system_uuid: String,
     #[serde(default, rename = "bootID", skip_serializing_if = "String::is_empty")]
     pub boot_id: String,
-    #[serde(default, rename = "kernelVersion", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "kernelVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub kernel_version: String,
     #[serde(default, rename = "osImage", skip_serializing_if = "String::is_empty")]
     pub os_image: String,
-    #[serde(default, rename = "containerRuntimeVersion", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "containerRuntimeVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub container_runtime_version: String,
-    #[serde(default, rename = "kubeletVersion", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "kubeletVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub kubelet_version: String,
-    #[serde(default, rename = "kubeProxyVersion", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "kubeProxyVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub kube_proxy_version: String,
-    #[serde(default, rename = "operatingSystem", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "operatingSystem",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub operating_system: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub architecture: String,
@@ -168,7 +208,6 @@ mod tests {
             prop_assert_eq!(back, spec);
         }
     }
-
 
     #[test]
     fn node_spec_round_trips_with_pod_cidrs_and_taints() {
@@ -221,7 +260,10 @@ mod tests {
         });
         let s = serde_json::to_string(&status).unwrap();
         assert!(s.contains("\"nodeInfo\""), "got: {s}");
-        assert!(s.contains("\"kubeletVersion\":\"v1.34.5+k3s1\""), "got: {s}");
+        assert!(
+            s.contains("\"kubeletVersion\":\"v1.34.5+k3s1\""),
+            "got: {s}"
+        );
         let back: NodeStatus = serde_json::from_str(&s).unwrap();
         assert_eq!(back, status);
     }

@@ -25,6 +25,9 @@ impl Manifest {
     /// Construct a new manifest.
     #[must_use]
     pub fn new(filename: impl Into<String>, body: impl Into<String>) -> Self {
-        Self { filename: filename.into(), body: body.into() }
+        Self {
+            filename: filename.into(),
+            body: body.into(),
+        }
     }
 }

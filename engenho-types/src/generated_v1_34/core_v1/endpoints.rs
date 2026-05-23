@@ -8,8 +8,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -31,7 +31,11 @@ pub struct Endpoints {
 pub struct EndpointSubset {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<EndpointAddress>,
-    #[serde(default, rename = "notReadyAddresses", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "notReadyAddresses",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub not_ready_addresses: Vec<EndpointAddress>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<EndpointPort>,
@@ -55,7 +59,11 @@ pub struct EndpointPort {
     pub port: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
-    #[serde(default, rename = "appProtocol", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "appProtocol",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub app_protocol: Option<String>,
 }
 
@@ -72,9 +80,17 @@ pub struct ObjectReference {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
-    #[serde(default, rename = "apiVersion", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "apiVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub api_version: Option<String>,
-    #[serde(default, rename = "resourceVersion", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "resourceVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub resource_version: Option<String>,
     #[serde(default, rename = "fieldPath", skip_serializing_if = "Option::is_none")]
     pub field_path: Option<String>,

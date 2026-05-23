@@ -263,9 +263,8 @@ impl VolumeRuntime for HostPathVolumeBackend {
             .map(|c| if c == '/' { '_' } else { c })
             .collect();
         let mount_path = self.root.join(&safe_name);
-        std::fs::create_dir_all(&mount_path).map_err(|e| {
-            VolumeError::Backend(format!("mkdir {}: {e}", mount_path.display()))
-        })?;
+        std::fs::create_dir_all(&mount_path)
+            .map_err(|e| VolumeError::Backend(format!("mkdir {}: {e}", mount_path.display())))?;
         let mount = MountedVolume {
             volume_id: safe_name.clone(),
             mount_path,
@@ -327,7 +326,7 @@ mod tests {
         let b = FakeVolumeBackend::new();
         let mut spec = sample_spec("p");
         b.mount(&spec).await.unwrap();
-        spec.size_mib = 2048;  // different params
+        spec.size_mib = 2048; // different params
         let err = b.mount(&spec).await.unwrap_err();
         assert_eq!(err.kind(), "conflict");
     }
@@ -362,10 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn hostpath_backend_creates_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "engenho-vol-test-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("engenho-vol-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let b = HostPathVolumeBackend::new(&root);
         let m = b.mount(&sample_spec("default/pvc1")).await.unwrap();
@@ -386,10 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn hostpath_backend_is_idempotent() {
-        let root = std::env::temp_dir().join(format!(
-            "engenho-vol-idem-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("engenho-vol-idem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let b = HostPathVolumeBackend::new(&root);
         let m1 = b.mount(&sample_spec("p")).await.unwrap();

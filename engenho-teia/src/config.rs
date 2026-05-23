@@ -245,7 +245,10 @@ mod tests {
             });
         assert_eq!(cfg.cluster, "test");
         assert_eq!(cfg.servers, vec!["nats://test:4222"]);
-        assert_eq!(cfg.credentials_path.as_deref(), Some("/etc/nats/test.creds"));
+        assert_eq!(
+            cfg.credentials_path.as_deref(),
+            Some("/etc/nats/test.creds")
+        );
         assert_eq!(cfg.leaf_remotes.len(), 1);
         cfg.validate().unwrap();
     }

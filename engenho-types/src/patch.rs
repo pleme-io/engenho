@@ -29,9 +29,9 @@ pub enum Patch {
         /// Identity of the caller doing the apply (e.g. `engenho-scheduler`).
         field_manager: String,
         /// Whether to take ownership of conflicting fields (rare).
-        force:         bool,
+        force: bool,
         /// The (possibly partial) resource state we're declaring.
-        body:          serde_json::Value,
+        body: serde_json::Value,
     },
 }
 
@@ -40,17 +40,26 @@ pub enum Patch {
 #[serde(rename_all = "lowercase", tag = "op")]
 pub enum JsonPatchOp {
     /// `{"op": "add", "path": "/spec/replicas", "value": 3}`
-    Add { path: String, value: serde_json::Value },
+    Add {
+        path: String,
+        value: serde_json::Value,
+    },
     /// `{"op": "remove", "path": "/spec/replicas"}`
     Remove { path: String },
     /// `{"op": "replace", "path": "/spec/replicas", "value": 5}`
-    Replace { path: String, value: serde_json::Value },
+    Replace {
+        path: String,
+        value: serde_json::Value,
+    },
     /// `{"op": "copy", "from": "/a", "path": "/b"}`
     Copy { from: String, path: String },
     /// `{"op": "move", "from": "/a", "path": "/b"}`
     Move { from: String, path: String },
     /// `{"op": "test", "path": "/a", "value": 1}`
-    Test { path: String, value: serde_json::Value },
+    Test {
+        path: String,
+        value: serde_json::Value,
+    },
 }
 
 impl Patch {
@@ -59,9 +68,9 @@ impl Patch {
     #[must_use]
     pub fn content_type(&self) -> &'static str {
         match self {
-            Self::Merge(_)     => "application/merge-patch+json",
+            Self::Merge(_) => "application/merge-patch+json",
             Self::Strategic(_) => "application/strategic-merge-patch+json",
-            Self::Json(_)      => "application/json-patch+json",
+            Self::Json(_) => "application/json-patch+json",
             Self::Apply { .. } => "application/apply-patch+yaml",
         }
     }
@@ -74,9 +83,9 @@ impl Patch {
     /// (effectively unreachable — all our variants are owned-data).
     pub fn body_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         match self {
-            Self::Merge(v)     | Self::Strategic(v) => serde_json::to_vec(v),
-            Self::Json(ops)                         => serde_json::to_vec(ops),
-            Self::Apply { body, .. }                => serde_json::to_vec(body),
+            Self::Merge(v) | Self::Strategic(v) => serde_json::to_vec(v),
+            Self::Json(ops) => serde_json::to_vec(ops),
+            Self::Apply { body, .. } => serde_json::to_vec(body),
         }
     }
 }
@@ -101,7 +110,7 @@ mod tests {
     #[test]
     fn json_patch_content_type() {
         let p = Patch::Json(vec![JsonPatchOp::Add {
-            path:  "/spec/replicas".into(),
+            path: "/spec/replicas".into(),
             value: json!(3),
         }]);
         assert_eq!(p.content_type(), "application/json-patch+json");
@@ -111,8 +120,8 @@ mod tests {
     fn apply_content_type_and_field_manager() {
         let p = Patch::Apply {
             field_manager: "engenho-scheduler".into(),
-            force:         false,
-            body:          json!({"apiVersion": "v1", "kind": "Pod"}),
+            force: false,
+            body: json!({"apiVersion": "v1", "kind": "Pod"}),
         };
         assert_eq!(p.content_type(), "application/apply-patch+yaml");
     }
@@ -120,12 +129,27 @@ mod tests {
     #[test]
     fn json_patch_body_roundtrips() {
         let p = Patch::Json(vec![
-            JsonPatchOp::Add { path: "/a".into(), value: json!(1) },
+            JsonPatchOp::Add {
+                path: "/a".into(),
+                value: json!(1),
+            },
             JsonPatchOp::Remove { path: "/b".into() },
-            JsonPatchOp::Replace { path: "/c".into(), value: json!("x") },
-            JsonPatchOp::Copy { from: "/d".into(), path: "/e".into() },
-            JsonPatchOp::Move { from: "/f".into(), path: "/g".into() },
-            JsonPatchOp::Test { path: "/h".into(), value: json!(true) },
+            JsonPatchOp::Replace {
+                path: "/c".into(),
+                value: json!("x"),
+            },
+            JsonPatchOp::Copy {
+                from: "/d".into(),
+                path: "/e".into(),
+            },
+            JsonPatchOp::Move {
+                from: "/f".into(),
+                path: "/g".into(),
+            },
+            JsonPatchOp::Test {
+                path: "/h".into(),
+                value: json!(true),
+            },
         ]);
         let bytes = p.body_bytes().unwrap();
         // Round-trip

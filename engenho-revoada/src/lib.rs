@@ -54,8 +54,7 @@ pub mod policy;
 pub mod topology;
 
 pub use audit::{
-    AuditEvent, AuditLog, AuditingBackend, FileAuditLog, InMemoryAuditLog, NoopAuditLog,
-    VerbKind,
+    AuditEvent, AuditLog, AuditingBackend, FileAuditLog, InMemoryAuditLog, NoopAuditLog, VerbKind,
 };
 pub use backend::{
     StoreBackend, StubBackend, kube_apiserver_stub, nomad_http_stub, raft_stub,
@@ -63,9 +62,9 @@ pub use backend::{
 };
 pub use backend_fs::FileSystemBackend;
 pub use backends::{
-    KubeApiServerBackend, KubeApiServerConfig, NomadHttpBackend, NomadHttpConfig,
-    RaftBackend, RaftConfig, SupervisedSystemdBackend, SupervisedSystemdConfig,
-    SystemdDbusBackend, SystemdDbusConfig,
+    KubeApiServerBackend, KubeApiServerConfig, NomadHttpBackend, NomadHttpConfig, RaftBackend,
+    RaftConfig, SupervisedSystemdBackend, SupervisedSystemdConfig, SystemdDbusBackend,
+    SystemdDbusConfig,
 };
 
 pub use format::{
@@ -73,29 +72,25 @@ pub use format::{
     NativePassthroughAdapter, encode_envelope,
 };
 
-pub use federation::{
-    FederatedEventKind, FederatedFabric, FederationError, RoutingPolicy,
-};
+pub use federation::{FederatedEventKind, FederatedFabric, FederationError, RoutingPolicy};
 
 pub use topology::{
-    Cluster3MNW, MeshAllPeers, NodeId as TopologyNodeId, NodeState, Pair, Phalanx,
-    Quorum3M, Role, RoleAssignment, Solo, TopologyError, TopologyReactor,
-    TopologyStrategy, Transition,
+    Cluster3MNW, MeshAllPeers, NodeId as TopologyNodeId, NodeState, Pair, Phalanx, Quorum3M, Role,
+    RoleAssignment, Solo, TopologyError, TopologyReactor, TopologyStrategy, Transition,
 };
 
-pub use fabric::{
-    AttestationConfig, ConsensusConfig, ConsensusKind, ContentConfig, FabricFace,
-    FabricStrategy, FabricStrategyError, FaceKind, MembershipConfig, PlacementPolicy,
-    ReconciliationCadence,
-};
-pub use face::{
-    BareMetalSupervisorFace, Face, FaceError, FaceWatchEvent, FaceWatchEventKind,
-    FaceWatchStream, KubernetesFace, NomadFace, PureRaftFace, ResourceFormat, ResourceRef,
-    SystemdFace, instantiate as instantiate_face,
-};
 pub use cluster::{
     Cluster, ClusterBuilder, ClusterBuilderError, ClusterCoherenceError, ClusterDeclaration,
     ClusterHealth, ClusterRuntimeError,
+};
+pub use fabric::{
+    AttestationConfig, ConsensusConfig, ConsensusKind, ContentConfig, FabricFace, FabricStrategy,
+    FabricStrategyError, FaceKind, MembershipConfig, PlacementPolicy, ReconciliationCadence,
+};
+pub use face::{
+    BareMetalSupervisorFace, Face, FaceError, FaceWatchEvent, FaceWatchEventKind, FaceWatchStream,
+    KubernetesFace, NomadFace, PureRaftFace, ResourceFormat, ResourceRef, SystemdFace,
+    instantiate as instantiate_face,
 };
 
 use serde::{Deserialize, Serialize};

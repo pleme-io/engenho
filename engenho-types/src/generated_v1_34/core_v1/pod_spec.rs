@@ -46,7 +46,11 @@ pub struct PodSpec {
 
     /// `RestartPolicy` for all containers within the pod. One of
     /// `Always`, `OnFailure`, `Never`. Default is `Always`.
-    #[serde(default, rename = "restartPolicy", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "restartPolicy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub restart_policy: Option<String>,
 
     /// `NodeName` is a request to schedule this pod onto a specific
@@ -153,7 +157,6 @@ pub struct EnvVar {
     /// Value of the environment variable. Defaults to empty string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
-
     // NOTE: valueFrom (ConfigMapKeyRef / SecretKeyRef / FieldRef
     // / ResourceFieldRef) is deferred to M0.0.3 codegen. Operators
     // setting env from a ConfigMap/Secret today land it as a JSON
@@ -234,7 +237,11 @@ pub struct PodCondition {
     pub status: String,
 
     /// Last time the condition transitioned from one status to another.
-    #[serde(default, rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastTransitionTime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_transition_time: Option<String>,
 
     /// Unique, one-word, CamelCase reason for the condition's last
@@ -270,7 +277,11 @@ pub struct ContainerStatus {
     pub restart_count: i32,
 
     /// `ContainerID` reported by the runtime.
-    #[serde(default, rename = "containerID", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "containerID",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub container_id: Option<String>,
 
     /// Whether the container is currently started (passed startup probe).
@@ -343,10 +354,14 @@ mod tests {
             restart_policy: Some("Always".into()),
             ..Default::default()
         };
-        spec.node_selector.insert("zone".into(), "us-east-1a".into());
+        spec.node_selector
+            .insert("zone".into(), "us-east-1a".into());
         let s = serde_json::to_string(&spec).unwrap();
         assert!(s.contains("\"restartPolicy\":\"Always\""), "got: {s}");
-        assert!(s.contains("\"nodeSelector\":{\"zone\":\"us-east-1a\"}"), "got: {s}");
+        assert!(
+            s.contains("\"nodeSelector\":{\"zone\":\"us-east-1a\"}"),
+            "got: {s}"
+        );
         let back: PodSpec = serde_json::from_str(&s).unwrap();
         assert_eq!(back, spec);
     }

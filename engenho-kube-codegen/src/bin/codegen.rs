@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use engenho_kube_codegen::{emit_kind, emit_module, KindEntry, OpenApiDoc, KIND_CATALOG};
+use engenho_kube_codegen::{KIND_CATALOG, KindEntry, OpenApiDoc, emit_kind, emit_module};
 
 #[derive(Parser, Debug)]
 #[command(name = "engenho-kube-codegen", version, about)]
@@ -41,10 +41,12 @@ struct Args {
 
 fn schema_path_for_group(schema_dir: &std::path::Path, group: &str) -> PathBuf {
     let fname = match group {
-        ""                            => "api__v1_openapi.json",
-        "apps"                        => "apis__apps__v1_openapi.json",
-        "rbac.authorization.k8s.io"   => "apis__rbac.authorization.k8s.io__v1_openapi.json",
-        other => panic!("no vendored OpenAPI schema for group {other:?} — extend codegen::schema_path_for_group"),
+        "" => "api__v1_openapi.json",
+        "apps" => "apis__apps__v1_openapi.json",
+        "rbac.authorization.k8s.io" => "apis__rbac.authorization.k8s.io__v1_openapi.json",
+        other => panic!(
+            "no vendored OpenAPI schema for group {other:?} — extend codegen::schema_path_for_group"
+        ),
     };
     schema_dir.join(fname)
 }
@@ -64,7 +66,7 @@ fn main() -> Result<()> {
     for entry in KIND_CATALOG {
         if !docs.contains_key(entry.group) {
             let path = schema_path_for_group(&args.schema, entry.group);
-            let doc  = OpenApiDoc::load(&path)
+            let doc = OpenApiDoc::load(&path)
                 .with_context(|| format!("load schema for group {:?}", entry.group))?;
             docs.insert(entry.group, doc);
         }
@@ -82,9 +84,9 @@ fn main() -> Result<()> {
 
         // Emit each kind.
         for entry in entries {
-            let doc   = docs.get(entry.group).expect("doc loaded above");
+            let doc = docs.get(entry.group).expect("doc loaded above");
             let shape = doc.shape(entry.openapi_key)?;
-            let rust  = emit_kind(entry, shape);
+            let rust = emit_kind(entry, shape);
             let target = module_dir.join(format!("{}.rs", entry.kind.to_lowercase()));
             if args.check {
                 let existing = std::fs::read_to_string(&target).unwrap_or_default();
@@ -115,7 +117,9 @@ fn main() -> Result<()> {
 
     // Top-level `lib.rs`-includable mod.rs.
     let top_mod = {
-        let mut s = String::from("//! GENERATED — engenho-kube-codegen — every K8s kind we currently emit.\n\n");
+        let mut s = String::from(
+            "//! GENERATED — engenho-kube-codegen — every K8s kind we currently emit.\n\n",
+        );
         for module in by_module.keys() {
             s.push_str(&format!("pub mod {};\n", module));
         }

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_controllers::{Controller, ControllerError, ReconcileReport};
 use engenho_store::{
+    StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
-    StoreMesh,
 };
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -125,18 +125,16 @@ impl Controller for Scheduler {
     }
 
     async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-        let report = Scheduler::tick(self)
-            .await
-            .map_err(|e| match e {
-                SchedulerError::Store(s) => ControllerError::Store(s),
-                SchedulerError::NoSchedulableNodes => {
-                    ControllerError::Internal("no schedulable nodes".into())
-                }
-                SchedulerError::InvalidPodMetadata => {
-                    ControllerError::InvalidResource("invalid pod metadata".into())
-                }
-                SchedulerError::Internal(s) => ControllerError::Internal(s),
-            })?;
+        let report = Scheduler::tick(self).await.map_err(|e| match e {
+            SchedulerError::Store(s) => ControllerError::Store(s),
+            SchedulerError::NoSchedulableNodes => {
+                ControllerError::Internal("no schedulable nodes".into())
+            }
+            SchedulerError::InvalidPodMetadata => {
+                ControllerError::InvalidResource("invalid pod metadata".into())
+            }
+            SchedulerError::Internal(s) => ControllerError::Internal(s),
+        })?;
         Ok(ReconcileReport {
             objects_examined: report.pods_examined,
             objects_changed: report.bound.len(),

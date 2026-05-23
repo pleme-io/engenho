@@ -84,12 +84,7 @@ impl ResourceCatalog {
         outcome
     }
 
-    fn apply_put(
-        &mut self,
-        key: &ResourceKey,
-        value: &ResourceValue,
-        index: u64,
-    ) -> ResourceOp {
+    fn apply_put(&mut self, key: &ResourceKey, value: &ResourceValue, index: u64) -> ResourceOp {
         let mut new_value = value.clone();
         let already_existed = self.resources.contains_key(key);
         if let Some(obj) = new_value.as_object_mut() {
@@ -131,12 +126,7 @@ impl ResourceCatalog {
         }
     }
 
-    fn apply_patch(
-        &mut self,
-        key: &ResourceKey,
-        patch: &ResourceValue,
-        index: u64,
-    ) -> ResourceOp {
+    fn apply_patch(&mut self, key: &ResourceKey, patch: &ResourceValue, index: u64) -> ResourceOp {
         let Some(existing) = self.resources.get_mut(key) else {
             return ResourceOp::NoOp;
         };
@@ -281,7 +271,10 @@ mod tests {
         );
         let stored = cat.get(&k).unwrap();
         let metadata = stored.get("metadata").unwrap();
-        assert_eq!(metadata.get("resourceVersion").unwrap(), &serde_json::json!("42"));
+        assert_eq!(
+            metadata.get("resourceVersion").unwrap(),
+            &serde_json::json!("42")
+        );
         // uid must be set + stable across replaces.
         let uid_1 = metadata.get("uid").unwrap().as_str().unwrap().to_string();
         assert!(uid_1.starts_with("uid-"));
@@ -454,13 +447,15 @@ mod tests {
             2,
         );
         let stored = cat.get(&k).unwrap();
-        assert!(stored
-            .get("spec")
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .get("annotations")
-            .is_none());
+        assert!(
+            stored
+                .get("spec")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .get("annotations")
+                .is_none()
+        );
         // Image survives
         assert_eq!(stored.get("spec").unwrap().get("image").unwrap(), "v1");
     }

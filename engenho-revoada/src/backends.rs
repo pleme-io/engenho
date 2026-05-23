@@ -113,11 +113,7 @@ impl StoreBackend for RaftBackend {
         self.store.apply(format, body)
     }
 
-    fn get(
-        &self,
-        reference: &ResourceRef,
-        format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError> {
+    fn get(&self, reference: &ResourceRef, format: ResourceFormat) -> Result<Vec<u8>, FaceError> {
         // Reads are local — operators tolerate eventual consistency
         // via raft's read-index or linearized via raft.client_read.
         self.store.get(reference, format)
@@ -227,11 +223,7 @@ impl StoreBackend for KubeApiServerBackend {
         self.store.apply(format, body)
     }
 
-    fn get(
-        &self,
-        reference: &ResourceRef,
-        format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError> {
+    fn get(&self, reference: &ResourceRef, format: ResourceFormat) -> Result<Vec<u8>, FaceError> {
         self.store.get(reference, format)
     }
 
@@ -325,11 +317,7 @@ impl StoreBackend for NomadHttpBackend {
         self.store.apply(format, body)
     }
 
-    fn get(
-        &self,
-        reference: &ResourceRef,
-        format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError> {
+    fn get(&self, reference: &ResourceRef, format: ResourceFormat) -> Result<Vec<u8>, FaceError> {
         self.store.get(reference, format)
     }
 
@@ -423,11 +411,7 @@ impl StoreBackend for SystemdDbusBackend {
     fn apply(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
         self.store.apply(format, body)
     }
-    fn get(
-        &self,
-        reference: &ResourceRef,
-        format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError> {
+    fn get(&self, reference: &ResourceRef, format: ResourceFormat) -> Result<Vec<u8>, FaceError> {
         self.store.get(reference, format)
     }
     fn list(
@@ -509,11 +493,7 @@ impl StoreBackend for SupervisedSystemdBackend {
     fn apply(&self, format: ResourceFormat, body: &[u8]) -> Result<(), FaceError> {
         self.store.apply(format, body)
     }
-    fn get(
-        &self,
-        reference: &ResourceRef,
-        format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError> {
+    fn get(&self, reference: &ResourceRef, format: ResourceFormat) -> Result<Vec<u8>, FaceError> {
         self.store.get(reference, format)
     }
     fn list(
@@ -586,7 +566,13 @@ mod tests {
         backend.apply(ResourceFormat::Native, &envelope()).unwrap();
         let r = pod_ref();
         assert_eq!(backend.get(&r, ResourceFormat::Native).unwrap(), envelope());
-        assert_eq!(backend.list("Pod", Some("default"), ResourceFormat::Native).unwrap().len(), 1);
+        assert_eq!(
+            backend
+                .list("Pod", Some("default"), ResourceFormat::Native)
+                .unwrap()
+                .len(),
+            1
+        );
         let _ = backend.watch("Pod", None, ResourceFormat::Native).unwrap();
         backend.delete(&r).unwrap();
     }
@@ -729,7 +715,8 @@ mod tests {
         let snaps: Vec<Vec<u8>> = backends.iter().map(|b| b.snapshot().unwrap()).collect();
         for i in 1..snaps.len() {
             assert_eq!(
-                snaps[i], snaps[0],
+                snaps[i],
+                snaps[0],
                 "backend {} snapshot diverged from backend 0",
                 backends[i].name(),
             );

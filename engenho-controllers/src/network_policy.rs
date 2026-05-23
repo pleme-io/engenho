@@ -172,20 +172,22 @@ impl NetworkPolicyEnforcer for FakeNetworkPolicyEnforcer {
 
     async fn upsert(&self, rule: &NetworkPolicyRule) -> Result<(), NetworkPolicyError> {
         if rule.policy_id.is_empty() {
-            return Err(NetworkPolicyError::InvalidPolicy(
-                "empty policy_id".into(),
-            ));
+            return Err(NetworkPolicyError::InvalidPolicy("empty policy_id".into()));
         }
         let mut state = self.inner.lock().await;
         state.rules.insert(rule.policy_id.clone(), rule.clone());
-        state.events.push(FakeNpEvent::Upsert(rule.policy_id.clone()));
+        state
+            .events
+            .push(FakeNpEvent::Upsert(rule.policy_id.clone()));
         Ok(())
     }
 
     async fn remove(&self, policy_id: &str) -> Result<(), NetworkPolicyError> {
         let mut state = self.inner.lock().await;
         state.rules.remove(policy_id);
-        state.events.push(FakeNpEvent::Remove(policy_id.to_string()));
+        state
+            .events
+            .push(FakeNpEvent::Remove(policy_id.to_string()));
         Ok(())
     }
 
@@ -264,21 +266,15 @@ impl NetworkPolicyEnforcer for CiliumNetworkPolicyAdapter {
 
     async fn upsert(&self, rule: &NetworkPolicyRule) -> Result<(), NetworkPolicyError> {
         if rule.policy_id.is_empty() {
-            return Err(NetworkPolicyError::InvalidPolicy(
-                "empty policy_id".into(),
-            ));
+            return Err(NetworkPolicyError::InvalidPolicy("empty policy_id".into()));
         }
         let yaml = Self::render_crd(rule);
         let file = self.output_dir.join(Self::rule_filename(rule));
         std::fs::create_dir_all(&self.output_dir).map_err(|e| {
-            NetworkPolicyError::Backend(format!(
-                "mkdir {}: {e}",
-                self.output_dir.display()
-            ))
+            NetworkPolicyError::Backend(format!("mkdir {}: {e}", self.output_dir.display()))
         })?;
-        std::fs::write(&file, yaml).map_err(|e| {
-            NetworkPolicyError::Backend(format!("write {}: {e}", file.display()))
-        })?;
+        std::fs::write(&file, yaml)
+            .map_err(|e| NetworkPolicyError::Backend(format!("write {}: {e}", file.display())))?;
         self.inner
             .lock()
             .await
@@ -395,10 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn cilium_upsert_writes_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "engenho-np-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("engenho-np-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let b = CiliumNetworkPolicyAdapter::new(&dir);
         b.upsert(&sample_rule()).await.unwrap();
@@ -414,10 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn cilium_remove_deletes_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "engenho-np-rm-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("engenho-np-rm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let b = CiliumNetworkPolicyAdapter::new(&dir);
         let r = sample_rule();
@@ -458,9 +448,6 @@ mod tests {
     #[test]
     fn backend_names_are_stable() {
         assert_eq!(FakeNetworkPolicyEnforcer::new().name(), "fake");
-        assert_eq!(
-            CiliumNetworkPolicyAdapter::new("/tmp").name(),
-            "cilium"
-        );
+        assert_eq!(CiliumNetworkPolicyAdapter::new("/tmp").name(), "cilium");
     }
 }

@@ -7,7 +7,7 @@
 //! metadata. That's the "this catalog matches the schema" check that
 //! gates `engenho-kube-codegen --check`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -52,11 +52,11 @@ pub struct KindShape {
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct XGvk {
     /// API group (`""` for core/v1).
-    pub group:   String,
+    pub group: String,
     /// API version.
     pub version: String,
     /// Kind name.
-    pub kind:    String,
+    pub kind: String,
 }
 
 impl OpenApiDoc {
@@ -66,10 +66,8 @@ impl OpenApiDoc {
     ///
     /// Forwards parse errors with context including the file path.
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("read {}", path.display()))?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", path.display()))
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
     }
 
     /// Find the `KindShape` for `openapi_key`, or error.
@@ -78,7 +76,9 @@ impl OpenApiDoc {
     ///
     /// Returns an error mentioning the key when absent.
     pub fn shape(&self, openapi_key: &str) -> Result<&KindShape> {
-        self.components.schemas.get(openapi_key)
+        self.components
+            .schemas
+            .get(openapi_key)
             .ok_or_else(|| anyhow!("kind {openapi_key:?} not in OpenAPI components.schemas"))
     }
 }
@@ -106,15 +106,22 @@ mod tests {
         let doc: OpenApiDoc = serde_json::from_value(json).unwrap();
         let pod = doc.shape("io.k8s.api.core.v1.Pod").unwrap();
         assert_eq!(pod.gvks.len(), 1);
-        assert_eq!(pod.gvks[0], XGvk {
-            group: "".into(), version: "v1".into(), kind: "Pod".into(),
-        });
+        assert_eq!(
+            pod.gvks[0],
+            XGvk {
+                group: "".into(),
+                version: "v1".into(),
+                kind: "Pod".into(),
+            }
+        );
     }
 
     #[test]
     fn missing_shape_errors() {
         let doc = OpenApiDoc {
-            components: Components { schemas: BTreeMap::new() },
+            components: Components {
+                schemas: BTreeMap::new(),
+            },
         };
         let err = doc.shape("io.k8s.api.core.v1.Pod").unwrap_err();
         assert!(err.to_string().contains("not in OpenAPI"));

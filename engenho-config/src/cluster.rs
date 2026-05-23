@@ -66,7 +66,10 @@ impl ClusterConfig {
         if self.name.contains('.') || self.name.contains(' ') {
             return Err(ConfigError::InvalidField {
                 field: "cluster.name".into(),
-                reason: format!("cluster name '{}' contains invalid chars (.,space)", self.name),
+                reason: format!(
+                    "cluster name '{}' contains invalid chars (.,space)",
+                    self.name
+                ),
             });
         }
         Ok(())

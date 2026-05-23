@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
-    command::{Reason, ResourceCommand},
     StoreMesh,
+    command::{Reason, ResourceCommand},
 };
 use serde_json::Value;
 use tracing::debug;
@@ -59,10 +59,7 @@ impl Controller for GcController {
         // Plus any other kind a future R9.x might add — extend
         // this list in lockstep.
         let mut known_uids: HashSet<String> = HashSet::new();
-        for (group, version, kind) in [
-            ("apps", "v1", "Deployment"),
-            ("apps", "v1", "ReplicaSet"),
-        ] {
+        for (group, version, kind) in [("apps", "v1", "Deployment"), ("apps", "v1", "ReplicaSet")] {
             for (_, obj) in self.store.list(group, version, kind, ns).await {
                 if let Some(uid) = obj
                     .get("metadata")
@@ -76,10 +73,7 @@ impl Controller for GcController {
 
         // Scan children. For each, if it has a controlling
         // ownerRef whose UID is NOT in known_uids, delete it.
-        for (group, version, kind) in [
-            ("", "v1", "Pod"),
-            ("apps", "v1", "ReplicaSet"),
-        ] {
+        for (group, version, kind) in [("", "v1", "Pod"), ("apps", "v1", "ReplicaSet")] {
             let children = self.store.list(group, version, kind, ns).await;
             report.objects_examined += children.len();
             for (key, value) in children {
@@ -114,7 +108,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::owner::{set_owner_reference, OwnerReference};
+    use crate::owner::{OwnerReference, set_owner_reference};
 
     fn owner_ref(uid: &str) -> OwnerReference {
         OwnerReference {

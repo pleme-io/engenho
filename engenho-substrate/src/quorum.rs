@@ -100,10 +100,7 @@ impl QuorumTracker {
     /// 2+ = dissent. 0 = no receipts yet.
     #[must_use]
     pub fn evidence_variants(&self) -> usize {
-        self.confirmations
-            .values()
-            .collect::<BTreeSet<_>>()
-            .len()
+        self.confirmations.values().collect::<BTreeSet<_>>().len()
     }
 
     /// Snapshot of distinct confirming emitters.
@@ -163,17 +160,12 @@ mod tests {
     use super::*;
 
     fn r(emitter: u8, evidence: u8) -> MaterializationReceipt {
-        MaterializationReceipt::for_drv(
-            [1u8; 32],
-            NodeId::new([emitter; 32]),
-            100,
-            [evidence; 32],
-        )
+        MaterializationReceipt::for_drv([1u8; 32], NodeId::new([emitter; 32]), 100, [evidence; 32])
     }
 
     fn other_subject_receipt(emitter: u8) -> MaterializationReceipt {
         MaterializationReceipt::for_drv(
-            [99u8; 32],   // different subject
+            [99u8; 32], // different subject
             NodeId::new([emitter; 32]),
             100,
             [0u8; 32],
@@ -181,12 +173,7 @@ mod tests {
     }
 
     fn other_kind_receipt(emitter: u8) -> MaterializationReceipt {
-        MaterializationReceipt::for_nar(
-            [1u8; 32],
-            NodeId::new([emitter; 32]),
-            100,
-            [0u8; 32],
-        )
+        MaterializationReceipt::for_nar([1u8; 32], NodeId::new([emitter; 32]), 100, [0u8; 32])
     }
 
     #[test]
@@ -204,8 +191,14 @@ mod tests {
     #[test]
     fn reaches_quorum_when_threshold_distinct_emitters_agree() {
         let mut t = QuorumTracker::new(ReceiptKind::Drv, [1u8; 32], 3);
-        assert!(matches!(t.ingest(&r(1, 5)), QuorumOutcome::Pending { confirmed: 1, .. }));
-        assert!(matches!(t.ingest(&r(2, 5)), QuorumOutcome::Pending { confirmed: 2, .. }));
+        assert!(matches!(
+            t.ingest(&r(1, 5)),
+            QuorumOutcome::Pending { confirmed: 1, .. }
+        ));
+        assert!(matches!(
+            t.ingest(&r(2, 5)),
+            QuorumOutcome::Pending { confirmed: 2, .. }
+        ));
         let o = t.ingest(&r(3, 5));
         assert_eq!(
             o,
@@ -220,7 +213,7 @@ mod tests {
     fn duplicate_emitter_doesnt_increment_count() {
         let mut t = QuorumTracker::new(ReceiptKind::Drv, [1u8; 32], 3);
         t.ingest(&r(1, 5));
-        t.ingest(&r(1, 5));  // same emitter, same evidence
+        t.ingest(&r(1, 5)); // same emitter, same evidence
         t.ingest(&r(1, 5));
         assert_eq!(t.confirmed_count(), 1);
         assert!(!t.has_quorum());
@@ -230,16 +223,22 @@ mod tests {
     fn dissent_when_evidence_variants_diverge_past_quorum() {
         let mut t = QuorumTracker::new(ReceiptKind::Drv, [1u8; 32], 2);
         t.ingest(&r(1, 5));
-        let o = t.ingest(&r(2, 6));  // different evidence
-        assert!(matches!(o, QuorumOutcome::Dissent { confirmed: 2, evidence_variants: 2 }));
+        let o = t.ingest(&r(2, 6)); // different evidence
+        assert!(matches!(
+            o,
+            QuorumOutcome::Dissent {
+                confirmed: 2,
+                evidence_variants: 2
+            }
+        ));
     }
 
     #[test]
     fn dissent_overrides_reached_when_thresholds_both_met() {
         let mut t = QuorumTracker::new(ReceiptKind::Drv, [1u8; 32], 2);
         t.ingest(&r(1, 5));
-        t.ingest(&r(2, 5));   // Reached
-        let o = t.ingest(&r(3, 7));  // Adds dissent.
+        t.ingest(&r(2, 5)); // Reached
+        let o = t.ingest(&r(3, 7)); // Adds dissent.
         assert!(matches!(o, QuorumOutcome::Dissent { .. }));
     }
 
@@ -247,7 +246,7 @@ mod tests {
     fn most_recent_evidence_per_emitter_wins() {
         let mut t = QuorumTracker::new(ReceiptKind::Drv, [1u8; 32], 1);
         t.ingest(&r(1, 5));
-        t.ingest(&r(1, 6));  // emitter 1 changes its mind
+        t.ingest(&r(1, 6)); // emitter 1 changes its mind
         assert_eq!(t.confirmed_count(), 1);
         // Only one evidence hash now → no dissent.
         assert_eq!(t.evidence_variants(), 1);
@@ -293,7 +292,7 @@ mod tests {
         let mut t = QuorumTracker::new(ReceiptKind::Drv, [1u8; 32], 3);
         t.ingest(&r(1, 5));
         t.ingest(&r(2, 5));
-        t.ingest(&r(1, 5));  // duplicate
+        t.ingest(&r(1, 5)); // duplicate
         let mut ids = t.emitters();
         ids.sort();
         assert_eq!(ids.len(), 2);

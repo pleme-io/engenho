@@ -120,10 +120,7 @@ impl FileSystemBackend {
     ///
     /// Returns [`FaceError::Unsupported`] wrapping any I/O failure
     /// (directory create denied, metadata parse error, etc.).
-    pub fn open(
-        root: impl Into<PathBuf>,
-        face_name: impl Into<String>,
-    ) -> Result<Self, FaceError> {
+    pub fn open(root: impl Into<PathBuf>, face_name: impl Into<String>) -> Result<Self, FaceError> {
         let root = root.into();
         let face_name = face_name.into();
         Self::open_with_adapters(root, face_name, AdapterRegistry::default())
@@ -185,10 +182,7 @@ impl FileSystemBackend {
         if let Some(ns) = &reference.namespace {
             Self::check_no_traversal("namespace", ns)?;
         }
-        let ns_segment = reference
-            .namespace
-            .as_deref()
-            .unwrap_or(CLUSTER_SCOPED_DIR);
+        let ns_segment = reference.namespace.as_deref().unwrap_or(CLUSTER_SCOPED_DIR);
         Ok(self
             .root
             .join(&reference.kind)
@@ -252,9 +246,7 @@ impl FileSystemBackend {
                 for resource_entry in std::fs::read_dir(&ns_path)? {
                     let resource_entry = resource_entry?;
                     let resource_path = resource_entry.path();
-                    if resource_path.extension().and_then(|s| s.to_str())
-                        != Some(ENVELOPE_EXT)
-                    {
+                    if resource_path.extension().and_then(|s| s.to_str()) != Some(ENVELOPE_EXT) {
                         continue;
                     }
                     let name = resource_path
@@ -319,11 +311,7 @@ impl StoreBackend for FileSystemBackend {
         Ok(())
     }
 
-    fn get(
-        &self,
-        reference: &ResourceRef,
-        format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError> {
+    fn get(&self, reference: &ResourceRef, format: ResourceFormat) -> Result<Vec<u8>, FaceError> {
         // Served from the cache (which mirrors disk).
         self.cache.get(reference, format)
     }
@@ -390,10 +378,8 @@ impl StoreBackend for FileSystemBackend {
         // to re-emit every file. Use the same snapshot codec as
         // we just consumed.
         let restored_snap = self.cache.snapshot()?;
-        let entries: Vec<(ResourceRef, Vec<u8>)> =
-            ciborium::from_reader(restored_snap.as_slice()).map_err(|e| {
-                FaceError::Unsupported(format!("filesystem restore: cbor decode: {e}"))
-            })?;
+        let entries: Vec<(ResourceRef, Vec<u8>)> = ciborium::from_reader(restored_snap.as_slice())
+            .map_err(|e| FaceError::Unsupported(format!("filesystem restore: cbor decode: {e}")))?;
         for (reference, envelope) in entries {
             let path = self.path_for(&reference)?;
             if let Some(parent) = path.parent() {
@@ -448,8 +434,12 @@ mod tests {
         let dir = temp_dir();
         {
             let backend = FileSystemBackend::open(dir.path(), "test").unwrap();
-            backend.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
-            backend.apply(ResourceFormat::Yaml, &yaml("b", "default")).unwrap();
+            backend
+                .apply(ResourceFormat::Yaml, &yaml("a", "default"))
+                .unwrap();
+            backend
+                .apply(ResourceFormat::Yaml, &yaml("b", "default"))
+                .unwrap();
             assert_eq!(backend.resource_count(), 2);
         }
         // Reopen — state should reload from disk.
@@ -466,7 +456,11 @@ mod tests {
         backend
             .apply(ResourceFormat::Yaml, &yaml("nginx", "default"))
             .unwrap();
-        let expected_path = dir.path().join("Pod").join("default").join("nginx.envelope");
+        let expected_path = dir
+            .path()
+            .join("Pod")
+            .join("default")
+            .join("nginx.envelope");
         assert!(expected_path.exists(), "expected file at {expected_path:?}");
     }
 
@@ -477,10 +471,7 @@ mod tests {
         let body = yaml("nginx", "default");
         backend.apply(ResourceFormat::Yaml, &body).unwrap();
         let r = pod_ref("nginx", "default");
-        assert_eq!(
-            backend.get(&r, ResourceFormat::Yaml).unwrap(),
-            body,
-        );
+        assert_eq!(backend.get(&r, ResourceFormat::Yaml).unwrap(), body,);
     }
 
     #[test]
@@ -492,7 +483,8 @@ mod tests {
             "kind": "Pod",
             "metadata": { "name": "x", "namespace": "default" },
             "spec": {}
-        })).unwrap();
+        }))
+        .unwrap();
         backend.apply(ResourceFormat::Json, &body).unwrap();
         let r = pod_ref("x", "default");
         assert_eq!(backend.get(&r, ResourceFormat::Json).unwrap(), body);
@@ -522,7 +514,11 @@ mod tests {
         }))
         .unwrap();
         backend.apply(ResourceFormat::Json, &body).unwrap();
-        let expected = dir.path().join("ClusterRole").join("_cluster").join("admin.envelope");
+        let expected = dir
+            .path()
+            .join("ClusterRole")
+            .join("_cluster")
+            .join("admin.envelope");
         assert!(expected.exists(), "expected cluster-scoped at {expected:?}");
     }
 
@@ -532,8 +528,14 @@ mod tests {
     fn delete_removes_envelope_file_and_cache_entry() {
         let dir = temp_dir();
         let backend = FileSystemBackend::open(dir.path(), "test").unwrap();
-        backend.apply(ResourceFormat::Yaml, &yaml("nginx", "default")).unwrap();
-        let path = dir.path().join("Pod").join("default").join("nginx.envelope");
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("nginx", "default"))
+            .unwrap();
+        let path = dir
+            .path()
+            .join("Pod")
+            .join("default")
+            .join("nginx.envelope");
         assert!(path.exists());
         let r = pod_ref("nginx", "default");
         backend.delete(&r).unwrap();
@@ -547,12 +549,22 @@ mod tests {
     fn list_filters_by_namespace() {
         let dir = temp_dir();
         let backend = FileSystemBackend::open(dir.path(), "test").unwrap();
-        backend.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
-        backend.apply(ResourceFormat::Yaml, &yaml("b", "default")).unwrap();
-        backend.apply(ResourceFormat::Yaml, &yaml("c", "other")).unwrap();
-        let default = backend.list("Pod", Some("default"), ResourceFormat::Yaml).unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("a", "default"))
+            .unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("b", "default"))
+            .unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("c", "other"))
+            .unwrap();
+        let default = backend
+            .list("Pod", Some("default"), ResourceFormat::Yaml)
+            .unwrap();
         assert_eq!(default.len(), 2);
-        let other = backend.list("Pod", Some("other"), ResourceFormat::Yaml).unwrap();
+        let other = backend
+            .list("Pod", Some("other"), ResourceFormat::Yaml)
+            .unwrap();
         assert_eq!(other.len(), 1);
     }
 
@@ -565,7 +577,9 @@ mod tests {
         let mut watch = backend
             .watch("Pod", Some("default"), ResourceFormat::Yaml)
             .unwrap();
-        backend.apply(ResourceFormat::Yaml, &yaml("nginx", "default")).unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("nginx", "default"))
+            .unwrap();
         let _ = watch.next_event().unwrap().expect("event");
     }
 
@@ -576,16 +590,30 @@ mod tests {
         let dir1 = temp_dir();
         let dir2 = temp_dir();
         let src = FileSystemBackend::open(dir1.path(), "src").unwrap();
-        src.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
-        src.apply(ResourceFormat::Yaml, &yaml("b", "default")).unwrap();
+        src.apply(ResourceFormat::Yaml, &yaml("a", "default"))
+            .unwrap();
+        src.apply(ResourceFormat::Yaml, &yaml("b", "default"))
+            .unwrap();
         let snap = src.snapshot().unwrap();
 
         let dst = FileSystemBackend::open(dir2.path(), "dst").unwrap();
         dst.restore(&snap).unwrap();
         assert_eq!(dst.resource_count(), 2);
         // Restored state also persisted to dst's disk.
-        assert!(dir2.path().join("Pod").join("default").join("a.envelope").exists());
-        assert!(dir2.path().join("Pod").join("default").join("b.envelope").exists());
+        assert!(
+            dir2.path()
+                .join("Pod")
+                .join("default")
+                .join("a.envelope")
+                .exists()
+        );
+        assert!(
+            dir2.path()
+                .join("Pod")
+                .join("default")
+                .join("b.envelope")
+                .exists()
+        );
     }
 
     #[test]
@@ -594,7 +622,8 @@ mod tests {
         // identical state. The cross-backend interop guarantee.
         let dir = temp_dir();
         let fs = FileSystemBackend::open(dir.path(), "fs").unwrap();
-        fs.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
+        fs.apply(ResourceFormat::Yaml, &yaml("a", "default"))
+            .unwrap();
         let snap = fs.snapshot().unwrap();
 
         let mem = InMemoryStore::new("mem");
@@ -607,16 +636,32 @@ mod tests {
         let dir = temp_dir();
         let backend = FileSystemBackend::open(dir.path(), "test").unwrap();
         // Initial state.
-        backend.apply(ResourceFormat::Yaml, &yaml("keep", "default")).unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("keep", "default"))
+            .unwrap();
         let snap_with_keep = backend.snapshot().unwrap();
         // Add a different resource.
-        backend.apply(ResourceFormat::Yaml, &yaml("transient", "default")).unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("transient", "default"))
+            .unwrap();
         assert_eq!(backend.resource_count(), 2);
         // Restore the prior snapshot — transient should be gone.
         backend.restore(&snap_with_keep).unwrap();
         assert_eq!(backend.resource_count(), 1);
-        assert!(!dir.path().join("Pod").join("default").join("transient.envelope").exists());
-        assert!(dir.path().join("Pod").join("default").join("keep.envelope").exists());
+        assert!(
+            !dir.path()
+                .join("Pod")
+                .join("default")
+                .join("transient.envelope")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("Pod")
+                .join("default")
+                .join("keep.envelope")
+                .exists()
+        );
     }
 
     // ── Path-traversal safety ───────────────────────────────────
@@ -707,7 +752,9 @@ mod tests {
         // file isn't there afterwards.
         let dir = temp_dir();
         let backend = FileSystemBackend::open(dir.path(), "test").unwrap();
-        backend.apply(ResourceFormat::Yaml, &yaml("nginx", "default")).unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("nginx", "default"))
+            .unwrap();
         let tmp_path = dir
             .path()
             .join("Pod")

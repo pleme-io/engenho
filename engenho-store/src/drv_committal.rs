@@ -24,7 +24,7 @@
 //! (CRD spec / OpenAPI / iroh blob ID / ...).
 
 use engenho_substrate::Drv;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::command::{Reason, ResourceCommand};
 use crate::resource::ResourceKey;
@@ -92,18 +92,8 @@ pub fn put_drv_command(
 
 /// Build a `ResourceCommand::Delete` for removing a Drv.
 #[must_use]
-pub fn delete_drv_command(
-    drv_hash_hex: &str,
-    namespace: &str,
-    reason: Reason,
-) -> ResourceCommand {
-    let key = ResourceKey::namespaced(
-        DRV_GROUP,
-        DRV_VERSION,
-        DRV_KIND,
-        namespace,
-        drv_hash_hex,
-    );
+pub fn delete_drv_command(drv_hash_hex: &str, namespace: &str, reason: Reason) -> ResourceCommand {
+    let key = ResourceKey::namespaced(DRV_GROUP, DRV_VERSION, DRV_KIND, namespace, drv_hash_hex);
     ResourceCommand::Delete { key, reason }
 }
 
@@ -151,10 +141,7 @@ mod tests {
             v.get("spec").unwrap().get("drvHash").unwrap(),
             &drv.drv_hash.to_hex()
         );
-        assert_eq!(
-            v.get("spec").unwrap().get("system").unwrap(),
-            &drv.system
-        );
+        assert_eq!(v.get("spec").unwrap().get("system").unwrap(), &drv.system);
     }
 
     #[test]

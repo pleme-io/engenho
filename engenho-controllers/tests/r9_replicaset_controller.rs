@@ -4,12 +4,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use engenho_controllers::{is_owned_by, Controller, ReplicaSetController};
+use engenho_controllers::{Controller, ReplicaSetController, is_owned_by};
 use engenho_store::{
+    InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
-    default_config, InProcessRouter, ResourceKey, StoreMesh,
+    default_config,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 async fn boot_store() -> Arc<StoreMesh> {
     let router = InProcessRouter::new();
@@ -62,7 +63,9 @@ async fn put_replicaset(store: &StoreMesh, name: &str, replicas: i64) -> String 
 
 async fn owned_pod_count(store: &StoreMesh, owner_uid: &str) -> usize {
     let pods = store.list("", "v1", "Pod", Some("default")).await;
-    pods.iter().filter(|(_, p)| is_owned_by(p, owner_uid)).count()
+    pods.iter()
+        .filter(|(_, p)| is_owned_by(p, owner_uid))
+        .count()
 }
 
 #[tokio::test]
@@ -113,8 +116,7 @@ async fn rs_controller_evicts_excess_when_replicas_decreases() {
     assert_eq!(owned_pod_count(&store, &uid).await, 4);
 
     // Patch RS to replicas=1.
-    let rs_key =
-        ResourceKey::namespaced("apps", "v1", "ReplicaSet", "default", "shrink");
+    let rs_key = ResourceKey::namespaced("apps", "v1", "ReplicaSet", "default", "shrink");
     store
         .propose(ResourceCommand::Patch {
             key: rs_key,
@@ -143,8 +145,7 @@ async fn rs_controller_scales_up_after_increasing_replicas() {
     assert_eq!(owned_pod_count(&store, &uid).await, 1);
 
     // Scale to 5.
-    let rs_key =
-        ResourceKey::namespaced("apps", "v1", "ReplicaSet", "default", "grow");
+    let rs_key = ResourceKey::namespaced("apps", "v1", "ReplicaSet", "default", "grow");
     store
         .propose(ResourceCommand::Patch {
             key: rs_key,

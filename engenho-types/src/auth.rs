@@ -44,9 +44,9 @@ pub enum KubeAuth {
         /// Path or PATH-resolvable name of the helper binary.
         command: String,
         /// Args passed to the helper.
-        args:    Vec<String>,
+        args: Vec<String>,
         /// Env vars to set in the helper's process.
-        env:     Vec<ExecEnv>,
+        env: Vec<ExecEnv>,
         /// API version the helper returns (`client.authentication.k8s.io/v1`).
         api_version: String,
     },
@@ -85,7 +85,7 @@ pub enum BytesOrPath {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecEnv {
     /// Variable name.
-    pub name:  String,
+    pub name: String,
     /// Variable value.
     pub value: String,
 }
@@ -105,7 +105,9 @@ mod tests {
 
     #[test]
     fn bearer_inline_round_trips() {
-        let v = KubeAuth::BearerToken(TokenSource::Inline { token: "abc".into() });
+        let v = KubeAuth::BearerToken(TokenSource::Inline {
+            token: "abc".into(),
+        });
         let s = serde_yaml::to_string(&v).unwrap();
         let back: KubeAuth = serde_yaml::from_str(&s).unwrap();
         assert_eq!(v, back);
@@ -113,7 +115,9 @@ mod tests {
 
     #[test]
     fn bearer_file_round_trips() {
-        let v = KubeAuth::BearerToken(TokenSource::File { path: "/var/run/sa-token".into() });
+        let v = KubeAuth::BearerToken(TokenSource::File {
+            path: "/var/run/sa-token".into(),
+        });
         let s = serde_yaml::to_string(&v).unwrap();
         let back: KubeAuth = serde_yaml::from_str(&s).unwrap();
         assert_eq!(v, back);
@@ -122,8 +126,12 @@ mod tests {
     #[test]
     fn client_cert_inline_round_trips() {
         let v = KubeAuth::ClientCert {
-            cert: BytesOrPath::Inline { data: "PEM-BYTES".into() },
-            key:  BytesOrPath::Inline { data: "PEM-KEY".into() },
+            cert: BytesOrPath::Inline {
+                data: "PEM-BYTES".into(),
+            },
+            key: BytesOrPath::Inline {
+                data: "PEM-KEY".into(),
+            },
         };
         let s = serde_yaml::to_string(&v).unwrap();
         let back: KubeAuth = serde_yaml::from_str(&s).unwrap();
@@ -134,8 +142,11 @@ mod tests {
     fn exec_round_trips() {
         let v = KubeAuth::Exec {
             command: "aws-iam-authenticator".into(),
-            args:    vec!["token".into(), "-i".into(), "my-cluster".into()],
-            env:     vec![ExecEnv { name: "AWS_REGION".into(), value: "us-east-1".into() }],
+            args: vec!["token".into(), "-i".into(), "my-cluster".into()],
+            env: vec![ExecEnv {
+                name: "AWS_REGION".into(),
+                value: "us-east-1".into(),
+            }],
             api_version: "client.authentication.k8s.io/v1".into(),
         };
         let s = serde_yaml::to_string(&v).unwrap();

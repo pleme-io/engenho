@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
-    command::{Reason, ResourceCommand},
     StoreMesh,
+    command::{Reason, ResourceCommand},
 };
 use engenho_substrate::{
     DerivationCacheBackend, Drv, DrvHash, NarBlob, NarHash, OutputPath, Realisation,
@@ -30,8 +30,8 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
-use crate::error::ControllerError;
 use crate::drv::DrvController;
+use crate::error::ControllerError;
 
 /// One build's output bundle — realisations + the NAR blobs
 /// referenced by them (typically one NAR per realisation).
@@ -145,10 +145,7 @@ impl BuildBackend for FakeBuildBackend {
             });
             nars.push(nar);
         }
-        Ok(BuildResult {
-            realisations,
-            nars,
-        })
+        Ok(BuildResult { realisations, nars })
     }
 }
 
@@ -324,7 +321,11 @@ impl BuildResult {
     pub fn nar_index(&self) -> BTreeMap<String, NarHash> {
         self.realisations
             .iter()
-            .filter_map(|r| r.nar_hash.as_ref().map(|h| (r.output_name.clone(), h.clone())))
+            .filter_map(|r| {
+                r.nar_hash
+                    .as_ref()
+                    .map(|h| (r.output_name.clone(), h.clone()))
+            })
             .collect()
     }
 }
@@ -421,10 +422,7 @@ mod tests {
         assert_eq!(r.realisations[0].drv_hash, drv_hash);
         assert_eq!(r.realisations[0].output_name, "out");
         assert_eq!(r.nars.len(), 1);
-        assert_eq!(
-            r.realisations[0].nar_hash.as_ref(),
-            Some(&r.nars[0].hash)
-        );
+        assert_eq!(r.realisations[0].nar_hash.as_ref(), Some(&r.nars[0].hash));
     }
 
     #[test]
@@ -464,7 +462,9 @@ mod tests {
         struct F;
         #[async_trait]
         impl Controller for F {
-            fn name(&self) -> &'static str { "drv-build" }
+            fn name(&self) -> &'static str {
+                "drv-build"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

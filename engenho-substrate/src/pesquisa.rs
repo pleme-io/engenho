@@ -281,12 +281,7 @@ impl<F: Clone> Arquivo<F> {
     ///
     /// The comparator returns true when `candidate` is BETTER than
     /// `incumbent` (i.e. should replace).
-    pub fn insert_if_better<C>(
-        &mut self,
-        niche: NicheKey,
-        candidate: Aptidao<F>,
-        better: C,
-    ) -> bool
+    pub fn insert_if_better<C>(&mut self, niche: NicheKey, candidate: Aptidao<F>, better: C) -> bool
     where
         C: Fn(&Aptidao<F>, &Aptidao<F>) -> bool,
     {
@@ -508,10 +503,7 @@ where
     ///
     /// # Errors
     /// Engine-specific failures via [`PesquisaError`].
-    async fn step(
-        &mut self,
-        prior: Option<&Geracao<F>>,
-    ) -> Result<Geracao<F>, PesquisaError>;
+    async fn step(&mut self, prior: Option<&Geracao<F>>) -> Result<Geracao<F>, PesquisaError>;
 
     /// Borrow the current linhagem (for telemetry + replay).
     fn linhagem(&self) -> &Linhagem;
@@ -571,7 +563,7 @@ impl Fitness<u32, f64> for FakeFitness {
 
     async fn evaluate(&self, genotype: &u32) -> Result<(f64, Evidence), FitnessError> {
         let distance = (*genotype as i64 - self.target as i64).unsigned_abs() as f64;
-        let fitness = -distance;  // higher = better
+        let fitness = -distance; // higher = better
         let mut evidence = self.target.to_le_bytes().to_vec();
         evidence.extend_from_slice(&genotype.to_le_bytes());
         Ok((fitness, evidence))
@@ -879,16 +871,12 @@ mod tests {
     fn arquivo_keeps_existing_when_candidate_worse() {
         let mut a: Arquivo<f64> = Arquivo::new();
         let niche = NicheKey::new(b"x".to_vec());
-        a.insert_if_better(
-            niche.clone(),
-            sample_aptidao(1, 0, 10.0),
-            |c, i| c.fitness > i.fitness,
-        );
-        let inserted = a.insert_if_better(
-            niche,
-            sample_aptidao(2, 0, 5.0),
-            |c, i| c.fitness > i.fitness,
-        );
+        a.insert_if_better(niche.clone(), sample_aptidao(1, 0, 10.0), |c, i| {
+            c.fitness > i.fitness
+        });
+        let inserted = a.insert_if_better(niche, sample_aptidao(2, 0, 5.0), |c, i| {
+            c.fitness > i.fitness
+        });
         assert!(!inserted);
         assert_eq!(a.len(), 1);
     }
@@ -897,16 +885,12 @@ mod tests {
     fn arquivo_replaces_when_candidate_better() {
         let mut a: Arquivo<f64> = Arquivo::new();
         let niche = NicheKey::new(b"x".to_vec());
-        a.insert_if_better(
-            niche.clone(),
-            sample_aptidao(1, 0, 5.0),
-            |c, i| c.fitness > i.fitness,
-        );
-        let inserted = a.insert_if_better(
-            niche.clone(),
-            sample_aptidao(2, 0, 10.0),
-            |c, i| c.fitness > i.fitness,
-        );
+        a.insert_if_better(niche.clone(), sample_aptidao(1, 0, 5.0), |c, i| {
+            c.fitness > i.fitness
+        });
+        let inserted = a.insert_if_better(niche.clone(), sample_aptidao(2, 0, 10.0), |c, i| {
+            c.fitness > i.fitness
+        });
         assert!(inserted);
         assert_eq!(a.entries[&niche].fitness, 10.0);
     }
@@ -968,7 +952,7 @@ mod tests {
         let pop = vec![
             sample_aptidao(0, 0, -10.0),
             sample_aptidao(1, 0, -5.0),
-            sample_aptidao(2, 0, 0.0),  // best
+            sample_aptidao(2, 0, 0.0), // best
             sample_aptidao(3, 0, -3.0),
         ];
         let mut rng = SearchRng::new(&seed(), b"sel");
@@ -1014,7 +998,10 @@ mod tests {
     #[test]
     fn tournament_name_is_stable() {
         let sel = TournamentSelector::new(3);
-        assert_eq!(<TournamentSelector as Selector<f64>>::name(&sel), "tournament");
+        assert_eq!(
+            <TournamentSelector as Selector<f64>>::name(&sel),
+            "tournament"
+        );
     }
 
     // ── score_ensaio + aptidao_to_receipt bridges ──────────────
@@ -1033,11 +1020,7 @@ mod tests {
     #[test]
     fn aptidao_to_receipt_carries_subject_and_evidence() {
         let aptidao = sample_aptidao(7, 0, 0.5);
-        let receipt = aptidao_to_receipt(
-            &aptidao,
-            crate::receipt::NodeId::from_bytes(b"n"),
-            42,
-        );
+        let receipt = aptidao_to_receipt(&aptidao, crate::receipt::NodeId::from_bytes(b"n"), 42);
         assert_eq!(receipt.subject, aptidao.ensaio.id.0);
         assert_eq!(receipt.evidence_hash, aptidao.evidence_hash);
         match receipt.kind {

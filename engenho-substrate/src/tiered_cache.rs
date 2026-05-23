@@ -99,7 +99,10 @@ impl DerivationCacheBackend for TieredCache {
         for (idx, tier) in self.tiers.iter().enumerate() {
             if let Some(drv) = tier.get_drv(hash).await? {
                 // Ask the promotion gate.
-                let ctx = PromotionContext { source_tier: idx, total_tiers: total };
+                let ctx = PromotionContext {
+                    source_tier: idx,
+                    total_tiers: total,
+                };
                 if let Some(promote_to) = self.gate.decide(ctx) {
                     for higher in &self.tiers[..promote_to] {
                         let _ = higher.put_drv(&drv).await;
@@ -128,7 +131,10 @@ impl DerivationCacheBackend for TieredCache {
             // Get from this tier. HashMismatch propagates — corrupt
             // cache is a halting fault, not a fallback trigger.
             if let Some(blob) = tier.get_nar(hash).await? {
-                let ctx = PromotionContext { source_tier: idx, total_tiers: total };
+                let ctx = PromotionContext {
+                    source_tier: idx,
+                    total_tiers: total,
+                };
                 if let Some(promote_to) = self.gate.decide(ctx) {
                     for higher in &self.tiers[..promote_to] {
                         let _ = higher.put_nar(&blob).await;
@@ -147,10 +153,7 @@ impl DerivationCacheBackend for TieredCache {
         Ok(())
     }
 
-    async fn list_realisations(
-        &self,
-        drv_hash: &DrvHash,
-    ) -> Result<Vec<Realisation>, CacheError> {
+    async fn list_realisations(&self, drv_hash: &DrvHash) -> Result<Vec<Realisation>, CacheError> {
         // Merge realisations across tiers: a realisation can exist
         // anywhere, and the lattice union is the correct answer
         // (every output-name distinct, latest wins).
@@ -164,10 +167,7 @@ impl DerivationCacheBackend for TieredCache {
         Ok(merged.into_values().collect())
     }
 
-    async fn put_realisation(
-        &self,
-        realisation: &Realisation,
-    ) -> Result<(), CacheError> {
+    async fn put_realisation(&self, realisation: &Realisation) -> Result<(), CacheError> {
         // Write to L0 only; promotion to upper tiers via reconcile.
         if let Some(local) = self.tiers.first() {
             local.put_realisation(realisation).await?;
@@ -215,7 +215,7 @@ mod tests {
         let l0 = Arc::new(MemoryDerivationCache::new());
         let l1 = Arc::new(MemoryDerivationCache::new());
         let drv = sample_drv(b"a");
-        l1.put_drv(&drv).await.unwrap();  // only in L1
+        l1.put_drv(&drv).await.unwrap(); // only in L1
         let c = TieredCache::new(vec![l0.clone(), l1.clone()]);
         let got = c.get_drv(&drv.drv_hash).await.unwrap();
         assert_eq!(got, Some(drv.clone()));
@@ -346,7 +346,12 @@ mod tests {
         let c = TieredCache::new(vec![l0, l1]);
         let h = DrvHash::from_bytes(b"never-seen");
         assert!(c.get_drv(&h).await.unwrap().is_none());
-        assert!(c.get_nar(&NarHash::from_bytes(b"never")).await.unwrap().is_none());
+        assert!(
+            c.get_nar(&NarHash::from_bytes(b"never"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

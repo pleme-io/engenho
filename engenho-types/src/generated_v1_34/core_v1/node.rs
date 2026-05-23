@@ -2,8 +2,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -61,8 +61,8 @@ fn is_empty_spec(s: &NodeSpec) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::node_spec::{NodeAddress, NodeCondition, NodeSystemInfo};
+    use super::*;
     use crate::primitives::Quantity;
     use std::str::FromStr;
 

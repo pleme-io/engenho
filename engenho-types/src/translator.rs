@@ -153,18 +153,13 @@ impl WorkloadTranslator for K8sDeploymentTranslator {
         let spec = manifest
             .get("spec")
             .ok_or_else(|| TranslateError::MissingField("spec".into()))?;
-        let replicas = spec
-            .get("replicas")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
+        let replicas = spec.get("replicas").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
         let containers = spec
             .get("template")
             .and_then(|t| t.get("spec"))
             .and_then(|s| s.get("containers"))
             .and_then(|c| c.as_array())
-            .ok_or_else(|| {
-                TranslateError::MissingField("spec.template.spec.containers".into())
-            })?;
+            .ok_or_else(|| TranslateError::MissingField("spec.template.spec.containers".into()))?;
         let first = containers
             .first()
             .ok_or_else(|| TranslateError::MissingField("containers[0]".into()))?;
@@ -188,8 +183,14 @@ impl WorkloadTranslator for K8sDeploymentTranslator {
             .unwrap_or_default();
         let req_block = first.get("resources").and_then(|r| r.get("requests"));
         let resources = match (
-            req_block.and_then(|r| r.get("cpu")).and_then(|c| c.as_str()).and_then(parse_k8s_cpu),
-            req_block.and_then(|r| r.get("memory")).and_then(|m| m.as_str()).and_then(parse_k8s_memory_mib),
+            req_block
+                .and_then(|r| r.get("cpu"))
+                .and_then(|c| c.as_str())
+                .and_then(parse_k8s_cpu),
+            req_block
+                .and_then(|r| r.get("memory"))
+                .and_then(|m| m.as_str())
+                .and_then(parse_k8s_memory_mib),
         ) {
             (Some(cpu_millicores), Some(memory_mib)) => Some(ResourceIntent {
                 cpu_millicores,
@@ -333,32 +334,32 @@ impl WorkloadTranslator for NomadJobTranslator {
             .get("Tasks")
             .and_then(|t| t.as_array())
             .and_then(|arr| arr.first())
-            .ok_or_else(|| {
-                TranslateError::MissingField("Job.TaskGroups[0].Tasks[0]".into())
-            })?;
+            .ok_or_else(|| TranslateError::MissingField("Job.TaskGroups[0].Tasks[0]".into()))?;
         let image = task
             .get("Config")
             .and_then(|c| c.get("image"))
             .and_then(|i| i.as_str())
-            .ok_or_else(|| {
-                TranslateError::MissingField("Tasks[0].Config.image".into())
-            })?
+            .ok_or_else(|| TranslateError::MissingField("Tasks[0].Config.image".into()))?
             .to_string();
         let env = task
             .get("Env")
             .and_then(|e| e.as_object())
             .map(|m| {
                 m.iter()
-                    .filter_map(|(k, v)| {
-                        v.as_str().map(|s| (k.clone(), s.to_string()))
-                    })
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                     .collect()
             })
             .unwrap_or_default();
         let res_block = task.get("Resources");
         let resources = match (
-            res_block.and_then(|r| r.get("CPU")).and_then(|c| c.as_u64()).map(|n| n as u32),
-            res_block.and_then(|r| r.get("MemoryMB")).and_then(|m| m.as_u64()).map(|n| n as u32),
+            res_block
+                .and_then(|r| r.get("CPU"))
+                .and_then(|c| c.as_u64())
+                .map(|n| n as u32),
+            res_block
+                .and_then(|r| r.get("MemoryMB"))
+                .and_then(|m| m.as_u64())
+                .map(|n| n as u32),
         ) {
             (Some(cpu_millicores), Some(memory_mib)) => Some(ResourceIntent {
                 cpu_millicores,
@@ -377,7 +378,10 @@ impl WorkloadTranslator for NomadJobTranslator {
                     .filter_map(|port| {
                         let label = port.get("Label").and_then(|l| l.as_str())?.to_string();
                         let to = port.get("To").and_then(|t| t.as_u64())? as u16;
-                        Some(PortIntent { label, container_port: to })
+                        Some(PortIntent {
+                            label,
+                            container_port: to,
+                        })
                     })
                     .collect()
             })
@@ -521,7 +525,9 @@ impl SystemdServiceTranslator {
         let manifest = SystemdServiceTranslator.write(intent);
         let mut out = String::new();
         for section in ["Unit", "Service", "Install"] {
-            let Some(s) = manifest.get(section) else { continue };
+            let Some(s) = manifest.get(section) else {
+                continue;
+            };
             let Some(map) = s.as_object() else { continue };
             out.push_str(&format!("[{section}]\n"));
             for (key, value) in map {
@@ -573,9 +579,7 @@ impl WorkloadTranslator for SystemdServiceTranslator {
         let image = service
             .get("X-EngenhoImage")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                TranslateError::MissingField("Service.X-EngenhoImage".into())
-            })?
+            .ok_or_else(|| TranslateError::MissingField("Service.X-EngenhoImage".into()))?
             .to_string();
         let replicas = service
             .get("X-EngenhoReplicas")
@@ -702,10 +706,7 @@ impl WorkloadTranslator for SystemdServiceTranslator {
         service.insert("Restart".into(), Value::String("on-failure".into()));
 
         let mut install = serde_json::Map::new();
-        install.insert(
-            "WantedBy".into(),
-            Value::String("multi-user.target".into()),
-        );
+        install.insert("WantedBy".into(), Value::String("multi-user.target".into()));
 
         Value::Object({
             let mut top = serde_json::Map::new();
@@ -996,30 +997,25 @@ mod tests {
     use proptest::prelude::*;
 
     fn arb_intent() -> impl Strategy<Value = WorkloadIntent> {
-        let arb_resources = prop::option::of(
-            (10u32..=64000, 1u32..=16384)
-                .prop_map(|(cpu_millicores, memory_mib)| ResourceIntent {
-                    // CPUQuota emits CPU/10 as integer percent — preserve
-                    // round-trip-ability by snapping cpu_millicores to
-                    // multiples of 10.
-                    cpu_millicores: (cpu_millicores / 10) * 10,
-                    memory_mib,
-                }),
-        );
+        let arb_resources = prop::option::of((10u32..=64000, 1u32..=16384).prop_map(
+            |(cpu_millicores, memory_mib)| ResourceIntent {
+                // CPUQuota emits CPU/10 as integer percent — preserve
+                // round-trip-ability by snapping cpu_millicores to
+                // multiples of 10.
+                cpu_millicores: (cpu_millicores / 10) * 10,
+                memory_mib,
+            },
+        ));
         (
-            "[a-z][a-z0-9-]{0,30}",     // name
-            "[a-z][a-z0-9-]{0,20}",     // namespace
-            "[a-z][a-z0-9./:-]{0,40}",  // image
-            1u32..=100,                 // replicas
-            prop::collection::btree_map(
-                "[A-Z][A-Z0-9_]{0,15}",
-                "[a-z0-9.-]{0,30}",
-                0..5,
-            ),
+            "[a-z][a-z0-9-]{0,30}",    // name
+            "[a-z][a-z0-9-]{0,20}",    // namespace
+            "[a-z][a-z0-9./:-]{0,40}", // image
+            1u32..=100,                // replicas
+            prop::collection::btree_map("[A-Z][A-Z0-9_]{0,15}", "[a-z0-9.-]{0,30}", 0..5),
             arb_resources,
         )
-            .prop_map(
-                |(name, namespace, image, replicas, env, resources)| WorkloadIntent {
+            .prop_map(|(name, namespace, image, replicas, env, resources)| {
+                WorkloadIntent {
                     name,
                     namespace,
                     image,
@@ -1028,8 +1024,8 @@ mod tests {
                     resources,
                     ports: vec![],
                     service_name: None,
-                },
-            )
+                }
+            })
     }
 
     proptest! {

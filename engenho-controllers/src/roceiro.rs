@@ -28,9 +28,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use engenho_substrate::{
-    MaterializationReceipt, NodeId, ReceiptKind, Stage, StageId,
-};
+use engenho_substrate::{MaterializationReceipt, NodeId, ReceiptKind, Stage, StageId};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -190,7 +188,7 @@ impl Roceiro for FakeRoceiro {
             ReceiptKind::Shape(stage.shape.tag()),
             subject,
             node,
-            42,  // synthetic deterministic timestamp
+            42, // synthetic deterministic timestamp
             evidence,
         ))
     }
@@ -284,10 +282,7 @@ mod tests {
         let calls = r.calls().await;
         assert_eq!(
             calls,
-            vec![
-                (StageId::new("a"), n(1)),
-                (StageId::new("b"), n(2)),
-            ]
+            vec![(StageId::new("a"), n(1)), (StageId::new("b"), n(2)),]
         );
     }
 

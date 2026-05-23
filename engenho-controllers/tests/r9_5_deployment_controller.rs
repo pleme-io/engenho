@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_controllers::{
-    is_owned_by, Controller, DeploymentController, GcController, ReplicaSetController,
+    Controller, DeploymentController, GcController, ReplicaSetController, is_owned_by,
 };
 use engenho_store::{
+    InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
-    default_config, InProcessRouter, ResourceKey, StoreMesh,
+    default_config,
 };
 use serde_json::json;
 
@@ -27,12 +28,7 @@ async fn boot_store() -> Arc<StoreMesh> {
     store
 }
 
-async fn put_deployment(
-    store: &StoreMesh,
-    name: &str,
-    replicas: i64,
-    image: &str,
-) -> String {
+async fn put_deployment(store: &StoreMesh, name: &str, replicas: i64, image: &str) -> String {
     let key = ResourceKey::namespaced("apps", "v1", "Deployment", "default", name);
     store
         .propose(ResourceCommand::Put {
@@ -55,17 +51,27 @@ async fn put_deployment(
         .await
         .unwrap();
     let d = store.get(&key).await.unwrap();
-    d.get("metadata").unwrap().get("uid").unwrap().as_str().unwrap().into()
+    d.get("metadata")
+        .unwrap()
+        .get("uid")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .into()
 }
 
 async fn replicaset_count_owned_by(store: &StoreMesh, owner_uid: &str) -> usize {
-    let rs = store.list("apps", "v1", "ReplicaSet", Some("default")).await;
+    let rs = store
+        .list("apps", "v1", "ReplicaSet", Some("default"))
+        .await;
     rs.iter().filter(|(_, r)| is_owned_by(r, owner_uid)).count()
 }
 
 async fn pod_count_owned_by(store: &StoreMesh, owner_uid: &str) -> usize {
     let pods = store.list("", "v1", "Pod", Some("default")).await;
-    pods.iter().filter(|(_, p)| is_owned_by(p, owner_uid)).count()
+    pods.iter()
+        .filter(|(_, p)| is_owned_by(p, owner_uid))
+        .count()
 }
 
 #[tokio::test]
@@ -142,8 +148,7 @@ async fn deployment_rollout_creates_new_replicaset_for_template_change() {
     assert_eq!(replicaset_count_owned_by(&store, &dep_uid).await, 1);
 
     // Patch the Deployment to a new image.
-    let dep_key =
-        ResourceKey::namespaced("apps", "v1", "Deployment", "default", "podinfo");
+    let dep_key = ResourceKey::namespaced("apps", "v1", "Deployment", "default", "podinfo");
     store
         .propose(ResourceCommand::Patch {
             key: dep_key,
@@ -175,7 +180,11 @@ async fn deployment_rollout_creates_new_replicaset_for_template_change() {
     let owned: Vec<i64> = rs_list
         .iter()
         .filter(|(_, r)| is_owned_by(r, &dep_uid))
-        .filter_map(|(_, r)| r.get("spec").and_then(|s| s.get("replicas")).and_then(|n| n.as_i64()))
+        .filter_map(|(_, r)| {
+            r.get("spec")
+                .and_then(|s| s.get("replicas"))
+                .and_then(|n| n.as_i64())
+        })
         .collect();
     let mut sorted = owned.clone();
     sorted.sort();
@@ -194,7 +203,10 @@ async fn deployment_is_idempotent_at_steady_state() {
 
     dc.tick().await.unwrap();
     let report2 = dc.tick().await.unwrap();
-    assert_eq!(report2.objects_changed, 0, "steady state should not change anything");
+    assert_eq!(
+        report2.objects_changed, 0,
+        "steady state should not change anything"
+    );
 
     drop(dc);
     let mesh = Arc::try_unwrap(store).ok().unwrap();
@@ -213,8 +225,7 @@ async fn gc_deletes_orphan_replicaset_when_deployment_is_removed() {
     assert_eq!(replicaset_count_owned_by(&store, &dep_uid).await, 1);
 
     // Delete the Deployment.
-    let dep_key =
-        ResourceKey::namespaced("apps", "v1", "Deployment", "default", "doomed");
+    let dep_key = ResourceKey::namespaced("apps", "v1", "Deployment", "default", "doomed");
     store
         .propose(ResourceCommand::Delete {
             key: dep_key,

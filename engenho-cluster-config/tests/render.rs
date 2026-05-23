@@ -18,9 +18,9 @@ use engenho_cluster_config::{
 fn base() -> ClusterConfig {
     ClusterConfig {
         cluster_name: "test".to_string(),
-        node_ip:      Ipv4Addr::new(192, 168, 64, 10),
-        network:      NetworkConfig::default(),
-        bootstrap:    BootstrapConfig::default(),
+        node_ip: Ipv4Addr::new(192, 168, 64, 10),
+        network: NetworkConfig::default(),
+        bootstrap: BootstrapConfig::default(),
     }
 }
 
@@ -65,14 +65,20 @@ fn cluster_dns_outside_service_cidr_rejected() {
 #[test]
 fn node_port_range_start_ge_end_rejected() {
     let mut c = base();
-    c.network.node_port_range = PortRange { start: 35_000, end: 30_000 };
+    c.network.node_port_range = PortRange {
+        start: 35_000,
+        end: 30_000,
+    };
     assert!(c.validate().is_err());
 }
 
 #[test]
 fn privileged_node_port_range_rejected() {
     let mut c = base();
-    c.network.node_port_range = PortRange { start: 80, end: 443 };
+    c.network.node_port_range = PortRange {
+        start: 80,
+        end: 443,
+    };
     assert!(c.validate().is_err());
 }
 
@@ -87,7 +93,11 @@ fn flannel_backend_with_calico_rejected() {
 #[test]
 fn dual_stack_without_v6_cidrs_rejected() {
     let mut c = base();
-    c.network.ipv6 = Ipv6Config { dual_stack: true, cluster_cidr_v6: None, service_cidr_v6: None };
+    c.network.ipv6 = Ipv6Config {
+        dual_stack: true,
+        cluster_cidr_v6: None,
+        service_cidr_v6: None,
+    };
     assert!(c.validate().is_err());
 }
 
@@ -138,10 +148,17 @@ fn flux_enable_without_source_is_install_only() {
     c.validate().expect("install-only mode accepted");
     // Render must emit the install manifest but NOT the source CR.
     let manifests = c.render_bootstrap_manifests();
-    let install = manifests.iter().find(|m| m.filename == "flux-system-install.yaml");
+    let install = manifests
+        .iter()
+        .find(|m| m.filename == "flux-system-install.yaml");
     assert!(install.is_some(), "install manifest still emitted");
-    let source = manifests.iter().find(|m| m.filename == "flux-system-source.yaml");
-    assert!(source.is_none(), "source manifest must NOT be emitted in install-only mode");
+    let source = manifests
+        .iter()
+        .find(|m| m.filename == "flux-system-source.yaml");
+    assert!(
+        source.is_none(),
+        "source manifest must NOT be emitted in install-only mode"
+    );
 }
 
 #[test]
@@ -150,10 +167,17 @@ fn argo_enable_without_source_is_install_only() {
     c.bootstrap.argocd.enable = true;
     c.validate().expect("install-only mode accepted");
     let manifests = c.render_bootstrap_manifests();
-    let install = manifests.iter().find(|m| m.filename == "argocd-install.yaml");
+    let install = manifests
+        .iter()
+        .find(|m| m.filename == "argocd-install.yaml");
     assert!(install.is_some(), "install manifest still emitted");
-    let app = manifests.iter().find(|m| m.filename.contains("application"));
-    assert!(app.is_none(), "application CR must NOT be emitted in install-only mode");
+    let app = manifests
+        .iter()
+        .find(|m| m.filename.contains("application"));
+    assert!(
+        app.is_none(),
+        "application CR must NOT be emitted in install-only mode"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -163,13 +187,19 @@ fn argo_enable_without_source_is_install_only() {
 #[test]
 fn render_yaml_includes_node_name() {
     let yaml = base().render_k3s_config_yaml();
-    assert!(yaml.contains("node-name: test"), "missing node-name: {yaml}");
+    assert!(
+        yaml.contains("node-name: test"),
+        "missing node-name: {yaml}"
+    );
 }
 
 #[test]
 fn render_yaml_includes_node_ip_as_tls_san() {
     let yaml = base().render_k3s_config_yaml();
-    assert!(yaml.contains("192.168.64.10"), "node_ip missing from tls-san: {yaml}");
+    assert!(
+        yaml.contains("192.168.64.10"),
+        "node_ip missing from tls-san: {yaml}"
+    );
 }
 
 #[test]
@@ -193,15 +223,27 @@ fn render_yaml_omits_cluster_and_service_cidrs() {
     let mut c = base();
     c.network.cluster_cidr = "10.100.0.0/16".into();
     let yaml = c.render_k3s_config_yaml();
-    assert!(!yaml.contains("cluster-cidr:"), "YAML must not emit cluster-cidr: {yaml}");
-    assert!(!yaml.contains("service-cidr:"), "YAML must not emit service-cidr: {yaml}");
-    assert!(!yaml.contains("cluster-dns:"),  "YAML must not emit cluster-dns: {yaml}");
+    assert!(
+        !yaml.contains("cluster-cidr:"),
+        "YAML must not emit cluster-cidr: {yaml}"
+    );
+    assert!(
+        !yaml.contains("service-cidr:"),
+        "YAML must not emit service-cidr: {yaml}"
+    );
+    assert!(
+        !yaml.contains("cluster-dns:"),
+        "YAML must not emit cluster-dns: {yaml}"
+    );
 }
 
 #[test]
 fn render_yaml_custom_node_port_range() {
     let mut c = base();
-    c.network.node_port_range = PortRange { start: 31_000, end: 31_999 };
+    c.network.node_port_range = PortRange {
+        start: 31_000,
+        end: 31_999,
+    };
     let yaml = c.render_k3s_config_yaml();
     assert!(yaml.contains("service-node-port-range: 31000-31999"));
 }
@@ -262,7 +304,10 @@ fn render_yaml_dual_stack_cidrs_not_in_yaml() {
 #[test]
 fn render_args_default_has_no_disable() {
     let args = base().render_k3s_server_args();
-    assert!(args.iter().all(|a| !a.starts_with("--disable=")), "default should have no disables: {args:?}");
+    assert!(
+        args.iter().all(|a| !a.starts_with("--disable=")),
+        "default should have no disables: {args:?}"
+    );
 }
 
 #[test]
@@ -270,7 +315,10 @@ fn render_args_nginx_ingress_disables_traefik() {
     let mut c = base();
     c.network.ingress = IngressChoice::Nginx;
     let args = c.render_k3s_server_args();
-    assert!(args.contains(&"--disable=traefik".to_string()), "got: {args:?}");
+    assert!(
+        args.contains(&"--disable=traefik".to_string()),
+        "got: {args:?}"
+    );
 }
 
 #[test]
@@ -358,7 +406,11 @@ fn render_args_disabled_components_appear_in_disable_list() {
 #[test]
 fn render_manifests_default_is_empty() {
     let m = base().render_bootstrap_manifests();
-    assert!(m.is_empty(), "default should emit no manifests, got: {:?}", m.iter().map(|x| &x.filename).collect::<Vec<_>>());
+    assert!(
+        m.is_empty(),
+        "default should emit no manifests, got: {:?}",
+        m.iter().map(|x| &x.filename).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -367,7 +419,10 @@ fn render_manifests_calico_emits_calico_helmchart() {
     c.network.cni = CniChoice::Calico;
     c.network.network_policy.enforce = NetworkPolicyEnforce::Delegated;
     let m = c.render_bootstrap_manifests();
-    let calico = m.iter().find(|x| x.filename == "calico.yaml").expect("calico manifest");
+    let calico = m
+        .iter()
+        .find(|x| x.filename == "calico.yaml")
+        .expect("calico manifest");
     assert!(calico.body.contains("chart: tigera-operator"));
 }
 
@@ -378,7 +433,10 @@ fn render_manifests_cilium_kube_proxy_replacement() {
     c.network.kube_proxy.disabled = true;
     c.network.network_policy.enforce = NetworkPolicyEnforce::Delegated;
     let m = c.render_bootstrap_manifests();
-    let cilium = m.iter().find(|x| x.filename == "cilium.yaml").expect("cilium manifest");
+    let cilium = m
+        .iter()
+        .find(|x| x.filename == "cilium.yaml")
+        .expect("cilium manifest");
     assert!(cilium.body.contains("kubeProxyReplacement: true"));
 }
 
@@ -427,7 +485,10 @@ fn render_manifests_nodelocal_dns_emits_chart() {
     let mut c = base();
     c.network.dns = DnsChoice::NodelocalDns;
     let m = c.render_bootstrap_manifests();
-    let dns = m.iter().find(|x| x.filename == "nodelocal-dns.yaml").expect("nodelocal-dns");
+    let dns = m
+        .iter()
+        .find(|x| x.filename == "nodelocal-dns.yaml")
+        .expect("nodelocal-dns");
     assert!(dns.body.contains("clusterDNS: 10.43.0.10"));
 }
 
@@ -437,17 +498,20 @@ fn render_manifests_fluxcd_emits_install_and_source() {
     c.bootstrap.fluxcd = FluxcdBootstrap {
         enable: true,
         source: Some(GitopsSource {
-            url:    "https://github.com/pleme-io/k8s".into(),
+            url: "https://github.com/pleme-io/k8s".into(),
             branch: "main".into(),
-            auth:   None,
+            auth: None,
         }),
         interval: "1m".into(),
-        path:     "./clusters/engenho-local".into(),
-        version:  "v2.3.0".into(),
+        path: "./clusters/engenho-local".into(),
+        version: "v2.3.0".into(),
     };
     let m = c.render_bootstrap_manifests();
     assert!(m.iter().any(|x| x.filename == "flux-system-install.yaml"));
-    let src = m.iter().find(|x| x.filename == "flux-system-source.yaml").expect("flux source");
+    let src = m
+        .iter()
+        .find(|x| x.filename == "flux-system-source.yaml")
+        .expect("flux source");
     assert!(src.body.contains("kind: GitRepository"));
     assert!(src.body.contains("url: https://github.com/pleme-io/k8s"));
     assert!(src.body.contains("kind: Kustomization"));
@@ -460,19 +524,22 @@ fn render_manifests_fluxcd_with_auth_emits_secret_placeholder() {
     c.bootstrap.fluxcd = FluxcdBootstrap {
         enable: true,
         source: Some(GitopsSource {
-            url:    "https://github.com/pleme-io/k8s".into(),
+            url: "https://github.com/pleme-io/k8s".into(),
             branch: "main".into(),
-            auth:   Some(SecretRef {
-                kind:     engenho_cluster_config::bootstrap::SecretKind::HttpsToken,
+            auth: Some(SecretRef {
+                kind: engenho_cluster_config::bootstrap::SecretKind::HttpsToken,
                 sops_key: "clusters/test/flux-github-token".into(),
             }),
         }),
         interval: "1m".into(),
-        path:     "./clusters/test".into(),
-        version:  "v2.3.0".into(),
+        path: "./clusters/test".into(),
+        version: "v2.3.0".into(),
     };
     let m = c.render_bootstrap_manifests();
-    let src = m.iter().find(|x| x.filename == "flux-system-source.yaml").expect("flux source");
+    let src = m
+        .iter()
+        .find(|x| x.filename == "flux-system-source.yaml")
+        .expect("flux source");
     assert!(src.body.contains("secretRef:"));
     assert!(src.body.contains("name: test-gitops-auth"));
     assert!(src.body.contains("REPLACED-BY-SOPS-NIX-ACTIVATION"));
@@ -484,19 +551,25 @@ fn render_manifests_argocd_emits_install_and_application() {
     c.bootstrap.argocd = ArgocdBootstrap {
         enable: true,
         source: Some(GitopsSource {
-            url:    "https://github.com/pleme-io/k8s".into(),
+            url: "https://github.com/pleme-io/k8s".into(),
             branch: "main".into(),
-            auth:   None,
+            auth: None,
         }),
         target_revision: None,
-        path:    "./argocd".into(),
+        path: "./argocd".into(),
         version: "v2.13.0".into(),
     };
     let m = c.render_bootstrap_manifests();
     assert!(m.iter().any(|x| x.filename == "argocd-install.yaml"));
-    let app = m.iter().find(|x| x.filename == "argocd-application.yaml").expect("argo app");
+    let app = m
+        .iter()
+        .find(|x| x.filename == "argocd-application.yaml")
+        .expect("argo app");
     assert!(app.body.contains("kind: Application"));
-    assert!(app.body.contains("repoURL: https://github.com/pleme-io/k8s"));
+    assert!(
+        app.body
+            .contains("repoURL: https://github.com/pleme-io/k8s")
+    );
     assert!(app.body.contains("targetRevision: main")); // falls back to branch
     assert!(app.body.contains("path: ./argocd"));
 }
@@ -523,8 +596,8 @@ fn yaml_round_trip_preserves_full_config() {
             auth: None,
         }),
         interval: "30s".into(),
-        path:     "./clusters/test".into(),
-        version:  "v2.3.0".into(),
+        path: "./clusters/test".into(),
+        version: "v2.3.0".into(),
     };
     c.validate().unwrap();
     let yaml = serde_yaml::to_string(&c).unwrap();

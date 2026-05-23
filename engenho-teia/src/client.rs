@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use tracing::{debug, info};
 
 use crate::config::TeiaConfig;
@@ -66,10 +66,7 @@ impl TeiaClient {
         )
         .await
         .map_err(|_| {
-            TeiaError::ConnectFailed(format!(
-                "timed out after {:?}",
-                config.connect_timeout
-            ))
+            TeiaError::ConnectFailed(format!("timed out after {:?}", config.connect_timeout))
         })?
         .map_err(|e| TeiaError::ConnectFailed(e.to_string()))?;
 
@@ -105,8 +102,7 @@ impl TeiaClient {
         subject: String,
         payload: &T,
     ) -> Result<(), TeiaError> {
-        let bytes = serde_json::to_vec(payload)
-            .map_err(|e| TeiaError::Encode(e.to_string()))?;
+        let bytes = serde_json::to_vec(payload).map_err(|e| TeiaError::Encode(e.to_string()))?;
         self.nats
             .publish(subject.clone(), bytes.into())
             .await
@@ -124,14 +120,14 @@ impl TeiaClient {
     ///
     /// [`TeiaError::SubscribeFailed`] if NATS subscribe fails.
     pub async fn subscribe(&self, subject: String) -> Result<Subscription, TeiaError> {
-        let sub = self
-            .nats
-            .subscribe(subject.clone())
-            .await
-            .map_err(|e| TeiaError::SubscribeFailed {
-                subject: subject.clone(),
-                detail: e.to_string(),
-            })?;
+        let sub =
+            self.nats
+                .subscribe(subject.clone())
+                .await
+                .map_err(|e| TeiaError::SubscribeFailed {
+                    subject: subject.clone(),
+                    detail: e.to_string(),
+                })?;
         Ok(Subscription { inner: sub })
     }
 
@@ -148,21 +144,17 @@ impl TeiaClient {
         payload: &Req,
         timeout: Duration,
     ) -> Result<Resp, TeiaError> {
-        let bytes = serde_json::to_vec(payload)
-            .map_err(|e| TeiaError::Encode(e.to_string()))?;
-        let reply = tokio::time::timeout(
-            timeout,
-            self.nats.request(subject.clone(), bytes.into()),
-        )
-        .await
-        .map_err(|_| TeiaError::RequestFailed {
-            subject: subject.clone(),
-            detail: format!("timed out after {timeout:?}"),
-        })?
-        .map_err(|e| TeiaError::RequestFailed {
-            subject: subject.clone(),
-            detail: e.to_string(),
-        })?;
+        let bytes = serde_json::to_vec(payload).map_err(|e| TeiaError::Encode(e.to_string()))?;
+        let reply = tokio::time::timeout(timeout, self.nats.request(subject.clone(), bytes.into()))
+            .await
+            .map_err(|_| TeiaError::RequestFailed {
+                subject: subject.clone(),
+                detail: format!("timed out after {timeout:?}"),
+            })?
+            .map_err(|e| TeiaError::RequestFailed {
+                subject: subject.clone(),
+                detail: e.to_string(),
+            })?;
         serde_json::from_slice::<Resp>(&reply.payload).map_err(|e| TeiaError::Decode(e.to_string()))
     }
 
@@ -193,8 +185,7 @@ impl Subscription {
     pub async fn next_json<T: DeserializeOwned>(&mut self) -> Option<Result<T, TeiaError>> {
         let msg = self.next_message().await?;
         Some(
-            serde_json::from_slice::<T>(&msg.payload)
-                .map_err(|e| TeiaError::Decode(e.to_string())),
+            serde_json::from_slice::<T>(&msg.payload).map_err(|e| TeiaError::Decode(e.to_string())),
         )
     }
 }

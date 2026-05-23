@@ -58,10 +58,7 @@ impl BroadcastLedger {
 
     /// Wrap with an explicit channel capacity.
     #[must_use]
-    pub fn with_capacity(
-        inner: Arc<dyn MaterializationLedger>,
-        capacity: usize,
-    ) -> Self {
+    pub fn with_capacity(inner: Arc<dyn MaterializationLedger>, capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
         Self { inner, sender }
     }
@@ -125,12 +122,7 @@ mod tests {
     use crate::receipt::{MaterializationReceipt, NodeId};
 
     fn rcpt(emitter: u8, evidence: u8) -> MaterializationReceipt {
-        MaterializationReceipt::for_drv(
-            [7u8; 32],
-            NodeId::new([emitter; 32]),
-            100,
-            [evidence; 32],
-        )
+        MaterializationReceipt::for_drv([7u8; 32], NodeId::new([emitter; 32]), 100, [evidence; 32])
     }
 
     fn stage() -> StageId {
@@ -148,7 +140,10 @@ mod tests {
         l.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
         let event = rx.recv().await.unwrap();
         match event {
-            LedgerEvent::ReceiptIngested { stage_id, outcome: _ } => {
+            LedgerEvent::ReceiptIngested {
+                stage_id,
+                outcome: _,
+            } => {
                 assert_eq!(stage_id, stage());
             }
             _ => panic!("expected ReceiptIngested"),
@@ -171,8 +166,8 @@ mod tests {
         let l = wrap_memory();
         let mut rx = l.subscribe();
         l.ingest(&stage(), 2, &rcpt(1, 5)).await.unwrap();
-        let _ = rx.recv().await;  // first Pending
-        l.ingest(&stage(), 2, &rcpt(2, 6)).await.unwrap();  // dissent
+        let _ = rx.recv().await; // first Pending
+        l.ingest(&stage(), 2, &rcpt(2, 6)).await.unwrap(); // dissent
         let event = rx.recv().await.unwrap();
         if let LedgerEvent::ReceiptIngested { outcome, .. } = event {
             assert!(matches!(outcome, QuorumOutcome::Dissent { .. }));
@@ -185,12 +180,7 @@ mod tests {
         let mut rx = l.subscribe();
         l.forget_stage(&stage()).await.unwrap();
         let event = rx.recv().await.unwrap();
-        assert_eq!(
-            event,
-            LedgerEvent::StageForgotten {
-                stage_id: stage()
-            }
-        );
+        assert_eq!(event, LedgerEvent::StageForgotten { stage_id: stage() });
     }
 
     #[tokio::test]

@@ -23,16 +23,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
+    StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
-    StoreMesh,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{is_owned_by, set_owner_reference, OwnerReference};
+use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
 
 /// StatefulSet controller — peer to ReplicaSetController with
 /// ordered identity semantics.
@@ -259,7 +259,9 @@ mod tests {
         struct Fake;
         #[async_trait]
         impl Controller for Fake {
-            fn name(&self) -> &'static str { "statefulset" }
+            fn name(&self) -> &'static str {
+                "statefulset"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use engenho_scheduler::{RoundRobinStrategy, Scheduler};
 use engenho_store::{
+    InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
-    default_config, InProcessRouter, ResourceKey, StoreMesh,
+    default_config,
 };
 use serde_json::json;
 
@@ -230,7 +231,10 @@ async fn scheduler_namespace_filter_works() {
     let report = sched.tick().await.unwrap();
     assert_eq!(report.pending_pods, 1);
     assert_eq!(report.bound.len(), 1);
-    assert_eq!(report.bound[0].pod_key.namespace.as_deref(), Some("default"));
+    assert_eq!(
+        report.bound[0].pod_key.namespace.as_deref(),
+        Some("default")
+    );
 
     // The kube-system pod stays pending — out of namespace.
     let system_key = ResourceKey::namespaced("", "v1", "Pod", "kube-system", "system-pod");

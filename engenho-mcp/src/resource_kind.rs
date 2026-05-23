@@ -150,7 +150,10 @@ mod tests {
 
     #[test]
     fn resource_kind_serializes_snake_case() {
-        assert_eq!(serde_json::to_string(&ResourceKind::Pod).unwrap(), "\"pod\"");
+        assert_eq!(
+            serde_json::to_string(&ResourceKind::Pod).unwrap(),
+            "\"pod\""
+        );
         assert_eq!(
             serde_json::to_string(&ResourceKind::ConfigMap).unwrap(),
             "\"config_map\""

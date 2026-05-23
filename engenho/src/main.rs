@@ -16,8 +16,10 @@ fn main() {
     println!("M0.0 — engenho-types crate seed.");
     println!("See theory/ENGENHO.md for destination, M0-ROADMAP.md for path.");
     println!();
-    println!("KubeResource trait: {} kinds (M0.0.4 target: ~150)",
-             count_registered_kinds());
+    println!(
+        "KubeResource trait: {} kinds (M0.0.4 target: ~150)",
+        count_registered_kinds()
+    );
 }
 
 /// M0.0 placeholder. Replaced at M0.0.4 with a real registry inspection.

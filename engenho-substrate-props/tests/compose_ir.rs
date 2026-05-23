@@ -25,7 +25,11 @@ fn service_strategy() -> impl Strategy<Value = ComposeService> {
 fn compose_ir_strategy(max_services: usize) -> impl Strategy<Value = ComposeIr> {
     (
         "[a-z][a-z0-9-]{1,16}", // project
-        proptest::collection::btree_map("[a-z][a-z0-9_-]{0,16}", service_strategy(), 1..max_services),
+        proptest::collection::btree_map(
+            "[a-z][a-z0-9_-]{0,16}",
+            service_strategy(),
+            1..max_services,
+        ),
     )
         .prop_map(|(project, services)| ComposeIr {
             project,

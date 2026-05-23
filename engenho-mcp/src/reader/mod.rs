@@ -79,19 +79,14 @@ pub trait ClusterReader: Send + Sync {
     async fn cluster_config(&self, cluster: &str) -> Result<ClusterConfigView, ReaderError>;
 
     /// Path + auth method, never the secret material itself.
-    async fn kubeconfig_descriptor(
-        &self,
-        cluster: &str,
-    ) -> Result<KubeAuthDescriptor, ReaderError>;
+    async fn kubeconfig_descriptor(&self, cluster: &str)
+    -> Result<KubeAuthDescriptor, ReaderError>;
 
     /// Snapshot meta if a fast-resume artifact is present; `None`
     /// when the cluster has no saved snapshot. Snapshot files may
     /// reference store paths that don't exist anymore — the view
     /// surfaces that via `all_paths_exist`.
-    async fn snapshot_meta(
-        &self,
-        cluster: &str,
-    ) -> Result<Option<SnapshotMetaView>, ReaderError>;
+    async fn snapshot_meta(&self, cluster: &str) -> Result<Option<SnapshotMetaView>, ReaderError>;
 
     /// List pods in the given namespace. First reader method that
     /// goes BEYOND on-disk state — talks to the live cluster's API
@@ -100,11 +95,7 @@ pub trait ClusterReader: Send + Sync {
     ///
     /// Default impl returns Unsupported so non-live readers (mock)
     /// don't have to implement.
-    async fn list_pods(
-        &self,
-        cluster: &str,
-        _namespace: &str,
-    ) -> Result<PodListView, ReaderError> {
+    async fn list_pods(&self, cluster: &str, _namespace: &str) -> Result<PodListView, ReaderError> {
         Err(ReaderError::InvalidState(format!(
             "list_pods not supported for cluster '{cluster}' (reader does not implement live API access)"
         )))

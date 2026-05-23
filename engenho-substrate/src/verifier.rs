@@ -223,9 +223,7 @@ impl Verifier for FakeVerifier {
         let pass = state.policies.get(tag).copied().unwrap_or(true);
         drop(state);
         if !pass {
-            return Err(VerifyError::Failed(format!(
-                "fake verifier denied {tag}"
-            )));
+            return Err(VerifyError::Failed(format!("fake verifier denied {tag}")));
         }
         // Synthetic evidence: BLAKE3 over (tag, subject_hash).
         let mut composed = tag.as_bytes().to_vec();
@@ -345,11 +343,12 @@ mod tests {
     fn tag_of_covers_every_variant() {
         for (v, expected) in [
             (sample_hash_eq(), "hash_equality"),
-            (Verificacao::CrossNodeAgreement { quorum: 1 }, "cross_node_agreement"),
             (
-                Verificacao::TameshiSigned {
-                    signer: "x".into(),
-                },
+                Verificacao::CrossNodeAgreement { quorum: 1 },
+                "cross_node_agreement",
+            ),
+            (
+                Verificacao::TameshiSigned { signer: "x".into() },
                 "tameshi_signed",
             ),
             (
@@ -386,12 +385,7 @@ mod tests {
     fn verification_receipt_round_trips_via_serde() {
         let r = VerificationReceipt::new(
             sample_hash_eq(),
-            MaterializationReceipt::for_drv(
-                [1u8; 32],
-                NodeId::from_bytes(b"x"),
-                100,
-                [2u8; 32],
-            ),
+            MaterializationReceipt::for_drv([1u8; 32], NodeId::from_bytes(b"x"), 100, [2u8; 32]),
             "fake".to_string(),
         );
         let bytes = serde_json::to_vec(&r).unwrap();

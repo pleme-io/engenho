@@ -56,15 +56,10 @@ impl StoreMesh {
 
         let (tx_rpc, mut rx_rpc) = mpsc::channel::<RpcRequest>(256);
 
-        let raft = Raft::<TypeConfig>::new(
-            node_id,
-            config,
-            router.clone(),
-            log_store,
-            state_machine,
-        )
-        .await
-        .map_err(|e| StoreError::Fatal(e.to_string()))?;
+        let raft =
+            Raft::<TypeConfig>::new(node_id, config, router.clone(), log_store, state_machine)
+                .await
+                .map_err(|e| StoreError::Fatal(e.to_string()))?;
 
         router.register(node_id, tx_rpc).await;
 
@@ -221,8 +216,7 @@ impl StoreMesh {
             if remaining.is_zero() {
                 return false;
             }
-            tokio::time::sleep(Duration::from_millis(50.min(remaining.as_millis() as u64)))
-                .await;
+            tokio::time::sleep(Duration::from_millis(50.min(remaining.as_millis() as u64))).await;
         }
     }
 

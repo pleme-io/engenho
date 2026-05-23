@@ -1,9 +1,9 @@
 //! K8s-style API errors. Mapped to HTTP status codes by the
 //! router; serialized to JSON per the K8s API conventions.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -91,7 +91,10 @@ mod tests {
 
     #[test]
     fn error_status_codes_match_k8s_conventions() {
-        assert_eq!(ApiError::NotFound("x".into()).status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            ApiError::NotFound("x".into()).status_code(),
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(
             ApiError::Conflict("x".into(), "y".into()).status_code(),
             StatusCode::CONFLICT

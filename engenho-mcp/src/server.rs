@@ -56,17 +56,23 @@ pub struct ClusterResourceListInput {
     /// Namespace to list resources in. Defaults to `default`. Ignored
     /// for cluster-scoped kinds.
     #[serde(default = "default_namespace")]
-    #[schemars(description = "Namespace to list resources in. Default 'default'. Ignored for cluster-scoped kinds.")]
+    #[schemars(
+        description = "Namespace to list resources in. Default 'default'. Ignored for cluster-scoped kinds."
+    )]
     pub namespace: String,
     /// Kubernetes label selector. e.g. `app=podinfo` or
     /// `app=podinfo,tier=backend`. Empty = no filter.
     #[serde(default)]
-    #[schemars(description = "Kubernetes label selector. e.g. 'app=podinfo' or 'app=podinfo,tier=backend'. Empty = no filter.")]
+    #[schemars(
+        description = "Kubernetes label selector. e.g. 'app=podinfo' or 'app=podinfo,tier=backend'. Empty = no filter."
+    )]
     pub label_selector: String,
     /// Kubernetes field selector. e.g. `status.phase=Running`.
     /// Empty = no filter.
     #[serde(default)]
-    #[schemars(description = "Kubernetes field selector. e.g. 'status.phase=Running'. Empty = no filter.")]
+    #[schemars(
+        description = "Kubernetes field selector. e.g. 'status.phase=Running'. Empty = no filter."
+    )]
     pub field_selector: String,
     /// Maximum number of items to return. None = no limit.
     #[serde(default)]
@@ -91,7 +97,9 @@ pub struct ClusterResourceGetInput {
     /// Namespace to fetch from. Defaults to `default`. Ignored for
     /// cluster-scoped kinds.
     #[serde(default = "default_namespace")]
-    #[schemars(description = "Namespace to fetch from. Default 'default'. Ignored for cluster-scoped kinds.")]
+    #[schemars(
+        description = "Namespace to fetch from. Default 'default'. Ignored for cluster-scoped kinds."
+    )]
     pub namespace: String,
 }
 
@@ -231,12 +239,8 @@ impl EngenhoMcp {
             .list_resource(&p.cluster, p.kind, &p.namespace, &spec)
             .await
         {
-            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|e| {
-                format!(
-                    "{{\"error\":\"serialize\",\"detail\":\"{}\"}}",
-                    e
-                )
-            }),
+            Ok(v) => serde_json::to_string_pretty(&v)
+                .unwrap_or_else(|e| format!("{{\"error\":\"serialize\",\"detail\":\"{}\"}}", e)),
             Err(e) => to_pretty_error(&e),
         }
     }
@@ -261,12 +265,8 @@ impl EngenhoMcp {
             .get_resource(&p.cluster, p.kind, &p.namespace, &p.name)
             .await
         {
-            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|e| {
-                format!(
-                    "{{\"error\":\"serialize\",\"detail\":\"{}\"}}",
-                    e
-                )
-            }),
+            Ok(v) => serde_json::to_string_pretty(&v)
+                .unwrap_or_else(|e| format!("{{\"error\":\"serialize\",\"detail\":\"{}\"}}", e)),
             Err(e) => to_pretty_error(&e),
         }
     }
@@ -359,7 +359,9 @@ mod tests {
     async fn cluster_status_returns_json_with_typed_shape() {
         let s = server();
         let raw = s
-            .cluster_status(Parameters(ClusterRef { cluster: "demo".into() }))
+            .cluster_status(Parameters(ClusterRef {
+                cluster: "demo".into(),
+            }))
             .await;
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["cluster"], "demo");
@@ -370,7 +372,9 @@ mod tests {
     async fn unknown_cluster_returns_typed_error_payload() {
         let s = server();
         let raw = s
-            .cluster_status(Parameters(ClusterRef { cluster: "missing".into() }))
+            .cluster_status(Parameters(ClusterRef {
+                cluster: "missing".into(),
+            }))
             .await;
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         // Clients pattern-match on the `error` field — stable kind
@@ -383,7 +387,9 @@ mod tests {
     async fn snapshot_response_is_explicitly_nullable() {
         let s = server();
         let raw = s
-            .cluster_snapshot_meta(Parameters(ClusterRef { cluster: "demo".into() }))
+            .cluster_snapshot_meta(Parameters(ClusterRef {
+                cluster: "demo".into(),
+            }))
             .await;
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(v["snapshot"].is_null());
@@ -393,7 +399,9 @@ mod tests {
     async fn cluster_config_serializes_gitops_backend_tagged() {
         let s = server();
         let raw = s
-            .cluster_config(Parameters(ClusterRef { cluster: "demo".into() }))
+            .cluster_config(Parameters(ClusterRef {
+                cluster: "demo".into(),
+            }))
             .await;
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["gitops"]["backend"], "none");
@@ -403,10 +411,22 @@ mod tests {
     async fn no_secret_material_in_any_serialized_response() {
         let s = server();
         for tool in [
-            s.cluster_status(Parameters(ClusterRef { cluster: "demo".into() })).await,
-            s.cluster_config(Parameters(ClusterRef { cluster: "demo".into() })).await,
-            s.cluster_kubeconfig(Parameters(ClusterRef { cluster: "demo".into() })).await,
-            s.cluster_snapshot_meta(Parameters(ClusterRef { cluster: "demo".into() })).await,
+            s.cluster_status(Parameters(ClusterRef {
+                cluster: "demo".into(),
+            }))
+            .await,
+            s.cluster_config(Parameters(ClusterRef {
+                cluster: "demo".into(),
+            }))
+            .await,
+            s.cluster_kubeconfig(Parameters(ClusterRef {
+                cluster: "demo".into(),
+            }))
+            .await,
+            s.cluster_snapshot_meta(Parameters(ClusterRef {
+                cluster: "demo".into(),
+            }))
+            .await,
         ] {
             let lower = tool.to_lowercase();
             // Defensive: an accidental token/password leak would
@@ -426,7 +446,10 @@ mod tests {
     fn get_info_advertises_tools_capability_and_instructions() {
         let s = server();
         let info = s.get_info();
-        assert!(info.capabilities.tools.is_some(), "tools capability missing");
+        assert!(
+            info.capabilities.tools.is_some(),
+            "tools capability missing"
+        );
         assert!(info.instructions.is_some(), "instructions missing");
         let i = info.instructions.unwrap();
         assert!(i.contains("engenho-mcp"));

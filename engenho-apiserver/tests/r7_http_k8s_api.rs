@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_apiserver::{ApiServer, ResourceHandler, StoreBackedHandler};
-use engenho_store::{default_config, InProcessRouter, StoreMesh};
+use engenho_store::{InProcessRouter, StoreMesh, default_config};
 
 async fn boot_store_and_server() -> (Arc<StoreMesh>, ApiServer) {
     let router = InProcessRouter::new();
@@ -66,7 +66,10 @@ async fn create_then_get_pod_via_http() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(created.get("metadata").unwrap().get("name").unwrap(), "podinfo");
+    assert_eq!(
+        created.get("metadata").unwrap().get("name").unwrap(),
+        "podinfo"
+    );
     let rv = created
         .get("metadata")
         .unwrap()
@@ -159,9 +162,7 @@ async fn patch_pod_merges_into_existing() {
     // PATCH the image only
     let patch = serde_json::json!({"spec": {"image": "v2"}});
     let resp = client
-        .patch(format!(
-            "http://{addr}/api/v1/namespaces/default/pods/p"
-        ))
+        .patch(format!("http://{addr}/api/v1/namespaces/default/pods/p"))
         .json(&patch)
         .send()
         .await
@@ -324,7 +325,10 @@ async fn openapi_spec_is_served_at_canonical_paths() {
             .as_object()
             .unwrap();
         for name in ["K8sResource", "K8sResourceList", "K8sStatus", "K8sPatch"] {
-            assert!(schemas.contains_key(name), "missing schema {name} at {path}");
+            assert!(
+                schemas.contains_key(name),
+                "missing schema {name} at {path}"
+            );
         }
     }
 

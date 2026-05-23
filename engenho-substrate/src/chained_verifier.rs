@@ -25,7 +25,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::receipt::NodeId;
-use crate::verifier::{Verificacao, VerificationReceipt, VerifyError, Verifier};
+use crate::verifier::{Verificacao, VerificationReceipt, Verifier, VerifyError};
 
 /// Composes N verifiers; first failure denies.
 pub struct ChainedVerifier {
@@ -86,10 +86,7 @@ impl Verifier for ChainedVerifier {
                     last_receipt = Some(receipt);
                 }
                 Err(e) => {
-                    return Err(VerifyError::Failed(format!(
-                        "{}: {e}",
-                        v.name()
-                    )));
+                    return Err(VerifyError::Failed(format!("{}: {e}", v.name())));
                 }
             }
         }
@@ -121,7 +118,12 @@ mod tests {
     async fn empty_chain_returns_backend_error() {
         let c = ChainedVerifier::default_named(vec![]);
         let err = c
-            .verify(&sample_verificacao(), sample_subject(), sample_emitter(), 100)
+            .verify(
+                &sample_verificacao(),
+                sample_subject(),
+                sample_emitter(),
+                100,
+            )
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "backend");
@@ -132,7 +134,12 @@ mod tests {
         let v: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());
         let c = ChainedVerifier::default_named(vec![v]);
         let receipt = c
-            .verify(&sample_verificacao(), sample_subject(), sample_emitter(), 100)
+            .verify(
+                &sample_verificacao(),
+                sample_subject(),
+                sample_emitter(),
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(receipt.verifier, "fake");
@@ -144,7 +151,12 @@ mod tests {
         let v2: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());
         let c = ChainedVerifier::default_named(vec![v1, v2]);
         let receipt = c
-            .verify(&sample_verificacao(), sample_subject(), sample_emitter(), 100)
+            .verify(
+                &sample_verificacao(),
+                sample_subject(),
+                sample_emitter(),
+                100,
+            )
             .await
             .unwrap();
         // Both verifiers ran; receipt is from the last (whichever).
@@ -161,7 +173,12 @@ mod tests {
             v2.clone() as Arc<dyn Verifier>,
         ]);
         let err = c
-            .verify(&sample_verificacao(), sample_subject(), sample_emitter(), 100)
+            .verify(
+                &sample_verificacao(),
+                sample_subject(),
+                sample_emitter(),
+                100,
+            )
             .await
             .unwrap_err();
         // Failure → Failed kind.
@@ -182,7 +199,12 @@ mod tests {
             v3.clone() as Arc<dyn Verifier>,
         ]);
         let err = c
-            .verify(&sample_verificacao(), sample_subject(), sample_emitter(), 100)
+            .verify(
+                &sample_verificacao(),
+                sample_subject(),
+                sample_emitter(),
+                100,
+            )
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "failed");
@@ -197,7 +219,12 @@ mod tests {
         v.set_policy("hash_equality", false).await;
         let c = ChainedVerifier::default_named(vec![v as Arc<dyn Verifier>]);
         let err = c
-            .verify(&sample_verificacao(), sample_subject(), sample_emitter(), 100)
+            .verify(
+                &sample_verificacao(),
+                sample_subject(),
+                sample_emitter(),
+                100,
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("fake"));

@@ -34,11 +34,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::NodeId;
 use crate::consensus::{MeshShape, Reason, RoleAssignment};
 use crate::membership::{MembershipView, NodeRole};
 use crate::policy::{Policy, TargetTopology};
 use crate::topology::{NodeId as TopologyNodeId, Role, TopologyReactor, Transition};
-use crate::NodeId;
 
 /// Policy that drives cluster shape via a [`TopologyReactor`].
 ///
@@ -80,11 +80,7 @@ impl FormationPolicy {
 
     /// Determine the role-set a node currently holds in consensus.
     fn current_roles(consensus: &MeshShape, node: &NodeId) -> BTreeSet<NodeRole> {
-        consensus
-            .assignments
-            .get(node)
-            .cloned()
-            .unwrap_or_default()
+        consensus.assignments.get(node).cloned().unwrap_or_default()
     }
 }
 
@@ -102,18 +98,18 @@ impl Policy for FormationPolicy {
     ) -> Vec<RoleAssignment> {
         // Build the typed membership snapshot.
         let alive: BTreeSet<NodeId> = membership.members.iter().map(|m| m.node_id).collect();
-        let known_in_consensus: BTreeSet<NodeId> =
-            consensus.assignments.keys().copied().collect();
+        let known_in_consensus: BTreeSet<NodeId> = consensus.assignments.keys().copied().collect();
 
-        let eligible_topo: Vec<TopologyNodeId> =
-            alive.iter().map(Self::to_topology_id).collect();
+        let eligible_topo: Vec<TopologyNodeId> = alive.iter().map(Self::to_topology_id).collect();
         let failed_topo: Vec<TopologyNodeId> = known_in_consensus
             .iter()
             .filter(|n| !alive.contains(n))
             .map(Self::to_topology_id)
             .collect();
 
-        let transitions = self.reactor.observe_membership(&eligible_topo, &failed_topo);
+        let transitions = self
+            .reactor
+            .observe_membership(&eligible_topo, &failed_topo);
 
         // Translate topology transitions → consensus role-assignments.
         let mut proposals = Vec::new();
@@ -123,7 +119,9 @@ impl Policy for FormationPolicy {
                     // Admission is membership-layer concern; no consensus op.
                 }
                 Transition::Promote(tid, role) => {
-                    let Some(node) = Self::from_topology_id(&tid) else { continue };
+                    let Some(node) = Self::from_topology_id(&tid) else {
+                        continue;
+                    };
                     match role {
                         Role::Master | Role::Bootstrap => {
                             proposals.push(RoleAssignment::Promote {
@@ -140,7 +138,9 @@ impl Policy for FormationPolicy {
                     }
                 }
                 Transition::Demote(tid) => {
-                    let Some(node) = Self::from_topology_id(&tid) else { continue };
+                    let Some(node) = Self::from_topology_id(&tid) else {
+                        continue;
+                    };
                     let current = Self::current_roles(consensus, &node);
                     if current.is_empty() {
                         continue;
@@ -152,7 +152,9 @@ impl Policy for FormationPolicy {
                     });
                 }
                 Transition::Reassign(tid, new_role) => {
-                    let Some(node) = Self::from_topology_id(&tid) else { continue };
+                    let Some(node) = Self::from_topology_id(&tid) else {
+                        continue;
+                    };
                     let current = Self::current_roles(consensus, &node);
                     match new_role {
                         Role::Master | Role::Bootstrap => {
@@ -176,7 +178,9 @@ impl Policy for FormationPolicy {
                     }
                 }
                 Transition::Evict(tid) => {
-                    let Some(node) = Self::from_topology_id(&tid) else { continue };
+                    let Some(node) = Self::from_topology_id(&tid) else {
+                        continue;
+                    };
                     let current = Self::current_roles(consensus, &node);
                     if current.is_empty() {
                         continue;

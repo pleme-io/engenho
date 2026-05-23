@@ -51,18 +51,18 @@ pub mod render;
 pub mod renderer;
 pub mod validate;
 
-pub use helm_chart::{chart_with_values, simple_chart, HelmChart, HelmChartSpec};
+pub use helm_chart::{HelmChart, HelmChartSpec, chart_with_values, simple_chart};
 pub use k3s_yaml::K3sServerConfig;
 pub use renderer::{ClusterConfigRenderer, EngenhoNativeRenderer, K3sRenderer};
 
 use serde::{Deserialize, Serialize};
 
-pub use bootstrap::{BootstrapConfig, FluxcdBootstrap, ArgocdBootstrap, GitopsSource, SecretRef};
+pub use bootstrap::{ArgocdBootstrap, BootstrapConfig, FluxcdBootstrap, GitopsSource, SecretRef};
 pub use manifest::Manifest;
 pub use network::{
-    CniChoice, DnsChoice, FlannelBackend, IngressChoice, Ipv6Config,
-    KubeProxyConfig, KubeProxyMode, K3sComponent, LoadBalancerChoice,
-    NetworkConfig, NetworkPolicyConfig, NetworkPolicyEnforce, PortRange,
+    CniChoice, DnsChoice, FlannelBackend, IngressChoice, Ipv6Config, K3sComponent, KubeProxyConfig,
+    KubeProxyMode, LoadBalancerChoice, NetworkConfig, NetworkPolicyConfig, NetworkPolicyEnforce,
+    PortRange,
 };
 pub use validate::ConfigError;
 

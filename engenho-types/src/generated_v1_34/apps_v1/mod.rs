@@ -5,13 +5,14 @@
 //! The typed shapes live in `deployment_spec` and reuse PodSpec
 //! from `core_v1::pod_spec`.
 
+mod daemonset;
 mod deployment;
 mod deployment_spec;
 mod replicaset;
 mod replicaset_spec;
 mod statefulset;
-mod daemonset;
 
+pub use daemonset::DaemonSet;
 pub use deployment::Deployment;
 pub use deployment_spec::{
     DeploymentCondition, DeploymentSpec, DeploymentStatus, LabelSelector, PodTemplateSpec,
@@ -19,4 +20,3 @@ pub use deployment_spec::{
 pub use replicaset::ReplicaSet;
 pub use replicaset_spec::{ReplicaSetCondition, ReplicaSetSpec, ReplicaSetStatus};
 pub use statefulset::StatefulSet;
-pub use daemonset::DaemonSet;

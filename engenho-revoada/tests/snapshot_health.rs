@@ -10,10 +10,8 @@ use engenho_revoada::{
 };
 
 fn yaml_manifest(name: &str, ns: &str) -> Vec<u8> {
-    format!(
-        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n"
-    )
-    .into_bytes()
+    format!("apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n")
+        .into_bytes()
 }
 
 fn raft_face() -> PureRaftFace {
@@ -118,7 +116,10 @@ fn malformed_snapshot_returns_err() {
     let face = raft_face();
     let err = face.restore(b"not cbor at all").unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("restore") || msg.contains("cbor"), "msg: {msg}");
+    assert!(
+        msg.contains("restore") || msg.contains("cbor"),
+        "msg: {msg}"
+    );
 }
 
 #[test]
@@ -133,8 +134,7 @@ fn snapshot_works_uniformly_across_all_five_faces() {
             .unwrap(),
         ),
         Box::new(
-            KubernetesFace::from_declaration(&FabricFace::prescribed_kubernetes_v1_34())
-                .unwrap(),
+            KubernetesFace::from_declaration(&FabricFace::prescribed_kubernetes_v1_34()).unwrap(),
         ),
         Box::new(
             NomadFace::from_declaration(&FabricFace {
@@ -217,13 +217,9 @@ fn health_resource_count_grows_with_applies() {
 fn health_subscriber_count_grows_with_watches() {
     let cluster = ok_cluster();
     assert_eq!(cluster.health().subscriber_count, 0);
-    let _w1 = cluster
-        .watch("Pod", None, ResourceFormat::Yaml)
-        .unwrap();
+    let _w1 = cluster.watch("Pod", None, ResourceFormat::Yaml).unwrap();
     assert_eq!(cluster.health().subscriber_count, 1);
-    let _w2 = cluster
-        .watch("Pod", None, ResourceFormat::Yaml)
-        .unwrap();
+    let _w2 = cluster.watch("Pod", None, ResourceFormat::Yaml).unwrap();
     assert_eq!(cluster.health().subscriber_count, 2);
 }
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_store::{
-    default_config, InProcessRouter, Reason, ResourceCommand, ResourceKey, StoreMesh,
+    InProcessRouter, Reason, ResourceCommand, ResourceKey, StoreMesh, default_config,
 };
 
 fn pod_key(name: &str) -> ResourceKey {
@@ -182,7 +182,22 @@ async fn three_node_store_replicates_resource_writes() {
         assert_eq!(list.len(), 3, "node{} list disagrees", mesh.node_id());
     }
 
-    Arc::try_unwrap(mesh_1).ok().unwrap().terminate().await.unwrap();
-    Arc::try_unwrap(mesh_2).ok().unwrap().terminate().await.unwrap();
-    Arc::try_unwrap(mesh_3).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh_1)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+    Arc::try_unwrap(mesh_2)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+    Arc::try_unwrap(mesh_3)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }

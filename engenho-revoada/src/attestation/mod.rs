@@ -27,14 +27,14 @@
 
 pub mod identity;
 
-pub use identity::{verify_signature, NodeIdentity};
+pub use identity::{NodeIdentity, verify_signature};
 
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::consensus::RoleAssignment;
 use crate::NodeId;
+use crate::consensus::RoleAssignment;
 
 /// One block in the role attestation chain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,9 +229,8 @@ pub fn verify_chain(blocks: &[RoleAttestationBlock]) -> Result<(), AttestationEr
         let mut sig_arr = [0u8; 64];
         sig_arr.copy_from_slice(sig_bytes);
         let canonical = block.canonical_bytes_for_signing();
-        verify_signature(&block.leader, &canonical, &sig_arr).map_err(|_| {
-            AttestationError::InvalidLeaderSignature { index: i }
-        })?;
+        verify_signature(&block.leader, &canonical, &sig_arr)
+            .map_err(|_| AttestationError::InvalidLeaderSignature { index: i })?;
         // Witness signatures (R4.5: today empty)
         for ws in &block.witness_signatures {
             let ws_sig_bytes = ws.signature.as_slice();
@@ -240,9 +239,8 @@ pub fn verify_chain(blocks: &[RoleAttestationBlock]) -> Result<(), AttestationEr
             }
             let mut ws_arr = [0u8; 64];
             ws_arr.copy_from_slice(ws_sig_bytes);
-            verify_signature(&ws.witness, &canonical, &ws_arr).map_err(|_| {
-                AttestationError::InvalidWitnessSignature { index: i }
-            })?;
+            verify_signature(&ws.witness, &canonical, &ws_arr)
+                .map_err(|_| AttestationError::InvalidWitnessSignature { index: i })?;
         }
     }
     Ok(())
@@ -415,10 +413,7 @@ mod tests {
             });
         }
         let err = chain.verify().unwrap_err();
-        assert_eq!(
-            err,
-            AttestationError::InvalidWitnessSignature { index: 0 }
-        );
+        assert_eq!(err, AttestationError::InvalidWitnessSignature { index: 0 });
     }
 
     #[test]

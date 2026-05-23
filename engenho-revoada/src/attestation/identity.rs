@@ -124,7 +124,10 @@ mod tests {
         let sig = id.sign(msg);
         let tampered = b"different payload";
         let err = verify_signature(&id.node_id(), tampered, &sig).unwrap_err();
-        assert!(matches!(err, super::super::AttestationError::BadSignature(_)));
+        assert!(matches!(
+            err,
+            super::super::AttestationError::BadSignature(_)
+        ));
     }
 
     #[test]
@@ -135,7 +138,10 @@ mod tests {
         // Bob signs; we try to verify with Alice's pubkey.
         let sig = bob.sign(msg);
         let err = verify_signature(&alice.node_id(), msg, &sig).unwrap_err();
-        assert!(matches!(err, super::super::AttestationError::BadSignature(_)));
+        assert!(matches!(
+            err,
+            super::super::AttestationError::BadSignature(_)
+        ));
     }
 
     #[test]

@@ -33,9 +33,9 @@ pub enum KubeError {
     #[error("apiserver status {code} {kind:?}: {message}")]
     ApiStatus {
         /// HTTP status code (404, 409, 410, 422, 500, …).
-        code:    u16,
+        code: u16,
         /// Typed classification of the status body's `reason` field.
-        kind:    ApiStatusKind,
+        kind: ApiStatusKind,
         /// Human-readable message from the status body.
         message: String,
     },
@@ -131,7 +131,7 @@ impl ApiStatusKind {
             500 => Self::InternalError,
             503 => Self::ServiceUnavailable,
             504 => Self::Timeout,
-            _   => Self::Other,
+            _ => Self::Other,
         }
     }
 }
@@ -154,9 +154,9 @@ impl KubeError {
     #[must_use]
     pub fn classify(&self) -> FailureClass {
         match self {
-            Self::Network(_)
-            | Self::WatchClosed
-            | Self::ResourceVersionExpired(_) => FailureClass::Transient,
+            Self::Network(_) | Self::WatchClosed | Self::ResourceVersionExpired(_) => {
+                FailureClass::Transient
+            }
             Self::ApiStatus { kind, .. } => match kind {
                 ApiStatusKind::Conflict
                 | ApiStatusKind::TooManyRequests
@@ -184,9 +184,7 @@ impl KubeError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Network(_) => Some(Duration::from_secs(1)),
-            Self::WatchClosed | Self::ResourceVersionExpired(_) => {
-                Some(Duration::from_millis(100))
-            }
+            Self::WatchClosed | Self::ResourceVersionExpired(_) => Some(Duration::from_millis(100)),
             Self::ApiStatus { kind, .. } => match kind {
                 ApiStatusKind::Conflict => Some(Duration::ZERO),
                 ApiStatusKind::TooManyRequests => Some(Duration::from_secs(5)),
@@ -222,8 +220,8 @@ mod tests {
     #[test]
     fn conflict_is_immediate_retry() {
         let e = KubeError::ApiStatus {
-            code:    409,
-            kind:    ApiStatusKind::Conflict,
+            code: 409,
+            kind: ApiStatusKind::Conflict,
             message: "resourceVersion mismatch".into(),
         };
         assert_eq!(e.classify(), FailureClass::Transient);
@@ -233,8 +231,8 @@ mod tests {
     #[test]
     fn forbidden_is_declarative() {
         let e = KubeError::ApiStatus {
-            code:    403,
-            kind:    ApiStatusKind::Forbidden,
+            code: 403,
+            kind: ApiStatusKind::Forbidden,
             message: "RBAC denied".into(),
         };
         assert_eq!(e.classify(), FailureClass::Declarative);
@@ -243,8 +241,8 @@ mod tests {
     #[test]
     fn too_many_requests_backs_off_5s() {
         let e = KubeError::ApiStatus {
-            code:    429,
-            kind:    ApiStatusKind::TooManyRequests,
+            code: 429,
+            kind: ApiStatusKind::TooManyRequests,
             message: "calm down".into(),
         };
         assert_eq!(e.retry_after(), Some(Duration::from_secs(5)));
@@ -258,9 +256,15 @@ mod tests {
         assert_eq!(ApiStatusKind::from_code(409), ApiStatusKind::Conflict);
         assert_eq!(ApiStatusKind::from_code(410), ApiStatusKind::Gone);
         assert_eq!(ApiStatusKind::from_code(422), ApiStatusKind::Invalid);
-        assert_eq!(ApiStatusKind::from_code(429), ApiStatusKind::TooManyRequests);
+        assert_eq!(
+            ApiStatusKind::from_code(429),
+            ApiStatusKind::TooManyRequests
+        );
         assert_eq!(ApiStatusKind::from_code(500), ApiStatusKind::InternalError);
-        assert_eq!(ApiStatusKind::from_code(503), ApiStatusKind::ServiceUnavailable);
+        assert_eq!(
+            ApiStatusKind::from_code(503),
+            ApiStatusKind::ServiceUnavailable
+        );
         assert_eq!(ApiStatusKind::from_code(504), ApiStatusKind::Timeout);
         assert_eq!(ApiStatusKind::from_code(418), ApiStatusKind::Other);
     }

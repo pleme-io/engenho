@@ -13,8 +13,8 @@
 //!    #1: every emit-from-typed-config path goes through ONE trait,
 //!    extended by adding a variant, not by adding free fns.
 
-use crate::manifest::Manifest;
 use crate::ClusterConfig;
+use crate::manifest::Manifest;
 
 /// What every cluster runtime needs to be configured at install time.
 ///
@@ -52,7 +52,9 @@ pub trait ClusterConfigRenderer {
 pub struct K3sRenderer;
 
 impl ClusterConfigRenderer for K3sRenderer {
-    fn name(&self) -> &'static str { "k3s" }
+    fn name(&self) -> &'static str {
+        "k3s"
+    }
 
     fn render_config_yaml(&self, cfg: &ClusterConfig) -> String {
         cfg.render_k3s_config_yaml()
@@ -79,7 +81,9 @@ impl ClusterConfigRenderer for K3sRenderer {
 pub struct EngenhoNativeRenderer;
 
 impl ClusterConfigRenderer for EngenhoNativeRenderer {
-    fn name(&self) -> &'static str { "engenho-native" }
+    fn name(&self) -> &'static str {
+        "engenho-native"
+    }
 
     fn render_config_yaml(&self, _cfg: &ClusterConfig) -> String {
         // engenho-native consumes a different on-disk config shape
@@ -108,9 +112,9 @@ mod tests {
     fn smoke_config() -> ClusterConfig {
         ClusterConfig {
             cluster_name: "smoke".into(),
-            node_ip:      Ipv4Addr::new(10, 0, 0, 1),
-            network:      crate::network::NetworkConfig::default(),
-            bootstrap:    crate::bootstrap::BootstrapConfig::default(),
+            node_ip: Ipv4Addr::new(10, 0, 0, 1),
+            network: crate::network::NetworkConfig::default(),
+            bootstrap: crate::bootstrap::BootstrapConfig::default(),
         }
     }
 
@@ -142,10 +146,8 @@ mod tests {
         // The whole point: a Vec<Box<dyn ClusterConfigRenderer>> lets
         // a consumer enumerate available renderers + pick one at
         // runtime/build-time without knowing the concrete type.
-        let renderers: Vec<Box<dyn ClusterConfigRenderer>> = vec![
-            Box::new(K3sRenderer),
-            Box::new(EngenhoNativeRenderer),
-        ];
+        let renderers: Vec<Box<dyn ClusterConfigRenderer>> =
+            vec![Box::new(K3sRenderer), Box::new(EngenhoNativeRenderer)];
         let names: Vec<&str> = renderers.iter().map(|r| r.name()).collect();
         assert_eq!(names, vec!["k3s", "engenho-native"]);
     }

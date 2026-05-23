@@ -169,14 +169,18 @@ impl ServiceRouter for FakeRouter {
         }
         let mut state = self.inner.lock().await;
         state.routes.insert(route.service_id.clone(), route.clone());
-        state.events.push(FakeRouterEvent::Upsert(route.service_id.clone()));
+        state
+            .events
+            .push(FakeRouterEvent::Upsert(route.service_id.clone()));
         Ok(())
     }
 
     async fn remove(&self, service_id: &str) -> Result<(), RouterError> {
         let mut state = self.inner.lock().await;
         state.routes.remove(service_id);
-        state.events.push(FakeRouterEvent::Remove(service_id.to_string()));
+        state
+            .events
+            .push(FakeRouterEvent::Remove(service_id.to_string()));
         Ok(())
     }
 
@@ -261,7 +265,8 @@ impl IptablesRouter {
             ));
             // For each pod IP, install a per-endpoint chain.
             for (i, pod_ip) in route.endpoints.iter().enumerate() {
-                let chain_ep = chain_name("KUBE-SEP", &format!("{}-{}-{i}", route.service_id, pod_ip));
+                let chain_ep =
+                    chain_name("KUBE-SEP", &format!("{}-{}-{i}", route.service_id, pod_ip));
                 script.push_str(&format!(":{chain_ep} - [0:0]\n"));
                 // Round-robin via statistic mode random; first endpoint
                 // gets 1/N, second 1/(N-1) etc.
@@ -346,9 +351,8 @@ impl ServiceRouter for IptablesRouter {
     async fn remove(&self, service_id: &str) -> Result<(), RouterError> {
         let chain_svc = chain_name("KUBE-SVC", service_id);
         // Flush + delete the per-service chain.
-        let script = format!(
-            "*nat\n:{chain_svc} - [0:0]\n-F {chain_svc}\n-X {chain_svc}\nCOMMIT\n"
-        );
+        let script =
+            format!("*nat\n:{chain_svc} - [0:0]\n-F {chain_svc}\n-X {chain_svc}\nCOMMIT\n");
         // Errors on remove are tolerated when the chain is already gone.
         let _ = self.run_restore(&script).await;
         let mut state = self.inner.lock().await;
@@ -602,9 +606,7 @@ impl ServiceRoutingController {
                             .into_iter()
                             .flatten()
                     })
-                    .filter_map(|addr| {
-                        addr.get("ip").and_then(|i| i.as_str()).map(String::from)
-                    })
+                    .filter_map(|addr| addr.get("ip").and_then(|i| i.as_str()).map(String::from))
                     .collect()
             })
             .unwrap_or_default();
@@ -638,7 +640,12 @@ impl Controller for ServiceRoutingController {
             .await;
         let endpoints_by_id: BTreeMap<String, serde_json::Value> = endpoints_list
             .into_iter()
-            .map(|(k, v)| (Self::service_id(k.namespace.as_deref().unwrap_or("default"), &k.name), v))
+            .map(|(k, v)| {
+                (
+                    Self::service_id(k.namespace.as_deref().unwrap_or("default"), &k.name),
+                    v,
+                )
+            })
             .collect();
 
         let mut report = ReconcileReport::default();
@@ -700,10 +707,7 @@ mod tests {
     }
 
     fn make_endpoints(ips: &[&str]) -> serde_json::Value {
-        let addresses: Vec<serde_json::Value> = ips
-            .iter()
-            .map(|ip| json!({"ip": ip}))
-            .collect();
+        let addresses: Vec<serde_json::Value> = ips.iter().map(|ip| json!({"ip": ip})).collect();
         json!({"subsets": [{"addresses": addresses}]})
     }
 
@@ -711,8 +715,7 @@ mod tests {
     fn build_route_extracts_cluster_ip_and_ports() {
         let svc = make_service("podinfo", "10.96.5.1", 80);
         let eps = make_endpoints(&["10.42.0.1", "10.42.0.2"]);
-        let r = ServiceRoutingController::build_route(&svc, Some(&eps), "default/podinfo")
-            .unwrap();
+        let r = ServiceRoutingController::build_route(&svc, Some(&eps), "default/podinfo").unwrap();
         assert_eq!(r.cluster_ip, "10.96.5.1");
         assert_eq!(r.ports[0].service_port, 80);
         assert_eq!(r.endpoints.len(), 2);
@@ -807,7 +810,10 @@ mod tests {
     #[test]
     fn error_kinds_are_stable() {
         assert_eq!(RouterError::Backend("x".into()).kind(), "backend");
-        assert_eq!(RouterError::InvalidRoute("x".into()).kind(), "invalid_route");
+        assert_eq!(
+            RouterError::InvalidRoute("x".into()).kind(),
+            "invalid_route"
+        );
     }
 
     #[test]
@@ -938,7 +944,9 @@ mod tests {
         struct Fake;
         #[async_trait]
         impl Controller for Fake {
-            fn name(&self) -> &'static str { "service_router" }
+            fn name(&self) -> &'static str {
+                "service_router"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

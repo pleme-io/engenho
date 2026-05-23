@@ -4,8 +4,8 @@
 //! these tests cover the full life-cycle of a formation under load.
 
 use engenho_revoada::topology::{
-    Cluster3MNW, MeshAllPeers, NodeId, NodeState, Pair, Phalanx, Quorum3M, Role,
-    Solo, TopologyReactor, Transition,
+    Cluster3MNW, MeshAllPeers, NodeId, NodeState, Pair, Phalanx, Quorum3M, Role, Solo,
+    TopologyReactor, Transition,
 };
 
 fn ids(n: usize) -> Vec<NodeId> {
@@ -111,11 +111,7 @@ fn reactor_handles_full_cluster_lifecycle() {
     assert_eq!(masters, Phalanx::target_masters(10));
 
     // Lose 3 nodes.
-    let failed = vec![
-        NodeId::new("n0"),
-        NodeId::new("n1"),
-        NodeId::new("n2"),
-    ];
+    let failed = vec![NodeId::new("n0"), NodeId::new("n1"), NodeId::new("n2")];
     let surviving: Vec<NodeId> = initial.iter().skip(3).cloned().collect();
     let tx = r.observe_membership(&surviving, &failed);
     r.apply_transitions(&tx);
@@ -141,10 +137,7 @@ fn reactor_apply_transition_individual_calls() {
         Some(NodeState::Active(Role::Master))
     );
     r.apply_transition(&Transition::Evict(NodeId::new("a")));
-    assert_eq!(
-        r.current().get(&NodeId::new("a")),
-        Some(NodeState::Failed)
-    );
+    assert_eq!(r.current().get(&NodeId::new("a")), Some(NodeState::Failed));
 }
 
 #[test]

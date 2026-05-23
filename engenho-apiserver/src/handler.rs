@@ -5,9 +5,9 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use engenho_store::{
+    StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
-    StoreMesh,
 };
 
 use crate::error::ApiError;
@@ -25,19 +25,11 @@ pub trait ResourceHandler: Send + Sync + 'static {
     fn plural(&self) -> &str;
     fn namespaced(&self) -> bool;
 
-    async fn get(
-        &self,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<Value, ApiError>;
+    async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError>;
 
     async fn list(&self, namespace: Option<&str>) -> Result<Value, ApiError>;
 
-    async fn create(
-        &self,
-        namespace: Option<&str>,
-        body: Value,
-    ) -> Result<Value, ApiError>;
+    async fn create(&self, namespace: Option<&str>, body: Value) -> Result<Value, ApiError>;
 
     async fn patch(
         &self,
@@ -46,11 +38,7 @@ pub trait ResourceHandler: Send + Sync + 'static {
         patch: Value,
     ) -> Result<Value, ApiError>;
 
-    async fn delete(
-        &self,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<(), ApiError>;
+    async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<(), ApiError>;
 }
 
 /// Default implementation backed by [`StoreMesh`]. Handles every
@@ -101,7 +89,11 @@ impl StoreBackedHandler {
                 "{}/{} is {}; got namespace={:?}",
                 self.kind,
                 name,
-                if self.namespaced { "namespaced" } else { "cluster-scoped" },
+                if self.namespaced {
+                    "namespaced"
+                } else {
+                    "cluster-scoped"
+                },
                 namespace
             )));
         }
@@ -130,11 +122,7 @@ impl ResourceHandler for StoreBackedHandler {
         self.namespaced
     }
 
-    async fn get(
-        &self,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<Value, ApiError> {
+    async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
         let v = self
             .store
@@ -165,18 +153,12 @@ impl ResourceHandler for StoreBackedHandler {
         }))
     }
 
-    async fn create(
-        &self,
-        namespace: Option<&str>,
-        body: Value,
-    ) -> Result<Value, ApiError> {
+    async fn create(&self, namespace: Option<&str>, body: Value) -> Result<Value, ApiError> {
         let name = body
             .get("metadata")
             .and_then(|m| m.get("name"))
             .and_then(|n| n.as_str())
-            .ok_or_else(|| {
-                ApiError::BadRequest("missing metadata.name in request body".into())
-            })?
+            .ok_or_else(|| ApiError::BadRequest("missing metadata.name in request body".into()))?
             .to_string();
         let key = self.key(namespace, &name)?;
         // Reject if already exists (POST semantics).
@@ -231,11 +213,7 @@ impl ResourceHandler for StoreBackedHandler {
         Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
     }
 
-    async fn delete(
-        &self,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<(), ApiError> {
+    async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<(), ApiError> {
         let key = self.key(namespace, name)?;
         self.store
             .propose(ResourceCommand::Delete {

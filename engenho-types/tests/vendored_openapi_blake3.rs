@@ -26,17 +26,21 @@ struct Manifest {
 
 #[derive(Debug, serde::Deserialize)]
 struct ManifestEntry {
-    path:   String,
+    path: String,
     blake3: String,
-    bytes:  u64,
+    bytes: u64,
 }
 
 fn manifest_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(VENDOR_DIR).join("MANIFEST.yaml")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(VENDOR_DIR)
+        .join("MANIFEST.yaml")
 }
 
 fn vendor_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(VENDOR_DIR).join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(VENDOR_DIR)
+        .join(name)
 }
 
 fn load_manifest() -> Manifest {
@@ -115,7 +119,12 @@ fn manifest_declares_kubernetes_1_34() {
 fn all_vendored_files_have_valid_blake3_format() {
     let manifest = load_manifest();
     for entry in &manifest.files {
-        assert_eq!(entry.blake3.len(), 64, "blake3 for {} not 64 hex chars", entry.path);
+        assert_eq!(
+            entry.blake3.len(),
+            64,
+            "blake3 for {} not 64 hex chars",
+            entry.path
+        );
         assert!(
             entry.blake3.chars().all(|c| c.is_ascii_hexdigit()),
             "blake3 for {} contains non-hex chars",

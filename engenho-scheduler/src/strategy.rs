@@ -53,10 +53,7 @@ impl RoundRobinStrategy {
     }
 
     fn schedulable_nodes<'a>(candidates: &'a [Value]) -> Vec<&'a Value> {
-        candidates
-            .iter()
-            .filter(|n| is_schedulable(n))
-            .collect()
+        candidates.iter().filter(|n| is_schedulable(n)).collect()
     }
 }
 

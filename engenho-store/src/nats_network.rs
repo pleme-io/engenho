@@ -30,15 +30,15 @@
 
 use std::time::Duration;
 
-use engenho_teia::{ClusterScope, NodeId as TeiaNodeId, TeiaClient};
 use engenho_teia::subject::RaftGroup;
+use engenho_teia::{ClusterScope, NodeId as TeiaNodeId, TeiaClient};
+use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
 use crate::type_config::{RaftNodeId, TypeConfig};
@@ -111,15 +111,18 @@ pub struct NatsRaftNetwork {
 
 impl NatsRaftNetwork {
     fn append_subject(&self) -> String {
-        self.scope.raft_append(RaftGroup::Store, self.target_teia.clone())
+        self.scope
+            .raft_append(RaftGroup::Store, self.target_teia.clone())
     }
 
     fn vote_subject(&self) -> String {
-        self.scope.raft_vote(RaftGroup::Store, self.target_teia.clone())
+        self.scope
+            .raft_vote(RaftGroup::Store, self.target_teia.clone())
     }
 
     fn snapshot_subject(&self) -> String {
-        self.scope.raft_snapshot(RaftGroup::Store, self.target_teia.clone())
+        self.scope
+            .raft_snapshot(RaftGroup::Store, self.target_teia.clone())
     }
 }
 
@@ -165,7 +168,11 @@ impl RaftNetwork<TypeConfig> for NatsRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<RaftNodeId>,
-        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, openraft::error::InstallSnapshotError>>,
+        RPCError<
+            RaftNodeId,
+            BasicNode,
+            RaftError<RaftNodeId, openraft::error::InstallSnapshotError>,
+        >,
     > {
         let envelope = NatsRpcEnvelope::InstallSnapshot(rpc);
         self.client

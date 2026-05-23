@@ -9,7 +9,7 @@ use engenho_revoada::face::{Face, ResourceFormat, ResourceRef};
 use engenho_revoada::topology::{Cluster3MNW, Phalanx, Quorum3M, Solo};
 use engenho_revoada::{
     Cluster, ClusterDeclaration, FabricFace, FabricStrategy, FaceKind, FederatedFabric,
-    K8sJsonAdapter, K8sYamlAdapter, FormatAdapter, ReconciliationCadence, RoutingPolicy,
+    FormatAdapter, K8sJsonAdapter, K8sYamlAdapter, ReconciliationCadence, RoutingPolicy,
     encode_envelope,
 };
 
@@ -22,10 +22,8 @@ fn dns_label() -> impl Strategy<Value = String> {
 }
 
 fn yaml_pod(name: &str, ns: &str) -> Vec<u8> {
-    format!(
-        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n"
-    )
-    .into_bytes()
+    format!("apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n")
+        .into_bytes()
 }
 
 fn json_pod(name: &str, ns: &str) -> Vec<u8> {

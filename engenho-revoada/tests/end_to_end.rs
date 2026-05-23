@@ -11,10 +11,8 @@ use engenho_revoada::{
 };
 
 fn yaml(name: &str, ns: &str) -> Vec<u8> {
-    format!(
-        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n"
-    )
-    .into_bytes()
+    format!("apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n")
+        .into_bytes()
 }
 
 fn build_cluster(face_name: &str, kind: FaceKind) -> Cluster {
@@ -36,9 +34,15 @@ fn e2e_single_cluster_full_crudw_flow() {
     let cluster = build_cluster("e2e-single", FaceKind::PureRaft);
 
     // Apply 3 pods, 1 in another namespace.
-    cluster.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
-    cluster.apply(ResourceFormat::Yaml, &yaml("b", "default")).unwrap();
-    cluster.apply(ResourceFormat::Yaml, &yaml("c", "other")).unwrap();
+    cluster
+        .apply(ResourceFormat::Yaml, &yaml("a", "default"))
+        .unwrap();
+    cluster
+        .apply(ResourceFormat::Yaml, &yaml("b", "default"))
+        .unwrap();
+    cluster
+        .apply(ResourceFormat::Yaml, &yaml("c", "other"))
+        .unwrap();
 
     // Health reflects accurate state.
     let h = cluster.health();
@@ -78,8 +82,10 @@ fn e2e_snapshot_round_trip_across_face_kinds() {
     // different kind. The store contract is face-kind-agnostic
     // (under the InMemoryStore backend) so this should work.
     let raft = build_cluster("raft", FaceKind::PureRaft);
-    raft.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
-    raft.apply(ResourceFormat::Yaml, &yaml("b", "default")).unwrap();
+    raft.apply(ResourceFormat::Yaml, &yaml("a", "default"))
+        .unwrap();
+    raft.apply(ResourceFormat::Yaml, &yaml("b", "default"))
+        .unwrap();
 
     let snap = raft.snapshot().unwrap();
 
@@ -201,15 +207,19 @@ fn e2e_heterogeneous_face_federation_all_5_kinds() {
     let federation = FederatedFabric::new(
         vec![
             Arc::new(build_cluster("raft", FaceKind::PureRaft)),
-            Arc::new(Cluster::builder()
-                .strategy(FabricStrategy::prescribed_homelab())
-                .face_kubernetes_prescribed()
-                .topology(Quorum3M)
-                .start()
-                .unwrap()),
+            Arc::new(
+                Cluster::builder()
+                    .strategy(FabricStrategy::prescribed_homelab())
+                    .face_kubernetes_prescribed()
+                    .topology(Quorum3M)
+                    .start()
+                    .unwrap(),
+            ),
             Arc::new(build_cluster(
                 "nomad",
-                FaceKind::Nomad { version: "1.7".into() },
+                FaceKind::Nomad {
+                    version: "1.7".into(),
+                },
             )),
             Arc::new(build_cluster(
                 "systemd",
@@ -266,9 +276,18 @@ fn e2e_mixed_format_apply_each_round_trips_in_its_format() {
     let r_yaml = ResourceRef::namespaced("Pod", "yaml-pod", "default");
     let r_json = ResourceRef::namespaced("Pod", "json-pod", "default");
     let r_native = ResourceRef::namespaced("Pod", "native-pod", "default");
-    assert_eq!(cluster.get(&r_yaml, ResourceFormat::Yaml).unwrap(), yaml_body);
-    assert_eq!(cluster.get(&r_json, ResourceFormat::Json).unwrap(), json_body);
-    assert_eq!(cluster.get(&r_native, ResourceFormat::Native).unwrap(), native);
+    assert_eq!(
+        cluster.get(&r_yaml, ResourceFormat::Yaml).unwrap(),
+        yaml_body
+    );
+    assert_eq!(
+        cluster.get(&r_json, ResourceFormat::Json).unwrap(),
+        json_body
+    );
+    assert_eq!(
+        cluster.get(&r_native, ResourceFormat::Native).unwrap(),
+        native
+    );
 }
 
 // ── RAII Drop under various lifecycle states ─────────────────────
@@ -277,7 +296,9 @@ fn e2e_mixed_format_apply_each_round_trips_in_its_format() {
 fn e2e_drop_after_apply_releases_resources_cleanly() {
     let initial = {
         let cluster = build_cluster("drop-test", FaceKind::PureRaft);
-        cluster.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
+        cluster
+            .apply(ResourceFormat::Yaml, &yaml("a", "default"))
+            .unwrap();
         cluster.health().resource_count
         // cluster drops here
     };
@@ -298,7 +319,9 @@ fn e2e_topology_swap_via_new_cluster() {
         .topology(Quorum3M)
         .start()
         .unwrap();
-    cluster_3m.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
+    cluster_3m
+        .apply(ResourceFormat::Yaml, &yaml("a", "default"))
+        .unwrap();
     let snap = cluster_3m.snapshot().unwrap();
     drop(cluster_3m);
 

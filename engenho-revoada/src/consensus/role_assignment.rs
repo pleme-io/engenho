@@ -6,8 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-use crate::membership::NodeRole;
 use crate::NodeId;
+use crate::membership::NodeRole;
 
 /// One mesh-shape mutation. All variants emit the same Raft-log
 /// shape; the state machine in `MeshShape` is deterministic.

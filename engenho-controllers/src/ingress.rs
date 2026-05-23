@@ -99,12 +99,7 @@ pub trait IngressBackend: Send + Sync {
     ///
     /// # Errors
     /// [`IngressError::Backend`] on backend failure.
-    async fn remove(
-        &self,
-        ingress_id: &str,
-        host: &str,
-        path: &str,
-    ) -> Result<(), IngressError>;
+    async fn remove(&self, ingress_id: &str, host: &str, path: &str) -> Result<(), IngressError>;
 
     /// Currently-installed routes.
     ///
@@ -177,16 +172,13 @@ impl IngressBackend for FakeIngressBackend {
         );
         let mut state = self.inner.lock().await;
         state.routes.insert(key.clone(), route.clone());
-        state.events.push(FakeIngressEvent::Upsert(key.0, key.1, key.2));
+        state
+            .events
+            .push(FakeIngressEvent::Upsert(key.0, key.1, key.2));
         Ok(())
     }
 
-    async fn remove(
-        &self,
-        ingress_id: &str,
-        host: &str,
-        path: &str,
-    ) -> Result<(), IngressError> {
+    async fn remove(&self, ingress_id: &str, host: &str, path: &str) -> Result<(), IngressError> {
         let key = (ingress_id.to_string(), host.to_string(), path.to_string());
         let mut state = self.inner.lock().await;
         state.routes.remove(&key);
@@ -239,14 +231,10 @@ impl TraefikIngressBackend {
     #[must_use]
     pub fn render_crd(route: &IngressRoute) -> String {
         let match_rule = match route.path_type {
-            PathType::Exact => format!(
-                "Host(`{}`) && Path(`{}`)",
-                route.host, route.path
-            ),
-            PathType::Prefix | PathType::ImplementationSpecific => format!(
-                "Host(`{}`) && PathPrefix(`{}`)",
-                route.host, route.path
-            ),
+            PathType::Exact => format!("Host(`{}`) && Path(`{}`)", route.host, route.path),
+            PathType::Prefix | PathType::ImplementationSpecific => {
+                format!("Host(`{}`) && PathPrefix(`{}`)", route.host, route.path)
+            }
         };
         let entry_points = if route.tls_secret.is_some() {
             "websecure"
@@ -254,9 +242,7 @@ impl TraefikIngressBackend {
             "web"
         };
         let tls_block = if let Some(secret) = &route.tls_secret {
-            format!(
-                "\n  tls:\n    secretName: {secret}"
-            )
+            format!("\n  tls:\n    secretName: {secret}")
         } else {
             String::new()
         };
@@ -316,9 +302,8 @@ impl IngressBackend for TraefikIngressBackend {
         std::fs::create_dir_all(&self.output_dir).map_err(|e| {
             IngressError::Backend(format!("mkdir {}: {e}", self.output_dir.display()))
         })?;
-        std::fs::write(&file, yaml).map_err(|e| {
-            IngressError::Backend(format!("write {}: {e}", file.display()))
-        })?;
+        std::fs::write(&file, yaml)
+            .map_err(|e| IngressError::Backend(format!("write {}: {e}", file.display())))?;
         let key = (
             route.ingress_id.clone(),
             route.host.clone(),
@@ -328,12 +313,7 @@ impl IngressBackend for TraefikIngressBackend {
         Ok(())
     }
 
-    async fn remove(
-        &self,
-        ingress_id: &str,
-        host: &str,
-        path: &str,
-    ) -> Result<(), IngressError> {
+    async fn remove(&self, ingress_id: &str, host: &str, path: &str) -> Result<(), IngressError> {
         let key = (ingress_id.to_string(), host.to_string(), path.to_string());
         // Build the route shell so the filename matches what upsert wrote.
         let proxy = IngressRoute {
@@ -426,7 +406,10 @@ impl NginxIngressBackend {
     }
 
     fn route_filename(route: &IngressRoute) -> String {
-        format!("{}.conf", sanitize_name(&route.ingress_id, &route.host, &route.path))
+        format!(
+            "{}.conf",
+            sanitize_name(&route.ingress_id, &route.host, &route.path)
+        )
     }
 }
 
@@ -445,9 +428,8 @@ impl IngressBackend for NginxIngressBackend {
         std::fs::create_dir_all(&self.output_dir).map_err(|e| {
             IngressError::Backend(format!("mkdir {}: {e}", self.output_dir.display()))
         })?;
-        std::fs::write(&file, snippet).map_err(|e| {
-            IngressError::Backend(format!("write {}: {e}", file.display()))
-        })?;
+        std::fs::write(&file, snippet)
+            .map_err(|e| IngressError::Backend(format!("write {}: {e}", file.display())))?;
         let key = (
             route.ingress_id.clone(),
             route.host.clone(),
@@ -457,12 +439,7 @@ impl IngressBackend for NginxIngressBackend {
         Ok(())
     }
 
-    async fn remove(
-        &self,
-        ingress_id: &str,
-        host: &str,
-        path: &str,
-    ) -> Result<(), IngressError> {
+    async fn remove(&self, ingress_id: &str, host: &str, path: &str) -> Result<(), IngressError> {
         let key = (ingress_id.to_string(), host.to_string(), path.to_string());
         let proxy = IngressRoute {
             ingress_id: key.0.clone(),
@@ -514,10 +491,7 @@ impl IngressController {
     /// Extract the typed routes from a K8s Ingress manifest.
     /// Pure — no I/O. Public so callers can introspect.
     #[must_use]
-    pub fn extract_routes(
-        ingress_id: &str,
-        ingress: &serde_json::Value,
-    ) -> Vec<IngressRoute> {
+    pub fn extract_routes(ingress_id: &str, ingress: &serde_json::Value) -> Vec<IngressRoute> {
         let spec = match ingress.get("spec") {
             Some(s) => s,
             None => return Vec::new(),
@@ -617,7 +591,12 @@ impl Controller for IngressController {
     async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
         let ingresses = self
             .store
-            .list("networking.k8s.io", "v1", "Ingress", self.namespace.as_deref())
+            .list(
+                "networking.k8s.io",
+                "v1",
+                "Ingress",
+                self.namespace.as_deref(),
+            )
             .await;
         let mut report = ReconcileReport::default();
         report.objects_examined = ingresses.len();
@@ -631,7 +610,11 @@ impl Controller for IngressController {
             );
             for route in Self::extract_routes(&id, value) {
                 desired.insert(
-                    (route.ingress_id.clone(), route.host.clone(), route.path.clone()),
+                    (
+                        route.ingress_id.clone(),
+                        route.host.clone(),
+                        route.path.clone(),
+                    ),
                     route,
                 );
             }
@@ -644,12 +627,7 @@ impl Controller for IngressController {
             .map_err(|e| ControllerError::Internal(e.to_string()))?;
         let installed_keys: BTreeMap<(String, String, String), IngressRoute> = installed
             .into_iter()
-            .map(|r| {
-                (
-                    (r.ingress_id.clone(), r.host.clone(), r.path.clone()),
-                    r,
-                )
-            })
+            .map(|r| ((r.ingress_id.clone(), r.host.clone(), r.path.clone()), r))
             .collect();
 
         for (key, route) in &desired {
@@ -782,10 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn nginx_upsert_writes_conf_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "engenho-nginx-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("engenho-nginx-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let b = NginxIngressBackend::new(&dir);
         b.upsert(&sample_route()).await.unwrap();
@@ -840,10 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn traefik_upsert_writes_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "engenho-ingress-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("engenho-ingress-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let b = TraefikIngressBackend::new(&dir);
         b.upsert(&sample_route()).await.unwrap();
@@ -859,10 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn traefik_remove_deletes_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "engenho-ingress-rm-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("engenho-ingress-rm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let b = TraefikIngressBackend::new(&dir);
         let r = sample_route();
@@ -881,7 +850,10 @@ mod tests {
         assert!(!n.starts_with('-'));
         assert!(!n.ends_with('-'));
         // Lowercase chars + dashes only.
-        assert!(n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(
+            n.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        );
     }
 
     #[test]
@@ -1036,7 +1008,9 @@ mod tests {
         struct Fake;
         #[async_trait]
         impl Controller for Fake {
-            fn name(&self) -> &'static str { "ingress" }
+            fn name(&self) -> &'static str {
+                "ingress"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

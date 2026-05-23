@@ -100,15 +100,11 @@ mod tests {
     }
 
     fn make_accessor() -> TestBytesAccessor {
-        Arc::new(|_subject: [u8; 32]| {
-            async move { Ok(Some(b"hello".to_vec())) }.boxed()
-        })
+        Arc::new(|_subject: [u8; 32]| async move { Ok(Some(b"hello".to_vec())) }.boxed())
     }
 
     fn make_arity_two() -> TestArity2 {
-        Arc::new(|name: String, n: u32| {
-            async move { Ok(name.len() as u32 == n) }.boxed()
-        })
+        Arc::new(|name: String, n: u32| async move { Ok(name.len() as u32 == n) }.boxed())
     }
 
     fn make_arity_zero() -> TestArity0 {

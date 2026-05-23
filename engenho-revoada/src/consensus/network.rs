@@ -20,14 +20,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::consensus::type_config::{RaftNodeId, TypeConfig};
 
@@ -89,7 +89,9 @@ pub struct InProcessNetwork {
 }
 
 impl InProcessNetwork {
-    fn map_send_err<E>(target: RaftNodeId) -> impl FnOnce(E) -> RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>
+    fn map_send_err<E>(
+        target: RaftNodeId,
+    ) -> impl FnOnce(E) -> RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>
     where
         E: std::error::Error + Send + Sync + 'static,
     {
@@ -105,8 +107,10 @@ impl RaftNetwork<TypeConfig> for InProcessNetwork {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<RaftNodeId>, RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>>
-    {
+    ) -> Result<
+        AppendEntriesResponse<RaftNodeId>,
+        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>,
+    > {
         let sender = self.router.lookup(self.target).await.ok_or_else(|| {
             RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
                 "no in-process route to node {}",
@@ -131,7 +135,11 @@ impl RaftNetwork<TypeConfig> for InProcessNetwork {
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<RaftNodeId>,
-        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, openraft::error::InstallSnapshotError>>,
+        RPCError<
+            RaftNodeId,
+            BasicNode,
+            RaftError<RaftNodeId, openraft::error::InstallSnapshotError>,
+        >,
     > {
         let sender = self.router.lookup(self.target).await.ok_or_else(|| {
             RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
@@ -140,12 +148,15 @@ impl RaftNetwork<TypeConfig> for InProcessNetwork {
             ))))
         })?;
         let (tx, rx) = oneshot::channel();
-        sender.send(RpcRequest::InstallSnapshot(rpc, tx)).await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
-                "InstallSnapshot send to {}: {e}",
-                self.target
-            ))))
-        })?;
+        sender
+            .send(RpcRequest::InstallSnapshot(rpc, tx))
+            .await
+            .map_err(|e| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                    "InstallSnapshot send to {}: {e}",
+                    self.target
+                ))))
+            })?;
         rx.await.map_err(|e| {
             RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
                 "InstallSnapshot oneshot dropped: {e}"

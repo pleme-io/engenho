@@ -13,14 +13,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engenho_revoada::consensus::{default_config, InProcessRouter, RaftMesh};
-use engenho_revoada::membership::{
-    GossipConfig, GossipMesh, NodeCapacity, NodeRole, NodeState,
-};
+use engenho_revoada::NodeId;
+use engenho_revoada::consensus::{InProcessRouter, RaftMesh, default_config};
+use engenho_revoada::membership::{GossipConfig, GossipMesh, NodeCapacity, NodeRole, NodeState};
 use engenho_revoada::policy::{
     AutoReplacementPolicy, PolicyEngine, PolicyEngineConfig, TargetTopology,
 };
-use engenho_revoada::NodeId;
 use engenho_types::primitives::Quantity;
 
 fn pick_port() -> u16 {
@@ -111,12 +109,12 @@ async fn policy_engine_promotes_to_meet_target_topology() {
     // === Tick: policy should propose 1 Promote ===
     let report = engine.tick().await.expect("tick");
     assert_eq!(report.proposals_seen, 1, "expected 1 proposal");
-    assert_eq!(
-        report.applied.len(),
-        1,
-        "expected 1 successful Raft commit"
+    assert_eq!(report.applied.len(), 1, "expected 1 successful Raft commit");
+    assert!(
+        report.errors.is_empty(),
+        "policy errors: {:?}",
+        report.errors
     );
-    assert!(report.errors.is_empty(), "policy errors: {:?}", report.errors);
 
     // === Verify the typed MeshShape now reflects the proposed role ===
     let shape_after = mesh.current_shape().await;

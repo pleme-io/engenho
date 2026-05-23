@@ -8,8 +8,9 @@ use engenho_controllers::{
     Controller, ControllerError, KindFilter, ReconcileReport, WatchDriver, WatchDriverConfig,
 };
 use engenho_store::{
+    InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
-    default_config, InProcessRouter, ResourceKey, StoreMesh,
+    default_config,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -52,7 +53,9 @@ async fn driver_ticks_on_matching_event() {
 
     let driver = WatchDriver::new(
         // For the trait dispatch to find tick_counter, we wrap a clone-able Arc.
-        TickCounterRef { inner: counter.clone() },
+        TickCounterRef {
+            inner: counter.clone(),
+        },
         store.clone(),
         WatchDriverConfig {
             filter: KindFilter::kind("Pod"),
@@ -96,10 +99,12 @@ async fn driver_filter_skips_irrelevant_events() {
     let counter = Arc::new(TickCounter::default());
 
     let driver = WatchDriver::new(
-        TickCounterRef { inner: counter.clone() },
+        TickCounterRef {
+            inner: counter.clone(),
+        },
         store.clone(),
         WatchDriverConfig {
-            filter: KindFilter::kind("Pod"),  // only Pods
+            filter: KindFilter::kind("Pod"), // only Pods
             debounce: Duration::from_millis(20),
             fallback_interval: Duration::from_secs(3600),
         },
@@ -139,7 +144,9 @@ async fn driver_coalesces_burst_events_into_one_tick() {
     let counter = Arc::new(TickCounter::default());
 
     let driver = WatchDriver::new(
-        TickCounterRef { inner: counter.clone() },
+        TickCounterRef {
+            inner: counter.clone(),
+        },
         store.clone(),
         WatchDriverConfig {
             filter: KindFilter::All,
@@ -173,7 +180,10 @@ async fn driver_coalesces_burst_events_into_one_tick() {
         (1..=5).contains(&count),
         "expected 1-5 coalesced ticks for 5 events; got {count}"
     );
-    assert!(count < 5, "expected coalescing; got {count} ticks for 5 events");
+    assert!(
+        count < 5,
+        "expected coalescing; got {count} ticks for 5 events"
+    );
 
     handle.abort();
     let _ = handle.await;
@@ -188,7 +198,9 @@ async fn driver_fallback_timer_ticks_with_no_events() {
     let counter = Arc::new(TickCounter::default());
 
     let driver = WatchDriver::new(
-        TickCounterRef { inner: counter.clone() },
+        TickCounterRef {
+            inner: counter.clone(),
+        },
         store.clone(),
         WatchDriverConfig {
             filter: KindFilter::All,
@@ -202,7 +214,10 @@ async fn driver_fallback_timer_ticks_with_no_events() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     let count = *counter.count.lock().await;
-    assert!(count >= 2, "fallback timer should have fired ≥2 times; got {count}");
+    assert!(
+        count >= 2,
+        "fallback timer should have fired ≥2 times; got {count}"
+    );
 
     handle.abort();
     let _ = handle.await;

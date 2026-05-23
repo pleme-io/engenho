@@ -27,11 +27,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
-    command::{Reason, ResourceCommand},
     StoreMesh,
+    command::{Reason, ResourceCommand},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
@@ -233,7 +233,12 @@ impl Controller for CrdController {
     async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
         let crds = self
             .store
-            .list("apiextensions.k8s.io", "v1", "CustomResourceDefinition", None)
+            .list(
+                "apiextensions.k8s.io",
+                "v1",
+                "CustomResourceDefinition",
+                None,
+            )
             .await;
         let mut report = ReconcileReport::default();
         report.objects_examined = crds.len();
@@ -465,7 +470,9 @@ mod tests {
         struct F;
         #[async_trait]
         impl Controller for F {
-            fn name(&self) -> &'static str { "crd" }
+            fn name(&self) -> &'static str {
+                "crd"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

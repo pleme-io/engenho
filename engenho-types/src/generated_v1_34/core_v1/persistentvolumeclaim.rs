@@ -5,8 +5,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -62,8 +62,8 @@ fn is_empty_spec(s: &PersistentVolumeClaimSpec) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::pvc_spec::{PvcPhase, ResourceRequirements};
+    use super::*;
     use crate::primitives::Quantity;
     use std::str::FromStr;
 
@@ -93,7 +93,10 @@ mod tests {
     #[test]
     fn pvc_gvk() {
         assert_eq!(PersistentVolumeClaim::GVK.kind, "PersistentVolumeClaim");
-        assert_eq!(PersistentVolumeClaim::GVR.resource, "persistentvolumeclaims");
+        assert_eq!(
+            PersistentVolumeClaim::GVR.resource,
+            "persistentvolumeclaims"
+        );
         assert_eq!(PersistentVolumeClaim::SCOPE, Scope::Namespaced);
     }
 }

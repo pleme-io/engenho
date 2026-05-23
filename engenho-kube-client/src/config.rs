@@ -184,7 +184,10 @@ impl Kubeconfig {
             .iter()
             .find(|c| c.name == ctx.context.cluster)
             .ok_or_else(|| {
-                KubeError::Auth(format!("cluster {:?} not in `clusters:`", ctx.context.cluster))
+                KubeError::Auth(format!(
+                    "cluster {:?} not in `clusters:`",
+                    ctx.context.cluster
+                ))
             })?;
         let user = self
             .users
@@ -202,21 +205,27 @@ impl Kubeconfig {
 
 fn auth_from_user(u: &AuthInfo) -> Result<KubeAuth, KubeError> {
     if let Some(t) = &u.token {
-        return Ok(KubeAuth::BearerToken(TokenSource::Inline { token: t.clone() }));
+        return Ok(KubeAuth::BearerToken(TokenSource::Inline {
+            token: t.clone(),
+        }));
     }
     if let Some(p) = &u.token_file {
         return Ok(KubeAuth::BearerToken(TokenSource::File { path: p.clone() }));
     }
-    let cert_src = bytes_or_path("client-certificate", &u.client_certificate_data, &u.client_certificate)?;
-    let key_src  = bytes_or_path("client-key",         &u.client_key_data,         &u.client_key)?;
+    let cert_src = bytes_or_path(
+        "client-certificate",
+        &u.client_certificate_data,
+        &u.client_certificate,
+    )?;
+    let key_src = bytes_or_path("client-key", &u.client_key_data, &u.client_key)?;
     if let (Some(cert), Some(key)) = (cert_src, key_src) {
         return Ok(KubeAuth::ClientCert { cert, key });
     }
     if let Some(e) = &u.exec {
         return Ok(KubeAuth::Exec {
-            command:     e.command.clone(),
-            args:        e.args.clone(),
-            env:         e.env.clone(),
+            command: e.command.clone(),
+            args: e.args.clone(),
+            env: e.env.clone(),
             api_version: e.api_version.clone(),
         });
     }
@@ -230,9 +239,9 @@ fn bytes_or_path(
 ) -> Result<Option<BytesOrPath>, KubeError> {
     if let Some(d) = inline_b64 {
         use base64::Engine as _;
-        let decoded = base64::engine::general_purpose::STANDARD.decode(d).map_err(|e| {
-            KubeError::Auth(format!("base64-decode {field}: {e}"))
-        })?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(d)
+            .map_err(|e| KubeError::Auth(format!("base64-decode {field}: {e}")))?;
         // BytesOrPath::Inline holds a String (the PEM text), so we
         // expect the inline content to be valid UTF-8 PEM bytes.
         let pem = String::from_utf8(decoded)
@@ -248,9 +257,11 @@ fn bytes_or_path(
 fn ca_from_cluster(c: &Cluster) -> Result<Option<Vec<u8>>, KubeError> {
     if let Some(d) = &c.certificate_authority_data {
         use base64::Engine as _;
-        let decoded = base64::engine::general_purpose::STANDARD.decode(d).map_err(|e| {
-            KubeError::Auth(format!("base64-decode certificate-authority-data: {e}"))
-        })?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(d)
+            .map_err(|e| {
+                KubeError::Auth(format!("base64-decode certificate-authority-data: {e}"))
+            })?;
         return Ok(Some(decoded));
     }
     if let Some(p) = &c.certificate_authority {
@@ -316,7 +327,10 @@ contexts:
         let kc = Kubeconfig::from_yaml(yaml).unwrap();
         let conn = kc.resolve_connection().unwrap();
         assert_eq!(conn.server(), "https://api.example.com");
-        assert_eq!(conn.bearer_token().unwrap().as_deref(), Some("secret-token-value"));
+        assert_eq!(
+            conn.bearer_token().unwrap().as_deref(),
+            Some("secret-token-value")
+        );
     }
 
     #[test]

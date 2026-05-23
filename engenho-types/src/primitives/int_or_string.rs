@@ -6,7 +6,7 @@
 //! `IntOrString::Int(i32)` / `IntOrString::String(String)` carries
 //! the variant unambiguously.
 
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use serde_json::Value as JsonValue;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -46,9 +46,8 @@ impl<'de> Deserialize<'de> for IntOrString {
                 let int = n.as_i64().ok_or_else(|| {
                     DeError::custom(format!("non-integer number in IntOrString: {n}"))
                 })?;
-                let int32 = i32::try_from(int).map_err(|_| {
-                    DeError::custom(format!("integer out of i32 range: {int}"))
-                })?;
+                let int32 = i32::try_from(int)
+                    .map_err(|_| DeError::custom(format!("integer out of i32 range: {int}")))?;
                 Ok(Self::Int(int32))
             }
             JsonValue::String(s) => Ok(Self::String(s)),

@@ -16,8 +16,8 @@
 use std::collections::HashSet;
 
 use engenho_revoada::topology::{
-    Cluster3MNW, MeshAllPeers, NodeId, NodeState, Pair, Phalanx, Quorum3M, Role,
-    RoleAssignment, Solo, TopologyStrategy, Transition,
+    Cluster3MNW, MeshAllPeers, NodeId, NodeState, Pair, Phalanx, Quorum3M, Role, RoleAssignment,
+    Solo, TopologyStrategy, Transition,
 };
 use proptest::prelude::*;
 
@@ -214,11 +214,7 @@ fn chaos_2_majority_partition_3_of_5() {
     let s = Quorum3M;
     let nodes = ids(5);
     let mut current = s.assign(&nodes).unwrap();
-    let lost = vec![
-        NodeId::new("n0"),
-        NodeId::new("n1"),
-        NodeId::new("n2"),
-    ];
+    let lost = vec![NodeId::new("n0"), NodeId::new("n1"), NodeId::new("n2")];
     let tx = s.react_to_loss(&current, &lost);
     apply(&mut current, &tx);
     // The surviving 2 nodes can't satisfy Quorum3M's min_nodes=3.
@@ -289,7 +285,11 @@ fn chaos_6_leader_crash_mid_commit() {
     // n0 is the leader; it crashes.
     let tx = s.react_to_loss(&current, &[NodeId::new("n0")]);
     apply(&mut current, &tx);
-    assert_eq!(current.voting_count(), 3, "quorum restored after leader crash");
+    assert_eq!(
+        current.voting_count(),
+        3,
+        "quorum restored after leader crash"
+    );
     assert!(
         current.get(&NodeId::new("n0")) == Some(NodeState::Failed),
         "crashed leader is Failed"
@@ -334,11 +334,7 @@ fn chaos_8_simultaneous_3_of_5_kill() {
     let nodes = ids(5);
     let mut current = s.assign(&nodes).unwrap();
     // Three masters die at once.
-    let lost = vec![
-        NodeId::new("n0"),
-        NodeId::new("n1"),
-        NodeId::new("n2"),
-    ];
+    let lost = vec![NodeId::new("n0"), NodeId::new("n1"), NodeId::new("n2")];
     let tx = s.react_to_loss(&current, &lost);
     apply(&mut current, &tx);
     let voters = current.voting_count();

@@ -117,10 +117,7 @@ impl<M: StateMachine> MachineRunner<M> {
     /// New runner starting from an explicit state. Useful for
     /// reconstruction / replay tests.
     #[must_use]
-    pub fn from_state(
-        state: M::State,
-        clock: std::sync::Arc<dyn crate::relogio::Clock>,
-    ) -> Self {
+    pub fn from_state(state: M::State, clock: std::sync::Arc<dyn crate::relogio::Clock>) -> Self {
         Self {
             state,
             history: Vec::new(),
@@ -139,8 +136,7 @@ impl<M: StateMachine> MachineRunner<M> {
         if M::is_terminal(&self.state) {
             return Err(MachineError::Terminal);
         }
-        let (next_state, effect) =
-            M::step(&self.state, &event).map_err(MachineError::Step)?;
+        let (next_state, effect) = M::step(&self.state, &event).map_err(MachineError::Step)?;
         let from = self.state.clone();
         self.history.push(TransitionRecord {
             from,
@@ -288,8 +284,12 @@ mod tests {
             match (state, event) {
                 (DoorState::Closed, DoorEvent::OpenIt) => Ok((DoorState::Open, DoorEffect::Creak)),
                 (DoorState::Open, DoorEvent::CloseIt) => Ok((DoorState::Closed, DoorEffect::Slam)),
-                (DoorState::Closed, DoorEvent::LockIt) => Ok((DoorState::Locked, DoorEffect::Click)),
-                (DoorState::Locked, DoorEvent::UnlockIt) => Ok((DoorState::Closed, DoorEffect::Click)),
+                (DoorState::Closed, DoorEvent::LockIt) => {
+                    Ok((DoorState::Locked, DoorEffect::Click))
+                }
+                (DoorState::Locked, DoorEvent::UnlockIt) => {
+                    Ok((DoorState::Closed, DoorEffect::Click))
+                }
                 _ => Err(DoorErr::Invalid {
                     state: format!("{state:?}"),
                     event: format!("{event:?}"),
@@ -298,7 +298,7 @@ mod tests {
         }
 
         fn is_terminal(_state: &DoorState) -> bool {
-            false  // door FSM has no terminals
+            false // door FSM has no terminals
         }
     }
 
@@ -440,7 +440,10 @@ mod tests {
             OneShotState::Pending
         }
 
-        fn step(_state: &OneShotState, _event: &OneShotEvent) -> Result<(OneShotState, ()), DoorErr> {
+        fn step(
+            _state: &OneShotState,
+            _event: &OneShotEvent,
+        ) -> Result<(OneShotState, ()), DoorErr> {
             Ok((OneShotState::Done, ()))
         }
 
@@ -451,8 +454,7 @@ mod tests {
 
     #[test]
     fn step_from_terminal_returns_terminal_error() {
-        let mut r: MachineRunner<OneShotMachine> =
-            MachineRunner::new(Arc::new(FrozenClock::at(0)));
+        let mut r: MachineRunner<OneShotMachine> = MachineRunner::new(Arc::new(FrozenClock::at(0)));
         r.step(OneShotEvent).unwrap(); // Pending -> Done
         assert!(r.is_terminal());
         let err = r.step(OneShotEvent).unwrap_err();
@@ -473,8 +475,7 @@ mod tests {
             at: Instant::new(100, 5),
         };
         let bytes = serde_json::to_vec(&r).unwrap();
-        let back: TransitionRecord<DoorState, DoorEvent> =
-            serde_json::from_slice(&bytes).unwrap();
+        let back: TransitionRecord<DoorState, DoorEvent> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, r);
     }
 }

@@ -9,9 +9,9 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use serde::{Deserialize, Serialize};
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -31,7 +31,11 @@ pub struct ConfigMap {
     /// `BinaryData` contains the binary data. Each key must consist
     /// of alphanumeric characters, `-`, `_` or `.`. Values are
     /// base64-encoded.
-    #[serde(default, rename = "binaryData", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        rename = "binaryData",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub binary_data: BTreeMap<String, String>,
 
     /// `Immutable`, if set to true, ensures that data stored in the
@@ -81,14 +85,21 @@ mod tests {
         let mut cm = ConfigMap::default();
         cm.metadata.name = "kube-proxy".into();
         cm.metadata.namespace = Some("kube-system".into());
-        cm.data.insert("config.conf".into(), "mode: iptables".into());
+        cm.data
+            .insert("config.conf".into(), "mode: iptables".into());
         cm.immutable = Some(true);
         let json = serde_json::to_string(&cm).unwrap();
         assert!(json.contains("\"config.conf\""));
         assert!(json.contains("\"immutable\":true"));
         // Wire-clean: no spec/status leaked.
-        assert!(!json.contains("\"spec\""), "ConfigMap must not emit spec field: {json}");
-        assert!(!json.contains("\"status\""), "ConfigMap must not emit status field: {json}");
+        assert!(
+            !json.contains("\"spec\""),
+            "ConfigMap must not emit spec field: {json}"
+        );
+        assert!(
+            !json.contains("\"status\""),
+            "ConfigMap must not emit status field: {json}"
+        );
         let back: ConfigMap = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cm);
     }

@@ -8,14 +8,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::type_config::{RaftNodeId, TypeConfig};
 
@@ -106,7 +106,11 @@ impl RaftNetwork<TypeConfig> for InProcessNetwork {
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<RaftNodeId>,
-        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, openraft::error::InstallSnapshotError>>,
+        RPCError<
+            RaftNodeId,
+            BasicNode,
+            RaftError<RaftNodeId, openraft::error::InstallSnapshotError>,
+        >,
     > {
         let sender = self.router.lookup(self.target).await.ok_or_else(|| {
             RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
@@ -118,10 +122,12 @@ impl RaftNetwork<TypeConfig> for InProcessNetwork {
         sender
             .send(RpcRequest::InstallSnapshot(rpc, tx))
             .await
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
-                "InstallSnapshot send to {}: {e}",
-                self.target
-            )))))?;
+            .map_err(|e| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                    "InstallSnapshot send to {}: {e}",
+                    self.target
+                ))))
+            })?;
         rx.await.map_err(|e| {
             RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
                 "InstallSnapshot oneshot dropped: {e}"

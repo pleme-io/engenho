@@ -90,13 +90,7 @@ mod tests {
         assert_eq!(k.label(), "v1/v1/Pod/default/podinfo");
         let c = ResourceKey::cluster_scoped("", "v1", "Namespace", "default");
         assert_eq!(c.label(), "v1/v1/Namespace/default");
-        let r = ResourceKey::namespaced(
-            "apps",
-            "v1",
-            "Deployment",
-            "default",
-            "podinfo",
-        );
+        let r = ResourceKey::namespaced("apps", "v1", "Deployment", "default", "podinfo");
         assert_eq!(r.label(), "apps/v1/Deployment/default/podinfo");
     }
 

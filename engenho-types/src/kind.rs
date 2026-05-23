@@ -19,16 +19,16 @@ use std::borrow::Cow;
 /// registry (planned M0.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GroupVersionKind {
-    pub group:   &'static str,
+    pub group: &'static str,
     pub version: &'static str,
-    pub kind:    &'static str,
+    pub kind: &'static str,
 }
 
 /// The Group/Version/Resource triple (resource = the plural URL segment).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GroupVersionResource {
-    pub group:    &'static str,
-    pub version:  &'static str,
+    pub group: &'static str,
+    pub version: &'static str,
     pub resource: &'static str,
 }
 
@@ -72,8 +72,16 @@ mod tests {
 
     #[test]
     fn gvk_equality_is_trivial() {
-        let a = GroupVersionKind { group: "", version: "v1", kind: "Pod" };
-        let b = GroupVersionKind { group: "", version: "v1", kind: "Pod" };
+        let a = GroupVersionKind {
+            group: "",
+            version: "v1",
+            kind: "Pod",
+        };
+        let b = GroupVersionKind {
+            group: "",
+            version: "v1",
+            kind: "Pod",
+        };
         assert_eq!(a, b);
     }
 

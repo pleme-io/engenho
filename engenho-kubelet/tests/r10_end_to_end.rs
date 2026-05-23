@@ -7,8 +7,9 @@ use std::time::Duration;
 use engenho_controllers::Controller;
 use engenho_kubelet::{FakeBackend, Kubelet};
 use engenho_store::{
+    InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
-    default_config, InProcessRouter, ResourceKey, StoreMesh,
+    default_config,
 };
 use serde_json::json;
 
@@ -74,9 +75,11 @@ async fn kubelet_starts_container_for_bound_pod() {
     assert_eq!(status.get("phase").unwrap(), "Running");
     assert!(status.get("podIP").is_some());
     let conditions = status.get("conditions").unwrap().as_array().unwrap();
-    assert!(conditions.iter().any(|c| {
-        c.get("type").unwrap() == "Ready" && c.get("status").unwrap() == "True"
-    }));
+    assert!(
+        conditions
+            .iter()
+            .any(|c| { c.get("type").unwrap() == "Ready" && c.get("status").unwrap() == "True" })
+    );
 
     drop(kubelet);
     let mesh = Arc::try_unwrap(store).ok().unwrap();

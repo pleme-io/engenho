@@ -41,12 +41,20 @@ pub struct ServiceSpec {
     pub cluster_ips: Vec<String>,
 
     /// `SessionAffinity` — `ClientIP` | `None`. Default `None`.
-    #[serde(default, rename = "sessionAffinity", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "sessionAffinity",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub session_affinity: Option<String>,
 
     /// `ExternalName` — DNS CNAME target. Required when
     /// `type=ExternalName`.
-    #[serde(default, rename = "externalName", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "externalName",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub external_name: Option<String>,
 
     /// `IPFamilies` — list of address families. Valid values:
@@ -78,7 +86,11 @@ pub struct ServicePort {
     /// `TargetPort` — number or name of the port to access on the
     /// pods targeted by the service. Encoded as either integer or
     /// string in JSON (IntOrString); we accept both.
-    #[serde(default, rename = "targetPort", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "targetPort",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub target_port: Option<serde_json::Value>,
 
     /// The `IP` protocol for this port. Default `TCP`.
@@ -96,7 +108,11 @@ pub struct ServicePort {
 pub struct ServiceStatus {
     /// `LoadBalancer` contains the current status of the
     /// load-balancer if one is present.
-    #[serde(default, rename = "loadBalancer", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "loadBalancer",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub load_balancer: Option<LoadBalancerStatus>,
 
     /// Current service state.
@@ -145,7 +161,10 @@ mod tests {
             let back: ServiceType = serde_json::from_str(&s).unwrap();
             assert_eq!(back, t);
         }
-        assert_eq!(serde_json::to_string(&ServiceType::ClusterIP).unwrap(), "\"ClusterIP\"");
+        assert_eq!(
+            serde_json::to_string(&ServiceType::ClusterIP).unwrap(),
+            "\"ClusterIP\""
+        );
     }
 
     #[test]

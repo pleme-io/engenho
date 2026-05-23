@@ -135,7 +135,6 @@ impl ComposeIr {
 crate::impl_fingerprint!(ComposeIr);
 
 impl ComposeIr {
-
     /// Render the IR as a docker-compose v3-shape YAML string.
     /// Pure helper — no I/O, no validation against docker.
     #[must_use]
@@ -204,11 +203,7 @@ impl ComposeStack {
     /// New stack bound to a runner + file path. The file isn't
     /// written until `up()` is called.
     #[must_use]
-    pub fn new(
-        ir: ComposeIr,
-        runner: Arc<dyn CommandRunner>,
-        compose_file: PathBuf,
-    ) -> Self {
+    pub fn new(ir: ComposeIr, runner: Arc<dyn CommandRunner>, compose_file: PathBuf) -> Self {
         Self {
             ir,
             runner,
@@ -250,14 +245,12 @@ impl ComposeStack {
         let yaml = self.ir.to_yaml();
         if let Some(parent) = self.compose_file.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    ComposeError::Io(format!("mkdir {}: {e}", parent.display()))
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| ComposeError::Io(format!("mkdir {}: {e}", parent.display())))?;
             }
         }
-        std::fs::write(&self.compose_file, yaml.as_bytes()).map_err(|e| {
-            ComposeError::Io(format!("write {}: {e}", self.compose_file.display()))
-        })?;
+        std::fs::write(&self.compose_file, yaml.as_bytes())
+            .map_err(|e| ComposeError::Io(format!("write {}: {e}", self.compose_file.display())))?;
         // Dispatch through the runner.
         let req = self.build_up_request();
         let resp = self
@@ -272,8 +265,7 @@ impl ComposeStack {
                 String::from_utf8_lossy(&resp.stderr)
             )));
         }
-        self.is_up
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.is_up.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -288,8 +280,7 @@ impl ComposeStack {
             .run(&req)
             .await
             .map_err(|e| ComposeError::Backend(format!("compose down: {e}")))?;
-        self.is_up
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.is_up.store(false, std::sync::atomic::Ordering::SeqCst);
         if !resp.is_success() {
             return Err(ComposeError::Backend(format!(
                 "compose down exit {:?}: {}",
@@ -446,7 +437,12 @@ mod tests {
     #[test]
     fn to_yaml_contains_version_and_services_block() {
         let yaml = simple_ir().to_yaml();
-        assert!(yaml.contains("version: '3.9'") || yaml.contains("version: \"3.9\"") || yaml.contains("version: '3.9'\n") || yaml.contains("version: 3.9"));
+        assert!(
+            yaml.contains("version: '3.9'")
+                || yaml.contains("version: \"3.9\"")
+                || yaml.contains("version: '3.9'\n")
+                || yaml.contains("version: 3.9")
+        );
         assert!(yaml.contains("services:"));
         assert!(yaml.contains("web:"));
         assert!(yaml.contains("nginx:1.27"));
@@ -543,8 +539,7 @@ mod tests {
     async fn with_binary_overrides_program() {
         let runner = Arc::new(FakeCommandRunner::new());
         let path = temp_compose_path("bin-override");
-        let stack =
-            ComposeStack::new(simple_ir(), runner, path).with_binary("podman");
+        let stack = ComposeStack::new(simple_ir(), runner, path).with_binary("podman");
         let req = stack.build_up_request();
         assert_eq!(req.program, "podman");
     }
@@ -630,9 +625,8 @@ mod tests {
         let stack = ComposeStack::new(simple_ir(), runner, nested.clone());
         stack.up().await.unwrap();
         assert!(nested.exists());
-        let _ = std::fs::remove_dir_all(
-            nested.parent().unwrap().parent().unwrap().parent().unwrap(),
-        );
+        let _ =
+            std::fs::remove_dir_all(nested.parent().unwrap().parent().unwrap().parent().unwrap());
     }
 
     #[test]
@@ -657,8 +651,7 @@ mod tests {
         // But we can assert .persist() sets the flag.
         let runner = Arc::new(FakeCommandRunner::new());
         let path = temp_compose_path("persist");
-        let stack =
-            ComposeStack::new(simple_ir(), runner, path.clone()).persist();
+        let stack = ComposeStack::new(simple_ir(), runner, path.clone()).persist();
         assert!(stack.persist_on_drop);
         let _ = std::fs::remove_file(&path);
     }

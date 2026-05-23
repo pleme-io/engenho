@@ -153,6 +153,10 @@ mod tests {
         let _ = t.build(&sample_drv()).await.unwrap();
         assert_eq!(h1.builds().await.len(), 1);
         assert_eq!(h2.builds().await.len(), 1);
-        assert_eq!(h3.builds().await.len(), 0, "h3 not queried after h2 succeeds");
+        assert_eq!(
+            h3.builds().await.len(),
+            0,
+            "h3 not queried after h2 succeeds"
+        );
     }
 }

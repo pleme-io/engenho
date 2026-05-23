@@ -51,7 +51,9 @@ pub trait Cache<R: KubeResource>: Send + Sync {
     fn len(&self) -> usize;
 
     /// Convenience: `len() == 0`.
-    fn is_empty(&self) -> bool { self.len() == 0 }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// The full informer: cache + event multiplexing + watch lifecycle.
@@ -86,7 +88,7 @@ pub struct CacheKey<'a> {
     /// `metadata.namespace`, or empty for cluster-scoped.
     pub namespace: Cow<'a, str>,
     /// `metadata.name`.
-    pub name:      Cow<'a, str>,
+    pub name: Cow<'a, str>,
 }
 
 impl<'a> CacheKey<'a> {
@@ -96,7 +98,7 @@ impl<'a> CacheKey<'a> {
     pub fn from_resource<R: KubeResource>(r: &'a R) -> Self {
         Self {
             namespace: r.namespace().unwrap_or(Cow::Borrowed("")),
-            name:      r.name(),
+            name: r.name(),
         }
     }
 }
@@ -107,8 +109,14 @@ mod tests {
 
     #[test]
     fn cache_key_equality() {
-        let a = CacheKey { namespace: "default".into(), name: "p1".into() };
-        let b = CacheKey { namespace: "default".into(), name: "p1".into() };
+        let a = CacheKey {
+            namespace: "default".into(),
+            name: "p1".into(),
+        };
+        let b = CacheKey {
+            namespace: "default".into(),
+            name: "p1".into(),
+        };
         assert_eq!(a, b);
     }
 }

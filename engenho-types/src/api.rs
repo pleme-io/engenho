@@ -81,10 +81,7 @@ mod tests {
 
     #[test]
     fn list_path_core_cluster() {
-        assert_eq!(
-            list_path(POD_GVR, Scope::Namespaced, None),
-            "/api/v1/pods"
-        );
+        assert_eq!(list_path(POD_GVR, Scope::Namespaced, None), "/api/v1/pods");
     }
 
     #[test]

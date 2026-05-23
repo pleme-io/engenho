@@ -27,11 +27,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
+    StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
-    StoreMesh,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -167,9 +167,7 @@ impl HorizontalPodAutoscalerController {
     }
 
     fn scale_target_ref(hpa: &Value) -> Option<(String, String)> {
-        let r = hpa
-            .get("spec")
-            .and_then(|s| s.get("scaleTargetRef"))?;
+        let r = hpa.get("spec").and_then(|s| s.get("scaleTargetRef"))?;
         let kind = r.get("kind").and_then(|k| k.as_str())?.to_string();
         let name = r.get("name").and_then(|n| n.as_str())?.to_string();
         Some((kind, name))
@@ -212,7 +210,12 @@ impl Controller for HorizontalPodAutoscalerController {
     async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
         let hpas = self
             .store
-            .list("autoscaling", "v2", "HorizontalPodAutoscaler", self.namespace.as_deref())
+            .list(
+                "autoscaling",
+                "v2",
+                "HorizontalPodAutoscaler",
+                self.namespace.as_deref(),
+            )
             .await;
         let mut report = ReconcileReport::default();
         report.objects_examined = hpas.len();
@@ -222,14 +225,17 @@ impl Controller for HorizontalPodAutoscalerController {
                 report.objects_skipped += 1;
                 continue;
             };
-            let ns = hpa_key.namespace.as_deref().unwrap_or("default").to_string();
+            let ns = hpa_key
+                .namespace
+                .as_deref()
+                .unwrap_or("default")
+                .to_string();
             let min = Self::min_replicas(hpa_value);
             let max = Self::max_replicas(hpa_value);
             let target_value = Self::target_value(hpa_value);
 
             let (g, v) = Self::target_gv(&target_kind);
-            let target_key =
-                ResourceKey::namespaced(g, v, &target_kind, &ns, &target_name);
+            let target_key = ResourceKey::namespaced(g, v, &target_kind, &ns, &target_name);
             let Some(target) = self.store.get(&target_key).await else {
                 report.objects_skipped += 1;
                 continue;
@@ -292,12 +298,18 @@ mod tests {
 
     #[test]
     fn min_replicas_defaults_to_1() {
-        assert_eq!(HorizontalPodAutoscalerController::min_replicas(&json!({})), 1);
+        assert_eq!(
+            HorizontalPodAutoscalerController::min_replicas(&json!({})),
+            1
+        );
     }
 
     #[test]
     fn max_replicas_defaults_to_1() {
-        assert_eq!(HorizontalPodAutoscalerController::max_replicas(&json!({})), 1);
+        assert_eq!(
+            HorizontalPodAutoscalerController::max_replicas(&json!({})),
+            1
+        );
     }
 
     #[test]
@@ -329,38 +341,32 @@ mod tests {
     #[test]
     fn compute_desired_scales_up_on_high_metric() {
         // 80% observed vs 50% target → 2× replicas
-        let d =
-            HorizontalPodAutoscalerController::compute_desired(2, 80.0, 50.0, 1, 10);
+        let d = HorizontalPodAutoscalerController::compute_desired(2, 80.0, 50.0, 1, 10);
         assert_eq!(d, 4);
     }
 
     #[test]
     fn compute_desired_scales_down_on_low_metric() {
         // 25% observed vs 50% target → ½× replicas
-        let d =
-            HorizontalPodAutoscalerController::compute_desired(4, 25.0, 50.0, 1, 10);
+        let d = HorizontalPodAutoscalerController::compute_desired(4, 25.0, 50.0, 1, 10);
         assert_eq!(d, 2);
     }
 
     #[test]
     fn compute_desired_clamps_to_min() {
-        let d =
-            HorizontalPodAutoscalerController::compute_desired(2, 1.0, 50.0, 3, 10);
+        let d = HorizontalPodAutoscalerController::compute_desired(2, 1.0, 50.0, 3, 10);
         assert_eq!(d, 3);
     }
 
     #[test]
     fn compute_desired_clamps_to_max() {
-        let d = HorizontalPodAutoscalerController::compute_desired(
-            5, 1000.0, 50.0, 1, 10,
-        );
+        let d = HorizontalPodAutoscalerController::compute_desired(5, 1000.0, 50.0, 1, 10);
         assert_eq!(d, 10);
     }
 
     #[test]
     fn compute_desired_never_below_1() {
-        let d =
-            HorizontalPodAutoscalerController::compute_desired(1, 0.0, 50.0, 1, 10);
+        let d = HorizontalPodAutoscalerController::compute_desired(1, 0.0, 50.0, 1, 10);
         assert_eq!(d, 1);
     }
 
@@ -394,7 +400,9 @@ mod tests {
         struct F;
         #[async_trait]
         impl Controller for F {
-            fn name(&self) -> &'static str { "hpa" }
+            fn name(&self) -> &'static str {
+                "hpa"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

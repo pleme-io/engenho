@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 
 use crate::ledger::{LedgerError, LedgerKey, MaterializationLedger};
 use crate::quorum::QuorumOutcome;
@@ -276,12 +276,7 @@ mod tests {
     use crate::receipt::{MaterializationReceipt, NodeId};
 
     fn rcpt(emitter: u8, evidence: u8) -> MaterializationReceipt {
-        MaterializationReceipt::for_drv(
-            [7u8; 32],
-            NodeId::new([emitter; 32]),
-            100,
-            [evidence; 32],
-        )
+        MaterializationReceipt::for_drv([7u8; 32], NodeId::new([emitter; 32]), 100, [evidence; 32])
     }
 
     fn stage() -> StageId {
@@ -320,7 +315,10 @@ mod tests {
     async fn fake_transport_fail_next_returns_typed_error() {
         let t = FakeGossipTransport::new();
         t.fail_next(GossipError::NotConnected).await;
-        let err = t.broadcast_receipt(&stage(), 1, &rcpt(1, 5)).await.unwrap_err();
+        let err = t
+            .broadcast_receipt(&stage(), 1, &rcpt(1, 5))
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "not_connected");
     }
 
@@ -413,8 +411,14 @@ mod tests {
     async fn inner_and_transport_accessors() {
         let (inner, transport, ledger) = assemble();
         // Just sanity that the borrowed references match the originals.
-        assert!(Arc::ptr_eq(ledger.inner(), &(inner as Arc<dyn MaterializationLedger>)));
-        assert!(Arc::ptr_eq(ledger.transport(), &(transport as Arc<dyn GossipBroadcaster>)));
+        assert!(Arc::ptr_eq(
+            ledger.inner(),
+            &(inner as Arc<dyn MaterializationLedger>)
+        ));
+        assert!(Arc::ptr_eq(
+            ledger.transport(),
+            &(transport as Arc<dyn GossipBroadcaster>)
+        ));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! Property: Hex trait — lowercase round-trip + length invariant.
 
-use engenho_substrate::{hex_encode, Hex};
+use engenho_substrate::{Hex, hex_encode};
 use proptest::prelude::*;
 
 proptest! {

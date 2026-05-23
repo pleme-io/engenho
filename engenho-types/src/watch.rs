@@ -50,7 +50,7 @@ pub struct RawWatchEvent {
     pub event_type: String,
     /// JSON of the typed resource (for ADDED/MODIFIED/DELETED) or
     /// a Status object (for ERROR/BOOKMARK).
-    pub object:    serde_json::Value,
+    pub object: serde_json::Value,
 }
 
 impl RawWatchEvent {
@@ -85,15 +85,19 @@ impl RawWatchEvent {
                     .and_then(|m| m.get("resourceVersion"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
-                        KubeError::Decode(
-                            "BOOKMARK missing metadata.resourceVersion".into(),
-                        )
+                        KubeError::Decode("BOOKMARK missing metadata.resourceVersion".into())
                     })?
                     .to_string();
-                Ok(WatchEvent::Bookmark { resource_version: rv })
+                Ok(WatchEvent::Bookmark {
+                    resource_version: rv,
+                })
             }
             "ERROR" => {
-                let code = self.object.get("code").and_then(|c| c.as_u64()).unwrap_or(0) as u16;
+                let code = self
+                    .object
+                    .get("code")
+                    .and_then(|c| c.as_u64())
+                    .unwrap_or(0) as u16;
                 let message = self
                     .object
                     .get("message")
@@ -158,14 +162,14 @@ mod tests {
         // exercise here.
         let raw = RawWatchEvent {
             event_type: "ADDED".into(),
-            object:     json!({"metadata": {"name": "p1"}}),
+            object: json!({"metadata": {"name": "p1"}}),
         };
         // Decoding to a non-existent type would fail; just verify
         // the parse + branch logic works for BOOKMARK + ERROR which
         // don't need a typed payload.
         let bookmark = RawWatchEvent {
             event_type: "BOOKMARK".into(),
-            object:     json!({"metadata": {"resourceVersion": "12345"}}),
+            object: json!({"metadata": {"resourceVersion": "12345"}}),
         };
         // Using `()` as a stand-in is unsound but exercising the
         // bookmark branch which never touches the payload-as-R is fine.
@@ -177,15 +181,25 @@ mod tests {
         }
         impl crate::kind::KubeResource for Stub {
             const GVK: crate::kind::GroupVersionKind = crate::kind::GroupVersionKind {
-                group: "", version: "v1", kind: "Stub",
+                group: "",
+                version: "v1",
+                kind: "Stub",
             };
             const GVR: crate::kind::GroupVersionResource = crate::kind::GroupVersionResource {
-                group: "", version: "v1", resource: "stubs",
+                group: "",
+                version: "v1",
+                resource: "stubs",
             };
             const SCOPE: crate::kind::Scope = crate::kind::Scope::Namespaced;
-            fn name(&self) -> std::borrow::Cow<'_, str> { "".into() }
-            fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> { None }
-            fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> { None }
+            fn name(&self) -> std::borrow::Cow<'_, str> {
+                "".into()
+            }
+            fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> {
+                None
+            }
+            fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> {
+                None
+            }
         }
         let typed: WatchEvent<Stub> = raw.into_typed().unwrap();
         assert!(matches!(typed, WatchEvent::Added(_)));
@@ -197,21 +211,31 @@ mod tests {
     fn unknown_event_type_errors() {
         let raw = RawWatchEvent {
             event_type: "GARBAGE".into(),
-            object:     json!({}),
+            object: json!({}),
         };
         #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
         struct Stub;
         impl crate::kind::KubeResource for Stub {
             const GVK: crate::kind::GroupVersionKind = crate::kind::GroupVersionKind {
-                group: "", version: "v1", kind: "Stub",
+                group: "",
+                version: "v1",
+                kind: "Stub",
             };
             const GVR: crate::kind::GroupVersionResource = crate::kind::GroupVersionResource {
-                group: "", version: "v1", resource: "stubs",
+                group: "",
+                version: "v1",
+                resource: "stubs",
             };
             const SCOPE: crate::kind::Scope = crate::kind::Scope::Namespaced;
-            fn name(&self) -> std::borrow::Cow<'_, str> { "".into() }
-            fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> { None }
-            fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> { None }
+            fn name(&self) -> std::borrow::Cow<'_, str> {
+                "".into()
+            }
+            fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> {
+                None
+            }
+            fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> {
+                None
+            }
         }
         let r: Result<WatchEvent<Stub>, _> = raw.into_typed();
         assert!(r.is_err());
@@ -222,21 +246,31 @@ mod tests {
     fn error_event_decodes_to_apistatus() {
         let raw = RawWatchEvent {
             event_type: "ERROR".into(),
-            object:     json!({"code": 410, "message": "too old resource version"}),
+            object: json!({"code": 410, "message": "too old resource version"}),
         };
         #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
         struct Stub;
         impl crate::kind::KubeResource for Stub {
             const GVK: crate::kind::GroupVersionKind = crate::kind::GroupVersionKind {
-                group: "", version: "v1", kind: "Stub",
+                group: "",
+                version: "v1",
+                kind: "Stub",
             };
             const GVR: crate::kind::GroupVersionResource = crate::kind::GroupVersionResource {
-                group: "", version: "v1", resource: "stubs",
+                group: "",
+                version: "v1",
+                resource: "stubs",
             };
             const SCOPE: crate::kind::Scope = crate::kind::Scope::Namespaced;
-            fn name(&self) -> std::borrow::Cow<'_, str> { "".into() }
-            fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> { None }
-            fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> { None }
+            fn name(&self) -> std::borrow::Cow<'_, str> {
+                "".into()
+            }
+            fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> {
+                None
+            }
+            fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> {
+                None
+            }
         }
         let typed: WatchEvent<Stub> = raw.into_typed().unwrap();
         match typed {

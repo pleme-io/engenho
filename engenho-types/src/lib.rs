@@ -64,14 +64,12 @@ pub mod kind;
 pub mod meta;
 pub mod nomad_v1;
 pub mod patch;
-pub mod translator;
 pub mod primitives;
 pub mod reconciler;
+pub mod translator;
 pub mod watch;
 
-pub use consistency_tier::{
-    tier_from_metadata, ConsistencyTier, CONSISTENCY_TIER_ANNOTATION,
-};
+pub use consistency_tier::{CONSISTENCY_TIER_ANNOTATION, ConsistencyTier, tier_from_metadata};
 
 // Generated kind modules land below this line. M0.0.1 introduces core_v1::Pod
 // as the proof-of-pipeline; M0.0.3 replaces it with generator output; M0.0.4

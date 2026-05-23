@@ -8,12 +8,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engenho_revoada::attestation::{verify_chain, AttestationError, NodeIdentity};
+use engenho_revoada::NodeId;
+use engenho_revoada::attestation::{AttestationError, NodeIdentity, verify_chain};
 use engenho_revoada::consensus::{
-    default_config, InProcessRouter, RaftMesh, Reason, RoleAssignment,
+    InProcessRouter, RaftMesh, Reason, RoleAssignment, default_config,
 };
 use engenho_revoada::membership::NodeRole;
-use engenho_revoada::NodeId;
 
 fn promote_cmd(seed: u8) -> RoleAssignment {
     let mut roles = BTreeSet::new();
@@ -81,15 +81,10 @@ async fn tampering_with_committed_chain_breaks_verification() {
     let router = InProcessRouter::new();
     let cfg = default_config("revoada-test-r4-tamper").unwrap();
     let identity = NodeIdentity::from_seed([0xb2; 32]);
-    let mesh = RaftMesh::start_with_identity(
-        2,
-        "in-process://node-2".into(),
-        router,
-        cfg,
-        identity,
-    )
-    .await
-    .unwrap();
+    let mesh =
+        RaftMesh::start_with_identity(2, "in-process://node-2".into(), router, cfg, identity)
+            .await
+            .unwrap();
     mesh.initialize_singleton().await.unwrap();
     mesh.wait_for_leadership(Duration::from_secs(3)).await;
 
@@ -174,7 +169,10 @@ async fn three_node_raft_each_leader_signs_blocks_with_its_identity() {
         (&mesh_3, &id_3)
     };
 
-    leader_mesh.propose(promote_cmd(0xfe)).await.expect("propose");
+    leader_mesh
+        .propose(promote_cmd(0xfe))
+        .await
+        .expect("propose");
     leader_mesh
         .wait_for_applied(1, Duration::from_secs(3))
         .await;
@@ -192,9 +190,24 @@ async fn three_node_raft_each_leader_signs_blocks_with_its_identity() {
     // own chain", not "all nodes converge on the chain".
     let _ = (leader_mesh, leader_identity);
 
-    Arc::try_unwrap(mesh_1).ok().unwrap().terminate().await.unwrap();
-    Arc::try_unwrap(mesh_2).ok().unwrap().terminate().await.unwrap();
-    Arc::try_unwrap(mesh_3).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh_1)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+    Arc::try_unwrap(mesh_2)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+    Arc::try_unwrap(mesh_3)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 /// R4.5: per-node chain. Every node — leader and follower — must
@@ -293,7 +306,8 @@ async fn r4_5_all_nodes_build_independent_chains_on_apply() {
         let blocks = mesh.attestation_chain().snapshot();
         for b in &blocks {
             assert_eq!(
-                b.leader, identity.node_id(),
+                b.leader,
+                identity.node_id(),
                 "every block on node{} must be signed by node{}'s identity",
                 mesh.node_id(),
                 mesh.node_id()
@@ -312,9 +326,24 @@ async fn r4_5_all_nodes_build_independent_chains_on_apply() {
         verify_chain(&recovered).expect("serialized chain verifies offline");
     }
 
-    Arc::try_unwrap(mesh_1).ok().unwrap().terminate().await.unwrap();
-    Arc::try_unwrap(mesh_2).ok().unwrap().terminate().await.unwrap();
-    Arc::try_unwrap(mesh_3).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh_1)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+    Arc::try_unwrap(mesh_2)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+    Arc::try_unwrap(mesh_3)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 /// Audit scenario: an external auditor receives the chain bytes
@@ -326,15 +355,9 @@ async fn external_auditor_verifies_serialized_chain() {
     let router = InProcessRouter::new();
     let cfg = default_config("revoada-test-r4-audit").unwrap();
     let identity = NodeIdentity::from_seed([0xc3; 32]);
-    let mesh = RaftMesh::start_with_identity(
-        7,
-        "in-process://7".into(),
-        router,
-        cfg,
-        identity,
-    )
-    .await
-    .unwrap();
+    let mesh = RaftMesh::start_with_identity(7, "in-process://7".into(), router, cfg, identity)
+        .await
+        .unwrap();
     mesh.initialize_singleton().await.unwrap();
     mesh.wait_for_leadership(Duration::from_secs(3)).await;
 

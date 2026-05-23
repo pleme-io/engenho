@@ -33,8 +33,8 @@
 //! on the [`NatsRpcEnvelope`]'s `kind` tag (not on the subject
 //! kind — they should agree, but envelope-tag is authoritative).
 
-use engenho_teia::subject::RaftGroup;
 use engenho_teia::TeiaClient;
+use engenho_teia::subject::RaftGroup;
 use futures::StreamExt;
 use openraft::Raft;
 use tokio::task::JoinHandle;
@@ -79,13 +79,12 @@ impl NatsListener {
         let subject = scope.raft_target_wildcard(target);
 
         let nats = client.nats().clone();
-        let mut sub = nats
-            .subscribe(subject.clone())
-            .await
-            .map_err(|e| engenho_teia::TeiaError::SubscribeFailed {
+        let mut sub = nats.subscribe(subject.clone()).await.map_err(|e| {
+            engenho_teia::TeiaError::SubscribeFailed {
                 subject: subject.clone(),
                 detail: e.to_string(),
-            })?;
+            }
+        })?;
 
         let _ = scope; // explicit drop — only the auto-builder used it
         // RaftGroup is referenced via the subject grammar; emit an
@@ -96,48 +95,43 @@ impl NatsListener {
         let raft_for_task = raft;
         let handle = tokio::spawn(async move {
             while let Some(msg) = sub.next().await {
-                let envelope: NatsRpcEnvelope =
-                    match serde_json::from_slice(&msg.payload) {
-                        Ok(env) => env,
-                        Err(e) => {
-                            warn!(error = %e, subject = %msg.subject, "drop malformed Raft RPC");
-                            continue;
-                        }
-                    };
+                let envelope: NatsRpcEnvelope = match serde_json::from_slice(&msg.payload) {
+                    Ok(env) => env,
+                    Err(e) => {
+                        warn!(error = %e, subject = %msg.subject, "drop malformed Raft RPC");
+                        continue;
+                    }
+                };
 
                 let reply_bytes: Vec<u8> = match envelope {
                     NatsRpcEnvelope::AppendEntries(req) => {
                         match raft_for_task.append_entries(req).await {
-                            Ok(resp) => {
-                                match serde_json::to_vec(&resp) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        error!(error = %e, "encode AppendEntries response");
-                                        continue;
-                                    }
+                            Ok(resp) => match serde_json::to_vec(&resp) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    error!(error = %e, "encode AppendEntries response");
+                                    continue;
                                 }
-                            }
+                            },
                             Err(e) => {
                                 warn!(error = %e, "AppendEntries dispatch failed");
                                 continue;
                             }
                         }
                     }
-                    NatsRpcEnvelope::Vote(req) => {
-                        match raft_for_task.vote(req).await {
-                            Ok(resp) => match serde_json::to_vec(&resp) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    error!(error = %e, "encode Vote response");
-                                    continue;
-                                }
-                            },
+                    NatsRpcEnvelope::Vote(req) => match raft_for_task.vote(req).await {
+                        Ok(resp) => match serde_json::to_vec(&resp) {
+                            Ok(b) => b,
                             Err(e) => {
-                                warn!(error = %e, "Vote dispatch failed");
+                                error!(error = %e, "encode Vote response");
                                 continue;
                             }
+                        },
+                        Err(e) => {
+                            warn!(error = %e, "Vote dispatch failed");
+                            continue;
                         }
-                    }
+                    },
                     NatsRpcEnvelope::InstallSnapshot(req) => {
                         match raft_for_task.install_snapshot(req).await {
                             Ok(resp) => match serde_json::to_vec(&resp) {

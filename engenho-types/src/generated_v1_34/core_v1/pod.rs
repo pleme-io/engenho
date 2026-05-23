@@ -18,8 +18,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -45,13 +45,13 @@ pub struct Pod {
 
 impl KubeResource for Pod {
     const GVK: GroupVersionKind = GroupVersionKind {
-        group:   "",
+        group: "",
         version: "v1",
-        kind:    "Pod",
+        kind: "Pod",
     };
     const GVR: GroupVersionResource = GroupVersionResource {
-        group:    "",
-        version:  "v1",
+        group: "",
+        version: "v1",
         resource: "pods",
     };
     const SCOPE: Scope = Scope::Namespaced;
@@ -71,13 +71,17 @@ impl KubeResource for Pod {
     }
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }
-fn is_empty_spec(s: &PodSpec) -> bool { s == &PodSpec::default() }
+fn is_empty_meta(m: &ObjectMeta) -> bool {
+    m == &ObjectMeta::default()
+}
+fn is_empty_spec(s: &PodSpec) -> bool {
+    s == &PodSpec::default()
+}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::pod_spec::{Container, ContainerPort, PodPhase};
+    use super::*;
 
     #[test]
     fn pod_round_trips_with_typed_spec_and_status() {

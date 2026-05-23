@@ -135,9 +135,21 @@ pub enum SecretKind {
     SshKey,
 }
 
-fn default_interval()    -> String { "1m".to_string() }
-fn default_flux_path()   -> String { "./clusters".to_string() }
-fn default_flux_version()-> String { "v2.3.0".to_string() }
-fn default_argo_path()   -> String { "./argocd".to_string() }
-fn default_argo_version()-> String { "v2.13.0".to_string() }
-fn default_branch()      -> String { "main".to_string() }
+fn default_interval() -> String {
+    "1m".to_string()
+}
+fn default_flux_path() -> String {
+    "./clusters".to_string()
+}
+fn default_flux_version() -> String {
+    "v2.3.0".to_string()
+}
+fn default_argo_path() -> String {
+    "./argocd".to_string()
+}
+fn default_argo_version() -> String {
+    "v2.13.0".to_string()
+}
+fn default_branch() -> String {
+    "main".to_string()
+}

@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_substrate::{
-    DerivationCacheBackend, Drv, DrvHash, MaterializationReceipt, NodeId, ReceiptKind,
-    Stage, Verifier,
+    DerivationCacheBackend, Drv, DrvHash, MaterializationReceipt, NodeId, ReceiptKind, Stage,
+    Verifier,
 };
 
 use crate::drv_build::BuildBackend;
@@ -108,9 +108,7 @@ impl Roceiro for BuildBackendRoceiro {
             self.cache
                 .put_realisation(r)
                 .await
-                .map_err(|e| {
-                    RoceiroError::Backend(format!("cache put_realisation: {e}"))
-                })?;
+                .map_err(|e| RoceiroError::Backend(format!("cache put_realisation: {e}")))?;
         }
 
         // 3. Run each Verificacao in stage.verify; first failure
@@ -152,9 +150,7 @@ impl Roceiro for BuildBackendRoceiro {
 mod tests {
     use super::*;
     use crate::drv_build::FakeBuildBackend;
-    use engenho_substrate::{
-        FakeVerifier, MemoryDerivationCache, Verificacao, WorkloadShape,
-    };
+    use engenho_substrate::{FakeVerifier, MemoryDerivationCache, Verificacao, WorkloadShape};
 
     fn n(b: u8) -> NodeId {
         NodeId::new([b; 32])
@@ -178,11 +174,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_succeeds_for_simple_stage() {
-        let r = BuildBackendRoceiro::default_named(
-            arc_build(),
-            arc_cache(),
-            arc_verifier(),
-        );
+        let r = BuildBackendRoceiro::default_named(arc_build(), arc_cache(), arc_verifier());
         let receipt = r.materialize(&stage("x"), n(1)).await.unwrap();
         match receipt.kind {
             ReceiptKind::Shape(tag) => assert_eq!(tag, "oci_image"),
@@ -209,11 +201,8 @@ mod tests {
         st.verify.push(Verificacao::HashEquality {
             expected: engenho_substrate::NarHash::from_bytes(b"x"),
         });
-        let r = BuildBackendRoceiro::default_named(
-            arc_build(),
-            arc_cache(),
-            v as Arc<dyn Verifier>,
-        );
+        let r =
+            BuildBackendRoceiro::default_named(arc_build(), arc_cache(), v as Arc<dyn Verifier>);
         let err = r.materialize(&st, n(1)).await.unwrap_err();
         assert_eq!(err.kind(), "verification_denied");
     }
@@ -221,11 +210,7 @@ mod tests {
     #[tokio::test]
     async fn cache_receives_nars_and_realisations() {
         let cache = Arc::new(MemoryDerivationCache::new());
-        let r = BuildBackendRoceiro::default_named(
-            arc_build(),
-            cache.clone(),
-            arc_verifier(),
-        );
+        let r = BuildBackendRoceiro::default_named(arc_build(), cache.clone(), arc_verifier());
         r.materialize(&stage("x"), n(1)).await.unwrap();
         // FakeBuildBackend produces one synthetic NAR per output;
         // default = 1 ("out") since no outputs declared.
@@ -234,11 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn faithful_nodes_produce_identical_receipts() {
-        let r = BuildBackendRoceiro::default_named(
-            arc_build(),
-            arc_cache(),
-            arc_verifier(),
-        );
+        let r = BuildBackendRoceiro::default_named(arc_build(), arc_cache(), arc_verifier());
         let r1 = r.materialize(&stage("x"), n(1)).await.unwrap();
         let r2 = r.materialize(&stage("x"), n(2)).await.unwrap();
         // Faithful build → identical evidence on different nodes.
@@ -272,7 +253,8 @@ mod tests {
         st.verify.push(Verificacao::HashEquality {
             expected: engenho_substrate::NarHash::from_bytes(b"a"),
         });
-        st.verify.push(Verificacao::CrossNodeAgreement { quorum: 3 });
+        st.verify
+            .push(Verificacao::CrossNodeAgreement { quorum: 3 });
         st.verify.push(Verificacao::TameshiSigned {
             signer: "engenho-pki".into(),
         });
@@ -296,22 +278,14 @@ mod tests {
 
     #[tokio::test]
     async fn name_passes_through_from_constructor() {
-        let r = BuildBackendRoceiro::new(
-            "custom-roceiro",
-            arc_build(),
-            arc_cache(),
-            arc_verifier(),
-        );
+        let r =
+            BuildBackendRoceiro::new("custom-roceiro", arc_build(), arc_cache(), arc_verifier());
         assert_eq!(r.name(), "custom-roceiro");
     }
 
     #[tokio::test]
     async fn default_name_is_build_backend() {
-        let r = BuildBackendRoceiro::default_named(
-            arc_build(),
-            arc_cache(),
-            arc_verifier(),
-        );
+        let r = BuildBackendRoceiro::default_named(arc_build(), arc_cache(), arc_verifier());
         assert_eq!(r.name(), "build-backend");
     }
 }

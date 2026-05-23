@@ -92,11 +92,8 @@ pub trait FormatAdapter: Send + Sync + 'static {
     /// - [`AdapterError::MissingField`] / [`AdapterError::WrongType`]
     ///   when the manifest doesn't carry the metadata the adapter
     ///   expects.
-    fn extract_ref(
-        &self,
-        format: ResourceFormat,
-        body: &[u8],
-    ) -> Result<ResourceRef, AdapterError>;
+    fn extract_ref(&self, format: ResourceFormat, body: &[u8])
+    -> Result<ResourceRef, AdapterError>;
 
     /// Convert an operator-authored manifest to the Native CBOR
     /// envelope. The result is what the face's backend stores.
@@ -115,11 +112,7 @@ pub trait FormatAdapter: Send + Sync + 'static {
     /// # Errors
     ///
     /// As [`Self::extract_ref`].
-    fn from_native(
-        &self,
-        format: ResourceFormat,
-        native: &[u8],
-    ) -> Result<Vec<u8>, AdapterError>;
+    fn from_native(&self, format: ResourceFormat, native: &[u8]) -> Result<Vec<u8>, AdapterError>;
 }
 
 /// Decode the CBOR `NativeEnvelope` shape used internally. Helper
@@ -152,16 +145,11 @@ pub fn encode_envelope(reference: &ResourceRef, payload: &[u8]) -> Result<Vec<u8
         payload: &'a [u8],
     }
     let mut out = Vec::new();
-    ciborium::into_writer(
-        &Wire {
-            reference,
-            payload,
-        },
-        &mut out,
-    )
-    .map_err(|e| AdapterError::Encode {
-        format: ResourceFormat::Native,
-        reason: e.to_string(),
+    ciborium::into_writer(&Wire { reference, payload }, &mut out).map_err(|e| {
+        AdapterError::Encode {
+            format: ResourceFormat::Native,
+            reason: e.to_string(),
+        }
     })?;
     Ok(out)
 }
@@ -203,11 +191,7 @@ impl FormatAdapter for NativePassthroughAdapter {
         Ok(body.to_vec())
     }
 
-    fn from_native(
-        &self,
-        format: ResourceFormat,
-        native: &[u8],
-    ) -> Result<Vec<u8>, AdapterError> {
+    fn from_native(&self, format: ResourceFormat, native: &[u8]) -> Result<Vec<u8>, AdapterError> {
         if format != ResourceFormat::Native {
             return Err(AdapterError::UnsupportedFormat { format });
         }
@@ -254,11 +238,7 @@ impl FormatAdapter for K8sJsonAdapter {
         encode_envelope(&reference, body)
     }
 
-    fn from_native(
-        &self,
-        format: ResourceFormat,
-        native: &[u8],
-    ) -> Result<Vec<u8>, AdapterError> {
+    fn from_native(&self, format: ResourceFormat, native: &[u8]) -> Result<Vec<u8>, AdapterError> {
         if format != ResourceFormat::Json {
             return Err(AdapterError::UnsupportedFormat { format });
         }
@@ -310,11 +290,10 @@ impl FormatAdapter for HclAdapter {
             format,
             reason: format!("hcl body is not utf-8: {e}"),
         })?;
-        let body_value: hcl::Body =
-            hcl::from_str(source).map_err(|e| AdapterError::Parse {
-                format,
-                reason: e.to_string(),
-            })?;
+        let body_value: hcl::Body = hcl::from_str(source).map_err(|e| AdapterError::Parse {
+            format,
+            reason: e.to_string(),
+        })?;
         extract_nomad_job_ref(&body_value)
     }
 
@@ -323,11 +302,7 @@ impl FormatAdapter for HclAdapter {
         encode_envelope(&reference, body)
     }
 
-    fn from_native(
-        &self,
-        format: ResourceFormat,
-        native: &[u8],
-    ) -> Result<Vec<u8>, AdapterError> {
+    fn from_native(&self, format: ResourceFormat, native: &[u8]) -> Result<Vec<u8>, AdapterError> {
         if format != ResourceFormat::Hcl {
             return Err(AdapterError::UnsupportedFormat { format });
         }
@@ -357,28 +332,23 @@ fn extract_nomad_job_ref(body: &hcl::Body) -> Result<ResourceRef, AdapterError> 
             .as_str()
             .to_string();
         // Look for an inner `namespace = "<ns>"` attribute.
-        let namespace = block
-            .body
-            .iter()
-            .find_map(|s| match s {
-                Structure::Attribute(attr) if attr.key.as_str() == "namespace" => {
-                    if let hcl::Expression::String(ns) = &attr.expr {
-                        Some(ns.clone())
-                    } else {
-                        None
-                    }
+        let namespace = block.body.iter().find_map(|s| match s {
+            Structure::Attribute(attr) if attr.key.as_str() == "namespace" => {
+                if let hcl::Expression::String(ns) = &attr.expr {
+                    Some(ns.clone())
+                } else {
+                    None
                 }
-                _ => None,
-            });
+            }
+            _ => None,
+        });
         return Ok(ResourceRef {
             kind: "Job".to_string(),
             name,
             namespace,
         });
     }
-    Err(AdapterError::MissingField {
-        field: "job block",
-    })
+    Err(AdapterError::MissingField { field: "job block" })
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -428,11 +398,7 @@ impl FormatAdapter for K8sYamlAdapter {
         encode_envelope(&reference, body)
     }
 
-    fn from_native(
-        &self,
-        format: ResourceFormat,
-        native: &[u8],
-    ) -> Result<Vec<u8>, AdapterError> {
+    fn from_native(&self, format: ResourceFormat, native: &[u8]) -> Result<Vec<u8>, AdapterError> {
         if format != ResourceFormat::Yaml {
             return Err(AdapterError::UnsupportedFormat { format });
         }
@@ -489,10 +455,7 @@ impl AdapterRegistry {
     ///
     /// Returns [`AdapterError::UnsupportedFormat`] when no adapter
     /// in the registry claims this format.
-    pub fn select(
-        &self,
-        format: ResourceFormat,
-    ) -> Result<Arc<dyn FormatAdapter>, AdapterError> {
+    pub fn select(&self, format: ResourceFormat) -> Result<Arc<dyn FormatAdapter>, AdapterError> {
         self.by_format
             .get(&format)
             .cloned()
@@ -527,11 +490,8 @@ impl Default for AdapterRegistry {
 
 impl std::fmt::Debug for AdapterRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut names: Vec<(ResourceFormat, &str)> = self
-            .by_format
-            .iter()
-            .map(|(k, v)| (*k, v.name()))
-            .collect();
+        let mut names: Vec<(ResourceFormat, &str)> =
+            self.by_format.iter().map(|(k, v)| (*k, v.name())).collect();
         names.sort_by_key(|(_, n)| *n);
         f.debug_struct("AdapterRegistry")
             .field("formats", &names)
@@ -592,9 +552,7 @@ mod tests {
     // ── Helpers ───────────────────────────────────────────────────
 
     fn pod_yaml(name: &str, ns: Option<&str>) -> Vec<u8> {
-        let mut s = format!(
-            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n"
-        );
+        let mut s = format!("apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n");
         if let Some(n) = ns {
             s.push_str(&format!("  namespace: {n}\n"));
         }
@@ -639,9 +597,7 @@ mod tests {
         let r = ResourceRef::namespaced("Pod", "nginx", "default");
         let env = encode_envelope(&r, b"payload").unwrap();
         let adapter = NativePassthroughAdapter;
-        let extracted = adapter
-            .extract_ref(ResourceFormat::Native, &env)
-            .unwrap();
+        let extracted = adapter.extract_ref(ResourceFormat::Native, &env).unwrap();
         assert_eq!(extracted, r);
         let nat = adapter.to_native(ResourceFormat::Native, &env).unwrap();
         assert_eq!(nat, env);
@@ -881,9 +837,7 @@ mod tests {
     #[test]
     fn hcl_adapter_extracts_ref_from_namespaced_job() {
         let body = nomad_job_hcl("web", Some("team-a"));
-        let r = HclAdapter
-            .extract_ref(ResourceFormat::Hcl, &body)
-            .unwrap();
+        let r = HclAdapter.extract_ref(ResourceFormat::Hcl, &body).unwrap();
         assert_eq!(r.kind, "Job");
         assert_eq!(r.name, "web");
         assert_eq!(r.namespace.as_deref(), Some("team-a"));
@@ -892,9 +846,7 @@ mod tests {
     #[test]
     fn hcl_adapter_extracts_ref_from_no_namespace_job() {
         let body = nomad_job_hcl("web", None);
-        let r = HclAdapter
-            .extract_ref(ResourceFormat::Hcl, &body)
-            .unwrap();
+        let r = HclAdapter.extract_ref(ResourceFormat::Hcl, &body).unwrap();
         assert_eq!(r.kind, "Job");
         assert_eq!(r.name, "web");
         assert!(r.namespace.is_none());
@@ -904,9 +856,7 @@ mod tests {
     fn hcl_adapter_round_trips_body_through_native() {
         let body = nomad_job_hcl("web", Some("default"));
         let env = HclAdapter.to_native(ResourceFormat::Hcl, &body).unwrap();
-        let back = HclAdapter
-            .from_native(ResourceFormat::Hcl, &env)
-            .unwrap();
+        let back = HclAdapter.from_native(ResourceFormat::Hcl, &env).unwrap();
         assert_eq!(back, body);
     }
 

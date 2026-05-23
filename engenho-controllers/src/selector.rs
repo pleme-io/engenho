@@ -70,7 +70,8 @@ mod tests {
     #[test]
     fn matches_labels_partial_match_is_match() {
         // K8s rule: selector is a subset condition.
-        let pod = json!({"metadata": {"labels": {"app": "podinfo", "tier": "backend", "extra": "x"}}});
+        let pod =
+            json!({"metadata": {"labels": {"app": "podinfo", "tier": "backend", "extra": "x"}}});
         let sel = json!({"app": "podinfo"});
         assert!(matches_labels(&pod, &sel));
     }

@@ -20,8 +20,8 @@
 //! typed policy. The default (Eager) preserves the old behavior;
 //! consumers opt into the others when warranted.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Promotion strategy applied on every `get_*` hit.
 #[derive(Clone, Debug)]
@@ -81,7 +81,7 @@ impl PromotionGate {
     /// and 1). `None` = don't promote.
     pub fn decide(&self, ctx: PromotionContext) -> Option<usize> {
         if ctx.source_tier == 0 {
-            return None;  // already at fastest tier
+            return None; // already at fastest tier
         }
         match self.policy {
             PromotionPolicy::Eager => Some(ctx.source_tier),
@@ -99,11 +99,7 @@ impl PromotionGate {
             }
             PromotionPolicy::OnlyTo(max) => {
                 let target = ctx.source_tier.min(max + 1);
-                if target == 0 {
-                    None
-                } else {
-                    Some(target)
-                }
+                if target == 0 { None } else { Some(target) }
             }
         }
     }
@@ -129,7 +125,7 @@ mod tests {
     #[test]
     fn eager_promotes_to_source_tier() {
         let g = PromotionGate::new(PromotionPolicy::Eager);
-        assert_eq!(g.decide(ctx(0, 3)), None);  // no promotion needed
+        assert_eq!(g.decide(ctx(0, 3)), None); // no promotion needed
         assert_eq!(g.decide(ctx(1, 3)), Some(1));
         assert_eq!(g.decide(ctx(2, 3)), Some(2));
     }
