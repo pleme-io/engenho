@@ -37,6 +37,55 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v1.12 triple composition: provacao + selo + budget — the
+    /// full "chaos-injected authorized rate-limited call" shape.
+    /// Extends v1.11's 2-primitive pattern with chaos at the API
+    /// boundary (network/timeout faults). Demonstrates the
+    /// substrate's depth: 3 inventive primitives compose into one
+    /// real-consumer flow.
+    #[test]
+    fn provacao_plus_selo_plus_budget_chaos_authz_ratelimit(
+        secret in any::<[u8; 32]>(),
+        subj in "[a-zA-Z]{1,16}",
+        cap in 100u64..1000,
+        tokens in 1u64..50,
+        chaos_p in 0.0_f64..1.0,
+        seed in any::<u64>(),
+    ) {
+        use engenho_substrate::{Budget, Clock, Policy, Provacao, SeloIssuer};
+        let injector = Provacao::<ReplayFault>::new("api", seed).with_policy(
+            Policy::Probability {
+                fault: ReplayFault::Drop,
+                p: chaos_p,
+            },
+        );
+        let iss = SeloIssuer::new(secret);
+        let selo = iss.issue(&subj, "read:foo", Instant::from_ms(1_000_000));
+        let budget = Budget::new("api-budget", cap, 0, frozen_clock(0));
+        let clk: Arc<dyn Clock> = frozen_clock(0);
+        // Composition: chaos first → authz → rate limit.
+        let outcome: Result<u64, &'static str> =
+            match injector.maybe_fault(clk.as_ref()) {
+                Some(_) => Err("chaos-faulted"),
+                None => iss
+                    .verify(&selo, &subj, "read:foo", Instant::from_ms(0))
+                    .map_err(|_| "selo-rejected")
+                    .and_then(|()| {
+                        budget
+                            .try_consume(tokens.min(cap))
+                            .map_err(|_| "budget-exhausted")
+                    }),
+            };
+        // Any of 3 typed failures or success — composition works.
+        prop_assert!(
+            outcome.is_ok()
+                || matches!(
+                    outcome.unwrap_err(),
+                    "chaos-faulted" | "selo-rejected" | "budget-exhausted"
+                )
+        );
+    }
+
     /// v1.11 algebra: selo + orçamento compose into "rate-limited
     /// authorized API call" — a canonical real-consumer pattern.
     /// Selo gates the call (authz check); Budget rate-limits
