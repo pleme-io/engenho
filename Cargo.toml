@@ -20,6 +20,7 @@ members = [
   "engenho-substrate-props",
   "engenho-sui-typescape",
   "engenho-fonte",
+  "engenho-fonte-cli",
 ]
 
 [workspace.package]

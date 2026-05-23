@@ -1196,6 +1196,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-fonte-cli"
+version = "0.1.4"
+dependencies = [
+ "async-trait",
+ "clap",
+ "engenho-fonte",
+ "engenho-revoada",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "engenho-kube-client"
 version = "0.1.4"
 dependencies = [
