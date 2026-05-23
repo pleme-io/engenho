@@ -13,7 +13,12 @@ authors.workspace = true
 description = "engenho-substrate — shared helpers extracted to the third-site rule. atomic_write (fsync-anchored tmp+rename), magic-headered blob encoding, file-format versioning. The substrate building blocks that compose under engenho-store::persistence, kasou's machine-identifier, and tend's daemon state."
 
 [dependencies]
+async-trait        = { workspace = true }
 thiserror          = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
+tokio              = { workspace = true, features = ["sync", "macros", "rt"] }
 blake3             = "1"
+
+[dev-dependencies]
+tokio              = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread"] }
