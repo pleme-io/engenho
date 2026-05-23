@@ -60,12 +60,8 @@ proptest_with_env! {
         prop_assert_eq!(snap.position, n_consume.min(n_events));
         prop_assert_eq!(snap.remaining, n_events - n_consume.min(n_events));
         prop_assert_eq!(snap.is_done, n_consume >= n_events);
-        // Through Mirante.
-        let chan: Arc<ObservationChannel<ReplayCursorSnapshot>> = Arc::new(
-            ObservationChannel::new(snap.clone(), frozen_clock(0)),
-        );
-        let mut m = Mirante::new();
-        m.register("cursor", chan);
+        // Through Mirante (v1.07 helper).
+        let m = engenho_substrate_props::helpers::fresh_mirante_publishing("cursor", &cursor);
         let all = m.snapshot_all();
         prop_assert_eq!(&all["cursor"]["name"], &serde_json::json!("test-cursor"));
         prop_assert_eq!(&all["cursor"]["len"], &serde_json::json!(n_events));
@@ -98,12 +94,8 @@ proptest_with_env! {
         let snap: ChildCountSnapshot = Observable::snapshot(&graph);
         prop_assert_eq!(snap.name, "lineage-graph");
         prop_assert_eq!(snap.child_count, n_nodes);
-        // Through Mirante.
-        let chan: Arc<ObservationChannel<ChildCountSnapshot>> = Arc::new(
-            ObservationChannel::new(snap.clone(), frozen_clock(0)),
-        );
-        let mut m = Mirante::new();
-        m.register("lineage", chan);
+        // Through Mirante (v1.07 helper).
+        let m = engenho_substrate_props::helpers::fresh_mirante_publishing("lineage", &graph);
         let all = m.snapshot_all();
         prop_assert_eq!(&all["lineage"]["name"], &serde_json::json!("lineage-graph"));
         prop_assert_eq!(&all["lineage"]["child_count"], &serde_json::json!(n_nodes));
@@ -136,14 +128,9 @@ proptest_with_env! {
         let snap: ChildCountSnapshot = Observable::snapshot(&plantio);
         prop_assert_eq!(snap.name, "plantio");
         prop_assert_eq!(snap.child_count, n_stages);
-        // Through the Mirante registry — substrate-internal channels
-        // surface the Plantio snapshot as JSON alongside any other
-        // Observable's snapshot.
-        let chan: Arc<ObservationChannel<ChildCountSnapshot>> = Arc::new(
-            ObservationChannel::new(snap.clone(), frozen_clock(0)),
-        );
-        let mut m = Mirante::new();
-        m.register("plantio", chan);
+        // Through the Mirante registry (v1.07 helper) — substrate-internal
+        // channels surface the Plantio snapshot as JSON.
+        let m = engenho_substrate_props::helpers::fresh_mirante_publishing("plantio", &plantio);
         let all = m.snapshot_all();
         prop_assert_eq!(&all["plantio"]["name"], &serde_json::json!("plantio"));
         prop_assert_eq!(&all["plantio"]["child_count"], &serde_json::json!(n_stages));

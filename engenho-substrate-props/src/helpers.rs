@@ -79,3 +79,36 @@ pub fn sample_receipt(subject: [u8; 32], node_byte: u8) -> MaterializationReceip
 pub fn frozen_clock(t_ms: u64) -> Arc<FrozenClock> {
     Arc::new(FrozenClock::at(t_ms))
 }
+
+/// Construct a fresh `Mirante` registry with one ObservationChannel
+/// registered under `name`, publishing the given observable's
+/// initial snapshot. Extracted per the third-site rule —
+/// `plantio_observable_publishes_to_mirante` (v0.97),
+/// `lineage_graph_observable_publishes_to_mirante` (v1.02),
+/// `replay_cursor_observable_publishes_to_mirante` (v1.03) all
+/// shared the exact same 4-line setup.
+///
+/// ## Usage
+///
+/// ```ignore
+/// use engenho_substrate_props::helpers::fresh_mirante_publishing;
+///
+/// let plantio = Plantio::new();
+/// let m = fresh_mirante_publishing("plantio", &plantio);
+/// let all = m.snapshot_all();
+/// assert_eq!(all["plantio"]["child_count"], 0);
+/// ```
+#[must_use]
+pub fn fresh_mirante_publishing<O>(name: &'static str, observable: &O) -> engenho_substrate::Mirante
+where
+    O: engenho_substrate::Observable,
+{
+    let snap = engenho_substrate::Observable::snapshot(observable);
+    let chan = Arc::new(engenho_substrate::ObservationChannel::new(
+        snap,
+        frozen_clock(0),
+    ));
+    let mut m = engenho_substrate::Mirante::new();
+    m.register(name, chan);
+    m
+}
