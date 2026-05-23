@@ -328,8 +328,10 @@ contexts:
         let conn = kc.resolve_connection().unwrap();
         assert_eq!(conn.server(), "https://api.example.com");
         assert_eq!(
-            conn.bearer_token().unwrap().as_deref(),
-            Some("secret-token-value")
+            conn.bearer_token()
+                .unwrap()
+                .map(|r| r.expose_secret().clone()),
+            Some("secret-token-value".to_string())
         );
     }
 

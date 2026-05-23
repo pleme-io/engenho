@@ -903,6 +903,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "engenho-substrate",
  "engenho-types",
  "futures-core",
  "futures-util",

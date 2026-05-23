@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use engenho_substrate::Risca;
 use engenho_types::auth::{BytesOrPath, KubeAuth, TokenSource};
 use engenho_types::error::KubeError;
 use reqwest::Client;
@@ -79,23 +80,34 @@ impl Connection {
     /// Resolve the bearer token if applicable. Re-reads files each
     /// call so rotated SA tokens are picked up.
     ///
+    /// The returned token is wrapped in [`Risca`] — accidental
+    /// leakage via `Debug` / `Display` / `Serialize` is impossible
+    /// at the type level. The single legitimate exposure path is
+    /// `.expose_secret()` (used internally by [`Self::auth_header`]
+    /// when handing the value to reqwest).
+    ///
     /// # Errors
     ///
     /// Returns [`KubeError::Auth`] when a file-backed token can't be read.
-    pub fn bearer_token(&self) -> Result<Option<String>, KubeError> {
+    pub fn bearer_token(&self) -> Result<Option<Risca<String>>, KubeError> {
         match &*self.auth {
-            KubeAuth::BearerToken(TokenSource::Inline { token }) => Ok(Some(token.clone())),
+            KubeAuth::BearerToken(TokenSource::Inline { token }) => {
+                Ok(Some(Risca::new(token.clone())))
+            }
             KubeAuth::BearerToken(TokenSource::File { path }) => {
                 let raw = std::fs::read_to_string(path).map_err(|e| {
                     KubeError::Auth(format!("read token file {}: {e}", path.display()))
                 })?;
-                Ok(Some(raw.trim().to_string()))
+                Ok(Some(Risca::new(raw.trim().to_string())))
             }
             _ => Ok(None),
         }
     }
 
-    /// Apply `Authorization: Bearer …` if applicable.
+    /// Apply `Authorization: Bearer …` if applicable. The single
+    /// substrate-blessed exposure site for the bearer token —
+    /// `.expose_secret()` is called inline to hand the value to
+    /// reqwest's `bearer_auth`.
     ///
     /// # Errors
     ///
@@ -105,7 +117,7 @@ impl Connection {
         mut rb: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, KubeError> {
         if let Some(t) = self.bearer_token()? {
-            rb = rb.bearer_auth(t);
+            rb = rb.bearer_auth(t.expose_secret());
         }
         Ok(rb)
     }
@@ -145,7 +157,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(c.bearer_token().unwrap().as_deref(), Some("abc123"));
+        assert_eq!(
+            c.bearer_token().unwrap().map(|r| r.expose_secret().clone()),
+            Some("abc123".to_string())
+        );
     }
 
     #[test]
@@ -158,8 +173,35 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(c.bearer_token().unwrap().as_deref(), Some("secret-token"));
+        assert_eq!(
+            c.bearer_token().unwrap().map(|r| r.expose_secret().clone()),
+            Some("secret-token".to_string())
+        );
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn bearer_token_debug_output_does_not_leak_inner() {
+        // The Risca<String> wrapper makes leakage via Debug impossible
+        // at the type level — proves the substrate guarantee at the
+        // kube-client layer.
+        let secret = "super-secret-bearer-9f3a";
+        let c = Connection::new(
+            "https://api.example.com",
+            KubeAuth::BearerToken(TokenSource::Inline {
+                token: secret.into(),
+            }),
+            None,
+        )
+        .unwrap();
+        let t = c.bearer_token().unwrap();
+        let dbg = format!("{t:?}");
+        assert!(
+            !dbg.contains(secret),
+            "Debug output leaked the bearer secret: {dbg}"
+        );
+        // Sanity: the wrapper IS present in the Debug output.
+        assert!(dbg.contains("RISCA"));
     }
 
     #[test]
