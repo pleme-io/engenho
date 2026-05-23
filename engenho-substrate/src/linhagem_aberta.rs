@@ -81,6 +81,36 @@ impl<T> Default for LineageGraph<T> {
     }
 }
 
+/// LineageGraph impl Named + Observable (v1.01 SSC) — exposes
+/// `ChildCountSnapshot { name: "lineage-graph", child_count: node count }`.
+/// Joins TieredCache + CompositeShapeRenderer + ChainedVerifier +
+/// Plantio + Provacao as the 6th ChildCountSnapshot consumer.
+///
+/// Hand-rolled (not via define_named! macro) because the existing
+/// `define_named!(Type<T: Bound>, "lit")` form only supports single-token
+/// bounds (`T: Send`); LineageGraph's `T: Fingerprint + Clone + ...`
+/// multi-bound shape doesn't fit. If a 3rd literal-name multi-bound
+/// generic appears, extract `define_named_multi!` (mirrors v0.94's
+/// `impl_named_field_generic!`).
+impl<T: Fingerprint + Clone + Send + Sync + 'static> crate::named::Named for LineageGraph<T> {
+    fn name(&self) -> &'static str {
+        "lineage-graph"
+    }
+}
+
+impl<T: Fingerprint + Clone + Send + Sync + 'static> crate::mirante::Observable
+    for LineageGraph<T>
+{
+    type Snapshot = crate::mirante::ChildCountSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        crate::mirante::ChildCountSnapshot {
+            name: "lineage-graph",
+            child_count: self.len(),
+        }
+    }
+}
+
 impl<T: Fingerprint + Clone> LineageGraph<T> {
     /// Empty graph.
     #[must_use]
