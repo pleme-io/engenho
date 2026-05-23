@@ -30,6 +30,7 @@ pub mod compose_ir;
 pub mod derivation;
 pub mod disposable;
 pub mod drv_disk;
+pub mod error_kind;
 pub mod gossip_ledger;
 pub mod ledger;
 pub mod magic_blob;
@@ -63,6 +64,7 @@ pub use compose_ir::{
     ComposeError, ComposeHealthcheck, ComposeIr, ComposeService, ComposeStack,
 };
 pub use disposable::{Disposable, DisposableError, Transient};
+pub use error_kind::ErrorKind;
 pub use gossip_ledger::{
     FakeGossipTransport, GossipBroadcast, GossipBroadcaster, GossipChannel,
     GossipDelivery, GossipError, GossipLedger,

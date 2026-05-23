@@ -175,15 +175,11 @@ pub enum ShapeError {
     UnsupportedShape(String),
 }
 
-impl ShapeError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::InvalidDrv(_) => "invalid_drv",
-            Self::UnsupportedShape(_) => "unsupported_shape",
-        }
+crate::impl_error_kind! {
+    ShapeError {
+        (Backend(_)) => "backend",
+        (InvalidDrv(_)) => "invalid_drv",
+        (UnsupportedShape(_)) => "unsupported_shape",
     }
 }
 
