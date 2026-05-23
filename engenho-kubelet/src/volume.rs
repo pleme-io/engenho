@@ -83,15 +83,11 @@ pub enum VolumeError {
     Conflict(String),
 }
 
-impl VolumeError {
-    /// Stable identifier for telemetry / SDK dispatch.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::UnsupportedStorageClass(_) => "unsupported_storage_class",
-            Self::Conflict(_) => "conflict",
-        }
+engenho_substrate::impl_error_kind! {
+    VolumeError {
+        (Backend(_)) => "backend",
+        (UnsupportedStorageClass(_)) => "unsupported_storage_class",
+        (Conflict(_)) => "conflict",
     }
 }
 

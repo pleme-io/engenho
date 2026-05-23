@@ -47,13 +47,9 @@ pub enum MetricsError {
     Backend(String),
 }
 
-impl MetricsError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-        }
+engenho_substrate::impl_error_kind! {
+    MetricsError {
+        (Backend(_)) => "backend",
     }
 }
 

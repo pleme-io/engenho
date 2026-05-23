@@ -237,15 +237,11 @@ pub enum CacheError {
     NotFound(String),
 }
 
-impl CacheError {
-    /// Stable identifier for telemetry / cross-language SDK dispatch.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::HashMismatch { .. } => "hash_mismatch",
-            Self::NotFound(_) => "not_found",
-        }
+crate::impl_error_kind! {
+    CacheError {
+        (Backend(_)) => "backend",
+        { HashMismatch { .. } } => "hash_mismatch",
+        (NotFound(_)) => "not_found",
     }
 }
 

@@ -42,14 +42,10 @@ pub enum VerifierError {
     InvalidRef(String),
 }
 
-impl VerifierError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::InvalidRef(_) => "invalid_ref",
-        }
+engenho_substrate::impl_error_kind! {
+    VerifierError {
+        (Backend(_)) => "backend",
+        (InvalidRef(_)) => "invalid_ref",
     }
 }
 

@@ -89,14 +89,10 @@ pub enum NetworkPolicyError {
     InvalidPolicy(String),
 }
 
-impl NetworkPolicyError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::InvalidPolicy(_) => "invalid_policy",
-        }
+engenho_substrate::impl_error_kind! {
+    NetworkPolicyError {
+        (Backend(_)) => "backend",
+        (InvalidPolicy(_)) => "invalid_policy",
     }
 }
 

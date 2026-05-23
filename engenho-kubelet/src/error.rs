@@ -24,15 +24,11 @@ pub enum KubeletError {
     },
 }
 
-impl KubeletError {
-    /// Stable identifier for telemetry / cross-language SDK dispatch.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Store(_) => "store",
-            Self::Backend(_) => "backend",
-            Self::InvalidPod { .. } => "invalid_pod",
-        }
+engenho_substrate::impl_error_kind! {
+    KubeletError {
+        (Store(_)) => "store",
+        (Backend(_)) => "backend",
+        { InvalidPod { .. } } => "invalid_pod",
     }
 }
 

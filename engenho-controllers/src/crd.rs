@@ -95,14 +95,10 @@ pub enum CrdError {
     },
 }
 
-impl CrdError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Conflict(_) => "conflict",
-            Self::InvalidSchema { .. } => "invalid_schema",
-        }
+engenho_substrate::impl_error_kind! {
+    CrdError {
+        (Conflict(_)) => "conflict",
+        { InvalidSchema { .. } } => "invalid_schema",
     }
 }
 

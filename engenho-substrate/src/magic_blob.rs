@@ -45,18 +45,14 @@ pub enum MagicBlobError {
     Io(String),
 }
 
-impl MagicBlobError {
-    /// Stable identifier for telemetry / SDK dispatch.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::BadMagic => "bad_magic",
-            Self::Truncated => "truncated",
-            Self::HashMismatch => "hash_mismatch",
-            Self::Encode(_) => "encode",
-            Self::Decode(_) => "decode",
-            Self::Io(_) => "io",
-        }
+crate::impl_error_kind! {
+    MagicBlobError {
+        BadMagic => "bad_magic",
+        Truncated => "truncated",
+        HashMismatch => "hash_mismatch",
+        (Encode(_)) => "encode",
+        (Decode(_)) => "decode",
+        (Io(_)) => "io",
     }
 }
 

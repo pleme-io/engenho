@@ -59,15 +59,11 @@ pub enum RoceiroError {
     },
 }
 
-impl RoceiroError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-            Self::UnsupportedStage { .. } => "unsupported_stage",
-            Self::VerificationDenied { .. } => "verification_denied",
-        }
+engenho_substrate::impl_error_kind! {
+    RoceiroError {
+        (Backend(_)) => "backend",
+        { UnsupportedStage { .. } } => "unsupported_stage",
+        { VerificationDenied { .. } } => "verification_denied",
     }
 }
 
