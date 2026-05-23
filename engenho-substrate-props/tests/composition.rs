@@ -37,6 +37,46 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v1.01 SSC: LineageGraph is now Observable + plugs into a
+    /// mirante registry. Asserts the snapshot reports the right
+    /// name + node_count + the registry surfaces it as JSON.
+    /// Pairs with v0.97's plantio test in shape; LineageGraph is the
+    /// 6th ChildCountSnapshot consumer.
+    #[test]
+    fn lineage_graph_observable_publishes_to_mirante(n_nodes in 0usize..6) {
+        use engenho_substrate::{
+            ChildCountSnapshot, LineageGraph, MiranteSnapshot, Observable,
+        };
+        let mut graph: LineageGraph<TransitionSample> = LineageGraph::new();
+        let mut prev: Option<[u8; 32]> = None;
+        for i in 0..n_nodes {
+            let sample = TransitionSample {
+                from: format!("s{i}"),
+                to: format!("s{}", i + 1),
+            };
+            let causes = prev
+                .map(|p| std::iter::once(p).collect())
+                .unwrap_or_default();
+            prev = Some(graph.append(sample, causes).unwrap());
+        }
+        // Direct Observable call.
+        let snap: ChildCountSnapshot = Observable::snapshot(&graph);
+        prop_assert_eq!(snap.name, "lineage-graph");
+        prop_assert_eq!(snap.child_count, n_nodes);
+        // Through Mirante.
+        let chan: Arc<ObservationChannel<ChildCountSnapshot>> = Arc::new(
+            ObservationChannel::new(snap.clone(), frozen_clock(0)),
+        );
+        let mut m = Mirante::new();
+        m.register("lineage", chan);
+        let all = m.snapshot_all();
+        prop_assert_eq!(&all["lineage"]["name"], &serde_json::json!("lineage-graph"));
+        prop_assert_eq!(&all["lineage"]["child_count"], &serde_json::json!(n_nodes));
+        // Snapshot-of-snapshots.
+        let m_snap: MiranteSnapshot = Observable::snapshot(&m);
+        prop_assert_eq!(m_snap.channel_count, 1);
+    }
+
     /// v0.96 SSC: Plantio is now Observable + plugs into a mirante
     /// registry alongside runtime wrappers. Asserts the snapshot
     /// carries the right name + stage count + the mirante registry
