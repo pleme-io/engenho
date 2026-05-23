@@ -57,6 +57,7 @@ mod attester;
 mod change;
 mod conduit;
 mod controller;
+mod defsistema;
 mod error;
 mod evaluator;
 mod federation;
@@ -96,6 +97,9 @@ pub use controller::{
     MockTopologyReconciler, PromessaReconciler, SystemController, TopologyReconciler,
     mock_system_controller,
 };
+#[cfg(feature = "with-sui-eval")]
+pub use defsistema::parse_nix;
+pub use defsistema::{SistemaBuilder, parse_json, to_authoring_form};
 pub use error::{FonteError, FonteResult};
 pub use evaluator::{Evaluator, MockEvaluator};
 pub use federation::{FederatedWatcher, FederationBroker};
