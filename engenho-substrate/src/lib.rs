@@ -50,6 +50,7 @@ pub mod provacao;
 pub mod quorum;
 pub mod receipt;
 pub mod relogio;
+pub mod replay;
 pub mod retrying_cache;
 pub mod roca;
 pub mod shape;
@@ -97,6 +98,7 @@ pub use provacao::{Policy, Provacao};
 pub use quorum::{QuorumOutcome, QuorumTracker};
 pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};
 pub use relogio::{Clock, FrozenClock, HlcClock, Instant, LogicalClock, WallClock};
+pub use replay::{ReplayCursor, replay_into, replay_until};
 pub use retrying_cache::{BackoffConfig, RetryingCacheBackend};
 pub use roca::{
     ConfirmacaoPolicy, JobTarget, MaterializationJob, Placement, Plantio, PlantioError, Stage,
