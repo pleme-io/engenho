@@ -37,6 +37,41 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v0.99 SSC composition test (added v1.03): ReplayCursor<E> is
+    /// Observable + publishes ReplayCursorSnapshot through a mirante
+    /// channel. Asserts the cursor's progress metadata (name +
+    /// position + len + remaining + is_done) reaches the registry.
+    /// Pairs with v0.97 plantio + v1.02 lineage in composition shape.
+    #[test]
+    fn replay_cursor_observable_publishes_to_mirante(
+        n_events in 1usize..8,
+        n_consume in 0usize..4,
+    ) {
+        use engenho_substrate::{Observable, ReplayCursor, ReplayCursorSnapshot};
+        let events: Vec<u32> = (0..n_events as u32).collect();
+        let cursor = ReplayCursor::new("test-cursor", events);
+        for _ in 0..n_consume.min(n_events) {
+            cursor.next();
+        }
+        // Direct Observable call.
+        let snap: ReplayCursorSnapshot = Observable::snapshot(&cursor);
+        prop_assert_eq!(snap.name, "test-cursor");
+        prop_assert_eq!(snap.len, n_events);
+        prop_assert_eq!(snap.position, n_consume.min(n_events));
+        prop_assert_eq!(snap.remaining, n_events - n_consume.min(n_events));
+        prop_assert_eq!(snap.is_done, n_consume >= n_events);
+        // Through Mirante.
+        let chan: Arc<ObservationChannel<ReplayCursorSnapshot>> = Arc::new(
+            ObservationChannel::new(snap.clone(), frozen_clock(0)),
+        );
+        let mut m = Mirante::new();
+        m.register("cursor", chan);
+        let all = m.snapshot_all();
+        prop_assert_eq!(&all["cursor"]["name"], &serde_json::json!("test-cursor"));
+        prop_assert_eq!(&all["cursor"]["len"], &serde_json::json!(n_events));
+        prop_assert_eq!(&all["cursor"]["position"], &serde_json::json!(n_consume.min(n_events)));
+    }
+
     /// v1.01 SSC: LineageGraph is now Observable + plugs into a
     /// mirante registry. Asserts the snapshot reports the right
     /// name + node_count + the registry surfaces it as JSON.
