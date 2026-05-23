@@ -39,48 +39,23 @@ use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
 use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
 
-/// Trait abstracting "what time is it now" — lets tests pin time.
-pub trait Clock: Send + Sync {
-    /// Unix timestamp seconds since epoch.
-    fn now_unix(&self) -> u64;
-}
+// Clock primitives previously defined here have been consolidated to
+// engenho_substrate::relogio (Clock + WallClock + FrozenClock). The
+// substrate trait carries unix_secs() as a default method so the
+// migration is a one-line swap at every call site (was now_unix() →
+// is unix_secs()). Tests construct FrozenClock::at(ms) where ms is
+// physical milliseconds since epoch (multiply by 1_000 when porting
+// from second-precision tests).
+pub use engenho_substrate::{Clock, FrozenClock, WallClock};
 
-/// Real clock — wraps `std::time::SystemTime`.
-pub struct SystemClock;
+/// Backwards-compat alias for the previous `SystemClock` export.
+pub type SystemClock = WallClock;
 
-impl Clock for SystemClock {
-    fn now_unix(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
-}
-
-/// Fixed-time clock for tests.
-pub struct FixedClock {
-    pub now: std::sync::Mutex<u64>,
-}
-
-impl FixedClock {
-    /// New clock at unix timestamp `t`.
-    #[must_use]
-    pub fn new(t: u64) -> Self {
-        Self {
-            now: std::sync::Mutex::new(t),
-        }
-    }
-    /// Advance the clock by `secs`.
-    pub fn advance(&self, secs: u64) {
-        let mut n = self.now.lock().unwrap();
-        *n += secs;
-    }
-}
-
-impl Clock for FixedClock {
-    fn now_unix(&self) -> u64 {
-        *self.now.lock().unwrap()
-    }
+/// Backwards-compat constructor — tests should migrate to
+/// [`FrozenClock::at`] directly (ms-precision instead of seconds).
+#[must_use]
+pub fn fixed_clock(unix_secs: u64) -> std::sync::Arc<FrozenClock> {
+    std::sync::Arc::new(FrozenClock::at(unix_secs * 1000))
 }
 
 // =================================================================
@@ -271,7 +246,7 @@ impl Controller for JobController {
 
 /// CronJob controller — creates Jobs at scheduled times.
 ///
-/// `spec.nextRunUnix` is the trigger; when `clock.now_unix() >=
+/// `spec.nextRunUnix` is the trigger; when `clock.unix_secs() >=
 /// nextRunUnix`, a Job is created + the CronJob's status is
 /// patched with `lastRunUnix`.
 pub struct CronJobController {
@@ -336,7 +311,8 @@ impl Controller for CronJobController {
         let mut report = ReconcileReport::default();
         report.objects_examined = cjs.len();
 
-        let now = self.clock.now_unix();
+        let now = self.clock.unix_secs();
+        // `now` is unix seconds — `spec.nextRunUnix` is in the same unit.
 
         for (cj_key, cj_value) in &cjs {
             let Some(next) = Self::next_run_unix(cj_value) else {
@@ -490,18 +466,28 @@ mod tests {
     }
 
     #[test]
-    fn fixed_clock_advances() {
-        let c = FixedClock::new(100);
-        assert_eq!(c.now_unix(), 100);
-        c.advance(50);
-        assert_eq!(c.now_unix(), 150);
+    fn frozen_clock_advances_unix_secs() {
+        // Substrate FrozenClock is ms-precision; advance(50_000ms) →
+        // unix_secs jumps by 50.
+        let c = FrozenClock::at(100_000); // 100s
+        assert_eq!(c.unix_secs(), 100);
+        c.advance(50_000); // +50s
+        assert_eq!(c.unix_secs(), 150);
     }
 
     #[test]
-    fn system_clock_returns_nonzero() {
+    fn wall_clock_returns_nonzero() {
         // The actual time isn't important; just that it returns
         // a sensible value (greater than the unix epoch's first second).
-        assert!(SystemClock.now_unix() > 1_000_000_000);
+        assert!(WallClock.unix_secs() > 1_000_000_000);
+    }
+
+    #[test]
+    fn fixed_clock_compat_helper_works() {
+        // Backwards-compat for any caller that hadn't yet migrated to
+        // the substrate's ms-precision FrozenClock.
+        let c = fixed_clock(100);
+        assert_eq!(c.unix_secs(), 100);
     }
 
     #[test]
