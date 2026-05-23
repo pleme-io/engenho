@@ -248,6 +248,18 @@ impl Plantio {
         <Self as crate::Fingerprint>::fingerprint(self)
     }
 
+    /// Observable snapshot — name + stage count. Pattern #2 SSC v0.96:
+    /// `Plantio` joins TieredCache + CompositeShapeRenderer +
+    /// ChainedVerifier as a 4th `ChildCountSnapshot` consumer.
+    /// Dashboards can show "this Plantio has N stages."
+    #[must_use]
+    pub fn snapshot(&self) -> crate::mirante::ChildCountSnapshot {
+        crate::mirante::ChildCountSnapshot {
+            name: "plantio",
+            child_count: self.len(),
+        }
+    }
+
     /// Validate topology: every depends_on resolves + the DAG is
     /// acyclic. Empty Plantio is trivially valid.
     ///
@@ -377,6 +389,9 @@ impl Plantio {
         Ok(jobs)
     }
 }
+
+crate::define_named!(Plantio, "plantio");
+crate::impl_observable!(Plantio, crate::mirante::ChildCountSnapshot);
 
 /// One unit of work emitted by `Plantio::compile_jobs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
