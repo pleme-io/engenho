@@ -44,6 +44,7 @@ pub mod pesquisa;
 pub mod promotion;
 pub mod quorum;
 pub mod receipt;
+pub mod relogio;
 pub mod retrying_cache;
 pub mod roca;
 pub mod shape;
@@ -88,6 +89,7 @@ pub use pesquisa::{
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
 pub use quorum::{QuorumOutcome, QuorumTracker};
 pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};
+pub use relogio::{Clock, FrozenClock, HlcClock, Instant, LogicalClock, WallClock};
 pub use retrying_cache::{BackoffConfig, RetryingCacheBackend};
 pub use roca::{
     ConfirmacaoPolicy, JobTarget, MaterializationJob, Placement, Plantio, PlantioError,
