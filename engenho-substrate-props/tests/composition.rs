@@ -17,6 +17,27 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 
+// ── orçamento + mirante: Budget IS Observable (v0.84) ──
+
+proptest_with_env! {
+    /// Budget now implements `Observable` directly. Passing
+    /// `<Budget as Observable>::snapshot()` and the inherent
+    /// `Budget::snapshot()` produces byte-identical output —
+    /// the trait impl delegates to the inherent method.
+    #[test]
+    fn budget_observable_matches_inherent_snapshot(
+        cap in 10u64..1000,
+        rate in 0u64..100,
+    ) {
+        use engenho_substrate::Observable;
+        let clock = frozen_clock(0);
+        let budget = Budget::new("test-budget", cap, rate, clock);
+        let inherent: BudgetSnapshot = Budget::snapshot(&budget);
+        let via_trait: BudgetSnapshot = Observable::snapshot(&budget);
+        prop_assert_eq!(inherent, via_trait);
+    }
+}
+
 // ── orçamento + mirante: Budget observable via ObservationChannel ──────
 
 proptest_with_env! {
