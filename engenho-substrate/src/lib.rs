@@ -46,6 +46,7 @@ pub mod oci_renderer;
 pub mod orcamento;
 pub mod pesquisa;
 pub mod promotion;
+pub mod provacao;
 pub mod quorum;
 pub mod receipt;
 pub mod relogio;
@@ -92,6 +93,7 @@ pub use pesquisa::{
     SearchRng, SearchSpace, Selector, TournamentSelector, aptidao_to_receipt, score_ensaio,
 };
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
+pub use provacao::{Policy, Provacao};
 pub use quorum::{QuorumOutcome, QuorumTracker};
 pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};
 pub use relogio::{Clock, FrozenClock, HlcClock, Instant, LogicalClock, WallClock};
