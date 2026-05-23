@@ -26,7 +26,7 @@
 //! emit a `(defsistema …)` envelope kind once revoada's
 //! FormatAdapter learns it; until then, YAML+Pod is the bridge.)
 
-use crate::{Decision, FonteError, FonteResult, ProposalId, Proposer};
+use crate::{Decision, FonteError, FonteResult, GossipBroker, ProposalId, Proposer};
 use async_trait::async_trait;
 use engenho_revoada::face::{Face, ResourceFormat};
 use std::sync::Arc;
@@ -69,15 +69,64 @@ impl Proposer for RevoadaProposer {
         let name = decision.change.source.replace('/', "-");
         let payload = serde_json::to_string(&decision.typed)
             .map_err(|e| FonteError::Propose(format!("serialize: {e}")))?;
-        let yaml = format!(
-            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {}\n  namespace: fonte\n  \
-             annotations:\n    pleme.io/sistema: |\n      {}\nspec: {{}}\n",
-            name,
-            payload.replace('\n', "\n      "),
-        );
+        let yaml = sistema_envelope(&name, &payload);
         self.face
             .apply_resource(ResourceFormat::Yaml, yaml.as_bytes())
             .map_err(|e| FonteError::Propose(format!("face apply_resource: {e}")))?;
         Ok(self.next_id.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+/// Synthesize a Pod-shaped YAML envelope carrying the typed Sistema
+/// payload as an annotation. Shared by [`RevoadaProposer`] +
+/// [`FaceGossipBroker`].
+fn sistema_envelope(name: &str, payload: &str) -> String {
+    format!(
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {}\n  namespace: fonte\n  \
+         annotations:\n    pleme.io/sistema: |\n      {}\nspec: {{}}\n",
+        name,
+        payload.replace('\n', "\n      "),
+    )
+}
+
+/// `GossipBroker` backed by a revoada [`Face`]. announce() sends a
+/// typed Sistema envelope through the face's apply_resource verb;
+/// peer subscribers see it via the face's watch stream (built
+/// separately — see `FaceWatcher` below).
+///
+/// Real cross-cluster gossip — every peer registers against the
+/// same Face (e.g. a shared PureRaftFace cluster) and broadcasts
+/// to every other peer via the face's typed protocol.
+pub struct FaceGossipBroker {
+    face: Arc<dyn Face>,
+    rev: AtomicU64,
+}
+
+impl FaceGossipBroker {
+    /// New broker — operator passes an already-`start()`-ed face.
+    #[must_use]
+    pub fn new(face: Arc<dyn Face>) -> Self {
+        Self {
+            face,
+            rev: AtomicU64::new(0),
+        }
+    }
+
+    /// Borrow the underlying face for assertions in tests.
+    #[must_use]
+    pub fn face(&self) -> &Arc<dyn Face> {
+        &self.face
+    }
+}
+
+#[async_trait]
+impl GossipBroker for FaceGossipBroker {
+    async fn announce(&self, source: Arc<str>, source_text: Arc<str>) -> FonteResult<u64> {
+        let name = source.replace('/', "-");
+        let yaml = sistema_envelope(&name, source_text.as_ref());
+        self.face
+            .apply_resource(ResourceFormat::Yaml, yaml.as_bytes())
+            .map_err(|e| FonteError::Propose(format!("face apply_resource: {e}")))?;
+        Ok(self.rev.fetch_add(1, Ordering::SeqCst))
     }
 }
