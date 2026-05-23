@@ -27,7 +27,10 @@ pub mod derivation;
 pub mod drv_disk;
 pub mod magic_blob;
 pub mod promotion;
+pub mod quorum;
+pub mod receipt;
 pub mod retrying_cache;
+pub mod shape;
 pub mod tiered_cache;
 pub mod watched_cache;
 
@@ -39,6 +42,9 @@ pub use derivation::{
 pub use drv_disk::DiskDerivationCache;
 pub use magic_blob::{MagicBlob, MagicBlobError};
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
+pub use quorum::{QuorumOutcome, QuorumTracker};
+pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};
 pub use retrying_cache::{BackoffConfig, RetryingCacheBackend};
+pub use shape::{RenderedArtifact, ShapeError, ShapeRenderer, WorkloadShape};
 pub use tiered_cache::TieredCache;
 pub use watched_cache::{CacheEvent, WatchedCache};
