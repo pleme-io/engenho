@@ -977,6 +977,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "engenho-config",
+ "engenho-substrate",
  "engenho-types",
  "hcl-rs",
  "openraft",

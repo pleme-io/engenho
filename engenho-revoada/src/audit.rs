@@ -99,14 +99,32 @@ pub struct AuditEvent {
 
 impl AuditEvent {
     /// Build an event with the current wall-clock timestamp.
+    ///
+    /// Preserves nanosecond precision via `SystemTime`. For typed
+    /// substrate-Clock construction (loses ns precision in exchange
+    /// for FrozenClock determinism in tests), use [`Self::at`].
     #[must_use]
     pub fn now(verb: VerbKind) -> Self {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
+        Self::with_timestamp(now.as_secs(), now.subsec_nanos(), verb)
+    }
+
+    /// Build an event using a typed `engenho_substrate::Clock` for the
+    /// timestamp source. `timestamp_ns` is set to 0 — substrate Clock
+    /// is ms-precision. Tests should reach for this with a
+    /// `FrozenClock` to get byte-deterministic audit-log payloads.
+    #[must_use]
+    pub fn at<C: engenho_substrate::Clock + ?Sized>(clock: &C, verb: VerbKind) -> Self {
+        Self::with_timestamp(clock.unix_secs(), 0, verb)
+    }
+
+    /// Shared constructor — both `now()` and `at()` route through here.
+    fn with_timestamp(timestamp_s: u64, timestamp_ns: u32, verb: VerbKind) -> Self {
         Self {
-            timestamp_s: now.as_secs(),
-            timestamp_ns: now.subsec_nanos(),
+            timestamp_s,
+            timestamp_ns,
             verb,
             reference: None,
             format: None,
@@ -743,6 +761,29 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         let back: AuditEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
+    }
+
+    // ── Typed Clock construction (substrate relógio adoption) ────
+
+    #[test]
+    fn audit_event_at_frozen_clock_is_deterministic() {
+        // Two events built from the same FrozenClock → byte-identical
+        // timestamps, deterministically reproducible across runs.
+        let clock = engenho_substrate::FrozenClock::at(1_700_000_000_000); // ms
+        let e1 = AuditEvent::at(&clock, VerbKind::Apply);
+        let e2 = AuditEvent::at(&clock, VerbKind::Apply);
+        assert_eq!(e1.timestamp_s, e2.timestamp_s);
+        assert_eq!(e1.timestamp_s, 1_700_000_000);
+        assert_eq!(e1.timestamp_ns, 0); // ms-precision substrate Clock
+    }
+
+    #[test]
+    fn audit_event_at_advances_with_clock() {
+        let clock = engenho_substrate::FrozenClock::at(1_700_000_000_000);
+        let e1 = AuditEvent::at(&clock, VerbKind::Get);
+        clock.advance(5_000); // +5 sec
+        let e2 = AuditEvent::at(&clock, VerbKind::Get);
+        assert_eq!(e2.timestamp_s - e1.timestamp_s, 5);
     }
 
     // ── Object safety ────────────────────────────────────────────
