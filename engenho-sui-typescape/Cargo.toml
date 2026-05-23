@@ -1,0 +1,26 @@
+[package]
+name = "engenho-sui-typescape"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+authors.workspace = true
+description = "Bidirectional bridge between sui's Nix-value tree and engenho's typescape primitives. TypescapeValue: a Send+Sync, thread-portable mirror of sui::Value (Null/Bool/Int/Float/String/Path/List/Attrs). Typescape trait: every typed primitive's to_typescape_value() / from_typescape_value() round-trip. Real sui evaluator integration ships behind the `with-sui-eval` feature once sui's public Value surface stabilizes."
+
+[dependencies]
+thiserror          = { workspace = true }
+# `rc` feature: enables Serialize+Deserialize for Arc<T> / Arc<str> /
+# Arc<[T]> — required for TypescapeValue's Send+Sync payloads to
+# survive serde round-trips.
+serde              = { version = "1.0", features = ["derive", "rc"] }
+serde_json         = { workspace = true }
+engenho-substrate  = { workspace = true }
+
+[dev-dependencies]
+proptest                = "1"
+engenho-substrate-props = { workspace = true }

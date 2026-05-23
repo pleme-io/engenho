@@ -1,0 +1,81 @@
+//! # engenho-fonte
+//!
+//! The **live source-of-truth reconciler**. Takes a typed declaration
+//! (a `(defsistema …)` tlisp form, a tatara-script, any `TypescapeValue`
+//! crossing the bridge from `engenho-sui-typescape`) and drives the
+//! cluster — across consensus, attestation, reconciliation, observation
+//! — to *be* what the declaration *says*.
+//!
+//! Named for Portuguese **fonte** ("source", "spring", "font"): this
+//! crate is where every change to a system declaration originates,
+//! before any subsystem on either side sees it.
+//!
+//! ## The five typed roles
+//!
+//! ```text
+//!  Watcher      → Evaluator    → Proposer     → Attester    → Publisher
+//!  ----------     -----------    -----------    ----------    ---------
+//!  shikumi        sui            revoada        tameshi       mirante
+//!  notify         (defsistema…)  Raft propose   +sekiban      ObservationChannel
+//!                                                 +kensa
+//!  ChangeEvent    TypescapeValue ProposalId     Receipt       Snapshot
+//! ```
+//!
+//! Each role is a typed [`async_trait`] with mock impls shipped by
+//! default. Consumer wires them under a [`Conduit`] supervisor that
+//! runs the seven-beat Viggy convergence tick:
+//!
+//!   Observe → Diff → Classify → Decide → Act → Attest → Tick
+//!
+//! ## What's in this crate (M0)
+//!
+//!   - The five typed traits + their typed error enums.
+//!   - Mock implementations (`MockWatcher`, `MockEvaluator`, …)
+//!     suitable for property tests + integration tests.
+//!   - The [`Conduit`] supervisor — a `shigoto`-shaped DAG wiring the
+//!     five traits end-to-end.
+//!   - The [`Change`] / [`Decision`] / [`Outcome`] typed event types
+//!     that flow through the pipeline.
+//!
+//! ## What's NOT in this crate yet
+//!
+//!   - Real shikumi-notify integration (M1.1 — feature `with-shikumi`)
+//!   - Real sui evaluator integration (M1.2 — feature `with-sui-eval`)
+//!   - Real engenho-revoada Face-bound Proposer (M1.3 — feature `with-revoada`)
+//!   - Real tameshi attestation chain (M1.4 — feature `with-tameshi`)
+//!   - Real mirante channel publish (M1.5 — feature `with-mirante`)
+//!
+//! Each integration ships as a focused PR adding one feature flag +
+//! one impl. The mock universe stays the always-on default so
+//! cross-substrate tests never depend on a real cluster.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+mod attester;
+mod change;
+mod conduit;
+mod controller;
+mod error;
+mod evaluator;
+mod proposer;
+mod publisher;
+mod sistema;
+mod watcher;
+
+pub use attester::{Attester, MockAttester, Receipt};
+pub use change::{Change, ChangeKind, Decision, Outcome};
+pub use conduit::Conduit;
+pub use controller::{
+    AppReconciler, InfraReconciler, MockAppReconciler, MockInfraReconciler, MockPromessaReconciler,
+    MockTopologyReconciler, PromessaReconciler, SystemController, TopologyReconciler,
+    mock_system_controller,
+};
+pub use error::{FonteError, FonteResult};
+pub use evaluator::{Evaluator, MockEvaluator};
+pub use proposer::{MockProposer, ProposalId, Proposer};
+pub use publisher::{MockPublisher, Publisher};
+pub use sistema::{
+    AppRef, InfraBackend, InfraRef, PromessaKind, PromessaRef, Sistema, TopologyRef,
+};
+pub use watcher::{MockWatcher, Watcher};

@@ -896,6 +896,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-fonte"
+version = "0.1.4"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "engenho-substrate",
+ "engenho-substrate-props",
+ "engenho-sui-typescape",
+ "futures",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "engenho-kube-client"
 version = "0.1.4"
 dependencies = [
@@ -1056,6 +1073,18 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "engenho-sui-typescape"
+version = "0.1.4"
+dependencies = [
+ "engenho-substrate",
+ "engenho-substrate-props",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

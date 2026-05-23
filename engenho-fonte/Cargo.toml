@@ -1,0 +1,32 @@
+[package]
+name = "engenho-fonte"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+authors.workspace = true
+description = "engenho-fonte — the live source-of-truth reconciler. shikumi-notify watches a (defsistema …) tlisp form; sui evaluates it; engenho-revoada Raft-proposes the new desired state; tameshi+sekiban attest the transition; engenho controllers reconcile; mirante publishes; orçamento budgets the change rate; provação chaos-tests the budgeted convergence. Five typed traits (Watcher, Evaluator, Proposer, Attester, Publisher) compose under a single Conduit. Mocks for every trait ship by default so consumers can wire end-to-end before any real subsystem is plugged in."
+
+[dependencies]
+async-trait            = { workspace = true }
+futures                = { workspace = true }
+# `rc` feature: needed because Change / Decision / Outcome carry
+# Arc<str> for the source path + receipt id (Send+Sync), and serde
+# round-trips them.
+serde                  = { version = "1.0", features = ["derive", "rc"] }
+serde_json             = { workspace = true }
+thiserror              = { workspace = true }
+tokio                  = { workspace = true, features = ["sync", "macros", "rt", "time"] }
+blake3                 = "1"
+engenho-substrate      = { workspace = true }
+engenho-sui-typescape  = { workspace = true }
+
+[dev-dependencies]
+tokio                  = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
+proptest               = "1"
+engenho-substrate-props = { workspace = true }
