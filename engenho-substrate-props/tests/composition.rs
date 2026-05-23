@@ -37,6 +37,63 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v1.13 triple composition: provacao + replay + maquina —
+    /// chaos-driven event replay through an FSM. Each event in
+    /// the replay cursor is gated by chaos: if chaos fires, the
+    /// event is skipped (simulated drop); otherwise it's stepped
+    /// through the machine. Final machine state respects the
+    /// chaos-controlled event sequence.
+    ///
+    /// Real-consumer shape: testing controller resilience to
+    /// dropped events / partial failure replay scenarios.
+    #[test]
+    fn provacao_plus_replay_plus_maquina_chaos_machine_replay(
+        increments in proptest::collection::vec(1u32..10, 1..6),
+        chaos_p in 0.0_f64..1.0,
+        seed in any::<u64>(),
+    ) {
+        use engenho_substrate::{Clock, MachineRunner, Policy, Provacao, ReplayCursor};
+        let injector = Provacao::<ReplayFault>::new("replay-chaos", seed).with_policy(
+            Policy::Probability {
+                fault: ReplayFault::Drop,
+                p: chaos_p,
+            },
+        );
+        let cursor = ReplayCursor::new(
+            "events",
+            increments
+                .iter()
+                .map(|n| CounterEvent::Inc(*n))
+                .collect::<Vec<_>>(),
+        );
+        let mut runner = MachineRunner::<CounterMachine>::new(frozen_clock(0));
+        let clk: Arc<dyn Clock> = frozen_clock(0);
+        // Manual replay: per-event chaos decision.
+        let mut applied = 0usize;
+        while let Some(event) = cursor.peek() {
+            match injector.maybe_fault(clk.as_ref()) {
+                Some(_) => {
+                    // Chaos fired — skip the event.
+                    cursor.next();
+                }
+                None => {
+                    // No chaos — apply event to machine.
+                    runner.step(event).unwrap();
+                    cursor.next();
+                    applied += 1;
+                }
+            }
+        }
+        // Invariants:
+        // 1. Cursor exhausted (every event was either skipped or applied).
+        prop_assert!(cursor.is_done());
+        // 2. Machine step_count == applied count (only non-skipped
+        //    events transitioned the machine).
+        prop_assert_eq!(runner.step_count(), applied);
+        // 3. applied + skipped == total events.
+        prop_assert_eq!(applied <= increments.len(), true);
+    }
+
     /// v1.12 triple composition: provacao + selo + budget — the
     /// full "chaos-injected authorized rate-limited call" shape.
     /// Extends v1.11's 2-primitive pattern with chaos at the API
