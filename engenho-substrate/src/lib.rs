@@ -25,6 +25,7 @@
 pub mod atomic_write;
 pub mod broadcast_ledger;
 pub mod chained_verifier;
+pub mod closure_types;
 pub mod command_runner;
 pub mod compose_ir;
 pub mod derivation;

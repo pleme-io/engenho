@@ -34,20 +34,26 @@ use crate::command_runner::{CommandRequest, CommandRunner};
 use crate::derivation::Drv;
 use crate::shape::{RenderedArtifact, ShapeError, ShapeRenderer, WorkloadShape};
 
-/// Operator-supplied source-reference generator. Given a Drv,
-/// returns the URI skopeo should read from (e.g.
-/// "docker-archive:/nix/store/{hash}-image.tar").
-pub type OciSourceRef = Arc<dyn Fn(&Drv) -> String + Send + Sync>;
+crate::async_closure_type! {
+    /// Operator-supplied source-reference generator. Given a Drv,
+    /// returns the URI skopeo should read from (e.g.
+    /// "docker-archive:/nix/store/{hash}-image.tar").
+    pub type OciSourceRef = sync (&Drv) -> String;
+}
 
-/// Operator-supplied destination-reference generator. Given a Drv,
-/// returns the URI skopeo should write to (e.g.
-/// "oci-archive:/tmp/{drv_hash_hex}-oci.tar").
-pub type OciDestRef = Arc<dyn Fn(&Drv) -> String + Send + Sync>;
+crate::async_closure_type! {
+    /// Operator-supplied destination-reference generator. Given a Drv,
+    /// returns the URI skopeo should write to (e.g.
+    /// "oci-archive:/tmp/{drv_hash_hex}-oci.tar").
+    pub type OciDestRef = sync (&Drv) -> String;
+}
 
-/// Optional accessor that reads the destination bytes back after
-/// a successful skopeo run. Production wires this to `std::fs::read`
-/// on the dest path; absence yields a synthetic artifact.
-pub type OciDestReader = Arc<dyn Fn(&Drv) -> Option<Vec<u8>> + Send + Sync>;
+crate::async_closure_type! {
+    /// Optional accessor that reads the destination bytes back after
+    /// a successful skopeo run. Production wires this to `std::fs::read`
+    /// on the dest path; absence yields a synthetic artifact.
+    pub type OciDestReader = sync (&Drv) -> Option<Vec<u8>>;
+}
 
 /// Renderer parameterized by a CommandRunner + the three ref/reader
 /// closures.

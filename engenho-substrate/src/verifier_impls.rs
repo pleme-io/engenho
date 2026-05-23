@@ -30,15 +30,13 @@ use crate::verifier::{Verificacao, VerificationReceipt, VerifyError, Verifier};
 // HashEqualityVerifier
 // =================================================================
 
-/// Operator-supplied accessor that returns the bytes the verifier
-/// should hash for `subject_hash`. Production wires this to the
-/// `DerivationCacheBackend::get_nar` path; tests pin a synthetic
-/// byte-source.
-pub type BytesAccessor = Arc<
-    dyn Fn([u8; 32]) -> futures::future::BoxFuture<'static, Result<Option<Vec<u8>>, VerifyError>>
-        + Send
-        + Sync,
->;
+crate::async_closure_type! {
+    /// Operator-supplied accessor that returns the bytes the verifier
+    /// should hash for `subject_hash`. Production wires this to the
+    /// `DerivationCacheBackend::get_nar` path; tests pin a synthetic
+    /// byte-source.
+    pub type BytesAccessor = ([u8; 32]) -> Result<Option<Vec<u8>>, VerifyError>;
+}
 
 /// Recomputes BLAKE3 of the bytes the accessor returns + compares
 /// to the predicate's `expected` NAR hash. Only implements the
@@ -119,15 +117,13 @@ impl Verifier for HashEqualityVerifier {
 // SmokeTestVerifier
 // =================================================================
 
-/// Operator-supplied function: given a `drv_hash_hex`, attempts a
-/// smoke-test build + returns Ok on success / Err on build failure.
-/// Production wires this to a BuildBackend-shape adapter; tests pin
-/// a deterministic outcome.
-pub type SmokeBuilder = Arc<
-    dyn Fn(String) -> futures::future::BoxFuture<'static, Result<(), VerifyError>>
-        + Send
-        + Sync,
->;
+crate::async_closure_type! {
+    /// Operator-supplied function: given a `drv_hash_hex`, attempts a
+    /// smoke-test build + returns Ok on success / Err on build failure.
+    /// Production wires this to a BuildBackend-shape adapter; tests pin
+    /// a deterministic outcome.
+    pub type SmokeBuilder = (String) -> Result<(), VerifyError>;
+}
 
 /// Runs a smoke-test drv via an operator-supplied builder; success
 /// of the build IS the verification proof.
@@ -197,14 +193,12 @@ impl Verifier for SmokeTestVerifier {
 // IndependentVerifier
 // =================================================================
 
-/// Operator-supplied independent rebuild: given the subject hash,
-/// runs an alternate build path + returns the NAR bytes the
-/// rebuild produced.
-pub type IndependentRebuild = Arc<
-    dyn Fn([u8; 32]) -> futures::future::BoxFuture<'static, Result<Vec<u8>, VerifyError>>
-        + Send
-        + Sync,
->;
+crate::async_closure_type! {
+    /// Operator-supplied independent rebuild: given the subject hash,
+    /// runs an alternate build path + returns the NAR bytes the
+    /// rebuild produced.
+    pub type IndependentRebuild = ([u8; 32]) -> Result<Vec<u8>, VerifyError>;
+}
 
 /// Re-derives via a second backend; emits a receipt whose evidence
 /// is BLAKE3 over the rebuilt bytes. Downstream `QuorumTracker`
@@ -271,16 +265,14 @@ impl Verifier for IndependentVerifier {
 // TameshiVerifier
 // =================================================================
 
-/// Operator-supplied signature check: given a `signer` chain id +
-/// the subject hash, returns the typed evidence (typically the
-/// signature bytes) or a typed error. Production wires this to the
-/// cosign / tameshi PKI integration; tests pin a deterministic
-/// outcome.
-pub type SignerCheck = Arc<
-    dyn Fn(String, [u8; 32]) -> futures::future::BoxFuture<'static, Result<Vec<u8>, VerifyError>>
-        + Send
-        + Sync,
->;
+crate::async_closure_type! {
+    /// Operator-supplied signature check: given a `signer` chain id +
+    /// the subject hash, returns the typed evidence (typically the
+    /// signature bytes) or a typed error. Production wires this to the
+    /// cosign / tameshi PKI integration; tests pin a deterministic
+    /// outcome.
+    pub type SignerCheck = (String, [u8; 32]) -> Result<Vec<u8>, VerifyError>;
+}
 
 /// Verifies cosign-style signatures via an operator-supplied check.
 /// Evidence is BLAKE3 over the returned signature bytes — faithful
