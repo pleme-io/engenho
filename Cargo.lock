@@ -882,6 +882,7 @@ version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "engenho-config",
  "engenho-store",
  "engenho-types",

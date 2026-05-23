@@ -44,6 +44,34 @@ pub struct DnsRecord {
     pub ttl: u32,
 }
 
+/// R12b — SRV record for headless services. Pods discover each
+/// other via `_port._proto.{service}.{namespace}.svc.{domain}`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SrvRecord {
+    /// Fully-qualified SRV name, e.g.
+    /// `_http._tcp.podinfo.default.svc.cluster.local`.
+    pub fqdn: String,
+    /// SRV priority (lower = preferred). Default 0.
+    pub priority: u16,
+    /// SRV weight (relative load distribution). Default 100.
+    pub weight: u16,
+    /// Target port.
+    pub port: u16,
+    /// Target FQDN (typically a pod hostname).
+    pub target: String,
+    /// TTL in seconds.
+    pub ttl: u32,
+}
+
+/// Build the SRV FQDN for a service port (pure helper).
+#[must_use]
+pub fn srv_fqdn(port_name: &str, protocol: &str, service: &str, namespace: &str, domain: &str) -> String {
+    format!(
+        "_{port_name}._{}.{service}.{namespace}.svc.{domain}",
+        protocol.to_lowercase()
+    )
+}
+
 /// Backend errors.
 #[derive(Debug, Clone, Error)]
 pub enum DnsError {
@@ -89,6 +117,32 @@ pub trait DnsBackend: Send + Sync {
     /// # Errors
     /// [`DnsError::Backend`] on backend failure.
     async fn list(&self) -> Result<BTreeMap<String, DnsRecord>, DnsError>;
+
+    /// R12b — Install/refresh an SRV record. Default impl returns
+    /// `Ok(())` so backends without SRV support don't break the
+    /// trait surface; production backends override.
+    ///
+    /// # Errors
+    /// [`DnsError::Backend`] on backend failure.
+    async fn upsert_srv(&self, _record: &SrvRecord) -> Result<(), DnsError> {
+        Ok(())
+    }
+
+    /// R12b — Remove an SRV record by FQDN.
+    ///
+    /// # Errors
+    /// [`DnsError::Backend`] on backend failure.
+    async fn remove_srv(&self, _fqdn: &str) -> Result<(), DnsError> {
+        Ok(())
+    }
+
+    /// R12b — Currently-installed SRV records.
+    ///
+    /// # Errors
+    /// [`DnsError::Backend`] on backend failure.
+    async fn list_srv(&self) -> Result<BTreeMap<String, SrvRecord>, DnsError> {
+        Ok(BTreeMap::new())
+    }
 }
 
 // =================================================================
@@ -105,16 +159,21 @@ pub struct InMemoryDnsZone {
 #[derive(Default)]
 struct DnsState {
     records: BTreeMap<String, DnsRecord>,
+    srv_records: BTreeMap<String, SrvRecord>,
     events: Vec<DnsEvent>,
 }
 
 /// Per-call event log entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DnsEvent {
-    /// `upsert(fqdn)` was invoked.
+    /// `upsert(fqdn)` was invoked (A record).
     Upsert(String),
-    /// `remove(fqdn)` was invoked.
+    /// `remove(fqdn)` was invoked (A record).
     Remove(String),
+    /// `upsert_srv(fqdn)` — R12b.
+    UpsertSrv(String),
+    /// `remove_srv(fqdn)` — R12b.
+    RemoveSrv(String),
 }
 
 impl InMemoryDnsZone {
@@ -163,6 +222,30 @@ impl DnsBackend for InMemoryDnsZone {
 
     async fn list(&self) -> Result<BTreeMap<String, DnsRecord>, DnsError> {
         Ok(self.inner.lock().await.records.clone())
+    }
+
+    async fn upsert_srv(&self, record: &SrvRecord) -> Result<(), DnsError> {
+        if record.fqdn.is_empty() {
+            return Err(DnsError::InvalidRecord("empty srv fqdn".into()));
+        }
+        if record.target.is_empty() {
+            return Err(DnsError::InvalidRecord("empty srv target".into()));
+        }
+        let mut state = self.inner.lock().await;
+        state.srv_records.insert(record.fqdn.clone(), record.clone());
+        state.events.push(DnsEvent::UpsertSrv(record.fqdn.clone()));
+        Ok(())
+    }
+
+    async fn remove_srv(&self, fqdn: &str) -> Result<(), DnsError> {
+        let mut state = self.inner.lock().await;
+        state.srv_records.remove(fqdn);
+        state.events.push(DnsEvent::RemoveSrv(fqdn.to_string()));
+        Ok(())
+    }
+
+    async fn list_srv(&self) -> Result<BTreeMap<String, SrvRecord>, DnsError> {
+        Ok(self.inner.lock().await.srv_records.clone())
     }
 }
 
@@ -394,5 +477,104 @@ mod tests {
     fn dns_controller_default_uses_cluster_local() {
         // Sanity: the default domain matches kubernetes convention.
         assert_eq!(DEFAULT_CLUSTER_DOMAIN, "cluster.local");
+    }
+
+    // ── R12b SRV records ───────────────────────────────────────────
+
+    #[test]
+    fn srv_fqdn_format() {
+        assert_eq!(
+            srv_fqdn("http", "TCP", "podinfo", "default", "cluster.local"),
+            "_http._tcp.podinfo.default.svc.cluster.local"
+        );
+        assert_eq!(
+            srv_fqdn("dns", "UDP", "coredns", "kube-system", "cluster.local"),
+            "_dns._udp.coredns.kube-system.svc.cluster.local"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_zone_upsert_srv_inserts() {
+        let zone = InMemoryDnsZone::new();
+        let srv = SrvRecord {
+            fqdn: "_http._tcp.x.default.svc.cluster.local".into(),
+            priority: 0,
+            weight: 100,
+            port: 80,
+            target: "pod-1.default.pod.cluster.local".into(),
+            ttl: 30,
+        };
+        zone.upsert_srv(&srv).await.unwrap();
+        let list = zone.list_srv().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list.contains_key(&srv.fqdn));
+    }
+
+    #[tokio::test]
+    async fn in_memory_zone_rejects_empty_srv_fqdn() {
+        let zone = InMemoryDnsZone::new();
+        let err = zone
+            .upsert_srv(&SrvRecord {
+                fqdn: String::new(),
+                priority: 0,
+                weight: 100,
+                port: 80,
+                target: "x".into(),
+                ttl: 30,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "invalid_record");
+    }
+
+    #[tokio::test]
+    async fn in_memory_zone_rejects_empty_srv_target() {
+        let zone = InMemoryDnsZone::new();
+        let err = zone
+            .upsert_srv(&SrvRecord {
+                fqdn: "x".into(),
+                priority: 0,
+                weight: 100,
+                port: 80,
+                target: String::new(),
+                ttl: 30,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "invalid_record");
+    }
+
+    #[tokio::test]
+    async fn in_memory_zone_remove_srv_clears() {
+        let zone = InMemoryDnsZone::new();
+        let srv = SrvRecord {
+            fqdn: "x".into(),
+            priority: 0,
+            weight: 100,
+            port: 80,
+            target: "y".into(),
+            ttl: 30,
+        };
+        zone.upsert_srv(&srv).await.unwrap();
+        zone.remove_srv("x").await.unwrap();
+        assert!(zone.list_srv().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn srv_events_record_in_order() {
+        let zone = InMemoryDnsZone::new();
+        let srv = SrvRecord {
+            fqdn: "a".into(),
+            priority: 0,
+            weight: 100,
+            port: 80,
+            target: "y".into(),
+            ttl: 30,
+        };
+        zone.upsert_srv(&srv).await.unwrap();
+        zone.remove_srv("a").await.unwrap();
+        let events = zone.events().await;
+        assert!(events.iter().any(|e| matches!(e, DnsEvent::UpsertSrv(n) if n == "a")));
+        assert!(events.iter().any(|e| matches!(e, DnsEvent::RemoveSrv(n) if n == "a")));
     }
 }

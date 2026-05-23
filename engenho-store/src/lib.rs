@@ -38,6 +38,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod command;
+pub mod durable_store;
 pub mod mesh;
 pub mod nats_listener;
 pub mod nats_network;
@@ -54,6 +55,7 @@ pub use command::{Reason, ResourceCommand, ResourceOp};
 pub use mesh::{default_config, StoreError, StoreMesh};
 pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
+pub use durable_store::{DurableInMemoryStore, JournalEntry};
 pub use persistence::{CatalogSnapshot, SnapshotError};
 pub use persistent_log::{PersistentLog, PersistentLogError};
 pub use network::InProcessRouter;
