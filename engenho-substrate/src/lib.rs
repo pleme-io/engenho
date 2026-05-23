@@ -25,6 +25,7 @@
 pub mod atomic_write;
 pub mod derivation;
 pub mod drv_disk;
+pub mod ledger;
 pub mod magic_blob;
 pub mod promotion;
 pub mod quorum;
@@ -43,6 +44,7 @@ pub use derivation::{
 };
 pub use drv_disk::DiskDerivationCache;
 pub use magic_blob::{MagicBlob, MagicBlobError};
+pub use ledger::{LedgerError, LedgerKey, MaterializationLedger, MemoryLedger};
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
 pub use quorum::{QuorumOutcome, QuorumTracker};
 pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};

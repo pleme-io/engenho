@@ -49,6 +49,8 @@ pub mod ingress;
 pub mod job;
 pub mod network_policy;
 pub mod pdb;
+pub mod plantio;
+pub mod roceiro;
 pub mod selector;
 pub mod service_router;
 pub mod statefulset;
@@ -93,6 +95,8 @@ pub use drv_build::{
     BuildBackend, BuildError, BuildResult, DrvBuildController, FakeBuildBackend,
 };
 pub use event_driven::EventDrivenController;
+pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};
+pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};
 pub use tiered_build::TieredBuildBackend;
 pub use tiered_reconciler::{PromotionScope, StaticPromotionScope, TieredCacheReconciler};
 pub use hpa::{
