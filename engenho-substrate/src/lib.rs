@@ -33,6 +33,7 @@ pub mod disposable;
 pub mod drv_disk;
 pub mod error_kind;
 pub mod gossip_ledger;
+pub mod fake_shell;
 pub mod ledger;
 pub mod magic_blob;
 pub mod named;
