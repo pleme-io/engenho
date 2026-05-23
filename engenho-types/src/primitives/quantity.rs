@@ -35,7 +35,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use std::fmt;
 use std::str::FromStr;
 
@@ -91,7 +91,11 @@ impl Quantity {
     pub fn from_millis(milli: i128) -> Self {
         Self::Parsed {
             milli,
-            suffix: if milli % 1000 == 0 { Suffix::None } else { Suffix::Milli },
+            suffix: if milli % 1000 == 0 {
+                Suffix::None
+            } else {
+                Suffix::Milli
+            },
         }
     }
 
@@ -136,7 +140,10 @@ impl FromStr for Quantity {
         // Parse numeric as decimal — convert to milli-units.
         let milli = parse_decimal_to_milli(num_part)?;
         let scaled = suffix.apply_to_milli(milli);
-        Ok(Self::Parsed { milli: scaled, suffix })
+        Ok(Self::Parsed {
+            milli: scaled,
+            suffix,
+        })
     }
 }
 
@@ -262,7 +269,11 @@ fn parse_decimal_to_milli(s: &str) -> Result<i128, QuantityParseError> {
     for _ in 0..(3 - trimmed.len()) {
         frac_val *= 10;
     }
-    let sign = if int_val < 0 || s.starts_with('-') { -1 } else { 1 };
+    let sign = if int_val < 0 || s.starts_with('-') {
+        -1
+    } else {
+        1
+    };
     Ok(int_val.saturating_mul(1000) + (frac_val * sign))
 }
 
@@ -350,18 +361,7 @@ mod tests {
     #[test]
     fn display_round_trips_canonical_inputs() {
         let cases = [
-            "0",
-            "1",
-            "42",
-            "100m",
-            "2.5",
-            "1k",
-            "5G",
-            "1Ki",
-            "1Mi",
-            "1Gi",
-            "8Gi",
-            "100Mi",
+            "0", "1", "42", "100m", "2.5", "1k", "5G", "1Ki", "1Mi", "1Gi", "8Gi", "100Mi",
         ];
         for input in cases {
             let q = parse(input);

@@ -7,41 +7,38 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Generate a Plantio with N stages where stage `i` may depend on
 /// any subset of stages `0..i` — this guarantees DAG (no cycles).
-fn acyclic_plantio_strategy(
-    max_n: usize,
-) -> impl Strategy<Value = Plantio> {
-    (1usize..max_n).prop_flat_map(|n| {
-        // For each stage i, pick a subset of {0..i} as deps.
-        let dep_maps = (0..n)
-            .map(|i| {
-                proptest::collection::vec(0..(i.max(1)), 0..i.max(1).min(4))
-                    .prop_map(move |deps| {
-                        let mut set: BTreeSet<usize> = deps.into_iter().collect();
-                        set.remove(&i);
-                        set
-                    })
-            })
-            .collect::<Vec<_>>();
-        (Just(n), dep_maps)
-    })
-    .prop_map(|(_n, dep_sets)| {
-        let mut plantio = Plantio::new();
-        let node = NodeId::new([0u8; 32]);
-        for (i, deps) in dep_sets.into_iter().enumerate() {
-            let mut stage = Stage::pinned(
-                format!("stage-{i:03}"),
-                WorkloadShape::OciImage,
-                node,
-            );
-            stage.depends_on = deps
-                .into_iter()
-                .map(|d| StageId::new(format!("stage-{d:03}")))
-                .collect();
-            stage.placement = Placement::Pinned { node };
-            plantio.add_stage(stage).unwrap();
-        }
-        plantio
-    })
+fn acyclic_plantio_strategy(max_n: usize) -> impl Strategy<Value = Plantio> {
+    (1usize..max_n)
+        .prop_flat_map(|n| {
+            // For each stage i, pick a subset of {0..i} as deps.
+            let dep_maps = (0..n)
+                .map(|i| {
+                    proptest::collection::vec(0..(i.max(1)), 0..i.max(1).min(4)).prop_map(
+                        move |deps| {
+                            let mut set: BTreeSet<usize> = deps.into_iter().collect();
+                            set.remove(&i);
+                            set
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            (Just(n), dep_maps)
+        })
+        .prop_map(|(_n, dep_sets)| {
+            let mut plantio = Plantio::new();
+            let node = NodeId::new([0u8; 32]);
+            for (i, deps) in dep_sets.into_iter().enumerate() {
+                let mut stage =
+                    Stage::pinned(format!("stage-{i:03}"), WorkloadShape::OciImage, node);
+                stage.depends_on = deps
+                    .into_iter()
+                    .map(|d| StageId::new(format!("stage-{d:03}")))
+                    .collect();
+                stage.placement = Placement::Pinned { node };
+                plantio.add_stage(stage).unwrap();
+            }
+            plantio
+        })
 }
 
 proptest! {

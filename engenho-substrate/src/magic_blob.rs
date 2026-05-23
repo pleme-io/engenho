@@ -12,10 +12,10 @@
 
 use std::path::Path;
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::atomic_write::{write_atomic, AtomicWriteError};
+use crate::atomic_write::{AtomicWriteError, write_atomic};
 
 /// Errors at encode / decode / I/O time.
 #[derive(Debug, Clone, Error)]
@@ -83,10 +83,9 @@ impl<'m, T: Serialize + DeserializeOwned> MagicBlob<'m, T> {
     ///
     /// Returns [`MagicBlobError::Encode`] if serde serialization fails.
     pub fn encode(&self) -> Result<Vec<u8>, MagicBlobError> {
-        let payload = serde_json::to_vec(&self.value)
-            .map_err(|e| MagicBlobError::Encode(e.to_string()))?;
-        let mut out =
-            Vec::with_capacity(self.magic.len() + 8 + blake3::OUT_LEN + payload.len());
+        let payload =
+            serde_json::to_vec(&self.value).map_err(|e| MagicBlobError::Encode(e.to_string()))?;
+        let mut out = Vec::with_capacity(self.magic.len() + 8 + blake3::OUT_LEN + payload.len());
         out.extend_from_slice(self.magic);
         out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         out.extend_from_slice(blake3::hash(&payload).as_bytes());
@@ -200,8 +199,7 @@ mod tests {
             value: sample(),
         };
         let bytes = blob.encode().unwrap();
-        let err =
-            MagicBlob::<Sample>::decode(TEST_MAGIC, &bytes[..bytes.len() - 5]).unwrap_err();
+        let err = MagicBlob::<Sample>::decode(TEST_MAGIC, &bytes[..bytes.len() - 5]).unwrap_err();
         assert_eq!(err.kind(), "truncated");
     }
 

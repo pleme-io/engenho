@@ -7,15 +7,11 @@
 
 use engenho_config::TopologyStrategyKind;
 
-use crate::topology::{
-    Cluster3MNW, MeshAllPeers, Pair, Phalanx, Quorum3M, Solo, TopologyStrategy,
-};
+use crate::topology::{Cluster3MNW, MeshAllPeers, Pair, Phalanx, Quorum3M, Solo, TopologyStrategy};
 
 /// Construct the topology trait object the operator's config asks for.
 #[must_use]
-pub fn make_topology_strategy(
-    cfg: &engenho_config::RevoadaConfig,
-) -> Box<dyn TopologyStrategy> {
+pub fn make_topology_strategy(cfg: &engenho_config::RevoadaConfig) -> Box<dyn TopologyStrategy> {
     match cfg.topology.strategy {
         TopologyStrategyKind::Solo => Box::new(Solo),
         TopologyStrategyKind::Pair => Box::new(Pair),

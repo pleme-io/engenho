@@ -18,13 +18,13 @@
 
 use indoc::formatdoc;
 
+use crate::ClusterConfig;
 use crate::bootstrap::{ArgocdBootstrap, FluxcdBootstrap, SecretKind};
 use crate::manifest::Manifest;
 use crate::network::{
-    CniChoice, DnsChoice, FlannelBackend, IngressChoice, K3sComponent,
-    KubeProxyMode, LoadBalancerChoice, NetworkPolicyEnforce,
+    CniChoice, DnsChoice, FlannelBackend, IngressChoice, K3sComponent, KubeProxyMode,
+    LoadBalancerChoice, NetworkPolicyEnforce,
 };
-use crate::ClusterConfig;
 
 impl ClusterConfig {
     /// Render the YAML body for `/etc/rancher/k3s/config.yaml`.
@@ -128,9 +128,7 @@ impl ClusterConfig {
         }
 
         // kube-proxy mode (only when not disabled).
-        if !net.kube_proxy.disabled
-            && !matches!(net.kube_proxy.mode, KubeProxyMode::Iptables)
-        {
+        if !net.kube_proxy.disabled && !matches!(net.kube_proxy.mode, KubeProxyMode::Iptables) {
             args.push(format!(
                 "--kube-proxy-arg=proxy-mode={}",
                 kube_proxy_mode(net.kube_proxy.mode)
@@ -153,25 +151,25 @@ impl ClusterConfig {
         // CNI install manifests.
         match net.cni {
             CniChoice::Flannel | CniChoice::None => {} // built-in or operator-provided
-            CniChoice::Calico  => out.push(calico_manifest()),
-            CniChoice::Cilium  => out.push(cilium_manifest(net.kube_proxy.disabled)),
+            CniChoice::Calico => out.push(calico_manifest()),
+            CniChoice::Cilium => out.push(cilium_manifest(net.kube_proxy.disabled)),
         }
 
         // Ingress controller manifests (only when non-default).
         match net.ingress {
-            IngressChoice::Traefik     => {} // k3s default
-            IngressChoice::Nginx       => out.push(nginx_ingress_manifest()),
-            IngressChoice::Contour     => out.push(contour_manifest()),
-            IngressChoice::GatewayApi  => out.push(gateway_api_manifest()),
-            IngressChoice::None        => {} // operator-provided
+            IngressChoice::Traefik => {} // k3s default
+            IngressChoice::Nginx => out.push(nginx_ingress_manifest()),
+            IngressChoice::Contour => out.push(contour_manifest()),
+            IngressChoice::GatewayApi => out.push(gateway_api_manifest()),
+            IngressChoice::None => {} // operator-provided
         }
 
         // LoadBalancer manifests (only when non-default).
         match net.load_balancer {
             LoadBalancerChoice::Servicelb => {} // k3s default
-            LoadBalancerChoice::Metallb   => out.push(metallb_manifest()),
-            LoadBalancerChoice::KubeVip   => out.push(kubevip_manifest()),
-            LoadBalancerChoice::None      => {} // operator-provided
+            LoadBalancerChoice::Metallb => out.push(metallb_manifest()),
+            LoadBalancerChoice::KubeVip => out.push(kubevip_manifest()),
+            LoadBalancerChoice::None => {} // operator-provided
         }
 
         // DNS overlay (nodelocal-dns when chosen).
@@ -183,13 +181,19 @@ impl ClusterConfig {
         if self.bootstrap.fluxcd.enable {
             out.push(fluxcd_install_manifest(&self.bootstrap.fluxcd));
             if self.bootstrap.fluxcd.source.is_some() {
-                out.push(fluxcd_source_manifest(&self.cluster_name, &self.bootstrap.fluxcd));
+                out.push(fluxcd_source_manifest(
+                    &self.cluster_name,
+                    &self.bootstrap.fluxcd,
+                ));
             }
         }
         if self.bootstrap.argocd.enable {
             out.push(argocd_install_manifest(&self.bootstrap.argocd));
             if self.bootstrap.argocd.source.is_some() {
-                out.push(argocd_application_manifest(&self.cluster_name, &self.bootstrap.argocd));
+                out.push(argocd_application_manifest(
+                    &self.cluster_name,
+                    &self.bootstrap.argocd,
+                ));
             }
         }
 
@@ -200,18 +204,18 @@ impl ClusterConfig {
 
 fn flannel_backend(b: FlannelBackend) -> &'static str {
     match b {
-        FlannelBackend::Vxlan            => "vxlan",
-        FlannelBackend::HostGw           => "host-gw",
-        FlannelBackend::WireguardNative  => "wireguard-native",
-        FlannelBackend::WireguardLegacy  => "wireguard",
-        FlannelBackend::Ipsec            => "ipsec",
+        FlannelBackend::Vxlan => "vxlan",
+        FlannelBackend::HostGw => "host-gw",
+        FlannelBackend::WireguardNative => "wireguard-native",
+        FlannelBackend::WireguardLegacy => "wireguard",
+        FlannelBackend::Ipsec => "ipsec",
     }
 }
 
 fn kube_proxy_mode(m: KubeProxyMode) -> &'static str {
     match m {
         KubeProxyMode::Iptables => "iptables",
-        KubeProxyMode::Ipvs     => "ipvs",
+        KubeProxyMode::Ipvs => "ipvs",
         KubeProxyMode::Nftables => "nftables",
     }
 }
@@ -239,7 +243,9 @@ fn calico_manifest() -> Manifest {
 
 fn cilium_manifest(replace_kube_proxy: bool) -> Manifest {
     let replace = if replace_kube_proxy { "true" } else { "false" };
-    Manifest::new("cilium.yaml", formatdoc! {"
+    Manifest::new(
+        "cilium.yaml",
+        formatdoc! {"
         apiVersion: helm.cattle.io/v1
         kind: HelmChart
         metadata:
@@ -253,7 +259,8 @@ fn cilium_manifest(replace_kube_proxy: bool) -> Manifest {
             kubeProxyReplacement: {replace}
             k8sServiceHost: 127.0.0.1
             k8sServicePort: 6443
-    ", replace = replace})
+    ", replace = replace},
+    )
 }
 
 fn nginx_ingress_manifest() -> Manifest {
@@ -289,7 +296,9 @@ fn contour_manifest() -> Manifest {
 fn gateway_api_manifest() -> Manifest {
     // Gateway API requires both the CRDs and a controller. Envoy
     // Gateway is the upstream-recommended controller.
-    Manifest::new("gateway-api.yaml", formatdoc! {"
+    Manifest::new(
+        "gateway-api.yaml",
+        formatdoc! {"
         apiVersion: helm.cattle.io/v1
         kind: HelmChart
         metadata:
@@ -300,11 +309,14 @@ fn gateway_api_manifest() -> Manifest {
           chart: gateway-helm
           targetNamespace: envoy-gateway-system
           createNamespace: true
-    "})
+    "},
+    )
 }
 
 fn metallb_manifest() -> Manifest {
-    Manifest::new("metallb.yaml", formatdoc! {"
+    Manifest::new(
+        "metallb.yaml",
+        formatdoc! {"
         apiVersion: helm.cattle.io/v1
         kind: HelmChart
         metadata:
@@ -315,11 +327,14 @@ fn metallb_manifest() -> Manifest {
           chart: metallb
           targetNamespace: metallb-system
           createNamespace: true
-    "})
+    "},
+    )
 }
 
 fn kubevip_manifest() -> Manifest {
-    Manifest::new("kube-vip.yaml", formatdoc! {"
+    Manifest::new(
+        "kube-vip.yaml",
+        formatdoc! {"
         apiVersion: helm.cattle.io/v1
         kind: HelmChart
         metadata:
@@ -329,11 +344,14 @@ fn kubevip_manifest() -> Manifest {
           repo: https://kube-vip.github.io/helm-charts
           chart: kube-vip
           targetNamespace: kube-system
-    "})
+    "},
+    )
 }
 
 fn nodelocal_dns_manifest(cluster_dns: std::net::Ipv4Addr) -> Manifest {
-    Manifest::new("nodelocal-dns.yaml", formatdoc! {"
+    Manifest::new(
+        "nodelocal-dns.yaml",
+        formatdoc! {"
         apiVersion: helm.cattle.io/v1
         kind: HelmChart
         metadata:
@@ -345,11 +363,14 @@ fn nodelocal_dns_manifest(cluster_dns: std::net::Ipv4Addr) -> Manifest {
           targetNamespace: kube-system
           valuesContent: |-
             clusterDNS: {dns}
-    ", dns = cluster_dns})
+    ", dns = cluster_dns},
+    )
 }
 
 fn fluxcd_install_manifest(cfg: &FluxcdBootstrap) -> Manifest {
-    Manifest::new("flux-system-install.yaml", formatdoc! {"
+    Manifest::new(
+        "flux-system-install.yaml",
+        formatdoc! {"
         apiVersion: helm.cattle.io/v1
         kind: HelmChart
         metadata:
@@ -361,11 +382,15 @@ fn fluxcd_install_manifest(cfg: &FluxcdBootstrap) -> Manifest {
           version: {ver}
           targetNamespace: flux-system
           createNamespace: true
-    ", ver = cfg.version})
+    ", ver = cfg.version},
+    )
 }
 
 fn fluxcd_source_manifest(cluster_name: &str, cfg: &FluxcdBootstrap) -> Manifest {
-    let source = cfg.source.as_ref().expect("validate() guarantees Some when enable=true");
+    let source = cfg
+        .source
+        .as_ref()
+        .expect("validate() guarantees Some when enable=true");
     let secret_ref = if source.auth.is_some() {
         formatdoc! {"
               secretRef:
@@ -414,13 +439,16 @@ fn fluxcd_source_manifest(cluster_name: &str, cfg: &FluxcdBootstrap) -> Manifest
     };
     let mut m = Manifest::new("flux-system-source.yaml", body);
     if let Some(auth) = &source.auth {
-        m.body.push_str(&render_gitops_secret_placeholder(cluster_name, auth.kind));
+        m.body
+            .push_str(&render_gitops_secret_placeholder(cluster_name, auth.kind));
     }
     m
 }
 
 fn argocd_install_manifest(cfg: &ArgocdBootstrap) -> Manifest {
-    Manifest::new("argocd-install.yaml", formatdoc! {"
+    Manifest::new(
+        "argocd-install.yaml",
+        formatdoc! {"
         apiVersion: helm.cattle.io/v1
         kind: HelmChart
         metadata:
@@ -432,13 +460,22 @@ fn argocd_install_manifest(cfg: &ArgocdBootstrap) -> Manifest {
           version: {ver}
           targetNamespace: argocd
           createNamespace: true
-    ", ver = cfg.version})
+    ", ver = cfg.version},
+    )
 }
 
 fn argocd_application_manifest(cluster_name: &str, cfg: &ArgocdBootstrap) -> Manifest {
-    let source = cfg.source.as_ref().expect("validate() guarantees Some when enable=true");
-    let target_rev = cfg.target_revision.clone().unwrap_or_else(|| source.branch.clone());
-    Manifest::new("argocd-application.yaml", formatdoc! {"
+    let source = cfg
+        .source
+        .as_ref()
+        .expect("validate() guarantees Some when enable=true");
+    let target_rev = cfg
+        .target_revision
+        .clone()
+        .unwrap_or_else(|| source.branch.clone());
+    Manifest::new(
+        "argocd-application.yaml",
+        formatdoc! {"
         apiVersion: argoproj.io/v1alpha1
         kind: Application
         metadata:
@@ -458,11 +495,12 @@ fn argocd_application_manifest(cluster_name: &str, cfg: &ArgocdBootstrap) -> Man
               prune: true
               selfHeal: true
     ",
-        name       = cluster_name,
-        url        = source.url,
-        target_rev = target_rev,
-        path       = cfg.path,
-    })
+            name       = cluster_name,
+            url        = source.url,
+            target_rev = target_rev,
+            path       = cfg.path,
+        },
+    )
 }
 
 fn render_gitops_secret_placeholder(cluster_name: &str, kind: SecretKind) -> String {
@@ -472,7 +510,7 @@ fn render_gitops_secret_placeholder(cluster_name: &str, kind: SecretKind) -> Str
     // populated YAML in place of this placeholder.
     let (secret_type, data_key) = match kind {
         SecretKind::HttpsToken => ("kubernetes.io/basic-auth", "password"),
-        SecretKind::SshKey     => ("kubernetes.io/ssh-auth",   "identity"),
+        SecretKind::SshKey => ("kubernetes.io/ssh-auth", "identity"),
     };
     formatdoc! {"
         ---

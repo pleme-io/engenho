@@ -30,25 +30,33 @@ pub struct ReqwestKubeClient {
 impl ReqwestKubeClient {
     /// Construct a new client over `conn`.
     #[must_use]
-    pub fn new(conn: Connection) -> Self { Self { conn } }
+    pub fn new(conn: Connection) -> Self {
+        Self { conn }
+    }
 
     /// Underlying [`Connection`] (shared with watchers + future
     /// engenho-controller-runtime).
     #[must_use]
-    pub fn connection(&self) -> Connection { self.conn.clone() }
+    pub fn connection(&self) -> Connection {
+        self.conn.clone()
+    }
 
     fn build_url<R: KubeResource>(&self, namespace: Option<&str>, name: Option<&str>) -> String {
         let path = match name {
             Some(n) => item_path(R::GVR, R::SCOPE, namespace, n),
-            None    => list_path(R::GVR, R::SCOPE, namespace),
+            None => list_path(R::GVR, R::SCOPE, namespace),
         };
         format!("{}{path}", self.conn.server())
     }
 
-    async fn parse_response<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T, KubeError> {
+    async fn parse_response<T: serde::de::DeserializeOwned>(
+        resp: reqwest::Response,
+    ) -> Result<T, KubeError> {
         let status = resp.status();
         if status.is_success() {
-            return resp.json::<T>().await
+            return resp
+                .json::<T>()
+                .await
                 .map_err(|e| KubeError::Decode(format!("response body: {e}")));
         }
         let code = status.as_u16();
@@ -65,24 +73,28 @@ impl ReqwestKubeClient {
         if matches!(kind, ApiStatusKind::NotFound) {
             return Err(KubeError::NotFound(text));
         }
-        Err(KubeError::ApiStatus { code, kind, message: text })
+        Err(KubeError::ApiStatus {
+            code,
+            kind,
+            message: text,
+        })
     }
 }
 
 fn reason_to_kind(reason: &str) -> ApiStatusKind {
     match reason {
-        "Unauthorized"        => ApiStatusKind::Unauthorized,
-        "Forbidden"           => ApiStatusKind::Forbidden,
-        "NotFound"            => ApiStatusKind::NotFound,
-        "Conflict"            => ApiStatusKind::Conflict,
-        "AlreadyExists"       => ApiStatusKind::AlreadyExists,
-        "Gone"                => ApiStatusKind::Gone,
-        "Invalid"             => ApiStatusKind::Invalid,
-        "TooManyRequests"     => ApiStatusKind::TooManyRequests,
-        "InternalError"       => ApiStatusKind::InternalError,
-        "ServiceUnavailable"  => ApiStatusKind::ServiceUnavailable,
-        "Timeout"             => ApiStatusKind::Timeout,
-        _                     => ApiStatusKind::Other,
+        "Unauthorized" => ApiStatusKind::Unauthorized,
+        "Forbidden" => ApiStatusKind::Forbidden,
+        "NotFound" => ApiStatusKind::NotFound,
+        "Conflict" => ApiStatusKind::Conflict,
+        "AlreadyExists" => ApiStatusKind::AlreadyExists,
+        "Gone" => ApiStatusKind::Gone,
+        "Invalid" => ApiStatusKind::Invalid,
+        "TooManyRequests" => ApiStatusKind::TooManyRequests,
+        "InternalError" => ApiStatusKind::InternalError,
+        "ServiceUnavailable" => ApiStatusKind::ServiceUnavailable,
+        "Timeout" => ApiStatusKind::Timeout,
+        _ => ApiStatusKind::Other,
     }
 }
 
@@ -94,8 +106,10 @@ impl KubeClient for ReqwestKubeClient {
         name: &str,
     ) -> Result<R, KubeError> {
         let url = self.build_url::<R>(namespace, Some(name));
-        let rb  = self.conn.auth_header(self.conn.http().get(&url))?;
-        let resp = rb.send().await
+        let rb = self.conn.auth_header(self.conn.http().get(&url))?;
+        let resp = rb
+            .send()
+            .await
             .map_err(|e| KubeError::Network(format!("GET {url}: {e}")))?;
         Self::parse_response::<R>(resp).await
     }
@@ -113,17 +127,26 @@ impl KubeClient for ReqwestKubeClient {
         if !opts.field_selector.is_empty() {
             qparts.push(format!("fieldSelector={}", url_enc(&opts.field_selector)));
         }
-        if let Some(lim) = opts.limit { qparts.push(format!("limit={lim}")); }
-        if let Some(c)   = &opts.continue_token { qparts.push(format!("continue={}", url_enc(c))); }
+        if let Some(lim) = opts.limit {
+            qparts.push(format!("limit={lim}"));
+        }
+        if let Some(c) = &opts.continue_token {
+            qparts.push(format!("continue={}", url_enc(c)));
+        }
         if !opts.resource_version.is_empty() {
-            qparts.push(format!("resourceVersion={}", url_enc(&opts.resource_version)));
+            qparts.push(format!(
+                "resourceVersion={}",
+                url_enc(&opts.resource_version)
+            ));
         }
         if !qparts.is_empty() {
             url.push('?');
             url.push_str(&qparts.join("&"));
         }
-        let rb  = self.conn.auth_header(self.conn.http().get(&url))?;
-        let resp = rb.send().await
+        let rb = self.conn.auth_header(self.conn.http().get(&url))?;
+        let resp = rb
+            .send()
+            .await
             .map_err(|e| KubeError::Network(format!("GET {url}: {e}")))?;
 
         // The k8s list response shape is `{ items: [...], metadata: { resourceVersion, continue } }`.
@@ -145,37 +168,50 @@ impl KubeClient for ReqwestKubeClient {
         }
         let raw: RawList<R> = Self::parse_response(resp).await?;
         Ok(List {
-            items:           raw.items,
+            items: raw.items,
             resource_version: raw.metadata.resource_version,
-            continue_token:  raw.metadata.continue_token.filter(|s| !s.is_empty()),
+            continue_token: raw.metadata.continue_token.filter(|s| !s.is_empty()),
         })
     }
 
-    async fn create<R: KubeResource + Send + Sync + 'static>(&self, resource: &R) -> Result<R, KubeError> {
+    async fn create<R: KubeResource + Send + Sync + 'static>(
+        &self,
+        resource: &R,
+    ) -> Result<R, KubeError> {
         let url = self.build_url::<R>(resource.namespace().as_deref(), None);
-        let body = serde_json::to_vec(resource).map_err(|e| KubeError::Encode(format!("create body: {e}")))?;
+        let body = serde_json::to_vec(resource)
+            .map_err(|e| KubeError::Encode(format!("create body: {e}")))?;
         let rb = self.conn.auth_header(
-            self.conn.http().post(&url)
+            self.conn
+                .http()
+                .post(&url)
                 .header("Content-Type", "application/json")
-                .body(body)
+                .body(body),
         )?;
-        let resp = rb.send().await
+        let resp = rb
+            .send()
+            .await
             .map_err(|e| KubeError::Network(format!("POST {url}: {e}")))?;
         Self::parse_response(resp).await
     }
 
-    async fn replace<R: KubeResource + Send + Sync + 'static>(&self, resource: &R) -> Result<R, KubeError> {
-        let url = self.build_url::<R>(
-            resource.namespace().as_deref(),
-            Some(&resource.name()),
-        );
-        let body = serde_json::to_vec(resource).map_err(|e| KubeError::Encode(format!("replace body: {e}")))?;
+    async fn replace<R: KubeResource + Send + Sync + 'static>(
+        &self,
+        resource: &R,
+    ) -> Result<R, KubeError> {
+        let url = self.build_url::<R>(resource.namespace().as_deref(), Some(&resource.name()));
+        let body = serde_json::to_vec(resource)
+            .map_err(|e| KubeError::Encode(format!("replace body: {e}")))?;
         let rb = self.conn.auth_header(
-            self.conn.http().put(&url)
+            self.conn
+                .http()
+                .put(&url)
                 .header("Content-Type", "application/json")
-                .body(body)
+                .body(body),
         )?;
-        let resp = rb.send().await
+        let resp = rb
+            .send()
+            .await
             .map_err(|e| KubeError::Network(format!("PUT {url}: {e}")))?;
         Self::parse_response(resp).await
     }
@@ -187,19 +223,31 @@ impl KubeClient for ReqwestKubeClient {
         patch: &Patch,
     ) -> Result<R, KubeError> {
         let mut url = self.build_url::<R>(namespace, Some(name));
-        if let Patch::Apply { field_manager, force, .. } = patch {
-            url.push_str(&format!("?fieldManager={}{}",
+        if let Patch::Apply {
+            field_manager,
+            force,
+            ..
+        } = patch
+        {
+            url.push_str(&format!(
+                "?fieldManager={}{}",
                 url_enc(field_manager),
                 if *force { "&force=true" } else { "" }
             ));
         }
-        let body = patch.body_bytes().map_err(|e| KubeError::Encode(format!("patch body: {e}")))?;
+        let body = patch
+            .body_bytes()
+            .map_err(|e| KubeError::Encode(format!("patch body: {e}")))?;
         let rb = self.conn.auth_header(
-            self.conn.http().patch(&url)
+            self.conn
+                .http()
+                .patch(&url)
                 .header("Content-Type", patch.content_type())
-                .body(body)
+                .body(body),
         )?;
-        let resp = rb.send().await
+        let resp = rb
+            .send()
+            .await
             .map_err(|e| KubeError::Network(format!("PATCH {url}: {e}")))?;
         Self::parse_response(resp).await
     }
@@ -211,13 +259,18 @@ impl KubeClient for ReqwestKubeClient {
         opts: &DeleteOptions,
     ) -> Result<(), KubeError> {
         let url = self.build_url::<R>(namespace, Some(name));
-        let body = serde_json::to_vec(opts).map_err(|e| KubeError::Encode(format!("delete opts: {e}")))?;
+        let body =
+            serde_json::to_vec(opts).map_err(|e| KubeError::Encode(format!("delete opts: {e}")))?;
         let rb = self.conn.auth_header(
-            self.conn.http().delete(&url)
+            self.conn
+                .http()
+                .delete(&url)
                 .header("Content-Type", "application/json")
-                .body(body)
+                .body(body),
         )?;
-        let resp = rb.send().await
+        let resp = rb
+            .send()
+            .await
             .map_err(|e| KubeError::Network(format!("DELETE {url}: {e}")))?;
         if resp.status().is_success() {
             return Ok(());
@@ -228,7 +281,11 @@ impl KubeClient for ReqwestKubeClient {
         if matches!(kind, ApiStatusKind::NotFound) {
             return Err(KubeError::NotFound(text));
         }
-        Err(KubeError::ApiStatus { code, kind, message: text })
+        Err(KubeError::ApiStatus {
+            code,
+            kind,
+            message: text,
+        })
     }
 
     fn watcher<R: KubeResource + Send + Sync + 'static>(&self) -> Box<dyn Watcher<R>> {
@@ -260,14 +317,23 @@ mod tests {
 
     #[test]
     fn reason_strings_map_to_typed_kinds() {
-        assert_eq!(reason_to_kind("Unauthorized"),    ApiStatusKind::Unauthorized);
-        assert_eq!(reason_to_kind("Forbidden"),       ApiStatusKind::Forbidden);
-        assert_eq!(reason_to_kind("AlreadyExists"),   ApiStatusKind::AlreadyExists);
-        assert_eq!(reason_to_kind("Conflict"),        ApiStatusKind::Conflict);
-        assert_eq!(reason_to_kind("Gone"),            ApiStatusKind::Gone);
-        assert_eq!(reason_to_kind("Invalid"),         ApiStatusKind::Invalid);
-        assert_eq!(reason_to_kind("TooManyRequests"), ApiStatusKind::TooManyRequests);
-        assert_eq!(reason_to_kind("InternalError"),   ApiStatusKind::InternalError);
-        assert_eq!(reason_to_kind("Garbage"),         ApiStatusKind::Other);
+        assert_eq!(reason_to_kind("Unauthorized"), ApiStatusKind::Unauthorized);
+        assert_eq!(reason_to_kind("Forbidden"), ApiStatusKind::Forbidden);
+        assert_eq!(
+            reason_to_kind("AlreadyExists"),
+            ApiStatusKind::AlreadyExists
+        );
+        assert_eq!(reason_to_kind("Conflict"), ApiStatusKind::Conflict);
+        assert_eq!(reason_to_kind("Gone"), ApiStatusKind::Gone);
+        assert_eq!(reason_to_kind("Invalid"), ApiStatusKind::Invalid);
+        assert_eq!(
+            reason_to_kind("TooManyRequests"),
+            ApiStatusKind::TooManyRequests
+        );
+        assert_eq!(
+            reason_to_kind("InternalError"),
+            ApiStatusKind::InternalError
+        );
+        assert_eq!(reason_to_kind("Garbage"), ApiStatusKind::Other);
     }
 }

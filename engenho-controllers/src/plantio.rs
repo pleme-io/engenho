@@ -29,13 +29,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
-    command::{Reason, ResourceCommand},
     StoreMesh,
+    command::{Reason, ResourceCommand},
 };
 use engenho_substrate::{
     JobTarget, MaterializationLedger, NodeId, Plantio, QuorumOutcome, StageId,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
@@ -145,10 +145,7 @@ impl PlantioController {
     /// Compute the set of StageIds whose deps are all Confirmed.
     /// Pure helper.
     #[must_use]
-    pub fn ready_stages(
-        plantio: &Plantio,
-        confirmed: &BTreeSet<StageId>,
-    ) -> Vec<StageId> {
+    pub fn ready_stages(plantio: &Plantio, confirmed: &BTreeSet<StageId>) -> Vec<StageId> {
         let mut ready = Vec::new();
         for (id, stage) in &plantio.stages {
             if confirmed.contains(id) {
@@ -221,16 +218,10 @@ impl Controller for PlantioController {
                 for stage_id in ready {
                     let stage = &plantio.stages[&stage_id];
                     let target = match stage.placement {
-                        engenho_substrate::Placement::Pinned { node } => {
-                            JobTarget::Node(node)
-                        }
+                        engenho_substrate::Placement::Pinned { node } => JobTarget::Node(node),
                         engenho_substrate::Placement::AnyOne => JobTarget::AnyOne,
-                        engenho_substrate::Placement::AnyK { k } => {
-                            JobTarget::AnyK { k }
-                        }
-                        engenho_substrate::Placement::Quorum { k } => {
-                            JobTarget::Quorum { k }
-                        }
+                        engenho_substrate::Placement::AnyK { k } => JobTarget::AnyK { k },
+                        engenho_substrate::Placement::Quorum { k } => JobTarget::Quorum { k },
                         engenho_substrate::Placement::AllNodes => JobTarget::AllNodes,
                     };
                     let nodes = self.resolver.resolve(&target).await?;
@@ -243,15 +234,12 @@ impl Controller for PlantioController {
                                     .ledger
                                     .ingest(&stage_id, threshold, &receipt)
                                     .await
-                                    .map_err(|e| {
-                                        ControllerError::Internal(e.to_string())
-                                    })?;
+                                    .map_err(|e| ControllerError::Internal(e.to_string()))?;
                                 quorum_outcome = Some(outcome);
                             }
                             Err(e) => {
                                 debug!(stage = %stage_id, error = %e, "materialize failed");
-                                stage_phases
-                                    .insert(stage_id.clone(), "Failed".into());
+                                stage_phases.insert(stage_id.clone(), "Failed".into());
                             }
                         }
                     }
@@ -271,9 +259,7 @@ impl Controller for PlantioController {
                         }
                         None => {
                             // Never even dispatched (no nodes resolved).
-                            stage_phases
-                                .entry(stage_id)
-                                .or_insert("Pending".into());
+                            stage_phases.entry(stage_id).or_insert("Pending".into());
                         }
                     }
                 }
@@ -283,10 +269,7 @@ impl Controller for PlantioController {
             }
 
             // Aggregate status.phase.
-            let all_confirmed = plantio
-                .stages
-                .keys()
-                .all(|id| confirmed.contains(id));
+            let all_confirmed = plantio.stages.keys().all(|id| confirmed.contains(id));
             let any_dissent = stage_phases.values().any(|p| p == "Dissent");
             let any_failed = stage_phases.values().any(|p| p == "Failed");
             let overall = if any_dissent || any_failed {
@@ -327,9 +310,7 @@ impl Controller for PlantioController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engenho_substrate::{
-        ConfirmacaoPolicy, MemoryLedger, Placement, Stage, WorkloadShape,
-    };
+    use engenho_substrate::{ConfirmacaoPolicy, MemoryLedger, Placement, Stage, WorkloadShape};
 
     fn n(b: u8) -> NodeId {
         NodeId::new([b; 32])
@@ -493,7 +474,9 @@ mod tests {
         struct F;
         #[async_trait]
         impl Controller for F {
-            fn name(&self) -> &'static str { "plantio" }
+            fn name(&self) -> &'static str {
+                "plantio"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }
@@ -514,16 +497,16 @@ mod tests {
         stage.placement = Placement::AnyK { k: 3 };
         let threshold = PlantioController::threshold_for(&stage);
         let resolver = StaticNodeResolver::new(vec![n(1), n(2), n(3)]);
-        let nodes = resolver
-            .resolve(&JobTarget::AnyK { k: 3 })
-            .await
-            .unwrap();
+        let nodes = resolver.resolve(&JobTarget::AnyK { k: 3 }).await.unwrap();
         let mut outcomes = Vec::new();
         for node in nodes {
             let r = roceiro.materialize(&stage, node).await.unwrap();
             outcomes.push(ledger.ingest(&stage.id, threshold, &r).await.unwrap());
         }
         // Third receipt should be Reached.
-        assert!(matches!(outcomes.last(), Some(QuorumOutcome::Reached { .. })));
+        assert!(matches!(
+            outcomes.last(),
+            Some(QuorumOutcome::Reached { .. })
+        ));
     }
 }

@@ -49,9 +49,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
 
+use crate::NodeId;
 use crate::consensus::{ApplyResult, RaftError, RaftMesh, Reason, RoleAssignment};
 use crate::membership::{GossipMesh, MembershipView, NodeRole};
-use crate::NodeId;
 
 /// The "desired shape" of the mesh — declared by the operator.
 /// Policies compare this against `MeshShape` (the actual
@@ -149,11 +149,7 @@ impl Policy for AutoReplacementPolicy {
         let mut proposals = Vec::new();
 
         // Set of NodeIds currently alive according to gossip.
-        let alive: BTreeSet<NodeId> = membership
-            .members
-            .iter()
-            .map(|m| m.node_id)
-            .collect();
+        let alive: BTreeSet<NodeId> = membership.members.iter().map(|m| m.node_id).collect();
 
         // Iterate the four control-plane roles.
         for &role in &[
@@ -164,10 +160,16 @@ impl Policy for AutoReplacementPolicy {
         ] {
             // Holders of this role per consensus state.
             let holders = consensus.holders(role);
-            let alive_holders: BTreeSet<NodeId> =
-                holders.iter().copied().filter(|n| alive.contains(n)).collect();
-            let dead_holders: BTreeSet<NodeId> =
-                holders.iter().copied().filter(|n| !alive.contains(n)).collect();
+            let alive_holders: BTreeSet<NodeId> = holders
+                .iter()
+                .copied()
+                .filter(|n| alive.contains(n))
+                .collect();
+            let dead_holders: BTreeSet<NodeId> = holders
+                .iter()
+                .copied()
+                .filter(|n| !alive.contains(n))
+                .collect();
 
             // (1) Demote each dead holder for THIS role.
             for dead in &dead_holders {
@@ -181,8 +183,7 @@ impl Policy for AutoReplacementPolicy {
             }
 
             // (2) Promote replacements if alive count < target.
-            let needed = target.target_for(role) as i64
-                - alive_holders.len() as i64;
+            let needed = target.target_for(role) as i64 - alive_holders.len() as i64;
             if needed > 0 {
                 // Find healthy gossip members not already holding the role.
                 let candidates: Vec<NodeId> = membership
@@ -245,11 +246,7 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    pub fn new(
-        gossip: Arc<GossipMesh>,
-        raft: Arc<RaftMesh>,
-        config: PolicyEngineConfig,
-    ) -> Self {
+    pub fn new(gossip: Arc<GossipMesh>, raft: Arc<RaftMesh>, config: PolicyEngineConfig) -> Self {
         Self {
             gossip,
             raft,
@@ -280,9 +277,7 @@ impl PolicyEngine {
 
         let mut report = TickReport::default();
         for policy in &self.policies {
-            let proposals = policy
-                .evaluate(&membership, &consensus, &self.target)
-                .await;
+            let proposals = policy.evaluate(&membership, &consensus, &self.target).await;
             report.proposals_seen += proposals.len();
             for cmd in proposals {
                 match self.raft.propose(cmd.clone()).await {
@@ -308,11 +303,7 @@ impl PolicyEngine {
                 // React on either:
                 //   - the next gossip change
                 //   - the audit interval elapsing
-                let _ = tokio::time::timeout(
-                    self.audit_interval,
-                    gossip_rx.changed(),
-                )
-                .await;
+                let _ = tokio::time::timeout(self.audit_interval, gossip_rx.changed()).await;
                 let _ = self.tick().await;
             }
         })
@@ -422,14 +413,18 @@ mod tests {
         let proposals = policy.evaluate(&membership, &consensus, &target).await;
         // Expect: 1 Demote on A + 1 Promote on B.
         assert_eq!(proposals.len(), 2);
-        let has_demote_a = proposals.iter().any(|p| matches!(
-            p,
-            RoleAssignment::Demote { node_id, .. } if *node_id == id_a
-        ));
-        let has_promote_b = proposals.iter().any(|p| matches!(
-            p,
-            RoleAssignment::Promote { node_id, .. } if *node_id == id_b
-        ));
+        let has_demote_a = proposals.iter().any(|p| {
+            matches!(
+                p,
+                RoleAssignment::Demote { node_id, .. } if *node_id == id_a
+            )
+        });
+        let has_promote_b = proposals.iter().any(|p| {
+            matches!(
+                p,
+                RoleAssignment::Promote { node_id, .. } if *node_id == id_b
+            )
+        });
         assert!(has_demote_a, "expected Demote on dead A: {proposals:?}");
         assert!(has_promote_b, "expected Promote on B: {proposals:?}");
     }
@@ -459,7 +454,10 @@ mod tests {
         };
 
         let proposals = policy.evaluate(&membership, &consensus, &target).await;
-        assert!(proposals.is_empty(), "expected no proposals at target: {proposals:?}");
+        assert!(
+            proposals.is_empty(),
+            "expected no proposals at target: {proposals:?}"
+        );
     }
 
     #[test]

@@ -153,8 +153,7 @@ impl CompositeShapeRenderer {
     /// Set of distinct shapes this composite knows how to render.
     #[must_use]
     pub fn supported_shapes(&self) -> Vec<WorkloadShape> {
-        let mut shapes: Vec<WorkloadShape> =
-            self.renderers.iter().map(|r| r.shape()).collect();
+        let mut shapes: Vec<WorkloadShape> = self.renderers.iter().map(|r| r.shape()).collect();
         // Deduplicate; preserve declaration order so first-hit
         // dispatch matches semantics below.
         shapes.dedup();
@@ -294,7 +293,10 @@ mod tests {
     #[tokio::test]
     async fn empty_composite_render_as_returns_unsupported() {
         let c = CompositeShapeRenderer::default_named(vec![]);
-        let err = c.render_as(&drv(b"x"), &WorkloadShape::OciImage).await.unwrap_err();
+        let err = c
+            .render_as(&drv(b"x"), &WorkloadShape::OciImage)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "unsupported_shape");
     }
 
@@ -306,9 +308,15 @@ mod tests {
             arc_fake(WorkloadShape::Qcow2),
         ]);
         // Each shape dispatches to its specific child.
-        let a_oci = c.render_as(&drv(b"x"), &WorkloadShape::OciImage).await.unwrap();
+        let a_oci = c
+            .render_as(&drv(b"x"), &WorkloadShape::OciImage)
+            .await
+            .unwrap();
         let a_wasm = c.render_as(&drv(b"x"), &WorkloadShape::Wasm).await.unwrap();
-        let a_qcow = c.render_as(&drv(b"x"), &WorkloadShape::Qcow2).await.unwrap();
+        let a_qcow = c
+            .render_as(&drv(b"x"), &WorkloadShape::Qcow2)
+            .await
+            .unwrap();
         assert_eq!(a_oci.shape, WorkloadShape::OciImage);
         assert_eq!(a_wasm.shape, WorkloadShape::Wasm);
         assert_eq!(a_qcow.shape, WorkloadShape::Qcow2);
@@ -329,7 +337,10 @@ mod tests {
         // We can't directly observe which one ran (both produce same
         // bytes for same drv/shape). But we can assert behavior is
         // consistent — both render the same artifact.
-        let a = c.render_as(&drv(b"x"), &WorkloadShape::OciImage).await.unwrap();
+        let a = c
+            .render_as(&drv(b"x"), &WorkloadShape::OciImage)
+            .await
+            .unwrap();
         let direct = FakeShapeRenderer::new("first", WorkloadShape::OciImage)
             .render(&drv(b"x"))
             .await
@@ -352,7 +363,7 @@ mod tests {
         let c = CompositeShapeRenderer::default_named(vec![
             arc_fake(WorkloadShape::OciImage),
             arc_fake(WorkloadShape::Wasm),
-            arc_fake(WorkloadShape::OciImage),  // dup — preserved by dedup
+            arc_fake(WorkloadShape::OciImage), // dup — preserved by dedup
         ]);
         let shapes = c.supported_shapes();
         assert!(shapes.contains(&WorkloadShape::OciImage));
@@ -383,10 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn composite_name_passes_through() {
-        let c = CompositeShapeRenderer::new(
-            "my-composite",
-            vec![arc_fake(WorkloadShape::Wasm)],
-        );
+        let c = CompositeShapeRenderer::new("my-composite", vec![arc_fake(WorkloadShape::Wasm)]);
         assert_eq!(c.name(), "my-composite");
     }
 
@@ -395,7 +403,10 @@ mod tests {
         let c = CompositeShapeRenderer::default_named(vec![Arc::new(
             FakeShapeRenderer::for_shape(WorkloadShape::OciImage).failing(),
         )]);
-        let err = c.render_as(&drv(b"x"), &WorkloadShape::OciImage).await.unwrap_err();
+        let err = c
+            .render_as(&drv(b"x"), &WorkloadShape::OciImage)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "backend");
     }
 }

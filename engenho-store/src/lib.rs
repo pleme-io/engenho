@@ -54,16 +54,16 @@ pub mod watch;
 
 pub use command::{Reason, ResourceCommand, ResourceOp};
 pub use drv_committal::{
-    delete_drv_command, drv_resource_key, put_drv_command, render_drv_resource,
-    DRV_GROUP, DRV_KIND, DRV_VERSION,
+    DRV_GROUP, DRV_KIND, DRV_VERSION, delete_drv_command, drv_resource_key, put_drv_command,
+    render_drv_resource,
 };
-pub use mesh::{default_config, StoreError, StoreMesh};
+pub use durable_store::{DurableInMemoryStore, JournalEntry};
+pub use mesh::{StoreError, StoreMesh, default_config};
 pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
-pub use durable_store::{DurableInMemoryStore, JournalEntry};
+pub use network::InProcessRouter;
 pub use persistence::{CatalogSnapshot, SnapshotError};
 pub use persistent_log::{PersistentLog, PersistentLogError};
-pub use network::InProcessRouter;
 pub use resource::{ResourceKey, ResourceValue};
 pub use state::{ResourceCatalog, ResourceCatalogSnapshot};
 pub use store::InMemoryStore;

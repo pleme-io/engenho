@@ -25,11 +25,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
-    command::{Reason, ResourceCommand},
     StoreMesh,
+    command::{Reason, ResourceCommand},
 };
 use engenho_substrate::{DerivationCacheBackend, DrvHash};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
@@ -215,7 +215,9 @@ mod tests {
         struct F;
         #[async_trait]
         impl Controller for F {
-            fn name(&self) -> &'static str { "drv" }
+            fn name(&self) -> &'static str {
+                "drv"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

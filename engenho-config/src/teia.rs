@@ -52,7 +52,9 @@ impl TieredConfig for TeiaConfig {
             } else {
                 self.cluster
             },
-            credentials_path: self.credentials_path.or_else(|| base.credentials_path.clone()),
+            credentials_path: self
+                .credentials_path
+                .or_else(|| base.credentials_path.clone()),
             connect_timeout_seconds: if self.connect_timeout_seconds == 0 {
                 base.connect_timeout_seconds
             } else {

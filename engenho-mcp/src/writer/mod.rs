@@ -64,7 +64,9 @@ pub enum WriterError {
     #[error("unknown cluster: {0}")]
     UnknownCluster(String),
 
-    #[error("authority required for write — current authority cannot mutate (waiting on saguão passport materialization at P2)")]
+    #[error(
+        "authority required for write — current authority cannot mutate (waiting on saguão passport materialization at P2)"
+    )]
     AuthorityRequired,
 
     #[error("io error during write of {what}: {source}")]

@@ -289,11 +289,8 @@ impl Plantio {
             }
         }
         // Compute in-degree per stage.
-        let mut in_degree: BTreeMap<StageId, usize> = self
-            .stages
-            .keys()
-            .map(|k| (k.clone(), 0usize))
-            .collect();
+        let mut in_degree: BTreeMap<StageId, usize> =
+            self.stages.keys().map(|k| (k.clone(), 0usize)).collect();
         for stage in self.stages.values() {
             for dep in &stage.depends_on {
                 // depends_on means dep → stage. Stage's in-degree
@@ -611,10 +608,8 @@ mod tests {
         st_all.placement = Placement::AllNodes;
         p.add_stage(st_all).unwrap();
         let jobs = p.compile_jobs().unwrap();
-        let targets: BTreeMap<StageId, JobTarget> = jobs
-            .into_iter()
-            .map(|j| (j.stage_id, j.target))
-            .collect();
+        let targets: BTreeMap<StageId, JobTarget> =
+            jobs.into_iter().map(|j| (j.stage_id, j.target)).collect();
         assert_eq!(targets[&s("p")], JobTarget::Node(n(7)));
         assert_eq!(targets[&s("any")], JobTarget::AnyOne);
         assert_eq!(targets[&s("q")], JobTarget::Quorum { k: 3 });

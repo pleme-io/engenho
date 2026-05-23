@@ -63,10 +63,7 @@ impl WatchedCache {
 
     /// Wrap `inner` with an explicit channel capacity.
     #[must_use]
-    pub fn with_capacity(
-        inner: Arc<dyn DerivationCacheBackend>,
-        capacity: usize,
-    ) -> Self {
+    pub fn with_capacity(inner: Arc<dyn DerivationCacheBackend>, capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
         Self { inner, sender }
     }
@@ -105,7 +102,9 @@ impl DerivationCacheBackend for WatchedCache {
         self.inner.put_drv(drv).await?;
         // Send is fallible only when there are no subscribers; we
         // ignore that — events are best-effort by design.
-        let _ = self.sender.send(CacheEvent::DrvUpserted(drv.drv_hash.clone()));
+        let _ = self
+            .sender
+            .send(CacheEvent::DrvUpserted(drv.drv_hash.clone()));
         Ok(())
     }
 
@@ -119,17 +118,11 @@ impl DerivationCacheBackend for WatchedCache {
         Ok(())
     }
 
-    async fn list_realisations(
-        &self,
-        drv_hash: &DrvHash,
-    ) -> Result<Vec<Realisation>, CacheError> {
+    async fn list_realisations(&self, drv_hash: &DrvHash) -> Result<Vec<Realisation>, CacheError> {
         self.inner.list_realisations(drv_hash).await
     }
 
-    async fn put_realisation(
-        &self,
-        realisation: &Realisation,
-    ) -> Result<(), CacheError> {
+    async fn put_realisation(&self, realisation: &Realisation) -> Result<(), CacheError> {
         self.inner.put_realisation(realisation).await?;
         let _ = self.sender.send(CacheEvent::RealisationUpserted {
             drv_hash: realisation.drv_hash.clone(),

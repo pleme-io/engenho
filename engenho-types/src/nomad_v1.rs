@@ -107,9 +107,17 @@ pub struct Resources {
 #[serde(rename_all = "PascalCase")]
 pub struct Network {
     pub mode: String,
-    #[serde(rename = "DynamicPorts", skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(
+        rename = "DynamicPorts",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
     pub dynamic_ports: Vec<Port>,
-    #[serde(rename = "ReservedPorts", skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(
+        rename = "ReservedPorts",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
     pub reserved_ports: Vec<Port>,
 }
 
@@ -198,10 +206,7 @@ mod tests {
                     driver: "docker".into(),
                     config: {
                         let mut m = BTreeMap::new();
-                        m.insert(
-                            "image".into(),
-                            serde_json::json!("stefanprodan/podinfo:6"),
-                        );
+                        m.insert("image".into(), serde_json::json!("stefanprodan/podinfo:6"));
                         m
                     },
                     env: BTreeMap::new(),

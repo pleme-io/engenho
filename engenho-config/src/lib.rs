@@ -91,7 +91,7 @@ mod teia;
 
 pub use cluster::ClusterConfig;
 pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
-pub use controllers::{ControllersConfig, ControllerEnable};
+pub use controllers::{ControllerEnable, ControllersConfig};
 pub use error::ConfigError;
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
@@ -204,10 +204,8 @@ impl EngenhoConfig {
         // requires all fields). We accept partial YAML via merging
         // serde_yaml::Value onto the default's Value, then
         // re-deserializing.
-        let default_v: serde_yaml::Value =
-            serde_yaml::to_value(Self::prescribed_default()).map_err(|e| {
-                ConfigError::Parse(format!("serialize default: {e}"))
-            })?;
+        let default_v: serde_yaml::Value = serde_yaml::to_value(Self::prescribed_default())
+            .map_err(|e| ConfigError::Parse(format!("serialize default: {e}")))?;
         let overlay: serde_yaml::Value = serde_yaml::from_str(yaml)
             .map_err(|e| ConfigError::Parse(format!("operator YAML: {e}")))?;
         let merged = merge_yaml(default_v, overlay);
@@ -250,7 +248,10 @@ mod tests {
 
     #[test]
     fn default_is_prescribed_default() {
-        assert_eq!(EngenhoConfig::default(), EngenhoConfig::prescribed_default());
+        assert_eq!(
+            EngenhoConfig::default(),
+            EngenhoConfig::prescribed_default()
+        );
     }
 
     #[test]

@@ -65,7 +65,13 @@ pub struct SrvRecord {
 
 /// Build the SRV FQDN for a service port (pure helper).
 #[must_use]
-pub fn srv_fqdn(port_name: &str, protocol: &str, service: &str, namespace: &str, domain: &str) -> String {
+pub fn srv_fqdn(
+    port_name: &str,
+    protocol: &str,
+    service: &str,
+    namespace: &str,
+    domain: &str,
+) -> String {
     format!(
         "_{port_name}._{}.{service}.{namespace}.svc.{domain}",
         protocol.to_lowercase()
@@ -186,7 +192,12 @@ impl InMemoryDnsZone {
 
     /// Resolve a name to its current IP (test helper).
     pub async fn resolve(&self, fqdn: &str) -> Option<String> {
-        self.inner.lock().await.records.get(fqdn).map(|r| r.ip.clone())
+        self.inner
+            .lock()
+            .await
+            .records
+            .get(fqdn)
+            .map(|r| r.ip.clone())
     }
 }
 
@@ -228,7 +239,9 @@ impl DnsBackend for InMemoryDnsZone {
             return Err(DnsError::InvalidRecord("empty srv target".into()));
         }
         let mut state = self.inner.lock().await;
-        state.srv_records.insert(record.fqdn.clone(), record.clone());
+        state
+            .srv_records
+            .insert(record.fqdn.clone(), record.clone());
         state.events.push(DnsEvent::UpsertSrv(record.fqdn.clone()));
         Ok(())
     }
@@ -306,11 +319,7 @@ impl Controller for DnsController {
             .into_iter()
             .filter_map(|(key, svc)| {
                 let ns = key.namespace.as_deref().unwrap_or("default");
-                let ip = svc
-                    .get("spec")?
-                    .get("clusterIP")?
-                    .as_str()?
-                    .to_string();
+                let ip = svc.get("spec")?.get("clusterIP")?.as_str()?.to_string();
                 if ip.is_empty() || ip == "None" {
                     // Headless service — skip A record (CoreDNS uses
                     // SRV pointing at endpoint IPs instead; future
@@ -318,14 +327,7 @@ impl Controller for DnsController {
                     return None;
                 }
                 let fqdn = Self::fqdn(&key.name, ns, &self.cluster_domain);
-                Some((
-                    fqdn.clone(),
-                    DnsRecord {
-                        fqdn,
-                        ip,
-                        ttl: 30,
-                    },
-                ))
+                Some((fqdn.clone(), DnsRecord { fqdn, ip, ttl: 30 }))
             })
             .collect();
 
@@ -570,7 +572,15 @@ mod tests {
         zone.upsert_srv(&srv).await.unwrap();
         zone.remove_srv("a").await.unwrap();
         let events = zone.events().await;
-        assert!(events.iter().any(|e| matches!(e, DnsEvent::UpsertSrv(n) if n == "a")));
-        assert!(events.iter().any(|e| matches!(e, DnsEvent::RemoveSrv(n) if n == "a")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DnsEvent::UpsertSrv(n) if n == "a"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DnsEvent::RemoveSrv(n) if n == "a"))
+        );
     }
 }

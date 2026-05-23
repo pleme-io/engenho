@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
-    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
-    SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
+    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta,
+    StorageError, StorageIOError, StoredMembership, Vote,
 };
 use tokio::sync::Mutex;
 
@@ -142,10 +142,7 @@ impl RaftLogStorage<TypeConfig> for InMemoryStore {
         self.clone()
     }
 
-    async fn save_vote(
-        &mut self,
-        vote: &Vote<RaftNodeId>,
-    ) -> Result<(), StorageError<RaftNodeId>> {
+    async fn save_vote(&mut self, vote: &Vote<RaftNodeId>) -> Result<(), StorageError<RaftNodeId>> {
         self.inner.lock().await.vote = Some(*vote);
         Ok(())
     }
@@ -286,7 +283,9 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
                         | crate::command::ResourceCommand::Patch { key, .. }
                         | crate::command::ResourceCommand::Delete { key, .. } => key.clone(),
                     };
-                    let outcome = guard.catalog.apply(cmd, log_id.leader_id.term, log_id.index);
+                    let outcome = guard
+                        .catalog
+                        .apply(cmd, log_id.leader_id.term, log_id.index);
                     // Emit a typed WatchEvent for every committed mutation.
                     let event_kind = match outcome {
                         crate::command::ResourceOp::Created => Some(WatchEventKind::Added),

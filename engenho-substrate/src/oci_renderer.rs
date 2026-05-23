@@ -151,9 +151,7 @@ impl OciImageRenderer {
     /// `oci-archive:/tmp/{hash}-oci.tar`.
     #[must_use]
     pub fn default_dest_ref() -> OciDestRef {
-        Arc::new(|drv: &Drv| {
-            format!("oci-archive:/tmp/{}-oci.tar", drv.drv_hash.to_hex())
-        })
+        Arc::new(|drv: &Drv| format!("oci-archive:/tmp/{}-oci.tar", drv.drv_hash.to_hex()))
     }
 
     /// Convenience: default dest-reader closure that strips the
@@ -161,8 +159,7 @@ impl OciImageRenderer {
     #[must_use]
     pub fn default_dest_reader() -> OciDestReader {
         Arc::new(|drv: &Drv| {
-            let path: PathBuf =
-                format!("/tmp/{}-oci.tar", drv.drv_hash.to_hex()).into();
+            let path: PathBuf = format!("/tmp/{}-oci.tar", drv.drv_hash.to_hex()).into();
             std::fs::read(&path).ok()
         })
     }
@@ -268,11 +265,7 @@ mod tests {
     #[tokio::test]
     async fn render_dispatches_through_runner() {
         let runner = Arc::new(FakeCommandRunner::new());
-        let renderer = OciImageRenderer::default_named(
-            runner.clone(),
-            src_ref(),
-            dst_ref(),
-        );
+        let renderer = OciImageRenderer::default_named(runner.clone(), src_ref(), dst_ref());
         let _ = renderer.render(&d(b"x")).await.unwrap();
         let calls = runner.invocations().await;
         assert_eq!(calls.len(), 1);
@@ -321,11 +314,7 @@ mod tests {
     #[tokio::test]
     async fn render_uses_pinned_response_when_runner_pins_command() {
         let runner = Arc::new(FakeCommandRunner::new());
-        let renderer = OciImageRenderer::default_named(
-            runner.clone(),
-            src_ref(),
-            dst_ref(),
-        );
+        let renderer = OciImageRenderer::default_named(runner.clone(), src_ref(), dst_ref());
         // Pin the exact skopeo invocation the renderer will build.
         let expected_req = renderer.build_request(&d(b"x"));
         runner
@@ -359,10 +348,7 @@ mod tests {
             .with_dest_reader(Arc::new(|_| Some(b"real-oci-bytes".to_vec())));
         let a = renderer.render(&d(b"x")).await.unwrap();
         assert_eq!(a.bytes, b"real-oci-bytes");
-        assert_eq!(
-            a.evidence_hash,
-            *blake3::hash(b"real-oci-bytes").as_bytes()
-        );
+        assert_eq!(a.evidence_hash, *blake3::hash(b"real-oci-bytes").as_bytes());
     }
 
     #[tokio::test]
@@ -375,8 +361,7 @@ mod tests {
     #[tokio::test]
     async fn name_passes_through_constructor() {
         let runner = Arc::new(FakeCommandRunner::new());
-        let renderer =
-            OciImageRenderer::new("custom-oci", runner, src_ref(), dst_ref());
+        let renderer = OciImageRenderer::new("custom-oci", runner, src_ref(), dst_ref());
         assert_eq!(renderer.name(), "custom-oci");
     }
 

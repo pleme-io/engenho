@@ -12,10 +12,8 @@ use engenho_revoada::{
 };
 
 fn yaml(name: &str, ns: &str) -> Vec<u8> {
-    format!(
-        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n"
-    )
-    .into_bytes()
+    format!("apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n")
+        .into_bytes()
 }
 
 /// One shipping backend per face kind + the in-memory default +
@@ -89,9 +87,15 @@ fn every_backend_round_trips_yaml_apply_get() {
 fn every_backend_lists_correctly_after_three_applies() {
     let dir = tempfile::tempdir().unwrap();
     for (label, backend) in all_shipping_backends(dir.path()) {
-        backend.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
-        backend.apply(ResourceFormat::Yaml, &yaml("b", "default")).unwrap();
-        backend.apply(ResourceFormat::Yaml, &yaml("c", "other")).unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("a", "default"))
+            .unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("b", "default"))
+            .unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("c", "other"))
+            .unwrap();
         let listed = backend
             .list("Pod", Some("default"), ResourceFormat::Yaml)
             .unwrap();
@@ -103,7 +107,9 @@ fn every_backend_lists_correctly_after_three_applies() {
 fn every_backend_delete_then_get_errors() {
     let dir = tempfile::tempdir().unwrap();
     for (label, backend) in all_shipping_backends(dir.path()) {
-        backend.apply(ResourceFormat::Yaml, &yaml("nginx", "default")).unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("nginx", "default"))
+            .unwrap();
         let r = ResourceRef::namespaced("Pod", "nginx", "default");
         backend.delete(&r).unwrap();
         assert!(
@@ -133,8 +139,12 @@ fn every_backend_watch_streams_apply_event() {
 fn every_backend_snapshot_restore_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     for (label, backend) in all_shipping_backends(dir.path()) {
-        backend.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
-        backend.apply(ResourceFormat::Yaml, &yaml("b", "default")).unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("a", "default"))
+            .unwrap();
+        backend
+            .apply(ResourceFormat::Yaml, &yaml("b", "default"))
+            .unwrap();
         let snap = backend
             .snapshot()
             .unwrap_or_else(|e| panic!("{label}: snapshot: {e}"));
@@ -152,8 +162,10 @@ fn snapshot_from_in_memory_restores_into_every_other_backend() {
     // Cross-backend snapshot interop — the killer feature of the
     // common CBOR codec.
     let mem = InMemoryStore::new("source");
-    mem.apply(ResourceFormat::Yaml, &yaml("a", "default")).unwrap();
-    mem.apply(ResourceFormat::Yaml, &yaml("b", "default")).unwrap();
+    mem.apply(ResourceFormat::Yaml, &yaml("a", "default"))
+        .unwrap();
+    mem.apply(ResourceFormat::Yaml, &yaml("b", "default"))
+        .unwrap();
     let snap = mem.snapshot().unwrap();
 
     let dir = tempfile::tempdir().unwrap();

@@ -12,10 +12,8 @@ use engenho_revoada::{
 };
 
 fn yaml(name: &str, ns: &str) -> Vec<u8> {
-    format!(
-        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n"
-    )
-    .into_bytes()
+    format!("apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n")
+        .into_bytes()
 }
 
 fn raft_face_shared(name: &str) -> Arc<engenho_revoada::PureRaftFace> {
@@ -246,8 +244,7 @@ fn federation_concurrent_apply_across_members() {
         h.join().unwrap();
     }
 
-    let total =
-        federation.members()[0].health().resource_count
+    let total = federation.members()[0].health().resource_count
         + federation.members()[1].health().resource_count;
     assert_eq!(total, threads * per_thread);
 }

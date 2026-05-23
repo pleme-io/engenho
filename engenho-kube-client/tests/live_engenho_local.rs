@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use engenho_kube_client::{config::Kubeconfig, client::ReqwestKubeClient};
+use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{KubeClient, ListOptions};
 use engenho_types::generated_v1_34::core_v1::Pod;
 
@@ -33,9 +33,9 @@ async fn list_pods_from_engenho_local() {
         return;
     };
 
-    let kc = Kubeconfig::load(&kc_path)
-        .expect("parse engenho-local kubeconfig");
-    let conn = kc.resolve_connection()
+    let kc = Kubeconfig::load(&kc_path).expect("parse engenho-local kubeconfig");
+    let conn = kc
+        .resolve_connection()
         .expect("resolve engenho-local connection");
     let client = ReqwestKubeClient::new(conn);
 

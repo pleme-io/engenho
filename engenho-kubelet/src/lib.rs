@@ -49,6 +49,6 @@ pub use config_bridge::make_container_runtime;
 pub use error::KubeletError;
 pub use kubelet::Kubelet;
 pub use volume::{
-    AccessMode, FakeVolumeBackend, FakeVolumeEvent, HostPathVolumeBackend,
-    MountedVolume, VolumeError, VolumeRuntime, VolumeSpec,
+    AccessMode, FakeVolumeBackend, FakeVolumeEvent, HostPathVolumeBackend, MountedVolume,
+    VolumeError, VolumeRuntime, VolumeSpec,
 };

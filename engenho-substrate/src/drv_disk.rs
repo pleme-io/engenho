@@ -47,7 +47,8 @@ impl DiskDerivationCache {
     }
 
     fn realisations_path(&self, drv_hash: &DrvHash) -> PathBuf {
-        self.root.join(format!("realisations-{}.bin", drv_hash.to_hex()))
+        self.root
+            .join(format!("realisations-{}.bin", drv_hash.to_hex()))
     }
 
     /// Root directory the cache reads + writes under.
@@ -128,22 +129,15 @@ impl DerivationCacheBackend for DiskDerivationCache {
         mb.save_to(&self.nar_path(&blob.hash)).map_err(map_err)
     }
 
-    async fn list_realisations(
-        &self,
-        drv_hash: &DrvHash,
-    ) -> Result<Vec<Realisation>, CacheError> {
+    async fn list_realisations(&self, drv_hash: &DrvHash) -> Result<Vec<Realisation>, CacheError> {
         let path = self.realisations_path(drv_hash);
         if !path.exists() {
             return Ok(Vec::new());
         }
-        MagicBlob::<Vec<Realisation>>::load_from(MAGIC_REALISATIONS_V1, &path)
-            .map_err(map_err)
+        MagicBlob::<Vec<Realisation>>::load_from(MAGIC_REALISATIONS_V1, &path).map_err(map_err)
     }
 
-    async fn put_realisation(
-        &self,
-        realisation: &Realisation,
-    ) -> Result<(), CacheError> {
+    async fn put_realisation(&self, realisation: &Realisation) -> Result<(), CacheError> {
         let path = self.realisations_path(&realisation.drv_hash);
         let mut existing: Vec<Realisation> = if path.exists() {
             MagicBlob::<Vec<Realisation>>::load_from(MAGIC_REALISATIONS_V1, &path)
@@ -167,10 +161,7 @@ mod tests {
     use crate::derivation::OutputPath;
 
     fn temp_root(suffix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "engenho-drv-disk-{}-{suffix}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("engenho-drv-disk-{}-{suffix}", std::process::id()))
     }
 
     #[tokio::test]
@@ -190,11 +181,13 @@ mod tests {
         let root = temp_root("missing");
         let _ = std::fs::remove_dir_all(&root);
         let cache = DiskDerivationCache::new(&root);
-        assert!(cache
-            .get_drv(&DrvHash::from_bytes(b"nothing"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            cache
+                .get_drv(&DrvHash::from_bytes(b"nothing"))
+                .await
+                .unwrap()
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -290,7 +283,13 @@ mod tests {
         // New cache instance, same root — same data.
         let cache2 = DiskDerivationCache::new(&root);
         for tag in [b"a".as_ref(), b"b", b"c"] {
-            assert!(cache2.get_drv(&DrvHash::from_bytes(tag)).await.unwrap().is_some());
+            assert!(
+                cache2
+                    .get_drv(&DrvHash::from_bytes(tag))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }

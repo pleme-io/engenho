@@ -1,8 +1,8 @@
 //! Property: Fingerprint trait — generic determinism + divergence.
 
 use engenho_substrate::{
-    fingerprint_blake3, Fingerprint, Linhagem, NodeId, Placement, Plantio, SearchId, Stage,
-    StageId, WorkloadShape,
+    Fingerprint, Linhagem, NodeId, Placement, Plantio, SearchId, Stage, StageId, WorkloadShape,
+    fingerprint_blake3,
 };
 use proptest::prelude::*;
 

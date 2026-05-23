@@ -46,7 +46,7 @@ impl Connection {
         }
         if let KubeAuth::ClientCert { cert, key } = &auth {
             let cert_bytes = resolve(cert)?;
-            let key_bytes  = resolve(key)?;
+            let key_bytes = resolve(key)?;
             let mut bundle = cert_bytes.clone();
             bundle.extend_from_slice(&key_bytes);
             let identity = reqwest::Identity::from_pem(&bundle)
@@ -57,16 +57,24 @@ impl Connection {
             .build()
             .map_err(|e| KubeError::Network(format!("reqwest builder: {e}")))?;
         let server = server.trim_end_matches('/').into();
-        Ok(Self { server, http, auth: Arc::new(auth) })
+        Ok(Self {
+            server,
+            http,
+            auth: Arc::new(auth),
+        })
     }
 
     /// Base URL (without trailing slash).
     #[must_use]
-    pub fn server(&self) -> &str { &self.server }
+    pub fn server(&self) -> &str {
+        &self.server
+    }
 
     /// reqwest client clone (cheap; reqwest::Client is internally Arc).
     #[must_use]
-    pub fn http(&self) -> Client { self.http.clone() }
+    pub fn http(&self) -> Client {
+        self.http.clone()
+    }
 
     /// Resolve the bearer token if applicable. Re-reads files each
     /// call so rotated SA tokens are picked up.
@@ -78,8 +86,9 @@ impl Connection {
         match &*self.auth {
             KubeAuth::BearerToken(TokenSource::Inline { token }) => Ok(Some(token.clone())),
             KubeAuth::BearerToken(TokenSource::File { path }) => {
-                let raw = std::fs::read_to_string(path)
-                    .map_err(|e| KubeError::Auth(format!("read token file {}: {e}", path.display())))?;
+                let raw = std::fs::read_to_string(path).map_err(|e| {
+                    KubeError::Auth(format!("read token file {}: {e}", path.display()))
+                })?;
                 Ok(Some(raw.trim().to_string()))
             }
             _ => Ok(None),
@@ -91,7 +100,10 @@ impl Connection {
     /// # Errors
     ///
     /// Same as [`Self::bearer_token`].
-    pub fn auth_header(&self, mut rb: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, KubeError> {
+    pub fn auth_header(
+        &self,
+        mut rb: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, KubeError> {
         if let Some(t) = self.bearer_token()? {
             rb = rb.bearer_auth(t);
         }
@@ -127,9 +139,12 @@ mod tests {
     fn inline_bearer_token_returns_value() {
         let c = Connection::new(
             "https://api.example.com",
-            KubeAuth::BearerToken(TokenSource::Inline { token: "abc123".into() }),
+            KubeAuth::BearerToken(TokenSource::Inline {
+                token: "abc123".into(),
+            }),
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(c.bearer_token().unwrap().as_deref(), Some("abc123"));
     }
 
@@ -141,7 +156,8 @@ mod tests {
             "https://api.example.com",
             KubeAuth::BearerToken(TokenSource::File { path: tmp.clone() }),
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(c.bearer_token().unwrap().as_deref(), Some("secret-token"));
         std::fs::remove_file(&tmp).ok();
     }
@@ -150,9 +166,12 @@ mod tests {
     fn file_bearer_token_missing_path_errors() {
         let c = Connection::new(
             "https://api.example.com",
-            KubeAuth::BearerToken(TokenSource::File { path: "/nonexistent".into() }),
+            KubeAuth::BearerToken(TokenSource::File {
+                path: "/nonexistent".into(),
+            }),
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let r = c.bearer_token();
         assert!(matches!(r, Err(KubeError::Auth(_))));
     }

@@ -130,7 +130,13 @@ impl MaterializationReceipt {
         emitted_at: u64,
         evidence_hash: [u8; 32],
     ) -> Self {
-        Self::new(ReceiptKind::Drv, drv_hash, emitter, emitted_at, evidence_hash)
+        Self::new(
+            ReceiptKind::Drv,
+            drv_hash,
+            emitter,
+            emitted_at,
+            evidence_hash,
+        )
     }
 
     /// Helper for constructing a Nar receipt.
@@ -141,7 +147,13 @@ impl MaterializationReceipt {
         emitted_at: u64,
         evidence_hash: [u8; 32],
     ) -> Self {
-        Self::new(ReceiptKind::Nar, nar_hash, emitter, emitted_at, evidence_hash)
+        Self::new(
+            ReceiptKind::Nar,
+            nar_hash,
+            emitter,
+            emitted_at,
+            evidence_hash,
+        )
     }
 
     /// True if two receipts attest to the SAME subject (regardless
@@ -167,12 +179,7 @@ mod tests {
     use super::*;
 
     fn sample(emitter: NodeId, ts: u64) -> MaterializationReceipt {
-        MaterializationReceipt::for_drv(
-            [1u8; 32],
-            emitter,
-            ts,
-            [2u8; 32],
-        )
+        MaterializationReceipt::for_drv([1u8; 32], emitter, ts, [2u8; 32])
     }
 
     #[test]
@@ -238,12 +245,7 @@ mod tests {
 
     #[test]
     fn for_drv_constructor_sets_kind() {
-        let r = MaterializationReceipt::for_drv(
-            [3u8; 32],
-            NodeId::from_bytes(b"x"),
-            42,
-            [4u8; 32],
-        );
+        let r = MaterializationReceipt::for_drv([3u8; 32], NodeId::from_bytes(b"x"), 42, [4u8; 32]);
         assert_eq!(r.kind, ReceiptKind::Drv);
         assert_eq!(r.subject, [3u8; 32]);
         assert_eq!(r.emitted_at, 42);
@@ -251,12 +253,7 @@ mod tests {
 
     #[test]
     fn for_nar_constructor_sets_kind() {
-        let r = MaterializationReceipt::for_nar(
-            [5u8; 32],
-            NodeId::from_bytes(b"x"),
-            42,
-            [6u8; 32],
-        );
+        let r = MaterializationReceipt::for_nar([5u8; 32], NodeId::from_bytes(b"x"), 42, [6u8; 32]);
         assert_eq!(r.kind, ReceiptKind::Nar);
     }
 

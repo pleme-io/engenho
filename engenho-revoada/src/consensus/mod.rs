@@ -25,7 +25,7 @@ pub mod role_assignment;
 pub mod store;
 pub mod type_config;
 
-pub use mesh::{default_config, RaftError, RaftMesh};
+pub use mesh::{RaftError, RaftMesh, default_config};
 pub use network::InProcessRouter;
 pub use role_assignment::{Reason, RoleAssignment};
 pub use store::InMemoryStore;
@@ -34,8 +34,8 @@ pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::membership::NodeRole;
 use crate::NodeId;
+use crate::membership::NodeRole;
 
 /// Deterministic state machine over the Raft log. Every committed
 /// [`RoleAssignment`] mutates this; followers and leader converge to
@@ -91,7 +91,13 @@ impl MeshShape {
     pub fn holders(&self, role: NodeRole) -> BTreeSet<NodeId> {
         self.assignments
             .iter()
-            .filter_map(|(id, roles)| if roles.contains(&role) { Some(*id) } else { None })
+            .filter_map(|(id, roles)| {
+                if roles.contains(&role) {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 }

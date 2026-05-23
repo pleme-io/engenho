@@ -40,19 +40,21 @@ fn arb_object_meta() -> impl Strategy<Value = ObjectMeta> {
         proptest::option::of(0i64..=2_000_000_000),
         proptest::collection::vec("[a-z]+/[a-z]+", 0..4),
     )
-        .prop_map(|(name, ns, rv, uid, labels, anns, generation_val, fins)| ObjectMeta {
-            name,
-            namespace: ns,
-            resource_version: rv.unwrap_or_default(),
-            uid,
-            labels,
-            annotations: anns,
-            creation_timestamp: None,
-            deletion_timestamp: None,
-            deletion_grace_period_seconds: None,
-            finalizers: fins,
-            generation: generation_val,
-        })
+        .prop_map(
+            |(name, ns, rv, uid, labels, anns, generation_val, fins)| ObjectMeta {
+                name,
+                namespace: ns,
+                resource_version: rv.unwrap_or_default(),
+                uid,
+                labels,
+                annotations: anns,
+                creation_timestamp: None,
+                deletion_timestamp: None,
+                deletion_grace_period_seconds: None,
+                finalizers: fins,
+                generation: generation_val,
+            },
+        )
 }
 
 fn arb_type_meta() -> impl Strategy<Value = TypeMeta> {

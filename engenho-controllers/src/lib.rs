@@ -28,31 +28,31 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-pub mod controller;
-pub mod deployment;
-pub mod endpoints;
-pub mod error;
-pub mod gc;
-pub mod owner;
-pub mod replicaset;
-pub mod runtime;
 pub mod admission;
 pub mod attestation;
 pub mod build_backend_roceiro;
+pub mod controller;
 pub mod crd;
 pub mod crd_validator;
+pub mod deployment;
 pub mod dns;
 pub mod drv;
 pub mod drv_build;
+pub mod endpoints;
+pub mod error;
 pub mod event_driven;
+pub mod gc;
 pub mod hpa;
 pub mod ingress;
 pub mod job;
 pub mod network_policy;
+pub mod owner;
 pub mod pdb;
 pub mod plantio;
 pub mod plantio_pipeline;
+pub mod replicaset;
 pub mod roceiro;
+pub mod runtime;
 pub mod selector;
 pub mod service_router;
 pub mod statefulset;
@@ -62,62 +62,60 @@ pub mod tiered_build;
 pub mod tiered_reconciler;
 pub mod watch_driver;
 
+pub use admission::{
+    AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionError, AdmissionMode,
+    AdmissionRequest, AdmissionWebhook, FakeAdmissionWebhook,
+};
+pub use attestation::{
+    FakeSignatureVerifier, SignatureVerifier, TameshiAttestationWebhook, VerifierError,
+    tameshi_attestation_webhook,
+};
+pub use build_backend_roceiro::BuildBackendRoceiro;
 pub use controller::{Controller, ReconcileReport};
+pub use crd::{CrdController, CrdEntry, CrdError, CrdRegistry, CrdScope};
+pub use crd_validator::{CrdValidationWebhook, crd_validation_webhook};
 pub use deployment::DeploymentController;
+pub use dns::{
+    DEFAULT_CLUSTER_DOMAIN, DnsBackend, DnsController, DnsError, DnsEvent, DnsRecord,
+    InMemoryDnsZone, SrvRecord, srv_fqdn,
+};
+pub use drv::DrvController;
+pub use drv_build::{BuildBackend, BuildError, BuildResult, DrvBuildController, FakeBuildBackend};
 pub use endpoints::EndpointsController;
 pub use error::ControllerError;
+pub use event_driven::EventDrivenController;
 pub use gc::GcController;
-pub use owner::{controlling_owner, is_owned_by, set_owner_reference, OwnerReference};
-pub use replicaset::ReplicaSetController;
-pub use runtime::{ControllerRuntime, RuntimeConfig};
-pub use selector::{matches_labels, selector_match_labels, service_selector};
-pub use dns::{
-    srv_fqdn, DnsBackend, DnsController, DnsError, DnsEvent, DnsRecord,
-    InMemoryDnsZone, SrvRecord, DEFAULT_CLUSTER_DOMAIN,
+pub use hpa::{
+    FakeMetricsProvider, HorizontalPodAutoscalerController, MetricsError, MetricsProvider,
+    ScaleTarget,
 };
 pub use ingress::{
-    FakeIngressBackend, FakeIngressEvent, IngressBackend, IngressController,
-    IngressError, IngressRoute, NginxIngressBackend, PathType, TraefikIngressBackend,
+    FakeIngressBackend, FakeIngressEvent, IngressBackend, IngressController, IngressError,
+    IngressRoute, NginxIngressBackend, PathType, TraefikIngressBackend,
 };
 pub use job::{Clock, CronJobController, FixedClock, JobController, SystemClock};
 pub use network_policy::{
     CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,
     NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,
 };
-pub use admission::{
-    AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionError, AdmissionMode,
-    AdmissionRequest, AdmissionWebhook, FakeAdmissionWebhook,
-};
-pub use attestation::{
-    tameshi_attestation_webhook, FakeSignatureVerifier, SignatureVerifier,
-    TameshiAttestationWebhook, VerifierError,
-};
-pub use crd::{CrdController, CrdEntry, CrdError, CrdRegistry, CrdScope};
-pub use crd_validator::{crd_validation_webhook, CrdValidationWebhook};
-pub use drv::DrvController;
-pub use drv_build::{
-    BuildBackend, BuildError, BuildResult, DrvBuildController, FakeBuildBackend,
-};
-pub use event_driven::EventDrivenController;
-pub use build_backend_roceiro::BuildBackendRoceiro;
+pub use owner::{OwnerReference, controlling_owner, is_owned_by, set_owner_reference};
+pub use pdb::PodDisruptionBudgetController;
 pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};
 pub use plantio_pipeline::{
-    bootstrap_pipeline, LedgerChoice, LedgerWrappers, NodeResolverChoice,
-    PipelineConfig, PlantioPipeline, RoceiroChoice,
+    LedgerChoice, LedgerWrappers, NodeResolverChoice, PipelineConfig, PlantioPipeline,
+    RoceiroChoice, bootstrap_pipeline,
 };
+pub use replicaset::ReplicaSetController;
 pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};
-pub use store_ledger::{StoreBackedLedger, DEFAULT_RECEIPT_NAMESPACE};
+pub use runtime::{ControllerRuntime, RuntimeConfig};
+pub use selector::{matches_labels, selector_match_labels, service_selector};
+pub use service_router::{
+    FakeRouter, FakeRouterEvent, IptablesRouter, IpvsRouter, PortMap, RouterError, ServiceRoute,
+    ServiceRouter, ServiceRoutingController,
+};
+pub use statefulset::StatefulSetController;
+pub use store_ledger::{DEFAULT_RECEIPT_NAMESPACE, StoreBackedLedger};
 pub use store_resolver::StoreBackedNodeResolver;
 pub use tiered_build::TieredBuildBackend;
 pub use tiered_reconciler::{PromotionScope, StaticPromotionScope, TieredCacheReconciler};
-pub use hpa::{
-    FakeMetricsProvider, HorizontalPodAutoscalerController, MetricsError,
-    MetricsProvider, ScaleTarget,
-};
-pub use pdb::PodDisruptionBudgetController;
-pub use statefulset::StatefulSetController;
-pub use service_router::{
-    FakeRouter, FakeRouterEvent, IptablesRouter, IpvsRouter, PortMap, RouterError,
-    ServiceRoute, ServiceRouter, ServiceRoutingController,
-};
 pub use watch_driver::{KindFilter, WatchDriver, WatchDriverConfig};

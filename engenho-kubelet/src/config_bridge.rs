@@ -49,10 +49,7 @@ mod tests {
 
     #[test]
     fn podman_backend_custom_path() {
-        let rt = make_container_runtime(
-            KubeletBackendKind::Podman,
-            Some("/opt/podman/bin/podman"),
-        );
+        let rt = make_container_runtime(KubeletBackendKind::Podman, Some("/opt/podman/bin/podman"));
         assert_eq!(rt.name(), "podman");
     }
 }

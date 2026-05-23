@@ -4,8 +4,8 @@
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
-use crate::network::{CniChoice, NetworkPolicyEnforce};
 use crate::ClusterConfig;
+use crate::network::{CniChoice, NetworkPolicyEnforce};
 
 /// Possible errors deserializing or validating a [`ClusterConfig`].
 #[derive(Debug, thiserror::Error)]
@@ -24,7 +24,9 @@ pub(crate) fn validate(cfg: &ClusterConfig) -> Result<(), ConfigError> {
 
     // ── Identity ───────────────────────────────────────────────────
     if cfg.cluster_name.is_empty() {
-        return Err(ConfigError::Invalid("cluster_name must not be empty".into()));
+        return Err(ConfigError::Invalid(
+            "cluster_name must not be empty".into(),
+        ));
     }
     if cfg.cluster_name.contains(['/', '\\', ' ']) {
         return Err(ConfigError::Invalid(format!(
@@ -91,7 +93,8 @@ pub(crate) fn validate(cfg: &ClusterConfig) -> Result<(), ConfigError> {
         }
     } else if net.ipv6.cluster_cidr_v6.is_some() || net.ipv6.service_cidr_v6.is_some() {
         return Err(ConfigError::Invalid(
-            "ipv6 cidrs set but dual_stack=false — set dual_stack=true or remove the v6 cidrs".into(),
+            "ipv6 cidrs set but dual_stack=false — set dual_stack=true or remove the v6 cidrs"
+                .into(),
         ));
     }
 
@@ -135,16 +138,19 @@ pub(crate) fn validate(cfg: &ClusterConfig) -> Result<(), ConfigError> {
 /// Returns `(network_address_as_u32, prefix_len)`.
 fn parse_cidr(s: &str, field: &str) -> Result<(u32, u8), ConfigError> {
     let (addr_s, prefix_s) = s.split_once('/').ok_or_else(|| {
-        ConfigError::Invalid(format!("{field} {s:?} missing /prefix (expected `a.b.c.d/N`)"))
+        ConfigError::Invalid(format!(
+            "{field} {s:?} missing /prefix (expected `a.b.c.d/N`)"
+        ))
     })?;
-    let addr = Ipv4Addr::from_str(addr_s).map_err(|e| {
-        ConfigError::Invalid(format!("{field} {s:?} invalid address: {e}"))
-    })?;
-    let prefix: u8 = prefix_s.parse().map_err(|e| {
-        ConfigError::Invalid(format!("{field} {s:?} invalid prefix length: {e}"))
-    })?;
+    let addr = Ipv4Addr::from_str(addr_s)
+        .map_err(|e| ConfigError::Invalid(format!("{field} {s:?} invalid address: {e}")))?;
+    let prefix: u8 = prefix_s
+        .parse()
+        .map_err(|e| ConfigError::Invalid(format!("{field} {s:?} invalid prefix length: {e}")))?;
     if prefix > 32 {
-        return Err(ConfigError::Invalid(format!("{field} {s:?} prefix length >32")));
+        return Err(ConfigError::Invalid(format!(
+            "{field} {s:?} prefix length >32"
+        )));
     }
     Ok((u32::from(addr), prefix))
 }
@@ -152,11 +158,19 @@ fn parse_cidr(s: &str, field: &str) -> Result<(u32, u8), ConfigError> {
 fn cidrs_overlap((a_addr, a_prefix): (u32, u8), (b_addr, b_prefix): (u32, u8)) -> bool {
     let shorter = a_prefix.min(b_prefix);
     // shift by 32 is UB in Rust for u32; guard against the /0 corner case.
-    let mask: u32 = if shorter == 0 { 0 } else { (!0u32).checked_shl(u32::from(32 - shorter)).unwrap_or(0) };
+    let mask: u32 = if shorter == 0 {
+        0
+    } else {
+        (!0u32).checked_shl(u32::from(32 - shorter)).unwrap_or(0)
+    };
     (a_addr & mask) == (b_addr & mask)
 }
 
 fn ipv4_in_cidr(addr: Ipv4Addr, (cidr_addr, prefix): (u32, u8)) -> bool {
-    let mask: u32 = if prefix == 0 { 0 } else { (!0u32).checked_shl(u32::from(32 - prefix)).unwrap_or(0) };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        (!0u32).checked_shl(u32::from(32 - prefix)).unwrap_or(0)
+    };
     (u32::from(addr) & mask) == (cidr_addr & mask)
 }

@@ -200,13 +200,19 @@ impl ReconciliationCadence {
 /// invariants) and at `prove_liveness` time (cross-field invariants).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FabricStrategyError {
-    #[error("reconciliation cadence cannot be zero — would break the always-eventually-resolves guarantee")]
+    #[error(
+        "reconciliation cadence cannot be zero — would break the always-eventually-resolves guarantee"
+    )]
     ZeroReconciliationCadence,
-    #[error("failure-detector timeout ({fd_ms}ms) >= reconciliation cadence ({rec_ms}ms) — a partition may not heal before the next convergence round, breaking liveness")]
+    #[error(
+        "failure-detector timeout ({fd_ms}ms) >= reconciliation cadence ({rec_ms}ms) — a partition may not heal before the next convergence round, breaking liveness"
+    )]
     DetectorOutpacesReconciliation { fd_ms: u32, rec_ms: u32 },
     #[error("consensus quorum size must be odd to avoid even-split deadlocks; got {0}")]
     EvenQuorum(u32),
-    #[error("consensus quorum size must be ≥ 3 for split-brain freedom under single-node failure; got {0}")]
+    #[error(
+        "consensus quorum size must be ≥ 3 for split-brain freedom under single-node failure; got {0}"
+    )]
     QuorumTooSmall(u32),
 }
 
@@ -279,8 +285,7 @@ impl FabricStrategy {
                 require_operator_signature: false,
             },
             placement: PlacementPolicy::ZoneAware { min_zones: 1 },
-            reconciliation: ReconciliationCadence::new(500)
-                .expect("500ms is non-zero"),
+            reconciliation: ReconciliationCadence::new(500).expect("500ms is non-zero"),
         }
     }
 }

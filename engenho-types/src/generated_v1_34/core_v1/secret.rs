@@ -14,9 +14,9 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use serde::{Deserialize, Serialize};
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -42,7 +42,11 @@ pub struct Secret {
     /// `StringData` is a write-only convenience field — clients
     /// provide values as raw UTF-8; the apiserver base64-encodes
     /// + merges into `data`. Read responses never carry it.
-    #[serde(default, rename = "stringData", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        rename = "stringData",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub string_data: BTreeMap<String, String>,
 
     /// `Immutable`, if set to true, ensures the Secret data is
@@ -158,10 +162,7 @@ mod tests {
         s.metadata.name = "podinfo-token".into();
         s.metadata.namespace = Some("default".into());
         s.r#type = Some(SecretType::Known(KnownSecretType::ServiceAccountToken));
-        s.data.insert(
-            "token".into(),
-            "ZXhhbXBsZS10b2tlbg==".into(),
-        );
+        s.data.insert("token".into(), "ZXhhbXBsZS10b2tlbg==".into());
         s.data.insert("ca.crt".into(), "LS0t".into());
         let json = serde_json::to_string(&s).unwrap();
         assert!(

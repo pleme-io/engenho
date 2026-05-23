@@ -56,9 +56,8 @@ impl KikaiClusterWriter {
                 kc_path.display()
             )));
         }
-        let kc = Kubeconfig::load(&kc_path).map_err(|e| {
-            WriterError::Invalid(format!("kubeconfig parse for '{cluster}': {e}"))
-        })?;
+        let kc = Kubeconfig::load(&kc_path)
+            .map_err(|e| WriterError::Invalid(format!("kubeconfig parse for '{cluster}': {e}")))?;
         let conn = kc.resolve_connection().map_err(|e| {
             WriterError::Invalid(format!("kubeconfig resolve for '{cluster}': {e}"))
         })?;
@@ -97,18 +96,50 @@ impl ClusterWriter for KikaiClusterWriter {
         // an arm here breaks the build (closed enum + exhaustive match).
         let result_json = match kind {
             ResourceKind::Pod => apply_typed::<Pod>(&client, ns_arg, name, &patch, "pod").await?,
-            ResourceKind::Service => apply_typed::<Service>(&client, ns_arg, name, &patch, "service").await?,
-            ResourceKind::ConfigMap => apply_typed::<ConfigMap>(&client, ns_arg, name, &patch, "configmap").await?,
-            ResourceKind::Secret => apply_typed::<Secret>(&client, ns_arg, name, &patch, "secret").await?,
-            ResourceKind::ServiceAccount => apply_typed::<ServiceAccount>(&client, ns_arg, name, &patch, "serviceaccount").await?,
-            ResourceKind::Endpoints => apply_typed::<Endpoints>(&client, ns_arg, name, &patch, "endpoints").await?,
-            ResourceKind::PersistentVolumeClaim => apply_typed::<PersistentVolumeClaim>(&client, ns_arg, name, &patch, "persistentvolumeclaim").await?,
-            ResourceKind::Namespace => apply_typed::<Namespace>(&client, ns_arg, name, &patch, "namespace").await?,
-            ResourceKind::Node => apply_typed::<Node>(&client, ns_arg, name, &patch, "node").await?,
-            ResourceKind::Deployment => apply_typed::<Deployment>(&client, ns_arg, name, &patch, "deployment").await?,
-            ResourceKind::ReplicaSet => apply_typed::<ReplicaSet>(&client, ns_arg, name, &patch, "replicaset").await?,
-            ResourceKind::Role => apply_typed::<Role>(&client, ns_arg, name, &patch, "role").await?,
-            ResourceKind::RoleBinding => apply_typed::<RoleBinding>(&client, ns_arg, name, &patch, "rolebinding").await?,
+            ResourceKind::Service => {
+                apply_typed::<Service>(&client, ns_arg, name, &patch, "service").await?
+            }
+            ResourceKind::ConfigMap => {
+                apply_typed::<ConfigMap>(&client, ns_arg, name, &patch, "configmap").await?
+            }
+            ResourceKind::Secret => {
+                apply_typed::<Secret>(&client, ns_arg, name, &patch, "secret").await?
+            }
+            ResourceKind::ServiceAccount => {
+                apply_typed::<ServiceAccount>(&client, ns_arg, name, &patch, "serviceaccount")
+                    .await?
+            }
+            ResourceKind::Endpoints => {
+                apply_typed::<Endpoints>(&client, ns_arg, name, &patch, "endpoints").await?
+            }
+            ResourceKind::PersistentVolumeClaim => {
+                apply_typed::<PersistentVolumeClaim>(
+                    &client,
+                    ns_arg,
+                    name,
+                    &patch,
+                    "persistentvolumeclaim",
+                )
+                .await?
+            }
+            ResourceKind::Namespace => {
+                apply_typed::<Namespace>(&client, ns_arg, name, &patch, "namespace").await?
+            }
+            ResourceKind::Node => {
+                apply_typed::<Node>(&client, ns_arg, name, &patch, "node").await?
+            }
+            ResourceKind::Deployment => {
+                apply_typed::<Deployment>(&client, ns_arg, name, &patch, "deployment").await?
+            }
+            ResourceKind::ReplicaSet => {
+                apply_typed::<ReplicaSet>(&client, ns_arg, name, &patch, "replicaset").await?
+            }
+            ResourceKind::Role => {
+                apply_typed::<Role>(&client, ns_arg, name, &patch, "role").await?
+            }
+            ResourceKind::RoleBinding => {
+                apply_typed::<RoleBinding>(&client, ns_arg, name, &patch, "rolebinding").await?
+            }
         };
         Ok(result_json)
     }
@@ -133,18 +164,45 @@ impl ClusterWriter for KikaiClusterWriter {
         let opts = DeleteOptions::default();
         match kind {
             ResourceKind::Pod => delete_typed::<Pod>(&client, ns_arg, name, &opts, "pod").await,
-            ResourceKind::Service => delete_typed::<Service>(&client, ns_arg, name, &opts, "service").await,
-            ResourceKind::ConfigMap => delete_typed::<ConfigMap>(&client, ns_arg, name, &opts, "configmap").await,
-            ResourceKind::Secret => delete_typed::<Secret>(&client, ns_arg, name, &opts, "secret").await,
-            ResourceKind::ServiceAccount => delete_typed::<ServiceAccount>(&client, ns_arg, name, &opts, "serviceaccount").await,
-            ResourceKind::Endpoints => delete_typed::<Endpoints>(&client, ns_arg, name, &opts, "endpoints").await,
-            ResourceKind::PersistentVolumeClaim => delete_typed::<PersistentVolumeClaim>(&client, ns_arg, name, &opts, "persistentvolumeclaim").await,
-            ResourceKind::Namespace => delete_typed::<Namespace>(&client, ns_arg, name, &opts, "namespace").await,
+            ResourceKind::Service => {
+                delete_typed::<Service>(&client, ns_arg, name, &opts, "service").await
+            }
+            ResourceKind::ConfigMap => {
+                delete_typed::<ConfigMap>(&client, ns_arg, name, &opts, "configmap").await
+            }
+            ResourceKind::Secret => {
+                delete_typed::<Secret>(&client, ns_arg, name, &opts, "secret").await
+            }
+            ResourceKind::ServiceAccount => {
+                delete_typed::<ServiceAccount>(&client, ns_arg, name, &opts, "serviceaccount").await
+            }
+            ResourceKind::Endpoints => {
+                delete_typed::<Endpoints>(&client, ns_arg, name, &opts, "endpoints").await
+            }
+            ResourceKind::PersistentVolumeClaim => {
+                delete_typed::<PersistentVolumeClaim>(
+                    &client,
+                    ns_arg,
+                    name,
+                    &opts,
+                    "persistentvolumeclaim",
+                )
+                .await
+            }
+            ResourceKind::Namespace => {
+                delete_typed::<Namespace>(&client, ns_arg, name, &opts, "namespace").await
+            }
             ResourceKind::Node => delete_typed::<Node>(&client, ns_arg, name, &opts, "node").await,
-            ResourceKind::Deployment => delete_typed::<Deployment>(&client, ns_arg, name, &opts, "deployment").await,
-            ResourceKind::ReplicaSet => delete_typed::<ReplicaSet>(&client, ns_arg, name, &opts, "replicaset").await,
+            ResourceKind::Deployment => {
+                delete_typed::<Deployment>(&client, ns_arg, name, &opts, "deployment").await
+            }
+            ResourceKind::ReplicaSet => {
+                delete_typed::<ReplicaSet>(&client, ns_arg, name, &opts, "replicaset").await
+            }
             ResourceKind::Role => delete_typed::<Role>(&client, ns_arg, name, &opts, "role").await,
-            ResourceKind::RoleBinding => delete_typed::<RoleBinding>(&client, ns_arg, name, &opts, "rolebinding").await,
+            ResourceKind::RoleBinding => {
+                delete_typed::<RoleBinding>(&client, ns_arg, name, &opts, "rolebinding").await
+            }
         }
     }
 }

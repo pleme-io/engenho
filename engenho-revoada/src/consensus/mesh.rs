@@ -103,15 +103,10 @@ impl RaftMesh {
 
         let (tx_rpc, mut rx_rpc) = mpsc::channel::<RpcRequest>(256);
 
-        let raft = Raft::<TypeConfig>::new(
-            node_id,
-            config,
-            router.clone(),
-            log_store,
-            state_machine,
-        )
-        .await
-        .map_err(|e| RaftError::Fatal(e.to_string()))?;
+        let raft =
+            Raft::<TypeConfig>::new(node_id, config, router.clone(), log_store, state_machine)
+                .await
+                .map_err(|e| RaftError::Fatal(e.to_string()))?;
 
         router.register(node_id, tx_rpc).await;
 
@@ -192,10 +187,7 @@ impl RaftMesh {
     /// is leader at submit time, EVERY node's local chain grows
     /// when the commit applies. The auditor can verify ANY node's
     /// chain offline (each block signed by THAT node's identity).
-    pub async fn propose(
-        &self,
-        cmd: RoleAssignment,
-    ) -> Result<ApplyResult, RaftError> {
+    pub async fn propose(&self, cmd: RoleAssignment) -> Result<ApplyResult, RaftError> {
         let resp: ClientWriteResponse<TypeConfig> = self
             .raft
             .client_write(cmd)
@@ -260,8 +252,7 @@ impl RaftMesh {
             if remaining.is_zero() {
                 return false;
             }
-            tokio::time::sleep(Duration::from_millis(50.min(remaining.as_millis() as u64)))
-                .await;
+            tokio::time::sleep(Duration::from_millis(50.min(remaining.as_millis() as u64))).await;
         }
     }
 
@@ -275,7 +266,13 @@ impl RaftMesh {
             .add_learner(node_id, BasicNode { addr }, true)
             .await
             .map_err(|e| RaftError::ClientWriteFailed(format!("add_learner: {e}")))?;
-        let mut new_members = self.raft.metrics().borrow().membership_config.voter_ids().collect::<std::collections::BTreeSet<_>>();
+        let mut new_members = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .voter_ids()
+            .collect::<std::collections::BTreeSet<_>>();
         new_members.insert(node_id);
         self.raft
             .change_membership(new_members, false)

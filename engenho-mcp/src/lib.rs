@@ -18,9 +18,9 @@ pub mod server;
 pub mod views;
 pub mod writer;
 
-pub use reader::{ClusterReader, ReaderError};
 pub use reader::kikai::KikaiClusterReader;
+pub use reader::{ClusterReader, ReaderError};
 pub use resource_kind::ResourceKind;
 pub use server::EngenhoMcp;
-pub use writer::{Authority, ClusterWriter, WriterError};
 pub use writer::kikai::KikaiClusterWriter;
+pub use writer::{Authority, ClusterWriter, WriterError};

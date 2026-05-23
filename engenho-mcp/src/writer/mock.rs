@@ -117,7 +117,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "authority_required");
-        assert!(writer.applies().is_empty(), "rejected calls must not record");
+        assert!(
+            writer.applies().is_empty(),
+            "rejected calls must not record"
+        );
     }
 
     /// The "if Authority::SaguaoPassport were valid" path — we

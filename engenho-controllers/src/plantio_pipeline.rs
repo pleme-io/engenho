@@ -27,9 +27,8 @@ use std::sync::Arc;
 
 use engenho_store::StoreMesh;
 use engenho_substrate::{
-    BroadcastLedger, DerivationCacheBackend, GossipBroadcaster, GossipLedger,
+    BroadcastLedger, DerivationCacheBackend, FakeVerifier, GossipBroadcaster, GossipLedger,
     MaterializationLedger, MemoryDerivationCache, MemoryLedger, NodeId, Verifier,
-    FakeVerifier,
 };
 
 use crate::build_backend_roceiro::BuildBackendRoceiro;
@@ -175,9 +174,7 @@ impl PlantioPipeline {
         // 2. Base ledger.
         let base_ledger: Arc<dyn MaterializationLedger> = match config.ledger {
             LedgerChoice::Memory => Arc::new(MemoryLedger::new()),
-            LedgerChoice::StoreBacked => {
-                Arc::new(StoreBackedLedger::new(config.store.clone()))
-            }
+            LedgerChoice::StoreBacked => Arc::new(StoreBackedLedger::new(config.store.clone())),
             LedgerChoice::Custom(l) => l,
         };
 
@@ -202,12 +199,10 @@ impl PlantioPipeline {
 
         // 5. Resolver.
         let resolver: Arc<dyn NodeResolver> = match config.resolver {
-            NodeResolverChoice::Static(nodes) => {
-                Arc::new(StaticNodeResolver::new(nodes))
+            NodeResolverChoice::Static(nodes) => Arc::new(StaticNodeResolver::new(nodes)),
+            NodeResolverChoice::StoreBackedClusterWide => {
+                Arc::new(StoreBackedNodeResolver::cluster_wide(config.store.clone()))
             }
-            NodeResolverChoice::StoreBackedClusterWide => Arc::new(
-                StoreBackedNodeResolver::cluster_wide(config.store.clone()),
-            ),
             NodeResolverChoice::StoreBackedNamespace(ns) => Arc::new(
                 StoreBackedNodeResolver::with_namespace(config.store.clone(), ns),
             ),
@@ -238,10 +233,7 @@ impl PlantioPipeline {
 /// BuildBackendRoceiro, plus Broadcast wrapper. Useful for
 /// integration tests + first-boot single-node clusters.
 #[must_use]
-pub fn bootstrap_pipeline(
-    store: Arc<StoreMesh>,
-    nodes: Vec<NodeId>,
-) -> PlantioPipeline {
+pub fn bootstrap_pipeline(store: Arc<StoreMesh>, nodes: Vec<NodeId>) -> PlantioPipeline {
     let build: Arc<dyn BuildBackend> = Arc::new(FakeBuildBackend::new());
     let cache: Arc<dyn DerivationCacheBackend> = Arc::new(MemoryDerivationCache::new());
     let verifier: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());

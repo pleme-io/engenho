@@ -103,11 +103,7 @@ impl ClusterScope {
     /// Wildcard subscription to all watch events for a GVK.
     #[must_use]
     pub fn watch_gvk_wildcard(&self, gvk: &Gvk) -> String {
-        format!(
-            "engenho.{}.watch.{}.>",
-            self.cluster,
-            gvk.subject_segment()
-        )
+        format!("engenho.{}.watch.{}.>", self.cluster, gvk.subject_segment())
     }
 
     /// Wildcard subscription to watch events across all GVKs.
@@ -412,10 +408,7 @@ mod tests {
     #[test]
     fn content_bucket_format() {
         let scope = ClusterScope::new("c1");
-        assert_eq!(
-            scope.content_bucket("images"),
-            "engenho.c1.content.images"
-        );
+        assert_eq!(scope.content_bucket("images"), "engenho.c1.content.images");
     }
 
     #[test]

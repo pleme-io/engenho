@@ -20,31 +20,33 @@ use proptest::prelude::*;
 /// shape every K8s namespaced resource carries.
 fn arb_object_meta() -> impl Strategy<Value = ObjectMeta> {
     (
-        ".{0,253}",                                          // name
-        proptest::option::of(".{1,63}"),                     // namespace
-        ".{0,32}",                                           // resource_version
-        proptest::option::of(".{32,36}"),                    // uid
-        btree_map(".{1,32}", ".{0,63}", 0..8),               // labels
-        btree_map(".{1,32}", ".{0,1024}", 0..8),             // annotations
-        proptest::collection::vec(".{1,253}", 0..4),         // finalizers
-        proptest::option::of(0i64..1_000_000i64),            // generation
+        ".{0,253}",                                  // name
+        proptest::option::of(".{1,63}"),             // namespace
+        ".{0,32}",                                   // resource_version
+        proptest::option::of(".{32,36}"),            // uid
+        btree_map(".{1,32}", ".{0,63}", 0..8),       // labels
+        btree_map(".{1,32}", ".{0,1024}", 0..8),     // annotations
+        proptest::collection::vec(".{1,253}", 0..4), // finalizers
+        proptest::option::of(0i64..1_000_000i64),    // generation
     )
-        .prop_map(|(name, ns, rv, uid, labels, annotations, finalizers, generation)| {
-            let mut m = ObjectMeta {
-                name,
-                namespace: ns,
-                resource_version: rv,
-                uid,
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-                finalizers,
-                generation,
-                ..Default::default()
-            };
-            m.labels = labels;
-            m.annotations = annotations;
-            m
-        })
+        .prop_map(
+            |(name, ns, rv, uid, labels, annotations, finalizers, generation)| {
+                let mut m = ObjectMeta {
+                    name,
+                    namespace: ns,
+                    resource_version: rv,
+                    uid,
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    finalizers,
+                    generation,
+                    ..Default::default()
+                };
+                m.labels = labels;
+                m.annotations = annotations;
+                m
+            },
+        )
 }
 
 proptest! {

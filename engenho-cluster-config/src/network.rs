@@ -104,7 +104,10 @@ impl Default for NetworkConfig {
             cluster_cidr: "10.42.0.0/16".to_string(),
             service_cidr: "10.43.0.0/16".to_string(),
             cluster_dns: Ipv4Addr::new(10, 43, 0, 10),
-            node_port_range: PortRange { start: 30_000, end: 32_767 },
+            node_port_range: PortRange {
+                start: 30_000,
+                end: 32_767,
+            },
             mtu: None,
             kube_proxy: KubeProxyConfig::default(),
             network_policy: NetworkPolicyConfig::default(),
@@ -173,7 +176,10 @@ pub struct KubeProxyConfig {
 
 impl Default for KubeProxyConfig {
     fn default() -> Self {
-        Self { mode: KubeProxyMode::Iptables, disabled: false }
+        Self {
+            mode: KubeProxyMode::Iptables,
+            disabled: false,
+        }
     }
 }
 
@@ -202,7 +208,9 @@ pub struct NetworkPolicyConfig {
 
 impl Default for NetworkPolicyConfig {
     fn default() -> Self {
-        Self { enforce: NetworkPolicyEnforce::Enabled }
+        Self {
+            enforce: NetworkPolicyEnforce::Enabled,
+        }
     }
 }
 
@@ -279,7 +287,11 @@ pub struct Ipv6Config {
 
 impl Default for Ipv6Config {
     fn default() -> Self {
-        Self { dual_stack: false, cluster_cidr_v6: None, service_cidr_v6: None }
+        Self {
+            dual_stack: false,
+            cluster_cidr_v6: None,
+            service_cidr_v6: None,
+        }
     }
 }
 
@@ -290,11 +302,16 @@ pub struct PortRange {
     /// Inclusive lower bound (default 30000).
     pub start: u16,
     /// Inclusive upper bound (default 32767).
-    pub end:   u16,
+    pub end: u16,
 }
 
 impl Default for PortRange {
-    fn default() -> Self { Self { start: 30_000, end: 32_767 } }
+    fn default() -> Self {
+        Self {
+            start: 30_000,
+            end: 32_767,
+        }
+    }
 }
 
 /// k3s component flags for `--disable=<component>`.
@@ -327,15 +344,15 @@ impl K3sComponent {
     #[must_use]
     pub fn as_k3s_disable(&self) -> &'static str {
         match self {
-            Self::Traefik         => "traefik",
-            Self::Servicelb       => "servicelb",
-            Self::MetricsServer   => "metrics-server",
-            Self::LocalStorage    => "local-storage",
-            Self::Coredns         => "coredns",
-            Self::NetworkPolicy   => "network-policy",
-            Self::HelmController  => "helm-controller",
+            Self::Traefik => "traefik",
+            Self::Servicelb => "servicelb",
+            Self::MetricsServer => "metrics-server",
+            Self::LocalStorage => "local-storage",
+            Self::Coredns => "coredns",
+            Self::NetworkPolicy => "network-policy",
+            Self::HelmController => "helm-controller",
             Self::CloudController => "cloud-controller",
-            Self::KubeProxy       => "kube-proxy",
+            Self::KubeProxy => "kube-proxy",
         }
     }
 }

@@ -294,19 +294,13 @@ pub trait DerivationCacheBackend: Send + Sync {
     ///
     /// # Errors
     /// [`CacheError::Backend`].
-    async fn list_realisations(
-        &self,
-        drv_hash: &DrvHash,
-    ) -> Result<Vec<Realisation>, CacheError>;
+    async fn list_realisations(&self, drv_hash: &DrvHash) -> Result<Vec<Realisation>, CacheError>;
 
     /// Record a realisation. Idempotent.
     ///
     /// # Errors
     /// [`CacheError::Backend`].
-    async fn put_realisation(
-        &self,
-        realisation: &Realisation,
-    ) -> Result<(), CacheError>;
+    async fn put_realisation(&self, realisation: &Realisation) -> Result<(), CacheError>;
 }
 
 // =================================================================
@@ -398,10 +392,7 @@ impl DerivationCacheBackend for MemoryDerivationCache {
         Ok(())
     }
 
-    async fn list_realisations(
-        &self,
-        drv_hash: &DrvHash,
-    ) -> Result<Vec<Realisation>, CacheError> {
+    async fn list_realisations(&self, drv_hash: &DrvHash) -> Result<Vec<Realisation>, CacheError> {
         Ok(self
             .inner
             .lock()
@@ -412,10 +403,7 @@ impl DerivationCacheBackend for MemoryDerivationCache {
             .unwrap_or_default())
     }
 
-    async fn put_realisation(
-        &self,
-        realisation: &Realisation,
-    ) -> Result<(), CacheError> {
+    async fn put_realisation(&self, realisation: &Realisation) -> Result<(), CacheError> {
         let mut s = self.inner.lock().await;
         let entry = s
             .realisations
@@ -497,7 +485,10 @@ mod tests {
         let drv = sample_drv();
         assert_eq!(cache.get_drv(&drv.drv_hash).await.unwrap(), None);
         cache.put_drv(&drv).await.unwrap();
-        assert_eq!(cache.get_drv(&drv.drv_hash).await.unwrap(), Some(drv.clone()));
+        assert_eq!(
+            cache.get_drv(&drv.drv_hash).await.unwrap(),
+            Some(drv.clone())
+        );
         assert_eq!(cache.drv_count().await, 1);
     }
 

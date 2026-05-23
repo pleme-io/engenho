@@ -22,7 +22,11 @@ pub struct OwnerReference {
     pub controller: bool,
     /// True if deletion of the owner should garbage-collect this
     /// child. Default true for controller-style ownership.
-    #[serde(rename = "blockOwnerDeletion", default, skip_serializing_if = "is_false")]
+    #[serde(
+        rename = "blockOwnerDeletion",
+        default,
+        skip_serializing_if = "is_false"
+    )]
     pub block_owner_deletion: bool,
 }
 
@@ -45,7 +49,9 @@ pub fn set_owner_reference(child: &mut Value, owner_ref: OwnerReference) -> bool
     let owner_refs = metadata_obj
         .entry("ownerReferences".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
-    let arr = owner_refs.as_array_mut().expect("ownerReferences must be array");
+    let arr = owner_refs
+        .as_array_mut()
+        .expect("ownerReferences must be array");
     // Idempotence: if a ref with the same uid exists, no-op.
     let already_present = arr.iter().any(|r| {
         r.get("uid")

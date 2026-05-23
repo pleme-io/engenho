@@ -249,7 +249,9 @@ impl InMemoryAuditLog {
 
 impl AuditLog for InMemoryAuditLog {
     fn record(&self, event: AuditEvent) {
-        let Ok(mut events) = self.events.lock() else { return };
+        let Ok(mut events) = self.events.lock() else {
+            return;
+        };
         if events.len() >= self.capacity {
             events.pop_front();
         }
@@ -299,7 +301,9 @@ impl FileAuditLog {
 
 impl AuditLog for FileAuditLog {
     fn record(&self, event: AuditEvent) {
-        let Ok(json) = serde_json::to_string(&event) else { return };
+        let Ok(json) = serde_json::to_string(&event) else {
+            return;
+        };
         let Ok(mut f) = self.file.lock() else { return };
         use std::io::Write;
         let _ = writeln!(f, "{json}");
@@ -374,11 +378,7 @@ impl<B: StoreBackend> StoreBackend for AuditingBackend<B> {
         result
     }
 
-    fn get(
-        &self,
-        reference: &ResourceRef,
-        format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError> {
+    fn get(&self, reference: &ResourceRef, format: ResourceFormat) -> Result<Vec<u8>, FaceError> {
         let result = self.inner.get(reference, format);
         let mut event = AuditEvent::now(VerbKind::Get)
             .with_ref(reference.clone())
@@ -637,14 +637,14 @@ mod tests {
         backend.apply(ResourceFormat::Native, &envelope()).unwrap();
         let r = pod_ref();
         backend.get(&r, ResourceFormat::Native).unwrap();
-        backend.list("Pod", Some("default"), ResourceFormat::Native).unwrap();
+        backend
+            .list("Pod", Some("default"), ResourceFormat::Native)
+            .unwrap();
         let _ = backend.watch("Pod", None, ResourceFormat::Native).unwrap();
         backend.delete(&r).unwrap();
         let _ = backend.snapshot().unwrap();
 
-        let events = backend
-            .log()
-            .recent(100);
+        let events = backend.log().recent(100);
         let verbs: Vec<VerbKind> = events.iter().map(|e| e.verb).collect();
         // The 5 verbs we called + the snapshot.
         assert!(verbs.contains(&VerbKind::Apply));
@@ -727,8 +727,7 @@ mod tests {
     #[test]
     fn auditing_backend_dispatches_through_store_backend_trait_object() {
         let inner = InMemoryStore::new("inner");
-        let backend: Box<dyn StoreBackend> =
-            Box::new(AuditingBackend::new(inner, NoopAuditLog));
+        let backend: Box<dyn StoreBackend> = Box::new(AuditingBackend::new(inner, NoopAuditLog));
         backend.apply(ResourceFormat::Yaml, &yaml()).unwrap();
         assert_eq!(backend.resource_count(), 1);
     }

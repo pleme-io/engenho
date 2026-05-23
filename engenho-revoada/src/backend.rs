@@ -56,11 +56,7 @@ pub trait StoreBackend: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns backend-specific errors via [`FaceError`].
-    fn get(
-        &self,
-        reference: &ResourceRef,
-        format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError>;
+    fn get(&self, reference: &ResourceRef, format: ResourceFormat) -> Result<Vec<u8>, FaceError>;
 
     /// List resources of a given kind in an optional namespace.
     /// See [`crate::Face::list_resources`].
@@ -143,11 +139,7 @@ impl StoreBackend for crate::face_store::InMemoryStore {
         self.apply(format, body)
     }
 
-    fn get(
-        &self,
-        reference: &ResourceRef,
-        format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError> {
+    fn get(&self, reference: &ResourceRef, format: ResourceFormat) -> Result<Vec<u8>, FaceError> {
         self.get(reference, format)
     }
 
@@ -229,11 +221,7 @@ impl StoreBackend for StubBackend {
         )))
     }
 
-    fn get(
-        &self,
-        _reference: &ResourceRef,
-        _format: ResourceFormat,
-    ) -> Result<Vec<u8>, FaceError> {
+    fn get(&self, _reference: &ResourceRef, _format: ResourceFormat) -> Result<Vec<u8>, FaceError> {
         Err(FaceError::Unsupported(format!(
             "get: {} stub backend (real impl pending)",
             self.backend_name
@@ -465,18 +453,19 @@ mod tests {
         // its canonical name regardless of constructor args.
         assert_eq!(backends[0].name(), "in-memory");
         // The 5 stubs name their planned R5/R6 milestone.
-        assert!(backends[1..].iter().all(|b| {
-            b.name().contains("R5") || b.name().contains("R6")
-        }));
+        assert!(
+            backends[1..]
+                .iter()
+                .all(|b| { b.name().contains("R5") || b.name().contains("R6") })
+        );
     }
 
     #[test]
     fn in_memory_backend_via_trait_object_round_trips_apply_get() {
         // Trait dispatch works end-to-end: apply through Box<dyn StoreBackend>
         // → get through Box<dyn StoreBackend> → original bytes.
-        let backend: Box<dyn StoreBackend> = Box::new(
-            crate::face_store::InMemoryStore::new("test"),
-        );
+        let backend: Box<dyn StoreBackend> =
+            Box::new(crate::face_store::InMemoryStore::new("test"));
         let env = crate::face::encode_native_envelope(&pod_ref(), b"payload").unwrap();
         backend.apply(ResourceFormat::Native, &env).unwrap();
         let got = backend.get(&pod_ref(), ResourceFormat::Native).unwrap();

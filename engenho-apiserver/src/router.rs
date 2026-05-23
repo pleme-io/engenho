@@ -16,11 +16,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use utoipa::OpenApi;
 
 use crate::error::ApiError;
@@ -63,7 +63,10 @@ pub fn build(state: RouterState) -> Router {
                 .patch(patch_namespaced)
                 .delete(delete_namespaced),
         )
-        .route("/api/v1/:plural", get(list_cluster_scoped).post(create_cluster_scoped))
+        .route(
+            "/api/v1/:plural",
+            get(list_cluster_scoped).post(create_cluster_scoped),
+        )
         .route(
             "/api/v1/:plural/:name",
             get(get_cluster_scoped)

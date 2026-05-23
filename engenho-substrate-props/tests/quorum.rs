@@ -2,9 +2,7 @@
 //! receipts always reach Reached; mixed-evidence above threshold
 //! always reports Dissent.
 
-use engenho_substrate::{
-    MaterializationReceipt, NodeId, QuorumTracker, ReceiptKind,
-};
+use engenho_substrate::{MaterializationReceipt, NodeId, QuorumTracker, ReceiptKind};
 use proptest::prelude::*;
 
 fn receipt(emitter_byte: u8, evidence_byte: u8) -> MaterializationReceipt {

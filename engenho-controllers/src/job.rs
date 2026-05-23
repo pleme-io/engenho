@@ -29,15 +29,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
+    StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
-    StoreMesh,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{is_owned_by, set_owner_reference, OwnerReference};
+use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
 
 /// Trait abstracting "what time is it now" — lets tests pin time.
 pub trait Clock: Send + Sync {
@@ -210,8 +210,7 @@ impl Controller for JobController {
             let active = owned
                 .iter()
                 .filter(|(_, p)| {
-                    !Self::pod_phase_is(p, "Succeeded")
-                        && !Self::pod_phase_is(p, "Failed")
+                    !Self::pod_phase_is(p, "Succeeded") && !Self::pod_phase_is(p, "Failed")
                 })
                 .count();
 
@@ -248,8 +247,7 @@ impl Controller for JobController {
                 };
                 set_owner_reference(&mut pod, owner_ref.clone());
                 let pod_ns = ns.unwrap_or("default");
-                let pod_key =
-                    ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
+                let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
                 self.store
                     .propose(ResourceCommand::Put {
                         key: pod_key,
@@ -285,11 +283,7 @@ pub struct CronJobController {
 impl CronJobController {
     /// New controller with the given clock + optional namespace scope.
     #[must_use]
-    pub fn new(
-        store: Arc<StoreMesh>,
-        clock: Arc<dyn Clock>,
-        namespace: Option<String>,
-    ) -> Self {
+    pub fn new(store: Arc<StoreMesh>, clock: Arc<dyn Clock>, namespace: Option<String>) -> Self {
         Self {
             store,
             clock,
@@ -448,7 +442,9 @@ mod tests {
         struct F;
         #[async_trait]
         impl Controller for F {
-            fn name(&self) -> &'static str { "job" }
+            fn name(&self) -> &'static str {
+                "job"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }
@@ -513,7 +509,9 @@ mod tests {
         struct F;
         #[async_trait]
         impl Controller for F {
-            fn name(&self) -> &'static str { "cronjob" }
+            fn name(&self) -> &'static str {
+                "cronjob"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

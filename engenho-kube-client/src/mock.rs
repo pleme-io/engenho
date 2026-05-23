@@ -35,7 +35,9 @@ struct MockState {
 impl MockKubeClient {
     /// Empty mock — no resources.
     #[must_use]
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Direct insertion (for setting up test fixtures without going
     /// through `create`).
@@ -47,7 +49,10 @@ impl MockKubeClient {
         let name = r.name().into_owned();
         let mut body = serde_json::to_value(&r).unwrap();
         if let Some(obj) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            obj.insert("resourceVersion".into(), serde_json::Value::String(s.counter.to_string()));
+            obj.insert(
+                "resourceVersion".into(),
+                serde_json::Value::String(s.counter.to_string()),
+            );
         }
         s.objects.insert((kind, ns, name), body);
     }
@@ -65,8 +70,14 @@ impl KubeClient for MockKubeClient {
         name: &str,
     ) -> Result<R, KubeError> {
         let s = self.inner.lock().unwrap();
-        let key = (kind_fqn::<R>(), namespace.unwrap_or("").to_string(), name.to_string());
-        let body = s.objects.get(&key)
+        let key = (
+            kind_fqn::<R>(),
+            namespace.unwrap_or("").to_string(),
+            name.to_string(),
+        );
+        let body = s
+            .objects
+            .get(&key)
             .ok_or_else(|| KubeError::NotFound(format!("mock: {key:?}")))?;
         serde_json::from_value(body.clone())
             .map_err(|e| KubeError::Decode(format!("mock decode: {e}")))
@@ -87,14 +98,24 @@ impl KubeClient for MockKubeClient {
                 items.push(r);
             }
         }
-        Ok(List { items, resource_version: s.counter.to_string(), continue_token: None })
+        Ok(List {
+            items,
+            resource_version: s.counter.to_string(),
+            continue_token: None,
+        })
     }
 
-    async fn create<R: KubeResource + Send + Sync + 'static>(&self, resource: &R) -> Result<R, KubeError> {
+    async fn create<R: KubeResource + Send + Sync + 'static>(
+        &self,
+        resource: &R,
+    ) -> Result<R, KubeError> {
         let mut s = self.inner.lock().unwrap();
         s.counter += 1;
         let kind = kind_fqn::<R>();
-        let ns = resource.namespace().map(|c| c.into_owned()).unwrap_or_default();
+        let ns = resource
+            .namespace()
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
         let name = resource.name().into_owned();
         let key = (kind, ns, name);
         if s.objects.contains_key(&key) {
@@ -107,17 +128,26 @@ impl KubeClient for MockKubeClient {
         let mut body = serde_json::to_value(resource)
             .map_err(|e| KubeError::Encode(format!("mock create: {e}")))?;
         if let Some(obj) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            obj.insert("resourceVersion".into(), serde_json::Value::String(s.counter.to_string()));
+            obj.insert(
+                "resourceVersion".into(),
+                serde_json::Value::String(s.counter.to_string()),
+            );
         }
         s.objects.insert(key, body.clone());
         serde_json::from_value(body).map_err(|e| KubeError::Decode(format!("mock decode: {e}")))
     }
 
-    async fn replace<R: KubeResource + Send + Sync + 'static>(&self, resource: &R) -> Result<R, KubeError> {
+    async fn replace<R: KubeResource + Send + Sync + 'static>(
+        &self,
+        resource: &R,
+    ) -> Result<R, KubeError> {
         let mut s = self.inner.lock().unwrap();
         s.counter += 1;
         let kind = kind_fqn::<R>();
-        let ns = resource.namespace().map(|c| c.into_owned()).unwrap_or_default();
+        let ns = resource
+            .namespace()
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
         let name = resource.name().into_owned();
         let key = (kind, ns, name);
         if !s.objects.contains_key(&key) {
@@ -126,7 +156,10 @@ impl KubeClient for MockKubeClient {
         let mut body = serde_json::to_value(resource)
             .map_err(|e| KubeError::Encode(format!("mock replace: {e}")))?;
         if let Some(obj) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            obj.insert("resourceVersion".into(), serde_json::Value::String(s.counter.to_string()));
+            obj.insert(
+                "resourceVersion".into(),
+                serde_json::Value::String(s.counter.to_string()),
+            );
         }
         s.objects.insert(key, body.clone());
         serde_json::from_value(body).map_err(|e| KubeError::Decode(format!("mock decode: {e}")))
@@ -141,18 +174,23 @@ impl KubeClient for MockKubeClient {
         let mut s = self.inner.lock().unwrap();
         let kind = kind_fqn::<R>();
         let key = (kind, namespace.unwrap_or("").to_string(), name.to_string());
-        let body = s.objects.get(&key)
+        let body = s
+            .objects
+            .get(&key)
             .ok_or_else(|| KubeError::NotFound(format!("mock: {key:?}")))?
             .clone();
         let merged = match patch {
-            Patch::Merge(p)     | Patch::Strategic(p) => merge_json(body, p.clone()),
-            Patch::Apply { body: p, .. }              => merge_json(body, p.clone()),
-            Patch::Json(_)                            => body, // skipping JSON Patch ops in mock
+            Patch::Merge(p) | Patch::Strategic(p) => merge_json(body, p.clone()),
+            Patch::Apply { body: p, .. } => merge_json(body, p.clone()),
+            Patch::Json(_) => body, // skipping JSON Patch ops in mock
         };
         s.counter += 1;
         let mut new_body = merged;
         if let Some(obj) = new_body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            obj.insert("resourceVersion".into(), serde_json::Value::String(s.counter.to_string()));
+            obj.insert(
+                "resourceVersion".into(),
+                serde_json::Value::String(s.counter.to_string()),
+            );
         }
         s.objects.insert(key, new_body.clone());
         serde_json::from_value(new_body).map_err(|e| KubeError::Decode(format!("mock decode: {e}")))
@@ -195,10 +233,16 @@ fn merge_json(mut base: serde_json::Value, patch: serde_json::Value) -> serde_js
 /// Mock watcher — yields an empty stream. Sufficient for the trait
 /// dyn-compat check; future enhancement: hook to `MockKubeClient`
 /// mutations to emit synthetic events.
-pub struct MockWatcher<R> { _kind: std::marker::PhantomData<R> }
+pub struct MockWatcher<R> {
+    _kind: std::marker::PhantomData<R>,
+}
 
 impl<R> Default for MockWatcher<R> {
-    fn default() -> Self { Self { _kind: std::marker::PhantomData } }
+    fn default() -> Self {
+        Self {
+            _kind: std::marker::PhantomData,
+        }
+    }
 }
 
 #[async_trait]
@@ -207,10 +251,8 @@ impl<R: KubeResource + Send + Sync + 'static> Watcher<R> for MockWatcher<R> {
         &self,
         _namespace: Option<&str>,
         _resource_version: &str,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<WatchEvent<R>, KubeError>> + Send>>,
-        KubeError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent<R>, KubeError>> + Send>>, KubeError>
+    {
         Ok(Box::pin(futures_util::stream::empty()))
     }
 }
@@ -228,13 +270,19 @@ mod tests {
 
     impl KubeResource for ToyPod {
         const GVK: GroupVersionKind = GroupVersionKind {
-            group: "", version: "v1", kind: "ToyPod",
+            group: "",
+            version: "v1",
+            kind: "ToyPod",
         };
         const GVR: GroupVersionResource = GroupVersionResource {
-            group: "", version: "v1", resource: "toypods",
+            group: "",
+            version: "v1",
+            resource: "toypods",
         };
         const SCOPE: Scope = Scope::Namespaced;
-        fn name(&self) -> std::borrow::Cow<'_, str> { self.metadata.name.as_str().into() }
+        fn name(&self) -> std::borrow::Cow<'_, str> {
+            self.metadata.name.as_str().into()
+        }
         fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> {
             self.metadata.namespace.as_deref().map(|s| s.into())
         }
@@ -283,7 +331,10 @@ mod tests {
         let r = c.create(&p).await;
         assert!(matches!(
             r,
-            Err(KubeError::ApiStatus { kind: ApiStatusKind::AlreadyExists, .. })
+            Err(KubeError::ApiStatus {
+                kind: ApiStatusKind::AlreadyExists,
+                ..
+            })
         ));
     }
 
@@ -322,7 +373,9 @@ mod tests {
     async fn delete_then_get_is_notfound() {
         let c = MockKubeClient::new();
         c.create(&pod("p1", "default")).await.unwrap();
-        c.delete::<ToyPod>(Some("default"), "p1", &DeleteOptions::default()).await.unwrap();
+        c.delete::<ToyPod>(Some("default"), "p1", &DeleteOptions::default())
+            .await
+            .unwrap();
         let r: Result<ToyPod, _> = c.get(Some("default"), "p1").await;
         assert!(matches!(r, Err(KubeError::NotFound(_))));
     }
@@ -330,7 +383,9 @@ mod tests {
     #[tokio::test]
     async fn delete_missing_is_notfound() {
         let c = MockKubeClient::new();
-        let r = c.delete::<ToyPod>(Some("default"), "p1", &DeleteOptions::default()).await;
+        let r = c
+            .delete::<ToyPod>(Some("default"), "p1", &DeleteOptions::default())
+            .await;
         assert!(matches!(r, Err(KubeError::NotFound(_))));
     }
 

@@ -19,14 +19,14 @@ use std::sync::Arc;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
-    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
-    SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
+    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta,
+    StorageError, StorageIOError, StoredMembership, Vote,
 };
 use tokio::sync::Mutex;
 
 use crate::attestation::{AttestationChain, NodeIdentity};
-use crate::consensus::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 use crate::consensus::MeshShape;
+use crate::consensus::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 
 /// Combined in-memory store. Both [`RaftLogStorage`] and
 /// [`RaftStateMachine`] share the same Arc<Mutex<Inner>> so a
@@ -98,11 +98,8 @@ impl RaftLogReader<TypeConfig> for InMemoryStore {
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<RaftNodeId>> {
         let guard = self.inner.lock().await;
-        let entries: Vec<Entry<TypeConfig>> = guard
-            .log
-            .range(range)
-            .map(|(_, e)| e.clone())
-            .collect();
+        let entries: Vec<Entry<TypeConfig>> =
+            guard.log.range(range).map(|(_, e)| e.clone()).collect();
         Ok(entries)
     }
 }
@@ -133,10 +130,7 @@ impl RaftLogStorage<TypeConfig> for InMemoryStore {
         self.clone()
     }
 
-    async fn save_vote(
-        &mut self,
-        vote: &Vote<RaftNodeId>,
-    ) -> Result<(), StorageError<RaftNodeId>> {
+    async fn save_vote(&mut self, vote: &Vote<RaftNodeId>) -> Result<(), StorageError<RaftNodeId>> {
         self.inner.lock().await.vote = Some(*vote);
         Ok(())
     }
@@ -188,10 +182,7 @@ impl RaftLogStorage<TypeConfig> for InMemoryStore {
         Ok(())
     }
 
-    async fn purge(
-        &mut self,
-        log_id: LogId<RaftNodeId>,
-    ) -> Result<(), StorageError<RaftNodeId>> {
+    async fn purge(&mut self, log_id: LogId<RaftNodeId>) -> Result<(), StorageError<RaftNodeId>> {
         let mut guard = self.inner.lock().await;
         guard.last_purged = Some(log_id);
         guard.log.retain(|&idx, _| idx > log_id.index);
@@ -213,10 +204,8 @@ impl RaftSnapshotBuilder<TypeConfig> for InMemorySnapshotBuilder {
         let mut guard = self.store.inner.lock().await;
         let last_applied = guard.last_applied;
         let last_membership = guard.last_membership.clone();
-        let shape_bytes = serde_json::to_vec(&guard.shape).map_err(|e| {
-            StorageError::IO {
-                source: StorageIOError::read_snapshot(None, &e),
-            }
+        let shape_bytes = serde_json::to_vec(&guard.shape).map_err(|e| StorageError::IO {
+            source: StorageIOError::read_snapshot(None, &e),
         })?;
         guard.snapshot_index += 1;
         let snapshot_id = format!("snap-{}", guard.snapshot_index);
@@ -269,10 +258,7 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
         Ok((guard.last_applied, guard.last_membership.clone()))
     }
 
-    async fn apply<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<Vec<ApplyResult>, StorageError<RaftNodeId>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ApplyResult>, StorageError<RaftNodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
@@ -336,10 +322,8 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<RaftNodeId>> {
         let bytes = snapshot.into_inner();
-        let shape: MeshShape = serde_json::from_slice(&bytes).map_err(|e| {
-            StorageError::IO {
-                source: StorageIOError::read_snapshot(Some(meta.signature()), &e),
-            }
+        let shape: MeshShape = serde_json::from_slice(&bytes).map_err(|e| StorageError::IO {
+            source: StorageIOError::read_snapshot(Some(meta.signature()), &e),
         })?;
         let mut guard = self.inner.lock().await;
         guard.shape = shape;
@@ -352,17 +336,20 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<RaftNodeId>> {
         let guard = self.inner.lock().await;
-        Ok(guard.snapshot.as_ref().map(SnapshotClone::clone_snapshot_data_or_skip))
+        Ok(guard
+            .snapshot
+            .as_ref()
+            .map(SnapshotClone::clone_snapshot_data_or_skip))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NodeId;
     use crate::attestation::NodeIdentity;
     use crate::consensus::{Reason, RoleAssignment};
     use crate::membership::NodeRole;
-    use crate::NodeId;
     use openraft::EntryPayload;
     use openraft::{CommittedLeaderId, LogId};
 

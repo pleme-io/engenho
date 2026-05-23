@@ -270,9 +270,18 @@ mod tests {
         let doc = ApiDoc::openapi();
         let json = serde_json::to_value(&doc).unwrap();
         // Top-level version + info + paths must be populated.
-        assert!(json.get("openapi").unwrap().as_str().unwrap().starts_with("3."));
+        assert!(
+            json.get("openapi")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("3.")
+        );
         let info = json.get("info").unwrap();
-        assert_eq!(info.get("title").unwrap(), "engenho-apiserver — K8s REST API");
+        assert_eq!(
+            info.get("title").unwrap(),
+            "engenho-apiserver — K8s REST API"
+        );
         let paths = json.get("paths").unwrap().as_object().unwrap();
         // All 10 routes present.
         assert!(paths.contains_key("/api/v1/namespaces/{ns}/{plural}/{name}"));

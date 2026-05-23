@@ -126,8 +126,9 @@ impl<C: Controller + 'static> WatchDriver<C> {
     /// One tick of the inner controller — useful in tests where
     /// the caller wants synchronous reconcile without the event
     /// loop.
-    pub async fn tick_once(&self) -> Result<crate::controller::ReconcileReport, crate::error::ControllerError>
-    {
+    pub async fn tick_once(
+        &self,
+    ) -> Result<crate::controller::ReconcileReport, crate::error::ControllerError> {
         self.controller.tick().await
     }
 }

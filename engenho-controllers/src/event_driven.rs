@@ -33,7 +33,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
@@ -66,10 +66,7 @@ impl<E: Clone + Send + 'static> EventDrivenController<E> {
     /// Wrap with default coalescing enabled (recommended for most
     /// controllers — saves redundant reconcile work).
     #[must_use]
-    pub fn coalesced(
-        inner: Arc<dyn Controller>,
-        receiver: broadcast::Receiver<E>,
-    ) -> Self {
+    pub fn coalesced(inner: Arc<dyn Controller>, receiver: broadcast::Receiver<E>) -> Self {
         Self::new(inner, receiver, true)
     }
 }
@@ -212,7 +209,7 @@ mod tests {
         let inner = Arc::new(CountingController::default());
         let (tx, rx) = broadcast::channel::<u32>(16);
         let outer = EventDrivenController::coalesced(inner.clone(), rx);
-        drop(tx);  // close sender
+        drop(tx); // close sender
         let _ = outer.tick().await.unwrap();
         assert_eq!(inner.ticks.load(Ordering::SeqCst), 0);
     }

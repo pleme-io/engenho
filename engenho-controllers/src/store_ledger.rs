@@ -31,13 +31,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
+    StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
-    StoreMesh,
 };
 use engenho_substrate::{
-    LedgerError, LedgerKey, MaterializationLedger, MaterializationReceipt,
-    QuorumOutcome, QuorumTracker, ReceiptKind, StageId,
+    LedgerError, LedgerKey, MaterializationLedger, MaterializationReceipt, QuorumOutcome,
+    QuorumTracker, ReceiptKind, StageId,
 };
 use serde_json::json;
 
@@ -68,10 +68,7 @@ impl StoreBackedLedger {
     /// prefixes to keep names readable while ensuring uniqueness
     /// per (stage, kind, subject, emitter) tuple.
     #[must_use]
-    pub fn receipt_name(
-        stage_id: &StageId,
-        receipt: &MaterializationReceipt,
-    ) -> String {
+    pub fn receipt_name(stage_id: &StageId, receipt: &MaterializationReceipt) -> String {
         let kind_tag = match &receipt.kind {
             ReceiptKind::Drv => "drv".to_string(),
             ReceiptKind::Nar => "nar".to_string(),
@@ -255,9 +252,7 @@ impl MaterializationLedger for StoreBackedLedger {
                         reason: Reason::Controller,
                     })
                     .await
-                    .map_err(|e| {
-                        LedgerError::Backend(format!("store delete: {e}"))
-                    })?;
+                    .map_err(|e| LedgerError::Backend(format!("store delete: {e}")))?;
             }
         }
         Ok(())
@@ -291,12 +286,7 @@ mod tests {
     use engenho_substrate::{NodeId, ReceiptKind};
 
     fn rcpt_drv(emitter: u8, evidence: u8) -> MaterializationReceipt {
-        MaterializationReceipt::for_drv(
-            [7u8; 32],
-            NodeId::new([emitter; 32]),
-            100,
-            [evidence; 32],
-        )
+        MaterializationReceipt::for_drv([7u8; 32], NodeId::new([emitter; 32]), 100, [evidence; 32])
     }
 
     fn rcpt_shape(emitter: u8, evidence: u8, tag: &str) -> MaterializationReceipt {
@@ -320,17 +310,14 @@ mod tests {
         let r = rcpt_drv(1, 5);
         let name = StoreBackedLedger::receipt_name(&stage(), &r);
         assert!(name.starts_with("build-image-drv-"));
-        assert!(name.contains("0707"));  // subject prefix (4 bytes hex)
-        assert!(name.contains("0101"));  // emitter prefix (4 bytes hex)
+        assert!(name.contains("0707")); // subject prefix (4 bytes hex)
+        assert!(name.contains("0101")); // emitter prefix (4 bytes hex)
     }
 
     #[test]
     fn receipt_name_sanitizes_stage_id() {
         let r = rcpt_drv(1, 5);
-        let name = StoreBackedLedger::receipt_name(
-            &StageId::new("build/with.slash"),
-            &r,
-        );
+        let name = StoreBackedLedger::receipt_name(&StageId::new("build/with.slash"), &r);
         assert!(!name.contains('/'));
         assert!(!name.contains('.'));
     }
@@ -338,12 +325,8 @@ mod tests {
     #[test]
     fn receipt_name_uses_kind_tag() {
         let r_drv = rcpt_drv(1, 5);
-        let r_nar = MaterializationReceipt::for_nar(
-            [7u8; 32],
-            NodeId::new([1u8; 32]),
-            100,
-            [5u8; 32],
-        );
+        let r_nar =
+            MaterializationReceipt::for_nar([7u8; 32], NodeId::new([1u8; 32]), 100, [5u8; 32]);
         let r_shape = rcpt_shape(1, 5, "oci_image");
         assert!(StoreBackedLedger::receipt_name(&stage(), &r_drv).contains("-drv-"));
         assert!(StoreBackedLedger::receipt_name(&stage(), &r_nar).contains("-nar-"));

@@ -16,16 +16,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
+    StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
-    StoreMesh,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{is_owned_by, set_owner_reference, OwnerReference};
+use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
 
 pub struct ReplicaSetController {
     store: Arc<StoreMesh>,
@@ -146,16 +146,14 @@ impl Controller for ReplicaSetController {
                     // don't collide on names. For tests we usually
                     // start at 0.
                     let idx = observed + i;
-                    let Some((pod_name, mut pod)) =
-                        Self::build_pod_from_template(rs_value, idx)
+                    let Some((pod_name, mut pod)) = Self::build_pod_from_template(rs_value, idx)
                     else {
                         report.objects_skipped += 1;
                         continue;
                     };
                     set_owner_reference(&mut pod, owner_ref.clone());
                     let pod_ns = ns.unwrap_or("default");
-                    let pod_key =
-                        ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
+                    let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
                     self.store
                         .propose(ResourceCommand::Put {
                             key: pod_key,
@@ -222,7 +220,12 @@ mod tests {
         assert_eq!(pod.get("metadata").unwrap().get("name").unwrap(), "rs1-0");
         // Template labels survive.
         assert_eq!(
-            pod.get("metadata").unwrap().get("labels").unwrap().get("app").unwrap(),
+            pod.get("metadata")
+                .unwrap()
+                .get("labels")
+                .unwrap()
+                .get("app")
+                .unwrap(),
             "rs1"
         );
     }
@@ -255,7 +258,9 @@ mod tests {
         struct Fake;
         #[async_trait]
         impl Controller for Fake {
-            fn name(&self) -> &'static str { "replicaset" }
+            fn name(&self) -> &'static str {
+                "replicaset"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

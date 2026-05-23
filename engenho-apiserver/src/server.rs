@@ -9,7 +9,7 @@ use axum::Router;
 use tokio::task::JoinHandle;
 
 use crate::handler::ResourceHandler;
-use crate::router::{build, RouterState};
+use crate::router::{RouterState, build};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -36,7 +36,9 @@ impl ApiServer {
         let state = RouterState::new(handlers);
         let router: Router = build(state);
 
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(ServerError::Bind)?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(ServerError::Bind)?;
         let bound_addr = listener.local_addr().map_err(ServerError::Bind)?;
 
         let (tx, rx) = tokio::sync::oneshot::channel();

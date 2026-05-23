@@ -17,7 +17,9 @@ use crate::NodeId;
 /// Content address — a BLAKE3 hash of canonical-form bytes (Pod
 /// manifest, ConfigMap data, image layer). Matches the existing
 /// tameshi hashing scheme.
-#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct ContentHash(pub [u8; 32]);
 

@@ -78,11 +78,8 @@ impl CatalogSnapshot {
     /// Returns [`SnapshotError::Encode`] if the catalog can't be
     /// serialized (should never happen for valid input).
     pub fn encode(&self) -> Result<Vec<u8>, SnapshotError> {
-        let payload = serde_json::to_vec(self)
-            .map_err(|e| SnapshotError::Encode(e.to_string()))?;
-        let mut out = Vec::with_capacity(
-            MAGIC_V1.len() + 8 + blake3::OUT_LEN + payload.len(),
-        );
+        let payload = serde_json::to_vec(self).map_err(|e| SnapshotError::Encode(e.to_string()))?;
+        let mut out = Vec::with_capacity(MAGIC_V1.len() + 8 + blake3::OUT_LEN + payload.len());
         out.extend_from_slice(MAGIC_V1);
         out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         out.extend_from_slice(blake3::hash(&payload).as_bytes());
@@ -141,22 +138,18 @@ impl CatalogSnapshot {
 
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    SnapshotError::Io(format!("mkdir {}: {e}", parent.display()))
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| SnapshotError::Io(format!("mkdir {}: {e}", parent.display())))?;
             }
         }
         let tmp = path.with_extension("snap.tmp");
         {
-            let mut f = std::fs::File::create(&tmp).map_err(|e| {
-                SnapshotError::Io(format!("create {}: {e}", tmp.display()))
-            })?;
-            f.write_all(&bytes).map_err(|e| {
-                SnapshotError::Io(format!("write {}: {e}", tmp.display()))
-            })?;
-            f.sync_all().map_err(|e| {
-                SnapshotError::Io(format!("fsync {}: {e}", tmp.display()))
-            })?;
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| SnapshotError::Io(format!("create {}: {e}", tmp.display())))?;
+            f.write_all(&bytes)
+                .map_err(|e| SnapshotError::Io(format!("write {}: {e}", tmp.display())))?;
+            f.sync_all()
+                .map_err(|e| SnapshotError::Io(format!("fsync {}: {e}", tmp.display())))?;
         }
         std::fs::rename(&tmp, path).map_err(|e| {
             SnapshotError::Io(format!(
@@ -176,9 +169,8 @@ impl CatalogSnapshot {
     /// or the file can't be read. Decoding errors propagate from
     /// [`Self::decode`].
     pub fn load_from(path: &Path) -> Result<Self, SnapshotError> {
-        let bytes = std::fs::read(path).map_err(|e| {
-            SnapshotError::Io(format!("read {}: {e}", path.display()))
-        })?;
+        let bytes = std::fs::read(path)
+            .map_err(|e| SnapshotError::Io(format!("read {}: {e}", path.display())))?;
         Self::decode(&bytes)
     }
 }
@@ -311,10 +303,7 @@ mod tests {
 
     #[test]
     fn save_load_round_trip_on_disk() {
-        let dir = std::env::temp_dir().join(format!(
-            "engenho-snap-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("engenho-snap-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("catalog.snap");
         let _ = std::fs::remove_file(&path);
@@ -340,7 +329,8 @@ mod tests {
         let snap = CatalogSnapshot::new();
         snap.save_to(&nested).unwrap();
         assert!(nested.exists());
-        let _ = std::fs::remove_dir_all(nested.parent().unwrap().parent().unwrap().parent().unwrap());
+        let _ =
+            std::fs::remove_dir_all(nested.parent().unwrap().parent().unwrap().parent().unwrap());
     }
 
     #[test]
@@ -363,10 +353,7 @@ mod tests {
     fn save_to_is_atomic_via_temp_rename() {
         // Verifies the tmp file is gone after a successful save —
         // proves the rename completed.
-        let dir = std::env::temp_dir().join(format!(
-            "engenho-snap-atomic-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("engenho-snap-atomic-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("catalog.snap");
         let tmp = path.with_extension("snap.tmp");

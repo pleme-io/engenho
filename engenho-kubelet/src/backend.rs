@@ -79,10 +79,7 @@ pub trait ContainerRuntime: Send + Sync {
     /// # Errors
     ///
     /// Returns [`KubeletError::Backend`] on backend inspection failure.
-    async fn status(
-        &self,
-        container_id: &str,
-    ) -> Result<Option<ContainerStatus>, KubeletError>;
+    async fn status(&self, container_id: &str) -> Result<Option<ContainerStatus>, KubeletError>;
 
     /// Stop a running container.
     ///
@@ -142,7 +139,11 @@ impl FakeBackend {
     /// Snapshot of all containers currently tracked.
     pub async fn containers(&self) -> Vec<(String, ContainerStatus)> {
         let state = self.inner.lock().await;
-        state.containers.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        state
+            .containers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Snapshot of the operations log (for test assertions).
@@ -174,17 +175,22 @@ impl ContainerRuntime for FakeBackend {
         let container_id = format!("fake-{:08x}", state.next_id);
         let pod_ip = format!("10.42.0.{}", state.next_id % 250);
         let status = ContainerStatus::running(container_id.clone(), pod_ip);
-        state.containers.insert(container_id.clone(), status.clone());
+        state
+            .containers
+            .insert(container_id.clone(), status.clone());
         state.specs.insert(container_id, spec.clone());
         state.events.push(FakeEvent::Start(spec.name.clone()));
         Ok(status)
     }
 
-    async fn status(
-        &self,
-        container_id: &str,
-    ) -> Result<Option<ContainerStatus>, KubeletError> {
-        Ok(self.inner.lock().await.containers.get(container_id).cloned())
+    async fn status(&self, container_id: &str) -> Result<Option<ContainerStatus>, KubeletError> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .containers
+            .get(container_id)
+            .cloned())
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
@@ -201,7 +207,9 @@ impl ContainerRuntime for FakeBackend {
         let mut state = self.inner.lock().await;
         state.containers.remove(container_id);
         state.specs.remove(container_id);
-        state.events.push(FakeEvent::Remove(container_id.to_string()));
+        state
+            .events
+            .push(FakeEvent::Remove(container_id.to_string()));
         Ok(())
     }
 }
@@ -280,10 +288,7 @@ impl ContainerRuntime for PodmanBackend {
         })
     }
 
-    async fn status(
-        &self,
-        container_id: &str,
-    ) -> Result<Option<ContainerStatus>, KubeletError> {
+    async fn status(&self, container_id: &str) -> Result<Option<ContainerStatus>, KubeletError> {
         let out = tokio::process::Command::new(&self.binary)
             .arg("inspect")
             .arg("--format")

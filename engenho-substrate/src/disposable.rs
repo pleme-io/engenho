@@ -108,10 +108,7 @@ pub trait Disposable: Send + Sync {
     ///
     /// # Errors
     /// [`DisposableError::Materialize`] on failure.
-    async fn materialize(
-        &self,
-        input: &Self::Input,
-    ) -> Result<Self::Handle, DisposableError>;
+    async fn materialize(&self, input: &Self::Input) -> Result<Self::Handle, DisposableError>;
 
     /// Dispose of the handle. Implementations MUST be idempotent;
     /// double-dispose is undefined behavior in operator land but
@@ -167,11 +164,7 @@ impl<D: Disposable> Transient<D> {
     ///
     /// # Errors
     /// Propagates all [`DisposableError`] variants.
-    pub async fn scope<F, T>(
-        &self,
-        input: &D::Input,
-        body: F,
-    ) -> Result<T, DisposableError>
+    pub async fn scope<F, T>(&self, input: &D::Input, body: F) -> Result<T, DisposableError>
     where
         F: for<'h> FnOnce(&'h D::Handle) -> BoxFuture<'h, Result<T, String>> + Send,
         T: Send,
@@ -205,17 +198,13 @@ impl<D: Disposable> Transient<D> {
         }
     }
 
-    async fn emit_receipt(
-        &self,
-        subject: [u8; 32],
-        phase: &str,
-    ) -> Result<(), DisposableError> {
+    async fn emit_receipt(&self, subject: [u8; 32], phase: &str) -> Result<(), DisposableError> {
         let receipt = MaterializationReceipt::new(
             ReceiptKind::Shape(format!("transient:{phase}:{}", self.disposable.name())),
             subject,
             self.emitter,
             now_unix(),
-            subject,  // evidence = subject (faithful nodes converge)
+            subject, // evidence = subject (faithful nodes converge)
         );
         self.ledger
             .ingest(&self.stage_id, 1, &receipt)
@@ -286,16 +275,13 @@ mod tests {
         }
 
         type Input = Vec<u8>;
-        type Handle = String;  // synthetic — represents the live instance
+        type Handle = String; // synthetic — represents the live instance
 
         fn subject_for(&self, input: &Self::Input) -> [u8; 32] {
             *blake3::hash(input).as_bytes()
         }
 
-        async fn materialize(
-            &self,
-            input: &Self::Input,
-        ) -> Result<Self::Handle, DisposableError> {
+        async fn materialize(&self, input: &Self::Input) -> Result<Self::Handle, DisposableError> {
             if self.fail_materialize.load(Ordering::SeqCst) {
                 return Err(DisposableError::Materialize("fake failed".into()));
             }
@@ -312,7 +298,11 @@ mod tests {
         }
     }
 
-    fn assemble() -> (Arc<FakeDisposable>, Arc<MemoryLedger>, Transient<FakeDisposable>) {
+    fn assemble() -> (
+        Arc<FakeDisposable>,
+        Arc<MemoryLedger>,
+        Transient<FakeDisposable>,
+    ) {
         let disp = Arc::new(FakeDisposable::new("fake"));
         let ledger = Arc::new(MemoryLedger::new());
         let t = Transient::new(
@@ -348,9 +338,7 @@ mod tests {
         let input = b"x".to_vec();
         let err = t
             .scope(&input, |_handle| {
-                Box::pin(async move {
-                    Err::<i32, _>("body failed".to_string())
-                })
+                Box::pin(async move { Err::<i32, _>("body failed".to_string()) })
             })
             .await
             .unwrap_err();
@@ -364,7 +352,9 @@ mod tests {
         let (disp, _ledger, t) = assemble();
         disp.fail_materialize();
         let err = t
-            .scope(&b"x".to_vec(), |_| Box::pin(async move { Ok::<_, String>(()) }))
+            .scope(&b"x".to_vec(), |_| {
+                Box::pin(async move { Ok::<_, String>(()) })
+            })
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "materialize");
@@ -377,7 +367,9 @@ mod tests {
         let (disp, _ledger, t) = assemble();
         disp.fail_dispose();
         let err = t
-            .scope(&b"x".to_vec(), |_| Box::pin(async move { Ok::<_, String>(()) }))
+            .scope(&b"x".to_vec(), |_| {
+                Box::pin(async move { Ok::<_, String>(()) })
+            })
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "dispose");
@@ -400,9 +392,11 @@ mod tests {
     #[tokio::test]
     async fn scope_emits_two_receipts_to_ledger() {
         let (_disp, ledger, t) = assemble();
-        t.scope(&b"x".to_vec(), |_| Box::pin(async move { Ok::<_, String>(()) }))
-            .await
-            .unwrap();
+        t.scope(&b"x".to_vec(), |_| {
+            Box::pin(async move { Ok::<_, String>(()) })
+        })
+        .await
+        .unwrap();
         // Materialize + dispose receipts → 2 trackers in the ledger
         // (different ReceiptKind::Shape tags).
         assert_eq!(ledger.len().await, 2);
@@ -425,7 +419,9 @@ mod tests {
         let (disp, ledger, t) = assemble();
         disp.fail_materialize();
         let _ = t
-            .scope(&b"x".to_vec(), |_| Box::pin(async move { Ok::<_, String>(()) }))
+            .scope(&b"x".to_vec(), |_| {
+                Box::pin(async move { Ok::<_, String>(()) })
+            })
             .await;
         // Materialize failed → no receipts written.
         assert_eq!(ledger.len().await, 0);

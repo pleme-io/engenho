@@ -89,7 +89,7 @@ impl WorkloadShape {
             Self::NixClosure => None, // a directory, not a file
             Self::Qcow2 => Some("qcow2"),
             Self::Wasm => Some("wasm"),
-            Self::StaticBinary { .. } => None,  // no canonical extension
+            Self::StaticBinary { .. } => None, // no canonical extension
             Self::HelmChart => Some("tgz"),
             Self::Custom { .. } => None,
         }
@@ -131,10 +131,7 @@ pub trait ShapeRenderer: Send + Sync {
     ///
     /// # Errors
     /// Renderer-specific failures via [`ShapeError`].
-    async fn render(
-        &self,
-        drv: &crate::derivation::Drv,
-    ) -> Result<RenderedArtifact, ShapeError>;
+    async fn render(&self, drv: &crate::derivation::Drv) -> Result<RenderedArtifact, ShapeError>;
 }
 
 /// Rendered output.
@@ -246,10 +243,7 @@ mod tests {
         assert_eq!(WorkloadShape::HelmChart.file_extension(), Some("tgz"));
         assert_eq!(WorkloadShape::NixClosure.file_extension(), None);
         assert_eq!(
-            WorkloadShape::StaticBinary {
-                triple: "x".into()
-            }
-            .file_extension(),
+            WorkloadShape::StaticBinary { triple: "x".into() }.file_extension(),
             None
         );
     }

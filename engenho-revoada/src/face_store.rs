@@ -98,7 +98,9 @@ impl InMemoryStore {
             {
                 return true;
             }
-            let Some(sender) = &sub.sender else { return false };
+            let Some(sender) = &sub.sender else {
+                return false;
+            };
             let event = FaceWatchEvent {
                 kind: event_kind,
                 body: body.clone(),
@@ -232,9 +234,8 @@ impl InMemoryStore {
                 .then(a.0.name.cmp(&b.0.name))
         });
         let mut out = Vec::new();
-        ciborium::into_writer(&entries, &mut out).map_err(|e| {
-            FaceError::Unsupported(format!("snapshot: cbor encode failed: {e}"))
-        })?;
+        ciborium::into_writer(&entries, &mut out)
+            .map_err(|e| FaceError::Unsupported(format!("snapshot: cbor encode failed: {e}")))?;
         Ok(out)
     }
 
@@ -248,10 +249,8 @@ impl InMemoryStore {
     /// Returns [`FaceError::Unsupported`] on CBOR decode failure
     /// (malformed snapshot bytes).
     pub fn restore(&self, snapshot_bytes: &[u8]) -> Result<(), FaceError> {
-        let entries: Vec<(ResourceRef, Vec<u8>)> =
-            ciborium::from_reader(snapshot_bytes).map_err(|e| {
-                FaceError::Unsupported(format!("restore: cbor decode failed: {e}"))
-            })?;
+        let entries: Vec<(ResourceRef, Vec<u8>)> = ciborium::from_reader(snapshot_bytes)
+            .map_err(|e| FaceError::Unsupported(format!("restore: cbor decode failed: {e}")))?;
         let mut store = self.store.lock().expect("store mutex poisoned");
         store.clear();
         for (r, body) in entries {

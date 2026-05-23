@@ -66,8 +66,7 @@ impl<'a> From<&'a Secret> for SecretView<'a> {
 /// a Secret response" via `kind`/`apiVersion` injection at the
 /// outer layer.
 pub fn redact_secret(s: &Secret) -> serde_json::Value {
-    serde_json::to_value(&SecretView::from(s))
-        .expect("SecretView is infallibly serializable")
+    serde_json::to_value(&SecretView::from(s)).expect("SecretView is infallibly serializable")
 }
 
 #[cfg(test)]
@@ -81,7 +80,8 @@ mod tests {
         s.metadata.namespace = Some("default".into());
         s.r#type = Some(SecretType::Known(KnownSecretType::ServiceAccountToken));
         // Two data keys with realistic values.
-        s.data.insert("token".into(), "ZXhhbXBsZS10b2tlbi12YWx1ZQ==".into());
+        s.data
+            .insert("token".into(), "ZXhhbXBsZS10b2tlbi12YWx1ZQ==".into());
         s.data.insert(
             "ca.crt".into(),
             "LS0tLS1CRUdJTi1DRVJUSUZJQ0FURS0tLS0t".into(),
@@ -121,14 +121,20 @@ mod tests {
         }
         // But the keys + metadata + type + redacted marker MUST be there.
         assert!(json_str.contains("\"ca.crt\""), "key missing: {json_str}");
-        assert!(json_str.contains("\"podinfo-token\""), "name missing: {json_str}");
+        assert!(
+            json_str.contains("\"podinfo-token\""),
+            "name missing: {json_str}"
+        );
         // upstream type id includes the prefix "kubernetes.io/" so
         // we assert on the canonical full string.
         assert!(
             json_str.contains("kubernetes.io/service-account-token"),
             "type missing: {json_str}"
         );
-        assert!(json_str.contains("\"redacted\":true"), "redacted marker missing: {json_str}");
+        assert!(
+            json_str.contains("\"redacted\":true"),
+            "redacted marker missing: {json_str}"
+        );
     }
 
     /// The full Secret still carries values through engenho-types'

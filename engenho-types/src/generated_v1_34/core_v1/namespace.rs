@@ -3,8 +3,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -64,8 +64,8 @@ fn is_empty_spec(s: &NamespaceSpec) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::namespace_spec::NamespacePhase;
+    use super::*;
 
     #[test]
     fn namespace_round_trips_with_typed_status() {
@@ -78,7 +78,10 @@ mod tests {
         let json = serde_json::to_string(&ns).unwrap();
         assert!(json.contains("\"Active\""), "got: {json}");
         // Cluster-scoped: serialized form must not carry a namespace.
-        assert!(!json.contains("\"namespace\""), "Namespace must not have its own .namespace field: {json}");
+        assert!(
+            !json.contains("\"namespace\""),
+            "Namespace must not have its own .namespace field: {json}"
+        );
         let back: Namespace = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ns);
     }

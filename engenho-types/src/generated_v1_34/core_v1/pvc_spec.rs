@@ -32,15 +32,27 @@ pub struct PersistentVolumeClaimSpec {
     pub resources: Option<ResourceRequirements>,
 
     /// `VolumeName` is the binding reference to the PV backing this claim.
-    #[serde(default, rename = "volumeName", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "volumeName",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub volume_name: Option<String>,
 
     /// `StorageClassName` references the StorageClass to use.
-    #[serde(default, rename = "storageClassName", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "storageClassName",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub storage_class_name: Option<String>,
 
     /// `VolumeMode` — `Filesystem` (default) | `Block`.
-    #[serde(default, rename = "volumeMode", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "volumeMode",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub volume_mode: Option<String>,
 }
 
@@ -87,7 +99,11 @@ pub struct PersistentVolumeClaimCondition {
     #[serde(rename = "type")]
     pub r#type: String,
     pub status: String,
-    #[serde(default, rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastTransitionTime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_transition_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use engenho_controllers::{Controller, EndpointsController};
 use engenho_store::{
+    InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
-    default_config, InProcessRouter, ResourceKey, StoreMesh,
+    default_config,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 async fn boot_store() -> Arc<StoreMesh> {
     let router = InProcessRouter::new();
@@ -74,7 +75,12 @@ async fn endpoint_ips(store: &StoreMesh, svc_name: &str) -> Vec<String> {
     };
     let mut out: Vec<String> = subsets
         .iter()
-        .flat_map(|s| s.get("addresses").and_then(|a| a.as_array()).into_iter().flatten())
+        .flat_map(|s| {
+            s.get("addresses")
+                .and_then(|a| a.as_array())
+                .into_iter()
+                .flatten()
+        })
         .filter_map(|a| a.get("ip").and_then(|i| i.as_str()).map(String::from))
         .collect();
     out.sort();

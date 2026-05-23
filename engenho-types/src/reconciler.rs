@@ -40,7 +40,7 @@ pub struct ReconcileRequest {
     /// `metadata.namespace`, or `None` for cluster-scoped resources.
     pub namespace: Option<String>,
     /// `metadata.name`.
-    pub name:      String,
+    pub name: String,
 }
 
 /// A reconciler: idempotent, side-effecting, returns a typed outcome.
@@ -61,10 +61,7 @@ pub trait Reconciler<R: KubeResource>: Send + Sync {
     /// Return [`KubeError`] to surface a transient failure (the
     /// framework will requeue with exponential backoff) or a
     /// declarative one (the framework deadletter + emits an event).
-    async fn reconcile(
-        &self,
-        req: &ReconcileRequest,
-    ) -> Result<ReconcileResult, KubeError>;
+    async fn reconcile(&self, req: &ReconcileRequest) -> Result<ReconcileResult, KubeError>;
 }
 
 #[cfg(test)]
@@ -75,7 +72,7 @@ mod tests {
     fn reconcile_request_round_trips_via_json() {
         let r = ReconcileRequest {
             namespace: Some("default".into()),
-            name:      "my-pod".into(),
+            name: "my-pod".into(),
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: ReconcileRequest = serde_json::from_str(&s).unwrap();
@@ -84,7 +81,10 @@ mod tests {
 
     #[test]
     fn cluster_scoped_request_has_no_namespace() {
-        let r = ReconcileRequest { namespace: None, name: "my-crd".into() };
+        let r = ReconcileRequest {
+            namespace: None,
+            name: "my-crd".into(),
+        };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"namespace\":null"));
     }

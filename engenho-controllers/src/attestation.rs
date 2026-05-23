@@ -322,7 +322,9 @@ mod tests {
         let v = Arc::new(FakeSignatureVerifier::new());
         let w = TameshiAttestationWebhook::new(v);
         let r = w.review(&pod_req("untrusted:latest")).await.unwrap();
-        assert!(matches!(r, AdmissionDecision::Deny(reason) if reason.contains("untrusted:latest")));
+        assert!(
+            matches!(r, AdmissionDecision::Deny(reason) if reason.contains("untrusted:latest"))
+        );
     }
 
     #[tokio::test]
@@ -360,7 +362,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r, AdmissionDecision::Allow);
-        assert!(v.calls().await.is_empty(), "verifier not called for ConfigMap");
+        assert!(
+            v.calls().await.is_empty(),
+            "verifier not called for ConfigMap"
+        );
     }
 
     #[tokio::test]

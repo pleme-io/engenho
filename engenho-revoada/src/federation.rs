@@ -37,8 +37,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::face::{FaceError, FaceWatchEvent, FaceWatchEventKind, FaceWatchStream, ResourceFormat, ResourceRef};
 use crate::Cluster;
+use crate::face::{
+    FaceError, FaceWatchEvent, FaceWatchEventKind, FaceWatchStream, ResourceFormat, ResourceRef,
+};
 
 // ─────────────────────────────────────────────────────────────────
 // RoutingPolicy — how verbs dispatch across members
@@ -164,7 +166,10 @@ impl FederatedFabric {
     /// - [`FederationError::BadDefaultIndex`] when a
     ///   `NamespacePrefix` policy's `default_member` is out of
     ///   bounds.
-    pub fn new(members: Vec<Arc<Cluster>>, routing: RoutingPolicy) -> Result<Self, FederationError> {
+    pub fn new(
+        members: Vec<Arc<Cluster>>,
+        routing: RoutingPolicy,
+    ) -> Result<Self, FederationError> {
         if members.is_empty() {
             return Err(FederationError::Empty);
         }
@@ -262,11 +267,10 @@ impl FederatedFabric {
         namespace: Option<&str>,
         format: ResourceFormat,
     ) -> Result<Vec<Vec<u8>>, FederationError> {
-        if let Some(idx) = self.routing.pick_for_kind_namespace(
-            kind,
-            namespace,
-            self.members.len(),
-        ) {
+        if let Some(idx) = self
+            .routing
+            .pick_for_kind_namespace(kind, namespace, self.members.len())
+        {
             return self.members[idx]
                 .list(kind, namespace, format)
                 .map_err(|e| FederationError::Member(idx, e));
@@ -326,11 +330,10 @@ impl FederatedFabric {
         namespace: Option<&str>,
         format: ResourceFormat,
     ) -> Result<Box<dyn FaceWatchStream>, FederationError> {
-        if let Some(idx) = self.routing.pick_for_kind_namespace(
-            kind,
-            namespace,
-            self.members.len(),
-        ) {
+        if let Some(idx) = self
+            .routing
+            .pick_for_kind_namespace(kind, namespace, self.members.len())
+        {
             return self.members[idx]
                 .watch(kind, namespace, format)
                 .map_err(|e| FederationError::Member(idx, e));
@@ -367,7 +370,7 @@ impl FederatedFabric {
             }
         }
         drop(tx); // close the writer side so the reader sees EOF
-                  // when all spawned threads exit.
+        // when all spawned threads exit.
         if started == 0
             && let Some((idx, e)) = first_err
         {
@@ -406,10 +409,10 @@ impl std::fmt::Debug for FederatedFabric {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::face::encode_native_envelope;
-    use crate::fabric::{FabricStrategy, FaceKind, FabricFace};
-    use crate::topology::Quorum3M;
     use crate::Cluster;
+    use crate::fabric::{FabricFace, FabricStrategy, FaceKind};
+    use crate::face::encode_native_envelope;
+    use crate::topology::Quorum3M;
 
     fn cluster(name: &str) -> Arc<Cluster> {
         Arc::new(
@@ -489,25 +492,18 @@ mod tests {
 
     #[test]
     fn first_policy_routes_all_writes_to_member_zero() {
-        let fab = FederatedFabric::new(
-            vec![cluster("a"), cluster("b")],
-            RoutingPolicy::First,
-        )
-        .unwrap();
+        let fab =
+            FederatedFabric::new(vec![cluster("a"), cluster("b")], RoutingPolicy::First).unwrap();
         let r = pod_ref("nginx", "default");
         let env = envelope(&r, b"x");
         fab.apply(&r, ResourceFormat::Native, &env).unwrap();
         // Member 0 has it, member 1 doesn't. Native get returns
         // the full envelope (adapter contract is symmetric).
         assert_eq!(
-            fab.members()[0]
-                .get(&r, ResourceFormat::Native)
-                .unwrap(),
+            fab.members()[0].get(&r, ResourceFormat::Native).unwrap(),
             env
         );
-        assert!(fab.members()[1]
-            .get(&r, ResourceFormat::Native)
-            .is_err());
+        assert!(fab.members()[1].get(&r, ResourceFormat::Native).is_err());
     }
 
     // ── NamespacePrefix policy ──────────────────────────────────
@@ -521,11 +517,7 @@ mod tests {
             map,
             default_member: None,
         };
-        let fab = FederatedFabric::new(
-            vec![cluster("a"), cluster("b")],
-            policy,
-        )
-        .unwrap();
+        let fab = FederatedFabric::new(vec![cluster("a"), cluster("b")], policy).unwrap();
         let ra = pod_ref("pod-a", "team-a");
         let rb = pod_ref("pod-b", "team-b");
         let env_a = envelope(&ra, b"A");
@@ -535,20 +527,14 @@ mod tests {
         // Each member has only its routed resource. Native get
         // returns the full envelope.
         assert_eq!(
-            fab.members()[0]
-                .get(&ra, ResourceFormat::Native)
-                .unwrap(),
+            fab.members()[0].get(&ra, ResourceFormat::Native).unwrap(),
             env_a
         );
         assert_eq!(
-            fab.members()[1]
-                .get(&rb, ResourceFormat::Native)
-                .unwrap(),
+            fab.members()[1].get(&rb, ResourceFormat::Native).unwrap(),
             env_b
         );
-        assert!(fab.members()[0]
-            .get(&rb, ResourceFormat::Native)
-            .is_err());
+        assert!(fab.members()[0].get(&rb, ResourceFormat::Native).is_err());
     }
 
     #[test]
@@ -578,9 +564,7 @@ mod tests {
         let env = envelope(&r, b"x");
         fab.apply(&r, ResourceFormat::Native, &env).unwrap();
         assert_eq!(
-            fab.members()[0]
-                .get(&r, ResourceFormat::Native)
-                .unwrap(),
+            fab.members()[0].get(&r, ResourceFormat::Native).unwrap(),
             env
         );
     }
@@ -589,11 +573,8 @@ mod tests {
 
     #[test]
     fn list_aggregates_across_all_members_for_non_namespace_policy() {
-        let fab = FederatedFabric::new(
-            vec![cluster("a"), cluster("b")],
-            RoutingPolicy::First,
-        )
-        .unwrap();
+        let fab =
+            FederatedFabric::new(vec![cluster("a"), cluster("b")], RoutingPolicy::First).unwrap();
         // Bypass routing for setup — write directly to each member
         // so list has something to aggregate.
         let ra = pod_ref("pod-a", "default");
@@ -626,11 +607,7 @@ mod tests {
             map,
             default_member: None,
         };
-        let fab = FederatedFabric::new(
-            vec![cluster("a"), cluster("b")],
-            policy,
-        )
-        .unwrap();
+        let fab = FederatedFabric::new(vec![cluster("a"), cluster("b")], policy).unwrap();
         let rb = pod_ref("pod-b", "team-b");
         let env_b = envelope(&rb, b"B");
         // Bypass routing for setup: write to member 1 directly.
@@ -654,29 +631,20 @@ mod tests {
             map,
             default_member: None,
         };
-        let fab = FederatedFabric::new(
-            vec![cluster("a"), cluster("b")],
-            policy,
-        )
-        .unwrap();
+        let fab = FederatedFabric::new(vec![cluster("a"), cluster("b")], policy).unwrap();
         let r = pod_ref("pod-a", "team-a");
         fab.apply(&r, ResourceFormat::Native, &envelope(&r, b"x"))
             .unwrap();
         fab.delete(&r).unwrap();
-        assert!(fab.members()[0]
-            .get(&r, ResourceFormat::Native)
-            .is_err());
+        assert!(fab.members()[0].get(&r, ResourceFormat::Native).is_err());
     }
 
     // ── watch fan-out ───────────────────────────────────────────
 
     #[test]
     fn watch_fans_events_across_all_members() {
-        let fab = FederatedFabric::new(
-            vec![cluster("a"), cluster("b")],
-            RoutingPolicy::First,
-        )
-        .unwrap();
+        let fab =
+            FederatedFabric::new(vec![cluster("a"), cluster("b")], RoutingPolicy::First).unwrap();
         let mut watch = fab
             .watch("Pod", Some("default"), ResourceFormat::Native)
             .unwrap();
@@ -712,11 +680,7 @@ mod tests {
             map,
             default_member: None,
         };
-        let fab = FederatedFabric::new(
-            vec![cluster("a"), cluster("b")],
-            policy,
-        )
-        .unwrap();
+        let fab = FederatedFabric::new(vec![cluster("a"), cluster("b")], policy).unwrap();
         let mut watch = fab
             .watch("Pod", Some("team-a"), ResourceFormat::Native)
             .unwrap();
@@ -735,11 +699,7 @@ mod tests {
 
     #[test]
     fn member_error_is_tagged_with_member_index() {
-        let fab = FederatedFabric::new(
-            vec![cluster("a")],
-            RoutingPolicy::First,
-        )
-        .unwrap();
+        let fab = FederatedFabric::new(vec![cluster("a")], RoutingPolicy::First).unwrap();
         // Get a non-existent resource — face errors as Unsupported;
         // federation wraps with the member index.
         let r = pod_ref("missing", "default");

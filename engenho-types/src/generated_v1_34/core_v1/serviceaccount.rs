@@ -10,8 +10,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -33,7 +33,11 @@ pub struct ServiceAccount {
 
     /// References to Secrets used for pulling images from private
     /// registries.
-    #[serde(default, rename = "imagePullSecrets", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "imagePullSecrets",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub image_pull_secrets: Vec<LocalObjectReference>,
 
     /// `AutomountServiceAccountToken` — opt out of API token auto-
@@ -102,8 +106,14 @@ mod tests {
         sa.automount_service_account_token = Some(true);
         let json = serde_json::to_string(&sa).unwrap();
         // Wire-clean: no spec/status leaked.
-        assert!(!json.contains("\"spec\""), "ServiceAccount must not emit spec: {json}");
-        assert!(!json.contains("\"status\""), "ServiceAccount must not emit status: {json}");
+        assert!(
+            !json.contains("\"spec\""),
+            "ServiceAccount must not emit spec: {json}"
+        );
+        assert!(
+            !json.contains("\"status\""),
+            "ServiceAccount must not emit status: {json}"
+        );
         assert!(json.contains("\"imagePullSecrets\""));
         let back: ServiceAccount = serde_json::from_str(&json).unwrap();
         assert_eq!(back, sa);

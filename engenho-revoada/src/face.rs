@@ -711,10 +711,18 @@ impl Face for KubernetesFace {
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.store.watch(kind, namespace, format)
     }
-    fn resource_count(&self) -> usize { self.store.len() }
-    fn subscriber_count(&self) -> usize { self.store.subscriber_count() }
-    fn snapshot(&self) -> Result<Vec<u8>, FaceError> { self.store.snapshot() }
-    fn restore(&self, b: &[u8]) -> Result<(), FaceError> { self.store.restore(b) }
+    fn resource_count(&self) -> usize {
+        self.store.len()
+    }
+    fn subscriber_count(&self) -> usize {
+        self.store.subscriber_count()
+    }
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> {
+        self.store.snapshot()
+    }
+    fn restore(&self, b: &[u8]) -> Result<(), FaceError> {
+        self.store.restore(b)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -846,10 +854,18 @@ impl Face for NomadFace {
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.store.watch(kind, namespace, format)
     }
-    fn resource_count(&self) -> usize { self.store.len() }
-    fn subscriber_count(&self) -> usize { self.store.subscriber_count() }
-    fn snapshot(&self) -> Result<Vec<u8>, FaceError> { self.store.snapshot() }
-    fn restore(&self, b: &[u8]) -> Result<(), FaceError> { self.store.restore(b) }
+    fn resource_count(&self) -> usize {
+        self.store.len()
+    }
+    fn subscriber_count(&self) -> usize {
+        self.store.subscriber_count()
+    }
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> {
+        self.store.snapshot()
+    }
+    fn restore(&self, b: &[u8]) -> Result<(), FaceError> {
+        self.store.restore(b)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -981,10 +997,18 @@ impl Face for SystemdFace {
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.store.watch(kind, namespace, format)
     }
-    fn resource_count(&self) -> usize { self.store.len() }
-    fn subscriber_count(&self) -> usize { self.store.subscriber_count() }
-    fn snapshot(&self) -> Result<Vec<u8>, FaceError> { self.store.snapshot() }
-    fn restore(&self, b: &[u8]) -> Result<(), FaceError> { self.store.restore(b) }
+    fn resource_count(&self) -> usize {
+        self.store.len()
+    }
+    fn subscriber_count(&self) -> usize {
+        self.store.subscriber_count()
+    }
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> {
+        self.store.snapshot()
+    }
+    fn restore(&self, b: &[u8]) -> Result<(), FaceError> {
+        self.store.restore(b)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1104,10 +1128,18 @@ impl Face for BareMetalSupervisorFace {
     ) -> Result<Box<dyn FaceWatchStream>, FaceError> {
         self.store.watch(kind, namespace, format)
     }
-    fn resource_count(&self) -> usize { self.store.len() }
-    fn subscriber_count(&self) -> usize { self.store.subscriber_count() }
-    fn snapshot(&self) -> Result<Vec<u8>, FaceError> { self.store.snapshot() }
-    fn restore(&self, b: &[u8]) -> Result<(), FaceError> { self.store.restore(b) }
+    fn resource_count(&self) -> usize {
+        self.store.len()
+    }
+    fn subscriber_count(&self) -> usize {
+        self.store.subscriber_count()
+    }
+    fn snapshot(&self) -> Result<Vec<u8>, FaceError> {
+        self.store.snapshot()
+    }
+    fn restore(&self, b: &[u8]) -> Result<(), FaceError> {
+        self.store.restore(b)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1126,20 +1158,17 @@ impl Face for BareMetalSupervisorFace {
 pub fn instantiate(decl: &FabricFace) -> Result<Box<dyn Face>, FaceError> {
     match &decl.kind {
         FaceKind::PureRaft => Ok(Box::new(
-            PureRaftFace::from_declaration(decl)
-                .expect("kind matched, declaration must construct"),
+            PureRaftFace::from_declaration(decl).expect("kind matched, declaration must construct"),
         )),
         FaceKind::Kubernetes { .. } => Ok(Box::new(
             KubernetesFace::from_declaration(decl)
                 .expect("kind matched, declaration must construct"),
         )),
         FaceKind::Nomad { .. } => Ok(Box::new(
-            NomadFace::from_declaration(decl)
-                .expect("kind matched, declaration must construct"),
+            NomadFace::from_declaration(decl).expect("kind matched, declaration must construct"),
         )),
         FaceKind::Systemd { .. } => Ok(Box::new(
-            SystemdFace::from_declaration(decl)
-                .expect("kind matched, declaration must construct"),
+            SystemdFace::from_declaration(decl).expect("kind matched, declaration must construct"),
         )),
         FaceKind::BareMetalSupervisor => Ok(Box::new(
             BareMetalSupervisorFace::from_declaration(decl)
@@ -1326,7 +1355,12 @@ mod tests {
 
     fn systemd_decl(user_units: bool) -> FabricFace {
         FabricFace {
-            name: if user_units { "systemd-user" } else { "systemd-system" }.into(),
+            name: if user_units {
+                "systemd-user"
+            } else {
+                "systemd-system"
+            }
+            .into(),
             kind: FaceKind::Systemd { user_units },
         }
     }
@@ -1433,7 +1467,9 @@ mod tests {
                 version: "1.34".into(),
                 certified_cncf: true,
             },
-            FaceKind::Nomad { version: "1.7".into() },
+            FaceKind::Nomad {
+                version: "1.7".into(),
+            },
             FaceKind::Systemd { user_units: false },
             FaceKind::BareMetalSupervisor,
         ];
@@ -1655,16 +1691,20 @@ mod tests {
             .unwrap()
             .with_adapters({
                 let mut r = crate::format::AdapterRegistry::empty();
-                r.register(std::sync::Arc::new(
-                    crate::format::NativePassthroughAdapter,
-                ));
+                r.register(std::sync::Arc::new(crate::format::NativePassthroughAdapter));
                 r
             });
         let r = pod_ref("nginx", "default");
         // YAML now rejected because no YAML adapter is registered.
-        match face.apply_resource(ResourceFormat::Yaml, b"apiVersion: v1\nkind: Pod\nmetadata: {name: x}\n") {
+        match face.apply_resource(
+            ResourceFormat::Yaml,
+            b"apiVersion: v1\nkind: Pod\nmetadata: {name: x}\n",
+        ) {
             Err(FaceError::Unsupported(msg)) => {
-                assert!(msg.contains("Yaml") || msg.contains("UnsupportedFormat"), "msg: {msg}");
+                assert!(
+                    msg.contains("Yaml") || msg.contains("UnsupportedFormat"),
+                    "msg: {msg}"
+                );
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -1680,7 +1720,10 @@ mod tests {
         let yaml = b"apiVersion: v1\nmetadata:\n  name: nginx\n";
         match face.apply_resource(ResourceFormat::Yaml, yaml) {
             Err(FaceError::Unsupported(msg)) => {
-                assert!(msg.contains("kind"), "msg should mention missing kind: {msg}");
+                assert!(
+                    msg.contains("kind"),
+                    "msg should mention missing kind: {msg}"
+                );
             }
             other => panic!("expected Unsupported (MissingField kind), got {other:?}"),
         }
@@ -1853,7 +1896,8 @@ mod tests {
         .unwrap();
         // Apply a Pod — SHOULD reach the watch.
         let pod_env = envelope(&pod_ref("nginx", "default"), b"P");
-        face.apply_resource(ResourceFormat::Native, &pod_env).unwrap();
+        face.apply_resource(ResourceFormat::Native, &pod_env)
+            .unwrap();
         let ev = pod_watch.next_event().unwrap().expect("pod event");
         assert_eq!(ev.body, pod_env);
     }
@@ -1870,7 +1914,8 @@ mod tests {
         )
         .unwrap();
         let default_env = envelope(&pod_ref("b", "default"), b"D");
-        face.apply_resource(ResourceFormat::Native, &default_env).unwrap();
+        face.apply_resource(ResourceFormat::Native, &default_env)
+            .unwrap();
         let ev = watch.next_event().unwrap().expect("event");
         // Only the "default" namespace event arrives.
         assert_eq!(ev.body, default_env);
@@ -1886,7 +1931,8 @@ mod tests {
             .watch_resources("Pod", None, ResourceFormat::Native)
             .unwrap();
         let pod_env = envelope(&pod_ref("nginx", "default"), b"x");
-        face.apply_resource(ResourceFormat::Native, &pod_env).unwrap();
+        face.apply_resource(ResourceFormat::Native, &pod_env)
+            .unwrap();
         let e1 = w1.next_event().unwrap().expect("w1 event");
         let e2 = w2.next_event().unwrap().expect("w2 event");
         assert_eq!(e1.body, pod_env);
@@ -1954,17 +2000,17 @@ mod tests {
             Box::new(SystemdFace::from_declaration(&systemd_decl(false)).unwrap()),
         ];
         assert_eq!(faces.len(), 4);
-        let kinds: Vec<&'static str> = faces.iter().map(|f| match f.kind() {
-            FaceKind::PureRaft => "PureRaft",
-            FaceKind::Kubernetes { .. } => "Kubernetes",
-            FaceKind::Nomad { .. } => "Nomad",
-            FaceKind::Systemd { .. } => "Systemd",
-            FaceKind::BareMetalSupervisor => "BareMetalSupervisor",
-        }).collect();
-        assert_eq!(
-            kinds,
-            vec!["PureRaft", "Kubernetes", "Nomad", "Systemd"],
-        );
+        let kinds: Vec<&'static str> = faces
+            .iter()
+            .map(|f| match f.kind() {
+                FaceKind::PureRaft => "PureRaft",
+                FaceKind::Kubernetes { .. } => "Kubernetes",
+                FaceKind::Nomad { .. } => "Nomad",
+                FaceKind::Systemd { .. } => "Systemd",
+                FaceKind::BareMetalSupervisor => "BareMetalSupervisor",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["PureRaft", "Kubernetes", "Nomad", "Systemd"],);
     }
 
     #[test]
@@ -1983,10 +2029,7 @@ mod tests {
         ];
         assert_eq!(faces.len(), 3);
         let names: Vec<&str> = faces.iter().map(|f| f.name()).collect();
-        assert_eq!(
-            names,
-            vec!["pure-raft-test", "k8s-v1.34", "nomad-1.7"],
-        );
+        assert_eq!(names, vec!["pure-raft-test", "k8s-v1.34", "nomad-1.7"],);
         for face in &faces {
             assert!(!face.is_running());
         }

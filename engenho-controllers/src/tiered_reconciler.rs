@@ -274,11 +274,18 @@ mod tests {
         // Nothing in either tier.
         let r = TieredCacheReconciler::new(
             vec![l0.clone(), l1.clone()],
-            Arc::new(StaticPromotionScope::new(vec![DrvHash::from_bytes(b"void")])),
+            Arc::new(StaticPromotionScope::new(vec![DrvHash::from_bytes(
+                b"void",
+            )])),
         );
         let report = r.tick().await.unwrap();
         assert_eq!(report.objects_changed, 0);
-        assert!(l0.get_drv(&DrvHash::from_bytes(b"void")).await.unwrap().is_none());
+        assert!(
+            l0.get_drv(&DrvHash::from_bytes(b"void"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

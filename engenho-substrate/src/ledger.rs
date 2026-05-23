@@ -138,10 +138,9 @@ impl MaterializationLedger for MemoryLedger {
             subject: receipt.subject,
         };
         let mut state = self.inner.write().await;
-        let tracker = state
-            .trackers
-            .entry(key)
-            .or_insert_with(|| QuorumTracker::new(receipt.kind.clone(), receipt.subject, threshold));
+        let tracker = state.trackers.entry(key).or_insert_with(|| {
+            QuorumTracker::new(receipt.kind.clone(), receipt.subject, threshold)
+        });
         Ok(tracker.ingest(receipt))
     }
 
@@ -190,9 +189,7 @@ impl MaterializationLedger for MemoryLedger {
 
     async fn forget_stage(&self, stage_id: &StageId) -> Result<(), LedgerError> {
         let mut state = self.inner.write().await;
-        state
-            .trackers
-            .retain(|k, _| &k.stage_id != stage_id);
+        state.trackers.retain(|k, _| &k.stage_id != stage_id);
         Ok(())
     }
 }
@@ -203,12 +200,7 @@ mod tests {
     use crate::receipt::{MaterializationReceipt, NodeId, ReceiptKind};
 
     fn rcpt(emitter: u8, evidence: u8) -> MaterializationReceipt {
-        MaterializationReceipt::for_drv(
-            [7u8; 32],
-            NodeId::new([emitter; 32]),
-            100,
-            [evidence; 32],
-        )
+        MaterializationReceipt::for_drv([7u8; 32], NodeId::new([emitter; 32]), 100, [evidence; 32])
     }
 
     fn stage() -> StageId {
@@ -245,7 +237,13 @@ mod tests {
         let o2 = l.ingest(&stage(), 3, &rcpt(2, 5)).await.unwrap();
         assert!(matches!(o2, QuorumOutcome::Pending { confirmed: 2, .. }));
         let o3 = l.ingest(&stage(), 3, &rcpt(3, 5)).await.unwrap();
-        assert!(matches!(o3, QuorumOutcome::Reached { confirmed: 3, threshold: 3 }));
+        assert!(matches!(
+            o3,
+            QuorumOutcome::Reached {
+                confirmed: 3,
+                threshold: 3
+            }
+        ));
     }
 
     #[tokio::test]

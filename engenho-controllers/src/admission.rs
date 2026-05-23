@@ -97,10 +97,8 @@ pub trait AdmissionWebhook: Send + Sync {
     /// [`AdmissionError::Backend`] on backend failure (caller
     /// decides whether to fail-open or fail-closed via the
     /// [`AdmissionChain`] mode).
-    async fn review(
-        &self,
-        request: &AdmissionRequest,
-    ) -> Result<AdmissionDecision, AdmissionError>;
+    async fn review(&self, request: &AdmissionRequest)
+    -> Result<AdmissionDecision, AdmissionError>;
 }
 
 // =================================================================
@@ -134,10 +132,7 @@ impl AdmissionChain {
 
     /// Evaluate the chain. Returns the final value (possibly
     /// mutated) on Allow; the Deny reason on rejection.
-    pub async fn review(
-        &self,
-        mut request: AdmissionRequest,
-    ) -> AdmissionDecision {
+    pub async fn review(&self, mut request: AdmissionRequest) -> AdmissionDecision {
         for hook in &self.hooks {
             let decision = match hook.review(&request).await {
                 Ok(d) => d,
@@ -157,10 +152,7 @@ impl AdmissionChain {
                     request.value = Some(new);
                 }
                 AdmissionDecision::Deny(reason) => {
-                    return AdmissionDecision::Deny(format!(
-                        "{}: {reason}",
-                        hook.name()
-                    ));
+                    return AdmissionDecision::Deny(format!("{}: {reason}", hook.name()));
                 }
             }
         }
@@ -240,9 +232,7 @@ impl AdmissionWebhook for FakeAdmissionWebhook {
         request: &AdmissionRequest,
     ) -> Result<AdmissionDecision, AdmissionError> {
         let mut state = self.inner.lock().await;
-        state
-            .call_log
-            .push((request.action, request.key.label()));
+        state.call_log.push((request.action, request.key.label()));
         if let Some(msg) = state.fail_with.take() {
             return Err(AdmissionError::Backend(msg));
         }
@@ -289,12 +279,13 @@ mod tests {
         let h2 = Arc::new(FakeAdmissionWebhook::new("h2"));
         h1.set_decision(&label_for("x"), AdmissionDecision::Deny("no".into()))
             .await;
-        let chain =
-            AdmissionChain::new(vec![h1.clone(), h2.clone()], AdmissionMode::FailClosed);
+        let chain = AdmissionChain::new(vec![h1.clone(), h2.clone()], AdmissionMode::FailClosed);
         let r = chain
             .review(req(AdmissionAction::Put, "x", json!({})))
             .await;
-        assert!(matches!(r, AdmissionDecision::Deny(reason) if reason.contains("h1") && reason.contains("no")));
+        assert!(
+            matches!(r, AdmissionDecision::Deny(reason) if reason.contains("h1") && reason.contains("no"))
+        );
         // h2 should NOT have been called.
         assert_eq!(h2.calls().await.len(), 0);
     }
@@ -309,8 +300,7 @@ mod tests {
         )
         .await;
         // h2 sees the mutated value: read the call log
-        let chain =
-            AdmissionChain::new(vec![h1.clone(), h2.clone()], AdmissionMode::FailClosed);
+        let chain = AdmissionChain::new(vec![h1.clone(), h2.clone()], AdmissionMode::FailClosed);
         let r = chain
             .review(req(AdmissionAction::Put, "x", json!({"spec": {}})))
             .await;

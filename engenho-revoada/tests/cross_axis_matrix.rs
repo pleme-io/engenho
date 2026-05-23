@@ -6,15 +6,11 @@ use engenho_revoada::face::{Face, ResourceFormat, ResourceRef};
 use engenho_revoada::topology::{
     Cluster3MNW, MeshAllPeers, Pair, Phalanx, Quorum3M, Solo, TopologyStrategy,
 };
-use engenho_revoada::{
-    Cluster, ClusterDeclaration, FabricFace, FabricStrategy, FaceKind,
-};
+use engenho_revoada::{Cluster, ClusterDeclaration, FabricFace, FabricStrategy, FaceKind};
 
 fn yaml_pod(name: &str, ns: &str) -> Vec<u8> {
-    format!(
-        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n"
-    )
-    .into_bytes()
+    format!("apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: {ns}\nspec: {{}}\n")
+        .into_bytes()
 }
 
 fn json_pod(name: &str, ns: &str) -> Vec<u8> {
@@ -215,18 +211,13 @@ fn matrix_full_3_axis_quorum_compatible_works() {
                 };
                 cluster
                     .apply(format, &body)
-                    .unwrap_or_else(|e| panic!(
-                        "{face_label}+{topo_label}+{format:?}: apply: {e}"
-                    ));
+                    .unwrap_or_else(|e| panic!("{face_label}+{topo_label}+{format:?}: apply: {e}"));
                 let r = ResourceRef::namespaced("Pod", "p", "default");
                 let got = cluster
                     .get(&r, format)
-                    .unwrap_or_else(|e| panic!(
-                        "{face_label}+{topo_label}+{format:?}: get: {e}"
-                    ));
+                    .unwrap_or_else(|e| panic!("{face_label}+{topo_label}+{format:?}: get: {e}"));
                 assert_eq!(
-                    got,
-                    body,
+                    got, body,
                     "{face_label}+{topo_label}+{format:?}: round-trip",
                 );
                 cluster.delete(&r).unwrap();

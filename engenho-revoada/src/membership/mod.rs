@@ -40,12 +40,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chitchat::transport::UdpTransport;
-use chitchat::{
-    spawn_chitchat, ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig,
-};
+use chitchat::{ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, spawn_chitchat};
 use engenho_types::primitives::Quantity;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 
 use crate::NodeId;
 
@@ -83,11 +81,7 @@ pub struct GossipConfig {
 impl GossipConfig {
     /// Construct a config with sane defaults for an engenho node.
     #[must_use]
-    pub fn new(
-        node_id: NodeId,
-        gossip_addr: SocketAddr,
-        initial_state: NodeState,
-    ) -> Self {
+    pub fn new(node_id: NodeId, gossip_addr: SocketAddr, initial_state: NodeState) -> Self {
         Self {
             node_id,
             gossip_addr,
@@ -210,11 +204,8 @@ impl GossipMesh {
     /// Returns [`MembershipError::StartFailed`] if chitchat can't
     /// bind the socket or if any other startup step fails.
     pub async fn start(config: GossipConfig) -> Result<Self, MembershipError> {
-        let chitchat_id = ChitchatId::new(
-            config.node_id.to_hex(),
-            unix_seconds(),
-            config.gossip_addr,
-        );
+        let chitchat_id =
+            ChitchatId::new(config.node_id.to_hex(), unix_seconds(), config.gossip_addr);
 
         let cc_config = ChitchatConfig {
             chitchat_id: chitchat_id.clone(),

@@ -230,7 +230,9 @@ mod tests {
     #[tokio::test]
     async fn fake_runner_records_invocations() {
         let r = FakeCommandRunner::new();
-        r.run(&req("skopeo", &["copy", "src", "dst"])).await.unwrap();
+        r.run(&req("skopeo", &["copy", "src", "dst"]))
+            .await
+            .unwrap();
         let calls = r.invocations().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].program, "skopeo");

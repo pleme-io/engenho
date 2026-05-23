@@ -84,10 +84,7 @@ impl CrdValidationWebhook {
     /// top-level keys named in `schema.required` are checked).
     /// Returns the first missing-required field name, or None.
     #[must_use]
-    pub fn first_missing_required<'a>(
-        schema: &'a Value,
-        value: &Value,
-    ) -> Option<&'a str> {
+    pub fn first_missing_required<'a>(schema: &'a Value, value: &Value) -> Option<&'a str> {
         let required = schema.get("required")?.as_array()?;
         for r in required {
             let Some(name) = r.as_str() else { continue };
@@ -150,9 +147,7 @@ impl AdmissionWebhook for CrdValidationWebhook {
         // required fields as long as the merged result has them).
         if request.action == AdmissionAction::Put {
             if let Some(value) = &request.value {
-                if let Some(missing) =
-                    Self::first_missing_required(&entry.schema, value)
-                {
+                if let Some(missing) = Self::first_missing_required(&entry.schema, value) {
                     return Ok(AdmissionDecision::Deny(format!(
                         "required field {missing} missing on {registry_key}"
                     )));
@@ -176,7 +171,12 @@ mod tests {
     use engenho_store::resource::ResourceKey;
     use serde_json::json;
 
-    fn ns_request(action: AdmissionAction, kind: &str, ns: Option<&str>, value: Value) -> AdmissionRequest {
+    fn ns_request(
+        action: AdmissionAction,
+        kind: &str,
+        ns: Option<&str>,
+        value: Value,
+    ) -> AdmissionRequest {
         let key = match ns {
             Some(n) => ResourceKey::namespaced("engenho.io", "v1", kind, n, "x"),
             None => ResourceKey::cluster_scoped("engenho.io", "v1", kind, "x"),
@@ -200,11 +200,13 @@ mod tests {
     #[tokio::test]
     async fn delete_always_allowed() {
         let w = webhook_with(vec![]).await;
-        let req = ns_request(AdmissionAction::Delete, "Unknown", Some("default"), json!({}));
-        assert_eq!(
-            w.review(&req).await.unwrap(),
-            AdmissionDecision::Allow
+        let req = ns_request(
+            AdmissionAction::Delete,
+            "Unknown",
+            Some("default"),
+            json!({}),
         );
+        assert_eq!(w.review(&req).await.unwrap(), AdmissionDecision::Allow);
     }
 
     #[tokio::test]
@@ -216,21 +218,13 @@ mod tests {
             value: Some(json!({})),
             current: None,
         };
-        assert_eq!(
-            w.review(&req).await.unwrap(),
-            AdmissionDecision::Allow
-        );
+        assert_eq!(w.review(&req).await.unwrap(), AdmissionDecision::Allow);
     }
 
     #[tokio::test]
     async fn unregistered_custom_kind_is_denied() {
         let w = webhook_with(vec![]).await;
-        let req = ns_request(
-            AdmissionAction::Put,
-            "Widget",
-            Some("default"),
-            json!({}),
-        );
+        let req = ns_request(AdmissionAction::Put, "Widget", Some("default"), json!({}));
         let r = w.review(&req).await.unwrap();
         match r {
             AdmissionDecision::Deny(reason) => {
@@ -258,10 +252,7 @@ mod tests {
             Some("default"),
             json!({"spec": {}}),
         );
-        assert_eq!(
-            w.review(&req).await.unwrap(),
-            AdmissionDecision::Allow
-        );
+        assert_eq!(w.review(&req).await.unwrap(), AdmissionDecision::Allow);
     }
 
     #[tokio::test]
@@ -298,7 +289,9 @@ mod tests {
         let w = webhook_with(vec![entry]).await;
         let req = ns_request(AdmissionAction::Put, "Widget", None, json!({}));
         let r = w.review(&req).await.unwrap();
-        assert!(matches!(r, AdmissionDecision::Deny(reason) if reason.contains("namespace required")));
+        assert!(
+            matches!(r, AdmissionDecision::Deny(reason) if reason.contains("namespace required"))
+        );
     }
 
     #[tokio::test]
@@ -316,7 +309,7 @@ mod tests {
             AdmissionAction::Put,
             "Widget",
             Some("default"),
-            json!({"metadata": {"name": "x"}}),  // spec missing
+            json!({"metadata": {"name": "x"}}), // spec missing
         );
         let r = w.review(&req).await.unwrap();
         assert!(matches!(r, AdmissionDecision::Deny(reason) if reason.contains("spec")));
@@ -339,10 +332,7 @@ mod tests {
             Some("default"),
             json!({"spec": {}}),
         );
-        assert_eq!(
-            w.review(&req).await.unwrap(),
-            AdmissionDecision::Allow
-        );
+        assert_eq!(w.review(&req).await.unwrap(), AdmissionDecision::Allow);
     }
 
     #[tokio::test]
@@ -360,13 +350,10 @@ mod tests {
             AdmissionAction::Patch,
             "Widget",
             Some("default"),
-            json!({"metadata": {"labels": {"app": "x"}}}),  // partial update; no spec
+            json!({"metadata": {"labels": {"app": "x"}}}), // partial update; no spec
         );
         // Patch is allowed without requiring all top-level fields.
-        assert_eq!(
-            w.review(&req).await.unwrap(),
-            AdmissionDecision::Allow
-        );
+        assert_eq!(w.review(&req).await.unwrap(), AdmissionDecision::Allow);
     }
 
     #[test]

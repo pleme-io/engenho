@@ -46,7 +46,11 @@ pub struct NamespaceCondition {
     #[serde(rename = "type")]
     pub r#type: String,
     pub status: String,
-    #[serde(default, rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastTransitionTime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_transition_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -60,7 +64,10 @@ mod tests {
 
     #[test]
     fn namespace_phase_round_trips() {
-        assert_eq!(serde_json::to_string(&NamespacePhase::Active).unwrap(), "\"Active\"");
+        assert_eq!(
+            serde_json::to_string(&NamespacePhase::Active).unwrap(),
+            "\"Active\""
+        );
         assert_eq!(
             serde_json::to_string(&NamespacePhase::Terminating).unwrap(),
             "\"Terminating\""

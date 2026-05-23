@@ -65,8 +65,7 @@ fn main() -> Result<()> {
     let mut manifest_paths = Vec::with_capacity(manifests.len());
     for m in &manifests {
         let p = manifests_dir.join(&m.filename);
-        std::fs::write(&p, &m.body)
-            .with_context(|| format!("write {}", p.display()))?;
+        std::fs::write(&p, &m.body).with_context(|| format!("write {}", p.display()))?;
         manifest_paths.push(p);
     }
 
@@ -80,7 +79,8 @@ fn main() -> Result<()> {
         });
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
-        eprintln!("wrote config + {} args + {} manifests to {}",
+        eprintln!(
+            "wrote config + {} args + {} manifests to {}",
             cfg.render_k3s_server_args().len(),
             manifests.len(),
             args.output_dir.display(),

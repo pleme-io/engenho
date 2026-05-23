@@ -94,10 +94,7 @@ impl RetryingCacheBackend {
 
     /// New wrapper with explicit backoff.
     #[must_use]
-    pub fn with_config(
-        inner: Arc<dyn DerivationCacheBackend>,
-        config: BackoffConfig,
-    ) -> Self {
+    pub fn with_config(inner: Arc<dyn DerivationCacheBackend>, config: BackoffConfig) -> Self {
         Self { inner, config }
     }
 
@@ -183,10 +180,7 @@ impl DerivationCacheBackend for RetryingCacheBackend {
         .await
     }
 
-    async fn list_realisations(
-        &self,
-        drv_hash: &DrvHash,
-    ) -> Result<Vec<Realisation>, CacheError> {
+    async fn list_realisations(&self, drv_hash: &DrvHash) -> Result<Vec<Realisation>, CacheError> {
         let inner = self.inner.clone();
         let drv_hash = drv_hash.clone();
         self.retry(|| {
@@ -197,10 +191,7 @@ impl DerivationCacheBackend for RetryingCacheBackend {
         .await
     }
 
-    async fn put_realisation(
-        &self,
-        realisation: &Realisation,
-    ) -> Result<(), CacheError> {
+    async fn put_realisation(&self, realisation: &Realisation) -> Result<(), CacheError> {
         let inner = self.inner.clone();
         let r = realisation.clone();
         self.retry(|| {
@@ -242,11 +233,7 @@ mod tests {
             if self
                 .fail_remaining
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    if n > 0 {
-                        Some(n - 1)
-                    } else {
-                        None
-                    }
+                    if n > 0 { Some(n - 1) } else { None }
                 })
                 .is_ok()
             {
@@ -285,10 +272,7 @@ mod tests {
             self.maybe_fail().await?;
             self.inner.list_realisations(drv_hash).await
         }
-        async fn put_realisation(
-            &self,
-            realisation: &Realisation,
-        ) -> Result<(), CacheError> {
+        async fn put_realisation(&self, realisation: &Realisation) -> Result<(), CacheError> {
             self.maybe_fail().await?;
             self.inner.put_realisation(realisation).await
         }
@@ -359,24 +343,18 @@ mod tests {
             async fn put_nar(&self, _: &NarBlob) -> Result<(), CacheError> {
                 Ok(())
             }
-            async fn list_realisations(
-                &self,
-                _: &DrvHash,
-            ) -> Result<Vec<Realisation>, CacheError> {
+            async fn list_realisations(&self, _: &DrvHash) -> Result<Vec<Realisation>, CacheError> {
                 Ok(Vec::new())
             }
-            async fn put_realisation(
-                &self,
-                _: &Realisation,
-            ) -> Result<(), CacheError> {
+            async fn put_realisation(&self, _: &Realisation) -> Result<(), CacheError> {
                 Ok(())
             }
         }
-        let wrapper = RetryingCacheBackend::with_config(
-            Arc::new(CorruptBackend),
-            fast_backoff(),
-        );
-        let err = wrapper.get_drv(&DrvHash::from_bytes(b"x")).await.unwrap_err();
+        let wrapper = RetryingCacheBackend::with_config(Arc::new(CorruptBackend), fast_backoff());
+        let err = wrapper
+            .get_drv(&DrvHash::from_bytes(b"x"))
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), "hash_mismatch");
         // Note: we don't assert call count = 1 because there's no
         // counter on CorruptBackend. The structural-error property
@@ -403,7 +381,7 @@ mod tests {
 
     #[test]
     fn delay_for_third_attempt_doubles_at_default_multiplier() {
-        let cfg = BackoffConfig::default();  // multiplier = 2.0
+        let cfg = BackoffConfig::default(); // multiplier = 2.0
         assert_eq!(cfg.delay_for(3), cfg.initial_delay * 2);
     }
 

@@ -38,7 +38,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 const MAGIC_V1: &[u8] = b"engenho-persistent-log v1\n";
@@ -113,22 +113,16 @@ impl PersistentLog {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        PersistentLogError::Io(format!(
-                            "mkdir {}: {e}",
-                            parent.display()
-                        ))
+                        PersistentLogError::Io(format!("mkdir {}: {e}", parent.display()))
                     })?;
                 }
             }
-            let mut f = std::fs::File::create(&path).map_err(|e| {
-                PersistentLogError::Io(format!("create {}: {e}", path.display()))
-            })?;
-            f.write_all(MAGIC_V1).map_err(|e| {
-                PersistentLogError::Io(format!("write magic: {e}"))
-            })?;
-            f.sync_all().map_err(|e| {
-                PersistentLogError::Io(format!("fsync magic: {e}"))
-            })?;
+            let mut f = std::fs::File::create(&path)
+                .map_err(|e| PersistentLogError::Io(format!("create {}: {e}", path.display())))?;
+            f.write_all(MAGIC_V1)
+                .map_err(|e| PersistentLogError::Io(format!("write magic: {e}")))?;
+            f.sync_all()
+                .map_err(|e| PersistentLogError::Io(format!("fsync magic: {e}")))?;
         }
         Ok(Self { path })
     }
@@ -140,8 +134,8 @@ impl PersistentLog {
     /// [`PersistentLogError::Encode`] if serialization fails;
     /// [`PersistentLogError::Io`] on filesystem failure.
     pub fn append<T: Serialize>(&self, index: u64, entry: &T) -> Result<(), PersistentLogError> {
-        let payload = serde_json::to_vec(entry)
-            .map_err(|e| PersistentLogError::Encode(e.to_string()))?;
+        let payload =
+            serde_json::to_vec(entry).map_err(|e| PersistentLogError::Encode(e.to_string()))?;
         let hash = blake3::hash(&payload);
 
         let mut f = std::fs::OpenOptions::new()
@@ -181,9 +175,8 @@ impl PersistentLog {
 
         // Read + verify magic.
         let mut header = vec![0u8; MAGIC_V1.len()];
-        f.read_exact(&mut header).map_err(|e| {
-            PersistentLogError::Io(format!("read magic: {e}"))
-        })?;
+        f.read_exact(&mut header)
+            .map_err(|e| PersistentLogError::Io(format!("read magic: {e}")))?;
         if header != MAGIC_V1 {
             return Err(PersistentLogError::BadMagic);
         }
@@ -224,12 +217,11 @@ impl PersistentLog {
                 return Err(PersistentLogError::HashMismatch { index });
             }
 
-            let decoded: T = serde_json::from_slice(&payload).map_err(|e| {
-                PersistentLogError::Decode {
+            let decoded: T =
+                serde_json::from_slice(&payload).map_err(|e| PersistentLogError::Decode {
                     index,
                     detail: e.to_string(),
-                }
-            })?;
+                })?;
             entries.push((index, decoded));
         }
         Ok(entries)
@@ -254,10 +246,7 @@ mod tests {
     }
 
     fn temp_path(suffix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "engenho-plog-{}-{suffix}.log",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("engenho-plog-{}-{suffix}.log", std::process::id()))
     }
 
     #[test]
@@ -276,9 +265,30 @@ mod tests {
         let path = temp_path("append");
         let _ = std::fs::remove_file(&path);
         let log = PersistentLog::open(&path).unwrap();
-        log.append(1, &Entry { cmd: "put".into(), n: 1 }).unwrap();
-        log.append(2, &Entry { cmd: "patch".into(), n: 2 }).unwrap();
-        log.append(3, &Entry { cmd: "delete".into(), n: 3 }).unwrap();
+        log.append(
+            1,
+            &Entry {
+                cmd: "put".into(),
+                n: 1,
+            },
+        )
+        .unwrap();
+        log.append(
+            2,
+            &Entry {
+                cmd: "patch".into(),
+                n: 2,
+            },
+        )
+        .unwrap();
+        log.append(
+            3,
+            &Entry {
+                cmd: "delete".into(),
+                n: 3,
+            },
+        )
+        .unwrap();
 
         let entries: Vec<(u64, Entry)> = log.replay().unwrap();
         assert_eq!(entries.len(), 3);
@@ -294,8 +304,22 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         {
             let log = PersistentLog::open(&path).unwrap();
-            log.append(10, &Entry { cmd: "x".into(), n: 99 }).unwrap();
-            log.append(11, &Entry { cmd: "y".into(), n: 100 }).unwrap();
+            log.append(
+                10,
+                &Entry {
+                    cmd: "x".into(),
+                    n: 99,
+                },
+            )
+            .unwrap();
+            log.append(
+                11,
+                &Entry {
+                    cmd: "y".into(),
+                    n: 100,
+                },
+            )
+            .unwrap();
         }
         // Drop the first log; reopen.
         let log2 = PersistentLog::open(&path).unwrap();
@@ -304,7 +328,14 @@ mod tests {
         assert_eq!(entries[1].1.n, 100);
 
         // Continue appending after replay.
-        log2.append(12, &Entry { cmd: "z".into(), n: 101 }).unwrap();
+        log2.append(
+            12,
+            &Entry {
+                cmd: "z".into(),
+                n: 101,
+            },
+        )
+        .unwrap();
         let entries: Vec<(u64, Entry)> = log2.replay().unwrap();
         assert_eq!(entries.len(), 3);
         let _ = std::fs::remove_file(&path);
@@ -329,7 +360,14 @@ mod tests {
         let path = temp_path("corrupt");
         let _ = std::fs::remove_file(&path);
         let log = PersistentLog::open(&path).unwrap();
-        log.append(1, &Entry { cmd: "good".into(), n: 1 }).unwrap();
+        log.append(
+            1,
+            &Entry {
+                cmd: "good".into(),
+                n: 1,
+            },
+        )
+        .unwrap();
 
         // Corrupt one byte of the payload area.
         let mut bytes = std::fs::read(&path).unwrap();
@@ -351,8 +389,22 @@ mod tests {
         let path = temp_path("partial");
         let _ = std::fs::remove_file(&path);
         let log = PersistentLog::open(&path).unwrap();
-        log.append(1, &Entry { cmd: "complete".into(), n: 1 }).unwrap();
-        log.append(2, &Entry { cmd: "complete".into(), n: 2 }).unwrap();
+        log.append(
+            1,
+            &Entry {
+                cmd: "complete".into(),
+                n: 1,
+            },
+        )
+        .unwrap();
+        log.append(
+            2,
+            &Entry {
+                cmd: "complete".into(),
+                n: 2,
+            },
+        )
+        .unwrap();
 
         // Truncate the last byte to simulate a crash mid-append.
         let mut bytes = std::fs::read(&path).unwrap();

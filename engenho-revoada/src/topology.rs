@@ -166,7 +166,10 @@ impl RoleAssignment {
     /// Get a node's state.
     #[must_use]
     pub fn get(&self, node: &NodeId) -> Option<NodeState> {
-        self.assignments.iter().find(|(n, _)| n == node).map(|(_, s)| *s)
+        self.assignments
+            .iter()
+            .find(|(n, _)| n == node)
+            .map(|(_, s)| *s)
     }
 
     /// All nodes currently serving the given role.
@@ -262,11 +265,7 @@ pub trait TopologyStrategy: Send + Sync + std::fmt::Debug {
     /// Given the current assignment + a set of newly-failed nodes,
     /// compute the list of [`Transition`]s that re-satisfies the
     /// strategy. Empty = nothing to do.
-    fn react_to_loss(
-        &self,
-        current: &RoleAssignment,
-        lost: &[NodeId],
-    ) -> Vec<Transition>;
+    fn react_to_loss(&self, current: &RoleAssignment, lost: &[NodeId]) -> Vec<Transition>;
 
     /// Validate an assignment against the strategy's invariants.
     /// Used at admission + in tests.
@@ -290,10 +289,7 @@ impl TopologyStrategy for Solo {
     }
     fn assign(&self, eligible: &[NodeId]) -> Result<RoleAssignment, TopologyError> {
         if eligible.is_empty() {
-            return Err(TopologyError::InsufficientNodes {
-                needed: 1,
-                have: 0,
-            });
+            return Err(TopologyError::InsufficientNodes { needed: 1, have: 0 });
         }
         let mut a = RoleAssignment::new();
         a.set(eligible[0].clone(), NodeState::Active(Role::Master));
@@ -304,11 +300,7 @@ impl TopologyStrategy for Solo {
         }
         Ok(a)
     }
-    fn react_to_loss(
-        &self,
-        current: &RoleAssignment,
-        lost: &[NodeId],
-    ) -> Vec<Transition> {
+    fn react_to_loss(&self, current: &RoleAssignment, lost: &[NodeId]) -> Vec<Transition> {
         let lost_set: HashSet<&NodeId> = lost.iter().collect();
         let master_lost = current
             .nodes_with_role(Role::Master)
@@ -375,11 +367,7 @@ impl TopologyStrategy for Pair {
         }
         Ok(a)
     }
-    fn react_to_loss(
-        &self,
-        current: &RoleAssignment,
-        lost: &[NodeId],
-    ) -> Vec<Transition> {
+    fn react_to_loss(&self, current: &RoleAssignment, lost: &[NodeId]) -> Vec<Transition> {
         let lost_set: HashSet<&NodeId> = lost.iter().collect();
         let mut tx = Vec::new();
         let masters_lost = current
@@ -443,11 +431,7 @@ impl TopologyStrategy for Quorum3M {
         }
         Ok(a)
     }
-    fn react_to_loss(
-        &self,
-        current: &RoleAssignment,
-        lost: &[NodeId],
-    ) -> Vec<Transition> {
+    fn react_to_loss(&self, current: &RoleAssignment, lost: &[NodeId]) -> Vec<Transition> {
         let lost_set: HashSet<&NodeId> = lost.iter().collect();
         let masters_lost: Vec<NodeId> = current
             .nodes_with_role(Role::Master)
@@ -515,11 +499,7 @@ impl TopologyStrategy for Cluster3MNW {
     fn assign(&self, eligible: &[NodeId]) -> Result<RoleAssignment, TopologyError> {
         Quorum3M.assign(eligible)
     }
-    fn react_to_loss(
-        &self,
-        current: &RoleAssignment,
-        lost: &[NodeId],
-    ) -> Vec<Transition> {
+    fn react_to_loss(&self, current: &RoleAssignment, lost: &[NodeId]) -> Vec<Transition> {
         Quorum3M.react_to_loss(current, lost)
     }
     fn validate(&self, a: &RoleAssignment) -> Result<(), TopologyError> {
@@ -547,10 +527,7 @@ impl TopologyStrategy for MeshAllPeers {
     }
     fn assign(&self, eligible: &[NodeId]) -> Result<RoleAssignment, TopologyError> {
         if eligible.is_empty() {
-            return Err(TopologyError::InsufficientNodes {
-                needed: 1,
-                have: 0,
-            });
+            return Err(TopologyError::InsufficientNodes { needed: 1, have: 0 });
         }
         let mut a = RoleAssignment::new();
         for n in eligible {
@@ -558,11 +535,7 @@ impl TopologyStrategy for MeshAllPeers {
         }
         Ok(a)
     }
-    fn react_to_loss(
-        &self,
-        _current: &RoleAssignment,
-        lost: &[NodeId],
-    ) -> Vec<Transition> {
+    fn react_to_loss(&self, _current: &RoleAssignment, lost: &[NodeId]) -> Vec<Transition> {
         lost.iter().map(|n| Transition::Evict(n.clone())).collect()
     }
     fn validate(&self, _a: &RoleAssignment) -> Result<(), TopologyError> {
@@ -599,10 +572,7 @@ impl TopologyStrategy for Phalanx {
     }
     fn assign(&self, eligible: &[NodeId]) -> Result<RoleAssignment, TopologyError> {
         if eligible.is_empty() {
-            return Err(TopologyError::InsufficientNodes {
-                needed: 1,
-                have: 0,
-            });
+            return Err(TopologyError::InsufficientNodes { needed: 1, have: 0 });
         }
         let m = Self::target_masters(eligible.len()).max(1);
         let mut a = RoleAssignment::new();
@@ -614,11 +584,7 @@ impl TopologyStrategy for Phalanx {
         }
         Ok(a)
     }
-    fn react_to_loss(
-        &self,
-        current: &RoleAssignment,
-        lost: &[NodeId],
-    ) -> Vec<Transition> {
+    fn react_to_loss(&self, current: &RoleAssignment, lost: &[NodeId]) -> Vec<Transition> {
         let lost_set: HashSet<&NodeId> = lost.iter().collect();
         let surviving: Vec<NodeId> = current
             .eligible()
@@ -717,10 +683,7 @@ impl TopologyReactor {
     /// Construct with a strategy + an existing assignment (used
     /// at process restart to recover from the Raft log replay).
     #[must_use]
-    pub fn with_initial(
-        strategy: Box<dyn TopologyStrategy>,
-        initial: RoleAssignment,
-    ) -> Self {
+    pub fn with_initial(strategy: Box<dyn TopologyStrategy>, initial: RoleAssignment) -> Self {
         Self {
             strategy,
             current: std::sync::Mutex::new(initial),
@@ -919,10 +882,7 @@ mod tests {
         let lost = vec![NodeId::new("node-0")];
         let tx = s.react_to_loss(&current, &lost);
         // Expect: reassign node-2 to Master + evict node-0.
-        assert!(tx.contains(&Transition::Reassign(
-            NodeId::new("node-2"),
-            Role::Master
-        )));
+        assert!(tx.contains(&Transition::Reassign(NodeId::new("node-2"), Role::Master)));
         assert!(tx.contains(&Transition::Evict(NodeId::new("node-0"))));
         // Apply transitions + re-validate.
         for t in tx {

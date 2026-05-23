@@ -22,10 +22,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
-    command::{Reason, ResourceCommand},
     StoreMesh,
+    command::{Reason, ResourceCommand},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
@@ -107,7 +107,12 @@ impl Controller for PodDisruptionBudgetController {
     async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
         let pdbs = self
             .store
-            .list("policy", "v1", "PodDisruptionBudget", self.namespace.as_deref())
+            .list(
+                "policy",
+                "v1",
+                "PodDisruptionBudget",
+                self.namespace.as_deref(),
+            )
             .await;
         let mut report = ReconcileReport::default();
         report.objects_examined = pdbs.len();
@@ -192,14 +197,16 @@ mod tests {
     #[test]
     fn max_unavailable_reads_spec_field() {
         let pdb = json!({"spec": {"maxUnavailable": 1}});
-        assert_eq!(PodDisruptionBudgetController::max_unavailable(&pdb), Some(1));
+        assert_eq!(
+            PodDisruptionBudgetController::max_unavailable(&pdb),
+            Some(1)
+        );
     }
 
     #[test]
     fn selector_match_labels_extracts_spec_field() {
         let pdb = json!({"spec": {"selector": {"matchLabels": {"app": "x"}}}});
-        let sel =
-            PodDisruptionBudgetController::selector_match_labels(&pdb).unwrap();
+        let sel = PodDisruptionBudgetController::selector_match_labels(&pdb).unwrap();
         assert_eq!(sel.get("app").unwrap(), "x");
     }
 
@@ -218,46 +225,32 @@ mod tests {
     #[test]
     fn compute_allowed_disruptions_min_available_floor() {
         // minAvailable=2, healthy=5 → allowed=3 (can lose up to 3)
-        let d = PodDisruptionBudgetController::compute_allowed_disruptions(
-            Some(2), None, 5, 5,
-        );
+        let d = PodDisruptionBudgetController::compute_allowed_disruptions(Some(2), None, 5, 5);
         assert_eq!(d, 3);
         // minAvailable=2, healthy=2 → allowed=0 (already at floor)
-        let d = PodDisruptionBudgetController::compute_allowed_disruptions(
-            Some(2), None, 2, 2,
-        );
+        let d = PodDisruptionBudgetController::compute_allowed_disruptions(Some(2), None, 2, 2);
         assert_eq!(d, 0);
         // minAvailable=2, healthy=1 → allowed=0 (already below; can't disrupt)
-        let d = PodDisruptionBudgetController::compute_allowed_disruptions(
-            Some(2), None, 1, 2,
-        );
+        let d = PodDisruptionBudgetController::compute_allowed_disruptions(Some(2), None, 1, 2);
         assert_eq!(d, 0);
     }
 
     #[test]
     fn compute_allowed_disruptions_max_unavailable_ceiling() {
         // maxUnavailable=2, healthy=5/5 total → allowed=2
-        let d = PodDisruptionBudgetController::compute_allowed_disruptions(
-            None, Some(2), 5, 5,
-        );
+        let d = PodDisruptionBudgetController::compute_allowed_disruptions(None, Some(2), 5, 5);
         assert_eq!(d, 2);
         // maxUnavailable=2, healthy=4/5 total (1 already unhealthy) → allowed=1
-        let d = PodDisruptionBudgetController::compute_allowed_disruptions(
-            None, Some(2), 4, 5,
-        );
+        let d = PodDisruptionBudgetController::compute_allowed_disruptions(None, Some(2), 4, 5);
         assert_eq!(d, 1);
         // maxUnavailable=2, healthy=3/5 (2 already unhealthy) → allowed=0
-        let d = PodDisruptionBudgetController::compute_allowed_disruptions(
-            None, Some(2), 3, 5,
-        );
+        let d = PodDisruptionBudgetController::compute_allowed_disruptions(None, Some(2), 3, 5);
         assert_eq!(d, 0);
     }
 
     #[test]
     fn compute_allowed_disruptions_no_budget_allows_all() {
-        let d = PodDisruptionBudgetController::compute_allowed_disruptions(
-            None, None, 5, 5,
-        );
+        let d = PodDisruptionBudgetController::compute_allowed_disruptions(None, None, 5, 5);
         assert_eq!(d, 5);
     }
 
@@ -266,7 +259,9 @@ mod tests {
         struct F;
         #[async_trait]
         impl Controller for F {
-            fn name(&self) -> &'static str { "pdb" }
+            fn name(&self) -> &'static str {
+                "pdb"
+            }
             async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
                 Ok(ReconcileReport::default())
             }

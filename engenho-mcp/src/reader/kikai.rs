@@ -20,16 +20,16 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::reader::ListSpec;
+use crate::redaction::redact_secret;
 use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{KubeClient, ListOptions};
 use engenho_types::generated_v1_34::apps_v1::{Deployment, ReplicaSet};
 use engenho_types::generated_v1_34::core_v1::{
-    ConfigMap, Endpoints, Namespace, Node, PersistentVolumeClaim, Pod, PodPhase, Secret,
-    Service, ServiceAccount,
+    ConfigMap, Endpoints, Namespace, Node, PersistentVolumeClaim, Pod, PodPhase, Secret, Service,
+    ServiceAccount,
 };
 use engenho_types::generated_v1_34::rbac_v1::{Role, RoleBinding};
-use crate::reader::ListSpec;
-use crate::redaction::redact_secret;
 
 use crate::reader::{ClusterReader, ReaderError};
 use crate::resource_kind::ResourceKind;
@@ -80,8 +80,8 @@ impl KikaiClusterReader {
             what: path.display().to_string(),
             source,
         })?;
-        let all: BTreeMap<String, ClusterYamlEntry> = serde_yaml::from_str(&contents)
-            .map_err(|source| ReaderError::Parse {
+        let all: BTreeMap<String, ClusterYamlEntry> =
+            serde_yaml::from_str(&contents).map_err(|source| ReaderError::Parse {
                 what: path.display().to_string(),
                 source,
             })?;
@@ -136,27 +136,18 @@ impl ClusterReader for KikaiClusterReader {
         })
     }
 
-    async fn snapshot_meta(
-        &self,
-        cluster: &str,
-    ) -> Result<Option<SnapshotMetaView>, ReaderError> {
+    async fn snapshot_meta(&self, cluster: &str) -> Result<Option<SnapshotMetaView>, ReaderError> {
         let _ = self.load_cluster_entry(cluster)?;
         read_snapshot_meta(cluster, &self.data_dir(cluster))
     }
 
-    async fn list_pods(
-        &self,
-        cluster: &str,
-        namespace: &str,
-    ) -> Result<PodListView, ReaderError> {
+    async fn list_pods(&self, cluster: &str, namespace: &str) -> Result<PodListView, ReaderError> {
         let client = self.build_kube_client(cluster)?;
         let list = client
             .list::<Pod>(Some(namespace), &ListOptions::default())
             .await
             .map_err(|e| {
-                ReaderError::InvalidState(format!(
-                    "LIST pods in {cluster}/{namespace} failed: {e}"
-                ))
+                ReaderError::InvalidState(format!("LIST pods in {cluster}/{namespace} failed: {e}"))
             })?;
         Ok(PodListView {
             cluster: cluster.to_string(),
@@ -205,18 +196,42 @@ impl ClusterReader for KikaiClusterReader {
         // a typed view in `crate::redaction`.
         let json = match kind {
             ResourceKind::Pod => list_to_json::<Pod>(&client, ns_arg, &opts, "pods").await?,
-            ResourceKind::Service => list_to_json::<Service>(&client, ns_arg, &opts, "services").await?,
-            ResourceKind::ConfigMap => list_to_json::<ConfigMap>(&client, ns_arg, &opts, "configmaps").await?,
+            ResourceKind::Service => {
+                list_to_json::<Service>(&client, ns_arg, &opts, "services").await?
+            }
+            ResourceKind::ConfigMap => {
+                list_to_json::<ConfigMap>(&client, ns_arg, &opts, "configmaps").await?
+            }
             ResourceKind::Secret => list_secrets_redacted(&client, ns_arg, &opts).await?,
-            ResourceKind::ServiceAccount => list_to_json::<ServiceAccount>(&client, ns_arg, &opts, "serviceaccounts").await?,
-            ResourceKind::Endpoints => list_to_json::<Endpoints>(&client, ns_arg, &opts, "endpoints").await?,
-            ResourceKind::PersistentVolumeClaim => list_to_json::<PersistentVolumeClaim>(&client, ns_arg, &opts, "persistentvolumeclaims").await?,
-            ResourceKind::Namespace => list_to_json::<Namespace>(&client, ns_arg, &opts, "namespaces").await?,
+            ResourceKind::ServiceAccount => {
+                list_to_json::<ServiceAccount>(&client, ns_arg, &opts, "serviceaccounts").await?
+            }
+            ResourceKind::Endpoints => {
+                list_to_json::<Endpoints>(&client, ns_arg, &opts, "endpoints").await?
+            }
+            ResourceKind::PersistentVolumeClaim => {
+                list_to_json::<PersistentVolumeClaim>(
+                    &client,
+                    ns_arg,
+                    &opts,
+                    "persistentvolumeclaims",
+                )
+                .await?
+            }
+            ResourceKind::Namespace => {
+                list_to_json::<Namespace>(&client, ns_arg, &opts, "namespaces").await?
+            }
             ResourceKind::Node => list_to_json::<Node>(&client, ns_arg, &opts, "nodes").await?,
-            ResourceKind::Deployment => list_to_json::<Deployment>(&client, ns_arg, &opts, "deployments").await?,
-            ResourceKind::ReplicaSet => list_to_json::<ReplicaSet>(&client, ns_arg, &opts, "replicasets").await?,
+            ResourceKind::Deployment => {
+                list_to_json::<Deployment>(&client, ns_arg, &opts, "deployments").await?
+            }
+            ResourceKind::ReplicaSet => {
+                list_to_json::<ReplicaSet>(&client, ns_arg, &opts, "replicasets").await?
+            }
             ResourceKind::Role => list_to_json::<Role>(&client, ns_arg, &opts, "roles").await?,
-            ResourceKind::RoleBinding => list_to_json::<RoleBinding>(&client, ns_arg, &opts, "rolebindings").await?,
+            ResourceKind::RoleBinding => {
+                list_to_json::<RoleBinding>(&client, ns_arg, &opts, "rolebindings").await?
+            }
         };
         Ok(json)
     }
@@ -236,18 +251,37 @@ impl ClusterReader for KikaiClusterReader {
         };
         let json = match kind {
             ResourceKind::Pod => get_to_json::<Pod>(&client, ns_arg, name, "pod").await?,
-            ResourceKind::Service => get_to_json::<Service>(&client, ns_arg, name, "service").await?,
-            ResourceKind::ConfigMap => get_to_json::<ConfigMap>(&client, ns_arg, name, "configmap").await?,
+            ResourceKind::Service => {
+                get_to_json::<Service>(&client, ns_arg, name, "service").await?
+            }
+            ResourceKind::ConfigMap => {
+                get_to_json::<ConfigMap>(&client, ns_arg, name, "configmap").await?
+            }
             ResourceKind::Secret => get_secret_redacted(&client, ns_arg, name).await?,
-            ResourceKind::ServiceAccount => get_to_json::<ServiceAccount>(&client, ns_arg, name, "serviceaccount").await?,
-            ResourceKind::Endpoints => get_to_json::<Endpoints>(&client, ns_arg, name, "endpoints").await?,
-            ResourceKind::PersistentVolumeClaim => get_to_json::<PersistentVolumeClaim>(&client, ns_arg, name, "persistentvolumeclaim").await?,
-            ResourceKind::Namespace => get_to_json::<Namespace>(&client, ns_arg, name, "namespace").await?,
+            ResourceKind::ServiceAccount => {
+                get_to_json::<ServiceAccount>(&client, ns_arg, name, "serviceaccount").await?
+            }
+            ResourceKind::Endpoints => {
+                get_to_json::<Endpoints>(&client, ns_arg, name, "endpoints").await?
+            }
+            ResourceKind::PersistentVolumeClaim => {
+                get_to_json::<PersistentVolumeClaim>(&client, ns_arg, name, "persistentvolumeclaim")
+                    .await?
+            }
+            ResourceKind::Namespace => {
+                get_to_json::<Namespace>(&client, ns_arg, name, "namespace").await?
+            }
             ResourceKind::Node => get_to_json::<Node>(&client, ns_arg, name, "node").await?,
-            ResourceKind::Deployment => get_to_json::<Deployment>(&client, ns_arg, name, "deployment").await?,
-            ResourceKind::ReplicaSet => get_to_json::<ReplicaSet>(&client, ns_arg, name, "replicaset").await?,
+            ResourceKind::Deployment => {
+                get_to_json::<Deployment>(&client, ns_arg, name, "deployment").await?
+            }
+            ResourceKind::ReplicaSet => {
+                get_to_json::<ReplicaSet>(&client, ns_arg, name, "replicaset").await?
+            }
             ResourceKind::Role => get_to_json::<Role>(&client, ns_arg, name, "role").await?,
-            ResourceKind::RoleBinding => get_to_json::<RoleBinding>(&client, ns_arg, name, "rolebinding").await?,
+            ResourceKind::RoleBinding => {
+                get_to_json::<RoleBinding>(&client, ns_arg, name, "rolebinding").await?
+            }
         };
         Ok(json)
     }
@@ -262,15 +296,11 @@ async fn list_secrets_redacted(
     namespace: Option<&str>,
     opts: &ListOptions,
 ) -> Result<serde_json::Value, ReaderError> {
-    let list = client
-        .list::<Secret>(namespace, opts)
-        .await
-        .map_err(|e| {
-            let where_str = namespace.unwrap_or("<cluster-scope>");
-            ReaderError::InvalidState(format!("LIST secrets in {where_str} failed: {e}"))
-        })?;
-    let redacted_items: Vec<serde_json::Value> =
-        list.items.iter().map(redact_secret).collect();
+    let list = client.list::<Secret>(namespace, opts).await.map_err(|e| {
+        let where_str = namespace.unwrap_or("<cluster-scope>");
+        ReaderError::InvalidState(format!("LIST secrets in {where_str} failed: {e}"))
+    })?;
+    let redacted_items: Vec<serde_json::Value> = list.items.iter().map(redact_secret).collect();
     Ok(serde_json::json!({
         "kind": "SecretList",
         "apiVersion": gvk_to_api_version::<Secret>(),
@@ -287,15 +317,10 @@ async fn get_secret_redacted(
     namespace: Option<&str>,
     name: &str,
 ) -> Result<serde_json::Value, ReaderError> {
-    let secret = client
-        .get::<Secret>(namespace, name)
-        .await
-        .map_err(|e| {
-            let where_str = namespace.unwrap_or("<cluster-scope>");
-            ReaderError::InvalidState(format!(
-                "GET secret/{name} in {where_str} failed: {e}"
-            ))
-        })?;
+    let secret = client.get::<Secret>(namespace, name).await.map_err(|e| {
+        let where_str = namespace.unwrap_or("<cluster-scope>");
+        ReaderError::InvalidState(format!("GET secret/{name} in {where_str} failed: {e}"))
+    })?;
     let mut redacted = redact_secret(&secret);
     if let Some(map) = redacted.as_object_mut() {
         map.insert(
@@ -348,20 +373,14 @@ async fn list_to_json<R>(
 where
     R: engenho_types::kind::KubeResource + Send + Sync + 'static,
 {
-    let list = client
-        .list::<R>(namespace, opts)
-        .await
-        .map_err(|e| {
-            let where_str = namespace.unwrap_or("<cluster-scope>");
-            ReaderError::InvalidState(format!(
-                "LIST {plural} in {where_str} failed: {e}"
-            ))
-        })?;
+    let list = client.list::<R>(namespace, opts).await.map_err(|e| {
+        let where_str = namespace.unwrap_or("<cluster-scope>");
+        ReaderError::InvalidState(format!("LIST {plural} in {where_str} failed: {e}"))
+    })?;
     // Re-serialize as a JSON list-shape that mirrors what kubectl
     // -o json would emit: {kind, apiVersion, items, metadata}.
-    let items_json = serde_json::to_value(&list.items).map_err(|e| {
-        ReaderError::InvalidState(format!("serialize {plural} list: {e}"))
-    })?;
+    let items_json = serde_json::to_value(&list.items)
+        .map_err(|e| ReaderError::InvalidState(format!("serialize {plural} list: {e}")))?;
     Ok(serde_json::json!({
         "kind": format!("{}List", R::GVK.kind),
         "apiVersion": gvk_to_api_version::<R>(),
@@ -383,18 +402,12 @@ async fn get_to_json<R>(
 where
     R: engenho_types::kind::KubeResource + Send + Sync + 'static,
 {
-    let item = client
-        .get::<R>(namespace, name)
-        .await
-        .map_err(|e| {
-            let where_str = namespace.unwrap_or("<cluster-scope>");
-            ReaderError::InvalidState(format!(
-                "GET {label}/{name} in {where_str} failed: {e}"
-            ))
-        })?;
-    let mut item_json = serde_json::to_value(&item).map_err(|e| {
-        ReaderError::InvalidState(format!("serialize {label}: {e}"))
+    let item = client.get::<R>(namespace, name).await.map_err(|e| {
+        let where_str = namespace.unwrap_or("<cluster-scope>");
+        ReaderError::InvalidState(format!("GET {label}/{name} in {where_str} failed: {e}"))
     })?;
+    let mut item_json = serde_json::to_value(&item)
+        .map_err(|e| ReaderError::InvalidState(format!("serialize {label}: {e}")))?;
     // Inject kind + apiVersion at the top of the serialized form
     // so the wire matches what kubectl-style consumers expect.
     if let Some(map) = item_json.as_object_mut() {
@@ -518,29 +531,67 @@ fn gitops_view_from_json(v: &serde_json::Value) -> GitopsBackendView {
     };
     match backend {
         "fluxcd" => GitopsBackendView::Fluxcd(FluxcdView {
-            namespace: v.get("namespace").and_then(|x| x.as_str()).unwrap_or("flux-system").into(),
-            source_url: v.get("source_url").and_then(|x| x.as_str()).unwrap_or_default().into(),
-            source_ref: v.get("source_ref").and_then(|x| x.as_str()).unwrap_or("main").into(),
-            source_path: v.get("source_path").and_then(|x| x.as_str()).unwrap_or("./").into(),
+            namespace: v
+                .get("namespace")
+                .and_then(|x| x.as_str())
+                .unwrap_or("flux-system")
+                .into(),
+            source_url: v
+                .get("source_url")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .into(),
+            source_ref: v
+                .get("source_ref")
+                .and_then(|x| x.as_str())
+                .unwrap_or("main")
+                .into(),
+            source_path: v
+                .get("source_path")
+                .and_then(|x| x.as_str())
+                .unwrap_or("./")
+                .into(),
             target_namespace: v
                 .get("target_namespace")
                 .and_then(|x| x.as_str())
                 .unwrap_or("default")
                 .into(),
-            interval_secs: v.get("interval_secs").and_then(|x| x.as_u64()).unwrap_or(60),
+            interval_secs: v
+                .get("interval_secs")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(60),
             has_secret: v.get("secret").is_some_and(|s| !s.is_null()),
-            target_count: v.get("targets").and_then(|x| x.as_array()).map_or(0, Vec::len),
+            target_count: v
+                .get("targets")
+                .and_then(|x| x.as_array())
+                .map_or(0, Vec::len),
         }),
         "argocd" => GitopsBackendView::Argocd(ArgocdView {
-            namespace: v.get("namespace").and_then(|x| x.as_str()).unwrap_or("argocd").into(),
-            application: v.get("application").and_then(|x| x.as_str()).unwrap_or_default().into(),
-            source_url: v.get("source_url").and_then(|x| x.as_str()).unwrap_or_default().into(),
+            namespace: v
+                .get("namespace")
+                .and_then(|x| x.as_str())
+                .unwrap_or("argocd")
+                .into(),
+            application: v
+                .get("application")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .into(),
+            source_url: v
+                .get("source_url")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .into(),
             target_revision: v
                 .get("target_revision")
                 .and_then(|x| x.as_str())
                 .unwrap_or("main")
                 .into(),
-            source_path: v.get("source_path").and_then(|x| x.as_str()).unwrap_or("./").into(),
+            source_path: v
+                .get("source_path")
+                .and_then(|x| x.as_str())
+                .unwrap_or("./")
+                .into(),
             destination_namespace: v
                 .get("destination_namespace")
                 .and_then(|x| x.as_str())
@@ -553,7 +604,10 @@ fn gitops_view_from_json(v: &serde_json::Value) -> GitopsBackendView {
                 .unwrap_or("automatic")
                 .into(),
             has_secret: v.get("secret").is_some_and(|s| !s.is_null()),
-            target_count: v.get("targets").and_then(|x| x.as_array()).map_or(0, Vec::len),
+            target_count: v
+                .get("targets")
+                .and_then(|x| x.as_array())
+                .map_or(0, Vec::len),
         }),
         _ => GitopsBackendView::None,
     }
@@ -700,9 +754,8 @@ fn read_snapshot_meta(
         what: meta_path.display().to_string(),
         source,
     })?;
-    let meta: AutoSnapshotMetaOnDisk = serde_json::from_str(&meta_str).map_err(|e| {
-        ReaderError::InvalidState(format!("snapshot meta parse failed: {e}"))
-    })?;
+    let meta: AutoSnapshotMetaOnDisk = serde_json::from_str(&meta_str)
+        .map_err(|e| ReaderError::InvalidState(format!("snapshot meta parse failed: {e}")))?;
     let state_size = std::fs::metadata(&state_path).map(|m| m.len()).unwrap_or(0);
     let all_paths_exist = [&meta.kernel, &meta.initrd, &meta.init, &meta.root_disk]
         .iter()
@@ -735,7 +788,9 @@ fn detect_auth_method(path: &std::path::Path) -> AuthMethod {
     // Order matters: exec > clientCert > token > anonymous.
     if contents.contains("exec:") {
         AuthMethod::Exec
-    } else if contents.contains("client-certificate-data") || contents.contains("client-certificate:") {
+    } else if contents.contains("client-certificate-data")
+        || contents.contains("client-certificate:")
+    {
         AuthMethod::ClientCert
     } else if contents.contains("token:") {
         AuthMethod::BearerToken
@@ -857,7 +912,10 @@ demo:
     fn auth_method_detection_recognises_each_shape() {
         let tmp = TempDir::new().unwrap();
         for (body, expected) in [
-            ("users:\n- user:\n    token: redacted\n", AuthMethod::BearerToken),
+            (
+                "users:\n- user:\n    token: redacted\n",
+                AuthMethod::BearerToken,
+            ),
             (
                 "users:\n- user:\n    client-certificate-data: redacted\n",
                 AuthMethod::ClientCert,

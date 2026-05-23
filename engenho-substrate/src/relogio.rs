@@ -329,10 +329,7 @@ impl Clock for HlcClock {
         let mut last = self.last.lock().unwrap();
         // HLC merge: take max of (wall_now, observed, last) + bump logical
         let candidate = wall_now.max(observed).max(*last);
-        *last = if candidate == *last
-            || candidate == observed
-            || candidate == wall_now
-        {
+        *last = if candidate == *last || candidate == observed || candidate == wall_now {
             Instant {
                 physical_ms: candidate.physical_ms,
                 logical: candidate.logical.saturating_add(1),

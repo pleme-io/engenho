@@ -189,7 +189,8 @@ mod tests {
         let f = FakeFoo::new();
         let f2 = f.clone();
         let h = tokio::spawn(async move {
-            f2.record_event(FakeFooEvent::Insert("from-task".into())).await;
+            f2.record_event(FakeFooEvent::Insert("from-task".into()))
+                .await;
         });
         h.await.unwrap();
         assert_eq!(f.call_count().await, 1);

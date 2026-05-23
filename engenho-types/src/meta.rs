@@ -62,7 +62,11 @@ pub struct ObjectMeta {
 /// `meta/v1.TypeMeta` — apiVersion + kind, the discriminator on the wire.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TypeMeta {
-    #[serde(rename = "apiVersion", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "apiVersion",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub api_version: String,
 
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -89,14 +93,20 @@ mod tests {
 
     #[test]
     fn object_meta_serializes_minimally() {
-        let m = ObjectMeta { name: "foo".into(), ..Default::default() };
+        let m = ObjectMeta {
+            name: "foo".into(),
+            ..Default::default()
+        };
         let j = serde_json::to_string(&m).unwrap();
         assert_eq!(j, r#"{"name":"foo"}"#);
     }
 
     #[test]
     fn type_meta_uses_api_version() {
-        let m = TypeMeta { api_version: "v1".into(), kind: "Pod".into() };
+        let m = TypeMeta {
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+        };
         let j = serde_json::to_string(&m).unwrap();
         assert!(j.contains("\"apiVersion\":\"v1\""));
     }
@@ -111,6 +121,9 @@ mod tests {
         let j = serde_json::to_string(&m).unwrap();
         let idx_aaa = j.find("\"aaa\"").unwrap();
         let idx_zzz = j.find("\"zzz\"").unwrap();
-        assert!(idx_aaa < idx_zzz, "BTreeMap must serialize keys in ascending order");
+        assert!(
+            idx_aaa < idx_zzz,
+            "BTreeMap must serialize keys in ascending order"
+        );
     }
 }

@@ -626,7 +626,9 @@ impl ClusterBuilder {
     /// surfaces wasn't set; [`ClusterBuilderError::Coherence`] on
     /// cross-surface check failure.
     pub fn build(self) -> Result<ClusterDeclaration, ClusterBuilderError> {
-        let strategy = self.strategy.ok_or(ClusterBuilderError::Missing("strategy"))?;
+        let strategy = self
+            .strategy
+            .ok_or(ClusterBuilderError::Missing("strategy"))?;
         let face = self.face.ok_or(ClusterBuilderError::Missing("face"))?;
         let topology = self
             .topology
@@ -745,7 +747,10 @@ mod runtime_tests {
             .start()
             .expect("k8s prescribed builder");
         match cluster.face().kind() {
-            FaceKind::Kubernetes { version, certified_cncf } => {
+            FaceKind::Kubernetes {
+                version,
+                certified_cncf,
+            } => {
                 assert_eq!(version, "1.34");
                 assert!(certified_cncf);
             }
@@ -804,7 +809,9 @@ mod runtime_tests {
             .build()
             .expect_err("Solo + 3-quorum must fail coherence");
         match err {
-            ClusterBuilderError::Coherence(ClusterCoherenceError::TopologyTooSmallForQuorum { .. }) => {}
+            ClusterBuilderError::Coherence(ClusterCoherenceError::TopologyTooSmallForQuorum {
+                ..
+            }) => {}
             other => panic!("expected TopologyTooSmallForQuorum, got {other:?}"),
         }
     }
@@ -853,9 +860,9 @@ mod runtime_tests {
         let cluster = Cluster::start_with(ok_decl()).unwrap();
         assert!(cluster.is_running());
         drop(cluster); // Drop runs face.shutdown(); should not panic.
-                       // If shutdown ran twice or on a stopped face,
-                       // FaceError::NotStarted would surface — but
-                       // Drop swallows errors. We confirm no panic.
+        // If shutdown ran twice or on a stopped face,
+        // FaceError::NotStarted would surface — but
+        // Drop swallows errors. We confirm no panic.
     }
 
     #[test]
@@ -903,8 +910,12 @@ mod runtime_tests {
     #[test]
     fn cluster_list_delegates_to_face_list_resources() {
         let cluster = Cluster::start_with(ok_decl()).unwrap();
-        cluster.apply(ResourceFormat::Native, &pod_envelope("a", b"A")).unwrap();
-        cluster.apply(ResourceFormat::Native, &pod_envelope("b", b"B")).unwrap();
+        cluster
+            .apply(ResourceFormat::Native, &pod_envelope("a", b"A"))
+            .unwrap();
+        cluster
+            .apply(ResourceFormat::Native, &pod_envelope("b", b"B"))
+            .unwrap();
         let listed = cluster
             .list("Pod", Some("default"), ResourceFormat::Native)
             .expect("list through cluster");
@@ -914,7 +925,9 @@ mod runtime_tests {
     #[test]
     fn cluster_delete_delegates_to_face_delete_resource() {
         let cluster = Cluster::start_with(ok_decl()).unwrap();
-        cluster.apply(ResourceFormat::Native, &pod_envelope("nginx", b"x")).unwrap();
+        cluster
+            .apply(ResourceFormat::Native, &pod_envelope("nginx", b"x"))
+            .unwrap();
         let r = ResourceRef::namespaced("Pod", "nginx", "default");
         cluster.delete(&r).expect("delete through cluster");
         match cluster.get(&r, ResourceFormat::Native) {
@@ -1050,31 +1063,28 @@ mod tests {
 
     #[test]
     fn quorum3m_topology_works_with_3node_consensus() {
-        let cluster = ClusterDeclaration::new(
-            prescribed_strategy(),
-            raft_face(),
-            Box::new(Quorum3M),
+        let cluster =
+            ClusterDeclaration::new(prescribed_strategy(), raft_face(), Box::new(Quorum3M));
+        assert!(
+            cluster.is_ok(),
+            "Quorum3M + OpenRaft{{3}} should be coherent"
         );
-        assert!(cluster.is_ok(), "Quorum3M + OpenRaft{{3}} should be coherent");
     }
 
     #[test]
     fn cluster3mnw_topology_works_with_3node_consensus() {
-        let cluster = ClusterDeclaration::new(
-            prescribed_strategy(),
-            k8s_face(),
-            Box::new(Cluster3MNW),
+        let cluster =
+            ClusterDeclaration::new(prescribed_strategy(), k8s_face(), Box::new(Cluster3MNW));
+        assert!(
+            cluster.is_ok(),
+            "Cluster3MNW + OpenRaft{{3}} should be coherent"
         );
-        assert!(cluster.is_ok(), "Cluster3MNW + OpenRaft{{3}} should be coherent");
     }
 
     #[test]
     fn phalanx_topology_works_with_3node_consensus() {
-        let cluster = ClusterDeclaration::new(
-            prescribed_strategy(),
-            raft_face(),
-            Box::new(Phalanx),
-        );
+        let cluster =
+            ClusterDeclaration::new(prescribed_strategy(), raft_face(), Box::new(Phalanx));
         // Phalanx min_nodes is configured by Phalanx itself; if it
         // satisfies the 3-quorum it must succeed here.
         if Phalanx.min_nodes() >= 3 {
@@ -1091,12 +1101,8 @@ mod tests {
         // Solo.min_nodes() == 1, OpenRaft quorum == 3 → coherence
         // failure. The cluster cannot boot to a state where any
         // write is committed.
-        let err = ClusterDeclaration::new(
-            prescribed_strategy(),
-            raft_face(),
-            Box::new(Solo),
-        )
-        .unwrap_err();
+        let err = ClusterDeclaration::new(prescribed_strategy(), raft_face(), Box::new(Solo))
+            .unwrap_err();
         match err {
             ClusterCoherenceError::TopologyTooSmallForQuorum {
                 topology,
@@ -1145,12 +1151,8 @@ mod tests {
 
     #[test]
     fn cluster_id_format_is_stable() {
-        let cluster = ClusterDeclaration::new(
-            prescribed_strategy(),
-            k8s_face(),
-            Box::new(Quorum3M),
-        )
-        .unwrap();
+        let cluster =
+            ClusterDeclaration::new(prescribed_strategy(), k8s_face(), Box::new(Quorum3M)).unwrap();
         let id = cluster.id();
         assert!(id.contains("k8s-v1.34"));
         assert!(id.contains("homelab-3node"));
@@ -1159,12 +1161,9 @@ mod tests {
 
     #[test]
     fn accessors_return_the_constructed_surfaces() {
-        let cluster = ClusterDeclaration::new(
-            prescribed_strategy(),
-            k8s_face(),
-            Box::new(Cluster3MNW),
-        )
-        .unwrap();
+        let cluster =
+            ClusterDeclaration::new(prescribed_strategy(), k8s_face(), Box::new(Cluster3MNW))
+                .unwrap();
         assert_eq!(cluster.strategy().name, "homelab-3node");
         assert_eq!(cluster.face().name, "k8s-v1.34");
         assert_eq!(cluster.topology().name(), Cluster3MNW.name());
@@ -1172,12 +1171,9 @@ mod tests {
 
     #[test]
     fn debug_format_names_all_three_surfaces() {
-        let cluster = ClusterDeclaration::new(
-            prescribed_strategy(),
-            raft_face(),
-            Box::new(Quorum3M),
-        )
-        .unwrap();
+        let cluster =
+            ClusterDeclaration::new(prescribed_strategy(), raft_face(), Box::new(Quorum3M))
+                .unwrap();
         let dbg = format!("{cluster:?}");
         assert!(dbg.contains("homelab-3node"));
         assert!(dbg.contains("pure-raft"));
@@ -1198,9 +1194,7 @@ mod tests {
             election_timeout_ms: 60_000, // 1 minute — extreme but valid
             snapshot_interval_entries: 1,
         };
-        assert!(
-            ClusterDeclaration::new(s, raft_face(), Box::new(Quorum3M)).is_ok()
-        );
+        assert!(ClusterDeclaration::new(s, raft_face(), Box::new(Quorum3M)).is_ok());
         let _ = ConsensusConfig {
             kind: ConsensusKind::OpenRaft {
                 quorum_size: 3,

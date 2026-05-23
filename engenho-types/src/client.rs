@@ -64,7 +64,10 @@ pub trait KubeClient: Send + Sync {
     /// Forbidden surface the same way.
     ///
     /// [`ApiStatusKind::AlreadyExists`]: crate::error::ApiStatusKind::AlreadyExists
-    async fn create<R: KubeResource + Send + Sync + 'static>(&self, resource: &R) -> Result<R, KubeError>;
+    async fn create<R: KubeResource + Send + Sync + 'static>(
+        &self,
+        resource: &R,
+    ) -> Result<R, KubeError>;
 
     /// REPLACE (PUT) an entire resource — must include current
     /// `resourceVersion` for optimistic concurrency.
@@ -76,7 +79,10 @@ pub trait KubeClient: Send + Sync {
     ///
     /// [`KubeError::ApiStatus`] with `Conflict` on resourceVersion
     /// mismatch.
-    async fn replace<R: KubeResource + Send + Sync + 'static>(&self, resource: &R) -> Result<R, KubeError>;
+    async fn replace<R: KubeResource + Send + Sync + 'static>(
+        &self,
+        resource: &R,
+    ) -> Result<R, KubeError>;
 
     /// PATCH an existing resource. The patch type is encoded in
     /// [`Patch`].

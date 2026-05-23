@@ -23,16 +23,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
+    StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
-    StoreMesh,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{is_owned_by, set_owner_reference, OwnerReference};
+use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
 
 pub struct DeploymentController {
     store: Arc<StoreMesh>,
@@ -160,12 +160,11 @@ impl Controller for DeploymentController {
                 continue;
             };
             let ns = d_key.namespace.as_deref();
-            let all_rs = self
-                .store
-                .list("apps", "v1", "ReplicaSet", ns)
-                .await;
-            let owned_rs: Vec<&(ResourceKey, Value)> =
-                all_rs.iter().filter(|(_, r)| is_owned_by(r, &uid)).collect();
+            let all_rs = self.store.list("apps", "v1", "ReplicaSet", ns).await;
+            let owned_rs: Vec<&(ResourceKey, Value)> = all_rs
+                .iter()
+                .filter(|(_, r)| is_owned_by(r, &uid))
+                .collect();
 
             // Look for a current-template RS.
             let current = owned_rs
@@ -231,9 +230,8 @@ impl Controller for DeploymentController {
                     };
                     set_owner_reference(&mut rs_value, owner_ref.clone());
                     let rs_ns = ns.unwrap_or("default");
-                    let rs_key = ResourceKey::namespaced(
-                        "apps", "v1", "ReplicaSet", rs_ns, &rs_name,
-                    );
+                    let rs_key =
+                        ResourceKey::namespaced("apps", "v1", "ReplicaSet", rs_ns, &rs_name);
                     self.store
                         .propose(ResourceCommand::Put {
                             key: rs_key,
@@ -258,7 +256,10 @@ mod tests {
     fn template_hash_is_deterministic() {
         let d1 = json!({"spec": {"template": {"spec": {"containers": [{"name": "x"}]}}}});
         let d2 = d1.clone();
-        assert_eq!(DeploymentController::template_hash(&d1), DeploymentController::template_hash(&d2));
+        assert_eq!(
+            DeploymentController::template_hash(&d1),
+            DeploymentController::template_hash(&d2)
+        );
     }
 
     #[test]
@@ -299,7 +300,10 @@ mod tests {
         assert_eq!(name, "podinfo-abcdef");
         assert_eq!(rs.get("spec").unwrap().get("replicas").unwrap(), 5);
         let selector = rs.get("spec").unwrap().get("selector").unwrap();
-        assert_eq!(selector.get("matchLabels").unwrap().get("app").unwrap(), "podinfo");
+        assert_eq!(
+            selector.get("matchLabels").unwrap().get("app").unwrap(),
+            "podinfo"
+        );
         let labels = rs.get("metadata").unwrap().get("labels").unwrap();
         assert_eq!(labels.get("pod-template-hash").unwrap(), "abcdef");
     }
