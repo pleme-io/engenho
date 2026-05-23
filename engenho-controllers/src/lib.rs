@@ -37,9 +37,11 @@ pub mod owner;
 pub mod replicaset;
 pub mod runtime;
 pub mod dns;
+pub mod hpa;
 pub mod ingress;
 pub mod job;
 pub mod network_policy;
+pub mod pdb;
 pub mod selector;
 pub mod service_router;
 pub mod statefulset;
@@ -67,6 +69,11 @@ pub use network_policy::{
     CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,
     NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,
 };
+pub use hpa::{
+    FakeMetricsProvider, HorizontalPodAutoscalerController, MetricsError,
+    MetricsProvider, ScaleTarget,
+};
+pub use pdb::PodDisruptionBudgetController;
 pub use statefulset::StatefulSetController;
 pub use service_router::{
     FakeRouter, FakeRouterEvent, IptablesRouter, IpvsRouter, PortMap, RouterError,
