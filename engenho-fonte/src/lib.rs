@@ -111,7 +111,7 @@ pub use remediation::{
     AnomalyHandler, AnomalyRouter, MockAnomalyHandler, RemediationPolicy, mock_anomaly_router,
 };
 #[cfg(feature = "with-revoada")]
-pub use revoada::RevoadaProposer;
+pub use revoada::{FaceGossipBroker, RevoadaProposer};
 #[cfg(feature = "with-shikumi")]
 pub use shikumi::ShikumiWatcher;
 pub use sistema::{
