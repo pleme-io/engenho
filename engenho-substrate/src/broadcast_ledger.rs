@@ -93,16 +93,7 @@ pub type BroadcastLedgerSnapshot = crate::mirante::SubscriberSnapshot;
 
 crate::define_named!(BroadcastLedger, "broadcast");
 
-impl crate::mirante::Observable for BroadcastLedger {
-    type Snapshot = crate::mirante::SubscriberSnapshot;
-
-    fn snapshot(&self) -> Self::Snapshot {
-        crate::mirante::SubscriberSnapshot {
-            name: "broadcast",
-            subscriber_count: self.subscriber_count(),
-        }
-    }
-}
+crate::impl_observable_subscriber!(BroadcastLedger, "broadcast");
 
 #[async_trait]
 impl MaterializationLedger for BroadcastLedger {

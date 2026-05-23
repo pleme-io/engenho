@@ -100,16 +100,7 @@ pub type WatchedCacheSnapshot = crate::mirante::SubscriberSnapshot;
 
 crate::define_named!(WatchedCache, "watched");
 
-impl crate::mirante::Observable for WatchedCache {
-    type Snapshot = crate::mirante::SubscriberSnapshot;
-
-    fn snapshot(&self) -> Self::Snapshot {
-        crate::mirante::SubscriberSnapshot {
-            name: "watched",
-            subscriber_count: self.subscriber_count(),
-        }
-    }
-}
+crate::impl_observable_subscriber!(WatchedCache, "watched");
 
 #[async_trait]
 impl DerivationCacheBackend for WatchedCache {

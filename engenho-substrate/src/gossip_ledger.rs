@@ -158,19 +158,11 @@ impl FakeGossipTransport {
 
 crate::define_named!(FakeGossipTransport, "fake-gossip");
 
-/// Third site (v0.87 TSR completion): `FakeGossipTransport` joins
-/// `BroadcastLedger` + `WatchedCache` as Observable wrappers all
-/// returning the canonical `SubscriberSnapshot`.
-impl crate::mirante::Observable for FakeGossipTransport {
-    type Snapshot = crate::mirante::SubscriberSnapshot;
-
-    fn snapshot(&self) -> Self::Snapshot {
-        crate::mirante::SubscriberSnapshot {
-            name: "fake-gossip",
-            subscriber_count: self.subscriber_count(),
-        }
-    }
-}
+// Third site (v0.87 TSR completion): `FakeGossipTransport` joins
+// `BroadcastLedger` + `WatchedCache` as Observable wrappers all
+// returning the canonical `SubscriberSnapshot`. v0.95: routed
+// through `impl_observable_subscriber!` macro.
+crate::impl_observable_subscriber!(FakeGossipTransport, "fake-gossip");
 
 impl FakeGossipTransport {
     // Implementation continuation — kept inside an inherent impl so the
