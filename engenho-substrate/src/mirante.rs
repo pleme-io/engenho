@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::Serialize;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 
 use crate::named::Named;
 use crate::relogio::{Clock, Instant};
@@ -76,7 +76,8 @@ impl<S: Clone + Send + Sync + 'static> ObservationChannel<S> {
         }
     }
 
-    /// Current snapshot (cheap; reads watch::Receiver::borrow()).
+    /// Current snapshot (cheap; reads `watch::Receiver::borrow()`).
+    #[must_use]
     pub fn current(&self) -> S {
         self.rx.borrow().clone()
     }
@@ -84,6 +85,7 @@ impl<S: Clone + Send + Sync + 'static> ObservationChannel<S> {
     /// Subscribe to changes — every publish wakes the receiver.
     /// (Last-value-only: a slow subscriber sees the LATEST value,
     /// not every intermediate.)
+    #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<S> {
         self.rx.clone()
     }
@@ -94,6 +96,7 @@ impl<S: Clone + Send + Sync + 'static> ObservationChannel<S> {
     }
 
     /// Currently-active subscriber count.
+    #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.tx.receiver_count()
     }
@@ -217,13 +220,19 @@ mod tests {
 
     #[tokio::test]
     async fn channel_publish_and_current_round_trip() {
-        let ch = ObservationChannel::new(
-            CacheStats { hits: 0, misses: 0 },
-            frozen_clock(100),
-        );
+        let ch = ObservationChannel::new(CacheStats { hits: 0, misses: 0 }, frozen_clock(100));
         assert_eq!(ch.current(), CacheStats { hits: 0, misses: 0 });
-        ch.publish(CacheStats { hits: 10, misses: 1 });
-        assert_eq!(ch.current(), CacheStats { hits: 10, misses: 1 });
+        ch.publish(CacheStats {
+            hits: 10,
+            misses: 1,
+        });
+        assert_eq!(
+            ch.current(),
+            CacheStats {
+                hits: 10,
+                misses: 1
+            }
+        );
     }
 
     #[tokio::test]
@@ -238,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn channel_subscriber_count_tracks_lifetimes() {
         let ch = ObservationChannel::new(0u32, frozen_clock(0));
-        assert_eq!(ch.subscriber_count(), 1);  // internal rx counts
+        assert_eq!(ch.subscriber_count(), 1); // internal rx counts
         let _rx2 = ch.subscribe();
         assert_eq!(ch.subscriber_count(), 2);
         drop(_rx2);
@@ -291,8 +300,14 @@ mod tests {
     #[tokio::test]
     async fn mirante_register_replaces_by_name() {
         let mut m = Mirante::new();
-        m.register("x", Arc::new(ObservationChannel::new(0u32, frozen_clock(0))));
-        m.register("x", Arc::new(ObservationChannel::new(99u32, frozen_clock(0))));
+        m.register(
+            "x",
+            Arc::new(ObservationChannel::new(0u32, frozen_clock(0))),
+        );
+        m.register(
+            "x",
+            Arc::new(ObservationChannel::new(99u32, frozen_clock(0))),
+        );
         let snap = m.snapshot_all();
         assert_eq!(snap["x"], serde_json::json!(99));
     }
@@ -301,7 +316,10 @@ mod tests {
     async fn mirante_snapshot_all_returns_json() {
         let mut m = Mirante::new();
         let cache_ch = Arc::new(ObservationChannel::new(
-            CacheStats { hits: 10, misses: 2 },
+            CacheStats {
+                hits: 10,
+                misses: 2,
+            },
             frozen_clock(0),
         ));
         m.register("cache", cache_ch);
