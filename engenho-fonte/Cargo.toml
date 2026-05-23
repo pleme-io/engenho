@@ -37,6 +37,10 @@ with-tameshi = ["dep:tameshi"]
 # promessa-types' TargetController + PromessaTargetKind enum.
 # Cross-workspace path dep to pleme-io/promessa.
 with-promessa = ["dep:promessa-types"]
+# tatara-lisp authoring surface — register Sistema as a typed
+# (defsistema …) keyword via #[derive(TataraDomain)]. Cross-
+# workspace path dep to pleme-io/tatara.
+with-tatara-lisp = ["dep:tatara-lisp"]
 
 [dependencies]
 async-trait            = { workspace = true }
@@ -63,6 +67,9 @@ tameshi                = { path = "../../tameshi", optional = true }
 # Optional — enabled by `with-promessa`. Cross-workspace path dep
 # to pleme-io/promessa for typed promise reconciliation.
 promessa-types         = { path = "../../promessa/promessa-types", optional = true }
+# Optional — enabled by `with-tatara-lisp`. Cross-workspace path
+# dep to pleme-io/tatara for the `(defsistema …)` Lisp keyword.
+tatara-lisp            = { path = "../../tatara/tatara-lisp", optional = true }
 # Optional — enabled by `with-revoada`.
 engenho-revoada        = { workspace = true, optional = true }
 # Optional — enabled by `with-shikumi`. Cross-workspace path dep
