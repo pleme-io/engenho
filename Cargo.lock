@@ -1184,6 +1184,7 @@ dependencies = [
  "engenho-substrate",
  "engenho-substrate-props",
  "engenho-sui-typescape",
+ "engenho-types",
  "futures",
  "notify",
  "proptest",
