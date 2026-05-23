@@ -16,7 +16,6 @@ use engenho_types::error::{ApiStatusKind, KubeError};
 use engenho_types::kind::KubeResource;
 use engenho_types::patch::Patch;
 use engenho_types::watch::Watcher;
-use reqwest::StatusCode;
 
 use crate::connection::Connection;
 use crate::watcher::ReqwestWatcher;
