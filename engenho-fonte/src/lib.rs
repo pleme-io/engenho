@@ -63,6 +63,8 @@ mod proposer;
 mod publisher;
 #[cfg(feature = "with-revoada")]
 mod revoada;
+#[cfg(feature = "with-shikumi")]
+mod shikumi;
 mod sistema;
 mod watcher;
 
@@ -81,6 +83,8 @@ pub use proposer::{MockProposer, ProposalId, Proposer};
 pub use publisher::{MockPublisher, Publisher};
 #[cfg(feature = "with-revoada")]
 pub use revoada::RevoadaProposer;
+#[cfg(feature = "with-shikumi")]
+pub use shikumi::ShikumiWatcher;
 pub use sistema::{
     AppRef, InfraBackend, InfraRef, PromessaKind, PromessaRef, Sistema, TopologyRef,
 };
