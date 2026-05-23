@@ -12,7 +12,8 @@ use std::path::Path;
 
 use thiserror::Error;
 
-/// Atomic-write errors. Stable `.kind()` for telemetry.
+/// Atomic-write errors. Stable `.kind()` for telemetry —
+/// generated via [`crate::impl_error_kind!`] per the PRIME DIRECTIVE.
 #[derive(Debug, Clone, Error)]
 pub enum AtomicWriteError {
     /// Filesystem I/O failure.
@@ -20,13 +21,9 @@ pub enum AtomicWriteError {
     Io(String),
 }
 
-impl AtomicWriteError {
-    /// Stable identifier for telemetry / SDK dispatch.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Io(_) => "io",
-        }
+crate::impl_error_kind! {
+    AtomicWriteError {
+        (Io(_)) => "io",
     }
 }
 

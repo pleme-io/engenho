@@ -47,13 +47,9 @@ pub enum LedgerError {
     Backend(String),
 }
 
-impl LedgerError {
-    /// Stable identifier for telemetry.
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Backend(_) => "backend",
-        }
+crate::impl_error_kind! {
+    LedgerError {
+        (Backend(_)) => "backend",
     }
 }
 
