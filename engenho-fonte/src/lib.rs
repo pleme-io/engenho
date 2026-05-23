@@ -60,6 +60,7 @@ mod controller;
 mod error;
 mod evaluator;
 mod federation;
+mod gossip;
 mod kube_app_reconciler;
 mod linhagem_chain;
 mod mirante_publisher;
@@ -91,6 +92,7 @@ pub use controller::{
 pub use error::{FonteError, FonteResult};
 pub use evaluator::{Evaluator, MockEvaluator};
 pub use federation::{FederatedWatcher, FederationBroker};
+pub use gossip::GossipBroker;
 pub use kube_app_reconciler::KubeAppReconciler;
 pub use linhagem_chain::LinhagemAnomalyChain;
 pub use mirante_publisher::MirantePublisher;
