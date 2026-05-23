@@ -386,6 +386,69 @@ mod tests {
         Arc::new(FrozenClock::at(t))
     }
 
+    // v1.06: contract tests for `impl_observable!` (v0.92) +
+    // `impl_observable_subscriber!` (v0.95). Synthetic types prove
+    // each macro generates the expected Observable impl.
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FooSnapshot {
+        pub name: &'static str,
+        pub answer: u32,
+    }
+
+    pub struct Foo {
+        pub answer: u32,
+    }
+    crate::define_named!(Foo, "foo");
+    impl Foo {
+        pub fn snapshot(&self) -> FooSnapshot {
+            FooSnapshot {
+                name: "foo",
+                answer: self.answer,
+            }
+        }
+    }
+    crate::impl_observable!(Foo, FooSnapshot);
+
+    pub struct BarBroadcast {
+        sender: tokio::sync::broadcast::Sender<u32>,
+    }
+    impl BarBroadcast {
+        pub fn new() -> Self {
+            let (sender, _) = tokio::sync::broadcast::channel(8);
+            Self { sender }
+        }
+        pub fn subscriber_count(&self) -> usize {
+            self.sender.receiver_count()
+        }
+    }
+    crate::define_named!(BarBroadcast, "bar-broadcast");
+    crate::impl_observable_subscriber!(BarBroadcast, "bar-broadcast");
+
+    #[test]
+    fn impl_observable_macro_delegates_to_inherent() {
+        let f = Foo { answer: 42 };
+        // Inherent snapshot
+        let inh = Foo::snapshot(&f);
+        // Trait snapshot
+        let via_trait = Observable::snapshot(&f);
+        assert_eq!(inh, via_trait);
+        assert_eq!(via_trait.name, "foo");
+        assert_eq!(via_trait.answer, 42);
+    }
+
+    #[test]
+    fn impl_observable_subscriber_macro_returns_subscriber_snapshot() {
+        let b = BarBroadcast::new();
+        let snap0 = Observable::snapshot(&b);
+        assert_eq!(snap0.name, "bar-broadcast");
+        assert_eq!(snap0.subscriber_count, 0);
+        let _rx1 = b.sender.subscribe();
+        let _rx2 = b.sender.subscribe();
+        let snap2 = Observable::snapshot(&b);
+        assert_eq!(snap2.subscriber_count, 2);
+    }
+
     #[tokio::test]
     async fn channel_publish_and_current_round_trip() {
         let ch = ObservationChannel::new(CacheStats { hits: 0, misses: 0 }, frozen_clock(100));
