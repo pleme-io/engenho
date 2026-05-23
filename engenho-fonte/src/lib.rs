@@ -63,6 +63,8 @@ mod federation;
 mod kube_app_reconciler;
 mod linhagem_chain;
 mod mirante_publisher;
+#[cfg(feature = "with-promessa")]
+mod promessa_reconciler;
 mod proposer;
 mod publisher;
 mod remediation;
@@ -92,6 +94,8 @@ pub use federation::{FederatedWatcher, FederationBroker};
 pub use kube_app_reconciler::KubeAppReconciler;
 pub use linhagem_chain::LinhagemAnomalyChain;
 pub use mirante_publisher::MirantePublisher;
+#[cfg(feature = "with-promessa")]
+pub use promessa_reconciler::{PromessaIntent, PromessaTargetReconciler, promessa_kind_to_target};
 pub use proposer::{MockProposer, ProposalId, Proposer};
 pub use publisher::{MockPublisher, Publisher};
 pub use remediation::{
