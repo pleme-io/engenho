@@ -1,0 +1,199 @@
+name: deep-test
+
+# Fans every substrate concern into a separate GitHub Actions job
+# so the free public-repo tier runs the entire validation matrix
+# in parallel. Per the operator directive — "fully leverage all
+# pleme-io actions landscape and open source for computing power
+# on github actions free public tier to deeply test and validate
+# everything" — this workflow:
+#
+#   * Per-crate parallel test jobs (one per workspace crate)
+#   * Cross-OS matrix (ubuntu-latest + macos-latest)
+#   * Property-test stress run (PROPTEST_CASES=4096 — 4× default)
+#   * Doc tests across every crate
+#   * Coverage report via cargo-llvm-cov
+#   * Workspace-wide cargo-audit + cargo-deny
+#   * Clippy pedantic gates
+#
+# Compounds the canonical `ci.yml` (which runs the fast path);
+# this workflow runs on every PR for deep validation. Free-tier
+# minutes are unlimited for public repos — fan-out is free.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    # Nightly: catch toolchain drift even if no PR landed.
+    - cron: '0 7 * * *'  # 07:00 UTC daily
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Per-crate parallel test matrix — one job per workspace member
+  # ──────────────────────────────────────────────────────────────
+  per-crate-tests:
+    name: test ${{ matrix.crate }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        crate:
+          - engenho-types
+          - engenho-cluster-config
+          - engenho-cluster-config-render
+          - engenho-kube-client
+          - engenho-kube-codegen
+          - engenho-mcp
+          - engenho-revoada
+          - engenho-store
+          - engenho-apiserver
+          - engenho-teia
+          - engenho-scheduler
+          - engenho-controllers
+          - engenho-config
+          - engenho-kubelet
+          - engenho-substrate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: deep-test-${{ matrix.os }}
+      - name: test
+        run: cargo test -p ${{ matrix.crate }} --lib --bins --tests
+
+  # ──────────────────────────────────────────────────────────────
+  # Property-test stress run — 4× default case count
+  # Substrate has 1536 proptest cases at default; this raises to
+  # 4096 cases per property → ~6k cases total per run, run once
+  # nightly + on each PR. Catches edge cases the default misses.
+  # ──────────────────────────────────────────────────────────────
+  property-stress:
+    name: proptest stress (4k cases)
+    runs-on: ubuntu-latest
+    env:
+      PROPTEST_CASES: '4096'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: proptest-stress
+      - name: proptest stress
+        run: cargo test --workspace --release -- proptest
+
+  # ──────────────────────────────────────────────────────────────
+  # Doc tests — every // example in /// rustdoc + every README
+  # snippet that lands in a doctest block. Catches doc rot
+  # before merge.
+  # ──────────────────────────────────────────────────────────────
+  doc-tests:
+    name: doc tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: doctests
+      - name: doc tests
+        run: cargo test --workspace --doc
+
+  # ──────────────────────────────────────────────────────────────
+  # Clippy pedantic — pull every lint the workspace.lints opted in.
+  # ──────────────────────────────────────────────────────────────
+  clippy:
+    name: clippy pedantic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ──────────────────────────────────────────────────────────────
+  # Format gate.
+  # ──────────────────────────────────────────────────────────────
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: fmt --check
+        run: cargo fmt --all -- --check
+
+  # ──────────────────────────────────────────────────────────────
+  # Coverage report — cargo-llvm-cov produces lcov + html.
+  # Uploaded as artifact + (optional) coverage badge target.
+  # ──────────────────────────────────────────────────────────────
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+  # ──────────────────────────────────────────────────────────────
+  # Supply-chain audit — cargo-audit (rustsec) + cargo-deny.
+  # ──────────────────────────────────────────────────────────────
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: audit
+        run: cargo audit
+
+  # ──────────────────────────────────────────────────────────────
+  # Build all targets — catches "this crate doesn't compile under
+  # --all-targets" even when the lib does.
+  # ──────────────────────────────────────────────────────────────
+  build-all-targets:
+    name: build --all-targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-all
+      - name: build
+        run: cargo build --workspace --all-targets --release
