@@ -52,6 +52,7 @@ pub mod receipt;
 pub mod relogio;
 pub mod replay;
 pub mod retrying_cache;
+pub mod risca;
 pub mod roca;
 pub mod shape;
 pub mod shape_renderers;
@@ -100,6 +101,7 @@ pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};
 pub use relogio::{Clock, FrozenClock, HlcClock, Instant, LogicalClock, WallClock};
 pub use replay::{ReplayCursor, replay_into, replay_until};
 pub use retrying_cache::{BackoffConfig, RetryingCacheBackend};
+pub use risca::{REDACTED, Redact, Risca, redact_credit_card, redact_email, redact_token};
 pub use roca::{
     ConfirmacaoPolicy, JobTarget, MaterializationJob, Placement, Plantio, PlantioError, Stage,
     StageId,
