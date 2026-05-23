@@ -1015,6 +1015,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "engenho-substrate",
  "engenho-teia",
  "engenho-types",
  "futures",

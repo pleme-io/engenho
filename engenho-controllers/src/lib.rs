@@ -37,8 +37,10 @@ pub mod owner;
 pub mod replicaset;
 pub mod runtime;
 pub mod admission;
+pub mod crd;
 pub mod dns;
 pub mod drv;
+pub mod drv_build;
 pub mod hpa;
 pub mod ingress;
 pub mod job;
@@ -75,7 +77,11 @@ pub use admission::{
     AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionError, AdmissionMode,
     AdmissionRequest, AdmissionWebhook, FakeAdmissionWebhook,
 };
+pub use crd::{CrdController, CrdEntry, CrdError, CrdRegistry, CrdScope};
 pub use drv::DrvController;
+pub use drv_build::{
+    BuildBackend, BuildError, BuildResult, DrvBuildController, FakeBuildBackend,
+};
 pub use hpa::{
     FakeMetricsProvider, HorizontalPodAutoscalerController, MetricsError,
     MetricsProvider, ScaleTarget,

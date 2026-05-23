@@ -38,6 +38,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod command;
+pub mod drv_committal;
 pub mod durable_store;
 pub mod mesh;
 pub mod nats_listener;
@@ -52,6 +53,10 @@ pub mod type_config;
 pub mod watch;
 
 pub use command::{Reason, ResourceCommand, ResourceOp};
+pub use drv_committal::{
+    delete_drv_command, drv_resource_key, put_drv_command, render_drv_resource,
+    DRV_GROUP, DRV_KIND, DRV_VERSION,
+};
 pub use mesh::{default_config, StoreError, StoreMesh};
 pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
