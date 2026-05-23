@@ -77,13 +77,7 @@ impl crate::named::Named for ChainedVerifier {
     }
 }
 
-impl crate::mirante::Observable for ChainedVerifier {
-    type Snapshot = crate::mirante::ChildCountSnapshot;
-
-    fn snapshot(&self) -> Self::Snapshot {
-        Self::snapshot(self)
-    }
-}
+crate::impl_observable!(ChainedVerifier, crate::mirante::ChildCountSnapshot);
 
 #[async_trait]
 impl Verifier for ChainedVerifier {

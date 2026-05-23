@@ -104,14 +104,7 @@ impl TieredCache {
 }
 
 crate::define_named!(TieredCache, "tiered");
-
-impl crate::mirante::Observable for TieredCache {
-    type Snapshot = crate::mirante::ChildCountSnapshot;
-
-    fn snapshot(&self) -> Self::Snapshot {
-        Self::snapshot(self)
-    }
-}
+crate::impl_observable!(TieredCache, crate::mirante::ChildCountSnapshot);
 
 #[async_trait]
 impl DerivationCacheBackend for TieredCache {
