@@ -37,6 +37,53 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v0.96 SSC: Plantio is now Observable + plugs into a mirante
+    /// registry alongside runtime wrappers. Asserts the snapshot
+    /// carries the right name + stage count + the mirante registry
+    /// surfaces it as JSON.
+    #[test]
+    fn plantio_observable_publishes_to_mirante(n_stages in 0usize..6) {
+        use engenho_substrate::{
+            ChildCountSnapshot, MiranteSnapshot, NodeId, Observable, Placement, Plantio, Stage,
+            StageId, WorkloadShape,
+        };
+        let mut plantio = Plantio::new();
+        for i in 0..n_stages {
+            let stage_id = format!("s{i}");
+            let stage = Stage::pinned(
+                stage_id.clone(),
+                WorkloadShape::OciImage,
+                NodeId::from_bytes(&[i as u8; 32]),
+            );
+            plantio.add_stage(stage).unwrap();
+        }
+        // Direct Observable call.
+        let snap: ChildCountSnapshot = Observable::snapshot(&plantio);
+        prop_assert_eq!(snap.name, "plantio");
+        prop_assert_eq!(snap.child_count, n_stages);
+        // Through the Mirante registry — substrate-internal channels
+        // surface the Plantio snapshot as JSON alongside any other
+        // Observable's snapshot.
+        let chan: Arc<ObservationChannel<ChildCountSnapshot>> = Arc::new(
+            ObservationChannel::new(snap.clone(), frozen_clock(0)),
+        );
+        let mut m = Mirante::new();
+        m.register("plantio", chan);
+        let all = m.snapshot_all();
+        prop_assert_eq!(&all["plantio"]["name"], &serde_json::json!("plantio"));
+        prop_assert_eq!(&all["plantio"]["child_count"], &serde_json::json!(n_stages));
+        // Bonus: the Mirante itself is Observable. Snapshot-of-snapshots.
+        let mirante_snap: MiranteSnapshot = Observable::snapshot(&m);
+        prop_assert_eq!(mirante_snap.channel_count, 1);
+        prop_assert_eq!(&mirante_snap.channel_names[0], &"plantio".to_string());
+        // Use the unused imports.
+        let _ = StageId::new("warm");
+        let _ = Placement::Pinned {
+            node: NodeId::from_bytes(&[0u8; 32]),
+        };
+        let _ = WorkloadShape::OciImage;
+    }
+
     /// v0.91 TSR: 3 wrapper-with-N-children primitives all return
     /// the canonical `ChildCountSnapshot`. TieredCache /
     /// CompositeShapeRenderer / ChainedVerifier all impl Observable.
