@@ -35,6 +35,7 @@ pub mod error_kind;
 pub mod gossip_ledger;
 pub mod fake_shell;
 pub mod fingerprint;
+pub mod hex;
 pub mod ledger;
 pub mod magic_blob;
 pub mod named;
@@ -70,6 +71,7 @@ pub use compose_ir::{
 pub use disposable::{Disposable, DisposableError, Transient};
 pub use error_kind::ErrorKind;
 pub use fingerprint::{fingerprint_blake3, Fingerprint};
+pub use hex::{hex_encode, Hex};
 pub use named::Named;
 pub use gossip_ledger::{
     FakeGossipTransport, GossipBroadcast, GossipBroadcaster, GossipChannel,
