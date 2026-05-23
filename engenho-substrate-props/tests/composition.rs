@@ -37,6 +37,25 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v0.90: Mirante registry observes ITSELF. A meta-Mirante can
+    /// register the primary registry and report on registry-level
+    /// liveness alongside per-channel state. The MiranteSnapshot
+    /// reports channel_count + channel_names from the BTreeMap.
+    #[test]
+    fn mirante_observes_itself(channel_count in 0usize..6) {
+        use engenho_substrate::{MiranteSnapshot, Observable};
+        let mut m = Mirante::new();
+        for i in 0..channel_count {
+            let name: &'static str = Box::leak(format!("chan{i}").into_boxed_str());
+            let ch = Arc::new(ObservationChannel::new(0u32, frozen_clock(0)));
+            m.register(name, ch);
+        }
+        let snap: MiranteSnapshot = Observable::snapshot(&m);
+        prop_assert_eq!(snap.name, "mirante");
+        prop_assert_eq!(snap.channel_count, channel_count);
+        prop_assert_eq!(snap.channel_names.len(), channel_count);
+    }
+
     /// v0.87 TSR: three Observable implementers all return the
     /// canonical `SubscriberSnapshot`. Asserts the shared shape
     /// is identical across BroadcastLedger / WatchedCache /

@@ -219,6 +219,35 @@ impl Mirante {
     }
 }
 
+/// Observable snapshot of a `Mirante` registry — channel count +
+/// channel names. Pattern #2 (substrate self-consumption, v0.90):
+/// the mirante registry now observes ITSELF. A meta-Mirante can
+/// register the primary registry and report on registry-level
+/// liveness alongside per-channel state.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MiranteSnapshot {
+    /// Telemetry name ("mirante").
+    pub name: &'static str,
+    /// Number of registered channels.
+    pub channel_count: usize,
+    /// Names of registered channels (sorted by BTreeMap iteration).
+    pub channel_names: Vec<String>,
+}
+
+crate::define_named!(Mirante, "mirante");
+
+impl Observable for Mirante {
+    type Snapshot = MiranteSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        MiranteSnapshot {
+            name: "mirante",
+            channel_count: self.len(),
+            channel_names: self.channels.keys().map(|s| (*s).to_string()).collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

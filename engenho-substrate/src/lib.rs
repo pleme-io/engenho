@@ -88,7 +88,9 @@ pub use ledger::{LedgerError, LedgerKey, MaterializationLedger, MemoryLedger};
 pub use linhagem_aberta::{LineageError, LineageGraph, LineageNode, LineageProof};
 pub use magic_blob::{MagicBlob, MagicBlobError};
 pub use maquina::{MachineError, MachineRunner, MachineSnapshot, StateMachine, TransitionRecord};
-pub use mirante::{AnyChannel, Mirante, Observable, ObservationChannel, SubscriberSnapshot};
+pub use mirante::{
+    AnyChannel, Mirante, MiranteSnapshot, Observable, ObservationChannel, SubscriberSnapshot,
+};
 pub use named::Named;
 pub use oci_renderer::{OciDestReader, OciDestRef, OciImageRenderer, OciSourceRef};
 pub use orcamento::{Budget, BudgetError, BudgetSnapshot};
