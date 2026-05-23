@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// What's being attested. Extends as the substrate grows.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptKind {
     /// A Drv was materialized into the cache.
