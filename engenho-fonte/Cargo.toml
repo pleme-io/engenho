@@ -29,6 +29,10 @@ with-sui-eval = ["engenho-sui-typescape/with-sui-eval"]
 # engenho-kube-client (already workspace dep). Default off — the
 # dry-run shape stays the always-on default.
 with-engenho-kube-client = ["dep:engenho-kube-client"]
+# Real Attester backed by tameshi's HeartbeatChain. Cross-workspace
+# path dep to pleme-io/tameshi. Off by default; integration sites
+# enable when they need cryptographic chain attestation.
+with-tameshi = ["dep:tameshi"]
 
 [dependencies]
 async-trait            = { workspace = true }
@@ -49,6 +53,9 @@ engenho-types          = { workspace = true }
 # Optional — enabled by `with-engenho-kube-client`. Real K8s apply
 # for KubeAppReconciler.
 engenho-kube-client    = { workspace = true, optional = true }
+# Optional — enabled by `with-tameshi`. Cross-workspace path dep
+# to pleme-io/tameshi for cryptographic chain attestation.
+tameshi                = { path = "../../tameshi", optional = true }
 # Optional — enabled by `with-revoada`.
 engenho-revoada        = { workspace = true, optional = true }
 # Optional — enabled by `with-shikumi`. Cross-workspace path dep
