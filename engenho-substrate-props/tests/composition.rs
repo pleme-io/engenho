@@ -334,6 +334,92 @@ proptest_with_env! {
     }
 }
 
+// ── relógio HLC: two clocks merge via Instant::tick into total order ──
+
+proptest_with_env! {
+    /// HLC tick: given two distinct Instants, `Instant::tick(now,
+    /// previous)` always returns one strictly greater than `previous`
+    /// in the lexicographic (physical_ms, logical) order. Closes the
+    /// substrate's typed-clock causal-merge guarantee.
+    #[test]
+    fn hlc_tick_strictly_after_previous(
+        prev_ms in 0u64..1_000_000,
+        prev_logical in 0u16..1000,
+        now_ms in 0u64..1_000_000,
+        now_logical in 0u16..1000,
+    ) {
+        let previous = Instant::new(prev_ms, prev_logical);
+        let now = Instant::new(now_ms, now_logical);
+        let next = Instant::tick(now, previous);
+        prop_assert!(
+            next.causally_after(&previous),
+            "HLC tick {next:?} not strictly after previous {previous:?}"
+        );
+    }
+
+    /// HLC tick on equal Instants bumps logical, preserves physical_ms.
+    #[test]
+    fn hlc_tick_on_equal_bumps_logical(
+        ms in 0u64..1_000_000,
+        logical in 0u16..1000,
+    ) {
+        let a = Instant::new(ms, logical);
+        let next = Instant::tick(a, a);
+        prop_assert_eq!(next.physical_ms, ms);
+        prop_assert_eq!(next.logical, logical.saturating_add(1));
+    }
+}
+
+// ── replay + provação: chaos-driven event replay ──
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+enum ReplayFault {
+    #[error("simulated drop")]
+    Drop,
+}
+
+impl_error_kind! {
+    ReplayFault {
+        Drop => "drop",
+    }
+}
+
+proptest_with_env! {
+    /// Drive a ReplayCursor with chaos injection: per-event, the
+    /// chaos injector decides whether to "drop" (skip) or "accept"
+    /// (advance). The cursor's bounded-position invariant holds
+    /// regardless of the chaos sequence.
+    #[test]
+    fn cursor_under_chaos_position_bounded(
+        events in proptest::collection::vec(any::<u32>(), 1..16),
+        chaos_p in 0.0_f64..1.0,
+        seed in any::<u64>(),
+    ) {
+        let cursor = ReplayCursor::new("incs", events.clone());
+        let injector = Provacao::<ReplayFault>::new("drops", seed).with_policy(
+            Policy::Probability {
+                fault: ReplayFault::Drop,
+                p: chaos_p,
+            },
+        );
+        let clk: Arc<dyn Clock> = frozen_clock(0);
+        // Walk the cursor; on fault, peek-and-skip; on no-fault, next.
+        while cursor.peek().is_some() {
+            match injector.maybe_fault(clk.as_ref()) {
+                Some(_) => {
+                    cursor.skip(1);
+                }
+                None => {
+                    let _ = cursor.next();
+                }
+            }
+        }
+        // Position bounded by len. Cursor saturates correctly.
+        prop_assert!(cursor.position() == events.len());
+        prop_assert!(cursor.is_done());
+    }
+}
+
 // ── selo + linhagem-aberta: typed capability delegation chain ──
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
