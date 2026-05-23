@@ -26,6 +26,7 @@ pub mod atomic_write;
 pub mod broadcast_ledger;
 pub mod chained_verifier;
 pub mod command_runner;
+pub mod compose_ir;
 pub mod derivation;
 pub mod drv_disk;
 pub mod gossip_ledger;
@@ -55,6 +56,9 @@ pub use broadcast_ledger::{BroadcastLedger, LedgerEvent};
 pub use chained_verifier::ChainedVerifier;
 pub use command_runner::{
     CommandError, CommandRequest, CommandResponse, CommandRunner, FakeCommandRunner,
+};
+pub use compose_ir::{
+    ComposeError, ComposeHealthcheck, ComposeIr, ComposeService, ComposeStack,
 };
 pub use gossip_ledger::{
     FakeGossipTransport, GossipBroadcast, GossipBroadcaster, GossipChannel,
