@@ -1,15 +1,10 @@
 //! Property: OciImageRenderer build_request semantics + builder chain.
 
-use engenho_substrate::{
-    Drv, DrvHash, FakeCommandRunner, OciDestRef, OciImageRenderer, OciSourceRef,
-};
+use engenho_substrate::{Drv, FakeCommandRunner, OciDestRef, OciImageRenderer, OciSourceRef};
+use engenho_substrate_props::helpers::sample_drv as drv;
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use std::sync::Arc;
-
-fn drv(b: u8) -> Drv {
-    Drv::synthetic(DrvHash::new([b; 32]), "x86_64-linux")
-}
 
 fn fixed_source(uri: &'static str) -> OciSourceRef {
     Arc::new(move |_: &Drv| uri.to_string())

@@ -1,20 +1,13 @@
 //! Property: WatchedCache event emission + subscriber semantics.
 
 use engenho_substrate::{
-    CacheEvent, DerivationCacheBackend, Drv, DrvHash, MemoryDerivationCache, NarBlob, NarHash,
-    Realisation, WatchedCache,
+    CacheEvent, DerivationCacheBackend, DrvHash, MemoryDerivationCache, NarHash, Realisation,
+    WatchedCache,
 };
+use engenho_substrate_props::helpers::{sample_drv as drv, sample_nar as nar_blob};
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use std::sync::Arc;
-
-fn drv(hash_byte: u8) -> Drv {
-    Drv::synthetic(DrvHash::new([hash_byte; 32]), "x86_64-linux")
-}
-
-fn nar_blob(payload_byte: u8) -> NarBlob {
-    NarBlob::from_bytes(vec![payload_byte; 16])
-}
 
 proptest_with_env! {
     /// Every put_drv emits one CacheEvent::DrvPut to active subscribers.

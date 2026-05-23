@@ -1,8 +1,9 @@
 //! Property: ChainedVerifier first-failure-denies + last-success-returns.
 
 use engenho_substrate::{
-    ChainedVerifier, FakeVerifier, NarHash, NodeId, Verificacao, Verifier, VerifyError,
+    ChainedVerifier, FakeVerifier, NarHash, Verificacao, Verifier, VerifyError,
 };
+use engenho_substrate_props::helpers::sample_emitter as emitter;
 use engenho_substrate_props::{block_on, proptest_with_env};
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -11,10 +12,6 @@ fn sample_verificacao() -> Verificacao {
     Verificacao::HashEquality {
         expected: NarHash::new([1u8; 32]),
     }
-}
-
-fn emitter(b: u8) -> NodeId {
-    NodeId::from_bytes(&[b; 32])
 }
 
 proptest_with_env! {

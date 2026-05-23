@@ -1,20 +1,12 @@
 //! Property: TieredCache walks tiers in order + promotes on hit.
 
 use engenho_substrate::{
-    DerivationCacheBackend, Drv, DrvHash, MemoryDerivationCache, NarBlob, PromotionPolicy,
-    TieredCache,
+    DerivationCacheBackend, DrvHash, MemoryDerivationCache, PromotionPolicy, TieredCache,
 };
+use engenho_substrate_props::helpers::{sample_drv as drv, sample_nar as nar};
 use engenho_substrate_props::{block_on, proptest_with_env};
 use proptest::prelude::*;
 use std::sync::Arc;
-
-fn drv(b: u8) -> Drv {
-    Drv::synthetic(DrvHash::new([b; 32]), "x86_64-linux")
-}
-
-fn nar(b: u8) -> NarBlob {
-    NarBlob::from_bytes(vec![b; 16])
-}
 
 fn tier_chain(
     n: usize,

@@ -2,21 +2,12 @@
 
 use engenho_substrate::{
     FakeGossipTransport, GossipBroadcaster, GossipError, GossipLedger, MaterializationLedger,
-    MaterializationReceipt, MemoryLedger, NodeId, ReceiptKind, StageId,
+    MemoryLedger, ReceiptKind, StageId,
 };
+use engenho_substrate_props::helpers::sample_receipt as receipt;
 use engenho_substrate_props::{block_on, proptest_with_env};
 use proptest::prelude::*;
 use std::sync::Arc;
-
-fn receipt(subject: [u8; 32], node_byte: u8) -> MaterializationReceipt {
-    MaterializationReceipt::new(
-        ReceiptKind::Shape("test".into()),
-        subject,
-        NodeId::from_bytes(&[node_byte; 32]),
-        0,
-        subject,
-    )
-}
 
 proptest_with_env! {
     /// Every successful ingest produces exactly one outbound broadcast.
