@@ -38,8 +38,11 @@ pub mod replicaset;
 pub mod runtime;
 pub mod dns;
 pub mod ingress;
+pub mod job;
+pub mod network_policy;
 pub mod selector;
 pub mod service_router;
+pub mod statefulset;
 pub mod watch_driver;
 
 pub use controller::{Controller, ReconcileReport};
@@ -57,8 +60,14 @@ pub use dns::{
 };
 pub use ingress::{
     FakeIngressBackend, FakeIngressEvent, IngressBackend, IngressController,
-    IngressError, IngressRoute, PathType, TraefikIngressBackend,
+    IngressError, IngressRoute, NginxIngressBackend, PathType, TraefikIngressBackend,
 };
+pub use job::{Clock, CronJobController, FixedClock, JobController, SystemClock};
+pub use network_policy::{
+    CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,
+    NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,
+};
+pub use statefulset::StatefulSetController;
 pub use service_router::{
     FakeRouter, FakeRouterEvent, IptablesRouter, IpvsRouter, PortMap, RouterError,
     ServiceRoute, ServiceRouter, ServiceRoutingController,
