@@ -15,6 +15,7 @@ use engenho_revoada::{
     BareMetalSupervisorFace, FabricFace, FaceKind, KubernetesFace, NomadFace, PureRaftFace,
     SystemdFace,
 };
+use engenho_substrate_props::proptest_with_env;
 
 use proptest::prelude::*;
 
@@ -154,7 +155,7 @@ fn every_face_delete_then_get_errors_uniformly() {
 
 // ── Property-based cross-face round-trip ──────────────────────────
 
-proptest! {
+proptest_with_env! {
     /// For any K8s-shape (kind, name, namespace) triple within a
     /// reasonable character set, every face apply/get round-trips
     /// the YAML manifest byte-identically.

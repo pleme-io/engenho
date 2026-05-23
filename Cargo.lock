@@ -979,6 +979,7 @@ dependencies = [
  "ed25519-dalek",
  "engenho-config",
  "engenho-substrate",
+ "engenho-substrate-props",
  "engenho-types",
  "hcl-rs",
  "openraft",

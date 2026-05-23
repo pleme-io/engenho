@@ -19,6 +19,7 @@ use engenho_revoada::topology::{
     Cluster3MNW, MeshAllPeers, NodeId, NodeState, Pair, Phalanx, Quorum3M, Role, RoleAssignment,
     Solo, TopologyStrategy, Transition,
 };
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
 fn ids(n: usize) -> Vec<NodeId> {
@@ -55,7 +56,7 @@ fn all_strategies() -> Vec<Box<dyn TopologyStrategy>> {
 // Universal invariants (proptest)
 // =================================================================
 
-proptest! {
+proptest_with_env! {
     /// I1: Every strategy at N >= min_nodes produces an assignment
     /// whose voting_count is >= 1. Guarantees: cluster never starts
     /// in a stuck-by-construction state.

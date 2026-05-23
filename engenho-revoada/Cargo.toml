@@ -58,4 +58,9 @@ hcl-rs             = "0.18"
 
 [dev-dependencies]
 proptest = "1"
+# v1.15: cross-crate test discipline migration — reuse the
+# substrate-props helpers (proptest_with_env! + block_on + sample_*)
+# so engenho-revoada's per-PR loop honors PROPTEST_CASES env var
+# just like substrate-props.
+engenho-substrate-props = { workspace = true }
 tempfile = "3"
