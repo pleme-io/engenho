@@ -4,10 +4,7 @@ use engenho_substrate::{Instant, Selo, SeloError, SeloIssuer};
 use proptest::prelude::*;
 
 fn at(ms: u64) -> Instant {
-    Instant {
-        physical_ms: ms,
-        logical: 0,
-    }
+    Instant::from_ms(ms)
 }
 
 proptest! {

@@ -12,13 +12,16 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// Risca<String> Debug output NEVER contains the inner string.
+    /// Risca<String> Debug output is exactly the framing template — it
+    /// never inspects the inner value at all (so it CAN'T leak).
+    /// Constant-output is a stronger contract than "doesn't contain":
+    /// if the secret happens to be a substring of the framing string
+    /// (e.g. "I" is in "RISCA"), substring-checks falsely fail. The
+    /// real guarantee is bit-identical output across all inputs.
     #[test]
-    fn debug_never_leaks_inner(secret in ".{1,100}") {
-        let r = Risca::new(secret.clone());
-        let dbg = format!("{r:?}");
-        prop_assert!(!dbg.contains(&secret), "debug leaked secret");
-        prop_assert!(dbg.contains("RISCA"));
+    fn debug_is_constant_framing(secret in any::<String>()) {
+        let r = Risca::new(secret);
+        prop_assert_eq!(format!("{r:?}"), "<RISCA:alloc::string::String>");
     }
 
     /// Risca<String> Display always emits exactly "<RISCA>".

@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::relogio::Instant;
+use crate::risca::Risca;
 
 /// Errors raised by [`SeloIssuer::verify`].
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -89,8 +90,14 @@ pub struct Selo {
 }
 
 /// Mints + verifies Selos using a shared 32-byte secret.
+///
+/// The secret is wrapped in [`Risca`] so it can NEVER leak via
+/// `Debug` / `Display` / `Serialize` — accidental observability
+/// of the issuer key is a type error. Only `compute_mac` reaches
+/// the inner bytes via the verbose `expose_secret()` call, marking
+/// every exposure as a deliberate, grep-able code-review event.
 pub struct SeloIssuer {
-    secret: [u8; 32],
+    secret: Risca<[u8; 32]>,
 }
 
 impl SeloIssuer {
@@ -98,7 +105,9 @@ impl SeloIssuer {
     /// secret via a cofre primitive in production.
     #[must_use]
     pub const fn new(secret: [u8; 32]) -> Self {
-        Self { secret }
+        Self {
+            secret: Risca::new(secret),
+        }
     }
 
     /// Mint a new selo. Always succeeds — minting is local + cheap.
@@ -159,7 +168,7 @@ impl SeloIssuer {
     }
 
     fn compute_mac(&self, subject: &str, capability: &str, expires_at: Instant) -> [u8; 32] {
-        let mut h = blake3::Hasher::new_keyed(&self.secret);
+        let mut h = blake3::Hasher::new_keyed(self.secret.expose_secret());
         h.update(b"selo/v1/");
         h.update((subject.len() as u64).to_le_bytes().as_slice());
         h.update(subject.as_bytes());
@@ -200,10 +209,7 @@ mod tests {
     }
 
     fn at(ms: u64) -> Instant {
-        Instant {
-            physical_ms: ms,
-            logical: 0,
-        }
+        Instant::from_ms(ms)
     }
 
     #[test]
