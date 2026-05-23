@@ -10,8 +10,11 @@
 //!       if hit -> promote to all higher tiers, return
 //!     return None
 //!   put_drv(d):
-//!     write to L0 + L1 (the local tiers); cluster + federation are
-//!     reconcile-driven, not write-through.
+//!     write to L0 only (the fastest local tier); L1+ are populated
+//!     by promotion-on-hit + an out-of-band reconcile loop. The
+//!     tiered-cache write contract is INTENTIONALLY narrow — see
+//!     property test put_drv_writes_only_to_l0 for the asserted
+//!     invariant.
 //! ```
 //!
 //! ## Why "promote on read" + "write to local only"
