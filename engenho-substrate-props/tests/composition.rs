@@ -37,6 +37,34 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v1.00 SSC composition test (added v1.08): Provacao<F> is
+    /// Observable + publishes ChildCountSnapshot through a mirante
+    /// channel. Asserts the policy_count flows through correctly.
+    /// First composition test consuming the v1.07
+    /// `fresh_mirante_publishing` helper as one-liner setup.
+    #[test]
+    fn provacao_observable_publishes_to_mirante(n_policies in 0usize..6) {
+        use engenho_substrate::{ChildCountSnapshot, Observable, Policy, Provacao};
+        // Reuse the v0.91 ReplayFault enum (defined further down in this file).
+        let mut prov = Provacao::<ReplayFault>::new("chaos-test", 0);
+        for _ in 0..n_policies {
+            prov = prov.with_policy(Policy::Probability {
+                fault: ReplayFault::Drop,
+                p: 0.1,
+            });
+        }
+        // Direct Observable call.
+        let snap: ChildCountSnapshot = Observable::snapshot(&prov);
+        prop_assert_eq!(snap.name, "chaos-test");
+        prop_assert_eq!(snap.child_count, n_policies);
+        // Through Mirante (v1.07 helper — one-line setup).
+        let m =
+            engenho_substrate_props::helpers::fresh_mirante_publishing("chaos", &prov);
+        let all = m.snapshot_all();
+        prop_assert_eq!(&all["chaos"]["name"], &serde_json::json!("chaos-test"));
+        prop_assert_eq!(&all["chaos"]["child_count"], &serde_json::json!(n_policies));
+    }
+
     /// v0.99 SSC composition test (added v1.03): ReplayCursor<E> is
     /// Observable + publishes ReplayCursorSnapshot through a mirante
     /// channel. Asserts the cursor's progress metadata (name +
