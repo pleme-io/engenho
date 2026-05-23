@@ -61,6 +61,7 @@ mod error;
 mod evaluator;
 mod proposer;
 mod publisher;
+mod remediation;
 #[cfg(feature = "with-revoada")]
 mod revoada;
 #[cfg(feature = "with-shikumi")]
@@ -83,6 +84,9 @@ pub use error::{FonteError, FonteResult};
 pub use evaluator::{Evaluator, MockEvaluator};
 pub use proposer::{MockProposer, ProposalId, Proposer};
 pub use publisher::{MockPublisher, Publisher};
+pub use remediation::{
+    AnomalyHandler, AnomalyRouter, MockAnomalyHandler, RemediationPolicy, mock_anomaly_router,
+};
 #[cfg(feature = "with-revoada")]
 pub use revoada::RevoadaProposer;
 #[cfg(feature = "with-shikumi")]
