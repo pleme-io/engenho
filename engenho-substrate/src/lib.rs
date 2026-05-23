@@ -105,7 +105,7 @@ pub use provacao::{Policy, Provacao};
 pub use quorum::{QuorumOutcome, QuorumTracker};
 pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};
 pub use relogio::{Clock, FrozenClock, HlcClock, Instant, LogicalClock, WallClock};
-pub use replay::{ReplayCursor, replay_into, replay_until};
+pub use replay::{ReplayCursor, ReplayCursorSnapshot, replay_into, replay_until};
 pub use retrying_cache::{BackoffConfig, RetryingCacheBackend};
 pub use risca::{REDACTED, Redact, Risca, redact_credit_card, redact_email, redact_token};
 pub use roca::{
