@@ -37,6 +37,7 @@ pub mod owner;
 pub mod replicaset;
 pub mod runtime;
 pub mod admission;
+pub mod attestation;
 pub mod crd;
 pub mod crd_validator;
 pub mod dns;
@@ -78,6 +79,10 @@ pub use network_policy::{
 pub use admission::{
     AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionError, AdmissionMode,
     AdmissionRequest, AdmissionWebhook, FakeAdmissionWebhook,
+};
+pub use attestation::{
+    tameshi_attestation_webhook, FakeSignatureVerifier, SignatureVerifier,
+    TameshiAttestationWebhook, VerifierError,
 };
 pub use crd::{CrdController, CrdEntry, CrdError, CrdRegistry, CrdScope};
 pub use crd_validator::{crd_validation_webhook, CrdValidationWebhook};

@@ -32,24 +32,47 @@ use async_trait::async_trait;
 use crate::derivation::{
     CacheError, DerivationCacheBackend, Drv, DrvHash, NarBlob, NarHash, Realisation,
 };
+use crate::promotion::{PromotionContext, PromotionGate, PromotionPolicy};
 
 /// Composed cache: walks tiers in order, returns first hit,
-/// promotes the hit to all higher (faster) tiers.
+/// promotes the hit to all higher (faster) tiers per the
+/// configured [`PromotionPolicy`].
 ///
-/// Construct with [`TieredCache::new`] passing tiers from FASTEST
-/// (L0) to SLOWEST (Ln). The order is load-bearing — the walker
-/// trusts position.
+/// Construct with [`TieredCache::new`] (eager promotion default)
+/// or [`TieredCache::with_promotion`] for a custom policy.
+/// Tiers are FASTEST (L0) first, SLOWEST (Ln) last — load-bearing.
 pub struct TieredCache {
     tiers: Vec<Arc<dyn DerivationCacheBackend>>,
+    gate: Arc<PromotionGate>,
 }
 
 impl TieredCache {
-    /// New tiered cache. Pass tiers in order from fastest to slowest.
+    /// New tiered cache with eager promotion (default).
     /// Empty vec → cache is a no-op (every get returns None, every
     /// put succeeds silently).
     #[must_use]
     pub fn new(tiers: Vec<Arc<dyn DerivationCacheBackend>>) -> Self {
-        Self { tiers }
+        Self {
+            tiers,
+            gate: Arc::new(PromotionGate::new(PromotionPolicy::Eager)),
+        }
+    }
+
+    /// New tiered cache with a specific promotion policy.
+    #[must_use]
+    pub fn with_promotion(
+        tiers: Vec<Arc<dyn DerivationCacheBackend>>,
+        policy: PromotionPolicy,
+    ) -> Self {
+        Self {
+            tiers,
+            gate: Arc::new(PromotionGate::new(policy)),
+        }
+    }
+
+    /// Total tiers (snapshot helper).
+    fn total(&self) -> usize {
+        self.tiers.len()
     }
 
     /// Number of tiers in this cache.
@@ -72,13 +95,15 @@ impl DerivationCacheBackend for TieredCache {
     }
 
     async fn get_drv(&self, hash: &DrvHash) -> Result<Option<Drv>, CacheError> {
+        let total = self.total();
         for (idx, tier) in self.tiers.iter().enumerate() {
             if let Some(drv) = tier.get_drv(hash).await? {
-                // Promote to all higher (faster) tiers.
-                for higher in &self.tiers[..idx] {
-                    // Promote is best-effort; backend failure doesn't
-                    // taint the read.
-                    let _ = higher.put_drv(&drv).await;
+                // Ask the promotion gate.
+                let ctx = PromotionContext { source_tier: idx, total_tiers: total };
+                if let Some(promote_to) = self.gate.decide(ctx) {
+                    for higher in &self.tiers[..promote_to] {
+                        let _ = higher.put_drv(&drv).await;
+                    }
                 }
                 return Ok(Some(drv));
             }
@@ -98,12 +123,16 @@ impl DerivationCacheBackend for TieredCache {
     }
 
     async fn get_nar(&self, hash: &NarHash) -> Result<Option<NarBlob>, CacheError> {
+        let total = self.total();
         for (idx, tier) in self.tiers.iter().enumerate() {
             // Get from this tier. HashMismatch propagates — corrupt
             // cache is a halting fault, not a fallback trigger.
             if let Some(blob) = tier.get_nar(hash).await? {
-                for higher in &self.tiers[..idx] {
-                    let _ = higher.put_nar(&blob).await;
+                let ctx = PromotionContext { source_tier: idx, total_tiers: total };
+                if let Some(promote_to) = self.gate.decide(ctx) {
+                    for higher in &self.tiers[..promote_to] {
+                        let _ = higher.put_nar(&blob).await;
+                    }
                 }
                 return Ok(Some(blob));
             }
@@ -318,5 +347,62 @@ mod tests {
         let h = DrvHash::from_bytes(b"never-seen");
         assert!(c.get_drv(&h).await.unwrap().is_none());
         assert!(c.get_nar(&NarHash::from_bytes(b"never")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn with_promotion_lazy_disables_promote_on_drv_read() {
+        let l0 = Arc::new(MemoryDerivationCache::new());
+        let l1 = Arc::new(MemoryDerivationCache::new());
+        let drv = sample_drv(b"lazy-drv");
+        l1.put_drv(&drv).await.unwrap();
+        let c = TieredCache::with_promotion(vec![l0.clone(), l1.clone()], PromotionPolicy::Lazy);
+        let got = c.get_drv(&drv.drv_hash).await.unwrap();
+        assert_eq!(got, Some(drv.clone()));
+        // L0 should NOT have been written to — promotion suppressed.
+        assert_eq!(l0.drv_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn with_promotion_lazy_disables_promote_on_nar_read() {
+        let l0 = Arc::new(MemoryDerivationCache::new());
+        let l1 = Arc::new(MemoryDerivationCache::new());
+        let blob = NarBlob::from_bytes(b"lazy-nar".to_vec());
+        l1.put_nar(&blob).await.unwrap();
+        let c = TieredCache::with_promotion(vec![l0.clone(), l1.clone()], PromotionPolicy::Lazy);
+        let got = c.get_nar(&blob.hash).await.unwrap();
+        assert_eq!(got, Some(blob));
+        assert_eq!(l0.nar_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn with_promotion_eager_still_promotes() {
+        let l0 = Arc::new(MemoryDerivationCache::new());
+        let l1 = Arc::new(MemoryDerivationCache::new());
+        let drv = sample_drv(b"eager-drv");
+        l1.put_drv(&drv).await.unwrap();
+        let c = TieredCache::with_promotion(vec![l0.clone(), l1.clone()], PromotionPolicy::Eager);
+        c.get_drv(&drv.drv_hash).await.unwrap();
+        // Eager preserves the original behavior.
+        assert_eq!(l0.drv_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn with_promotion_sample_rate_promotes_one_in_n() {
+        let l0 = Arc::new(MemoryDerivationCache::new());
+        let l1 = Arc::new(MemoryDerivationCache::new());
+        // Pre-populate L1 with several distinct drvs.
+        let drvs: Vec<Drv> = (0u8..6).map(|i| sample_drv(&[b'k', i])).collect();
+        for d in &drvs {
+            l1.put_drv(d).await.unwrap();
+        }
+        let c = TieredCache::with_promotion(
+            vec![l0.clone(), l1.clone()],
+            PromotionPolicy::SampleRate(3),
+        );
+        // 6 reads at rate 3 → exactly 2 promotions.
+        for d in &drvs {
+            c.get_drv(&d.drv_hash).await.unwrap();
+        }
+        assert_eq!(l0.drv_count().await, 2);
     }
 }
