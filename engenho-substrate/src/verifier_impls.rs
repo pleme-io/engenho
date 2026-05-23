@@ -268,6 +268,83 @@ impl Verifier for IndependentVerifier {
 }
 
 // =================================================================
+// TameshiVerifier
+// =================================================================
+
+/// Operator-supplied signature check: given a `signer` chain id +
+/// the subject hash, returns the typed evidence (typically the
+/// signature bytes) or a typed error. Production wires this to the
+/// cosign / tameshi PKI integration; tests pin a deterministic
+/// outcome.
+pub type SignerCheck = Arc<
+    dyn Fn(String, [u8; 32]) -> futures::future::BoxFuture<'static, Result<Vec<u8>, VerifyError>>
+        + Send
+        + Sync,
+>;
+
+/// Verifies cosign-style signatures via an operator-supplied check.
+/// Evidence is BLAKE3 over the returned signature bytes — faithful
+/// nodes presenting the same signature for the same subject produce
+/// identical evidence (QuorumTracker reaches; tampered nodes
+/// produce a divergent signature → Dissent).
+pub struct TameshiVerifier {
+    name: &'static str,
+    check: SignerCheck,
+}
+
+impl TameshiVerifier {
+    /// New verifier with telemetry name + signature check.
+    #[must_use]
+    pub fn new(name: &'static str, check: SignerCheck) -> Self {
+        Self { name, check }
+    }
+
+    /// Convenience: name `"tameshi"`.
+    #[must_use]
+    pub fn default_named(check: SignerCheck) -> Self {
+        Self::new("tameshi", check)
+    }
+}
+
+#[async_trait]
+impl Verifier for TameshiVerifier {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn verify(
+        &self,
+        verificacao: &Verificacao,
+        subject_hash: [u8; 32],
+        emitter: NodeId,
+        emitted_at: u64,
+    ) -> Result<VerificationReceipt, VerifyError> {
+        let signer = match verificacao {
+            Verificacao::TameshiSigned { signer } => signer.clone(),
+            _ => {
+                return Err(VerifyError::Unsupported(
+                    "TameshiVerifier only handles TameshiSigned".into(),
+                ));
+            }
+        };
+        let sig_bytes = (self.check)(signer, subject_hash).await?;
+        let evidence = *blake3::hash(&sig_bytes).as_bytes();
+        let receipt = MaterializationReceipt::new(
+            ReceiptKind::Shape("verify:tameshi_signed".into()),
+            subject_hash,
+            emitter,
+            emitted_at,
+            evidence,
+        );
+        Ok(VerificationReceipt::new(
+            verificacao.clone(),
+            receipt,
+            self.name.to_string(),
+        ))
+    }
+}
+
+// =================================================================
 // hex helper (shared)
 // =================================================================
 
@@ -556,6 +633,143 @@ mod tests {
     async fn independent_default_name() {
         let v = IndependentVerifier::default_named(rebuild_returning(vec![]));
         assert_eq!(v.name(), "independent");
+    }
+
+    // ── TameshiVerifier ────────────────────────────────────────
+
+    fn sig_returning(bytes: Vec<u8>) -> SignerCheck {
+        Arc::new(move |_signer, _subject| {
+            let b = bytes.clone();
+            async move { Ok(b) }.boxed()
+        })
+    }
+
+    fn sig_failing(msg: &'static str) -> SignerCheck {
+        Arc::new(move |_, _| async move { Err(VerifyError::Backend(msg.into())) }.boxed())
+    }
+
+    #[tokio::test]
+    async fn tameshi_passes_when_signer_returns_signature() {
+        let v = TameshiVerifier::default_named(sig_returning(b"sig-bytes".to_vec()));
+        let r = v
+            .verify(
+                &Verificacao::TameshiSigned {
+                    signer: "engenho-pki".into(),
+                },
+                subj(),
+                emit(),
+                42,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.verifier, "tameshi");
+        assert_eq!(r.receipt.evidence_hash, *blake3::hash(b"sig-bytes").as_bytes());
+    }
+
+    #[tokio::test]
+    async fn tameshi_propagates_signer_failure() {
+        let v = TameshiVerifier::default_named(sig_failing("untrusted"));
+        let err = v
+            .verify(
+                &Verificacao::TameshiSigned {
+                    signer: "engenho-pki".into(),
+                },
+                subj(),
+                emit(),
+                42,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "backend");
+    }
+
+    #[tokio::test]
+    async fn tameshi_rejects_wrong_variant() {
+        let v = TameshiVerifier::default_named(sig_returning(vec![]));
+        let err = v
+            .verify(
+                &Verificacao::HashEquality {
+                    expected: NarHash::from_bytes(b"x"),
+                },
+                subj(),
+                emit(),
+                42,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "unsupported");
+    }
+
+    #[tokio::test]
+    async fn tameshi_faithful_nodes_agree_on_evidence() {
+        let v = TameshiVerifier::default_named(sig_returning(b"sig".to_vec()));
+        let r1 = v
+            .verify(
+                &Verificacao::TameshiSigned {
+                    signer: "engenho-pki".into(),
+                },
+                subj(),
+                NodeId::from_bytes(b"node-1"),
+                42,
+            )
+            .await
+            .unwrap();
+        let r2 = v
+            .verify(
+                &Verificacao::TameshiSigned {
+                    signer: "engenho-pki".into(),
+                },
+                subj(),
+                NodeId::from_bytes(b"node-2"),
+                100,
+            )
+            .await
+            .unwrap();
+        // Same signature bytes → same evidence (QuorumTracker reaches).
+        assert_eq!(r1.receipt.evidence_hash, r2.receipt.evidence_hash);
+    }
+
+    #[tokio::test]
+    async fn tameshi_byzantine_node_diverges() {
+        let v_real = TameshiVerifier::default_named(sig_returning(b"valid".to_vec()));
+        let v_byz = TameshiVerifier::default_named(sig_returning(b"forged".to_vec()));
+        let r_real = v_real
+            .verify(
+                &Verificacao::TameshiSigned {
+                    signer: "engenho-pki".into(),
+                },
+                subj(),
+                emit(),
+                42,
+            )
+            .await
+            .unwrap();
+        let r_byz = v_byz
+            .verify(
+                &Verificacao::TameshiSigned {
+                    signer: "engenho-pki".into(),
+                },
+                subj(),
+                emit(),
+                42,
+            )
+            .await
+            .unwrap();
+        // Different signature bytes → different evidence → Dissent
+        // when QuorumTracker sees both.
+        assert_ne!(r_real.receipt.evidence_hash, r_byz.receipt.evidence_hash);
+    }
+
+    #[tokio::test]
+    async fn tameshi_default_name() {
+        let v = TameshiVerifier::default_named(sig_returning(vec![]));
+        assert_eq!(v.name(), "tameshi");
+    }
+
+    #[tokio::test]
+    async fn tameshi_custom_name() {
+        let v = TameshiVerifier::new("cosign-chain-prod", sig_returning(vec![]));
+        assert_eq!(v.name(), "cosign-chain-prod");
     }
 
     #[tokio::test]
