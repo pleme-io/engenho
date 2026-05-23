@@ -37,6 +37,41 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v1.04 SSC composition test (added v1.09): ObservationChannel<S>
+    /// is itself Observable + publishes SubscriberSnapshot through
+    /// another mirante channel. Closes the v1.08-noted gap — 14 of 14
+    /// Observable implementers now have dedicated publish-to-mirante
+    /// tests. Recursive observability at scale: a channel observed
+    /// through another channel through a mirante registry.
+    #[test]
+    fn observation_channel_observable_publishes_to_mirante(n_subs in 0usize..6) {
+        use engenho_substrate::{Observable, SubscriberSnapshot};
+        // The inner channel — carrying u32 snapshots, observable itself.
+        let inner: Arc<ObservationChannel<u32>> =
+            Arc::new(ObservationChannel::new(0u32, frozen_clock(0)));
+        // Open N subscribers on the inner channel.
+        let _receivers: Vec<_> = (0..n_subs).map(|_| inner.subscribe()).collect();
+        // Direct Observable call on the inner channel.
+        let snap: SubscriberSnapshot = Observable::snapshot(inner.as_ref());
+        prop_assert_eq!(snap.name, "observation-channel");
+        // baseline 1 from the channel's own internal rx + n_subs
+        prop_assert_eq!(snap.subscriber_count, 1 + n_subs);
+        // Through Mirante (v1.07 helper — 1-line setup).
+        let m = engenho_substrate_props::helpers::fresh_mirante_publishing(
+            "inner-channel",
+            inner.as_ref(),
+        );
+        let all = m.snapshot_all();
+        prop_assert_eq!(
+            &all["inner-channel"]["name"],
+            &serde_json::json!("observation-channel")
+        );
+        prop_assert_eq!(
+            &all["inner-channel"]["subscriber_count"],
+            &serde_json::json!(1 + n_subs)
+        );
+    }
+
     /// v1.00 SSC composition test (added v1.08): Provacao<F> is
     /// Observable + publishes ChildCountSnapshot through a mirante
     /// channel. Asserts the policy_count flows through correctly.
