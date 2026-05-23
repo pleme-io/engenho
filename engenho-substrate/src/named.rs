@@ -80,6 +80,47 @@ macro_rules! define_named {
     };
 }
 
+/// Generate `impl Named for $type` that reads the type's own
+/// `self.name: &'static str` field. Third-site extraction (v0.93 TSR):
+/// `Budget`, `CompositeShapeRenderer`, `ChainedVerifier` all had
+/// hand-rolled `impl Named { fn name(&self) -> self.name }` blocks.
+///
+/// Generic types (e.g. `MachineRunner<M>`, `Provacao<F>`,
+/// `ReplayCursor<E>`) keep hand-rolled impls — their bound shapes
+/// (`M: StateMachine`, `F: ErrorKind + Clone`, `E: Clone`) don't
+/// fit a uniform macro template.
+///
+/// ## Usage
+///
+/// ```ignore
+/// use engenho_substrate::impl_named_field;
+///
+/// pub struct Foo {
+///     name: &'static str,
+///     // other fields ...
+/// }
+///
+/// impl_named_field!(Foo);
+/// ```
+///
+/// Expands to:
+///
+/// ```ignore
+/// impl engenho_substrate::Named for Foo {
+///     fn name(&self) -> &'static str { self.name }
+/// }
+/// ```
+#[macro_export]
+macro_rules! impl_named_field {
+    ($type:ident) => {
+        impl $crate::named::Named for $type {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

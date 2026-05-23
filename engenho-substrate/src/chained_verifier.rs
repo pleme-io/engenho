@@ -71,11 +71,7 @@ impl ChainedVerifier {
     }
 }
 
-impl crate::named::Named for ChainedVerifier {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
+crate::impl_named_field!(ChainedVerifier);
 
 crate::impl_observable!(ChainedVerifier, crate::mirante::ChildCountSnapshot);
 

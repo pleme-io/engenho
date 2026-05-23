@@ -28,7 +28,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::named::Named;
 use crate::relogio::{Clock, Instant};
 
 /// Budget errors.
@@ -241,11 +240,7 @@ impl Budget {
     }
 }
 
-impl Named for Budget {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
+crate::impl_named_field!(Budget);
 
 // `Budget` is `Observable` — `BudgetSnapshot` plugs directly into
 // a `mirante::ObservationChannel`. v0.92: routed through canonical

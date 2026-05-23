@@ -194,11 +194,7 @@ impl CompositeShapeRenderer {
     }
 }
 
-impl crate::named::Named for CompositeShapeRenderer {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
+crate::impl_named_field!(CompositeShapeRenderer);
 
 crate::impl_observable!(CompositeShapeRenderer, crate::mirante::ChildCountSnapshot);
 
