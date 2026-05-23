@@ -67,6 +67,7 @@ mod mirante_publisher;
 #[cfg(feature = "with-promessa")]
 mod promessa_reconciler;
 mod proposer;
+mod provacao_conduit;
 mod provisioning;
 mod publisher;
 mod remediation;
@@ -105,6 +106,7 @@ pub use mirante_publisher::MirantePublisher;
 #[cfg(feature = "with-promessa")]
 pub use promessa_reconciler::{PromessaIntent, PromessaTargetReconciler, promessa_kind_to_target};
 pub use proposer::{MockProposer, ProposalId, Proposer};
+pub use provacao_conduit::{FonteFault, ProvacaoConduit};
 pub use provisioning::{
     MockProvisioningStage, ProvisioningController, ProvisioningReport, ProvisioningStage,
     StageKind, mock_provisioning_controller,
