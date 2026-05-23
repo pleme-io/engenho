@@ -36,6 +36,31 @@ proptest_with_env! {
         let via_trait: BudgetSnapshot = Observable::snapshot(&budget);
         prop_assert_eq!(inherent, via_trait);
     }
+
+    /// v0.85: `MachineRunner<M>` now implements `Observable`. The
+    /// MachineSnapshot carries (name, state, step_count, is_terminal)
+    /// — substrate self-consumption: every FSM plugs into mirante
+    /// without a per-consumer adapter.
+    #[test]
+    fn machine_runner_observable_carries_state_and_step_count(
+        increments in proptest::collection::vec(1u32..50, 0..6),
+    ) {
+        use engenho_substrate::Observable;
+        let safe_incs: Vec<_> = increments.into_iter().take(6).collect();
+        let clock = frozen_clock(0);
+        let mut runner = MachineRunner::<CounterMachine>::new(clock);
+        for inc in &safe_incs {
+            runner.step(CounterEvent::Inc(*inc)).unwrap();
+        }
+        let snap = Observable::snapshot(&runner);
+        prop_assert_eq!(snap.name, "counter");
+        prop_assert_eq!(snap.step_count, safe_incs.len());
+        prop_assert!(!snap.is_terminal); // CounterMachine never terminates
+        // Trip-back through serde keeps the snapshot intact.
+        let json = serde_json::to_value(&snap).unwrap();
+        prop_assert_eq!(&json["step_count"], &serde_json::json!(safe_incs.len()));
+        prop_assert_eq!(&json["name"], &serde_json::json!("counter"));
+    }
 }
 
 // ── orçamento + mirante: Budget observable via ObservationChannel ──────
