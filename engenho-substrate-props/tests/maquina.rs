@@ -1,8 +1,6 @@
 //! Property: máquina StateMachine + MachineRunner invariants.
 
-use engenho_substrate::{
-    define_named, impl_error_kind, FrozenClock, MachineRunner, StateMachine,
-};
+use engenho_substrate::{FrozenClock, MachineRunner, StateMachine, define_named, impl_error_kind};
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -46,7 +44,7 @@ const CAP: u32 = 100;
 impl StateMachine for CounterMachine {
     type State = CounterState;
     type Event = CounterEvent;
-    type Effect = u32;  // current count after step
+    type Effect = u32; // current count after step
     type Err = CounterErr;
 
     fn initial() -> CounterState {
@@ -63,9 +61,7 @@ impl StateMachine for CounterMachine {
                     Ok((CounterState::Active(next), next))
                 }
             }
-            (CounterState::Active(_), CounterEvent::Reset) => {
-                Ok((CounterState::Active(0), 0))
-            }
+            (CounterState::Active(_), CounterEvent::Reset) => Ok((CounterState::Active(0), 0)),
             (CounterState::Capped, _) => Err(CounterErr::Invalid("capped".into())),
         }
     }
