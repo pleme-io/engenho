@@ -34,6 +34,7 @@ pub mod gossip_ledger;
 pub mod ledger;
 pub mod magic_blob;
 pub mod oci_renderer;
+pub mod pesquisa;
 pub mod promotion;
 pub mod quorum;
 pub mod receipt;
@@ -68,6 +69,12 @@ pub use gossip_ledger::{
 };
 pub use ledger::{LedgerError, LedgerKey, MaterializationLedger, MemoryLedger};
 pub use oci_renderer::{OciDestReader, OciDestRef, OciImageRenderer, OciSourceRef};
+pub use pesquisa::{
+    aptidao_to_receipt, score_ensaio, Aptidao, Arquivo, Ensaio, EnsaioId, Evidence,
+    FakeFitness, FakeSearchSpace, Fitness, FitnessError, Geracao, GeracaoId, Linhagem,
+    NicheKey, PesquisaError, SearchEngine, SearchId, SearchRng, SearchSpace, Selector,
+    TournamentSelector,
+};
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
 pub use quorum::{QuorumOutcome, QuorumTracker};
 pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};
