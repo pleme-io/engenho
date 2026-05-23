@@ -37,6 +37,16 @@
 //! - **Linhagem**: fingerprint() is deterministic + diverges per
 //!   distinct chain.
 //!
+//! ## Cross-crate adoption (v1.15+)
+//!
+//! `proptest_with_env!`, `block_on()`, and the `helpers::*` fixtures
+//! are also consumed by sister crates' integration tests as a
+//! `dev-dependencies` entry. First adopter: `engenho-revoada`
+//! (migrated 8 `proptest!` sites across `topology_invariants.rs`,
+//! `proptest_invariants.rs`, `cross_face_verbs.rs`). The unified
+//! `PROPTEST_CASES` env contract means deep-test CI lifts every
+//! consumer crate's property tests automatically.
+//!
 //! ## Running
 //!
 //! ```bash

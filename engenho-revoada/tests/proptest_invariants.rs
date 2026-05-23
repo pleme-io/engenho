@@ -12,6 +12,7 @@ use engenho_revoada::{
     FormatAdapter, K8sJsonAdapter, K8sYamlAdapter, ReconciliationCadence, RoutingPolicy,
     encode_envelope,
 };
+use engenho_substrate_props::proptest_with_env;
 
 use proptest::prelude::*;
 
@@ -47,7 +48,7 @@ fn raft_cluster(name: &str) -> Cluster {
 
 // ── FabricStrategy invariants ────────────────────────────────────
 
-proptest! {
+proptest_with_env! {
     /// ReconciliationCadence::new rejects zero EXACTLY, accepts
     /// every other u32.
     #[test]
@@ -89,7 +90,7 @@ proptest! {
 
 // ── ResourceRef + ResourceFormat round-trips ────────────────────
 
-proptest! {
+proptest_with_env! {
     /// Any namespaced ResourceRef can be encoded into a CBOR
     /// envelope + decoded back without loss.
     #[test]
@@ -117,7 +118,7 @@ proptest! {
 
 // ── Format adapters extract consistent refs ─────────────────────
 
-proptest! {
+proptest_with_env! {
     /// YAML and JSON adapters extract byte-identical ResourceRef
     /// for equivalent manifests.
     #[test]
@@ -139,7 +140,7 @@ proptest! {
 
 // ── Snapshot determinism + round-trip ────────────────────────────
 
-proptest! {
+proptest_with_env! {
     /// Apply N pods (1..32), snapshot, restore into a fresh
     /// cluster, verify identical resource count.
     #[test]
@@ -182,7 +183,7 @@ proptest! {
 
 // ── Last-writer-wins ─────────────────────────────────────────────
 
-proptest! {
+proptest_with_env! {
     /// N applies to the same ref → last value wins.
     #[test]
     fn last_writer_wins_for_repeated_applies(
@@ -207,7 +208,7 @@ proptest! {
 
 // ── Federation routing ──────────────────────────────────────────
 
-proptest! {
+proptest_with_env! {
     /// NamespacePrefix policy: every apply lands on the routed
     /// member; non-routed members stay empty.
     #[test]
@@ -248,7 +249,7 @@ proptest! {
 
 // ── Topology min_nodes invariant ────────────────────────────────
 
-proptest! {
+proptest_with_env! {
     /// For every pre-packed topology, ClusterDeclaration::new
     /// rejects a 3-quorum strategy iff topology.min_nodes() < 3.
     #[test]
