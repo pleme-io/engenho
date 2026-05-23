@@ -119,6 +119,43 @@ impl<E: Clone> ReplayCursor<E> {
 
 crate::impl_named_field_generic!(ReplayCursor, E: Clone);
 
+/// Observable snapshot of a `ReplayCursor<E>` — cursor progress
+/// metadata (name + position + len + remaining + is_done). Pattern
+/// #2 (SSC v0.99): ReplayCursor's progress becomes plottable on
+/// any mirante dashboard without per-consumer adapter.
+///
+/// Note: the snapshot does NOT include the cursor's E-typed events
+/// (could be large + would conflict with the generic bound). Just
+/// the metadata that operators need for "how far through replay
+/// are we" telemetry.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplayCursorSnapshot {
+    /// Cursor name (telemetry identifier).
+    pub name: &'static str,
+    /// Current 0-based position (0..=len).
+    pub position: usize,
+    /// Total event count.
+    pub len: usize,
+    /// Remaining events to consume from current position.
+    pub remaining: usize,
+    /// True when position == len (no more events).
+    pub is_done: bool,
+}
+
+impl<E: Clone + Send + Sync + 'static> crate::mirante::Observable for ReplayCursor<E> {
+    type Snapshot = ReplayCursorSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        ReplayCursorSnapshot {
+            name: <Self as crate::named::Named>::name(self),
+            position: self.position(),
+            len: self.len(),
+            remaining: self.remaining(),
+            is_done: self.is_done(),
+        }
+    }
+}
+
 /// Drive a `MachineRunner<M>` through every remaining event in
 /// `cursor`. Stops on first machine error OR when cursor is
 /// exhausted; returns the number of events actually applied.
