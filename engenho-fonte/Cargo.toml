@@ -18,6 +18,10 @@ default = []
 # (already in the workspace). Operator gets to compose: mock proposer
 # for unit tests, real revoada proposer for integration/cluster runs.
 with-revoada = ["dep:engenho-revoada"]
+# Real shikumi-notify-backed Watcher. Pulls in pleme-io/shikumi via
+# a cross-workspace path dep. Default off — file-watch consumers
+# enable explicitly.
+with-shikumi = ["dep:shikumi", "dep:notify"]
 
 [dependencies]
 async-trait            = { workspace = true }
@@ -34,8 +38,15 @@ engenho-substrate      = { workspace = true }
 engenho-sui-typescape  = { workspace = true }
 # Optional — enabled by `with-revoada`.
 engenho-revoada        = { workspace = true, optional = true }
+# Optional — enabled by `with-shikumi`. Cross-workspace path dep
+# (shikumi is the cross-fleet config primitive; not in this workspace).
+shikumi                = { path = "../../shikumi", optional = true }
+# Optional — re-exported by `shikumi`'s ConfigWatcher callback shape.
+# Pulled at the same feature flag so the dep set matches shikumi.
+notify                 = { version = "8.2", optional = true }
 
 [dev-dependencies]
 tokio                  = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
 proptest               = "1"
 engenho-substrate-props = { workspace = true }
+tempfile               = "3"
