@@ -25,6 +25,10 @@ anyhow             = { workspace = true }
 engenho-types      = { workspace = true }
 engenho-config     = { workspace = true }
 
+# Substrate: typed Clock for audit-event timestamps + future relógio
+# adoption across consensus / membership / backend timestamping.
+engenho-substrate  = { workspace = true }
+
 # Layer A — chitchat gossip + phi-accrual failure detector.
 chitchat           = { workspace = true }
 
