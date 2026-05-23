@@ -43,6 +43,18 @@ pub enum WorkloadShape {
 }
 
 impl WorkloadShape {
+    /// Project a [`Realisation`] into its native shape. Every
+    /// Realisation IS a NixClosure by definition (it's the output
+    /// of a Drv); upper layers re-render via [`ShapeRenderer`] for
+    /// other shapes.
+    ///
+    /// Returns `None` if the realisation has no NAR hash (cache
+    /// only carries the path; the NAR hasn't been fetched yet).
+    #[must_use]
+    pub fn from_realisation(_r: &crate::derivation::Realisation) -> Self {
+        WorkloadShape::NixClosure
+    }
+
     /// Stable identifier (snake_case) used as a tag in receipts
     /// + cache keys. Mirrors the serde rename — keeps consistency
     /// between in-process matching + on-wire receipts.
@@ -284,6 +296,21 @@ mod tests {
         assert_eq!(a.bytes, b"hello");
         assert_eq!(a.evidence_hash, *blake3::hash(b"hello").as_bytes());
         assert_eq!(a.shape, WorkloadShape::Wasm);
+    }
+
+    #[test]
+    fn from_realisation_projects_to_nix_closure() {
+        use crate::derivation::{DrvHash, OutputPath, Realisation};
+        let r = Realisation {
+            drv_hash: DrvHash::from_bytes(b"d"),
+            output_name: "out".into(),
+            output_path: OutputPath::new("/nix/store/a-out"),
+            nar_hash: None,
+        };
+        assert_eq!(
+            WorkloadShape::from_realisation(&r),
+            WorkloadShape::NixClosure
+        );
     }
 
     #[test]

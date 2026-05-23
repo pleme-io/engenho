@@ -30,8 +30,10 @@ pub mod promotion;
 pub mod quorum;
 pub mod receipt;
 pub mod retrying_cache;
+pub mod roca;
 pub mod shape;
 pub mod tiered_cache;
+pub mod verifier;
 pub mod watched_cache;
 
 pub use atomic_write::{AtomicWriteError, write_atomic};
@@ -45,6 +47,11 @@ pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
 pub use quorum::{QuorumOutcome, QuorumTracker};
 pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};
 pub use retrying_cache::{BackoffConfig, RetryingCacheBackend};
+pub use roca::{
+    ConfirmacaoPolicy, JobTarget, MaterializationJob, Placement, Plantio, PlantioError,
+    Stage, StageId,
+};
 pub use shape::{RenderedArtifact, ShapeError, ShapeRenderer, WorkloadShape};
 pub use tiered_cache::TieredCache;
+pub use verifier::{FakeVerifier, Verificacao, VerificationReceipt, VerifierId, Verifier, VerifyError};
 pub use watched_cache::{CacheEvent, WatchedCache};
