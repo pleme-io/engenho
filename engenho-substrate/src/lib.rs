@@ -13,16 +13,22 @@
 //!   * [`magic_blob`] — versioned magic header + BLAKE3-hashed
 //!     payload format for any disk artifact that needs corruption
 //!     detection + forward-compatible version bumps
-//!
-//! Both are no-async-runtime helpers; they only need `std::fs` +
-//! `serde` + `blake3`.
+//!   * [`derivation`] — typed Nix-derivation primitive +
+//!     `DerivationCacheBackend` pluggable trait. Sui-as-substrate:
+//!     derivations become a location-independent typed value the
+//!     engenho fabric can move + cache anywhere.
 
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
 #![allow(clippy::module_name_repetitions)]
 
 pub mod atomic_write;
+pub mod derivation;
 pub mod magic_blob;
 
 pub use atomic_write::{AtomicWriteError, write_atomic};
+pub use derivation::{
+    CacheError, DerivationCacheBackend, Drv, DrvHash, MemoryDerivationCache, NarBlob,
+    NarHash, OutputPath, Realisation,
+};
 pub use magic_blob::{MagicBlob, MagicBlobError};
