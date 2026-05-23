@@ -98,11 +98,7 @@ impl WatchedCache {
 )]
 pub type WatchedCacheSnapshot = crate::mirante::SubscriberSnapshot;
 
-impl crate::named::Named for WatchedCache {
-    fn name(&self) -> &'static str {
-        "watched"
-    }
-}
+crate::define_named!(WatchedCache, "watched");
 
 impl crate::mirante::Observable for WatchedCache {
     type Snapshot = crate::mirante::SubscriberSnapshot;

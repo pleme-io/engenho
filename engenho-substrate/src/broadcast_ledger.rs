@@ -91,11 +91,7 @@ impl BroadcastLedger {
 )]
 pub type BroadcastLedgerSnapshot = crate::mirante::SubscriberSnapshot;
 
-impl crate::named::Named for BroadcastLedger {
-    fn name(&self) -> &'static str {
-        "broadcast"
-    }
-}
+crate::define_named!(BroadcastLedger, "broadcast");
 
 impl crate::mirante::Observable for BroadcastLedger {
     type Snapshot = crate::mirante::SubscriberSnapshot;

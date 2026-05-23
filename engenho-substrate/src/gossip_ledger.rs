@@ -156,11 +156,7 @@ impl FakeGossipTransport {
     }
 }
 
-impl crate::named::Named for FakeGossipTransport {
-    fn name(&self) -> &'static str {
-        "fake-gossip"
-    }
-}
+crate::define_named!(FakeGossipTransport, "fake-gossip");
 
 /// Third site (v0.87 TSR completion): `FakeGossipTransport` joins
 /// `BroadcastLedger` + `WatchedCache` as Observable wrappers all
