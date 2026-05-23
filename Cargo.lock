@@ -1044,6 +1044,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-substrate-props"
+version = "0.1.4"
+dependencies = [
+ "engenho-substrate",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "engenho-teia"
 version = "0.1.4"
 dependencies = [
