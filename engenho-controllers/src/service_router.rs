@@ -190,6 +190,339 @@ impl ServiceRouter for FakeRouter {
 }
 
 // =================================================================
+// IptablesRouter — Linux production backend (R11b)
+// =================================================================
+
+/// Production ServiceRouter for Linux nodes. Renders the desired
+/// state as iptables rules + applies them via `iptables-restore`.
+///
+/// Per the org's NO SHELL rule, this is the ONE acceptable
+/// shell-out site for ServiceRouter — the integration boundary
+/// itself, not orchestration glue.
+///
+/// ## Approach
+///
+/// Each `upsert` builds a fully-formed iptables-restore script
+/// for the `KUBE-SERVICES` + `KUBE-SVC-{hash}` + `KUBE-SEP-{hash}`
+/// chain hierarchy + pipes it to `iptables-restore --noflush`.
+/// The same idempotent rule structure kube-proxy's iptables mode
+/// uses. Removal flushes the relevant chains.
+///
+/// In-memory tracking of installed routes (so `list` returns the
+/// authoritative state without re-parsing iptables-save output).
+#[derive(Clone)]
+pub struct IptablesRouter {
+    /// Binary path; default `iptables-restore`.
+    binary: String,
+    inner: Arc<Mutex<IptablesState>>,
+}
+
+#[derive(Default)]
+struct IptablesState {
+    /// Routes the router has installed.
+    routes: BTreeMap<String, ServiceRoute>,
+}
+
+impl Default for IptablesRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IptablesRouter {
+    /// New router using `iptables-restore` from `$PATH`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_binary("iptables-restore")
+    }
+
+    /// New router with an explicit binary path. Useful for testing
+    /// against `iptables-legacy-restore` or for shimming in CI.
+    #[must_use]
+    pub fn with_binary(binary: impl Into<String>) -> Self {
+        Self {
+            binary: binary.into(),
+            inner: Arc::new(Mutex::new(IptablesState::default())),
+        }
+    }
+
+    /// Render the iptables-restore script for one route. Pure —
+    /// no I/O. Test helper exposed publicly so callers can inspect
+    /// what the router would emit.
+    #[must_use]
+    pub fn render_script(route: &ServiceRoute) -> String {
+        let chain_svc = chain_name("KUBE-SVC", &route.service_id);
+        let mut script = String::new();
+        script.push_str("*nat\n");
+        script.push_str(&format!(":{chain_svc} - [0:0]\n"));
+        for port in &route.ports {
+            // Hit the per-service chain from KUBE-SERVICES.
+            script.push_str(&format!(
+                "-A KUBE-SERVICES -d {}/32 -p {} --dport {} -j {chain_svc}\n",
+                route.cluster_ip,
+                port.protocol.to_lowercase(),
+                port.service_port
+            ));
+            // For each pod IP, install a per-endpoint chain.
+            for (i, pod_ip) in route.endpoints.iter().enumerate() {
+                let chain_ep = chain_name("KUBE-SEP", &format!("{}-{}-{i}", route.service_id, pod_ip));
+                script.push_str(&format!(":{chain_ep} - [0:0]\n"));
+                // Round-robin via statistic mode random; first endpoint
+                // gets 1/N, second 1/(N-1) etc.
+                let remaining = route.endpoints.len() - i;
+                let probability = format!("--probability {:.6}", 1.0 / (remaining as f64));
+                script.push_str(&format!(
+                    "-A {chain_svc} -m statistic --mode random {probability} -j {chain_ep}\n"
+                ));
+                // The endpoint chain DNATs to the pod.
+                script.push_str(&format!(
+                    "-A {chain_ep} -p {} -j DNAT --to-destination {pod_ip}:{}\n",
+                    port.protocol.to_lowercase(),
+                    port.target_port
+                ));
+            }
+        }
+        script.push_str("COMMIT\n");
+        script
+    }
+
+    async fn run_restore(&self, script: &str) -> Result<(), RouterError> {
+        use std::process::Stdio;
+        let mut cmd = tokio::process::Command::new(&self.binary);
+        cmd.arg("--noflush")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| RouterError::Backend(format!("{} spawn: {e}", self.binary)))?;
+        use tokio::io::AsyncWriteExt;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(script.as_bytes())
+                .await
+                .map_err(|e| RouterError::Backend(format!("stdin write: {e}")))?;
+            stdin
+                .shutdown()
+                .await
+                .map_err(|e| RouterError::Backend(format!("stdin close: {e}")))?;
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| RouterError::Backend(format!("wait: {e}")))?;
+        if !out.status.success() {
+            return Err(RouterError::Backend(format!(
+                "{} exit {:?}: {}",
+                self.binary,
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Hash a free-form id to a 12-char iptables-chain-safe suffix.
+fn chain_name(prefix: &str, key: &str) -> String {
+    let hash = blake3::hash(key.as_bytes());
+    let hex = hash.to_hex();
+    format!("{prefix}-{}", &hex.as_str()[..12].to_uppercase())
+}
+
+#[async_trait]
+impl ServiceRouter for IptablesRouter {
+    fn name(&self) -> &'static str {
+        "iptables"
+    }
+
+    async fn upsert(&self, route: &ServiceRoute) -> Result<(), RouterError> {
+        if route.service_id.is_empty() {
+            return Err(RouterError::InvalidRoute("empty service_id".into()));
+        }
+        let script = Self::render_script(route);
+        self.run_restore(&script).await?;
+        let mut state = self.inner.lock().await;
+        state.routes.insert(route.service_id.clone(), route.clone());
+        Ok(())
+    }
+
+    async fn remove(&self, service_id: &str) -> Result<(), RouterError> {
+        let chain_svc = chain_name("KUBE-SVC", service_id);
+        // Flush + delete the per-service chain.
+        let script = format!(
+            "*nat\n:{chain_svc} - [0:0]\n-F {chain_svc}\n-X {chain_svc}\nCOMMIT\n"
+        );
+        // Errors on remove are tolerated when the chain is already gone.
+        let _ = self.run_restore(&script).await;
+        let mut state = self.inner.lock().await;
+        state.routes.remove(service_id);
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<BTreeMap<String, ServiceRoute>, RouterError> {
+        Ok(self.inner.lock().await.routes.clone())
+    }
+}
+
+// =================================================================
+// IPVSRouter — R11c — scalable backend (>1k services)
+// =================================================================
+
+/// IPVS-backed router. Production backend for large clusters
+/// where iptables rule walking becomes O(n) per packet (≥1000
+/// services). IPVS uses hash-based virtual-server lookup → O(1)
+/// regardless of cluster size.
+///
+/// Per the NO SHELL rule, this shells out to `ipvsadm` — the
+/// integration boundary. Future R11d swaps in netlink-direct
+/// IPVS control via the `ipvs` crate (no shell).
+#[derive(Clone)]
+pub struct IpvsRouter {
+    binary: String,
+    inner: Arc<Mutex<IpvsState>>,
+}
+
+#[derive(Default)]
+struct IpvsState {
+    routes: BTreeMap<String, ServiceRoute>,
+}
+
+impl Default for IpvsRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IpvsRouter {
+    /// New router using `ipvsadm` from `$PATH`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_binary("ipvsadm")
+    }
+
+    /// New router with explicit binary path.
+    #[must_use]
+    pub fn with_binary(binary: impl Into<String>) -> Self {
+        Self {
+            binary: binary.into(),
+            inner: Arc::new(Mutex::new(IpvsState::default())),
+        }
+    }
+
+    /// Render the ipvsadm script for one route. Pure — no I/O.
+    ///
+    /// Format: sequence of `-A` (add-service) + `-a` (add-real-server)
+    /// lines that ipvsadm-restore consumes.
+    #[must_use]
+    pub fn render_script(route: &ServiceRoute) -> String {
+        let mut out = String::new();
+        for port in &route.ports {
+            // -A: add virtual service. -t = TCP, -u = UDP.
+            let proto_flag = match port.protocol.to_uppercase().as_str() {
+                "UDP" => "-u",
+                _ => "-t",
+            };
+            out.push_str(&format!(
+                "-A {proto_flag} {}:{} -s rr\n",
+                route.cluster_ip, port.service_port
+            ));
+            for pod_ip in &route.endpoints {
+                // -a: add real server. -m = masquerade (NAT).
+                out.push_str(&format!(
+                    "-a {proto_flag} {}:{} -r {pod_ip}:{} -m\n",
+                    route.cluster_ip, port.service_port, port.target_port
+                ));
+            }
+        }
+        out
+    }
+
+    async fn run_restore(&self, script: &str) -> Result<(), RouterError> {
+        use std::process::Stdio;
+        let mut cmd = tokio::process::Command::new(&self.binary);
+        cmd.arg("-R")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| RouterError::Backend(format!("{} spawn: {e}", self.binary)))?;
+        use tokio::io::AsyncWriteExt;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(script.as_bytes())
+                .await
+                .map_err(|e| RouterError::Backend(format!("stdin write: {e}")))?;
+            stdin
+                .shutdown()
+                .await
+                .map_err(|e| RouterError::Backend(format!("stdin close: {e}")))?;
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| RouterError::Backend(format!("wait: {e}")))?;
+        if !out.status.success() {
+            return Err(RouterError::Backend(format!(
+                "{} exit {:?}: {}",
+                self.binary,
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ServiceRouter for IpvsRouter {
+    fn name(&self) -> &'static str {
+        "ipvs"
+    }
+
+    async fn upsert(&self, route: &ServiceRoute) -> Result<(), RouterError> {
+        if route.service_id.is_empty() {
+            return Err(RouterError::InvalidRoute("empty service_id".into()));
+        }
+        let script = Self::render_script(route);
+        self.run_restore(&script).await?;
+        let mut state = self.inner.lock().await;
+        state.routes.insert(route.service_id.clone(), route.clone());
+        Ok(())
+    }
+
+    async fn remove(&self, service_id: &str) -> Result<(), RouterError> {
+        // Delete each virtual service this route owned.
+        let route = {
+            let state = self.inner.lock().await;
+            state.routes.get(service_id).cloned()
+        };
+        if let Some(route) = route {
+            let mut script = String::new();
+            for port in &route.ports {
+                let proto_flag = match port.protocol.to_uppercase().as_str() {
+                    "UDP" => "-u",
+                    _ => "-t",
+                };
+                script.push_str(&format!(
+                    "-D {proto_flag} {}:{}\n",
+                    route.cluster_ip, port.service_port
+                ));
+            }
+            let _ = self.run_restore(&script).await;
+        }
+        let mut state = self.inner.lock().await;
+        state.routes.remove(service_id);
+        Ok(())
+    }
+
+    async fn list(&self) -> Result<BTreeMap<String, ServiceRoute>, RouterError> {
+        Ok(self.inner.lock().await.routes.clone())
+    }
+}
+
+// =================================================================
 // ServiceRoutingController — reads store, drives the backend
 // =================================================================
 
@@ -479,6 +812,129 @@ mod tests {
     fn error_kinds_are_stable() {
         assert_eq!(RouterError::Backend("x".into()).kind(), "backend");
         assert_eq!(RouterError::InvalidRoute("x".into()).kind(), "invalid_route");
+    }
+
+    #[test]
+    fn ipvs_router_render_script_contains_virtual_services() {
+        let route = ServiceRoute {
+            service_id: "default/podinfo".into(),
+            cluster_ip: "10.96.5.1".into(),
+            ports: vec![PortMap {
+                name: "http".into(),
+                service_port: 80,
+                target_port: 9898,
+                protocol: "TCP".into(),
+            }],
+            endpoints: ["10.42.0.1".to_string(), "10.42.0.2".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        let script = IpvsRouter::render_script(&route);
+        assert!(script.contains("-A -t 10.96.5.1:80 -s rr"));
+        assert!(script.contains("-a -t 10.96.5.1:80 -r 10.42.0.1:9898 -m"));
+        assert!(script.contains("-a -t 10.96.5.1:80 -r 10.42.0.2:9898 -m"));
+    }
+
+    #[test]
+    fn ipvs_router_renders_udp_with_u_flag() {
+        let route = ServiceRoute {
+            service_id: "default/dns".into(),
+            cluster_ip: "10.96.0.10".into(),
+            ports: vec![PortMap {
+                name: "dns".into(),
+                service_port: 53,
+                target_port: 53,
+                protocol: "UDP".into(),
+            }],
+            endpoints: ["10.42.0.5".to_string()].into_iter().collect(),
+        };
+        let script = IpvsRouter::render_script(&route);
+        assert!(script.contains("-A -u 10.96.0.10:53"));
+        assert!(script.contains("-a -u 10.96.0.10:53 -r 10.42.0.5:53"));
+    }
+
+    #[test]
+    fn ipvs_router_name_is_stable() {
+        assert_eq!(IpvsRouter::new().name(), "ipvs");
+    }
+
+    #[test]
+    fn ipvs_with_binary_uses_path() {
+        let r = IpvsRouter::with_binary("/usr/sbin/ipvsadm");
+        assert_eq!(r.binary, "/usr/sbin/ipvsadm");
+    }
+
+    #[tokio::test]
+    async fn ipvs_rejects_empty_service_id() {
+        let r = IpvsRouter::with_binary("/nonexistent-binary");
+        let route = ServiceRoute {
+            service_id: String::new(),
+            cluster_ip: "10.0.0.1".into(),
+            ports: vec![],
+            endpoints: BTreeSet::new(),
+        };
+        let err = r.upsert(&route).await.unwrap_err();
+        assert_eq!(err.kind(), "invalid_route");
+    }
+
+    #[test]
+    fn iptables_router_render_script_contains_chains() {
+        let route = ServiceRoute {
+            service_id: "default/podinfo".into(),
+            cluster_ip: "10.96.5.1".into(),
+            ports: vec![PortMap {
+                name: "http".into(),
+                service_port: 80,
+                target_port: 9898,
+                protocol: "TCP".into(),
+            }],
+            endpoints: ["10.42.0.1".to_string(), "10.42.0.2".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        let script = IptablesRouter::render_script(&route);
+        assert!(script.starts_with("*nat\n"));
+        assert!(script.ends_with("COMMIT\n"));
+        assert!(script.contains("-A KUBE-SERVICES -d 10.96.5.1/32 -p tcp --dport 80"));
+        assert!(script.contains("DNAT --to-destination 10.42.0.1:9898"));
+        assert!(script.contains("DNAT --to-destination 10.42.0.2:9898"));
+        assert!(script.contains("-m statistic --mode random"));
+    }
+
+    #[test]
+    fn iptables_chain_name_is_deterministic_short_hex() {
+        let n = chain_name("KUBE-SVC", "default/podinfo");
+        assert!(n.starts_with("KUBE-SVC-"));
+        // 12 hex chars (uppercase).
+        let suffix = n.trim_start_matches("KUBE-SVC-");
+        assert_eq!(suffix.len(), 12);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        // Determinism: same input → same chain name.
+        assert_eq!(n, chain_name("KUBE-SVC", "default/podinfo"));
+    }
+
+    #[test]
+    fn iptables_router_name_is_stable() {
+        assert_eq!(IptablesRouter::new().name(), "iptables");
+    }
+
+    #[test]
+    fn iptables_with_binary_uses_path() {
+        let r = IptablesRouter::with_binary("/sbin/iptables-restore");
+        assert_eq!(r.binary, "/sbin/iptables-restore");
+    }
+
+    #[tokio::test]
+    async fn iptables_rejects_empty_service_id() {
+        let r = IptablesRouter::with_binary("/nonexistent-binary");
+        let route = ServiceRoute {
+            service_id: String::new(),
+            cluster_ip: "10.0.0.1".into(),
+            ports: vec![],
+            endpoints: BTreeSet::new(),
+        };
+        let err = r.upsert(&route).await.unwrap_err();
+        assert_eq!(err.kind(), "invalid_route");
     }
 
     #[test]

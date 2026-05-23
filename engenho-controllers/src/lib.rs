@@ -36,6 +36,7 @@ pub mod gc;
 pub mod owner;
 pub mod replicaset;
 pub mod runtime;
+pub mod dns;
 pub mod selector;
 pub mod service_router;
 pub mod watch_driver;
@@ -49,8 +50,12 @@ pub use owner::{controlling_owner, is_owned_by, set_owner_reference, OwnerRefere
 pub use replicaset::ReplicaSetController;
 pub use runtime::{ControllerRuntime, RuntimeConfig};
 pub use selector::{matches_labels, selector_match_labels, service_selector};
+pub use dns::{
+    srv_fqdn, DnsBackend, DnsController, DnsError, DnsEvent, DnsRecord,
+    InMemoryDnsZone, SrvRecord, DEFAULT_CLUSTER_DOMAIN,
+};
 pub use service_router::{
-    FakeRouter, FakeRouterEvent, PortMap, RouterError, ServiceRoute, ServiceRouter,
-    ServiceRoutingController,
+    FakeRouter, FakeRouterEvent, IptablesRouter, IpvsRouter, PortMap, RouterError,
+    ServiceRoute, ServiceRouter, ServiceRoutingController,
 };
 pub use watch_driver::{KindFilter, WatchDriver, WatchDriverConfig};
