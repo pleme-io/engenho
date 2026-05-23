@@ -1,6 +1,7 @@
 //! Property: PromotionPolicy decisions match their declared semantics.
 
 use engenho_substrate::{PromotionContext, PromotionGate, PromotionPolicy};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
 fn ctx(source: usize, total: usize) -> PromotionContext {
@@ -10,15 +11,7 @@ fn ctx(source: usize, total: usize) -> PromotionContext {
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Eager always promotes to source_tier (when source > 0).
     #[test]
     fn eager_always_promotes_above_l0(

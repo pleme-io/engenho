@@ -1,6 +1,7 @@
 //! Property: orçamento Budget invariants.
 
 use engenho_substrate::{Budget, BudgetError, FrozenClock};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -10,15 +11,7 @@ fn budget(cap: u64, rate: u64) -> (Budget, Arc<FrozenClock>) {
     (b, clock)
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Fresh budget always starts at capacity.
     #[test]
     fn fresh_budget_starts_at_capacity(cap in 1u64..1_000_000, rate in 0u64..10_000) {

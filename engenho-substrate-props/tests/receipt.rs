@@ -1,6 +1,7 @@
 //! Property: MaterializationReceipt round-trip + content-addressed id.
 
 use engenho_substrate::{MaterializationReceipt, NodeId, ReceiptKind};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
 fn receipt_kind_strategy() -> impl Strategy<Value = ReceiptKind> {
@@ -13,15 +14,7 @@ fn receipt_kind_strategy() -> impl Strategy<Value = ReceiptKind> {
     ]
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Receipt round-trips through serde_json.
     #[test]
     fn receipt_serde_round_trip(

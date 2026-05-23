@@ -3,6 +3,7 @@
 use engenho_substrate::{
     MaterializationReceipt, NodeId, QuorumOutcome, QuorumTracker, ReceiptKind,
 };
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
 fn receipt(emitter_byte: u8, evidence_byte: u8) -> MaterializationReceipt {
@@ -14,15 +15,7 @@ fn receipt(emitter_byte: u8, evidence_byte: u8) -> MaterializationReceipt {
     )
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Ingest order doesn't affect final outcome (commutative).
     #[test]
     fn ingest_order_commutative(

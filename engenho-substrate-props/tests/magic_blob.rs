@@ -2,6 +2,7 @@
 //! rejected.
 
 use engenho_substrate::MagicBlob;
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -14,15 +15,7 @@ struct Payload {
     bytes: Vec<u8>,
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// encode → decode produces the original value.
     #[test]
     fn encode_decode_round_trips(

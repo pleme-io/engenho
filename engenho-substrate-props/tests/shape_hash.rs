@@ -2,6 +2,7 @@
 //! per (shape, drv_hash_hex) pair.
 
 use engenho_substrate::WorkloadShape;
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
 fn shape_strategy() -> impl Strategy<Value = WorkloadShape> {
@@ -20,15 +21,7 @@ fn drv_hex_strategy() -> impl Strategy<Value = String> {
     "[0-9a-f]{64}".prop_map(|s| s)
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Same shape + same drv_hash_hex → byte-identical shape_hash.
     #[test]
     fn shape_hash_is_deterministic(

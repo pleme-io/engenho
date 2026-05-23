@@ -1,6 +1,7 @@
 //! Property: mirante ObservationChannel + Mirante registry invariants.
 
 use engenho_substrate::{Clock, FrozenClock, Mirante, ObservationChannel};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -8,15 +9,7 @@ fn frozen(t: u64) -> Arc<dyn Clock> {
     Arc::new(FrozenClock::at(t))
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Sequence of publishes: current() always equals the last published value.
     #[test]
     fn current_equals_last_published(

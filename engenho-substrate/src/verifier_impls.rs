@@ -18,6 +18,7 @@
 //!     outcome if the independent rebuild produces a different
 //!     hash from the primary materializer's claim.
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -1,17 +1,10 @@
 //! Property: relógio HLC + Instant invariants.
 
 use engenho_substrate::{Clock, FrozenClock, HlcClock, Instant, LogicalClock};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Instant pack/unpack is lossless within 48-bit physical range.
     #[test]
     fn instant_pack_round_trip(
