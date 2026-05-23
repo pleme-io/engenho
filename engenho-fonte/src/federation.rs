@@ -65,6 +65,12 @@ impl FederationBroker {
     /// Announce a Sistema change to every federated peer. Returns
     /// the assigned monotone federation revision.
     pub fn announce(&self, source: Arc<str>, source_text: Arc<str>) -> u64 {
+        self.announce_with_revision(source, source_text)
+    }
+
+    /// Synchronous variant returning the assigned revision — used
+    /// by the [`crate::GossipBroker`] adapter impl.
+    pub fn announce_with_revision(&self, source: Arc<str>, source_text: Arc<str>) -> u64 {
         let revision = self.revision.fetch_add(1, Ordering::SeqCst);
         let change = Change {
             source,
