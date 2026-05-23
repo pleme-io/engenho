@@ -250,6 +250,7 @@ crate::impl_observable!(Budget, BudgetSnapshot);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::named::Named;
     use crate::relogio::FrozenClock;
 
     fn budget(cap: u64, rate: u64, t0: u64) -> (Budget, Arc<FrozenClock>) {
