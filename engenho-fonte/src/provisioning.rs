@@ -36,7 +36,7 @@ use std::sync::Mutex;
 
 /// Typed identifier of a single provisioning stage. Used for
 /// telemetry + DAG ordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StageKind {
     /// Cloud VM / pod allocation (magma layer).
