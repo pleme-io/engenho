@@ -38,6 +38,7 @@ pub mod fingerprint;
 pub mod hex;
 pub mod ledger;
 pub mod magic_blob;
+pub mod maquina;
 pub mod named;
 pub mod oci_renderer;
 pub mod pesquisa;
@@ -79,6 +80,7 @@ pub use gossip_ledger::{
     GossipDelivery, GossipError, GossipLedger,
 };
 pub use ledger::{LedgerError, LedgerKey, MaterializationLedger, MemoryLedger};
+pub use maquina::{MachineError, MachineRunner, StateMachine, TransitionRecord};
 pub use oci_renderer::{OciDestReader, OciDestRef, OciImageRenderer, OciSourceRef};
 pub use pesquisa::{
     aptidao_to_receipt, score_ensaio, Aptidao, Arquivo, Ensaio, EnsaioId, Evidence,
