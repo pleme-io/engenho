@@ -1,6 +1,6 @@
 //! Property: provação Provacao injector invariants.
 
-use engenho_substrate::{Clock, FrozenClock, Policy, Provacao, impl_error_kind};
+use engenho_substrate::{Clock, Policy, Provacao, impl_error_kind};
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ impl_error_kind! {
 }
 
 fn clock(t: u64) -> Arc<dyn Clock> {
-    Arc::new(FrozenClock::at(t))
+    engenho_substrate_props::helpers::frozen_clock(t)
 }
 
 proptest_with_env! {
@@ -113,7 +113,7 @@ proptest_with_env! {
         let policy_start = start;
         let policy_end = end;
         let sample_t = (start as i64 + sample_offset).max(0) as u64;
-        let c = Arc::new(FrozenClock::at(sample_t));
+        let c = engenho_substrate_props::helpers::frozen_clock(sample_t);
         let p = Provacao::<Fault>::new("test", 0).with_policy(Policy::TimeWindow {
             fault: Fault::Timeout,
             start_ms: policy_start,

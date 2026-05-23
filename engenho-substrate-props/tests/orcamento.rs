@@ -6,7 +6,7 @@ use proptest::prelude::*;
 use std::sync::Arc;
 
 fn budget(cap: u64, rate: u64) -> (Budget, Arc<FrozenClock>) {
-    let clock = Arc::new(FrozenClock::at(0));
+    let clock = engenho_substrate_props::helpers::frozen_clock(0);
     let b = Budget::new("test", cap, rate, clock.clone());
     (b, clock)
 }

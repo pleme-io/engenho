@@ -1,10 +1,9 @@
 //! Property: máquina StateMachine + MachineRunner invariants.
 
-use engenho_substrate::{FrozenClock, MachineRunner, StateMachine, define_named, impl_error_kind};
+use engenho_substrate::{MachineRunner, StateMachine, define_named, impl_error_kind};
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use thiserror::Error;
 
 // ── Counter machine: increments u32, terminal at MAX ─────────
@@ -73,7 +72,7 @@ impl StateMachine for CounterMachine {
 }
 
 fn make_runner() -> MachineRunner<CounterMachine> {
-    MachineRunner::new(Arc::new(FrozenClock::at(0)))
+    MachineRunner::new(engenho_substrate_props::helpers::frozen_clock(0))
 }
 
 proptest_with_env! {
@@ -185,7 +184,7 @@ proptest_with_env! {
         n_steps in 2usize..16,
         step_ms in 1u64..100,
     ) {
-        let clock = Arc::new(FrozenClock::at(0));
+        let clock = engenho_substrate_props::helpers::frozen_clock(0);
         let mut r = MachineRunner::<CounterMachine>::new(clock.clone());
         for _ in 0..n_steps {
             if r.is_terminal() {
