@@ -43,6 +43,7 @@ pub mod crd_validator;
 pub mod dns;
 pub mod drv;
 pub mod drv_build;
+pub mod event_driven;
 pub mod hpa;
 pub mod ingress;
 pub mod job;
@@ -52,6 +53,7 @@ pub mod selector;
 pub mod service_router;
 pub mod statefulset;
 pub mod tiered_build;
+pub mod tiered_reconciler;
 pub mod watch_driver;
 
 pub use controller::{Controller, ReconcileReport};
@@ -90,7 +92,9 @@ pub use drv::DrvController;
 pub use drv_build::{
     BuildBackend, BuildError, BuildResult, DrvBuildController, FakeBuildBackend,
 };
+pub use event_driven::EventDrivenController;
 pub use tiered_build::TieredBuildBackend;
+pub use tiered_reconciler::{PromotionScope, StaticPromotionScope, TieredCacheReconciler};
 pub use hpa::{
     FakeMetricsProvider, HorizontalPodAutoscalerController, MetricsError,
     MetricsProvider, ScaleTarget,

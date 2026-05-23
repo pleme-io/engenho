@@ -27,6 +27,7 @@ pub mod derivation;
 pub mod drv_disk;
 pub mod magic_blob;
 pub mod promotion;
+pub mod retrying_cache;
 pub mod tiered_cache;
 pub mod watched_cache;
 
@@ -38,5 +39,6 @@ pub use derivation::{
 pub use drv_disk::DiskDerivationCache;
 pub use magic_blob::{MagicBlob, MagicBlobError};
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
+pub use retrying_cache::{BackoffConfig, RetryingCacheBackend};
 pub use tiered_cache::TieredCache;
 pub use watched_cache::{CacheEvent, WatchedCache};
