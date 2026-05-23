@@ -24,6 +24,7 @@ anyhow             = { workspace = true }
 engenho-types      = { workspace = true }
 engenho-store      = { workspace = true }
 engenho-config     = { workspace = true }
+engenho-substrate  = { workspace = true }
 blake3             = "1"
 
 [dev-dependencies]

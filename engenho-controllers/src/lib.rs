@@ -36,7 +36,9 @@ pub mod gc;
 pub mod owner;
 pub mod replicaset;
 pub mod runtime;
+pub mod admission;
 pub mod dns;
+pub mod drv;
 pub mod hpa;
 pub mod ingress;
 pub mod job;
@@ -69,6 +71,11 @@ pub use network_policy::{
     CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,
     NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,
 };
+pub use admission::{
+    AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionError, AdmissionMode,
+    AdmissionRequest, AdmissionWebhook, FakeAdmissionWebhook,
+};
+pub use drv::DrvController;
 pub use hpa::{
     FakeMetricsProvider, HorizontalPodAutoscalerController, MetricsError,
     MetricsProvider, ScaleTarget,
