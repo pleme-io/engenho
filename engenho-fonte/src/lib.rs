@@ -66,6 +66,8 @@ mod customer_kpi_controller;
 mod defsistema;
 mod error;
 mod evaluator;
+#[cfg(feature = "with-revoada")]
+mod face_federated_watcher;
 mod federation;
 mod gossip;
 mod kube_app_reconciler;
@@ -122,6 +124,8 @@ pub use defsistema::parse_nix;
 pub use defsistema::{SistemaBuilder, parse_json, to_authoring_form};
 pub use error::{FonteError, FonteResult};
 pub use evaluator::{Evaluator, MockEvaluator};
+#[cfg(feature = "with-revoada")]
+pub use face_federated_watcher::FaceFederatedWatcher;
 pub use federation::{FederatedWatcher, FederationBroker};
 pub use gossip::GossipBroker;
 pub use kube_app_reconciler::KubeAppReconciler;
