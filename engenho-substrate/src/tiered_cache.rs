@@ -84,10 +84,32 @@ impl TieredCache {
         self.tiers.len()
     }
 
+    /// Observable snapshot of the tier stack — name + tier_count.
+    /// Pattern #2 (SSC v0.91) — TieredCache + CompositeShapeRenderer +
+    /// ChainedVerifier all return canonical
+    /// [`crate::mirante::ChildCountSnapshot`].
+    #[must_use]
+    pub fn snapshot(&self) -> crate::mirante::ChildCountSnapshot {
+        crate::mirante::ChildCountSnapshot {
+            name: "tiered",
+            child_count: self.tier_count(),
+        }
+    }
+
     /// Backend name of tier `i` (telemetry helper).
     #[must_use]
     pub fn tier_name(&self, i: usize) -> Option<&'static str> {
         self.tiers.get(i).map(|t| t.name())
+    }
+}
+
+crate::define_named!(TieredCache, "tiered");
+
+impl crate::mirante::Observable for TieredCache {
+    type Snapshot = crate::mirante::ChildCountSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        Self::snapshot(self)
     }
 }
 

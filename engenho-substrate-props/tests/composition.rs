@@ -37,6 +37,45 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v0.91 TSR: 3 wrapper-with-N-children primitives all return
+    /// the canonical `ChildCountSnapshot`. TieredCache /
+    /// CompositeShapeRenderer / ChainedVerifier all impl Observable.
+    /// Asserts the shape extraction is functionally consistent
+    /// across all three implementers.
+    #[test]
+    fn all_three_child_count_observables_share_shape(_seed in any::<u8>()) {
+        use engenho_substrate::{
+            ChildCountSnapshot, Observable,
+        };
+        use std::sync::Arc;
+        // TieredCache with 2 memory tiers.
+        let tier_a: Arc<dyn engenho_substrate::DerivationCacheBackend> =
+            Arc::new(engenho_substrate::MemoryDerivationCache::new());
+        let tier_b: Arc<dyn engenho_substrate::DerivationCacheBackend> =
+            Arc::new(engenho_substrate::MemoryDerivationCache::new());
+        let cache = engenho_substrate::TieredCache::new(vec![tier_a, tier_b]);
+        let cache_snap: ChildCountSnapshot = Observable::snapshot(&cache);
+        prop_assert_eq!(cache_snap.name, "tiered");
+        prop_assert_eq!(cache_snap.child_count, 2);
+
+        // CompositeShapeRenderer with 1 renderer.
+        let r: Arc<dyn engenho_substrate::ShapeRenderer> = Arc::new(
+            engenho_substrate::FakeShapeRenderer::for_shape(
+                engenho_substrate::WorkloadShape::OciImage,
+            ),
+        );
+        let comp = engenho_substrate::CompositeShapeRenderer::default_named(vec![r]);
+        let comp_snap: ChildCountSnapshot = Observable::snapshot(&comp);
+        prop_assert_eq!(comp_snap.name, "composite");
+        prop_assert_eq!(comp_snap.child_count, 1);
+
+        // ChainedVerifier with 0 verifiers.
+        let chain = engenho_substrate::ChainedVerifier::default_named(vec![]);
+        let chain_snap: ChildCountSnapshot = Observable::snapshot(&chain);
+        prop_assert_eq!(chain_snap.name, "chained");
+        prop_assert_eq!(chain_snap.child_count, 0);
+    }
+
     /// v0.90: Mirante registry observes ITSELF. A meta-Mirante can
     /// register the primary registry and report on registry-level
     /// liveness alongside per-channel state. The MiranteSnapshot

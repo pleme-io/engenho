@@ -48,6 +48,21 @@ pub struct SubscriberSnapshot {
     pub subscriber_count: usize,
 }
 
+/// Canonical snapshot for substrate wrappers that compose N
+/// children — captures name + child count. Third-site extraction
+/// (v0.91 TSR): `TieredCache`, `CompositeShapeRenderer`,
+/// `ChainedVerifier` all return this from `Observable::snapshot()`.
+///
+/// Sibling to [`SubscriberSnapshot`]; both standardize the
+/// wrapper-with-N pattern at the snapshot layer.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChildCountSnapshot {
+    /// Telemetry name of the wrapper.
+    pub name: &'static str,
+    /// Number of children currently composed.
+    pub child_count: usize,
+}
+
 /// Universal observable surface. Every substrate primitive that
 /// has live state worth observing implements this trait.
 pub trait Observable: Named + Send + Sync {

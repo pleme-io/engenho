@@ -58,6 +58,31 @@ impl ChainedVerifier {
     pub fn is_empty(&self) -> bool {
         self.verifiers.is_empty()
     }
+
+    /// Observable snapshot — name + verifier count. Pattern #2
+    /// (SSC v0.91) — returns canonical
+    /// [`crate::mirante::ChildCountSnapshot`].
+    #[must_use]
+    pub fn snapshot(&self) -> crate::mirante::ChildCountSnapshot {
+        crate::mirante::ChildCountSnapshot {
+            name: self.name,
+            child_count: self.len(),
+        }
+    }
+}
+
+impl crate::named::Named for ChainedVerifier {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+impl crate::mirante::Observable for ChainedVerifier {
+    type Snapshot = crate::mirante::ChildCountSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        Self::snapshot(self)
+    }
 }
 
 #[async_trait]
