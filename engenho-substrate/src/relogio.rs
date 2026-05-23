@@ -67,6 +67,17 @@ impl Instant {
         }
     }
 
+    /// Construct from a physical millisecond timestamp with logical=0.
+    /// Third-site extraction — pattern appeared in selo, orcamento, and
+    /// 4+ test sites before this constructor existed.
+    #[must_use]
+    pub const fn from_ms(physical_ms: u64) -> Self {
+        Self {
+            physical_ms,
+            logical: 0,
+        }
+    }
+
     /// Pack into 64 bits: 48-bit physical | 16-bit logical.
     /// `physical_ms` above 2^48 is silently saturated.
     #[must_use]
@@ -361,6 +372,19 @@ mod tests {
     fn instant_zero_is_minimal() {
         assert!(Instant::new(1, 0) > Instant::zero());
         assert!(Instant::new(0, 1) > Instant::zero());
+    }
+
+    #[test]
+    fn instant_from_ms_yields_logical_zero() {
+        let i = Instant::from_ms(42_000);
+        assert_eq!(i.physical_ms, 42_000);
+        assert_eq!(i.logical, 0);
+        assert_eq!(i, Instant::new(42_000, 0));
+    }
+
+    #[test]
+    fn instant_from_ms_zero_equals_zero() {
+        assert_eq!(Instant::from_ms(0), Instant::zero());
     }
 
     #[test]

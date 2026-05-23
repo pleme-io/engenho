@@ -190,10 +190,7 @@ impl Budget {
             .saturating_add(self.refill_per_sec.saturating_sub(1))
             / self.refill_per_sec;
         let last = self.last_refill_ms.load(Ordering::Acquire);
-        Some(Instant {
-            physical_ms: last.saturating_add(ms),
-            logical: 0,
-        })
+        Some(Instant::from_ms(last.saturating_add(ms)))
     }
 
     /// Snapshot for mirante publish.
@@ -204,11 +201,8 @@ impl Budget {
             available,
             capacity: self.capacity,
             refill_per_sec: self.refill_per_sec,
-            last_refill_packed: Instant {
-                physical_ms: self.last_refill_ms.load(Ordering::Acquire),
-                logical: 0,
-            }
-            .to_packed(),
+            last_refill_packed: Instant::from_ms(self.last_refill_ms.load(Ordering::Acquire))
+                .to_packed(),
         }
     }
 

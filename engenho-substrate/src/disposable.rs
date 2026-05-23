@@ -127,13 +127,17 @@ pub struct Transient<D: Disposable> {
     ledger: Arc<dyn MaterializationLedger>,
     emitter: NodeId,
     stage_id: StageId,
+    clock: Arc<dyn crate::relogio::Clock>,
 }
 
 impl<D: Disposable> Transient<D> {
-    /// New Transient. `stage_id` is what the receipts route to in
-    /// the ledger (typically the test name or a stable identifier
-    /// for the scope's purpose). `emitter` identifies the node
-    /// for cross-cluster attestation.
+    /// New Transient with `WallClock` (production). For tests under
+    /// FrozenClock use [`Self::with_clock`].
+    ///
+    /// `stage_id` is what the receipts route to in the ledger
+    /// (typically the test name or a stable identifier for the
+    /// scope's purpose). `emitter` identifies the node for
+    /// cross-cluster attestation.
     #[must_use]
     pub fn new(
         disposable: Arc<D>,
@@ -141,11 +145,31 @@ impl<D: Disposable> Transient<D> {
         emitter: NodeId,
         stage_id: StageId,
     ) -> Self {
+        Self::with_clock(
+            disposable,
+            ledger,
+            emitter,
+            stage_id,
+            Arc::new(crate::relogio::WallClock),
+        )
+    }
+
+    /// New Transient with a typed Clock. Tests should pass a
+    /// `FrozenClock` to make receipt timestamps deterministic.
+    #[must_use]
+    pub fn with_clock(
+        disposable: Arc<D>,
+        ledger: Arc<dyn MaterializationLedger>,
+        emitter: NodeId,
+        stage_id: StageId,
+        clock: Arc<dyn crate::relogio::Clock>,
+    ) -> Self {
         Self {
             disposable,
             ledger,
             emitter,
             stage_id,
+            clock,
         }
     }
 
@@ -203,8 +227,8 @@ impl<D: Disposable> Transient<D> {
             ReceiptKind::Shape(format!("transient:{phase}:{}", self.disposable.name())),
             subject,
             self.emitter,
-            now_unix(),
-            subject, // evidence = subject (faithful nodes converge)
+            self.clock.now().physical_ms / 1000, // seconds (legacy receipt shape)
+            subject,                             // evidence = subject (faithful nodes converge)
         );
         self.ledger
             .ingest(&self.stage_id, 1, &receipt)
@@ -224,13 +248,6 @@ impl<D: Disposable> Transient<D> {
     pub fn ledger(&self) -> &Arc<dyn MaterializationLedger> {
         &self.ledger
     }
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -448,6 +465,29 @@ mod tests {
         let (_disp, _ledger, t) = assemble();
         assert_eq!(t.disposable().name(), "fake");
         assert_eq!(t.ledger().name(), "memory");
+    }
+
+    #[tokio::test]
+    async fn with_clock_uses_typed_clock_for_receipt_timestamps() {
+        // Verifies the relógio migration: same FrozenClock seed →
+        // same receipt timestamps, deterministically reproducible.
+        let disp = Arc::new(FakeDisposable::new("fake"));
+        let ledger = Arc::new(MemoryLedger::new());
+        let clock = Arc::new(crate::relogio::FrozenClock::at(1_700_000_000_000));
+        let t = Transient::with_clock(
+            disp.clone(),
+            ledger.clone(),
+            NodeId::from_bytes(b"node"),
+            StageId::new("test-stage"),
+            clock,
+        );
+        t.scope(&b"x".to_vec(), |_| {
+            Box::pin(async move { Ok::<_, String>(()) })
+        })
+        .await
+        .unwrap();
+        // Both receipts written.
+        assert_eq!(ledger.len().await, 2);
     }
 
     #[test]
