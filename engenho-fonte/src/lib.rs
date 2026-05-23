@@ -55,8 +55,14 @@
 mod anomaly;
 mod attester;
 mod change;
+#[cfg(feature = "with-promessa")]
+mod compliance_controller;
 mod conduit;
 mod controller;
+#[cfg(feature = "with-promessa")]
+mod cost_budget_controller;
+#[cfg(feature = "with-promessa")]
+mod customer_kpi_controller;
 mod defsistema;
 mod error;
 mod evaluator;
@@ -74,6 +80,8 @@ mod publisher;
 mod remediation;
 #[cfg(feature = "with-revoada")]
 mod revoada;
+#[cfg(feature = "with-promessa")]
+mod security_controller;
 #[cfg(feature = "with-shikumi")]
 mod shikumi;
 mod sistema;
@@ -91,11 +99,23 @@ mod watcher;
 pub use anomaly::{AnomalyChain, AnomalyEntry, AnomalyEvent, MockAnomalyChain};
 pub use attester::{Attester, MockAttester, Receipt};
 pub use change::{Change, ChangeKind, Decision, Outcome};
+#[cfg(feature = "with-promessa")]
+pub use compliance_controller::{
+    ComplianceController, ComplianceDrift, ComplianceSnapshot, ComplianceSpec,
+};
 pub use conduit::Conduit;
 pub use controller::{
     AppReconciler, InfraReconciler, MockAppReconciler, MockInfraReconciler, MockPromessaReconciler,
     MockTopologyReconciler, PromessaReconciler, SystemController, TopologyReconciler,
     mock_system_controller,
+};
+#[cfg(feature = "with-promessa")]
+pub use cost_budget_controller::{
+    CostBudgetController, CostBudgetDrift, CostBudgetSnapshot, CostBudgetSpec,
+};
+#[cfg(feature = "with-promessa")]
+pub use customer_kpi_controller::{
+    CustomerKpiController, CustomerKpiDrift, CustomerKpiSnapshot, CustomerKpiSpec,
 };
 #[cfg(feature = "with-sui-eval")]
 pub use defsistema::parse_nix;
@@ -121,6 +141,8 @@ pub use remediation::{
 };
 #[cfg(feature = "with-revoada")]
 pub use revoada::{FaceGossipBroker, RevoadaProposer};
+#[cfg(feature = "with-promessa")]
+pub use security_controller::{SecurityController, SecurityDrift, SecuritySnapshot, SecuritySpec};
 #[cfg(feature = "with-shikumi")]
 pub use shikumi::ShikumiWatcher;
 pub use sistema::{
