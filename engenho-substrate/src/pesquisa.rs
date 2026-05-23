@@ -236,6 +236,11 @@ impl Linhagem {
 
     /// Canonical fingerprint over the entire chain — operators
     /// commit this to attest a search was reproducible.
+    ///
+    /// COMPOSITE form (not serde-JSON) — the chain semantics are
+    /// hash-of-(search_id || generation_ids), which is more compact
+    /// than full serde encoding and matches what a future
+    /// cross-cluster federation would gossip.
     #[must_use]
     pub fn fingerprint(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
@@ -476,6 +481,15 @@ crate::impl_error_kind! {
         (Fitness(_)) => "fitness",
         (Engine(_)) => "engine",
         (Diverged(_)) => "diverged",
+    }
+}
+
+// Trait impl forwards to the composite hand-written method —
+// keeps the chain semantics + lets generic Fingerprint consumers
+// dispatch polymorphically.
+impl crate::fingerprint::Fingerprint for Linhagem {
+    fn fingerprint(&self) -> [u8; 32] {
+        Self::fingerprint(self)
     }
 }
 
