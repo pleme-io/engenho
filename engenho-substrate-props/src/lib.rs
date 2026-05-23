@@ -72,6 +72,43 @@ pub fn proptest_cases() -> u32 {
         .unwrap_or(256)
 }
 
+/// Run an async block on a fresh tokio runtime. The async property-test
+/// pattern repeats verbatim in ledger / broadcast_ledger / watched_cache
+/// and will appear in every future async property file — extracted per
+/// the third-site rule.
+///
+/// ## Before
+///
+/// ```ignore
+/// #[test]
+/// fn my_async_invariant() {
+///     let rt = tokio::runtime::Runtime::new().unwrap();
+///     rt.block_on(async {
+///         let l = MemoryLedger::new();
+///         l.ingest(...).await.unwrap();
+///     });
+/// }
+/// ```
+///
+/// ## After
+///
+/// ```ignore
+/// use engenho_substrate_props::block_on;
+///
+/// #[test]
+/// fn my_async_invariant() {
+///     block_on(async {
+///         let l = MemoryLedger::new();
+///         l.ingest(...).await.unwrap();
+///     });
+/// }
+/// ```
+pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    ::tokio::runtime::Runtime::new()
+        .expect("tokio runtime")
+        .block_on(f)
+}
+
 /// Wraps `proptest::proptest!` with the env-driven `ProptestConfig`
 /// applied automatically. Saves the 5-line ceremony in every
 /// property-test file.

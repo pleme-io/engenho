@@ -18,10 +18,13 @@ path = "src/lib.rs"
 
 [dependencies]
 engenho-substrate = { workspace = true }
+# Public API: `proptest_with_env!` macro + `block_on` helper need
+# proptest and tokio in regular deps (not dev-dependencies) so
+# consumers downstream can call them.
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [dev-dependencies]
-proptest = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
