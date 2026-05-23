@@ -44,14 +44,14 @@ proptest_with_env! {
     #[test]
     fn plantio_observable_publishes_to_mirante(n_stages in 0usize..6) {
         use engenho_substrate::{
-            ChildCountSnapshot, MiranteSnapshot, NodeId, Observable, Placement, Plantio, Stage,
-            StageId, WorkloadShape,
+            ChildCountSnapshot, MiranteSnapshot, NodeId, Observable, Plantio, Stage,
+            WorkloadShape,
         };
         let mut plantio = Plantio::new();
         for i in 0..n_stages {
             let stage_id = format!("s{i}");
             let stage = Stage::pinned(
-                stage_id.clone(),
+                stage_id,
                 WorkloadShape::OciImage,
                 NodeId::from_bytes(&[i as u8; 32]),
             );
@@ -76,12 +76,6 @@ proptest_with_env! {
         let mirante_snap: MiranteSnapshot = Observable::snapshot(&m);
         prop_assert_eq!(mirante_snap.channel_count, 1);
         prop_assert_eq!(&mirante_snap.channel_names[0], &"plantio".to_string());
-        // Use the unused imports.
-        let _ = StageId::new("warm");
-        let _ = Placement::Pinned {
-            node: NodeId::from_bytes(&[0u8; 32]),
-        };
-        let _ = WorkloadShape::OciImage;
     }
 
     /// v0.91 TSR: 3 wrapper-with-N-children primitives all return
