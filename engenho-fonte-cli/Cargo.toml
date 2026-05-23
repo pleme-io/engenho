@@ -1,0 +1,28 @@
+[package]
+name = "engenho-fonte-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+authors.workspace = true
+description = "engenho-fonte-cli — operator-facing daemon. Watches a (defsistema …) tlisp file via shikumi-notify, evaluates it via sui, materializes through a revoada FabricFace, BLAKE3-chains every transition, routes anomalies through the typed RemediationPolicy. One binary that wires the entire Viggy convergence loop."
+
+[[bin]]
+name = "engenho-fonte"
+path = "src/main.rs"
+
+[dependencies]
+async-trait    = { workspace = true }
+clap           = { version = "4", features = ["derive"] }
+tokio          = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time", "signal"] }
+tracing        = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# All three real-substrate features enabled — this binary is the
+# integration point for the full Viggy convergence loop.
+engenho-fonte  = { workspace = true, features = ["with-shikumi", "with-sui-eval", "with-revoada"] }
+engenho-revoada = { workspace = true }
