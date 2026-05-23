@@ -88,6 +88,33 @@ impl WatchedCache {
     }
 }
 
+/// Observable snapshot for a `WatchedCache` — what an ops dashboard
+/// sees. Pattern #2 (substrate self-consumption v0.86).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WatchedCacheSnapshot {
+    /// Telemetry name ("watched").
+    pub name: &'static str,
+    /// Currently-active subscribers on the broadcast channel.
+    pub subscriber_count: usize,
+}
+
+impl crate::named::Named for WatchedCache {
+    fn name(&self) -> &'static str {
+        "watched"
+    }
+}
+
+impl crate::mirante::Observable for WatchedCache {
+    type Snapshot = WatchedCacheSnapshot;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        WatchedCacheSnapshot {
+            name: "watched",
+            subscriber_count: self.subscriber_count(),
+        }
+    }
+}
+
 #[async_trait]
 impl DerivationCacheBackend for WatchedCache {
     fn name(&self) -> &'static str {

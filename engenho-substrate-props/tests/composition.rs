@@ -37,6 +37,26 @@ proptest_with_env! {
         prop_assert_eq!(inherent, via_trait);
     }
 
+    /// v0.86: `BroadcastLedger` + `WatchedCache` both implement
+    /// `Observable`. Their snapshots carry the subscriber_count
+    /// for live ops dashboards. Asserts subscriber_count tracks
+    /// active subscribers + the snapshot reflects it.
+    #[test]
+    fn broadcast_ledger_observable_tracks_subscribers(n_subs in 0usize..6) {
+        use engenho_substrate::{BroadcastLedger, MaterializationLedger, MemoryLedger, Observable};
+        block_on(async {
+            let inner: Arc<dyn MaterializationLedger> = Arc::new(MemoryLedger::new());
+            let ledger = BroadcastLedger::new(inner);
+            let baseline = ledger.snapshot().subscriber_count;
+            let receivers: Vec<_> = (0..n_subs).map(|_| ledger.subscribe()).collect();
+            let snap = ledger.snapshot();
+            assert_eq!(snap.name, "broadcast");
+            assert_eq!(snap.subscriber_count, baseline + n_subs);
+            drop(receivers);
+            assert_eq!(ledger.snapshot().subscriber_count, baseline);
+        });
+    }
+
     /// v0.85: `MachineRunner<M>` now implements `Observable`. The
     /// MachineSnapshot carries (name, state, step_count, is_terminal)
     /// — substrate self-consumption: every FSM plugs into mirante
