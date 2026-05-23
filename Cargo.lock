@@ -885,6 +885,7 @@ dependencies = [
  "blake3",
  "engenho-config",
  "engenho-store",
+ "engenho-substrate",
  "engenho-types",
  "proptest",
  "serde",

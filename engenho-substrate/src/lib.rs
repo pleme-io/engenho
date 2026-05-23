@@ -24,11 +24,15 @@
 
 pub mod atomic_write;
 pub mod derivation;
+pub mod drv_disk;
 pub mod magic_blob;
+pub mod tiered_cache;
 
 pub use atomic_write::{AtomicWriteError, write_atomic};
 pub use derivation::{
     CacheError, DerivationCacheBackend, Drv, DrvHash, MemoryDerivationCache, NarBlob,
     NarHash, OutputPath, Realisation,
 };
+pub use drv_disk::DiskDerivationCache;
 pub use magic_blob::{MagicBlob, MagicBlobError};
+pub use tiered_cache::TieredCache;
