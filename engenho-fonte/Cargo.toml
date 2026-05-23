@@ -22,6 +22,9 @@ with-revoada = ["dep:engenho-revoada"]
 # a cross-workspace path dep. Default off — file-watch consumers
 # enable explicitly.
 with-shikumi = ["dep:shikumi", "dep:notify"]
+# Real sui_eval-backed Evaluator. Pulls in engenho-sui-typescape's
+# with-sui-eval feature (which pulls in sui-eval cross-workspace).
+with-sui-eval = ["engenho-sui-typescape/with-sui-eval"]
 
 [dependencies]
 async-trait            = { workspace = true }

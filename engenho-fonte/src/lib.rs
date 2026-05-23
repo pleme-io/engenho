@@ -66,6 +66,8 @@ mod revoada;
 #[cfg(feature = "with-shikumi")]
 mod shikumi;
 mod sistema;
+#[cfg(feature = "with-sui-eval")]
+mod sui_evaluator;
 mod watcher;
 
 pub use anomaly::{AnomalyChain, AnomalyEntry, AnomalyEvent, MockAnomalyChain};
@@ -88,4 +90,6 @@ pub use shikumi::ShikumiWatcher;
 pub use sistema::{
     AppRef, InfraBackend, InfraRef, PromessaKind, PromessaRef, Sistema, TopologyRef,
 };
+#[cfg(feature = "with-sui-eval")]
+pub use sui_evaluator::SuiEvaluator;
 pub use watcher::{MockWatcher, Watcher};
