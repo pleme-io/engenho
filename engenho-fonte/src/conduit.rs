@@ -2,8 +2,8 @@
 //! tick across the five typed roles.
 
 use crate::{
-    Attester, Change, Decision, Evaluator, FonteError, FonteResult, Outcome, Proposer, Publisher,
-    Watcher,
+    Attester, Change, Decision, Evaluator, FonteError, FonteResult, Outcome, OutcomeChainRecorder,
+    Proposer, Publisher, Watcher,
 };
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ pub struct Conduit {
     proposer: Arc<dyn Proposer>,
     attester: Arc<dyn Attester>,
     publisher: Arc<dyn Publisher>,
+    outcome_chain: Option<Arc<dyn OutcomeChainRecorder>>,
     last_revision: std::sync::Mutex<Option<u64>>,
 }
 
@@ -48,8 +49,19 @@ impl Conduit {
             proposer,
             attester,
             publisher,
+            outcome_chain: None,
             last_revision: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Attach an OutcomeChainRecorder — every tick's Outcome will be
+    /// recorded after publish. The chain runs AFTER publish so a
+    /// Publish failure doesn't poison the outcome record (we only
+    /// chain outcomes that actually completed the pipeline).
+    #[must_use]
+    pub fn with_outcome_chain(mut self, chain: Arc<dyn OutcomeChainRecorder>) -> Self {
+        self.outcome_chain = Some(chain);
+        self
     }
 
     /// Run one full convergence tick: pull changes off the watcher
@@ -103,6 +115,9 @@ impl Conduit {
             finalized_at_ms: receipt.sealed_at_ms,
         };
         self.publisher.publish(&outcome).await?;
+        if let Some(chain) = &self.outcome_chain {
+            chain.record(&outcome).await?;
+        }
         Ok(outcome)
     }
 }
