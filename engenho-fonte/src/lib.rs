@@ -56,6 +56,8 @@ mod anomaly;
 mod attester;
 #[cfg(feature = "with-caixa")]
 mod caixa_app_reconciler;
+#[cfg(feature = "with-caixa")]
+mod caixa_helm_installer;
 mod change;
 #[cfg(feature = "with-promessa")]
 mod compliance_controller;
@@ -110,6 +112,8 @@ pub use anomaly::{AnomalyChain, AnomalyEntry, AnomalyEvent, MockAnomalyChain};
 pub use attester::{Attester, MockAttester, Receipt};
 #[cfg(feature = "with-caixa")]
 pub use caixa_app_reconciler::CaixaAppReconciler;
+#[cfg(feature = "with-caixa")]
+pub use caixa_helm_installer::{CaixaHelmInstaller, InstallRecord};
 pub use change::{Change, ChangeKind, Decision, Outcome};
 #[cfg(feature = "with-promessa")]
 pub use compliance_controller::{
