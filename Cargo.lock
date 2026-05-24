@@ -1292,7 +1292,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "shigoto-budget",
  "shigoto-dag",
+ "shigoto-retry",
  "shigoto-types",
  "shikumi 0.1.0",
  "tameshi",
@@ -5553,6 +5555,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
+name = "shigoto-budget"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "shigoto-types",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "shigoto-dag"
 version = "0.1.0"
 dependencies = [
@@ -5560,6 +5571,14 @@ dependencies = [
  "serde",
  "shigoto-types",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "shigoto-retry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "shigoto-types",
 ]
 
 [[package]]
