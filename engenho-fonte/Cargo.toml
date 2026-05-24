@@ -47,7 +47,7 @@ with-tatara-lisp = ["dep:tatara-lisp"]
 with-caixa = ["dep:caixa-core", "dep:caixa-helm", "dep:serde_yaml", "dep:tempfile"]
 # shigoto DAG integration — ShigotoProvisioningController uses
 # shigoto-dag for typed topological ordering + parallel waves.
-with-shigoto = ["dep:shigoto-dag", "dep:shigoto-types"]
+with-shigoto = ["dep:shigoto-dag", "dep:shigoto-types", "dep:shigoto-retry", "dep:shigoto-budget"]
 
 [dependencies]
 async-trait            = { workspace = true }
@@ -87,6 +87,8 @@ serde_yaml             = { workspace = true, optional = true }
 tempfile               = { version = "3", optional = true }
 shigoto-dag            = { path = "../../shigoto/shigoto-dag", optional = true }
 shigoto-types          = { path = "../../shigoto/shigoto-types", optional = true }
+shigoto-retry          = { path = "../../shigoto/shigoto-retry", optional = true }
+shigoto-budget         = { path = "../../shigoto/shigoto-budget", optional = true }
 # Optional — enabled by `with-revoada`.
 engenho-revoada        = { workspace = true, optional = true }
 # Optional — enabled by `with-shikumi`. Cross-workspace path dep

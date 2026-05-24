@@ -91,6 +91,8 @@ mod revoada;
 mod security_controller;
 #[cfg(feature = "with-shigoto")]
 mod shigoto_provisioning;
+#[cfg(feature = "with-shigoto")]
+mod shigoto_retry_conduit;
 #[cfg(feature = "with-shikumi")]
 mod shikumi;
 mod sistema;
@@ -168,6 +170,8 @@ pub use security_controller::{SecurityController, SecurityDrift, SecuritySnapsho
 pub use shigoto_provisioning::{
     ShigotoProvisioningController, StageDag, StageDagBuilder, stage_kind_to_job_id,
 };
+#[cfg(feature = "with-shigoto")]
+pub use shigoto_retry_conduit::ShigotoRetryConduit;
 #[cfg(feature = "with-shikumi")]
 pub use shikumi::ShikumiWatcher;
 pub use sistema::{
