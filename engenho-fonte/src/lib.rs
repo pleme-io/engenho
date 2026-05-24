@@ -75,7 +75,6 @@ mod gossip;
 mod kube_app_reconciler;
 mod linhagem_chain;
 mod mirante_publisher;
-#[cfg(feature = "with-tameshi")]
 mod outcome_chain;
 #[cfg(feature = "with-promessa")]
 mod promessa_reconciler;
@@ -143,7 +142,8 @@ pub use kube_app_reconciler::KubeAppReconciler;
 pub use linhagem_chain::LinhagemAnomalyChain;
 pub use mirante_publisher::MirantePublisher;
 #[cfg(feature = "with-tameshi")]
-pub use outcome_chain::{OutcomeChainRecorder, TameshiOutcomeChain};
+pub use outcome_chain::TameshiOutcomeChain;
+pub use outcome_chain::{MockOutcomeChain, OutcomeChainRecorder};
 #[cfg(feature = "with-promessa")]
 pub use promessa_reconciler::{PromessaIntent, PromessaTargetReconciler, promessa_kind_to_target};
 pub use proposer::{MockProposer, ProposalId, Proposer};
