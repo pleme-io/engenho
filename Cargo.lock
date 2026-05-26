@@ -570,8 +570,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "tatara-lisp 0.2.0",
- "tatara-lisp-derive 0.2.0",
+ "tatara-lisp 0.2.1",
+ "tatara-lisp-derive 0.2.1",
  "thiserror 2.0.18",
 ]
 
@@ -748,6 +748,7 @@ dependencies = [
 [[package]]
 name = "cofre-types"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/cofre?branch=main#1c39975891795a1e873f4ec3ab68ecbca7cd915a"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -1298,7 +1299,7 @@ dependencies = [
  "shigoto-types",
  "shikumi 0.1.0",
  "tameshi",
- "tatara-lisp 0.2.0",
+ "tatara-lisp 0.2.1",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4339,6 +4340,7 @@ dependencies = [
 name = "promessa-types"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "chrono",
  "cofre-types",
@@ -6019,7 +6021,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sui-bytecode"
-version = "0.1.7"
+version = "0.1.10"
 dependencies = [
  "rnix",
  "rowan",
@@ -6033,7 +6035,7 @@ dependencies = [
 
 [[package]]
 name = "sui-compat"
-version = "0.1.7"
+version = "0.1.10"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -6046,7 +6048,7 @@ dependencies = [
 
 [[package]]
 name = "sui-eval"
-version = "0.1.7"
+version = "0.1.10"
 dependencies = [
  "base64",
  "blake3",
@@ -6084,14 +6086,14 @@ dependencies = [
 
 [[package]]
 name = "sui-intern"
-version = "0.1.7"
+version = "0.1.10"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
 
 [[package]]
 name = "sui-spec"
-version = "0.1.7"
+version = "0.1.10"
 dependencies = [
  "base64",
  "libc",
@@ -6100,15 +6102,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "sui-compat",
- "tatara-lisp 0.2.1",
- "tatara-lisp-derive 0.2.1",
+ "tatara-lisp 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tatara-lisp-derive 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
  "url",
 ]
 
 [[package]]
 name = "sui-store"
-version = "0.1.7"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "ed25519-dalek",
@@ -6239,12 +6241,12 @@ dependencies = [
 
 [[package]]
 name = "tatara-lisp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "serde",
  "serde_json",
- "tatara-lisp-derive 0.2.0",
+ "tatara-lisp-derive 0.2.1",
  "thiserror 2.0.18",
 ]
 
@@ -6257,13 +6259,13 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
- "tatara-lisp-derive 0.2.1",
+ "tatara-lisp-derive 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "tatara-lisp-derive"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "quote",

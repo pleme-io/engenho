@@ -41,33 +41,33 @@
     };
 
     # Per-system slim package for the cluster-config renderer. Built
-    # via the COMMITTED Cargo.nix (no crate2nix IFD) so consumers
-    # (nixos-k3s-vm in pleme-io/nix) can evaluate the renderer
-    # derivation without first triggering an IFD chain on the
-    # linux-builder. Crate2nix-of-the-tree is regenerated explicitly
-    # via `nix run .#regenerate-cargo-nix` whenever Cargo.lock changes.
+    # via substrate's lockfile-builder (gen-driven; Cargo.build-spec.json
+    # is auto-derived from Cargo.lock + cargo metadata, no Cargo.nix
+    # regenerate dance). Regenerate the spec via `gen build .` whenever
+    # Cargo.lock changes.
     renderBinFor = system: let
       pkgs = import nixpkgs { inherit system; };
-      generated = import ./Cargo.nix {
-        inherit pkgs;
+      lockfileBuilder = import "${substrate}/lib/build/rust/lockfile-builder.nix" { inherit pkgs; };
+      project = lockfileBuilder.mkProject {
+        src = self;
         defaultCrateOverrides = pkgs.defaultCrateOverrides // {};
       };
-    in generated.workspaceMembers.engenho-cluster-config-render.build;
+    in project.workspaceMembers.engenho-cluster-config-render.build;
 
     # engenho-mcp is a sibling MCP server binary built from the same
-    # workspace. Same Cargo.nix-driven path as the renderer above so
-    # IFD doesn't fire on consumers. rmcp's `model.rs:860` uses
-    # `env!("CARGO_CRATE_NAME")`, which crate2nix doesn't set by
-    # default. The override matches the zoekt-mcp precedent.
+    # workspace. rmcp's `model.rs:860` uses `env!("CARGO_CRATE_NAME")`
+    # which buildRustCrate doesn't set by default — override matches
+    # the zoekt-mcp precedent.
     mcpBinFor = system: let
       pkgs = import nixpkgs { inherit system; };
-      generated = import ./Cargo.nix {
-        inherit pkgs;
+      lockfileBuilder = import "${substrate}/lib/build/rust/lockfile-builder.nix" { inherit pkgs; };
+      project = lockfileBuilder.mkProject {
+        src = self;
         defaultCrateOverrides = pkgs.defaultCrateOverrides // {
           rmcp = attrs: { CARGO_CRATE_NAME = "rmcp"; };
         };
       };
-    in generated.workspaceMembers.engenho-mcp.build;
+    in project.workspaceMembers.engenho-mcp.build;
 
     # ============================================================
     # Docker images via substrate's rust-tool-image-flake.nix.
