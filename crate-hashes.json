@@ -1,3 +1,4 @@
 {
+  "git+https://github.com/pleme-io/cofre?branch=main#cofre-types@0.1.0": "19ay93nkmnrpr3phv83pa862nlf3dlxkma88cg1a34d2jxz3xqzv",
   "git+https://github.com/pleme-io/shikumi#0.1.0": "1959r1drjhjs55hzd6mc0xgwyvg593j25bg8f6pw0ap36161rvd1"
 }

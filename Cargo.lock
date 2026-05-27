@@ -570,8 +570,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "tatara-lisp 0.2.1",
- "tatara-lisp-derive 0.2.1",
+ "tatara-lisp 0.2.0",
+ "tatara-lisp-derive 0.2.0",
  "thiserror 2.0.18",
 ]
 
@@ -1299,7 +1299,7 @@ dependencies = [
  "shigoto-types",
  "shikumi 0.1.0",
  "tameshi",
- "tatara-lisp 0.2.1",
+ "tatara-lisp 0.2.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1368,6 +1368,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "engenho-machines"
+version = "0.1.4"
+dependencies = [
+ "engenho-substrate",
+ "engenho-sui-typescape",
+ "proptest",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6102,8 +6113,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "sui-compat",
- "tatara-lisp 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "tatara-lisp-derive 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tatara-lisp 0.2.1",
+ "tatara-lisp-derive 0.2.1",
  "thiserror 2.0.18",
  "url",
 ]
@@ -6205,6 +6216,7 @@ dependencies = [
  "blake3",
  "chrono",
  "const-hex",
+ "ed25519-dalek",
  "futures",
  "object_store",
  "reqwest 0.12.28",
@@ -6241,12 +6253,12 @@ dependencies = [
 
 [[package]]
 name = "tatara-lisp"
-version = "0.2.1"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "serde",
  "serde_json",
- "tatara-lisp-derive 0.2.1",
+ "tatara-lisp-derive 0.2.0",
  "thiserror 2.0.18",
 ]
 
@@ -6259,13 +6271,13 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
- "tatara-lisp-derive 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tatara-lisp-derive 0.2.1",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "tatara-lisp-derive"
-version = "0.2.1"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
