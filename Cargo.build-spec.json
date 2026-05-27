@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "workspace": {
     "root": "/Users/drzzln/code/github/pleme-io/engenho",
     "members": [
@@ -45052,7 +45052,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/shikumi",
         "rev": "48c7c6d7b9755c9a2b769b53ddc95800aba98b7f",
-        "sha256": null
+        "sha256": "1959r1drjhjs55hzd6mc0xgwyvg593j25bg8f6pw0ap36161rvd1"
       },
       "features": [
         "default"
@@ -58368,5 +58368,92 @@
     "engenho-sui-typescape-0.1.4",
     "engenho-fonte-0.1.4",
     "engenho-fonte-cli-0.1.4"
-  ]
+  ],
+  "flake_metadata": {
+    "engenho": {
+      "default_bin": "engenho",
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-types": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-cluster-config": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-cluster-config-render": {
+      "default_bin": "engenho-cluster-config-render",
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-kube-client": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-substrate": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-kube-codegen": {
+      "default_bin": "engenho-kube-codegen",
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-mcp": {
+      "default_bin": "engenho-mcp",
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-revoada": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-config": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-substrate-props": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-store": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-teia": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-apiserver": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-scheduler": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-controllers": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-kubelet": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-sui-typescape": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-fonte": {
+      "default_bin": null,
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-fonte-cli": {
+      "default_bin": "engenho-fonte",
+      "repo": "pleme-io/engenho"
+    }
+  },
+  "crate_overrides": {
+    "rmcp": {
+      "pre_build": "export CARGO_CRATE_NAME=rmcp"
+    }
+  }
 }
