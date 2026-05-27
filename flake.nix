@@ -45,27 +45,25 @@
     # is auto-derived from Cargo.lock + cargo metadata, no Cargo.nix
     # regenerate dance). Regenerate the spec via `gen build .` whenever
     # Cargo.lock changes.
+    plemeCrateOverrides = import "${substrate}/lib/build/rust/pleme-crate-overrides.nix";
     renderBinFor = system: let
       pkgs = import nixpkgs { inherit system; };
       lockfileBuilder = import "${substrate}/lib/build/rust/lockfile-builder.nix" { inherit pkgs; };
       project = lockfileBuilder.mkProject {
         src = self;
-        defaultCrateOverrides = pkgs.defaultCrateOverrides // {};
+        defaultCrateOverrides = pkgs.defaultCrateOverrides // plemeCrateOverrides;
       };
     in project.workspaceMembers.engenho-cluster-config-render.build;
 
     # engenho-mcp is a sibling MCP server binary built from the same
-    # workspace. rmcp's `model.rs:860` uses `env!("CARGO_CRATE_NAME")`
-    # which buildRustCrate doesn't set by default — override matches
-    # the zoekt-mcp precedent.
+    # workspace. rmcp override now lives in pleme-crate-overrides.nix —
+    # composed via the shared plemeCrateOverrides attrset.
     mcpBinFor = system: let
       pkgs = import nixpkgs { inherit system; };
       lockfileBuilder = import "${substrate}/lib/build/rust/lockfile-builder.nix" { inherit pkgs; };
       project = lockfileBuilder.mkProject {
         src = self;
-        defaultCrateOverrides = pkgs.defaultCrateOverrides // {
-          rmcp = attrs: { CARGO_CRATE_NAME = "rmcp"; };
-        };
+        defaultCrateOverrides = pkgs.defaultCrateOverrides // plemeCrateOverrides;
       };
     in project.workspaceMembers.engenho-mcp.build;
 
