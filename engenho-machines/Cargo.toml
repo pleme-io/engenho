@@ -1,0 +1,21 @@
+[package]
+name = "engenho-machines"
+description = "Typed state machines + typescape registrations for the engenho runtime — the documented FSMs (docs/STATE-MACHINES.md) lifted into engenho-substrate::maquina::StateMachine impls."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+engenho-substrate = { workspace = true }
+engenho-sui-typescape = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

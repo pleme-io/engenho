@@ -21,6 +21,7 @@ members = [
   "engenho-sui-typescape",
   "engenho-fonte",
   "engenho-fonte-cli",
+  "engenho-machines",
 ]
 
 [workspace.package]

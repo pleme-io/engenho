@@ -1,7 +1,7 @@
 {
   "version": 2,
   "workspace": {
-    "root": "/Users/drzzln/code/github/pleme-io/engenho",
+    "root": "/Users/luis.d/code/github/pleme-io/engenho",
     "members": [
       {
         "name": "engenho",
@@ -82,6 +82,10 @@
       {
         "name": "engenho-fonte-cli",
         "relative_path": "engenho-fonte-cli"
+      },
+      {
+        "name": "engenho-machines",
+        "relative_path": "engenho-machines"
       }
     ]
   },
@@ -10303,6 +10307,118 @@
           {
             "version": "0.1.4",
             "rename": "engenho_types"
+          }
+        ]
+      }
+    },
+    "engenho-machines-0.1.4": {
+      "name": "engenho-machines",
+      "version": "0.1.4",
+      "edition": "2024",
+      "source": {
+        "kind": "path",
+        "relative_path": "engenho-machines"
+      },
+      "features": [],
+      "proc_macro": false,
+      "build_script": null,
+      "binaries": [],
+      "lib_target": {
+        "name": "engenho_machines",
+        "path": "src/lib.rs"
+      },
+      "dependencies": [
+        {
+          "name": "engenho_substrate",
+          "package_key": "engenho-substrate-0.1.4",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": false,
+          "target": null
+        },
+        {
+          "name": "engenho_sui_typescape",
+          "package_key": "engenho-sui-typescape-0.1.4",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": false,
+          "target": null
+        },
+        {
+          "name": "serde",
+          "package_key": "serde-1.0.228",
+          "kind": "normal",
+          "features": [
+            "derive"
+          ],
+          "uses_default_features": true,
+          "optional": false,
+          "target": null
+        },
+        {
+          "name": "thiserror",
+          "package_key": "thiserror-2.0.18",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": false,
+          "target": null
+        }
+      ],
+      "runtime_dependencies": [
+        {
+          "name": "engenho_substrate",
+          "package_key": "engenho-substrate-0.1.4",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": false,
+          "target": null
+        },
+        {
+          "name": "engenho_sui_typescape",
+          "package_key": "engenho-sui-typescape-0.1.4",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": false,
+          "target": null
+        },
+        {
+          "name": "serde",
+          "package_key": "serde-1.0.228",
+          "kind": "normal",
+          "features": [
+            "derive"
+          ],
+          "uses_default_features": true,
+          "optional": false,
+          "target": null
+        },
+        {
+          "name": "thiserror",
+          "package_key": "thiserror-2.0.18",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": false,
+          "target": null
+        }
+      ],
+      "build_dependencies": [],
+      "crate_renames": {
+        "engenho-substrate": [
+          {
+            "version": "0.1.4",
+            "rename": "engenho_substrate"
+          }
+        ],
+        "engenho-sui-typescape": [
+          {
+            "version": "0.1.4",
+            "rename": "engenho_sui_typescape"
           }
         ]
       }
@@ -60610,7 +60726,8 @@
     "engenho-kubelet-0.1.4",
     "engenho-sui-typescape-0.1.4",
     "engenho-fonte-0.1.4",
-    "engenho-fonte-cli-0.1.4"
+    "engenho-fonte-cli-0.1.4",
+    "engenho-machines-0.1.4"
   ],
   "flake_metadata": {
     "engenho": {
@@ -60691,6 +60808,10 @@
     },
     "engenho-fonte-cli": {
       "default_bin": "engenho-fonte",
+      "repo": "pleme-io/engenho"
+    },
+    "engenho-machines": {
+      "default_bin": null,
       "repo": "pleme-io/engenho"
     }
   }
