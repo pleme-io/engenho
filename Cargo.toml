@@ -58,6 +58,12 @@ engenho-substrate-props = { path = "engenho-substrate-props", version = "0.1.4" 
 engenho-sui-typescape  = { path = "engenho-sui-typescape", version = "0.1.4" }
 engenho-fonte          = { path = "engenho-fonte", version = "0.1.4" }
 engenho-revoada        = { path = "engenho-revoada", version = "0.1.4" }
+
+# Pleme-io sibling-directory path deps for typed-dispatcher
+# catalog integration (theory/UNIFIED-COMPUTING-MODEL.md §VI).
+gen-platform = { path = "../gen/crates/gen-platform" }
+gen-types = { path = "../gen/crates/gen-types" }
+
 axum                   = "0.7"
 hyper                  = "1"
 tower                  = "0.5"

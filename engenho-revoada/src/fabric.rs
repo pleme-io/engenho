@@ -144,7 +144,7 @@ pub struct AttestationConfig {
 /// Strategies compose via [`PlacementPolicy::Spread`] over multiple
 /// constraints in future revisions; today each variant is its own
 /// single rule.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, gen_platform::TypedDispatcher)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum PlacementPolicy {
     /// Workload replicas must span ≥ `min_zones` failure domains.
@@ -159,6 +159,13 @@ pub enum PlacementPolicy {
     /// No placement preference — first-fit.
     None,
 }
+
+// Fleet-wide dispatcher-catalog registration for the engenho
+// fabric's placement policy surface. Sixth consumer class adopting
+// gen-platform's typed-dispatcher catamorphism (after gen / caixa /
+// wasm-platform / cofre / shigoto). See
+// theory/UNIFIED-COMPUTING-MODEL.md §VI.
+gen_platform::register_dispatcher!("engenho.placement-policy", PlacementPolicy);
 
 /// Reconciliation cadence — how often the fabric runs a convergence
 /// tick. Wraps `Duration` so the "zero tick" case (which would break
