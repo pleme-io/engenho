@@ -25,6 +25,11 @@ anyhow             = { workspace = true }
 engenho-types      = { workspace = true }
 engenho-config     = { workspace = true }
 
+# Gen-platform — typed-dispatcher catalog registration for
+# PlacementPolicy.
+gen-platform       = { workspace = true }
+gen-types          = { workspace = true }
+
 # Substrate: typed Clock for audit-event timestamps + future relógio
 # adoption across consensus / membership / backend timestamping.
 engenho-substrate  = { workspace = true }
