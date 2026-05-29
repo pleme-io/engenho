@@ -13475,7 +13475,7 @@
         },
         {
           "name": "openraft",
-          "package_key": "openraft-0.9.24",
+          "package_key": "openraft-0.9.22",
           "kind": "normal",
           "features": [
             "serde",
@@ -13684,7 +13684,7 @@
         },
         {
           "name": "openraft",
-          "package_key": "openraft-0.9.24",
+          "package_key": "openraft-0.9.22",
           "kind": "normal",
           "features": [
             "serde",
@@ -14295,7 +14295,7 @@
         },
         {
           "name": "openraft",
-          "package_key": "openraft-0.9.24",
+          "package_key": "openraft-0.9.22",
           "kind": "normal",
           "features": [
             "serde",
@@ -14434,7 +14434,7 @@
         },
         {
           "name": "openraft",
-          "package_key": "openraft-0.9.24",
+          "package_key": "openraft-0.9.22",
           "kind": "normal",
           "features": [
             "serde",
@@ -18041,7 +18041,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/gen",
         "rev": "0d9df5087f3b9c1a30988b9dfe08e280f72df83f",
-        "sha256": "07f021ijf8aq0g7jwcc9p3j6qdq98qxj1n750x4q1371vdisn05i"
+        "sha256": "sha256-sQCrY9vhjIBJB+XYIDtGCTds5LiJMS7PA1ghJ2MQwB0="
       },
       "features": [],
       "proc_macro": true,
@@ -18153,7 +18153,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/gen",
         "rev": "0d9df5087f3b9c1a30988b9dfe08e280f72df83f",
-        "sha256": "07f021ijf8aq0g7jwcc9p3j6qdq98qxj1n750x4q1371vdisn05i"
+        "sha256": "sha256-sQCrY9vhjIBJB+XYIDtGCTds5LiJMS7PA1ghJ2MQwB0="
       },
       "features": [],
       "proc_macro": false,
@@ -18334,7 +18334,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/gen",
         "rev": "0d9df5087f3b9c1a30988b9dfe08e280f72df83f",
-        "sha256": "07f021ijf8aq0g7jwcc9p3j6qdq98qxj1n750x4q1371vdisn05i"
+        "sha256": "sha256-sQCrY9vhjIBJB+XYIDtGCTds5LiJMS7PA1ghJ2MQwB0="
       },
       "features": [],
       "proc_macro": false,
@@ -43729,15 +43729,15 @@
         "preBuild": "export CARGO_CRATE_NAME=once_cell;"
       }
     },
-    "openraft-0.9.24": {
+    "openraft-0.9.22": {
       "name": "openraft",
-      "version": "0.9.24",
+      "version": "0.9.22",
       "edition": "2021",
       "source": {
         "kind": "registry",
-        "url": "https://static.crates.io/crates/openraft/openraft-0.9.24.crate",
-        "sha256": "80d35e2f60cdf9bcfc39a020966091017c6dc2a4b43b355a22ca3e76106f4a0a",
-        "name_with_ext": "openraft-0.9.24.tar.gz"
+        "url": "https://static.crates.io/crates/openraft/openraft-0.9.22.crate",
+        "sha256": "cc2f40b0e23149ea8673591325bff055939f7a59f4f9a28476f0854282444ab3",
+        "name_with_ext": "openraft-0.9.22.tar.gz"
       },
       "features": [
         "serde",
@@ -44119,7 +44119,7 @@
       },
       "build_rust_crate_args": {
         "crateName": "openraft",
-        "version": "0.9.24",
+        "version": "0.9.22",
         "edition": "2021",
         "features": [
           "serde",
@@ -60093,7 +60093,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/shikumi",
         "rev": "14ba02ab0dc28e88507181dcb6380db3911ec200",
-        "sha256": "0214iwrb0dx4z32ipj38dad7flvfh8pcnzyl81g6j1nz361dvzwh"
+        "sha256": "sha256-kP/dghnfBmleQNR/yy6CblN3mmpoyBvF+KQ3sDKPJAg="
       },
       "features": [
         "default"
@@ -65893,7 +65893,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/sui",
         "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
-        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
+        "sha256": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80="
       },
       "features": [],
       "proc_macro": false,
@@ -66122,7 +66122,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/sui",
         "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
-        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
+        "sha256": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80="
       },
       "features": [],
       "proc_macro": false,
@@ -66323,7 +66323,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/sui",
         "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
-        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
+        "sha256": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80="
       },
       "features": [],
       "proc_macro": false,
@@ -67130,7 +67130,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/sui",
         "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
-        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
+        "sha256": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80="
       },
       "features": [],
       "proc_macro": false,
@@ -67195,7 +67195,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/sui",
         "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
-        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
+        "sha256": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80="
       },
       "features": [],
       "proc_macro": false,
@@ -67497,7 +67497,7 @@
         "kind": "git",
         "url": "https://github.com/pleme-io/sui",
         "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
-        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
+        "sha256": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80="
       },
       "features": [],
       "proc_macro": false,
@@ -87252,7 +87252,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -87461,7 +87461,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -87860,7 +87860,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -87999,7 +87999,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -106873,7 +106873,7 @@
             "std"
           ]
         },
-        "openraft-0.9.24": {
+        "openraft-0.9.22": {
           "dependencies": [
             {
               "name": "anyerror",
@@ -138423,7 +138423,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -138632,7 +138632,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -139031,7 +139031,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -139170,7 +139170,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -158022,7 +158022,7 @@
             "std"
           ]
         },
-        "openraft-0.9.24": {
+        "openraft-0.9.22": {
           "dependencies": [
             {
               "name": "anyerror",
@@ -189421,7 +189421,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -189630,7 +189630,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -190029,7 +190029,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -190168,7 +190168,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -208937,7 +208937,7 @@
             "std"
           ]
         },
-        "openraft-0.9.24": {
+        "openraft-0.9.22": {
           "dependencies": [
             {
               "name": "anyerror",
@@ -240281,7 +240281,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -240490,7 +240490,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -240889,7 +240889,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -241028,7 +241028,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -259797,7 +259797,7 @@
             "std"
           ]
         },
-        "openraft-0.9.24": {
+        "openraft-0.9.22": {
           "dependencies": [
             {
               "name": "anyerror",
@@ -291065,7 +291065,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -291274,7 +291274,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -291673,7 +291673,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -291812,7 +291812,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -310603,7 +310603,7 @@
             "std"
           ]
         },
-        "openraft-0.9.24": {
+        "openraft-0.9.22": {
           "dependencies": [
             {
               "name": "anyerror",
@@ -341911,7 +341911,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -342120,7 +342120,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -342519,7 +342519,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -342658,7 +342658,7 @@
             },
             {
               "name": "openraft",
-              "package_key": "openraft-0.9.24",
+              "package_key": "openraft-0.9.22",
               "kind": "normal",
               "features": [
                 "serde",
@@ -361449,7 +361449,7 @@
             "std"
           ]
         },
-        "openraft-0.9.24": {
+        "openraft-0.9.22": {
           "dependencies": [
             {
               "name": "anyerror",
@@ -384014,5 +384014,5 @@
       }
     }
   },
-  "cargo_lock_sha256": "2754e93c19bbaa135761337f70cc168b848f2e5fdb3de20cd63eed2f8bab48c5"
+  "cargo_lock_sha256": "1a17525da5af928e88cf257b52cb55fcfeafefa8498918de82aaf2f21415ce63"
 }
