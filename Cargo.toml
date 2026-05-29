@@ -61,8 +61,8 @@ engenho-revoada        = { path = "engenho-revoada", version = "0.1.4" }
 
 # Pleme-io sibling-directory path deps for typed-dispatcher
 # catalog integration (theory/UNIFIED-COMPUTING-MODEL.md §VI).
-gen-platform = { path = "../gen/crates/gen-platform" }
-gen-types = { path = "../gen/crates/gen-types" }
+gen-platform = { git = "https://github.com/pleme-io/gen" }
+gen-types = { git = "https://github.com/pleme-io/gen" }
 
 axum                   = "0.7"
 hyper                  = "1"
