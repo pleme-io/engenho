@@ -31,7 +31,7 @@ engenho-substrate  = { workspace = true }
 # Optional — enabled by `with-sui-eval`. Cross-workspace path dep
 # to pleme-io/sui. The adapter is the only file that touches sui's
 # types.
-sui-eval           = { path = "../../sui/sui-eval", optional = true }
+sui-eval           = { git = "https://github.com/pleme-io/sui", optional = true }
 
 [dev-dependencies]
 proptest                = "1"

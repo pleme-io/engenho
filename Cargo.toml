@@ -87,7 +87,9 @@ rmcp                   = { version = "0.15", features = ["server", "transport-io
 # Distribution-layer deps (used by engenho-revoada). Pinned to the
 # same versions tatara-engine ships in production so we stay in sync.
 chitchat               = "0.10"
-openraft               = { version = "0.9", features = ["serde", "storage-v2"] }
+# Pinned at =0.9.22 — 0.9.24 has a trait-inference conflict with newer
+# rkyv's PartialEq impl (rustc E0283 in openraft/src/metrics/wait.rs:231).
+openraft               = { version = "=0.9.22", features = ["serde", "storage-v2"] }
 
 [workspace.lints]
 
