@@ -65890,18 +65890,17 @@
       "version": "0.1.10",
       "edition": "2024",
       "source": {
-        "kind": "path",
-        "relative_path": "../sui/sui-bytecode"
+        "kind": "git",
+        "url": "https://github.com/pleme-io/sui",
+        "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
+        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
       },
       "features": [],
       "proc_macro": false,
       "build_script": null,
       "links": null,
       "binaries": [],
-      "lib_target": {
-        "name": "sui_bytecode",
-        "path": "src/lib.rs"
-      },
+      "lib_target": null,
       "dependencies": [
         {
           "name": "rnix",
@@ -66112,8 +66111,6 @@
           ]
         },
         "release": true,
-        "libName": "sui_bytecode",
-        "libPath": "src/lib.rs",
         "preBuild": "export CARGO_CRATE_NAME=sui_bytecode;"
       }
     },
@@ -66122,18 +66119,17 @@
       "version": "0.1.10",
       "edition": "2024",
       "source": {
-        "kind": "path",
-        "relative_path": "../sui/sui-compat"
+        "kind": "git",
+        "url": "https://github.com/pleme-io/sui",
+        "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
+        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
       },
       "features": [],
       "proc_macro": false,
       "build_script": null,
       "links": null,
       "binaries": [],
-      "lib_target": {
-        "name": "sui_compat",
-        "path": "src/lib.rs"
-      },
+      "lib_target": null,
       "dependencies": [
         {
           "name": "base64",
@@ -66316,8 +66312,6 @@
           ]
         },
         "release": true,
-        "libName": "sui_compat",
-        "libPath": "src/lib.rs",
         "preBuild": "export CARGO_CRATE_NAME=sui_compat;"
       }
     },
@@ -66326,18 +66320,17 @@
       "version": "0.1.10",
       "edition": "2024",
       "source": {
-        "kind": "path",
-        "relative_path": "../sui/sui-eval"
+        "kind": "git",
+        "url": "https://github.com/pleme-io/sui",
+        "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
+        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
       },
       "features": [],
       "proc_macro": false,
       "build_script": null,
       "links": null,
       "binaries": [],
-      "lib_target": {
-        "name": "sui_eval",
-        "path": "src/lib.rs"
-      },
+      "lib_target": null,
       "dependencies": [
         {
           "name": "base64",
@@ -67126,8 +67119,6 @@
           ]
         },
         "release": true,
-        "libName": "sui_eval",
-        "libPath": "src/lib.rs",
         "preBuild": "export CARGO_CRATE_NAME=sui_eval;"
       }
     },
@@ -67136,18 +67127,17 @@
       "version": "0.1.10",
       "edition": "2024",
       "source": {
-        "kind": "path",
-        "relative_path": "../sui/sui-intern"
+        "kind": "git",
+        "url": "https://github.com/pleme-io/sui",
+        "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
+        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
       },
       "features": [],
       "proc_macro": false,
       "build_script": null,
       "links": null,
       "binaries": [],
-      "lib_target": {
-        "name": "sui_intern",
-        "path": "src/lib.rs"
-      },
+      "lib_target": null,
       "dependencies": [
         {
           "name": "rustc_hash",
@@ -67194,8 +67184,6 @@
           ]
         },
         "release": true,
-        "libName": "sui_intern",
-        "libPath": "src/lib.rs",
         "preBuild": "export CARGO_CRATE_NAME=sui_intern;"
       }
     },
@@ -67204,8 +67192,10 @@
       "version": "0.1.10",
       "edition": "2024",
       "source": {
-        "kind": "path",
-        "relative_path": "../sui/sui-spec"
+        "kind": "git",
+        "url": "https://github.com/pleme-io/sui",
+        "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
+        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
       },
       "features": [],
       "proc_macro": false,
@@ -67221,10 +67211,7 @@
           "path": "src/bin/sui-sweep.rs"
         }
       ],
-      "lib_target": {
-        "name": "sui_spec",
-        "path": "src/lib.rs"
-      },
+      "lib_target": null,
       "dependencies": [
         {
           "name": "base64",
@@ -67499,8 +67486,6 @@
           ]
         },
         "release": true,
-        "libName": "sui_spec",
-        "libPath": "src/lib.rs",
         "preBuild": "export CARGO_CRATE_NAME=sui_spec;"
       }
     },
@@ -67509,18 +67494,17 @@
       "version": "0.1.10",
       "edition": "2024",
       "source": {
-        "kind": "path",
-        "relative_path": "../sui/sui-store"
+        "kind": "git",
+        "url": "https://github.com/pleme-io/sui",
+        "rev": "12398d43741b571cea989c7fb23a6cd1b0d36ac9",
+        "sha256": "1kcz8m94ql7g6ik78y80xx818bjv9a33kwyajw6vaxwkbblyggl5"
       },
       "features": [],
       "proc_macro": false,
       "build_script": null,
       "links": null,
       "binaries": [],
-      "lib_target": {
-        "name": "sui_store",
-        "path": "src/lib.rs"
-      },
+      "lib_target": null,
       "dependencies": [
         {
           "name": "async_trait",
@@ -67891,8 +67875,6 @@
           ]
         },
         "release": true,
-        "libName": "sui_store",
-        "libPath": "src/lib.rs",
         "preBuild": "export CARGO_CRATE_NAME=sui_store;"
       }
     },
@@ -384032,5 +384014,5 @@
       }
     }
   },
-  "cargo_lock_sha256": "21704829c18e29d6c4761f6b0c35e875c6e484a3067fe1f2913964611085c394"
+  "cargo_lock_sha256": "2754e93c19bbaa135761337f70cc168b848f2e5fdb3de20cd63eed2f8bab48c5"
 }

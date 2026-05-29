@@ -565,6 +565,7 @@ dependencies = [
 [[package]]
 name = "caixa-core"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/caixa#4eda0dde98b2a1a936c3e4362445998e899c9ea6"
 dependencies = [
  "gen-platform",
  "gen-types",
@@ -580,6 +581,7 @@ dependencies = [
 [[package]]
 name = "caixa-helm"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/caixa#4eda0dde98b2a1a936c3e4362445998e899c9ea6"
 dependencies = [
  "caixa-core",
  "serde",
@@ -1252,7 +1254,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "shikumi 0.1.0 (git+https://github.com/pleme-io/shikumi)",
+ "shikumi",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -1301,7 +1303,7 @@ dependencies = [
  "shigoto-dag",
  "shigoto-retry",
  "shigoto-types",
- "shikumi 0.1.0",
+ "shikumi",
  "tameshi",
  "tatara-lisp 0.2.1",
  "tempfile",
@@ -4404,6 +4406,7 @@ dependencies = [
 [[package]]
 name = "promessa-types"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/promessa#97e995a5fe1f9ba650ced878d982202eb83e6aed"
 dependencies = [
  "async-trait",
  "blake3",
@@ -5624,6 +5627,7 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 [[package]]
 name = "shigoto-budget"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
 dependencies = [
  "serde",
  "shigoto-types",
@@ -5633,6 +5637,7 @@ dependencies = [
 [[package]]
 name = "shigoto-dag"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
 dependencies = [
  "petgraph",
  "serde",
@@ -5643,6 +5648,7 @@ dependencies = [
 [[package]]
 name = "shigoto-retry"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
 dependencies = [
  "serde",
  "shigoto-types",
@@ -5651,6 +5657,7 @@ dependencies = [
 [[package]]
 name = "shigoto-types"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5660,23 +5667,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "shikumi"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "async-trait",
- "figment",
- "gen-platform",
- "gen-types",
- "notify",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
@@ -6093,6 +6083,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sui-bytecode"
 version = "0.1.10"
+source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
 dependencies = [
  "rnix",
  "rowan",
@@ -6107,6 +6098,7 @@ dependencies = [
 [[package]]
 name = "sui-compat"
 version = "0.1.10"
+source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -6120,6 +6112,7 @@ dependencies = [
 [[package]]
 name = "sui-eval"
 version = "0.1.10"
+source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
 dependencies = [
  "base64",
  "blake3",
@@ -6158,6 +6151,7 @@ dependencies = [
 [[package]]
 name = "sui-intern"
 version = "0.1.10"
+source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
@@ -6165,6 +6159,7 @@ dependencies = [
 [[package]]
 name = "sui-spec"
 version = "0.1.10"
+source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
 dependencies = [
  "base64",
  "libc",
@@ -6182,6 +6177,7 @@ dependencies = [
 [[package]]
 name = "sui-store"
 version = "0.1.10"
+source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
 dependencies = [
  "async-trait",
  "ed25519-dalek",
@@ -6271,6 +6267,7 @@ dependencies = [
 [[package]]
 name = "tameshi"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/tameshi#4e3aa6732748abcec6792040d6788f57599b0d08"
 dependencies = [
  "axum 0.8.9",
  "blake3",
@@ -6285,7 +6282,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
- "shikumi 0.1.0 (git+https://github.com/pleme-io/shikumi)",
+ "shikumi",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -6313,6 +6310,7 @@ dependencies = [
 [[package]]
 name = "tatara-lisp"
 version = "0.2.1"
+source = "git+https://github.com/pleme-io/tatara#ceaab25b5e7c0fcb48668b0ec02a63a707fcf604"
 dependencies = [
  "blake3",
  "serde",
@@ -6337,6 +6335,7 @@ dependencies = [
 [[package]]
 name = "tatara-lisp-derive"
 version = "0.2.1"
+source = "git+https://github.com/pleme-io/tatara#ceaab25b5e7c0fcb48668b0ec02a63a707fcf604"
 dependencies = [
  "proc-macro2",
  "quote",
