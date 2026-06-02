@@ -64,6 +64,15 @@ engenho-revoada        = { path = "engenho-revoada", version = "0.1.4" }
 gen-platform = { git = "https://github.com/pleme-io/gen" }
 gen-types = { git = "https://github.com/pleme-io/gen" }
 
+# Convergence primitive — engenho-types' KubeError::classify consumes the
+# canonical Transient/Declarative split (theory/CONVERGENCE-ADOPTION.md;
+# theory/FAILURE-CLASSIFICATION.md) instead of hand-rolling FailureClass.
+# version+git: `version` keeps engenho-types crates.io-publishable
+# (FailureKind ships in shigoto-types 0.1.0); `git`+`rev` resolve the
+# local build against the re-home commit, whose transitive gen-platform
+# unifies with engenho's own git gen-platform (single closure).
+shigoto-types = { version = "0.1", git = "https://github.com/pleme-io/shigoto", rev = "417bf9d538a1741c5576b29a4d71673e92cf5d22" }
+
 axum                   = "0.7"
 hyper                  = "1"
 tower                  = "0.5"

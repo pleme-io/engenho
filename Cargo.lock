@@ -1302,7 +1302,7 @@ dependencies = [
  "shigoto-budget",
  "shigoto-dag",
  "shigoto-retry",
- "shigoto-types",
+ "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto)",
  "shikumi",
  "tameshi",
  "tatara-lisp 0.2.1",
@@ -1546,6 +1546,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto?rev=417bf9d538a1741c5576b29a4d71673e92cf5d22)",
  "thiserror 2.0.18",
 ]
 
@@ -5630,7 +5631,7 @@ version = "0.1.0"
 source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
 dependencies = [
  "serde",
- "shigoto-types",
+ "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto)",
  "thiserror 2.0.18",
 ]
 
@@ -5641,7 +5642,7 @@ source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f0
 dependencies = [
  "petgraph",
  "serde",
- "shigoto-types",
+ "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto)",
  "thiserror 2.0.18",
 ]
 
@@ -5651,7 +5652,22 @@ version = "0.1.0"
 source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
 dependencies = [
  "serde",
- "shigoto-types",
+ "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto)",
+]
+
+[[package]]
+name = "shigoto-types"
+version = "0.1.0"
+source = "git+https://github.com/pleme-io/shigoto?rev=417bf9d538a1741c5576b29a4d71673e92cf5d22#417bf9d538a1741c5576b29a4d71673e92cf5d22"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "gen-platform",
+ "gen-types",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

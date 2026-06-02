@@ -22,7 +22,7 @@ pub enum KubeError {
     /// TLS failure, DNS resolution, request build). Always [`Transient`]:
     /// the caller should retry with backoff.
     ///
-    /// [`Transient`]: FailureClass::Transient
+    /// [`Transient`]: FailureKind::Transient
     #[error("network error: {0}")]
     Network(String),
 
@@ -44,7 +44,7 @@ pub enum KubeError {
     /// [`Declarative`] — the wire shape doesn't match our typed
     /// expectation and retrying won't fix it.
     ///
-    /// [`Declarative`]: FailureClass::Declarative
+    /// [`Declarative`]: FailureKind::Declarative
     #[error("decode error: {0}")]
     Decode(String),
 
@@ -137,25 +137,22 @@ impl ApiStatusKind {
 }
 
 /// Retry classification — the typed decision a controller makes per
-/// failure. Mirrors `shigoto_types::failure::FailureKind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureClass {
-    /// Try again with backoff. The substrate's automatic retry loop
-    /// is appropriate.
-    Transient,
-    /// Don't retry — the input itself is wrong + bot retry will fix
-    /// it. Surface to the operator.
-    Declarative,
-}
+/// failure. This IS `shigoto_types::failure::FailureKind`, the canonical
+/// convergence primitive (theory/CONVERGENCE-ADOPTION.md;
+/// theory/FAILURE-CLASSIFICATION.md). `KubeError::classify` is a consumer
+/// of the fleet-wide Transient/Declarative split — not a hand-rolled
+/// mirror of it. Re-exported so the classify return type stays nameable
+/// as `engenho_types::error::FailureKind`.
+pub use shigoto_types::failure::FailureKind;
 
 impl KubeError {
     /// Classify this error for the substrate's retry decision. Pair
     /// with [`Self::retry_after`] to know if + when to retry.
     #[must_use]
-    pub fn classify(&self) -> FailureClass {
+    pub fn classify(&self) -> FailureKind {
         match self {
             Self::Network(_) | Self::WatchClosed | Self::ResourceVersionExpired(_) => {
-                FailureClass::Transient
+                FailureKind::Transient
             }
             Self::ApiStatus { kind, .. } => match kind {
                 ApiStatusKind::Conflict
@@ -163,14 +160,14 @@ impl KubeError {
                 | ApiStatusKind::InternalError
                 | ApiStatusKind::ServiceUnavailable
                 | ApiStatusKind::Timeout
-                | ApiStatusKind::Gone => FailureClass::Transient,
-                _ => FailureClass::Declarative,
+                | ApiStatusKind::Gone => FailureKind::Transient,
+                _ => FailureKind::Declarative,
             },
             Self::NotFound(_)
             | Self::Decode(_)
             | Self::Encode(_)
             | Self::Auth(_)
-            | Self::Other(_) => FailureClass::Declarative,
+            | Self::Other(_) => FailureKind::Declarative,
         }
     }
 
@@ -179,7 +176,7 @@ impl KubeError {
     /// (immediate) for the `Conflict` retry-loop. Callers MAY override
     /// (e.g., exponential backoff).
     ///
-    /// [`Transient`]: FailureClass::Transient
+    /// [`Transient`]: FailureKind::Transient
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
@@ -206,14 +203,14 @@ mod tests {
     #[test]
     fn network_error_is_transient() {
         let e = KubeError::Network("connection refused".into());
-        assert_eq!(e.classify(), FailureClass::Transient);
+        assert_eq!(e.classify(), FailureKind::Transient);
         assert_eq!(e.retry_after(), Some(Duration::from_secs(1)));
     }
 
     #[test]
     fn auth_error_is_declarative() {
         let e = KubeError::Auth("kubeconfig parse failed".into());
-        assert_eq!(e.classify(), FailureClass::Declarative);
+        assert_eq!(e.classify(), FailureKind::Declarative);
         assert_eq!(e.retry_after(), None);
     }
 
@@ -224,7 +221,7 @@ mod tests {
             kind: ApiStatusKind::Conflict,
             message: "resourceVersion mismatch".into(),
         };
-        assert_eq!(e.classify(), FailureClass::Transient);
+        assert_eq!(e.classify(), FailureKind::Transient);
         assert_eq!(e.retry_after(), Some(Duration::ZERO));
     }
 
@@ -235,7 +232,7 @@ mod tests {
             kind: ApiStatusKind::Forbidden,
             message: "RBAC denied".into(),
         };
-        assert_eq!(e.classify(), FailureClass::Declarative);
+        assert_eq!(e.classify(), FailureKind::Declarative);
     }
 
     #[test]
