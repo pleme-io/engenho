@@ -25,6 +25,8 @@ thiserror   = "2"
 async-trait = "0.1"
 futures-core = "0.3"
 bytes       = "1"
+# Canonical Transient/Declarative failure classification (KubeError::classify).
+shigoto-types = { workspace = true }
 
 [dev-dependencies]
 insta    = { version = "1", features = ["json", "yaml"] }
