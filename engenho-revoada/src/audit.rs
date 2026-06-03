@@ -45,6 +45,8 @@
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use shigoto_types::sink::{AuditFileSink, NullSink, Sink};
+
 use crate::backend::StoreBackend;
 use crate::face::{FaceError, FaceWatchStream, ResourceFormat, ResourceRef};
 
@@ -189,30 +191,33 @@ impl AuditEvent {
 /// **Object-safe by design** — `Send + Sync + 'static` so backends
 /// can hold `Box<dyn AuditLog>` and swap implementations behind
 /// a trait object.
-pub trait AuditLog: Send + Sync + 'static {
-    /// Record one event. Sinks should not block — slow sinks
-    /// should buffer and drop on overflow rather than back-pressure
-    /// the verb path.
-    fn record(&self, event: AuditEvent);
-
-    /// Optional: surface recent events for inspection. Default
-    /// returns an empty Vec; sinks that retain history override.
+///
+/// The write half IS the fleet [`shigoto_types::sink::Sink<AuditEvent>`]
+/// (`record(&self, &AuditEvent)`) — `AuditLog` extends it with a `recent`
+/// read for queryable sinks. Any `Sink<AuditEvent>` (the fleet
+/// `NullSink` / `AuditFileSink` / `MultiSink`) is therefore an `AuditLog`
+/// the moment it `impl AuditLog {}`, and the audit sinks compose with the
+/// rest of the fleet's sink ecosystem.
+pub trait AuditLog: Sink<AuditEvent> + 'static {
+    /// Optional: surface recent events for inspection. Default returns
+    /// an empty Vec; sinks that retain history (the in-memory ring)
+    /// override.
     fn recent(&self, _limit: usize) -> Vec<AuditEvent> {
         Vec::new()
     }
 }
 
 // ─────────────────────────────────────────────────────────────────
-// NoopAuditLog — drops every event
+// NoopAuditLog — drops every event (the fleet NullSink<AuditEvent>)
 // ─────────────────────────────────────────────────────────────────
 
 /// Discards every event. Use when audit isn't required (dev /
-/// tests / production-without-audit-tier).
-pub struct NoopAuditLog;
+/// tests / production-without-audit-tier). This is the fleet
+/// [`shigoto_types::sink::NullSink`] specialized to `AuditEvent` —
+/// no hand-rolled impl.
+pub type NoopAuditLog = NullSink<AuditEvent>;
 
-impl AuditLog for NoopAuditLog {
-    fn record(&self, _event: AuditEvent) {}
-}
+impl AuditLog for NullSink<AuditEvent> {}
 
 // ─────────────────────────────────────────────────────────────────
 // InMemoryAuditLog — bounded ring buffer
@@ -265,17 +270,19 @@ impl InMemoryAuditLog {
     }
 }
 
-impl AuditLog for InMemoryAuditLog {
-    fn record(&self, event: AuditEvent) {
+impl Sink<AuditEvent> for InMemoryAuditLog {
+    fn record(&self, event: &AuditEvent) {
         let Ok(mut events) = self.events.lock() else {
             return;
         };
         if events.len() >= self.capacity {
             events.pop_front();
         }
-        events.push_back(event);
+        events.push_back(event.clone());
     }
+}
 
+impl AuditLog for InMemoryAuditLog {
     fn recent(&self, limit: usize) -> Vec<AuditEvent> {
         self.events
             .lock()
@@ -292,42 +299,33 @@ impl AuditLog for InMemoryAuditLog {
 // ─────────────────────────────────────────────────────────────────
 
 /// Appends every event to a file as JSONL (one JSON object per
-/// line). Survives process restart. R6+ replaces with a typed
-/// segmented log (rotation, compaction) but the trait + on-disk
-/// format are stable.
-pub struct FileAuditLog {
-    file: Mutex<std::fs::File>,
-}
+/// line). Survives process restart. A thin newtype over the fleet
+/// [`shigoto_types::sink::AuditFileSink`] — the canonical
+/// append-JSONL-per-event sink — so the file-write path is no longer
+/// hand-rolled. R6+ replaces with a typed segmented log (rotation,
+/// compaction) but the trait + on-disk format are stable.
+pub struct FileAuditLog(AuditFileSink<AuditEvent>);
 
 impl FileAuditLog {
-    /// Open the file in append mode (creates if absent).
+    /// Open the file in append mode (creates if absent, with parent dirs).
     ///
     /// # Errors
     ///
     /// Returns the underlying io::Error wrapped in [`FaceError::Unsupported`].
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, FaceError> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.as_ref())
-            .map_err(|e| FaceError::Unsupported(format!("audit log open: {e}")))?;
-        Ok(Self {
-            file: Mutex::new(file),
-        })
+        AuditFileSink::new(path.as_ref())
+            .map(Self)
+            .map_err(|e| FaceError::Unsupported(format!("audit log open: {e}")))
     }
 }
 
-impl AuditLog for FileAuditLog {
-    fn record(&self, event: AuditEvent) {
-        let Ok(json) = serde_json::to_string(&event) else {
-            return;
-        };
-        let Ok(mut f) = self.file.lock() else { return };
-        use std::io::Write;
-        let _ = writeln!(f, "{json}");
-        let _ = f.flush();
+impl Sink<AuditEvent> for FileAuditLog {
+    fn record(&self, event: &AuditEvent) {
+        self.0.record(event);
     }
 }
+
+impl AuditLog for FileAuditLog {}
 
 // ─────────────────────────────────────────────────────────────────
 // AuditingBackend — wraps any StoreBackend with any AuditLog
@@ -392,7 +390,7 @@ impl<B: StoreBackend> StoreBackend for AuditingBackend<B> {
             Ok(()) => event.ok(),
             Err(e) => event.err(e),
         };
-        self.log.record(event);
+        self.log.record(&event);
         result
     }
 
@@ -405,7 +403,7 @@ impl<B: StoreBackend> StoreBackend for AuditingBackend<B> {
             Ok(_) => event.ok(),
             Err(e) => event.err(e),
         };
-        self.log.record(event);
+        self.log.record(&event);
         result
     }
 
@@ -423,7 +421,7 @@ impl<B: StoreBackend> StoreBackend for AuditingBackend<B> {
             Ok(_) => event.ok(),
             Err(e) => event.err(e),
         };
-        self.log.record(event);
+        self.log.record(&event);
         result
     }
 
@@ -434,7 +432,7 @@ impl<B: StoreBackend> StoreBackend for AuditingBackend<B> {
             Ok(()) => event.ok(),
             Err(e) => event.err(e),
         };
-        self.log.record(event);
+        self.log.record(&event);
         result
     }
 
@@ -452,7 +450,7 @@ impl<B: StoreBackend> StoreBackend for AuditingBackend<B> {
             Ok(_) => event.ok(),
             Err(e) => event.err(e),
         };
-        self.log.record(event);
+        self.log.record(&event);
         result
     }
 
@@ -471,7 +469,7 @@ impl<B: StoreBackend> StoreBackend for AuditingBackend<B> {
             Ok(_) => event.ok(),
             Err(e) => event.err(e),
         };
-        self.log.record(event);
+        self.log.record(&event);
         result
     }
 
@@ -482,7 +480,7 @@ impl<B: StoreBackend> StoreBackend for AuditingBackend<B> {
             Ok(()) => event.ok(),
             Err(e) => event.err(e),
         };
-        self.log.record(event);
+        self.log.record(&event);
         result
     }
 }
@@ -553,9 +551,9 @@ mod tests {
 
     #[test]
     fn noop_log_drops_every_event_silently() {
-        let log = NoopAuditLog;
+        let log = NoopAuditLog::new();
         for _ in 0..1000 {
-            log.record(AuditEvent::now(VerbKind::Apply));
+            log.record(&AuditEvent::now(VerbKind::Apply));
         }
         // No retention; recent() returns empty.
         assert_eq!(log.recent(10).len(), 0);
@@ -567,7 +565,7 @@ mod tests {
     fn in_memory_log_retains_events_up_to_capacity() {
         let log = InMemoryAuditLog::with_capacity(3);
         for i in 0..5 {
-            log.record(AuditEvent::now(VerbKind::Apply).with_body_bytes(i));
+            log.record(&AuditEvent::now(VerbKind::Apply).with_body_bytes(i));
         }
         assert_eq!(log.len(), 3);
         let snap = log.snapshot();
@@ -581,7 +579,7 @@ mod tests {
     fn in_memory_log_recent_returns_most_recent_n_in_order() {
         let log = InMemoryAuditLog::with_capacity(10);
         for i in 0..5 {
-            log.record(AuditEvent::now(VerbKind::Apply).with_body_bytes(i));
+            log.record(&AuditEvent::now(VerbKind::Apply).with_body_bytes(i));
         }
         let recent = log.recent(3);
         assert_eq!(recent.len(), 3);
@@ -594,7 +592,7 @@ mod tests {
     #[test]
     fn in_memory_log_clear_empties_buffer() {
         let log = InMemoryAuditLog::with_capacity(10);
-        log.record(AuditEvent::now(VerbKind::Apply));
+        log.record(&AuditEvent::now(VerbKind::Apply));
         assert_eq!(log.len(), 1);
         log.clear();
         assert!(log.is_empty());
@@ -603,8 +601,8 @@ mod tests {
     #[test]
     fn in_memory_log_with_capacity_zero_normalizes_to_one() {
         let log = InMemoryAuditLog::with_capacity(0);
-        log.record(AuditEvent::now(VerbKind::Apply));
-        log.record(AuditEvent::now(VerbKind::Get));
+        log.record(&AuditEvent::now(VerbKind::Apply));
+        log.record(&AuditEvent::now(VerbKind::Get));
         assert_eq!(log.len(), 1);
     }
 
@@ -615,8 +613,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let log = FileAuditLog::open(&path).unwrap();
-        log.record(AuditEvent::now(VerbKind::Apply).with_body_bytes(10));
-        log.record(AuditEvent::now(VerbKind::Get).with_ref(pod_ref()));
+        log.record(&AuditEvent::now(VerbKind::Apply).with_body_bytes(10));
+        log.record(&AuditEvent::now(VerbKind::Get).with_ref(pod_ref()));
         drop(log);
         let contents = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
@@ -634,11 +632,11 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         {
             let log = FileAuditLog::open(&path).unwrap();
-            log.record(AuditEvent::now(VerbKind::Apply).with_body_bytes(1));
+            log.record(&AuditEvent::now(VerbKind::Apply).with_body_bytes(1));
         }
         // Reopen + append more.
         let log = FileAuditLog::open(&path).unwrap();
-        log.record(AuditEvent::now(VerbKind::Delete).with_ref(pod_ref()));
+        log.record(&AuditEvent::now(VerbKind::Delete).with_ref(pod_ref()));
         drop(log);
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.lines().count(), 2);
@@ -711,7 +709,7 @@ mod tests {
     #[test]
     fn auditing_backend_preserves_inner_backend_name() {
         let inner = InMemoryStore::new("inner");
-        let backend = AuditingBackend::new(inner, NoopAuditLog);
+        let backend = AuditingBackend::new(inner, NoopAuditLog::new());
         // Inner is "in-memory" via the blanket StoreBackend impl
         // on InMemoryStore.
         assert_eq!(backend.name(), "in-memory");
@@ -720,7 +718,7 @@ mod tests {
     #[test]
     fn auditing_backend_inner_borrow_for_telemetry() {
         let inner = InMemoryStore::new("inner");
-        let backend = AuditingBackend::new(inner, NoopAuditLog);
+        let backend = AuditingBackend::new(inner, NoopAuditLog::new());
         backend.apply(ResourceFormat::Yaml, &yaml()).unwrap();
         // Access the inner backend through inner() for telemetry.
         assert_eq!(backend.inner().len(), 1);
@@ -745,7 +743,7 @@ mod tests {
     #[test]
     fn auditing_backend_dispatches_through_store_backend_trait_object() {
         let inner = InMemoryStore::new("inner");
-        let backend: Box<dyn StoreBackend> = Box::new(AuditingBackend::new(inner, NoopAuditLog));
+        let backend: Box<dyn StoreBackend> = Box::new(AuditingBackend::new(inner, NoopAuditLog::new()));
         backend.apply(ResourceFormat::Yaml, &yaml()).unwrap();
         assert_eq!(backend.resource_count(), 1);
     }
@@ -793,8 +791,32 @@ mod tests {
         fn assert_object_safe<T: ?Sized>() {}
         assert_object_safe::<dyn AuditLog>();
         let _heterogeneous: Vec<Box<dyn AuditLog>> = vec![
-            Box::new(NoopAuditLog),
+            Box::new(NoopAuditLog::new()),
             Box::new(InMemoryAuditLog::with_capacity(10)),
         ];
+    }
+
+    // ── Fleet Sink ecosystem ─────────────────────────────────────
+
+    /// The audit sinks are now real `shigoto_types::sink::Sink<AuditEvent>`,
+    /// so they compose through the fleet `MultiSink` — one audit event fans
+    /// out to several sinks (e.g. a durable file + an in-memory ring). This
+    /// is the payoff of `AuditLog: Sink<AuditEvent>`.
+    #[test]
+    fn audit_sinks_compose_via_fleet_multisink() {
+        use shigoto_types::sink::MultiSink;
+        use std::sync::Arc;
+
+        let ring = Arc::new(InMemoryAuditLog::with_capacity(16));
+        let multi = MultiSink::<AuditEvent>::new()
+            .with(ring.clone() as Arc<dyn Sink<AuditEvent>>)
+            .with(Arc::new(NoopAuditLog::new()) as Arc<dyn Sink<AuditEvent>>);
+
+        multi.record(&AuditEvent::now(VerbKind::Apply));
+        multi.record(&AuditEvent::now(VerbKind::Delete));
+
+        // The in-memory child captured both; the null child dropped them.
+        assert_eq!(ring.len(), 2);
+        assert_eq!(ring.recent(16).len(), 2);
     }
 }
