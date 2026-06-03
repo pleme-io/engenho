@@ -1430,6 +1430,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto?rev=417bf9d538a1741c5576b29a4d71673e92cf5d22)",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

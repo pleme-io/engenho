@@ -16,6 +16,7 @@ description = "engenho's distribution layer — dynamic K8s control-plane / work
 async-trait        = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
+shigoto-types      = { workspace = true }
 thiserror          = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
