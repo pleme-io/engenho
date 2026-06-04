@@ -1413,11 +1413,11 @@
         "substrate": "substrate"
       },
       "locked": {
-        "lastModified": 1780513255,
-        "narHash": "sha256-i/WARMRtfe75MEmoS0ILOHaWWRhLz7ktfSQWX4277w4=",
+        "lastModified": 1780549246,
+        "narHash": "sha256-Yfv2LwoQoHo1eF4/+4Oa4hYSXZ4Km2dYUPww0AZHe6A=",
         "owner": "pleme-io",
         "repo": "forge",
-        "rev": "243d0ed8c559f6c1e2c85ba888c5706f45b7651e",
+        "rev": "ddc789d29a6da0728b7198fc5cc822b97ce1153f",
         "type": "github"
       },
       "original": {
