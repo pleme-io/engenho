@@ -33,6 +33,7 @@
 
 pub mod catalog;
 pub mod emit;
+pub mod emit_typed;
 pub mod openapi;
 pub mod types;
 
