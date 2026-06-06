@@ -1,99 +1,60 @@
-//! `ReplicaSet` — M0.0.2 typed expansion #9 (apps/v1).
+//! GENERATED — DO NOT EDIT by hand. Source: engenho-kube-codegen.
 //!
-//! Promotes ReplicaSet.spec / .status to typed
-//! `ReplicaSetSpec` / `ReplicaSetStatus`. Reuses
-//! `LabelSelector` + `PodTemplateSpec` from `deployment_spec`.
+//! Regenerate via `cargo run -p engenho-kube-codegen -- \
+//!     --schema engenho-types/vendor/openapi/v1.34.0 \
+//!     --output engenho-types/src/generated_v1_34`.
+//!
+//! Edit src/catalog.rs to add or remove kinds.
 
 #![allow(clippy::module_name_repetitions)]
 
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use serde::{Deserialize, Serialize};
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
+use crate::generated_v1_34::types::*;
 
-use super::replicaset_spec::{ReplicaSetSpec, ReplicaSetStatus};
-
-/// `ReplicaSet` ensures that a specified number of pod replicas
-/// are running at any given time.
+/// ReplicaSet ensures that a specified number of pod replicas are running at any given time.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReplicaSet {
+    /// If the Labels of a ReplicaSet are empty, they are defaulted to be the same as the Pod(s) that the ReplicaSet manages. Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
     #[serde(default, skip_serializing_if = "is_empty_meta")]
-    pub metadata: ObjectMeta,
-
-    #[serde(default, skip_serializing_if = "is_empty_spec")]
-    pub spec: ReplicaSetSpec,
-
+    pub metadata: crate::meta::ObjectMeta,
+    /// Spec defines the specification of the desired behavior of the ReplicaSet. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<ReplicaSetSpec>,
+    /// Status is the most recently observed status of the ReplicaSet. This data may be out of date by some window of time. Populated by the system. Read-only. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ReplicaSetStatus>,
 }
 
 impl KubeResource for ReplicaSet {
-    const GVK: GroupVersionKind = GroupVersionKind {
-        group: "apps",
-        version: "v1",
-        kind: "ReplicaSet",
-    };
-    const GVR: GroupVersionResource = GroupVersionResource {
-        group: "apps",
-        version: "v1",
-        resource: "replicasets",
-    };
-    const SCOPE: Scope = Scope::Namespaced;
+const GVK: GroupVersionKind = GroupVersionKind {
+group:   "apps",
+version: "v1",
+kind:    "ReplicaSet",
+};
+const GVR: GroupVersionResource = GroupVersionResource {
+group:    "apps",
+version:  "v1",
+resource: "replicasets",
+};
+const SCOPE: Scope = Scope::Namespaced;
 
-    fn name(&self) -> Cow<'_, str> {
-        Cow::Borrowed(self.metadata.name.as_str())
-    }
-    fn namespace(&self) -> Option<Cow<'_, str>> {
-        self.metadata.namespace.as_deref().map(Cow::Borrowed)
-    }
-    fn resource_version(&self) -> Option<Cow<'_, str>> {
-        if self.metadata.resource_version.is_empty() {
-            None
-        } else {
-            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-        }
-    }
+fn name(&self) -> Cow<'_, str> {
+Cow::Borrowed(self.metadata.name.as_str())
+}
+fn namespace(&self) -> Option<Cow<'_, str>> {
+self.metadata.namespace.as_deref().map(Cow::Borrowed)
+}
+fn resource_version(&self) -> Option<Cow<'_, str>> {
+if self.metadata.resource_version.is_empty() {
+None
+} else {
+Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+}
+}
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool {
-    m == &ObjectMeta::default()
-}
-fn is_empty_spec(s: &ReplicaSetSpec) -> bool {
-    s == &ReplicaSetSpec::default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::generated_v1_34::core_v1::Container;
-
-    #[test]
-    fn replicaset_round_trips_with_typed_spec() {
-        let mut rs = ReplicaSet::default();
-        rs.metadata.name = "podinfo-8df8b84cd".into();
-        rs.metadata.namespace = Some("default".into());
-        rs.spec.replicas = Some(2);
-        rs.spec
-            .selector
-            .match_labels
-            .insert("app".into(), "podinfo".into());
-        rs.spec.template.spec.containers.push(Container {
-            name: "podinfod".into(),
-            image: "ghcr.io/stefanprodan/podinfo:6.12.0".into(),
-            ..Default::default()
-        });
-        let json = serde_json::to_string(&rs).unwrap();
-        assert!(json.contains("\"podinfod\""));
-        let back: ReplicaSet = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, rs);
-    }
-
-    #[test]
-    fn replicaset_gvk_is_apps_v1() {
-        assert_eq!(ReplicaSet::GVK.group, "apps");
-        assert_eq!(ReplicaSet::GVK.kind, "ReplicaSet");
-        assert_eq!(ReplicaSet::GVR.resource, "replicasets");
-        assert_eq!(ReplicaSet::SCOPE, Scope::Namespaced);
-    }
-}
+fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }

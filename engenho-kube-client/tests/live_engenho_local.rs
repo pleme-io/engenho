@@ -27,6 +27,7 @@ fn engenho_local_kubeconfig_path() -> Option<PathBuf> {
 }
 
 #[tokio::test]
+#[ignore = "live: requires a reachable engenho-local cluster; run with --ignored"]
 async fn list_pods_from_engenho_local() {
     let Some(kc_path) = engenho_local_kubeconfig_path() else {
         eprintln!("skipping: ~/.kube/configs/engenho-local not present");
@@ -66,16 +67,20 @@ async fn list_pods_from_engenho_local() {
 
     // Validate typed PodSpec parsed: container name + image.
     let first = podinfo[0];
+    let pod_spec = first
+        .spec
+        .as_ref()
+        .expect("podinfo pod has no typed spec — check engenho-types PodSpec expansion");
     assert!(
-        !first.spec.containers.is_empty(),
+        !pod_spec.containers.is_empty(),
         "podinfo pod has no containers in typed spec — check engenho-types PodSpec expansion"
     );
-    let c = &first.spec.containers[0];
+    let c = &pod_spec.containers[0];
     assert_eq!(c.name, "podinfod", "container name mismatch: {}", c.name);
+    let img = c.image.as_deref().unwrap_or_default();
     assert!(
-        c.image.contains("podinfo"),
-        "container image doesn't reference podinfo: {}",
-        c.image
+        img.contains("podinfo"),
+        "container image doesn't reference podinfo: {img}"
     );
 
     // Validate typed PodStatus parsed for running pod: phase +
@@ -84,7 +89,7 @@ async fn list_pods_from_engenho_local() {
         .status
         .as_ref()
         .expect("typed PodStatus must be present on Running pod");
-    use engenho_types::generated_v1_34::core_v1::PodPhase;
+    use engenho_types::curated_enums::PodPhase;
     assert_eq!(
         status.phase,
         Some(PodPhase::Running),
@@ -101,6 +106,7 @@ async fn list_pods_from_engenho_local() {
 }
 
 #[tokio::test]
+#[ignore = "live: requires a reachable engenho-local cluster; run with --ignored"]
 async fn get_specific_pod_from_engenho_local() {
     let Some(kc_path) = engenho_local_kubeconfig_path() else {
         eprintln!("skipping: ~/.kube/configs/engenho-local not present");

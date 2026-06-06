@@ -8,54 +8,53 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use serde::{Deserialize, Serialize};
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
+use crate::generated_v1_34::types::*;
 
 /// ClusterRoleBinding references a ClusterRole, but not contain it.  It can reference a ClusterRole in the global namespace, and adds who information via Subject.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClusterRoleBinding {
-    /// Standard object metadata.
+    /// Standard object's metadata.
     #[serde(default, skip_serializing_if = "is_empty_meta")]
-    pub metadata: ObjectMeta,
-    /// Spec (typed expansion is M0.0.4; today opaque JSON).
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub spec: serde_json::Value,
-    /// Status (typed expansion is M0.0.4; today opaque JSON).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<serde_json::Value>,
+    pub metadata: crate::meta::ObjectMeta,
+    /// RoleRef can only reference a ClusterRole in the global namespace. If the RoleRef cannot be resolved, the Authorizer must return an error. This field is immutable.
+    #[serde(default, rename = "roleRef")]
+    pub role_ref: RoleRef,
+    /// Subjects holds references to the objects the role applies to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<Subject>,
 }
 
 impl KubeResource for ClusterRoleBinding {
-    const GVK: GroupVersionKind = GroupVersionKind {
-        group: "rbac.authorization.k8s.io",
-        version: "v1",
-        kind: "ClusterRoleBinding",
-    };
-    const GVR: GroupVersionResource = GroupVersionResource {
-        group: "rbac.authorization.k8s.io",
-        version: "v1",
-        resource: "clusterrolebindings",
-    };
-    const SCOPE: Scope = Scope::Cluster;
+const GVK: GroupVersionKind = GroupVersionKind {
+group:   "rbac.authorization.k8s.io",
+version: "v1",
+kind:    "ClusterRoleBinding",
+};
+const GVR: GroupVersionResource = GroupVersionResource {
+group:    "rbac.authorization.k8s.io",
+version:  "v1",
+resource: "clusterrolebindings",
+};
+const SCOPE: Scope = Scope::Cluster;
 
-    fn name(&self) -> Cow<'_, str> {
-        Cow::Borrowed(self.metadata.name.as_str())
-    }
-    fn namespace(&self) -> Option<Cow<'_, str>> {
-        self.metadata.namespace.as_deref().map(Cow::Borrowed)
-    }
-    fn resource_version(&self) -> Option<Cow<'_, str>> {
-        if self.metadata.resource_version.is_empty() {
-            None
-        } else {
-            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-        }
-    }
+fn name(&self) -> Cow<'_, str> {
+Cow::Borrowed(self.metadata.name.as_str())
+}
+fn namespace(&self) -> Option<Cow<'_, str>> {
+self.metadata.namespace.as_deref().map(Cow::Borrowed)
+}
+fn resource_version(&self) -> Option<Cow<'_, str>> {
+if self.metadata.resource_version.is_empty() {
+None
+} else {
+Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+}
+}
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool {
-    m == &ObjectMeta::default()
-}
+fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }

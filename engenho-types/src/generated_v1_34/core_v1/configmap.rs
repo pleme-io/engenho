@@ -1,148 +1,62 @@
-//! `ConfigMap` — M0.0.2 typed expansion #3.
+//! GENERATED — DO NOT EDIT by hand. Source: engenho-kube-codegen.
 //!
-//! ConfigMap is wire-different from the Pod/Service shape: it has
-//! NO spec/status. The data + binaryData + immutable fields live
-//! directly on the top-level object. The generator's original
-//! output had `spec` / `status` fields which were wire-wrong
-//! (ConfigMap requests with those fields would be rejected by
-//! the apiserver). M0.0.2 fixes the shape AND types the maps.
+//! Regenerate via `cargo run -p engenho-kube-codegen -- \
+//!     --schema engenho-types/vendor/openapi/v1.34.0 \
+//!     --output engenho-types/src/generated_v1_34`.
+//!
+//! Edit src/catalog.rs to add or remove kinds.
 
 #![allow(clippy::module_name_repetitions)]
 
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
 
-/// `ConfigMap` holds configuration data for pods to consume.
+/// ConfigMap holds configuration data for pods to consume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigMap {
-    /// Standard object metadata.
-    #[serde(default, skip_serializing_if = "is_empty_meta")]
-    pub metadata: ObjectMeta,
-
-    /// `Data` contains the configuration data. Each key must be a
-    /// valid DNS_SUBDOMAIN with an optional leading dot.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub data: BTreeMap<String, String>,
-
-    /// `BinaryData` contains the binary data. Each key must consist
-    /// of alphanumeric characters, `-`, `_` or `.`. Values are
-    /// base64-encoded.
-    #[serde(
-        default,
-        rename = "binaryData",
-        skip_serializing_if = "BTreeMap::is_empty"
-    )]
-    pub binary_data: BTreeMap<String, String>,
-
-    /// `Immutable`, if set to true, ensures that data stored in the
-    /// ConfigMap cannot be updated (only object meta can be modified).
+    /// BinaryData contains the binary data. Each key must consist of alphanumeric characters, '-', '_' or '.'. BinaryData can contain byte sequences that are not in the UTF-8 range. The keys stored in BinaryData must not overlap with the ones in the Data field, this is enforced during validation process. Using this field will require 1.10+ apiserver and kubelet.
+    #[serde(default, rename = "binaryData", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub binary_data: std::collections::BTreeMap<String, String>,
+    /// Data contains the configuration data. Each key must consist of alphanumeric characters, '-', '_' or '.'. Values with non-UTF-8 byte sequences must use the BinaryData field. The keys stored in Data must not overlap with the keys in the BinaryData field, this is enforced during validation process.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub data: std::collections::BTreeMap<String, String>,
+    /// Immutable, if set to true, ensures that data stored in the ConfigMap cannot be updated (only object metadata can be modified). If not set to true, the field can be modified at any time. Defaulted to nil.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub immutable: Option<bool>,
+    /// Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+    #[serde(default, skip_serializing_if = "is_empty_meta")]
+    pub metadata: crate::meta::ObjectMeta,
 }
 
 impl KubeResource for ConfigMap {
-    const GVK: GroupVersionKind = GroupVersionKind {
-        group: "",
-        version: "v1",
-        kind: "ConfigMap",
-    };
-    const GVR: GroupVersionResource = GroupVersionResource {
-        group: "",
-        version: "v1",
-        resource: "configmaps",
-    };
-    const SCOPE: Scope = Scope::Namespaced;
+const GVK: GroupVersionKind = GroupVersionKind {
+group:   "",
+version: "v1",
+kind:    "ConfigMap",
+};
+const GVR: GroupVersionResource = GroupVersionResource {
+group:    "",
+version:  "v1",
+resource: "configmaps",
+};
+const SCOPE: Scope = Scope::Namespaced;
 
-    fn name(&self) -> Cow<'_, str> {
-        Cow::Borrowed(self.metadata.name.as_str())
-    }
-    fn namespace(&self) -> Option<Cow<'_, str>> {
-        self.metadata.namespace.as_deref().map(Cow::Borrowed)
-    }
-    fn resource_version(&self) -> Option<Cow<'_, str>> {
-        if self.metadata.resource_version.is_empty() {
-            None
-        } else {
-            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-        }
-    }
+fn name(&self) -> Cow<'_, str> {
+Cow::Borrowed(self.metadata.name.as_str())
+}
+fn namespace(&self) -> Option<Cow<'_, str>> {
+self.metadata.namespace.as_deref().map(Cow::Borrowed)
+}
+fn resource_version(&self) -> Option<Cow<'_, str>> {
+if self.metadata.resource_version.is_empty() {
+None
+} else {
+Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+}
+}
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool {
-    m == &ObjectMeta::default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn configmap_round_trips_with_data() {
-        let mut cm = ConfigMap::default();
-        cm.metadata.name = "kube-proxy".into();
-        cm.metadata.namespace = Some("kube-system".into());
-        cm.data
-            .insert("config.conf".into(), "mode: iptables".into());
-        cm.immutable = Some(true);
-        let json = serde_json::to_string(&cm).unwrap();
-        assert!(json.contains("\"config.conf\""));
-        assert!(json.contains("\"immutable\":true"));
-        // Wire-clean: no spec/status leaked.
-        assert!(
-            !json.contains("\"spec\""),
-            "ConfigMap must not emit spec field: {json}"
-        );
-        assert!(
-            !json.contains("\"status\""),
-            "ConfigMap must not emit status field: {json}"
-        );
-        let back: ConfigMap = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, cm);
-    }
-
-    #[test]
-    fn configmap_gvk_is_core_v1() {
-        assert_eq!(ConfigMap::GVK.kind, "ConfigMap");
-        assert_eq!(ConfigMap::GVR.resource, "configmaps");
-        assert_eq!(ConfigMap::SCOPE, Scope::Namespaced);
-    }
-
-    #[test]
-    fn empty_configmap_serializes_minimally() {
-        let s = serde_json::to_string(&ConfigMap::default()).unwrap();
-        assert_eq!(s, "{}");
-    }
-
-    use proptest::prelude::*;
-
-    /// Property-based round-trip: any ConfigMap with arbitrary
-    /// data keys + values must JSON-identity. Catches a future
-    /// rename or skip_serializing regression on the data map.
-    proptest! {
-        #[test]
-        fn arb_configmap_round_trips(
-            name in "[a-z][a-z0-9-]{0,30}",
-            ns in "[a-z][a-z0-9-]{0,30}",
-            key in "[a-z][a-z0-9.-]{0,30}",
-            value in ".{0,200}",
-            immutable in any::<bool>(),
-        ) {
-            let mut cm = ConfigMap::default();
-            cm.metadata.name = name.clone();
-            cm.metadata.namespace = Some(ns.clone());
-            cm.data.insert(key.clone(), value.clone());
-            cm.immutable = Some(immutable);
-            let json = serde_json::to_string(&cm).unwrap();
-            // Wire-clean invariant — no spurious spec/status on
-            // ConfigMap regardless of input.
-            prop_assert!(!json.contains("\"spec\""));
-            prop_assert!(!json.contains("\"status\""));
-            let back: ConfigMap = serde_json::from_str(&json).unwrap();
-            prop_assert_eq!(back, cm);
-        }
-    }
-}
+fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }

@@ -8,56 +8,55 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use serde::{Deserialize, Serialize};
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
+use crate::generated_v1_34::types::*;
 
 /// StatefulSet represents a set of pods with consistent identities. Identities are defined as:
 /// - Network: A single stable DNS and hostname.
 /// - Storage: As many VolumeClaims as requested.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatefulSet {
-    /// Standard object metadata.
+    /// Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
     #[serde(default, skip_serializing_if = "is_empty_meta")]
-    pub metadata: ObjectMeta,
-    /// Spec (typed expansion is M0.0.4; today opaque JSON).
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub spec: serde_json::Value,
-    /// Status (typed expansion is M0.0.4; today opaque JSON).
+    pub metadata: crate::meta::ObjectMeta,
+    /// Spec defines the desired identities of pods in this set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<serde_json::Value>,
+    pub spec: Option<StatefulSetSpec>,
+    /// Status is the current status of Pods in this StatefulSet. This data may be out of date by some window of time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<StatefulSetStatus>,
 }
 
 impl KubeResource for StatefulSet {
-    const GVK: GroupVersionKind = GroupVersionKind {
-        group: "apps",
-        version: "v1",
-        kind: "StatefulSet",
-    };
-    const GVR: GroupVersionResource = GroupVersionResource {
-        group: "apps",
-        version: "v1",
-        resource: "statefulsets",
-    };
-    const SCOPE: Scope = Scope::Namespaced;
+const GVK: GroupVersionKind = GroupVersionKind {
+group:   "apps",
+version: "v1",
+kind:    "StatefulSet",
+};
+const GVR: GroupVersionResource = GroupVersionResource {
+group:    "apps",
+version:  "v1",
+resource: "statefulsets",
+};
+const SCOPE: Scope = Scope::Namespaced;
 
-    fn name(&self) -> Cow<'_, str> {
-        Cow::Borrowed(self.metadata.name.as_str())
-    }
-    fn namespace(&self) -> Option<Cow<'_, str>> {
-        self.metadata.namespace.as_deref().map(Cow::Borrowed)
-    }
-    fn resource_version(&self) -> Option<Cow<'_, str>> {
-        if self.metadata.resource_version.is_empty() {
-            None
-        } else {
-            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-        }
-    }
+fn name(&self) -> Cow<'_, str> {
+Cow::Borrowed(self.metadata.name.as_str())
+}
+fn namespace(&self) -> Option<Cow<'_, str>> {
+self.metadata.namespace.as_deref().map(Cow::Borrowed)
+}
+fn resource_version(&self) -> Option<Cow<'_, str>> {
+if self.metadata.resource_version.is_empty() {
+None
+} else {
+Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+}
+}
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool {
-    m == &ObjectMeta::default()
-}
+fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }

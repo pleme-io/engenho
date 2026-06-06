@@ -17,7 +17,8 @@
 //! token-projected volumes). Each gets its own typed view that
 //! lives here.
 
-use engenho_types::generated_v1_34::core_v1::{Secret, SecretType};
+use engenho_types::curated_enums::SecretType;
+use engenho_types::generated_v1_34::core_v1::Secret;
 use engenho_types::meta::ObjectMeta;
 use serde::Serialize;
 
@@ -72,7 +73,7 @@ pub fn redact_secret(s: &Secret) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engenho_types::generated_v1_34::core_v1::{KnownSecretType, SecretType};
+    use engenho_types::curated_enums::{KnownSecretType, SecretType};
 
     fn sample_secret() -> Secret {
         let mut s = Secret::default();

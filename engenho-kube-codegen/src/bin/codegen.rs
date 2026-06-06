@@ -16,7 +16,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use engenho_kube_codegen::{KIND_CATALOG, KindEntry, OpenApiDoc, emit_kind, emit_module};
+use engenho_kube_codegen::{
+    KIND_CATALOG, KindEntry, OpenApiDoc, SchemaView, emit_kind_typed, emit_module,
+    emit_shared_module, shared_substructs,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "engenho-kube-codegen", version, about)]
@@ -72,9 +75,47 @@ fn main() -> Result<()> {
         }
     }
 
+    // Merge every group's components.schemas into one map so the typed
+    // emitter can resolve $refs across groups (e.g. apps Deployment →
+    // core PodTemplateSpec). BTreeMap → deterministic; first writer wins
+    // (identical schema keys across files carry identical bodies).
+    let mut schemas: BTreeMap<String, SchemaView> = BTreeMap::new();
+    for doc in docs.values() {
+        for (key, shape) in &doc.components.schemas {
+            schemas.entry(key.clone()).or_insert_with(|| SchemaView {
+                description: shape.description.clone(),
+                properties: shape.properties.clone(),
+                required: shape.required.clone(),
+            });
+        }
+    }
+
     // Per-module emission. Each module gets `<module>/{kind}.rs` files
     // + a `<module>/mod.rs` that re-exports them.
     let mut drift = false;
+
+    // Emit the shared sub-struct module (types.rs) once — every kind's $ref
+    // closure, globally deduplicated into one canonical set.
+    {
+        let kind_keys: Vec<&str> = KIND_CATALOG.iter().map(|e| e.openapi_key).collect();
+        let kind_names: Vec<&str> = KIND_CATALOG.iter().map(|e| e.kind).collect();
+        let shared = shared_substructs(&kind_keys, &kind_names, &schemas);
+        let shared_src = emit_shared_module(&shared, KIND_CATALOG);
+        let shared_target = args.output.join("types.rs");
+        if args.check {
+            let existing = std::fs::read_to_string(&shared_target).unwrap_or_default();
+            if existing != shared_src {
+                eprintln!("DRIFT: {}", shared_target.display());
+                drift = true;
+            }
+        } else {
+            std::fs::create_dir_all(&args.output)
+                .with_context(|| format!("create {}", args.output.display()))?;
+            std::fs::write(&shared_target, shared_src)
+                .with_context(|| format!("write {}", shared_target.display()))?;
+        }
+    }
+
     for (module, entries) in &by_module {
         let module_dir = args.output.join(module);
         if !args.check {
@@ -82,11 +123,12 @@ fn main() -> Result<()> {
                 .with_context(|| format!("create {}", module_dir.display()))?;
         }
 
-        // Emit each kind.
+        // Emit each kind (typed: walks properties + transitive $ref closure).
         for entry in entries {
-            let doc = docs.get(entry.group).expect("doc loaded above");
-            let shape = doc.shape(entry.openapi_key)?;
-            let rust = emit_kind(entry, shape);
+            let view = schemas.get(entry.openapi_key).ok_or_else(|| {
+                anyhow::anyhow!("kind {:?} not in merged schemas", entry.openapi_key)
+            })?;
+            let rust = emit_kind_typed(entry, view, &schemas);
             let target = module_dir.join(format!("{}.rs", entry.kind.to_lowercase()));
             if args.check {
                 let existing = std::fs::read_to_string(&target).unwrap_or_default();
@@ -123,6 +165,8 @@ fn main() -> Result<()> {
         for module in by_module.keys() {
             s.push_str(&format!("pub mod {};\n", module));
         }
+        // Shared sub-structs module + flat re-export.
+        s.push_str("pub mod types;\npub use types::*;\n");
         s
     };
     let top_target = args.output.join("mod.rs");
