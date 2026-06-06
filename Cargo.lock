@@ -525,8 +525,20 @@ version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23cdc57ce23ac53c931e88a43d06d070a6fd142f2617be5855eb75efc9beb1c2"
 dependencies = [
- "bytecheck_derive",
- "ptr_meta",
+ "bytecheck_derive 0.6.12",
+ "ptr_meta 0.1.4",
+ "simdutf8",
+]
+
+[[package]]
+name = "bytecheck"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0caa33a2c0edca0419d15ac723dff03f1956f7978329b1e3b5fdaaaed9d3ca8b"
+dependencies = [
+ "bytecheck_derive 0.8.2",
+ "ptr_meta 0.3.1",
+ "rancor",
  "simdutf8",
 ]
 
@@ -539,6 +551,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "bytecheck_derive"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89385e82b5d1821d2219e0b095efa2cc1f246cbf99080f3be46a1a85c0d392d9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -565,7 +588,7 @@ dependencies = [
 [[package]]
 name = "caixa-core"
 version = "0.1.0"
-source = "git+https://github.com/pleme-io/caixa#4eda0dde98b2a1a936c3e4362445998e899c9ea6"
+source = "git+https://github.com/pleme-io/caixa#97286e66834d188b92c1e1511293159516150bb3"
 dependencies = [
  "gen-platform",
  "gen-types",
@@ -573,15 +596,15 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "tatara-lisp 0.2.1",
- "tatara-lisp-derive 0.2.1",
+ "tatara-lisp 0.2.4",
+ "tatara-lisp-derive 0.2.4",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "caixa-helm"
 version = "0.1.0"
-source = "git+https://github.com/pleme-io/caixa#4eda0dde98b2a1a936c3e4362445998e899c9ea6"
+source = "git+https://github.com/pleme-io/caixa#97286e66834d188b92c1e1511293159516150bb3"
 dependencies = [
  "caixa-core",
  "serde",
@@ -752,7 +775,7 @@ dependencies = [
 [[package]]
 name = "cofre-types"
 version = "0.1.0"
-source = "git+https://github.com/pleme-io/cofre?branch=main#e84879428379c1aa6cff72ea9406ca8d408d7708"
+source = "git+https://github.com/pleme-io/cofre?branch=main#bb1c98752c507278fea937a4fdd2940dd216ae59"
 dependencies = [
  "gen-platform",
  "gen-types",
@@ -1302,10 +1325,10 @@ dependencies = [
  "shigoto-budget",
  "shigoto-dag",
  "shigoto-retry",
- "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto)",
+ "shigoto-types 0.1.6",
  "shikumi",
  "tameshi",
- "tatara-lisp 0.2.1",
+ "tatara-lisp 0.2.4",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1430,7 +1453,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto?rev=417bf9d538a1741c5576b29a4d71673e92cf5d22)",
+ "shigoto-types 0.1.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1547,7 +1570,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto?rev=417bf9d538a1741c5576b29a4d71673e92cf5d22)",
+ "shigoto-types 0.1.0",
  "thiserror 2.0.18",
 ]
 
@@ -1833,8 +1856,8 @@ dependencies = [
 
 [[package]]
 name = "gen-macros"
-version = "0.1.0"
-source = "git+https://github.com/pleme-io/gen#0d9df5087f3b9c1a30988b9dfe08e280f72df83f"
+version = "0.1.9"
+source = "git+https://github.com/pleme-io/gen#6d82c9d3885c781e923ec46330d05d7eca469a3b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1843,8 +1866,8 @@ dependencies = [
 
 [[package]]
 name = "gen-platform"
-version = "0.1.0"
-source = "git+https://github.com/pleme-io/gen#0d9df5087f3b9c1a30988b9dfe08e280f72df83f"
+version = "0.1.9"
+source = "git+https://github.com/pleme-io/gen#6d82c9d3885c781e923ec46330d05d7eca469a3b"
 dependencies = [
  "gen-macros",
  "gen-types",
@@ -1856,8 +1879,8 @@ dependencies = [
 
 [[package]]
 name = "gen-types"
-version = "0.1.0"
-source = "git+https://github.com/pleme-io/gen#0d9df5087f3b9c1a30988b9dfe08e280f72df83f"
+version = "0.1.9"
+source = "git+https://github.com/pleme-io/gen#6d82c9d3885c781e923ec46330d05d7eca469a3b"
 dependencies = [
  "blake3",
  "chrono",
@@ -2320,7 +2343,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -2914,9 +2937,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "hashlink"
@@ -3797,6 +3817,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "munge"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e17401f259eba956ca16491461b6e8f72913a0a114e39736ce404410f915a0c"
+dependencies = [
+ "munge_macro",
+]
+
+[[package]]
+name = "munge_macro"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4568f25ccbd45ab5d5603dc34318c1ec56b117531781260002151b8530a9f931"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4408,7 +4448,7 @@ dependencies = [
 [[package]]
 name = "promessa-types"
 version = "0.1.0"
-source = "git+https://github.com/pleme-io/promessa#97e995a5fe1f9ba650ced878d982202eb83e6aed"
+source = "git+https://github.com/pleme-io/promessa#5c3a12672bd96cf0c048659d00d41cb117bdef27"
 dependencies = [
  "async-trait",
  "blake3",
@@ -4457,7 +4497,16 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0738ccf7ea06b608c10564b31debd4f5bc5e197fc8bfe088f68ae5ce81e7a4f1"
 dependencies = [
- "ptr_meta_derive",
+ "ptr_meta_derive 0.1.4",
+]
+
+[[package]]
+name = "ptr_meta"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b9a0cf95a1196af61d4f1cbdab967179516d9a4a4312af1f31948f8f6224a79"
+dependencies = [
+ "ptr_meta_derive 0.3.1",
 ]
 
 [[package]]
@@ -4469,6 +4518,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "ptr_meta_derive"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7347867d0a7e1208d93b46767be83e2b8f978c3dad35f775ac8d8847551d6fe1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4569,6 +4629,15 @@ name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+
+[[package]]
+name = "rancor"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a063ea72381527c2a0561da9c80000ef822bdd7c3241b1cc1b12100e3df081ee"
+dependencies = [
+ "ptr_meta 0.3.1",
+]
 
 [[package]]
 name = "rand"
@@ -4746,7 +4815,16 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fe3824f5629716b1589be05dacd749f6aa084c87e00e016714a8cdfccc997c"
 dependencies = [
- "bytecheck",
+ "bytecheck 0.6.12",
+]
+
+[[package]]
+name = "rend"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cadadef317c2f20755a64d7fdc48f9e7178ee6b0e1f7fce33fa60f1d68a276e6"
+dependencies = [
+ "bytecheck 0.8.2",
 ]
 
 [[package]]
@@ -4858,13 +4936,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2297bf9c81a3f0dc96bc9521370b88f054168c29826a75e89c55ff196e7ed6a1"
 dependencies = [
  "bitvec",
- "bytecheck",
+ "bytecheck 0.6.12",
  "bytes",
  "hashbrown 0.12.3",
- "ptr_meta",
- "rend",
- "rkyv_derive",
+ "ptr_meta 0.1.4",
+ "rend 0.4.2",
+ "rkyv_derive 0.7.46",
  "seahash",
+ "tinyvec",
+ "uuid",
+]
+
+[[package]]
+name = "rkyv"
+version = "0.8.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73389e0c99e664f919275ab5b5b0471391fe9a8de61e1dff9b1eaf56a90f16e3"
+dependencies = [
+ "bytecheck 0.8.2",
+ "bytes",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "munge",
+ "ptr_meta 0.3.1",
+ "rancor",
+ "rend 0.5.3",
+ "rkyv_derive 0.8.16",
  "tinyvec",
  "uuid",
 ]
@@ -4878,6 +4975,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "rkyv_derive"
+version = "0.8.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d2ed0b54125315fb36bd021e82d314d1c126548f871634b483f46b31d13cac6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4976,7 +5084,7 @@ dependencies = [
  "bytes",
  "num-traits",
  "rand 0.8.6",
- "rkyv",
+ "rkyv 0.7.46",
  "serde",
  "serde_json",
  "wasm-bindgen",
@@ -5628,32 +5736,32 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shigoto-budget"
-version = "0.1.0"
-source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
+version = "0.1.6"
+source = "git+https://github.com/pleme-io/shigoto#0dc3dda4be38e2f251e8a90684e39af998144a6a"
 dependencies = [
  "serde",
- "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto)",
+ "shigoto-types 0.1.6",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "shigoto-dag"
-version = "0.1.0"
-source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
+version = "0.1.6"
+source = "git+https://github.com/pleme-io/shigoto#0dc3dda4be38e2f251e8a90684e39af998144a6a"
 dependencies = [
  "petgraph",
  "serde",
- "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto)",
+ "shigoto-types 0.1.6",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "shigoto-retry"
-version = "0.1.0"
-source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
+version = "0.1.6"
+source = "git+https://github.com/pleme-io/shigoto#0dc3dda4be38e2f251e8a90684e39af998144a6a"
 dependencies = [
  "serde",
- "shigoto-types 0.1.0 (git+https://github.com/pleme-io/shigoto)",
+ "shigoto-types 0.1.6",
 ]
 
 [[package]]
@@ -5673,8 +5781,8 @@ dependencies = [
 
 [[package]]
 name = "shigoto-types"
-version = "0.1.0"
-source = "git+https://github.com/pleme-io/shigoto#ed9df4e2befe93b2a11796e46457f06ede327414"
+version = "0.1.6"
+source = "git+https://github.com/pleme-io/shigoto#0dc3dda4be38e2f251e8a90684e39af998144a6a"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5688,8 +5796,8 @@ dependencies = [
 
 [[package]]
 name = "shikumi"
-version = "0.1.0"
-source = "git+https://github.com/pleme-io/shikumi#14ba02ab0dc28e88507181dcb6380db3911ec200"
+version = "0.1.2"
+source = "git+https://github.com/pleme-io/shikumi#61e5f97ad2f61205599b8679a4ff7b2075506003"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6099,8 +6207,8 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sui-bytecode"
-version = "0.1.10"
-source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
+version = "0.1.12"
+source = "git+https://github.com/pleme-io/sui#cd18f45c16c7191d68378884364256f9d58d3b66"
 dependencies = [
  "rnix",
  "rowan",
@@ -6114,8 +6222,8 @@ dependencies = [
 
 [[package]]
 name = "sui-compat"
-version = "0.1.10"
-source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
+version = "0.1.12"
+source = "git+https://github.com/pleme-io/sui#cd18f45c16c7191d68378884364256f9d58d3b66"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -6128,8 +6236,8 @@ dependencies = [
 
 [[package]]
 name = "sui-eval"
-version = "0.1.10"
-source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
+version = "0.1.12"
+source = "git+https://github.com/pleme-io/sui#cd18f45c16c7191d68378884364256f9d58d3b66"
 dependencies = [
  "base64",
  "blake3",
@@ -6154,6 +6262,7 @@ dependencies = [
  "stacker",
  "sui-bytecode",
  "sui-compat",
+ "sui-graph-store",
  "sui-intern",
  "sui-spec",
  "sui-store",
@@ -6166,35 +6275,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "sui-graph-store"
+version = "0.1.12"
+source = "git+https://github.com/pleme-io/sui#cd18f45c16c7191d68378884364256f9d58d3b66"
+dependencies = [
+ "blake3",
+ "bytecheck 0.8.2",
+ "data-encoding",
+ "memmap2",
+ "redb",
+ "rkyv 0.8.16",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "sui-intern"
-version = "0.1.10"
-source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
+version = "0.1.12"
+source = "git+https://github.com/pleme-io/sui#cd18f45c16c7191d68378884364256f9d58d3b66"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
 
 [[package]]
 name = "sui-spec"
-version = "0.1.10"
-source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
+version = "0.1.12"
+source = "git+https://github.com/pleme-io/sui#cd18f45c16c7191d68378884364256f9d58d3b66"
 dependencies = [
  "base64",
+ "blake3",
+ "bytecheck 0.8.2",
+ "flate2",
  "libc",
  "regex",
+ "rkyv 0.8.16",
+ "rnix",
+ "rowan",
  "serde",
  "serde_json",
  "sha2",
  "sui-compat",
+ "tar",
  "tatara-lisp 0.2.2",
  "tatara-lisp-derive 0.2.2",
  "thiserror 2.0.18",
+ "ureq",
  "url",
 ]
 
 [[package]]
 name = "sui-store"
-version = "0.1.10"
-source = "git+https://github.com/pleme-io/sui#12398d43741b571cea989c7fb23a6cd1b0d36ac9"
+version = "0.1.12"
+source = "git+https://github.com/pleme-io/sui#cd18f45c16c7191d68378884364256f9d58d3b66"
 dependencies = [
  "async-trait",
  "ed25519-dalek",
@@ -6284,7 +6416,7 @@ dependencies = [
 [[package]]
 name = "tameshi"
 version = "0.1.0"
-source = "git+https://github.com/pleme-io/tameshi#4e3aa6732748abcec6792040d6788f57599b0d08"
+source = "git+https://github.com/pleme-io/tameshi#a25397187633a6618638dedbd89861a98f17e132"
 dependencies = [
  "axum 0.8.9",
  "blake3",
@@ -6326,18 +6458,6 @@ dependencies = [
 
 [[package]]
 name = "tatara-lisp"
-version = "0.2.1"
-source = "git+https://github.com/pleme-io/tatara#ceaab25b5e7c0fcb48668b0ec02a63a707fcf604"
-dependencies = [
- "blake3",
- "serde",
- "serde_json",
- "tatara-lisp-derive 0.2.1",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "tatara-lisp"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d59364e99b1ff04079d8a8264b68d40771a431ff84dfaf5a16bd435481deb9cc"
@@ -6350,9 +6470,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tatara-lisp"
+version = "0.2.4"
+source = "git+https://github.com/pleme-io/tatara#fb6dfcc1bad6880c06b774164882ad845522e84a"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "tatara-lisp-derive 0.2.4",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tatara-lisp-derive"
-version = "0.2.1"
-source = "git+https://github.com/pleme-io/tatara#ceaab25b5e7c0fcb48668b0ec02a63a707fcf604"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aca2ea9795bfcae07e78500cd16f50b84ced1d14a666be71619e545fbd3c47e3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6361,9 +6494,8 @@ dependencies = [
 
 [[package]]
 name = "tatara-lisp-derive"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aca2ea9795bfcae07e78500cd16f50b84ced1d14a666be71619e545fbd3c47e3"
+version = "0.2.4"
+source = "git+https://github.com/pleme-io/tatara#fb6dfcc1bad6880c06b774164882ad845522e84a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7243,7 +7375,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
