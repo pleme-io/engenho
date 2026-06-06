@@ -34,6 +34,7 @@
 pub mod catalog;
 pub mod emit;
 pub mod openapi;
+pub mod types;
 
 pub use catalog::{KIND_CATALOG, KindEntry};
 pub use emit::{emit_kind, emit_module};
