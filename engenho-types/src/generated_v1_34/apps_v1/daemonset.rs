@@ -8,54 +8,53 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use serde::{Deserialize, Serialize};
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
+use crate::generated_v1_34::types::*;
 
 /// DaemonSet represents the configuration of a daemon set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DaemonSet {
-    /// Standard object metadata.
+    /// Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
     #[serde(default, skip_serializing_if = "is_empty_meta")]
-    pub metadata: ObjectMeta,
-    /// Spec (typed expansion is M0.0.4; today opaque JSON).
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub spec: serde_json::Value,
-    /// Status (typed expansion is M0.0.4; today opaque JSON).
+    pub metadata: crate::meta::ObjectMeta,
+    /// The desired behavior of this daemon set. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<serde_json::Value>,
+    pub spec: Option<DaemonSetSpec>,
+    /// The current status of this daemon set. This data may be out of date by some window of time. Populated by the system. Read-only. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<DaemonSetStatus>,
 }
 
 impl KubeResource for DaemonSet {
-    const GVK: GroupVersionKind = GroupVersionKind {
-        group: "apps",
-        version: "v1",
-        kind: "DaemonSet",
-    };
-    const GVR: GroupVersionResource = GroupVersionResource {
-        group: "apps",
-        version: "v1",
-        resource: "daemonsets",
-    };
-    const SCOPE: Scope = Scope::Namespaced;
+const GVK: GroupVersionKind = GroupVersionKind {
+group:   "apps",
+version: "v1",
+kind:    "DaemonSet",
+};
+const GVR: GroupVersionResource = GroupVersionResource {
+group:    "apps",
+version:  "v1",
+resource: "daemonsets",
+};
+const SCOPE: Scope = Scope::Namespaced;
 
-    fn name(&self) -> Cow<'_, str> {
-        Cow::Borrowed(self.metadata.name.as_str())
-    }
-    fn namespace(&self) -> Option<Cow<'_, str>> {
-        self.metadata.namespace.as_deref().map(Cow::Borrowed)
-    }
-    fn resource_version(&self) -> Option<Cow<'_, str>> {
-        if self.metadata.resource_version.is_empty() {
-            None
-        } else {
-            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-        }
-    }
+fn name(&self) -> Cow<'_, str> {
+Cow::Borrowed(self.metadata.name.as_str())
+}
+fn namespace(&self) -> Option<Cow<'_, str>> {
+self.metadata.namespace.as_deref().map(Cow::Borrowed)
+}
+fn resource_version(&self) -> Option<Cow<'_, str>> {
+if self.metadata.resource_version.is_empty() {
+None
+} else {
+Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+}
+}
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool {
-    m == &ObjectMeta::default()
-}
+fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }

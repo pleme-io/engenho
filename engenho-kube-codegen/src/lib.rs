@@ -38,5 +38,6 @@ pub mod openapi;
 pub mod types;
 
 pub use catalog::{KIND_CATALOG, KindEntry};
-pub use emit::{emit_kind, emit_module};
+pub use emit::{emit_kind, emit_kind_typed, emit_module, emit_shared_module};
+pub use emit_typed::{SchemaView, shared_substructs};
 pub use openapi::{KindShape, OpenApiDoc};

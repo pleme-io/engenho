@@ -25,8 +25,9 @@ use crate::redaction::redact_secret;
 use engenho_kube_client::{client::ReqwestKubeClient, config::Kubeconfig};
 use engenho_types::client::{KubeClient, ListOptions};
 use engenho_types::generated_v1_34::apps_v1::{Deployment, ReplicaSet};
+use engenho_types::curated_enums::PodPhase;
 use engenho_types::generated_v1_34::core_v1::{
-    ConfigMap, Endpoints, Namespace, Node, PersistentVolumeClaim, Pod, PodPhase, Secret, Service,
+    ConfigMap, Endpoints, Namespace, Node, PersistentVolumeClaim, Pod, Secret, Service,
     ServiceAccount,
 };
 use engenho_types::generated_v1_34::rbac_v1::{Role, RoleBinding};

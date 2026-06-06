@@ -135,7 +135,12 @@ async fn full_stack_convergence_loop_typed_end_to_end() {
     // typed image string.
     let dep = &apps.emitted()[0];
     assert_eq!(&dep.metadata.name, "podinfo");
-    assert_eq!(dep.spec.template.spec.containers[0].image, "podinfo:6.4.1");
+    assert_eq!(
+        dep.spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0]
+            .image
+            .as_deref(),
+        Some("podinfo:6.4.1")
+    );
 
     // LinhagemAnomalyChain recorded the initial diff (1 AppAdded +
     // 1 TopologyChanged from synthetic empty Sistema).

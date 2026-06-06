@@ -3,3 +3,5 @@
 pub mod apps_v1;
 pub mod core_v1;
 pub mod rbac_v1;
+pub mod types;
+pub use types::*;

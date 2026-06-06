@@ -13,11 +13,13 @@ async fn translate_app_ref_with_version_produces_typed_deployment() {
     let dep = r.translate(&app);
     assert_eq!(&dep.metadata.name, "podinfo");
     assert_eq!(dep.metadata.namespace.as_deref(), Some("default"));
-    assert_eq!(dep.spec.replicas, Some(1));
-    assert_eq!(dep.spec.template.spec.containers.len(), 1);
-    let c = &dep.spec.template.spec.containers[0];
+    let spec = dep.spec.as_ref().unwrap();
+    assert_eq!(spec.replicas, Some(1));
+    let pod_spec = spec.template.spec.as_ref().unwrap();
+    assert_eq!(pod_spec.containers.len(), 1);
+    let c = &pod_spec.containers[0];
     assert_eq!(c.name, "podinfo");
-    assert_eq!(c.image, "podinfo:6.4.1");
+    assert_eq!(c.image.as_deref(), Some("podinfo:6.4.1"));
 }
 
 #[tokio::test]
@@ -27,8 +29,8 @@ async fn no_version_falls_back_to_latest_tag() {
         name: "x".into(),
         version: None,
     });
-    let c = &dep.spec.template.spec.containers[0];
-    assert_eq!(c.image, "x:latest");
+    let c = &dep.spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0];
+    assert_eq!(c.image.as_deref(), Some("x:latest"));
 }
 
 #[tokio::test]
@@ -55,6 +57,8 @@ async fn label_invariants_hold() {
     // selector + template labels include `app`
     assert_eq!(
         dep.spec
+            .as_ref()
+            .unwrap()
             .selector
             .match_labels
             .get("app")
@@ -63,6 +67,8 @@ async fn label_invariants_hold() {
     );
     assert_eq!(
         dep.spec
+            .as_ref()
+            .unwrap()
             .template
             .metadata
             .labels
@@ -102,8 +108,10 @@ async fn reconcile_records_manifest_in_audit_log() {
     assert_eq!(&emitted[0].metadata.name, "first");
     assert_eq!(&emitted[1].metadata.name, "second");
     assert_eq!(
-        emitted[1].spec.template.spec.containers[0].image,
-        "second:1.0"
+        emitted[1].spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0]
+            .image
+            .as_deref(),
+        Some("second:1.0")
     );
 }
 
@@ -166,7 +174,9 @@ async fn kube_reconciler_plugs_into_system_controller() {
     assert_eq!(emitted.len(), 1);
     assert_eq!(&emitted[0].metadata.name, "podinfo");
     assert_eq!(
-        emitted[0].spec.template.spec.containers[0].image,
-        "podinfo:6.4.1"
+        emitted[0].spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0]
+            .image
+            .as_deref(),
+        Some("podinfo:6.4.1")
     );
 }

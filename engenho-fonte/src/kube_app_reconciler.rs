@@ -128,27 +128,28 @@ impl KubeAppReconciler {
                 labels: labels.clone(),
                 ..Default::default()
             },
-            spec: DeploymentSpec {
+            spec: Some(DeploymentSpec {
                 replicas: Some(1),
                 selector: LabelSelector {
                     match_labels: selector_labels.clone(),
+                    ..Default::default()
                 },
                 template: PodTemplateSpec {
                     metadata: ObjectMeta {
                         labels: selector_labels,
                         ..Default::default()
                     },
-                    spec: PodSpec {
+                    spec: Some(PodSpec {
                         containers: vec![Container {
                             name: name.clone(),
-                            image,
+                            image: Some(image),
                             ..Default::default()
                         }],
                         ..Default::default()
-                    },
+                    }),
                 },
                 ..Default::default()
-            },
+            }),
             status: None,
         }
     }
