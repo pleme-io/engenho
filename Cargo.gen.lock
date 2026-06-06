@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cargo_lock_sha256": "06ad8ebde094fa94864bc4d6f151b204155f867a51b7fc1d265679316942e39b",
+  "cargo_lock_sha256": "1e4db3db6184df5b1305243ec93fff2fe798939578e17a58e61bc88844ade755",
   "target_resolves": {
     "base": {
       "adler2-2.0.1": {
@@ -1668,6 +1668,55 @@
           "std"
         ]
       },
+      "bytecheck-0.8.2": {
+        "runtime_dependencies": [
+          {
+            "name": "bytecheck_derive",
+            "package_key": "bytecheck_derive-0.8.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          },
+          {
+            "name": "ptr_meta",
+            "package_key": "ptr_meta-0.3.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rancor",
+            "package_key": "rancor-0.1.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "simdutf8",
+            "package_key": "simdutf8-0.1.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "default",
+          "simdutf8"
+        ]
+      },
       "bytecheck_derive-0.6.12": {
         "runtime_dependencies": [
           {
@@ -1705,6 +1754,49 @@
         "features": [
           "std"
         ]
+      },
+      "bytecheck_derive-0.8.2": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.45",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.117",
+            "kind": "normal",
+            "features": [
+              "clone-impls",
+              "derive",
+              "full",
+              "parsing",
+              "printing",
+              "proc-macro"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
       },
       "byteorder-1.5.0": {
         "runtime_dependencies": [],
@@ -3528,7 +3620,7 @@
           },
           {
             "name": "shikumi",
-            "package_key": "shikumi-0.1.0",
+            "package_key": "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3787,7 +3879,7 @@
           },
           {
             "name": "shikumi",
-            "package_key": "shikumi-0.1.0",
+            "package_key": "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4558,7 +4650,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.0",
+            "package_key": "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4568,7 +4660,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.0",
+            "package_key": "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4634,6 +4726,16 @@
           {
             "name": "serde_yaml",
             "package_key": "serde_yaml-0.9.34+deprecated",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "shigoto_types",
+            "package_key": "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5109,7 +5211,7 @@
           },
           {
             "name": "sui_eval",
-            "package_key": "sui-eval-0.1.10",
+            "package_key": "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5344,7 +5446,7 @@
           },
           {
             "name": "shigoto_types",
-            "package_key": "shigoto-types-0.1.0",
+            "package_key": "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6110,7 +6212,7 @@
           "std"
         ]
       },
-      "gen-macros-0.1.0": {
+      "gen-macros-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -6149,11 +6251,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-platform-0.1.0": {
+      "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
         "runtime_dependencies": [
           {
             "name": "gen_macros",
-            "package_key": "gen-macros-0.1.0",
+            "package_key": "gen-macros-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6163,7 +6265,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.0",
+            "package_key": "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6217,7 +6319,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-types-0.1.0": {
+      "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -8816,7 +8918,7 @@
           },
           {
             "name": "hashbrown",
-            "package_key": "hashbrown-0.17.1",
+            "package_key": "hashbrown-0.16.1",
             "kind": "normal",
             "features": [
               "default-hasher",
@@ -11957,21 +12059,9 @@
         ]
       },
       "hashbrown-0.17.1": {
-        "runtime_dependencies": [
-          {
-            "name": "foldhash",
-            "package_key": "foldhash-0.2.0",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          }
-        ],
+        "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
-          "default-hasher",
           "inline-more"
         ]
       },
@@ -14032,6 +14122,64 @@
           "os-poll"
         ]
       },
+      "munge-0.4.7": {
+        "runtime_dependencies": [
+          {
+            "name": "munge_macro",
+            "package_key": "munge_macro-0.4.7",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "munge_macro-0.4.7": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.45",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.117",
+            "kind": "normal",
+            "features": [
+              "clone-impls",
+              "full",
+              "parsing",
+              "printing",
+              "proc-macro"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
       "nix-0.29.0": {
         "runtime_dependencies": [
           {
@@ -15627,6 +15775,26 @@
           "std"
         ]
       },
+      "ptr_meta-0.3.1": {
+        "runtime_dependencies": [
+          {
+            "name": "ptr_meta_derive",
+            "package_key": "ptr_meta_derive-0.3.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "host"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "derive",
+          "ptr_meta_derive",
+          "std"
+        ]
+      },
       "ptr_meta_derive-0.1.4": {
         "runtime_dependencies": [
           {
@@ -15657,6 +15825,51 @@
               "full"
             ],
             "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "ptr_meta_derive-0.3.1": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.45",
+            "kind": "normal",
+            "features": [
+              "proc-macro"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.117",
+            "kind": "normal",
+            "features": [
+              "clone-impls",
+              "derive",
+              "full",
+              "parsing",
+              "printing",
+              "proc-macro"
+            ],
+            "uses_default_features": false,
             "optional": false,
             "target": null,
             "tree": "target"
@@ -16014,6 +16227,26 @@
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": []
+      },
+      "rancor-0.1.1": {
+        "runtime_dependencies": [
+          {
+            "name": "ptr_meta",
+            "package_key": "ptr_meta-0.3.1",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "alloc"
+        ]
       },
       "rand-0.8.6": {
         "runtime_dependencies": [
@@ -16496,6 +16729,24 @@
         "features": [
           "bytecheck",
           "std"
+        ]
+      },
+      "rend-0.5.3": {
+        "runtime_dependencies": [
+          {
+            "name": "bytecheck",
+            "package_key": "bytecheck-0.8.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "bytecheck"
         ]
       },
       "reqwest-0.12.28": {
@@ -17309,6 +17560,128 @@
           "std"
         ]
       },
+      "rkyv-0.8.16": {
+        "runtime_dependencies": [
+          {
+            "name": "bytecheck",
+            "package_key": "bytecheck-0.8.2",
+            "kind": "normal",
+            "features": [
+              "simdutf8"
+            ],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "bytes_1",
+            "package_key": "bytes-1.11.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "hashbrown",
+            "package_key": "hashbrown-0.17.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "indexmap_2",
+            "package_key": "indexmap-2.14.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "munge",
+            "package_key": "munge-0.4.7",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "ptr_meta",
+            "package_key": "ptr_meta-0.3.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rancor",
+            "package_key": "rancor-0.1.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rend",
+            "package_key": "rend-0.5.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rkyv_derive",
+            "package_key": "rkyv_derive-0.8.16",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          },
+          {
+            "name": "tinyvec_1",
+            "package_key": "tinyvec-1.11.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "uuid_1",
+            "package_key": "uuid-1.23.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "alloc",
+          "bytecheck",
+          "std"
+        ]
+      },
       "rkyv_derive-0.7.46": {
         "runtime_dependencies": [
           {
@@ -17345,6 +17718,52 @@
         "build_dependencies": [],
         "features": [
           "default"
+        ]
+      },
+      "rkyv_derive-0.8.16": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.45",
+            "kind": "normal",
+            "features": [
+              "proc-macro"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.117",
+            "kind": "normal",
+            "features": [
+              "clone-impls",
+              "derive",
+              "parsing",
+              "printing",
+              "proc-macro"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "bytecheck"
         ]
       },
       "rmcp-0.15.0": {
@@ -20063,7 +20482,7 @@
           "std"
         ]
       },
-      "shigoto-types-0.1.0": {
+      "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -20089,7 +20508,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.0",
+            "package_key": "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -20099,7 +20518,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.0",
+            "package_key": "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -20155,7 +20574,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "shikumi-0.1.0": {
+      "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003": {
         "runtime_dependencies": [
           {
             "name": "arc_swap",
@@ -20193,7 +20612,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.0",
+            "package_key": "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -20203,7 +20622,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.0",
+            "package_key": "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -20215,12 +20634,20 @@
             "name": "notify",
             "package_key": "notify-8.2.0",
             "kind": "normal",
-            "features": [
-              "macos_kqueue"
-            ],
+            "features": [],
             "uses_default_features": false,
             "optional": false,
             "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "notify",
+            "package_key": "notify-8.2.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": "cfg(target_os = \"macos\")",
             "tree": "target"
           },
           {
@@ -22449,7 +22876,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-bytecode-0.1.10": {
+      "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
         "runtime_dependencies": [
           {
             "name": "rnix",
@@ -22493,7 +22920,7 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.10",
+            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22503,7 +22930,7 @@
           },
           {
             "name": "sui_intern",
-            "package_key": "sui-intern-0.1.10",
+            "package_key": "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22513,7 +22940,7 @@
           },
           {
             "name": "sui_spec",
-            "package_key": "sui-spec-0.1.10",
+            "package_key": "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22535,7 +22962,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-compat-0.1.10": {
+      "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
         "runtime_dependencies": [
           {
             "name": "base64",
@@ -22613,7 +23040,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-eval-0.1.10": {
+      "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
         "runtime_dependencies": [
           {
             "name": "base64",
@@ -22838,7 +23265,7 @@
           },
           {
             "name": "sui_bytecode",
-            "package_key": "sui-bytecode-0.1.10",
+            "package_key": "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22848,7 +23275,17 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.10",
+            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "sui_graph_store",
+            "package_key": "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22858,7 +23295,7 @@
           },
           {
             "name": "sui_intern",
-            "package_key": "sui-intern-0.1.10",
+            "package_key": "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22868,7 +23305,7 @@
           },
           {
             "name": "sui_spec",
-            "package_key": "sui-spec-0.1.10",
+            "package_key": "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22878,7 +23315,7 @@
           },
           {
             "name": "sui_store",
-            "package_key": "sui-store-0.1.10",
+            "package_key": "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22952,7 +23389,97 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-intern-0.1.10": {
+      "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+        "runtime_dependencies": [
+          {
+            "name": "blake3",
+            "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "bytecheck",
+            "package_key": "bytecheck-0.8.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "data_encoding",
+            "package_key": "data-encoding-2.11.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "memmap2",
+            "package_key": "memmap2-0.9.10",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "redb",
+            "package_key": "redb-2.6.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rkyv",
+            "package_key": "rkyv-0.8.16",
+            "kind": "normal",
+            "features": [
+              "std",
+              "bytecheck",
+              "alloc"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing",
+            "package_key": "tracing-0.1.44",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
         "runtime_dependencies": [
           {
             "name": "rustc_hash",
@@ -22968,11 +23495,41 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-spec-0.1.10": {
+      "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
         "runtime_dependencies": [
           {
             "name": "base64",
             "package_key": "base64-0.22.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "blake3",
+            "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "bytecheck",
+            "package_key": "bytecheck-0.8.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "flate2",
+            "package_key": "flate2-1.1.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22993,6 +23550,40 @@
           {
             "name": "regex",
             "package_key": "regex-1.12.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rkyv",
+            "package_key": "rkyv-0.8.16",
+            "kind": "normal",
+            "features": [
+              "std",
+              "bytecheck",
+              "alloc"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rnix",
+            "package_key": "rnix-0.14.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rowan",
+            "package_key": "rowan-0.16.1",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23034,7 +23625,17 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.10",
+            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tar",
+            "package_key": "tar-0.4.46",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23073,6 +23674,16 @@
             "tree": "target"
           },
           {
+            "name": "ureq",
+            "package_key": "ureq-3.3.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "url",
             "package_key": "url-2.5.8",
             "kind": "normal",
@@ -23086,7 +23697,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-store-0.1.10": {
+      "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -23176,7 +23787,7 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.10",
+            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -33302,7 +33913,14 @@
       "edition": "2021",
       "build_script": "build.rs"
     },
+    "bytecheck-0.8.2": {
+      "edition": "2021"
+    },
     "bytecheck_derive-0.6.12": {
+      "edition": "2021",
+      "proc_macro": true
+    },
+    "bytecheck_derive-0.8.2": {
       "edition": "2021",
       "proc_macro": true
     },
@@ -33754,14 +34372,14 @@
     "futures-util-0.3.32": {
       "edition": "2018"
     },
-    "gen-macros-0.1.0": {
+    "gen-macros-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
       "edition": "2024",
       "proc_macro": true
     },
-    "gen-platform-0.1.0": {
+    "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
       "edition": "2024"
     },
-    "gen-types-0.1.0": {
+    "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
       "edition": "2024"
     },
     "generic-array-0.14.7": {
@@ -34217,6 +34835,13 @@
     "mio-1.2.1": {
       "edition": "2021"
     },
+    "munge-0.4.7": {
+      "edition": "2021"
+    },
+    "munge_macro-0.4.7": {
+      "edition": "2021",
+      "proc_macro": true
+    },
     "native-tls-0.2.18": {
       "edition": "2021",
       "build_script": "build.rs"
@@ -34397,8 +35022,15 @@
     "ptr_meta-0.1.4": {
       "edition": "2018"
     },
+    "ptr_meta-0.3.1": {
+      "edition": "2021"
+    },
     "ptr_meta_derive-0.1.4": {
       "edition": "2018",
+      "proc_macro": true
+    },
+    "ptr_meta_derive-0.3.1": {
+      "edition": "2021",
       "proc_macro": true
     },
     "quick-error-1.2.3": {
@@ -34422,6 +35054,9 @@
     "radium-0.7.0": {
       "edition": "2018",
       "build_script": "build.rs"
+    },
+    "rancor-0.1.1": {
+      "edition": "2021"
     },
     "rand-0.8.6": {
       "edition": "2018"
@@ -34478,6 +35113,9 @@
       "edition": "2018",
       "build_script": "build.rs"
     },
+    "rend-0.5.3": {
+      "edition": "2021"
+    },
     "reqwest-0.12.28": {
       "edition": "2021"
     },
@@ -34493,7 +35131,14 @@
       "edition": "2021",
       "build_script": "build.rs"
     },
+    "rkyv-0.8.16": {
+      "edition": "2021"
+    },
     "rkyv_derive-0.7.46": {
+      "edition": "2021",
+      "proc_macro": true
+    },
+    "rkyv_derive-0.8.16": {
       "edition": "2021",
       "proc_macro": true
     },
@@ -34718,10 +35363,10 @@
     "shell-words-1.1.1": {
       "edition": "2015"
     },
-    "shigoto-types-0.1.0": {
+    "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22": {
       "edition": "2024"
     },
-    "shikumi-0.1.0": {
+    "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003": {
       "edition": "2024"
     },
     "shlex-1.3.0": {
@@ -34810,19 +35455,22 @@
     "subtle-2.6.1": {
       "edition": "2018"
     },
-    "sui-bytecode-0.1.10": {
+    "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
       "edition": "2024"
     },
-    "sui-compat-0.1.10": {
+    "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
       "edition": "2024"
     },
-    "sui-eval-0.1.10": {
+    "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
       "edition": "2024"
     },
-    "sui-intern-0.1.10": {
+    "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
       "edition": "2024"
     },
-    "sui-spec-0.1.10": {
+    "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "edition": "2024"
+    },
+    "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
       "edition": "2024",
       "binaries": [
         {
@@ -34835,7 +35483,7 @@
         }
       ]
     },
-    "sui-store-0.1.10": {
+    "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
       "edition": "2024"
     },
     "symlink-0.1.0": {
@@ -35239,17 +35887,18 @@
     }
   },
   "git_nar_sha256": {
-    "gen-macros-0.1.0": "sha256-sQCrY9vhjIBJB+XYIDtGCTds5LiJMS7PA1ghJ2MQwB0=",
-    "gen-platform-0.1.0": "sha256-sQCrY9vhjIBJB+XYIDtGCTds5LiJMS7PA1ghJ2MQwB0=",
-    "gen-types-0.1.0": "sha256-sQCrY9vhjIBJB+XYIDtGCTds5LiJMS7PA1ghJ2MQwB0=",
-    "shigoto-types-0.1.0": "sha256-KaNUnx3IpQFGdlox6zK3vHHiGVXiy+fHyb4BxOxHQn4=",
-    "shikumi-0.1.0": "sha256-kP/dghnfBmleQNR/yy6CblN3mmpoyBvF+KQ3sDKPJAg=",
-    "sui-bytecode-0.1.10": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80=",
-    "sui-compat-0.1.10": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80=",
-    "sui-eval-0.1.10": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80=",
-    "sui-intern-0.1.10": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80=",
-    "sui-spec-0.1.10": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80=",
-    "sui-store-0.1.10": "sha256-hb7n6VqTd7UNl8rzOYZKWy4UUO8AeXRmNO9QTFJFn80="
+    "gen-macros-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": "sha256-KkZmHxQBwz3Q4XNaJVLdl6TLLPiR+erMbGOrrvPRE0A=",
+    "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": "sha256-KkZmHxQBwz3Q4XNaJVLdl6TLLPiR+erMbGOrrvPRE0A=",
+    "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": "sha256-KkZmHxQBwz3Q4XNaJVLdl6TLLPiR+erMbGOrrvPRE0A=",
+    "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22": "sha256-KaNUnx3IpQFGdlox6zK3vHHiGVXiy+fHyb4BxOxHQn4=",
+    "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003": "sha256-pkEmUjEdtwr6ag8rHhCeRikPDAEwzDbEcxojFhHKsCU=",
+    "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc="
   },
   "flake_metadata": {}
 }
