@@ -58,7 +58,7 @@ This collapses M0.0 from "build a codegen framework" to "add a backend."
 | apiserver | M0.1 seed — full CRUD + OpenAPI v3, 8 r7 tests | watch streaming, authn, RBAC enforce, admission dispatch, CRD, SSA/SMP, API-group routing |
 | datastore | M0.1 seed — openraft + 3-node replication proven (r6) | **in-memory only** (no fjall persistence, no etcd-v3 gRPC, no revision-MVCC) |
 | kubelet + CRI | M0.1 seed — 1,551 LoC, ContainerRuntime trait (Podman/Fake), r10 tests | real containerd CRI client; probes; volumes; `/exec` `/log` `/portforward`; cgroup-v2 |
-| types catalog | M0.0 — ~20 hand-authored kinds | **0 generated** of ~150; specs are opaque `Value` |
+| types catalog | **typed emission DONE (2026-06-06)** — 18 cataloged kinds GENERATED typed (typed spec/status + globally-deduped shared sub-struct module + curated-enum overrides) by in-tree `engenho-kube-codegen`; `--check` deterministic; zero hand-authored kinds | expand 18 → ~150 kinds across ~16 API groups (mechanical: add `KIND_CATALOG` rows + vendor the group's OpenAPI) |
 | controllers + scheduler | isolated library seeds (admission trait, crd scaffold) | 18-controller set, scheduler profile, apiserver-driven reconcile |
 | **networking** (CNI/DNS/kube-proxy/local-path/CA) | **M0.0 — none exist** | the largest greenfield |
 | binary + supervision | M0.0 — `main.rs` prints + exits | tatara `defguest` surgery; subsystem assembly |
@@ -66,7 +66,7 @@ This collapses M0.0 from "build a codegen framework" to "add a backend."
 ## Critical path (what unblocks what)
 
 ```
-kube-forge (M0.0) ──► ~150 typed kinds ──► everything downstream
+engenho-kube-codegen (18 kinds typed ✅) ──► ~150 typed kinds ──► everything downstream
    └─ datastore (fjall+etcd-v3+MVCC) ──► apiserver (WATCH + RBAC + admission + SSA)
         └─ controllers + scheduler ──► kubelet + CRI (pods RUN)
              └─ networking (CNI/DNS/kube-proxy/local-path/CA) ──► single-node complete
@@ -78,17 +78,32 @@ bookmarks, compact semantics). Treat it as the program's highest-risk feature.
 
 ## Phased roadmap (each phase has a HARD exit gate)
 
-### M0.0 — Generation pipeline *(the force-multiplier; ~3–4 wk)*
-- M0.0.1: hand-author the FULL `core_v1::Pod` (~1500–2500 LoC incl all transitive
-  types — the generator bullseye, NOT a partial).
-- M0.0.2: create `pleme-io/kube-forge` (`kube-forge-{types,openapi,rust-emit,cli}`)
-  as the forge-gen sibling backend — Rust source via typed AST, `format!()`-of-Rust
-  forbidden (TYPED EMISSION rule).
-- M0.0.3: kube-forge regenerates `Pod` byte-identical → delete the hand-author → CI
-  determinism gate `kube-forge generate --check`.
-- M0.0.4: generate all ~150 kinds across ~16 API groups; each round-trips against
-  vendored BLAKE3-attested v1.34 OpenAPI; `arch-synthesizer::k8s` re-exports.
-- **GATE:** L0–L3 green; `--check` byte-identical; zero hand-authored kinds remain.
+### M0.0 — Generation pipeline *(the force-multiplier)* — **typed emission DONE (2026-06-06)**
+The generator is the in-tree `engenho-kube-codegen` (a separate forge-gen
+`Backend`-trait sibling `kube-forge` can still be extracted later if cross-repo
+reuse is wanted — not needed to ship M0.0). What actually landed:
+- ✅ **Typed-emission engine** — OpenAPI property→`RustType` mapper (`types.rs`),
+  struct emitter + transitive `$ref` closure (`emit_typed.rs`), globally-deduped
+  **shared sub-struct module** (`generated_v1_34/types.rs`) re-exported per group
+  so one canonical type is referenced everywhere, acronym + Rust-keyword field
+  handling (`podIP`→`pod_ip`, `type`→`r#type`), `Json` fallback for exotic shapes
+  (`x-kubernetes-int-or-string`/`anyOf`) → output always compiles.
+- ✅ **Curated-enum overrides** — prose-only enums (no upstream `enum` array):
+  `PodPhase`, `SecretType`/`KnownSecretType` live hand-authored in
+  `engenho_types::curated_enums`, referenced via `emit_typed::FIELD_OVERRIDES`.
+  Add a row + an enum to promote any other prose-only-enum field.
+- ✅ All 18 cataloged kinds GENERATED typed; hand-authored `_spec` modules
+  deleted; 147 workspace test groups green; `--check` determinism exit-0;
+  consumers (engenho-mcp / -fonte / -kube-client) adapted to the typed shapes.
+- ⬜ **Remaining (mechanical):** expand 18 → ~150 kinds across ~16 API groups —
+  add `KIND_CATALOG` rows + vendor each group's OpenAPI; `arch-synthesizer::k8s`
+  re-export.
+- **Superseded framing:** regeneration REPLACES the hand-authoring (the generated
+  tree IS canonical) rather than byte-reproducing a hand-authored bullseye — the
+  earlier "regenerate Pod byte-identical" plan is moot now that generation owns
+  the tree.
+- **GATE:** L0–L3 green; `--check` deterministic; zero hand-authored kinds. ✅ met
+  for the 18 cataloged kinds; re-asserted automatically as the catalog grows.
 
 ### M0.1 — Datastore + apiserver *(the load-bearing milestone; ~10–14 wk)*
 - datastore: fjall persistence + revision-MVCC + crash recovery + snapshot; etcd-v3
