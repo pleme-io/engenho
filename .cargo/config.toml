@@ -1,0 +1,6 @@
+# Use the authenticated git CLI to fetch private pleme-io git deps
+# (engenho-fonte → tameshi, etc.). Without this, `cargo build` fails with
+# "failed to acquire username/password from local configuration" on any host
+# whose cargo isn't configured with a credential helper for github.com.
+[net]
+git-fetch-with-cli = true
