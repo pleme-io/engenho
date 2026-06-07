@@ -110,10 +110,20 @@ jobs:
         run: cargo test --workspace --doc
 
   # ──────────────────────────────────────────────────────────────
-  # Clippy pedantic — pull every lint the workspace.lints opted in.
+  # Clippy pedantic + TYPED EMISSION (with-format-ban) gate.
+  #
+  # `cargo clippy --workspace -- -D warnings` enforces every lint the
+  # workspace.lints opted in AND the per-crate `disallowed-macros`
+  # ban on `std::format`. The ban is SCOPED via crate-local
+  # `clippy.toml` files (see ./clippy.toml for the rationale + the
+  # list of crates still being migrated). Today the ban is active on
+  # the `engenho` binary crate (format!()-clean); the workspace-root
+  # clippy.toml deliberately does NOT ban so the rest of the
+  # workspace stays green while the emission crates are converted to
+  # typed surfaces. Per pleme-io/theory/TYPED-EMISSION.md.
   # ──────────────────────────────────────────────────────────────
   clippy:
-    name: clippy pedantic
+    name: clippy pedantic + format-ban
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,7 +133,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy
-      - name: clippy
+      - name: clippy (pedantic + with-format-ban)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   # ──────────────────────────────────────────────────────────────

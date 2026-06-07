@@ -1,0 +1,53 @@
+# engenho — TYPED EMISSION (with-format-ban) clippy gate, SCOPED.
+#
+# Canonical rule: https://github.com/pleme-io/theory/blob/main/TYPED-EMISSION.md
+# Substrate helper: pleme-io/substrate/lib/build/rust/format-ban.{nix,clippy.toml}
+#
+# ── Why this root config carries NO `disallowed-macros` entry ──────────
+#
+# `format!()` of WIRE / SYNTAX (YAML, INI, iptables, nginx, URL paths,
+# systemd quantities, protobuf descriptor names, Rust source) is the
+# thing TYPED EMISSION bans. But clippy's `disallowed-macros = std::format`
+# is a BLUNT, all-or-nothing lint — it cannot distinguish a wire
+# `format!("/apis/{g}/{v}")` (banned) from an `anyhow` error-context
+# `format!("read {path}")` or a test-helper `format!("s-{i:02}")`
+# (both legitimate per TYPED-EMISSION.md's allowed surfaces).
+#
+# clippy also reads exactly ONE `clippy.toml` per crate, resolved by
+# walking up from the crate's manifest to the first config found; a
+# crate-local `clippy.toml` REPLACES (not merges with) this one. That
+# gives us per-crate scoping: a crate opts INTO the ban by shipping its
+# own `clippy.toml` that re-declares `disallowed-macros`. Crates without
+# one inherit this root config — which deliberately does NOT ban — so
+# `cargo clippy --workspace -- -D warnings` stays green while the
+# emission crates are migrated one at a time.
+#
+# ── Per-crate opt-in (the ban lives here) ──────────────────────────────
+#
+#   engenho/clippy.toml          ← BANS std::format (crate is format!()-clean)
+#
+# To extend the ban to another crate once it is confirmed clean for
+# wire/syntax emission (no `format!()` of YAML/INI/paths/argv left, and
+# any genuine Display/error/test-helper site carries a targeted
+# `#[allow(clippy::disallowed_macros)]` with a reason), drop a
+# `clippy.toml` into that crate's directory copying engenho/clippy.toml.
+#
+# ── Crates NOT yet in scope (remaining TYPED EMISSION work) ─────────────
+#
+#   engenho-types        — api.rs builds REST URL paths via
+#                          `format!("/apis/{g}/{v}/…")`; translator.rs
+#                          builds systemd/k8s quantity strings
+#                          (`format!("{pct}%")`, `{}Mi`, `k=v`). Needs a
+#                          typed PathBuilder + typed Quantity render.
+#   engenho-controllers  — patch/label bodies still composed via format!().
+#   engenho-kube-client  — request URL assembly partially typed
+#                          (url_builder.rs); residual format!() remains.
+#   engenho-kube-codegen — emit.rs / emit_typed.rs build Rust source via
+#                          string concatenation; needs a quote!/syn AST
+#                          emitter (the macro-farm pattern) before it can
+#                          adopt the ban.
+#
+# These are excluded by construction (they have no crate-local clippy.toml,
+# so they inherit this non-banning root). Each is a follow-up that converts
+# the remaining wire/syntax `format!()` to a typed surface, then ships a
+# crate-local clippy.toml.
