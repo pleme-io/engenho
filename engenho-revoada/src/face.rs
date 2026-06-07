@@ -43,6 +43,16 @@ pub enum FaceError {
     Unsupported(String),
 }
 
+engenho_substrate::impl_error_kind! {
+    FaceError {
+        AlreadyStarted => "already_started",
+        NotStarted => "not_started",
+        (StartFailed(_)) => "start_failed",
+        (ShutdownFailed(_)) => "shutdown_failed",
+        (Unsupported(_)) => "unsupported",
+    }
+}
+
 /// The contract every fabric face honors.
 ///
 /// **Lifecycle:** every face is constructed disabled, transitions to

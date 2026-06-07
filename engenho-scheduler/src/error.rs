@@ -5,7 +5,7 @@ use engenho_config::SchedulerStrategyKind;
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
     #[error("store error during list/patch: {0}")]
-    Store(String),
+    Store(#[from] engenho_store::StoreError),
 
     #[error("no schedulable nodes available")]
     NoSchedulableNodes,
@@ -49,7 +49,10 @@ mod tests {
     #[test]
     fn error_kind_is_stable() {
         for (e, k) in [
-            (SchedulerError::Store("x".into()), "store"),
+            (
+                SchedulerError::Store(engenho_store::StoreError::ClientWriteFailed("x".into())),
+                "store",
+            ),
             (SchedulerError::NoSchedulableNodes, "no_schedulable_nodes"),
             (SchedulerError::InvalidPodMetadata, "invalid_pod_metadata"),
             (

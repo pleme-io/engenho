@@ -142,6 +142,15 @@ pub enum FederationError {
     Member(usize, #[source] FaceError),
 }
 
+engenho_substrate::impl_error_kind! {
+    FederationError {
+        Empty => "empty",
+        (NoRoute(_)) => "no_route",
+        (BadDefaultIndex(..)) => "bad_default_index",
+        (Member(..)) => "member",
+    }
+}
+
 /// N clusters federated under one typed handle.
 ///
 /// Constructed via [`FederatedFabric::new`] with ≥1 member +

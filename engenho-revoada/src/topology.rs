@@ -244,6 +244,14 @@ pub enum TopologyError {
     UnsatisfiableShape,
 }
 
+engenho_substrate::impl_error_kind! {
+    TopologyError {
+        { InsufficientNodes { .. } } => "insufficient_nodes",
+        (InvariantViolated(_)) => "invariant_violated",
+        UnsatisfiableShape => "unsatisfiable_shape",
+    }
+}
+
 /// The pluggable interface every strategy implements.
 pub trait TopologyStrategy: Send + Sync + std::fmt::Debug {
     /// Stable name for telemetry + config.

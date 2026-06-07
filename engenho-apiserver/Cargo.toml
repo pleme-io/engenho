@@ -34,6 +34,8 @@ engenho-types      = { workspace = true }
 engenho-store      = { workspace = true }
 engenho-controllers = { workspace = true }
 engenho-kube-proto = { workspace = true }
+# ErrorKind trait + impl_error_kind! macro — stable .kind() tags.
+engenho-substrate  = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

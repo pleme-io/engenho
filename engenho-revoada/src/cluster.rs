@@ -64,6 +64,14 @@ pub enum ClusterCoherenceError {
     },
 }
 
+engenho_substrate::impl_error_kind! {
+    ClusterCoherenceError {
+        (StrategyError(_)) => "strategy_error",
+        { TopologyTooSmallForQuorum { .. } } => "topology_too_small_for_quorum",
+        { FaceSignaturePromiseUnmet { .. } } => "face_signature_promise_unmet",
+    }
+}
+
 /// A fully-coherent declaration of a cluster. The only way to obtain
 /// one is via [`ClusterDeclaration::new`], which runs every cross-
 /// surface check before constructing.
@@ -199,6 +207,14 @@ pub enum ClusterRuntimeError {
     AlreadyStarted,
     #[error("cluster not started")]
     NotStarted,
+}
+
+engenho_substrate::impl_error_kind! {
+    ClusterRuntimeError {
+        (Face(_)) => "face",
+        AlreadyStarted => "already_started",
+        NotStarted => "not_started",
+    }
 }
 
 /// The **running** composition of strategy + face + topology.
@@ -578,6 +594,14 @@ pub enum ClusterBuilderError {
     Coherence(#[from] ClusterCoherenceError),
     #[error("runtime construction failed: {0}")]
     Runtime(#[from] ClusterRuntimeError),
+}
+
+engenho_substrate::impl_error_kind! {
+    ClusterBuilderError {
+        (Missing(_)) => "missing",
+        (Coherence(_)) => "coherence",
+        (Runtime(_)) => "runtime",
+    }
 }
 
 impl ClusterBuilder {

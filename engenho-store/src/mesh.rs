@@ -34,6 +34,15 @@ pub enum StoreError {
     Fatal(String),
 }
 
+engenho_substrate::impl_error_kind! {
+    StoreError {
+        (ConfigInvalid(_)) => "config_invalid",
+        (InitializeFailed(_)) => "initialize_failed",
+        (ClientWriteFailed(_)) => "client_write_failed",
+        (Fatal(_)) => "fatal",
+    }
+}
+
 /// The store backend a [`StoreMesh`] is built over. Both variants
 /// impl the same four openraft v2 traits + the same read/watch
 /// surface; the enum routes the handle-side reads to whichever was

@@ -44,6 +44,15 @@ pub enum RaftError {
     Fatal(String),
 }
 
+engenho_substrate::impl_error_kind! {
+    RaftError {
+        (ConfigInvalid(_)) => "config_invalid",
+        (InitializeFailed(_)) => "initialize_failed",
+        (ClientWriteFailed(_)) => "client_write_failed",
+        (Fatal(_)) => "fatal",
+    }
+}
+
 /// Wrapping handle for a single engenho-revoada Raft node.
 ///
 /// At R4.5 the attestation chain LIVES in the [`InMemoryStore`]

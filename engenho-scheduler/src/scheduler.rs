@@ -148,8 +148,7 @@ impl Scheduler {
                     expected: None,
                     reason: Reason::Scheduler,
                 })
-                .await
-                .map_err(|e| SchedulerError::Store(e.to_string()))?;
+                .await?;
 
             // Decrement the chosen node's running free so a later pending
             // pod in THIS SAME tick can't also "fit" capacity that is now
@@ -206,8 +205,7 @@ impl Scheduler {
                 expected: None,
                 reason: Reason::Scheduler,
             })
-            .await
-            .map_err(|e| SchedulerError::Store(e.to_string()))?;
+            .await?;
         Ok(())
     }
 

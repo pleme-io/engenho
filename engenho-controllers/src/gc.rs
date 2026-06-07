@@ -89,8 +89,7 @@ impl Controller for GcController {
                         expected: None,
                         reason: Reason::GarbageCollector,
                     })
-                    .await
-                    .map_err(|e| ControllerError::Store(e.to_string()))?;
+                    .await?;
                 report.objects_changed += 1;
             }
         }

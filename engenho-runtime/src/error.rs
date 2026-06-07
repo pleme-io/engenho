@@ -9,15 +9,15 @@ use engenho_store::StoreError;
 pub enum RuntimeError {
     /// Config failed `validate()` or a section was incoherent.
     #[error("config error: {0}")]
-    Config(#[source] ConfigError),
+    Config(#[from] ConfigError),
 
     /// The store mesh failed to start, initialize, or take leadership.
     #[error("store error: {0}")]
-    Store(#[source] StoreError),
+    Store(#[from] StoreError),
 
     /// The apiserver failed to bind or serve.
     #[error("apiserver error: {0}")]
-    Server(#[source] ServerError),
+    Server(#[from] ServerError),
 
     /// Raft leadership wasn't reached within the configured timeout.
     /// The store started but never elected a leader, so no `propose`
@@ -64,20 +64,15 @@ pub enum RuntimeError {
     },
 }
 
-impl From<ConfigError> for RuntimeError {
-    fn from(e: ConfigError) -> Self {
-        Self::Config(e)
-    }
-}
-
-impl From<StoreError> for RuntimeError {
-    fn from(e: StoreError) -> Self {
-        Self::Store(e)
-    }
-}
-
-impl From<ServerError> for RuntimeError {
-    fn from(e: ServerError) -> Self {
-        Self::Server(e)
+engenho_substrate::impl_error_kind! {
+    RuntimeError {
+        (Config(_)) => "config",
+        (Store(_)) => "store",
+        (Server(_)) => "server",
+        { LeadershipTimeout { .. } } => "leadership_timeout",
+        { ListenAddr { .. } } => "listen_addr",
+        { StoreStillShared { .. } } => "store_still_shared",
+        (Kubeconfig(_)) => "kubeconfig",
+        { KubeconfigIo { .. } } => "kubeconfig_io",
     }
 }

@@ -67,6 +67,16 @@ pub enum AdapterError {
     },
 }
 
+engenho_substrate::impl_error_kind! {
+    AdapterError {
+        { UnsupportedFormat { .. } } => "unsupported_format",
+        { MissingField { .. } } => "missing_field",
+        { WrongType { .. } } => "wrong_type",
+        { Parse { .. } } => "parse",
+        { Encode { .. } } => "encode",
+    }
+}
+
 /// The contract every format adapter honors.
 ///
 /// **Object-safe by design** — `Send + Sync + 'static` so faces

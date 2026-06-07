@@ -151,8 +151,7 @@ pub async fn write_status_cas(
             expected: Some(expected),
             reason: Reason::Controller,
         })
-        .await
-        .map_err(|e| ControllerError::Store(e.to_string()))?;
+        .await?;
 
     if result.op == ResourceOp::Conflict {
         // A concurrent spec change advanced mod_revision between the list

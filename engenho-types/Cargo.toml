@@ -27,6 +27,8 @@ futures-core = "0.3"
 bytes       = "1"
 # Canonical Transient/Declarative failure classification (KubeError::classify).
 shigoto-types = { workspace = true }
+# ErrorKind trait + impl_error_kind! macro — stable .kind() tags for KubeError.
+engenho-substrate = { workspace = true }
 
 [dev-dependencies]
 insta    = { version = "1", features = ["json", "yaml"] }

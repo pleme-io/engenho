@@ -40,12 +40,15 @@ pub enum ServerError {
     #[error("tls setup failed: {0}")]
     Tls(#[source] std::io::Error),
     #[error("pki error: {0}")]
-    Pki(#[source] PkiError),
+    Pki(#[from] PkiError),
 }
 
-impl From<PkiError> for ServerError {
-    fn from(e: PkiError) -> Self {
-        Self::Pki(e)
+engenho_substrate::impl_error_kind! {
+    ServerError {
+        (Bind(_)) => "bind",
+        (Serve(_)) => "serve",
+        (Tls(_)) => "tls",
+        (Pki(_)) => "pki",
     }
 }
 

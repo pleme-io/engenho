@@ -23,6 +23,8 @@ engenho-controllers = { workspace = true }
 engenho-scheduler   = { workspace = true }
 engenho-kubelet     = { workspace = true }
 engenho-kube-client = { workspace = true }
+# ErrorKind trait + impl_error_kind! macro — stable .kind() tags.
+engenho-substrate   = { workspace = true }
 
 serde_json          = { workspace = true }
 thiserror           = { workspace = true }
