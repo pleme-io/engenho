@@ -1,0 +1,36 @@
+[package]
+name = "engenho-runtime"
+description = "engenho-runtime — the single-node assembly layer. Boots StoreMesh + ApiServer + controllers + scheduler + kubelet over ONE durable store in ONE process, so a POSTed apps/v1 Deployment converges to a running container. The engenho binary is a thin launcher over Runtime::start. Spec: theory/ENGENHO.md §IX; M0.1 item 7."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+engenho-config      = { workspace = true }
+engenho-store       = { workspace = true }
+engenho-apiserver   = { workspace = true }
+engenho-controllers = { workspace = true }
+engenho-scheduler   = { workspace = true }
+engenho-kubelet     = { workspace = true }
+
+serde_json          = { workspace = true }
+thiserror           = { workspace = true }
+tokio               = { workspace = true }
+tracing             = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+shikumi = { git = "https://github.com/pleme-io/shikumi", version = "0.1.0" }
+tempfile = "3"
+tokio = { workspace = true }

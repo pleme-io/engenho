@@ -52,4 +52,4 @@ pub use params::{
     status_410_line, to_k8s_watch_line,
 };
 pub use router::{RouterState, build};
-pub use server::ApiServer;
+pub use server::{ApiServer, ServerError};

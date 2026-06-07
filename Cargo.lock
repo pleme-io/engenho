@@ -1261,7 +1261,13 @@ dependencies = [
 name = "engenho"
 version = "0.1.4"
 dependencies = [
+ "anyhow",
+ "engenho-config",
+ "engenho-runtime",
  "engenho-types",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1494,6 +1500,25 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shigoto-types 0.1.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "engenho-runtime"
+version = "0.1.4"
+dependencies = [
+ "engenho-apiserver",
+ "engenho-config",
+ "engenho-controllers",
+ "engenho-kubelet",
+ "engenho-scheduler",
+ "engenho-store",
+ "reqwest 0.12.28",
+ "serde_json",
+ "shikumi",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
