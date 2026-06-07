@@ -87,14 +87,14 @@ pub fn put_drv_command(
 ) -> Result<ResourceCommand, serde_json::Error> {
     let value = render_drv_resource(drv, namespace)?;
     let key = drv_resource_key(drv, namespace);
-    Ok(ResourceCommand::Put { key, value, reason })
+    Ok(ResourceCommand::put(key, value, reason))
 }
 
 /// Build a `ResourceCommand::Delete` for removing a Drv.
 #[must_use]
 pub fn delete_drv_command(drv_hash_hex: &str, namespace: &str, reason: Reason) -> ResourceCommand {
     let key = ResourceKey::namespaced(DRV_GROUP, DRV_VERSION, DRV_KIND, namespace, drv_hash_hex);
-    ResourceCommand::Delete { key, reason }
+    ResourceCommand::delete(key, reason)
 }
 
 #[cfg(test)]
@@ -159,7 +159,9 @@ mod tests {
         let drv = sample_drv();
         let cmd = put_drv_command(&drv, "default", Reason::Operator).unwrap();
         match cmd {
-            ResourceCommand::Put { key, value, reason } => {
+            ResourceCommand::Put {
+                key, value, reason, ..
+            } => {
                 assert_eq!(key.kind, "Derivation");
                 assert_eq!(reason, Reason::Operator);
                 assert_eq!(value.get("kind").unwrap(), "Derivation");
@@ -172,7 +174,7 @@ mod tests {
     fn delete_drv_command_constructs_delete_variant() {
         let cmd = delete_drv_command("abc123", "default", Reason::Operator);
         match cmd {
-            ResourceCommand::Delete { key, reason } => {
+            ResourceCommand::Delete { key, reason, .. } => {
                 assert_eq!(key.name, "abc123");
                 assert_eq!(reason, Reason::Operator);
             }

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use engenho_store::resource::ResourceKey;
 use engenho_store::watch::WatchEvent;
-use engenho_store::{Revision, WatchEventKind};
+use engenho_store::{ContinueToken, Revision, WatchEventKind};
 
 use crate::error::ApiError;
 
@@ -48,9 +48,11 @@ pub struct ListWatchParams {
     /// Accepted + parsed, no-op at M0.1 (informer long-poll timeout).
     #[serde(rename = "timeoutSeconds")]
     pub timeout_seconds: Option<String>,
-    /// Accepted + parsed, no-op at M0.1 (pagination = item 5).
+    /// `limit=N` — page size (item 5). Parsed by [`Self::limit`]; `0` /
+    /// absent = unbounded.
     pub limit: Option<String>,
-    /// Accepted + parsed, no-op at M0.1 (pagination = item 5).
+    /// `continue=<opaque token>` — the page cursor (item 5). Decoded +
+    /// integrity-verified by [`Self::continue_token`]; invalid → 410.
     #[serde(rename = "continue")]
     pub continue_: Option<String>,
 }
@@ -87,6 +89,97 @@ impl ListWatchParams {
             labels: parse_kv(self.label_selector.as_deref(), "labelSelector")?,
             fields: parse_kv(self.field_selector.as_deref(), "fieldSelector")?,
         })
+    }
+
+    /// Interpret `limit` with K8s semantics: absent / `""` / `"0"` => 0
+    /// (unbounded); `"N"` => N; anything else => a real 400.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::BadRequest`] when `limit` is present and non-empty but
+    /// not a base-10 unsigned integer.
+    pub fn limit(&self) -> Result<usize, ApiError> {
+        match self.limit.as_deref() {
+            None | Some("") | Some("0") => Ok(0),
+            Some(s) => s.parse::<usize>().map_err(|_| {
+                ApiError::BadRequest(format!(
+                    "invalid limit: {s:?} (must be a non-negative integer)"
+                ))
+            }),
+        }
+    }
+
+    /// Decode + integrity-verify the `continue` token. Absent / empty =>
+    /// `None` (first page). A present-but-invalid/expired/corrupt token
+    /// => [`ApiError::Gone`] (HTTP 410 / Expired), the K8s contract for a
+    /// stale continue cursor.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Gone`] when the token fails to decode or its integrity
+    /// digest / version tag don't verify.
+    pub fn continue_token(&self) -> Result<Option<ContinueToken>, ApiError> {
+        match self.continue_.as_deref() {
+            None | Some("") => Ok(None),
+            Some(s) => ContinueToken::decode(s).map(Some).map_err(|e| {
+                ApiError::Gone(format!("invalid or expired continue token: {}", e.reason))
+            }),
+        }
+    }
+
+    /// Interpret `resourceVersion` as a DELETE precondition
+    /// (`Preconditions.resourceVersion`, K8s `?resourceVersion=N` on
+    /// DELETE): absent / `""` / `"0"` => `None` (unconditional delete);
+    /// `"N"` => `Some(Revision(N))`; anything else => a real 400.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::BadRequest`] when `resourceVersion` is present and
+    /// non-empty but not a base-10 unsigned integer.
+    pub fn precondition(&self) -> Result<Option<Revision>, ApiError> {
+        match self.resource_version.as_deref() {
+            None | Some("") | Some("0") => Ok(None),
+            Some(s) => s.parse::<u64>().map(|n| Some(Revision(n))).map_err(|_| {
+                ApiError::BadRequest(format!(
+                    "invalid resourceVersion precondition: {s:?} (must be a non-negative integer)"
+                ))
+            }),
+        }
+    }
+}
+
+/// Read the optimistic-concurrency precondition from an inbound resource
+/// BODY (create / patch): `metadata.resourceVersion`.
+///
+///   * absent => `None` (unconditional — K8s semantics for absent rv).
+///   * `"N"` => `Some(Revision(N))`.
+///   * present-but-malformed => a real 400.
+///
+/// Uses the SAME `Revision`-parse shape as [`ListWatchParams::precondition`].
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] when `metadata.resourceVersion` is present
+/// but not a base-10 unsigned integer.
+pub fn body_precondition(body: &serde_json::Value) -> Result<Option<Revision>, ApiError> {
+    let rv = body
+        .get("metadata")
+        .and_then(|m| m.get("resourceVersion"));
+    match rv {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) if s.is_empty() => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            s.parse::<u64>().map(|n| Some(Revision(n))).map_err(|_| {
+                ApiError::BadRequest(format!(
+                    "invalid metadata.resourceVersion: {s:?} (must be a non-negative integer)"
+                ))
+            })
+        }
+        // K8s resourceVersion is a string on the wire; a non-string is a
+        // malformed body.
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "metadata.resourceVersion must be a string, got {other}"
+        ))),
     }
 }
 
@@ -325,6 +418,91 @@ mod tests {
             params_with_rv(Some("0")).resume_point().unwrap(),
             ResumePoint::MostRecent
         );
+    }
+
+    #[test]
+    fn limit_parses_with_k8s_semantics() {
+        let p = |s: Option<&str>| ListWatchParams {
+            limit: s.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(p(None).limit().unwrap(), 0);
+        assert_eq!(p(Some("")).limit().unwrap(), 0);
+        assert_eq!(p(Some("0")).limit().unwrap(), 0);
+        assert_eq!(p(Some("25")).limit().unwrap(), 25);
+        assert!(matches!(p(Some("nope")).limit(), Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn continue_token_accessor_round_trips_and_rejects_garbage() {
+        let token = ContinueToken::new(
+            Revision(9),
+            ResourceKey::namespaced("", "v1", "Pod", "default", "p3"),
+        );
+        let encoded = token.encode();
+        let p = ListWatchParams {
+            continue_: Some(encoded),
+            ..Default::default()
+        };
+        assert_eq!(p.continue_token().unwrap(), Some(token));
+
+        // Absent / empty → None.
+        assert_eq!(
+            ListWatchParams::default().continue_token().unwrap(),
+            None
+        );
+
+        // Garbage → Gone (410).
+        let bad = ListWatchParams {
+            continue_: Some("not-a-token".into()),
+            ..Default::default()
+        };
+        assert!(matches!(bad.continue_token(), Err(ApiError::Gone(_))));
+    }
+
+    #[test]
+    fn delete_precondition_parses() {
+        let p = |s: Option<&str>| ListWatchParams {
+            resource_version: s.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(p(None).precondition().unwrap(), None);
+        assert_eq!(p(Some("")).precondition().unwrap(), None);
+        assert_eq!(p(Some("0")).precondition().unwrap(), None);
+        assert_eq!(p(Some("7")).precondition().unwrap(), Some(Revision(7)));
+        assert!(matches!(
+            p(Some("x")).precondition(),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn body_precondition_reads_metadata_resource_version() {
+        // Absent → None.
+        assert_eq!(
+            body_precondition(&serde_json::json!({"metadata": {"name": "p"}})).unwrap(),
+            None
+        );
+        // String "5" → Some(5).
+        assert_eq!(
+            body_precondition(&serde_json::json!({"metadata": {"resourceVersion": "5"}})).unwrap(),
+            Some(Revision(5))
+        );
+        // Empty string → None.
+        assert_eq!(
+            body_precondition(&serde_json::json!({"metadata": {"resourceVersion": ""}})).unwrap(),
+            None
+        );
+        // Malformed string → BadRequest.
+        assert!(matches!(
+            body_precondition(&serde_json::json!({"metadata": {"resourceVersion": "abc"}})),
+            Err(ApiError::BadRequest(_))
+        ));
+        // Non-string → BadRequest.
+        assert!(matches!(
+            body_precondition(&serde_json::json!({"metadata": {"resourceVersion": 5}})),
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[test]

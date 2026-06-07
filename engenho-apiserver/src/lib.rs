@@ -48,8 +48,8 @@ pub use handler::{
 };
 pub use openapi::ApiDoc;
 pub use params::{
-    ListWatchParams, ResumePoint, Selectors, bookmark_line, gvk_ns_matches, status_410_line,
-    to_k8s_watch_line,
+    ListWatchParams, ResumePoint, Selectors, body_precondition, bookmark_line, gvk_ns_matches,
+    status_410_line, to_k8s_watch_line,
 };
 pub use router::{RouterState, build};
 pub use server::ApiServer;

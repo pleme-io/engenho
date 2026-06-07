@@ -64,6 +64,7 @@ async fn put_emits_added_watch_event() {
         .propose(ResourceCommand::Put {
             key: pod_key("p1"),
             value: json!({"spec": {"image": "v1"}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -89,6 +90,7 @@ async fn put_then_put_emits_added_then_modified() {
         .propose(ResourceCommand::Put {
             key: pod_key("p"),
             value: json!({"spec": {"v": 1}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -97,6 +99,7 @@ async fn put_then_put_emits_added_then_modified() {
         .propose(ResourceCommand::Put {
             key: pod_key("p"),
             value: json!({"spec": {"v": 2}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -121,6 +124,7 @@ async fn patch_emits_modified_event() {
         .propose(ResourceCommand::Put {
             key: pod_key("p"),
             value: json!({"spec": {"v": 1, "label": "a"}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -131,6 +135,7 @@ async fn patch_emits_modified_event() {
         .propose(ResourceCommand::Patch {
             key: pod_key("p"),
             patch: json!({"spec": {"v": 2}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -154,6 +159,7 @@ async fn delete_emits_deleted_event() {
         .propose(ResourceCommand::Put {
             key: pod_key("p"),
             value: json!({"spec": {"image": "podinfo"}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -163,6 +169,7 @@ async fn delete_emits_deleted_event() {
     store
         .propose(ResourceCommand::Delete {
             key: pod_key("p"),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -203,6 +210,7 @@ async fn multiple_subscribers_each_get_every_event() {
         .propose(ResourceCommand::Put {
             key: pod_key("p1"),
             value: json!({"spec": {}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -211,6 +219,7 @@ async fn multiple_subscribers_each_get_every_event() {
         .propose(ResourceCommand::Put {
             key: pod_key("p2"),
             value: json!({"spec": {}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -239,6 +248,7 @@ async fn late_subscriber_does_not_see_history() {
         .propose(ResourceCommand::Put {
             key: pod_key("ancient"),
             value: json!({"spec": {}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -262,6 +272,7 @@ async fn late_subscriber_does_not_see_history() {
         .propose(ResourceCommand::Put {
             key: pod_key("fresh"),
             value: json!({"spec": {}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -283,6 +294,7 @@ async fn watch_event_resource_version_matches_revision() {
         .propose(ResourceCommand::Put {
             key: pod_key("p"),
             value: json!({"spec": {}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await

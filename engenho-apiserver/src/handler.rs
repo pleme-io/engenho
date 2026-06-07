@@ -6,15 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_store::{
-    Revision, StoreMesh, WatchGone, WatchOpts, WatchStream,
-    command::{Reason, ResourceCommand},
+    ContinueToken, Revision, StoreMesh, WatchGone, WatchOpts, WatchStream,
+    command::{Reason, ResourceCommand, ResourceOp},
     resource::ResourceKey,
     watch_backend::WATCH_CHANNEL_CAPACITY,
 };
 use engenho_types::generated_v1_34::RESOURCE_CATALOG;
 
 use crate::error::ApiError;
-use crate::params::{ResumePoint, Selectors};
+use crate::params::{ResumePoint, Selectors, body_precondition};
 
 /// Bookmark cadence handed to `watch_from` when the client opted into
 /// bookmarks (`allowWatchBookmarks=true`). Mirrors the store default.
@@ -72,6 +72,37 @@ pub trait ResourceHandler: Send + Sync + 'static {
         sel: &Selectors,
     ) -> Result<(Vec<Value>, Revision), ApiError>;
 
+    /// PAGED LIST — at most `limit` selector-matched items, resuming from
+    /// `continue_token` (the cursor of the previous page). The
+    /// selector-vs-limit interaction is load-bearing: selectors are
+    /// applied apiserver-side, so `limit` counts items AFTER filtering,
+    /// and `continue` encodes the last EMITTED key. The handler
+    /// over-fetches store pages within the snapshot, selector-filters,
+    /// and accumulates until `limit` matches are collected or the
+    /// snapshot is exhausted.
+    ///
+    /// All store pages in one request AND across the continue series read
+    /// from the SAME revision (the token's snapshot rev) so the series is
+    /// consistent (etcd consistent-list semantics).
+    ///
+    /// Returns `(items, snapshot_rv, continue, remaining)`:
+    ///   * `items` — up to `limit` selector-matched objects.
+    ///   * `snapshot_rv` — the page-series consistent revision (baked
+    ///     into the next continue token + the LIST envelope's
+    ///     `resourceVersion`).
+    ///   * `continue` — the opaque next-page token iff more matching
+    ///     items remain, else `None`.
+    ///   * `remaining` — a lower bound on the still-unreturned matching
+    ///     items (the store-side GVK tail count after the last emitted
+    ///     key), or `None` when there is no continuation.
+    async fn list_page(
+        &self,
+        namespace: Option<&str>,
+        sel: &Selectors,
+        limit: usize,
+        continue_token: Option<ContinueToken>,
+    ) -> Result<(Vec<Value>, Revision, Option<String>, Option<u64>), ApiError>;
+
     /// Open a streaming WATCH from `from`. The returned [`WatchStream`]
     /// is cluster-wide (the store fans every kind through one registry);
     /// the router filters each event down to this handler's GVK +
@@ -101,6 +132,19 @@ pub trait ResourceHandler: Send + Sync + 'static {
 
     async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<(), ApiError>;
 
+    /// DELETE with an optimistic-concurrency precondition
+    /// (`Preconditions.resourceVersion`, surfaced as `?resourceVersion=`).
+    /// `expected = None` is an unconditional delete (identical to
+    /// [`Self::delete`]); `Some(N)` deletes iff the live object's
+    /// `mod_revision == N`, else a typed
+    /// [`ApiError::ResourceVersionConflict`] (409).
+    async fn delete_with_precondition(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        expected: Option<Revision>,
+    ) -> Result<(), ApiError>;
+
     /// The `apiVersion` string for this kind — `"v1"` for the core
     /// group, `"<group>/<version>"` otherwise.
     fn api_version(&self) -> String {
@@ -115,13 +159,27 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// items + the snapshot revision. Shared by the router's LIST branch
     /// (which calls [`Self::list_at`] with selectors) so the
     /// cluster-scoped + namespaced cases emit ONE body shape.
-    fn list_response(&self, items: Vec<Value>, rv: Revision) -> Value {
+    ///
+    /// The unpaged path passes `continue_ = None`, `remaining = None`
+    /// (both fields omitted from the body). The paged path
+    /// ([`Self::list_page`]) passes the next-page token + remaining count.
+    fn list_response(
+        &self,
+        items: Vec<Value>,
+        rv: Revision,
+        continue_: Option<String>,
+        remaining: Option<u64>,
+    ) -> Value {
         let env = ListEnvelope {
             kind: format!("{}List", self.kind()),
             api_version: self.api_version(),
             items,
             metadata: ListMeta {
                 resource_version: rv.to_string(),
+                continue_,
+                // K8s `remainingItemCount` is an int64; our store count
+                // fits (resource counts are far below i64::MAX).
+                remaining_item_count: remaining.map(|r| r as i64),
             },
         };
         serde_json::to_value(env).unwrap_or(Value::Null)
@@ -262,7 +320,7 @@ impl ResourceHandler for StoreBackedHandler {
         // empty selector set so both the router LIST branch and any
         // direct caller share ONE body.
         let (items, rv) = self.list_at(namespace, &Selectors::default()).await?;
-        Ok(self.list_response(items, rv))
+        Ok(self.list_response(items, rv, None, None))
     }
 
     async fn list_at(
@@ -284,6 +342,134 @@ impl ResourceHandler for StoreBackedHandler {
             .map(|(_, v)| inject_type_meta(&v, self.api_version(), &self.kind))
             .collect();
         Ok((items, rv))
+    }
+
+    async fn list_page(
+        &self,
+        namespace: Option<&str>,
+        sel: &Selectors,
+        limit: usize,
+        continue_token: Option<ContinueToken>,
+    ) -> Result<(Vec<Value>, Revision, Option<String>, Option<u64>), ApiError> {
+        // Resolve the page-series snapshot revision + the resume cursor.
+        // The FIRST page (no continue token) captures the snapshot rev
+        // below; every subsequent page reuses the token's snapshot rev so
+        // the whole series is consistent. The cursor is the token's
+        // last_key.
+        let series_snapshot = continue_token.as_ref().map(|t| t.snapshot_rev);
+        let mut cursor: Option<ResourceKey> = continue_token.map(|t| t.last_key);
+
+        // limit == 0 → unbounded. One store page (limit=0 = all after
+        // cursor), selector-filter, no continuation. The snapshot rev is
+        // captured here (or reused from the token).
+        if limit == 0 {
+            let (entries, snap, _next, _remaining) = self
+                .store
+                .list_page_at_revision(
+                    &self.group,
+                    &self.version,
+                    &self.kind,
+                    namespace,
+                    cursor.as_ref(),
+                    0,
+                )
+                .await;
+            let rv = series_snapshot.unwrap_or(snap);
+            let items: Vec<Value> = entries
+                .into_iter()
+                .filter(|(_, v)| sel.matches(v))
+                .map(|(_, v)| inject_type_meta(&v, self.api_version(), &self.kind))
+                .collect();
+            return Ok((items, rv, None, None));
+        }
+
+        // Selector-aware paging: `limit` counts items AFTER selector
+        // filtering, but the store pages on the GVK-keyed catalog. Loop:
+        // over-fetch a store page, selector-filter, accumulate until we
+        // have `limit` matches or the GVK set is exhausted. The over-fetch
+        // chunk is `limit` (a reasonable default; with no selectors it is
+        // exactly one store page per accepted page).
+        let mut accepted: Vec<Value> = Vec::with_capacity(limit);
+        // `last_emitted_key` is the key of the last ACCEPTED item — the
+        // basis for the next continue token (must be the last EMITTED key,
+        // not the last SCANNED key).
+        let mut last_emitted_key: Option<ResourceKey> = None;
+        // The store-side tail count after the last scanned store page —
+        // becomes `remainingItemCount` when we stop with a continuation.
+        // The `loop` always assigns it before the post-loop read.
+        let mut store_tail_remaining: u64;
+        // The snapshot rv (captured from the first store fetch if the
+        // series didn't already pin one).
+        let mut snapshot_rv: Option<Revision> = series_snapshot;
+        // The chunk size to over-fetch per store page.
+        let chunk = limit.max(1);
+
+        loop {
+            let (entries, snap, next, remaining) = self
+                .store
+                .list_page_at_revision(
+                    &self.group,
+                    &self.version,
+                    &self.kind,
+                    namespace,
+                    cursor.as_ref(),
+                    chunk,
+                )
+                .await;
+            if snapshot_rv.is_none() {
+                snapshot_rv = Some(snap);
+            }
+            store_tail_remaining = remaining;
+
+            let store_page_empty = entries.is_empty();
+            for (k, v) in entries {
+                if sel.matches(&v) {
+                    accepted.push(inject_type_meta(&v, self.api_version(), &self.kind));
+                    last_emitted_key = Some(k);
+                    if accepted.len() == limit {
+                        break;
+                    }
+                }
+            }
+
+            // Done if we filled the page, the GVK set has no more items
+            // after this store page (`next` is None), or the store page
+            // came back empty (defensive — `next: None` already covers
+            // it).
+            if accepted.len() == limit || next.is_none() || store_page_empty {
+                break;
+            }
+            // Advance the store cursor to the last SCANNED key of this
+            // store page and fetch the next chunk (more matches may lie
+            // beyond the selector-rejected items).
+            cursor = next;
+        }
+
+        let rv = snapshot_rv.unwrap_or_else(Revision::default);
+
+        // Build the continuation. There is a next page iff we stopped
+        // because the page filled AND more matching items may remain.
+        // After the last emitted key, the remaining matching count is at
+        // most the store tail (`store_tail_remaining`) plus any items
+        // scanned-but-not-emitted in the final store page — but at M0.1
+        // `remainingItemCount` is documented as a lower bound (the store
+        // GVK tail after the last store page). We emit a continuation iff
+        // the page is full AND (the store reported a tail OR the last
+        // store page had a `next`). Conservatively: if the page filled and
+        // there's a known last_emitted_key and the store still has a tail,
+        // continue.
+        let page_full = accepted.len() == limit;
+        let (continue_str, remaining_out) = if page_full && store_tail_remaining > 0 {
+            // More GVK items remain after the last store page; resume
+            // strictly after the last EMITTED key at the series snapshot.
+            let token = last_emitted_key
+                .map(|k| ContinueToken::new(rv, k).encode());
+            (token, Some(store_tail_remaining))
+        } else {
+            (None, None)
+        };
+
+        Ok((accepted, rv, continue_str, remaining_out))
     }
 
     async fn watch_stream(
@@ -322,7 +508,13 @@ impl ResourceHandler for StoreBackedHandler {
             .ok_or_else(|| ApiError::BadRequest("missing metadata.name in request body".into()))?
             .to_string();
         let key = self.key(namespace, &name)?;
-        // Reject if already exists (POST semantics).
+        // Optimistic-concurrency precondition from the inbound body's
+        // metadata.resourceVersion. For a CREATE (POST) of a NEW object
+        // the rv is absent → None (unconditional create); a re-PUT-style
+        // body carrying an rv threads CAS into the proposal.
+        let expected = body_precondition(&body)?;
+        // Reject if already exists (POST semantics). The no-rv POST keeps
+        // its existing already-exists Conflict/"AlreadyExists" path.
         if self.store.get(&key).await.is_some() {
             return Err(ApiError::Conflict(
                 format!("{}/{}", self.kind, name),
@@ -334,12 +526,17 @@ impl ResourceHandler for StoreBackedHandler {
             .propose(ResourceCommand::Put {
                 key: key.clone(),
                 value: body,
+                expected,
                 reason: Reason::Operator,
             })
             .await
             .map_err(|e| ApiError::StorageError(e.to_string()))?;
+        // A CAS conflict from the deterministic apply path → typed 409
+        // "Conflict" (distinct from the already-exists path above).
+        if result.op == ResourceOp::Conflict {
+            return Err(self.rv_conflict(&name, expected));
+        }
         // Read back the committed resource (with resourceVersion).
-        let _ = result;
         let stored = self
             .store
             .get(&key)
@@ -355,17 +552,25 @@ impl ResourceHandler for StoreBackedHandler {
         patch: Value,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
+        // Precondition from the inbound patch body's
+        // metadata.resourceVersion (absent → unconditional).
+        let expected = body_precondition(&patch)?;
         if self.store.get(&key).await.is_none() {
             return Err(ApiError::NotFound(format!("{}/{}", self.kind, name)));
         }
-        self.store
+        let result = self
+            .store
             .propose(ResourceCommand::Patch {
                 key: key.clone(),
                 patch,
+                expected,
                 reason: Reason::Operator,
             })
             .await
             .map_err(|e| ApiError::StorageError(e.to_string()))?;
+        if result.op == ResourceOp::Conflict {
+            return Err(self.rv_conflict(name, expected));
+        }
         let stored = self
             .store
             .get(&key)
@@ -375,15 +580,47 @@ impl ResourceHandler for StoreBackedHandler {
     }
 
     async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<(), ApiError> {
+        // Unconditional delete (no precondition). The precondition path
+        // is [`Self::delete_with_precondition`], driven by `?resourceVersion=`.
+        self.delete_with_precondition(namespace, name, None).await
+    }
+
+    async fn delete_with_precondition(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        expected: Option<Revision>,
+    ) -> Result<(), ApiError> {
         let key = self.key(namespace, name)?;
-        self.store
+        let result = self
+            .store
             .propose(ResourceCommand::Delete {
                 key,
+                expected,
                 reason: Reason::Operator,
             })
             .await
             .map_err(|e| ApiError::StorageError(e.to_string()))?;
+        if result.op == ResourceOp::Conflict {
+            return Err(self.rv_conflict(name, expected));
+        }
         Ok(())
+    }
+}
+
+impl StoreBackedHandler {
+    /// Build the typed optimistic-concurrency 409 ("Conflict") error for
+    /// a CAS failure on `name` with the caller's `expected` revision. The
+    /// message mirrors kube-apiserver's optimistic-concurrency phrasing.
+    fn rv_conflict(&self, name: &str, expected: Option<Revision>) -> ApiError {
+        let expected_str = expected
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        ApiError::ResourceVersionConflict(format!(
+            "Operation cannot be fulfilled on {} \"{}\": the object has been modified; \
+             expected resourceVersion {} did not match the live object",
+            self.plural, name, expected_str
+        ))
     }
 }
 
@@ -427,6 +664,14 @@ struct ListEnvelope {
 struct ListMeta {
     #[serde(rename = "resourceVersion")]
     resource_version: String,
+    /// The opaque next-page cursor — present only on a paged LIST that
+    /// has more items. Omitted otherwise (K8s contract).
+    #[serde(rename = "continue", skip_serializing_if = "Option::is_none")]
+    continue_: Option<String>,
+    /// A lower bound on the still-unreturned matching items — present
+    /// only on a paged LIST with a continuation. Omitted otherwise.
+    #[serde(rename = "remainingItemCount", skip_serializing_if = "Option::is_none")]
+    remaining_item_count: Option<i64>,
 }
 
 /// Add `kind` + `apiVersion` to a resource if missing. Matches

@@ -23,26 +23,15 @@ fn pod_key(name: &str) -> ResourceKey {
 }
 
 fn put_cmd(key: ResourceKey, value: ResourceValue) -> ResourceCommand {
-    ResourceCommand::Put {
-        key,
-        value,
-        reason: Reason::Operator,
-    }
+    ResourceCommand::put(key, value, Reason::Operator)
 }
 
 fn patch_cmd(key: ResourceKey, patch: ResourceValue) -> ResourceCommand {
-    ResourceCommand::Patch {
-        key,
-        patch,
-        reason: Reason::Operator,
-    }
+    ResourceCommand::patch(key, patch, Reason::Operator)
 }
 
 fn delete_cmd(key: ResourceKey) -> ResourceCommand {
-    ResourceCommand::Delete {
-        key,
-        reason: Reason::Operator,
-    }
+    ResourceCommand::delete(key, Reason::Operator)
 }
 
 // One generated op kind. 4 keys + 3 verbs keeps the state space dense

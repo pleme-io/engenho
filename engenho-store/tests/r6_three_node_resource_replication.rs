@@ -25,6 +25,7 @@ async fn single_node_store_put_and_get() {
     let cmd = ResourceCommand::Put {
         key: pod_key("podinfo"),
         value: serde_json::json!({"spec": {"image": "ghcr.io/stefanprodan/podinfo:6.12.0"}}),
+        expected: None,
         reason: Reason::Operator,
     };
     let result = mesh.propose(cmd).await.unwrap();
@@ -67,6 +68,7 @@ async fn put_then_patch_then_delete_full_lifecycle() {
     mesh.propose(ResourceCommand::Put {
         key: pod_key("p"),
         value: serde_json::json!({"spec": {"image": "v1", "replicas": 3}}),
+        expected: None,
         reason: Reason::Operator,
     })
     .await
@@ -77,6 +79,7 @@ async fn put_then_patch_then_delete_full_lifecycle() {
         .propose(ResourceCommand::Patch {
             key: pod_key("p"),
             patch: serde_json::json!({"spec": {"image": "v2"}}),
+            expected: None,
             reason: Reason::Controller,
         })
         .await
@@ -91,6 +94,7 @@ async fn put_then_patch_then_delete_full_lifecycle() {
     let deleted = mesh
         .propose(ResourceCommand::Delete {
             key: pod_key("p"),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -155,6 +159,7 @@ async fn three_node_store_replicates_resource_writes() {
             .propose(ResourceCommand::Put {
                 key: pod_key(name),
                 value: serde_json::json!({"spec": {"image": format!("img-{name}")}}),
+                expected: None,
                 reason: Reason::Operator,
             })
             .await
