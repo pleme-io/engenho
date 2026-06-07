@@ -214,8 +214,12 @@ async fn do_delete(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
     name: &str,
+    p: &ListWatchParams,
 ) -> Result<Response, ApiError> {
-    h.delete(ns, name).await?;
+    // `?resourceVersion=N` is the K8s DELETE precondition
+    // (`Preconditions.resourceVersion`); absent/"0" → unconditional.
+    let expected = p.precondition()?;
+    h.delete_with_precondition(ns, name, expected).await?;
     Ok(StatusCode::OK.into_response())
 }
 
@@ -234,8 +238,20 @@ async fn do_list_or_watch(
     if p.watch {
         watch_response(h, namespace, p, sel).await
     } else {
-        let (items, rv) = h.list_at(namespace.as_deref(), &sel).await?;
-        Ok(Json(h.list_response(items, rv)).into_response())
+        // Paged path when `limit` or `continue` is present; otherwise the
+        // unbounded atomic-rv LIST envelope (back-compat: no continue /
+        // remainingItemCount fields emitted).
+        let limit = p.limit()?;
+        let continue_token = p.continue_token()?;
+        if limit > 0 || continue_token.is_some() {
+            let (items, rv, cont, remaining) = h
+                .list_page(namespace.as_deref(), &sel, limit, continue_token)
+                .await?;
+            Ok(Json(h.list_response(items, rv, cont, remaining)).into_response())
+        } else {
+            let (items, rv) = h.list_at(namespace.as_deref(), &sel).await?;
+            Ok(Json(h.list_response(items, rv, None, None)).into_response())
+        }
     }
 }
 
@@ -383,9 +399,10 @@ async fn patch_namespaced(
 async fn delete_namespaced(
     State(state): State<RouterState>,
     Path((ns, plural, name)): Path<(String, String, String)>,
+    Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_delete(h, Some(&ns), &name).await
+    do_delete(h, Some(&ns), &name, &p).await
 }
 
 async fn get_cluster_scoped(
@@ -426,9 +443,10 @@ async fn patch_cluster_scoped(
 async fn delete_cluster_scoped(
     State(state): State<RouterState>,
     Path((plural, name)): Path<(String, String)>,
+    Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_delete(h, None, &name).await
+    do_delete(h, None, &name, &p).await
 }
 
 // ── named-group route handlers (/apis/<group>/<version>) ───────────────
@@ -471,9 +489,10 @@ async fn patch_ns_grouped(
 async fn delete_ns_grouped(
     State(state): State<RouterState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_delete(h, Some(&ns), &name).await
+    do_delete(h, Some(&ns), &name, &p).await
 }
 
 async fn get_grouped(
@@ -514,7 +533,8 @@ async fn patch_grouped(
 async fn delete_grouped(
     State(state): State<RouterState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_delete(h, None, &name).await
+    do_delete(h, None, &name, &p).await
 }

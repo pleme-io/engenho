@@ -48,6 +48,7 @@ async fn restart_preserves_resources_and_revision() {
         mesh.propose(ResourceCommand::Put {
             key: pod_key("a"),
             value: serde_json::json!({"spec": {"image": "a:v1"}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -56,6 +57,7 @@ async fn restart_preserves_resources_and_revision() {
         mesh.propose(ResourceCommand::Put {
             key: pod_key("b"),
             value: serde_json::json!({"spec": {"image": "b:v1"}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -64,6 +66,7 @@ async fn restart_preserves_resources_and_revision() {
         mesh.propose(ResourceCommand::Patch {
             key: pod_key("a"),
             patch: serde_json::json!({"spec": {"image": "a:v2"}}),
+            expected: None,
             reason: Reason::Controller,
         })
         .await
@@ -72,6 +75,7 @@ async fn restart_preserves_resources_and_revision() {
         let deleted = mesh
             .propose(ResourceCommand::Delete {
                 key: pod_key("b"),
+                expected: None,
                 reason: Reason::Operator,
             })
             .await
@@ -139,6 +143,7 @@ async fn restart_preserves_raft_log_and_does_not_reinitialize() {
             mesh.propose(ResourceCommand::Put {
                 key: pod_key(name),
                 value: serde_json::json!({"spec": {}}),
+                expected: None,
                 reason: Reason::Operator,
             })
             .await
@@ -203,6 +208,7 @@ async fn restart_preserves_high_revision_and_per_key_meta() {
             mesh.propose(ResourceCommand::Put {
                 key: pod_key(&format!("k{i}")),
                 value: serde_json::json!({"i": i}),
+                expected: None,
                 reason: Reason::Operator,
             })
             .await
@@ -212,6 +218,7 @@ async fn restart_preserves_high_revision_and_per_key_meta() {
             mesh.propose(ResourceCommand::Put {
                 key: pod_key("hot"),
                 value: serde_json::json!({"v": v}),
+                expected: None,
                 reason: Reason::Operator,
             })
             .await
@@ -262,6 +269,7 @@ async fn empty_store_first_boot_initializes() {
         .propose(ResourceCommand::Put {
             key: pod_key("first"),
             value: serde_json::json!({"spec": {"image": "v1"}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await

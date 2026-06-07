@@ -830,6 +830,7 @@ mod tests {
         let cmd = ResourceCommand::Put {
             key: ResourceKey::namespaced("", "v1", "Pod", "default", name),
             value: serde_json::json!({"spec": {"image": "v1"}}),
+            expected: None,
             reason: Reason::Operator,
         };
         Entry {

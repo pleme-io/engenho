@@ -12,6 +12,14 @@ pub enum ApiError {
     NotFound(String),
     #[error("conflict on resource {0}: {1}")]
     Conflict(String, String),
+    /// Optimistic-concurrency precondition failed — the inbound
+    /// `metadata.resourceVersion` (or `?resourceVersion=` on DELETE) did
+    /// not match the live object's revision. The K8s 409 "Conflict"
+    /// equivalent, DISTINCT from [`ApiError::Conflict`] (which renders
+    /// reason "AlreadyExists" for create-already-exists). Carries the
+    /// human-readable message rendered into the `Status` body.
+    #[error("{0}")]
+    ResourceVersionConflict(String),
     #[error("invalid request: {0}")]
     BadRequest(String),
     /// The requested `resourceVersion` resume point has been compacted
@@ -31,6 +39,7 @@ pub enum ApiError {
 pub enum ErrorKind {
     NotFound,
     Conflict,
+    ResourceVersionConflict,
     BadRequest,
     Gone,
     Internal,
@@ -43,6 +52,7 @@ impl ApiError {
         match self {
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Conflict(_, _) => ErrorKind::Conflict,
+            Self::ResourceVersionConflict(_) => ErrorKind::ResourceVersionConflict,
             Self::BadRequest(_) => ErrorKind::BadRequest,
             Self::Gone(_) => ErrorKind::Gone,
             Self::Internal(_) => ErrorKind::Internal,
@@ -53,7 +63,7 @@ impl ApiError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Conflict(_, _) => StatusCode::CONFLICT,
+            Self::Conflict(_, _) | Self::ResourceVersionConflict(_) => StatusCode::CONFLICT,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Gone(_) => StatusCode::GONE,
             Self::Internal(_) | Self::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -103,6 +113,10 @@ impl IntoResponse for ApiError {
         let reason = match self {
             ApiError::NotFound(_) => "NotFound",
             ApiError::Conflict(_, _) => "AlreadyExists",
+            // Optimistic-concurrency failure uses reason "Conflict"
+            // (K8s uses `.details` for these) — distinct from the
+            // create-already-exists "AlreadyExists" above.
+            ApiError::ResourceVersionConflict(_) => "Conflict",
             ApiError::BadRequest(_) => "BadRequest",
             ApiError::Gone(_) => "Expired",
             ApiError::Internal(_) => "InternalError",
@@ -158,6 +172,39 @@ mod tests {
             ApiError::Gone("x".into()).kind(),
             ErrorKind::Gone
         ));
+    }
+
+    #[test]
+    fn resource_version_conflict_renders_409_conflict() {
+        // Optimistic-concurrency failure → HTTP 409 + reason "Conflict"
+        // (distinct from create-already-exists "AlreadyExists").
+        let err = ApiError::ResourceVersionConflict(
+            "Operation cannot be fulfilled on pods \"p\": resourceVersion mismatch".into(),
+        );
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert!(matches!(err.kind(), ErrorKind::ResourceVersionConflict));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn conflict_and_rv_conflict_have_distinct_reasons() {
+        // Both are 409, but the create-already-exists path is
+        // "AlreadyExists" and the optimistic-concurrency path is
+        // "Conflict" — assert the reason strings differ via the rendered
+        // Status body.
+        use axum::body::to_bytes;
+        async fn reason_of(err: ApiError) -> String {
+            let resp = err.into_response();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v.get("reason").unwrap().as_str().unwrap().to_string()
+        }
+        let already = reason_of(ApiError::Conflict("p".into(), "exists".into())).await;
+        let cas = reason_of(ApiError::ResourceVersionConflict("mismatch".into())).await;
+        assert_eq!(already, "AlreadyExists");
+        assert_eq!(cas, "Conflict");
+        assert_ne!(already, cas);
     }
 
     #[test]

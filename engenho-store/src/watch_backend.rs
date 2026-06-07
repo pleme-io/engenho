@@ -910,6 +910,7 @@ mod tests {
                 &crate::command::ResourceCommand::Put {
                     key: pod_key(&format!("p{i}")),
                     value: serde_json::json!({"i": i}),
+                    expected: None,
                     reason: crate::command::Reason::Operator,
                 },
                 1,
@@ -955,6 +956,7 @@ mod tests {
                 &crate::command::ResourceCommand::Put {
                     key: pod_key(&format!("p{i}")),
                     value: serde_json::json!({"i": i}),
+                    expected: None,
                     reason: crate::command::Reason::Operator,
                 },
                 1,
@@ -998,6 +1000,7 @@ mod tests {
                 &crate::command::ResourceCommand::Put {
                     key: pod_key(&format!("p{i}")),
                     value: serde_json::json!({"i": i}),
+                    expected: None,
                     reason: crate::command::Reason::Operator,
                 },
                 1,
@@ -1049,6 +1052,7 @@ mod tests {
                 &crate::command::ResourceCommand::Put {
                     key: pod_key(&format!("p{i}")),
                     value: serde_json::json!({"i": i}),
+                    expected: None,
                     reason: crate::command::Reason::Operator,
                 },
                 1,

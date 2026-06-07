@@ -680,6 +680,7 @@ async fn handler_list_at_returns_items_and_current_revision() {
             .propose(engenho_store::command::ResourceCommand::Put {
                 key: engenho_store::ResourceKey::namespaced("", "v1", "Pod", "default", n),
                 value: serde_json::json!({"metadata": {"name": n}, "spec": {}}),
+                expected: None,
                 reason: engenho_store::command::Reason::Operator,
             })
             .await

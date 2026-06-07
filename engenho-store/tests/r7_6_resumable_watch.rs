@@ -74,6 +74,7 @@ async fn put(mesh: &StoreMesh, name: &str, v: u64) -> u64 {
     mesh.propose(ResourceCommand::Put {
         key: pod_key(name),
         value: json!({"spec": {"v": v}}),
+        expected: None,
         reason: Reason::Operator,
     })
     .await
@@ -327,6 +328,7 @@ async fn registry_nonempty_replay_then_immediate_live_is_ordered() {
             &ResourceCommand::Put {
                 key: pod_key(&format!("p{i}")),
                 value: json!({"i": i}),
+                expected: None,
                 reason: Reason::Operator,
             },
             1,
@@ -343,6 +345,7 @@ async fn registry_nonempty_replay_then_immediate_live_is_ordered() {
         &ResourceCommand::Put {
             key: pod_key("p6"),
             value: json!({"i": 6}),
+            expected: None,
             reason: Reason::Operator,
         },
         1,
@@ -409,6 +412,7 @@ async fn gone_on_compaction_registry() {
             &ResourceCommand::Put {
                 key: pod_key(&format!("p{i}")),
                 value: json!({"i": i}),
+                expected: None,
                 reason: Reason::Operator,
             },
             1,
@@ -713,6 +717,7 @@ async fn event_kinds_through_watch_from_memory() {
     put(&mesh, "k", 2).await;
     mesh.propose(ResourceCommand::Delete {
         key: pod_key("k"),
+        expected: None,
         reason: Reason::Operator,
     })
     .await

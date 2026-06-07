@@ -26,10 +26,36 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::ops::Bound;
 
 use crate::command::{ResourceCommand, ResourceOp};
+use crate::pagination::ListPage;
 use crate::resource::{ResourceKey, ResourceValue};
 use crate::revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
+
+/// Optimistic-concurrency precondition check (the CAS heart). Pure
+/// function over the caller's expected revision + the key's live
+/// version metadata:
+///
+///   * `expected == None` → unconditional, always ok (K8s semantics:
+///     absent `resourceVersion`).
+///   * `expected == Some(N)` and the key exists with
+///     `meta.mod_revision == N` → ok.
+///   * `expected == Some(N)` and (key missing OR `mod_revision != N`)
+///     → CONFLICT.
+///
+/// Called FIRST inside each `apply_*` BEFORE any mutation. On `false`
+/// the apply returns [`ResourceOp::Conflict`] + `change: None`, so the
+/// outer [`ResourceCatalog::apply`] leaves `current_revision`
+/// untouched, pushes no history, fans nothing to watchers — the
+/// "no mutation / no revision advance" guarantee is reused verbatim.
+#[must_use]
+pub fn check_precondition(expected: Option<Revision>, live: Option<VersionMeta>) -> bool {
+    match expected {
+        None => true,
+        Some(n) => live.is_some_and(|m| m.mod_revision == n),
+    }
+}
 
 /// Default bound on the in-memory history ring. 8192 committed
 /// mutations is enough to cover the recent window + the live tail
@@ -188,9 +214,21 @@ impl ResourceCatalog {
         // mutation is real (not a no-op).
         let rev = self.current_revision.next();
         let outcome = match cmd {
-            ResourceCommand::Put { key, value, .. } => self.apply_put(key, value, rev),
-            ResourceCommand::Patch { key, patch, .. } => self.apply_patch(key, patch, rev),
-            ResourceCommand::Delete { key, .. } => self.apply_delete(key, rev),
+            ResourceCommand::Put {
+                key,
+                value,
+                expected,
+                ..
+            } => self.apply_put(key, value, *expected, rev),
+            ResourceCommand::Patch {
+                key,
+                patch,
+                expected,
+                ..
+            } => self.apply_patch(key, patch, *expected, rev),
+            ResourceCommand::Delete { key, expected, .. } => {
+                self.apply_delete(key, *expected, rev)
+            }
         };
         self.last_applied_term = term;
         self.last_applied_index = index;
@@ -217,10 +255,28 @@ impl ResourceCatalog {
         }
     }
 
-    fn apply_put(&mut self, key: &ResourceKey, value: &ResourceValue, rev: Revision) -> ApplyOutcome {
+    fn apply_put(
+        &mut self,
+        key: &ResourceKey,
+        value: &ResourceValue,
+        expected: Option<Revision>,
+        rev: Revision,
+    ) -> ApplyOutcome {
         // Capture the pre-image BEFORE mutating — this is the prior
         // object every consumer (watch, optimistic-concurrency) needs.
         let prior_entry = self.resources.get(key).cloned();
+
+        // Optimistic-concurrency precondition (CAS) — checked BEFORE any
+        // mutation. On conflict: ResourceOp::Conflict + change: None, so
+        // the outer apply leaves the catalog byte-identical (no revision
+        // advance, no history, no fan-out).
+        if !check_precondition(expected, prior_entry.as_ref().map(|(_, m)| *m)) {
+            return ApplyOutcome {
+                op: ResourceOp::Conflict,
+                change: None,
+            };
+        }
+
         let prior_value = prior_entry.as_ref().map(|(v, _)| v.clone());
 
         let version_meta = match &prior_entry {
@@ -279,13 +335,33 @@ impl ResourceCatalog {
         }
     }
 
-    fn apply_patch(&mut self, key: &ResourceKey, patch: &ResourceValue, rev: Revision) -> ApplyOutcome {
+    fn apply_patch(
+        &mut self,
+        key: &ResourceKey,
+        patch: &ResourceValue,
+        expected: Option<Revision>,
+        rev: Revision,
+    ) -> ApplyOutcome {
         let Some((existing_value, existing_meta)) = self.resources.get(key) else {
+            // Missing key. A `Some(_)` precondition can't be satisfied
+            // (cannot CAS a non-existent object) → Conflict; an
+            // unconditional patch on a missing key stays a NoOp (existing
+            // semantics). Both leave the catalog byte-identical.
+            let op = if expected.is_some() {
+                ResourceOp::Conflict
+            } else {
+                ResourceOp::NoOp
+            };
+            return ApplyOutcome { op, change: None };
+        };
+        // Optimistic-concurrency precondition (CAS) on the existing key —
+        // checked BEFORE the merge. On conflict the catalog is untouched.
+        if !check_precondition(expected, Some(*existing_meta)) {
             return ApplyOutcome {
-                op: ResourceOp::NoOp,
+                op: ResourceOp::Conflict,
                 change: None,
             };
-        };
+        }
         // Capture pre-image before the merge.
         let prior_value = existing_value.clone();
         let version_meta = existing_meta.bumped_at(rev);
@@ -320,7 +396,24 @@ impl ResourceCatalog {
         }
     }
 
-    fn apply_delete(&mut self, key: &ResourceKey, rev: Revision) -> ApplyOutcome {
+    fn apply_delete(
+        &mut self,
+        key: &ResourceKey,
+        expected: Option<Revision>,
+        rev: Revision,
+    ) -> ApplyOutcome {
+        // Precondition (CAS) BEFORE the remove. A `Some(_)` precondition
+        // on a missing key, or one that mismatches the live mod_revision,
+        // is a Conflict; an unconditional delete-not-found stays NoOp.
+        // Both leave the catalog byte-identical (the `remove` only runs
+        // after the precondition passes).
+        let live_meta = self.resources.get(key).map(|(_, m)| *m);
+        if !check_precondition(expected, live_meta) {
+            return ApplyOutcome {
+                op: ResourceOp::Conflict,
+                change: None,
+            };
+        }
         let Some((removed_value, removed_meta)) = self.resources.remove(key) else {
             return ApplyOutcome {
                 op: ResourceOp::NoOp,
@@ -418,6 +511,90 @@ impl ResourceCatalog {
             .collect()
     }
 
+    /// One page of resources matching (group, version, kind), optionally
+    /// namespace-scoped, in total [`ResourceKey`] order — the
+    /// range-pagination primitive (etcd consistent-list semantics).
+    ///
+    /// Iterates the underlying [`BTreeMap`] in key order starting
+    /// STRICTLY AFTER `after` (the continue cursor's last key), filtered
+    /// by GVK + optional namespace, taking up to `limit` matching items.
+    ///
+    ///   * `next` = the last key returned IFF more matching items remain
+    ///     after it (the cursor for the following page); else `None`.
+    ///   * `remaining` = the count of still-unreturned matching items
+    ///     after this page.
+    ///   * `limit == 0` → return ALL matching items after `after`
+    ///     (K8s: limit unset/0 = no bound), `next = None`,
+    ///     `remaining = 0`.
+    ///
+    /// Filtering by GVK/namespace stays in the store (the catalog is
+    /// GVK-keyed); SELECTOR filtering remains apiserver-side, which forces
+    /// the apiserver's limit/continue over-fetch loop.
+    #[must_use]
+    pub fn list_page(
+        &self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        after: Option<&ResourceKey>,
+        limit: usize,
+    ) -> ListPage<'_> {
+        // BTreeMap range starting STRICTLY after `after` (Excluded), to
+        // the end (Unbounded). When `after` is None, scan from the start.
+        let lower = match after {
+            Some(k) => Bound::Excluded(k.clone()),
+            None => Bound::Unbounded,
+        };
+        let matches = |k: &ResourceKey| {
+            k.group == group
+                && k.version == version
+                && k.kind == kind
+                && match (namespace, k.namespace.as_deref()) {
+                    (None, _) => true,
+                    (Some(want), Some(have)) => want == have,
+                    (Some(_), None) => false,
+                }
+        };
+
+        let mut filtered = self
+            .resources
+            .range((lower, Bound::Unbounded))
+            .filter(|(k, _)| matches(k))
+            .map(|(k, (v, _))| (k, v));
+
+        // limit == 0 → unbounded: take all matching items after `after`.
+        if limit == 0 {
+            let items: Vec<(&ResourceKey, &ResourceValue)> = filtered.collect();
+            return ListPage {
+                items,
+                next: None,
+                remaining: 0,
+            };
+        }
+
+        let mut items: Vec<(&ResourceKey, &ResourceValue)> = Vec::with_capacity(limit);
+        for entry in filtered.by_ref().take(limit) {
+            items.push(entry);
+        }
+
+        // Peek the remaining matching tail to set `next` + `remaining`.
+        // `next` is the last EMITTED key iff at least one more matching
+        // item exists after the page.
+        let remaining_tail: u64 = filtered.count() as u64;
+        let next = if remaining_tail > 0 {
+            items.last().map(|(k, _)| (*k).clone())
+        } else {
+            None
+        };
+
+        ListPage {
+            items,
+            next,
+            remaining: remaining_tail,
+        }
+    }
+
     /// Total resource count (across all kinds + namespaces).
     #[must_use]
     pub fn len(&self) -> usize {
@@ -467,6 +644,7 @@ mod tests {
             &ResourceCommand::Put {
                 key: key.clone(),
                 value,
+                expected: None,
                 reason: Reason::Operator,
             },
             1,
@@ -478,6 +656,7 @@ mod tests {
         cat.apply(
             &ResourceCommand::Delete {
                 key: key.clone(),
+                expected: None,
                 reason: Reason::Operator,
             },
             1,
@@ -595,6 +774,7 @@ mod tests {
             &ResourceCommand::Patch {
                 key: pod_key("ghost"),
                 patch: serde_json::json!({"x": 1}),
+                expected: None,
                 reason: Reason::Operator,
             },
             1,
@@ -621,6 +801,7 @@ mod tests {
             &ResourceCommand::Patch {
                 key: k.clone(),
                 patch: serde_json::json!({"spec": {"image": "v2"}}),
+                expected: None,
                 reason: Reason::Operator,
             },
             1,
@@ -728,6 +909,7 @@ mod tests {
             &ResourceCommand::Patch {
                 key: k.clone(),
                 patch: serde_json::json!({"spec": {"annotations": null}}),
+                expected: None,
                 reason: Reason::Operator,
             },
             1,
@@ -808,6 +990,7 @@ mod tests {
             &ResourceCommand::Patch {
                 key: pod_key("ghost"),
                 patch: serde_json::json!({"y": 1}),
+                expected: None,
                 reason: Reason::Operator,
             },
             1,

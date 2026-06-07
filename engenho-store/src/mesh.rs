@@ -360,6 +360,49 @@ impl StoreMesh {
         (items, cat.revision())
     }
 
+    /// One page of resources matching (group, version, kind), optionally
+    /// namespace-scoped, AND the snapshot [`crate::revision::Revision`]
+    /// captured from the SAME catalog clone — atomically. The
+    /// range-pagination sibling of [`Self::list_at_revision`].
+    ///
+    /// Clones the catalog ONCE so the page items + the page-series
+    /// snapshot revision come from the same clone — the snapshot rev is
+    /// what gets baked into the continue token so the WHOLE page series
+    /// reads from a single consistent revision (etcd consistent-list
+    /// semantics).
+    ///
+    /// Returns `(items, snapshot_rev, next, remaining)`:
+    ///   * `items` — up to `limit` `(key, value)` pairs starting strictly
+    ///     after `after`, in total key order.
+    ///   * `snapshot_rev` — `cat.revision()` (dense MVCC), the page
+    ///     series' consistent revision.
+    ///   * `next` — the cursor key for the following page (the last
+    ///     emitted key iff more matching items remain), else `None`.
+    ///   * `remaining` — count of still-unreturned matching items.
+    pub async fn list_page_at_revision(
+        &self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        after: Option<&ResourceKey>,
+        limit: usize,
+    ) -> (
+        Vec<(ResourceKey, ResourceValue)>,
+        crate::revision::Revision,
+        Option<ResourceKey>,
+        u64,
+    ) {
+        let cat = self.store.current_catalog().await;
+        let page = cat.list_page(group, version, kind, namespace, after, limit);
+        let items = page
+            .items
+            .into_iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        (items, cat.revision(), page.next, page.remaining)
+    }
+
     /// Read-only snapshot of the whole catalog.
     pub async fn current_catalog(&self) -> ResourceCatalog {
         self.store.current_catalog().await
