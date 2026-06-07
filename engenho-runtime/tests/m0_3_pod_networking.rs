@@ -141,6 +141,61 @@ fn podman_tcp_reachable(from_container: &str, to_ip: &str, port: u16) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve `name` from a SEPARATE short-lived client container on `network`
+/// via busybox `nslookup <name>`, returning the set of resolved A-record IPs.
+///
+/// busybox does NOT ship `getent`, so we use its built-in `nslookup`. Two
+/// quirks handled: (1) busybox appends the host search domains (e.g.
+/// `*.ts.net`) which NXDOMAIN and can set a NON-ZERO exit even though the bare
+/// name resolves — so we parse stdout regardless of exit status; (2) the
+/// resolver line is `Address: <ip>:53` (carries a port) and is excluded; real
+/// answers are `Address: <ip>` (no port). The client is a throwaway `podman
+/// run --rm --network <net> busybox nslookup <name>` — NOT one of the workload
+/// pods, so resolution is proven network-wide (aardvark-dns on a user
+/// network), not just self-resolution. Empty vec on exec failure / no answer.
+fn resolve_via_client(network: &str, name: &str) -> Vec<String> {
+    let out = Command::new("podman")
+        .args([
+            "run", "--rm", "--network", network, "docker.io/library/busybox", "nslookup", name,
+        ])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    // Parse stdout even on non-zero exit (search-domain NXDOMAIN noise).
+    let text = String::from_utf8_lossy(&out.stdout);
+    let is_ipv4 = |s: &str| s.split('.').count() == 4 && s.split('.').all(|o| o.parse::<u8>().is_ok());
+    let mut ips: Vec<String> = text
+        .lines()
+        .filter(|line| line.contains("Address"))
+        // last whitespace token of an `Address[: N]: <ip>` line
+        .filter_map(|line| line.split_whitespace().last().map(str::to_string))
+        .filter(|tok| !tok.contains(':')) // drop the resolver `<ip>:53`
+        .filter(|tok| is_ipv4(tok))
+        .collect();
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+/// Connect-by-name probe from a throwaway client container: `podman run
+/// --rm --network <net> busybox nc -z -w3 <name> <port>` exit-0 test.
+/// Proves name→IP→reachable backend end-to-end (the client resolves the
+/// Service name via aardvark-dns THEN connects). Requires a listener on a
+/// backend pod bound to `<name>` (see [`podman_start_listener`]).
+fn client_connect_by_name(network: &str, name: &str, port: u16) -> bool {
+    let port_s = port.to_string();
+    Command::new("podman")
+        .args([
+            "run", "--rm", "--network", network, "docker.io/library/busybox", "nc", "-z", "-w3",
+            name, &port_s,
+        ])
+        .output()
+        .ok()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 // =====================================================================
 // HTTP helpers (mirror the M0.2 real-container test)
 // =====================================================================
@@ -611,5 +666,359 @@ async fn two_replica_deployment_gets_real_ips_endpoints_and_pod_to_pod_reachabil
     // The shared engenho-net network is intentionally left in place
     // (ensure_network is idempotent; reuse is correct). `cleanup` Drop
     // runs here (best-effort rm -f; containers already gone).
+    drop(cleanup);
+}
+
+// =====================================================================
+// M0.3 cluster-DNS — Service-name resolution via aardvark-dns
+// =====================================================================
+
+/// The shared engenho-net network the PodmanBackend attaches pods to (its
+/// default). aardvark-dns runs for this user-defined network, resolving
+/// `--network-alias` names the kubelet feeds at pod-start.
+const ENGENHO_NET: &str = "engenho-net";
+
+/// A ClusterIP-less Service named `svc_name` selecting `app=<app_label>` on
+/// port 80→80. The kubelet derives `--network-alias` forms from the Service
+/// NAME (`<svc_name>`, `<svc_name>.default`, `<svc_name>.default.svc.cluster.local`)
+/// for every pod whose labels satisfy the selector.
+fn named_service_body(svc_name: &str, app_label: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": { "name": svc_name },
+        "spec": {
+            "selector": { "app": app_label },
+            "ports": [{ "port": 80, "targetPort": 80 }]
+        }
+    })
+}
+
+/// A 2-replica busybox Deployment whose pod template carries `app=<app_label>`
+/// so the pods match the Service selector + earn its DNS aliases. `dep_name`
+/// is the (unique-per-run) Deployment object name; `app_label` is the
+/// selector value the Service keys on.
+fn labeled_deployment_body(dep_name: &str, app_label: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": { "name": dep_name },
+        "spec": {
+            "replicas": 2,
+            "selector": { "matchLabels": { "app": app_label } },
+            "template": {
+                "metadata": { "labels": { "app": app_label } },
+                "spec": { "containers": [{
+                    "name": "main",
+                    "image": "docker.io/library/busybox",
+                    "command": ["sleep", "300"]
+                }] }
+            }
+        }
+    })
+}
+
+/// M0.3 cluster-DNS: a Service name resolves to its backend pod IPs via
+/// aardvark-dns, and a SEPARATE client container connects to a backend BY
+/// NAME — proving the `--network-alias` feed the kubelet computes at
+/// pod-start is load-bearing headless-Service DNS (no ClusterIP / kube-proxy).
+///
+/// Multi-thread runtime is REQUIRED for the same reason as the sibling test:
+/// the probe path shells out to `podman` via blocking `std::process` +
+/// `std::thread::sleep`, which would starve the single-threaded driver tasks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-container: needs podman + aardvark-dns on engenho-net + cached busybox + REGISTRY_AUTH_FILE"]
+async fn service_name_resolves_via_aardvark_dns_and_client_connects_by_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _authfile = set_empty_registry_auth(tmp.path());
+
+    // Unique-per-run names so concurrent / leftover runs don't collide on
+    // the deterministic <ns>_<pod> container names OR on the Service-name
+    // alias aardvark-dns answers.
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let svc_name = format!("web-{run_id}");
+    let dep_name = format!("m0-3-dns-{run_id}");
+    // The pod label the Service selects on; doubles as the alias source via
+    // the Service name (NOT this label) — kept distinct to prove the alias
+    // comes from the Service NAME, not the selector value.
+    let app_label = format!("dnsapp-{run_id}");
+
+    let mut cleanup = PodmanCleanup::new();
+
+    let rt = Runtime::start(durable_podman_config(tmp.path()))
+        .await
+        .expect("Runtime boots with Podman backend");
+    let addr = rt.local_addr();
+    let client = reqwest::Client::new();
+
+    const TIMEOUT: Duration = Duration::from_secs(45);
+    const INTERVAL: Duration = Duration::from_millis(250);
+
+    // ── ARRANGE: POST the Service then the 2-replica Deployment ──────────
+    let svc_resp = client
+        .post(format!("http://{addr}/api/v1/namespaces/default/services"))
+        .json(&named_service_body(&svc_name, &app_label))
+        .send()
+        .await
+        .expect("POST service");
+    assert_eq!(
+        svc_resp.status(),
+        reqwest::StatusCode::CREATED,
+        "service POST should 201"
+    );
+
+    let dep_resp = client
+        .post(format!(
+            "http://{addr}/apis/apps/v1/namespaces/default/deployments"
+        ))
+        .json(&labeled_deployment_body(&dep_name, &app_label))
+        .send()
+        .await
+        .expect("POST deployment");
+    assert_eq!(
+        dep_resp.status(),
+        reqwest::StatusCode::CREATED,
+        "deployment POST should 201"
+    );
+    let created: serde_json::Value = dep_resp.json().await.unwrap();
+    let dep_uid = created
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|u| u.as_str())
+        .expect("deployment got a uid")
+        .to_string();
+
+    // ── Resolve the RS-generated pod names via HTTP ─────────────────────
+    let rs = poll_until(TIMEOUT, INTERVAL, || async {
+        let items = http_list(&client, addr, "/apis/apps/v1/namespaces/default/replicasets").await;
+        items.into_iter().find(|r| is_owned_by(r, &dep_uid))
+    })
+    .await
+    .expect("ReplicaSet created for Deployment");
+    let rs_uid = rs
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|u| u.as_str())
+        .expect("RS uid")
+        .to_string();
+
+    let pod_names = poll_until(TIMEOUT, INTERVAL, || async {
+        let items = http_list(&client, addr, "/api/v1/namespaces/default/pods").await;
+        let mut names: Vec<String> = items
+            .iter()
+            .filter(|p| is_owned_by(p, &rs_uid))
+            .filter_map(|p| {
+                p.get("metadata")
+                    .and_then(|m| m.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        names.sort();
+        if names.len() == 2 { Some(names) } else { None }
+    })
+    .await
+    .expect("two Pods created by the ReplicaSet");
+
+    let container_names: Vec<String> = pod_names
+        .iter()
+        .map(|p| format!("default_{p}"))
+        .collect();
+    for cn in &container_names {
+        cleanup.track(cn);
+    }
+
+    // ── WAIT: both pods Running+Ready with real IPs + Endpoints carry them ─
+    // Proves the M0.3-foundation pipeline still holds (the backends came up
+    // with real per-network IPs the EndpointsController materialized).
+    let pod_ips = poll_until(TIMEOUT, INTERVAL, || {
+        let client = &client;
+        let pod_names = &pod_names;
+        async move {
+            let mut ips: Vec<String> = Vec::new();
+            for pn in pod_names {
+                let pod = http_get(
+                    client,
+                    addr,
+                    &format!("/api/v1/namespaces/default/pods/{pn}"),
+                )
+                .await?;
+                if !pod_running_ready(&pod) {
+                    return None;
+                }
+                ips.push(pod_ip(&pod)?);
+            }
+            ips.sort();
+            if ips.len() == 2 && ips[0] != ips[1] {
+                Some(ips)
+            } else {
+                None
+            }
+        }
+    })
+    .await
+    .expect("both pods Running+Ready with two distinct real podIPs");
+
+    let endpoints_ok = poll_until(TIMEOUT, INTERVAL, || {
+        let client = &client;
+        let svc_name = &svc_name;
+        let pod_ips = &pod_ips;
+        async move {
+            let ep = http_get(
+                client,
+                addr,
+                &format!("/api/v1/namespaces/default/endpoints/{svc_name}"),
+            )
+            .await?;
+            let ips = endpoints_ips(&ep);
+            if ips == *pod_ips { Some(()) } else { None }
+        }
+    })
+    .await;
+    assert!(
+        endpoints_ok.is_some(),
+        "Endpoints/{svc_name} should carry exactly the two pods' real podIPs {pod_ips:?}"
+    );
+
+    // ── ACT + ASSERT: resolve the Service name via a SEPARATE client ─────
+    // A throwaway `podman run --rm --network engenho-net busybox getent
+    // hosts <svc>` resolves the Service NAME through aardvark-dns (which
+    // answers the kubelet-fed --network-alias). The resolved IP(s) must be a
+    // subset of the two real pod IPs from the Endpoints set — proving DNS
+    // returns the real backend pod IPs (headless multi-A), not a ClusterIP.
+    let resolved = poll_until(TIMEOUT, INTERVAL, || {
+        let svc_name = svc_name.clone();
+        let pod_ips = pod_ips.clone();
+        async move {
+            let ips = resolve_via_client(ENGENHO_NET, &svc_name);
+            // Require at least one resolved IP, and every resolved IP must
+            // be one of the real backend pod IPs.
+            if !ips.is_empty() && ips.iter().all(|ip| pod_ips.contains(ip)) {
+                Some(ips)
+            } else {
+                None
+            }
+        }
+    })
+    .await
+    .expect(
+        "client container should resolve the Service name to real backend pod IPs via aardvark-dns",
+    );
+    assert!(
+        resolved.iter().all(|ip| pod_ips.contains(ip)),
+        "every resolved IP {resolved:?} must be a real backend podIP {pod_ips:?}"
+    );
+
+    // FQDN form must resolve to the SAME set (proves all three alias forms
+    // — bare / .<ns> / .<ns>.svc.<domain> — landed in aardvark-dns).
+    let fqdn = format!("{svc_name}.default.svc.cluster.local");
+    let resolved_fqdn = poll_until(TIMEOUT, INTERVAL, || {
+        let fqdn = fqdn.clone();
+        let pod_ips = pod_ips.clone();
+        async move {
+            let ips = resolve_via_client(ENGENHO_NET, &fqdn);
+            if !ips.is_empty() && ips.iter().all(|ip| pod_ips.contains(ip)) {
+                Some(ips)
+            } else {
+                None
+            }
+        }
+    })
+    .await
+    .expect("FQDN form should resolve to real backend pod IPs (third alias form landed)");
+    assert!(
+        resolved_fqdn.iter().all(|ip| pod_ips.contains(ip)),
+        "FQDN-resolved IPs {resolved_fqdn:?} must be real backend podIPs {pod_ips:?}"
+    );
+
+    // ── ASSERT: connect-by-name works (name → IP → reachable backend) ────
+    // Start a TCP listener in each backend pod, then a throwaway client
+    // `nc -z web <port>` — exit 0 proves the client resolved the Service
+    // name AND reached a real backend. (ICMP ping needs CAP_NET_RAW, denied
+    // under rootless podman; a TCP listener + nc -z needs no capability.)
+    const PROBE_PORT: u16 = 9998;
+    for cn in &container_names {
+        podman_start_listener(cn, PROBE_PORT);
+    }
+    let connected = poll_until_blocking(TIMEOUT, INTERVAL, || {
+        client_connect_by_name(ENGENHO_NET, &svc_name, PROBE_PORT)
+    });
+    assert!(
+        connected,
+        "a client container should connect to {svc_name}:{PROBE_PORT} BY NAME \
+         (Service-name → aardvark-dns → real backend pod, headless)"
+    );
+
+    // ── ROUND-ROBIN (best-effort): both IPs appear across N resolutions ──
+    // aardvark-dns returns a multi-A answer for a shared alias; over several
+    // getent calls BOTH pod IPs should appear. Ordering is implementation-
+    // defined, so this is best-effort/loose — the load-bearing asserts above
+    // are "resolves to a real backend IP and connects by name". A non-multi-A
+    // resolver (single-answer) would still pass those; this just documents
+    // the headless multi-backend behavior when present.
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        for ip in resolve_via_client(ENGENHO_NET, &svc_name) {
+            seen.insert(ip);
+        }
+        if seen.len() >= 2 {
+            break;
+        }
+    }
+    // Loose: only assert the resolver saw at least one real backend IP (the
+    // hard multi-A guarantee is aardvark-version-dependent).
+    assert!(
+        seen.iter().all(|ip| pod_ips.contains(ip)) && !seen.is_empty(),
+        "round-robin resolutions {seen:?} must all be real backend podIPs {pod_ips:?}"
+    );
+
+    // ── TEARDOWN: DELETE the Deployment + both Pods over HTTP ────────────
+    let del_dep = client
+        .delete(format!(
+            "http://{addr}/apis/apps/v1/namespaces/default/deployments/{dep_name}"
+        ))
+        .send()
+        .await
+        .expect("DELETE deployment");
+    assert!(
+        del_dep.status().is_success(),
+        "deployment DELETE should succeed, got {}",
+        del_dep.status()
+    );
+    for pn in &pod_names {
+        let del_pod = client
+            .delete(format!("http://{addr}/api/v1/namespaces/default/pods/{pn}"))
+            .send()
+            .await
+            .expect("DELETE pod");
+        assert!(
+            del_pod.status().is_success(),
+            "pod {pn} DELETE should succeed, got {}",
+            del_pod.status()
+        );
+    }
+    // Best-effort DELETE the Service too (no orphan Endpoints/Service).
+    let _ = client
+        .delete(format!(
+            "http://{addr}/api/v1/namespaces/default/services/{svc_name}"
+        ))
+        .send()
+        .await;
+
+    // ── ASSERT: both real containers gone (kubelet stop-then-remove) ─────
+    const CLEANUP_TIMEOUT: Duration = Duration::from_secs(45);
+    let gone = poll_until_blocking(CLEANUP_TIMEOUT, INTERVAL, || {
+        container_names.iter().all(|cn| !podman_container_exists(cn))
+    });
+    assert!(
+        gone,
+        "expected podman to show NO containers {container_names:?} after workload delete"
+    );
+
+    // ── CLEANUP: graceful shutdown; engenho-net left in place (idempotent) ─
+    rt.shutdown().await.expect("graceful shutdown");
     drop(cleanup);
 }

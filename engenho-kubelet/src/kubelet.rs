@@ -36,6 +36,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_controllers::{
     Controller, ControllerError, ReconcileReport,
+    dns::DEFAULT_CLUSTER_DOMAIN,
+    selector::{matches_labels, service_selector},
     status::{resource_version_of, write_status_cas},
 };
 use engenho_store::{StoreMesh, resource::ResourceKey};
@@ -154,7 +156,79 @@ impl Kubelet {
             image,
             env,
             command,
+            // Service-name DNS aliases are computed separately in
+            // `start_bound_pod` (it needs the live Service list from the
+            // store, which this pure manifest→spec map deliberately does
+            // not touch) and assigned onto the returned spec there.
+            network_aliases: Vec::new(),
         })
+    }
+
+    /// Compute the Service-name DNS aliases a Pod earns by matching
+    /// Services' selectors (M0.3 cluster-DNS brick).
+    ///
+    /// For each `(svc_key, svc_value)` in `services`, if the Service has a
+    /// non-empty `spec.selector` AND the Pod's `metadata.labels` satisfy it
+    /// (using the EXACT same predicate the [`EndpointsController`] uses —
+    /// [`service_selector`] + [`matches_labels`], reused not reimplemented),
+    /// the Pod earns three aliases for that Service's name:
+    ///
+    ///   * `<service>`
+    ///   * `<service>.<namespace>`
+    ///   * `<service>.<namespace>.svc.<cluster_domain>`
+    ///
+    /// These are the three Service-name forms aardvark-dns resolves on a
+    /// user-defined network, mirroring K8s headless-Service DNS. The
+    /// `namespace` is the POD's namespace (NOT hard-coded `default`); the
+    /// `cluster_domain` is the cluster's DNS suffix (default
+    /// [`DEFAULT_CLUSTER_DOMAIN`] = `cluster.local`).
+    ///
+    /// The result is sorted + deduped for determinism (multiple matching
+    /// Services contribute their own three aliases; aardvark-dns accepts an
+    /// alias appearing once per container). A Pod matching zero Services
+    /// (no labels, or no selector matched) earns zero aliases — it still
+    /// runs, just unaddressable by Service name (preserving today's
+    /// behavior). A Service with an empty/absent selector contributes
+    /// nothing ([`matches_labels`] returns false on an empty selector, per
+    /// K8s convention).
+    ///
+    /// Pure: takes the already-listed Services (no store, no podman) so it
+    /// is unit-testable. The store-using LIST lives in `start_bound_pod`.
+    ///
+    /// [`EndpointsController`]: engenho_controllers::EndpointsController
+    #[must_use]
+    fn service_aliases_for_pod(
+        pod: &Value,
+        namespace: &str,
+        services: &[(ResourceKey, Value)],
+        cluster_domain: &str,
+    ) -> Vec<String> {
+        let mut aliases: Vec<String> = Vec::new();
+        for (_svc_key, svc_value) in services {
+            // Same selector semantics as EndpointsController::tick: a
+            // present selector that the pod's labels satisfy. An empty /
+            // absent selector → matches_labels false → no alias (correct
+            // K8s behavior — empty selector matches nothing here).
+            let Some(selector) = service_selector(svc_value) else {
+                continue;
+            };
+            if !matches_labels(pod, selector) {
+                continue;
+            }
+            let Some(svc_name) = svc_value
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+            else {
+                continue;
+            };
+            aliases.push(svc_name.to_string());
+            aliases.push(format!("{svc_name}.{namespace}"));
+            aliases.push(format!("{svc_name}.{namespace}.svc.{cluster_domain}"));
+        }
+        aliases.sort();
+        aliases.dedup();
+        aliases
     }
 
     /// First container's logical name, as it appears in
@@ -374,7 +448,7 @@ impl Kubelet {
         report: &mut ReconcileReport,
     ) -> Result<(), ControllerError> {
         let namespace = key.namespace.as_deref().unwrap_or("default");
-        let spec = match Self::pod_to_container_spec(namespace, &key.name, value) {
+        let mut spec = match Self::pod_to_container_spec(namespace, &key.name, value) {
             Ok(s) => s,
             Err(e) => {
                 warn!(
@@ -387,10 +461,24 @@ impl Kubelet {
             }
         };
 
+        // (M0.3 cluster-DNS) Compute the Service-name aliases this Pod
+        // earns BEFORE building the run argv — `--network-alias` is a
+        // `podman run` flag and cannot be added to a running container. LIST
+        // Services in the pod's namespace from the store (the store-using
+        // step — mirrors EndpointsController::tick's Service LIST) and reuse
+        // the EndpointsController selector predicate to compute matches. A
+        // Service created AFTER this pod starts won't alias it until the pod
+        // is recreated (accepted M0.3 limitation; M0.4 engenho-dns removes
+        // it). aardvark-dns then resolves these names to the pod's IP.
+        let services = self.store.list("", "v1", "Service", Some(namespace)).await;
+        spec.network_aliases =
+            Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
+
         debug!(
             pod = %key.label(),
             image = %spec.image,
             backend = self.backend.name(),
+            aliases = spec.network_aliases.len(),
             "kubelet starting container"
         );
 
@@ -660,5 +748,159 @@ mod tests {
         assert_eq!(term["exitCode"], 137);
         assert_eq!(term["reason"], "Error");
         assert!(status.get("podIP").is_none());
+    }
+
+    // ── M0.3 cluster-DNS: service_aliases_for_pod (pure, no podman/store) ─
+
+    /// Build a `(ResourceKey, Value)` Service entry for the alias tests.
+    fn svc(name: &str, namespace: &str, selector: Value) -> (ResourceKey, Value) {
+        let key = ResourceKey::namespaced("", "v1", "Service", namespace, name);
+        let value = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": name },
+            "spec": { "selector": selector },
+        });
+        (key, value)
+    }
+
+    #[test]
+    fn service_aliases_single_match_emits_three_forms_in_order() {
+        let pod = json!({"metadata": {"labels": {"app": "web"}}});
+        let services = vec![svc("web", "default", json!({"app": "web"}))];
+        let aliases = Kubelet::service_aliases_for_pod(&pod, "default", &services, "cluster.local");
+        // Exactly the three forms, sorted+deduped.
+        assert_eq!(
+            aliases,
+            vec![
+                "web".to_string(),
+                "web.default".to_string(),
+                "web.default.svc.cluster.local".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn service_aliases_excludes_non_matching_selector() {
+        // Core "excluding non-matching selectors" assertion: a pod labeled
+        // app=web with two Services (web→app=web, db→app=db) earns ONLY
+        // web's three aliases, none from db.
+        let pod = json!({"metadata": {"labels": {"app": "web"}}});
+        let services = vec![
+            svc("web", "default", json!({"app": "web"})),
+            svc("db", "default", json!({"app": "db"})),
+        ];
+        let aliases = Kubelet::service_aliases_for_pod(&pod, "default", &services, "cluster.local");
+        assert_eq!(
+            aliases,
+            vec![
+                "web".to_string(),
+                "web.default".to_string(),
+                "web.default.svc.cluster.local".to_string(),
+            ]
+        );
+        assert!(
+            !aliases.iter().any(|a| a.starts_with("db")),
+            "db's aliases must be excluded: {aliases:?}"
+        );
+    }
+
+    #[test]
+    fn service_aliases_multiple_matches_union_sorted_deduped() {
+        // A pod matching BOTH `web` (app=web) and `frontend` (tier=web)
+        // earns the union of each Service's three aliases, sorted+deduped.
+        let pod = json!({"metadata": {"labels": {"app": "web", "tier": "web"}}});
+        let services = vec![
+            svc("web", "default", json!({"app": "web"})),
+            svc("frontend", "default", json!({"tier": "web"})),
+        ];
+        let aliases = Kubelet::service_aliases_for_pod(&pod, "default", &services, "cluster.local");
+        assert_eq!(
+            aliases,
+            vec![
+                "frontend".to_string(),
+                "frontend.default".to_string(),
+                "frontend.default.svc.cluster.local".to_string(),
+                "web".to_string(),
+                "web.default".to_string(),
+                "web.default.svc.cluster.local".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn service_aliases_empty_selector_contributes_nothing() {
+        // A Service with an empty selector → matches_labels false → zero
+        // aliases (K8s empty-selector-matches-nothing convention).
+        let pod = json!({"metadata": {"labels": {"app": "web"}}});
+        let services = vec![svc("web", "default", json!({}))];
+        let aliases = Kubelet::service_aliases_for_pod(&pod, "default", &services, "cluster.local");
+        assert!(aliases.is_empty(), "empty selector → no aliases: {aliases:?}");
+    }
+
+    #[test]
+    fn service_aliases_absent_selector_contributes_nothing() {
+        // A Service with no spec.selector at all → service_selector None →
+        // skipped → zero aliases.
+        let pod = json!({"metadata": {"labels": {"app": "web"}}});
+        let key = ResourceKey::namespaced("", "v1", "Service", "default", "web");
+        let value = json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": { "name": "web" }, "spec": { "ports": [{ "port": 80 }] }
+        });
+        let services = vec![(key, value)];
+        let aliases = Kubelet::service_aliases_for_pod(&pod, "default", &services, "cluster.local");
+        assert!(aliases.is_empty(), "absent selector → no aliases: {aliases:?}");
+    }
+
+    #[test]
+    fn service_aliases_pod_without_labels_gets_none() {
+        let pod = json!({"metadata": {"name": "p"}});
+        let services = vec![svc("web", "default", json!({"app": "web"}))];
+        let aliases = Kubelet::service_aliases_for_pod(&pod, "default", &services, "cluster.local");
+        assert!(aliases.is_empty(), "no labels → no Service matches: {aliases:?}");
+    }
+
+    #[test]
+    fn service_aliases_threads_pod_namespace() {
+        // The <ns> segment uses the POD's namespace, not a hard-coded
+        // default. A pod in `prod` earns web.prod + web.prod.svc.*.
+        let pod = json!({"metadata": {"labels": {"app": "web"}}});
+        let services = vec![svc("web", "prod", json!({"app": "web"}))];
+        let aliases = Kubelet::service_aliases_for_pod(&pod, "prod", &services, "cluster.local");
+        assert_eq!(
+            aliases,
+            vec![
+                "web".to_string(),
+                "web.prod".to_string(),
+                "web.prod.svc.cluster.local".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn service_aliases_threads_custom_cluster_domain() {
+        let pod = json!({"metadata": {"labels": {"app": "web"}}});
+        let services = vec![svc("web", "default", json!({"app": "web"}))];
+        let aliases =
+            Kubelet::service_aliases_for_pod(&pod, "default", &services, "engenho.internal");
+        assert_eq!(
+            aliases,
+            vec![
+                "web".to_string(),
+                "web.default".to_string(),
+                "web.default.svc.engenho.internal".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn service_aliases_default_cluster_domain_is_cluster_local() {
+        // Wiring sanity: the production call uses DEFAULT_CLUSTER_DOMAIN.
+        let pod = json!({"metadata": {"labels": {"app": "web"}}});
+        let services = vec![svc("web", "default", json!({"app": "web"}))];
+        let aliases =
+            Kubelet::service_aliases_for_pod(&pod, "default", &services, DEFAULT_CLUSTER_DOMAIN);
+        assert!(aliases.contains(&"web.default.svc.cluster.local".to_string()));
     }
 }
