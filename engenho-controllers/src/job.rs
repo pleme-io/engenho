@@ -38,6 +38,7 @@ use serde_json::{Value, json};
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
 use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
+use crate::status::{observed_generation, write_status_cas};
 
 // Clock primitives previously defined here have been consolidated to
 // engenho_substrate::relogio (Clock + WallClock + FrozenClock). The
@@ -189,52 +190,97 @@ impl Controller for JobController {
                 })
                 .count();
 
-            if succeeded >= completions {
-                continue; // job complete
-            }
+            // ── Child reconcile: create pods toward completions (unless
+            // already complete). Done BEFORE the status write so status
+            // reflects the LIVE pods (incl. ones created this tick).
+            let complete = succeeded >= completions;
+            if !complete {
+                // Create up to `parallelism - active` more pods.
+                let needed = completions
+                    .saturating_sub(succeeded)
+                    .min(parallelism)
+                    .saturating_sub(active);
+                if needed > 0 {
+                    let existing_indices: std::collections::BTreeSet<usize> = owned
+                        .iter()
+                        .filter_map(|(k, _)| {
+                            let job_name = Self::job_name(job_value)?;
+                            let prefix = format!("{job_name}-");
+                            k.name.strip_prefix(&prefix).and_then(|s| s.parse().ok())
+                        })
+                        .collect();
 
-            // Create up to `parallelism - active` more pods.
-            let needed = completions
-                .saturating_sub(succeeded)
-                .min(parallelism)
-                .saturating_sub(active);
-            if needed == 0 {
-                continue;
-            }
-            let existing_indices: std::collections::BTreeSet<usize> = owned
-                .iter()
-                .filter_map(|(k, _)| {
-                    let job_name = Self::job_name(job_value)?;
-                    let prefix = format!("{job_name}-");
-                    k.name.strip_prefix(&prefix).and_then(|s| s.parse().ok())
-                })
-                .collect();
-
-            let mut to_create = needed;
-            let mut idx = 0usize;
-            while to_create > 0 {
-                while existing_indices.contains(&idx) {
-                    idx += 1;
+                    let mut to_create = needed;
+                    let mut idx = 0usize;
+                    while to_create > 0 {
+                        while existing_indices.contains(&idx) {
+                            idx += 1;
+                        }
+                        let Some((pod_name, mut pod)) = Self::build_pod(job_value, idx) else {
+                            report.objects_skipped += 1;
+                            break;
+                        };
+                        set_owner_reference(&mut pod, owner_ref.clone());
+                        let pod_ns = ns.unwrap_or("default");
+                        let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
+                        self.store
+                            .propose(ResourceCommand::Put {
+                                key: pod_key,
+                                value: pod,
+                                expected: None,
+                                reason: Reason::Controller,
+                            })
+                            .await
+                            .map_err(|e| ControllerError::Store(e.to_string()))?;
+                        report.objects_changed += 1;
+                        to_create -= 1;
+                        idx += 1;
+                    }
                 }
-                let Some((pod_name, mut pod)) = Self::build_pod(job_value, idx) else {
-                    report.objects_skipped += 1;
-                    break;
-                };
-                set_owner_reference(&mut pod, owner_ref.clone());
-                let pod_ns = ns.unwrap_or("default");
-                let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
-                self.store
-                    .propose(ResourceCommand::Put {
-                        key: pod_key,
-                        value: pod,
-                        expected: None,
-                        reason: Reason::Controller,
-                    })
-                    .await
-                    .map_err(|e| ControllerError::Store(e.to_string()))?;
+            }
+
+            // ── Status: computed from the LIVE owned-Pod phases AFTER the
+            // reconcile (re-list so this tick's creates count toward
+            // `active`). Single source of truth — never an incremented
+            // counter. On `succeeded >= completions` set a Complete=True
+            // condition. observedGeneration included for symmetry.
+            let fresh_pods = self.store.list("", "v1", "Pod", ns).await;
+            let owned_now: Vec<&Value> = fresh_pods
+                .iter()
+                .filter(|(_, p)| is_owned_by(p, &uid))
+                .map(|(_, p)| p)
+                .collect();
+            let succeeded_now = owned_now
+                .iter()
+                .filter(|p| Self::pod_phase_is(p, "Succeeded"))
+                .count();
+            let failed_now = owned_now
+                .iter()
+                .filter(|p| Self::pod_phase_is(p, "Failed"))
+                .count();
+            let active_now = owned_now
+                .iter()
+                .filter(|p| {
+                    !Self::pod_phase_is(p, "Succeeded") && !Self::pod_phase_is(p, "Failed")
+                })
+                .count();
+            let mut desired_status = json!({
+                "active": i64::try_from(active_now).unwrap_or(i64::MAX),
+                "succeeded": i64::try_from(succeeded_now).unwrap_or(i64::MAX),
+                "failed": i64::try_from(failed_now).unwrap_or(i64::MAX),
+                "observedGeneration": observed_generation(job_value),
+            });
+            if succeeded_now >= completions {
+                desired_status["conditions"] = json!([{
+                    "type": "Complete",
+                    "status": "True",
+                }]);
+            }
+            if write_status_cas(&self.store, job_key, job_value, &desired_status)
+                .await?
+                .changed()
+            {
                 report.objects_changed += 1;
-                to_create -= 1;
-                idx += 1;
             }
         }
         Ok(report)

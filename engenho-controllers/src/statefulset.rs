@@ -33,6 +33,7 @@ use tracing::debug;
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
 use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
+use crate::status::{observed_generation, pod_is_ready, write_status_cas};
 
 /// StatefulSet controller — peer to ReplicaSetController with
 /// ordered identity semantics.
@@ -189,6 +190,36 @@ impl Controller for StatefulSetController {
                         report.objects_changed += 1;
                     }
                 }
+            }
+
+            // ── Status: computed from the LIVE owned pods after the
+            // create/delete reconcile (re-list so deletes/creates this
+            // tick are reflected). `replicas` = owned pod count;
+            // `readyReplicas`/`availableReplicas` = ready owned pods;
+            // `updatedReplicas`/`currentReplicas` == replicas (single
+            // revision at M0.1).
+            let fresh_pods = self.store.list("", "v1", "Pod", ns).await;
+            let owned_now: Vec<&Value> = fresh_pods
+                .iter()
+                .filter(|(_, p)| is_owned_by(p, &uid))
+                .map(|(_, p)| p)
+                .collect();
+            let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
+            let ready = i64::try_from(owned_now.iter().filter(|p| pod_is_ready(p)).count())
+                .unwrap_or(i64::MAX);
+            let desired_status = json!({
+                "replicas": replicas,
+                "readyReplicas": ready,
+                "availableReplicas": ready,
+                "updatedReplicas": replicas,
+                "currentReplicas": replicas,
+                "observedGeneration": observed_generation(sts_value),
+            });
+            if write_status_cas(&self.store, sts_key, sts_value, &desired_status)
+                .await?
+                .changed()
+            {
+                report.objects_changed += 1;
             }
         }
         Ok(report)

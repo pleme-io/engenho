@@ -56,6 +56,7 @@ pub mod runtime;
 pub mod selector;
 pub mod service_router;
 pub mod statefulset;
+pub mod status;
 pub mod store_ledger;
 pub mod store_resolver;
 pub mod tiered_build;
@@ -122,6 +123,10 @@ pub use service_router::{
     ServiceRouter, ServiceRoutingController,
 };
 pub use statefulset::StatefulSetController;
+pub use status::{
+    StatusWriteOutcome, generation_of, observed_generation, pod_is_ready, resource_version_of,
+    write_status_cas,
+};
 pub use store_ledger::{DEFAULT_RECEIPT_NAMESPACE, StoreBackedLedger};
 pub use store_resolver::StoreBackedNodeResolver;
 pub use tiered_build::TieredBuildBackend;

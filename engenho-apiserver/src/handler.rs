@@ -5,6 +5,9 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
+use engenho_controllers::admission::{
+    AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionRequest,
+};
 use engenho_store::{
     ContinueToken, Revision, StoreMesh, WatchGone, WatchOpts, WatchStream,
     command::{Reason, ResourceCommand, ResourceOp},
@@ -197,6 +200,12 @@ pub struct StoreBackedHandler {
     plural: String,
     namespaced: bool,
     store: Arc<StoreMesh>,
+    /// Optional admission chain dispatched on the write path (create /
+    /// patch / delete) at the API boundary. `None` = no admission — every
+    /// existing constructor produces this, so legacy callers + tests are
+    /// unaffected by the new field. Controller writes (`Reason::Controller`)
+    /// do NOT flow through a handler, so they never hit admission.
+    admission: Option<Arc<AdmissionChain>>,
 }
 
 impl StoreBackedHandler {
@@ -216,6 +225,47 @@ impl StoreBackedHandler {
             kind: kind.into(),
             plural: plural.into(),
             namespaced,
+            admission: None,
+        }
+    }
+
+    /// Attach an [`AdmissionChain`] to this handler (builder style). The
+    /// chain is dispatched on every create / patch / delete BEFORE the
+    /// store proposal; an empty chain is a no-op (admits everything).
+    #[must_use]
+    pub fn with_admission(mut self, admission: Arc<AdmissionChain>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
+    /// Run the admission chain for `action` on `key` and return the body
+    /// to actually propose (possibly mutated). `None` admission, or an
+    /// empty chain, returns `body` unchanged. A `Deny` becomes a typed
+    /// [`ApiError::Forbidden`] (HTTP 403).
+    ///
+    /// For Delete the body is `None`; the chain still runs (so a policy
+    /// can block deletes) and the returned value is ignored by the
+    /// caller.
+    async fn admit(
+        &self,
+        action: AdmissionAction,
+        key: &ResourceKey,
+        body: Option<Value>,
+    ) -> Result<Option<Value>, ApiError> {
+        let Some(chain) = &self.admission else {
+            return Ok(body);
+        };
+        let current = self.store.get(key).await;
+        let request = AdmissionRequest {
+            action,
+            key: key.clone(),
+            value: body.clone(),
+            current,
+        };
+        match chain.review(request).await {
+            AdmissionDecision::Allow => Ok(body),
+            AdmissionDecision::Mutate(v) => Ok(Some(v)),
+            AdmissionDecision::Deny(reason) => Err(ApiError::Forbidden(reason)),
         }
     }
 
@@ -508,10 +558,16 @@ impl ResourceHandler for StoreBackedHandler {
             .ok_or_else(|| ApiError::BadRequest("missing metadata.name in request body".into()))?
             .to_string();
         let key = self.key(namespace, &name)?;
-        // Optimistic-concurrency precondition from the inbound body's
-        // metadata.resourceVersion. For a CREATE (POST) of a NEW object
-        // the rv is absent → None (unconditional create); a re-PUT-style
-        // body carrying an rv threads CAS into the proposal.
+        // Admission runs at the API boundary BEFORE any store proposal.
+        // A Mutate replaces the body; a Deny short-circuits with 403.
+        let body = self
+            .admit(AdmissionAction::Put, &key, Some(body))
+            .await?
+            .expect("admit(Put, Some(_)) preserves Some on Allow/Mutate");
+        // Optimistic-concurrency precondition from the (post-admission)
+        // body's metadata.resourceVersion. For a CREATE (POST) of a NEW
+        // object the rv is absent → None (unconditional create); a
+        // re-PUT-style body carrying an rv threads CAS into the proposal.
         let expected = body_precondition(&body)?;
         // Reject if already exists (POST semantics). The no-rv POST keeps
         // its existing already-exists Conflict/"AlreadyExists" path.
@@ -552,7 +608,12 @@ impl ResourceHandler for StoreBackedHandler {
         patch: Value,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
-        // Precondition from the inbound patch body's
+        // Admission runs at the API boundary BEFORE the store proposal.
+        let patch = self
+            .admit(AdmissionAction::Patch, &key, Some(patch))
+            .await?
+            .expect("admit(Patch, Some(_)) preserves Some on Allow/Mutate");
+        // Precondition from the (post-admission) patch body's
         // metadata.resourceVersion (absent → unconditional).
         let expected = body_precondition(&patch)?;
         if self.store.get(&key).await.is_none() {
@@ -592,6 +653,10 @@ impl ResourceHandler for StoreBackedHandler {
         expected: Option<Revision>,
     ) -> Result<(), ApiError> {
         let key = self.key(namespace, name)?;
+        // Admission runs at the API boundary BEFORE the store proposal so
+        // a policy can block deletes. The Delete body is None; any Mutate
+        // value is ignored (delete has no body to rewrite).
+        let _ = self.admit(AdmissionAction::Delete, &key, None).await?;
         let result = self
             .store
             .propose(ResourceCommand::Delete {
@@ -644,6 +709,35 @@ pub fn handlers_from_catalog(store: Arc<StoreMesh>) -> Vec<Arc<dyn ResourceHandl
                 d.plural,
                 d.namespaced,
             )) as Arc<dyn ResourceHandler>
+        })
+        .collect()
+}
+
+/// Build one admission-dispatching [`StoreBackedHandler`] per row of the
+/// generated [`RESOURCE_CATALOG`]. Identical to [`handlers_from_catalog`]
+/// except every handler carries the shared `admission` chain — so create
+/// / patch / delete flow through admission at the API boundary. The
+/// SAME chain `Arc` is cloned into every handler (one chain governs the
+/// whole API surface).
+#[must_use]
+pub fn handlers_from_catalog_with_admission(
+    store: Arc<StoreMesh>,
+    admission: Arc<AdmissionChain>,
+) -> Vec<Arc<dyn ResourceHandler>> {
+    RESOURCE_CATALOG
+        .iter()
+        .map(|d| {
+            Arc::new(
+                StoreBackedHandler::new(
+                    store.clone(),
+                    d.group,
+                    d.version,
+                    d.kind,
+                    d.plural,
+                    d.namespaced,
+                )
+                .with_admission(admission.clone()),
+            ) as Arc<dyn ResourceHandler>
         })
         .collect()
 }

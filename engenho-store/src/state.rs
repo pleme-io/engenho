@@ -284,6 +284,19 @@ impl ResourceCatalog {
             None => VersionMeta::created_at(rev),
         };
 
+        // generation reflects SPEC-INTENT revisions (the K8s contract
+        // `observedGeneration` reconciles against), NOT every mutation.
+        // On first create generation == 1; on replace it bumps iff
+        // `spec` changed (deep compare prior vs new spec), else the prior
+        // generation is preserved. A status-only replace (rare via Put,
+        // common via Patch) thus leaves generation untouched. Computed in
+        // the deterministic apply path so every Raft node stamps the
+        // identical value.
+        let next_generation = compute_generation_on_put(
+            prior_entry.as_ref().map(|(v, _)| v),
+            value,
+        );
+
         let mut new_value = value.clone();
         if let Some(obj) = new_value.as_object_mut() {
             let metadata = obj
@@ -293,6 +306,10 @@ impl ResourceCatalog {
                 meta_obj.insert(
                     "resourceVersion".to_string(),
                     serde_json::Value::String(rev.to_string()),
+                );
+                meta_obj.insert(
+                    "generation".to_string(),
+                    serde_json::Value::Number(next_generation.into()),
                 );
                 // Preserve uid across updates; mint a deterministic
                 // one (from key + create_revision) on first create.
@@ -368,6 +385,13 @@ impl ResourceCatalog {
 
         let mut merged = existing_value.clone();
         merge_json(&mut merged, patch);
+        // generation bumps iff the MERGED `spec` differs from the prior
+        // `spec`. A patch touching ONLY `status` (or only metadata) leaves
+        // `spec` unchanged → generation preserved. This is the
+        // load-bearing invariant the controllers' observedGeneration
+        // convergence relies on: a status-only write never advances the
+        // generation it is meant to be catching up to.
+        let next_generation = compute_generation_on_put(Some(&prior_value), &merged);
         if let Some(obj) = merged.as_object_mut() {
             let metadata = obj
                 .entry("metadata".to_string())
@@ -376,6 +400,10 @@ impl ResourceCatalog {
                 meta_obj.insert(
                     "resourceVersion".to_string(),
                     serde_json::Value::String(rev.to_string()),
+                );
+                meta_obj.insert(
+                    "generation".to_string(),
+                    serde_json::Value::Number(next_generation.into()),
                 );
             }
         }
@@ -622,6 +650,48 @@ impl ResourceCatalog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.resources.is_empty()
+    }
+}
+
+/// Borrow `value.spec` if present.
+fn spec_of(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value.get("spec")
+}
+
+/// Read `metadata.generation` off a stored object (the value already in
+/// hand). `0` (the "no generation" sentinel) when absent or non-integer —
+/// the very first create's prior is `None`, not a zero-generation object.
+fn generation_of(value: &serde_json::Value) -> i64 {
+    value
+        .get("metadata")
+        .and_then(|m| m.get("generation"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+}
+
+/// Compute the `metadata.generation` to stamp on a create/replace/patch.
+///
+///   * No prior (first create) → `1`.
+///   * Prior exists + `spec` UNCHANGED → preserve the prior generation
+///     (treating a missing prior generation as `1`, since a
+///     pre-generation object is logically at its first spec-intent).
+///   * Prior exists + `spec` CHANGED → prior generation + 1.
+///
+/// `spec`-equality is a structural deep compare of the two `spec`
+/// subtrees (both-absent counts as equal). Pure + deterministic so every
+/// Raft node stamps the identical generation.
+#[must_use]
+fn compute_generation_on_put(prior: Option<&serde_json::Value>, next: &serde_json::Value) -> i64 {
+    match prior {
+        None => 1,
+        Some(prior_value) => {
+            let prior_gen = generation_of(prior_value).max(1);
+            if spec_of(prior_value) == spec_of(next) {
+                prior_gen
+            } else {
+                prior_gen + 1
+            }
+        }
     }
 }
 
@@ -993,6 +1063,143 @@ mod tests {
         // History is deliberately not persisted (rebuilt by replay).
         assert!(back.history.is_empty());
         assert_eq!(back.history_capacity, DEFAULT_HISTORY_CAPACITY);
+    }
+
+    /// Read `metadata.generation` off the live stored object.
+    fn live_generation(cat: &ResourceCatalog, key: &ResourceKey) -> i64 {
+        cat.get(key)
+            .and_then(|v| v.get("metadata"))
+            .and_then(|m| m.get("generation"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_else(|| panic!("metadata.generation missing"))
+    }
+
+    fn patch(
+        cat: &mut ResourceCatalog,
+        key: &ResourceKey,
+        patch: serde_json::Value,
+        index: u64,
+    ) -> ApplyOutcome {
+        cat.apply(
+            &ResourceCommand::Patch {
+                key: key.clone(),
+                patch,
+                expected: None,
+                reason: Reason::Operator,
+            },
+            1,
+            index,
+        )
+    }
+
+    #[test]
+    fn put_first_create_stamps_generation_1() {
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("gen-create");
+        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 1}}), 1);
+        assert_eq!(live_generation(&cat, &k), 1, "first create → generation 1");
+    }
+
+    #[test]
+    fn put_replace_with_changed_spec_bumps_generation() {
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("gen-bump");
+        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 1}}), 1);
+        assert_eq!(live_generation(&cat, &k), 1);
+        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 2}}), 2);
+        assert_eq!(
+            live_generation(&cat, &k),
+            2,
+            "spec changed on replace → generation bumps"
+        );
+    }
+
+    #[test]
+    fn put_replace_with_identical_spec_preserves_generation() {
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("gen-stable");
+        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 3}}), 1);
+        assert_eq!(live_generation(&cat, &k), 1);
+        // Replace with the SAME spec but a changed status — generation
+        // must NOT bump (status is not spec-intent).
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replicas": 3}, "status": {"replicas": 3}}),
+            2,
+        );
+        assert_eq!(
+            live_generation(&cat, &k),
+            1,
+            "identical spec on replace → generation preserved"
+        );
+    }
+
+    #[test]
+    fn patch_status_only_does_not_bump_generation() {
+        // THE LOAD-BEARING INVARIANT: a status-only patch leaves
+        // metadata.generation unchanged so observedGeneration can
+        // converge against it.
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("gen-status-patch");
+        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 2}}), 1);
+        assert_eq!(live_generation(&cat, &k), 1);
+        let out = patch(
+            &mut cat,
+            &k,
+            serde_json::json!({"status": {"readyReplicas": 2}}),
+            2,
+        );
+        assert_eq!(out.op, ResourceOp::Patched);
+        assert_eq!(
+            live_generation(&cat, &k),
+            1,
+            "status-only patch must NOT bump generation"
+        );
+        // The status landed.
+        assert_eq!(
+            cat.get(&k).unwrap().get("status").unwrap().get("readyReplicas").unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn patch_spec_change_bumps_generation() {
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("gen-spec-patch");
+        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 2}}), 1);
+        assert_eq!(live_generation(&cat, &k), 1);
+        let out = patch(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replicas": 5}}),
+            2,
+        );
+        assert_eq!(out.op, ResourceOp::Patched);
+        assert_eq!(
+            live_generation(&cat, &k),
+            2,
+            "spec-changing patch bumps generation"
+        );
+    }
+
+    #[test]
+    fn patch_metadata_only_does_not_bump_generation() {
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("gen-meta-patch");
+        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 1}}), 1);
+        let out = patch(
+            &mut cat,
+            &k,
+            serde_json::json!({"metadata": {"labels": {"team": "x"}}}),
+            2,
+        );
+        assert_eq!(out.op, ResourceOp::Patched);
+        assert_eq!(
+            live_generation(&cat, &k),
+            1,
+            "metadata-only patch must NOT bump generation"
+        );
     }
 
     #[test]
