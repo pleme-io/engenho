@@ -48,8 +48,8 @@ pub use discovery::{
 };
 pub use error::{ApiError, ErrorKind, status_object};
 pub use handler::{
-    ResourceHandler, StoreBackedHandler, gone_to_api_error, handlers_from_catalog,
-    handlers_from_catalog_with_admission,
+    ResourceHandler, RouterHandlerSink, StoreBackedHandler, gone_to_api_error,
+    handlers_from_catalog, handlers_from_catalog_with_admission,
 };
 pub use health::VersionInfo;
 pub use openapi::ApiDoc;

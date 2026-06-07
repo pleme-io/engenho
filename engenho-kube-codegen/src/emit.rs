@@ -348,6 +348,17 @@ pub struct ResourceDescriptor {
     /// kubectl resource categories (e.g. `[\"all\"]`). Empty for kinds in
     /// no category. Flows into discovery `categories`.
     pub categories: &'static [&'static str],
+    /// `true` ⇒ this kind has NO vendored OpenAPI v3 schema document and NO
+    /// typed struct — it is served as opaque JSON via the generic
+    /// `StoreBackedHandler` (e.g.
+    /// `apiextensions.k8s.io/v1.CustomResourceDefinition`, stored as plain
+    /// JSON). Such kinds are routable + discoverable but absent from the
+    /// `/openapi/v3` served set, so the ★★ CATALOG-REFLECTION invariant
+    /// (`SERVED (group,version) == non-opaque RESOURCE_CATALOG (group,version)`)
+    /// excludes them. `kubectl apply` of an opaque kind needs
+    /// `--validate=false` (no schema to validate against); `kubectl explain`
+    /// is unavailable. Non-opaque kinds are `false`.
+    pub opaque: bool,
 }
 
 impl ResourceDescriptor {
@@ -407,7 +418,7 @@ pub fn emit_catalog(catalog: &[KindEntry]) -> String {
             format!("{}/{}", e.group, e.version)
         };
         out.push_str(&format!(
-            "    ResourceDescriptor {{ group: {:?}, version: {:?}, kind: {:?}, plural: {:?}, namespaced: {}, api_version: {:?}, short_names: {}, singular: {:?}, categories: {} }},\n",
+            "    ResourceDescriptor {{ group: {:?}, version: {:?}, kind: {:?}, plural: {:?}, namespaced: {}, api_version: {:?}, short_names: {}, singular: {:?}, categories: {}, opaque: {} }},\n",
             e.group,
             e.version,
             e.kind,
@@ -417,6 +428,7 @@ pub fn emit_catalog(catalog: &[KindEntry]) -> String {
             render_str_slice(e.short_names),
             e.singular,
             render_str_slice(e.categories),
+            e.opaque,
         ));
     }
     out.push_str("];\n");
@@ -482,6 +494,7 @@ mod tests {
             short_names: &["po"],
             singular: "pod",
             categories: &["all"],
+            opaque: false,
         }
     }
 
@@ -602,6 +615,34 @@ mod tests {
     }
 
     #[test]
+    fn opaque_crd_kind_is_catalog_only_no_module_struct() {
+        // The apiextensions CRD kind is OPAQUE: it appears as a
+        // RESOURCE_CATALOG row (so routing + discovery light up) but has NO
+        // `module` / `openapi_key`, so the generator emits no per-kind
+        // struct for it. This is the ★★ CATALOG-REFLECTION invariant for
+        // the opaque seam — a regression where the CRD row gained a module
+        // would break codegen (no vendored schema), so pin both facts.
+        use crate::catalog::KIND_CATALOG;
+        let crd = KIND_CATALOG
+            .iter()
+            .find(|e| e.kind == "CustomResourceDefinition")
+            .expect("CustomResourceDefinition cataloged");
+        assert!(crd.opaque, "CRD kind is opaque (no typed struct)");
+        assert!(crd.module.is_empty(), "opaque CRD has no module");
+        assert!(crd.openapi_key.is_empty(), "opaque CRD has no openapi_key");
+        assert_eq!(crd.group, "apiextensions.k8s.io");
+        assert_eq!(crd.resource, "customresourcedefinitions");
+        assert!(crd.cluster_scoped, "CRDs are cluster-scoped");
+        // The catalog row IS emitted (descriptor present) even though no
+        // module struct is.
+        let src = emit_catalog(KIND_CATALOG);
+        assert!(
+            src.contains(r#"kind: "CustomResourceDefinition", plural: "customresourcedefinitions""#),
+            "opaque CRD still gets a RESOURCE_CATALOG row"
+        );
+    }
+
+    #[test]
     fn every_singular_is_lowercase_kind() {
         use crate::catalog::KIND_CATALOG;
         for e in KIND_CATALOG {
@@ -661,6 +702,7 @@ mod tests {
                 short_names: &["svc"],
                 singular: "service",
                 categories: &["all"],
+                opaque: false,
             },
         ];
         let refs: Vec<&KindEntry> = entries.iter().collect();

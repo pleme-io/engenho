@@ -25,6 +25,7 @@ axum-server        = { workspace = true }
 tower              = { workspace = true }
 utoipa             = { workspace = true }
 futures            = { workspace = true }
+arc-swap           = { workspace = true }
 bytes              = "1"
 rcgen              = { workspace = true }
 rustls             = { workspace = true }

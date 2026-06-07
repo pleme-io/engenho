@@ -77,8 +77,11 @@ pub use build_backend_roceiro::BuildBackendRoceiro;
 pub use controller::{
     Controller, ReconcileOutcome, ReconcileReport, ReconcileResult,
 };
-pub use crd::{CrdController, CrdEntry, CrdError, CrdRegistry, CrdScope};
-pub use crd_validator::{CrdValidationWebhook, crd_validation_webhook};
+pub use crd::{
+    CrdController, CrdEntry, CrdError, CrdHandlerSpec, CrdNames, CrdScope, CrdSpec, CrdVersion,
+    DynamicHandlerSink,
+};
+pub use crd_validator::{CrdValidationWebhook, ValidationRegistry, crd_validation_webhook};
 pub use deployment::DeploymentController;
 pub use dns::{
     DEFAULT_CLUSTER_DOMAIN, DnsBackend, DnsController, DnsError, DnsEvent, DnsRecord,

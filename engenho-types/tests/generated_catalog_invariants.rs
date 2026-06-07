@@ -225,19 +225,41 @@ fn openapi_v3_document_for_apps_is_openapi_3() {
 }
 
 #[test]
-fn served_openapi_tuples_equal_catalog_group_version_pairs() {
+fn served_openapi_tuples_equal_non_opaque_catalog_group_version_pairs() {
     // ★★ CATALOG REFLECTION invariant: the set of (group, version) pairs in
     // the served OpenAPI-v3 table MUST equal the distinct (group, version)
-    // pairs in RESOURCE_CATALOG. Adding a group is one catalog change + one
-    // vendored file + one SERVED row — never a hand-wired divergence.
-    let catalog_pairs: std::collections::BTreeSet<(&str, &str)> =
-        RESOURCE_CATALOG.iter().map(|d| (d.group, d.version)).collect();
+    // pairs of the NON-OPAQUE rows in RESOURCE_CATALOG. Adding a
+    // schema-backed group is one catalog change + one vendored file + one
+    // SERVED row — never a hand-wired divergence.
+    //
+    // OPAQUE kinds (no vendored OpenAPI schema — e.g.
+    // apiextensions.k8s.io/v1.CustomResourceDefinition, stored as plain
+    // JSON) are EXCLUDED by design: they are routable + discoverable but
+    // have no `/openapi/v3` schema document (kubectl applies them with
+    // `--validate=false`; `kubectl explain` is unavailable). Their presence
+    // in RESOURCE_CATALOG without a SERVED row is the intended seam, so the
+    // comparison filters them out.
+    let catalog_pairs: std::collections::BTreeSet<(&str, &str)> = RESOURCE_CATALOG
+        .iter()
+        .filter(|d| !d.opaque)
+        .map(|d| (d.group, d.version))
+        .collect();
     let served_pairs: std::collections::BTreeSet<(&str, &str)> = engenho_types::openapi_v3::SERVED
         .iter()
         .map(|d| (d.group, d.version))
         .collect();
     assert_eq!(
         served_pairs, catalog_pairs,
-        "served OpenAPI-v3 (group,version) set must equal RESOURCE_CATALOG's"
+        "served OpenAPI-v3 (group,version) set must equal the NON-OPAQUE RESOURCE_CATALOG's"
+    );
+
+    // And the apiextensions group (the opaque CRD kind) is deliberately
+    // ABSENT from the served OpenAPI set — pin that so a future accidental
+    // SERVED row for it (without a real vendored schema) is caught.
+    assert!(
+        !engenho_types::openapi_v3::SERVED
+            .iter()
+            .any(|d| d.group == "apiextensions.k8s.io"),
+        "apiextensions.k8s.io is opaque — must NOT have a served OpenAPI doc"
     );
 }

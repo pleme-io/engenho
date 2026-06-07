@@ -823,6 +823,101 @@ pub fn handlers_from_catalog_with_admission(
         .collect()
 }
 
+// ── DynamicHandlerSink — apiserver impl over the live RouterState ──────
+//
+// The `CrdController` (in engenho-controllers) can't depend on
+// engenho-apiserver (that's a cycle — apiserver already depends on
+// controllers for admission), so it mutates the router table through the
+// typed `DynamicHandlerSink` trait. This is the apiserver-side impl: it
+// owns the store + the admission chain + a clone of the live RouterState,
+// and on `register_crd` builds the SAME `StoreBackedHandler` the cataloged
+// path builds (opaque-JSON CRUD, admission-dispatched) under the CRD's GVK
+// + names, then lands it via `RouterState::register`. NO parallel CR
+// codepath — a registered CR handler IS a StoreBackedHandler.
+
+use engenho_controllers::{CrdHandlerSpec, DynamicHandlerSink};
+
+/// Apiserver-provided [`DynamicHandlerSink`] over the live
+/// [`crate::router::RouterState`]. Built once at boot + shared (as
+/// `Arc<dyn DynamicHandlerSink>`) with the `CrdController`.
+pub struct RouterHandlerSink {
+    store: Arc<StoreMesh>,
+    /// The SAME admission chain the cataloged handlers carry, so CR
+    /// create/patch/delete flow through admission identically.
+    admission: Arc<AdmissionChain>,
+    /// A clone of the live RouterState — `register`/`unregister` swap the
+    /// shared `ArcSwap`, so the change is visible to in-flight requests.
+    router: crate::router::RouterState,
+}
+
+impl RouterHandlerSink {
+    /// New sink. `router` MUST be a clone of the RouterState the
+    /// [`crate::ApiServer`] was started with (same `Arc<ArcSwap<…>>`).
+    #[must_use]
+    pub fn new(
+        store: Arc<StoreMesh>,
+        admission: Arc<AdmissionChain>,
+        router: crate::router::RouterState,
+    ) -> Self {
+        Self {
+            store,
+            admission,
+            router,
+        }
+    }
+
+    /// Box as the trait object the controller consumes.
+    #[must_use]
+    pub fn into_dyn(self) -> Arc<dyn DynamicHandlerSink> {
+        Arc::new(self)
+    }
+}
+
+impl DynamicHandlerSink for RouterHandlerSink {
+    fn register_crd(&self, spec: CrdHandlerSpec) {
+        // Leak the per-CRD discovery metadata to `&'static` — the
+        // `StoreBackedHandler` registration-metadata slots are `&'static`
+        // (the cataloged path sources them from the `&'static`
+        // RESOURCE_CATALOG). A CRD registration is rare + permanent for the
+        // process lifetime (the handler lives until the CRD is deleted, and
+        // even an unregister just drops the Arc — the leaked metadata is a
+        // bounded one-time-per-served-version cost, not a per-request leak).
+        let short_names: &'static [&'static str] = Box::leak(
+            spec.short_names
+                .iter()
+                .map(|s| Box::leak(s.clone().into_boxed_str()) as &'static str)
+                .collect::<Vec<&'static str>>()
+                .into_boxed_slice(),
+        );
+        let categories: &'static [&'static str] = Box::leak(
+            spec.categories
+                .iter()
+                .map(|s| Box::leak(s.clone().into_boxed_str()) as &'static str)
+                .collect::<Vec<&'static str>>()
+                .into_boxed_slice(),
+        );
+        let singular: &'static str = Box::leak(spec.singular.clone().into_boxed_str());
+
+        let handler: Arc<dyn ResourceHandler> = Arc::new(
+            StoreBackedHandler::new(
+                self.store.clone(),
+                spec.group.clone(),
+                spec.version.clone(),
+                spec.kind.clone(),
+                spec.plural.clone(),
+                spec.namespaced,
+            )
+            .with_registration_metadata(short_names, singular, categories)
+            .with_admission(self.admission.clone()),
+        );
+        self.router.register(handler);
+    }
+
+    fn unregister_crd(&self, group: &str, version: &str, plural: &str) -> bool {
+        self.router.unregister(group, version, plural)
+    }
+}
+
 /// Typed K8s `<Kind>List` envelope. `metadata.resourceVersion` is the
 /// snapshot rv captured atomically with `items` in
 /// [`ResourceHandler::list_at`].

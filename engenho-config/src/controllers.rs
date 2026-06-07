@@ -38,6 +38,11 @@ pub struct ControllerEnable {
     pub endpoints: bool,
     /// Owner-reference garbage collector.
     pub gc: bool,
+    /// CRD → dynamic CR-handler registration controller. Watches
+    /// CustomResourceDefinition objects + registers a `StoreBackedHandler`
+    /// per served version into the live apiserver router table.
+    #[serde(default = "default_true")]
+    pub crd: bool,
 }
 
 /// serde default for the `statefulset` / `job` toggles — `true` so an
@@ -57,6 +62,7 @@ impl TieredConfig for ControllersConfig {
                 job: false,
                 endpoints: false,
                 gc: false,
+                crd: false,
             },
             namespace: String::new(),
             fallback_interval_seconds: 0,
@@ -73,6 +79,7 @@ impl TieredConfig for ControllersConfig {
                 job: true,
                 endpoints: true,
                 gc: true,
+                crd: true,
             },
             namespace: String::new(),
             fallback_interval_seconds: 30,
@@ -132,6 +139,7 @@ mod tests {
         assert!(cfg.enable.job);
         assert!(cfg.enable.endpoints);
         assert!(cfg.enable.gc);
+        assert!(cfg.enable.crd);
         cfg.validate().unwrap();
     }
 
