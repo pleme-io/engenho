@@ -1,0 +1,68 @@
+//! Typed runtime errors — `thiserror`, no `anyhow` in the lib.
+
+use engenho_apiserver::ServerError;
+use engenho_config::ConfigError;
+use engenho_store::StoreError;
+
+/// Everything that can go wrong booting or shutting down a [`crate::Runtime`].
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    /// Config failed `validate()` or a section was incoherent.
+    #[error("config error: {0}")]
+    Config(#[source] ConfigError),
+
+    /// The store mesh failed to start, initialize, or take leadership.
+    #[error("store error: {0}")]
+    Store(#[source] StoreError),
+
+    /// The apiserver failed to bind or serve.
+    #[error("apiserver error: {0}")]
+    Server(#[source] ServerError),
+
+    /// Raft leadership wasn't reached within the configured timeout.
+    /// The store started but never elected a leader, so no `propose`
+    /// (Node registration, apiserver writes) could ever succeed.
+    #[error("store did not reach leadership within {seconds}s")]
+    LeadershipTimeout {
+        /// The configured leadership timeout that elapsed.
+        seconds: u32,
+    },
+
+    /// `listen_addr` couldn't be parsed into a `SocketAddr`.
+    #[error("invalid listen_addr {addr:?}: {source}")]
+    ListenAddr {
+        /// The unparseable address string.
+        addr: String,
+        /// The parse error.
+        #[source]
+        source: std::net::AddrParseError,
+    },
+
+    /// At shutdown, the Runtime could not become the sole owner of the
+    /// store `Arc` (a driver task or apiserver handler still holds a
+    /// clone). `terminate` consumes `StoreMesh` and requires the only
+    /// strong ref; this surfaces the leak rather than hanging.
+    #[error("could not acquire sole store ownership for terminate ({strong_count} strong refs remain)")]
+    StoreStillShared {
+        /// How many strong refs remained when `try_unwrap` failed.
+        strong_count: usize,
+    },
+}
+
+impl From<ConfigError> for RuntimeError {
+    fn from(e: ConfigError) -> Self {
+        Self::Config(e)
+    }
+}
+
+impl From<StoreError> for RuntimeError {
+    fn from(e: StoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
+impl From<ServerError> for RuntimeError {
+    fn from(e: ServerError) -> Self {
+        Self::Server(e)
+    }
+}

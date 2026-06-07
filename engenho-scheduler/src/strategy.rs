@@ -28,6 +28,24 @@ pub trait SchedulingStrategy: Send + Sync {
     async fn pick<'a>(&self, pod: &'a Value, candidates: &'a [Value]) -> Option<String>;
 }
 
+/// Blanket impl so the boxed trait object that
+/// [`crate::make_scheduling_strategy`] returns composes directly with
+/// [`crate::Scheduler::new`]`<S: SchedulingStrategy + 'static>`. Without
+/// this, the config-driven factory output (`Box<dyn SchedulingStrategy>`)
+/// can't be handed to the scheduler, forcing callers to match on the
+/// strategy kind a second time. Delegates every method to the inner
+/// strategy.
+#[async_trait]
+impl SchedulingStrategy for Box<dyn SchedulingStrategy> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    async fn pick<'a>(&self, pod: &'a Value, candidates: &'a [Value]) -> Option<String> {
+        (**self).pick(pod, candidates).await
+    }
+}
+
 /// Round-robin across schedulable nodes. Cursor advances on every
 /// pick so consecutive pods spread evenly.
 ///

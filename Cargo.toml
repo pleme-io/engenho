@@ -16,6 +16,7 @@ members = [
   "engenho-controllers",
   "engenho-config",
   "engenho-kubelet",
+  "engenho-runtime",
   "engenho-substrate",
   "engenho-substrate-props",
   "engenho-sui-typescape",
@@ -48,6 +49,8 @@ engenho-types          = { path = "engenho-types", version = "0.1.4" }
 engenho-cluster-config = { path = "engenho-cluster-config", version = "0.1.4" }
 engenho-kube-client    = { path = "engenho-kube-client", version = "0.1.4" }
 engenho-store          = { path = "engenho-store", version = "0.1.4" }
+engenho-apiserver      = { path = "engenho-apiserver", version = "0.1.4" }
+engenho-runtime        = { path = "engenho-runtime", version = "0.1.4" }
 engenho-scheduler      = { path = "engenho-scheduler", version = "0.1.4" }
 engenho-controllers    = { path = "engenho-controllers", version = "0.1.4" }
 engenho-config         = { path = "engenho-config", version = "0.1.4" }

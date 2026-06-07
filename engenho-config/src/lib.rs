@@ -86,6 +86,7 @@ mod consistency;
 mod controllers;
 mod error;
 mod revoada;
+mod runtime;
 mod scheduler;
 mod teia;
 
@@ -94,6 +95,7 @@ pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
 pub use controllers::{ControllerEnable, ControllersConfig};
 pub use error::ConfigError;
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
+pub use runtime::{KubeletBackendKind, RuntimeConfig};
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
 pub use teia::TeiaConfig;
 
@@ -113,6 +115,9 @@ pub struct EngenhoConfig {
     pub controllers: ControllersConfig,
     /// Per-resource ConsistencyTier defaults.
     pub consistency: ConsistencyConfig,
+    /// Single-process assembly knobs (listen addr, data dir, node
+    /// name, kubelet backend, leadership timeout).
+    pub runtime: RuntimeConfig,
 }
 
 impl TieredConfig for EngenhoConfig {
@@ -124,6 +129,7 @@ impl TieredConfig for EngenhoConfig {
             scheduler: SchedulerConfig::bare(),
             controllers: ControllersConfig::bare(),
             consistency: ConsistencyConfig::bare(),
+            runtime: RuntimeConfig::bare(),
         }
     }
 
@@ -135,6 +141,7 @@ impl TieredConfig for EngenhoConfig {
             scheduler: SchedulerConfig::prescribed_default(),
             controllers: ControllersConfig::prescribed_default(),
             consistency: ConsistencyConfig::prescribed_default(),
+            runtime: RuntimeConfig::prescribed_default(),
         }
     }
 
@@ -146,6 +153,7 @@ impl TieredConfig for EngenhoConfig {
             scheduler: self.scheduler.extend(&base.scheduler),
             controllers: self.controllers.extend(&base.controllers),
             consistency: self.consistency.extend(&base.consistency),
+            runtime: self.runtime.extend(&base.runtime),
         }
     }
 }
@@ -175,6 +183,7 @@ impl EngenhoConfig {
         self.scheduler.validate()?;
         self.controllers.validate()?;
         self.consistency.validate()?;
+        self.runtime.validate()?;
 
         // Cross-section: quorum-requiring consensus needs >=3 nodes.
         if matches!(
@@ -188,6 +197,62 @@ impl EngenhoConfig {
             )));
         }
         Ok(())
+    }
+
+    /// Discover + load the operator config via the shikumi cascade,
+    /// layered on [`Self::prescribed_default`]:
+    ///
+    /// ```text
+    /// 1. $ENGENHO_CONFIG (single file)
+    /// 2. $XDG_CONFIG_HOME/engenho/engenho.yaml (~/.config/engenho/…)
+    /// 3. /etc/engenho/engenho.yaml
+    /// 4. prescribed_default() — compiled-in safe values (no file found)
+    /// ```
+    ///
+    /// The first existing file wins; its YAML overlays the prescribed
+    /// defaults (operators specify only what they override). When no
+    /// file is found, returns `prescribed_default()` unchanged. The
+    /// returned config is always `validate()`d.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Parse`] if a discovered file can't be
+    /// read or is malformed; [`ConfigError::Incoherent`] /
+    /// [`ConfigError::InvalidField`] on a validation failure.
+    pub fn discover() -> Result<Self, ConfigError> {
+        match Self::discover_path() {
+            Some(path) => {
+                let yaml = std::fs::read_to_string(&path).map_err(|e| {
+                    ConfigError::Parse(format!("reading {}: {e}", path.display()))
+                })?;
+                Self::from_yaml_with_defaults(&yaml)
+            }
+            None => {
+                let cfg = Self::prescribed_default();
+                cfg.validate()?;
+                Ok(cfg)
+            }
+        }
+    }
+
+    /// Resolve the first existing config file path via the cascade
+    /// (`$ENGENHO_CONFIG` → XDG → `/etc/engenho/engenho.yaml`), or
+    /// `None` when no file exists. Separated from [`Self::discover`]
+    /// so callers (and tests) can introspect which file would be used.
+    #[must_use]
+    pub fn discover_path() -> Option<std::path::PathBuf> {
+        // Tier 1 + 2: env override + XDG/home standard paths.
+        let discovery = shikumi::ConfigDiscovery::new("engenho").env_override("ENGENHO_CONFIG");
+        if let Ok(path) = discovery.discover() {
+            return Some(path);
+        }
+        // Tier 3: system-wide /etc location (not part of shikumi's
+        // default XDG/home scan).
+        let etc = std::path::PathBuf::from("/etc/engenho/engenho.yaml");
+        if etc.exists() {
+            return Some(etc);
+        }
+        None
     }
 
     /// Parse an `EngenhoConfig` from YAML, layered on prescribed

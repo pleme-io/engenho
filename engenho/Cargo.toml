@@ -20,4 +20,11 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-engenho-types = { workspace = true }
+engenho-types      = { workspace = true }
+engenho-config     = { workspace = true }
+engenho-runtime    = { workspace = true }
+
+anyhow             = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
