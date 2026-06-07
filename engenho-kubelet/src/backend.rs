@@ -277,6 +277,57 @@ impl PullPolicy {
     }
 }
 
+/// Podman network the backend attaches every container to. Typed so
+/// the network-membership knob is a closed enum (mirroring [`PullPolicy`])
+/// rather than a bare string threaded through the run path.
+///
+/// M0.3 defaults to [`PodmanNetwork::Named`]`("engenho-net")`: a single
+/// shared user-defined network every engenho pod joins so containers
+/// reach each other by IP (pod-to-pod L3 connectivity). On podman 5.x /
+/// netavark a user-defined network is reachable container-to-container
+/// AND surfaces a per-network IP under
+/// `NetworkSettings.Networks.<net>.IPAddress` — which is what the
+/// kubelet records as `status.podIP`. The legacy top-level
+/// `NetworkSettings.IPAddress` field is empty on modern netavark, so a
+/// shared named network is load-bearing for the podIP→Endpoints path.
+///
+/// [`PodmanNetwork::Default`] keeps the backend forward-compatible: an
+/// operator who wants podman's ambient default network (no `--network`
+/// flag) selects it. No `format!()` for the flag value — the typed
+/// method returns the network name directly (per ★★ TYPED EMISSION).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "name")]
+pub enum PodmanNetwork {
+    /// Attach every container to a named user-defined network. The
+    /// M0.3 default (`"engenho-net"`); [`PodmanBackend::ensure_network`]
+    /// idempotently creates it before the first `start`.
+    Named(String),
+    /// Use podman's ambient default network — emit NO `--network` flag.
+    /// Forward-compat escape hatch; the per-network IP extraction still
+    /// works because the inspect template ranges over ALL networks.
+    Default,
+}
+
+impl Default for PodmanNetwork {
+    fn default() -> Self {
+        Self::Named("engenho-net".to_string())
+    }
+}
+
+impl PodmanNetwork {
+    /// The network NAME this variant attaches to, or `None` for
+    /// [`PodmanNetwork::Default`] (no explicit network). Used to decide
+    /// whether `run_argv` emits a `--network <name>` flag and whether
+    /// `ensure_network` has work to do. Typed accessor — no `format!()`.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            PodmanNetwork::Named(n) => Some(n.as_str()),
+            PodmanNetwork::Default => None,
+        }
+    }
+}
+
 /// Real podman backend. Shells out to the `podman` CLI on the host.
 /// Designed for local engenho-managed clusters running on Darwin
 /// (podman machine) + Linux nodes. Per the org's NO SHELL rule,
@@ -302,7 +353,24 @@ impl PullPolicy {
 ///     surfaces a podman name-conflict as a recognizable typed error
 ///     (stderr contains "already in use") rather than a generic failure.
 ///
+/// ## Networking invariants (M0.3)
+///
+///   * **Shared network membership** — every `podman run` carries
+///     `--network <name>` (default `engenho-net`) so all engenho pods
+///     join ONE user-defined network + reach each other by IP.
+///     [`ensure_network`] idempotently creates it (exists-then-create)
+///     before the first `start`.
+///   * **Per-network IP extraction** — `inspect` reads the per-network
+///     `NetworkSettings.Networks.<net>.IPAddress` (ranged over all
+///     networks), NOT the empty legacy top-level `NetworkSettings.IPAddress`
+///     field, so the kubelet records a real `status.podIP` → the
+///     EndpointsController populates Service Endpoints with real IPs.
+///   * **Prompt IP surfacing** — after a successful `run`, `start`
+///     re-inspects so it can return `pod_ip: Some(..)` immediately,
+///     closing the one-tick empty-Endpoints window.
+///
 /// [`registry_auth_file`]: PodmanBackend::registry_auth_file
+/// [`ensure_network`]: PodmanBackend::ensure_network
 pub struct PodmanBackend {
     /// Binary name or absolute path of the podman CLI (default `podman`).
     pub binary: String,
@@ -313,6 +381,10 @@ pub struct PodmanBackend {
     /// ambient `REGISTRY_AUTH_FILE`. `Some(path)` forces it explicitly so
     /// a test is deterministic without depending on ambient env.
     pub registry_auth_file: Option<PathBuf>,
+    /// Shared podman network every container joins (default
+    /// [`PodmanNetwork::Named`]`("engenho-net")`). Makes pod-to-pod
+    /// L3 connectivity + per-network IP extraction work.
+    pub network: PodmanNetwork,
 }
 
 impl Default for PodmanBackend {
@@ -321,6 +393,7 @@ impl Default for PodmanBackend {
             binary: "podman".to_string(),
             pull_policy: PullPolicy::Never,
             registry_auth_file: None,
+            network: PodmanNetwork::default(),
         }
     }
 }
@@ -359,24 +432,41 @@ impl PodmanBackend {
         self
     }
 
+    /// Builder: set the shared [`PodmanNetwork`] every container joins.
+    /// Defaults to `Named("engenho-net")`; pass [`PodmanNetwork::Default`]
+    /// to use podman's ambient network (no `--network` flag).
+    #[must_use]
+    pub fn with_network(mut self, network: PodmanNetwork) -> Self {
+        self.network = network;
+        self
+    }
+
     // ── Pure typed argv builders (unit-testable without podman) ─────────
     //
     // Each builder emits the argv AFTER the binary, so a test can assert
     // the exact ContainerSpec → podman mapping without spawning a process.
     // The async methods below construct their `Command` from these vecs.
 
-    /// `podman run` argv for `spec`, honoring `pull_policy`:
-    /// `["run","-d","--pull",<policy>,"--name",<name>, (-e k=v)*, <image>, (cmd)*]`.
+    /// `podman run` argv for `spec`, honoring `pull_policy` + `network`:
+    /// `["run","-d", ("--network",<net>)?, "--pull",<policy>,"--name",<name>, (-e k=v)*, <image>, (cmd)*]`.
+    ///
+    /// The `--network <name>` flag is emitted immediately after `-d` when
+    /// the backend's [`PodmanNetwork`] names a network (the M0.3 default
+    /// `engenho-net`); [`PodmanNetwork::Default`] omits it (ambient
+    /// network).
     #[must_use]
     pub fn run_argv(&self, spec: &ContainerSpec) -> Vec<String> {
-        let mut argv = vec![
-            "run".to_string(),
-            "-d".to_string(),
-            "--pull".to_string(),
-            self.pull_policy.flag_value().to_string(),
-            "--name".to_string(),
-            spec.name.clone(),
-        ];
+        let mut argv = vec!["run".to_string(), "-d".to_string()];
+        // Shared-network membership: pod-to-pod L3 connectivity + a
+        // per-network IP the kubelet records as status.podIP.
+        if let Some(net) = self.network.name() {
+            argv.push("--network".to_string());
+            argv.push(net.to_string());
+        }
+        argv.push("--pull".to_string());
+        argv.push(self.pull_policy.flag_value().to_string());
+        argv.push("--name".to_string());
+        argv.push(spec.name.clone());
         // BTreeMap iteration is sorted → deterministic env ordering.
         for (k, v) in &spec.env {
             argv.push("-e".to_string());
@@ -392,14 +482,51 @@ impl PodmanBackend {
     /// `podman inspect` argv for `id` — the exact pipe template the
     /// status parser ([`parse_inspect`]) consumes.
     ///
+    /// The third field reads the **per-network** IP by ranging over
+    /// `NetworkSettings.Networks` — NOT the legacy top-level
+    /// `NetworkSettings.IPAddress`, which is EMPTY on modern netavark
+    /// (podman 5.x) when the container is on a user-defined network. Each
+    /// engenho container is attached to exactly one network (`engenho-net`),
+    /// so the range yields exactly that network's `IPAddress`. Ranging
+    /// (rather than hard-coding the network name) keeps the template robust
+    /// if [`PodmanNetwork`] is reconfigured. Empty (no networks / unbound)
+    /// → `parse_inspect` yields `pod_ip = None`.
+    ///
     /// [`parse_inspect`]: PodmanBackend::parse_inspect
     #[must_use]
     pub fn inspect_argv(id: &str) -> Vec<String> {
         vec![
             "inspect".to_string(),
             "--format".to_string(),
-            "{{.State.Running}}|{{.State.ExitCode}}|{{.NetworkSettings.IPAddress}}".to_string(),
+            "{{.State.Running}}|{{.State.ExitCode}}|{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}".to_string(),
             id.to_string(),
+        ]
+    }
+
+    /// `podman network exists <name>` argv — exits 0 iff the network is
+    /// already present. Used by [`ensure_network`] to make creation
+    /// idempotent.
+    ///
+    /// [`ensure_network`]: PodmanBackend::ensure_network
+    #[must_use]
+    pub fn network_exists_argv(name: &str) -> Vec<String> {
+        vec![
+            "network".to_string(),
+            "exists".to_string(),
+            name.to_string(),
+        ]
+    }
+
+    /// `podman network create <name>` argv — creates the shared
+    /// user-defined network. A name-conflict (race / leftover) is treated
+    /// as success by [`ensure_network`] (idempotent), mirroring the
+    /// run-path "already in use" handling.
+    #[must_use]
+    pub fn network_create_argv(name: &str) -> Vec<String> {
+        vec![
+            "network".to_string(),
+            "create".to_string(),
+            name.to_string(),
         ]
     }
 
@@ -466,6 +593,62 @@ impl PodmanBackend {
         }
         cmd
     }
+
+    /// Idempotently ensure the shared engenho podman network exists.
+    ///
+    /// Runs `podman network exists <name>` first; if that exits 0 the
+    /// network is already present and we're done. Otherwise we run
+    /// `podman network create <name>` and treat a name-conflict
+    /// ("already exists" / "already used" — a race or a leftover) as
+    /// success, mirroring the run-path name-conflict handling. A
+    /// [`PodmanNetwork::Default`] backend has no named network to ensure,
+    /// so this is a no-op.
+    ///
+    /// The kubelet/Runtime calls this once before the first `start`
+    /// (or eagerly at construction) so every subsequent `podman run
+    /// --network <name>` finds the network present.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] if `podman network create` fails for a
+    /// reason OTHER than the network already existing (spawn failure,
+    /// permission denied, etc.) — surfaced, never silently swallowed.
+    pub async fn ensure_network(&self) -> Result<(), KubeletError> {
+        let Some(name) = self.network.name() else {
+            // PodmanNetwork::Default — nothing to ensure.
+            return Ok(());
+        };
+
+        // (1) exists? — `podman network exists <name>` exits 0 iff present.
+        let exists = self
+            .command(&Self::network_exists_argv(name))
+            .output()
+            .await
+            .map_err(|e| KubeletError::Backend(format!("podman network exists spawn: {e}")))?;
+        if exists.status.success() {
+            return Ok(());
+        }
+
+        // (2) create — idempotent: a concurrent creator / leftover that
+        // wins the race surfaces an "already exists" stderr we treat as
+        // success (mirrors the run-path "already in use" handling).
+        let created = self
+            .command(&Self::network_create_argv(name))
+            .output()
+            .await
+            .map_err(|e| KubeletError::Backend(format!("podman network create spawn: {e}")))?;
+        if created.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&created.stderr);
+        if stderr.contains("already exists") || stderr.contains("already used") {
+            return Ok(());
+        }
+        Err(KubeletError::Backend(format!(
+            "podman network create {name:?} failed (status {:?}): {stderr}",
+            created.status.code(),
+        )))
+    }
 }
 
 #[async_trait]
@@ -475,6 +658,12 @@ impl ContainerRuntime for PodmanBackend {
     }
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
+        // (M0.3 item a) Ensure the shared engenho network exists before the
+        // first run so `--network <name>` resolves. Idempotent + cheap
+        // (exists-check short-circuits after the first creation); a
+        // PodmanNetwork::Default backend makes this a no-op.
+        self.ensure_network().await?;
+
         let argv = self.run_argv(spec);
         let out = self
             .command(&argv)
@@ -502,12 +691,26 @@ impl ContainerRuntime for PodmanBackend {
             )));
         }
         let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        Ok(ContainerStatus {
-            container_id,
-            running: true,
-            pod_ip: None, // podman inspect needed; deferred to status()
-            exit_code: None,
-        })
+
+        // (M0.3 item c) Re-inspect immediately so `start` can return a real
+        // per-network `pod_ip` instead of always `None`, closing the
+        // one-tick empty-Endpoints window. The IP is usually assigned by
+        // the time `run` returns the container id; if it isn't yet (rare
+        // race) we fall back to `running: true, pod_ip: None` — the
+        // kubelet's reconcile_running poll converges it on the next tick,
+        // so this is a latency optimization, not a correctness dependency.
+        // An inspect error here is non-fatal for the same reason: the
+        // container DID start (run succeeded); we just couldn't read its IP
+        // yet, so we return the started status and let the poll path retry.
+        match self.status(&container_id).await {
+            Ok(Some(observed)) if observed.running => Ok(observed),
+            _ => Ok(ContainerStatus {
+                container_id,
+                running: true,
+                pod_ip: None, // not yet readable; status() poll converges it
+                exit_code: None,
+            }),
+        }
     }
 
     async fn status(&self, container_id: &str) -> Result<Option<ContainerStatus>, KubeletError> {
@@ -744,6 +947,9 @@ mod tests {
             vec![
                 "run",
                 "-d",
+                // M0.3: shared-network membership, right after -d.
+                "--network",
+                "engenho-net",
                 "--pull",
                 "never",
                 "--name",
@@ -763,10 +969,12 @@ mod tests {
         let s = spec("c", "img", &[], &["echo", "hi"]);
         let argv = backend.run_argv(&s);
         assert!(!argv.iter().any(|a| a == "-e"), "no -e for empty env: {argv:?}");
-        // ["run","-d","--pull","never","--name","c","img","echo","hi"]
         assert_eq!(
             argv,
-            vec!["run", "-d", "--pull", "never", "--name", "c", "img", "echo", "hi"]
+            vec![
+                "run", "-d", "--network", "engenho-net", "--pull", "never", "--name", "c", "img",
+                "echo", "hi"
+            ]
         );
     }
 
@@ -776,7 +984,7 @@ mod tests {
         let s = spec("c", "img", &[], &[]);
         assert_eq!(
             backend.run_argv(&s),
-            vec!["run", "-d", "--pull", "never", "--name", "c", "img"]
+            vec!["run", "-d", "--network", "engenho-net", "--pull", "never", "--name", "c", "img"]
         );
     }
 
@@ -790,7 +998,7 @@ mod tests {
         assert_eq!(
             backend.run_argv(&s),
             vec![
-                "run", "-d", "--pull", "never", "--name", "c", //
+                "run", "-d", "--network", "engenho-net", "--pull", "never", "--name", "c", //
                 "-e", "ALPHA=1", "-e", "MID=5", "-e", "ZED=9", //
                 "img",
             ]
@@ -807,18 +1015,107 @@ mod tests {
         assert_eq!(argv[pull_idx + 1], "newer");
     }
 
+    // ── M0.3 shared-network membership ──────────────────────────────────
+
+    #[test]
+    fn run_argv_includes_shared_network_right_after_d() {
+        let backend = PodmanBackend::new();
+        let s = spec("c", "img", &[], &[]);
+        let argv = backend.run_argv(&s);
+        // --network engenho-net is emitted immediately after -d.
+        let d_idx = argv.iter().position(|a| a == "-d").unwrap();
+        assert_eq!(argv[d_idx + 1], "--network");
+        assert_eq!(argv[d_idx + 2], "engenho-net");
+    }
+
+    #[test]
+    fn run_argv_with_custom_named_network_overrides() {
+        let backend = PodmanBackend::new().with_network(PodmanNetwork::Named("custom-net".into()));
+        let s = spec("c", "img", &[], &[]);
+        let argv = backend.run_argv(&s);
+        let net_idx = argv.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(argv[net_idx + 1], "custom-net");
+    }
+
+    #[test]
+    fn run_argv_default_network_emits_no_network_flag() {
+        // PodmanNetwork::Default → ambient network → NO --network flag.
+        let backend = PodmanBackend::new().with_network(PodmanNetwork::Default);
+        let s = spec("c", "img", &[], &[]);
+        let argv = backend.run_argv(&s);
+        assert!(
+            !argv.iter().any(|a| a == "--network"),
+            "Default network must not emit --network: {argv:?}"
+        );
+        assert_eq!(
+            argv,
+            vec!["run", "-d", "--pull", "never", "--name", "c", "img"]
+        );
+    }
+
+    #[test]
+    fn podman_network_default_is_engenho_net() {
+        assert_eq!(
+            PodmanNetwork::default(),
+            PodmanNetwork::Named("engenho-net".into())
+        );
+        assert_eq!(PodmanBackend::new().network.name(), Some("engenho-net"));
+    }
+
+    #[test]
+    fn podman_network_name_accessor() {
+        assert_eq!(PodmanNetwork::Named("x".into()).name(), Some("x"));
+        assert_eq!(PodmanNetwork::Default.name(), None);
+    }
+
+    #[test]
+    fn network_exists_argv_shape() {
+        assert_eq!(
+            PodmanBackend::network_exists_argv("engenho-net"),
+            vec!["network", "exists", "engenho-net"]
+        );
+    }
+
+    #[test]
+    fn network_create_argv_shape() {
+        assert_eq!(
+            PodmanBackend::network_create_argv("engenho-net"),
+            vec!["network", "create", "engenho-net"]
+        );
+    }
+
+    #[test]
+    fn with_network_keeps_other_defaults() {
+        let backend = PodmanBackend::new().with_network(PodmanNetwork::Named("n".into()));
+        assert_eq!(backend.network, PodmanNetwork::Named("n".into()));
+        assert_eq!(backend.pull_policy, PullPolicy::Never);
+        assert!(backend.registry_auth_file.is_none());
+    }
+
     // ── inspect / stop / rm argv ────────────────────────────────────────
 
     #[test]
-    fn inspect_argv_uses_exact_pipe_template() {
+    fn inspect_argv_reads_per_network_ip() {
+        let argv = PodmanBackend::inspect_argv("abc123");
         assert_eq!(
-            PodmanBackend::inspect_argv("abc123"),
+            argv,
             vec![
                 "inspect",
                 "--format",
-                "{{.State.Running}}|{{.State.ExitCode}}|{{.NetworkSettings.IPAddress}}",
+                "{{.State.Running}}|{{.State.ExitCode}}|{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
                 "abc123",
             ]
+        );
+        // Regression guard: the template MUST read the per-network IP,
+        // NOT the empty legacy top-level NetworkSettings.IPAddress field.
+        let template = &argv[2];
+        assert!(
+            template.contains(".NetworkSettings.Networks"),
+            "inspect template must range over .NetworkSettings.Networks: {template}"
+        );
+        assert!(
+            !template.contains("{{.NetworkSettings.IPAddress}}"),
+            "inspect template must NOT read the empty legacy top-level field: {template}"
         );
     }
 
@@ -862,5 +1159,38 @@ mod tests {
     fn parse_inspect_rejects_short_shape() {
         let err = PodmanBackend::parse_inspect("cid", "true|0").unwrap_err();
         assert_eq!(err.kind(), "backend");
+    }
+
+    // ── M0.3 per-network IP regression guards ──────────────────────────
+    //
+    // The new inspect template ranges over .NetworkSettings.Networks and
+    // emits each network's IPAddress (no separator) as the third pipe
+    // field. With exactly one engenho-net membership, that's a single
+    // dotted-quad. parse_inspect's split('|') + parts[2] logic is
+    // unchanged; these tests pin the two ends of the fix.
+
+    #[test]
+    fn parse_inspect_per_network_ip_is_surfaced() {
+        // The fixed behavior: a non-empty per-network IP → pod_ip Some.
+        let s = PodmanBackend::parse_inspect("cid", "true|0|10.89.0.4").unwrap();
+        assert!(s.running);
+        assert_eq!(s.exit_code, Some(0));
+        assert_eq!(s.pod_ip.as_deref(), Some("10.89.0.4"));
+    }
+
+    #[test]
+    fn parse_inspect_empty_per_network_ip_is_none() {
+        // Documents the OLD broken behavior that GAP A produced: the
+        // legacy top-level field was empty → third field empty → None →
+        // status.podIP never written → Endpoints stayed empty. With the
+        // fixed template a netavark container yields a real IP (test
+        // above); this proves an empty third field still maps to None so
+        // an unbound / not-yet-networked container is honestly reported.
+        let s = PodmanBackend::parse_inspect("cid", "true|0|").unwrap();
+        assert!(s.running);
+        assert!(
+            s.pod_ip.is_none(),
+            "empty per-network IP must yield pod_ip None"
+        );
     }
 }

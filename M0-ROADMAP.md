@@ -60,7 +60,7 @@ This collapses M0.0 from "build a codegen framework" to "add a backend."
 | kubelet + CRI | M0.1 seed — 1,551 LoC, ContainerRuntime trait (Podman/Fake), r10 tests | real containerd CRI client; probes; volumes; `/exec` `/log` `/portforward`; cgroup-v2 |
 | types catalog | **typed emission DONE (2026-06-06)** — 18 cataloged kinds GENERATED typed (typed spec/status + globally-deduped shared sub-struct module + curated-enum overrides) by in-tree `engenho-kube-codegen`; `--check` deterministic; zero hand-authored kinds | expand 18 → ~150 kinds across ~16 API groups (mechanical: add `KIND_CATALOG` rows + vendor the group's OpenAPI) |
 | controllers + scheduler | isolated library seeds (admission trait, crd scaffold) | 18-controller set, scheduler profile, apiserver-driven reconcile |
-| **networking** (CNI/DNS/kube-proxy/local-path/CA) | **M0.0 — none exist** | the largest greenfield |
+| **networking** (CNI/DNS/kube-proxy/local-path/CA) | **M0.3 foundation brick landed** — pods get real IPs on a shared `engenho-net` podman network, kubelet records `status.podIP`, EndpointsController populates Service Endpoints (ignore-gated real-podman e2e green: 2-replica Deployment → real IPs → Endpoints carry them → pod-to-pod TCP reachability); ServiceRouter/DNS controllers are typed-surface seeds | ClusterIP allocation + real kube-proxy apply, CNI bridge/IPAM, DNS authority, local-path, cluster CA (the M0.4 greenfield) |
 | binary + supervision | M0.0 — `main.rs` prints + exits | tatara `defguest` surgery; subsystem assembly |
 
 ## Critical path (what unblocks what)

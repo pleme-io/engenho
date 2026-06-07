@@ -292,6 +292,46 @@ mod tests {
     }
 
     #[test]
+    fn build_endpoints_two_addresses_in_sorted_order() {
+        // M0.3 podIP→Endpoints math: two ready pods on the same selector
+        // produce a 2-address subset. The controller sorts addresses
+        // (endpoints.rs:170) before building, so the IP+name pairs land in
+        // deterministic order regardless of pod-listing order — proven
+        // here by feeding them pre-sorted (as the controller does) and
+        // asserting both IPs + their targetRefs survive intact. This pins
+        // the Endpoints-from-pods computation with NO container runtime.
+        let svc = json!({
+            "metadata": {"name": "podinfo"},
+            "spec": {"selector": {"app": "podinfo"}, "ports": [{"port": 80, "targetPort": 80}]}
+        });
+        let mut addrs = vec![
+            ("10.89.0.7".to_string(), "pod-b".to_string()),
+            ("10.89.0.4".to_string(), "pod-a".to_string()),
+        ];
+        // Mirror the controller's `addresses.sort()` before build.
+        addrs.sort();
+        let ep = EndpointsController::build_endpoints(&svc, addrs);
+        let subsets = ep.get("subsets").unwrap().as_array().unwrap();
+        assert_eq!(subsets.len(), 1);
+        let addresses = subsets[0].get("addresses").unwrap().as_array().unwrap();
+        assert_eq!(addresses.len(), 2);
+        // Sorted: 10.89.0.4 (pod-a) before 10.89.0.7 (pod-b).
+        assert_eq!(addresses[0].get("ip").unwrap(), "10.89.0.4");
+        assert_eq!(
+            addresses[0].get("targetRef").unwrap().get("name").unwrap(),
+            "pod-a"
+        );
+        assert_eq!(addresses[1].get("ip").unwrap(), "10.89.0.7");
+        assert_eq!(
+            addresses[1].get("targetRef").unwrap().get("name").unwrap(),
+            "pod-b"
+        );
+        // Port copied from the Service.
+        let ports = subsets[0].get("ports").unwrap().as_array().unwrap();
+        assert_eq!(ports[0].get("port").unwrap(), 80);
+    }
+
+    #[test]
     fn subsets_equivalent_compares_only_subsets() {
         let a = json!({"metadata": {"resourceVersion": "5"}, "subsets": [{"x": 1}]});
         let b = json!({"metadata": {"resourceVersion": "99"}, "subsets": [{"x": 1}]});
