@@ -141,7 +141,7 @@ async fn delete_emits_deleted_event() {
     store
         .propose(ResourceCommand::Put {
             key: pod_key("p"),
-            value: json!({"spec": {}}),
+            value: json!({"spec": {"image": "podinfo"}}),
             reason: Reason::Operator,
         })
         .await
@@ -162,6 +162,20 @@ async fn delete_emits_deleted_event() {
         .unwrap();
     assert_eq!(ev.kind, WatchEventKind::Deleted);
     assert_eq!(ev.key.name, "p");
+    // The Deleted event MUST carry the last-known object (the
+    // tombstone), never Null. Regression for the "Deleted-event
+    // prior-object" bug: catalog.apply now captures the pre-image
+    // before removal + returns it in the Change, so the event's
+    // object is the real prior spec.
+    assert!(
+        !ev.object.is_null(),
+        "Deleted event object must be the prior object, not Null"
+    );
+    assert_eq!(
+        ev.object.get("spec").unwrap().get("image").unwrap(),
+        "podinfo",
+        "Deleted event carries the original spec"
+    );
 
     drop(watch);
     let mesh = Arc::try_unwrap(store).ok().unwrap();
@@ -253,7 +267,7 @@ async fn late_subscriber_does_not_see_history() {
 }
 
 #[tokio::test]
-async fn watch_event_resource_version_matches_apply_index() {
+async fn watch_event_resource_version_matches_revision() {
     let store = boot().await;
     let mut watch = store.watch();
 
@@ -269,8 +283,12 @@ async fn watch_event_resource_version_matches_apply_index() {
         .await
         .unwrap()
         .unwrap();
-    // The WatchEvent.resource_version equals the apply_index returned to the proposer.
-    assert_eq!(ev.resource_version, result.applied_index);
+    // The WatchEvent.resource_version equals the global MVCC revision
+    // stamped on the mutation (decoupled from the Raft log index).
+    assert_eq!(ev.resource_version, result.revision);
+    // First real mutation → revision 1 (the blank init entry at Raft
+    // index 1 consumed no revision).
+    assert_eq!(result.revision, 1);
 
     drop(watch);
     let mesh = Arc::try_unwrap(store).ok().unwrap();

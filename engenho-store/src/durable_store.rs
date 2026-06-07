@@ -96,7 +96,7 @@ impl DurableInMemoryStore {
         // Journal FIRST; catalog state must never get ahead of disk.
         self.log.append(index, &entry)?;
         let mut catalog = self.catalog.lock().await;
-        Ok(catalog.apply(command, term, index))
+        Ok(catalog.apply(command, term, index).op)
     }
 
     /// Read a resource from the in-memory catalog.
