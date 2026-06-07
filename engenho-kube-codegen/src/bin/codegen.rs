@@ -59,14 +59,31 @@ fn main() -> Result<()> {
 
     // Group catalog entries by module (core_v1, apps_v1, rbac_v1).
     // BTreeMap so emission order is deterministic across runs.
+    //
+    // OPAQUE kinds (no vendored OpenAPI schema, no typed struct — e.g.
+    // `apiextensions.k8s.io/v1.CustomResourceDefinition`, stored as plain
+    // JSON) are EXCLUDED from per-module struct emission here. They have no
+    // `module` / `openapi_key`, so they only appear as a `RESOURCE_CATALOG`
+    // row (emitted below over the FULL `KIND_CATALOG`). Skipping them keeps
+    // `schema_path_for_group` from panicking on a group with no vendored
+    // schema + keeps the merged-schemas lookup from failing.
     let mut by_module: BTreeMap<&'static str, Vec<&KindEntry>> = BTreeMap::new();
     for e in KIND_CATALOG {
+        if e.opaque {
+            continue;
+        }
         by_module.entry(e.module).or_default().push(e);
     }
 
-    // Cache loaded OpenAPI docs per group so we don't re-parse.
+    // Cache loaded OpenAPI docs per group so we don't re-parse. Opaque
+    // kinds carry no schema (their group may have no vendored doc), so
+    // they're skipped — `schema_path_for_group` only sees schema-backed
+    // groups.
     let mut docs: BTreeMap<&'static str, OpenApiDoc> = BTreeMap::new();
     for entry in KIND_CATALOG {
+        if entry.opaque {
+            continue;
+        }
         if !docs.contains_key(entry.group) {
             let path = schema_path_for_group(&args.schema, entry.group);
             let doc = OpenApiDoc::load(&path)
@@ -97,8 +114,17 @@ fn main() -> Result<()> {
     // Emit the shared sub-struct module (types.rs) once — every kind's $ref
     // closure, globally deduplicated into one canonical set.
     {
-        let kind_keys: Vec<&str> = KIND_CATALOG.iter().map(|e| e.openapi_key).collect();
-        let kind_names: Vec<&str> = KIND_CATALOG.iter().map(|e| e.kind).collect();
+        // Opaque kinds have no schema → no shared sub-structs to seed.
+        let kind_keys: Vec<&str> = KIND_CATALOG
+            .iter()
+            .filter(|e| !e.opaque)
+            .map(|e| e.openapi_key)
+            .collect();
+        let kind_names: Vec<&str> = KIND_CATALOG
+            .iter()
+            .filter(|e| !e.opaque)
+            .map(|e| e.kind)
+            .collect();
         let shared = shared_substructs(&kind_keys, &kind_names, &schemas);
         let shared_src = emit_shared_module(&shared, KIND_CATALOG);
         let shared_target = args.output.join("types.rs");

@@ -79,6 +79,11 @@ gen-types = { git = "https://github.com/pleme-io/gen" }
 shigoto-types = { version = "0.1", git = "https://github.com/pleme-io/shigoto", rev = "417bf9d538a1741c5576b29a4d71673e92cf5d22" }
 
 axum                   = "0.7"
+# Lock-free runtime-mutable handler table for the apiserver dispatch map.
+# ArcSwap::load() is a cheap atomic load on the hot read path (every
+# request's lookup); register/unregister is a rare clone-insert-swap via
+# rcu (read-copy-update, lost-write-safe under racing CrdController ticks).
+arc-swap               = "1"
 hyper                  = "1"
 tower                  = "0.5"
 reqwest                = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

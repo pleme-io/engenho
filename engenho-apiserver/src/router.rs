@@ -70,7 +70,20 @@ pub type HandlerKey = (String, String, String);
 #[derive(Clone)]
 pub struct RouterState {
     /// `(group, version, plural)` → handler. Lookup is O(1).
-    pub handlers: Arc<HashMap<HandlerKey, Arc<dyn ResourceHandler>>>,
+    ///
+    /// Wrapped in an [`arc_swap::ArcSwap`] so the table is RUNTIME-MUTABLE:
+    /// the hot read path ([`Self::lookup`], [`Self::handler_set`]) loads a
+    /// snapshot lock-free (a cheap atomic load returning a guarded
+    /// `Arc<HashMap>`), while [`Self::register`] / [`Self::unregister`] do a
+    /// rare clone-insert-swap via `rcu` (read-copy-update, lost-write-safe
+    /// under concurrent CrdController ticks). This is what lets the
+    /// CrdController register a `StoreBackedHandler` for a freshly-installed
+    /// CRD's served version at runtime — the swap is visible to in-flight
+    /// requests immediately. The outer `Arc` makes `RouterState`
+    /// cheaply-cloneable into axum `with_state` while every clone shares the
+    /// SAME `ArcSwap`, so a `register()` from the controller task is seen by
+    /// every per-request handler clone.
+    pub handlers: Arc<arc_swap::ArcSwap<HashMap<HandlerKey, Arc<dyn ResourceHandler>>>>,
 }
 
 impl RouterState {
@@ -78,27 +91,71 @@ impl RouterState {
     pub fn new(handlers: Vec<Arc<dyn ResourceHandler>>) -> Self {
         let map: HashMap<HandlerKey, Arc<dyn ResourceHandler>> = handlers
             .into_iter()
-            .map(|h| {
-                (
-                    (
-                        h.group().to_string(),
-                        h.version().to_string(),
-                        h.plural().to_string(),
-                    ),
-                    h,
-                )
-            })
+            .map(|h| (Self::key_of(&h), h))
             .collect();
         Self {
-            handlers: Arc::new(map),
+            handlers: Arc::new(arc_swap::ArcSwap::from_pointee(map)),
         }
     }
 
+    /// The dispatch key `(group, version, plural)` for a handler.
+    fn key_of(h: &Arc<dyn ResourceHandler>) -> HandlerKey {
+        (
+            h.group().to_string(),
+            h.version().to_string(),
+            h.plural().to_string(),
+        )
+    }
+
+    /// Register a handler at runtime (clone-insert-swap via `rcu`). Used by
+    /// the apiserver-side [`crate::DynamicHandlerSink`] impl when the
+    /// `CrdController` observes a newly-served CRD version: it builds a
+    /// `StoreBackedHandler` for `(group, version, plural)` + names and lands
+    /// it here. `rcu` (read-copy-update) retries on a concurrent swap, so
+    /// two racing register/unregister calls never lose a write. Idempotent:
+    /// re-registering the same `(group, version, plural)` overwrites (a
+    /// harmless refresh — the same GVK handler).
+    pub fn register(&self, h: Arc<dyn ResourceHandler>) {
+        let key = Self::key_of(&h);
+        self.handlers.rcu(|cur| {
+            let mut m = HashMap::clone(cur);
+            m.insert(key.clone(), h.clone());
+            m
+        });
+    }
+
+    /// Unregister the handler keyed by `(group, version, plural)` (the CRD
+    /// GC path: a deleted CRD ⇒ its CR handler is removed, so subsequent CR
+    /// access resolves to a typed `NotFound`). Returns `true` iff a handler
+    /// was present + removed. `rcu` makes the remove lost-write-safe under
+    /// concurrent ticks.
+    pub fn unregister(&self, group: &str, version: &str, plural: &str) -> bool {
+        let key: HandlerKey = (group.to_string(), version.to_string(), plural.to_string());
+        // Pre-check on a snapshot for the boolean report, then swap. The
+        // window between the check + the rcu can only flip present→absent
+        // (no concurrent re-register of the SAME deleted CRD key in the same
+        // tick), so the reported bool matches the observed-desired transition
+        // the CrdController acts on. The rcu itself is the authoritative,
+        // lost-write-safe removal.
+        let present = self.handlers.load().contains_key(&key);
+        self.handlers.rcu(|cur| {
+            let mut m = HashMap::clone(cur);
+            m.remove(&key);
+            m
+        });
+        present
+    }
+
     /// The registered handlers, for discovery folding. Order is
-    /// unspecified (HashMap); discovery sorts for determinism.
+    /// unspecified (HashMap); discovery sorts for determinism. Returns
+    /// OWNED `Arc`s (cloned out of the loaded snapshot) because the
+    /// `ArcSwap` guard borrow can't escape the call — discovery's three
+    /// builders consume `h.as_ref()` / `h.group()` identically on an owned
+    /// `Arc`. The fold reads ONE snapshot, so a CRD-registered handler
+    /// appears in discovery AND routing atomically.
     #[must_use]
-    pub fn handler_set(&self) -> Vec<&Arc<dyn ResourceHandler>> {
-        self.handlers.values().collect()
+    pub fn handler_set(&self) -> Vec<Arc<dyn ResourceHandler>> {
+        self.handlers.load().values().cloned().collect()
     }
 
     /// Resolve a CORE-group handler by plural (keyed on `("","v1",plural)`).
@@ -113,7 +170,7 @@ impl RouterState {
     /// [`ApiError::NotFound`] when no core handler is registered for `plural`.
     #[cfg(test)]
     #[inline]
-    fn lookup_core(&self, plural: &str) -> Result<&Arc<dyn ResourceHandler>, ApiError> {
+    fn lookup_core(&self, plural: &str) -> Result<Arc<dyn ResourceHandler>, ApiError> {
         self.lookup("", "v1", plural)
     }
 
@@ -122,6 +179,12 @@ impl RouterState {
     /// into — the map key is already the full triple with `group=""`/
     /// `version="v1"` as the core sentinel, so this subsumes the old
     /// `lookup_core`.
+    ///
+    /// Returns an OWNED `Arc<dyn ResourceHandler>` (cloned from the loaded
+    /// snapshot) rather than `&Arc<…>`: the `ArcSwap` guard borrow can't
+    /// escape, so the resolved handler is cloned out. Cloning an `Arc` is a
+    /// single atomic refcount bump — negligible on the hot path, and the
+    /// verb handlers already cloned for the watch-unfold path.
     ///
     /// The `NotFound` message text branches on whether `group` is the core
     /// sentinel so the core-plural-miss body stays `unknown core kind
@@ -136,9 +199,10 @@ impl RouterState {
         group: &str,
         version: &str,
         plural: &str,
-    ) -> Result<&Arc<dyn ResourceHandler>, ApiError> {
-        self.handlers
-            .get(&(group.to_string(), version.to_string(), plural.to_string()))
+    ) -> Result<Arc<dyn ResourceHandler>, ApiError> {
+        let snap = self.handlers.load();
+        snap.get(&(group.to_string(), version.to_string(), plural.to_string()))
+            .cloned()
             .ok_or_else(|| {
                 if group.is_empty() {
                     // Core-group miss — preserve the exact legacy text so
@@ -706,18 +770,19 @@ async fn resource_get_or_list(
     reject_subresource(&coords)?;
     match &coords.name {
         // Collection GET → LIST or WATCH (the shared body branches on
-        // `p.watch`). Needs an owned `Arc` for the watch unfold stream.
+        // `p.watch`). `lookup` already returns an owned `Arc` (the
+        // ArcSwap-snapshot clone) — exactly what the watch unfold stream
+        // needs, no extra `.clone()`.
         None => {
-            let h = state
-                .lookup(coords.group_key(), coords.version_key(), &coords.plural)?
-                .clone();
+            let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
             do_list_or_watch(h, coords.namespace, p).await
         }
-        // Instance GET → the shared `do_get` body.
+        // Instance GET → the shared `do_get` body. Bind the owned `Arc`,
+        // pass it by reference (`do_get` takes `&Arc`).
         Some(name) => {
             let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
             do_get(
-                h,
+                &h,
                 coords.namespace.as_deref(),
                 name,
                 ResponseCodec::from_headers(&headers),
@@ -745,7 +810,7 @@ async fn resource_create(
         ));
     }
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    do_create(h, coords.namespace.as_deref(), &headers, &raw).await
+    do_create(&h, coords.namespace.as_deref(), &headers, &raw).await
 }
 
 /// PATCH on a resource path — PATCH a single instance (requires `name`).
@@ -760,7 +825,7 @@ async fn resource_patch(
         ApiError::BadRequest("PATCH requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    do_patch(h, coords.namespace.as_deref(), name, &headers, &raw).await
+    do_patch(&h, coords.namespace.as_deref(), name, &headers, &raw).await
 }
 
 /// DELETE on a resource path — DELETE a single instance (requires `name`).
@@ -775,7 +840,7 @@ async fn resource_delete(
         ApiError::BadRequest("DELETE requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    do_delete(h, coords.namespace.as_deref(), name, &headers, &p).await
+    do_delete(&h, coords.namespace.as_deref(), name, &headers, &p).await
 }
 
 #[cfg(test)]
@@ -794,9 +859,9 @@ mod tests {
     fn lookup_core_folds_into_lookup() {
         let state = RouterState::new(Vec::new());
 
-        // The Ok type (`&Arc<dyn ResourceHandler>`) is not `Debug`, so
+        // The Ok type (`Arc<dyn ResourceHandler>`) is not `Debug`, so
         // extract the miss error by match rather than `unwrap_err()`.
-        let msg = |r: Result<&Arc<dyn ResourceHandler>, ApiError>| match r {
+        let msg = |r: Result<Arc<dyn ResourceHandler>, ApiError>| match r {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected a NotFound miss against the empty handler set"),
         };
@@ -819,5 +884,297 @@ mod tests {
             grouped, "resource not found: unknown kind: apps/v1/deployments",
         );
         assert_ne!(grouped, via_core);
+    }
+
+    // ── runtime-mutable dispatch table (ArcSwap register/unregister) ─────
+    //
+    // A minimal `ResourceHandler` carrying only its GVK + plural. The
+    // routing-table assertions exercise ONLY the sync identity methods
+    // (`group`/`version`/`plural`/…); the async CRUD/watch methods are
+    // never called here, so they return a typed `ApiError` (NOT a panic /
+    // `unimplemented!()` — per the no-stub discipline, an unexercised
+    // surface returns a typed error, never a silent wrong answer).
+
+    struct FakeHandler {
+        group: String,
+        version: String,
+        kind: String,
+        plural: String,
+        namespaced: bool,
+        short_names: Vec<&'static str>,
+        singular: &'static str,
+    }
+
+    impl FakeHandler {
+        fn arc(
+            group: &str,
+            version: &str,
+            kind: &str,
+            plural: &str,
+            namespaced: bool,
+        ) -> Arc<dyn ResourceHandler> {
+            Arc::new(Self {
+                group: group.into(),
+                version: version.into(),
+                kind: kind.into(),
+                plural: plural.into(),
+                namespaced,
+                short_names: Vec::new(),
+                singular: "",
+            })
+        }
+
+        fn arc_with_meta(
+            group: &str,
+            version: &str,
+            kind: &str,
+            plural: &str,
+            namespaced: bool,
+            short_names: Vec<&'static str>,
+            singular: &'static str,
+        ) -> Arc<dyn ResourceHandler> {
+            Arc::new(Self {
+                group: group.into(),
+                version: version.into(),
+                kind: kind.into(),
+                plural: plural.into(),
+                namespaced,
+                short_names,
+                singular,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceHandler for FakeHandler {
+        fn group(&self) -> &str {
+            &self.group
+        }
+        fn version(&self) -> &str {
+            &self.version
+        }
+        fn kind(&self) -> &str {
+            &self.kind
+        }
+        fn plural(&self) -> &str {
+            &self.plural
+        }
+        fn namespaced(&self) -> bool {
+            self.namespaced
+        }
+        fn short_names(&self) -> &[&str] {
+            &self.short_names
+        }
+        fn singular_name(&self) -> &str {
+            self.singular
+        }
+        async fn get(&self, _ns: Option<&str>, _name: &str) -> Result<serde_json::Value, ApiError> {
+            Err(ApiError::Internal("fake handler: get not exercised".into()))
+        }
+        async fn list(&self, _ns: Option<&str>) -> Result<serde_json::Value, ApiError> {
+            Err(ApiError::Internal("fake handler: list not exercised".into()))
+        }
+        async fn list_at(
+            &self,
+            _ns: Option<&str>,
+            _sel: &crate::params::Selectors,
+        ) -> Result<(Vec<serde_json::Value>, engenho_store::Revision), ApiError> {
+            Err(ApiError::Internal("fake handler: list_at not exercised".into()))
+        }
+        async fn list_page(
+            &self,
+            _ns: Option<&str>,
+            _sel: &crate::params::Selectors,
+            _limit: usize,
+            _continue_token: Option<engenho_store::ContinueToken>,
+        ) -> Result<(Vec<serde_json::Value>, engenho_store::Revision, Option<String>, Option<u64>), ApiError>
+        {
+            Err(ApiError::Internal("fake handler: list_page not exercised".into()))
+        }
+        async fn watch_stream(
+            &self,
+            _ns: Option<&str>,
+            _from: crate::params::ResumePoint,
+            _allow_bookmarks: bool,
+        ) -> Result<engenho_store::WatchStream, ApiError> {
+            Err(ApiError::Internal("fake handler: watch_stream not exercised".into()))
+        }
+        async fn create(
+            &self,
+            _ns: Option<&str>,
+            _body: serde_json::Value,
+        ) -> Result<serde_json::Value, ApiError> {
+            Err(ApiError::Internal("fake handler: create not exercised".into()))
+        }
+        async fn patch(
+            &self,
+            _ns: Option<&str>,
+            _name: &str,
+            _patch: serde_json::Value,
+        ) -> Result<serde_json::Value, ApiError> {
+            Err(ApiError::Internal("fake handler: patch not exercised".into()))
+        }
+        async fn delete(
+            &self,
+            _ns: Option<&str>,
+            _name: &str,
+        ) -> Result<serde_json::Value, ApiError> {
+            Err(ApiError::Internal("fake handler: delete not exercised".into()))
+        }
+        async fn delete_with_precondition(
+            &self,
+            _ns: Option<&str>,
+            _name: &str,
+            _expected: Option<engenho_store::Revision>,
+        ) -> Result<serde_json::Value, ApiError> {
+            Err(ApiError::Internal("fake handler: delete_with_precondition not exercised".into()))
+        }
+    }
+
+    #[test]
+    fn register_then_lookup_resolves_the_handler() {
+        let state = RouterState::new(Vec::new());
+        // Empty table → a NotFound miss.
+        assert!(state.lookup("example.com", "v1", "widgets").is_err());
+
+        state.register(FakeHandler::arc("example.com", "v1", "Widget", "widgets", true));
+
+        let h = state
+            .lookup("example.com", "v1", "widgets")
+            .expect("registered Widget handler resolves");
+        assert_eq!(h.kind(), "Widget");
+        assert_eq!(h.plural(), "widgets");
+        assert!(h.namespaced());
+    }
+
+    #[test]
+    fn unregister_then_lookup_is_notfound() {
+        let state = RouterState::new(Vec::new());
+        state.register(FakeHandler::arc("example.com", "v1", "Widget", "widgets", true));
+        assert!(state.lookup("example.com", "v1", "widgets").is_ok());
+
+        let removed = state.unregister("example.com", "v1", "widgets");
+        assert!(removed, "unregister reports the handler was present");
+
+        // Subsequent lookup → typed NotFound with the grouped message. The
+        // Ok type (`Arc<dyn ResourceHandler>`) isn't `Debug`, so match
+        // rather than `expect_err`.
+        match state.lookup("example.com", "v1", "widgets") {
+            Err(e) => assert_eq!(
+                e.to_string(),
+                "resource not found: unknown kind: example.com/v1/widgets"
+            ),
+            Ok(_) => panic!("unregistered Widget must no longer resolve"),
+        }
+
+        // Unregistering again reports false (nothing present).
+        assert!(!state.unregister("example.com", "v1", "widgets"));
+    }
+
+    #[test]
+    fn handler_set_reflects_post_register_snapshot() {
+        let state = RouterState::new(Vec::new());
+        assert!(state.handler_set().is_empty());
+        state.register(FakeHandler::arc("example.com", "v1", "Widget", "widgets", true));
+        let set = state.handler_set();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].group(), "example.com");
+        assert_eq!(set[0].plural(), "widgets");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_register_from_two_tasks_both_land() {
+        // rcu (read-copy-update) is lost-write-safe: two tasks each
+        // registering a DISTINCT handler must BOTH be present afterward
+        // even if their clone-insert-swaps race (the loser of a swap retries
+        // against the winner's map). A naive `load → clone → store` would
+        // drop one.
+        let state = RouterState::new(Vec::new());
+        let s1 = state.clone();
+        let s2 = state.clone();
+        let t1 = tokio::spawn(async move {
+            for i in 0..50 {
+                let plural = format!("widgets{i}");
+                s1.register(FakeHandler::arc(
+                    "a.example.com",
+                    "v1",
+                    "Widget",
+                    Box::leak(plural.into_boxed_str()),
+                    true,
+                ));
+            }
+        });
+        let t2 = tokio::spawn(async move {
+            for i in 0..50 {
+                let plural = format!("gadgets{i}");
+                s2.register(FakeHandler::arc(
+                    "b.example.com",
+                    "v1",
+                    "Gadget",
+                    Box::leak(plural.into_boxed_str()),
+                    false,
+                ));
+            }
+        });
+        t1.await.unwrap();
+        t2.await.unwrap();
+
+        // All 100 distinct registrations survived (no lost write).
+        assert_eq!(state.handler_set().len(), 100, "no lost write under racing rcu");
+        assert!(state.lookup("a.example.com", "v1", "widgets0").is_ok());
+        assert!(state.lookup("b.example.com", "v1", "gadgets49").is_ok());
+    }
+
+    #[test]
+    fn registered_handler_carries_metadata_into_handler_set() {
+        // The metadata (shortNames / singular) a registered handler carries
+        // flows through `handler_set()` for discovery to fold — this is the
+        // load-bearing wiring for `kubectl get wd` short-name resolution.
+        let state = RouterState::new(Vec::new());
+        state.register(FakeHandler::arc_with_meta(
+            "example.com",
+            "v1",
+            "Widget",
+            "widgets",
+            true,
+            vec!["wd"],
+            "widget",
+        ));
+        let set = state.handler_set();
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].short_names(), &["wd"]);
+        assert_eq!(set[0].singular_name(), "widget");
+    }
+
+    #[test]
+    fn discovery_group_resources_folds_registered_widget() {
+        // build_group_resources folds the live ArcSwap snapshot → a
+        // dynamically-registered Widget handler appears as a `widgets` row
+        // with its shortNames + singular. This is exactly what drives
+        // `kubectl api-resources --api-group=example.com`.
+        let state = RouterState::new(Vec::new());
+        state.register(FakeHandler::arc_with_meta(
+            "example.com",
+            "v1",
+            "Widget",
+            "widgets",
+            true,
+            vec!["wd"],
+            "widget",
+        ));
+        let list = crate::discovery::build_group_resources(&state, "example.com", "v1")
+            .expect("example.com/v1 resource list present after register");
+        assert_eq!(list.group_version, "example.com/v1");
+        assert_eq!(list.resources.len(), 1);
+        let r = &list.resources[0];
+        assert_eq!(r.name, "widgets");
+        assert_eq!(r.singular_name, "widget");
+        assert!(r.namespaced);
+        assert_eq!(r.short_names, vec!["wd".to_string()]);
+        assert!(r.verbs.iter().any(|v| v == "watch"));
+
+        // And the group shows up in /apis (build_api_groups).
+        let groups = crate::discovery::build_api_groups(&state);
+        assert!(groups.groups.iter().any(|g| g.name == "example.com"));
     }
 }

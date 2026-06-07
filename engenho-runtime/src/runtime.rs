@@ -5,14 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_apiserver::{
-    ApiServer, ServerSanInputs, TlsMaterial, handlers_from_catalog_with_admission,
-    issue_server_material, load_or_generate_ca,
+    ApiServer, RouterHandlerSink, RouterState, ServerSanInputs, TlsMaterial,
+    handlers_from_catalog_with_admission, issue_server_material, load_or_generate_ca,
 };
 use engenho_kube_client::emit_kubeconfig;
 use engenho_config::{ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind};
 use engenho_controllers::{
-    DeploymentController, EndpointsController, GcController, JobController, KindFilter,
-    ReplicaSetController, StatefulSetController, WatchDriver, WatchDriverConfig,
+    CrdController, DeploymentController, DynamicHandlerSink, EndpointsController, GcController,
+    JobController, KindFilter, ReplicaSetController, StatefulSetController, WatchDriver,
+    WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode},
 };
 use engenho_kubelet::config_bridge::KubeletBackendKind;
@@ -140,12 +141,24 @@ impl Runtime {
         // now a one-line change. Controller writes (Reason::Controller)
         // never flow through a handler, so they bypass admission.
         let admission = Arc::new(AdmissionChain::new(Vec::new(), AdmissionMode::FailOpen));
-        let apiserver = ApiServer::start(
-            listen_addr,
-            handlers_from_catalog_with_admission(store.clone(), admission),
-            tls,
-        )
-        .await?;
+
+        // Build the RouterState HERE (not inside ApiServer::start) so the
+        // SAME table is shared with the CrdController's DynamicHandlerSink.
+        // A controller-driven `register()` mutates this exact ArcSwap, and
+        // the swap is visible to in-flight requests this server dispatches.
+        let router_state = RouterState::new(handlers_from_catalog_with_admission(
+            store.clone(),
+            admission.clone(),
+        ));
+        // The CRD handler sink: builds a StoreBackedHandler (admission-
+        // dispatched, opaque-JSON) per served CRD version + registers it
+        // into the SAME router_state. Shared (as Arc<dyn DynamicHandlerSink>)
+        // with the CrdController spawned in spawn_drivers.
+        let handler_sink: Arc<dyn DynamicHandlerSink> =
+            RouterHandlerSink::new(store.clone(), admission.clone(), router_state.clone())
+                .into_dyn();
+
+        let apiserver = ApiServer::start_with_state(listen_addr, router_state, tls).await?;
         let bound_addr = apiserver.local_addr();
         info!(addr = %bound_addr, tls = config.runtime.tls.enabled, "apiserver bound");
 
@@ -174,8 +187,10 @@ impl Runtime {
             other => RuntimeError::Config(ConfigError::Incoherent(other.to_string())),
         })?;
 
-        // 7. Spawn the controller / scheduler / kubelet drivers.
-        let drivers = spawn_drivers(&config, &store, &backend, strategy);
+        // 7. Spawn the controller / scheduler / kubelet drivers (incl. the
+        //    CrdController, which registers CR handlers into the shared
+        //    router table via handler_sink).
+        let drivers = spawn_drivers(&config, &store, &backend, strategy, &handler_sink);
         info!(count = drivers.len(), "drivers spawned");
 
         Ok(Self {
@@ -397,6 +412,7 @@ fn spawn_drivers(
     store: &Arc<StoreMesh>,
     backend: &Arc<dyn ContainerRuntime>,
     strategy: Box<dyn engenho_scheduler::SchedulingStrategy>,
+    handler_sink: &Arc<dyn DynamicHandlerSink>,
 ) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
 
@@ -471,6 +487,25 @@ fn spawn_drivers(
         );
     }
 
+    // CRD: CustomResourceDefinition → dynamic CR-handler registration. The
+    // controller registers a StoreBackedHandler per served CRD version into
+    // the shared RouterState via `handler_sink`, so CR instances become
+    // routable + discoverable with no parallel codepath. Filtered to
+    // ["CustomResourceDefinition"] so only CRD writes wake it; the fallback
+    // tick covers cold start / missed events (so a CRD installed before the
+    // driver subscribed still gets registered on the first fallback tick).
+    if enable.crd {
+        let c = CrdController::new(store.clone(), handler_sink.clone());
+        handles.push(
+            WatchDriver::new(
+                c,
+                store.clone(),
+                driver_config(&["CustomResourceDefinition"]),
+            )
+            .spawn(),
+        );
+    }
+
     // Scheduler: pending Pod → spec.nodeName. Watches Pods + Nodes.
     // The strategy was constructed fallibly by the caller (a typed error
     // for unimplemented strategies — never a silent round-robin fallback).
@@ -534,9 +569,9 @@ mod tests {
             node.get("spec").unwrap().get("unschedulable").unwrap(),
             false
         );
-        // Drivers: 6 reconcilers (deployment, replicaset, statefulset,
-        // job, endpoints, gc) + scheduler + kubelet = 8.
-        assert_eq!(rt.drivers.len(), 8);
+        // Drivers: 7 reconcilers (deployment, replicaset, statefulset,
+        // job, endpoints, gc, crd) + scheduler + kubelet = 9.
+        assert_eq!(rt.drivers.len(), 9);
         rt.shutdown().await.unwrap();
     }
 

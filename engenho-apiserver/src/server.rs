@@ -84,6 +84,26 @@ impl ApiServer {
         tls: Option<TlsMaterial>,
     ) -> Result<Self, ServerError> {
         let state = RouterState::new(handlers);
+        Self::start_with_state(addr, state, tls).await
+    }
+
+    /// Spawn the server over a pre-built [`RouterState`]. Identical to
+    /// [`Self::start`] except the caller owns the `RouterState` + can RETAIN
+    /// a clone of it — the load-bearing seam for CRD serving: the runtime
+    /// builds ONE RouterState, hands a clone here AND a clone to the
+    /// `CrdController`'s [`crate::handler::RouterHandlerSink`], so a
+    /// controller-driven `register()` mutates the SAME live `ArcSwap` table
+    /// this server dispatches on (the swap is visible to in-flight requests).
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Bind`] if the listener can't bind; [`ServerError::Tls`]
+    /// if the rustls config can't be built from the supplied PEM.
+    pub async fn start_with_state(
+        addr: SocketAddr,
+        state: RouterState,
+        tls: Option<TlsMaterial>,
+    ) -> Result<Self, ServerError> {
         let router: Router = build(state);
 
         match tls {

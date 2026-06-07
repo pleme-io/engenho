@@ -45,6 +45,20 @@ pub struct KindEntry {
     /// the workload + networking core kinds). Empty for kinds in no
     /// category. PURE registration metadata, like `short_names`.
     pub categories: &'static [&'static str],
+    /// `true` ⇒ this kind has NO vendored OpenAPI schema and NO typed
+    /// struct — it is served as opaque JSON via the generic
+    /// `StoreBackedHandler` and appears ONLY as a `RESOURCE_CATALOG` row
+    /// (no `<module>/<kind>.rs`, no `$ref` closure, no schema lookup).
+    ///
+    /// This is the codegen seam for kinds whose object is stored opaquely
+    /// (e.g. `apiextensions.k8s.io/v1.CustomResourceDefinition` — the
+    /// apiserver stores the CRD body as plain JSON, never decoding it into
+    /// a typed struct). The generator SKIPS such kinds in the per-kind
+    /// struct/module emission (no OpenAPI schema is required, so
+    /// `openapi_key` / `module` may be empty) while STILL emitting the
+    /// catalog descriptor row, so routing + discovery light up exactly as
+    /// for a schema-backed kind. Non-opaque kinds set this `false`.
+    pub opaque: bool,
 }
 
 /// The curated set of M0.0.1 kinds.
@@ -64,6 +78,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["po"],
         singular: "pod",
         categories: &["all"],
+        opaque: false,
     },
     KindEntry {
         kind: "Service",
@@ -76,6 +91,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["svc"],
         singular: "service",
         categories: &["all"],
+        opaque: false,
     },
     KindEntry {
         kind: "ConfigMap",
@@ -88,6 +104,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["cm"],
         singular: "configmap",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "Secret",
@@ -100,6 +117,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &[],
         singular: "secret",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "Namespace",
@@ -112,6 +130,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["ns"],
         singular: "namespace",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "ServiceAccount",
@@ -124,6 +143,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["sa"],
         singular: "serviceaccount",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "Node",
@@ -136,6 +156,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["no"],
         singular: "node",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "PersistentVolume",
@@ -148,6 +169,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["pv"],
         singular: "persistentvolume",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "PersistentVolumeClaim",
@@ -160,6 +182,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["pvc"],
         singular: "persistentvolumeclaim",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "Endpoints",
@@ -172,6 +195,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["ep"],
         singular: "endpoints",
         categories: &[],
+        opaque: false,
     },
     // ── apps/v1 ─────────────────────────────────────────────────────
     KindEntry {
@@ -185,6 +209,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["deploy"],
         singular: "deployment",
         categories: &["all"],
+        opaque: false,
     },
     KindEntry {
         kind: "ReplicaSet",
@@ -197,6 +222,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["rs"],
         singular: "replicaset",
         categories: &["all"],
+        opaque: false,
     },
     KindEntry {
         kind: "StatefulSet",
@@ -209,6 +235,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["sts"],
         singular: "statefulset",
         categories: &["all"],
+        opaque: false,
     },
     KindEntry {
         kind: "DaemonSet",
@@ -221,6 +248,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &["ds"],
         singular: "daemonset",
         categories: &["all"],
+        opaque: false,
     },
     // ── rbac.authorization.k8s.io/v1 ────────────────────────────────
     KindEntry {
@@ -234,6 +262,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &[],
         singular: "role",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "ClusterRole",
@@ -246,6 +275,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &[],
         singular: "clusterrole",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "RoleBinding",
@@ -258,6 +288,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &[],
         singular: "rolebinding",
         categories: &[],
+        opaque: false,
     },
     KindEntry {
         kind: "ClusterRoleBinding",
@@ -270,5 +301,34 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         short_names: &[],
         singular: "clusterrolebinding",
         categories: &[],
+        opaque: false,
+    },
+    // ── apiextensions.k8s.io/v1 ─────────────────────────────────────
+    //
+    // The CRD kind itself. OPAQUE: the apiserver stores a CRD object as
+    // plain JSON (the `StoreBackedHandler` never decodes it into a typed
+    // struct; the `CrdController` parses the few `spec.*` paths it needs
+    // through a typed serde border in engenho-controllers), so this kind
+    // needs NO vendored OpenAPI schema doc + NO generated `<module>/crd.rs`
+    // — it appears ONLY as a `RESOURCE_CATALOG` descriptor row. That row is
+    // enough: `handlers_from_catalog{,_with_admission}` builds a
+    // `StoreBackedHandler` for it, the catch-all routes CRUD/list/watch,
+    // and discovery folds it into `/apis` + `/apis/apiextensions.k8s.io/v1`
+    // so `kubectl get crd` resolves the `customresourcedefinitions` plural
+    // (shortNames crd/crds). Vendoring the apiextensions schema doc + a
+    // typed CRD struct is DEFERRED (kubectl `apply -f crd.yaml` works; only
+    // `kubectl explain customresourcedefinition` needs the schema doc).
+    KindEntry {
+        kind: "CustomResourceDefinition",
+        openapi_key: "",
+        group: "apiextensions.k8s.io",
+        version: "v1",
+        resource: "customresourcedefinitions",
+        cluster_scoped: true,
+        module: "",
+        short_names: &["crd", "crds"],
+        singular: "customresourcedefinition",
+        categories: &["api-extensions"],
+        opaque: true,
     },
 ];

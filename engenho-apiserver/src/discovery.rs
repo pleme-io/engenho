@@ -132,7 +132,7 @@ fn resource_of(h: &dyn ResourceHandler) -> APIResource {
 
 /// Build the `/api/v1` `APIResourceList` from the core handlers (group ==
 /// "", version == "v1"), sorted by plural for determinism.
-fn build_core_resources(state: &RouterState) -> APIResourceList {
+pub(crate) fn build_core_resources(state: &RouterState) -> APIResourceList {
     let mut rows: Vec<APIResource> = state
         .handler_set()
         .into_iter()
@@ -150,7 +150,7 @@ fn build_core_resources(state: &RouterState) -> APIResourceList {
 
 /// Build the `/apis` `APIGroupList`: one `APIGroup` per distinct non-core
 /// group, each advertising the single registered `(group, version)` pair.
-fn build_api_groups(state: &RouterState) -> APIGroupList {
+pub(crate) fn build_api_groups(state: &RouterState) -> APIGroupList {
     // group → set of versions present (BTree for deterministic ordering).
     let mut by_group: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
     for h in state.handler_set() {
@@ -199,7 +199,7 @@ fn build_api_groups(state: &RouterState) -> APIGroupList {
 
 /// Build the `/apis/<group>/<version>` `APIResourceList`, or `None` if no
 /// handler is registered for that `(group, version)` pair.
-fn build_group_resources(
+pub(crate) fn build_group_resources(
     state: &RouterState,
     group: &str,
     version: &str,

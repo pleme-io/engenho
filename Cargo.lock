@@ -1358,6 +1358,7 @@ name = "engenho-apiserver"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum 0.7.9",
  "axum-server",
