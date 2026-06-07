@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cargo_lock_sha256": "1e4db3db6184df5b1305243ec93fff2fe798939578e17a58e61bc88844ade755",
+  "cargo_lock_sha256": "17aa7d55e4e2e375c857c5476017025ad311b92e28bcdd68f38f797ff98e9cd0",
   "target_resolves": {
     "base": {
       "adler2-2.0.1": {
@@ -1802,6 +1802,7 @@
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
+          "default",
           "std"
         ]
       },
@@ -1825,6 +1826,13 @@
           "default",
           "serde",
           "std"
+        ]
+      },
+      "byteview-0.6.1": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": [
+          "default"
         ]
       },
       "camino-1.2.2": {
@@ -2322,6 +2330,11 @@
         "build_dependencies": [],
         "features": []
       },
+      "compare-0.0.6": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
       "concurrent-queue-2.5.0": {
         "runtime_dependencies": [
           {
@@ -2416,8 +2429,57 @@
           "std"
         ]
       },
+      "crossbeam-epoch-0.9.18": {
+        "runtime_dependencies": [
+          {
+            "name": "crossbeam_utils",
+            "package_key": "crossbeam-utils-0.8.21",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "alloc",
+          "std"
+        ]
+      },
       "crossbeam-queue-0.3.12": {
         "runtime_dependencies": [
+          {
+            "name": "crossbeam_utils",
+            "package_key": "crossbeam-utils-0.8.21",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "alloc",
+          "default",
+          "std"
+        ]
+      },
+      "crossbeam-skiplist-0.1.3": {
+        "runtime_dependencies": [
+          {
+            "name": "crossbeam_epoch",
+            "package_key": "crossbeam-epoch-0.9.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
           {
             "name": "crossbeam_utils",
             "package_key": "crossbeam-utils-0.8.21",
@@ -3119,6 +3181,11 @@
         "build_dependencies": [],
         "features": []
       },
+      "double-ended-peekable-0.1.0": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
       "dunce-1.0.5": {
         "runtime_dependencies": [],
         "build_dependencies": [],
@@ -3311,8 +3378,70 @@
       "engenho-0.1.4": {
         "runtime_dependencies": [
           {
+            "name": "anyhow",
+            "package_key": "anyhow-1.0.102",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_config",
+            "package_key": "engenho-config-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_runtime",
+            "package_key": "engenho-runtime-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "engenho_types",
             "package_key": "engenho-types-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio",
+            "package_key": "tokio-1.52.3",
+            "kind": "normal",
+            "features": [
+              "full"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing",
+            "package_key": "tracing-0.1.44",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing_subscriber",
+            "package_key": "tracing-subscriber-0.3.23",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3357,6 +3486,26 @@
             "tree": "target"
           },
           {
+            "name": "bytes",
+            "package_key": "bytes-1.11.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_controllers",
+            "package_key": "engenho-controllers-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "engenho_store",
             "package_key": "engenho-store-0.1.4",
             "kind": "normal",
@@ -3369,6 +3518,16 @@
           {
             "name": "engenho_types",
             "package_key": "engenho-types-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "futures",
+            "package_key": "futures-0.3.32",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3620,7 +3779,7 @@
           },
           {
             "name": "shikumi",
-            "package_key": "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003",
+            "package_key": "shikumi-0.1.2",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3879,7 +4038,7 @@
           },
           {
             "name": "shikumi",
-            "package_key": "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003",
+            "package_key": "shikumi-0.1.2",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4650,7 +4809,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
+            "package_key": "gen-platform-0.1.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4660,7 +4819,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
+            "package_key": "gen-types-0.1.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4735,7 +4894,115 @@
           },
           {
             "name": "shigoto_types",
-            "package_key": "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22",
+            "package_key": "shigoto-types-0.1.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio",
+            "package_key": "tokio-1.52.3",
+            "kind": "normal",
+            "features": [
+              "full"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing",
+            "package_key": "tracing-0.1.44",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "engenho-runtime-0.1.4": {
+        "runtime_dependencies": [
+          {
+            "name": "engenho_apiserver",
+            "package_key": "engenho-apiserver-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_config",
+            "package_key": "engenho-config-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_controllers",
+            "package_key": "engenho-controllers-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_kubelet",
+            "package_key": "engenho-kubelet-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_scheduler",
+            "package_key": "engenho-scheduler-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_store",
+            "package_key": "engenho-store-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4954,6 +5221,16 @@
           {
             "name": "engenho_types",
             "package_key": "engenho-types-0.1.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "fjall",
+            "package_key": "fjall-2.11.2",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5211,7 +5488,7 @@
           },
           {
             "name": "sui_eval",
-            "package_key": "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-eval-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5446,7 +5723,7 @@
           },
           {
             "name": "shigoto_types",
-            "package_key": "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22",
+            "package_key": "shigoto-types-0.1.0",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5469,6 +5746,54 @@
         "features": [
           "default"
         ]
+      },
+      "enum_dispatch-0.3.13": {
+        "runtime_dependencies": [
+          {
+            "name": "once_cell",
+            "package_key": "once_cell-1.21.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.45",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.117",
+            "kind": "normal",
+            "features": [
+              "full"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
       },
       "equivalent-1.0.2": {
         "runtime_dependencies": [],
@@ -5696,6 +6021,106 @@
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": []
+      },
+      "fjall-2.11.2": {
+        "runtime_dependencies": [
+          {
+            "name": "byteorder",
+            "package_key": "byteorder-1.5.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "byteview",
+            "package_key": "byteview-0.6.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "dashmap",
+            "package_key": "dashmap-6.2.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "log",
+            "package_key": "log-0.4.30",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "lsm_tree",
+            "package_key": "lsm-tree-2.10.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "path_absolutize",
+            "package_key": "path-absolutize-3.1.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "std_semaphore",
+            "package_key": "std-semaphore-0.1.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tempfile",
+            "package_key": "tempfile-3.27.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "xxhash_rust",
+            "package_key": "xxhash-rust-0.8.15",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "default",
+          "lz4",
+          "single_writer_tx"
+        ]
       },
       "flate2-1.1.9": {
         "runtime_dependencies": [
@@ -6212,7 +6637,7 @@
           "std"
         ]
       },
-      "gen-macros-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
+      "gen-macros-0.1.9": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -6251,11 +6676,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
+      "gen-platform-0.1.9": {
         "runtime_dependencies": [
           {
             "name": "gen_macros",
-            "package_key": "gen-macros-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
+            "package_key": "gen-macros-0.1.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6265,7 +6690,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
+            "package_key": "gen-types-0.1.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6319,7 +6744,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
+      "gen-types-0.1.9": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -8918,7 +9343,7 @@
           },
           {
             "name": "hashbrown",
-            "package_key": "hashbrown-0.16.1",
+            "package_key": "hashbrown-0.17.1",
             "kind": "normal",
             "features": [
               "default-hasher",
@@ -11777,6 +12202,11 @@
         "build_dependencies": [],
         "features": []
       },
+      "guardian-1.3.0": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
       "h2-0.4.14": {
         "runtime_dependencies": [
           {
@@ -12059,9 +12489,21 @@
         ]
       },
       "hashbrown-0.17.1": {
-        "runtime_dependencies": [],
+        "runtime_dependencies": [
+          {
+            "name": "foldhash",
+            "package_key": "foldhash-0.2.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          }
+        ],
         "build_dependencies": [],
         "features": [
+          "default-hasher",
           "inline-more"
         ]
       },
@@ -13499,6 +13941,22 @@
           "yaml"
         ]
       },
+      "interval-heap-0.0.5": {
+        "runtime_dependencies": [
+          {
+            "name": "compare",
+            "package_key": "compare-0.0.6",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
       "inventory-0.3.24": {
         "runtime_dependencies": [],
         "build_dependencies": [],
@@ -13840,6 +14298,179 @@
         ]
       },
       "lru-slab-0.1.2": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
+      "lsm-tree-2.10.4": {
+        "runtime_dependencies": [
+          {
+            "name": "byteorder",
+            "package_key": "byteorder-1.5.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "crossbeam_skiplist",
+            "package_key": "crossbeam-skiplist-0.1.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "double_ended_peekable",
+            "package_key": "double-ended-peekable-0.1.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "enum_dispatch",
+            "package_key": "enum_dispatch-0.3.13",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          },
+          {
+            "name": "guardian",
+            "package_key": "guardian-1.3.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "interval_heap",
+            "package_key": "interval-heap-0.0.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "log",
+            "package_key": "log-0.4.30",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "lz4_flex",
+            "package_key": "lz4_flex-0.11.6",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "path_absolutize",
+            "package_key": "path-absolutize-3.1.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quick_cache",
+            "package_key": "quick_cache-0.6.23",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rustc_hash",
+            "package_key": "rustc-hash-2.1.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "self_cell",
+            "package_key": "self_cell-1.2.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tempfile",
+            "package_key": "tempfile-3.27.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "value_log",
+            "package_key": "value-log-1.9.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "varint_rs",
+            "package_key": "varint-rs-2.2.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "xxhash_rust",
+            "package_key": "xxhash-rust-0.8.15",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "lz4"
+        ]
+      },
+      "lz4_flex-0.11.6": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": []
@@ -15076,6 +15707,38 @@
         "build_dependencies": [],
         "features": []
       },
+      "path-absolutize-3.1.1": {
+        "runtime_dependencies": [
+          {
+            "name": "path_dedot",
+            "package_key": "path-dedot-3.1.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "path-dedot-3.1.1": {
+        "runtime_dependencies": [
+          {
+            "name": "once_cell",
+            "package_key": "once_cell-1.21.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
       "pear-0.2.9": {
         "runtime_dependencies": [
           {
@@ -15880,6 +16543,34 @@
       },
       "quick-error-1.2.3": {
         "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
+      "quick_cache-0.6.23": {
+        "runtime_dependencies": [
+          {
+            "name": "equivalent",
+            "package_key": "equivalent-1.0.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "hashbrown",
+            "package_key": "hashbrown-0.16.1",
+            "kind": "normal",
+            "features": [
+              "inline-more"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
         "build_dependencies": [],
         "features": []
       },
@@ -19875,6 +20566,11 @@
           "default"
         ]
       },
+      "self_cell-1.2.2": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
       "semver-1.0.28": {
         "runtime_dependencies": [],
         "build_dependencies": [],
@@ -20482,7 +21178,7 @@
           "std"
         ]
       },
-      "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22": {
+      "shigoto-types-0.1.0": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -20508,7 +21204,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
+            "package_key": "gen-platform-0.1.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -20518,7 +21214,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
+            "package_key": "gen-types-0.1.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -20574,7 +21270,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003": {
+      "shikumi-0.1.2": {
         "runtime_dependencies": [
           {
             "name": "arc_swap",
@@ -20612,7 +21308,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
+            "package_key": "gen-platform-0.1.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -20622,7 +21318,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b",
+            "package_key": "gen-types-0.1.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22825,6 +23521,11 @@
         "build_dependencies": [],
         "features": []
       },
+      "std-semaphore-0.1.0": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
       "stringprep-0.1.5": {
         "runtime_dependencies": [
           {
@@ -22876,7 +23577,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-bytecode-0.1.12": {
         "runtime_dependencies": [
           {
             "name": "rnix",
@@ -22920,7 +23621,7 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-compat-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22930,7 +23631,7 @@
           },
           {
             "name": "sui_intern",
-            "package_key": "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-intern-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22940,7 +23641,7 @@
           },
           {
             "name": "sui_spec",
-            "package_key": "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-spec-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22962,7 +23663,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-compat-0.1.12": {
         "runtime_dependencies": [
           {
             "name": "base64",
@@ -23040,7 +23741,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-eval-0.1.12": {
         "runtime_dependencies": [
           {
             "name": "base64",
@@ -23265,7 +23966,7 @@
           },
           {
             "name": "sui_bytecode",
-            "package_key": "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-bytecode-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23275,7 +23976,7 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-compat-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23285,7 +23986,7 @@
           },
           {
             "name": "sui_graph_store",
-            "package_key": "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-graph-store-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23295,7 +23996,7 @@
           },
           {
             "name": "sui_intern",
-            "package_key": "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-intern-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23305,7 +24006,7 @@
           },
           {
             "name": "sui_spec",
-            "package_key": "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-spec-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23315,7 +24016,7 @@
           },
           {
             "name": "sui_store",
-            "package_key": "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-store-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23389,7 +24090,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-graph-store-0.1.12": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -23479,7 +24180,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-intern-0.1.12": {
         "runtime_dependencies": [
           {
             "name": "rustc_hash",
@@ -23495,7 +24196,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-spec-0.1.12": {
         "runtime_dependencies": [
           {
             "name": "base64",
@@ -23625,7 +24326,7 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-compat-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23697,7 +24398,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-store-0.1.12": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -23787,7 +24488,7 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-compat-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -26304,6 +27005,111 @@
           "macros"
         ]
       },
+      "value-log-1.9.0": {
+        "runtime_dependencies": [
+          {
+            "name": "byteorder",
+            "package_key": "byteorder-1.5.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "byteview",
+            "package_key": "byteview-0.6.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "interval_heap",
+            "package_key": "interval-heap-0.0.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "log",
+            "package_key": "log-0.4.30",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "path_absolutize",
+            "package_key": "path-absolutize-3.1.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rustc_hash",
+            "package_key": "rustc-hash-2.1.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tempfile",
+            "package_key": "tempfile-3.27.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "varint_rs",
+            "package_key": "varint-rs-2.2.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "xxhash_rust",
+            "package_key": "xxhash-rust-0.8.15",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "varint-rs-2.2.1": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": [
+          "default",
+          "signed",
+          "std"
+        ]
+      },
       "vcpkg-0.2.15": {
         "runtime_dependencies": [],
         "build_dependencies": [],
@@ -26502,6 +27308,13 @@
         "features": [
           "default",
           "unsupported"
+        ]
+      },
+      "xxhash-rust-0.8.15": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": [
+          "xxh3"
         ]
       },
       "xz2-0.1.7": {
@@ -33930,6 +34743,9 @@
     "bytes-1.11.1": {
       "edition": "2021"
     },
+    "byteview-0.6.1": {
+      "edition": "2021"
+    },
     "camino-1.2.2": {
       "edition": "2021",
       "build_script": "build.rs"
@@ -33989,6 +34805,9 @@
     "colorchoice-1.0.5": {
       "edition": "2021"
     },
+    "compare-0.0.6": {
+      "edition": "2015"
+    },
     "concurrent-queue-2.5.0": {
       "edition": "2021"
     },
@@ -34026,7 +34845,13 @@
       "edition": "2021",
       "build_script": "build.rs"
     },
+    "crossbeam-epoch-0.9.18": {
+      "edition": "2021"
+    },
     "crossbeam-queue-0.3.12": {
+      "edition": "2021"
+    },
+    "crossbeam-skiplist-0.1.3": {
       "edition": "2021"
     },
     "crossbeam-utils-0.8.21": {
@@ -34101,6 +34926,9 @@
           "path": "src/bin/dotenvy.rs"
         }
       ]
+    },
+    "double-ended-peekable-0.1.0": {
+      "edition": "2021"
     },
     "dunce-1.0.5": {
       "edition": "2021"
@@ -34236,6 +35064,13 @@
         "path": "src/lib.rs"
       }
     },
+    "engenho-runtime-0.1.4": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_runtime",
+        "path": "src/lib.rs"
+      }
+    },
     "engenho-scheduler-0.1.4": {
       "edition": "2024",
       "lib_target": {
@@ -34285,6 +35120,10 @@
         "path": "src/lib.rs"
       }
     },
+    "enum_dispatch-0.3.13": {
+      "edition": "2018",
+      "proc_macro": true
+    },
     "equivalent-1.0.2": {
       "edition": "2015"
     },
@@ -34309,6 +35148,9 @@
     },
     "find-msvc-tools-0.1.9": {
       "edition": "2018"
+    },
+    "fjall-2.11.2": {
+      "edition": "2021"
     },
     "flate2-1.1.9": {
       "edition": "2018"
@@ -34372,14 +35214,14 @@
     "futures-util-0.3.32": {
       "edition": "2018"
     },
-    "gen-macros-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
+    "gen-macros-0.1.9": {
       "edition": "2024",
       "proc_macro": true
     },
-    "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
+    "gen-platform-0.1.9": {
       "edition": "2024"
     },
-    "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": {
+    "gen-types-0.1.9": {
       "edition": "2024"
     },
     "generic-array-0.14.7": {
@@ -34568,6 +35410,9 @@
     "glob-0.3.3": {
       "edition": "2015"
     },
+    "guardian-1.3.0": {
+      "edition": "2021"
+    },
     "h2-0.4.14": {
       "edition": "2021"
     },
@@ -34714,6 +35559,9 @@
     "insta-1.47.2": {
       "edition": "2021"
     },
+    "interval-heap-0.0.5": {
+      "edition": "2015"
+    },
     "inventory-0.3.24": {
       "edition": "2021"
     },
@@ -34786,6 +35634,12 @@
       "edition": "2015"
     },
     "lru-slab-0.1.2": {
+      "edition": "2021"
+    },
+    "lsm-tree-2.10.4": {
+      "edition": "2021"
+    },
+    "lz4_flex-0.11.6": {
       "edition": "2021"
     },
     "lzma-sys-0.1.20": {
@@ -34943,6 +35797,12 @@
       "edition": "2018",
       "proc_macro": true
     },
+    "path-absolutize-3.1.1": {
+      "edition": "2021"
+    },
+    "path-dedot-3.1.1": {
+      "edition": "2021"
+    },
     "pear-0.2.9": {
       "edition": "2018"
     },
@@ -35035,6 +35895,9 @@
     },
     "quick-error-1.2.3": {
       "edition": "2015"
+    },
+    "quick_cache-0.6.23": {
+      "edition": "2021"
     },
     "quinn-0.11.9": {
       "edition": "2021",
@@ -35297,6 +36160,9 @@
     "security-framework-sys-2.17.0": {
       "edition": "2021"
     },
+    "self_cell-1.2.2": {
+      "edition": "2018"
+    },
     "semver-1.0.28": {
       "edition": "2021"
     },
@@ -35363,10 +36229,10 @@
     "shell-words-1.1.1": {
       "edition": "2015"
     },
-    "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22": {
+    "shigoto-types-0.1.0": {
       "edition": "2024"
     },
-    "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003": {
+    "shikumi-0.1.2": {
       "edition": "2024"
     },
     "shlex-1.3.0": {
@@ -35443,6 +36309,9 @@
     "static_assertions-1.1.0": {
       "edition": "2015"
     },
+    "std-semaphore-0.1.0": {
+      "edition": "2015"
+    },
     "stringprep-0.1.5": {
       "edition": "2015"
     },
@@ -35455,22 +36324,22 @@
     "subtle-2.6.1": {
       "edition": "2018"
     },
-    "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-bytecode-0.1.12": {
       "edition": "2024"
     },
-    "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-compat-0.1.12": {
       "edition": "2024"
     },
-    "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-eval-0.1.12": {
       "edition": "2024"
     },
-    "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-graph-store-0.1.12": {
       "edition": "2024"
     },
-    "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-intern-0.1.12": {
       "edition": "2024"
     },
-    "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-spec-0.1.12": {
       "edition": "2024",
       "binaries": [
         {
@@ -35483,7 +36352,7 @@
         }
       ]
     },
-    "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-store-0.1.12": {
       "edition": "2024"
     },
     "symlink-0.1.0": {
@@ -35724,6 +36593,12 @@
     "validit-0.2.5": {
       "edition": "2024"
     },
+    "value-log-1.9.0": {
+      "edition": "2021"
+    },
+    "varint-rs-2.2.1": {
+      "edition": "2018"
+    },
     "vcpkg-0.2.15": {
       "edition": "2015"
     },
@@ -35783,6 +36658,9 @@
     },
     "xattr-1.6.1": {
       "edition": "2021"
+    },
+    "xxhash-rust-0.8.15": {
+      "edition": "2018"
     },
     "xz2-0.1.7": {
       "edition": "2018"
@@ -35887,18 +36765,18 @@
     }
   },
   "git_nar_sha256": {
-    "gen-macros-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": "sha256-KkZmHxQBwz3Q4XNaJVLdl6TLLPiR+erMbGOrrvPRE0A=",
-    "gen-platform-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": "sha256-KkZmHxQBwz3Q4XNaJVLdl6TLLPiR+erMbGOrrvPRE0A=",
-    "gen-types-0.1.9-6d82c9d3885c781e923ec46330d05d7eca469a3b": "sha256-KkZmHxQBwz3Q4XNaJVLdl6TLLPiR+erMbGOrrvPRE0A=",
-    "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22": "sha256-KaNUnx3IpQFGdlox6zK3vHHiGVXiy+fHyb4BxOxHQn4=",
-    "shikumi-0.1.2-61e5f97ad2f61205599b8679a4ff7b2075506003": "sha256-pkEmUjEdtwr6ag8rHhCeRikPDAEwzDbEcxojFhHKsCU=",
-    "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc="
+    "gen-macros-0.1.9": "sha256-KkZmHxQBwz3Q4XNaJVLdl6TLLPiR+erMbGOrrvPRE0A=",
+    "gen-platform-0.1.9": "sha256-KkZmHxQBwz3Q4XNaJVLdl6TLLPiR+erMbGOrrvPRE0A=",
+    "gen-types-0.1.9": "sha256-KkZmHxQBwz3Q4XNaJVLdl6TLLPiR+erMbGOrrvPRE0A=",
+    "shigoto-types-0.1.0": "sha256-KaNUnx3IpQFGdlox6zK3vHHiGVXiy+fHyb4BxOxHQn4=",
+    "shikumi-0.1.2": "sha256-pkEmUjEdtwr6ag8rHhCeRikPDAEwzDbEcxojFhHKsCU=",
+    "sui-bytecode-0.1.12": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-compat-0.1.12": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-eval-0.1.12": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-graph-store-0.1.12": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-intern-0.1.12": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-spec-0.1.12": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
+    "sui-store-0.1.12": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc="
   },
   "flake_metadata": {}
 }
