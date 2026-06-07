@@ -2,24 +2,35 @@
 //! [`ResourceHandler`] trait methods.
 //!
 //! The router supports kubectl's canonical URLs across BOTH the core
-//! group (`/api/v1/…`) and named groups (`/apis/<group>/<version>/…`):
+//! group (`/api/v1/…`) and named groups (`/apis/<group>/<version>/…`)
+//! through ONE coords → dispatch path: two catch-all routes feed the
+//! [`crate::coords::ResourceCoords`] extractor (the single place URL
+//! shapes are parsed), and scope-agnostic per-method verb handlers resolve
+//! a handler via ONE resolver ([`RouterState::lookup`]) then delegate to
+//! the shared per-verb `do_*` bodies. This collapses the ~20 hand-fanned
+//! per-scope/per-verb route wrappers (5 verbs × 4 scope/group shapes) into
+//! one extractor + four method handlers (GET fans LIST/WATCH vs single-GET
+//! internally on `coords.name`).
 //!
-//! Core group (`/api/v1`):
-//!   * GET    /api/v1/namespaces/{ns}/{plural}/{name}
-//!   * GET    /api/v1/namespaces/{ns}/{plural}
-//!   * POST   /api/v1/namespaces/{ns}/{plural}
-//!   * PATCH  /api/v1/namespaces/{ns}/{plural}/{name}
-//!   * DELETE /api/v1/namespaces/{ns}/{plural}/{name}
-//!   * GET/POST   /api/v1/{plural}                (cluster-scoped)
-//!   * GET/PATCH/DELETE /api/v1/{plural}/{name}   (cluster-scoped)
+//! Feeding routes:
+//!   * `/api/v1/*rest`               → core group (extractor synthesizes
+//!                                      `group=None, version="v1"`).
+//!   * `/apis/:group/:version/*rest` → named group (`group`/`version` from
+//!                                      the path).
 //!
-//! Named groups (`/apis/<group>/<version>`): the same eight shapes,
-//! with `(group, version)` extracted from the path and matched against
-//! the registered handler set keyed by `(group, version, plural)`.
+//! The extractor decomposes the `*rest` tail into the six K8s resource URL
+//! shapes (namespaced/cluster × collection/instance, + an optional
+//! subresource segment); the verb handlers pick list-vs-watch +
+//! collection-vs-instance from `?watch=` + `coords.name`. A handler-map
+//! key is the full `(group, version, plural)` triple with `group=""`/
+//! `version="v1"` as the core sentinel, so the old `lookup_core(p)` is
+//! exactly `lookup("", "v1", p)` — the two resolvers fold into one.
 //!
 //! Discovery (`/api`, `/api/v1`, `/apis`, `/apis/<group>/<version>`) is
 //! served by [`crate::discovery`] from the same handler set, so what is
-//! advertised is exactly what is routable.
+//! advertised is exactly what is routable. Those routes are more-specific
+//! (static or a shallower param leaf) than the catch-alls and take
+//! precedence in matchit.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -91,17 +102,31 @@ impl RouterState {
     }
 
     /// Resolve a CORE-group handler by plural (keyed on `("","v1",plural)`).
+    /// A thin `#[inline]` shim over [`Self::lookup`] with the core sentinel
+    /// — the canonical statement that `lookup_core(p)` IS `lookup("", "v1",
+    /// p)`. The coords path folded both old resolvers onto [`Self::lookup`]
+    /// directly, so the only remaining caller is the fold-equivalence test;
+    /// `#[cfg(test)]`-gated so the production build has no dead method.
     ///
     /// # Errors
     ///
     /// [`ApiError::NotFound`] when no core handler is registered for `plural`.
+    #[cfg(test)]
+    #[inline]
     fn lookup_core(&self, plural: &str) -> Result<&Arc<dyn ResourceHandler>, ApiError> {
-        self.handlers
-            .get(&(String::new(), "v1".to_string(), plural.to_string()))
-            .ok_or_else(|| ApiError::NotFound(format!("unknown core kind plural: {plural}")))
+        self.lookup("", "v1", plural)
     }
 
     /// Resolve a handler by the full `(group, version, plural)` triple.
+    /// The ONE resolver both the core (`group=""`) and grouped scopes fold
+    /// into — the map key is already the full triple with `group=""`/
+    /// `version="v1"` as the core sentinel, so this subsumes the old
+    /// `lookup_core`.
+    ///
+    /// The `NotFound` message text branches on whether `group` is the core
+    /// sentinel so the core-plural-miss body stays `unknown core kind
+    /// plural: {plural}` (behavior-preserving) while named-group misses
+    /// keep `unknown kind: {g}/{v}/{plural}`.
     ///
     /// # Errors
     ///
@@ -115,52 +140,55 @@ impl RouterState {
         self.handlers
             .get(&(group.to_string(), version.to_string(), plural.to_string()))
             .ok_or_else(|| {
-                ApiError::NotFound(format!("unknown kind: {group}/{version}/{plural}"))
+                if group.is_empty() {
+                    // Core-group miss — preserve the exact legacy text so
+                    // the rendered Status body is byte-identical.
+                    ApiError::NotFound(format!("unknown core kind plural: {plural}"))
+                } else {
+                    ApiError::NotFound(format!("unknown kind: {group}/{version}/{plural}"))
+                }
             })
     }
 }
 
 pub fn build(state: RouterState) -> Router {
     Router::new()
-        // ── core group (/api/v1) ──────────────────────────────────────
+        // ── resources: ONE coords→dispatch path, fed by two catch-alls ─
+        //
+        // The ~20 hand-fanned per-scope/per-verb wrappers collapse into
+        // the [`ResourceCoords`] extractor + the scope-agnostic verb
+        // handlers (one per HTTP method: GET handles both LIST/WATCH and
+        // single-GET, branching on `coords.name`; POST/PATCH/DELETE map to
+        // create/patch/delete). Two catch-all routes feed the extractor:
+        //
+        //   * `/api/v1/*rest`               → core group (the extractor
+        //                                      synthesizes group=None,
+        //                                      version="v1").
+        //   * `/apis/:group/:version/*rest` → named group.
+        //
+        // Each catch-all registers EXACTLY the methods the K8s wire
+        // supports for a resource path; the extractor + `?watch=` flag
+        // pick list-vs-watch + collection-vs-instance from `coords.name`.
+        // An unrouted method on a matched resource path yields axum's 405
+        // — the same terminal semantics the legacy MethodRouter gave (e.g.
+        // PUT was never registered, so it 405'd then too). The discovery /
+        // openapi / health routes below are MORE-SPECIFIC (static or a
+        // shallower param leaf) and take precedence over the catch-alls in
+        // matchit (verified: `/api/v1` exact beats `/api/v1/*rest`, and
+        // `/apis/:g/:v` coexists with the one-segment-deeper catch-all).
         .route(
-            "/api/v1/namespaces/:ns/:plural",
-            get(list_namespaced).post(create_namespaced),
+            "/api/v1/*rest",
+            get(resource_get_or_list)
+                .post(resource_create)
+                .patch(resource_patch)
+                .delete(resource_delete),
         )
         .route(
-            "/api/v1/namespaces/:ns/:plural/:name",
-            get(get_namespaced)
-                .patch(patch_namespaced)
-                .delete(delete_namespaced),
-        )
-        .route(
-            "/api/v1/:plural",
-            get(list_cluster_scoped).post(create_cluster_scoped),
-        )
-        .route(
-            "/api/v1/:plural/:name",
-            get(get_cluster_scoped)
-                .patch(patch_cluster_scoped)
-                .delete(delete_cluster_scoped),
-        )
-        // ── named groups (/apis/<group>/<version>) ────────────────────
-        .route(
-            "/apis/:group/:version/namespaces/:ns/:plural",
-            get(list_ns_grouped).post(create_ns_grouped),
-        )
-        .route(
-            "/apis/:group/:version/namespaces/:ns/:plural/:name",
-            get(get_ns_grouped)
-                .patch(patch_ns_grouped)
-                .delete(delete_ns_grouped),
-        )
-        .route(
-            "/apis/:group/:version/:plural",
-            get(list_grouped).post(create_grouped),
-        )
-        .route(
-            "/apis/:group/:version/:plural/:name",
-            get(get_grouped).patch(patch_grouped).delete(delete_grouped),
+            "/apis/:group/:version/*rest",
+            get(resource_get_or_list)
+                .post(resource_create)
+                .patch(resource_patch)
+                .delete(resource_delete),
         )
         // ── discovery ─────────────────────────────────────────────────
         .route("/api", get(discovery::api_versions))
@@ -640,198 +668,156 @@ async fn watch_response(
     Ok(resp)
 }
 
-// ── core-group route handlers (/api/v1) ────────────────────────────────
+// ── scope-agnostic verb handlers (ONE per verb; both URL families) ─────
+//
+// Each handler takes the [`ResourceCoords`] extractor (the ONE place URL
+// shapes are parsed) + does exactly: resolve the handler via the SINGLE
+// resolver `state.lookup(coords.group_key(), coords.version_key(),
+// &coords.plural)`, then delegate to the matching shared `do_*` body. The
+// namespaced-vs-cluster scope assertion still lives inside
+// `StoreBackedHandler::key()` (typed 400 on mismatch); coords just carries
+// `namespace: Option<String>` straight through. No subresource handler
+// exists today — a `Some(subresource)` returns a typed `NotFound` (no stub
+// Ok), reserved for the status/scale follow-up.
 
-async fn get_namespaced(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((ns, plural, name)): Path<(String, String, String)>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?;
-    do_get(h, Some(&ns), &name, ResponseCodec::from_headers(&headers)).await
+/// Reject a subresource request until status/scale handlers land. Returns a
+/// typed K8s `Status` 404 (NOT a stub `Ok`, NOT axum's empty 404) so the
+/// gap surfaces mechanically. `None` (the only live case today) is a no-op.
+fn reject_subresource(coords: &crate::coords::ResourceCoords) -> Result<(), ApiError> {
+    match &coords.subresource {
+        None => Ok(()),
+        Some(sub) => Err(ApiError::NotFound(format!(
+            "subresource {sub:?} is not served for {}/{} (no status/scale handler registered yet)",
+            coords.plural,
+            coords.name.as_deref().unwrap_or("")
+        ))),
+    }
 }
 
-async fn list_namespaced(
+/// GET on a resource path — LIST/WATCH a collection (no `name`) or GET a
+/// single instance (with `name`). The `?watch=` flag + `coords.name` pick
+/// the branch, exactly as the legacy list-vs-get split did.
+async fn resource_get_or_list(
     State(state): State<RouterState>,
-    Path((ns, plural)): Path<(String, String)>,
+    coords: crate::coords::ResourceCoords,
+    headers: HeaderMap,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?.clone();
-    do_list_or_watch(h, Some(ns), p).await
+    reject_subresource(&coords)?;
+    match &coords.name {
+        // Collection GET → LIST or WATCH (the shared body branches on
+        // `p.watch`). Needs an owned `Arc` for the watch unfold stream.
+        None => {
+            let h = state
+                .lookup(coords.group_key(), coords.version_key(), &coords.plural)?
+                .clone();
+            do_list_or_watch(h, coords.namespace, p).await
+        }
+        // Instance GET → the shared `do_get` body.
+        Some(name) => {
+            let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+            do_get(
+                h,
+                coords.namespace.as_deref(),
+                name,
+                ResponseCodec::from_headers(&headers),
+            )
+            .await
+        }
+    }
 }
 
-async fn create_namespaced(
+/// POST on a resource path — CREATE into a collection. A POST that carries
+/// a `name` (instance path) is not a K8s CREATE shape; `do_create` would
+/// have no body slot for it under the legacy routes (POST was only wired on
+/// the collection routes), so reject it with a typed `BadRequest` mirroring
+/// that the legacy instance routes never accepted POST.
+async fn resource_create(
     State(state): State<RouterState>,
+    coords: crate::coords::ResourceCoords,
     headers: HeaderMap,
-    Path((ns, plural)): Path<(String, String)>,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?;
-    do_create(h, Some(&ns), &headers, &raw).await
+    reject_subresource(&coords)?;
+    if coords.name.is_some() {
+        return Err(ApiError::BadRequest(
+            "POST is only valid on a collection path (no resource name)".into(),
+        ));
+    }
+    let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    do_create(h, coords.namespace.as_deref(), &headers, &raw).await
 }
 
-async fn patch_namespaced(
+/// PATCH on a resource path — PATCH a single instance (requires `name`).
+async fn resource_patch(
     State(state): State<RouterState>,
+    coords: crate::coords::ResourceCoords,
     headers: HeaderMap,
-    Path((ns, plural, name)): Path<(String, String, String)>,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?;
-    do_patch(h, Some(&ns), &name, &headers, &raw).await
+    reject_subresource(&coords)?;
+    let name = coords.name.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("PATCH requires a resource name (instance path)".into())
+    })?;
+    let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    do_patch(h, coords.namespace.as_deref(), name, &headers, &raw).await
 }
 
-async fn delete_namespaced(
+/// DELETE on a resource path — DELETE a single instance (requires `name`).
+async fn resource_delete(
     State(state): State<RouterState>,
+    coords: crate::coords::ResourceCoords,
     headers: HeaderMap,
-    Path((ns, plural, name)): Path<(String, String, String)>,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?;
-    do_delete(h, Some(&ns), &name, &headers, &p).await
+    reject_subresource(&coords)?;
+    let name = coords.name.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("DELETE requires a resource name (instance path)".into())
+    })?;
+    let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    do_delete(h, coords.namespace.as_deref(), name, &headers, &p).await
 }
 
-async fn get_cluster_scoped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((plural, name)): Path<(String, String)>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?;
-    do_get(h, None, &name, ResponseCodec::from_headers(&headers)).await
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn list_cluster_scoped(
-    State(state): State<RouterState>,
-    Path(plural): Path<String>,
-    Query(p): Query<ListWatchParams>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?.clone();
-    do_list_or_watch(h, None, p).await
-}
+    /// `lookup_core(p)` IS `lookup("", "v1", p)` — the fold the refactor
+    /// asserts. Both resolvers key on the SAME `("", "v1", p)` triple AND
+    /// render the SAME `Status` body on a miss, so collapsing the two old
+    /// route families onto one resolver is byte-identical for the core
+    /// case the `endpointss`-style tests exercise. Proven against an empty
+    /// handler set (the miss path) — both calls produce the identical
+    /// core-miss message; the grouped call produces the distinct grouped
+    /// message.
+    #[test]
+    fn lookup_core_folds_into_lookup() {
+        let state = RouterState::new(Vec::new());
 
-async fn create_cluster_scoped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path(plural): Path<String>,
-    raw: Bytes,
-) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?;
-    do_create(h, None, &headers, &raw).await
-}
+        // The Ok type (`&Arc<dyn ResourceHandler>`) is not `Debug`, so
+        // extract the miss error by match rather than `unwrap_err()`.
+        let msg = |r: Result<&Arc<dyn ResourceHandler>, ApiError>| match r {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a NotFound miss against the empty handler set"),
+        };
 
-async fn patch_cluster_scoped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((plural, name)): Path<(String, String)>,
-    raw: Bytes,
-) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?;
-    do_patch(h, None, &name, &headers, &raw).await
-}
+        let via_core = msg(state.lookup_core("pods"));
+        let via_full = msg(state.lookup("", "v1", "pods"));
+        assert_eq!(
+            via_core, via_full,
+            "lookup_core(p) == lookup(\"\", \"v1\", p): same Status body"
+        );
+        assert_eq!(
+            via_core, "resource not found: unknown core kind plural: pods",
+            "core-miss message text is preserved byte-for-byte",
+        );
 
-async fn delete_cluster_scoped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((plural, name)): Path<(String, String)>,
-    Query(p): Query<ListWatchParams>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup_core(&plural)?;
-    do_delete(h, None, &name, &headers, &p).await
-}
-
-// ── named-group route handlers (/apis/<group>/<version>) ───────────────
-
-async fn get_ns_grouped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?;
-    do_get(h, Some(&ns), &name, ResponseCodec::from_headers(&headers)).await
-}
-
-async fn list_ns_grouped(
-    State(state): State<RouterState>,
-    Path((group, version, ns, plural)): Path<(String, String, String, String)>,
-    Query(p): Query<ListWatchParams>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?.clone();
-    do_list_or_watch(h, Some(ns), p).await
-}
-
-async fn create_ns_grouped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((group, version, ns, plural)): Path<(String, String, String, String)>,
-    raw: Bytes,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?;
-    do_create(h, Some(&ns), &headers, &raw).await
-}
-
-async fn patch_ns_grouped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-    raw: Bytes,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?;
-    do_patch(h, Some(&ns), &name, &headers, &raw).await
-}
-
-async fn delete_ns_grouped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-    Query(p): Query<ListWatchParams>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?;
-    do_delete(h, Some(&ns), &name, &headers, &p).await
-}
-
-async fn get_grouped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?;
-    do_get(h, None, &name, ResponseCodec::from_headers(&headers)).await
-}
-
-async fn list_grouped(
-    State(state): State<RouterState>,
-    Path((group, version, plural)): Path<(String, String, String)>,
-    Query(p): Query<ListWatchParams>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?.clone();
-    do_list_or_watch(h, None, p).await
-}
-
-async fn create_grouped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((group, version, plural)): Path<(String, String, String)>,
-    raw: Bytes,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?;
-    do_create(h, None, &headers, &raw).await
-}
-
-async fn patch_grouped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-    raw: Bytes,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?;
-    do_patch(h, None, &name, &headers, &raw).await
-}
-
-async fn delete_grouped(
-    State(state): State<RouterState>,
-    headers: HeaderMap,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-    Query(p): Query<ListWatchParams>,
-) -> Result<Response, ApiError> {
-    let h = state.lookup(&group, &version, &plural)?;
-    do_delete(h, None, &name, &headers, &p).await
+        // The grouped miss keeps its DISTINCT message — the message branch
+        // on `group.is_empty()` is what makes the fold behavior-preserving.
+        let grouped = msg(state.lookup("apps", "v1", "deployments"));
+        assert_eq!(
+            grouped, "resource not found: unknown kind: apps/v1/deployments",
+        );
+        assert_ne!(grouped, via_core);
+    }
 }
