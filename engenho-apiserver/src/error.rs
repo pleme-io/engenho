@@ -22,6 +22,15 @@ pub enum ApiError {
     ResourceVersionConflict(String),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    /// The request carried a `Content-Type` the apiserver does not accept
+    /// for this verb — the K8s 415 Unsupported Media Type equivalent.
+    /// Rendered as a proper K8s `Status` JSON body (reason
+    /// "UnsupportedMediaType", code 415), NOT axum's built-in plain-text
+    /// `JsonRejection`. The write handlers extract the raw body + headers
+    /// themselves precisely so this typed error renders instead of the
+    /// framework's 415.
+    #[error("{0}")]
+    UnsupportedMediaType(String),
     /// An admission webhook DENIED the request — the K8s 403 Forbidden
     /// equivalent. Carries the chain's human-readable deny reason
     /// (prefixed with the rejecting webhook's name by the
@@ -47,6 +56,7 @@ pub enum ErrorKind {
     Conflict,
     ResourceVersionConflict,
     BadRequest,
+    UnsupportedMediaType,
     Forbidden,
     Gone,
     Internal,
@@ -61,6 +71,7 @@ impl ApiError {
             Self::Conflict(_, _) => ErrorKind::Conflict,
             Self::ResourceVersionConflict(_) => ErrorKind::ResourceVersionConflict,
             Self::BadRequest(_) => ErrorKind::BadRequest,
+            Self::UnsupportedMediaType(_) => ErrorKind::UnsupportedMediaType,
             Self::Forbidden(_) => ErrorKind::Forbidden,
             Self::Gone(_) => ErrorKind::Gone,
             Self::Internal(_) => ErrorKind::Internal,
@@ -73,6 +84,7 @@ impl ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_, _) | Self::ResourceVersionConflict(_) => StatusCode::CONFLICT,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Gone(_) => StatusCode::GONE,
             Self::Internal(_) | Self::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -116,6 +128,18 @@ pub fn status_object(message: String, code: u16, reason: &str) -> serde_json::Va
     serde_json::to_value(status).unwrap_or(serde_json::Value::Null)
 }
 
+/// A protobuf-codec failure at the HTTP boundary becomes an
+/// [`ApiError::BadRequest`] — bad magic, an uncataloged kind, or an
+/// undecodable object body are all malformed-request conditions (HTTP
+/// 400 with a proper K8s `Status`), never a panic. The codec is a TOTAL
+/// function returning typed errors; this is the single mapping into the
+/// apiserver's error surface.
+impl From<engenho_kube_proto::CodecError> for ApiError {
+    fn from(e: engenho_kube_proto::CodecError) -> Self {
+        ApiError::BadRequest(e.to_string())
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let code = self.status_code();
@@ -127,6 +151,7 @@ impl IntoResponse for ApiError {
             // create-already-exists "AlreadyExists" above.
             ApiError::ResourceVersionConflict(_) => "Conflict",
             ApiError::BadRequest(_) => "BadRequest",
+            ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
             ApiError::Forbidden(_) => "Forbidden",
             ApiError::Gone(_) => "Expired",
             ApiError::Internal(_) => "InternalError",

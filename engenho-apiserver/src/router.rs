@@ -28,11 +28,15 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Json, Path, Query, State};
-use axum::http::StatusCode;
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{ACCEPT, CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
+use engenho_kube_proto::{
+    self as kube_proto, CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type,
+    response_wants_protobuf,
+};
 use engenho_store::{WatchGone, WatchSignal, WatchStream};
 use utoipa::OpenApi;
 
@@ -182,6 +186,151 @@ async fn openapi_spec() -> impl IntoResponse {
     Json(ApiDoc::openapi())
 }
 
+// ── content negotiation (the protobuf <-> JSON boundary) ───────────────
+//
+// kubectl's typed clientset (imperative `kubectl create configmap/secret/
+// deployment …`) negotiates `application/vnd.kubernetes.protobuf` ONCE at
+// client construction and never renegotiates — a 415 is a TERMINAL error,
+// not a fall-back-to-JSON trigger (proven empirically). So the write
+// handlers extract the raw body + headers themselves and dispatch on
+// Content-Type through the typed `engenho-kube-proto` codec, with a
+// proper ApiError-rendered 415 K8s Status for anything else (NEVER axum's
+// built-in plain-text JsonRejection). The downstream handler/store/
+// admission/read-back pipeline stays serde_json::Value-typed.
+
+/// The codec to use for a RESPONSE body, negotiated from the request
+/// `Accept` header. kubectl's typed clientset sends
+/// `Accept: application/vnd.kubernetes.protobuf,application/json`
+/// (protobuf first); the dynamic/unstructured client sends
+/// `Accept: application/json`.
+#[derive(Clone, Copy)]
+enum ResponseCodec {
+    Json,
+    Protobuf,
+}
+
+impl ResponseCodec {
+    /// Negotiate from the request headers' `Accept`. Defaults to JSON
+    /// when `Accept` is absent or does not list protobuf.
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let accept = headers
+            .get(ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if response_wants_protobuf(accept) {
+            ResponseCodec::Protobuf
+        } else {
+            ResponseCodec::Json
+        }
+    }
+}
+
+/// The GVK a handler speaks, as the K8s wire `(apiVersion, kind)` —
+/// the key the protobuf codec uses to select the per-kind descriptor.
+fn handler_gvk(h: &Arc<dyn ResourceHandler>) -> Gvk {
+    Gvk::new(h.api_version(), h.kind())
+}
+
+/// Decode a write request body into the `serde_json::Value` the handler
+/// pipeline expects, dispatching on `Content-Type`:
+///
+///   * `application/json` (or absent → JSON) → `serde_json::from_slice`.
+///   * `application/vnd.kubernetes.protobuf` → the typed
+///     `engenho-kube-proto` codec (magic + `runtime.Unknown` + per-kind
+///     `DynamicMessage` → Value).
+///   * anything else → a typed [`ApiError::UnsupportedMediaType`] (HTTP
+///     415, proper K8s `Status` body) — NOT axum's plain-text rejection.
+fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Value, ApiError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let media = content_type.split(';').next().unwrap_or("").trim();
+    if media.is_empty() || media.eq_ignore_ascii_case("application/json") {
+        serde_json::from_slice(raw)
+            .map_err(|e| ApiError::BadRequest(format!("invalid JSON request body: {e}")))
+    } else if is_protobuf_content_type(content_type) {
+        Ok(kube_proto::decode_protobuf(raw)?)
+    } else {
+        Err(ApiError::UnsupportedMediaType(format!(
+            "the body of the request was in an unsupported format - \
+             accepted media types are application/json, \
+             {CONTENT_TYPE_PROTOBUF}; got {media:?}"
+        )))
+    }
+}
+
+/// Decode a PATCH request body. The patch Content-Types
+/// (strategic/merge/json-patch) are all JSON-family and parse as JSON;
+/// only a full-object replace via protobuf goes through the codec. An
+/// unknown media type is a typed 415. (kubectl patch always sends a
+/// JSON-family patch body, so the JSON branch is the live path.)
+fn decode_patch_body(
+    headers: &HeaderMap,
+    raw: &[u8],
+    gvk: &Gvk,
+) -> Result<serde_json::Value, ApiError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let media = content_type.split(';').next().unwrap_or("").trim();
+    // Every JSON-family patch media type parses as JSON. K8s patch
+    // content-types: application/json-patch+json,
+    // application/merge-patch+json,
+    // application/strategic-merge-patch+json, application/apply-patch+yaml
+    // (the +json family + the JSON subset of apply-patch). All are
+    // JSON-decodable except apply-patch+yaml — which we accept as JSON too
+    // (kubectl apply --server-side sends JSON-shaped YAML; full SSA is a
+    // later phase). The default kubectl patch (no --type) is
+    // strategic-merge-patch+json.
+    if media.is_empty()
+        || media.eq_ignore_ascii_case("application/json")
+        || media.ends_with("+json")
+        || media.ends_with("+yaml")
+    {
+        serde_json::from_slice(raw)
+            .map_err(|e| ApiError::BadRequest(format!("invalid JSON patch body: {e}")))
+    } else if is_protobuf_content_type(content_type) {
+        // A protobuf full-object replace (rare): decode via the codec.
+        let _ = gvk;
+        Ok(kube_proto::decode_protobuf(raw)?)
+    } else {
+        Err(ApiError::UnsupportedMediaType(format!(
+            "the body of the patch request was in an unsupported format; got {media:?}"
+        )))
+    }
+}
+
+/// Render a handler-returned `serde_json::Value` as the negotiated
+/// response codec, with the given HTTP status. JSON → `axum::Json`;
+/// protobuf → the typed `engenho-kube-proto` encoder (magic +
+/// `runtime.Unknown` + per-kind `DynamicMessage`) with
+/// `Content-Type: application/vnd.kubernetes.protobuf`.
+fn render_object(
+    codec: ResponseCodec,
+    gvk: &Gvk,
+    status: StatusCode,
+    value: serde_json::Value,
+) -> Result<Response, ApiError> {
+    match codec {
+        ResponseCodec::Json => Ok((status, Json(value)).into_response()),
+        ResponseCodec::Protobuf => {
+            // The read-back Value carries apiVersion+kind from
+            // inject_type_meta; the codec re-derives the per-kind
+            // descriptor from `gvk` (the handler's GVK), so the response
+            // wraps correctly even if the stored object omitted TypeMeta.
+            let bytes = kube_proto::encode_response(gvk, &value)?;
+            Ok((
+                status,
+                [(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)],
+                bytes,
+            )
+                .into_response())
+        }
+    }
+}
+
 // ── shared per-verb bodies (core + grouped wrappers reuse these) ───────
 //
 // The five helpers below are the ONE implementation of each verb. The
@@ -193,28 +342,36 @@ async fn do_get(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
     name: &str,
+    codec: ResponseCodec,
 ) -> Result<Response, ApiError> {
     let v = h.get(ns, name).await?;
-    Ok(Json(v).into_response())
+    render_object(codec, &handler_gvk(h), StatusCode::OK, v)
 }
 
 async fn do_create(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
-    body: serde_json::Value,
+    headers: &HeaderMap,
+    raw: &[u8],
 ) -> Result<Response, ApiError> {
+    let body = decode_write_body(headers, raw)?;
     let v = h.create(ns, body).await?;
-    Ok((StatusCode::CREATED, Json(v)).into_response())
+    let codec = ResponseCodec::from_headers(headers);
+    render_object(codec, &handler_gvk(h), StatusCode::CREATED, v)
 }
 
 async fn do_patch(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
     name: &str,
-    patch: serde_json::Value,
+    headers: &HeaderMap,
+    raw: &[u8],
 ) -> Result<Response, ApiError> {
+    let gvk = handler_gvk(h);
+    let patch = decode_patch_body(headers, raw, &gvk)?;
     let v = h.patch(ns, name, patch).await?;
-    Ok(Json(v).into_response())
+    let codec = ResponseCodec::from_headers(headers);
+    render_object(codec, &gvk, StatusCode::OK, v)
 }
 
 async fn do_delete(
@@ -370,10 +527,11 @@ async fn watch_response(
 
 async fn get_namespaced(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((ns, plural, name)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_get(h, Some(&ns), &name).await
+    do_get(h, Some(&ns), &name, ResponseCodec::from_headers(&headers)).await
 }
 
 async fn list_namespaced(
@@ -387,20 +545,22 @@ async fn list_namespaced(
 
 async fn create_namespaced(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((ns, plural)): Path<(String, String)>,
-    Json(body): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_create(h, Some(&ns), body).await
+    do_create(h, Some(&ns), &headers, &raw).await
 }
 
 async fn patch_namespaced(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((ns, plural, name)): Path<(String, String, String)>,
-    Json(patch_body): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_patch(h, Some(&ns), &name, patch_body).await
+    do_patch(h, Some(&ns), &name, &headers, &raw).await
 }
 
 async fn delete_namespaced(
@@ -414,10 +574,11 @@ async fn delete_namespaced(
 
 async fn get_cluster_scoped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((plural, name)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_get(h, None, &name).await
+    do_get(h, None, &name, ResponseCodec::from_headers(&headers)).await
 }
 
 async fn list_cluster_scoped(
@@ -431,20 +592,22 @@ async fn list_cluster_scoped(
 
 async fn create_cluster_scoped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path(plural): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_create(h, None, body).await
+    do_create(h, None, &headers, &raw).await
 }
 
 async fn patch_cluster_scoped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((plural, name)): Path<(String, String)>,
-    Json(patch_body): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_patch(h, None, &name, patch_body).await
+    do_patch(h, None, &name, &headers, &raw).await
 }
 
 async fn delete_cluster_scoped(
@@ -460,10 +623,11 @@ async fn delete_cluster_scoped(
 
 async fn get_ns_grouped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_get(h, Some(&ns), &name).await
+    do_get(h, Some(&ns), &name, ResponseCodec::from_headers(&headers)).await
 }
 
 async fn list_ns_grouped(
@@ -477,20 +641,22 @@ async fn list_ns_grouped(
 
 async fn create_ns_grouped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
-    Json(body): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_create(h, Some(&ns), body).await
+    do_create(h, Some(&ns), &headers, &raw).await
 }
 
 async fn patch_ns_grouped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-    Json(patch_body): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_patch(h, Some(&ns), &name, patch_body).await
+    do_patch(h, Some(&ns), &name, &headers, &raw).await
 }
 
 async fn delete_ns_grouped(
@@ -504,10 +670,11 @@ async fn delete_ns_grouped(
 
 async fn get_grouped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_get(h, None, &name).await
+    do_get(h, None, &name, ResponseCodec::from_headers(&headers)).await
 }
 
 async fn list_grouped(
@@ -521,20 +688,22 @@ async fn list_grouped(
 
 async fn create_grouped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((group, version, plural)): Path<(String, String, String)>,
-    Json(body): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_create(h, None, body).await
+    do_create(h, None, &headers, &raw).await
 }
 
 async fn patch_grouped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
-    Json(patch_body): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_patch(h, None, &name, patch_body).await
+    do_patch(h, None, &name, &headers, &raw).await
 }
 
 async fn delete_grouped(

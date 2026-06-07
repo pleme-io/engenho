@@ -7,6 +7,7 @@ members = [
   "engenho-cluster-config-render",
   "engenho-kube-client",
   "engenho-kube-codegen",
+  "engenho-kube-proto",
   "engenho-mcp",
   "engenho-revoada",
   "engenho-store",
@@ -48,6 +49,7 @@ keywords = ["kubernetes", "engenho", "pleme-io"]
 engenho-types          = { path = "engenho-types", version = "0.1.4" }
 engenho-cluster-config = { path = "engenho-cluster-config", version = "0.1.4" }
 engenho-kube-client    = { path = "engenho-kube-client", version = "0.1.4" }
+engenho-kube-proto     = { path = "engenho-kube-proto", version = "0.1.4" }
 engenho-store          = { path = "engenho-store", version = "0.1.4" }
 engenho-apiserver      = { path = "engenho-apiserver", version = "0.1.4" }
 engenho-runtime        = { path = "engenho-runtime", version = "0.1.4" }

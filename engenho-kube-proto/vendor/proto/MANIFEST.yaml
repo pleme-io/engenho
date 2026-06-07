@@ -1,0 +1,81 @@
+# engenho-kube-proto — vendored Kubernetes protobuf (.proto) manifest (v1.34)
+#
+# Per theory/ENGENHO.md §VI.1 ("Determinism contract — generated source"),
+# every byte the protobuf codec consumes is BLAKE3-attested — the same
+# discipline as the vendored OpenAPI schemas in engenho-types. Any drift
+# between this manifest and the on-disk file contents is caught by
+# tests/vendored_proto_blake3.rs in CI.
+#
+# These are the go-to-protobuf-emitted .proto descriptors for the cataloged
+# API groups (core/v1, apps/v1, rbac.authorization.k8s.io/v1) plus the shared
+# apimachinery wrappers (runtime.Unknown framing, ObjectMeta, intstr,
+# resource.Quantity, schema). The proto FIELD NAMES are already camelCase
+# (e.g. `binaryData`) — go-to-protobuf strips the gogoproto jsontag and emits
+# the JSON tag name verbatim — so the descriptor json_name (== K8s camelCase)
+# drives the prost-reflect DynamicMessage <-> serde_json::Value bridge with no
+# hand-maintained field map.
+#
+# Upstream source: https://github.com/kubernetes/kubernetes
+# Branch:          release-1.34
+# Path:            staging/src/<import-path>
+#
+# Update protocol:
+#   1. Re-curl the .proto set under vendor/proto/<import-path>.
+#   2. Recompute BLAKE3 (blake3::hash of the file bytes, to_hex).
+#   3. Update this manifest.
+#   4. `cargo test -p engenho-kube-proto` must pass (BLAKE3 + codec round-trip).
+---
+schema_version: proto2
+kubernetes_version: 1.34
+upstream_ref: release-1.34
+fetched_at: "2026-06-07T00:00:00Z"
+attestation: blake3
+files:
+  - path: k8s.io/api/core/v1/generated.proto
+    group: ""
+    version: v1
+    description: "Core API protobuf — Pod, Service, ConfigMap, Secret, Namespace, ServiceAccount, Node, PersistentVolume, PersistentVolumeClaim, Endpoints"
+    blake3: "4a6f2e1cb29063e96103ec5392127ac6bc47c71ac9aa38b5ca5aef41c6799622"
+    bytes: 317059
+  - path: k8s.io/api/apps/v1/generated.proto
+    group: apps
+    version: v1
+    description: "Apps API protobuf — Deployment, ReplicaSet, StatefulSet, DaemonSet"
+    blake3: "5b268e07ecbb661161eebb85fe53d4e2cef93a4950f339936fedd8b507ee2c5b"
+    bytes: 36063
+  - path: k8s.io/api/rbac/v1/generated.proto
+    group: rbac.authorization.k8s.io
+    version: v1
+    description: "RBAC API protobuf — Role, ClusterRole, RoleBinding, ClusterRoleBinding"
+    blake3: "732b10896fad50481c22826d51f6d1fd83ba6f04cfe621002f719e4cd4253f36"
+    bytes: 8056
+  - path: k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
+    group: meta
+    version: v1
+    description: "apimachinery meta/v1 — ObjectMeta, ListMeta, OwnerReference, LabelSelector, Time, Status"
+    blake3: "bbf8e7a82a0e771a3f3c7a492107d47159dde8b45f41e831d5c231c86b7d4086"
+    bytes: 56638
+  - path: k8s.io/apimachinery/pkg/runtime/generated.proto
+    group: runtime
+    version: ""
+    description: "apimachinery runtime — Unknown (the magic-prefixed wrapper), TypeMeta, RawExtension"
+    blake3: "93126c4dd0b247e765d4dd13821897f8282abbfa09ae6559437be7a93b8a050c"
+    bytes: 4335
+  - path: k8s.io/apimachinery/pkg/runtime/schema/generated.proto
+    group: runtime.schema
+    version: ""
+    description: "apimachinery runtime/schema — GVK/GVR descriptors"
+    blake3: "b55d883765f69562cb7cf7410cbe304ce57208a1e9910630f3824f577436ee67"
+    bytes: 829
+  - path: k8s.io/apimachinery/pkg/util/intstr/generated.proto
+    group: util.intstr
+    version: ""
+    description: "apimachinery util/intstr — IntOrString"
+    blake3: "a8e3ef0bb1484351f27ff25e0c236ada164df6a040ed4bea0f59c078939dd631"
+    bytes: 1325
+  - path: k8s.io/apimachinery/pkg/api/resource/generated.proto
+    group: api.resource
+    version: ""
+    description: "apimachinery api/resource — Quantity"
+    blake3: "bef5a679bb500224560465bd24a4589ad3926b7e04a887582c0183eacfcea12b"
+    bytes: 3949

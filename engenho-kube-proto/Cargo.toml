@@ -1,0 +1,36 @@
+[package]
+name = "engenho-kube-proto"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+homepage.workspace     = true
+readme.workspace       = true
+categories.workspace   = true
+keywords.workspace     = true
+description = "Kubernetes protobuf wire codec for the engenho apiserver HTTP boundary. Compiles the vendored go-to-protobuf generated.proto set (core/apps/rbac + apimachinery) into a FileDescriptorSet via protox (no protoc), then converts the `runtime.Unknown`-framed K8s protobuf wire format <-> serde_json::Value through prost-reflect DynamicMessage. The downstream JSON-Value pipeline (handler/store/admission/read-back) is untouched. Per theory/ENGENHO.md §VI.1 — generation over composition (Pillar 12); proto descriptors ARE the typed serializer."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+prost         = "0.14"
+prost-reflect = { version = "0.16", features = ["serde"] }
+bytes         = "1"
+serde_json    = { workspace = true }
+thiserror     = { workspace = true }
+
+[build-dependencies]
+protox        = "0.9"
+prost-reflect = { version = "0.16", features = ["serde"] }
+prost-types   = "0.14"
+
+[dev-dependencies]
+serde      = { workspace = true }
+serde_yaml = { workspace = true }
+blake3     = "1"
+
+[lints]
+workspace = true
