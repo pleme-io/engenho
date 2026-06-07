@@ -131,17 +131,24 @@ proptest! {
 proptest! {
     #[test]
     fn label_order_independence_of_serialization(
-        mut pairs in proptest::collection::vec(
+        pairs in proptest::collection::vec(
             (arb_label_key(), arb_label_value()), 0..6
         ),
     ) {
-        // Two ObjectMetas with same set but constructed from different
-        // pair orderings.
+        // Order independence is only meaningful for a set of DISTINCT keys:
+        // duplicate keys are last-write-wins by definition, so two insertion
+        // orders of [("u","_"),("u","0")] legitimately yield different maps.
+        // Dedup to distinct keys first (that IS "the same logical set"), then
+        // prove forward vs reverse insertion serialize byte-identically.
+        let mut distinct: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in &pairs { distinct.insert(k.clone(), v.clone()); }
+        let mut ordered: Vec<(String, String)> = distinct.into_iter().collect();
+
         let mut m_a = ObjectMeta { name: "x".into(), ..Default::default() };
-        for (k, v) in &pairs { m_a.labels.insert(k.clone(), v.clone()); }
-        pairs.reverse();
+        for (k, v) in &ordered { m_a.labels.insert(k.clone(), v.clone()); }
+        ordered.reverse();
         let mut m_b = ObjectMeta { name: "x".into(), ..Default::default() };
-        for (k, v) in &pairs { m_b.labels.insert(k.clone(), v.clone()); }
+        for (k, v) in &ordered { m_b.labels.insert(k.clone(), v.clone()); }
         let a = serde_json::to_vec(&m_a).unwrap();
         let b = serde_json::to_vec(&m_b).unwrap();
         prop_assert_eq!(a, b);
