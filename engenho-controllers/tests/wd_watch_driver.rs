@@ -73,6 +73,7 @@ async fn driver_ticks_on_matching_event() {
         .propose(ResourceCommand::Put {
             key: ResourceKey::namespaced("", "v1", "Pod", "default", "p1"),
             value: json!({"spec": {}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -117,6 +118,7 @@ async fn driver_filter_skips_irrelevant_events() {
         .propose(ResourceCommand::Put {
             key: ResourceKey::cluster_scoped("", "v1", "Node", "node-1"),
             value: json!({"spec": {}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -163,6 +165,7 @@ async fn driver_coalesces_burst_events_into_one_tick() {
             .propose(ResourceCommand::Put {
                 key: ResourceKey::namespaced("", "v1", "Pod", "default", &format!("p{i}")),
                 value: json!({"spec": {}}),
+                expected: None,
                 reason: Reason::Operator,
             })
             .await

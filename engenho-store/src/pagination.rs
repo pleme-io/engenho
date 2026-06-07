@@ -1,16 +1,32 @@
 //! Range pagination — the typed [`ListPage`] view + the
-//! integrity-tagged [`ContinueToken`] (etcd consistent-list semantics).
+//! integrity-tagged [`ContinueToken`].
 //!
-//! ## Why pagination is half of one invariant
+//! ## Consistency model: cursor-based (M0.1), NOT MVCC snapshot isolation
 //!
-//! CAS (optimistic concurrency) and pagination are the two halves of a
-//! single invariant: **a store mutation/read is a function of (snapshot
-//! revision, expected revision) — the revision is the
-//! optimistic-concurrency and consistent-pagination token alike.** The
-//! [`ContinueToken`] carries the snapshot revision captured by the FIRST
-//! page so the WHOLE page series reads from one consistent revision; the
-//! [`crate::revision::VersionMeta::mod_revision`] is exactly the value a
-//! CAS precondition compares against.
+//! M0.1 pagination is CURSOR-based: each page ranges the LIVE catalog
+//! `BTreeMap` from `Bound::Excluded(last_key)`. For a QUIESCENT key set
+//! the page series is gap-free + dup-free, and a key sorting AT OR BEFORE
+//! the cursor cannot resurface (mechanical cursor exclusion). It does NOT
+//! provide true etcd-style consistent-list semantics: a key inserted
+//! AFTER the cursor between page calls WILL surface on a later page
+//! (real etcd excludes it by revision). The [`ContinueToken`]'s
+//! `snapshot_rev` is only the envelope `resourceVersion` LABEL captured
+//! by the first page — it is NOT a read-isolation mechanism.
+//!
+//! DESTINATION (deferred): revision-indexed historical reads — page each
+//! request AS OF the token's `snapshot_rev`, which requires retaining
+//! historical MVCC views (per-key revision history / time-travel index),
+//! not the single live materialized map M0.1 keeps. Do not claim
+//! snapshot consistency for the page series until that lands.
+//!
+//! ## Relation to CAS
+//!
+//! CAS (optimistic concurrency) and pagination both key off the
+//! revision: the [`crate::revision::VersionMeta::mod_revision`] is the
+//! value a CAS precondition compares against, and the same revision is
+//! the LABEL the continue token carries. CAS IS deterministic +
+//! replicated; pagination's revision is currently a label only (see
+//! above).
 //!
 //! ## The continue token is opaque + tamper-evident
 //!
@@ -42,12 +58,15 @@ pub struct ListPage<'a> {
 
 /// The opaque continue cursor a paged LIST round-trips to its client.
 ///
-///   * `snapshot_rev` — the revision captured by the FIRST page of the
-///     series. Every continue in the series carries it so the page
-///     SERIES is consistent (`remainingItemCount` + the LIST envelope's
-///     `resourceVersion` are reported against it).
+///   * `snapshot_rev` — the revision LABEL captured by the FIRST page of
+///     the series, threaded unchanged through every continue. It is the
+///     `resourceVersion` reported on the LIST envelope; it is NOT a
+///     read-isolation mechanism (M0.1 reads the live catalog each page —
+///     see the module-level doc). The cursor that actually advances the
+///     series is `last_key`.
 ///   * `last_key` — the last EMITTED key of the previous page; the next
-///     page resumes STRICTLY after it.
+///     page resumes STRICTLY after it (`Bound::Excluded`). This is the
+///     load-bearing pagination cursor in M0.1.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContinueToken {
     pub snapshot_rev: Revision,

@@ -173,6 +173,7 @@ impl Controller for PodDisruptionBudgetController {
                             "disruptionsAllowed": allowed,
                         }
                     }),
+                    expected: None,
                     reason: Reason::Controller,
                 })
                 .await

@@ -530,11 +530,19 @@ async fn pagination_invalid_limit_is_400() {
 }
 
 #[tokio::test]
-async fn pagination_series_pinned_to_snapshot_does_not_surface_late_insert() {
+async fn pagination_continue_excludes_pre_cursor_late_insert() {
     // Start a limit=3 series; insert a pod that sorts BEFORE the cursor
     // between pages; the continued pages (resuming strictly after the
-    // cursor) must NOT surface it. The LIST envelope reports the snapshot
-    // rv consistently across the series.
+    // cursor) must NOT surface it. This proves CURSOR exclusion
+    // (`Bound::Excluded(last_key)`), NOT MVCC snapshot isolation: it
+    // holds for any cursor scheme and does not depend on revision pinning.
+    //
+    // NOTE: M0.1 pagination does NOT isolate against a POST-cursor
+    // mid-pagination insert — a pod inserted AFTER the cursor between
+    // pages WOULD surface on a later page (the LIST reads the live store
+    // each call; the envelope `resourceVersion` is a label, not a
+    // read-isolation revision). Destination = revision-indexed historical
+    // reads (deferred). See engenho-store::pagination module docs.
     let (_store, server) = boot_store_and_server().await;
     let addr = server.local_addr();
     let client = reqwest::Client::new();

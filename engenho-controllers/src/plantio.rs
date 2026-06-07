@@ -297,6 +297,7 @@ impl Controller for PlantioController {
                 .propose(ResourceCommand::Patch {
                     key: cr_key.clone(),
                     patch: new_status,
+                    expected: None,
                     reason: Reason::Controller,
                 })
                 .await

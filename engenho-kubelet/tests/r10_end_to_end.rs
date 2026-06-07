@@ -45,6 +45,7 @@ async fn put_pod(store: &StoreMesh, name: &str, image: &str, node_name: Option<&
         .propose(ResourceCommand::Put {
             key: ResourceKey::namespaced("", "v1", "Pod", "default", name),
             value,
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -145,6 +146,7 @@ async fn kubelet_skips_pods_with_invalid_manifest() {
                 "spec": {"nodeName": "node-A"}
                 // No containers field
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await

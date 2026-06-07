@@ -12,10 +12,17 @@
 //!     revision advance, no history entry) — proven via Clone + PartialEq
 //!     and serde_json byte-equality.
 //!   * CAS success advances the revision + the per-key mod_revision.
-//!   * Pagination is gap/dup-free + stable across the page series.
+//!   * Pagination is gap/dup-free + stable across the page series for a
+//!     QUIESCENT series (cursor-based: `Bound::Excluded(last_key)` over
+//!     the live BTreeMap). This is NOT true MVCC snapshot isolation — a
+//!     POST-cursor mid-pagination insert can surface on a later page (the
+//!     `snapshot_rev` is an envelope resourceVersion label, not a
+//!     read-isolation mechanism). Destination (revision-indexed
+//!     historical reads) is deferred; see the read-site doc comments.
 //!   * The continue token round-trips + rejects tamper/truncation/
 //!     wrong-version.
-//!   * The page series is pinned to the token's snapshot revision.
+//!   * The continue cursor excludes a PRE-cursor late insert (cursor
+//!     exclusion, not snapshot isolation).
 
 use engenho_store::command::{Reason, ResourceCommand, ResourceOp};
 use engenho_store::pagination::ContinueToken;
@@ -387,14 +394,27 @@ fn hex_decode(s: &str) -> Vec<u8> {
 }
 
 #[test]
-fn pagination_series_pinned_to_snapshot_rev() {
-    // Start a limit=3 series, capture the snapshot rev, insert a new pod
-    // BETWEEN pages, and assert the continued pages (read at the token's
-    // snapshot rev via the mesh's list_page_at_revision in the HTTP tests)
-    // still reflect a consistent key set. Here at the catalog layer we
-    // assert: a continue token captured at snapshot rv N, and that token's
-    // snapshot_rev never changes as we thread it; the new pod that sorts
-    // INTO an already-passed range does not retroactively appear.
+fn pagination_excludes_pre_cursor_late_insert() {
+    // What this PROVES: the BTreeMap range cursor (Bound::Excluded(last_key))
+    // mechanically excludes any key that sorts AT OR BEFORE the cursor — so a
+    // pod inserted mid-pagination that sorts BEFORE the cursor ("p00a") cannot
+    // resurface on a continued page. This is cursor exclusion, NOT MVCC
+    // snapshot isolation: it is trivially true for any cursor-based scheme and
+    // holds regardless of revision pinning.
+    //
+    // What this does NOT prove (and M0.1 pagination does NOT provide): true
+    // snapshot isolation against a POST-cursor mid-pagination insert. A pod
+    // inserted AFTER the cursor between pages WOULD surface on a later page,
+    // because list_page reads the LIVE BTreeMap each call (real etcd would
+    // exclude it by revision). The token's snapshot_rev is an envelope
+    // resourceVersion LABEL, not a read-isolation mechanism. See the doc
+    // comments on `state::list_page` / `mesh::list_page_at_revision` /
+    // `pagination::ContinueToken` for the destination (revision-indexed
+    // historical reads, deferred).
+    //
+    // The assertions below: a continue token captured at snapshot rv N keeps
+    // that snapshot_rev immutable as we thread it; a new pod that sorts BEFORE
+    // the cursor does not retroactively appear on the continued range.
     let mut cat = cat_with_pods(6); // p00..p05, rev 6
     let snapshot_rev = cat.revision();
     assert_eq!(snapshot_rev, Revision(6));

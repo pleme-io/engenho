@@ -46,6 +46,7 @@ async fn put_replicaset(store: &StoreMesh, name: &str, replicas: i64) -> String 
                     }
                 }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -121,6 +122,7 @@ async fn rs_controller_evicts_excess_when_replicas_decreases() {
         .propose(ResourceCommand::Patch {
             key: rs_key,
             patch: json!({"spec": {"replicas": 1}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -150,6 +152,7 @@ async fn rs_controller_scales_up_after_increasing_replicas() {
         .propose(ResourceCommand::Patch {
             key: rs_key,
             patch: json!({"spec": {"replicas": 5}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await

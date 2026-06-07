@@ -271,6 +271,7 @@ impl Controller for CrdController {
                     .propose(ResourceCommand::Patch {
                         key: crd_key.clone(),
                         patch: json!({"status": {"established": true}}),
+                        expected: None,
                         reason: Reason::Controller,
                     })
                     .await

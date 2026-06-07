@@ -46,6 +46,7 @@ async fn put_deployment(store: &StoreMesh, name: &str, replicas: i64, image: &st
                     }
                 }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -160,6 +161,7 @@ async fn deployment_rollout_creates_new_replicaset_for_template_change() {
                     }
                 }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -229,6 +231,7 @@ async fn gc_deletes_orphan_replicaset_when_deployment_is_removed() {
     store
         .propose(ResourceCommand::Delete {
             key: dep_key,
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -276,6 +279,7 @@ async fn gc_deletes_orphan_pods_when_replicaset_is_removed() {
     store
         .propose(ResourceCommand::Delete {
             key: rs_key.clone(),
+            expected: None,
             reason: Reason::Operator,
         })
         .await

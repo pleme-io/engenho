@@ -227,6 +227,7 @@ impl Controller for JobController {
                     .propose(ResourceCommand::Put {
                         key: pod_key,
                         value: pod,
+                        expected: None,
                         reason: Reason::Controller,
                     })
                     .await
@@ -332,6 +333,7 @@ impl Controller for CronJobController {
                 .propose(ResourceCommand::Put {
                     key: job_key,
                     value: job,
+                    expected: None,
                     reason: Reason::Controller,
                 })
                 .await
@@ -341,6 +343,7 @@ impl Controller for CronJobController {
                 .propose(ResourceCommand::Patch {
                     key: cj_key.clone(),
                     patch: json!({ "status": { "lastRunUnix": now } }),
+                    expected: None,
                     reason: Reason::Controller,
                 })
                 .await

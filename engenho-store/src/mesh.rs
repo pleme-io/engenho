@@ -361,21 +361,31 @@ impl StoreMesh {
     }
 
     /// One page of resources matching (group, version, kind), optionally
-    /// namespace-scoped, AND the snapshot [`crate::revision::Revision`]
-    /// captured from the SAME catalog clone — atomically. The
-    /// range-pagination sibling of [`Self::list_at_revision`].
+    /// namespace-scoped, AND the [`crate::revision::Revision`] read from
+    /// the SAME catalog clone — so the items + the reported revision are
+    /// mutually consistent FOR THIS CALL. The range-pagination sibling of
+    /// [`Self::list_at_revision`].
     ///
-    /// Clones the catalog ONCE so the page items + the page-series
-    /// snapshot revision come from the same clone — the snapshot rev is
-    /// what gets baked into the continue token so the WHOLE page series
-    /// reads from a single consistent revision (etcd consistent-list
-    /// semantics).
+    /// ## Consistency: per-call clone, NOT cross-page snapshot isolation
+    ///
+    /// Each call clones the CURRENT catalog and pages it; the returned
+    /// `snapshot_rev` is the live revision at THIS call. Across a page
+    /// SERIES this is cursor-based pagination (gap/dup-free for a
+    /// quiescent key set, and a PRE-cursor late insert cannot resurface),
+    /// NOT true MVCC snapshot isolation: a POST-cursor insert committed
+    /// between page calls WILL appear on a later page, because the next
+    /// call re-clones the live catalog rather than reading AS OF the
+    /// token's first-page revision. The `snapshot_rev` baked into the
+    /// continue token is the envelope `resourceVersion` LABEL, not a
+    /// read-isolation mechanism. See [`crate::state::ResourceCatalog::list_page`]
+    /// for the destination (revision-indexed historical reads, deferred —
+    /// needs retained historical MVCC views).
     ///
     /// Returns `(items, snapshot_rev, next, remaining)`:
     ///   * `items` — up to `limit` `(key, value)` pairs starting strictly
     ///     after `after`, in total key order.
-    ///   * `snapshot_rev` — `cat.revision()` (dense MVCC), the page
-    ///     series' consistent revision.
+    ///   * `snapshot_rev` — `cat.revision()` at this call (the LABEL
+    ///     reported in the LIST envelope `resourceVersion`).
     ///   * `next` — the cursor key for the following page (the last
     ///     emitted key iff more matching items remain), else `None`.
     ///   * `remaining` — count of still-unreturned matching items.

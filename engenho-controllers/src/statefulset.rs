@@ -165,6 +165,7 @@ impl Controller for StatefulSetController {
                     .propose(ResourceCommand::Put {
                         key: pod_key,
                         value: pod,
+                        expected: None,
                         reason: Reason::Controller,
                     })
                     .await
@@ -180,6 +181,7 @@ impl Controller for StatefulSetController {
                         self.store
                             .propose(ResourceCommand::Delete {
                                 key: (*pod_key).clone(),
+                                expected: None,
                                 reason: Reason::Controller,
                             })
                             .await
