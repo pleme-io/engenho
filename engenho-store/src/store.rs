@@ -278,39 +278,35 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
             let op = match entry.payload {
                 EntryPayload::Blank => crate::command::ResourceOp::NoOp,
                 EntryPayload::Normal(ref cmd) => {
-                    let key_for_event = match cmd {
-                        crate::command::ResourceCommand::Put { key, .. }
-                        | crate::command::ResourceCommand::Patch { key, .. }
-                        | crate::command::ResourceCommand::Delete { key, .. } => key.clone(),
-                    };
                     let outcome = guard
                         .catalog
                         .apply(cmd, log_id.leader_id.term, log_id.index);
-                    // Emit a typed WatchEvent for every committed mutation.
-                    let event_kind = match outcome {
-                        crate::command::ResourceOp::Created => Some(WatchEventKind::Added),
-                        crate::command::ResourceOp::Replaced
-                        | crate::command::ResourceOp::Patched => Some(WatchEventKind::Modified),
-                        crate::command::ResourceOp::Deleted => Some(WatchEventKind::Deleted),
-                        crate::command::ResourceOp::NoOp => None,
-                    };
-                    if let Some(kind) = event_kind {
-                        // For Deleted events, use the last-known
-                        // value (which catalog.apply just removed
-                        // from its map but we kept the key).
-                        let object = guard
-                            .catalog
-                            .get(&key_for_event)
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::Value::Null);
+                    // Emit a typed WatchEvent for every committed
+                    // mutation. The catalog returns the committed
+                    // Change, so the Deleted event carries the REAL
+                    // prior object (the change's tombstone value) —
+                    // no post-removal catalog.get() that returns None.
+                    if let Some(change) = &outcome.change {
+                        let kind = match change.kind {
+                            crate::revision::ChangeKind::Put => match outcome.op {
+                                crate::command::ResourceOp::Created => WatchEventKind::Added,
+                                _ => WatchEventKind::Modified,
+                            },
+                            crate::revision::ChangeKind::Delete => WatchEventKind::Deleted,
+                        };
                         watch_events.push(WatchEvent {
                             kind,
-                            object,
-                            key: key_for_event,
-                            resource_version: log_id.index,
+                            // For Put: the post-image. For Delete: the
+                            // tombstone (last-known object) — never Null.
+                            object: change.value.clone(),
+                            key: change.key.clone(),
+                            // Decoupled from the Raft index — this is
+                            // the global MVCC revision the catalog
+                            // stamped onto metadata.resourceVersion.
+                            resource_version: change.revision.get(),
                         });
                     }
-                    outcome
+                    outcome.op
                 }
                 EntryPayload::Membership(m) => {
                     guard.last_membership = StoredMembership::new(Some(log_id), m);
@@ -322,6 +318,7 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
                 applied_index: log_id.index,
                 applied_term: log_id.leader_id.term,
                 op,
+                revision: guard.catalog.revision().get(),
             });
         }
         drop(guard);

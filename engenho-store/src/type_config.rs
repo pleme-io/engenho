@@ -17,6 +17,12 @@ pub struct ApplyResult {
     pub applied_term: u64,
     /// What the catalog did with this command.
     pub op: ResourceOp,
+    /// The global MVCC revision stamped onto this mutation's
+    /// `metadata.resourceVersion`. `0` for a no-op (no revision was
+    /// consumed). Decoupled from `applied_index` (the Raft log
+    /// index) — see [`crate::revision`]. Consumers use this for
+    /// list-then-watch resume + optimistic concurrency.
+    pub revision: u64,
 }
 
 openraft::declare_raft_types!(

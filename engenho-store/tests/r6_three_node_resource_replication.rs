@@ -29,9 +29,11 @@ async fn single_node_store_put_and_get() {
     };
     let result = mesh.propose(cmd).await.unwrap();
     // openraft writes a blank entry at index 1 during initialize;
-    // our client_write lands at index 2.
+    // our client_write lands at index 2. The blank entry consumes NO
+    // MVCC revision (only real mutations do) → this first Put is
+    // revision 1, decoupled from its Raft index.
     assert!(result.applied_index >= 1);
-    let applied_index = result.applied_index;
+    assert_eq!(result.revision, 1);
     assert_eq!(result.op, engenho_store::command::ResourceOp::Created);
 
     let stored = mesh.get(&pod_key("podinfo")).await.unwrap();
@@ -39,13 +41,14 @@ async fn single_node_store_put_and_get() {
         stored.get("spec").unwrap().get("image").unwrap(),
         "ghcr.io/stefanprodan/podinfo:6.12.0"
     );
-    // resource_version reflects the Raft log index it was committed at.
+    // resource_version reflects the global MVCC revision (1), NOT the
+    // Raft log index — the etcd-style decoupling.
     let rv = stored
         .get("metadata")
         .unwrap()
         .get("resourceVersion")
         .unwrap();
-    assert_eq!(rv, &serde_json::json!(applied_index.to_string()));
+    assert_eq!(rv, &serde_json::json!(result.revision.to_string()));
 
     mesh.terminate().await.unwrap();
 }

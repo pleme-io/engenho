@@ -1,39 +1,134 @@
 //! `ResourceCatalog` — the deterministic state machine over the
 //! Raft log. Each committed [`ResourceCommand`] mutates this;
 //! followers and leader converge by replay.
+//!
+//! ## MVCC revision model (R6.1)
+//!
+//! The catalog tracks a global, strictly-monotonic [`Revision`]
+//! counter that advances by EXACTLY ONE per real mutation (Put /
+//! Patch / Delete that actually changes state). No-op mutations
+//! (patch-missing, delete-not-found) and the Raft-internal entries
+//! (blank on init, membership changes) do NOT consume a revision —
+//! they are filtered out before `apply` is ever called for them, and
+//! a no-op outcome here leaves the revision untouched.
+//!
+//! Per key the catalog stores `(value, VersionMeta)` where
+//! [`VersionMeta`] carries `(create_revision, mod_revision,
+//! version)` — etcd's per-key versioning triple. The wire
+//! `metadata.resourceVersion` is stamped from the global revision
+//! (NOT the Raft log index).
+//!
+//! A bounded in-memory history ring records every committed
+//! [`Change`]; it is the watch-replay source. When the ring
+//! overflows `history_capacity`, the oldest entry is evicted and the
+//! `compacted_revision` watermark advances. Reads / watches that ask
+//! for history below the watermark get a typed [`CompactedTooOld`].
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::command::{ResourceCommand, ResourceOp};
 use crate::resource::{ResourceKey, ResourceValue};
+use crate::revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
+
+/// Default bound on the in-memory history ring. 8192 committed
+/// mutations is enough to cover the recent window + the live tail
+/// every local watch consumer replays; older revisions fall below
+/// `compacted_revision`.
+pub const DEFAULT_HISTORY_CAPACITY: usize = 8192;
+
+/// What [`ResourceCatalog::apply`] returns: the resource operation
+/// the apiserver / client gets back, plus the typed [`Change`] the
+/// mutation committed (or `None` for a no-op).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApplyOutcome {
+    /// Created / Replaced / Patched / Deleted / NoOp.
+    pub op: ResourceOp,
+    /// The committed change — `Some` for every real mutation, `None`
+    /// for a no-op. Carries the post-image, the prior object (so the
+    /// Deleted event always has the real prior, never Null), the
+    /// stamped revision, and the per-key version metadata.
+    pub change: Option<Change>,
+}
 
 /// In-memory K8s resource catalog. Keyed by [`ResourceKey`] (which
 /// encodes group + version + kind + namespace + name), values are
-/// opaque [`ResourceValue`] (serde_json::Value) at R6.
+/// `(ResourceValue, VersionMeta)` — the opaque JSON object plus its
+/// MVCC version metadata.
 ///
-/// The catalog tracks `last_applied_index` so consumers (the
-/// apiserver, watchers) can express read-after-write semantics by
-/// waiting for a specific index.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// The catalog tracks `last_applied_index` (Raft log index, for
+/// read-after-write + snapshot resume) AND `current_revision` (the
+/// global MVCC counter consumers stamp resourceVersion from).
+#[derive(Clone, Debug)]
 pub struct ResourceCatalog {
-    pub resources: BTreeMap<ResourceKey, ResourceValue>,
+    /// Keyed store: value + per-key version metadata.
+    pub resources: BTreeMap<ResourceKey, (ResourceValue, VersionMeta)>,
     pub last_applied_term: u64,
     pub last_applied_index: u64,
+    /// Global MVCC revision counter — advances by 1 per real
+    /// mutation. `Revision(0)` means "no write has happened yet".
+    pub current_revision: Revision,
+    /// Bounded history ring — the watch-replay source.
+    pub history: VecDeque<Change>,
+    /// Lowest revision still retained in `history`. Reads / watches
+    /// below this return [`CompactedTooOld`]. `Revision(0)` means
+    /// nothing has been compacted yet.
+    pub compacted_revision: Revision,
+    /// Max entries retained in `history` before the oldest is evicted
+    /// (advancing `compacted_revision`).
+    pub history_capacity: usize,
+}
+
+impl Default for ResourceCatalog {
+    fn default() -> Self {
+        Self {
+            resources: BTreeMap::new(),
+            last_applied_term: 0,
+            last_applied_index: 0,
+            current_revision: Revision::ZERO,
+            history: VecDeque::new(),
+            compacted_revision: Revision::ZERO,
+            history_capacity: DEFAULT_HISTORY_CAPACITY,
+        }
+    }
+}
+
+impl PartialEq for ResourceCatalog {
+    /// Equality covers the durable, convergence-relevant state:
+    /// resources (value + version metadata), applied position, and
+    /// the global revision. The history ring + capacity are a local
+    /// replay buffer, not part of the converged state, so they're
+    /// excluded — two nodes that applied the same command sequence
+    /// are equal even if one has compacted more of its ring.
+    fn eq(&self, other: &Self) -> bool {
+        self.resources == other.resources
+            && self.last_applied_term == other.last_applied_term
+            && self.last_applied_index == other.last_applied_index
+            && self.current_revision == other.current_revision
+    }
 }
 
 // serde_json doesn't support struct map-keys directly. Custom impl
-// flattens the BTreeMap into Vec<(ResourceKey, ResourceValue)> at
-// the wire — preserves order (BTreeMap iter is sorted) so the
-// resulting bytes are deterministic across nodes.
+// flattens the BTreeMap into Vec<(ResourceKey, (ResourceValue,
+// VersionMeta))> at the wire — preserves order (BTreeMap iter is
+// sorted) so the resulting bytes are deterministic across nodes.
+//
+// The history ring is intentionally NOT serialized: it is a local
+// watch-replay buffer rebuilt by re-applying the log, not part of
+// the converged durable state. Persisting `current_revision` +
+// `compacted_revision` keeps the contract honest across snapshot /
+// restart.
 impl Serialize for ResourceCatalog {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = ser.serialize_struct("ResourceCatalog", 3)?;
-        let entries: Vec<(&ResourceKey, &ResourceValue)> = self.resources.iter().collect();
+        let mut state = ser.serialize_struct("ResourceCatalog", 5)?;
+        let entries: Vec<(&ResourceKey, &(ResourceValue, VersionMeta))> =
+            self.resources.iter().collect();
         state.serialize_field("resources", &entries)?;
         state.serialize_field("last_applied_term", &self.last_applied_term)?;
         state.serialize_field("last_applied_index", &self.last_applied_index)?;
+        state.serialize_field("current_revision", &self.current_revision)?;
+        state.serialize_field("compacted_revision", &self.compacted_revision)?;
         state.end()
     }
 }
@@ -42,15 +137,23 @@ impl<'de> Deserialize<'de> for ResourceCatalog {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct Helper {
-            resources: Vec<(ResourceKey, ResourceValue)>,
+            resources: Vec<(ResourceKey, (ResourceValue, VersionMeta))>,
             last_applied_term: u64,
             last_applied_index: u64,
+            #[serde(default)]
+            current_revision: Revision,
+            #[serde(default)]
+            compacted_revision: Revision,
         }
         let h = Helper::deserialize(de)?;
         Ok(Self {
             resources: h.resources.into_iter().collect(),
             last_applied_term: h.last_applied_term,
             last_applied_index: h.last_applied_index,
+            current_revision: h.current_revision,
+            history: VecDeque::new(),
+            compacted_revision: h.compacted_revision,
+            history_capacity: DEFAULT_HISTORY_CAPACITY,
         })
     }
 }
@@ -64,29 +167,76 @@ pub struct ResourceCatalogSnapshot {
 }
 
 impl ResourceCatalog {
-    /// Apply a single committed command. Pure function. Returns
-    /// the operation outcome the apiserver / client gets back.
+    /// Construct a catalog with an explicit history-ring capacity.
+    /// Used by callers that want a tighter compaction window (and by
+    /// tests that force compaction with a tiny capacity).
+    #[must_use]
+    pub fn with_history_capacity(history_capacity: usize) -> Self {
+        Self {
+            history_capacity: history_capacity.max(1),
+            ..Self::default()
+        }
+    }
+
+    /// Apply a single committed command. Pure function. Returns the
+    /// [`ApplyOutcome`] — operation + committed [`Change`].
     ///
-    /// Resource versioning: every successful Put / Patch /
-    /// Delete writes `metadata.resourceVersion = index` (the
-    /// committed Raft log index). On Put, `metadata.uid` is set
-    /// to a deterministic hash of `(key, index)` if it doesn't
-    /// already exist. This mirrors etcd-key-versioning behavior
-    /// at the apiserver boundary.
-    pub fn apply(&mut self, cmd: &ResourceCommand, term: u64, index: u64) -> ResourceOp {
+    /// Revision semantics:
+    ///
+    ///   * A NoOp outcome (delete-not-found, patch-missing) does NOT
+    ///     advance `current_revision` and emits no `Change`.
+    ///   * Any real mutation advances `current_revision` by exactly
+    ///     1, stamps `metadata.resourceVersion = <revision>` (NOT the
+    ///     Raft index), preserves/sets `metadata.uid`, updates the
+    ///     per-key [`VersionMeta`], and pushes a [`Change`] onto the
+    ///     history ring (evicting the front + advancing
+    ///     `compacted_revision` when over capacity).
+    pub fn apply(&mut self, cmd: &ResourceCommand, term: u64, index: u64) -> ApplyOutcome {
+        // Tentatively reserve the next revision; only committed if the
+        // mutation is real (not a no-op).
+        let rev = self.current_revision.next();
         let outcome = match cmd {
-            ResourceCommand::Put { key, value, .. } => self.apply_put(key, value, index),
-            ResourceCommand::Patch { key, patch, .. } => self.apply_patch(key, patch, index),
-            ResourceCommand::Delete { key, .. } => self.apply_delete(key),
+            ResourceCommand::Put { key, value, .. } => self.apply_put(key, value, rev),
+            ResourceCommand::Patch { key, patch, .. } => self.apply_patch(key, patch, rev),
+            ResourceCommand::Delete { key, .. } => self.apply_delete(key, rev),
         };
         self.last_applied_term = term;
         self.last_applied_index = index;
+        if let Some(change) = &outcome.change {
+            // Commit the revision + record history only for real
+            // mutations. The stamped revision is exactly `rev`.
+            debug_assert_eq!(change.revision, rev);
+            self.current_revision = rev;
+            self.push_history(change.clone());
+        }
         outcome
     }
 
-    fn apply_put(&mut self, key: &ResourceKey, value: &ResourceValue, index: u64) -> ResourceOp {
+    /// Push a change onto the ring, evicting the oldest + advancing
+    /// the compaction watermark when over capacity.
+    fn push_history(&mut self, change: Change) {
+        self.history.push_back(change);
+        while self.history.len() > self.history_capacity {
+            if let Some(evicted) = self.history.pop_front() {
+                // The lowest retained revision is now the revision of
+                // the NEW front. Anything <= evicted.revision is gone.
+                self.compacted_revision = evicted.revision;
+            }
+        }
+    }
+
+    fn apply_put(&mut self, key: &ResourceKey, value: &ResourceValue, rev: Revision) -> ApplyOutcome {
+        // Capture the pre-image BEFORE mutating — this is the prior
+        // object every consumer (watch, optimistic-concurrency) needs.
+        let prior_entry = self.resources.get(key).cloned();
+        let prior_value = prior_entry.as_ref().map(|(v, _)| v.clone());
+
+        let version_meta = match &prior_entry {
+            Some((_, meta)) => meta.bumped_at(rev),
+            None => VersionMeta::created_at(rev),
+        };
+
         let mut new_value = value.clone();
-        let already_existed = self.resources.contains_key(key);
         if let Some(obj) = new_value.as_object_mut() {
             let metadata = obj
                 .entry("metadata".to_string())
@@ -94,69 +244,164 @@ impl ResourceCatalog {
             if let Some(meta_obj) = metadata.as_object_mut() {
                 meta_obj.insert(
                     "resourceVersion".to_string(),
-                    serde_json::Value::String(index.to_string()),
+                    serde_json::Value::String(rev.to_string()),
                 );
-                // Set uid only if not already present + not already in store
-                let needs_uid = !meta_obj.contains_key("uid")
-                    && !self
-                        .resources
-                        .get(key)
-                        .and_then(|v| v.get("metadata").and_then(|m| m.get("uid")))
-                        .is_some();
-                if needs_uid {
-                    let uid = format!("uid-{}-{}", key.label().replace('/', "-"), index);
-                    meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
-                } else if let Some(prior_uid) = self
-                    .resources
-                    .get(key)
-                    .and_then(|v| v.get("metadata"))
+                // Preserve uid across updates; mint a deterministic
+                // one (from key + create_revision) on first create.
+                let prior_uid = prior_entry
+                    .as_ref()
+                    .and_then(|(v, _)| v.get("metadata"))
                     .and_then(|m| m.get("uid"))
-                    .cloned()
-                {
-                    // Preserve uid across updates.
+                    .cloned();
+                if let Some(prior_uid) = prior_uid {
                     meta_obj.insert("uid".to_string(), prior_uid);
+                } else if !meta_obj.contains_key("uid") {
+                    let uid = format!(
+                        "uid-{}-{}",
+                        key.label().replace('/', "-"),
+                        version_meta.create_revision
+                    );
+                    meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
                 }
             }
         }
-        self.resources.insert(key.clone(), new_value);
-        if already_existed {
+
+        self.resources
+            .insert(key.clone(), (new_value.clone(), version_meta));
+
+        let op = if prior_value.is_some() {
             ResourceOp::Replaced
         } else {
             ResourceOp::Created
+        };
+        ApplyOutcome {
+            op,
+            change: Some(Change {
+                revision: rev,
+                key: key.clone(),
+                kind: ChangeKind::Put,
+                value: new_value,
+                prior: prior_value,
+                version_meta,
+            }),
         }
     }
 
-    fn apply_patch(&mut self, key: &ResourceKey, patch: &ResourceValue, index: u64) -> ResourceOp {
-        let Some(existing) = self.resources.get_mut(key) else {
-            return ResourceOp::NoOp;
+    fn apply_patch(&mut self, key: &ResourceKey, patch: &ResourceValue, rev: Revision) -> ApplyOutcome {
+        let Some((existing_value, existing_meta)) = self.resources.get(key) else {
+            return ApplyOutcome {
+                op: ResourceOp::NoOp,
+                change: None,
+            };
         };
-        merge_json(existing, patch);
-        if let Some(obj) = existing.as_object_mut() {
+        // Capture pre-image before the merge.
+        let prior_value = existing_value.clone();
+        let version_meta = existing_meta.bumped_at(rev);
+
+        let mut merged = existing_value.clone();
+        merge_json(&mut merged, patch);
+        if let Some(obj) = merged.as_object_mut() {
             let metadata = obj
                 .entry("metadata".to_string())
                 .or_insert_with(|| serde_json::json!({}));
             if let Some(meta_obj) = metadata.as_object_mut() {
                 meta_obj.insert(
                     "resourceVersion".to_string(),
-                    serde_json::Value::String(index.to_string()),
+                    serde_json::Value::String(rev.to_string()),
                 );
             }
         }
-        ResourceOp::Patched
-    }
 
-    fn apply_delete(&mut self, key: &ResourceKey) -> ResourceOp {
-        if self.resources.remove(key).is_some() {
-            ResourceOp::Deleted
-        } else {
-            ResourceOp::NoOp
+        self.resources
+            .insert(key.clone(), (merged.clone(), version_meta));
+
+        ApplyOutcome {
+            op: ResourceOp::Patched,
+            change: Some(Change {
+                revision: rev,
+                key: key.clone(),
+                kind: ChangeKind::Put,
+                value: merged,
+                prior: Some(prior_value),
+                version_meta,
+            }),
         }
     }
 
-    /// Read a single resource by key.
+    fn apply_delete(&mut self, key: &ResourceKey, rev: Revision) -> ApplyOutcome {
+        let Some((removed_value, removed_meta)) = self.resources.remove(key) else {
+            return ApplyOutcome {
+                op: ResourceOp::NoOp,
+                change: None,
+            };
+        };
+        // The tombstone (post-image) IS the last-known object — so
+        // watch consumers see what was deleted. Both `value` and
+        // `prior` carry it; the Deleted event never carries Null.
+        ApplyOutcome {
+            op: ResourceOp::Deleted,
+            change: Some(Change {
+                revision: rev,
+                key: key.clone(),
+                kind: ChangeKind::Delete,
+                value: removed_value.clone(),
+                prior: Some(removed_value),
+                version_meta: removed_meta,
+            }),
+        }
+    }
+
+    /// Read a single resource by key (value only).
     #[must_use]
     pub fn get(&self, key: &ResourceKey) -> Option<&ResourceValue> {
-        self.resources.get(key)
+        self.resources.get(key).map(|(v, _)| v)
+    }
+
+    /// Read a single resource by key with its MVCC version metadata.
+    #[must_use]
+    pub fn get_with_meta(&self, key: &ResourceKey) -> Option<(&ResourceValue, VersionMeta)> {
+        self.resources.get(key).map(|(v, m)| (v, *m))
+    }
+
+    /// The current global revision — the atomic list-snapshot
+    /// resourceVersion. `list()` callers capture this under the same
+    /// lock to get a consistent list-then-watch resume point.
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.current_revision
+    }
+
+    /// The compaction watermark — the lowest revision still
+    /// retained in the history ring.
+    #[must_use]
+    pub fn compacted_revision(&self) -> Revision {
+        self.compacted_revision
+    }
+
+    /// All committed changes with `revision > rv`, in revision order.
+    ///
+    /// This is the watch-replay primitive: a client that last saw
+    /// revision `rv` resumes by replaying exactly these changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactedTooOld`] when `rv < compacted_revision` —
+    /// the requested resume point has been compacted away (the 410
+    /// Gone equivalent). Asking from exactly `compacted_revision` (or
+    /// above) is always honored.
+    pub fn changes_since(&self, rv: Revision) -> Result<Vec<Change>, CompactedTooOld> {
+        if rv < self.compacted_revision {
+            return Err(CompactedTooOld {
+                requested: rv,
+                compacted: self.compacted_revision,
+            });
+        }
+        Ok(self
+            .history
+            .iter()
+            .filter(|c| c.revision > rv)
+            .cloned()
+            .collect())
     }
 
     /// List resources matching (group, version, kind), optionally
@@ -177,6 +422,7 @@ impl ResourceCatalog {
                 (Some(want), Some(have)) => want == have,
                 (Some(_), None) => false,
             })
+            .map(|(k, (v, _))| (k, v))
             .collect()
     }
 
@@ -224,70 +470,93 @@ mod tests {
         ResourceKey::namespaced("", "v1", "Pod", "default", name)
     }
 
+    fn put(cat: &mut ResourceCatalog, key: &ResourceKey, value: serde_json::Value, index: u64) -> ApplyOutcome {
+        cat.apply(
+            &ResourceCommand::Put {
+                key: key.clone(),
+                value,
+                reason: Reason::Operator,
+            },
+            1,
+            index,
+        )
+    }
+
+    fn delete(cat: &mut ResourceCatalog, key: &ResourceKey, index: u64) -> ApplyOutcome {
+        cat.apply(
+            &ResourceCommand::Delete {
+                key: key.clone(),
+                reason: Reason::Operator,
+            },
+            1,
+            index,
+        )
+    }
+
     #[test]
     fn put_creates_then_replaces() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("podinfo");
-        let v = serde_json::json!({"spec": {"image": "v1"}});
-        let op = cat.apply(
-            &ResourceCommand::Put {
-                key: k.clone(),
-                value: v.clone(),
-                reason: Reason::Operator,
-            },
-            1,
-            1,
-        );
-        assert_eq!(op, ResourceOp::Created);
+        let op = put(&mut cat, &k, serde_json::json!({"spec": {"image": "v1"}}), 1);
+        assert_eq!(op.op, ResourceOp::Created);
         assert_eq!(cat.len(), 1);
 
-        // Replace
-        let v2 = serde_json::json!({"spec": {"image": "v2"}});
-        let op = cat.apply(
-            &ResourceCommand::Put {
-                key: k.clone(),
-                value: v2,
-                reason: Reason::Operator,
-            },
-            1,
-            2,
-        );
-        assert_eq!(op, ResourceOp::Replaced);
+        let op = put(&mut cat, &k, serde_json::json!({"spec": {"image": "v2"}}), 2);
+        assert_eq!(op.op, ResourceOp::Replaced);
         assert_eq!(cat.len(), 1);
     }
 
     #[test]
-    fn put_sets_resource_version_and_uid() {
+    fn put_stamps_revision_not_raft_index() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("podinfo");
-        cat.apply(
-            &ResourceCommand::Put {
-                key: k.clone(),
-                value: serde_json::json!({"spec": {}}),
-                reason: Reason::Operator,
-            },
-            1,
-            42,
-        );
+        // Raft index 42, but this is the FIRST real mutation → rev 1.
+        put(&mut cat, &k, serde_json::json!({"spec": {}}), 42);
         let stored = cat.get(&k).unwrap();
         let metadata = stored.get("metadata").unwrap();
         assert_eq!(
             metadata.get("resourceVersion").unwrap(),
-            &serde_json::json!("42")
+            &serde_json::json!("1"),
+            "resourceVersion is the global revision (1), not the Raft index (42)"
         );
-        // uid must be set + stable across replaces.
-        let uid_1 = metadata.get("uid").unwrap().as_str().unwrap().to_string();
+        assert_eq!(cat.revision(), Revision(1));
+    }
+
+    #[test]
+    fn put_then_put_advances_mod_revision_stable_create_revision() {
+        // I3: create_revision stable, mod_revision advances, version 1->2.
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("podinfo");
+        put(&mut cat, &k, serde_json::json!({"spec": {}}), 5);
+        let (_, m1) = cat.get_with_meta(&k).unwrap();
+        assert_eq!(m1.create_revision, Revision(1));
+        assert_eq!(m1.mod_revision, Revision(1));
+        assert_eq!(m1.version, 1);
+
+        put(&mut cat, &k, serde_json::json!({"spec": {"replaced": true}}), 6);
+        let (_, m2) = cat.get_with_meta(&k).unwrap();
+        assert_eq!(m2.create_revision, Revision(1), "create_revision stable");
+        assert_eq!(m2.mod_revision, Revision(2), "mod_revision advances");
+        assert_eq!(m2.version, 2, "version increments by exactly 1");
+    }
+
+    #[test]
+    fn uid_is_set_and_preserved_across_replaces() {
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("podinfo");
+        put(&mut cat, &k, serde_json::json!({"spec": {}}), 1);
+        let uid_1 = cat
+            .get(&k)
+            .unwrap()
+            .get("metadata")
+            .unwrap()
+            .get("uid")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(uid_1.starts_with("uid-"));
-        // Replace; uid should survive.
-        cat.apply(
-            &ResourceCommand::Put {
-                key: k.clone(),
-                value: serde_json::json!({"spec": {"replaced": true}}),
-                reason: Reason::Operator,
-            },
-            1,
-            100,
-        );
+        put(&mut cat, &k, serde_json::json!({"spec": {"x": true}}), 2);
         let uid_2 = cat
             .get(&k)
             .unwrap()
@@ -302,18 +571,60 @@ mod tests {
     }
 
     #[test]
-    fn patch_merges_into_existing() {
+    fn delete_then_recreate_yields_new_create_revision() {
+        // I3: recreate-after-delete gets a NEW create_revision + version resets.
         let mut cat = ResourceCatalog::default();
-        let k = pod_key("podinfo");
-        cat.apply(
-            &ResourceCommand::Put {
-                key: k.clone(),
-                value: serde_json::json!({"spec": {"image": "v1", "replicas": 2}}),
+        let k = pod_key("phoenix");
+        put(&mut cat, &k, serde_json::json!({"spec": {"gen": 1}}), 1); // rev 1
+        let (_, m1) = cat.get_with_meta(&k).unwrap();
+        assert_eq!(m1.create_revision, Revision(1));
+
+        delete(&mut cat, &k, 2); // rev 2
+        assert!(cat.get(&k).is_none());
+
+        put(&mut cat, &k, serde_json::json!({"spec": {"gen": 2}}), 3); // rev 3
+        let (_, m2) = cat.get_with_meta(&k).unwrap();
+        assert_eq!(
+            m2.create_revision,
+            Revision(3),
+            "recreate gets a fresh create_revision"
+        );
+        assert_eq!(m2.mod_revision, Revision(3));
+        assert_eq!(m2.version, 1, "version resets to 1 on recreate");
+    }
+
+    #[test]
+    fn noop_does_not_advance_revision_or_history() {
+        // I2: patch-missing + delete-not-found leave revision + history untouched.
+        let mut cat = ResourceCatalog::default();
+        assert_eq!(cat.revision(), Revision(0));
+
+        let patched = cat.apply(
+            &ResourceCommand::Patch {
+                key: pod_key("ghost"),
+                patch: serde_json::json!({"x": 1}),
                 reason: Reason::Operator,
             },
             1,
             1,
         );
+        assert_eq!(patched.op, ResourceOp::NoOp);
+        assert!(patched.change.is_none());
+        assert_eq!(cat.revision(), Revision(0));
+        assert!(cat.history.is_empty());
+
+        let deleted = delete(&mut cat, &pod_key("ghost"), 2);
+        assert_eq!(deleted.op, ResourceOp::NoOp);
+        assert!(deleted.change.is_none());
+        assert_eq!(cat.revision(), Revision(0));
+        assert!(cat.history.is_empty());
+    }
+
+    #[test]
+    fn patch_merges_into_existing_and_bumps_version() {
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("podinfo");
+        put(&mut cat, &k, serde_json::json!({"spec": {"image": "v1", "replicas": 2}}), 1);
         let op = cat.apply(
             &ResourceCommand::Patch {
                 key: k.clone(),
@@ -323,118 +634,102 @@ mod tests {
             1,
             2,
         );
-        assert_eq!(op, ResourceOp::Patched);
+        assert_eq!(op.op, ResourceOp::Patched);
+        let change = op.change.unwrap();
+        assert_eq!(change.revision, Revision(2));
+        assert_eq!(change.version_meta.create_revision, Revision(1));
+        assert_eq!(change.version_meta.mod_revision, Revision(2));
+        assert_eq!(change.version_meta.version, 2);
         let stored = cat.get(&k).unwrap();
         assert_eq!(stored.get("spec").unwrap().get("image").unwrap(), "v2");
-        // replicas survived the merge
         assert_eq!(stored.get("spec").unwrap().get("replicas").unwrap(), 2);
     }
 
     #[test]
-    fn patch_on_missing_is_noop() {
+    fn delete_change_carries_prior_object_not_null() {
+        // I4: every Delete change has prior == Some(last_known) and value != Null.
         let mut cat = ResourceCatalog::default();
-        let op = cat.apply(
-            &ResourceCommand::Patch {
-                key: pod_key("ghost"),
-                patch: serde_json::json!({"x": 1}),
-                reason: Reason::Operator,
-            },
-            1,
+        let k = pod_key("podinfo");
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"image": "podinfo:6", "replicas": 3}}),
             1,
         );
-        assert_eq!(op, ResourceOp::NoOp);
+        let op = delete(&mut cat, &k, 2);
+        assert_eq!(op.op, ResourceOp::Deleted);
+        let change = op.change.unwrap();
+        assert_eq!(change.kind, ChangeKind::Delete);
+        // value is the tombstone (the prior object), NEVER Null.
+        assert!(!change.value.is_null());
+        assert_eq!(
+            change.value.get("spec").unwrap().get("image").unwrap(),
+            "podinfo:6"
+        );
+        // prior carries the same last-known object.
+        let prior = change.prior.unwrap();
+        assert_eq!(prior.get("spec").unwrap().get("replicas").unwrap(), 3);
     }
 
     #[test]
-    fn delete_removes_then_noop() {
+    fn changes_since_returns_tail_in_order() {
+        // I5: 5 puts (rev 1..5); changes_since(2) yields revs 3,4,5.
         let mut cat = ResourceCatalog::default();
-        let k = pod_key("podinfo");
-        cat.apply(
-            &ResourceCommand::Put {
-                key: k.clone(),
-                value: serde_json::json!({}),
-                reason: Reason::Operator,
-            },
-            1,
-            1,
-        );
-        assert_eq!(cat.len(), 1);
-        let op = cat.apply(
-            &ResourceCommand::Delete {
-                key: k.clone(),
-                reason: Reason::Operator,
-            },
-            1,
-            2,
-        );
-        assert_eq!(op, ResourceOp::Deleted);
-        assert_eq!(cat.len(), 0);
-        // Second delete is no-op.
-        let op = cat.apply(
-            &ResourceCommand::Delete {
-                key: k.clone(),
-                reason: Reason::GarbageCollector,
-            },
-            1,
-            3,
-        );
-        assert_eq!(op, ResourceOp::NoOp);
+        for i in 1..=5 {
+            put(&mut cat, &pod_key(&format!("p{i}")), serde_json::json!({"i": i}), i);
+        }
+        let tail = cat.changes_since(Revision(2)).unwrap();
+        let revs: Vec<u64> = tail.iter().map(|c| c.revision.0).collect();
+        assert_eq!(revs, vec![3, 4, 5]);
+        // changes_since(0) yields all five.
+        assert_eq!(cat.changes_since(Revision(0)).unwrap().len(), 5);
+        // changes_since(current) yields none.
+        assert!(cat.changes_since(Revision(5)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn changes_since_below_compaction_errors() {
+        // I5: force compaction with tiny capacity; below-watermark → CompactedTooOld.
+        let mut cat = ResourceCatalog::with_history_capacity(2);
+        for i in 1..=5 {
+            put(&mut cat, &pod_key(&format!("p{i}")), serde_json::json!({"i": i}), i);
+        }
+        // Only the last 2 changes (rev 4, 5) are retained; compacted at rev 3.
+        assert_eq!(cat.history.len(), 2);
+        assert_eq!(cat.compacted_revision(), Revision(3));
+        let err = cat.changes_since(Revision(1)).unwrap_err();
+        assert_eq!(err.requested, Revision(1));
+        assert_eq!(err.compacted, Revision(3));
+        // Asking from exactly the watermark is honored.
+        assert_eq!(cat.changes_since(Revision(3)).unwrap().len(), 2);
     }
 
     #[test]
     fn list_filters_by_gvk_and_namespace() {
         let mut cat = ResourceCatalog::default();
+        let mut idx = 0;
         for name in ["a", "b", "c"] {
-            cat.apply(
-                &ResourceCommand::Put {
-                    key: ResourceKey::namespaced("", "v1", "Pod", "default", name),
-                    value: serde_json::json!({}),
-                    reason: Reason::Operator,
-                },
-                1,
-                1,
-            );
+            idx += 1;
+            put(&mut cat, &ResourceKey::namespaced("", "v1", "Pod", "default", name), serde_json::json!({}), idx);
         }
-        cat.apply(
-            &ResourceCommand::Put {
-                key: ResourceKey::namespaced("", "v1", "Pod", "kube-system", "coredns"),
-                value: serde_json::json!({}),
-                reason: Reason::Operator,
-            },
-            1,
-            1,
-        );
-        cat.apply(
-            &ResourceCommand::Put {
-                key: ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm-1"),
-                value: serde_json::json!({}),
-                reason: Reason::Operator,
-            },
-            1,
-            1,
-        );
-        // List all Pods in default → a, b, c
-        let pods = cat.list("", "v1", "Pod", Some("default"));
-        assert_eq!(pods.len(), 3);
-        // List ConfigMaps in default → 1
-        let cms = cat.list("", "v1", "ConfigMap", Some("default"));
-        assert_eq!(cms.len(), 1);
-        // List all Pods (any namespace) → 4
-        let all_pods = cat.list("", "v1", "Pod", None);
-        assert_eq!(all_pods.len(), 4);
+        idx += 1;
+        put(&mut cat, &ResourceKey::namespaced("", "v1", "Pod", "kube-system", "coredns"), serde_json::json!({}), idx);
+        idx += 1;
+        put(&mut cat, &ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm-1"), serde_json::json!({}), idx);
+
+        assert_eq!(cat.list("", "v1", "Pod", Some("default")).len(), 3);
+        assert_eq!(cat.list("", "v1", "ConfigMap", Some("default")).len(), 1);
+        assert_eq!(cat.list("", "v1", "Pod", None).len(), 4);
     }
 
     #[test]
     fn json_merge_patch_null_deletes_field() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("p");
-        cat.apply(
-            &ResourceCommand::Put {
-                key: k.clone(),
-                value: serde_json::json!({"spec": {"image": "v1", "annotations": {"a": "b"}}}),
-                reason: Reason::Operator,
-            },
-            1,
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"image": "v1", "annotations": {"a": "b"}}}),
             1,
         );
         cat.apply(
@@ -456,7 +751,27 @@ mod tests {
                 .get("annotations")
                 .is_none()
         );
-        // Image survives
         assert_eq!(stored.get("spec").unwrap().get("image").unwrap(), "v1");
+    }
+
+    #[test]
+    fn current_revision_counts_real_mutations() {
+        // current_revision == count of non-NoOp ops.
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("p");
+        put(&mut cat, &k, serde_json::json!({}), 1); // rev 1
+        put(&mut cat, &k, serde_json::json!({"x": 1}), 2); // rev 2
+        delete(&mut cat, &k, 3); // rev 3
+        delete(&mut cat, &k, 4); // NoOp — no revision
+        cat.apply(
+            &ResourceCommand::Patch {
+                key: pod_key("ghost"),
+                patch: serde_json::json!({"y": 1}),
+                reason: Reason::Operator,
+            },
+            1,
+            5,
+        ); // NoOp — no revision
+        assert_eq!(cat.revision(), Revision(3));
     }
 }
