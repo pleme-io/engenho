@@ -18,7 +18,7 @@ use crate::error::KubeletError;
 
 /// Spec describing what the kubelet wants the backend to run.
 /// Distilled from `engenho_types::core_v1::Pod.spec.containers[0]`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerSpec {
     /// Logical container name (namespace/podname/container).
     pub name: String,
@@ -28,6 +28,32 @@ pub struct ContainerSpec {
     pub env: BTreeMap<String, String>,
     /// Command to run inside the container; empty = image default.
     pub command: Vec<String>,
+    /// Per-pod DNS aliases (`--network-alias`) the kubelet computed from
+    /// the Services whose selector matches this Pod's labels (M0.3
+    /// cluster-DNS brick). Each alias is a Service-name form — `<svc>`,
+    /// `<svc>.<ns>`, `<svc>.<ns>.svc.<cluster_domain>` — fed to podman's
+    /// aardvark-dns so a pod on the shared user-defined network resolves
+    /// Service names to backend pod IPs (headless multi-A, no ClusterIP).
+    ///
+    /// Empty = the Pod matched no Service (or the backend is on the
+    /// ambient network, where aliases are meaningless). Carried on
+    /// `ContainerSpec` (not a separate `start` arg) so the
+    /// [`ContainerRuntime::start`] signature is unchanged and
+    /// [`FakeBackend`] needs no new method — aliases are just data.
+    ///
+    /// ## Start-time only (accepted M0.3 limitation)
+    ///
+    /// Aliases are computed once, at pod-start, because `--network-alias`
+    /// is a `podman run` flag that cannot be added to a running container
+    /// without recreate. A Service created AFTER a pod starts does NOT
+    /// retroactively alias that pod until it is recreated. The
+    /// EndpointsController (reconciled) keeps Service→Endpoints current
+    /// for any consumer reading Endpoints; this alias path is the
+    /// convenience DNS layer. The M0.4 `engenho-dns` authority (hickory +
+    /// KubernetesAuthority owning ClusterIP A-records + SRV) removes the
+    /// limitation entirely — named here so this interim is a conscious
+    /// shortest-correct step toward that destination, not the easy path.
+    pub network_aliases: Vec<String>,
 }
 
 /// Status the backend reports back.
@@ -447,13 +473,25 @@ impl PodmanBackend {
     // the exact ContainerSpec → podman mapping without spawning a process.
     // The async methods below construct their `Command` from these vecs.
 
-    /// `podman run` argv for `spec`, honoring `pull_policy` + `network`:
-    /// `["run","-d", ("--network",<net>)?, "--pull",<policy>,"--name",<name>, (-e k=v)*, <image>, (cmd)*]`.
+    /// `podman run` argv for `spec`, honoring `pull_policy` + `network` +
+    /// per-pod `network_aliases`:
+    /// `["run","-d", ("--network",<net>)?, ("--network-alias",<alias>)*, "--pull",<policy>,"--name",<name>, (-e k=v)*, <image>, (cmd)*]`.
     ///
     /// The `--network <name>` flag is emitted immediately after `-d` when
     /// the backend's [`PodmanNetwork`] names a network (the M0.3 default
     /// `engenho-net`); [`PodmanNetwork::Default`] omits it (ambient
     /// network).
+    ///
+    /// Each entry of `spec.network_aliases` becomes a `--network-alias
+    /// <alias>` pair, emitted immediately AFTER the `--network <net>` pair
+    /// and BEFORE `--pull` (deterministic, unit-assertable position).
+    /// aardvark-dns (which already runs for a user-defined network) then
+    /// resolves those alias names to this container's IP, so a pod resolves
+    /// a Service name to the backend pod IPs (headless multi-A). Aliases
+    /// are emitted ONLY when [`PodmanNetwork::name`] is `Some(_)`: on the
+    /// ambient [`PodmanNetwork::Default`] network there is no aardvark-dns
+    /// alias resolution, so aliases would be silently meaningless — we omit
+    /// them entirely rather than emit a flag that does nothing.
     #[must_use]
     pub fn run_argv(&self, spec: &ContainerSpec) -> Vec<String> {
         let mut argv = vec!["run".to_string(), "-d".to_string()];
@@ -462,6 +500,14 @@ impl PodmanBackend {
         if let Some(net) = self.network.name() {
             argv.push("--network".to_string());
             argv.push(net.to_string());
+            // Service-name DNS aliases for aardvark-dns. ONLY on a named
+            // user network (aardvark-dns resolves --network-alias names
+            // there); on the ambient network they're meaningless, so the
+            // `if let Some` guard already gates this block.
+            for alias in &spec.network_aliases {
+                argv.push("--network-alias".to_string());
+                argv.push(alias.clone());
+            }
         }
         argv.push("--pull".to_string());
         argv.push(self.pull_policy.flag_value().to_string());
@@ -779,6 +825,7 @@ mod tests {
             image: "stefanprodan/podinfo:6".into(),
             env: BTreeMap::new(),
             command: vec![],
+            ..Default::default()
         };
         let status = backend.start(&spec).await.unwrap();
         assert!(status.running);
@@ -795,6 +842,7 @@ mod tests {
             image: "i".into(),
             env: BTreeMap::new(),
             command: vec![],
+            ..Default::default()
         };
         let s = backend.start(&spec).await.unwrap();
         backend.stop(&s.container_id).await.unwrap();
@@ -811,6 +859,7 @@ mod tests {
             image: "i".into(),
             env: BTreeMap::new(),
             command: vec![],
+            ..Default::default()
         };
         let s = backend.start(&spec).await.unwrap();
         backend.remove(&s.container_id).await.unwrap();
@@ -825,6 +874,7 @@ mod tests {
             image: "i".into(),
             env: BTreeMap::new(),
             command: vec![],
+            ..Default::default()
         };
         let s = backend.start(&spec).await.unwrap();
         backend.stop(&s.container_id).await.unwrap();
@@ -844,6 +894,7 @@ mod tests {
             image: "i".into(),
             env: BTreeMap::new(),
             command: vec![],
+            ..Default::default()
         };
         let s = backend.start(&spec).await.unwrap();
         backend.set_exit(&s.container_id, 137).await;
@@ -864,6 +915,7 @@ mod tests {
             image: "i".into(),
             env: BTreeMap::new(),
             command: vec![],
+            ..Default::default()
         };
         let s = backend.start(&spec).await.unwrap();
         assert_eq!(backend.running_count().await, 1);
@@ -930,6 +982,24 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
             command: command.iter().map(|c| (*c).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Like [`spec`] but with explicit `network_aliases` — used by the
+    /// M0.3 `--network-alias` emission tests.
+    fn spec_with_aliases(
+        name: &str,
+        image: &str,
+        command: &[&str],
+        aliases: &[&str],
+    ) -> ContainerSpec {
+        ContainerSpec {
+            name: name.into(),
+            image: image.into(),
+            env: BTreeMap::new(),
+            command: command.iter().map(|c| (*c).to_string()).collect(),
+            network_aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
         }
     }
 
@@ -1090,6 +1160,133 @@ mod tests {
         assert_eq!(backend.network, PodmanNetwork::Named("n".into()));
         assert_eq!(backend.pull_policy, PullPolicy::Never);
         assert!(backend.registry_auth_file.is_none());
+    }
+
+    // ── M0.3 cluster-DNS: --network-alias emission ──────────────────────
+    //
+    // The kubelet computes Service-name aliases (in kubelet.rs) + stores
+    // them on ContainerSpec.network_aliases; run_argv emits one
+    // `--network-alias <alias>` pair per entry, AFTER `--network <net>`
+    // and BEFORE `--pull`, ONLY on a named user network (aardvark-dns
+    // resolves --network-alias names only there).
+
+    #[test]
+    fn run_argv_emits_network_alias_after_network_before_pull() {
+        let backend = PodmanBackend::new();
+        let s = spec_with_aliases(
+            "default_web-abc",
+            "img",
+            &[],
+            &["web", "web.default", "web.default.svc.cluster.local"],
+        );
+        let argv = backend.run_argv(&s);
+        assert_eq!(
+            argv,
+            vec![
+                "run",
+                "-d",
+                "--network",
+                "engenho-net",
+                "--network-alias",
+                "web",
+                "--network-alias",
+                "web.default",
+                "--network-alias",
+                "web.default.svc.cluster.local",
+                "--pull",
+                "never",
+                "--name",
+                "default_web-abc",
+                "img",
+            ]
+        );
+        // Position guard (mirrors run_argv_includes_shared_network_right_after_d):
+        // every alias flag sits after the --network pair and before --pull.
+        let net_idx = argv.iter().position(|a| a == "--network").unwrap();
+        let pull_idx = argv.iter().position(|a| a == "--pull").unwrap();
+        let first_alias = argv.iter().position(|a| a == "--network-alias").unwrap();
+        let last_alias = argv.iter().rposition(|a| a == "--network-alias").unwrap();
+        assert!(net_idx < first_alias, "alias flags must follow --network");
+        assert!(last_alias < pull_idx, "alias flags must precede --pull");
+    }
+
+    #[test]
+    fn run_argv_empty_aliases_emit_no_network_alias() {
+        // No aliases → NO --network-alias token (mirrors
+        // run_argv_empty_env_emits_no_dash_e).
+        let backend = PodmanBackend::new();
+        let s = spec_with_aliases("c", "img", &[], &[]);
+        let argv = backend.run_argv(&s);
+        assert!(
+            !argv.iter().any(|a| a == "--network-alias"),
+            "no --network-alias for empty aliases: {argv:?}"
+        );
+        // The base shape is unchanged from the no-alias case.
+        assert_eq!(
+            argv,
+            vec!["run", "-d", "--network", "engenho-net", "--pull", "never", "--name", "c", "img"]
+        );
+    }
+
+    #[test]
+    fn run_argv_default_network_omits_aliases_even_when_present() {
+        // PodmanNetwork::Default → ambient network → aardvark-dns does NOT
+        // resolve --network-alias names → omit them entirely. Regression
+        // guards the "ambient network can't resolve aliases" rule: aliases
+        // are present on the spec but MUST NOT appear in argv.
+        let backend = PodmanBackend::new().with_network(PodmanNetwork::Default);
+        let s = spec_with_aliases("c", "img", &[], &["web", "web.default"]);
+        let argv = backend.run_argv(&s);
+        assert!(
+            !argv.iter().any(|a| a == "--network-alias"),
+            "Default network must not emit --network-alias even with aliases set: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--network"),
+            "Default network must not emit --network: {argv:?}"
+        );
+        assert_eq!(
+            argv,
+            vec!["run", "-d", "--pull", "never", "--name", "c", "img"]
+        );
+    }
+
+    #[test]
+    fn run_argv_full_mapping_with_aliases_in_order() {
+        // Golden: env + aliases + command together pin the complete argv
+        // shape (extends run_argv_full_mapping_in_order with the alias
+        // block). Ordering: run -d, --network, --network-alias*, --pull,
+        // --name, -e*, image, cmd*.
+        let backend = PodmanBackend::new();
+        let mut s = spec(
+            "default_p1",
+            "docker.io/library/busybox",
+            &[("FOO", "bar")],
+            &["sleep", "300"],
+        );
+        s.network_aliases = vec!["web".into(), "web.default".into()];
+        assert_eq!(
+            backend.run_argv(&s),
+            vec![
+                "run",
+                "-d",
+                "--network",
+                "engenho-net",
+                "--network-alias",
+                "web",
+                "--network-alias",
+                "web.default",
+                "--pull",
+                "never",
+                "--name",
+                "default_p1",
+                "-e",
+                "FOO=bar",
+                "docker.io/library/busybox",
+                "sleep",
+                "300",
+            ]
+        );
     }
 
     // ── inspect / stop / rm argv ────────────────────────────────────────
