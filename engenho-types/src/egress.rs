@@ -406,13 +406,17 @@ impl IptablesScript {
 
     /// Append a `-F <chain>` flush rule.
     pub fn flush(&mut self, chain: &str) -> &mut Self {
-        self.lines.push(IptablesLine::Rule(format!("-F {chain}")));
+        let mut line = String::new();
+        let _ = write!(line, "-F {chain}");
+        self.lines.push(IptablesLine::Rule(line));
         self
     }
 
     /// Append a `-X <chain>` delete-chain rule.
     pub fn delete_chain(&mut self, chain: &str) -> &mut Self {
-        self.lines.push(IptablesLine::Rule(format!("-X {chain}")));
+        let mut line = String::new();
+        let _ = write!(line, "-X {chain}");
+        self.lines.push(IptablesLine::Rule(line));
         self
     }
 
