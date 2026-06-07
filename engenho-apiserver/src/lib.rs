@@ -30,6 +30,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod coords;
 pub mod discovery;
 pub mod error;
 pub mod handler;
@@ -40,6 +41,7 @@ pub mod pki;
 pub mod router;
 pub mod server;
 
+pub use coords::ResourceCoords;
 pub use discovery::{
     APIGroup, APIGroupList, APIResource, APIResourceList, APIVersions, GroupVersionForDiscovery,
     ServerAddressByClientCIDR,
