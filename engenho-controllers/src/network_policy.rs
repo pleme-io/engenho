@@ -227,30 +227,19 @@ impl CiliumNetworkPolicyAdapter {
     }
 
     /// Render the CiliumNetworkPolicy CRD YAML for one rule. Pure.
+    ///
+    /// Builds a typed [`engenho_types::egress::CiliumNetworkPolicy`]
+    /// + renders it through `serde_yaml` (per the ★★ TYPED EMISSION
+    /// rule — no `format!()` of YAML syntax).
     #[must_use]
     pub fn render_crd(rule: &NetworkPolicyRule) -> String {
+        use engenho_types::egress::{CiliumDirection, CiliumNetworkPolicy};
         let name = rule.policy_id.replace('/', "-");
-        let selector_yaml = rule
-            .pod_selector
-            .iter()
-            .map(|(k, v)| format!("      {k}: {v}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let direction_key = match rule.direction {
-            Direction::Ingress => "ingress",
-            Direction::Egress => "egress",
+        let direction = match rule.direction {
+            Direction::Ingress => CiliumDirection::Ingress,
+            Direction::Egress => CiliumDirection::Egress,
         };
-        format!(
-            "apiVersion: cilium.io/v2\n\
-             kind: CiliumNetworkPolicy\n\
-             metadata:\n\
-             \x20\x20name: {name}\n\
-             spec:\n\
-             \x20\x20endpointSelector:\n\
-             \x20\x20\x20\x20matchLabels:\n{selector_yaml}\n\
-             \x20\x20{direction_key}:\n\
-             \x20\x20\x20\x20- {{}}\n"
-        )
+        CiliumNetworkPolicy::new(name, rule.pod_selector.clone(), direction).to_yaml()
     }
 
     fn rule_filename(rule: &NetworkPolicyRule) -> String {

@@ -520,37 +520,44 @@ pub struct SystemdServiceTranslator;
 impl SystemdServiceTranslator {
     /// Render the typed manifest Value into canonical systemd
     /// INI bytes (the `[Unit]` / `[Service]` / `[Install]` shape).
+    ///
+    /// Built as a typed [`crate::egress::SystemdUnit`] AST + rendered
+    /// through its `Display` chokepoint (★★ TYPED EMISSION — no
+    /// `format!()` of INI syntax).
     #[must_use]
     pub fn to_unit_file(intent: &WorkloadIntent) -> String {
+        use crate::egress::{SystemdSection, SystemdUnit, SystemdValue};
         let manifest = SystemdServiceTranslator.write(intent);
-        let mut out = String::new();
+        let mut unit = SystemdUnit::new();
         for section in ["Unit", "Service", "Install"] {
             let Some(s) = manifest.get(section) else {
                 continue;
             };
             let Some(map) = s.as_object() else { continue };
-            out.push_str(&format!("[{section}]\n"));
+            let mut sec = SystemdSection::new(section);
             for (key, value) in map {
                 match value {
                     Value::String(s) => {
-                        out.push_str(&format!("{key}={s}\n"));
+                        sec.push(key, SystemdValue::Str(s.clone()));
                     }
                     Value::Number(n) => {
-                        out.push_str(&format!("{key}={n}\n"));
+                        if let Some(i) = n.as_i64() {
+                            sec.push(key, SystemdValue::Num(i));
+                        }
                     }
                     Value::Array(arr) => {
-                        for item in arr {
-                            if let Some(s) = item.as_str() {
-                                out.push_str(&format!("{key}={s}\n"));
-                            }
-                        }
+                        let lines: Vec<String> = arr
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect();
+                        sec.push(key, SystemdValue::Lines(lines));
                     }
                     _ => {}
                 }
             }
-            out.push('\n');
+            unit.section(sec);
         }
-        out
+        unit.to_string()
     }
 }
 
@@ -666,12 +673,12 @@ impl WorkloadTranslator for SystemdServiceTranslator {
 
         let mut service = serde_json::Map::new();
         service.insert("Type".into(), Value::String("notify".into()));
+        // ExecStart is a typed podman argv rendered to its command
+        // line — not a `format!()` shell string (★★ TYPED EMISSION).
+        let exec_start = crate::egress::PodmanRunArgv::new(&intent.name, &intent.image);
         service.insert(
             "ExecStart".into(),
-            Value::String(format!(
-                "/usr/bin/podman run --name {} {}",
-                intent.name, intent.image
-            )),
+            Value::String(exec_start.to_command_line()),
         );
         service.insert("X-EngenhoImage".into(), Value::String(intent.image.clone()));
         service.insert(

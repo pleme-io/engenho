@@ -58,6 +58,7 @@ pub mod auth;
 pub mod client;
 pub mod consistency_tier;
 pub mod curated_enums;
+pub mod egress;
 pub mod error;
 pub mod generated_v1_34;
 pub mod informer;

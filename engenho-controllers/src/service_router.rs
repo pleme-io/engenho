@@ -249,42 +249,41 @@ impl IptablesRouter {
     /// Render the iptables-restore script for one route. Pure —
     /// no I/O. Test helper exposed publicly so callers can inspect
     /// what the router would emit.
+    ///
+    /// Built as a typed [`engenho_types::egress::IptablesScript`] +
+    /// rendered through its `Display` chokepoint (★★ TYPED EMISSION —
+    /// no `format!()` of iptables syntax).
     #[must_use]
     pub fn render_script(route: &ServiceRoute) -> String {
+        use engenho_types::egress::IptablesScript;
         let chain_svc = chain_name("KUBE-SVC", &route.service_id);
-        let mut script = String::new();
-        script.push_str("*nat\n");
-        script.push_str(&format!(":{chain_svc} - [0:0]\n"));
+        let mut script = IptablesScript::new();
+        script.table("nat").chain(&chain_svc);
         for port in &route.ports {
+            let proto = port.protocol.to_lowercase();
             // Hit the per-service chain from KUBE-SERVICES.
-            script.push_str(&format!(
-                "-A KUBE-SERVICES -d {}/32 -p {} --dport {} -j {chain_svc}\n",
-                route.cluster_ip,
-                port.protocol.to_lowercase(),
-                port.service_port
-            ));
+            script.jump_to_service_chain(
+                &route.cluster_ip,
+                &proto,
+                port.service_port,
+                &chain_svc,
+            );
             // For each pod IP, install a per-endpoint chain.
             for (i, pod_ip) in route.endpoints.iter().enumerate() {
                 let chain_ep =
                     chain_name("KUBE-SEP", &format!("{}-{}-{i}", route.service_id, pod_ip));
-                script.push_str(&format!(":{chain_ep} - [0:0]\n"));
+                script.chain(&chain_ep);
                 // Round-robin via statistic mode random; first endpoint
                 // gets 1/N, second 1/(N-1) etc.
                 let remaining = route.endpoints.len() - i;
-                let probability = format!("--probability {:.6}", 1.0 / (remaining as f64));
-                script.push_str(&format!(
-                    "-A {chain_svc} -m statistic --mode random {probability} -j {chain_ep}\n"
-                ));
+                let probability = 1.0 / (remaining as f64);
+                script.statistic_jump(&chain_svc, probability, &chain_ep);
                 // The endpoint chain DNATs to the pod.
-                script.push_str(&format!(
-                    "-A {chain_ep} -p {} -j DNAT --to-destination {pod_ip}:{}\n",
-                    port.protocol.to_lowercase(),
-                    port.target_port
-                ));
+                script.dnat(&chain_ep, &proto, pod_ip, port.target_port);
             }
         }
-        script.push_str("COMMIT\n");
-        script
+        script.commit();
+        script.to_string()
     }
 
     async fn run_restore(&self, script: &str) -> Result<(), RouterError> {
@@ -331,6 +330,15 @@ fn chain_name(prefix: &str, key: &str) -> String {
     format!("{prefix}-{}", &hex.as_str()[..12].to_uppercase())
 }
 
+/// Map a K8s protocol string to the ipvsadm transport flag.
+/// `UDP` → `-u`; everything else (TCP default) → `-t`.
+fn ipvs_proto_flag(protocol: &str) -> &'static str {
+    match protocol.to_uppercase().as_str() {
+        "UDP" => "-u",
+        _ => "-t",
+    }
+}
+
 #[async_trait]
 impl ServiceRouter for IptablesRouter {
     fn name(&self) -> &'static str {
@@ -349,12 +357,19 @@ impl ServiceRouter for IptablesRouter {
     }
 
     async fn remove(&self, service_id: &str) -> Result<(), RouterError> {
+        use engenho_types::egress::IptablesScript;
         let chain_svc = chain_name("KUBE-SVC", service_id);
-        // Flush + delete the per-service chain.
-        let script =
-            format!("*nat\n:{chain_svc} - [0:0]\n-F {chain_svc}\n-X {chain_svc}\nCOMMIT\n");
+        // Flush + delete the per-service chain — typed script, no
+        // `format!()` of iptables syntax (★★ TYPED EMISSION).
+        let mut script = IptablesScript::new();
+        script
+            .table("nat")
+            .chain(&chain_svc)
+            .flush(&chain_svc)
+            .delete_chain(&chain_svc)
+            .commit();
         // Errors on remove are tolerated when the chain is already gone.
-        let _ = self.run_restore(&script).await;
+        let _ = self.run_restore(&script.to_string()).await;
         let mut state = self.inner.lock().await;
         state.routes.remove(service_id);
         Ok(())
@@ -413,29 +428,34 @@ impl IpvsRouter {
     /// Render the ipvsadm script for one route. Pure — no I/O.
     ///
     /// Format: sequence of `-A` (add-service) + `-a` (add-real-server)
-    /// lines that ipvsadm-restore consumes.
+    /// lines that ipvsadm-restore consumes. Built as a typed
+    /// [`engenho_types::egress::IpvsScript`] + rendered through its
+    /// `Display` chokepoint (★★ TYPED EMISSION — no `format!()` of
+    /// ipvsadm syntax).
     #[must_use]
     pub fn render_script(route: &ServiceRoute) -> String {
-        let mut out = String::new();
+        use engenho_types::egress::{IpvsLine, IpvsScript};
+        let mut script = IpvsScript::new();
         for port in &route.ports {
             // -A: add virtual service. -t = TCP, -u = UDP.
-            let proto_flag = match port.protocol.to_uppercase().as_str() {
-                "UDP" => "-u",
-                _ => "-t",
-            };
-            out.push_str(&format!(
-                "-A {proto_flag} {}:{} -s rr\n",
-                route.cluster_ip, port.service_port
-            ));
+            let proto_flag = ipvs_proto_flag(&port.protocol);
+            script.push(IpvsLine::AddService {
+                proto_flag: proto_flag.to_string(),
+                vip: route.cluster_ip.clone(),
+                port: port.service_port,
+            });
             for pod_ip in &route.endpoints {
                 // -a: add real server. -m = masquerade (NAT).
-                out.push_str(&format!(
-                    "-a {proto_flag} {}:{} -r {pod_ip}:{} -m\n",
-                    route.cluster_ip, port.service_port, port.target_port
-                ));
+                script.push(IpvsLine::AddRealServer {
+                    proto_flag: proto_flag.to_string(),
+                    vip: route.cluster_ip.clone(),
+                    port: port.service_port,
+                    pod_ip: pod_ip.clone(),
+                    target_port: port.target_port,
+                });
             }
         }
-        out
+        script.to_string()
     }
 
     async fn run_restore(&self, script: &str) -> Result<(), RouterError> {
@@ -499,18 +519,16 @@ impl ServiceRouter for IpvsRouter {
             state.routes.get(service_id).cloned()
         };
         if let Some(route) = route {
-            let mut script = String::new();
+            use engenho_types::egress::{IpvsLine, IpvsScript};
+            let mut script = IpvsScript::new();
             for port in &route.ports {
-                let proto_flag = match port.protocol.to_uppercase().as_str() {
-                    "UDP" => "-u",
-                    _ => "-t",
-                };
-                script.push_str(&format!(
-                    "-D {proto_flag} {}:{}\n",
-                    route.cluster_ip, port.service_port
-                ));
+                script.push(IpvsLine::DeleteService {
+                    proto_flag: ipvs_proto_flag(&port.protocol).to_string(),
+                    vip: route.cluster_ip.clone(),
+                    port: port.service_port,
+                });
             }
-            let _ = self.run_restore(&script).await;
+            let _ = self.run_restore(&script.to_string()).await;
         }
         let mut state = self.inner.lock().await;
         state.routes.remove(service_id);

@@ -31,6 +31,7 @@
 pub mod client;
 pub mod config;
 pub mod connection;
+pub mod url_builder;
 pub mod watcher;
 
 #[cfg(any(test, feature = "mock"))]
@@ -39,4 +40,5 @@ pub mod mock;
 pub use client::ReqwestKubeClient;
 pub use config::{Kubeconfig, emit_kubeconfig};
 pub use connection::Connection;
+pub use url_builder::KubeUrlBuilder;
 pub use watcher::ReqwestWatcher;
