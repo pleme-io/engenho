@@ -37,6 +37,26 @@
 //! Both are fixed here: per-watcher bounded `mpsc` channels (isolated
 //! backpressure → typed Gone, never a global silent drop) + the
 //! under-the-lock atomic handoff (closes the race window entirely).
+//!
+//! ## Replay is fed UNDER THE LOCK, before the sender is reachable
+//!
+//! The replay→live ordering is made STRUCTURAL, not timing-dependent.
+//! [`WatcherRegistry::register_captured`] enqueues the entire replay
+//! (in revision order) into the per-watcher channel BEFORE the handle
+//! is pushed onto the registry — so before `fan_change` can ever reach
+//! it. Because both `register_captured` and `fan_change` run under the
+//! SAME catalog lock, every live event (`revision > boundary`) is
+//! necessarily enqueued AFTER the whole replay. The channel is FIFO,
+//! so insertion order == delivery order == revision order. There is no
+//! separate feeder task and no second producer racing the apply path.
+//!
+//! A replay larger than the per-watcher buffer (e.g. a watcher resuming
+//! from far behind, where the retained ring up to 8192 entries doesn't
+//! fit a 1024-slot buffer) overflows DURING the replay feed and arms a
+//! typed [`WatchGone::Overflow`] carrying the highest replay revision
+//! actually enqueued — the consumer then re-lists + resumes, exactly
+//! the same contract a compacted resume point gets. Never a silent
+//! drop, never a block on the lock.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -344,21 +364,22 @@ impl WatcherRegistry {
     /// `catalog` is the live catalog (already locked by the caller).
     /// `opts` is the subscription request.
     ///
-    /// On success returns:
+    /// On success returns the consumer-facing [`WatchStream`]. The
+    /// replay (every change with `revision > opts.from`, in revision
+    /// order) has ALREADY been enqueued into the stream's channel by the
+    /// time this returns — see [`Self::register_captured`].
     ///
-    ///   * the consumer-facing [`WatchStream`],
-    ///   * a [`ReplaySender`] the caller drives (`.feed(replay).await`,
-    ///     typically on a spawned task) to push the replay FIRST,
-    ///     before the live tail,
-    ///   * the replay `Vec<Change>` (in revision order).
+    /// The replay is captured + fed here, under the lock, at the same
+    /// instant the live sender becomes reachable by `fan_change` — so:
     ///
-    /// The replay is captured here, under the lock, at the same instant
-    /// the live sender is registered — so:
-    ///
-    ///   * every change with `revision <= boundary` is in `replay`,
+    ///   * every change with `revision <= boundary` is enqueued FIRST,
+    ///     in revision order, before the handle is pushed onto the
+    ///     registry,
     ///   * every change with `revision > boundary` reaches this watcher
-    ///     via the live fan-out (the sender is registered),
-    ///   * nothing in between — no gap, no dup.
+    ///     via the live fan-out — and only AFTER the replay, because
+    ///     `fan_change` cannot see the handle until this call returns
+    ///     and runs under the SAME lock,
+    ///   * nothing in between — no gap, no dup, no reorder.
     ///
     /// A rejected watch (`from` below compaction) allocates NO channel
     /// — it returns `Err(WatchGone::CompactedTooOld)` before any sender
@@ -372,7 +393,7 @@ impl WatcherRegistry {
         &mut self,
         catalog: &ResourceCatalog,
         opts: &WatchOpts,
-    ) -> Result<(WatchStream, ReplaySender, Vec<Change>), WatchGone> {
+    ) -> Result<WatchStream, WatchGone> {
         // (a) Capture replay + boundary BEFORE allocating anything. A
         // rejected watch costs nothing. Both reads happen here so the
         // caller can do them under the catalog lock atomically with the
@@ -382,7 +403,8 @@ impl WatcherRegistry {
         Ok(self.register_captured(replay, boundary, opts))
     }
 
-    /// Register a watcher from an ALREADY-CAPTURED replay + boundary.
+    /// Register a watcher from an ALREADY-CAPTURED replay + boundary,
+    /// feeding the replay into the channel BEFORE the handle is live.
     ///
     /// Lets callers that can't split-borrow the catalog + the registry
     /// from one lock guard (e.g. via a `tokio::MutexGuard`'s `Deref`)
@@ -390,21 +412,39 @@ impl WatcherRegistry {
     /// + Copy `boundary`, then call this with only `&mut self`. The
     /// reads + this call MUST happen under the SAME catalog lock for the
     /// handoff to be atomic.
+    ///
+    /// ## Why the replay is fed here (not on a spawned task)
+    ///
+    /// The replay is `try_send`-pushed into the per-watcher channel
+    /// IN REVISION ORDER, then the handle is appended to the registry.
+    /// Only after this returns can `fan_change` (which runs under the
+    /// same lock) reach the handle — so every live event lands strictly
+    /// after the whole replay. Insertion order == delivery order ==
+    /// revision order, by construction. There is no second producer and
+    /// no timing window.
+    ///
+    /// If the replay is larger than `opts.buffer`, the channel fills
+    /// mid-feed; we arm [`WatchGone::Overflow`] carrying the highest
+    /// replay revision actually enqueued (the resume point). The handle
+    /// is still registered (already overflowed) so it is reaped on the
+    /// next `fan_change` / `tick_bookmarks` sweep; the stream drains its
+    /// buffered prefix then surfaces the single terminal Gone. A
+    /// far-behind watcher thus re-lists, the same contract a compacted
+    /// resume point gets — never a silent drop, never a block.
     pub fn register_captured(
         &mut self,
         replay: Vec<Change>,
         boundary: Revision,
         opts: &WatchOpts,
-    ) -> (WatchStream, ReplaySender, Vec<Change>) {
-        // Allocate the bounded channel + register the live sender.
+    ) -> WatchStream {
+        // Allocate the bounded channel + build the handle.
         let capacity = opts.buffer.max(1);
         let (tx, rx) = mpsc::channel::<WatchSignal>(capacity);
         let gone = Arc::new(GoneSlot::default());
         // last_seen starts at the resume point: the consumer has
         // logically "seen" everything up to `from`.
         let last_seen = opts.from;
-        let replay_sender = ReplaySender { tx: tx.clone() };
-        self.handles.push(WatcherHandle {
+        let mut handle = WatcherHandle {
             tx,
             boundary,
             last_seen,
@@ -414,16 +454,34 @@ impl WatcherRegistry {
             last_bookmarked_rev: None,
             gone: gone.clone(),
             overflowed: false,
-        });
+        };
 
-        let stream = WatchStream {
+        // Feed the replay FIRST, in revision order, through the same
+        // FIFO channel the live path uses — under the lock, before the
+        // handle is reachable by `fan_change`. `try_enqueue` accounts
+        // `last_seen` per signal and arms `Overflow` (capturing the
+        // resume point) if the buffer fills mid-replay. We stop feeding
+        // on the first non-delivered outcome (overflow / closed) — there
+        // is no point pushing more into a dead channel.
+        for change in replay {
+            let ev = watch_event_from_change(&change);
+            if handle.try_enqueue(WatchSignal::Event(ev)) != HandleSendOutcome::Sent {
+                break;
+            }
+        }
+
+        // Register the handle (now carrying the buffered replay) so the
+        // live fan-out can reach it. Anything `fan_change` enqueues from
+        // here lands strictly after the replay already in the channel.
+        self.handles.push(handle);
+
+        WatchStream {
             rx,
             gone,
             last_seen,
             terminal_emitted: false,
             draining_for_gone: false,
-        };
-        (stream, replay_sender, replay)
+        }
     }
 
     /// Fan one committed change to every live watcher whose
@@ -747,47 +805,6 @@ impl Drop for BookmarkTicker {
     }
 }
 
-/// A sender clone handed to the replay feeder. Wraps the per-watcher
-/// `mpsc::Sender` so the feeder can `await` on a full buffer (replay is
-/// off the hot path; blocking the feeder task is acceptable, unlike the
-/// apply path which must `try_send`).
-#[derive(Debug)]
-pub struct ReplaySender {
-    tx: mpsc::Sender<WatchSignal>,
-}
-
-impl ReplaySender {
-    /// Feed a replay `Vec<Change>` into the registered stream, then
-    /// return — the live tail flows through the same channel
-    /// afterward.
-    ///
-    /// The replay is pushed FIRST (in revision order) through the SAME
-    /// bounded channel the live path uses, so ordering is preserved and
-    /// a too-small buffer overflows on replay exactly as it would live
-    /// (the consumer then resumes from `last_seen`).
-    ///
-    /// This runs OUTSIDE the catalog lock (the lock is dropped before
-    /// the feeder runs); registration under the lock already guarantees
-    /// no live event with `revision > boundary` is lost — those are
-    /// queued by the fan-out into the same channel and interleave
-    /// correctly because the channel is FIFO and the replay revisions
-    /// are all `<= boundary` < any live revision.
-    ///
-    /// `await`-blocks on a full buffer (replay is bounded by the
-    /// history ring + runs on its own task — never holds the catalog
-    /// lock). If the consumer drops the stream mid-replay the send
-    /// errors and the feeder returns early.
-    pub async fn feed(self, replay: Vec<Change>) {
-        for change in replay {
-            let ev = watch_event_from_change(&change);
-            if self.tx.send(WatchSignal::Event(ev)).await.is_err() {
-                // Consumer dropped — nothing to do.
-                return;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,22 +917,21 @@ mod tests {
             );
         }
         let mut reg = WatcherRegistry::new();
-        let (mut stream, replay_sender, replay) = reg
+        // Register from rev2 → replay {3,4,5} is enqueued UNDER this call,
+        // before the handle is reachable by fan_change. No feeder task,
+        // no replay-sender tuple.
+        let mut stream = reg
             .register(&cat, &WatchOpts::from_revision(Revision(2)))
             .unwrap();
-        // Replay is revs 3,4,5.
-        let replay_revs: Vec<u64> = replay.iter().map(|c| c.revision.0).collect();
-        assert_eq!(replay_revs, vec![3, 4, 5]);
 
-        // Feed replay through the channel (simulating the backend).
-        replay_sender.feed(replay).await;
-
-        // Now a live change at rev 6 — fan it.
+        // IMMEDIATELY fan a live change at rev 6 — boundary captured at
+        // register == 5, so rev 6 > boundary → delivered AFTER the replay
+        // by construction (replay already sits in the FIFO ahead of it).
         let live = change_at(6, "p6", ChangeKind::Put);
-        // boundary captured at register == 5, so rev 6 > boundary → delivered.
         reg.fan_change(&live);
 
-        // Drain: 3,4,5 (replay) then 6 (live), contiguous, no dup.
+        // Drain: 3,4,5 (replay) then 6 (live), contiguous, no dup, no
+        // reorder — even though fan_change ran before we polled once.
         let mut got = Vec::new();
         for _ in 0..4 {
             if let Some(Ok(WatchSignal::Event(ev))) = stream.next().await {
@@ -923,6 +939,106 @@ mod tests {
             }
         }
         assert_eq!(got, vec![3, 4, 5, 6]);
+    }
+
+    /// Structural ordering guard at the registry layer: the replay is
+    /// enqueued by `register_captured` BEFORE `fan_change` can reach the
+    /// handle, so a live event committed at boundary+1 can NEVER overtake
+    /// not-yet-fed replay revisions. This is the unit-level mirror of the
+    /// store-level boundary-ordering regression test — it FAILS with the
+    /// old `tokio::spawn(feed)` path (delivery [6,3,4,5]) and PASSES now.
+    #[tokio::test]
+    async fn replay_precedes_live_even_when_fan_runs_before_first_poll() {
+        let mut cat = ResourceCatalog::default();
+        for i in 1..=5u64 {
+            cat.apply(
+                &crate::command::ResourceCommand::Put {
+                    key: pod_key(&format!("p{i}")),
+                    value: serde_json::json!({"i": i}),
+                    reason: crate::command::Reason::Operator,
+                },
+                1,
+                i,
+            );
+        }
+        let mut reg = WatcherRegistry::new();
+        // Capture replay {3,4,5} + boundary 5, then register_captured.
+        let replay = cat.changes_since(Revision(2)).unwrap();
+        let boundary = cat.revision();
+        assert_eq!(
+            replay.iter().map(|c| c.revision.0).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        let mut stream = reg.register_captured(replay, boundary, &WatchOpts::from_revision(Revision(2)));
+
+        // Fan the live event at boundary+1 (== 6) WITHOUT polling first.
+        reg.fan_change(&change_at(6, "p6", ChangeKind::Put));
+
+        // Exact contiguous ordered range — no reorder, no gap, no dup.
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            match stream.next().await {
+                Some(Ok(WatchSignal::Event(ev))) => got.push(ev.resource_version),
+                other => panic!("unexpected signal: {other:?}"),
+            }
+        }
+        assert_eq!(got, vec![3, 4, 5, 6]);
+    }
+
+    /// A replay larger than the per-watcher buffer overflows DURING the
+    /// under-the-lock feed: the consumer gets the in-order prefix then a
+    /// typed `WatchGone::Overflow` whose `last_seen` == the highest
+    /// replay revision actually enqueued (the resume point). Never a
+    /// silent drop, never a block on the lock.
+    #[tokio::test]
+    async fn oversized_replay_overflows_with_typed_gone_under_lock() {
+        let mut cat = ResourceCatalog::default();
+        for i in 1..=10u64 {
+            cat.apply(
+                &crate::command::ResourceCommand::Put {
+                    key: pod_key(&format!("p{i}")),
+                    value: serde_json::json!({"i": i}),
+                    reason: crate::command::Reason::Operator,
+                },
+                1,
+                i,
+            );
+        }
+        let mut reg = WatcherRegistry::new();
+        // Replay = revs 1..=10 (from ZERO), buffer = 3 → overflow mid-feed.
+        let mut stream = reg
+            .register(&cat, &WatchOpts::live_tail(Revision::ZERO, 3))
+            .unwrap();
+        // The overflowed handle is reaped on the next sweep.
+        reg.fan_change(&change_at(11, "p11", ChangeKind::Put));
+        assert_eq!(reg.len(), 0, "overflowed handle reaped");
+
+        // Drain the in-order prefix then exactly one terminal Overflow.
+        let mut prefix = Vec::new();
+        let gone = loop {
+            match stream.next().await {
+                Some(Ok(WatchSignal::Event(ev))) => prefix.push(ev.resource_version),
+                Some(Ok(WatchSignal::Bookmark(_))) => {}
+                Some(Err(g)) => break g,
+                None => panic!("stream closed without surfacing Overflow"),
+            }
+        };
+        assert!(!prefix.is_empty(), "delivered an in-order prefix: {prefix:?}");
+        let mut sorted = prefix.clone();
+        sorted.sort_unstable();
+        assert_eq!(prefix, sorted, "prefix is in revision order");
+        match gone {
+            WatchGone::Overflow { capacity, last_seen } => {
+                assert_eq!(capacity, 3);
+                assert_eq!(
+                    last_seen.get(),
+                    *prefix.last().unwrap(),
+                    "last_seen == highest replay revision actually enqueued"
+                );
+            }
+            other => panic!("expected Overflow, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none(), "stream ends after the terminal");
     }
 
     #[tokio::test]
@@ -954,12 +1070,17 @@ mod tests {
         // No channel registered.
         assert_eq!(reg.len(), 0);
 
-        // From exactly the watermark succeeds.
-        let (_stream, _replay_sender, replay) = reg
+        // From exactly the watermark succeeds; the replay (revs 4,5) is
+        // enqueued into the stream — drain it to prove 2 events landed.
+        let mut stream = reg
             .register(&cat, &WatchOpts::from_revision(Revision(3)))
             .unwrap();
-        assert_eq!(replay.len(), 2);
         assert_eq!(reg.len(), 1);
+        let mut replayed = Vec::new();
+        while let Some(Ok(WatchSignal::Event(ev))) = stream.try_next() {
+            replayed.push(ev.resource_version);
+        }
+        assert_eq!(replayed, vec![4, 5]);
     }
 
     // ── Overflow → typed Gone, isolated per-watcher ────────────────
@@ -969,11 +1090,11 @@ mod tests {
         let cat = ResourceCatalog::default();
         let mut reg = WatcherRegistry::new();
         // Slow watcher: buffer 2, never drained.
-        let (mut slow, _slow_sender, _slow_replay) = reg
+        let mut slow = reg
             .register(&cat, &WatchOpts::live_tail(Revision(0), 2))
             .unwrap();
         // Fast watcher: ample buffer, will be drained.
-        let (mut fast, _fast_sender, _fast_replay) = reg
+        let mut fast = reg
             .register(&cat, &WatchOpts::live_tail(Revision(0), 64))
             .unwrap();
 
@@ -1023,12 +1144,11 @@ mod tests {
     async fn closed_receiver_is_reaped_on_next_fan() {
         let cat = ResourceCatalog::default();
         let mut reg = WatcherRegistry::new();
-        let (stream, replay_sender, _replay) = reg
+        let stream = reg
             .register(&cat, &WatchOpts::live_tail(Revision(0), 8))
             .unwrap();
         assert_eq!(reg.len(), 1);
-        drop(stream); // consumer goes away
-        drop(replay_sender); // and its replay sender
+        drop(stream); // consumer goes away — the only receiver closes
         // Next fan reaps the closed handle.
         reg.fan_change(&change_at(1, "p", ChangeKind::Put));
         assert_eq!(reg.len(), 0);
@@ -1040,7 +1160,7 @@ mod tests {
     async fn bookmark_tick_delivers_then_advances() {
         let cat = ResourceCatalog::default();
         let mut reg = WatcherRegistry::new();
-        let (mut stream, _replay_sender, _replay) = reg
+        let mut stream = reg
             .register(
                 &cat,
                 &WatchOpts {
@@ -1073,7 +1193,7 @@ mod tests {
         // delivers.
         let cat = ResourceCatalog::default();
         let mut reg = WatcherRegistry::new();
-        let (mut stream, _replay_sender, _replay) = reg
+        let mut stream = reg
             .register(
                 &cat,
                 &WatchOpts {
@@ -1101,7 +1221,7 @@ mod tests {
     async fn bookmark_disabled_when_cadence_zero() {
         let cat = ResourceCatalog::default();
         let mut reg = WatcherRegistry::new();
-        let (mut stream, _replay_sender, _replay) = reg
+        let mut stream = reg
             .register(&cat, &WatchOpts::live_tail(Revision(0), 8))
             .unwrap();
         reg.tick_bookmarks(Revision(5), tokio::time::Instant::now() + Duration::from_secs(60));
@@ -1116,13 +1236,12 @@ mod tests {
     async fn store_dropped_yields_none_not_err() {
         let cat = ResourceCatalog::default();
         let mut reg = WatcherRegistry::new();
-        let (mut stream, replay_sender, _replay) = reg
+        let mut stream = reg
             .register(&cat, &WatchOpts::live_tail(Revision(0), 8))
             .unwrap();
-        // Drop the registry (== store dropped) + the replay sender. All
-        // senders close WITHOUT arming a Gone → clean None.
+        // Drop the registry (== store dropped). The sole sender closes
+        // WITHOUT arming a Gone → clean None.
         drop(reg);
-        drop(replay_sender);
         assert!(stream.next().await.is_none());
     }
 }

@@ -209,6 +209,166 @@ async fn gap_freedom_fjall() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// =================================================================
+// 2b. NON-EMPTY replay → live ordering at the boundary (regression)
+// =================================================================
+//
+// The original gap-freedom cases (2 above) subscribe at rv0 == the
+// CURRENT tip, so `changes_since(tip)` is EMPTY — the replay→live
+// boundary with NON-EMPTY replay content was never exercised. This is
+// EXACTLY the case the adversarial review reproduced as delivery order
+// [6, 3, 4, 5]: a live event at boundary+1 overtook not-yet-fed replay
+// revisions 3,4,5 because the racy `tokio::spawn(replay_sender.feed)`
+// path pushed the replay from a SEPARATE task AFTER the lock dropped,
+// while the apply path's `fan_change` ran under the lock.
+//
+// Here we subscribe from an OLD revision so the replay is non-empty,
+// WHILE concurrently applying writes that interleave at the boundary,
+// and assert the delivered stream equals the EXACT contiguous ordered
+// range (from, final] — no reorder, no gap, no dup. FAILS before the
+// structural fix (replay fed under the lock), PASSES after.
+
+async fn nonempty_replay_boundary_iteration(
+    mesh: &Arc<StoreMesh>,
+    backlog: u64,
+    live: u64,
+) {
+    // (1) Build a NON-EMPTY backlog: put `backlog` revisions, then pick
+    // a resume point `from` partway through so the replay is non-empty.
+    let base = mesh.current_catalog().await.revision().get();
+    for i in 1..=backlog {
+        put(&mesh, &format!("bk{base}_{i}"), i).await;
+    }
+    // Resume from the MIDPOINT of the backlog → replay covers the upper
+    // half (non-empty), and `from` < current tip.
+    let from = Revision(base + backlog / 2);
+    let final_before_live = base + backlog;
+
+    // (2) Subscribe from the OLD revision (NON-EMPTY replay sits in the
+    // channel), then drive `live` writes that land at the boundary. With
+    // the old spawned-feeder path, an apply at boundary+1 could `fan` its
+    // event into the channel BEFORE the feeder task drained the replay —
+    // delivering it ahead of the replay revisions (the [6,3,4,5] defect).
+    let mut w = mesh.watch_from(WatchOpts::from_revision(from)).await.unwrap();
+
+    let writer = {
+        let mesh = mesh.clone();
+        let start = final_before_live;
+        tokio::spawn(async move {
+            let mut last = start;
+            for i in 1..=live {
+                last = put(&mesh, &format!("lv{start}_{i}"), i).await;
+            }
+            last
+        })
+    };
+
+    // (3) Drain concurrently with the writer (don't `await` it first —
+    // that would hand the runtime time to drain the feeder before any
+    // live event lands, masking the race). Collect delivered Event
+    // revisions IN ARRIVAL ORDER until we reach the writer's final.
+    let final_rev = final_before_live + live;
+    let mut delivered: Vec<u64> = Vec::new();
+    while delivered.last().copied() != Some(final_rev) {
+        delivered.push(next_event_rev(&mut w).await);
+    }
+    let reported_final = writer.await.unwrap();
+    assert_eq!(reported_final, final_rev, "writer reached the expected tip");
+
+    // The exact contiguous integer range (from, final] — replay tail
+    // FIRST (from+1 .. final_before_live), then the live tail
+    // (final_before_live+1 .. final), in ARRIVAL ORDER, with no
+    // reorder/gap/dup.
+    let expected: Vec<u64> = (from.get() + 1..=final_rev).collect();
+    assert_eq!(
+        delivered, expected,
+        "NON-EMPTY replay→live: delivered must equal the contiguous ordered range (from, final] \
+         — a live event must NEVER overtake not-yet-delivered replay revisions"
+    );
+
+    drop(w);
+}
+
+#[tokio::test]
+async fn nonempty_replay_boundary_ordering_memory() {
+    let mesh = boot_memory().await;
+    // Many iterations to shake the boundary race; backlog ensures a
+    // non-empty replay, live writes interleave at the boundary.
+    for _ in 0..40 {
+        nonempty_replay_boundary_iteration(&mesh, 20, 10).await;
+    }
+    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn nonempty_replay_boundary_ordering_fjall() {
+    let dir = temp_dir("nonempty-replay");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mesh = boot_fjall(&dir).await;
+    // Fjall fsyncs per apply → fewer iterations; identical boundary logic.
+    for _ in 0..12 {
+        nonempty_replay_boundary_iteration(&mesh, 12, 6).await;
+    }
+    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Registry-level mirror driving the primitive directly (no Raft, no
+/// store): register from rev2 → replay {3,4,5}; IMMEDIATELY fan_change
+/// rev6 (before the first poll); assert delivery is exactly 3,4,5,6.
+/// This is the tightest reproduction of the [6,3,4,5] defect — it
+/// FAILS with the old spawned-feeder path and PASSES with the replay
+/// fed under the lock inside `register_captured`.
+#[tokio::test]
+async fn registry_nonempty_replay_then_immediate_live_is_ordered() {
+    let mut cat = ResourceCatalog::default();
+    for i in 1..=5u64 {
+        cat.apply(
+            &ResourceCommand::Put {
+                key: pod_key(&format!("p{i}")),
+                value: json!({"i": i}),
+                reason: Reason::Operator,
+            },
+            1,
+            i,
+        );
+    }
+    let mut reg = WatcherRegistry::new();
+    // Register from rev2 → replay {3,4,5} enqueued under this call.
+    let mut stream = reg
+        .register(&cat, &WatchOpts::from_revision(Revision(2)))
+        .unwrap();
+    // Live rev6 fanned BEFORE any poll (boundary == 5, so 6 > boundary).
+    cat.apply(
+        &ResourceCommand::Put {
+            key: pod_key("p6"),
+            value: json!({"i": 6}),
+            reason: Reason::Operator,
+        },
+        1,
+        6,
+    );
+    let change6 = cat.changes_since(Revision(5)).unwrap().pop().unwrap();
+    assert_eq!(change6.revision, Revision(6));
+    reg.fan_change(&change6);
+
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("signal before timeout")
+        {
+            Some(Ok(WatchSignal::Event(ev))) => got.push(ev.resource_version),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+    assert_eq!(
+        got,
+        vec![3, 4, 5, 6],
+        "replay {{3,4,5}} must precede the immediate live event 6 — no reorder"
+    );
+}
+
 /// Headline variant: race a fresh watch_from(rv0) against the single
 /// propose whose revision == rv0+1, asserting that event is delivered
 /// exactly once regardless of interleaving.
@@ -273,12 +433,18 @@ async fn gone_on_compaction_registry() {
     assert_eq!(err.kind(), "compacted_too_old");
     assert_eq!(reg.len(), 0, "rejected watch allocates no channel");
 
-    // From exactly the watermark succeeds (watermark honored).
-    let (_stream, _sender, replay) = reg
+    // From exactly the watermark succeeds (watermark honored); the
+    // replay (revs 4,5) is enqueued into the stream — drain it to prove
+    // exactly 2 events landed.
+    let mut stream = reg
         .register(&cat, &WatchOpts::from_revision(Revision(3)))
         .unwrap();
-    assert_eq!(replay.len(), 2);
     assert_eq!(reg.len(), 1);
+    let mut replayed = Vec::new();
+    while let Some(Ok(WatchSignal::Event(ev))) = stream.try_next() {
+        replayed.push(ev.resource_version);
+    }
+    assert_eq!(replayed, vec![4, 5]);
 }
 
 // =================================================================

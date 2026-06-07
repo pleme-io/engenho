@@ -100,27 +100,22 @@ impl InMemoryStore {
     /// [`WatchGone::CompactedTooOld`] when `opts.from` is below the
     /// catalog's compaction watermark (no channel is allocated).
     pub async fn watch_from(&self, opts: WatchOpts) -> Result<WatchStream, WatchGone> {
-        let (stream, replay_sender, replay) = {
-            // ── under the catalog lock ─────────────────────────────
-            let mut guard = self.inner.lock().await;
-            // Read replay + boundary from the catalog (immutable),
-            // then register the sender on the registry (mutable) — both
-            // under the SAME lock, so the handoff is atomic. Borrows are
-            // sequential (no split-borrow of the MutexGuard's Deref) and
-            // the catalog ring is NOT cloned.
-            let replay = guard
-                .catalog
-                .changes_since(opts.from)
-                .map_err(WatchGone::from)?;
-            let boundary = guard.catalog.revision();
-            guard.watchers.register_captured(replay, boundary, &opts)
-            // lock drops here
-        };
-        // Feed the replay tail on its own task (off the catalog lock):
-        // the live tail flows through the same FIFO channel afterward,
-        // and every revision > boundary is already attached.
-        tokio::spawn(replay_sender.feed(replay));
-        Ok(stream)
+        // ── under the catalog lock ─────────────────────────────────
+        let mut guard = self.inner.lock().await;
+        // Read replay + boundary from the catalog (immutable), then
+        // register the sender on the registry (mutable). `register_captured`
+        // enqueues the entire replay into the channel IN REVISION ORDER
+        // before the handle is reachable by `fan_change` — all under THIS
+        // lock, so the replay→live handoff is atomic AND structurally
+        // ordered (no feeder task, no second producer racing apply).
+        // Borrows are sequential (no split-borrow of the MutexGuard's
+        // Deref) and the catalog ring is NOT cloned.
+        let replay = guard
+            .catalog
+            .changes_since(opts.from)
+            .map_err(WatchGone::from)?;
+        let boundary = guard.catalog.revision();
+        Ok(guard.watchers.register_captured(replay, boundary, &opts))
     }
 
     pub async fn current_catalog(&self) -> ResourceCatalog {
