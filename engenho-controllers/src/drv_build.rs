@@ -267,6 +267,7 @@ impl Controller for DrvBuildController {
                                     "message": e.to_string(),
                                 }
                             }),
+                            expected: None,
                             reason: Reason::Controller,
                         })
                         .await

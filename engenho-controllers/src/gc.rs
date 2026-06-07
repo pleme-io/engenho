@@ -92,6 +92,7 @@ impl Controller for GcController {
                 self.store
                     .propose(ResourceCommand::Delete {
                         key,
+                        expected: None,
                         reason: Reason::GarbageCollector,
                     })
                     .await

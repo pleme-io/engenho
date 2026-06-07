@@ -166,6 +166,7 @@ impl Controller for DrvController {
                             "realisations": realisations_json,
                         }
                     }),
+                    expected: None,
                     reason: Reason::Controller,
                 })
                 .await

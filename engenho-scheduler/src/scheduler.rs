@@ -84,6 +84,7 @@ impl Scheduler {
                 .propose(ResourceCommand::Patch {
                     key: pod_key.clone(),
                     patch,
+                    expected: None,
                     reason: Reason::Scheduler,
                 })
                 .await

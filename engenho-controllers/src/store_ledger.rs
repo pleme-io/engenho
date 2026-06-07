@@ -135,6 +135,7 @@ impl MaterializationLedger for StoreBackedLedger {
             .propose(ResourceCommand::Put {
                 key,
                 value,
+                expected: None,
                 reason: Reason::Controller,
             })
             .await
@@ -249,6 +250,7 @@ impl MaterializationLedger for StoreBackedLedger {
                 self.store
                     .propose(ResourceCommand::Delete {
                         key,
+                        expected: None,
                         reason: Reason::Controller,
                     })
                     .await

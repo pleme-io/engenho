@@ -158,6 +158,7 @@ impl Controller for ReplicaSetController {
                         .propose(ResourceCommand::Put {
                             key: pod_key,
                             value: pod,
+                            expected: None,
                             reason: Reason::Controller,
                         })
                         .await
@@ -174,6 +175,7 @@ impl Controller for ReplicaSetController {
                     self.store
                         .propose(ResourceCommand::Delete {
                             key: (*pod_key).clone(),
+                            expected: None,
                             reason: Reason::Controller,
                         })
                         .await

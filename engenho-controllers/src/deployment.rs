@@ -192,6 +192,7 @@ impl Controller for DeploymentController {
                         .propose(ResourceCommand::Patch {
                             key: (*rs_key).clone(),
                             patch: json!({"spec": {"replicas": 0}}),
+                            expected: None,
                             reason: Reason::Controller,
                         })
                         .await
@@ -213,6 +214,7 @@ impl Controller for DeploymentController {
                             .propose(ResourceCommand::Patch {
                                 key: rs_key.clone(),
                                 patch: json!({"spec": {"replicas": desired_replicas}}),
+                                expected: None,
                                 reason: Reason::Controller,
                             })
                             .await
@@ -236,6 +238,7 @@ impl Controller for DeploymentController {
                         .propose(ResourceCommand::Put {
                             key: rs_key,
                             value: rs_value,
+                            expected: None,
                             reason: Reason::Controller,
                         })
                         .await

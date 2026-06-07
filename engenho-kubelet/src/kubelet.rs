@@ -213,6 +213,7 @@ impl Controller for Kubelet {
                         .propose(ResourceCommand::Patch {
                             key: key.clone(),
                             patch: patch_value,
+                            expected: None,
                             reason: Reason::Controller,
                         })
                         .await

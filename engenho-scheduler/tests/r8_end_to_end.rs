@@ -42,6 +42,7 @@ async fn put_node(store: &StoreMesh, name: &str) {
                     "conditions": [{ "type": "Ready", "status": "True" }]
                 }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -60,6 +61,7 @@ async fn put_pending_pod(store: &StoreMesh, name: &str) {
                     "containers": [{ "name": "main", "image": "podinfo:6" }]
                 }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -148,6 +150,7 @@ async fn scheduler_skips_already_bound_pods() {
                 "metadata": { "name": "already-bound" },
                 "spec": { "nodeName": "node-original", "containers": [] }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -186,6 +189,7 @@ async fn scheduler_reports_skipped_when_no_schedulable_nodes() {
                 "spec": { "unschedulable": true },
                 "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -217,6 +221,7 @@ async fn scheduler_namespace_filter_works() {
         .propose(ResourceCommand::Put {
             key: ResourceKey::namespaced("", "v1", "Pod", "kube-system", "system-pod"),
             value: json!({"metadata": {"name": "system-pod"}, "spec": {}}),
+            expected: None,
             reason: Reason::Operator,
         })
         .await

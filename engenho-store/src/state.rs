@@ -530,6 +530,24 @@ impl ResourceCatalog {
     /// Filtering by GVK/namespace stays in the store (the catalog is
     /// GVK-keyed); SELECTOR filtering remains apiserver-side, which forces
     /// the apiserver's limit/continue over-fetch loop.
+    ///
+    /// ## Consistency: cursor-based, NOT MVCC snapshot-isolated (M0.1)
+    ///
+    /// Each call ranges the LIVE `BTreeMap` from `Bound::Excluded(after)`.
+    /// For a QUIESCENT key set the page series is gap-free + dup-free, and
+    /// a key that sorts AT OR BEFORE the cursor cannot resurface
+    /// (mechanical cursor exclusion). It is NOT true MVCC snapshot
+    /// isolation: a key inserted AFTER the cursor between page calls WILL
+    /// surface on a later page (real etcd excludes it by revision). The
+    /// continue token's `snapshot_rev` is only the envelope
+    /// `resourceVersion` LABEL — it is NOT a read-isolation mechanism.
+    ///
+    /// DESTINATION (deferred): revision-indexed historical reads — page
+    /// each request against the catalog AS OF the token's snapshot
+    /// revision, which requires retaining historical MVCC views (a
+    /// per-key revision history / time-travel index), not the single live
+    /// materialized map M0.1 keeps. Until then, do not claim snapshot
+    /// consistency for the page series.
     #[must_use]
     pub fn list_page(
         &self,

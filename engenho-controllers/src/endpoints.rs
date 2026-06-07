@@ -205,6 +205,7 @@ impl Controller for EndpointsController {
                 .propose(ResourceCommand::Put {
                     key: endpoints_key,
                     value: new_endpoints,
+                    expected: None,
                     reason: Reason::Controller,
                 })
                 .await

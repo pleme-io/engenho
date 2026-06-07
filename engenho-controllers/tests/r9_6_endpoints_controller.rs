@@ -38,6 +38,7 @@ async fn put_service(store: &StoreMesh, name: &str, selector: Value) {
                     "ports": [{ "port": 80, "targetPort": 9898 }]
                 }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -58,6 +59,7 @@ async fn put_ready_pod(store: &StoreMesh, name: &str, labels: Value, pod_ip: &st
                     "conditions": [{"type": "Ready", "status": "True"}]
                 }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await
@@ -140,6 +142,7 @@ async fn endpoints_exclude_unready_pods() {
                     "conditions": [{"type": "Ready", "status": "False"}]
                 }
             }),
+            expected: None,
             reason: Reason::Operator,
         })
         .await

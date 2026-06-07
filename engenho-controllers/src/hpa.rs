@@ -282,6 +282,7 @@ impl Controller for HorizontalPodAutoscalerController {
                 .propose(ResourceCommand::Patch {
                     key: target_key,
                     patch: json!({"spec": {"replicas": desired}}),
+                    expected: None,
                     reason: Reason::Controller,
                 })
                 .await
