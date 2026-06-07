@@ -105,3 +105,139 @@ fn catalog_routing_keys_are_unique() {
         assert!(seen.insert(key), "duplicate routing key: {key:?}");
     }
 }
+
+// ── per-kind registration metadata (short names / singular / categories) ──
+
+/// Resolve the kind a short name maps to, by scanning the catalog.
+fn kind_for_short_name(short: &str) -> Option<&'static str> {
+    RESOURCE_CATALOG
+        .iter()
+        .find(|d| d.short_names.contains(&short))
+        .map(|d| d.kind)
+}
+
+#[test]
+fn known_short_names_map_to_expected_kinds() {
+    // The exact upstream kube-apiserver short-name registrations we vendor.
+    // kubectl resolves these against /api/v1 + /apis/<g>/<v> discovery.
+    let cases = [
+        ("deploy", "Deployment"),
+        ("rs", "ReplicaSet"),
+        ("po", "Pod"),
+        ("svc", "Service"),
+        ("cm", "ConfigMap"),
+        ("ns", "Namespace"),
+        ("sa", "ServiceAccount"),
+        ("ep", "Endpoints"),
+        ("pv", "PersistentVolume"),
+        ("pvc", "PersistentVolumeClaim"),
+        ("sts", "StatefulSet"),
+        ("ds", "DaemonSet"),
+        ("no", "Node"),
+    ];
+    for (short, kind) in cases {
+        assert_eq!(
+            kind_for_short_name(short),
+            Some(kind),
+            "short name {short:?} must resolve to {kind}"
+        );
+    }
+}
+
+#[test]
+fn short_names_are_globally_unique() {
+    // A short name resolving to two kinds is ambiguous — forbidden.
+    let mut seen = std::collections::BTreeSet::new();
+    for d in RESOURCE_CATALOG {
+        for s in d.short_names {
+            assert!(seen.insert(*s), "duplicate short name across kinds: {s:?}");
+        }
+    }
+}
+
+#[test]
+fn every_kind_has_singular_equal_to_lowercase_kind() {
+    for d in RESOURCE_CATALOG {
+        assert!(!d.singular.is_empty(), "{}: singular present", d.kind);
+        assert_eq!(
+            d.singular,
+            d.kind.to_lowercase(),
+            "{}: singular == lowercased kind",
+            d.kind
+        );
+    }
+}
+
+#[test]
+fn secret_and_rbac_kinds_have_no_short_names() {
+    // Secret + every RBAC kind have NO upstream short name — empty by
+    // construction (we mirror upstream, never invent).
+    for kind in ["Secret", "Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding"] {
+        let d = row(kind);
+        assert!(
+            d.short_names.is_empty(),
+            "{kind} has no upstream short name — must be empty"
+        );
+    }
+}
+
+#[test]
+fn all_category_is_on_the_workload_kinds() {
+    // The "all" category is carried by exactly the workload+networking core
+    // kinds we catalog: Pod, Service, Deployment, ReplicaSet, StatefulSet,
+    // DaemonSet (ReplicationController is not cataloged).
+    let want_all = [
+        "Pod",
+        "Service",
+        "Deployment",
+        "ReplicaSet",
+        "StatefulSet",
+        "DaemonSet",
+    ];
+    for kind in want_all {
+        assert!(
+            row(kind).categories.contains(&"all"),
+            "{kind} must be in category 'all'"
+        );
+    }
+    // Secret / Namespace / RBAC are NOT in any category.
+    for kind in ["Secret", "Namespace", "Role", "Node"] {
+        assert!(
+            row(kind).categories.is_empty(),
+            "{kind} must be in no category"
+        );
+    }
+}
+
+// ── /openapi/v3 served-tuples ↔ catalog invariant ─────────────────────────
+
+#[test]
+fn openapi_v3_document_for_apps_is_openapi_3() {
+    let doc = engenho_types::openapi_v3::document_for("apps", "v1")
+        .expect("apps/v1 OpenAPI v3 document served");
+    let parsed: serde_json::Value =
+        serde_json::from_str(doc).expect("apps/v1 doc parses as JSON");
+    assert_eq!(
+        parsed.get("openapi").and_then(|v| v.as_str()),
+        Some("3.0.0"),
+        "apps/v1 vendored document is openapi 3.0.0"
+    );
+}
+
+#[test]
+fn served_openapi_tuples_equal_catalog_group_version_pairs() {
+    // ★★ CATALOG REFLECTION invariant: the set of (group, version) pairs in
+    // the served OpenAPI-v3 table MUST equal the distinct (group, version)
+    // pairs in RESOURCE_CATALOG. Adding a group is one catalog change + one
+    // vendored file + one SERVED row — never a hand-wired divergence.
+    let catalog_pairs: std::collections::BTreeSet<(&str, &str)> =
+        RESOURCE_CATALOG.iter().map(|d| (d.group, d.version)).collect();
+    let served_pairs: std::collections::BTreeSet<(&str, &str)> = engenho_types::openapi_v3::SERVED
+        .iter()
+        .map(|d| (d.group, d.version))
+        .collect();
+    assert_eq!(
+        served_pairs, catalog_pairs,
+        "served OpenAPI-v3 (group,version) set must equal RESOURCE_CATALOG's"
+    );
+}

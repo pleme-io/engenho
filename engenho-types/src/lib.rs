@@ -64,6 +64,7 @@ pub mod informer;
 pub mod kind;
 pub mod meta;
 pub mod nomad_v1;
+pub mod openapi_v3;
 pub mod patch;
 pub mod primitives;
 pub mod reconciler;

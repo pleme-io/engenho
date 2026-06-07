@@ -32,6 +32,19 @@ pub struct KindEntry {
     /// Generated module path under `engenho-types::generated_v1_34::`
     /// (e.g. `core_v1` for core/v1 kinds).
     pub module: &'static str,
+    /// kubectl short-name aliases (e.g. `["deploy"]` for `Deployment`).
+    /// PURE registration metadata — NOT in OpenAPI; sourced verbatim from
+    /// upstream kube-apiserver Go REST storage. Empty for kinds with no
+    /// upstream short name (e.g. `Secret`, every RBAC kind).
+    pub short_names: &'static [&'static str],
+    /// The singular resource name (the lowercase kind, e.g. `deployment`).
+    /// Served as discovery `singularName`; `kubectl` uses it to round-trip
+    /// the kind. Always `kind.to_lowercase()`.
+    pub singular: &'static str,
+    /// kubectl resource categories the kind belongs to (e.g. `["all"]` for
+    /// the workload + networking core kinds). Empty for kinds in no
+    /// category. PURE registration metadata, like `short_names`.
+    pub categories: &'static [&'static str],
 }
 
 /// The curated set of M0.0.1 kinds.
@@ -48,6 +61,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "pods",
         cluster_scoped: false,
         module: "core_v1",
+        short_names: &["po"],
+        singular: "pod",
+        categories: &["all"],
     },
     KindEntry {
         kind: "Service",
@@ -57,6 +73,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "services",
         cluster_scoped: false,
         module: "core_v1",
+        short_names: &["svc"],
+        singular: "service",
+        categories: &["all"],
     },
     KindEntry {
         kind: "ConfigMap",
@@ -66,6 +85,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "configmaps",
         cluster_scoped: false,
         module: "core_v1",
+        short_names: &["cm"],
+        singular: "configmap",
+        categories: &[],
     },
     KindEntry {
         kind: "Secret",
@@ -75,6 +97,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "secrets",
         cluster_scoped: false,
         module: "core_v1",
+        short_names: &[],
+        singular: "secret",
+        categories: &[],
     },
     KindEntry {
         kind: "Namespace",
@@ -84,6 +109,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "namespaces",
         cluster_scoped: true,
         module: "core_v1",
+        short_names: &["ns"],
+        singular: "namespace",
+        categories: &[],
     },
     KindEntry {
         kind: "ServiceAccount",
@@ -93,6 +121,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "serviceaccounts",
         cluster_scoped: false,
         module: "core_v1",
+        short_names: &["sa"],
+        singular: "serviceaccount",
+        categories: &[],
     },
     KindEntry {
         kind: "Node",
@@ -102,6 +133,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "nodes",
         cluster_scoped: true,
         module: "core_v1",
+        short_names: &["no"],
+        singular: "node",
+        categories: &[],
     },
     KindEntry {
         kind: "PersistentVolume",
@@ -111,6 +145,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "persistentvolumes",
         cluster_scoped: true,
         module: "core_v1",
+        short_names: &["pv"],
+        singular: "persistentvolume",
+        categories: &[],
     },
     KindEntry {
         kind: "PersistentVolumeClaim",
@@ -120,6 +157,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "persistentvolumeclaims",
         cluster_scoped: false,
         module: "core_v1",
+        short_names: &["pvc"],
+        singular: "persistentvolumeclaim",
+        categories: &[],
     },
     KindEntry {
         kind: "Endpoints",
@@ -129,6 +169,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "endpoints",
         cluster_scoped: false,
         module: "core_v1",
+        short_names: &["ep"],
+        singular: "endpoints",
+        categories: &[],
     },
     // ── apps/v1 ─────────────────────────────────────────────────────
     KindEntry {
@@ -139,6 +182,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "deployments",
         cluster_scoped: false,
         module: "apps_v1",
+        short_names: &["deploy"],
+        singular: "deployment",
+        categories: &["all"],
     },
     KindEntry {
         kind: "ReplicaSet",
@@ -148,6 +194,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "replicasets",
         cluster_scoped: false,
         module: "apps_v1",
+        short_names: &["rs"],
+        singular: "replicaset",
+        categories: &["all"],
     },
     KindEntry {
         kind: "StatefulSet",
@@ -157,6 +206,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "statefulsets",
         cluster_scoped: false,
         module: "apps_v1",
+        short_names: &["sts"],
+        singular: "statefulset",
+        categories: &["all"],
     },
     KindEntry {
         kind: "DaemonSet",
@@ -166,6 +218,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "daemonsets",
         cluster_scoped: false,
         module: "apps_v1",
+        short_names: &["ds"],
+        singular: "daemonset",
+        categories: &["all"],
     },
     // ── rbac.authorization.k8s.io/v1 ────────────────────────────────
     KindEntry {
@@ -176,6 +231,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "roles",
         cluster_scoped: false,
         module: "rbac_v1",
+        short_names: &[],
+        singular: "role",
+        categories: &[],
     },
     KindEntry {
         kind: "ClusterRole",
@@ -185,6 +243,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "clusterroles",
         cluster_scoped: true,
         module: "rbac_v1",
+        short_names: &[],
+        singular: "clusterrole",
+        categories: &[],
     },
     KindEntry {
         kind: "RoleBinding",
@@ -194,6 +255,9 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "rolebindings",
         cluster_scoped: false,
         module: "rbac_v1",
+        short_names: &[],
+        singular: "rolebinding",
+        categories: &[],
     },
     KindEntry {
         kind: "ClusterRoleBinding",
@@ -203,5 +267,8 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         resource: "clusterrolebindings",
         cluster_scoped: true,
         module: "rbac_v1",
+        short_names: &[],
+        singular: "clusterrolebinding",
+        categories: &[],
     },
 ];

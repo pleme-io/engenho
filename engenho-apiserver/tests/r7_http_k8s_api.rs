@@ -294,44 +294,63 @@ async fn openapi_spec_is_served_at_canonical_paths() {
     let addr = server.local_addr();
     let client = reqwest::Client::new();
 
-    // Both /openapi.json and /openapi/v3 must serve the spec.
-    for path in ["/openapi.json", "/openapi/v3"] {
-        let resp = client
-            .get(format!("http://{addr}{path}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        let spec: serde_json::Value = resp.json().await.unwrap();
-        // openapi version 3.x
-        let v = spec.get("openapi").unwrap().as_str().unwrap();
-        assert!(v.starts_with("3."), "{path} returned non-v3 spec: {v}");
-        // info.title is our title
-        assert_eq!(
-            spec.get("info").unwrap().get("title").unwrap(),
-            "engenho-apiserver — K8s REST API"
-        );
-        // The 10 K8s REST paths are documented
-        let paths = spec.get("paths").unwrap().as_object().unwrap();
-        assert!(paths.contains_key("/api/v1/namespaces/{ns}/{plural}/{name}"));
-        assert!(paths.contains_key("/api/v1/namespaces/{ns}/{plural}"));
-        assert!(paths.contains_key("/api/v1/{plural}/{name}"));
-        assert!(paths.contains_key("/api/v1/{plural}"));
-        // The 4 typed schemas are exported
-        let schemas = spec
-            .get("components")
-            .unwrap()
-            .get("schemas")
-            .unwrap()
-            .as_object()
-            .unwrap();
-        for name in ["K8sResource", "K8sResourceList", "K8sStatus", "K8sPatch"] {
-            assert!(
-                schemas.contains_key(name),
-                "missing schema {name} at {path}"
-            );
-        }
+    // `/openapi.json` serves the utoipa-derived description of engenho's OWN
+    // REST surface (SDK/codegen consumers) — unchanged.
+    let resp = client
+        .get(format!("http://{addr}/openapi.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let spec: serde_json::Value = resp.json().await.unwrap();
+    let v = spec.get("openapi").unwrap().as_str().unwrap();
+    assert!(v.starts_with("3."), "/openapi.json returned non-v3 spec: {v}");
+    assert_eq!(
+        spec.get("info").unwrap().get("title").unwrap(),
+        "engenho-apiserver — K8s REST API"
+    );
+    let paths = spec.get("paths").unwrap().as_object().unwrap();
+    assert!(paths.contains_key("/api/v1/namespaces/{ns}/{plural}/{name}"));
+    assert!(paths.contains_key("/api/v1/namespaces/{ns}/{plural}"));
+    assert!(paths.contains_key("/api/v1/{plural}/{name}"));
+    assert!(paths.contains_key("/api/v1/{plural}"));
+    let schemas = spec
+        .get("components")
+        .unwrap()
+        .get("schemas")
+        .unwrap()
+        .as_object()
+        .unwrap();
+    for name in ["K8sResource", "K8sResourceList", "K8sStatus", "K8sPatch"] {
+        assert!(schemas.contains_key(name), "missing schema {name}");
     }
+
+    // `/openapi/v3` now serves the K8s OpenAPI-v3 DISCOVERY INDEX (what
+    // kubectl apply --validate + explain consume), NOT the engenho-own
+    // utoipa stub. It is a `{ paths: { <group-key>: { serverRelativeURL }}}`
+    // index over exactly the cataloged groups.
+    let resp = client
+        .get(format!("http://{addr}/openapi/v3"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let idx: serde_json::Value = resp.json().await.unwrap();
+    let idx_paths = idx.get("paths").unwrap().as_object().unwrap();
+    for key in ["api/v1", "apis/apps/v1", "apis/rbac.authorization.k8s.io/v1"] {
+        let item = idx_paths
+            .get(key)
+            .unwrap_or_else(|| panic!("discovery index missing key {key}"));
+        assert!(
+            item.get("serverRelativeURL").is_some(),
+            "index entry {key} has a serverRelativeURL"
+        );
+    }
+    // It is the discovery index, NOT the utoipa stub.
+    assert!(
+        idx.get("info").is_none(),
+        "/openapi/v3 is the K8s discovery index (no utoipa info block)"
+    );
 
     server.shutdown().await.unwrap();
 }

@@ -379,6 +379,28 @@ async fn discovery_apps_v1_resource_list_shape() {
         .expect("deployments resource advertised");
     assert_eq!(dep.get("kind").unwrap(), "Deployment");
     assert_eq!(dep.get("namespaced").unwrap(), true);
+    // Registration metadata: shortNames ["deploy"], singularName
+    // "deployment", categories ["all"] — this is what lets `kubectl get
+    // deploy` resolve to deployments.
+    assert_eq!(dep.get("singularName").unwrap(), "deployment");
+    let short_names: Vec<&str> = dep
+        .get("shortNames")
+        .expect("Deployment row carries shortNames")
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(short_names, vec!["deploy"]);
+    let categories: Vec<&str> = dep
+        .get("categories")
+        .expect("Deployment row carries categories")
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(categories, vec!["all"]);
     let verbs: Vec<&str> = dep
         .get("verbs")
         .unwrap()
@@ -430,9 +452,36 @@ async fn discovery_core_api_and_api_v1() {
     assert_eq!(rl.get("kind").unwrap(), "APIResourceList");
     assert_eq!(rl.get("groupVersion").unwrap(), "v1");
     let resources = rl.get("resources").unwrap().as_array().unwrap();
+    let pod = resources
+        .iter()
+        .find(|r| r.get("name").unwrap() == "pods")
+        .expect("pods advertised under /api/v1");
+    // Pod registration metadata: shortNames ["po"], singularName "pod".
+    assert_eq!(pod.get("singularName").unwrap(), "pod");
+    let pod_short: Vec<&str> = pod
+        .get("shortNames")
+        .expect("Pod carries shortNames")
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(pod_short, vec!["po"]);
+
+    // Endpoints singularName is "endpoints" (singular == lowercased kind).
+    let ep = resources
+        .iter()
+        .find(|r| r.get("name").unwrap() == "endpoints")
+        .expect("endpoints advertised under /api/v1");
+    assert_eq!(ep.get("singularName").unwrap(), "endpoints");
+    // Secret has NO shortNames → the field is omitted (empty slice skipped).
+    let secret = resources
+        .iter()
+        .find(|r| r.get("name").unwrap() == "secrets")
+        .expect("secrets advertised under /api/v1");
     assert!(
-        resources.iter().any(|r| r.get("name").unwrap() == "pods"),
-        "pods advertised under /api/v1"
+        secret.get("shortNames").is_none(),
+        "Secret carries no shortNames (field omitted when empty)"
     );
 
     server.shutdown().await.unwrap();
@@ -551,6 +600,93 @@ async fn core_pod_crud_regression() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    server.shutdown().await.unwrap();
+}
+
+// =========================================================================
+// 8. OPENAPI v3 — K8s discovery index + per-group schema documents
+// =========================================================================
+
+#[tokio::test]
+async fn openapi_v3_discovery_index_and_documents() {
+    let (_store, server) = boot().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    // GET /openapi/v3 → discovery index. paths keys == the three cataloged
+    // groups, each with a serverRelativeURL.
+    let resp = client
+        .get(format!("http://{addr}/openapi/v3"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let idx: serde_json::Value = resp.json().await.unwrap();
+    let paths = idx.get("paths").unwrap().as_object().unwrap();
+    let keys: std::collections::BTreeSet<&str> = paths.keys().map(String::as_str).collect();
+    let want: std::collections::BTreeSet<&str> = ["api/v1", "apis/apps/v1", "apis/rbac.authorization.k8s.io/v1"]
+        .into_iter()
+        .collect();
+    assert_eq!(keys, want, "discovery index keys == cataloged groups");
+    // Each entry carries a serverRelativeURL.
+    for (_k, item) in paths {
+        let url = item
+            .get("serverRelativeURL")
+            .expect("each path item has serverRelativeURL")
+            .as_str()
+            .unwrap();
+        assert!(url.starts_with("/openapi/v3/"), "serverRelativeURL: {url}");
+    }
+
+    // GET /openapi/v3/apis/apps/v1 → openapi 3.0.0 with Deployment schema.
+    let resp = client
+        .get(format!("http://{addr}/openapi/v3/apis/apps/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let apps: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(apps.get("openapi").unwrap(), "3.0.0");
+    assert!(
+        apps.get("components")
+            .unwrap()
+            .get("schemas")
+            .unwrap()
+            .get("io.k8s.api.apps.v1.Deployment")
+            .is_some(),
+        "apps/v1 document carries the Deployment schema"
+    );
+
+    // GET /openapi/v3/api/v1 → core document carrying the Pod schema.
+    let resp = client
+        .get(format!("http://{addr}/openapi/v3/api/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let core: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        core.get("components")
+            .unwrap()
+            .get("schemas")
+            .unwrap()
+            .get("io.k8s.api.core.v1.Pod")
+            .is_some(),
+        "core/v1 document carries the Pod schema"
+    );
+
+    // An uncataloged group/version → 404.
+    let resp = client
+        .get(format!("http://{addr}/openapi/v3/apis/nope.example.com/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "uncataloged OpenAPI v3 group → 404"
+    );
 
     server.shutdown().await.unwrap();
 }

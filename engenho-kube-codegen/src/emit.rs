@@ -338,6 +338,16 @@ pub struct ResourceDescriptor {
     pub namespaced: bool,
     /// `\"v1\"` for core, `\"<group>/<version>\"` otherwise.
     pub api_version: &'static str,
+    /// kubectl short-name aliases (e.g. `[\"deploy\"]`). Empty for kinds
+    /// with no upstream short name. Pure registration metadata (NOT in the
+    /// OpenAPI schema) — flows into discovery `shortNames`.
+    pub short_names: &'static [&'static str],
+    /// Singular resource name (lowercase kind) — served as discovery
+    /// `singularName`.
+    pub singular: &'static str,
+    /// kubectl resource categories (e.g. `[\"all\"]`). Empty for kinds in
+    /// no category. Flows into discovery `categories`.
+    pub categories: &'static [&'static str],
 }
 
 impl ResourceDescriptor {
@@ -397,17 +407,38 @@ pub fn emit_catalog(catalog: &[KindEntry]) -> String {
             format!("{}/{}", e.group, e.version)
         };
         out.push_str(&format!(
-            "    ResourceDescriptor {{ group: {:?}, version: {:?}, kind: {:?}, plural: {:?}, namespaced: {}, api_version: {:?} }},\n",
+            "    ResourceDescriptor {{ group: {:?}, version: {:?}, kind: {:?}, plural: {:?}, namespaced: {}, api_version: {:?}, short_names: {}, singular: {:?}, categories: {} }},\n",
             e.group,
             e.version,
             e.kind,
             e.resource,
             !e.cluster_scoped,
             api_version,
+            render_str_slice(e.short_names),
+            e.singular,
+            render_str_slice(e.categories),
         ));
     }
     out.push_str("];\n");
     out
+}
+
+/// Render a `&'static [&'static str]` as the Rust slice literal that
+/// reconstructs it: `&[]` for empty, `&["a", "b"]` otherwise. Each element
+/// is rendered through `{:?}` (the typed string-debug surface) so the
+/// output is a valid, escaped Rust string literal and byte-deterministic.
+/// This is the typed slice renderer the ★★ TYPED EMISSION rule requires for
+/// emitting `&[&str]` constants — no hand-built quoting.
+fn render_str_slice(items: &[&str]) -> String {
+    if items.is_empty() {
+        return "&[]".to_string();
+    }
+    let joined = items
+        .iter()
+        .map(|s| format!("{s:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("&[{joined}]")
 }
 
 /// Emit a module-level `mod.rs` listing every per-kind submodule in
@@ -448,6 +479,9 @@ mod tests {
             resource: "pods",
             cluster_scoped: false,
             module: "core_v1",
+            short_names: &["po"],
+            singular: "pod",
+            categories: &["all"],
         }
     }
 
@@ -568,6 +602,51 @@ mod tests {
     }
 
     #[test]
+    fn every_singular_is_lowercase_kind() {
+        use crate::catalog::KIND_CATALOG;
+        for e in KIND_CATALOG {
+            assert_eq!(
+                e.singular,
+                e.kind.to_lowercase(),
+                "{}: singular must be the lowercased kind",
+                e.kind
+            );
+        }
+    }
+
+    #[test]
+    fn emit_catalog_renders_short_names_singular_categories() {
+        use crate::catalog::KIND_CATALOG;
+        let src = emit_catalog(KIND_CATALOG);
+        // Deployment: deploy short name + all category.
+        assert!(
+            src.contains(
+                r#"kind: "Deployment", plural: "deployments", namespaced: true, api_version: "apps/v1", short_names: &["deploy"], singular: "deployment", categories: &["all"]"#
+            ),
+            "Deployment row carries deploy/deployment/all"
+        );
+        // Secret: NO short name (empty slice literal) + no category.
+        assert!(
+            src.contains(
+                r#"kind: "Secret", plural: "secrets", namespaced: true, api_version: "v1", short_names: &[], singular: "secret", categories: &[]"#
+            ),
+            "Secret row carries an empty short_names + categories slice"
+        );
+        // Pod: po short name + all category (core kind).
+        assert!(
+            src.contains(r#"short_names: &["po"], singular: "pod", categories: &["all"]"#),
+            "Pod row carries po/pod/all"
+        );
+    }
+
+    #[test]
+    fn render_str_slice_empty_and_nonempty() {
+        assert_eq!(render_str_slice(&[]), "&[]");
+        assert_eq!(render_str_slice(&["deploy"]), r#"&["deploy"]"#);
+        assert_eq!(render_str_slice(&["a", "b"]), r#"&["a", "b"]"#);
+    }
+
+    #[test]
     fn emit_module_lists_each_kind() {
         let entries: Vec<KindEntry> = vec![
             entry(),
@@ -579,6 +658,9 @@ mod tests {
                 resource: "services",
                 cluster_scoped: false,
                 module: "core_v1",
+                short_names: &["svc"],
+                singular: "service",
+                categories: &["all"],
             },
         ];
         let refs: Vec<&KindEntry> = entries.iter().collect();

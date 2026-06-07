@@ -34,6 +34,16 @@ pub struct ResourceDescriptor {
     pub namespaced: bool,
     /// `"v1"` for core, `"<group>/<version>"` otherwise.
     pub api_version: &'static str,
+    /// kubectl short-name aliases (e.g. `["deploy"]`). Empty for kinds
+    /// with no upstream short name. Pure registration metadata (NOT in the
+    /// OpenAPI schema) — flows into discovery `shortNames`.
+    pub short_names: &'static [&'static str],
+    /// Singular resource name (lowercase kind) — served as discovery
+    /// `singularName`.
+    pub singular: &'static str,
+    /// kubectl resource categories (e.g. `["all"]`). Empty for kinds in
+    /// no category. Flows into discovery `categories`.
+    pub categories: &'static [&'static str],
 }
 
 impl ResourceDescriptor {
@@ -70,22 +80,22 @@ impl ResourceDescriptor {
 
 /// Every routable/discoverable kind, in `KIND_CATALOG` order.
 pub const RESOURCE_CATALOG: &[ResourceDescriptor] = &[
-    ResourceDescriptor { group: "", version: "v1", kind: "Pod", plural: "pods", namespaced: true, api_version: "v1" },
-    ResourceDescriptor { group: "", version: "v1", kind: "Service", plural: "services", namespaced: true, api_version: "v1" },
-    ResourceDescriptor { group: "", version: "v1", kind: "ConfigMap", plural: "configmaps", namespaced: true, api_version: "v1" },
-    ResourceDescriptor { group: "", version: "v1", kind: "Secret", plural: "secrets", namespaced: true, api_version: "v1" },
-    ResourceDescriptor { group: "", version: "v1", kind: "Namespace", plural: "namespaces", namespaced: false, api_version: "v1" },
-    ResourceDescriptor { group: "", version: "v1", kind: "ServiceAccount", plural: "serviceaccounts", namespaced: true, api_version: "v1" },
-    ResourceDescriptor { group: "", version: "v1", kind: "Node", plural: "nodes", namespaced: false, api_version: "v1" },
-    ResourceDescriptor { group: "", version: "v1", kind: "PersistentVolume", plural: "persistentvolumes", namespaced: false, api_version: "v1" },
-    ResourceDescriptor { group: "", version: "v1", kind: "PersistentVolumeClaim", plural: "persistentvolumeclaims", namespaced: true, api_version: "v1" },
-    ResourceDescriptor { group: "", version: "v1", kind: "Endpoints", plural: "endpoints", namespaced: true, api_version: "v1" },
-    ResourceDescriptor { group: "apps", version: "v1", kind: "Deployment", plural: "deployments", namespaced: true, api_version: "apps/v1" },
-    ResourceDescriptor { group: "apps", version: "v1", kind: "ReplicaSet", plural: "replicasets", namespaced: true, api_version: "apps/v1" },
-    ResourceDescriptor { group: "apps", version: "v1", kind: "StatefulSet", plural: "statefulsets", namespaced: true, api_version: "apps/v1" },
-    ResourceDescriptor { group: "apps", version: "v1", kind: "DaemonSet", plural: "daemonsets", namespaced: true, api_version: "apps/v1" },
-    ResourceDescriptor { group: "rbac.authorization.k8s.io", version: "v1", kind: "Role", plural: "roles", namespaced: true, api_version: "rbac.authorization.k8s.io/v1" },
-    ResourceDescriptor { group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole", plural: "clusterroles", namespaced: false, api_version: "rbac.authorization.k8s.io/v1" },
-    ResourceDescriptor { group: "rbac.authorization.k8s.io", version: "v1", kind: "RoleBinding", plural: "rolebindings", namespaced: true, api_version: "rbac.authorization.k8s.io/v1" },
-    ResourceDescriptor { group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding", plural: "clusterrolebindings", namespaced: false, api_version: "rbac.authorization.k8s.io/v1" },
+    ResourceDescriptor { group: "", version: "v1", kind: "Pod", plural: "pods", namespaced: true, api_version: "v1", short_names: &["po"], singular: "pod", categories: &["all"] },
+    ResourceDescriptor { group: "", version: "v1", kind: "Service", plural: "services", namespaced: true, api_version: "v1", short_names: &["svc"], singular: "service", categories: &["all"] },
+    ResourceDescriptor { group: "", version: "v1", kind: "ConfigMap", plural: "configmaps", namespaced: true, api_version: "v1", short_names: &["cm"], singular: "configmap", categories: &[] },
+    ResourceDescriptor { group: "", version: "v1", kind: "Secret", plural: "secrets", namespaced: true, api_version: "v1", short_names: &[], singular: "secret", categories: &[] },
+    ResourceDescriptor { group: "", version: "v1", kind: "Namespace", plural: "namespaces", namespaced: false, api_version: "v1", short_names: &["ns"], singular: "namespace", categories: &[] },
+    ResourceDescriptor { group: "", version: "v1", kind: "ServiceAccount", plural: "serviceaccounts", namespaced: true, api_version: "v1", short_names: &["sa"], singular: "serviceaccount", categories: &[] },
+    ResourceDescriptor { group: "", version: "v1", kind: "Node", plural: "nodes", namespaced: false, api_version: "v1", short_names: &["no"], singular: "node", categories: &[] },
+    ResourceDescriptor { group: "", version: "v1", kind: "PersistentVolume", plural: "persistentvolumes", namespaced: false, api_version: "v1", short_names: &["pv"], singular: "persistentvolume", categories: &[] },
+    ResourceDescriptor { group: "", version: "v1", kind: "PersistentVolumeClaim", plural: "persistentvolumeclaims", namespaced: true, api_version: "v1", short_names: &["pvc"], singular: "persistentvolumeclaim", categories: &[] },
+    ResourceDescriptor { group: "", version: "v1", kind: "Endpoints", plural: "endpoints", namespaced: true, api_version: "v1", short_names: &["ep"], singular: "endpoints", categories: &[] },
+    ResourceDescriptor { group: "apps", version: "v1", kind: "Deployment", plural: "deployments", namespaced: true, api_version: "apps/v1", short_names: &["deploy"], singular: "deployment", categories: &["all"] },
+    ResourceDescriptor { group: "apps", version: "v1", kind: "ReplicaSet", plural: "replicasets", namespaced: true, api_version: "apps/v1", short_names: &["rs"], singular: "replicaset", categories: &["all"] },
+    ResourceDescriptor { group: "apps", version: "v1", kind: "StatefulSet", plural: "statefulsets", namespaced: true, api_version: "apps/v1", short_names: &["sts"], singular: "statefulset", categories: &["all"] },
+    ResourceDescriptor { group: "apps", version: "v1", kind: "DaemonSet", plural: "daemonsets", namespaced: true, api_version: "apps/v1", short_names: &["ds"], singular: "daemonset", categories: &["all"] },
+    ResourceDescriptor { group: "rbac.authorization.k8s.io", version: "v1", kind: "Role", plural: "roles", namespaced: true, api_version: "rbac.authorization.k8s.io/v1", short_names: &[], singular: "role", categories: &[] },
+    ResourceDescriptor { group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole", plural: "clusterroles", namespaced: false, api_version: "rbac.authorization.k8s.io/v1", short_names: &[], singular: "clusterrole", categories: &[] },
+    ResourceDescriptor { group: "rbac.authorization.k8s.io", version: "v1", kind: "RoleBinding", plural: "rolebindings", namespaced: true, api_version: "rbac.authorization.k8s.io/v1", short_names: &[], singular: "rolebinding", categories: &[] },
+    ResourceDescriptor { group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding", plural: "clusterrolebindings", namespaced: false, api_version: "rbac.authorization.k8s.io/v1", short_names: &[], singular: "clusterrolebinding", categories: &[] },
 ];

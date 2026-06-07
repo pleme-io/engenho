@@ -100,18 +100,33 @@ pub struct APIResource {
     pub namespaced: bool,
     pub kind: String,
     pub verbs: Vec<String>,
+    /// kubectl short-name aliases (e.g. `["deploy"]`). Omitted when empty
+    /// (matches kube-apiserver, which only emits `shortNames` for kinds
+    /// that have one). This is what lets `kubectl get deploy` resolve.
+    #[serde(rename = "shortNames", skip_serializing_if = "Vec::is_empty")]
+    pub short_names: Vec<String>,
+    /// Resource categories (e.g. `["all"]`). Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
 }
 
 // ── builders (fold the handler set; deterministic via BTree ordering) ───
 
-/// Project one handler into an `APIResource` discovery row.
+/// Project one handler into an `APIResource` discovery row. The
+/// registration metadata (singularName / shortNames / categories) flows
+/// from the handler — which sources it from the generated catalog — so
+/// `/api/v1` and `/apis/<g>/<v>` advertise it identically with no
+/// per-route wiring. kubectl reads `shortNames` here to resolve
+/// `deploy` → `deployments`, etc.
 fn resource_of(h: &dyn ResourceHandler) -> APIResource {
     APIResource {
         name: h.plural().to_string(),
-        singular_name: String::new(),
+        singular_name: h.singular_name().to_string(),
         namespaced: h.namespaced(),
         kind: h.kind().to_string(),
         verbs: VERBS.iter().map(|v| (*v).to_string()).collect(),
+        short_names: h.short_names().iter().map(|s| (*s).to_string()).collect(),
+        categories: h.categories().iter().map(|c| (*c).to_string()).collect(),
     }
 }
 
