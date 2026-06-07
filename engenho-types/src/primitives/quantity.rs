@@ -35,7 +35,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 
