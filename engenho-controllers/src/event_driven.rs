@@ -35,7 +35,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, broadcast};
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 
 /// Generic wrapper that drains an event channel + issues ticks.
@@ -78,7 +78,7 @@ impl<E: Clone + Send + Sync + 'static> Controller for EventDrivenController<E> {
         self.inner.name()
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let mut rx = self.receiver.lock().await;
         // Drain pending events.
         let mut drained = 0usize;
@@ -107,20 +107,25 @@ impl<E: Clone + Send + Sync + 'static> Controller for EventDrivenController<E> {
         }
         drop(rx);
         if had_event && self.coalesce {
-            // Single downstream tick for the entire drained batch.
-            let mut report = self.inner.tick().await?;
+            // Single downstream tick for the entire drained batch. Preserve
+            // the inner controller's requeue decision while bumping the
+            // examined count to reflect the coalesced batch size.
+            let outcome = self.inner.tick().await?;
+            let result = outcome.result;
+            let mut report = outcome.report;
             report.objects_examined = report.objects_examined.max(drained);
-            return Ok(report);
+            return Ok(ReconcileOutcome::new(report, result));
         }
         if !had_event {
             // No events — no work to do.
-            return Ok(ReconcileReport::default());
+            return Ok(ReconcileReport::default().into());
         }
         // Per-event mode: at least one tick was already issued.
         Ok(ReconcileReport {
             objects_examined: drained,
             ..ReconcileReport::default()
-        })
+        }
+        .into())
     }
 }
 
@@ -140,9 +145,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "counting"
         }
-        async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+        async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
             self.ticks.fetch_add(1, Ordering::SeqCst);
-            Ok(ReconcileReport::default())
+            Ok(ReconcileReport::default().into())
         }
     }
 

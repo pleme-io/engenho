@@ -38,7 +38,7 @@ use engenho_substrate::{
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 use crate::roceiro::Roceiro;
 
@@ -166,7 +166,7 @@ impl Controller for PlantioController {
         "plantio"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let crs = self
             .store
             .list("engenho.io", "v1", "Plantio", self.namespace.as_deref())
@@ -303,7 +303,7 @@ impl Controller for PlantioController {
                 .await?;
             report.objects_changed += 1;
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 
@@ -477,8 +477,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "plantio"
             }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
+            async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+                Ok(ReconcileReport::default().into())
             }
         }
         assert_eq!(F.name(), "plantio");

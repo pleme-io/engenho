@@ -129,15 +129,16 @@ impl<C: Controller + 'static> WatchDriver<C> {
 
     /// One tick of the inner controller — useful in tests where
     /// the caller wants synchronous reconcile without the event
-    /// loop.
+    /// loop. Returns the typed [`ReconcileOutcome`] (report + requeue
+    /// decision).
     pub async fn tick_once(
         &self,
-    ) -> Result<crate::controller::ReconcileReport, crate::error::ControllerError> {
+    ) -> Result<crate::controller::ReconcileOutcome, crate::error::ControllerError> {
         self.controller.tick().await
     }
 }
 
-async fn run<C: Controller + ?Sized>(
+async fn run<C: Controller + ?Sized + 'static>(
     controller: Arc<C>,
     store: Arc<StoreMesh>,
     config: WatchDriverConfig,
@@ -175,7 +176,7 @@ async fn run<C: Controller + ?Sized>(
                 if let Some(stream) = rx.as_mut() {
                     drain_pending(stream, controller.name(), &config);
                 }
-                tick_and_log(controller.as_ref()).await;
+                tick_and_log(&controller).await;
             }
             EventOrTimer::Gone(gone) => {
                 // Typed terminal: tick once (cover the gap) + resubscribe
@@ -186,11 +187,11 @@ async fn run<C: Controller + ?Sized>(
                     gone = %gone,
                     "watch stream gone; ticking + re-subscribing"
                 );
-                tick_and_log(controller.as_ref()).await;
+                tick_and_log(&controller).await;
                 rx = store.watch().await.ok();
             }
             EventOrTimer::FallbackTimer => {
-                tick_and_log(controller.as_ref()).await;
+                tick_and_log(&controller).await;
             }
             EventOrTimer::Shutdown => {
                 info!(controller = controller.name(), "watch driver shutting down");
@@ -198,6 +199,20 @@ async fn run<C: Controller + ?Sized>(
             }
         }
     }
+}
+
+/// Arm a one-shot re-tick of `controller` after `delay`. A coarse
+/// whole-kind re-tick (the controller's `tick` is already a full sweep),
+/// fired off the hot loop so the requeue doesn't block event processing.
+/// This is the brick that makes `ReconcileResult::Requeue` LOAD-BEARING;
+/// the per-key DelayQueue RequeueDriver is the next brick + simply swaps
+/// this one-shot sleep for a keyed coalescing queue.
+fn arm_requeue<C: Controller + ?Sized + 'static>(controller: Arc<C>, delay: Duration) {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        debug!(controller = controller.name(), "requeue timer fired");
+        tick_and_log(&controller).await;
+    });
 }
 
 #[derive(Debug)]
@@ -261,14 +276,61 @@ fn drain_pending(stream: &mut WatchStream, controller_name: &str, config: &Watch
     }
 }
 
-async fn tick_and_log<C: Controller + ?Sized>(controller: &C) {
+/// Tick the controller, log its report, AND act on the typed outcome —
+/// the propagation that replaces the pre-unification swallow.
+///
+///   * `Ok(outcome)` with `result == Done` → log only (today's behavior).
+///   * `Ok(outcome)` with `result == Requeue{after}` /
+///     `RequeueWithProgress{after}` → log + arm a one-shot re-tick at
+///     `after` (instead of waiting up to `fallback_interval` for a blind
+///     re-tick).
+///   * `Err(e)` → classify via the fleet `FailureKind` classifier
+///     ([`ControllerError::classify`]):
+///       - `Declarative` → log at ERROR + DO NOT schedule a retry (the
+///         operator's declaration is broken; blind-retrying is futile —
+///         the fallback timer still re-ticks coarsely, but we don't
+///         pile on a targeted retry).
+///       - `Transient` → log at WARN + arm a retry at the
+///         `retry_after`-derived delay (1s) instead of the flat 30s
+///         fallback wait.
+async fn tick_and_log<C: Controller + ?Sized + 'static>(controller: &Arc<C>) {
     match controller.tick().await {
-        Ok(report) => report.log(controller.name()),
-        Err(e) => warn!(
-            controller = controller.name(),
-            error = %e,
-            "reconcile failed"
-        ),
+        Ok(outcome) => {
+            outcome.log(controller.name());
+            if let Some(after) = outcome.result.requeue_after() {
+                debug!(
+                    controller = controller.name(),
+                    after_ms = after.as_millis() as u64,
+                    "controller requested requeue; arming one-shot re-tick"
+                );
+                arm_requeue(controller.clone(), after);
+            }
+        }
+        Err(e) => {
+            if e.classify() == shigoto_types::failure::FailureKind::Declarative {
+                // Surfaced, NOT blind-retried — the prior loop retried a
+                // declarative error forever at the 30s fallback. (The
+                // periodic fallback still re-ticks coarsely; we just don't
+                // pile a targeted retry on a broken declaration.)
+                tracing::error!(
+                    controller = controller.name(),
+                    error = %e,
+                    "reconcile failed (declarative — surfacing, not scheduling a targeted retry)"
+                );
+            } else {
+                // Transient (+ any future #[non_exhaustive] class,
+                // conservatively): schedule a targeted retry at the derived
+                // delay instead of waiting for the flat fallback.
+                let after = e.retry_after().unwrap_or(Duration::from_secs(1));
+                warn!(
+                    controller = controller.name(),
+                    error = %e,
+                    after_ms = after.as_millis() as u64,
+                    "reconcile failed (transient — scheduling targeted retry)"
+                );
+                arm_requeue(controller.clone(), after);
+            }
+        }
     }
 }
 

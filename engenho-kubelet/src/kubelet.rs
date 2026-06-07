@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_controllers::{
-    Controller, ControllerError, ReconcileReport,
+    Controller, ControllerError, ReconcileOutcome, ReconcileReport,
     dns::DEFAULT_CLUSTER_DOMAIN,
     selector::{matches_labels, service_selector},
     status::{resource_version_of, write_status_cas},
@@ -343,7 +343,7 @@ impl Controller for Kubelet {
         "kubelet"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let pods = self.store.list("", "v1", "Pod", None).await;
         let mut report = ReconcileReport::default();
 
@@ -425,7 +425,7 @@ impl Controller for Kubelet {
                 "kubelet tick"
             );
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 

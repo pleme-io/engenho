@@ -31,7 +31,7 @@ use engenho_store::{
 use engenho_substrate::{DerivationCacheBackend, DrvHash};
 use serde_json::{Value, json};
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 
 /// Controller that propagates derivation state from a cache backend
@@ -80,7 +80,7 @@ impl Controller for DrvController {
         "drv"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let drs = self
             .store
             .list("engenho.io", "v1", "Derivation", self.namespace.as_deref())
@@ -172,7 +172,7 @@ impl Controller for DrvController {
                 .await?;
             report.objects_changed += 1;
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 
@@ -218,8 +218,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "drv"
             }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
+            async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+                Ok(ReconcileReport::default().into())
             }
         }
         assert_eq!(F.name(), "drv");

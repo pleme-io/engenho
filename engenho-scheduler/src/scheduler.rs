@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use engenho_controllers::{Controller, ControllerError, ReconcileReport};
+use engenho_controllers::{Controller, ControllerError, ReconcileOutcome, ReconcileReport};
 use engenho_store::{
     StoreMesh,
     command::{Reason, ResourceCommand},
@@ -229,7 +229,7 @@ impl Controller for Scheduler {
         "scheduler"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let report = Scheduler::tick(self).await.map_err(|e| match e {
             SchedulerError::Store(s) => ControllerError::Store(s),
             SchedulerError::NoSchedulableNodes => {
@@ -259,7 +259,8 @@ impl Controller for Scheduler {
             } else {
                 None
             },
-        })
+        }
+        .into())
     }
 }
 

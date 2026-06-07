@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 
 /// One ingress routing rule — public hostname + path → service backend.
@@ -567,7 +567,7 @@ impl Controller for IngressController {
         "ingress"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let ingresses = self
             .store
             .list(
@@ -627,7 +627,7 @@ impl Controller for IngressController {
                 report.objects_changed += 1;
             }
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 
@@ -990,8 +990,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "ingress"
             }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
+            async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+                Ok(ReconcileReport::default().into())
             }
         }
         assert_eq!(Fake.name(), "ingress");

@@ -29,7 +29,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::drv::DrvController;
 use crate::error::ControllerError;
 
@@ -209,7 +209,7 @@ impl Controller for DrvBuildController {
         "drv-build"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let drs = self
             .store
             .list("engenho.io", "v1", "Derivation", self.namespace.as_deref())
@@ -280,7 +280,7 @@ impl Controller for DrvBuildController {
             Self::ingest(&self.cache, &result).await?;
             report.objects_changed += 1;
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 
@@ -465,8 +465,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "drv-build"
             }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
+            async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+                Ok(ReconcileReport::default().into())
             }
         }
         assert_eq!(F.name(), "drv-build");

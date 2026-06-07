@@ -47,6 +47,7 @@ pub mod ingress;
 pub mod job;
 pub mod meta;
 pub mod network_policy;
+pub mod owned_children;
 pub mod owner;
 pub mod pdb;
 pub mod plantio;
@@ -73,7 +74,9 @@ pub use attestation::{
     tameshi_attestation_webhook,
 };
 pub use build_backend_roceiro::BuildBackendRoceiro;
-pub use controller::{Controller, ReconcileReport};
+pub use controller::{
+    Controller, ReconcileOutcome, ReconcileReport, ReconcileResult,
+};
 pub use crd::{CrdController, CrdEntry, CrdError, CrdRegistry, CrdScope};
 pub use crd_validator::{CrdValidationWebhook, crd_validation_webhook};
 pub use deployment::DeploymentController;
@@ -109,6 +112,9 @@ pub use network_policy::{
     NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,
 };
 pub use meta::ObjectMeta;
+pub use owned_children::{
+    ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta,
+};
 pub use owner::{OwnerReference, controlling_owner, is_owned_by, owner_ref_for, set_owner_reference};
 pub use pdb::PodDisruptionBudgetController;
 pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};

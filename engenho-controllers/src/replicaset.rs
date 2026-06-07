@@ -21,13 +21,12 @@ use engenho_store::{
     resource::ResourceKey,
 };
 use serde_json::{Value, json};
-use tracing::debug;
 
-use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
 use crate::meta::ObjectMeta;
-use crate::owner::{is_owned_by, owner_ref_for, set_owner_reference};
-use crate::status::{observed_generation, pod_is_ready, write_status_cas};
+use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
+use crate::owner::{owner_ref_for, set_owner_reference};
+use crate::status::{observed_generation, pod_is_ready};
 
 pub struct ReplicaSetController {
     store: Arc<StoreMesh>,
@@ -69,122 +68,107 @@ impl ReplicaSetController {
 }
 
 #[async_trait]
-impl Controller for ReplicaSetController {
+impl OwnedChildrenReconciler for ReplicaSetController {
     fn name(&self) -> &'static str {
         "replicaset"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-        let rs_list = self
-            .store
-            .list("apps", "v1", "ReplicaSet", self.namespace.as_deref())
-            .await;
-        let mut report = ReconcileReport::default();
-        report.objects_examined = rs_list.len();
+    fn parent_gvk(&self) -> ParentGvk {
+        ParentGvk::new("apps", "v1", "ReplicaSet", "apps/v1")
+    }
 
-        for (rs_key, rs_value) in &rs_list {
-            let Some(uid) = rs_value.uid() else {
-                debug!(rs = %rs_key.label(), "skipping RS with no metadata.uid");
-                report.objects_skipped += 1;
-                continue;
-            };
-            let desired = rs_value.spec_i64("replicas", 1).max(0) as usize;
-            let ns = rs_key.namespace.as_deref();
+    fn child_kinds(&self) -> &'static [ChildKind] {
+        const CHILD_KINDS: &[ChildKind] = &[ChildKind::new("", "v1", "Pod")];
+        CHILD_KINDS
+    }
 
-            // Find owned Pods.
-            let all_pods = self.store.list("", "v1", "Pod", ns).await;
-            let owned_pods: Vec<&(ResourceKey, Value)> = all_pods
-                .iter()
-                .filter(|(_, p)| is_owned_by(p, uid))
-                .collect();
+    fn store(&self) -> &StoreMesh {
+        &self.store
+    }
 
-            let observed = owned_pods.len();
+    fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
 
-            // ── Child reconcile (create/evict to meet spec.replicas) ──
-            if observed != desired {
-                let Some(owner_ref) = owner_ref_for(rs_value, "apps/v1", "ReplicaSet") else {
-                    report.objects_skipped += 1;
+    async fn reconcile_one(
+        &self,
+        rs_value: &Value,
+        owned_pods: &[(ResourceKey, Value)],
+    ) -> Result<ReconcileDelta, ControllerError> {
+        let desired = rs_value.spec_i64("replicas", 1).max(0) as usize;
+        let observed = owned_pods.len();
+
+        // Fixpoint — nothing to create or evict.
+        if observed == desired {
+            return Ok(ReconcileDelta::none());
+        }
+
+        // Lazily build the owner ref; skip (empty delta) when the parent
+        // has no uid/name yet (a freshly minted RS). The blanket already
+        // skipped no-uid parents, but name may still be missing.
+        let Some(owner_ref) = owner_ref_for(rs_value, "apps/v1", "ReplicaSet") else {
+            return Ok(ReconcileDelta::none());
+        };
+        let ns = self.namespace.as_deref();
+        let pod_ns = ns.unwrap_or("default");
+        let mut commands = Vec::new();
+
+        if observed < desired {
+            // Create the difference. Index from observed+i so consecutive
+            // ticks don't collide on names.
+            let to_create = desired - observed;
+            for i in 0..to_create {
+                let idx = observed + i;
+                let Some((pod_name, mut pod)) = Self::build_pod_from_template(rs_value, idx) else {
                     continue;
                 };
-
-                if observed < desired {
-                    // Create the difference.
-                    let to_create = desired - observed;
-                    for i in 0..to_create {
-                        // Index from observed+i so consecutive ticks
-                        // don't collide on names. For tests we usually
-                        // start at 0.
-                        let idx = observed + i;
-                        let Some((pod_name, mut pod)) =
-                            Self::build_pod_from_template(rs_value, idx)
-                        else {
-                            report.objects_skipped += 1;
-                            continue;
-                        };
-                        set_owner_reference(&mut pod, owner_ref.clone());
-                        let pod_ns = ns.unwrap_or("default");
-                        let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
-                        self.store
-                            .propose(ResourceCommand::Put {
-                                key: pod_key,
-                                value: pod,
-                                expected: None,
-                                reason: Reason::Controller,
-                            })
-                            .await?;
-                        report.objects_changed += 1;
-                    }
-                } else {
-                    // observed > desired — evict the excess.
-                    let to_delete = observed - desired;
-                    // Sort owned pods by name for deterministic eviction.
-                    let mut owned_sorted: Vec<&(ResourceKey, Value)> = owned_pods.clone();
-                    owned_sorted.sort_by(|a, b| a.0.name.cmp(&b.0.name));
-                    for (pod_key, _) in owned_sorted.iter().rev().take(to_delete) {
-                        self.store
-                            .propose(ResourceCommand::Delete {
-                                key: (*pod_key).clone(),
-                                expected: None,
-                                reason: Reason::Controller,
-                            })
-                            .await?;
-                        report.objects_changed += 1;
-                    }
-                }
+                set_owner_reference(&mut pod, owner_ref.clone());
+                let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
+                commands.push(ResourceCommand::Put {
+                    key: pod_key,
+                    value: pod,
+                    expected: None,
+                    reason: Reason::Controller,
+                });
             }
-
-            // ── Status (always; computed from LIVE owned children) ────
-            // Re-list owned pods AFTER the create/evict reconcile so this
-            // tick's own creates/deletes are reflected (the store applies
-            // proposals synchronously). Source of truth = the live pod
-            // set, never a counter the controller increments.
-            // readyReplicas counts pods with a Ready=True condition;
-            // availableReplicas == readyReplicas at M0.1 (no
-            // minReadySeconds); fullyLabeledReplicas == replicas.
-            let fresh_pods = self.store.list("", "v1", "Pod", ns).await;
-            let owned_now: Vec<&Value> = fresh_pods
-                .iter()
-                .filter(|(_, p)| is_owned_by(p, uid))
-                .map(|(_, p)| p)
-                .collect();
-            let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
-            let ready = i64::try_from(owned_now.iter().filter(|p| pod_is_ready(p)).count())
-                .unwrap_or(i64::MAX);
-            let desired_status = json!({
-                "replicas": replicas,
-                "readyReplicas": ready,
-                "availableReplicas": ready,
-                "fullyLabeledReplicas": replicas,
-                "observedGeneration": observed_generation(rs_value),
-            });
-            if write_status_cas(&self.store, rs_key, rs_value, &desired_status)
-                .await?
-                .changed()
-            {
-                report.objects_changed += 1;
+        } else {
+            // observed > desired — evict the excess by name order (highest
+            // names first) for deterministic eviction.
+            let to_delete = observed - desired;
+            let mut owned_sorted: Vec<&(ResourceKey, Value)> = owned_pods.iter().collect();
+            owned_sorted.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+            for (pod_key, _) in owned_sorted.iter().rev().take(to_delete) {
+                commands.push(ResourceCommand::Delete {
+                    key: (*pod_key).clone(),
+                    expected: None,
+                    reason: Reason::Controller,
+                });
             }
         }
-        Ok(report)
+
+        Ok(ReconcileDelta::from_commands(commands))
+    }
+
+    fn compute_status(
+        &self,
+        rs_value: &Value,
+        owned_now: &[(ResourceKey, Value)],
+    ) -> Option<Value> {
+        // Status computed from the LIVE owned pods AFTER the reconcile
+        // delta. readyReplicas counts Ready=True pods; availableReplicas
+        // == readyReplicas at M0.1 (no minReadySeconds);
+        // fullyLabeledReplicas == replicas.
+        let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
+        let ready =
+            i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
+                .unwrap_or(i64::MAX);
+        Some(json!({
+            "replicas": replicas,
+            "readyReplicas": ready,
+            "availableReplicas": ready,
+            "fullyLabeledReplicas": replicas,
+            "observedGeneration": observed_generation(rs_value),
+        }))
     }
 }
 
@@ -252,21 +236,4 @@ mod tests {
         assert!(owner_ref_for(&rs, "apps/v1", "ReplicaSet").is_none());
     }
 
-    #[test]
-    fn controller_name_is_stable() {
-        // We can't construct a real ReplicaSetController without
-        // an Arc<StoreMesh>; but the trait impl exposes name().
-        // This test documents the canonical name.
-        struct Fake;
-        #[async_trait]
-        impl Controller for Fake {
-            fn name(&self) -> &'static str {
-                "replicaset"
-            }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
-            }
-        }
-        assert_eq!(Fake.name(), "replicaset");
-    }
 }

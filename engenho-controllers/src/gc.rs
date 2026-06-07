@@ -19,7 +19,7 @@ use engenho_store::{
 };
 use tracing::debug;
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 use crate::owner::controlling_owner;
 
@@ -41,7 +41,7 @@ impl Controller for GcController {
         "gc"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let mut report = ReconcileReport::default();
         let ns = self.namespace.as_deref();
 
@@ -93,7 +93,7 @@ impl Controller for GcController {
                 report.objects_changed += 1;
             }
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 

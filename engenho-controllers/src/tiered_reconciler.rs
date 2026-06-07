@@ -27,7 +27,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_substrate::{DerivationCacheBackend, DrvHash};
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 
 /// Source of "items of interest" for proactive promotion.
@@ -91,11 +91,11 @@ impl Controller for TieredCacheReconciler {
         "tiered-cache-reconciler"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let mut report = ReconcileReport::default();
         if self.tiers.len() < 2 {
             // No promotion possible with < 2 tiers.
-            return Ok(report);
+            return Ok(report.into());
         }
         let pins = self.scope.drv_hashes_of_interest().await?;
         report.objects_examined = pins.len();
@@ -153,7 +153,7 @@ impl Controller for TieredCacheReconciler {
                 }
             }
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 

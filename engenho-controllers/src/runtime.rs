@@ -90,15 +90,46 @@ impl ControllerRuntime {
         for (controller, interval) in self.controllers {
             let handle = tokio::spawn(async move {
                 loop {
-                    match controller.tick().await {
-                        Ok(report) => report.log(controller.name()),
-                        Err(e) => tracing::error!(
-                            controller = controller.name(),
-                            error = %e,
-                            "reconcile failed"
-                        ),
-                    }
-                    tokio::time::sleep(interval).await;
+                    // The interval-only fallback path now consumes the typed
+                    // ReconcileOutcome the same way the WatchDriver does: on
+                    // a requeue request, re-tick at `after` (capped at the
+                    // configured interval — never wait LONGER than the
+                    // fallback would); on a Declarative error, surface +
+                    // wait the normal interval (no faster blind retry); on
+                    // a Transient error, retry at the derived delay.
+                    let next_delay = match controller.tick().await {
+                        Ok(outcome) => {
+                            outcome.log(controller.name());
+                            match outcome.result.requeue_after() {
+                                Some(after) => after.min(interval),
+                                None => interval,
+                            }
+                        }
+                        Err(e) => {
+                            if e.classify() == shigoto_types::failure::FailureKind::Declarative {
+                                tracing::error!(
+                                    controller = controller.name(),
+                                    error = %e,
+                                    "reconcile failed (declarative — surfacing; waiting normal interval)"
+                                );
+                                interval
+                            } else {
+                                // Transient (+ future class): retry at the
+                                // derived delay, capped at the interval.
+                                let after = e
+                                    .retry_after()
+                                    .unwrap_or(Duration::from_secs(1))
+                                    .min(interval);
+                                tracing::warn!(
+                                    controller = controller.name(),
+                                    error = %e,
+                                    "reconcile failed (transient — retrying)"
+                                );
+                                after
+                            }
+                        }
+                    };
+                    tokio::time::sleep(next_delay).await;
                 }
             });
             handles.push(handle);
@@ -121,7 +152,7 @@ impl ControllerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{Controller, ReconcileReport};
+    use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
     use crate::error::ControllerError;
     use async_trait::async_trait;
 
@@ -134,11 +165,12 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+        async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
             Ok(ReconcileReport {
                 objects_examined: 1,
                 ..Default::default()
-            })
+            }
+            .into())
         }
     }
 

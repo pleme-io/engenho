@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 
 /// Default cluster DNS suffix (matches CoreDNS convention).
@@ -307,7 +307,7 @@ impl Controller for DnsController {
         "dns"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let services = self
             .store
             .list("", "v1", "Service", self.namespace.as_deref())
@@ -356,7 +356,7 @@ impl Controller for DnsController {
             }
         }
 
-        Ok(report)
+        Ok(report.into())
     }
 }
 

@@ -30,11 +30,11 @@ use engenho_store::{
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
 use crate::meta::ObjectMeta;
-use crate::owner::{is_owned_by, owner_ref_for, set_owner_reference};
-use crate::status::{observed_generation, pod_is_ready, write_status_cas};
+use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
+use crate::owner::{owner_ref_for, set_owner_reference};
+use crate::status::{observed_generation, pod_is_ready};
 
 /// StatefulSet controller — peer to ReplicaSetController with
 /// ordered identity semantics.
@@ -79,118 +79,110 @@ impl StatefulSetController {
 }
 
 #[async_trait]
-impl Controller for StatefulSetController {
+impl OwnedChildrenReconciler for StatefulSetController {
     fn name(&self) -> &'static str {
         "statefulset"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-        let sts_list = self
-            .store
-            .list("apps", "v1", "StatefulSet", self.namespace.as_deref())
-            .await;
-        let mut report = ReconcileReport::default();
-        report.objects_examined = sts_list.len();
+    fn parent_gvk(&self) -> ParentGvk {
+        ParentGvk::new("apps", "v1", "StatefulSet", "apps/v1")
+    }
 
-        for (sts_key, sts_value) in &sts_list {
-            let Some(uid) = sts_value.uid() else {
-                report.objects_skipped += 1;
+    fn child_kinds(&self) -> &'static [ChildKind] {
+        const CHILD_KINDS: &[ChildKind] = &[ChildKind::new("", "v1", "Pod")];
+        CHILD_KINDS
+    }
+
+    fn store(&self) -> &StoreMesh {
+        &self.store
+    }
+
+    fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    async fn reconcile_one(
+        &self,
+        sts_value: &Value,
+        owned: &[(ResourceKey, Value)],
+    ) -> Result<ReconcileDelta, ControllerError> {
+        // No name / owner-ref → no-op (parent freshly minted; blanket
+        // already skipped no-uid parents).
+        let Some(sts_name) = sts_value.name() else {
+            return Ok(ReconcileDelta::none());
+        };
+        let Some(owner_ref) = owner_ref_for(sts_value, "apps/v1", "StatefulSet") else {
+            return Ok(ReconcileDelta::none());
+        };
+
+        let desired = sts_value.spec_i64("replicas", 1).max(0) as usize;
+        let ns = self.namespace.as_deref();
+        let pod_ns = ns.unwrap_or("default");
+
+        let existing_ordinals: std::collections::BTreeSet<usize> = owned
+            .iter()
+            .filter_map(|(k, _)| Self::ordinal_of(&k.name, sts_name))
+            .collect();
+
+        let mut commands = Vec::new();
+
+        // Create missing ordinals 0..desired.
+        for ordinal in 0..desired {
+            if existing_ordinals.contains(&ordinal) {
+                continue;
+            }
+            let Some((pod_name, mut pod)) = Self::build_pod(sts_value, ordinal) else {
                 continue;
             };
-            let Some(sts_name) = sts_value.name() else {
-                report.objects_skipped += 1;
-                continue;
-            };
-            let Some(owner_ref) = owner_ref_for(sts_value, "apps/v1", "StatefulSet") else {
-                report.objects_skipped += 1;
-                continue;
-            };
-            let desired = sts_value.spec_i64("replicas", 1).max(0) as usize;
-            let ns = sts_key.namespace.as_deref();
-            let all_pods = self.store.list("", "v1", "Pod", ns).await;
-            let owned: Vec<&(ResourceKey, Value)> = all_pods
-                .iter()
-                .filter(|(_, p)| is_owned_by(p, uid))
-                .collect();
+            set_owner_reference(&mut pod, owner_ref.clone());
+            let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
+            debug!(sts = sts_name, ordinal, "creating ordered pod");
+            commands.push(ResourceCommand::Put {
+                key: pod_key,
+                value: pod,
+                expected: None,
+                reason: Reason::Controller,
+            });
+        }
 
-            // Map ordinal → existing pod_key for fast lookup.
-            let existing_ordinals: std::collections::BTreeSet<usize> = owned
-                .iter()
-                .filter_map(|(k, _)| Self::ordinal_of(&k.name, sts_name))
-                .collect();
-
-            // Create missing ordinals 0..desired.
-            for ordinal in 0..desired {
-                if existing_ordinals.contains(&ordinal) {
-                    continue;
-                }
-                let Some((pod_name, mut pod)) = Self::build_pod(sts_value, ordinal) else {
-                    report.objects_skipped += 1;
-                    continue;
-                };
-                set_owner_reference(&mut pod, owner_ref.clone());
-                let pod_ns = ns.unwrap_or("default");
-                let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
-                debug!(sts = sts_name, ordinal, "creating ordered pod");
-                self.store
-                    .propose(ResourceCommand::Put {
-                        key: pod_key,
-                        value: pod,
+        // Scale-down: remove pods with ordinal >= desired.
+        for (pod_key, _) in owned {
+            if let Some(ord) = Self::ordinal_of(&pod_key.name, sts_name) {
+                if ord >= desired {
+                    debug!(sts = sts_name, pod = %pod_key.label(), "scaling down ordered pod");
+                    commands.push(ResourceCommand::Delete {
+                        key: pod_key.clone(),
                         expected: None,
                         reason: Reason::Controller,
-                    })
-                    .await?;
-                report.objects_changed += 1;
-            }
-
-            // Scale-down: remove pods with ordinal >= desired.
-            for (pod_key, _) in &owned {
-                if let Some(ord) = Self::ordinal_of(&pod_key.name, sts_name) {
-                    if ord >= desired {
-                        debug!(sts = sts_name, pod = %pod_key.label(), "scaling down ordered pod");
-                        self.store
-                            .propose(ResourceCommand::Delete {
-                                key: (*pod_key).clone(),
-                                expected: None,
-                                reason: Reason::Controller,
-                            })
-                            .await?;
-                        report.objects_changed += 1;
-                    }
+                    });
                 }
             }
-
-            // ── Status: computed from the LIVE owned pods after the
-            // create/delete reconcile (re-list so deletes/creates this
-            // tick are reflected). `replicas` = owned pod count;
-            // `readyReplicas`/`availableReplicas` = ready owned pods;
-            // `updatedReplicas`/`currentReplicas` == replicas (single
-            // revision at M0.1).
-            let fresh_pods = self.store.list("", "v1", "Pod", ns).await;
-            let owned_now: Vec<&Value> = fresh_pods
-                .iter()
-                .filter(|(_, p)| is_owned_by(p, uid))
-                .map(|(_, p)| p)
-                .collect();
-            let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
-            let ready = i64::try_from(owned_now.iter().filter(|p| pod_is_ready(p)).count())
-                .unwrap_or(i64::MAX);
-            let desired_status = json!({
-                "replicas": replicas,
-                "readyReplicas": ready,
-                "availableReplicas": ready,
-                "updatedReplicas": replicas,
-                "currentReplicas": replicas,
-                "observedGeneration": observed_generation(sts_value),
-            });
-            if write_status_cas(&self.store, sts_key, sts_value, &desired_status)
-                .await?
-                .changed()
-            {
-                report.objects_changed += 1;
-            }
         }
-        Ok(report)
+
+        Ok(ReconcileDelta::from_commands(commands))
+    }
+
+    fn compute_status(
+        &self,
+        sts_value: &Value,
+        owned_now: &[(ResourceKey, Value)],
+    ) -> Option<Value> {
+        // Computed from the LIVE owned pods after the reconcile.
+        // `replicas` = owned pod count; `readyReplicas`/`availableReplicas`
+        // = ready owned pods; `updatedReplicas`/`currentReplicas` ==
+        // replicas (single revision at M0.1).
+        let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
+        let ready =
+            i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
+                .unwrap_or(i64::MAX);
+        Some(json!({
+            "replicas": replicas,
+            "readyReplicas": ready,
+            "availableReplicas": ready,
+            "updatedReplicas": replicas,
+            "currentReplicas": replicas,
+            "observedGeneration": observed_generation(sts_value),
+        }))
     }
 }
 
@@ -255,18 +247,4 @@ mod tests {
         assert!(owner_ref_for(&sts, "apps/v1", "StatefulSet").is_none());
     }
 
-    #[test]
-    fn controller_name_is_stable() {
-        struct Fake;
-        #[async_trait]
-        impl Controller for Fake {
-            fn name(&self) -> &'static str {
-                "statefulset"
-            }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
-            }
-        }
-        assert_eq!(Fake.name(), "statefulset");
-    }
 }

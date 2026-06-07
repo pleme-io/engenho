@@ -25,6 +25,10 @@ engenho-types      = { workspace = true }
 engenho-store      = { workspace = true }
 engenho-config     = { workspace = true }
 engenho-substrate  = { workspace = true }
+# Convergence primitives — the reconcile loop classifies failures via the
+# fleet-wide FailureKind classifier (Transient/Declarative) rather than a
+# hand-rolled fork. Same crate engenho-types already re-exports FailureKind from.
+shigoto-types      = { workspace = true }
 blake3             = "1"
 
 [dev-dependencies]
