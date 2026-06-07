@@ -1,5 +1,6 @@
 //! The reconcile loop.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::error::SchedulerError;
+use crate::fit::{NodeResources, fits, node_allocatable, pod_requests};
 use crate::strategy::SchedulingStrategy;
 
 /// The scheduler.
@@ -39,10 +41,23 @@ impl Scheduler {
 
     /// One reconcile tick.
     ///
-    /// 1. List all Pods (matching namespace filter).
-    /// 2. Filter to those with empty/missing `spec.nodeName`.
-    /// 3. For each pending pod, ask the strategy to pick a node.
-    /// 4. Patch the pod with the binding.
+    /// 1. List all Pods (matching namespace filter) + all Nodes.
+    /// 2. Seed each Node's running **free** capacity =
+    ///    `allocatable − Σ requests of pods already bound there`
+    ///    (the resource-fit **Filter** stage's accumulator).
+    /// 3. For each pending Pod (empty/missing `spec.nodeName`): compute
+    ///    its summed resource requests; filter Nodes to those that
+    ///    currently FIT the request; ask the strategy to pick from the
+    ///    fitting subset only; on a pick, patch `spec.nodeName` AND
+    ///    decrement that Node's running free so a later Pod in the SAME
+    ///    tick can't overcommit it; on NO fitting node, leave the Pod
+    ///    unbound + write a typed `PodScheduled=False /
+    ///    reason=Unschedulable` status.
+    ///
+    /// The fit predicate runs in FRONT of the strategy — exactly the
+    /// upstream kube-scheduler `Filter (Predicates) → Score (Strategy)`
+    /// split. The strategy stays pure over its candidate set and is
+    /// never handed a node the Pod can't fit.
     ///
     /// # Errors
     ///
@@ -60,12 +75,58 @@ impl Scheduler {
 
         let node_values: Vec<Value> = nodes.iter().map(|(_, v)| v.clone()).collect();
 
+        // Seed per-node running free capacity = allocatable − Σ requests
+        // of pods already bound to it. We scan EVERY pod (cluster-wide,
+        // not just the namespace-scoped pending set) so a pod bound in
+        // another namespace still counts against the node's capacity.
+        let all_pods = self.store.list("", "v1", "Pod", None).await;
+        let mut free: HashMap<String, NodeResources> = node_values
+            .iter()
+            .filter_map(|n| node_name_of(n).map(|name| (name, node_allocatable(n))))
+            .collect();
+        for (_, pod) in &all_pods {
+            let Some(node) = bound_node(pod) else {
+                continue;
+            };
+            if let Some(f) = free.get_mut(&node) {
+                let req = pod_requests(pod);
+                f.cpu_milli = (f.cpu_milli - req.cpu_milli).max(0);
+                f.mem_milli = (f.mem_milli - req.mem_milli).max(0);
+            }
+        }
+
         for (pod_key, pod_value) in &pods {
             if !is_pending(pod_value) {
                 continue;
             }
             report.pending_pods += 1;
-            let Some(node_name) = self.strategy.pick(pod_value, &node_values).await else {
+
+            // Resource-fit Filter: restrict candidates to nodes that fit
+            // THIS pod's request given current running free capacity.
+            let req = pod_requests(pod_value);
+            let fitting: Vec<Value> = node_values
+                .iter()
+                .filter(|n| {
+                    node_name_of(n)
+                        .and_then(|name| free.get(&name).copied())
+                        .is_some_and(|f| fits(&f, &req))
+                })
+                .cloned()
+                .collect();
+
+            if fitting.is_empty() {
+                report.unschedulable_no_fit += 1;
+                warn!(
+                    pod = %pod_key.label(),
+                    nodes = report.nodes_available,
+                    "no node fits pod's resource requests; staying Pending"
+                );
+                self.mark_unschedulable(pod_key, report.nodes_available)
+                    .await?;
+                continue;
+            }
+
+            let Some(node_name) = self.strategy.pick(pod_value, &fitting).await else {
                 report.skipped_no_node += 1;
                 warn!(
                     pod = %pod_key.label(),
@@ -89,6 +150,15 @@ impl Scheduler {
                 })
                 .await
                 .map_err(|e| SchedulerError::Store(e.to_string()))?;
+
+            // Decrement the chosen node's running free so a later pending
+            // pod in THIS SAME tick can't also "fit" capacity that is now
+            // spoken for (within-tick overcommit defense).
+            if let Some(f) = free.get_mut(&node_name) {
+                f.cpu_milli = (f.cpu_milli - req.cpu_milli).max(0);
+                f.mem_milli = (f.mem_milli - req.mem_milli).max(0);
+            }
+
             report.bound.push(Binding {
                 pod_key: pod_key.clone(),
                 node_name,
@@ -99,10 +169,46 @@ impl Scheduler {
                 bound = report.bound.len(),
                 pending = report.pending_pods,
                 skipped = report.skipped_no_node,
+                unschedulable = report.unschedulable_no_fit,
                 "scheduler tick done"
             );
         }
         Ok(report)
+    }
+
+    /// Write a typed `PodScheduled=False / reason=Unschedulable` status
+    /// condition onto a pod that fits no node — mirroring upstream
+    /// kube-scheduler. The Pod is NOT bound; its `spec.nodeName` stays
+    /// absent (so "Pending" is still the absence of a binding), but the
+    /// reason is now machine-readable instead of an invisible omission.
+    async fn mark_unschedulable(
+        &self,
+        pod_key: &ResourceKey,
+        node_count: usize,
+    ) -> Result<(), SchedulerError> {
+        let patch = serde_json::json!({
+            "status": {
+                "phase": "Pending",
+                "conditions": [{
+                    "type": "PodScheduled",
+                    "status": "False",
+                    "reason": "Unschedulable",
+                    "message": format!(
+                        "0/{node_count} nodes are available: insufficient cpu/memory"
+                    ),
+                }]
+            }
+        });
+        self.store
+            .propose(ResourceCommand::Patch {
+                key: pod_key.clone(),
+                patch,
+                expected: None,
+                reason: Reason::Scheduler,
+            })
+            .await
+            .map_err(|e| SchedulerError::Store(e.to_string()))?;
+        Ok(())
     }
 
     /// Strategy in use (for telemetry / introspection).
@@ -134,17 +240,22 @@ impl Controller for Scheduler {
             SchedulerError::InvalidPodMetadata => {
                 ControllerError::InvalidResource("invalid pod metadata".into())
             }
+            SchedulerError::UnsupportedStrategy { requested } => {
+                ControllerError::Internal(format!("unsupported scheduling strategy: {requested:?}"))
+            }
             SchedulerError::Internal(s) => ControllerError::Internal(s),
         })?;
         Ok(ReconcileReport {
             objects_examined: report.pods_examined,
-            objects_changed: report.bound.len(),
+            // Both binds AND Unschedulable-status writes mutate objects.
+            objects_changed: report.bound.len() + report.unschedulable_no_fit,
             objects_skipped: report.skipped_no_node,
             note: if report.pending_pods > 0 {
                 Some(format!(
-                    "{} pending → {} bound, {} skipped",
+                    "{} pending → {} bound, {} unschedulable, {} skipped",
                     report.pending_pods,
                     report.bound.len(),
+                    report.unschedulable_no_fit,
                     report.skipped_no_node
                 ))
             } else {
@@ -160,7 +271,14 @@ pub struct TickReport {
     pub pods_examined: usize,
     pub nodes_available: usize,
     pub pending_pods: usize,
+    /// Pending pods left unbound because NO schedulable node existed at
+    /// all (every node cordoned / not-Ready). Distinct from
+    /// `unschedulable_no_fit`.
     pub skipped_no_node: usize,
+    /// Pending pods left unbound because no node had enough free
+    /// cpu/memory to fit the pod's requests. Each such pod gets a typed
+    /// `PodScheduled=False / reason=Unschedulable` status.
+    pub unschedulable_no_fit: usize,
     pub bound: Vec<Binding>,
 }
 
@@ -177,6 +295,24 @@ pub fn is_pending(pod: &Value) -> bool {
         .and_then(|n| n.as_str())
         .map(str::is_empty)
         .unwrap_or(true)
+}
+
+/// A node's `metadata.name`, if present.
+fn node_name_of(node: &Value) -> Option<String> {
+    node.get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|n| n.as_str())
+        .map(String::from)
+}
+
+/// The node a pod is already bound to (non-empty `spec.nodeName`), or
+/// `None` if the pod is still pending.
+fn bound_node(pod: &Value) -> Option<String> {
+    pod.get("spec")
+        .and_then(|s| s.get("nodeName"))
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 #[cfg(test)]

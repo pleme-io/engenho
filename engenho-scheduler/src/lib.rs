@@ -39,10 +39,12 @@
 
 pub mod config_bridge;
 pub mod error;
+pub mod fit;
 pub mod scheduler;
 pub mod strategy;
 
 pub use config_bridge::make_scheduling_strategy;
 pub use error::SchedulerError;
+pub use fit::{NodeResources, PodRequests, fits, free_on_node, node_allocatable, pod_requests};
 pub use scheduler::{Scheduler, TickReport};
 pub use strategy::{RoundRobinStrategy, SchedulingStrategy};

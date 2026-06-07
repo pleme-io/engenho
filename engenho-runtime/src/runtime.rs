@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_apiserver::{ApiServer, handlers_from_catalog_with_admission};
-use engenho_config::{EngenhoConfig, KubeletBackendKind as CfgBackendKind};
+use engenho_config::{ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind};
 use engenho_controllers::{
     DeploymentController, EndpointsController, GcController, JobController, KindFilter,
     ReplicaSetController, StatefulSetController, WatchDriver, WatchDriverConfig,
@@ -117,8 +117,24 @@ impl Runtime {
         .await?;
         info!(addr = %apiserver.local_addr(), "apiserver bound");
 
-        // 6. Spawn the controller / scheduler / kubelet drivers.
-        let drivers = spawn_drivers(&config, &store, &backend);
+        // 6. Construct the scheduling strategy from config. A
+        //    designed-but-unimplemented strategy (BinPack/Affinity) is a
+        //    typed error here — never a silent downgrade to round-robin.
+        //    (config.validate() already rejects these in step 1; this is
+        //    the load-bearing construction-time guard so the fallible
+        //    factory can never be bypassed.)
+        let strategy = make_scheduling_strategy(&config.scheduler).map_err(|e| match e {
+            engenho_scheduler::SchedulerError::UnsupportedStrategy { requested } => {
+                RuntimeError::Config(ConfigError::InvalidField {
+                    field: "scheduler.strategy".into(),
+                    reason: format!("unsupported scheduling strategy: {requested:?}"),
+                })
+            }
+            other => RuntimeError::Config(ConfigError::Incoherent(other.to_string())),
+        })?;
+
+        // 7. Spawn the controller / scheduler / kubelet drivers.
+        let drivers = spawn_drivers(&config, &store, &backend, strategy);
         info!(count = drivers.len(), "drivers spawned");
 
         Ok(Self {
@@ -207,8 +223,7 @@ async fn boot_store(config: &EngenhoConfig) -> Result<Arc<StoreMesh>, RuntimeErr
 
     if config.runtime.durable {
         let store_path = config.runtime.data_dir.join("store");
-        let (mesh, fresh) =
-            StoreMesh::start_or_resume(1, listen, router, cfg, store_path).await?;
+        let (mesh, fresh) = StoreMesh::start_or_resume(1, listen, router, cfg, store_path).await?;
         info!(fresh, "durable store opened");
         Ok(Arc::new(mesh))
     } else {
@@ -223,13 +238,24 @@ async fn boot_store(config: &EngenhoConfig) -> Result<Arc<StoreMesh>, RuntimeErr
 /// store preserves `metadata.uid` across updates. K8s shape mirrors the
 /// scheduler's `is_schedulable` expectation: `spec.unschedulable=false`
 /// + a Ready=True condition.
+///
+/// Writes `status.allocatable` (+ `status.capacity`) for cpu/memory.
+/// This is LOAD-BEARING: engenho-scheduler's M0.1 resource-fit predicate
+/// uses a zero-on-absent allocatable policy (an un-sized node fits NO
+/// pod that requests cpu/memory). Without these values, every pod that
+/// declares a request would stay Pending forever. We report the host's
+/// actual logical-CPU count + total memory so the single-node cluster
+/// advertises real capacity.
 async fn register_node(store: &StoreMesh, node_name: &str) -> Result<(), RuntimeError> {
+    let (cpu, memory) = host_capacity();
     let value = serde_json::json!({
         "kind": "Node",
         "apiVersion": "v1",
         "metadata": { "name": node_name },
         "spec": { "unschedulable": false },
         "status": {
+            "capacity": { "cpu": cpu, "memory": memory },
+            "allocatable": { "cpu": cpu, "memory": memory },
             "conditions": [{ "type": "Ready", "status": "True" }]
         }
     });
@@ -245,6 +271,23 @@ async fn register_node(store: &StoreMesh, node_name: &str) -> Result<(), Runtime
     Ok(())
 }
 
+/// Host capacity advertised on the self-registered Node: `(cpu, memory)`
+/// as K8s quantity strings.
+///
+/// CPU is the host's logical-core count (`std::thread::available_parallelism`,
+/// falling back to 1). Memory is a conservative fixed default (`8Gi`,
+/// the documented engenho-local VM size) — a real total-memory probe is
+/// a follow-up (would add a sysinfo dep); the value only needs to be a
+/// truthful lower bound for the resource-fit predicate to admit normal
+/// workloads. Both are integer/SI quantities the scheduler parses back
+/// through the typed `Quantity` surface.
+fn host_capacity() -> (String, String) {
+    let cpus = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    (cpus.to_string(), "8Gi".to_string())
+}
+
 /// Build + spawn every driver gated on `controllers.enable.*`. The
 /// scheduler + kubelet always run (a single-node runtime that can't
 /// schedule or run containers is useless); the four reconcilers are
@@ -253,6 +296,7 @@ fn spawn_drivers(
     config: &EngenhoConfig,
     store: &Arc<StoreMesh>,
     backend: &Arc<dyn ContainerRuntime>,
+    strategy: Box<dyn engenho_scheduler::SchedulingStrategy>,
 ) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
 
@@ -263,8 +307,7 @@ fn spawn_drivers(
     };
 
     let debounce = Duration::from_millis(u64::from(config.controllers.debounce_milliseconds));
-    let fallback =
-        Duration::from_secs(u64::from(config.controllers.fallback_interval_seconds));
+    let fallback = Duration::from_secs(u64::from(config.controllers.fallback_interval_seconds));
 
     let driver_config = |kinds: &[&str]| WatchDriverConfig {
         filter: KindFilter::Kinds(kinds.iter().map(|k| (*k).to_string()).collect()),
@@ -277,8 +320,12 @@ fn spawn_drivers(
     if enable.deployment {
         let c = DeploymentController::new(store.clone(), ns.clone());
         handles.push(
-            WatchDriver::new(c, store.clone(), driver_config(&["Deployment", "ReplicaSet"]))
-                .spawn(),
+            WatchDriver::new(
+                c,
+                store.clone(),
+                driver_config(&["Deployment", "ReplicaSet"]),
+            )
+            .spawn(),
         );
     }
     if enable.replicaset {
@@ -325,28 +372,31 @@ fn spawn_drivers(
     }
 
     // Scheduler: pending Pod → spec.nodeName. Watches Pods + Nodes.
+    // The strategy was constructed fallibly by the caller (a typed error
+    // for unimplemented strategies — never a silent round-robin fallback).
     {
-        let strategy = make_scheduling_strategy(&config.scheduler);
         let c = Scheduler::new(store.clone(), strategy, ns.clone());
-        handles.push(
-            WatchDriver::new(c, store.clone(), driver_config(&["Pod", "Node"])).spawn(),
-        );
+        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Pod", "Node"])).spawn());
     }
 
     // Kubelet: bound Pod → container via the backend. Watches Pods.
     {
-        let c = Kubelet::new(store.clone(), backend.clone(), config.runtime.node_name.clone());
-        handles.push(
-            WatchDriver::new(c, store.clone(), driver_config(&["Pod"])).spawn(),
+        let c = Kubelet::new(
+            store.clone(),
+            backend.clone(),
+            config.runtime.node_name.clone(),
         );
+        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Pod"])).spawn());
     }
 
     handles
 }
 
-// `make_scheduling_strategy` returns `Box<dyn SchedulingStrategy>`,
-// which `Scheduler::new<S: SchedulingStrategy + 'static>` accepts
-// (Box<dyn Trait> implements Trait). No extra glue needed.
+// `make_scheduling_strategy` returns `Result<Box<dyn SchedulingStrategy>,
+// SchedulerError>`; the boxed strategy is unwrapped fallibly in
+// `start_inner` (typed error for unimplemented strategies) and handed to
+// `spawn_drivers`. `Scheduler::new<S: SchedulingStrategy + 'static>`
+// accepts the box (Box<dyn Trait> implements Trait via the blanket impl).
 
 #[cfg(test)]
 mod tests {
@@ -396,5 +446,43 @@ mod tests {
             Err(other) => panic!("expected Config error, got {other:?}"),
             Ok(_) => panic!("expected validation failure, got a booted Runtime"),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_unimplemented_scheduling_strategy() {
+        // A config asking for BinPack must fail fast at boot with a typed
+        // Config error — NEVER silently boot a round-robin cluster.
+        let mut cfg = ephemeral_test_config();
+        cfg.scheduler.strategy = engenho_config::SchedulerStrategyKind::BinPack;
+        match Runtime::start(cfg).await {
+            Err(RuntimeError::Config(ConfigError::InvalidField { field, .. })) => {
+                assert_eq!(field, "scheduler.strategy");
+            }
+            Err(other) => panic!("expected Config/InvalidField, got {other:?}"),
+            Ok(_) => panic!("expected a typed strategy error, got a booted Runtime"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_node_advertises_allocatable() {
+        // The companion fix: the self-registered Node MUST carry
+        // status.allocatable so the resource-fit predicate (zero-on-absent)
+        // admits normal workloads.
+        let rt = Runtime::start(ephemeral_test_config()).await.unwrap();
+        let key = ResourceKey::cluster_scoped("", "v1", "Node", "node-A");
+        let node = rt.store().get(&key).await.expect("Node registered");
+        let alloc = node
+            .get("status")
+            .and_then(|s| s.get("allocatable"))
+            .expect("status.allocatable present");
+        assert!(
+            alloc.get("cpu").and_then(|c| c.as_str()).is_some(),
+            "allocatable.cpu must be set; node={node:#}"
+        );
+        assert!(
+            alloc.get("memory").and_then(|m| m.as_str()).is_some(),
+            "allocatable.memory must be set; node={node:#}"
+        );
+        rt.shutdown().await.unwrap();
     }
 }

@@ -30,6 +30,12 @@ async fn boot_store() -> Arc<StoreMesh> {
 }
 
 async fn put_node(store: &StoreMesh, name: &str) {
+    // Nodes now advertise status.allocatable (M0.1 item 10): the
+    // resource-fit predicate treats absent allocatable as zero-free, so a
+    // realistic node carries cpu/memory. (The pods these tests bind
+    // request NOTHING, so they'd fit even a zero-sized node — but a sized
+    // node is the truthful shape + guards the predicate doesn't reject a
+    // zero-request pod against a sized node.)
     store
         .propose(ResourceCommand::Put {
             key: ResourceKey::cluster_scoped("", "v1", "Node", name),
@@ -39,6 +45,8 @@ async fn put_node(store: &StoreMesh, name: &str) {
                 "metadata": { "name": name },
                 "spec": { "unschedulable": false },
                 "status": {
+                    "capacity": { "cpu": "4", "memory": "8Gi" },
+                    "allocatable": { "cpu": "4", "memory": "8Gi" },
                     "conditions": [{ "type": "Ready", "status": "True" }]
                 }
             }),
