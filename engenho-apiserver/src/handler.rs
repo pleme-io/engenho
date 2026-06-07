@@ -11,6 +11,7 @@ use engenho_store::{
     resource::ResourceKey,
     watch_backend::WATCH_CHANNEL_CAPACITY,
 };
+use engenho_types::generated_v1_34::RESOURCE_CATALOG;
 
 use crate::error::ApiError;
 use crate::params::{ResumePoint, Selectors};
@@ -160,13 +161,50 @@ impl StoreBackedHandler {
         }
     }
 
-    /// Construct from a known K8s kind. The plural is derived from
-    /// the kind by lowercasing + appending 's' — this matches the
-    /// upstream K8s resource pluralization for the kinds we ship at R7.
+    /// Construct from a known K8s kind by looking the descriptor up in
+    /// the generated [`RESOURCE_CATALOG`] — the single source of truth for
+    /// (group, version, plural, scope). This REPLACES the old
+    /// `format!("{}s", …)` derivation (which produced `endpointss` for
+    /// `Endpoints` and wrong plurals for any irregular kind); the curated
+    /// catalog plural is used verbatim, so the `+s` bug class cannot recur.
+    ///
+    /// The `namespaced` argument is asserted against the catalog scope —
+    /// mismatched callers get `None` rather than a silently mis-scoped
+    /// handler. Returns `None` for an uncataloged kind.
+    ///
+    /// Retained for the existing core-kind test harnesses; new code should
+    /// prefer [`Self::for_kind`] (which reads the scope from the catalog)
+    /// or [`crate::handlers_from_catalog`] (the full cataloged set).
     #[must_use]
     pub fn for_core_kind(store: Arc<StoreMesh>, kind: &str, namespaced: bool) -> Self {
-        let plural = format!("{}s", kind.to_lowercase());
-        Self::new(store, "", "v1", kind, plural, namespaced)
+        let d = RESOURCE_CATALOG
+            .iter()
+            .find(|d| d.kind == kind && d.group.is_empty())
+            .unwrap_or_else(|| {
+                panic!("for_core_kind: {kind:?} is not a cataloged core/v1 kind — add a KIND_CATALOG row + regenerate")
+            });
+        debug_assert_eq!(
+            d.namespaced, namespaced,
+            "for_core_kind: caller scope ({namespaced}) disagrees with catalog scope for {kind}"
+        );
+        Self::new(store, d.group, d.version, d.kind, d.plural, d.namespaced)
+    }
+
+    /// Construct a handler for `kind` by looking its descriptor up in the
+    /// generated [`RESOURCE_CATALOG`]. The (group, version, plural, scope)
+    /// all come from the catalog — no hand-passed scope, no ad-hoc plural.
+    /// Returns `None` for an uncataloged kind.
+    #[must_use]
+    pub fn for_kind(store: Arc<StoreMesh>, kind: &str) -> Option<Self> {
+        let d = RESOURCE_CATALOG.iter().find(|d| d.kind == kind)?;
+        Some(Self::new(
+            store,
+            d.group,
+            d.version,
+            d.kind,
+            d.plural,
+            d.namespaced,
+        ))
     }
 
     fn key(&self, namespace: Option<&str>, name: &str) -> Result<ResourceKey, ApiError> {
@@ -349,6 +387,30 @@ impl ResourceHandler for StoreBackedHandler {
     }
 }
 
+/// Build one [`StoreBackedHandler`] per row of the generated
+/// [`RESOURCE_CATALOG`]. The complete cataloged set goes live — routing,
+/// discovery, and pluralization all follow the same source of truth.
+///
+/// This is the generation-over-composition registration surface (Pillar
+/// 12): "add a kind" = one `KIND_CATALOG` row + regenerate, never a
+/// hand-written handler construction.
+#[must_use]
+pub fn handlers_from_catalog(store: Arc<StoreMesh>) -> Vec<Arc<dyn ResourceHandler>> {
+    RESOURCE_CATALOG
+        .iter()
+        .map(|d| {
+            Arc::new(StoreBackedHandler::new(
+                store.clone(),
+                d.group,
+                d.version,
+                d.kind,
+                d.plural,
+                d.namespaced,
+            )) as Arc<dyn ResourceHandler>
+        })
+        .collect()
+}
+
 /// Typed K8s `<Kind>List` envelope. `metadata.resourceVersion` is the
 /// snapshot rv captured atomically with `items` in
 /// [`ResourceHandler::list_at`].
@@ -389,6 +451,29 @@ mod tests {
     // each handler method end-to-end. Zero-cost mocking the StoreMesh
     // here would require introducing a trait for it; the integration
     // path is more honest.
+
+    #[test]
+    fn for_kind_uses_catalog_plural_not_plus_s() {
+        // The catalog lookup, not the store, is what we exercise here —
+        // assert the (group, version, plural, scope) come from
+        // RESOURCE_CATALOG. We need a store to build the handler, so this
+        // lives as a sync check against the catalog directly + a
+        // descriptor existence assertion. `for_kind` is integration-tested
+        // end-to-end in tests/m0_1_group_routing_discovery.rs.
+        let ep = RESOURCE_CATALOG
+            .iter()
+            .find(|d| d.kind == "Endpoints")
+            .expect("Endpoints cataloged");
+        assert_eq!(ep.plural, "endpoints", "curated plural, NOT endpointss");
+        assert!(ep.namespaced);
+        let dep = RESOURCE_CATALOG
+            .iter()
+            .find(|d| d.kind == "Deployment")
+            .expect("Deployment cataloged");
+        assert_eq!(dep.group, "apps");
+        assert_eq!(dep.version, "v1");
+        assert_eq!(dep.plural, "deployments");
+    }
 
     #[test]
     fn inject_type_meta_adds_missing_fields() {

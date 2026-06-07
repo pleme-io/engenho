@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use engenho_kube_codegen::{
-    KIND_CATALOG, KindEntry, OpenApiDoc, SchemaView, emit_kind_typed, emit_module,
+    KIND_CATALOG, KindEntry, OpenApiDoc, SchemaView, emit_catalog, emit_kind_typed, emit_module,
     emit_shared_module, shared_substructs,
 };
 
@@ -157,6 +157,27 @@ fn main() -> Result<()> {
         }
     }
 
+    // Runtime-iterable catalog (one ResourceDescriptor per KIND_CATALOG
+    // entry). The single most important generated artifact for M0.1 group
+    // routing/discovery — drives handler construction, routing keys, and
+    // discovery from ONE source. Plural = entry.resource verbatim.
+    {
+        let catalog_src = emit_catalog(KIND_CATALOG);
+        let catalog_target = args.output.join("catalog.rs");
+        if args.check {
+            let existing = std::fs::read_to_string(&catalog_target).unwrap_or_default();
+            if existing != catalog_src {
+                eprintln!("DRIFT: {}", catalog_target.display());
+                drift = true;
+            }
+        } else {
+            std::fs::create_dir_all(&args.output)
+                .with_context(|| format!("create {}", args.output.display()))?;
+            std::fs::write(&catalog_target, catalog_src)
+                .with_context(|| format!("write {}", catalog_target.display()))?;
+        }
+    }
+
     // Top-level `lib.rs`-includable mod.rs.
     let top_mod = {
         let mut s = String::from(
@@ -167,6 +188,8 @@ fn main() -> Result<()> {
         }
         // Shared sub-structs module + flat re-export.
         s.push_str("pub mod types;\npub use types::*;\n");
+        // Runtime-iterable resource catalog + flat re-export.
+        s.push_str("pub mod catalog;\npub use catalog::*;\n");
         s
     };
     let top_target = args.output.join("mod.rs");

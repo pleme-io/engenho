@@ -5,3 +5,5 @@ pub mod core_v1;
 pub mod rbac_v1;
 pub mod types;
 pub use types::*;
+pub mod catalog;
+pub use catalog::*;

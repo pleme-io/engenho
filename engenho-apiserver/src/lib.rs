@@ -30,6 +30,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod discovery;
 pub mod error;
 pub mod handler;
 pub mod openapi;
@@ -37,8 +38,14 @@ pub mod params;
 pub mod router;
 pub mod server;
 
+pub use discovery::{
+    APIGroup, APIGroupList, APIResource, APIResourceList, APIVersions, GroupVersionForDiscovery,
+    ServerAddressByClientCIDR,
+};
 pub use error::{ApiError, ErrorKind, status_object};
-pub use handler::{ResourceHandler, StoreBackedHandler, gone_to_api_error};
+pub use handler::{
+    ResourceHandler, StoreBackedHandler, gone_to_api_error, handlers_from_catalog,
+};
 pub use openapi::ApiDoc;
 pub use params::{
     ListWatchParams, ResumePoint, Selectors, bookmark_line, gvk_ns_matches, status_410_line,

@@ -294,6 +294,122 @@ pub fn emit_shared_module(shared: &[(String, String, SchemaView)], catalog: &[Ki
     out
 }
 
+/// Header for the runtime catalog module (`generated_v1_34/catalog.rs`).
+const CATALOG_HEADER: &str = "\
+//! GENERATED — DO NOT EDIT by hand. Source: engenho-kube-codegen.
+//!
+//! Runtime-iterable resource catalog — one [`ResourceDescriptor`] per
+//! generated kind. The apiserver folds [`RESOURCE_CATALOG`] to build
+//! handlers, register routes, and serve discovery; the curated plural
+//! (`KindEntry.resource`) flows verbatim into every consumer so there is
+//! ONE source of truth for pluralization (no `+s` derivation).
+//!
+//! Regenerate via `cargo run -p engenho-kube-codegen -- \\
+//!     --schema engenho-types/vendor/openapi/v1.34.0 \\
+//!     --output engenho-types/src/generated_v1_34`.
+//!
+//! Edit src/catalog.rs to add or remove kinds.
+
+use crate::kind::{GroupVersionKind, GroupVersionResource, Scope};
+";
+
+/// Body of the runtime `ResourceDescriptor` type + its `to_gvk`/`to_gvr`
+/// helpers. Kept as a fixed string so the generated catalog is fully
+/// self-contained (the apiserver depends on `engenho-types`, never on the
+/// codegen crate) and byte-deterministic.
+const CATALOG_TYPE_DECL: &str = "\
+/// One runtime row describing a routable/discoverable Kubernetes kind.
+///
+/// `plural` is the curated URL segment (`KindEntry.resource`) — irregular
+/// plurals (e.g. `Endpoints` → `endpoints`) are correct by construction.
+/// `api_version` is `\"v1\"` for the core group, `\"<group>/<version>\"`
+/// otherwise — precomputed so consumers never re-derive it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResourceDescriptor {
+    /// API group (`\"\"` for core/v1).
+    pub group: &'static str,
+    /// API version (`\"v1\"`, …).
+    pub version: &'static str,
+    /// Kind (`\"Pod\"`, `\"Deployment\"`, …).
+    pub kind: &'static str,
+    /// Plural URL segment (`\"pods\"`, `\"endpoints\"`, …) — curated, never `+s`.
+    pub plural: &'static str,
+    /// `true` ⇒ namespaced; `false` ⇒ cluster-scoped.
+    pub namespaced: bool,
+    /// `\"v1\"` for core, `\"<group>/<version>\"` otherwise.
+    pub api_version: &'static str,
+}
+
+impl ResourceDescriptor {
+    /// The Group/Version/Kind triple for this descriptor.
+    #[must_use]
+    pub const fn to_gvk(&self) -> GroupVersionKind {
+        GroupVersionKind {
+            group: self.group,
+            version: self.version,
+            kind: self.kind,
+        }
+    }
+
+    /// The Group/Version/Resource triple for this descriptor.
+    #[must_use]
+    pub const fn to_gvr(&self) -> GroupVersionResource {
+        GroupVersionResource {
+            group: self.group,
+            version: self.version,
+            resource: self.plural,
+        }
+    }
+
+    /// The runtime [`Scope`] for this descriptor.
+    #[must_use]
+    pub const fn scope(&self) -> Scope {
+        if self.namespaced {
+            Scope::Namespaced
+        } else {
+            Scope::Cluster
+        }
+    }
+}
+";
+
+/// Emit `generated_v1_34/catalog.rs`: the runtime [`ResourceDescriptor`]
+/// type + `pub const RESOURCE_CATALOG` with one row per `catalog` entry.
+///
+/// The plural is `entry.resource` verbatim (the curated, correct plural);
+/// `namespaced = !entry.cluster_scoped`; `api_version = entry.version` for
+/// the core group else `"<group>/<version>"`. Deterministic: same catalog →
+/// same string (iteration follows the static `KIND_CATALOG` order).
+#[must_use]
+pub fn emit_catalog(catalog: &[KindEntry]) -> String {
+    let mut out = String::from(CATALOG_HEADER);
+    out.push('\n');
+    out.push_str(CATALOG_TYPE_DECL);
+    out.push('\n');
+    out.push_str(
+        "/// Every routable/discoverable kind, in `KIND_CATALOG` order.\n\
+         pub const RESOURCE_CATALOG: &[ResourceDescriptor] = &[\n",
+    );
+    for e in catalog {
+        let api_version = if e.group.is_empty() {
+            e.version.to_string()
+        } else {
+            format!("{}/{}", e.group, e.version)
+        };
+        out.push_str(&format!(
+            "    ResourceDescriptor {{ group: {:?}, version: {:?}, kind: {:?}, plural: {:?}, namespaced: {}, api_version: {:?} }},\n",
+            e.group,
+            e.version,
+            e.kind,
+            e.resource,
+            !e.cluster_scoped,
+            api_version,
+        ));
+    }
+    out.push_str("];\n");
+    out
+}
+
 /// Emit a module-level `mod.rs` listing every per-kind submodule in
 /// `entries` (typically all entries with the same `module` field).
 ///
@@ -389,6 +505,66 @@ mod tests {
         let s1 = emit_kind(&entry(), &shape());
         let s2 = emit_kind(&entry(), &shape());
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn emit_catalog_has_one_row_per_entry() {
+        use crate::catalog::KIND_CATALOG;
+        let src = emit_catalog(KIND_CATALOG);
+        // Count the const rows specifically — they are the only lines that
+        // open with the 4-space-indented descriptor literal. The struct
+        // decl + impl block use `pub struct` / `impl`, not this prefix.
+        let rows = src.matches("    ResourceDescriptor { group:").count();
+        assert_eq!(
+            rows,
+            KIND_CATALOG.len(),
+            "one RESOURCE_CATALOG row per KIND_CATALOG entry"
+        );
+    }
+
+    #[test]
+    fn emit_catalog_uses_curated_plural_not_plus_s() {
+        use crate::catalog::KIND_CATALOG;
+        let src = emit_catalog(KIND_CATALOG);
+        // Endpoints is the canonical irregular kind: the curated plural is
+        // "endpoints", NOT the naive "endpointss".
+        assert!(
+            src.contains(r#"kind: "Endpoints", plural: "endpoints""#),
+            "Endpoints row carries the curated plural"
+        );
+        assert!(
+            !src.contains("endpointss"),
+            "no naive +s pluralization survives in the catalog"
+        );
+    }
+
+    #[test]
+    fn emit_catalog_api_version_core_vs_grouped() {
+        use crate::catalog::KIND_CATALOG;
+        let src = emit_catalog(KIND_CATALOG);
+        // core kind → api_version "v1".
+        assert!(src.contains(r#"kind: "Pod", plural: "pods", namespaced: true, api_version: "v1""#));
+        // grouped kind → "<group>/<version>".
+        assert!(src.contains(
+            r#"kind: "Deployment", plural: "deployments", namespaced: true, api_version: "apps/v1""#
+        ));
+    }
+
+    #[test]
+    fn emit_catalog_namespaced_flag_matches_scope() {
+        use crate::catalog::KIND_CATALOG;
+        let src = emit_catalog(KIND_CATALOG);
+        // Cluster-scoped Namespace → namespaced: false.
+        assert!(
+            src.contains(r#"kind: "Namespace", plural: "namespaces", namespaced: false"#),
+            "cluster-scoped Namespace → namespaced: false"
+        );
+    }
+
+    #[test]
+    fn emit_catalog_is_deterministic() {
+        use crate::catalog::KIND_CATALOG;
+        assert_eq!(emit_catalog(KIND_CATALOG), emit_catalog(KIND_CATALOG));
     }
 
     #[test]
