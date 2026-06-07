@@ -93,62 +93,18 @@ pub use face::{
     instantiate as instantiate_face,
 };
 
-use serde::{Deserialize, Serialize};
-
-/// Stable node identifier — ed25519 public key bytes, hex-encoded
-/// for serde wire form. Used across all four layers as the canonical
-/// "which engenho instance is this" reference.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct NodeId(pub [u8; 32]);
-
-impl NodeId {
-    /// Construct from raw 32 bytes (the ed25519 public key).
-    #[must_use]
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// 64-char hex string for log lines + telemetry.
-    #[must_use]
-    pub fn to_hex(&self) -> String {
-        let mut out = String::with_capacity(64);
-        for b in self.0 {
-            out.push_str(&format!("{b:02x}"));
-        }
-        out
-    }
-
-    /// Parse a NodeId from its hex representation. Accepts any
-    /// length 1..=64; shorter values left-zero-pad so test-friendly
-    /// shorthand like "ab" round-trips through translation layers.
+engenho_substrate::define_hash_newtype! {
+    #[derive(Copy)]
+    #[serde(transparent)]
+    /// Stable node identifier — ed25519 public key bytes, hex-encoded
+    /// for serde wire form. Used across all four layers as the canonical
+    /// "which engenho instance is this" reference.
     ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the input contains non-hex characters or
-    /// exceeds 64 chars.
-    pub fn from_hex(s: &str) -> Result<Self, String> {
-        if s.is_empty() || s.len() > 64 {
-            return Err(format!("hex must be 1..=64 chars, got {}", s.len()));
-        }
-        let padded = format!("{s:0>64}");
-        let mut bytes = [0u8; 32];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            let pair = &padded[i * 2..i * 2 + 2];
-            *byte = u8::from_str_radix(pair, 16).map_err(|e| e.to_string())?;
-        }
-        Ok(Self(bytes))
-    }
-}
-
-impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // First 12 hex chars — short enough to read, long enough to disambiguate.
-        for b in &self.0[..6] {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
-    }
+    /// `Display` is the first 6 bytes (12 hex chars) — short enough to
+    /// read, long enough to disambiguate. `from_hex` left-zero-pads
+    /// `1..=64`-char input so shorthand like `"ab"` round-trips through
+    /// translation layers.
+    NodeId { display = prefix(6), from_hex = padded }
 }
 
 #[cfg(test)]

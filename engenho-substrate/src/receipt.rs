@@ -43,36 +43,12 @@ pub enum ReceiptKind {
     Shape(String),
 }
 
-/// Opaque node identifier — 32 raw bytes (typically BLAKE3 of the
-/// node's public key, or whatever the operator's identity layer
-/// produces).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct NodeId(pub [u8; 32]);
-
-impl NodeId {
-    /// Construct from raw bytes.
-    #[must_use]
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Derive from arbitrary bytes via BLAKE3.
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self(*blake3::hash(bytes).as_bytes())
-    }
-
-    /// Hex representation (64 chars).
-    #[must_use]
-    pub fn to_hex(&self) -> String {
-        hex_encode(&self.0)
-    }
-}
-
-impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_hex())
-    }
+crate::define_hash_newtype! {
+    #[derive(Copy)]
+    /// Opaque node identifier — 32 raw bytes (typically BLAKE3 of the
+    /// node's public key, or whatever the operator's identity layer
+    /// produces).
+    NodeId
 }
 
 /// Typed receipt — one node's claim that one thing was materialized.
@@ -171,8 +147,6 @@ impl MaterializationReceipt {
         self.same_subject(other) && self.evidence_hash == other.evidence_hash
     }
 }
-
-use crate::hex::hex_encode;
 
 #[cfg(test)]
 mod tests {

@@ -14,24 +14,13 @@ use std::collections::BTreeSet;
 
 use crate::NodeId;
 
-/// Content address — a BLAKE3 hash of canonical-form bytes (Pod
-/// manifest, ConfigMap data, image layer). Matches the existing
-/// tameshi hashing scheme.
-#[derive(
-    Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct ContentHash(pub [u8; 32]);
-
-impl ContentHash {
-    #[must_use]
-    pub fn to_hex(&self) -> String {
-        let mut out = String::with_capacity(64);
-        for b in self.0 {
-            out.push_str(&format!("{b:02x}"));
-        }
-        out
-    }
+engenho_substrate::define_hash_newtype! {
+    #[derive(Copy, Default)]
+    #[serde(transparent)]
+    /// Content address — a BLAKE3 hash of canonical-form bytes (Pod
+    /// manifest, ConfigMap data, image layer). Matches the existing
+    /// tameshi hashing scheme.
+    ContentHash
 }
 
 /// Per-content advertisement gossiped to the mainline DHT.

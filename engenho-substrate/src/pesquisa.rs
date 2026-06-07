@@ -58,10 +58,12 @@ impl std::fmt::Display for SearchId {
     }
 }
 
-/// Typed trial identifier. BLAKE3 over canonical inputs — same
-/// inputs always produce the same EnsaioId.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct EnsaioId(pub [u8; 32]);
+crate::define_hash_newtype! {
+    #[derive(Copy)]
+    /// Typed trial identifier. BLAKE3 over canonical inputs — same
+    /// inputs always produce the same EnsaioId.
+    EnsaioId
+}
 
 impl EnsaioId {
     /// Derive from `(search_id, generation_idx, canonical_genotype_bytes,
@@ -83,23 +85,13 @@ impl EnsaioId {
         hasher.update(lineage_root);
         Self(*hasher.finalize().as_bytes())
     }
-
-    /// Hex representation.
-    #[must_use]
-    pub fn to_hex(&self) -> String {
-        hex_encode(&self.0)
-    }
 }
 
-impl std::fmt::Display for EnsaioId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_hex())
-    }
+crate::define_hash_newtype! {
+    #[derive(Copy)]
+    /// Generation identifier — BLAKE3-chained.
+    GeracaoId
 }
-
-/// Generation identifier — BLAKE3-chained.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct GeracaoId(pub [u8; 32]);
 
 impl GeracaoId {
     /// Derive from `(prior_geracao_id, sorted_ensaio_ids, selection_seed)`.
@@ -124,12 +116,6 @@ impl GeracaoId {
         hasher.update(b"|");
         hasher.update(selection_seed);
         Self(*hasher.finalize().as_bytes())
-    }
-
-    /// Hex representation.
-    #[must_use]
-    pub fn to_hex(&self) -> String {
-        hex_encode(&self.0)
     }
 }
 
@@ -623,8 +609,8 @@ where
     }
 }
 
-// hex_encode helper extracted to crate::hex per PRIME DIRECTIVE.
-use crate::hex::hex_encode;
+// hex_encode helper extracted to crate::hex per PRIME DIRECTIVE;
+// EnsaioId / GeracaoId now go through `define_hash_newtype!`.
 
 // =================================================================
 // Conversion helpers — turn fitness evidence into receipts
