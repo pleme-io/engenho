@@ -39,6 +39,7 @@ use utoipa::OpenApi;
 use crate::discovery;
 use crate::error::ApiError;
 use crate::handler::ResourceHandler;
+use crate::health;
 use crate::openapi::ApiDoc;
 use crate::params::{
     ListWatchParams, ResumePoint, Selectors, bookmark_line, gvk_ns_matches, status_410_line,
@@ -165,6 +166,12 @@ pub fn build(state: RouterState) -> Router {
         // ── openapi ───────────────────────────────────────────────────
         .route("/openapi.json", get(openapi_spec))
         .route("/openapi/v3", get(openapi_spec))
+        // ── version + health (no RouterState; kubectl/client-go probe
+        //    these before they will trust the server) ──────────────────
+        .route("/version", get(health::version))
+        .route("/readyz", get(health::readyz))
+        .route("/livez", get(health::livez))
+        .route("/healthz", get(health::healthz))
         .with_state(state)
 }
 

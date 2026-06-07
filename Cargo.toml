@@ -109,6 +109,20 @@ openraft               = { version = "=0.9.22", features = ["serde", "storage-v2
 # catalog / snapshot). Crash-safe append via keyspace.persist(SyncAll).
 fjall                  = "2"
 
+# Apiserver TLS — self-generated, data_dir-persisted cluster CA + a
+# per-boot server cert (rcgen), served over HTTPS via axum-server's
+# rustls acceptor. rustls is pinned to the 0.23 line fleet-wide and the
+# `ring` provider is installed explicitly at boot so a single crypto
+# provider closure unifies with reqwest's rustls-tls (no aws-lc-rs/ring
+# double-install panic). `tls-rustls-no-provider` keeps the provider
+# choice in our hands (we install ring); rcgen needs x509-parser to
+# reload a persisted CA from its PEM.
+rcgen                  = { version = "0.13", features = ["pem", "x509-parser"] }
+axum-server            = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls                 = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile         = "2"
+time                   = "0.3"
+
 [workspace.lints]
 
 [workspace.lints.clippy]

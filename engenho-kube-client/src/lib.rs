@@ -37,5 +37,6 @@ pub mod watcher;
 pub mod mock;
 
 pub use client::ReqwestKubeClient;
+pub use config::{Kubeconfig, emit_kubeconfig};
 pub use connection::Connection;
 pub use watcher::ReqwestWatcher;

@@ -20,9 +20,11 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-engenho-types      = { workspace = true }
-engenho-config     = { workspace = true }
-engenho-runtime    = { workspace = true }
+engenho-types       = { workspace = true }
+engenho-config      = { workspace = true }
+engenho-runtime     = { workspace = true }
+engenho-apiserver   = { workspace = true }
+engenho-kube-client = { workspace = true }
 
 anyhow             = { workspace = true }
 tokio              = { workspace = true }

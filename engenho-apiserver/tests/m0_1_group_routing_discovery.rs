@@ -41,7 +41,7 @@ async fn boot() -> (Arc<StoreMesh>, ApiServer) {
     // The FULL cataloged set — routing + discovery + pluralization all
     // follow RESOURCE_CATALOG.
     let handlers = handlers_from_catalog(store.clone());
-    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), handlers)
+    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), handlers, None)
         .await
         .unwrap();
     (store, server)

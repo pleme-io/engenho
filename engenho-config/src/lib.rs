@@ -89,6 +89,7 @@ mod revoada;
 mod runtime;
 mod scheduler;
 mod teia;
+mod tls;
 
 pub use cluster::ClusterConfig;
 pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
@@ -98,6 +99,7 @@ pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
 pub use runtime::{KubeletBackendKind, RuntimeConfig};
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
 pub use teia::TeiaConfig;
+pub use tls::TlsConfig;
 
 /// The top-level engenho config. One per process.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

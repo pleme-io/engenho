@@ -4,7 +4,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engenho_apiserver::{ApiServer, handlers_from_catalog_with_admission};
+use engenho_apiserver::{
+    ApiServer, ServerSanInputs, TlsMaterial, handlers_from_catalog_with_admission,
+    issue_server_material, load_or_generate_ca,
+};
+use engenho_kube_client::emit_kubeconfig;
 use engenho_config::{ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind};
 use engenho_controllers::{
     DeploymentController, EndpointsController, GcController, JobController, KindFilter,
@@ -104,6 +108,32 @@ impl Runtime {
                     addr: config.runtime.listen_addr.clone(),
                     source,
                 })?;
+
+        // 5a. Build the TLS material BEFORE binding (when tls.enabled).
+        //     load-or-generate the data_dir-persisted cluster CA, then
+        //     issue a server cert whose SANs cover loopback + node name +
+        //     the concrete listen IP (skipping 0.0.0.0/:: which aren't
+        //     valid SAN IPs — loopback access rides on 127.0.0.1/localhost).
+        //     `ca_cert_pem` is captured for the boot-time kubeconfig write.
+        let mut ca_cert_pem: Option<String> = None;
+        let tls: Option<TlsMaterial> = if config.runtime.tls.enabled {
+            let ca = load_or_generate_ca(&config.runtime.data_dir)
+                .map_err(|e| RuntimeError::Server(e.into()))?;
+            ca_cert_pem = Some(ca.cert_pem().to_string());
+            let listen_ip = san_listen_ip(listen_addr);
+            let material = issue_server_material(
+                &ca,
+                &ServerSanInputs {
+                    node_name: &config.runtime.node_name,
+                    listen_ip,
+                },
+            )
+            .map_err(|e| RuntimeError::Server(e.into()))?;
+            Some(material)
+        } else {
+            None
+        };
+
         // Admission chain dispatched on every API-boundary create / patch
         // / delete. M0.1 starts with an EMPTY chain (admits everything);
         // the wiring is the load-bearing part — registering a webhook is
@@ -113,9 +143,20 @@ impl Runtime {
         let apiserver = ApiServer::start(
             listen_addr,
             handlers_from_catalog_with_admission(store.clone(), admission),
+            tls,
         )
         .await?;
-        info!(addr = %apiserver.local_addr(), "apiserver bound");
+        let bound_addr = apiserver.local_addr();
+        info!(addr = %bound_addr, tls = config.runtime.tls.enabled, "apiserver bound");
+
+        // 5b. Boot-time kubeconfig write (TLS only — handing kubectl an
+        //     anonymous-over-plaintext kubeconfig makes no sense). Uses the
+        //     ACTUALLY-bound port so an ephemeral `:0` config still yields a
+        //     usable kubeconfig, and the SAME CA the server cert chains to so
+        //     kubectl's certificate-authority-data verifies the presented cert.
+        if let Some(ca_pem) = ca_cert_pem.as_deref() {
+            write_boot_kubeconfig(&config, bound_addr, ca_pem)?;
+        }
 
         // 6. Construct the scheduling strategy from config. A
         //    designed-but-unimplemented strategy (BinPack/Affinity) is a
@@ -288,6 +329,65 @@ fn host_capacity() -> (String, String) {
     (cpus.to_string(), "8Gi".to_string())
 }
 
+/// The listen IP to add as a server-cert SAN, or `None` when it isn't a
+/// usable SAN IP. `0.0.0.0` / `::` are *unspecified* bind addresses, not
+/// valid SAN IPs — a cert with an unspecified-IP SAN verifies against no
+/// real connection, so we drop them and let the always-present
+/// `127.0.0.1` + `localhost` SANs carry loopback access.
+fn san_listen_ip(addr: SocketAddr) -> Option<std::net::IpAddr> {
+    let ip = addr.ip();
+    if ip.is_unspecified() { None } else { Some(ip) }
+}
+
+/// Write `data_dir/kubeconfig` (mode 0644) so an operator can immediately
+/// `kubectl --kubeconfig <data_dir>/kubeconfig get nodes`. server_url is
+/// `https://127.0.0.1:<bound_port>` (loopback SAN + the real bound port);
+/// `ca_pem` is the cluster CA the server cert chains to.
+fn write_boot_kubeconfig(
+    config: &EngenhoConfig,
+    bound_addr: SocketAddr,
+    ca_pem: &str,
+) -> Result<(), RuntimeError> {
+    // Loopback server URL with the actually-bound port (handles `:0`).
+    let server_url = loopback_server_url(bound_addr);
+    let yaml = emit_kubeconfig(&config.cluster.name, &server_url, ca_pem.as_bytes())
+        .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
+    let path = config.runtime.data_dir.join("kubeconfig");
+    write_mode_0644(&path, &yaml)?;
+    info!(path = %path.display(), server = %server_url, "kubeconfig written");
+    Ok(())
+}
+
+/// `https://127.0.0.1:<port>` — the loopback URL kubectl targets. We use
+/// loopback (not the bound IP) because `127.0.0.1` is always a server-cert
+/// SAN, so the kubeconfig is usable even when `listen_addr` is `0.0.0.0`.
+fn loopback_server_url(bound_addr: SocketAddr) -> String {
+    let mut url = String::from("https://127.0.0.1:");
+    url.push_str(&bound_addr.port().to_string());
+    url
+}
+
+/// Write `contents` to `path` with mode 0644 on unix (no-op chmod
+/// elsewhere). Creates the parent dir if missing (it normally exists —
+/// the durable store already opened `data_dir/store`).
+fn write_mode_0644(path: &std::path::Path, contents: &str) -> Result<(), RuntimeError> {
+    let io_err = |p: &std::path::Path| {
+        let p = p.to_path_buf();
+        move |source: std::io::Error| RuntimeError::KubeconfigIo { path: p.clone(), source }
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+    }
+    std::fs::write(path, contents.as_bytes()).map_err(io_err(path))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+            .map_err(io_err(path))?;
+    }
+    Ok(())
+}
+
 /// Build + spawn every driver gated on `controllers.enable.*`. The
 /// scheduler + kubelet always run (a single-node runtime that can't
 /// schedule or run containers is useless); the four reconcilers are
@@ -411,6 +511,11 @@ mod tests {
         cfg.runtime.node_name = "node-A".into();
         cfg.runtime.kubelet_backend = CfgKind::Fake;
         cfg.runtime.leadership_timeout_seconds = 5;
+        // Plaintext: these unit tests assert subsystem assembly, not TLS,
+        // and the prescribed data_dir (/var/lib/engenho) isn't writable in
+        // CI. The dedicated TLS integration test (tests/m0_4_tls_kubectl.rs)
+        // exercises the HTTPS + kubeconfig path with a tempdir data_dir.
+        cfg.runtime.tls.enabled = false;
         cfg.controllers.fallback_interval_seconds = 1;
         cfg.controllers.debounce_milliseconds = 20;
         cfg
