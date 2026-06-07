@@ -147,15 +147,16 @@ pub struct NamedContext {
 /// ([`Kubeconfig::from_yaml`]) share ONE type, emit∘parse round-trips for
 /// free.
 ///
-/// **Anonymous over TLS — the M0.4 posture.** The emitted `user` is
-/// `anonymous` with an all-`None` [`AuthInfo`], which
-/// [`Kubeconfig::resolve_connection`] resolves to
-/// [`KubeAuth::Anonymous`](engenho_types::auth::KubeAuth::Anonymous) — no
-/// client credential is emitted. Authn/RBAC is explicitly out of scope at
-/// M0.4 (the apiserver runs a FailOpen admission chain that admits
-/// everything); a later brick adds bearer-token / client-cert auth and
-/// this emitter grows the matching `user` block. TLS is still load-bearing:
-/// kubectl verifies the server's presented cert against `ca_pem`.
+/// **Anonymous over TLS — the M0.4 posture.** The emitted `user` carries a
+/// fixed placeholder bearer token ([`ANONYMOUS_TOKEN`]), NOT an empty user:
+/// real `kubectl` blocks on a `Please enter Username:` stdin prompt for a
+/// credential-less user, so an all-`None` `AuthInfo` would make every
+/// `kubectl get`/`apply` hang. The token is a complete auth method, so
+/// kubectl sends it and proceeds; engenho has no authn yet (the apiserver
+/// runs a FailOpen admission chain and serves anonymous-root) so the value is
+/// ignored. A later brick replaces the placeholder with a real ServiceAccount
+/// / client-cert credential. TLS is load-bearing throughout: kubectl verifies
+/// the server's presented cert against `ca_pem`.
 ///
 /// * `cluster_name` — the `clusters[].name` + `current-context` value.
 /// * `server_url`   — `https://<host>:<port>`; for a loopback engenho use
@@ -168,6 +169,12 @@ pub struct NamedContext {
 /// [`KubeError::Encode`] if serde_yaml can't serialize the value (does not
 /// happen for the fixed shape built here, but the typed surface keeps the
 /// fallible contract).
+/// Placeholder bearer token emitted into the kubeconfig so real `kubectl`
+/// does not block on an interactive username prompt. engenho has no authn at
+/// M0.4 and ignores its value (anonymous-root); the authn brick replaces it
+/// with a real credential.
+pub const ANONYMOUS_TOKEN: &str = "engenho-anonymous";
+
 pub fn emit_kubeconfig(
     cluster_name: &str,
     server_url: &str,
@@ -191,8 +198,18 @@ pub fn emit_kubeconfig(
         }],
         users: vec![NamedAuthInfo {
             name: "anonymous".to_string(),
-            // All-None AuthInfo → resolve_connection yields KubeAuth::Anonymous.
-            user: AuthInfo::default(),
+            // A placeholder bearer token, NOT an empty user. Real `kubectl`
+            // treats a credential-less user as "needs interactive auth" and
+            // BLOCKS on a `Please enter Username:` stdin prompt — so an
+            // all-None AuthInfo makes `kubectl get`/`apply` hang forever. A
+            // bearer token is a complete auth method, so kubectl sends it and
+            // never prompts; engenho has no authn yet (M0.4) so it ignores the
+            // value and serves anonymous-root. The authn brick replaces this
+            // placeholder with a real ServiceAccount/client-cert credential.
+            user: AuthInfo {
+                token: Some(ANONYMOUS_TOKEN.to_string()),
+                ..AuthInfo::default()
+            },
         }],
         contexts: vec![NamedContext {
             name: cluster_name.to_string(),
@@ -458,32 +475,38 @@ contexts: []
     }
 
     #[test]
-    fn emitted_kubeconfig_resolves_to_anonymous() {
-        // The anonymous `user` block resolves to KubeAuth::Anonymous —
-        // proven directly via `auth_from_user` (the auth resolver the
-        // apiserver's eventual authn will key on). The full
-        // `resolve_connection` (which builds a verifying reqwest Client and
-        // needs a REAL CA cert) is exercised end-to-end by the apiserver's
-        // m0_4 TLS integration test, not here.
+    fn emitted_kubeconfig_carries_placeholder_token() {
+        // The emitted `user` carries the fixed ANONYMOUS_TOKEN placeholder
+        // (NOT an empty user) so real kubectl does not block on a
+        // `Please enter Username:` prompt. It resolves to a BearerToken on
+        // the client; the apiserver has no authn yet and ignores the value,
+        // serving anonymous-root. The full `resolve_connection` (verifying
+        // reqwest Client, real CA) is exercised by the apiserver m0_4 test.
         let yaml =
             emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
         let kc = Kubeconfig::from_yaml(&yaml).expect("parse");
+        // The placeholder token is on the user (so kubectl never prompts) …
+        assert_eq!(kc.users[0].user.token.as_deref(), Some(ANONYMOUS_TOKEN));
+        // … and resolves to a BearerToken auth (NOT Anonymous, which would
+        // make real kubectl block on a username prompt).
         let resolved = auth_from_user(&kc.users[0].user).expect("resolve auth");
         assert!(
-            matches!(resolved, KubeAuth::Anonymous),
-            "M0.4 posture is anonymous-over-TLS; got {resolved:?}"
+            matches!(resolved, KubeAuth::BearerToken(_)),
+            "placeholder-token-over-TLS so kubectl never prompts; got {resolved:?}"
         );
     }
 
     #[test]
-    fn emitted_kubeconfig_has_no_client_credential() {
-        // The anonymous posture: NO token, NO client cert/key anywhere.
+    fn emitted_kubeconfig_has_only_placeholder_token() {
+        // The placeholder-token posture: the ANONYMOUS_TOKEN bearer token and
+        // NOTHING else (no token-file, no client cert/key) — a complete auth
+        // method so kubectl proceeds, but no real credential material.
         let yaml =
             emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
         let kc = Kubeconfig::from_yaml(&yaml).expect("parse");
         assert_eq!(kc.users.len(), 1);
         let u = &kc.users[0].user;
-        assert!(u.token.is_none(), "no bearer token in anonymous posture");
+        assert_eq!(u.token.as_deref(), Some(ANONYMOUS_TOKEN), "placeholder bearer token present");
         assert!(u.token_file.is_none());
         assert!(
             u.client_certificate_data.is_none() && u.client_certificate.is_none(),
