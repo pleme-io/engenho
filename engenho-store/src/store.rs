@@ -22,31 +22,33 @@ use tokio::sync::Mutex;
 
 use crate::state::ResourceCatalog;
 use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
-use crate::watch::{WatchEvent, WatchEventKind};
+use crate::watch_backend::{
+    BookmarkTickable, BookmarkTicker, WatchGone, WatchOpts, WatchStream, WatcherRegistry,
+};
 
-/// Watch channel capacity — how many events buffer per consumer
-/// before the slow-consumer detection (broadcast::Receiver::recv
-/// returns Err(Lagged(n))). 1024 is a reasonable default; large
-/// enough to absorb burst applies, small enough to detect a stuck
-/// consumer.
-const WATCH_CHANNEL_CAPACITY: usize = 1024;
+/// Default per-watcher buffer — same capacity the legacy broadcast
+/// path used.
+const WATCH_CHANNEL_CAPACITY: usize = crate::watch_backend::WATCH_CHANNEL_CAPACITY;
 
 #[derive(Clone)]
 pub struct InMemoryStore {
     inner: Arc<Mutex<Inner>>,
-    /// Broadcast channel for watch events emitted on every apply.
-    /// Subscribers via [`InMemoryStore::watch_subscribe`] get a
-    /// `broadcast::Receiver` they can `.recv().await` for each
-    /// committed mutation.
-    watch_tx: tokio::sync::broadcast::Sender<WatchEvent>,
+    /// Store-level bookmark ticker — one per store, driving the
+    /// per-watcher bookmark cadence under the catalog lock. `Arc` so
+    /// every clone of the store shares (and keeps alive) the single
+    /// ticker; dropping the last store clone aborts it.
+    _bookmark_ticker: Arc<BookmarkTicker>,
 }
 
 impl Default for InMemoryStore {
     fn default() -> Self {
-        let (watch_tx, _) = tokio::sync::broadcast::channel(WATCH_CHANNEL_CAPACITY);
+        let inner = Arc::new(Mutex::new(Inner::default()));
+        // The ticker holds a Weak<Mutex<Inner>> so it never keeps the
+        // store alive; it exits when the last store clone drops.
+        let ticker = BookmarkTicker::spawn(Arc::downgrade(&inner));
         Self {
-            inner: Arc::new(Mutex::new(Inner::default())),
-            watch_tx,
+            inner,
+            _bookmark_ticker: Arc::new(ticker),
         }
     }
 }
@@ -62,11 +64,63 @@ struct Inner {
     last_membership: StoredMembership<RaftNodeId, openraft::BasicNode>,
     snapshot: Option<Snapshot<TypeConfig>>,
     snapshot_index: u64,
+    /// Live watch registry — lives UNDER this catalog lock so
+    /// subscription + replay-capture + live fan-out are atomic against
+    /// `catalog.apply` (the crux of the gap-free / dup-free handoff).
+    watchers: WatcherRegistry,
+}
+
+/// The ticker drives bookmarks under the SAME `Mutex<Inner>` the apply
+/// path holds — so a bookmark + a concurrent apply can't interleave on
+/// the registry. The trait is local, so this impl on the foreign
+/// `tokio::sync::Mutex` is allowed by the orphan rule.
+impl BookmarkTickable for Mutex<Inner> {
+    async fn tick_once(&self) {
+        let mut guard = self.lock().await;
+        let rev = guard.catalog.revision();
+        let now = tokio::time::Instant::now();
+        guard.watchers.tick_bookmarks(rev, now);
+    }
 }
 
 impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open a resumable, gap-free watch from `opts.from`. See
+    /// [`crate::watch_backend`] for the full contract.
+    ///
+    /// The subscription registers UNDER the catalog lock, so the replay
+    /// snapshot + the live-tail attachment are one atomic act — no
+    /// change committed during subscription is missed or doubled.
+    ///
+    /// # Errors
+    ///
+    /// [`WatchGone::CompactedTooOld`] when `opts.from` is below the
+    /// catalog's compaction watermark (no channel is allocated).
+    pub async fn watch_from(&self, opts: WatchOpts) -> Result<WatchStream, WatchGone> {
+        let (stream, replay_sender, replay) = {
+            // ── under the catalog lock ─────────────────────────────
+            let mut guard = self.inner.lock().await;
+            // Read replay + boundary from the catalog (immutable),
+            // then register the sender on the registry (mutable) — both
+            // under the SAME lock, so the handoff is atomic. Borrows are
+            // sequential (no split-borrow of the MutexGuard's Deref) and
+            // the catalog ring is NOT cloned.
+            let replay = guard
+                .catalog
+                .changes_since(opts.from)
+                .map_err(WatchGone::from)?;
+            let boundary = guard.catalog.revision();
+            guard.watchers.register_captured(replay, boundary, &opts)
+            // lock drops here
+        };
+        // Feed the replay tail on its own task (off the catalog lock):
+        // the live tail flows through the same FIFO channel afterward,
+        // and every revision > boundary is already attached.
+        tokio::spawn(replay_sender.feed(replay));
+        Ok(stream)
     }
 
     pub async fn current_catalog(&self) -> ResourceCatalog {
@@ -82,21 +136,30 @@ impl InMemoryStore {
         self.inner.lock().await.catalog.get(key).cloned()
     }
 
-    /// Subscribe to the watch stream. Each subscriber sees every
-    /// committed [`WatchEvent`] from this node from subscription
-    /// time onward. Late subscribers do NOT see history — that's
-    /// what the JetStream tier (C2/F3) provides via durable
-    /// streams + cursor replay.
-    #[must_use]
-    pub fn watch_subscribe(&self) -> tokio::sync::broadcast::Receiver<WatchEvent> {
-        self.watch_tx.subscribe()
+    /// Subscribe to the LIVE-TAIL watch stream (the compatibility shim
+    /// over [`Self::watch_from`]). Attaches from the current revision
+    /// forward with NO replay + NO bookmarks — exactly the legacy
+    /// `watch_subscribe` semantics, but as a typed [`WatchStream`] that
+    /// surfaces overflow as [`WatchGone::Overflow`] instead of a silent
+    /// `broadcast::RecvError::Lagged`.
+    ///
+    /// For resumable, gap-free watches use [`Self::watch_from`].
+    ///
+    /// # Errors
+    ///
+    /// Never errors in practice — live-tail resumes from the current
+    /// revision, which is never below the compaction watermark. The
+    /// `Result` matches `watch_from`'s signature.
+    pub async fn watch_subscribe(&self) -> Result<WatchStream, WatchGone> {
+        let from = self.inner.lock().await.catalog.revision();
+        self.watch_from(WatchOpts::live_tail(from, WATCH_CHANNEL_CAPACITY))
+            .await
     }
 
-    /// Active subscriber count. Useful for telemetry + test
-    /// instrumentation.
-    #[must_use]
-    pub fn watch_subscriber_count(&self) -> usize {
-        self.watch_tx.receiver_count()
+    /// Active watch subscriber count (live registry size). Useful for
+    /// telemetry + test instrumentation.
+    pub async fn watch_subscriber_count(&self) -> usize {
+        self.inner.lock().await.watchers.len()
     }
 }
 
@@ -268,11 +331,6 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
     {
         let mut guard = self.inner.lock().await;
         let mut results = Vec::new();
-        // Collect watch events to publish AFTER releasing the
-        // catalog lock — broadcast::Sender::send is sync but the
-        // receivers may be on other tasks; we don't want to hold
-        // the apply lock across event delivery.
-        let mut watch_events: Vec<WatchEvent> = Vec::new();
         for entry in entries {
             let log_id = entry.log_id;
             let op = match entry.payload {
@@ -281,30 +339,19 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
                     let outcome = guard
                         .catalog
                         .apply(cmd, log_id.leader_id.term, log_id.index);
-                    // Emit a typed WatchEvent for every committed
-                    // mutation. The catalog returns the committed
-                    // Change, so the Deleted event carries the REAL
-                    // prior object (the change's tombstone value) —
-                    // no post-removal catalog.get() that returns None.
-                    if let Some(change) = &outcome.change {
-                        let kind = match change.kind {
-                            crate::revision::ChangeKind::Put => match outcome.op {
-                                crate::command::ResourceOp::Created => WatchEventKind::Added,
-                                _ => WatchEventKind::Modified,
-                            },
-                            crate::revision::ChangeKind::Delete => WatchEventKind::Deleted,
-                        };
-                        watch_events.push(WatchEvent {
-                            kind,
-                            // For Put: the post-image. For Delete: the
-                            // tombstone (last-known object) — never Null.
-                            object: change.value.clone(),
-                            key: change.key.clone(),
-                            // Decoupled from the Raft index — this is
-                            // the global MVCC revision the catalog
-                            // stamped onto metadata.resourceVersion.
-                            resource_version: change.revision.get(),
-                        });
+                    // Fan the committed change to live watchers WHILE
+                    // STILL HOLDING the catalog lock — this closes the
+                    // replay→live race window entirely (the legacy
+                    // post-drop broadcast left a gap/dup window). The
+                    // catalog returns the committed Change, so the
+                    // Deleted event carries the REAL prior object (the
+                    // tombstone), never Null. `fan_change` derives
+                    // Added vs Modified from `change.prior` + uses
+                    // non-blocking try_send (overflow → typed Gone,
+                    // never a silent drop, never a block on a slow
+                    // consumer).
+                    if let Some(change) = outcome.change {
+                        guard.watchers.fan_change(&change);
                     }
                     outcome.op
                 }
@@ -320,15 +367,6 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
                 op,
                 revision: guard.catalog.revision().get(),
             });
-        }
-        drop(guard);
-        // Broadcast watch events. Send is sync but won't block
-        // even if all receivers have lagged — broadcast::Sender
-        // drops oldest in slow consumers' queues. We ignore
-        // SendError (no subscribers) because watch is optional;
-        // controllers can poll if they don't subscribe.
-        for ev in watch_events {
-            let _ = self.watch_tx.send(ev);
         }
         Ok(results)
     }

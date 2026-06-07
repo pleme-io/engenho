@@ -61,17 +61,29 @@ impl StoreBackend {
         }
     }
 
-    fn watch_subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::watch::WatchEvent> {
+    async fn watch_from(
+        &self,
+        opts: crate::watch_backend::WatchOpts,
+    ) -> Result<crate::watch_backend::WatchStream, crate::watch_backend::WatchGone> {
         match self {
-            Self::Memory(s) => s.watch_subscribe(),
-            Self::Fjall(s) => s.watch_subscribe(),
+            Self::Memory(s) => s.watch_from(opts).await,
+            Self::Fjall(s) => s.watch_from(opts).await,
         }
     }
 
-    fn watch_subscriber_count(&self) -> usize {
+    async fn watch_subscribe(
+        &self,
+    ) -> Result<crate::watch_backend::WatchStream, crate::watch_backend::WatchGone> {
         match self {
-            Self::Memory(s) => s.watch_subscriber_count(),
-            Self::Fjall(s) => s.watch_subscriber_count(),
+            Self::Memory(s) => s.watch_subscribe().await,
+            Self::Fjall(s) => s.watch_subscribe().await,
+        }
+    }
+
+    async fn watch_subscriber_count(&self) -> usize {
+        match self {
+            Self::Memory(s) => s.watch_subscriber_count().await,
+            Self::Fjall(s) => s.watch_subscriber_count().await,
         }
     }
 
@@ -320,22 +332,49 @@ impl StoreMesh {
         self.store.current_catalog().await
     }
 
-    /// Subscribe to the watch stream — every committed mutation
-    /// emits a typed [`engenho_store::WatchEvent`] (Added /
-    /// Modified / Deleted with the resource value + Raft log index).
+    /// Open a RESUMABLE, gap-free watch from `opts.from`. The
+    /// subscription registers under the backend's catalog lock, so the
+    /// replay snapshot + the live-tail attachment are one atomic act —
+    /// no change committed during subscription is missed or doubled.
+    /// Routes through [`StoreBackend`] so both Memory + Fjall get the
+    /// single implementation.
     ///
-    /// Late subscribers do NOT see history. R7.5b's JetStream
-    /// tier provides durable replay from a cursor; this is the
-    /// fast in-process path consumed by local controllers.
-    #[must_use]
-    pub fn watch(&self) -> tokio::sync::broadcast::Receiver<crate::watch::WatchEvent> {
-        self.store.watch_subscribe()
+    /// This is the entry point the apiserver hands to kubectl
+    /// `--watch` + controller informers: list at revision R, then
+    /// `watch_from(R)` resumes with no gap + no dup.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::watch_backend::WatchGone::CompactedTooOld`] when
+    /// `opts.from` is below the compaction watermark.
+    pub async fn watch_from(
+        &self,
+        opts: crate::watch_backend::WatchOpts,
+    ) -> Result<crate::watch_backend::WatchStream, crate::watch_backend::WatchGone> {
+        self.store.watch_from(opts).await
     }
 
-    /// Active watch subscriber count (telemetry + test helper).
-    #[must_use]
-    pub fn watch_subscriber_count(&self) -> usize {
-        self.store.watch_subscriber_count()
+    /// Subscribe to the LIVE-TAIL watch stream (compatibility shim over
+    /// [`Self::watch_from`]) — attaches from the current revision
+    /// forward with NO replay + NO bookmarks. Surfaces overflow as a
+    /// typed [`crate::watch_backend::WatchGone::Overflow`] (the
+    /// consumer re-lists / resumes), never a silent
+    /// `broadcast::RecvError::Lagged`.
+    ///
+    /// # Errors
+    ///
+    /// Never errors in practice (live-tail resumes from current
+    /// revision); the `Result` matches `watch_from`.
+    pub async fn watch(
+        &self,
+    ) -> Result<crate::watch_backend::WatchStream, crate::watch_backend::WatchGone> {
+        self.store.watch_subscribe().await
+    }
+
+    /// Active watch subscriber count (live registry size; telemetry +
+    /// test helper).
+    pub async fn watch_subscriber_count(&self) -> usize {
+        self.store.watch_subscriber_count().await
     }
 
     pub async fn is_leader(&self) -> bool {

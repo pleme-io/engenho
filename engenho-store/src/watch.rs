@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::resource::{ResourceKey, ResourceValue};
 
 /// One change notification.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WatchEvent {
     #[serde(rename = "type")]
     pub kind: WatchEventKind,
