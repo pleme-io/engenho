@@ -63,10 +63,12 @@ use tokio::sync::Mutex;
 use crate::mesh::StoreError;
 use crate::state::ResourceCatalog;
 use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
-use crate::watch::{WatchEvent, WatchEventKind};
+use crate::watch_backend::{
+    BookmarkTickable, BookmarkTicker, WatchGone, WatchOpts, WatchStream, WatcherRegistry,
+};
 
-/// Watch channel capacity — mirrors [`crate::store::InMemoryStore`].
-const WATCH_CHANNEL_CAPACITY: usize = 1024;
+/// Watch buffer capacity — mirrors [`crate::store::InMemoryStore`].
+const WATCH_CHANNEL_CAPACITY: usize = crate::watch_backend::WATCH_CHANNEL_CAPACITY;
 
 /// fjall partition names.
 const LOG_PARTITION: &str = "log";
@@ -97,9 +99,11 @@ type RMembership = StoredMembership<RaftNodeId, openraft::BasicNode>;
 #[derive(Clone)]
 pub struct FjallStore {
     inner: Arc<FjallInner>,
-    /// Broadcast channel for watch events emitted on every apply —
-    /// identical contract to `InMemoryStore::watch_tx`.
-    watch_tx: tokio::sync::broadcast::Sender<WatchEvent>,
+    /// Store-level bookmark ticker — one per store, driving the
+    /// per-watcher bookmark cadence under the catalog lock. `Arc` so
+    /// every clone of the store shares (and keeps alive) the single
+    /// ticker; dropping the last store clone aborts it.
+    _bookmark_ticker: Arc<BookmarkTicker>,
 }
 
 /// The on-disk handles + the in-RAM working copy.
@@ -111,6 +115,19 @@ struct FjallInner {
     /// In-RAM mirror of the state machine — hydrated on open,
     /// kept in lockstep with the disk partitions under one lock.
     state: Mutex<MaterializedState>,
+}
+
+/// The ticker drives bookmarks under the SAME `Mutex<MaterializedState>`
+/// the apply path holds — so a bookmark + a concurrent apply can't
+/// interleave on the registry. The trait is local, so this impl on the
+/// foreign `tokio::sync::Mutex` is allowed by the orphan rule.
+impl BookmarkTickable for FjallInner {
+    async fn tick_once(&self) {
+        let mut state = self.state.lock().await;
+        let rev = state.catalog.revision();
+        let now = tokio::time::Instant::now();
+        state.watchers.tick_bookmarks(rev, now);
+    }
 }
 
 /// In-RAM working copy of the durable state. Mirrors `Inner` from
@@ -125,6 +142,11 @@ struct MaterializedState {
     last_applied: Option<LogId<RNodeId>>,
     last_membership: RMembership,
     snapshot_index: u64,
+    /// Live watch registry — lives UNDER this catalog lock so
+    /// subscription + replay-capture + live fan-out are atomic against
+    /// `catalog.apply`. The crux of the gap-free / dup-free handoff,
+    /// identical to the in-memory store.
+    watchers: WatcherRegistry,
 }
 
 // ── error mapping helpers ─────────────────────────────────────────
@@ -226,16 +248,19 @@ impl FjallStore {
         }
         state.snapshot_index = meta_get_json(&meta, META_SNAPSHOT_INDEX)?.unwrap_or(0);
 
-        let (watch_tx, _) = tokio::sync::broadcast::channel(WATCH_CHANNEL_CAPACITY);
+        let inner = Arc::new(FjallInner {
+            keyspace,
+            log,
+            meta,
+            catalog,
+            state: Mutex::new(state),
+        });
+        // The ticker holds a Weak<FjallInner> so it never keeps the
+        // store alive; it exits when the last store clone drops.
+        let ticker = BookmarkTicker::spawn(Arc::downgrade(&inner));
         Ok(Self {
-            inner: Arc::new(FjallInner {
-                keyspace,
-                log,
-                meta,
-                catalog,
-                state: Mutex::new(state),
-            }),
-            watch_tx,
+            inner,
+            _bookmark_ticker: Arc::new(ticker),
         })
     }
 
@@ -269,17 +294,51 @@ impl FjallStore {
         self.inner.state.lock().await.catalog.get(key).cloned()
     }
 
-    /// Subscribe to the watch stream — every committed mutation that
-    /// survived to disk emits a [`WatchEvent`].
-    #[must_use]
-    pub fn watch_subscribe(&self) -> tokio::sync::broadcast::Receiver<WatchEvent> {
-        self.watch_tx.subscribe()
+    /// Open a resumable, gap-free watch from `opts.from`. Same contract
+    /// + same single implementation as
+    /// [`crate::store::InMemoryStore::watch_from`] — registration under
+    /// the catalog lock makes the replay→live handoff atomic. For Fjall,
+    /// live events are only fanned AFTER the apply's fsync returns
+    /// (durable-before-observable), preserving "a watcher never sees an
+    /// event that didn't survive to disk."
+    ///
+    /// # Errors
+    ///
+    /// [`WatchGone::CompactedTooOld`] when `opts.from` is below the
+    /// compaction watermark (no channel is allocated).
+    pub async fn watch_from(&self, opts: WatchOpts) -> Result<WatchStream, WatchGone> {
+        let (stream, replay_sender, replay) = {
+            let mut state = self.inner.state.lock().await;
+            let replay = state
+                .catalog
+                .changes_since(opts.from)
+                .map_err(WatchGone::from)?;
+            let boundary = state.catalog.revision();
+            state.watchers.register_captured(replay, boundary, &opts)
+        };
+        tokio::spawn(replay_sender.feed(replay));
+        Ok(stream)
     }
 
-    /// Active subscriber count.
-    #[must_use]
-    pub fn watch_subscriber_count(&self) -> usize {
-        self.watch_tx.receiver_count()
+    /// Subscribe to the LIVE-TAIL watch stream (compatibility shim over
+    /// [`Self::watch_from`]) — attaches from the current revision
+    /// forward with NO replay + NO bookmarks, surfacing overflow as a
+    /// typed [`WatchGone::Overflow`] instead of a silent
+    /// `broadcast::RecvError::Lagged`.
+    ///
+    /// # Errors
+    ///
+    /// Never errors in practice (live-tail resumes from the current
+    /// revision); the `Result` matches `watch_from`.
+    pub async fn watch_subscribe(&self) -> Result<WatchStream, WatchGone> {
+        let from = self.inner.state.lock().await.catalog.revision();
+        self.watch_from(WatchOpts::live_tail(from, WATCH_CHANNEL_CAPACITY))
+            .await
+    }
+
+    /// Active watch subscriber count (live registry size).
+    pub async fn watch_subscriber_count(&self) -> usize {
+        self.inner.state.lock().await.watchers.len()
     }
 
     /// Persist (fsync) the keyspace. Helper centralizing the verb so
@@ -606,7 +665,10 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
     {
         let mut state = self.inner.state.lock().await;
         let mut results = Vec::new();
-        let mut watch_events: Vec<WatchEvent> = Vec::new();
+        // Buffer the committed changes; we fan them to watchers AFTER
+        // the fsync (durable-before-observable) but BEFORE dropping the
+        // lock (so the replay→live handoff stays atomic).
+        let mut committed: Vec<crate::revision::Change> = Vec::new();
         // Track whether last_membership changed so we persist it.
         let mut membership_changed = false;
 
@@ -618,20 +680,8 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
                     let outcome = state
                         .catalog
                         .apply(cmd, log_id.leader_id.term, log_id.index);
-                    if let Some(change) = &outcome.change {
-                        let kind = match change.kind {
-                            crate::revision::ChangeKind::Put => match outcome.op {
-                                crate::command::ResourceOp::Created => WatchEventKind::Added,
-                                _ => WatchEventKind::Modified,
-                            },
-                            crate::revision::ChangeKind::Delete => WatchEventKind::Deleted,
-                        };
-                        watch_events.push(WatchEvent {
-                            kind,
-                            object: change.value.clone(),
-                            key: change.key.clone(),
-                            resource_version: change.revision.get(),
-                        });
+                    if let Some(change) = outcome.change {
+                        committed.push(change);
                     }
                     outcome.op
                 }
@@ -650,7 +700,7 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
             });
         }
 
-        // ── durable write BEFORE we broadcast any watch event ──────
+        // ── durable write BEFORE we make any event observable ──────
         // Overwrite the single catalog key (idempotent full write —
         // cheap for small clusters; batched-delta is a future
         // optimization, not pre-optimized here) + last_applied (+
@@ -674,11 +724,16 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         }
         self.persist(write_sm_err)?;
 
-        drop(state);
-        // Only now that the batch survived to disk do we broadcast.
-        for ev in watch_events {
-            let _ = self.watch_tx.send(ev);
+        // ── fan watch events: AFTER fsync, STILL UNDER THE LOCK ────
+        // After-fsync = "a watcher never sees an event that didn't
+        // survive to disk." Still-under-lock = the replay→live handoff
+        // stays atomic against a concurrent `watch_from` registration
+        // (which also runs under this same `state` lock). Non-blocking
+        // try_send (overflow → typed Gone, never silent, never blocks).
+        for change in &committed {
+            state.watchers.fan_change(change);
         }
+        drop(state);
         Ok(results)
     }
 

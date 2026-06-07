@@ -68,6 +68,7 @@ pub mod state;
 pub mod store;
 pub mod type_config;
 pub mod watch;
+pub mod watch_backend;
 
 pub use command::{Reason, ResourceCommand, ResourceOp};
 pub use drv_committal::{
@@ -85,3 +86,4 @@ pub use state::{ApplyOutcome, ResourceCatalog, DEFAULT_HISTORY_CAPACITY};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
 pub use watch::{WatchEvent, WatchEventKind};
+pub use watch_backend::{WatchGone, WatchOpts, WatchSignal, WatchStream};

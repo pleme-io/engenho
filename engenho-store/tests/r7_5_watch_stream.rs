@@ -1,13 +1,20 @@
-//! R7.5b / C2 integration — every committed mutation emits a
-//! typed WatchEvent on the broadcast channel. Validates that
-//! controllers + apiserver subscribers can react to changes
-//! in real time without polling.
+//! R7.5b / C2 integration — every committed mutation emits a typed
+//! watch signal on the per-watcher stream. Validates that controllers
+//! + apiserver subscribers can react to changes in real time without
+//! polling.
+//!
+//! Migrated from the legacy `tokio::sync::broadcast` fan-out to the
+//! resumable watch backend (M0.1 item 3): `StoreMesh::watch()` is now
+//! the LIVE-TAIL shim over `watch_from` — same semantics (attach from
+//! the current revision forward, no replay), but it yields a typed
+//! `WatchStream` whose `next()` returns `WatchSignal` and surfaces
+//! overflow as a typed `WatchGone` instead of a silent `Lagged`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_store::{
-    InProcessRouter, ResourceKey, StoreMesh, WatchEventKind,
+    InProcessRouter, ResourceKey, StoreMesh, WatchEventKind, WatchSignal,
     command::{Reason, ResourceCommand},
     default_config,
 };
@@ -30,11 +37,28 @@ fn pod_key(name: &str) -> ResourceKey {
     ResourceKey::namespaced("", "v1", "Pod", "default", name)
 }
 
+/// Drain one Event from the stream (skipping any bookmarks).
+async fn next_event(
+    stream: &mut engenho_store::WatchStream,
+) -> engenho_store::WatchEvent {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("signal arrived")
+        {
+            Some(Ok(WatchSignal::Event(ev))) => return ev,
+            Some(Ok(WatchSignal::Bookmark(_))) => continue,
+            Some(Err(g)) => panic!("unexpected WatchGone: {g:?}"),
+            None => panic!("stream closed unexpectedly"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn put_emits_added_watch_event() {
     let store = boot().await;
-    let mut watch = store.watch();
-    assert_eq!(store.watch_subscriber_count(), 1);
+    let mut watch = store.watch().await.unwrap();
+    assert_eq!(store.watch_subscriber_count().await, 1);
 
     store
         .propose(ResourceCommand::Put {
@@ -45,10 +69,7 @@ async fn put_emits_added_watch_event() {
         .await
         .unwrap();
 
-    let ev = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-        .await
-        .expect("event arrived")
-        .expect("not lagged");
+    let ev = next_event(&mut watch).await;
     assert_eq!(ev.kind, WatchEventKind::Added);
     assert_eq!(ev.key.name, "p1");
     assert!(ev.resource_version >= 1);
@@ -62,7 +83,7 @@ async fn put_emits_added_watch_event() {
 #[tokio::test]
 async fn put_then_put_emits_added_then_modified() {
     let store = boot().await;
-    let mut watch = store.watch();
+    let mut watch = store.watch().await.unwrap();
 
     store
         .propose(ResourceCommand::Put {
@@ -81,14 +102,8 @@ async fn put_then_put_emits_added_then_modified() {
         .await
         .unwrap();
 
-    let ev1 = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let ev2 = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let ev1 = next_event(&mut watch).await;
+    let ev2 = next_event(&mut watch).await;
     assert_eq!(ev1.kind, WatchEventKind::Added);
     assert_eq!(ev2.kind, WatchEventKind::Modified);
     // ev2's resource_version is strictly larger than ev1's.
@@ -110,7 +125,7 @@ async fn patch_emits_modified_event() {
         })
         .await
         .unwrap();
-    let mut watch = store.watch(); // subscribe AFTER the put
+    let mut watch = store.watch().await.unwrap(); // subscribe AFTER the put
 
     store
         .propose(ResourceCommand::Patch {
@@ -121,10 +136,7 @@ async fn patch_emits_modified_event() {
         .await
         .unwrap();
 
-    let ev = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let ev = next_event(&mut watch).await;
     assert_eq!(ev.kind, WatchEventKind::Modified);
     assert_eq!(ev.object.get("spec").unwrap().get("v").unwrap(), 2);
     // Patch preserves other fields.
@@ -146,7 +158,7 @@ async fn delete_emits_deleted_event() {
         })
         .await
         .unwrap();
-    let mut watch = store.watch();
+    let mut watch = store.watch().await.unwrap();
 
     store
         .propose(ResourceCommand::Delete {
@@ -156,17 +168,14 @@ async fn delete_emits_deleted_event() {
         .await
         .unwrap();
 
-    let ev = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let ev = next_event(&mut watch).await;
     assert_eq!(ev.kind, WatchEventKind::Deleted);
     assert_eq!(ev.key.name, "p");
     // The Deleted event MUST carry the last-known object (the
     // tombstone), never Null. Regression for the "Deleted-event
-    // prior-object" bug: catalog.apply now captures the pre-image
-    // before removal + returns it in the Change, so the event's
-    // object is the real prior spec.
+    // prior-object" bug: catalog.apply captures the pre-image before
+    // removal + returns it in the Change, so the event's object is the
+    // real prior spec.
     assert!(
         !ev.object.is_null(),
         "Deleted event object must be the prior object, not Null"
@@ -185,10 +194,10 @@ async fn delete_emits_deleted_event() {
 #[tokio::test]
 async fn multiple_subscribers_each_get_every_event() {
     let store = boot().await;
-    let mut sub_a = store.watch();
-    let mut sub_b = store.watch();
-    let mut sub_c = store.watch();
-    assert_eq!(store.watch_subscriber_count(), 3);
+    let mut sub_a = store.watch().await.unwrap();
+    let mut sub_b = store.watch().await.unwrap();
+    let mut sub_c = store.watch().await.unwrap();
+    assert_eq!(store.watch_subscriber_count().await, 3);
 
     store
         .propose(ResourceCommand::Put {
@@ -207,13 +216,11 @@ async fn multiple_subscribers_each_get_every_event() {
         .await
         .unwrap();
 
-    // Each subscriber sees both Add events independently.
+    // Each subscriber sees both Add events independently (per-watcher
+    // channel — no shared broadcast ring).
     for sub in [&mut sub_a, &mut sub_b, &mut sub_c] {
         for expected_name in ["p1", "p2"] {
-            let ev = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let ev = next_event(sub).await;
             assert_eq!(ev.kind, WatchEventKind::Added);
             assert_eq!(ev.key.name, expected_name);
         }
@@ -237,13 +244,17 @@ async fn late_subscriber_does_not_see_history() {
         .await
         .unwrap();
 
-    let mut watch = store.watch();
+    // The LIVE-TAIL shim (`watch()`) attaches from the current revision
+    // forward with no replay — exactly the legacy semantics.
+    let mut watch = store.watch().await.unwrap();
     // Tiny pause to let any in-flight delivery settle.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // No event ready.
+    // No event ready (live-tail does not replay history; use
+    // `watch_from` for that).
+    let immediate = tokio::time::timeout(Duration::from_millis(50), watch.next()).await;
     assert!(
-        watch.try_recv().is_err(),
-        "late subscriber should NOT see past events; that's JetStream's job"
+        immediate.is_err(),
+        "live-tail subscriber should NOT see past events; that's watch_from's job"
     );
 
     // But future events do flow.
@@ -255,10 +266,7 @@ async fn late_subscriber_does_not_see_history() {
         })
         .await
         .unwrap();
-    let ev = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let ev = next_event(&mut watch).await;
     assert_eq!(ev.key.name, "fresh");
 
     drop(watch);
@@ -269,7 +277,7 @@ async fn late_subscriber_does_not_see_history() {
 #[tokio::test]
 async fn watch_event_resource_version_matches_revision() {
     let store = boot().await;
-    let mut watch = store.watch();
+    let mut watch = store.watch().await.unwrap();
 
     let result = store
         .propose(ResourceCommand::Put {
@@ -279,10 +287,7 @@ async fn watch_event_resource_version_matches_revision() {
         })
         .await
         .unwrap();
-    let ev = tokio::time::timeout(Duration::from_secs(2), watch.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let ev = next_event(&mut watch).await;
     // The WatchEvent.resource_version equals the global MVCC revision
     // stamped on the mutation (decoupled from the Raft log index).
     assert_eq!(ev.resource_version, result.revision);
