@@ -33,9 +33,12 @@ time               = { workspace = true }
 engenho-types      = { workspace = true }
 engenho-store      = { workspace = true }
 engenho-controllers = { workspace = true }
+engenho-kube-proto = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
 reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 serde_urlencoded = "0.7"
 tempfile = "3"
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
