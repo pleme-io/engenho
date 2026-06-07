@@ -24,7 +24,7 @@ use engenho_store::{
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 use crate::meta::ObjectMeta;
 use crate::owner::{owner_ref_for, set_owner_reference};
@@ -108,7 +108,7 @@ impl Controller for EndpointsController {
         "endpoints"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let services = self
             .store
             .list("", "v1", "Service", self.namespace.as_deref())
@@ -188,7 +188,7 @@ impl Controller for EndpointsController {
                 .await?;
             report.objects_changed += 1;
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 
@@ -324,8 +324,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "endpoints"
             }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
+            async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+                Ok(ReconcileReport::default().into())
             }
         }
         assert_eq!(Fake.name(), "endpoints");

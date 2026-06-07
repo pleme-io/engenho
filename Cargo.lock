@@ -1434,6 +1434,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "shigoto-types 0.1.0",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

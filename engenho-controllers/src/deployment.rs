@@ -28,13 +28,12 @@ use engenho_store::{
     resource::ResourceKey,
 };
 use serde_json::{Value, json};
-use tracing::debug;
 
-use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
 use crate::meta::ObjectMeta;
-use crate::owner::{is_owned_by, owner_ref_for, set_owner_reference};
-use crate::status::{observed_generation, write_status_cas};
+use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
+use crate::owner::{owner_ref_for, set_owner_reference};
+use crate::status::observed_generation;
 
 pub struct DeploymentController {
     store: Arc<StoreMesh>,
@@ -114,159 +113,141 @@ impl DeploymentController {
 }
 
 #[async_trait]
-impl Controller for DeploymentController {
+impl OwnedChildrenReconciler for DeploymentController {
     fn name(&self) -> &'static str {
         "deployment"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-        let deployments = self
-            .store
-            .list("apps", "v1", "Deployment", self.namespace.as_deref())
-            .await;
-        let mut report = ReconcileReport::default();
-        report.objects_examined = deployments.len();
+    fn parent_gvk(&self) -> ParentGvk {
+        ParentGvk::new("apps", "v1", "Deployment", "apps/v1")
+    }
 
-        for (d_key, d_value) in &deployments {
-            let Some(uid) = d_value.uid() else {
-                report.objects_skipped += 1;
+    fn child_kinds(&self) -> &'static [ChildKind] {
+        const CHILD_KINDS: &[ChildKind] = &[ChildKind::new("apps", "v1", "ReplicaSet")];
+        CHILD_KINDS
+    }
+
+    fn store(&self) -> &StoreMesh {
+        &self.store
+    }
+
+    fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    async fn reconcile_one(
+        &self,
+        d_value: &Value,
+        owned_rs: &[(ResourceKey, Value)],
+    ) -> Result<ReconcileDelta, ControllerError> {
+        // No template / owner-ref → nothing to do this tick (the parent
+        // is freshly minted; the blanket already skipped no-uid parents).
+        let Some(desired_hash) = Self::template_hash(d_value) else {
+            return Ok(ReconcileDelta::none());
+        };
+        let Some(owner_ref) = owner_ref_for(d_value, "apps/v1", "Deployment") else {
+            return Ok(ReconcileDelta::none());
+        };
+
+        let ns = self.namespace.as_deref();
+        let desired_replicas = d_value.spec_i64("replicas", 1);
+        let mut commands = Vec::new();
+
+        // Scale stale RSes to 0 (revision history retained at replicas=0).
+        for (rs_key, rs_value) in owned_rs {
+            if Self::rs_template_hash(rs_value).as_deref() == Some(&desired_hash) {
                 continue;
-            };
-            let Some(desired_hash) = Self::template_hash(d_value) else {
-                report.objects_skipped += 1;
-                continue;
-            };
-            let Some(owner_ref) = owner_ref_for(d_value, "apps/v1", "Deployment") else {
-                report.objects_skipped += 1;
-                continue;
-            };
-            let ns = d_key.namespace.as_deref();
-            let all_rs = self.store.list("apps", "v1", "ReplicaSet", ns).await;
-            let owned_rs: Vec<&(ResourceKey, Value)> = all_rs
-                .iter()
-                .filter(|(_, r)| is_owned_by(r, uid))
-                .collect();
+            }
+            let current_replicas = rs_value
+                .get("spec")
+                .and_then(|s| s.get("replicas"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if current_replicas != 0 {
+                commands.push(ResourceCommand::Patch {
+                    key: rs_key.clone(),
+                    patch: json!({"spec": {"replicas": 0}}),
+                    expected: None,
+                    reason: Reason::Controller,
+                });
+            }
+        }
 
-            // Look for a current-template RS.
-            let current = owned_rs
-                .iter()
-                .find(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash))
-                .cloned();
-
-            let desired_replicas = d_value.spec_i64("replicas", 1);
-
-            // Scale stale RSes to 0.
-            for (rs_key, rs_value) in &owned_rs {
-                let hash_matches =
-                    Self::rs_template_hash(rs_value).as_deref() == Some(&desired_hash);
-                if hash_matches {
-                    continue;
-                }
+        // Ensure the current-template RS exists + has the right replica
+        // count.
+        let current = owned_rs
+            .iter()
+            .find(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash));
+        match current {
+            Some((rs_key, rs_value)) => {
                 let current_replicas = rs_value
                     .get("spec")
                     .and_then(|s| s.get("replicas"))
-                    .and_then(|n| n.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
-                if current_replicas != 0 {
-                    debug!(rs = %rs_key.label(), "scaling stale RS to 0");
-                    self.store
-                        .propose(ResourceCommand::Patch {
-                            key: (*rs_key).clone(),
-                            patch: json!({"spec": {"replicas": 0}}),
-                            expected: None,
-                            reason: Reason::Controller,
-                        })
-                        .await?;
-                    report.objects_changed += 1;
+                if current_replicas != desired_replicas {
+                    commands.push(ResourceCommand::Patch {
+                        key: rs_key.clone(),
+                        patch: json!({"spec": {"replicas": desired_replicas}}),
+                        expected: None,
+                        reason: Reason::Controller,
+                    });
                 }
             }
-
-            // Ensure the current-template RS exists + has correct replica count.
-            match current {
-                Some((rs_key, rs_value)) => {
-                    let current_replicas = rs_value
-                        .get("spec")
-                        .and_then(|s| s.get("replicas"))
-                        .and_then(|n| n.as_i64())
-                        .unwrap_or(0);
-                    if current_replicas != desired_replicas {
-                        self.store
-                            .propose(ResourceCommand::Patch {
-                                key: rs_key.clone(),
-                                patch: json!({"spec": {"replicas": desired_replicas}}),
-                                expected: None,
-                                reason: Reason::Controller,
-                            })
-                            .await?;
-                        report.objects_changed += 1;
-                    }
-                }
-                None => {
-                    // Create the current-template RS.
-                    let Some((rs_name, mut rs_value)) =
-                        Self::build_replicaset_from(d_value, &desired_hash)
-                    else {
-                        report.objects_skipped += 1;
-                        continue;
-                    };
+            None => {
+                if let Some((rs_name, mut rs_value)) =
+                    Self::build_replicaset_from(d_value, &desired_hash)
+                {
                     set_owner_reference(&mut rs_value, owner_ref.clone());
                     let rs_ns = ns.unwrap_or("default");
                     let rs_key =
                         ResourceKey::namespaced("apps", "v1", "ReplicaSet", rs_ns, &rs_name);
-                    self.store
-                        .propose(ResourceCommand::Put {
-                            key: rs_key,
-                            value: rs_value,
-                            expected: None,
-                            reason: Reason::Controller,
-                        })
-                        .await?;
-                    report.objects_changed += 1;
+                    commands.push(ResourceCommand::Put {
+                        key: rs_key,
+                        value: rs_value,
+                        expected: None,
+                        reason: Reason::Controller,
+                    });
                 }
             }
-
-            // ── Status: aggregate over CURRENT-template owned RS(es) ──
-            // Re-list owned RSes so we read the status the RS controller
-            // wrote (it may have advanced its own .status since the start
-            // of this tick). `replicas`/`ready`/`available` SUM across
-            // every current-template owned RS; `updatedReplicas` is the
-            // current-template RS's replica count (single-template at
-            // M0.1). Source of truth = the live RS status, never a
-            // counter.
-            let fresh_rs = self.store.list("apps", "v1", "ReplicaSet", ns).await;
-            let current_rses: Vec<&Value> = fresh_rs
-                .iter()
-                .filter(|(_, r)| is_owned_by(r, uid))
-                .filter(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash))
-                .map(|(_, r)| r)
-                .collect();
-            let sum = |field: &str| -> i64 {
-                current_rses
-                    .iter()
-                    .map(|r| Self::rs_status_field(r, field))
-                    .sum()
-            };
-            let replicas = sum("replicas");
-            let ready = sum("readyReplicas");
-            let available = sum("availableReplicas");
-            // updatedReplicas == current-template RS replicas (M0.1: a
-            // single current template, so this equals `replicas`).
-            let updated = replicas;
-            let desired_status = json!({
-                "replicas": replicas,
-                "readyReplicas": ready,
-                "availableReplicas": available,
-                "updatedReplicas": updated,
-                "observedGeneration": observed_generation(d_value),
-            });
-            if write_status_cas(&self.store, d_key, d_value, &desired_status)
-                .await?
-                .changed()
-            {
-                report.objects_changed += 1;
-            }
         }
-        Ok(report)
+
+        Ok(ReconcileDelta::from_commands(commands))
+    }
+
+    fn compute_status(
+        &self,
+        d_value: &Value,
+        owned_rs_after: &[(ResourceKey, Value)],
+    ) -> Option<Value> {
+        // Aggregate over CURRENT-template owned RS(es) — read the status
+        // the RS controller wrote. `replicas`/`ready`/`available` SUM
+        // across every current-template owned RS; `updatedReplicas` ==
+        // current-template RS replica count (single template at M0.1, so
+        // it equals `replicas`). Source of truth = the live RS status.
+        let desired_hash = Self::template_hash(d_value)?;
+        let current_rses: Vec<&Value> = owned_rs_after
+            .iter()
+            .filter(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash))
+            .map(|(_, r)| r)
+            .collect();
+        let sum = |field: &str| -> i64 {
+            current_rses
+                .iter()
+                .map(|r| Self::rs_status_field(r, field))
+                .sum()
+        };
+        let replicas = sum("replicas");
+        let ready = sum("readyReplicas");
+        let available = sum("availableReplicas");
+        let updated = replicas;
+        Some(json!({
+            "replicas": replicas,
+            "readyReplicas": ready,
+            "availableReplicas": available,
+            "updatedReplicas": updated,
+            "observedGeneration": observed_generation(d_value),
+        }))
     }
 }
 

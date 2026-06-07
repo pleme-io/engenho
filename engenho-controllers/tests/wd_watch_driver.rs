@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_controllers::{
-    Controller, ControllerError, KindFilter, ReconcileReport, WatchDriver, WatchDriverConfig,
+    Controller, ControllerError, KindFilter, ReconcileOutcome, ReconcileReport, WatchDriver,
+    WatchDriverConfig,
 };
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
@@ -26,10 +27,10 @@ impl Controller for TickCounter {
     fn name(&self) -> &'static str {
         "tick_counter"
     }
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let mut c = self.count.lock().await;
         *c += 1;
-        Ok(ReconcileReport::default())
+        Ok(ReconcileReport::default().into())
     }
 }
 
@@ -240,7 +241,7 @@ impl Controller for TickCounterRef {
     fn name(&self) -> &'static str {
         "tick_counter"
     }
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         self.inner.tick().await
     }
 }

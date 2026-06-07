@@ -27,7 +27,7 @@ use engenho_store::{
 };
 use serde_json::{Value, json};
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 use crate::selector::matches_labels;
 
@@ -104,7 +104,7 @@ impl Controller for PodDisruptionBudgetController {
         "pdb"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let pdbs = self
             .store
             .list(
@@ -179,7 +179,7 @@ impl Controller for PodDisruptionBudgetController {
                 .await?;
             report.objects_changed += 1;
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 
@@ -262,8 +262,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "pdb"
             }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
+            async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+                Ok(ReconcileReport::default().into())
             }
         }
         assert_eq!(F.name(), "pdb");

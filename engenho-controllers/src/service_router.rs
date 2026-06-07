@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 
 /// A single routing entry — one ClusterIP:port → set of pod backends.
@@ -647,7 +647,7 @@ impl Controller for ServiceRoutingController {
         "service_router"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let services = self
             .store
             .list("", "v1", "Service", self.namespace.as_deref())
@@ -704,7 +704,7 @@ impl Controller for ServiceRoutingController {
                 report.objects_changed += 1;
             }
         }
-        Ok(report)
+        Ok(report.into())
     }
 }
 
@@ -965,8 +965,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "service_router"
             }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
+            async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+                Ok(ReconcileReport::default().into())
             }
         }
         assert_eq!(Fake.name(), "service_router");

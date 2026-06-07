@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::controller::{Controller, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
 
 /// Resource scope.
@@ -230,7 +230,7 @@ impl Controller for CrdController {
         "crd"
     }
 
-    async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let crds = self
             .store
             .list(
@@ -294,7 +294,7 @@ impl Controller for CrdController {
             }
         }
 
-        Ok(report)
+        Ok(report.into())
     }
 }
 
@@ -473,8 +473,8 @@ mod tests {
             fn name(&self) -> &'static str {
                 "crd"
             }
-            async fn tick(&self) -> Result<ReconcileReport, ControllerError> {
-                Ok(ReconcileReport::default())
+            async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+                Ok(ReconcileReport::default().into())
             }
         }
         assert_eq!(F.name(), "crd");
