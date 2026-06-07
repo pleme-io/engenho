@@ -44,7 +44,7 @@ async fn boot_store_and_server() -> (Arc<StoreMesh>, ApiServer) {
     let store = boot_store().await;
     let pod_handler: Arc<dyn ResourceHandler> =
         Arc::new(StoreBackedHandler::for_core_kind(store.clone(), "Pod", true));
-    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![pod_handler])
+    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![pod_handler], None)
         .await
         .unwrap();
     (store, server)

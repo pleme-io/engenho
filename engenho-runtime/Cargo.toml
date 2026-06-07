@@ -22,6 +22,7 @@ engenho-apiserver   = { workspace = true }
 engenho-controllers = { workspace = true }
 engenho-scheduler   = { workspace = true }
 engenho-kubelet     = { workspace = true }
+engenho-kube-client = { workspace = true }
 
 serde_json          = { workspace = true }
 thiserror           = { workspace = true }

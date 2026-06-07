@@ -47,6 +47,21 @@ pub enum RuntimeError {
         /// How many strong refs remained when `try_unwrap` failed.
         strong_count: usize,
     },
+
+    /// Failed to build or persist the boot-time kubeconfig
+    /// (`data_dir/kubeconfig`). Carries the emitter / io message.
+    #[error("kubeconfig emission failed: {0}")]
+    Kubeconfig(String),
+
+    /// A filesystem operation while writing the kubeconfig failed.
+    #[error("kubeconfig io error at {path}: {source}")]
+    KubeconfigIo {
+        /// The path the operation targeted.
+        path: std::path::PathBuf,
+        /// The underlying io error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl From<ConfigError> for RuntimeError {

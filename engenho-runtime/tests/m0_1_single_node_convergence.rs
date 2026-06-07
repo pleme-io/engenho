@@ -36,6 +36,9 @@ fn durable_config(data_dir: &std::path::Path) -> EngenhoConfig {
     cfg.runtime.node_name = "node-A".into();
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;
     cfg.runtime.leadership_timeout_seconds = 5;
+    // Plaintext: this suite asserts convergence over http://; the TLS +
+    // kubeconfig path has its own integration test (m0_4_tls_kubectl.rs).
+    cfg.runtime.tls.enabled = false;
     // Every reconciler on.
     cfg.controllers.enable.deployment = true;
     cfg.controllers.enable.replicaset = true;

@@ -64,7 +64,7 @@ async fn admission_mutate_injects_label_into_stored_object() {
 
     let handler: Arc<dyn ResourceHandler> =
         Arc::new(StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain));
-    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![handler])
+    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![handler], None)
         .await
         .unwrap();
     let addr = server.local_addr();
@@ -108,7 +108,7 @@ async fn admission_deny_returns_403_and_commits_nothing() {
 
     let handler: Arc<dyn ResourceHandler> =
         Arc::new(StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain));
-    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![handler])
+    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![handler], None)
         .await
         .unwrap();
     let addr = server.local_addr();
@@ -150,7 +150,7 @@ async fn no_admission_path_is_unaffected() {
     // plain Pod create exactly as before.
     let store = boot_store().await;
     let handlers = handlers_from_catalog(store.clone());
-    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), handlers)
+    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), handlers, None)
         .await
         .unwrap();
     let addr = server.local_addr();

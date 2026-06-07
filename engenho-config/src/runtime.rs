@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use shikumi::TieredConfig;
 
 use crate::error::ConfigError;
+use crate::tls::TlsConfig;
 
 /// Operator-facing kubelet backend choice — config-side mirror of
 /// `engenho_kubelet::KubeletBackendKind`. Lives here so `engenho-config`
@@ -66,6 +67,10 @@ pub struct RuntimeConfig {
     /// How long to wait for raft leadership before the Runtime gives
     /// up at boot. Must be > 0.
     pub leadership_timeout_seconds: u32,
+    /// Apiserver TLS posture (HTTPS + self-generated cluster CA). The
+    /// load-bearing half of local-kubectl compatibility — real kubectl
+    /// refuses a `server: https://…` cluster over plaintext.
+    pub tls: TlsConfig,
 }
 
 impl TieredConfig for RuntimeConfig {
@@ -78,6 +83,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             leadership_timeout_seconds: 0,
+            tls: TlsConfig::bare(),
         }
     }
 
@@ -93,6 +99,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::Podman,
             podman_binary: None,
             leadership_timeout_seconds: 10,
+            tls: TlsConfig::prescribed_default(),
         }
     }
 
@@ -124,6 +131,7 @@ impl TieredConfig for RuntimeConfig {
             } else {
                 self.leadership_timeout_seconds
             },
+            tls: self.tls.extend(&base.tls),
         }
     }
 }
@@ -159,7 +167,28 @@ impl RuntimeConfig {
                 reason: "leadership timeout must be > 0".into(),
             });
         }
+        self.tls.validate()?;
         Ok(())
+    }
+
+    /// The effective CA cert path: explicit `tls.ca_cert_path` or the
+    /// derived `data_dir/pki/ca.crt`.
+    #[must_use]
+    pub fn ca_cert_path(&self) -> PathBuf {
+        self.tls
+            .ca_cert_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("pki").join("ca.crt"))
+    }
+
+    /// The effective CA key path: explicit `tls.ca_key_path` or the
+    /// derived `data_dir/pki/ca.key`.
+    #[must_use]
+    pub fn ca_key_path(&self) -> PathBuf {
+        self.tls
+            .ca_key_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("pki").join("ca.key"))
     }
 }
 
@@ -220,6 +249,7 @@ mod tests {
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             leadership_timeout_seconds: 0,
+            tls: TlsConfig::bare(),
         };
         let base = RuntimeConfig::prescribed_default();
         let merged = overlay.extend(&base);
@@ -238,5 +268,33 @@ mod tests {
     fn backend_kind_serializes_snake_case() {
         let json = serde_json::to_string(&KubeletBackendKind::Fake).unwrap();
         assert_eq!(json, "\"fake\"");
+    }
+
+    #[test]
+    fn prescribed_default_enables_tls() {
+        let cfg = RuntimeConfig::prescribed_default();
+        assert!(cfg.tls.enabled);
+        assert!(cfg.tls.auto_generate);
+    }
+
+    #[test]
+    fn ca_paths_derive_from_data_dir_when_unset() {
+        let mut cfg = RuntimeConfig::prescribed_default();
+        cfg.data_dir = PathBuf::from("/srv/engenho");
+        assert_eq!(
+            cfg.ca_cert_path(),
+            PathBuf::from("/srv/engenho/pki/ca.crt")
+        );
+        assert_eq!(cfg.ca_key_path(), PathBuf::from("/srv/engenho/pki/ca.key"));
+    }
+
+    #[test]
+    fn explicit_ca_paths_override_derived() {
+        let mut cfg = RuntimeConfig::prescribed_default();
+        cfg.data_dir = PathBuf::from("/srv/engenho");
+        cfg.tls.ca_cert_path = Some(PathBuf::from("/custom/ca.crt"));
+        assert_eq!(cfg.ca_cert_path(), PathBuf::from("/custom/ca.crt"));
+        // ca_key still derives (only ca_cert was overridden).
+        assert_eq!(cfg.ca_key_path(), PathBuf::from("/srv/engenho/pki/ca.key"));
     }
 }

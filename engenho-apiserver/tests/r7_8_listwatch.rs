@@ -56,6 +56,7 @@ async fn boot_store_and_server() -> (Arc<StoreMesh>, ApiServer) {
     let server = ApiServer::start(
         "127.0.0.1:0".parse().unwrap(),
         vec![pod_handler, cm_handler],
+        None,
     )
     .await
     .unwrap();

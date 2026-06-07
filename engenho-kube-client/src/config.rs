@@ -139,6 +139,75 @@ pub struct NamedContext {
     pub context: Context,
 }
 
+/// Emit a kubeconfig YAML for an engenho-served cluster.
+///
+/// Builds the typed [`Kubeconfig`] value and serializes it with
+/// `serde_yaml` — a typed AST render, never a hand-rolled YAML string
+/// (per the ★★ TYPED EMISSION rule). Because the emitter and the parser
+/// ([`Kubeconfig::from_yaml`]) share ONE type, emit∘parse round-trips for
+/// free.
+///
+/// **Anonymous over TLS — the M0.4 posture.** The emitted `user` is
+/// `anonymous` with an all-`None` [`AuthInfo`], which
+/// [`Kubeconfig::resolve_connection`] resolves to
+/// [`KubeAuth::Anonymous`](engenho_types::auth::KubeAuth::Anonymous) — no
+/// client credential is emitted. Authn/RBAC is explicitly out of scope at
+/// M0.4 (the apiserver runs a FailOpen admission chain that admits
+/// everything); a later brick adds bearer-token / client-cert auth and
+/// this emitter grows the matching `user` block. TLS is still load-bearing:
+/// kubectl verifies the server's presented cert against `ca_pem`.
+///
+/// * `cluster_name` — the `clusters[].name` + `current-context` value.
+/// * `server_url`   — `https://<host>:<port>`; for a loopback engenho use
+///   `https://127.0.0.1:<bound_port>` so the loopback SAN matches.
+/// * `ca_pem`       — the cluster CA cert PEM (the SAME CA the server cert
+///   chains to); embedded base64-encoded as `certificate-authority-data`.
+///
+/// # Errors
+///
+/// [`KubeError::Encode`] if serde_yaml can't serialize the value (does not
+/// happen for the fixed shape built here, but the typed surface keeps the
+/// fallible contract).
+pub fn emit_kubeconfig(
+    cluster_name: &str,
+    server_url: &str,
+    ca_pem: &[u8],
+) -> Result<String, KubeError> {
+    use base64::Engine as _;
+    let ca_b64 = base64::engine::general_purpose::STANDARD.encode(ca_pem);
+
+    let config = Kubeconfig {
+        api_version: "v1".to_string(),
+        kind: "Config".to_string(),
+        current_context: cluster_name.to_string(),
+        clusters: vec![NamedCluster {
+            name: cluster_name.to_string(),
+            cluster: Cluster {
+                server: server_url.to_string(),
+                certificate_authority_data: Some(ca_b64),
+                certificate_authority: None,
+                insecure_skip_tls_verify: false,
+            },
+        }],
+        users: vec![NamedAuthInfo {
+            name: "anonymous".to_string(),
+            // All-None AuthInfo → resolve_connection yields KubeAuth::Anonymous.
+            user: AuthInfo::default(),
+        }],
+        contexts: vec![NamedContext {
+            name: cluster_name.to_string(),
+            context: Context {
+                cluster: cluster_name.to_string(),
+                user: "anonymous".to_string(),
+                namespace: Some("default".to_string()),
+            },
+        }],
+    };
+
+    serde_yaml::to_string(&config)
+        .map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
+}
+
 impl Kubeconfig {
     /// Parse YAML.
     ///
@@ -348,5 +417,91 @@ contexts: []
         let kc = Kubeconfig::from_yaml(yaml).unwrap();
         let r = kc.resolve_connection();
         assert!(matches!(r, Err(KubeError::Auth(_))));
+    }
+
+    // ── emit_kubeconfig round-trip + anonymous-posture tests ───────────
+
+    const SAMPLE_CA_PEM: &[u8] =
+        b"-----BEGIN CERTIFICATE-----\nMIIBdummyCAcontent==\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn emit_kubeconfig_round_trips_through_parser() {
+        use base64::Engine as _;
+        let yaml = emit_kubeconfig("engenho-local", "https://127.0.0.1:6443", SAMPLE_CA_PEM)
+            .expect("emit");
+        // Parse it BACK with the shared type — emit∘parse identity on the
+        // fields we set.
+        let kc = Kubeconfig::from_yaml(&yaml).expect("parse emitted kubeconfig");
+
+        assert_eq!(kc.api_version, "v1");
+        assert_eq!(kc.kind, "Config");
+        assert_eq!(kc.current_context, "engenho-local");
+        assert_eq!(kc.clusters.len(), 1);
+        let cluster = &kc.clusters[0].cluster;
+        assert!(
+            cluster.server.starts_with("https://"),
+            "server must be https; got {}",
+            cluster.server
+        );
+        assert_eq!(cluster.server, "https://127.0.0.1:6443");
+        // certificate-authority-data decodes back to the input PEM.
+        let cad = cluster
+            .certificate_authority_data
+            .as_ref()
+            .expect("certificate-authority-data present");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(cad)
+            .expect("CA data is valid base64");
+        assert_eq!(decoded, SAMPLE_CA_PEM);
+        // not insecure.
+        assert!(!cluster.insecure_skip_tls_verify);
+    }
+
+    #[test]
+    fn emitted_kubeconfig_resolves_to_anonymous() {
+        // The anonymous `user` block resolves to KubeAuth::Anonymous —
+        // proven directly via `auth_from_user` (the auth resolver the
+        // apiserver's eventual authn will key on). The full
+        // `resolve_connection` (which builds a verifying reqwest Client and
+        // needs a REAL CA cert) is exercised end-to-end by the apiserver's
+        // m0_4 TLS integration test, not here.
+        let yaml =
+            emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
+        let kc = Kubeconfig::from_yaml(&yaml).expect("parse");
+        let resolved = auth_from_user(&kc.users[0].user).expect("resolve auth");
+        assert!(
+            matches!(resolved, KubeAuth::Anonymous),
+            "M0.4 posture is anonymous-over-TLS; got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn emitted_kubeconfig_has_no_client_credential() {
+        // The anonymous posture: NO token, NO client cert/key anywhere.
+        let yaml =
+            emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
+        let kc = Kubeconfig::from_yaml(&yaml).expect("parse");
+        assert_eq!(kc.users.len(), 1);
+        let u = &kc.users[0].user;
+        assert!(u.token.is_none(), "no bearer token in anonymous posture");
+        assert!(u.token_file.is_none());
+        assert!(
+            u.client_certificate_data.is_none() && u.client_certificate.is_none(),
+            "no client cert in anonymous posture"
+        );
+        assert!(
+            u.client_key_data.is_none() && u.client_key.is_none(),
+            "no client key in anonymous posture"
+        );
+        assert!(u.exec.is_none());
+    }
+
+    #[test]
+    fn emitted_kubeconfig_is_valid_yaml() {
+        // serde_yaml round-trips the emitted document (no structural junk).
+        let yaml =
+            emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
+        let _v: serde_yaml::Value =
+            serde_yaml::from_str(&yaml).expect("emitted kubeconfig is valid YAML");
     }
 }

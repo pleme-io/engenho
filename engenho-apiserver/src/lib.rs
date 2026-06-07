@@ -33,8 +33,10 @@
 pub mod discovery;
 pub mod error;
 pub mod handler;
+pub mod health;
 pub mod openapi;
 pub mod params;
+pub mod pki;
 pub mod router;
 pub mod server;
 
@@ -47,10 +49,14 @@ pub use handler::{
     ResourceHandler, StoreBackedHandler, gone_to_api_error, handlers_from_catalog,
     handlers_from_catalog_with_admission,
 };
+pub use health::VersionInfo;
 pub use openapi::ApiDoc;
 pub use params::{
     ListWatchParams, ResumePoint, Selectors, body_precondition, bookmark_line, gvk_ns_matches,
     status_410_line, to_k8s_watch_line,
+};
+pub use pki::{
+    ClusterCa, PkiError, ServerSanInputs, TlsMaterial, issue_server_material, load_or_generate_ca,
 };
 pub use router::{RouterState, build};
 pub use server::{ApiServer, ServerError};
