@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::meta::ObjectMeta;
+
 /// K8s `OwnerReference` shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerReference {
@@ -97,6 +99,31 @@ pub fn is_owned_by(child: &Value, owner_uid: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Build a controller-style [`OwnerReference`] pointing at `parent`
+/// for the given `api_version` + `kind`.
+///
+/// `controller` + `block_owner_deletion` are both `true` — the
+/// standard "this object owns + garbage-collects its child" shape
+/// every workload controller (ReplicaSet→Pod, Deployment→ReplicaSet,
+/// StatefulSet→Pod, Job→Pod, Service→Endpoints) uses. Each controller
+/// passes its own `api_version`/`kind` literals.
+///
+/// Returns `None` when `parent` lacks a `metadata.name` or
+/// `metadata.uid` — a freshly minted parent the apiserver has not
+/// finished stamping; the caller then skips this tick rather than
+/// minting a child with a dangling owner ref.
+#[must_use]
+pub fn owner_ref_for(parent: &Value, api_version: &str, kind: &str) -> Option<OwnerReference> {
+    Some(OwnerReference {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        name: parent.name()?.to_string(),
+        uid: parent.uid()?.to_string(),
+        controller: true,
+        block_owner_deletion: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +201,26 @@ mod tests {
         set_owner_reference(&mut pod, rs_owner());
         assert!(is_owned_by(&pod, "uid-rs-1"));
         assert!(!is_owned_by(&pod, "uid-other"));
+    }
+
+    #[test]
+    fn owner_ref_for_builds_controller_ref() {
+        let parent = json!({"metadata": {"name": "podinfo-abc", "uid": "uid-rs-1"}});
+        let r = owner_ref_for(&parent, "apps/v1", "ReplicaSet").expect("ref");
+        assert_eq!(r.api_version, "apps/v1");
+        assert_eq!(r.kind, "ReplicaSet");
+        assert_eq!(r.name, "podinfo-abc");
+        assert_eq!(r.uid, "uid-rs-1");
+        assert!(r.controller);
+        assert!(r.block_owner_deletion);
+    }
+
+    #[test]
+    fn owner_ref_for_none_without_name_or_uid() {
+        let no_uid = json!({"metadata": {"name": "x"}});
+        assert!(owner_ref_for(&no_uid, "apps/v1", "ReplicaSet").is_none());
+        let no_name = json!({"metadata": {"uid": "u"}});
+        assert!(owner_ref_for(&no_name, "apps/v1", "ReplicaSet").is_none());
     }
 
     #[test]

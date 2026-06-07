@@ -32,7 +32,8 @@ use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
+use crate::meta::ObjectMeta;
+use crate::owner::{is_owned_by, owner_ref_for, set_owner_reference};
 use crate::status::{observed_generation, pod_is_ready, write_status_cas};
 
 /// StatefulSet controller — peer to ReplicaSetController with
@@ -49,41 +50,10 @@ impl StatefulSetController {
         Self { store, namespace }
     }
 
-    fn replicas(sts: &Value) -> i64 {
-        sts.get("spec")
-            .and_then(|s| s.get("replicas"))
-            .and_then(|n| n.as_i64())
-            .unwrap_or(1)
-    }
-
-    fn sts_uid(sts: &Value) -> Option<String> {
-        sts.get("metadata")
-            .and_then(|m| m.get("uid"))
-            .and_then(|u| u.as_str())
-            .map(String::from)
-    }
-
-    fn sts_name(sts: &Value) -> Option<&str> {
-        sts.get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-    }
-
-    fn owner_ref_for(sts: &Value) -> Option<OwnerReference> {
-        Some(OwnerReference {
-            api_version: "apps/v1".into(),
-            kind: "StatefulSet".into(),
-            name: Self::sts_name(sts)?.to_string(),
-            uid: Self::sts_uid(sts)?,
-            controller: true,
-            block_owner_deletion: true,
-        })
-    }
-
     /// Build a Pod from the StatefulSet template at ordinal `i`.
     /// The name is `{sts_name}-{i}` — ordered + persistent.
     fn build_pod(sts: &Value, ordinal: usize) -> Option<(String, Value)> {
-        let sts_name = Self::sts_name(sts)?;
+        let sts_name = sts.name()?;
         let template = sts.get("spec").and_then(|s| s.get("template"))?;
         let mut pod = template.clone();
         let pod_obj = pod.as_object_mut()?;
@@ -123,24 +93,24 @@ impl Controller for StatefulSetController {
         report.objects_examined = sts_list.len();
 
         for (sts_key, sts_value) in &sts_list {
-            let Some(uid) = Self::sts_uid(sts_value) else {
+            let Some(uid) = sts_value.uid() else {
                 report.objects_skipped += 1;
                 continue;
             };
-            let Some(sts_name) = Self::sts_name(sts_value) else {
+            let Some(sts_name) = sts_value.name() else {
                 report.objects_skipped += 1;
                 continue;
             };
-            let Some(owner_ref) = Self::owner_ref_for(sts_value) else {
+            let Some(owner_ref) = owner_ref_for(sts_value, "apps/v1", "StatefulSet") else {
                 report.objects_skipped += 1;
                 continue;
             };
-            let desired = Self::replicas(sts_value).max(0) as usize;
+            let desired = sts_value.spec_i64("replicas", 1).max(0) as usize;
             let ns = sts_key.namespace.as_deref();
             let all_pods = self.store.list("", "v1", "Pod", ns).await;
             let owned: Vec<&(ResourceKey, Value)> = all_pods
                 .iter()
-                .filter(|(_, p)| is_owned_by(p, &uid))
+                .filter(|(_, p)| is_owned_by(p, uid))
                 .collect();
 
             // Map ordinal → existing pod_key for fast lookup.
@@ -201,7 +171,7 @@ impl Controller for StatefulSetController {
             let fresh_pods = self.store.list("", "v1", "Pod", ns).await;
             let owned_now: Vec<&Value> = fresh_pods
                 .iter()
-                .filter(|(_, p)| is_owned_by(p, &uid))
+                .filter(|(_, p)| is_owned_by(p, uid))
                 .map(|(_, p)| p)
                 .collect();
             let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
@@ -243,13 +213,13 @@ mod tests {
     #[test]
     fn replicas_defaults_to_1() {
         let sts = json!({"metadata": {"name": "x"}, "spec": {}});
-        assert_eq!(StatefulSetController::replicas(&sts), 1);
+        assert_eq!(sts.spec_i64("replicas", 1), 1);
     }
 
     #[test]
     fn replicas_reads_spec_field() {
         let sts = json!({"spec": {"replicas": 3}});
-        assert_eq!(StatefulSetController::replicas(&sts), 3);
+        assert_eq!(sts.spec_i64("replicas", 1), 3);
     }
 
     #[test]
@@ -274,7 +244,7 @@ mod tests {
     #[test]
     fn owner_ref_for_constructs_typed_ref() {
         let sts = json!({"metadata": {"name": "web", "uid": "u-1"}});
-        let r = StatefulSetController::owner_ref_for(&sts).unwrap();
+        let r = owner_ref_for(&sts, "apps/v1", "StatefulSet").unwrap();
         assert_eq!(r.kind, "StatefulSet");
         assert_eq!(r.api_version, "apps/v1");
         assert_eq!(r.uid, "u-1");
@@ -284,7 +254,7 @@ mod tests {
     #[test]
     fn owner_ref_none_without_uid() {
         let sts = json!({"metadata": {"name": "web"}});
-        assert!(StatefulSetController::owner_ref_for(&sts).is_none());
+        assert!(owner_ref_for(&sts, "apps/v1", "StatefulSet").is_none());
     }
 
     #[test]

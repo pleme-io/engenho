@@ -26,7 +26,8 @@ use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{OwnerReference, set_owner_reference};
+use crate::meta::ObjectMeta;
+use crate::owner::{owner_ref_for, set_owner_reference};
 use crate::selector::{matches_labels, service_selector};
 
 pub struct EndpointsController {
@@ -38,19 +39,6 @@ impl EndpointsController {
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
         Self { store, namespace }
-    }
-
-    fn service_uid(svc: &Value) -> Option<String> {
-        svc.get("metadata")
-            .and_then(|m| m.get("uid"))
-            .and_then(|u| u.as_str())
-            .map(String::from)
-    }
-
-    fn service_name(svc: &Value) -> Option<&str> {
-        svc.get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
     }
 
     /// Pod's IP from `status.podIP`. Returns None for unbound
@@ -77,21 +65,10 @@ impl EndpointsController {
             .unwrap_or(false)
     }
 
-    fn owner_ref_for(svc: &Value) -> Option<OwnerReference> {
-        Some(OwnerReference {
-            api_version: "v1".into(),
-            kind: "Service".into(),
-            name: Self::service_name(svc)?.to_string(),
-            uid: Self::service_uid(svc)?,
-            controller: true,
-            block_owner_deletion: true,
-        })
-    }
-
     /// Build the Endpoints object body. `addresses` is a typed
     /// list of (ip, target_pod_name) pairs.
     fn build_endpoints(svc: &Value, addresses: Vec<(String, String)>) -> Value {
-        let name = Self::service_name(svc).unwrap_or("");
+        let name = svc.name().unwrap_or("");
         let ports = svc
             .get("spec")
             .and_then(|s| s.get("ports"))
@@ -144,7 +121,7 @@ impl Controller for EndpointsController {
                 report.objects_skipped += 1;
                 continue;
             };
-            let Some(owner_ref) = Self::owner_ref_for(svc_value) else {
+            let Some(owner_ref) = owner_ref_for(svc_value, "v1", "Service") else {
                 report.objects_skipped += 1;
                 continue;
             };
@@ -175,7 +152,7 @@ impl Controller for EndpointsController {
                 "v1",
                 "Endpoints",
                 endpoints_ns,
-                Self::service_name(svc_value).unwrap_or(""),
+                svc_value.name().unwrap_or(""),
             );
 
             // Check if existing Endpoints already matches what we'd write.

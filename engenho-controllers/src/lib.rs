@@ -45,6 +45,7 @@ pub mod gc;
 pub mod hpa;
 pub mod ingress;
 pub mod job;
+pub mod meta;
 pub mod network_policy;
 pub mod owner;
 pub mod pdb;
@@ -107,7 +108,8 @@ pub use network_policy::{
     CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,
     NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,
 };
-pub use owner::{OwnerReference, controlling_owner, is_owned_by, set_owner_reference};
+pub use meta::ObjectMeta;
+pub use owner::{OwnerReference, controlling_owner, is_owned_by, owner_ref_for, set_owner_reference};
 pub use pdb::PodDisruptionBudgetController;
 pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};
 pub use plantio_pipeline::{

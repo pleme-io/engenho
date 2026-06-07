@@ -32,7 +32,8 @@ use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
+use crate::meta::ObjectMeta;
+use crate::owner::{is_owned_by, owner_ref_for, set_owner_reference};
 use crate::status::{observed_generation, write_status_cas};
 
 pub struct DeploymentController {
@@ -44,26 +45,6 @@ impl DeploymentController {
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
         Self { store, namespace }
-    }
-
-    fn deployment_uid(d: &Value) -> Option<String> {
-        d.get("metadata")
-            .and_then(|m| m.get("uid"))
-            .and_then(|u| u.as_str())
-            .map(String::from)
-    }
-
-    fn deployment_name(d: &Value) -> Option<&str> {
-        d.get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-    }
-
-    fn desired_replicas(d: &Value) -> i64 {
-        d.get("spec")
-            .and_then(|s| s.get("replicas"))
-            .and_then(|n| n.as_i64())
-            .unwrap_or(1)
     }
 
     /// Deterministic hash of `spec.template`. Production K8s uses
@@ -84,26 +65,15 @@ impl DeploymentController {
         Some(format!("{hash:016x}").chars().take(10).collect())
     }
 
-    fn owner_ref_for(d: &Value) -> Option<OwnerReference> {
-        Some(OwnerReference {
-            api_version: "apps/v1".into(),
-            kind: "Deployment".into(),
-            name: Self::deployment_name(d)?.to_string(),
-            uid: Self::deployment_uid(d)?,
-            controller: true,
-            block_owner_deletion: true,
-        })
-    }
-
     /// Build a ReplicaSet object from a Deployment + chosen
     /// template hash. The RS's `spec.template` is the
     /// Deployment's; the RS gets the deployment's labels +
     /// a `pod-template-hash` label for kubectl-rollout-friendly
     /// debugging.
     fn build_replicaset_from(d: &Value, hash: &str) -> Option<(String, Value)> {
-        let d_name = Self::deployment_name(d)?;
+        let d_name = d.name()?;
         let template = d.get("spec").and_then(|s| s.get("template"))?.clone();
-        let replicas = Self::desired_replicas(d);
+        let replicas = d.spec_i64("replicas", 1);
         let rs_name = format!("{d_name}-{hash}");
         let value = json!({
             "kind": "ReplicaSet",
@@ -158,7 +128,7 @@ impl Controller for DeploymentController {
         report.objects_examined = deployments.len();
 
         for (d_key, d_value) in &deployments {
-            let Some(uid) = Self::deployment_uid(d_value) else {
+            let Some(uid) = d_value.uid() else {
                 report.objects_skipped += 1;
                 continue;
             };
@@ -166,7 +136,7 @@ impl Controller for DeploymentController {
                 report.objects_skipped += 1;
                 continue;
             };
-            let Some(owner_ref) = Self::owner_ref_for(d_value) else {
+            let Some(owner_ref) = owner_ref_for(d_value, "apps/v1", "Deployment") else {
                 report.objects_skipped += 1;
                 continue;
             };
@@ -174,7 +144,7 @@ impl Controller for DeploymentController {
             let all_rs = self.store.list("apps", "v1", "ReplicaSet", ns).await;
             let owned_rs: Vec<&(ResourceKey, Value)> = all_rs
                 .iter()
-                .filter(|(_, r)| is_owned_by(r, &uid))
+                .filter(|(_, r)| is_owned_by(r, uid))
                 .collect();
 
             // Look for a current-template RS.
@@ -183,7 +153,7 @@ impl Controller for DeploymentController {
                 .find(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash))
                 .cloned();
 
-            let desired_replicas = Self::desired_replicas(d_value);
+            let desired_replicas = d_value.spec_i64("replicas", 1);
 
             // Scale stale RSes to 0.
             for (rs_key, rs_value) in &owned_rs {
@@ -269,7 +239,7 @@ impl Controller for DeploymentController {
             let fresh_rs = self.store.list("apps", "v1", "ReplicaSet", ns).await;
             let current_rses: Vec<&Value> = fresh_rs
                 .iter()
-                .filter(|(_, r)| is_owned_by(r, &uid))
+                .filter(|(_, r)| is_owned_by(r, uid))
                 .filter(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash))
                 .map(|(_, r)| r)
                 .collect();
