@@ -22,6 +22,12 @@ pub enum ApiError {
     ResourceVersionConflict(String),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    /// An admission webhook DENIED the request — the K8s 403 Forbidden
+    /// equivalent. Carries the chain's human-readable deny reason
+    /// (prefixed with the rejecting webhook's name by the
+    /// [`crate::handler::AdmissionChain`]).
+    #[error("admission denied: {0}")]
+    Forbidden(String),
     /// The requested `resourceVersion` resume point has been compacted
     /// away — the K8s 410 Gone / Expired equivalent. The client must
     /// re-LIST + re-WATCH from the fresh list revision. Carries the
@@ -41,6 +47,7 @@ pub enum ErrorKind {
     Conflict,
     ResourceVersionConflict,
     BadRequest,
+    Forbidden,
     Gone,
     Internal,
     StorageError,
@@ -54,6 +61,7 @@ impl ApiError {
             Self::Conflict(_, _) => ErrorKind::Conflict,
             Self::ResourceVersionConflict(_) => ErrorKind::ResourceVersionConflict,
             Self::BadRequest(_) => ErrorKind::BadRequest,
+            Self::Forbidden(_) => ErrorKind::Forbidden,
             Self::Gone(_) => ErrorKind::Gone,
             Self::Internal(_) => ErrorKind::Internal,
             Self::StorageError(_) => ErrorKind::StorageError,
@@ -65,6 +73,7 @@ impl ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_, _) | Self::ResourceVersionConflict(_) => StatusCode::CONFLICT,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Gone(_) => StatusCode::GONE,
             Self::Internal(_) | Self::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -118,6 +127,7 @@ impl IntoResponse for ApiError {
             // create-already-exists "AlreadyExists" above.
             ApiError::ResourceVersionConflict(_) => "Conflict",
             ApiError::BadRequest(_) => "BadRequest",
+            ApiError::Forbidden(_) => "Forbidden",
             ApiError::Gone(_) => "Expired",
             ApiError::Internal(_) => "InternalError",
             ApiError::StorageError(_) => "ServiceUnavailable",
@@ -205,6 +215,17 @@ mod tests {
         assert_eq!(already, "AlreadyExists");
         assert_eq!(cas, "Conflict");
         assert_ne!(already, cas);
+    }
+
+    #[test]
+    fn forbidden_renders_403_forbidden_status() {
+        // Admission Deny → ApiError::Forbidden → HTTP 403 + reason
+        // "Forbidden".
+        let err = ApiError::Forbidden("compliance: image not signed".into());
+        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
+        assert!(matches!(err.kind(), ErrorKind::Forbidden));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

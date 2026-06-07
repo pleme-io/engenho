@@ -4,11 +4,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engenho_apiserver::{ApiServer, handlers_from_catalog};
+use engenho_apiserver::{ApiServer, handlers_from_catalog_with_admission};
 use engenho_config::{EngenhoConfig, KubeletBackendKind as CfgBackendKind};
 use engenho_controllers::{
-    DeploymentController, EndpointsController, GcController, KindFilter, ReplicaSetController,
-    WatchDriver, WatchDriverConfig,
+    DeploymentController, EndpointsController, GcController, JobController, KindFilter,
+    ReplicaSetController, StatefulSetController, WatchDriver, WatchDriverConfig,
+    admission::{AdmissionChain, AdmissionMode},
 };
 use engenho_kubelet::config_bridge::KubeletBackendKind;
 use engenho_kubelet::{ContainerRuntime, Kubelet, make_container_runtime};
@@ -103,7 +104,17 @@ impl Runtime {
                     addr: config.runtime.listen_addr.clone(),
                     source,
                 })?;
-        let apiserver = ApiServer::start(listen_addr, handlers_from_catalog(store.clone())).await?;
+        // Admission chain dispatched on every API-boundary create / patch
+        // / delete. M0.1 starts with an EMPTY chain (admits everything);
+        // the wiring is the load-bearing part — registering a webhook is
+        // now a one-line change. Controller writes (Reason::Controller)
+        // never flow through a handler, so they bypass admission.
+        let admission = Arc::new(AdmissionChain::new(Vec::new(), AdmissionMode::FailOpen));
+        let apiserver = ApiServer::start(
+            listen_addr,
+            handlers_from_catalog_with_admission(store.clone(), admission),
+        )
+        .await?;
         info!(addr = %apiserver.local_addr(), "apiserver bound");
 
         // 6. Spawn the controller / scheduler / kubelet drivers.
@@ -276,6 +287,16 @@ fn spawn_drivers(
             WatchDriver::new(c, store.clone(), driver_config(&["ReplicaSet", "Pod"])).spawn(),
         );
     }
+    if enable.statefulset {
+        let c = StatefulSetController::new(store.clone(), ns.clone());
+        handles.push(
+            WatchDriver::new(c, store.clone(), driver_config(&["StatefulSet", "Pod"])).spawn(),
+        );
+    }
+    if enable.job {
+        let c = JobController::new(store.clone(), ns.clone());
+        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Job", "Pod"])).spawn());
+    }
     if enable.endpoints {
         let c = EndpointsController::new(store.clone(), ns.clone());
         handles.push(
@@ -358,8 +379,9 @@ mod tests {
             node.get("spec").unwrap().get("unschedulable").unwrap(),
             false
         );
-        // Drivers: 4 reconcilers + scheduler + kubelet = 6.
-        assert_eq!(rt.drivers.len(), 6);
+        // Drivers: 6 reconcilers (deployment, replicaset, statefulset,
+        // job, endpoints, gc) + scheduler + kubelet = 8.
+        assert_eq!(rt.drivers.len(), 8);
         rt.shutdown().await.unwrap();
     }
 

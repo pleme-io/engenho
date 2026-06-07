@@ -26,6 +26,7 @@ use tracing::debug;
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
 use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
+use crate::status::{observed_generation, pod_is_ready, write_status_cas};
 
 pub struct ReplicaSetController {
     store: Arc<StoreMesh>,
@@ -129,59 +130,91 @@ impl Controller for ReplicaSetController {
                 .collect();
 
             let observed = owned_pods.len();
-            if observed == desired {
-                continue;
+
+            // ── Child reconcile (create/evict to meet spec.replicas) ──
+            if observed != desired {
+                let Some(owner_ref) = Self::owner_ref_for(rs_value) else {
+                    report.objects_skipped += 1;
+                    continue;
+                };
+
+                if observed < desired {
+                    // Create the difference.
+                    let to_create = desired - observed;
+                    for i in 0..to_create {
+                        // Index from observed+i so consecutive ticks
+                        // don't collide on names. For tests we usually
+                        // start at 0.
+                        let idx = observed + i;
+                        let Some((pod_name, mut pod)) =
+                            Self::build_pod_from_template(rs_value, idx)
+                        else {
+                            report.objects_skipped += 1;
+                            continue;
+                        };
+                        set_owner_reference(&mut pod, owner_ref.clone());
+                        let pod_ns = ns.unwrap_or("default");
+                        let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
+                        self.store
+                            .propose(ResourceCommand::Put {
+                                key: pod_key,
+                                value: pod,
+                                expected: None,
+                                reason: Reason::Controller,
+                            })
+                            .await
+                            .map_err(|e| ControllerError::Store(e.to_string()))?;
+                        report.objects_changed += 1;
+                    }
+                } else {
+                    // observed > desired — evict the excess.
+                    let to_delete = observed - desired;
+                    // Sort owned pods by name for deterministic eviction.
+                    let mut owned_sorted: Vec<&(ResourceKey, Value)> = owned_pods.clone();
+                    owned_sorted.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+                    for (pod_key, _) in owned_sorted.iter().rev().take(to_delete) {
+                        self.store
+                            .propose(ResourceCommand::Delete {
+                                key: (*pod_key).clone(),
+                                expected: None,
+                                reason: Reason::Controller,
+                            })
+                            .await
+                            .map_err(|e| ControllerError::Store(e.to_string()))?;
+                        report.objects_changed += 1;
+                    }
+                }
             }
 
-            let Some(owner_ref) = Self::owner_ref_for(rs_value) else {
-                report.objects_skipped += 1;
-                continue;
-            };
-
-            if observed < desired {
-                // Create the difference.
-                let to_create = desired - observed;
-                for i in 0..to_create {
-                    // Index from observed+i so consecutive ticks
-                    // don't collide on names. For tests we usually
-                    // start at 0.
-                    let idx = observed + i;
-                    let Some((pod_name, mut pod)) = Self::build_pod_from_template(rs_value, idx)
-                    else {
-                        report.objects_skipped += 1;
-                        continue;
-                    };
-                    set_owner_reference(&mut pod, owner_ref.clone());
-                    let pod_ns = ns.unwrap_or("default");
-                    let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
-                    self.store
-                        .propose(ResourceCommand::Put {
-                            key: pod_key,
-                            value: pod,
-                            expected: None,
-                            reason: Reason::Controller,
-                        })
-                        .await
-                        .map_err(|e| ControllerError::Store(e.to_string()))?;
-                    report.objects_changed += 1;
-                }
-            } else {
-                // observed > desired — evict the excess.
-                let to_delete = observed - desired;
-                // Sort owned pods by name for deterministic eviction.
-                let mut owned_sorted: Vec<&(ResourceKey, Value)> = owned_pods.clone();
-                owned_sorted.sort_by(|a, b| a.0.name.cmp(&b.0.name));
-                for (pod_key, _) in owned_sorted.iter().rev().take(to_delete) {
-                    self.store
-                        .propose(ResourceCommand::Delete {
-                            key: (*pod_key).clone(),
-                            expected: None,
-                            reason: Reason::Controller,
-                        })
-                        .await
-                        .map_err(|e| ControllerError::Store(e.to_string()))?;
-                    report.objects_changed += 1;
-                }
+            // ── Status (always; computed from LIVE owned children) ────
+            // Re-list owned pods AFTER the create/evict reconcile so this
+            // tick's own creates/deletes are reflected (the store applies
+            // proposals synchronously). Source of truth = the live pod
+            // set, never a counter the controller increments.
+            // readyReplicas counts pods with a Ready=True condition;
+            // availableReplicas == readyReplicas at M0.1 (no
+            // minReadySeconds); fullyLabeledReplicas == replicas.
+            let fresh_pods = self.store.list("", "v1", "Pod", ns).await;
+            let owned_now: Vec<&Value> = fresh_pods
+                .iter()
+                .filter(|(_, p)| is_owned_by(p, &uid))
+                .map(|(_, p)| p)
+                .collect();
+            let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
+            let ready = i64::try_from(owned_now.iter().filter(|p| pod_is_ready(p)).count())
+                .unwrap_or(i64::MAX);
+            let desired_status = json!({
+                "replicas": replicas,
+                "readyReplicas": ready,
+                "availableReplicas": ready,
+                "fullyLabeledReplicas": replicas,
+                "observedGeneration": observed_generation(rs_value),
+            });
+            if write_status_cas(&self.store, rs_key, rs_value, &desired_status)
+                .await?
+                .changed()
+            {
+                report.objects_changed += 1;
             }
         }
         Ok(report)

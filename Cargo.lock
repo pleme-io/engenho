@@ -1278,6 +1278,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "bytes",
+ "engenho-controllers",
  "engenho-store",
  "engenho-types",
  "futures",

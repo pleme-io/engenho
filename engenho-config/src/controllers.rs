@@ -28,10 +28,23 @@ pub struct ControllerEnable {
     pub replicaset: bool,
     /// Deployment → ReplicaSet controller.
     pub deployment: bool,
+    /// StatefulSet → ordered Pod controller.
+    #[serde(default = "default_true")]
+    pub statefulset: bool,
+    /// Job → Pod-to-completion controller.
+    #[serde(default = "default_true")]
+    pub job: bool,
     /// Service → Endpoints controller.
     pub endpoints: bool,
     /// Owner-reference garbage collector.
     pub gc: bool,
+}
+
+/// serde default for the `statefulset` / `job` toggles — `true` so an
+/// operator YAML written before these flags existed still enables them
+/// (mirrors `prescribed_default`).
+fn default_true() -> bool {
+    true
 }
 
 impl TieredConfig for ControllersConfig {
@@ -40,6 +53,8 @@ impl TieredConfig for ControllersConfig {
             enable: ControllerEnable {
                 replicaset: false,
                 deployment: false,
+                statefulset: false,
+                job: false,
                 endpoints: false,
                 gc: false,
             },
@@ -54,6 +69,8 @@ impl TieredConfig for ControllersConfig {
             enable: ControllerEnable {
                 replicaset: true,
                 deployment: true,
+                statefulset: true,
+                job: true,
                 endpoints: true,
                 gc: true,
             },
@@ -111,6 +128,8 @@ mod tests {
         let cfg = ControllersConfig::prescribed_default();
         assert!(cfg.enable.replicaset);
         assert!(cfg.enable.deployment);
+        assert!(cfg.enable.statefulset);
+        assert!(cfg.enable.job);
         assert!(cfg.enable.endpoints);
         assert!(cfg.enable.gc);
         cfg.validate().unwrap();

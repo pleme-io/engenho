@@ -33,6 +33,7 @@ use tracing::debug;
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
 use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
+use crate::status::{observed_generation, write_status_cas};
 
 pub struct DeploymentController {
     store: Arc<StoreMesh>,
@@ -129,6 +130,16 @@ impl DeploymentController {
             .and_then(|l| l.get("pod-template-hash"))
             .and_then(|h| h.as_str())
             .map(String::from)
+    }
+
+    /// Read an i64 `status.<field>` off a ReplicaSet (the status the RS
+    /// controller wrote), defaulting to 0 — Deployment status aggregates
+    /// these across its current-template RS(es).
+    fn rs_status_field(rs: &Value, field: &str) -> i64 {
+        rs.get("status")
+            .and_then(|s| s.get(field))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
     }
 }
 
@@ -245,6 +256,47 @@ impl Controller for DeploymentController {
                         .map_err(|e| ControllerError::Store(e.to_string()))?;
                     report.objects_changed += 1;
                 }
+            }
+
+            // ── Status: aggregate over CURRENT-template owned RS(es) ──
+            // Re-list owned RSes so we read the status the RS controller
+            // wrote (it may have advanced its own .status since the start
+            // of this tick). `replicas`/`ready`/`available` SUM across
+            // every current-template owned RS; `updatedReplicas` is the
+            // current-template RS's replica count (single-template at
+            // M0.1). Source of truth = the live RS status, never a
+            // counter.
+            let fresh_rs = self.store.list("apps", "v1", "ReplicaSet", ns).await;
+            let current_rses: Vec<&Value> = fresh_rs
+                .iter()
+                .filter(|(_, r)| is_owned_by(r, &uid))
+                .filter(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash))
+                .map(|(_, r)| r)
+                .collect();
+            let sum = |field: &str| -> i64 {
+                current_rses
+                    .iter()
+                    .map(|r| Self::rs_status_field(r, field))
+                    .sum()
+            };
+            let replicas = sum("replicas");
+            let ready = sum("readyReplicas");
+            let available = sum("availableReplicas");
+            // updatedReplicas == current-template RS replicas (M0.1: a
+            // single current template, so this equals `replicas`).
+            let updated = replicas;
+            let desired_status = json!({
+                "replicas": replicas,
+                "readyReplicas": ready,
+                "availableReplicas": available,
+                "updatedReplicas": updated,
+                "observedGeneration": observed_generation(d_value),
+            });
+            if write_status_cas(&self.store, d_key, d_value, &desired_status)
+                .await?
+                .changed()
+            {
+                report.objects_changed += 1;
             }
         }
         Ok(report)

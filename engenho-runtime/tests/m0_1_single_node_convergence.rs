@@ -319,6 +319,107 @@ async fn deployment_posted_over_http_converges_to_running_container() {
 }
 
 #[tokio::test]
+async fn deployment_status_converges_then_reconcile_is_bounded() {
+    // M0.1 item 8 (Part E) — status converges through the autonomous
+    // WatchDriver chain reading REAL children, AND the post-convergence
+    // reconcile is BOUNDED (no unbounded hot-loop): once at the fixpoint,
+    // an idle window with no external mutation advances the store
+    // revision by at most a small bounded constant (0 in steady state).
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = Arc::new(FakeBackend::new());
+    let backend_dyn: Arc<dyn ContainerRuntime> = backend.clone();
+
+    let rt = Runtime::start_with_backend(durable_config(tmp.path()), backend_dyn)
+        .await
+        .expect("Runtime boots");
+    let addr = rt.local_addr();
+    let client = reqwest::Client::new();
+
+    // POST the Deployment.
+    let resp = client
+        .post(format!(
+            "http://{addr}/apis/apps/v1/namespaces/default/deployments"
+        ))
+        .json(&deployment_body())
+        .send()
+        .await
+        .expect("POST deployment");
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    const TIMEOUT: Duration = Duration::from_secs(20);
+    const INTERVAL: Duration = Duration::from_millis(50);
+
+    // The Deployment status converges: observedGeneration matches the
+    // spec-intent generation AND readyReplicas == 2 (proves status was
+    // computed from REAL ready children flowing RS→Pod→kubelet, not a
+    // counter).
+    let converged = poll_until(TIMEOUT, INTERVAL, || async {
+        let dep = http_get(
+            &client,
+            addr,
+            "/apis/apps/v1/namespaces/default/deployments/podinfo",
+        )
+        .await?;
+        let status = dep.get("status")?;
+        let generation = dep.get("metadata")?.get("generation")?.as_i64()?;
+        let observed = status.get("observedGeneration")?.as_i64()?;
+        let ready = status.get("readyReplicas").and_then(|r| r.as_i64()).unwrap_or(0);
+        if observed == generation && ready == 2 {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await;
+    assert!(
+        converged.is_some(),
+        "Deployment .status should converge to observedGeneration==generation + readyReplicas==2"
+    );
+
+    // The RS status also converged (the source of truth the Deployment
+    // aggregates).
+    let rs_ready = poll_until(TIMEOUT, INTERVAL, || async {
+        let items = http_list(
+            &client,
+            addr,
+            "/apis/apps/v1/namespaces/default/replicasets",
+        )
+        .await;
+        let rs = items.into_iter().next()?;
+        let ready = rs.get("status")?.get("readyReplicas")?.as_i64()?;
+        if ready == 2 { Some(()) } else { None }
+    })
+    .await;
+    assert!(rs_ready.is_some(), "RS status.readyReplicas should converge to 2");
+
+    // ── BOUNDED RECONCILE: capture the revision at the fixpoint, idle
+    // past several fallback intervals with NO external mutation, re-read.
+    // The revision must advance by at most a small bounded constant
+    // (steady-state idempotent skip proposes nothing → 0), NEVER climb
+    // monotonically.
+    //
+    // We sample twice across an idle window: rev grows by a bounded
+    // amount (the last in-flight status converging) then STOPS.
+    let store = rt.store();
+    // Let any final in-flight status writes settle.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let rev_a = store.current_catalog().await.revision();
+    // Idle window > 2 fallback intervals (fallback = 1s) with no mutation.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let rev_b = store.current_catalog().await.revision();
+    assert_eq!(
+        rev_a, rev_b,
+        "post-convergence idle reconcile must NOT advance the revision \
+         (idempotent-skip hot-loop defense); rev_a={rev_a}, rev_b={rev_b}"
+    );
+
+    // Drop our store clone BEFORE shutdown — `terminate` needs the sole
+    // strong ref (every driver/handler clone is dropped by shutdown).
+    drop(store);
+    rt.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
 async fn durable_store_resumes_deployment_across_runtime_restart() {
     // Both starts share ONE data_dir in ONE sequential test (not
     // parallel fns) — proves start_or_resume resumption at the Runtime

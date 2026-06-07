@@ -156,6 +156,8 @@ mod tests {
             enable: ControllerEnable {
                 replicaset: true,
                 deployment: true,
+                statefulset: true,
+                job: true,
                 endpoints: true,
                 gc: true,
             },
