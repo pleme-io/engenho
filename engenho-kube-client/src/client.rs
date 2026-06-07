@@ -118,30 +118,17 @@ impl KubeClient for ReqwestKubeClient {
         namespace: Option<&str>,
         opts: &ListOptions,
     ) -> Result<List<R>, KubeError> {
-        let mut url = self.build_url::<R>(namespace, None);
-        let mut qparts: Vec<String> = Vec::new();
-        if !opts.label_selector.is_empty() {
-            qparts.push(format!("labelSelector={}", url_enc(&opts.label_selector)));
-        }
-        if !opts.field_selector.is_empty() {
-            qparts.push(format!("fieldSelector={}", url_enc(&opts.field_selector)));
-        }
-        if let Some(lim) = opts.limit {
-            qparts.push(format!("limit={lim}"));
-        }
-        if let Some(c) = &opts.continue_token {
-            qparts.push(format!("continue={}", url_enc(c)));
-        }
-        if !opts.resource_version.is_empty() {
-            qparts.push(format!(
-                "resourceVersion={}",
-                url_enc(&opts.resource_version)
-            ));
-        }
-        if !qparts.is_empty() {
-            url.push('?');
-            url.push_str(&qparts.join("&"));
-        }
+        let base = self.build_url::<R>(namespace, None);
+        // Typed query composition via url::Url — no `format!()` of
+        // query-string syntax (★★ TYPED EMISSION). Append order +
+        // form-urlencoding match the prior hand-rolled string.
+        let url = crate::url_builder::KubeUrlBuilder::new(&base)?
+            .pair_if_nonempty("labelSelector", &opts.label_selector)
+            .pair_if_nonempty("fieldSelector", &opts.field_selector)
+            .opt_int("limit", opts.limit)
+            .opt_pair("continue", opts.continue_token.as_deref())
+            .pair_if_nonempty("resourceVersion", &opts.resource_version)
+            .finish();
         let rb = self.conn.auth_header(self.conn.http().get(&url))?;
         let resp = rb
             .send()
@@ -221,19 +208,23 @@ impl KubeClient for ReqwestKubeClient {
         name: &str,
         patch: &Patch,
     ) -> Result<R, KubeError> {
-        let mut url = self.build_url::<R>(namespace, Some(name));
-        if let Patch::Apply {
+        let base = self.build_url::<R>(namespace, Some(name));
+        let url = if let Patch::Apply {
             field_manager,
             force,
             ..
         } = patch
         {
-            url.push_str(&format!(
-                "?fieldManager={}{}",
-                url_enc(field_manager),
-                if *force { "&force=true" } else { "" }
-            ));
-        }
+            // Typed query composition (★★ TYPED EMISSION).
+            let mut b =
+                crate::url_builder::KubeUrlBuilder::new(&base)?.pair("fieldManager", field_manager);
+            if *force {
+                b = b.flag("force", "true");
+            }
+            b.finish()
+        } else {
+            base
+        };
         let body = patch
             .body_bytes()
             .map_err(|e| KubeError::Encode(format!("patch body: {e}")))?;
@@ -292,10 +283,6 @@ impl KubeClient for ReqwestKubeClient {
     }
 }
 
-fn url_enc(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,11 +295,8 @@ mod tests {
         let _c = ReqwestKubeClient::new(conn);
     }
 
-    #[test]
-    fn url_enc_round_trips_simple() {
-        assert_eq!(url_enc("foo=bar"), "foo%3Dbar");
-        assert_eq!(url_enc("ns:default"), "ns%3Adefault");
-    }
+    // Query-string urlencoding is now owned by KubeUrlBuilder; see
+    // `url_builder::tests::list_pairs_match_hand_rolled_encoding`.
 
     #[test]
     fn reason_strings_map_to_typed_kinds() {

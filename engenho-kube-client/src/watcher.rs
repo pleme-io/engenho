@@ -45,21 +45,18 @@ impl<R: KubeResource + Send + Sync + 'static> Watcher<R> for ReqwestWatcher<R> {
         resource_version: &str,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent<R>, KubeError>> + Send>>, KubeError>
     {
-        let mut url = format!(
+        let base = format!(
             "{}{}",
             self.conn.server(),
             list_path(R::GVR, R::SCOPE, namespace)
         );
-        let rv_part = if resource_version.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "&resourceVersion={}",
-                url::form_urlencoded::byte_serialize(resource_version.as_bytes())
-                    .collect::<String>()
-            )
-        };
-        url.push_str(&format!("?watch=true{rv_part}"));
+        // Typed query composition via url::Url — no `format!()` of the
+        // `?watch=true&resourceVersion=…` query string (★★ TYPED
+        // EMISSION). Byte-identical to the prior hand-rolled form.
+        let url = crate::url_builder::KubeUrlBuilder::new(&base)?
+            .flag("watch", "true")
+            .pair_if_nonempty("resourceVersion", resource_version)
+            .finish();
         let rb = self.conn.auth_header(self.conn.http().get(&url))?;
         let resp = rb
             .send()
