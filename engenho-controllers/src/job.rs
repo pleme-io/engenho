@@ -37,7 +37,8 @@ use serde_json::{Value, json};
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
+use crate::meta::ObjectMeta;
+use crate::owner::{is_owned_by, owner_ref_for, set_owner_reference};
 use crate::status::{observed_generation, write_status_cas};
 
 // Clock primitives previously defined here have been consolidated to
@@ -76,33 +77,6 @@ impl JobController {
         Self { store, namespace }
     }
 
-    fn job_uid(job: &Value) -> Option<String> {
-        job.get("metadata")
-            .and_then(|m| m.get("uid"))
-            .and_then(|u| u.as_str())
-            .map(String::from)
-    }
-
-    fn job_name(job: &Value) -> Option<&str> {
-        job.get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-    }
-
-    fn completions(job: &Value) -> i64 {
-        job.get("spec")
-            .and_then(|s| s.get("completions"))
-            .and_then(|n| n.as_i64())
-            .unwrap_or(1)
-    }
-
-    fn parallelism(job: &Value) -> i64 {
-        job.get("spec")
-            .and_then(|s| s.get("parallelism"))
-            .and_then(|n| n.as_i64())
-            .unwrap_or(1)
-    }
-
     fn pod_phase_is(pod: &Value, phase: &str) -> bool {
         pod.get("status")
             .and_then(|s| s.get("phase"))
@@ -110,20 +84,9 @@ impl JobController {
             == Some(phase)
     }
 
-    fn owner_ref_for(job: &Value) -> Option<OwnerReference> {
-        Some(OwnerReference {
-            api_version: "batch/v1".into(),
-            kind: "Job".into(),
-            name: Self::job_name(job)?.to_string(),
-            uid: Self::job_uid(job)?,
-            controller: true,
-            block_owner_deletion: true,
-        })
-    }
-
     /// Build a Pod from the Job template + index.
     fn build_pod(job: &Value, idx: usize) -> Option<(String, Value)> {
-        let job_name = Self::job_name(job)?;
+        let job_name = job.name()?;
         let template = job.get("spec").and_then(|s| s.get("template"))?;
         let mut pod = template.clone();
         let pod_obj = pod.as_object_mut()?;
@@ -162,21 +125,21 @@ impl Controller for JobController {
         report.objects_examined = jobs.len();
 
         for (job_key, job_value) in &jobs {
-            let Some(uid) = Self::job_uid(job_value) else {
+            let Some(uid) = job_value.uid() else {
                 report.objects_skipped += 1;
                 continue;
             };
-            let Some(owner_ref) = Self::owner_ref_for(job_value) else {
+            let Some(owner_ref) = owner_ref_for(job_value, "batch/v1", "Job") else {
                 report.objects_skipped += 1;
                 continue;
             };
-            let completions = Self::completions(job_value).max(0) as usize;
-            let parallelism = Self::parallelism(job_value).max(0) as usize;
+            let completions = job_value.spec_i64("completions", 1).max(0) as usize;
+            let parallelism = job_value.spec_i64("parallelism", 1).max(0) as usize;
             let ns = job_key.namespace.as_deref();
             let all_pods = self.store.list("", "v1", "Pod", ns).await;
             let owned: Vec<&(ResourceKey, Value)> = all_pods
                 .iter()
-                .filter(|(_, p)| is_owned_by(p, &uid))
+                .filter(|(_, p)| is_owned_by(p, uid))
                 .collect();
 
             let succeeded = owned
@@ -204,7 +167,7 @@ impl Controller for JobController {
                     let existing_indices: std::collections::BTreeSet<usize> = owned
                         .iter()
                         .filter_map(|(k, _)| {
-                            let job_name = Self::job_name(job_value)?;
+                            let job_name = job_value.name()?;
                             let prefix = format!("{job_name}-");
                             k.name.strip_prefix(&prefix).and_then(|s| s.parse().ok())
                         })
@@ -247,7 +210,7 @@ impl Controller for JobController {
             let fresh_pods = self.store.list("", "v1", "Pod", ns).await;
             let owned_now: Vec<&Value> = fresh_pods
                 .iter()
-                .filter(|(_, p)| is_owned_by(p, &uid))
+                .filter(|(_, p)| is_owned_by(p, uid))
                 .map(|(_, p)| p)
                 .collect();
             let succeeded_now = owned_now
@@ -319,15 +282,9 @@ impl CronJobController {
             .and_then(|n| n.as_u64())
     }
 
-    fn name(cj: &Value) -> Option<&str> {
-        cj.get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-    }
-
     /// Construct a Job from the CronJob's `spec.jobTemplate.spec`.
     fn build_job(cj: &Value, ts: u64) -> Option<(String, Value)> {
-        let cj_name = Self::name(cj)?;
+        let cj_name = cj.name()?;
         let job_spec = cj
             .get("spec")
             .and_then(|s| s.get("jobTemplate"))
@@ -410,19 +367,19 @@ mod tests {
     #[test]
     fn job_completions_defaults_to_1() {
         let j = json!({"spec": {}});
-        assert_eq!(JobController::completions(&j), 1);
+        assert_eq!(j.spec_i64("completions", 1), 1);
     }
 
     #[test]
     fn job_parallelism_defaults_to_1() {
         let j = json!({"spec": {}});
-        assert_eq!(JobController::parallelism(&j), 1);
+        assert_eq!(j.spec_i64("parallelism", 1), 1);
     }
 
     #[test]
     fn job_completions_reads_spec_field() {
         let j = json!({"spec": {"completions": 5}});
-        assert_eq!(JobController::completions(&j), 5);
+        assert_eq!(j.spec_i64("completions", 1), 5);
     }
 
     #[test]
@@ -446,7 +403,7 @@ mod tests {
     #[test]
     fn job_owner_ref_has_batch_v1_api_version() {
         let j = json!({"metadata": {"name": "x", "uid": "u"}});
-        let r = JobController::owner_ref_for(&j).unwrap();
+        let r = owner_ref_for(&j, "batch/v1", "Job").unwrap();
         assert_eq!(r.api_version, "batch/v1");
         assert_eq!(r.kind, "Job");
     }

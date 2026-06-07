@@ -25,7 +25,8 @@ use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
 use crate::error::ControllerError;
-use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
+use crate::meta::ObjectMeta;
+use crate::owner::{is_owned_by, owner_ref_for, set_owner_reference};
 use crate::status::{observed_generation, pod_is_ready, write_status_cas};
 
 pub struct ReplicaSetController {
@@ -40,44 +41,12 @@ impl ReplicaSetController {
         Self { store, namespace }
     }
 
-    fn replicas(rs: &Value) -> i64 {
-        rs.get("spec")
-            .and_then(|s| s.get("replicas"))
-            .and_then(|n| n.as_i64())
-            .unwrap_or(1)
-    }
-
-    fn rs_uid(rs: &Value) -> Option<String> {
-        rs.get("metadata")
-            .and_then(|m| m.get("uid"))
-            .and_then(|u| u.as_str())
-            .map(String::from)
-    }
-
-    fn rs_name(rs: &Value) -> Option<&str> {
-        rs.get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-    }
-
-    /// Build the OwnerReference pointing at this ReplicaSet.
-    fn owner_ref_for(rs: &Value) -> Option<OwnerReference> {
-        Some(OwnerReference {
-            api_version: "apps/v1".into(),
-            kind: "ReplicaSet".into(),
-            name: Self::rs_name(rs)?.to_string(),
-            uid: Self::rs_uid(rs)?,
-            controller: true,
-            block_owner_deletion: true,
-        })
-    }
-
     /// Construct a Pod object from a ReplicaSet's `spec.template`.
     /// Names the Pod `{rs_name}-{index}-{random}`; the index +
     /// random suffix make names deterministic for tests + readable
     /// for operators.
     fn build_pod_from_template(rs: &Value, index: usize) -> Option<(String, Value)> {
-        let rs_name = Self::rs_name(rs)?;
+        let rs_name = rs.name()?;
         let template = rs.get("spec").and_then(|s| s.get("template"))?;
         let mut pod = template.clone();
         // Ensure pod is an object
@@ -114,26 +83,26 @@ impl Controller for ReplicaSetController {
         report.objects_examined = rs_list.len();
 
         for (rs_key, rs_value) in &rs_list {
-            let Some(uid) = Self::rs_uid(rs_value) else {
+            let Some(uid) = rs_value.uid() else {
                 debug!(rs = %rs_key.label(), "skipping RS with no metadata.uid");
                 report.objects_skipped += 1;
                 continue;
             };
-            let desired = Self::replicas(rs_value).max(0) as usize;
+            let desired = rs_value.spec_i64("replicas", 1).max(0) as usize;
             let ns = rs_key.namespace.as_deref();
 
             // Find owned Pods.
             let all_pods = self.store.list("", "v1", "Pod", ns).await;
             let owned_pods: Vec<&(ResourceKey, Value)> = all_pods
                 .iter()
-                .filter(|(_, p)| is_owned_by(p, &uid))
+                .filter(|(_, p)| is_owned_by(p, uid))
                 .collect();
 
             let observed = owned_pods.len();
 
             // ── Child reconcile (create/evict to meet spec.replicas) ──
             if observed != desired {
-                let Some(owner_ref) = Self::owner_ref_for(rs_value) else {
+                let Some(owner_ref) = owner_ref_for(rs_value, "apps/v1", "ReplicaSet") else {
                     report.objects_skipped += 1;
                     continue;
                 };
@@ -197,7 +166,7 @@ impl Controller for ReplicaSetController {
             let fresh_pods = self.store.list("", "v1", "Pod", ns).await;
             let owned_now: Vec<&Value> = fresh_pods
                 .iter()
-                .filter(|(_, p)| is_owned_by(p, &uid))
+                .filter(|(_, p)| is_owned_by(p, uid))
                 .map(|(_, p)| p)
                 .collect();
             let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
@@ -228,13 +197,13 @@ mod tests {
     #[test]
     fn replicas_defaults_to_1() {
         let rs = json!({"metadata": {"name": "rs"}, "spec": {}});
-        assert_eq!(ReplicaSetController::replicas(&rs), 1);
+        assert_eq!(rs.spec_i64("replicas", 1), 1);
     }
 
     #[test]
     fn replicas_reads_spec_field() {
         let rs = json!({"spec": {"replicas": 5}});
-        assert_eq!(ReplicaSetController::replicas(&rs), 5);
+        assert_eq!(rs.spec_i64("replicas", 1), 5);
     }
 
     #[test]
@@ -271,7 +240,7 @@ mod tests {
             "metadata": {"name": "rs1", "uid": "uid-1"},
             "spec": {"replicas": 1}
         });
-        let owner = ReplicaSetController::owner_ref_for(&rs).unwrap();
+        let owner = owner_ref_for(&rs, "apps/v1", "ReplicaSet").unwrap();
         assert_eq!(owner.api_version, "apps/v1");
         assert_eq!(owner.kind, "ReplicaSet");
         assert_eq!(owner.uid, "uid-1");
@@ -282,7 +251,7 @@ mod tests {
     #[test]
     fn owner_ref_for_returns_none_without_uid() {
         let rs = json!({"metadata": {"name": "rs1"}});
-        assert!(ReplicaSetController::owner_ref_for(&rs).is_none());
+        assert!(owner_ref_for(&rs, "apps/v1", "ReplicaSet").is_none());
     }
 
     #[test]

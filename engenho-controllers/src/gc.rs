@@ -17,7 +17,6 @@ use engenho_store::{
     StoreMesh,
     command::{Reason, ResourceCommand},
 };
-use serde_json::Value;
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileReport};
@@ -33,11 +32,6 @@ impl GcController {
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
         Self { store, namespace }
-    }
-
-    /// Returns the controller-owner's UID if `child` has one.
-    fn owner_uid(child: &Value) -> Option<String> {
-        controlling_owner(child).map(|o| o.uid)
     }
 }
 
@@ -77,7 +71,7 @@ impl Controller for GcController {
             let children = self.store.list(group, version, kind, ns).await;
             report.objects_examined += children.len();
             for (key, value) in children {
-                let Some(uid) = Self::owner_uid(&value) else {
+                let Some(uid) = controlling_owner(&value).map(|o| o.uid) else {
                     // No controller-owner — not our problem.
                     continue;
                 };
@@ -126,12 +120,15 @@ mod tests {
     fn owner_uid_returns_controller_uid() {
         let mut pod = json!({"metadata": {"name": "p"}});
         set_owner_reference(&mut pod, owner_ref("uid-123"));
-        assert_eq!(GcController::owner_uid(&pod), Some("uid-123".into()));
+        assert_eq!(
+            controlling_owner(&pod).map(|o| o.uid),
+            Some("uid-123".into())
+        );
     }
 
     #[test]
     fn owner_uid_none_without_owner_ref() {
         let pod = json!({"metadata": {"name": "p"}});
-        assert!(GcController::owner_uid(&pod).is_none());
+        assert!(controlling_owner(&pod).map(|o| o.uid).is_none());
     }
 }
