@@ -44,7 +44,7 @@ pub mod error;
 pub mod kubelet;
 pub mod volume;
 
-pub use backend::{ContainerRuntime, ContainerStatus, FakeBackend, PodmanBackend};
+pub use backend::{ContainerRuntime, ContainerStatus, FakeBackend, PodmanBackend, PullPolicy};
 pub use config_bridge::make_container_runtime;
 pub use error::KubeletError;
 pub use kubelet::Kubelet;

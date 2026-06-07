@@ -11,6 +11,11 @@
 //! network beyond loopback (127.0.0.1:0), durable store in a tempdir
 //! (proves the durable path + the restart-resume seam, not just
 //! ephemeral).
+//!
+//! The REAL-container peer is `m0_2_real_container.rs` (M0.2): same
+//! autonomous chain but driven by the live `PodmanBackend` instead of the
+//! FakeBackend, ignore-gated because it shells to `podman`. This test
+//! stays FakeBackend-only so it runs in CI with no host runtime.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
