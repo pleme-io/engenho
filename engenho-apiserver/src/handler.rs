@@ -154,7 +154,12 @@ pub trait ResourceHandler: Send + Sync + 'static {
         patch: Value,
     ) -> Result<Value, ApiError>;
 
-    async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<(), ApiError>;
+    /// DELETE a resource. Returns the response BODY as the K8s wire
+    /// contract requires — the deleted object when one existed (so kubectl
+    /// can decode + discard it), or a `metav1.Status{status:"Success"}`
+    /// when the name was already absent (idempotent no-op). NEVER `()`:
+    /// an empty body crashes kubectl's `json.Unmarshal([]byte{})`.
+    async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError>;
 
     /// DELETE with an optimistic-concurrency precondition
     /// (`Preconditions.resourceVersion`, surfaced as `?resourceVersion=`).
@@ -162,12 +167,15 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// [`Self::delete`]); `Some(N)` deletes iff the live object's
     /// `mod_revision == N`, else a typed
     /// [`ApiError::ResourceVersionConflict`] (409).
+    ///
+    /// Returns the response BODY (deleted object, or Status-Success when
+    /// the name was absent) — same contract as [`Self::delete`].
     async fn delete_with_precondition(
         &self,
         namespace: Option<&str>,
         name: &str,
         expected: Option<Revision>,
-    ) -> Result<(), ApiError>;
+    ) -> Result<Value, ApiError>;
 
     /// The `apiVersion` string for this kind — `"v1"` for the core
     /// group, `"<group>/<version>"` otherwise.
@@ -706,7 +714,7 @@ impl ResourceHandler for StoreBackedHandler {
         Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
     }
 
-    async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<(), ApiError> {
+    async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
         // Unconditional delete (no precondition). The precondition path
         // is [`Self::delete_with_precondition`], driven by `?resourceVersion=`.
         self.delete_with_precondition(namespace, name, None).await
@@ -717,12 +725,23 @@ impl ResourceHandler for StoreBackedHandler {
         namespace: Option<&str>,
         name: &str,
         expected: Option<Revision>,
-    ) -> Result<(), ApiError> {
+    ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
         // Admission runs at the API boundary BEFORE the store proposal so
         // a policy can block deletes. The Delete body is None; any Mutate
         // value is ignored (delete has no body to rewrite).
         let _ = self.admit(AdmissionAction::Delete, &key, None).await?;
+        // Read the LIVE object BEFORE proposing the delete — this is the
+        // body the K8s DELETE wire returns. The store's `ApplyResult`
+        // carries only op+revision (NOT the removed object — see
+        // engenho-store type_config.rs), so the apiserver captures the
+        // pre-image here. The read-then-delete is two store ops (not atomic
+        // with the CAS); a lost race just means we return the last-read
+        // object, while the CAS precondition is still enforced inside
+        // `propose`. Threading the apply outcome's `Change.prior` back
+        // through `ApplyResult` is a larger store-layer change deferred to
+        // a later brick.
+        let prior = self.store.get(&key).await;
         let result = self
             .store
             .propose(ResourceCommand::Delete {
@@ -735,7 +754,16 @@ impl ResourceHandler for StoreBackedHandler {
         if result.op == ResourceOp::Conflict {
             return Err(self.rv_conflict(name, expected));
         }
-        Ok(())
+        // Return the response BODY:
+        //   * object existed at delete time → the removed object exactly as
+        //     it was, through the SAME `inject_type_meta` path GET uses
+        //     (renders cleanly as json OR protobuf — its GVK is in the pool).
+        //   * object absent (idempotent no-op) → a typed
+        //     `metav1.Status{status:"Success"}`. Never an empty body.
+        match prior {
+            Some(v) => Ok(inject_type_meta(&v, self.api_version(), &self.kind)),
+            None => Ok(crate::error::delete_status_success(name, &self.kind)),
+        }
     }
 }
 

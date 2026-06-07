@@ -34,10 +34,16 @@ async fn boot_store_and_server() -> (Arc<StoreMesh>, ApiServer) {
         "Namespace",
         false,
     ));
+    // apps/v1 Deployment — used by the DELETE protobuf round-trip test
+    // (its GVK resolves cleanly in the kube-proto pool, unlike Status).
+    let deploy_handler: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_kind(store.clone(), "Deployment")
+            .expect("Deployment is a cataloged kind"),
+    );
 
     let server = ApiServer::start(
         "127.0.0.1:0".parse().unwrap(),
-        vec![pod_handler, cm_handler, ns_handler],
+        vec![pod_handler, cm_handler, ns_handler, deploy_handler],
         None,
     )
     .await
@@ -199,6 +205,13 @@ async fn delete_pod_removes_it_from_store() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // The DELETE wire returns a NON-empty typed body (the deleted object).
+    // An empty 200 crashes kubectl's `json.Unmarshal([]byte{})`.
+    let body = resp.bytes().await.unwrap();
+    assert!(
+        !body.is_empty(),
+        "DELETE 200 must carry a non-empty body (empty crashes kubectl)"
+    );
 
     // Subsequent GET should 404.
     let resp = client
@@ -209,6 +222,192 @@ async fn delete_pod_removes_it_from_store() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.shutdown().await.unwrap();
+}
+
+/// DELETE of an existing object with `Accept: application/json` returns
+/// HTTP 200 with a NON-empty body that parses to the deleted object
+/// (apiVersion/kind/metadata.name present). This is the bug the empty-body
+/// DELETE caused: kubectl ran `json.Unmarshal([]byte{})` → "unexpected end
+/// of JSON input". The body MUST be the typed object now.
+#[tokio::test]
+async fn delete_pod_returns_object_json() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({"metadata": {"name": "byebye"}, "spec": {}});
+    client
+        .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .delete(format!("http://{addr}/api/v1/namespaces/default/pods/byebye"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let raw = resp.bytes().await.unwrap();
+    assert!(!raw.is_empty(), "DELETE body must not be empty");
+    let obj: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        obj.get("metadata").unwrap().get("name").unwrap(),
+        "byebye",
+        "DELETE returns the deleted object"
+    );
+    assert_eq!(obj.get("kind").unwrap(), "Pod");
+    assert_eq!(obj.get("apiVersion").unwrap(), "v1");
+
+    server.shutdown().await.unwrap();
+}
+
+/// DELETE of an existing apps/v1 Deployment with
+/// `Accept: application/vnd.kubernetes.protobuf,application/json` returns
+/// HTTP 200 with `Content-Type: application/vnd.kubernetes.protobuf` and a
+/// non-empty body that round-trips through the kube-proto decoder back to
+/// the deleted object. Proves the protobuf branch of `render_object` fires
+/// for DELETE (the object GVK resolves cleanly in the proto pool).
+#[tokio::test]
+async fn delete_returns_object_protobuf() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": { "name": "web" },
+        "spec": {}
+    });
+    let created = client
+        .post(format!(
+            "http://{addr}/apis/apps/v1/namespaces/default/deployments"
+        ))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    let resp = client
+        .delete(format!(
+            "http://{addr}/apis/apps/v1/namespaces/default/deployments/web"
+        ))
+        .header(
+            "Accept",
+            "application/vnd.kubernetes.protobuf,application/json",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/vnd.kubernetes.protobuf"),
+        "DELETE honors the protobuf Accept for an existing object"
+    );
+    let raw = resp.bytes().await.unwrap();
+    assert!(!raw.is_empty(), "protobuf DELETE body must not be empty");
+    let decoded = engenho_kube_proto::decode_protobuf(&raw)
+        .expect("DELETE protobuf body round-trips");
+    assert_eq!(
+        decoded.get("metadata").unwrap().get("name").unwrap(),
+        "web",
+        "decoded protobuf is the deleted Deployment"
+    );
+    assert_eq!(decoded.get("kind").unwrap(), "Deployment");
+    assert_eq!(decoded.get("apiVersion").unwrap(), "apps/v1");
+
+    server.shutdown().await.unwrap();
+}
+
+/// DELETE of a never-created name returns HTTP 200 with a non-empty body
+/// that parses to a `metav1.Status{status:"Success"}` (idempotent no-op,
+/// matching the store's NoOp semantics). Proves the no-object branch is
+/// typed and non-empty, not an empty 200 that crashes kubectl.
+#[tokio::test]
+async fn delete_absent_returns_status_success_json() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!(
+            "http://{addr}/api/v1/namespaces/default/configmaps/ghost"
+        ))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let raw = resp.bytes().await.unwrap();
+    assert!(
+        !raw.is_empty(),
+        "absent-DELETE body must not be empty (empty crashes kubectl)"
+    );
+    let obj: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(obj.get("kind").unwrap(), "Status");
+    assert_eq!(obj.get("status").unwrap(), "Success");
+    assert_eq!(
+        obj.get("details").unwrap().get("name").unwrap(),
+        "ghost",
+        "Status-Success names the target"
+    );
+    assert_eq!(
+        obj.get("details").unwrap().get("kind").unwrap(),
+        "ConfigMap"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+/// DELETE with a stale `?resourceVersion=` precondition still returns the
+/// typed 409 Conflict — unchanged by the DELETE-body fix.
+#[tokio::test]
+async fn delete_with_stale_resource_version_conflicts() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({"metadata": {"name": "cas"}, "spec": {}});
+    let created = client
+        .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let created: serde_json::Value = created.json().await.unwrap();
+    let rv: u64 = created
+        .get("metadata")
+        .unwrap()
+        .get("resourceVersion")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // A resourceVersion that cannot match the live object's mod_revision
+    // (well above it — no future delete will bump the pod's rv here).
+    let stale = rv + 1000;
+
+    let resp = client
+        .delete(format!(
+            "http://{addr}/api/v1/namespaces/default/pods/cas?resourceVersion={stale}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let obj: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(obj.get("kind").unwrap(), "Status");
+    assert_eq!(obj.get("reason").unwrap(), "Conflict");
 
     server.shutdown().await.unwrap();
 }
