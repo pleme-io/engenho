@@ -131,10 +131,17 @@ pub fn get_namespaced_resource() {}
     params(
         ("ns" = String, Path, description = "Namespace"),
         ("plural" = String, Path, description = "Resource plural"),
+        ("watch" = Option<bool>, Query, description = "Stream changes as newline-delimited WatchEvents instead of returning a list"),
+        ("resourceVersion" = Option<String>, Query, description = "Resume point. Absent/\"0\" = most recent (no replay); \"N\" = replay changes after revision N then live"),
+        ("labelSelector" = Option<String>, Query, description = "Comma-separated k=v label equality selectors"),
+        ("fieldSelector" = Option<String>, Query, description = "Comma-separated field selectors (metadata.name, metadata.namespace)"),
+        ("allowWatchBookmarks" = Option<bool>, Query, description = "Opt into periodic BOOKMARK progress events (default true)"),
     ),
     responses(
-        (status = 200, description = "List of resources", body = K8sResourceList),
+        (status = 200, description = "List of resources (or, with watch=true, a chunked WatchEvent stream)", body = K8sResourceList),
+        (status = 400, description = "Malformed resourceVersion or selector", body = K8sStatus),
         (status = 404, description = "Unknown kind", body = K8sStatus),
+        (status = 410, description = "resourceVersion compacted away (re-list + re-watch)", body = K8sStatus),
     ),
     tag = "namespaced"
 )]
@@ -208,10 +215,19 @@ pub fn get_cluster_scoped_resource() {}
 #[utoipa::path(
     get,
     path = "/api/v1/{plural}",
-    params(("plural" = String, Path, description = "Cluster-scoped resource plural")),
+    params(
+        ("plural" = String, Path, description = "Cluster-scoped resource plural"),
+        ("watch" = Option<bool>, Query, description = "Stream changes as newline-delimited WatchEvents instead of returning a list"),
+        ("resourceVersion" = Option<String>, Query, description = "Resume point. Absent/\"0\" = most recent (no replay); \"N\" = replay changes after revision N then live"),
+        ("labelSelector" = Option<String>, Query, description = "Comma-separated k=v label equality selectors"),
+        ("fieldSelector" = Option<String>, Query, description = "Comma-separated field selectors (metadata.name, metadata.namespace)"),
+        ("allowWatchBookmarks" = Option<bool>, Query, description = "Opt into periodic BOOKMARK progress events (default true)"),
+    ),
     responses(
-        (status = 200, description = "List of resources", body = K8sResourceList),
+        (status = 200, description = "List of resources (or, with watch=true, a chunked WatchEvent stream)", body = K8sResourceList),
+        (status = 400, description = "Malformed resourceVersion or selector", body = K8sStatus),
         (status = 404, description = "Unknown kind", body = K8sStatus),
+        (status = 410, description = "resourceVersion compacted away (re-list + re-watch)", body = K8sStatus),
     ),
     tag = "cluster-scoped"
 )]

@@ -312,7 +312,12 @@ impl StoreMesh {
     }
 
     /// List resources matching (group, version, kind), optionally
-    /// namespace-scoped.
+    /// namespace-scoped — dropping the snapshot revision.
+    ///
+    /// Thin wrapper over [`Self::list_at_revision`]: callers that need
+    /// the atomic list-then-watch resume point MUST use that instead.
+    /// This method exists for the (rare) callers that only want the
+    /// items.
     pub async fn list(
         &self,
         group: &str,
@@ -320,11 +325,39 @@ impl StoreMesh {
         kind: &str,
         namespace: Option<&str>,
     ) -> Vec<(ResourceKey, ResourceValue)> {
+        self.list_at_revision(group, version, kind, namespace)
+            .await
+            .0
+    }
+
+    /// List resources matching (group, version, kind), optionally
+    /// namespace-scoped, AND the snapshot [`Revision`] captured from
+    /// the SAME catalog clone — atomically.
+    ///
+    /// This is the atomic list-then-watch primitive the apiserver
+    /// builds its `LIST` envelope on. Both the items and `rev` come from
+    /// ONE `current_catalog()` clone: within that clone `cat.list(...)`
+    /// and `cat.revision()` are a consistent snapshot of each other. A
+    /// client that LISTs at the returned `rev` then `watch_from(rev)`
+    /// resumes from exactly that snapshot boundary — gap-free + dup-free.
+    ///
+    /// Returns `current_revision` (the dense MVCC counter the watch
+    /// backend keys on), NEVER `last_applied_index` (the Raft log
+    /// index) — the latter is the load-bearing bug item 4 fixes.
+    pub async fn list_at_revision(
+        &self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> (Vec<(ResourceKey, ResourceValue)>, crate::revision::Revision) {
         let cat = self.store.current_catalog().await;
-        cat.list(group, version, kind, namespace)
+        let items = cat
+            .list(group, version, kind, namespace)
             .into_iter()
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect();
+        (items, cat.revision())
     }
 
     /// Read-only snapshot of the whole catalog.
