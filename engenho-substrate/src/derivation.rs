@@ -42,66 +42,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-/// BLAKE3 hash of a derivation's canonical encoding. Newtype so the
-/// type system distinguishes "this is a drv hash" from "this is a
-/// NAR hash" — different things, both BLAKE3, easy to confuse.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct DrvHash(pub [u8; 32]);
-
-impl DrvHash {
-    /// New from raw bytes.
-    #[must_use]
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Compute from arbitrary bytes via BLAKE3.
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self(*blake3::hash(bytes).as_bytes())
-    }
-
-    /// Lowercase hex representation (64 chars).
-    #[must_use]
-    pub fn to_hex(&self) -> String {
-        hex_encode(&self.0)
-    }
+crate::define_hash_newtype! {
+    /// BLAKE3 hash of a derivation's canonical encoding. Newtype so the
+    /// type system distinguishes "this is a drv hash" from "this is a
+    /// NAR hash" — different things, both BLAKE3, easy to confuse.
+    DrvHash
 }
 
-impl std::fmt::Display for DrvHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_hex())
-    }
-}
-
-/// BLAKE3 hash of a NAR's bytes. Sibling type to [`DrvHash`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct NarHash(pub [u8; 32]);
-
-impl NarHash {
-    /// New from raw bytes.
-    #[must_use]
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Compute from NAR bytes.
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self(*blake3::hash(bytes).as_bytes())
-    }
-
-    /// Lowercase hex representation.
-    #[must_use]
-    pub fn to_hex(&self) -> String {
-        hex_encode(&self.0)
-    }
-}
-
-impl std::fmt::Display for NarHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_hex())
-    }
+crate::define_hash_newtype! {
+    /// BLAKE3 hash of a NAR's bytes. Sibling type to [`DrvHash`].
+    NarHash
 }
 
 /// Typed `/nix/store/{hash}-{name}` path. The hash here is the
@@ -420,12 +370,13 @@ impl DerivationCacheBackend for MemoryDerivationCache {
 // Helpers
 // =================================================================
 
-// hex_encode helper extracted to crate::hex per PRIME DIRECTIVE.
-use crate::hex::hex_encode;
+// hex_encode helper extracted to crate::hex per PRIME DIRECTIVE;
+// DrvHash / NarHash now go through `define_hash_newtype!`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hex::hex_encode;
 
     fn sample_drv() -> Drv {
         let hash = DrvHash::from_bytes(b"sample-drv");

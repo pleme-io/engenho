@@ -35,6 +35,7 @@ pub mod error_kind;
 pub mod fake_shell;
 pub mod fingerprint;
 pub mod gossip_ledger;
+pub mod hash_newtype;
 pub mod hex;
 pub mod ledger;
 pub mod linhagem_aberta;
@@ -82,6 +83,9 @@ pub use fingerprint::{Fingerprint, fingerprint_blake3};
 pub use gossip_ledger::{
     FakeGossipTransport, GossipBroadcast, GossipBroadcaster, GossipChannel, GossipDelivery,
     GossipError, GossipLedger,
+};
+pub use hash_newtype::{
+    HashNewtypeError, hex_full, hex_prefix, parse_hex_32_padded, parse_hex_32_strict,
 };
 pub use hex::{Hex, hex_encode};
 pub use ledger::{LedgerError, LedgerKey, MaterializationLedger, MemoryLedger};
