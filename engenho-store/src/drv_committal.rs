@@ -45,7 +45,7 @@ pub fn drv_resource_key(drv: &Drv, namespace: &str) -> ResourceKey {
         DRV_VERSION,
         DRV_KIND,
         namespace,
-        &drv.drv_hash.to_hex(),
+        drv.drv_hash.to_hex(),
     )
 }
 
