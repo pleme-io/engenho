@@ -307,17 +307,17 @@ impl FjallStore {
     /// [`WatchGone::CompactedTooOld`] when `opts.from` is below the
     /// compaction watermark (no channel is allocated).
     pub async fn watch_from(&self, opts: WatchOpts) -> Result<WatchStream, WatchGone> {
-        let (stream, replay_sender, replay) = {
-            let mut state = self.inner.state.lock().await;
-            let replay = state
-                .catalog
-                .changes_since(opts.from)
-                .map_err(WatchGone::from)?;
-            let boundary = state.catalog.revision();
-            state.watchers.register_captured(replay, boundary, &opts)
-        };
-        tokio::spawn(replay_sender.feed(replay));
-        Ok(stream)
+        // Registration enqueues the replay IN REVISION ORDER before the
+        // handle is reachable by `fan_change` — all under THIS lock, so
+        // the replay→live handoff is atomic AND structurally ordered (no
+        // feeder task, no second producer racing apply).
+        let mut state = self.inner.state.lock().await;
+        let replay = state
+            .catalog
+            .changes_since(opts.from)
+            .map_err(WatchGone::from)?;
+        let boundary = state.catalog.revision();
+        Ok(state.watchers.register_captured(replay, boundary, &opts))
     }
 
     /// Subscribe to the LIVE-TAIL watch stream (compatibility shim over
