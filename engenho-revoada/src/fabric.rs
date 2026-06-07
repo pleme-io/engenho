@@ -223,6 +223,15 @@ pub enum FabricStrategyError {
     QuorumTooSmall(u32),
 }
 
+engenho_substrate::impl_error_kind! {
+    FabricStrategyError {
+        ZeroReconciliationCadence => "zero_reconciliation_cadence",
+        { DetectorOutpacesReconciliation { .. } } => "detector_outpaces_reconciliation",
+        (EvenQuorum(_)) => "even_quorum",
+        (QuorumTooSmall(_)) => "quorum_too_small",
+    }
+}
+
 impl FabricStrategy {
     /// Prove the two fabric-level liveness theorems hold for this
     /// strategy. Returns `Ok` iff:

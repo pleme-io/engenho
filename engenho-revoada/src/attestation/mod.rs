@@ -119,6 +119,18 @@ pub enum AttestationError {
     Empty,
 }
 
+engenho_substrate::impl_error_kind! {
+    AttestationError {
+        { BrokenLink { .. } } => "broken_link",
+        { InvalidLeaderSignature { .. } } => "invalid_leader_signature",
+        { InvalidWitnessSignature { .. } } => "invalid_witness_signature",
+        InvalidGenesis => "invalid_genesis",
+        (InvalidPublicKey(_)) => "invalid_public_key",
+        (BadSignature(_)) => "bad_signature",
+        Empty => "empty",
+    }
+}
+
 /// In-memory append-only chain of attestation blocks.
 #[derive(Clone, Default)]
 pub struct AttestationChain {

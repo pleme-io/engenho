@@ -45,7 +45,7 @@ pub enum PkiError {
 
     /// rcgen failed to generate, parse, or sign a certificate / key.
     #[error("pki crypto error: {0}")]
-    Crypto(#[source] rcgen::Error),
+    Crypto(#[from] rcgen::Error),
 
     /// A SAN entry (DNS name) was not a valid IA5 string.
     #[error("invalid SAN {value:?}: {source}")]
@@ -58,9 +58,11 @@ pub enum PkiError {
     },
 }
 
-impl From<rcgen::Error> for PkiError {
-    fn from(e: rcgen::Error) -> Self {
-        Self::Crypto(e)
+engenho_substrate::impl_error_kind! {
+    PkiError {
+        { Io { .. } } => "io",
+        (Crypto(_)) => "crypto",
+        { San { .. } } => "san",
     }
 }
 

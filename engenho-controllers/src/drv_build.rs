@@ -270,8 +270,7 @@ impl Controller for DrvBuildController {
                             expected: None,
                             reason: Reason::Controller,
                         })
-                        .await
-                        .map_err(|se| ControllerError::Store(se.to_string()))?;
+                        .await?;
                     report.objects_changed += 1;
                     continue;
                 }

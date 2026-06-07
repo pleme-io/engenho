@@ -50,5 +50,17 @@ pub enum FonteError {
     Abort,
 }
 
+engenho_substrate::impl_error_kind! {
+    FonteError {
+        (Watch(_)) => "watch",
+        (Eval(_)) => "eval",
+        (Propose(_)) => "propose",
+        (Attest(_)) => "attest",
+        (Publish(_)) => "publish",
+        { Budget { .. } } => "budget",
+        Abort => "abort",
+    }
+}
+
 /// Convenience alias for the result type used throughout the crate.
 pub type FonteResult<T> = Result<T, FonteError>;

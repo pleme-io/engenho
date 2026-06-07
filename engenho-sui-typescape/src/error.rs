@@ -43,3 +43,12 @@ pub enum TypescapeError {
         reason: String,
     },
 }
+
+engenho_substrate::impl_error_kind! {
+    TypescapeError {
+        { VariantMismatch { .. } } => "variant_mismatch",
+        (MissingAttr(_)) => "missing_attr",
+        { Cardinality { .. } } => "cardinality",
+        { Invariant { .. } } => "invariant",
+    }
+}

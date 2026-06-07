@@ -285,8 +285,7 @@ impl Controller for HorizontalPodAutoscalerController {
                     expected: None,
                     reason: Reason::Controller,
                 })
-                .await
-                .map_err(|e| ControllerError::Store(e.to_string()))?;
+                .await?;
             report.objects_changed += 1;
         }
         Ok(report)

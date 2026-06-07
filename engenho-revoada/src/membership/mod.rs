@@ -179,6 +179,14 @@ pub enum MembershipError {
     Invalid(String),
 }
 
+engenho_substrate::impl_error_kind! {
+    MembershipError {
+        (StartFailed(_)) => "start_failed",
+        (Encode(_)) => "encode",
+        (Invalid(_)) => "invalid",
+    }
+}
+
 /// Wraps a running chitchat instance + a derived `MembershipView`
 /// watcher that subscribers can clone to react to membership
 /// changes.

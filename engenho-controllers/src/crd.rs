@@ -274,8 +274,7 @@ impl Controller for CrdController {
                         expected: None,
                         reason: Reason::Controller,
                     })
-                    .await
-                    .map_err(|e| ControllerError::Store(e.to_string()))?;
+                    .await?;
             }
         }
 

@@ -82,6 +82,20 @@ pub enum KubeError {
     Other(String),
 }
 
+engenho_substrate::impl_error_kind! {
+    KubeError {
+        (Network(_)) => "network",
+        { ApiStatus { .. } } => "api_status",
+        (Decode(_)) => "decode",
+        (Encode(_)) => "encode",
+        (Auth(_)) => "auth",
+        WatchClosed => "watch_closed",
+        (ResourceVersionExpired(_)) => "resource_version_expired",
+        (NotFound(_)) => "not_found",
+        (Other(_)) => "other",
+    }
+}
+
 /// Classification of an apiserver Status response. Mirrors the
 /// upstream `metav1.StatusReason` constants but condensed to the
 /// variants the substrate actually decides on.

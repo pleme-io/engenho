@@ -3,7 +3,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum ControllerError {
     #[error("store error during reconcile: {0}")]
-    Store(String),
+    Store(#[from] engenho_store::StoreError),
 
     #[error("invalid resource: {0}")]
     InvalidResource(String),
@@ -27,7 +27,10 @@ mod tests {
     #[test]
     fn error_kind_is_stable() {
         for (e, k) in [
-            (ControllerError::Store("x".into()), "store"),
+            (
+                ControllerError::Store(engenho_store::StoreError::ClientWriteFailed("x".into())),
+                "store",
+            ),
             (
                 ControllerError::InvalidResource("x".into()),
                 "invalid_resource",

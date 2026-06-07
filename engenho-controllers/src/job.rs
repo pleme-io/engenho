@@ -193,8 +193,7 @@ impl Controller for JobController {
                                 expected: None,
                                 reason: Reason::Controller,
                             })
-                            .await
-                            .map_err(|e| ControllerError::Store(e.to_string()))?;
+                            .await?;
                         report.objects_changed += 1;
                         to_create -= 1;
                         idx += 1;
@@ -339,8 +338,7 @@ impl Controller for CronJobController {
                     expected: None,
                     reason: Reason::Controller,
                 })
-                .await
-                .map_err(|e| ControllerError::Store(e.to_string()))?;
+                .await?;
             // Patch CronJob status with lastRunUnix.
             self.store
                 .propose(ResourceCommand::Patch {
@@ -349,8 +347,7 @@ impl Controller for CronJobController {
                     expected: None,
                     reason: Reason::Controller,
                 })
-                .await
-                .map_err(|e| ControllerError::Store(e.to_string()))?;
+                .await?;
             report.objects_changed += 2;
         }
         Ok(report)
