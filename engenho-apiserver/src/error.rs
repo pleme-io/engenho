@@ -14,6 +14,12 @@ pub enum ApiError {
     Conflict(String, String),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    /// The requested `resourceVersion` resume point has been compacted
+    /// away — the K8s 410 Gone / Expired equivalent. The client must
+    /// re-LIST + re-WATCH from the fresh list revision. Carries the
+    /// human-readable message rendered into the `Status` body.
+    #[error("{0}")]
+    Gone(String),
     #[error("internal error: {0}")]
     Internal(String),
     #[error("storage error: {0}")]
@@ -26,6 +32,7 @@ pub enum ErrorKind {
     NotFound,
     Conflict,
     BadRequest,
+    Gone,
     Internal,
     StorageError,
 }
@@ -37,6 +44,7 @@ impl ApiError {
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Conflict(_, _) => ErrorKind::Conflict,
             Self::BadRequest(_) => ErrorKind::BadRequest,
+            Self::Gone(_) => ErrorKind::Gone,
             Self::Internal(_) => ErrorKind::Internal,
             Self::StorageError(_) => ErrorKind::StorageError,
         }
@@ -47,11 +55,16 @@ impl ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_, _) => StatusCode::CONFLICT,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Gone(_) => StatusCode::GONE,
             Self::Internal(_) | Self::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
 
+/// A typed K8s `Status` object. The single render surface for every
+/// failure body — both the [`IntoResponse`] path (a real HTTP error)
+/// and the in-band watch-stream 410 line (`params::status_410_line`)
+/// build their JSON through this struct, never `format!()` of JSON.
 #[derive(Serialize)]
 struct K8sStatus {
     kind: &'static str,
@@ -59,8 +72,29 @@ struct K8sStatus {
     api_version: &'static str,
     status: &'static str,
     code: u16,
-    reason: &'static str,
+    reason: String,
     message: String,
+}
+
+/// Build a typed K8s `Status` value (`{kind:"Status",apiVersion:"v1",
+/// status:"Failure",code,reason,message}`) as `serde_json::Value`.
+///
+/// Used by the watch streaming path to emit an in-band terminal Status
+/// object (e.g. the mid-stream 410 Expired) — the response is already
+/// HTTP 200, so the per-event status is carried in-band, matching
+/// kube-apiserver's long-poll watch behavior.
+#[must_use]
+pub fn status_object(message: String, code: u16, reason: &str) -> serde_json::Value {
+    let status = K8sStatus {
+        kind: "Status",
+        api_version: "v1",
+        status: "Failure",
+        code,
+        reason: reason.to_string(),
+        message,
+    };
+    // Infallible for this concrete struct.
+    serde_json::to_value(status).unwrap_or(serde_json::Value::Null)
 }
 
 impl IntoResponse for ApiError {
@@ -70,6 +104,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(_) => "NotFound",
             ApiError::Conflict(_, _) => "AlreadyExists",
             ApiError::BadRequest(_) => "BadRequest",
+            ApiError::Gone(_) => "Expired",
             ApiError::Internal(_) => "InternalError",
             ApiError::StorageError(_) => "ServiceUnavailable",
         };
@@ -78,7 +113,7 @@ impl IntoResponse for ApiError {
             api_version: "v1",
             status: "Failure",
             code: code.as_u16(),
-            reason,
+            reason: reason.to_string(),
             message: self.to_string(),
         };
         (code, Json(payload)).into_response()
@@ -119,5 +154,18 @@ mod tests {
             ApiError::StorageError("x".into()).kind(),
             ErrorKind::StorageError
         ));
+        assert!(matches!(
+            ApiError::Gone("x".into()).kind(),
+            ErrorKind::Gone
+        ));
+    }
+
+    #[test]
+    fn gone_renders_410_expired_status() {
+        // CompactedTooOld → ApiError::Gone → HTTP 410 + reason "Expired".
+        let err = ApiError::Gone("too old resource version: 2 (5)".into());
+        assert_eq!(err.status_code(), StatusCode::GONE);
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 }

@@ -3,14 +3,42 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 
 use engenho_store::{
-    StoreMesh,
+    Revision, StoreMesh, WatchGone, WatchOpts, WatchStream,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
+    watch_backend::WATCH_CHANNEL_CAPACITY,
 };
 
 use crate::error::ApiError;
+use crate::params::{ResumePoint, Selectors};
+
+/// Bookmark cadence handed to `watch_from` when the client opted into
+/// bookmarks (`allowWatchBookmarks=true`). Mirrors the store default.
+const WATCH_BOOKMARK_EVERY: Duration = Duration::from_secs(5);
+
+/// Map a [`WatchGone`] surfaced at WATCH REGISTRATION to an
+/// [`ApiError::Gone`] (HTTP 410 / Expired). Both variants become 410:
+/// the client re-LISTs + re-WATCHes from a fresh list revision.
+///
+/// `CompactedTooOld` is the common at-registration case (`from` below
+/// the compaction watermark). `Overflow` cannot occur at registration
+/// (the channel is empty) but is mapped for completeness — never a
+/// silent wrong answer.
+#[must_use]
+pub fn gone_to_api_error(gone: WatchGone) -> ApiError {
+    match gone {
+        WatchGone::CompactedTooOld {
+            requested,
+            compacted,
+        } => ApiError::Gone(format!("too old resource version: {requested} ({compacted})")),
+        WatchGone::Overflow { last_seen, .. } => ApiError::Gone(format!(
+            "watch buffer overflowed at registration; resume from {last_seen}"
+        )),
+    }
+}
 
 /// Typed K8s-resource CRUD trait. Each registered kind implements
 /// this; the router dispatches REST routes to the trait methods.
@@ -29,6 +57,38 @@ pub trait ResourceHandler: Send + Sync + 'static {
 
     async fn list(&self, namespace: Option<&str>) -> Result<Value, ApiError>;
 
+    /// LIST the items + the snapshot resourceVersion captured ATOMICALLY
+    /// from the SAME catalog clone, with selectors applied apiserver-side.
+    ///
+    /// Returns `(filtered items, snapshot rv)`. The rv is
+    /// `current_revision` (the dense MVCC counter), NOT
+    /// `last_applied_index` — so a client that LISTs at `rv=N` then
+    /// `WATCH ?resourceVersion=N` resumes from exactly the snapshot
+    /// boundary, gap-free + dup-free.
+    async fn list_at(
+        &self,
+        namespace: Option<&str>,
+        sel: &Selectors,
+    ) -> Result<(Vec<Value>, Revision), ApiError>;
+
+    /// Open a streaming WATCH from `from`. The returned [`WatchStream`]
+    /// is cluster-wide (the store fans every kind through one registry);
+    /// the router filters each event down to this handler's GVK +
+    /// requested namespace + selectors.
+    ///
+    /// `allow_bookmarks` toggles the bookmark cadence (`5s` vs disabled).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Gone`] when `from` is below the compaction watermark
+    /// at registration (`WatchGone::CompactedTooOld`).
+    async fn watch_stream(
+        &self,
+        namespace: Option<&str>,
+        from: ResumePoint,
+        allow_bookmarks: bool,
+    ) -> Result<WatchStream, ApiError>;
+
     async fn create(&self, namespace: Option<&str>, body: Value) -> Result<Value, ApiError>;
 
     async fn patch(
@@ -39,6 +99,32 @@ pub trait ResourceHandler: Send + Sync + 'static {
     ) -> Result<Value, ApiError>;
 
     async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<(), ApiError>;
+
+    /// The `apiVersion` string for this kind — `"v1"` for the core
+    /// group, `"<group>/<version>"` otherwise.
+    fn api_version(&self) -> String {
+        if self.group().is_empty() {
+            self.version().to_string()
+        } else {
+            format!("{}/{}", self.group(), self.version())
+        }
+    }
+
+    /// Build the typed K8s `<Kind>List` envelope from already-filtered
+    /// items + the snapshot revision. Shared by the router's LIST branch
+    /// (which calls [`Self::list_at`] with selectors) so the
+    /// cluster-scoped + namespaced cases emit ONE body shape.
+    fn list_response(&self, items: Vec<Value>, rv: Revision) -> Value {
+        let env = ListEnvelope {
+            kind: format!("{}List", self.kind()),
+            api_version: self.api_version(),
+            items,
+            metadata: ListMeta {
+                resource_version: rv.to_string(),
+            },
+        };
+        serde_json::to_value(env).unwrap_or(Value::Null)
+    }
 }
 
 /// Default implementation backed by [`StoreMesh`]. Handles every
@@ -133,24 +219,61 @@ impl ResourceHandler for StoreBackedHandler {
     }
 
     async fn list(&self, namespace: Option<&str>) -> Result<Value, ApiError> {
-        if self.namespaced && namespace.is_none() {
-            // List across all namespaces — common kubectl pattern
-            // for kubectl get pods --all-namespaces.
-        }
-        let entries = self
+        // Default (no selectors) LIST. The atomic-rv envelope is built
+        // by the trait's `list_response`; this wraps `list_at` with an
+        // empty selector set so both the router LIST branch and any
+        // direct caller share ONE body.
+        let (items, rv) = self.list_at(namespace, &Selectors::default()).await?;
+        Ok(self.list_response(items, rv))
+    }
+
+    async fn list_at(
+        &self,
+        namespace: Option<&str>,
+        sel: &Selectors,
+    ) -> Result<(Vec<Value>, Revision), ApiError> {
+        // ONE catalog clone → (items, snapshot rv). The rv is
+        // current_revision (dense MVCC), NOT last_applied_index — the
+        // load-bearing fix. Selector filtering stays apiserver-side
+        // (the store is GVK-keyed).
+        let (entries, rv) = self
             .store
-            .list(&self.group, &self.version, &self.kind, namespace)
+            .list_at_revision(&self.group, &self.version, &self.kind, namespace)
             .await;
         let items: Vec<Value> = entries
             .into_iter()
+            .filter(|(_, v)| sel.matches(v))
             .map(|(_, v)| inject_type_meta(&v, self.api_version(), &self.kind))
             .collect();
-        Ok(serde_json::json!({
-            "kind": format!("{}List", self.kind),
-            "apiVersion": self.api_version(),
-            "items": items,
-            "metadata": { "resourceVersion": self.store.current_catalog().await.last_applied_index.to_string() },
-        }))
+        Ok((items, rv))
+    }
+
+    async fn watch_stream(
+        &self,
+        _namespace: Option<&str>,
+        from: ResumePoint,
+        allow_bookmarks: bool,
+    ) -> Result<WatchStream, ApiError> {
+        // Resolve the resume revision. MostRecent ("0"/absent) means
+        // "from now, no replay" → read the current revision under one
+        // catalog clone and start there.
+        let from_rev = match from {
+            ResumePoint::At(rev) => rev,
+            ResumePoint::MostRecent => self.store.current_catalog().await.revision(),
+        };
+        let opts = WatchOpts {
+            from: from_rev,
+            buffer: WATCH_CHANNEL_CAPACITY,
+            bookmark_every: if allow_bookmarks {
+                WATCH_BOOKMARK_EVERY
+            } else {
+                Duration::ZERO
+            },
+        };
+        // CompactedTooOld at registration → a real HTTP 410 Gone. The
+        // client re-LISTs + re-WATCHes from the fresh list rv. Overflow
+        // cannot occur at registration (the channel is empty).
+        self.store.watch_from(opts).await.map_err(gone_to_api_error)
     }
 
     async fn create(&self, namespace: Option<&str>, body: Value) -> Result<Value, ApiError> {
@@ -226,14 +349,22 @@ impl ResourceHandler for StoreBackedHandler {
     }
 }
 
-impl StoreBackedHandler {
-    fn api_version(&self) -> String {
-        if self.group.is_empty() {
-            self.version.clone()
-        } else {
-            format!("{}/{}", self.group, self.version)
-        }
-    }
+/// Typed K8s `<Kind>List` envelope. `metadata.resourceVersion` is the
+/// snapshot rv captured atomically with `items` in
+/// [`ResourceHandler::list_at`].
+#[derive(serde::Serialize)]
+struct ListEnvelope {
+    kind: String,
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    items: Vec<Value>,
+    metadata: ListMeta,
+}
+
+#[derive(serde::Serialize)]
+struct ListMeta {
+    #[serde(rename = "resourceVersion")]
+    resource_version: String,
 }
 
 /// Add `kind` + `apiVersion` to a resource if missing. Matches
@@ -274,5 +405,36 @@ mod tests {
         // Existing kind / apiVersion survive.
         assert_eq!(out.get("kind").unwrap(), "Pod");
         assert_eq!(out.get("apiVersion").unwrap(), "v1");
+    }
+
+    #[test]
+    fn compacted_too_old_maps_to_gone_410() {
+        // The translation arm: WatchGone::CompactedTooOld => ApiError::Gone,
+        // which renders HTTP 410 / Expired (proven in error::tests).
+        let gone = WatchGone::CompactedTooOld {
+            requested: Revision(2),
+            compacted: Revision(5),
+        };
+        let err = gone_to_api_error(gone);
+        assert!(matches!(err, ApiError::Gone(_)));
+        let msg = err.to_string();
+        assert!(msg.contains('2') && msg.contains('5'), "carries req + compacted: {msg}");
+        // Renders HTTP 410.
+        use axum::response::IntoResponse;
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::GONE,
+            "CompactedTooOld → ApiError::Gone → HTTP 410"
+        );
+    }
+
+    #[test]
+    fn overflow_at_registration_also_maps_to_gone() {
+        let gone = WatchGone::Overflow {
+            capacity: 4,
+            last_seen: Revision(7),
+        };
+        let err = gone_to_api_error(gone);
+        assert!(matches!(err, ApiError::Gone(_)));
     }
 }

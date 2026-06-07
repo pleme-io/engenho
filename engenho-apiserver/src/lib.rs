@@ -33,10 +33,16 @@
 pub mod error;
 pub mod handler;
 pub mod openapi;
+pub mod params;
 pub mod router;
 pub mod server;
 
-pub use error::{ApiError, ErrorKind};
-pub use handler::{ResourceHandler, StoreBackedHandler};
+pub use error::{ApiError, ErrorKind, status_object};
+pub use handler::{ResourceHandler, StoreBackedHandler, gone_to_api_error};
 pub use openapi::ApiDoc;
+pub use params::{
+    ListWatchParams, ResumePoint, Selectors, bookmark_line, gvk_ns_matches, status_410_line,
+    to_k8s_watch_line,
+};
+pub use router::{RouterState, build};
 pub use server::ApiServer;

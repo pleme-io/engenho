@@ -63,9 +63,23 @@ impl ApiServer {
     }
 
     /// Initiate graceful shutdown + await the server task.
+    ///
+    /// Signals graceful shutdown, then waits a bounded grace for
+    /// in-flight requests to drain. Long-poll WATCH streams never drain
+    /// on their own (they stay open until the client disconnects), so a
+    /// K8s apiserver SEVERS them on shutdown — after the grace elapses we
+    /// abort the serve task, dropping any open watch connections. This is
+    /// the correct production behavior (clients reconnect) AND keeps the
+    /// shutdown bounded instead of hanging forever on an open watch.
     pub async fn shutdown(self) -> Result<(), ServerError> {
+        const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
         let _ = self.shutdown.send(());
-        self.task.await.ok();
+        let abort = self.task.abort_handle();
+        if tokio::time::timeout(SHUTDOWN_GRACE, self.task).await.is_err() {
+            // Open long-poll watches didn't drain within the grace —
+            // sever them by aborting the serve task (no leaked task).
+            abort.abort();
+        }
         Ok(())
     }
 }

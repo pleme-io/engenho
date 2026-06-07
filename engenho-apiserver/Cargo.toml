@@ -23,6 +23,8 @@ anyhow             = { workspace = true }
 axum               = { workspace = true }
 tower              = { workspace = true }
 utoipa             = { workspace = true }
+futures            = { workspace = true }
+bytes              = "1"
 
 engenho-types      = { workspace = true }
 engenho-store      = { workspace = true }
@@ -30,3 +32,4 @@ engenho-store      = { workspace = true }
 [dev-dependencies]
 proptest = "1"
 reqwest = { workspace = true }
+serde_urlencoded = "0.7"
