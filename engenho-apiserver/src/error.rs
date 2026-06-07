@@ -107,6 +107,56 @@ struct K8sStatus {
     message: String,
 }
 
+/// A typed K8s `Status` SUCCESS object — the `metav1.Status{status:"Success"}`
+/// shape kube-apiserver returns from a DELETE that had no object to hand
+/// back (an idempotent delete of an already-absent name). DISTINCT from
+/// [`K8sStatus`] (the failure shape): no `code`, no `reason`/`message`,
+/// `status:"Success"`, and a `details{name,kind}` block naming the target.
+/// Built with serde, never `format!()` of JSON (TYPED EMISSION).
+#[derive(Serialize)]
+struct K8sStatusSuccess {
+    kind: &'static str,
+    #[serde(rename = "apiVersion")]
+    api_version: &'static str,
+    status: &'static str,
+    details: StatusDetails,
+}
+
+/// The `metav1.StatusDetails` block — names the resource a Status refers
+/// to. For the DELETE-success fallback only `name` + `kind` are known.
+#[derive(Serialize)]
+struct StatusDetails {
+    name: String,
+    kind: String,
+}
+
+/// Build the typed `metav1.Status{status:"Success"}` value DELETE returns
+/// when there was no object to hand back (idempotent delete of an absent
+/// name). kubectl's delete codepath decodes this body and treats it as a
+/// clean success — it is NEVER the empty body that crashes
+/// `json.Unmarshal([]byte{})`.
+///
+/// `kind` is the deleted resource's kind (e.g. `"ConfigMap"`); the
+/// envelope is always the meta/v1 `Status` kind (`apiVersion:"v1"`). This
+/// value is only ever rendered as JSON — the meta/v1 `Status` protobuf
+/// descriptor is not reachable through the kube-proto core/v1 package map,
+/// and the no-object branch is the only place it arises (the conformance
+/// DELETE always targets an existing object → object path → protobuf works).
+#[must_use]
+pub fn delete_status_success(name: &str, kind: &str) -> serde_json::Value {
+    let status = K8sStatusSuccess {
+        kind: "Status",
+        api_version: "v1",
+        status: "Success",
+        details: StatusDetails {
+            name: name.to_string(),
+            kind: kind.to_string(),
+        },
+    };
+    // Infallible for this concrete struct.
+    serde_json::to_value(status).unwrap_or(serde_json::Value::Null)
+}
+
 /// Build a typed K8s `Status` value (`{kind:"Status",apiVersion:"v1",
 /// status:"Failure",code,reason,message}`) as `serde_json::Value`.
 ///

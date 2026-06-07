@@ -469,13 +469,39 @@ async fn do_delete(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
     name: &str,
+    headers: &HeaderMap,
     p: &ListWatchParams,
 ) -> Result<Response, ApiError> {
     // `?resourceVersion=N` is the K8s DELETE precondition
     // (`Preconditions.resourceVersion`); absent/"0" → unconditional.
     let expected = p.precondition()?;
-    h.delete_with_precondition(ns, name, expected).await?;
-    Ok(StatusCode::OK.into_response())
+    // The K8s DELETE wire returns a NON-empty typed body (the deleted
+    // object, or a `metav1.Status{status:"Success"}` when the name was
+    // absent). An empty 200 crashes kubectl's `json.Unmarshal([]byte{})`
+    // ("unexpected end of JSON input"). This is the SAME content-negotiated
+    // emission chokepoint create/get use — zero new serialization code.
+    let obj = h.delete_with_precondition(ns, name, expected).await?;
+    let codec = ResponseCodec::from_headers(headers);
+    // PROTOBUF CAVEAT: the deleted-object branch encodes cleanly (its GVK
+    // — Deployment, ConfigMap, … — is in the proto pool). The Status-Success
+    // fallback only arises when no object existed; `Status` lives in
+    // meta/v1, NOT the core/v1 package the kube-proto map reaches, so
+    // encoding it as protobuf would hit `CodecError::UncatalogedKind`.
+    // Render that one value as JSON regardless of Accept. This is invisible
+    // to conformance: the conformance DELETE always targets an existing
+    // object (object path → protobuf works).
+    if is_status_value(&obj) {
+        return render_object(ResponseCodec::Json, &handler_gvk(h), StatusCode::OK, obj);
+    }
+    render_object(codec, &handler_gvk(h), StatusCode::OK, obj)
+}
+
+/// `true` iff `v` is a `kind: "Status"` envelope — the meta/v1 Status that
+/// the DELETE no-object fallback returns. Used by [`do_delete`] to force
+/// JSON for that one value (its protobuf descriptor is not reachable
+/// through the kube-proto core/v1 package map).
+fn is_status_value(v: &serde_json::Value) -> bool {
+    v.get("kind").and_then(serde_json::Value::as_str) == Some("Status")
 }
 
 /// The shared LIST/WATCH body for both the core + grouped cases.
@@ -656,11 +682,12 @@ async fn patch_namespaced(
 
 async fn delete_namespaced(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((ns, plural, name)): Path<(String, String, String)>,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_delete(h, Some(&ns), &name, &p).await
+    do_delete(h, Some(&ns), &name, &headers, &p).await
 }
 
 async fn get_cluster_scoped(
@@ -703,11 +730,12 @@ async fn patch_cluster_scoped(
 
 async fn delete_cluster_scoped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((plural, name)): Path<(String, String)>,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup_core(&plural)?;
-    do_delete(h, None, &name, &p).await
+    do_delete(h, None, &name, &headers, &p).await
 }
 
 // ── named-group route handlers (/apis/<group>/<version>) ───────────────
@@ -752,11 +780,12 @@ async fn patch_ns_grouped(
 
 async fn delete_ns_grouped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_delete(h, Some(&ns), &name, &p).await
+    do_delete(h, Some(&ns), &name, &headers, &p).await
 }
 
 async fn get_grouped(
@@ -799,9 +828,10 @@ async fn patch_grouped(
 
 async fn delete_grouped(
     State(state): State<RouterState>,
+    headers: HeaderMap,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     let h = state.lookup(&group, &version, &plural)?;
-    do_delete(h, None, &name, &p).await
+    do_delete(h, None, &name, &headers, &p).await
 }
