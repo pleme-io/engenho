@@ -161,6 +161,26 @@ impl FakeBackend {
             .filter(|s| s.running)
             .count()
     }
+
+    /// Test hook: simulate a container exiting ON ITS OWN with
+    /// `exit_code` (distinct from an operator-initiated [`stop`]). Flips
+    /// the tracked container to `running == false` + records the exit
+    /// code, WITHOUT emitting a [`FakeEvent::Stop`] — modeling a process
+    /// that terminated by itself rather than being told to. The kubelet's
+    /// running-status poll then observes the terminated container on its
+    /// next tick.
+    ///
+    /// No-op (silently) if `container_id` isn't tracked — mirrors a
+    /// best-effort host observation.
+    ///
+    /// [`stop`]: ContainerRuntime::stop
+    pub async fn set_exit(&self, container_id: &str, exit_code: i32) {
+        let mut state = self.inner.lock().await;
+        if let Some(s) = state.containers.get_mut(container_id) {
+            s.running = false;
+            s.exit_code = Some(exit_code);
+        }
+    }
 }
 
 #[async_trait]
@@ -430,6 +450,43 @@ mod tests {
         assert_eq!(events[0], FakeEvent::Start("a".into()));
         assert_eq!(events[1], FakeEvent::Stop(s.container_id.clone()));
         assert_eq!(events[2], FakeEvent::Remove(s.container_id));
+    }
+
+    #[tokio::test]
+    async fn fake_backend_set_exit_marks_terminated_without_stop_event() {
+        let backend = FakeBackend::new();
+        let spec = ContainerSpec {
+            name: "p".into(),
+            image: "i".into(),
+            env: BTreeMap::new(),
+            command: vec![],
+        };
+        let s = backend.start(&spec).await.unwrap();
+        backend.set_exit(&s.container_id, 137).await;
+        let after = backend.status(&s.container_id).await.unwrap().unwrap();
+        assert!(!after.running);
+        assert_eq!(after.exit_code, Some(137));
+        // set_exit models a self-exit, NOT an operator stop — only the
+        // Start event was recorded.
+        let events = backend.events().await;
+        assert_eq!(events, vec![FakeEvent::Start("p".into())]);
+    }
+
+    #[tokio::test]
+    async fn fake_backend_set_exit_zero_is_distinct_from_running() {
+        let backend = FakeBackend::new();
+        let spec = ContainerSpec {
+            name: "q".into(),
+            image: "i".into(),
+            env: BTreeMap::new(),
+            command: vec![],
+        };
+        let s = backend.start(&spec).await.unwrap();
+        assert_eq!(backend.running_count().await, 1);
+        backend.set_exit(&s.container_id, 0).await;
+        assert_eq!(backend.running_count().await, 0);
+        let after = backend.status(&s.container_id).await.unwrap().unwrap();
+        assert_eq!(after.exit_code, Some(0));
     }
 
     #[test]
