@@ -227,7 +227,7 @@ mod tests {
     fn raft_id_to_teia_is_zero_padded() {
         assert_eq!(raft_id_to_teia(1).0, "0000000000000001");
         assert_eq!(raft_id_to_teia(42).0, "000000000000002a");
-        assert_eq!(raft_id_to_teia(0xdeadbeef).0, "00000000deadbeef");
+        assert_eq!(raft_id_to_teia(0xdead_beef).0, "00000000deadbeef");
     }
 
     #[test]

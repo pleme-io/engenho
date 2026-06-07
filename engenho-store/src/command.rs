@@ -4,8 +4,8 @@
 //! K8s API operations decompose into these primitives:
 //!
 //!   * `kubectl apply` → `Put` (idempotent create-or-replace)
-//!   * `kubectl create` → `Put` (with metadata.resourceVersion = 0 enforced
-//!                         to detect existing)
+//!   * `kubectl create` → `Put` (with metadata.resourceVersion = 0
+//!     enforced to detect existing)
 //!   * `kubectl patch` → `Patch` (merge / strategic merge)
 //!   * `kubectl delete` → `Delete`
 

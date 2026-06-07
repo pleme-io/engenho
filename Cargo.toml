@@ -100,6 +100,12 @@ chitchat               = "0.10"
 # rkyv's PartialEq impl (rustc E0283 in openraft/src/metrics/wait.rs:231).
 openraft               = { version = "=0.9.22", features = ["serde", "storage-v2"] }
 
+# Embedded LSM key-value store — the single durable backend for
+# engenho-store's openraft RaftLogStorage + RaftStateMachine. One
+# keyspace per store dir, one partition per concern (log / meta /
+# catalog / snapshot). Crash-safe append via keyspace.persist(SyncAll).
+fjall                  = "2"
+
 [workspace.lints]
 
 [workspace.lints.clippy]

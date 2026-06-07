@@ -15,6 +15,7 @@ use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
 
 use crate::command::ResourceCommand;
+use crate::fjall_store::FjallStore;
 use crate::network::{InProcessRouter, RpcRequest};
 use crate::resource::{ResourceKey, ResourceValue};
 use crate::state::ResourceCatalog;
@@ -33,10 +34,62 @@ pub enum StoreError {
     Fatal(String),
 }
 
+/// The store backend a [`StoreMesh`] is built over. Both variants
+/// impl the same four openraft v2 traits + the same read/watch
+/// surface; the enum routes the handle-side reads to whichever was
+/// chosen at construction. The ephemeral [`InMemoryStore`] stays the
+/// test double; [`FjallStore`] is the durable backend that survives
+/// restart.
+#[derive(Clone)]
+enum StoreBackend {
+    Memory(InMemoryStore),
+    Fjall(FjallStore),
+}
+
+impl StoreBackend {
+    async fn get_resource(&self, key: &ResourceKey) -> Option<ResourceValue> {
+        match self {
+            Self::Memory(s) => s.get_resource(key).await,
+            Self::Fjall(s) => s.get_resource(key).await,
+        }
+    }
+
+    async fn current_catalog(&self) -> ResourceCatalog {
+        match self {
+            Self::Memory(s) => s.current_catalog().await,
+            Self::Fjall(s) => s.current_catalog().await,
+        }
+    }
+
+    fn watch_subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::watch::WatchEvent> {
+        match self {
+            Self::Memory(s) => s.watch_subscribe(),
+            Self::Fjall(s) => s.watch_subscribe(),
+        }
+    }
+
+    fn watch_subscriber_count(&self) -> usize {
+        match self {
+            Self::Memory(s) => s.watch_subscriber_count(),
+            Self::Fjall(s) => s.watch_subscriber_count(),
+        }
+    }
+
+    /// `true` if the underlying store already holds Raft state. The
+    /// in-memory store is never durably initialized — it always reports
+    /// `false` so the ephemeral path always initializes on `start`.
+    async fn is_initialized(&self) -> bool {
+        match self {
+            Self::Memory(_) => false,
+            Self::Fjall(s) => s.is_initialized().await,
+        }
+    }
+}
+
 /// Raft-replicated K8s resource store.
 pub struct StoreMesh {
     raft: Raft<TypeConfig>,
-    store: InMemoryStore,
+    store: StoreBackend,
     node_id: RaftNodeId,
     listen_addr: String,
     router: InProcessRouter,
@@ -44,6 +97,9 @@ pub struct StoreMesh {
 }
 
 impl StoreMesh {
+    /// Start an EPHEMERAL (in-memory) store mesh — the test / dev
+    /// path. Process restart discards all state. For durable
+    /// single-node restart-safe storage use [`Self::start_durable`].
     pub async fn start(
         node_id: RaftNodeId,
         listen_addr: String,
@@ -51,9 +107,87 @@ impl StoreMesh {
         config: Arc<Config>,
     ) -> Result<Self, StoreError> {
         let store = InMemoryStore::new();
-        let log_store = store.clone();
-        let state_machine = store.clone();
+        Self::start_with_backend(
+            node_id,
+            listen_addr,
+            router,
+            config,
+            store.clone(),
+            store.clone(),
+            StoreBackend::Memory(store),
+        )
+        .await
+    }
 
+    /// Start a DURABLE store mesh backed by a fjall keyspace at
+    /// `store_path`. The keyspace is opened (or created) + hydrated
+    /// before `Raft::new`, so openraft sees any persisted vote / log /
+    /// applied position and resumes WITHOUT re-initializing. On a
+    /// fresh dir the store is empty and the caller must call
+    /// [`Self::initialize_if_fresh`] (or [`Self::start_or_resume`],
+    /// which does it for you).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Fatal`] if the keyspace can't be opened /
+    /// hydrated or `Raft::new` fails.
+    pub async fn start_durable(
+        node_id: RaftNodeId,
+        listen_addr: String,
+        router: InProcessRouter,
+        config: Arc<Config>,
+        store_path: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, StoreError> {
+        let store = FjallStore::open(store_path)?;
+        Self::start_with_backend(
+            node_id,
+            listen_addr,
+            router,
+            config,
+            store.clone(),
+            store.clone(),
+            StoreBackend::Fjall(store),
+        )
+        .await
+    }
+
+    /// Start a durable mesh AND initialize it iff the store is fresh
+    /// (no persisted vote / applied position). On a restart this is a
+    /// no-op for initialization — openraft resumes from disk. The
+    /// boolean in the return tuple is `true` when the mesh was freshly
+    /// initialized this call, `false` when it resumed existing state.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::start_durable`] + initialize failures.
+    pub async fn start_or_resume(
+        node_id: RaftNodeId,
+        listen_addr: String,
+        router: InProcessRouter,
+        config: Arc<Config>,
+        store_path: impl Into<std::path::PathBuf>,
+    ) -> Result<(Self, bool), StoreError> {
+        let mesh = Self::start_durable(node_id, listen_addr, router, config, store_path).await?;
+        let initialized = mesh.initialize_if_fresh().await?;
+        Ok((mesh, initialized))
+    }
+
+    /// Shared raft + rpc-task wiring. The store is passed three times
+    /// — as the log store, the state machine, and the read-side
+    /// backend handle — all clones of the same underlying store.
+    async fn start_with_backend<LS, SM>(
+        node_id: RaftNodeId,
+        listen_addr: String,
+        router: InProcessRouter,
+        config: Arc<Config>,
+        log_store: LS,
+        state_machine: SM,
+        backend: StoreBackend,
+    ) -> Result<Self, StoreError>
+    where
+        LS: openraft::storage::RaftLogStorage<TypeConfig>,
+        SM: openraft::storage::RaftStateMachine<TypeConfig>,
+    {
         let (tx_rpc, mut rx_rpc) = mpsc::channel::<RpcRequest>(256);
 
         let raft =
@@ -88,12 +222,35 @@ impl StoreMesh {
 
         Ok(Self {
             raft,
-            store,
+            store: backend,
             node_id,
             listen_addr,
             router,
             rpc_task,
         })
+    }
+
+    /// `true` if the underlying store already holds Raft state (a
+    /// vote was persisted OR a command was applied). In-memory meshes
+    /// always report `false`.
+    pub async fn is_initialized(&self) -> bool {
+        self.store.is_initialized().await
+    }
+
+    /// Initialize the singleton cluster ONLY when the store is fresh.
+    /// Returns `true` if it initialized, `false` if the store already
+    /// held state (a restart — calling `initialize` again would error).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::initialize_singleton`] failures on a fresh
+    /// store.
+    pub async fn initialize_if_fresh(&self) -> Result<bool, StoreError> {
+        if self.is_initialized().await {
+            return Ok(false);
+        }
+        self.initialize_singleton().await?;
+        Ok(true)
     }
 
     pub async fn initialize_singleton(&self) -> Result<(), StoreError> {

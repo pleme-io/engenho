@@ -158,14 +158,6 @@ impl<'de> Deserialize<'de> for ResourceCatalog {
     }
 }
 
-/// Snapshot for serde — same shape as the catalog. Provided as a
-/// distinct type for forward compat (R6.5 may store the snapshot
-/// in a more compact compressed form on disk).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ResourceCatalogSnapshot {
-    pub catalog: ResourceCatalog,
-}
-
 impl ResourceCatalog {
     /// Construct a catalog with an explicit history-ring capacity.
     /// Used by callers that want a tighter compaction window (and by
@@ -752,6 +744,55 @@ mod tests {
                 .is_none()
         );
         assert_eq!(stored.get("spec").unwrap().get("image").unwrap(), "v1");
+    }
+
+    #[test]
+    fn catalog_serde_carries_revision_state() {
+        // Locks item-1's serde contract independent of fjall: the
+        // catalog's hand-written Serialize/Deserialize round-trips
+        // current_revision + compacted_revision + per-key VersionMeta.
+        // This is exactly the durable state the fjall `catalog`
+        // partition persists — proving the contract here means the
+        // backend gets revision survival for free.
+        let mut cat = ResourceCatalog::with_history_capacity(2);
+        let k = pod_key("rev-state");
+        // 5 puts → current_revision 5; capacity 2 forces compaction so
+        // compacted_revision advances to 3 (last two changes retained).
+        for i in 1..=5u64 {
+            put(&mut cat, &pod_key(&format!("p{i}")), serde_json::json!({"i": i}), i);
+        }
+        // One more put on a tracked key so we can assert its meta.
+        put(&mut cat, &k, serde_json::json!({"spec": {}}), 6); // rev 6 (create)
+        put(&mut cat, &k, serde_json::json!({"spec": {"x": 1}}), 7); // rev 7 (bump)
+        assert_eq!(cat.current_revision, Revision(7));
+        assert_eq!(cat.compacted_revision, Revision(5));
+        let (_, meta_before) = cat.get_with_meta(&k).unwrap();
+        assert_eq!(meta_before.create_revision, Revision(6));
+        assert_eq!(meta_before.mod_revision, Revision(7));
+        assert_eq!(meta_before.version, 2);
+
+        // Round-trip through serde — the disk form.
+        let bytes = serde_json::to_vec(&cat).unwrap();
+        let back: ResourceCatalog = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            back.current_revision,
+            Revision(7),
+            "current_revision survives serde"
+        );
+        assert_eq!(
+            back.compacted_revision,
+            Revision(5),
+            "compacted_revision survives serde"
+        );
+        let (_, meta_after) = back.get_with_meta(&k).unwrap();
+        assert_eq!(
+            meta_after, meta_before,
+            "per-key VersionMeta is byte-identical across serde"
+        );
+        // History is deliberately not persisted (rebuilt by replay).
+        assert!(back.history.is_empty());
+        assert_eq!(back.history_capacity, DEFAULT_HISTORY_CAPACITY);
     }
 
     #[test]

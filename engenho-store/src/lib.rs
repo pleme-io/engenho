@@ -36,16 +36,32 @@
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+// `StorageError<NodeId>` is openraft's own large error type (its
+// source notes "StorageError is 136 bytes, try to reduce the size").
+// Every openraft storage-trait method returns it by contract — we
+// can't box it without breaking the trait signatures.
+#![allow(clippy::result_large_err)]
+// Pervasive pure-style pedantic noise across this crate (and the
+// fleet). Allowed at the crate root the same way
+// `module_name_repetitions` is — keeps the substantive lints loud
+// while not gating on doc-prose formatting.
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::must_use_candidate)]
+// `is_leader` keeps its `async fn` signature for API symmetry with
+// the rest of StoreMesh's async surface (callers `.await` it across
+// the fleet); the millis-cast in `wait_for_applied` is a bounded
+// timeout value. Both predate item-2 and are out of its scope.
+#![allow(clippy::unused_async)]
+#![allow(clippy::cast_possible_truncation)]
 
 pub mod command;
 pub mod drv_committal;
-pub mod durable_store;
+pub mod fjall_store;
 pub mod mesh;
 pub mod nats_listener;
 pub mod nats_network;
 pub mod network;
-pub mod persistence;
-pub mod persistent_log;
 pub mod resource;
 pub mod revision;
 pub mod state;
@@ -58,16 +74,14 @@ pub use drv_committal::{
     DRV_GROUP, DRV_KIND, DRV_VERSION, delete_drv_command, drv_resource_key, put_drv_command,
     render_drv_resource,
 };
-pub use durable_store::{DurableInMemoryStore, JournalEntry};
+pub use fjall_store::FjallStore;
 pub use mesh::{StoreError, StoreMesh, default_config};
 pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
 pub use network::InProcessRouter;
-pub use persistence::{CatalogSnapshot, SnapshotError};
-pub use persistent_log::{PersistentLog, PersistentLogError};
 pub use resource::{ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
-pub use state::{ApplyOutcome, ResourceCatalog, ResourceCatalogSnapshot, DEFAULT_HISTORY_CAPACITY};
+pub use state::{ApplyOutcome, ResourceCatalog, DEFAULT_HISTORY_CAPACITY};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
 pub use watch::{WatchEvent, WatchEventKind};
