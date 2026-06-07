@@ -168,8 +168,18 @@ pub fn build(state: RouterState) -> Router {
         .route("/apis", get(discovery::api_groups))
         .route("/apis/:group/:version", get(discovery::group_resources))
         // ── openapi ───────────────────────────────────────────────────
+        // `/openapi.json` keeps the utoipa-derived description of engenho's
+        // own REST surface (SDK/codegen consumers). `/openapi/v3` is the
+        // K8s OpenAPI-v3 DISCOVERY surface kubectl `apply --validate` +
+        // `explain` consume — a typed index + per-group vendored schemas,
+        // scoped to exactly the cataloged groups.
         .route("/openapi.json", get(openapi_spec))
-        .route("/openapi/v3", get(openapi_spec))
+        .route("/openapi/v3", get(openapi_v3_index))
+        .route("/openapi/v3/api/v1", get(openapi_v3_core))
+        .route(
+            "/openapi/v3/apis/:group/:version",
+            get(openapi_v3_group),
+        )
         // ── version + health (no RouterState; kubectl/client-go probe
         //    these before they will trust the server) ──────────────────
         .route("/version", get(health::version))
@@ -184,6 +194,87 @@ pub fn build(state: RouterState) -> Router {
 /// multi-face plan in docs/API-SURFACE.md.
 async fn openapi_spec() -> impl IntoResponse {
     Json(ApiDoc::openapi())
+}
+
+// ── K8s OpenAPI-v3 discovery surface (/openapi/v3) ─────────────────────
+//
+// kubectl's client-side `--validate` path + `kubectl explain` fetch the K8s
+// OpenAPI-v3 DISCOVERY document at `/openapi/v3` — a typed index mapping each
+// served `(group, version)` to a `serverRelativeURL` — then GET each
+// per-group schema document. We serve the BLAKE3-attested vendored bodies
+// verbatim (already valid OpenAPI 3.0.0; NEVER round-tripped through utoipa),
+// scoped to exactly the cataloged groups so the index advertises only what
+// is routable + schema-served (mirroring the discovery invariant).
+
+/// The `/openapi/v3` discovery document — `{ paths: { <key>:
+/// { serverRelativeURL } } }`. Typed serde struct per the ★★ TYPED EMISSION
+/// rule (NOT `json!()`). `paths` keys are `api/v1` for core and
+/// `apis/<group>/<version>` for named groups.
+#[derive(serde::Serialize)]
+struct OpenApiV3Discovery {
+    paths: std::collections::BTreeMap<String, OpenApiV3PathItem>,
+}
+
+/// One entry in the [`OpenApiV3Discovery`] index: the relative URL of the
+/// per-group schema document, with the vendored BLAKE3 as the `?hash=`
+/// cache key (kubectl caches the document keyed on this digest).
+#[derive(serde::Serialize)]
+struct OpenApiV3PathItem {
+    #[serde(rename = "serverRelativeURL")]
+    server_relative_url: String,
+}
+
+/// `GET /openapi/v3` → the K8s OpenAPI-v3 discovery index, built by
+/// iterating the engenho-types `SERVED` table (the single source scoped to
+/// the cataloged groups). Each entry's `serverRelativeURL` points at the
+/// per-group document endpoint with the attested hash for caching.
+async fn openapi_v3_index() -> impl IntoResponse {
+    let mut paths = std::collections::BTreeMap::new();
+    for d in engenho_types::openapi_v3::SERVED {
+        let key = d.index_key();
+        // serverRelativeURL = "/openapi/v3/<key>?hash=<blake3>". Built by
+        // concatenation (no format! of the URL) — the pieces are all typed.
+        let url = ["/openapi/v3/", &key, "?hash=", d.blake3].concat();
+        paths.insert(
+            key,
+            OpenApiV3PathItem {
+                server_relative_url: url,
+            },
+        );
+    }
+    Json(OpenApiV3Discovery { paths })
+}
+
+/// `GET /openapi/v3/api/v1` → the core group's vendored OpenAPI v3 document,
+/// served verbatim as `application/json`.
+async fn openapi_v3_core() -> Result<Response, ApiError> {
+    serve_openapi_v3_document("", "v1")
+}
+
+/// `GET /openapi/v3/apis/<group>/<version>` → that group's vendored OpenAPI
+/// v3 document verbatim, or a 404 K8s Status for an uncataloged pair.
+async fn openapi_v3_group(
+    Path((group, version)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    serve_openapi_v3_document(&group, &version)
+}
+
+/// Serve the vendored OpenAPI v3 document for `(group, version)` verbatim
+/// (Content-Type `application/json`), or a typed 404 for an uncataloged
+/// pair. The bytes are already valid OpenAPI 3.0.0 — emitted as-is, never
+/// re-serialized.
+fn serve_openapi_v3_document(group: &str, version: &str) -> Result<Response, ApiError> {
+    match engenho_types::openapi_v3::document_for(group, version) {
+        Some(body) => Ok((
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()),
+        None => Err(ApiError::NotFound(format!(
+            "no OpenAPI v3 document for group/version {group}/{version}"
+        ))),
+    }
 }
 
 // ── content negotiation (the protobuf <-> JSON boundary) ───────────────

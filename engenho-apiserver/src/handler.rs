@@ -14,7 +14,7 @@ use engenho_store::{
     resource::ResourceKey,
     watch_backend::WATCH_CHANNEL_CAPACITY,
 };
-use engenho_types::generated_v1_34::RESOURCE_CATALOG;
+use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor};
 
 use crate::error::ApiError;
 use crate::params::{ResumePoint, Selectors, body_precondition};
@@ -56,6 +56,27 @@ pub trait ResourceHandler: Send + Sync + 'static {
     fn kind(&self) -> &str;
     fn plural(&self) -> &str;
     fn namespaced(&self) -> bool;
+
+    /// kubectl short-name aliases for this kind (e.g. `["deploy"]`).
+    /// Pure registration metadata flowing into discovery `shortNames`,
+    /// which is how `kubectl get deploy` resolves to `deployments`.
+    /// Empty default so non-`StoreBacked` handlers are unaffected.
+    fn short_names(&self) -> &[&str] {
+        &[]
+    }
+
+    /// The singular resource name (lowercase kind) — served as discovery
+    /// `singularName`. Empty default; `StoreBackedHandler` overrides it
+    /// from the catalog.
+    fn singular_name(&self) -> &str {
+        ""
+    }
+
+    /// kubectl resource categories (e.g. `["all"]`) — served as discovery
+    /// `categories`. Empty default; `StoreBackedHandler` overrides it.
+    fn categories(&self) -> &[&str] {
+        &[]
+    }
 
     async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError>;
 
@@ -199,6 +220,14 @@ pub struct StoreBackedHandler {
     kind: String,
     plural: String,
     namespaced: bool,
+    /// kubectl short-name aliases, singular name, and categories — pure
+    /// registration metadata sourced from the generated `RESOURCE_CATALOG`.
+    /// `&'static` because the catalog is `&'static`; the empty defaults for
+    /// the legacy constructors are `&[]` / `""` (no metadata, identical to
+    /// the trait defaults).
+    short_names: &'static [&'static str],
+    singular: &'static str,
+    categories: &'static [&'static str],
     store: Arc<StoreMesh>,
     /// Optional admission chain dispatched on the write path (create /
     /// patch / delete) at the API boundary. `None` = no admission — every
@@ -225,8 +254,31 @@ impl StoreBackedHandler {
             kind: kind.into(),
             plural: plural.into(),
             namespaced,
+            // Legacy constructor: no registration metadata (identical to
+            // the trait defaults). The cataloged registration path uses
+            // [`Self::with_registration_metadata`] / [`Self::from_descriptor`].
+            short_names: &[],
+            singular: "",
+            categories: &[],
             admission: None,
         }
+    }
+
+    /// Attach the per-kind discovery registration metadata (short names,
+    /// singular name, categories) sourced from the generated catalog
+    /// descriptor. Builder style; the cataloged registration path
+    /// ([`crate::handlers_from_catalog`]) is the only production caller.
+    #[must_use]
+    pub fn with_registration_metadata(
+        mut self,
+        short_names: &'static [&'static str],
+        singular: &'static str,
+        categories: &'static [&'static str],
+    ) -> Self {
+        self.short_names = short_names;
+        self.singular = singular;
+        self.categories = categories;
+        self
     }
 
     /// Attach an [`AdmissionChain`] to this handler (builder style). The
@@ -305,14 +357,19 @@ impl StoreBackedHandler {
     #[must_use]
     pub fn for_kind(store: Arc<StoreMesh>, kind: &str) -> Option<Self> {
         let d = RESOURCE_CATALOG.iter().find(|d| d.kind == kind)?;
-        Some(Self::new(
-            store,
-            d.group,
-            d.version,
-            d.kind,
-            d.plural,
-            d.namespaced,
-        ))
+        Some(Self::from_descriptor(store, d))
+    }
+
+    /// Construct a fully-registered handler from a generated catalog
+    /// [`ResourceDescriptor`] — (group, version, plural, scope) PLUS the
+    /// discovery registration metadata (short names, singular, categories).
+    /// This is the single canonical constructor the cataloged registration
+    /// path uses so every routable kind also carries the metadata kubectl
+    /// needs to resolve short names + run `explain`.
+    #[must_use]
+    pub fn from_descriptor(store: Arc<StoreMesh>, d: &'static ResourceDescriptor) -> Self {
+        Self::new(store, d.group, d.version, d.kind, d.plural, d.namespaced)
+            .with_registration_metadata(d.short_names, d.singular, d.categories)
     }
 
     fn key(&self, namespace: Option<&str>, name: &str) -> Result<ResourceKey, ApiError> {
@@ -352,6 +409,15 @@ impl ResourceHandler for StoreBackedHandler {
     }
     fn namespaced(&self) -> bool {
         self.namespaced
+    }
+    fn short_names(&self) -> &[&str] {
+        self.short_names
+    }
+    fn singular_name(&self) -> &str {
+        self.singular
+    }
+    fn categories(&self) -> &[&str] {
+        self.categories
     }
 
     async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
@@ -701,14 +767,8 @@ pub fn handlers_from_catalog(store: Arc<StoreMesh>) -> Vec<Arc<dyn ResourceHandl
     RESOURCE_CATALOG
         .iter()
         .map(|d| {
-            Arc::new(StoreBackedHandler::new(
-                store.clone(),
-                d.group,
-                d.version,
-                d.kind,
-                d.plural,
-                d.namespaced,
-            )) as Arc<dyn ResourceHandler>
+            Arc::new(StoreBackedHandler::from_descriptor(store.clone(), d))
+                as Arc<dyn ResourceHandler>
         })
         .collect()
 }
@@ -728,15 +788,8 @@ pub fn handlers_from_catalog_with_admission(
         .iter()
         .map(|d| {
             Arc::new(
-                StoreBackedHandler::new(
-                    store.clone(),
-                    d.group,
-                    d.version,
-                    d.kind,
-                    d.plural,
-                    d.namespaced,
-                )
-                .with_admission(admission.clone()),
+                StoreBackedHandler::from_descriptor(store.clone(), d)
+                    .with_admission(admission.clone()),
             ) as Arc<dyn ResourceHandler>
         })
         .collect()
