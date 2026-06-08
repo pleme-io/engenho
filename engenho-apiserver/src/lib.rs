@@ -30,6 +30,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod authn;
 pub mod coords;
 pub mod discovery;
 pub mod error;
@@ -42,6 +43,10 @@ pub mod router;
 pub mod scale;
 pub mod server;
 
+pub use authn::{
+    AnonymousAuthenticator, AuthnError, Authenticator, BootstrapAdminTokenAuthenticator,
+    ChainAuthenticator, RequestCreds, ServiceAccountTokenAuthenticator, X509Authenticator,
+};
 pub use coords::ResourceCoords;
 pub use discovery::{
     APIGroup, APIGroupList, APIResource, APIResourceList, APIVersions, GroupVersionForDiscovery,
@@ -59,7 +64,9 @@ pub use params::{
     status_410_line, to_k8s_watch_line,
 };
 pub use pki::{
-    ClusterCa, PkiError, ServerSanInputs, TlsMaterial, issue_server_material, load_or_generate_ca,
+    ClientMaterial, ClusterCa, PkiError, ServerSanInputs, TlsMaterial, VerifiedClientCert,
+    client_verifier, issue_admin_client_material, issue_server_material, load_or_generate_ca,
+    parse_client_cert,
 };
 pub use router::{RouterState, build};
 pub use scale::{Scale, ScaleMeta, ScaleSpec, ScaleStatus, label_selector_to_string, project_scale};

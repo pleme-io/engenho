@@ -24,11 +24,16 @@
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, DnValue,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
+use rustls::pki_types::CertificateDer;
+use rustls::server::WebPkiClientVerifier;
+use rustls::server::danger::ClientCertVerifier;
+use rustls::RootCertStore;
 
 /// Everything that can go wrong building or loading the cluster PKI.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +61,13 @@ pub enum PkiError {
         #[source]
         source: rcgen::Error,
     },
+
+    /// Building the OPTIONAL client-cert verifier failed — the CA cert PEM
+    /// could not be parsed into a [`rustls::RootCertStore`], or the
+    /// [`WebPkiClientVerifier`] builder rejected the roots. Typed, never a
+    /// silent insecure fall-through to no-client-auth.
+    #[error("client verifier build error: {0}")]
+    ClientVerifier(String),
 }
 
 engenho_substrate::impl_error_kind! {
@@ -63,6 +75,7 @@ engenho_substrate::impl_error_kind! {
         { Io { .. } } => "io",
         (Crypto(_)) => "crypto",
         { San { .. } } => "san",
+        (ClientVerifier(_)) => "client_verifier",
     }
 }
 
@@ -72,6 +85,9 @@ engenho_substrate::impl_error_kind! {
 const CA_VALIDITY_DAYS: i64 = 3650;
 /// Server-cert validity. Re-issued every boot, so a year is generous.
 const SERVER_VALIDITY_DAYS: i64 = 365;
+/// Admin CLIENT-cert validity. Re-issued each boot (cheap) but persisted so
+/// the operator's kubeconfig stays stable; matches the server-cert horizon.
+const CLIENT_VALIDITY_DAYS: i64 = 365;
 
 /// The CA the cluster signs server certs with. Holds the parsed params
 /// (DN + key-usages, needed to act as an issuer) + the keypair (the
@@ -116,6 +132,38 @@ pub struct TlsMaterial {
     /// The cluster CA cert PEM (== the kubeconfig's
     /// `certificate-authority-data`, base64'd at emit time).
     pub ca_cert_pem: String,
+    /// The OPTIONAL client-cert verifier. When `Some`, the server requests a
+    /// client cert (verified against the cluster CA) but still completes the
+    /// handshake for a no-cert client (`allow_unauthenticated`) — so existing
+    /// token/anonymous kubectl keeps connecting. When `None`, the server runs
+    /// with no client auth (`with_no_client_auth`) — the pre-authn behavior,
+    /// kept for the plaintext-floor + tests that don't exercise mTLS.
+    pub client_verifier: Option<std::sync::Arc<dyn ClientCertVerifier>>,
+}
+
+/// The admin CLIENT-cert material: a leaf cert + private key PEM the
+/// operator's kubeconfig embeds as `client-certificate-data` +
+/// `client-key-data`. Leaf-only (the client need NOT present the CA — the
+/// server already trusts it via [`client_verifier`]'s root store).
+pub struct ClientMaterial {
+    /// The client leaf cert PEM (NO CA appended — leaf only).
+    pub cert_pem: String,
+    /// The client private key PEM.
+    pub key_pem: String,
+}
+
+/// A verified peer client certificate's identity, parsed AFTER rustls
+/// completed (and verified) the TLS handshake. The X509 authenticator stage
+/// turns this into a `UserInfo` (`username = common_name`, `groups =
+/// organizations + system:authenticated`). Injected into each request's
+/// extensions by the custom TLS acceptor; ABSENT when the client presented
+/// no cert (the `allow_unauthenticated` path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedClientCert {
+    /// The cert's Subject Common Name (the authenticated username).
+    pub common_name: String,
+    /// The cert's Subject Organization values (mapped to K8s groups).
+    pub organizations: Vec<String>,
 }
 
 /// SAN inputs for the server cert. The listen IP is `Some` only when the
@@ -240,7 +288,163 @@ pub fn issue_server_material(
         cert_chain_pem,
         key_pem: leaf_key.serialize_pem(),
         ca_cert_pem: ca.ca_cert_pem.clone(),
+        // No client verifier by default — the runtime attaches the OPTIONAL
+        // verifier via [`TlsMaterial::with_client_verifier`] when it wants mTLS.
+        client_verifier: None,
     })
+}
+
+impl TlsMaterial {
+    /// Attach the OPTIONAL client-cert verifier (builder style). The runtime
+    /// builds it from the SAME cluster CA via [`client_verifier`] and attaches
+    /// it here so the server requests-but-does-not-require a client cert.
+    #[must_use]
+    pub fn with_client_verifier(
+        mut self,
+        verifier: std::sync::Arc<dyn ClientCertVerifier>,
+    ) -> Self {
+        self.client_verifier = Some(verifier);
+        self
+    }
+}
+
+/// Issue the bootstrap ADMIN client cert from the SAME cluster CA. Mirrors
+/// [`issue_server_material`] exactly but for a CLIENT identity:
+/// `CN=engenho-admin`, `O=system:masters`, EKU `clientAuth`, NO SANs (a
+/// client cert needs none). Returns the leaf cert + key PEM (leaf only — the
+/// client never presents the CA; the server trusts it via the CA root store
+/// in [`client_verifier`]).
+///
+/// This is the load-bearing material behind `kubectl auth whoami →
+/// engenho-admin / system:masters`: the operator's kubeconfig embeds this
+/// cert and the X509 authenticator maps `CN` + `O` to `UserInfo::admin()`.
+///
+/// # Errors
+///
+/// [`PkiError::Crypto`] if rcgen can't generate / sign the client leaf.
+pub fn issue_admin_client_material(ca: &ClusterCa) -> Result<ClientMaterial, PkiError> {
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::NoCa;
+    params.distinguished_name = DistinguishedName::new();
+    // CN = the authenticated username; O = the K8s super-user group.
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "engenho-admin");
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "system:masters");
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    // clientAuth (NOT serverAuth) — this cert authenticates a CLIENT.
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    set_validity(&mut params, CLIENT_VALIDITY_DAYS);
+    // No SANs: a client cert is identified by its Subject, not a SAN.
+
+    let leaf_key = KeyPair::generate()?;
+    let issuer = ca.issuer()?;
+    let leaf_cert = params.signed_by(&leaf_key, &issuer, &ca.key)?;
+
+    Ok(ClientMaterial {
+        cert_pem: leaf_cert.pem(),
+        key_pem: leaf_key.serialize_pem(),
+    })
+}
+
+/// Build the OPTIONAL client-cert verifier rooted at the cluster CA.
+///
+/// `allow_unauthenticated()` is the LOAD-BEARING call: a client that presents
+/// NO certificate still completes the TLS handshake (so the existing
+/// token/anonymous kubectl + the CA-only `curl` keep connecting). A client
+/// that DOES present a cert has it verified against the CA root store; the
+/// verified leaf's Subject is then read post-handshake by the custom acceptor
+/// into a [`VerifiedClientCert`].
+///
+/// The CA DER comes from re-parsing `ca.ca_cert_pem` via `rustls-pemfile`
+/// (already a dep). A malformed CA PEM or a builder rejection is a typed
+/// [`PkiError::ClientVerifier`] — never a silent downgrade to no-client-auth.
+///
+/// # Errors
+///
+/// [`PkiError::ClientVerifier`] if the CA PEM can't be parsed into a root
+/// store or the `WebPkiClientVerifier` builder rejects the roots.
+pub fn client_verifier(ca: &ClusterCa) -> Result<Arc<dyn ClientCertVerifier>, PkiError> {
+    // `WebPkiClientVerifier::builder(...).build()` reads the process-level
+    // crypto provider; install `ring` idempotently first (same provider the
+    // server config + reqwest use) so a fresh process that builds the verifier
+    // before any TLS handshake doesn't panic with "no process-level
+    // CryptoProvider". An Err means another component already installed one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut roots = RootCertStore::empty();
+    let mut pem = ca.ca_cert_pem.as_bytes();
+    for der in rustls_pemfile::certs(&mut pem) {
+        let der: CertificateDer<'static> =
+            der.map_err(|e| PkiError::ClientVerifier(format!("parse CA PEM: {e}")))?;
+        roots
+            .add(der)
+            .map_err(|e| PkiError::ClientVerifier(format!("add CA to root store: {e}")))?;
+    }
+    if roots.is_empty() {
+        return Err(PkiError::ClientVerifier(
+            "no CA certificate found in ca_cert_pem".to_string(),
+        ));
+    }
+    WebPkiClientVerifier::builder(Arc::new(roots))
+        // OPTIONAL: a no-cert client still handshakes (existing kubectl works).
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| PkiError::ClientVerifier(format!("build client verifier: {e}")))
+}
+
+/// Extract the inner string of a [`DnValue`], whatever ASN.1 string encoding
+/// it carries. Our own certs push CN/O via `&str` → `Utf8String`, but a
+/// re-parsed cert may surface other encodings (printable / ia5); this folds
+/// every string variant to its text so the X509 authenticator never misses an
+/// identity over an encoding mismatch. Returns `None` for the BMP/Universal
+/// variants we never emit (kept total, no panic).
+fn dn_value_str(v: &DnValue) -> Option<String> {
+    match v {
+        DnValue::Utf8String(s) => Some(s.clone()),
+        DnValue::PrintableString(s) => Some(s.as_str().to_string()),
+        DnValue::Ia5String(s) => Some(s.as_str().to_string()),
+        DnValue::TeletexString(s) => Some(s.as_str().to_string()),
+        // BMP / Universal are UCS-2/UTF-32 wide encodings we never emit for
+        // CN/O — not reachable for engenho-minted certs; skip rather than
+        // mis-decode. `DnValue` is #[non_exhaustive]; the wildcard also folds
+        // any future variant to None (skip, never a wrong identity).
+        _ => None,
+    }
+}
+
+/// Parse a verified peer client cert's leaf DER into a [`VerifiedClientCert`]
+/// (Subject CN + Organizations). Reuses rcgen's `from_ca_cert_der` purely as
+/// a DN extractor — it reads the Subject regardless of BasicConstraints (it
+/// does NOT require the cert to be a CA), so a client leaf parses cleanly.
+///
+/// Returns `None` when the cert has no CN (an unusable identity — the X509
+/// stage then declines, falling through to the next authenticator).
+///
+/// # Errors
+///
+/// [`PkiError::Crypto`] if the DER can't be parsed at all.
+pub fn parse_client_cert(leaf_der: &[u8]) -> Result<Option<VerifiedClientCert>, PkiError> {
+    let der = CertificateDer::from(leaf_der.to_vec());
+    let params = CertificateParams::from_ca_cert_der(&der)?;
+    let dn = &params.distinguished_name;
+    let Some(common_name) = dn.get(&DnType::CommonName).and_then(dn_value_str) else {
+        return Ok(None);
+    };
+    let organizations: Vec<String> = dn
+        .iter()
+        .filter(|(ty, _)| **ty == DnType::OrganizationName)
+        .filter_map(|(_, v)| dn_value_str(v))
+        .collect();
+    Ok(Some(VerifiedClientCert {
+        common_name,
+        organizations,
+    }))
 }
 
 /// Build the server cert SAN list. DNS SANs are deduped-by-construction
@@ -509,7 +713,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admin_client_cert_carries_cn_o_and_client_auth() {
+        let (_dir, ca) = ca_in_tempdir();
+        let mat = issue_admin_client_material(&ca).unwrap();
+
+        // Parse the leaf back through rcgen's DN extractor.
+        let der = pem_block_to_der(&mat.cert_pem);
+        let leaf = CertificateParams::from_ca_cert_der(&der.into()).unwrap();
+
+        // EKU clientAuth (NOT serverAuth).
+        assert!(
+            leaf.extended_key_usages
+                .contains(&ExtendedKeyUsagePurpose::ClientAuth),
+            "admin client cert must have EKU clientAuth; got {:?}",
+            leaf.extended_key_usages
+        );
+        assert!(
+            !leaf
+                .extended_key_usages
+                .contains(&ExtendedKeyUsagePurpose::ServerAuth),
+            "admin client cert must NOT carry serverAuth"
+        );
+
+        // CN=engenho-admin, O=system:masters.
+        let cn = leaf.distinguished_name.get(&DnType::CommonName).unwrap();
+        assert!(format!("{cn:?}").contains("engenho-admin"), "CN: {cn:?}");
+        let o = leaf
+            .distinguished_name
+            .get(&DnType::OrganizationName)
+            .unwrap();
+        assert!(format!("{o:?}").contains("system:masters"), "O: {o:?}");
+
+        // It is leaf-ONLY (one PEM block, no CA appended).
+        assert_eq!(
+            mat.cert_pem.matches("BEGIN CERTIFICATE").count(),
+            1,
+            "admin client material is leaf-only (no CA appended)"
+        );
+        assert!(mat.key_pem.contains("PRIVATE KEY"), "key PEM present");
+    }
+
+    #[test]
+    fn parse_client_cert_reads_cn_and_orgs() {
+        // The acceptor-side parse: minted admin cert → VerifiedClientCert with
+        // CN=engenho-admin + O=[system:masters].
+        let (_dir, ca) = ca_in_tempdir();
+        let mat = issue_admin_client_material(&ca).unwrap();
+        let der = pem_block_to_der(&mat.cert_pem);
+        let parsed = parse_client_cert(&der)
+            .unwrap()
+            .expect("admin cert has a CN");
+        assert_eq!(parsed.common_name, "engenho-admin");
+        assert_eq!(parsed.organizations, vec!["system:masters".to_string()]);
+    }
+
+    #[test]
+    fn client_verifier_builds_from_ca() {
+        // The OPTIONAL verifier builds from the cluster CA without error. The
+        // allow_unauthenticated posture is exercised end-to-end by the live
+        // proof (no-cert curl still connects); here we assert construction.
+        let (_dir, ca) = ca_in_tempdir();
+        let verifier = client_verifier(&ca).expect("verifier builds from CA");
+        // offer_client_auth() is true (the verifier requests a cert) but the
+        // allow_unauthenticated() path makes presenting one OPTIONAL.
+        assert!(
+            verifier.offer_client_auth(),
+            "verifier offers (optional) client auth"
+        );
+    }
+
+    #[test]
+    fn admin_cert_chains_to_the_cluster_ca() {
+        // The minted admin client cert verifies against the CA root store —
+        // proves the leaf actually chains to the cluster CA the verifier
+        // trusts (the same CA the server presents).
+        let (_dir, ca) = ca_in_tempdir();
+        let mat = issue_admin_client_material(&ca).unwrap();
+        let leaf_der = CertificateDer::from(pem_block_to_der(&mat.cert_pem));
+
+        let mut roots = RootCertStore::empty();
+        let mut ca_pem = ca.cert_pem().as_bytes();
+        for der in rustls_pemfile::certs(&mut ca_pem) {
+            roots.add(der.unwrap()).unwrap();
+        }
+        // webpki verification needs a crypto provider; install ring.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+        // No intermediates: the admin leaf chains directly to the CA root.
+        verifier
+            .verify_client_cert(&leaf_der, &[], now)
+            .expect("admin leaf verifies against the cluster CA root");
+    }
+
     // ── small parsing helpers for the tests above ──────────────────────
+
+    /// Decode the first PEM certificate block of `pem` to its DER bytes.
+    fn pem_block_to_der(pem: &str) -> Vec<u8> {
+        let mut bytes = pem.as_bytes();
+        rustls_pemfile::certs(&mut bytes)
+            .next()
+            .expect("a cert block")
+            .expect("valid PEM cert")
+            .to_vec()
+    }
 
     fn first_pem_block(chain: &str) -> String {
         let begin = "-----BEGIN CERTIFICATE-----";

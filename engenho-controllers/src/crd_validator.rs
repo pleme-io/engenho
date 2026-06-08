@@ -250,6 +250,7 @@ mod tests {
             key,
             value: Some(value),
             current: None,
+            user_info: engenho_types::auth::UserInfo::default(),
         }
     }
 
@@ -293,6 +294,7 @@ mod tests {
             key: ResourceKey::namespaced("", "v1", "Pod", "default", "x"),
             value: Some(json!({})),
             current: None,
+            user_info: engenho_types::auth::UserInfo::default(),
         };
         assert_eq!(w.review(&req).await.unwrap(), AdmissionDecision::Allow);
     }

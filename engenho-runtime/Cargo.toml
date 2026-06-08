@@ -30,6 +30,9 @@ serde_json          = { workspace = true }
 thiserror           = { workspace = true }
 tokio               = { workspace = true }
 tracing             = { workspace = true }
+# OS entropy for the bootstrap admin bearer token (no plaintext secret in the
+# tree; the token is minted + persisted 0600 at first boot).
+getrandom           = "0.3"
 
 [dev-dependencies]
 reqwest = { workspace = true }

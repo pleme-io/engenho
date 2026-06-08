@@ -225,6 +225,78 @@ pub fn emit_kubeconfig(
         .map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
 }
 
+/// User name + context name for the admin-client-cert kubeconfig.
+const ADMIN_USER: &str = "engenho-admin";
+
+/// Emit a kubeconfig whose user authenticates with the ADMIN CLIENT CERT
+/// (instead of the placeholder bearer token). This is the load-bearing change
+/// behind `kubectl auth whoami → engenho-admin / system:masters`: the embedded
+/// client cert (`O=system:masters`) is verified by the apiserver's optional
+/// client verifier and mapped to the admin identity by the X509 authenticator.
+///
+/// The `AuthInfo` carries `client-certificate-data` + `client-key-data` (both
+/// base64-PEM, the kubeconfig convention) — NOT a token. The parser side needs
+/// ZERO change: `auth_from_user` already resolves these to
+/// [`KubeAuth::ClientCert`].
+///
+/// * `cluster_name`   — `clusters[].name` + `current-context`.
+/// * `server_url`     — `https://<host>:<port>`.
+/// * `ca_pem`         — the cluster CA cert PEM (`certificate-authority-data`).
+/// * `admin_cert_pem` — the admin client leaf cert PEM (`client-certificate-data`).
+/// * `admin_key_pem`  — the admin client private key PEM (`client-key-data`).
+///
+/// # Errors
+///
+/// [`KubeError::Encode`] if serde_yaml can't serialize the value.
+pub fn emit_kubeconfig_with_admin(
+    cluster_name: &str,
+    server_url: &str,
+    ca_pem: &[u8],
+    admin_cert_pem: &[u8],
+    admin_key_pem: &[u8],
+) -> Result<String, KubeError> {
+    use base64::Engine as _;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+
+    let config = Kubeconfig {
+        api_version: "v1".to_string(),
+        kind: "Config".to_string(),
+        current_context: cluster_name.to_string(),
+        clusters: vec![NamedCluster {
+            name: cluster_name.to_string(),
+            cluster: Cluster {
+                server: server_url.to_string(),
+                certificate_authority_data: Some(b64(ca_pem)),
+                certificate_authority: None,
+                insecure_skip_tls_verify: false,
+            },
+        }],
+        users: vec![NamedAuthInfo {
+            name: ADMIN_USER.to_string(),
+            // CLIENT-CERT user (NOT a token user): the admin cert + key embed
+            // directly. The apiserver's optional client verifier validates the
+            // cert against the cluster CA + the X509 authenticator maps its
+            // CN/O to the admin identity → `kubectl auth whoami` reports it.
+            user: AuthInfo {
+                client_certificate_data: Some(b64(admin_cert_pem)),
+                client_key_data: Some(b64(admin_key_pem)),
+                ..AuthInfo::default()
+            },
+        }],
+        contexts: vec![NamedContext {
+            name: cluster_name.to_string(),
+            context: Context {
+                cluster: cluster_name.to_string(),
+                user: ADMIN_USER.to_string(),
+                namespace: Some("default".to_string()),
+            },
+        }],
+    };
+
+    serde_yaml::to_string(&config)
+        .map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
+}
+
 impl Kubeconfig {
     /// Parse YAML.
     ///
@@ -517,6 +589,73 @@ contexts: []
             "no client key in anonymous posture"
         );
         assert!(u.exec.is_none());
+    }
+
+    const SAMPLE_CERT_PEM: &[u8] =
+        b"-----BEGIN CERTIFICATE-----\nMIIBadminCert==\n-----END CERTIFICATE-----\n";
+    const SAMPLE_KEY_PEM: &[u8] =
+        b"-----BEGIN PRIVATE KEY-----\nMIIBadminKey==\n-----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn admin_kubeconfig_embeds_client_cert_and_key() {
+        use base64::Engine as _;
+        let yaml = emit_kubeconfig_with_admin(
+            "engenho-local",
+            "https://127.0.0.1:6443",
+            SAMPLE_CA_PEM,
+            SAMPLE_CERT_PEM,
+            SAMPLE_KEY_PEM,
+        )
+        .expect("emit admin kubeconfig");
+        let kc = Kubeconfig::from_yaml(&yaml).expect("parse admin kubeconfig");
+
+        // The user is a CLIENT-CERT user (no token), named engenho-admin.
+        assert_eq!(kc.users.len(), 1);
+        assert_eq!(kc.users[0].name, "engenho-admin");
+        let u = &kc.users[0].user;
+        assert!(u.token.is_none(), "admin user is cert-based, NOT a token");
+
+        // client-certificate-data + client-key-data base64-decode to the input PEM.
+        let cert_b64 = u
+            .client_certificate_data
+            .as_ref()
+            .expect("client-certificate-data present");
+        let key_b64 = u
+            .client_key_data
+            .as_ref()
+            .expect("client-key-data present");
+        let cert = base64::engine::general_purpose::STANDARD
+            .decode(cert_b64)
+            .unwrap();
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(key_b64)
+            .unwrap();
+        assert_eq!(cert, SAMPLE_CERT_PEM);
+        assert_eq!(key, SAMPLE_KEY_PEM);
+
+        // Context binds the engenho-admin user.
+        assert_eq!(kc.contexts[0].context.user, "engenho-admin");
+    }
+
+    #[test]
+    fn admin_kubeconfig_resolves_to_client_cert_auth() {
+        // The parser side: the emitted client-cert user resolves to
+        // KubeAuth::ClientCert (proves emit∘parse round-trips into the right
+        // auth method — kubectl uses the cert, not a token).
+        let yaml = emit_kubeconfig_with_admin(
+            "c",
+            "https://127.0.0.1:6443",
+            SAMPLE_CA_PEM,
+            SAMPLE_CERT_PEM,
+            SAMPLE_KEY_PEM,
+        )
+        .expect("emit");
+        let kc = Kubeconfig::from_yaml(&yaml).expect("parse");
+        let resolved = auth_from_user(&kc.users[0].user).expect("resolve auth");
+        assert!(
+            matches!(resolved, KubeAuth::ClientCert { .. }),
+            "admin kubeconfig resolves to ClientCert auth; got {resolved:?}"
+        );
     }
 
     #[test]
