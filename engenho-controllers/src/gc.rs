@@ -84,11 +84,7 @@ impl Controller for GcController {
                     "deleting orphan"
                 );
                 self.store
-                    .propose(ResourceCommand::Delete {
-                        key,
-                        expected: None,
-                        reason: Reason::GarbageCollector,
-                    })
+                    .propose(ResourceCommand::delete(key, Reason::GarbageCollector))
                     .await?;
                 report.objects_changed += 1;
             }

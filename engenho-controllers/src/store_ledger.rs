@@ -248,11 +248,7 @@ impl MaterializationLedger for StoreBackedLedger {
                 .map(StageId::new);
             if stage.as_ref() == Some(stage_id) {
                 self.store
-                    .propose(ResourceCommand::Delete {
-                        key,
-                        expected: None,
-                        reason: Reason::Controller,
-                    })
+                    .propose(ResourceCommand::delete(key, Reason::Controller))
                     .await
                     .map_err(|e| LedgerError::Backend(format!("store delete: {e}")))?;
             }

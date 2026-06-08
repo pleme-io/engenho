@@ -46,6 +46,7 @@ pub mod hpa;
 pub mod ingress;
 pub mod job;
 pub mod meta;
+pub mod namespace;
 pub mod network_policy;
 pub mod owned_children;
 pub mod owner;
@@ -115,6 +116,7 @@ pub use network_policy::{
     NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,
 };
 pub use meta::ObjectMeta;
+pub use namespace::{NamespaceController, namespaced_kinds};
 pub use owned_children::{
     ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta,
 };

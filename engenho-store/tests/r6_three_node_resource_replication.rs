@@ -95,6 +95,7 @@ async fn put_then_patch_then_delete_full_lifecycle() {
             key: pod_key("p"),
             expected: None,
             reason: Reason::Operator,
+            deletion_timestamp: None,
         })
         .await
         .unwrap();

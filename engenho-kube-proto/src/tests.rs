@@ -225,3 +225,54 @@ fn json_inner_content_type_is_parsed_directly() {
     assert_eq!(v["metadata"]["name"], "j");
     assert_eq!(v["data"]["a"], "b");
 }
+
+#[test]
+fn normalize_metadata_times_converts_rfc3339_to_seconds_nanos() {
+    // The metav1.Time JSON↔proto duality: an RFC3339 string in
+    // metadata.creationTimestamp becomes {seconds, nanos} so prost-reflect
+    // can encode the Time MESSAGE field.
+    let v = json!({
+        "metadata": {
+            "name": "x",
+            "creationTimestamp": "2026-06-08T12:34:56Z"
+        }
+    });
+    let out = normalize_metadata_times(&v);
+    let ts = &out["metadata"]["creationTimestamp"];
+    // 2026-06-08T12:34:56Z → epoch seconds (computed independently).
+    let expected = chrono::DateTime::parse_from_rfc3339("2026-06-08T12:34:56Z")
+        .unwrap()
+        .timestamp();
+    assert_eq!(ts["seconds"], expected);
+    assert_eq!(ts["nanos"], 0);
+    // The name field is untouched.
+    assert_eq!(out["metadata"]["name"], "x");
+}
+
+#[test]
+fn normalize_metadata_times_leaves_absent_and_nonstring_untouched() {
+    // No metadata → no-op clone.
+    let v = json!({"spec": {"replicas": 1}});
+    assert_eq!(normalize_metadata_times(&v), v);
+    // Already an object form → untouched (idempotent for the proto shape).
+    let v2 = json!({"metadata": {"creationTimestamp": {"seconds": 10, "nanos": 0}}});
+    assert_eq!(normalize_metadata_times(&v2), v2);
+}
+
+#[test]
+fn deployment_with_creation_timestamp_encodes() {
+    // The exact regression the object-lifecycle brick introduced: a created
+    // Deployment carrying a string creationTimestamp must encode to protobuf
+    // (the Time field is normalized to the proto message form first).
+    let gvk = Gvk::new("apps/v1", "Deployment");
+    let dep = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": { "name": "web", "creationTimestamp": "2026-06-08T12:34:56Z" },
+        "spec": { "replicas": 2 }
+    });
+    let bytes = encode_response(&gvk, &dep).expect("deployment with timestamp encodes");
+    let back = decode_protobuf(&bytes).expect("decodes back");
+    assert_eq!(back["metadata"]["name"], "web");
+    assert_eq!(back["kind"], "Deployment");
+}

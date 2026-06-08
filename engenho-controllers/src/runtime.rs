@@ -193,6 +193,7 @@ mod tests {
                 endpoints: true,
                 gc: true,
                 crd: true,
+                namespace: true,
             },
             namespace: String::new(),
             fallback_interval_seconds: 45,

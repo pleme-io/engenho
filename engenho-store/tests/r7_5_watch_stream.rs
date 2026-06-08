@@ -170,6 +170,7 @@ async fn delete_emits_deleted_event() {
             key: pod_key("p"),
             expected: None,
             reason: Reason::Operator,
+            deletion_timestamp: None,
         })
         .await
         .unwrap();

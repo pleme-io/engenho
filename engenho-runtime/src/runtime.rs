@@ -17,8 +17,8 @@ use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_config::{ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind};
 use engenho_controllers::{
     CrdController, DeploymentController, DynamicHandlerSink, EndpointsController, GcController,
-    JobController, KindFilter, ReplicaSetController, StatefulSetController, WatchDriver,
-    WatchDriverConfig,
+    JobController, KindFilter, NamespaceController, ReplicaSetController, StatefulSetController,
+    WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode},
 };
 use engenho_kubelet::config_bridge::KubeletBackendKind;
@@ -372,7 +372,7 @@ async fn boot_store(config: &EngenhoConfig) -> Result<Arc<StoreMesh>, RuntimeErr
 /// advertises real capacity.
 async fn register_node(store: &StoreMesh, node_name: &str) -> Result<(), RuntimeError> {
     let (cpu, memory) = host_capacity();
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "kind": "Node",
         "apiVersion": "v1",
         "metadata": { "name": node_name },
@@ -383,6 +383,10 @@ async fn register_node(store: &StoreMesh, node_name: &str) -> Result<(), Runtime
             "conditions": [{ "type": "Ready", "status": "True" }]
         }
     });
+    // Route the self-registered Node through the SAME boundary stamp the
+    // apiserver create path uses, so AGE works on the Node too. Frozen once
+    // into the replicated Put.
+    stamp_creation_timestamp_value(&mut value);
     store
         .propose(ResourceCommand::Put {
             key: ResourceKey::cluster_scoped("", "v1", "Node", node_name),
@@ -393,6 +397,29 @@ async fn register_node(store: &StoreMesh, node_name: &str) -> Result<(), Runtime
         .await?;
     info!(node = %node_name, "registered schedulable node");
     Ok(())
+}
+
+/// Inject `metadata.creationTimestamp` (if absent) into an opaque JSON
+/// body from the typed RFC3339 boundary render — the non-handler `Put`
+/// seeders (register_node) route through this so every born object,
+/// including the self-registered Node, carries a real creationTimestamp.
+/// Mirrors the apiserver handler's `stamp_creation_timestamp`.
+fn stamp_creation_timestamp_value(body: &mut serde_json::Value) {
+    if let Some(obj) = body.as_object_mut() {
+        let metadata = obj
+            .entry("metadata".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            let absent = !meta_obj.contains_key("creationTimestamp")
+                || meta_obj.get("creationTimestamp") == Some(&serde_json::Value::Null);
+            if absent {
+                meta_obj.insert(
+                    "creationTimestamp".to_string(),
+                    serde_json::Value::String(engenho_types::time::now_rfc3339_utc()),
+                );
+            }
+        }
+    }
 }
 
 /// The RBAC group + version every seed key carries.
@@ -546,7 +573,10 @@ async fn seed_bootstrap_rbac(store: &StoreMesh) -> Result<(), RuntimeError> {
 }
 
 /// Typed [`ObjectMeta`] carrying just a name — the shape every bootstrap RBAC
-/// object needs.
+/// object needs. The `creationTimestamp` is stamped at the Put boundary
+/// (`put_cluster_role` / `put_cluster_role_binding` route the serialized
+/// value through `stamp_creation_timestamp_value`), so every seeded RBAC
+/// object carries a real timestamp exactly like the apiserver create path.
 fn rbac_meta(name: &str) -> engenho_types::meta::ObjectMeta {
     engenho_types::meta::ObjectMeta {
         name: name.to_string(),
@@ -578,8 +608,9 @@ fn group_subject(name: &str) -> Subject {
 /// body is serialized from the typed value (TYPED EMISSION); only the Put
 /// envelope is hand-built.
 async fn put_cluster_role(store: &StoreMesh, cr: &ClusterRole) -> Result<(), RuntimeError> {
-    let value = serde_json::to_value(cr)
+    let mut value = serde_json::to_value(cr)
         .map_err(|e| RuntimeError::Server(seed_serialize_err("ClusterRole", &e)))?;
+    stamp_creation_timestamp_value(&mut value);
     let name = cr.metadata.name.clone();
     store
         .propose(ResourceCommand::Put {
@@ -597,8 +628,9 @@ async fn put_cluster_role_binding(
     store: &StoreMesh,
     crb: &ClusterRoleBinding,
 ) -> Result<(), RuntimeError> {
-    let value = serde_json::to_value(crb)
+    let mut value = serde_json::to_value(crb)
         .map_err(|e| RuntimeError::Server(seed_serialize_err("ClusterRoleBinding", &e)))?;
+    stamp_creation_timestamp_value(&mut value);
     let name = crb.metadata.name.clone();
     store
         .propose(ResourceCommand::Put {
@@ -892,6 +924,18 @@ fn spawn_drivers(
         );
     }
 
+    // Namespace: cascade-deletion of a Terminating namespace's contents +
+    // finalizer clear. Watches the cluster-scoped Namespace kind (KindFilter
+    // matches on ev.key.kind, so cluster-scoped works) PLUS the fallback tick
+    // so a Terminating namespace drains over a few reconcile cycles. Mirrors
+    // the gc block; gated on controllers.enable.namespace.
+    if enable.namespace {
+        let c = NamespaceController::new(store.clone(), ns.clone());
+        handles.push(
+            WatchDriver::new(c, store.clone(), driver_config(&["Namespace"])).spawn(),
+        );
+    }
+
     // CRD: CustomResourceDefinition → dynamic CR-handler registration. The
     // controller registers a StoreBackedHandler per served CRD version into
     // the shared RouterState via `handler_sink`, so CR instances become
@@ -987,9 +1031,9 @@ mod tests {
             node.get("spec").unwrap().get("unschedulable").unwrap(),
             false
         );
-        // Drivers: 7 reconcilers (deployment, replicaset, statefulset,
-        // job, endpoints, gc, crd) + scheduler + kubelet = 9.
-        assert_eq!(rt.drivers.len(), 9);
+        // Drivers: 8 reconcilers (deployment, replicaset, statefulset,
+        // job, endpoints, gc, namespace, crd) + scheduler + kubelet = 10.
+        assert_eq!(rt.drivers.len(), 10);
         rt.shutdown().await.unwrap();
     }
 

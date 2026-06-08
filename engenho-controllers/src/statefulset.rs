@@ -150,11 +150,7 @@ impl OwnedChildrenReconciler for StatefulSetController {
             if let Some(ord) = Self::ordinal_of(&pod_key.name, sts_name) {
                 if ord >= desired {
                     debug!(sts = sts_name, pod = %pod_key.label(), "scaling down ordered pod");
-                    commands.push(ResourceCommand::Delete {
-                        key: pod_key.clone(),
-                        expected: None,
-                        reason: Reason::Controller,
-                    });
+                    commands.push(ResourceCommand::delete(pod_key.clone(), Reason::Controller));
                 }
             }
         }

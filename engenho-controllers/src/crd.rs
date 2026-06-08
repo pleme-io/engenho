@@ -759,11 +759,7 @@ mod tests {
 
         // Delete the CRD object, then tick → the handler is unregistered.
         store
-            .propose(ResourceCommand::Delete {
-                key: crd_key,
-                expected: None,
-                reason: Reason::Operator,
-            })
+            .propose(ResourceCommand::delete(crd_key, Reason::Operator))
             .await
             .unwrap();
         ctrl.tick().await.unwrap();

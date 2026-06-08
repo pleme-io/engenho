@@ -319,6 +319,45 @@ pub fn decode_protobuf(bytes: &[u8]) -> Result<serde_json::Value, CodecError> {
     Ok(value)
 }
 
+/// The two `metav1.Time` metadata fields engenho stamps as RFC3339 strings
+/// (the wire form) that must be converted to the proto `Time` message
+/// `{seconds, nanos}` for protobuf encoding.
+const TIME_METADATA_FIELDS: [&str; 2] = ["creationTimestamp", "deletionTimestamp"];
+
+/// Convert `metadata.{creationTimestamp,deletionTimestamp}` from their
+/// RFC3339-string wire form into the proto `Time` object form
+/// `{"seconds": <i64>, "nanos": <i32>}`, returning a normalized clone.
+///
+/// K8s `metav1.Time` is a protobuf MESSAGE but JSON-marshals (Go custom
+/// marshaller) as an RFC3339 string; prost-reflect doesn't know that
+/// custom duality, so the protobuf encoder needs the object form. A field
+/// that is absent, already an object, null, or an unparseable string is
+/// left untouched (the latter would surface as the normal typed
+/// `CodecError::FromJson` downstream — never a silent wrong answer).
+fn normalize_metadata_times(value: &serde_json::Value) -> serde_json::Value {
+    let mut out = value.clone();
+    let Some(metadata) = out
+        .as_object_mut()
+        .and_then(|o| o.get_mut("metadata"))
+        .and_then(|m| m.as_object_mut())
+    else {
+        return out;
+    };
+    for field in TIME_METADATA_FIELDS {
+        if let Some(serde_json::Value::String(s)) = metadata.get(field) {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                let seconds = dt.timestamp();
+                let nanos = i64::from(dt.timestamp_subsec_nanos());
+                metadata.insert(
+                    field.to_string(),
+                    serde_json::json!({ "seconds": seconds, "nanos": nanos }),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Encode a read-back `serde_json::Value` (the object the handler
 /// returned) into a magic-prefixed `runtime.Unknown`-framed K8s protobuf
 /// response body for the given GVK.
@@ -331,6 +370,16 @@ pub fn decode_protobuf(bytes: &[u8]) -> Result<serde_json::Value, CodecError> {
 pub fn encode_response(gvk: &Gvk, value: &serde_json::Value) -> Result<Bytes, CodecError> {
     // Build the per-kind DynamicMessage from the JSON Value.
     let msg_desc = message_for_gvk(gvk)?;
+    // K8s `metav1.Time` is a protobuf MESSAGE `{ int64 seconds; int32 nanos }`
+    // but JSON-marshals (in Go) as an RFC3339 STRING. prost-reflect has no
+    // knowledge of that custom mapping, so a JSON value carrying a string
+    // `metadata.creationTimestamp` / `deletionTimestamp` would fail to
+    // deserialize into the `Time` message field. Normalize those two
+    // well-known Time fields from their RFC3339-string wire form into the
+    // proto `{seconds, nanos}` object form before handing the Value to
+    // prost-reflect — the codec's typed model of metav1.Time's JSON↔proto
+    // duality (mirrors what kube-apiserver does in Go).
+    let value = normalize_metadata_times(value);
     let serialized = value.to_string();
     let mut de = serde_json::Deserializer::from_str(&serialized);
     let dynamic = DynamicMessage::deserialize_with_options(msg_desc, &mut de, &deserialize_options())
