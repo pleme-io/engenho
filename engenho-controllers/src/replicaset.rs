@@ -138,11 +138,10 @@ impl OwnedChildrenReconciler for ReplicaSetController {
             let mut owned_sorted: Vec<&(ResourceKey, Value)> = owned_pods.iter().collect();
             owned_sorted.sort_by(|a, b| a.0.name.cmp(&b.0.name));
             for (pod_key, _) in owned_sorted.iter().rev().take(to_delete) {
-                commands.push(ResourceCommand::Delete {
-                    key: (*pod_key).clone(),
-                    expected: None,
-                    reason: Reason::Controller,
-                });
+                commands.push(ResourceCommand::delete(
+                    (*pod_key).clone(),
+                    Reason::Controller,
+                ));
             }
         }
 

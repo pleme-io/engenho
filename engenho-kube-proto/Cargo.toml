@@ -21,6 +21,9 @@ prost-reflect = { version = "0.16", features = ["serde"] }
 bytes         = "1"
 serde_json    = { workspace = true }
 thiserror     = { workspace = true }
+# Parse the RFC3339 `metav1.Time` wire string into epoch seconds/nanos when
+# normalizing for the protobuf `{seconds, nanos}` message form.
+chrono        = "0.4"
 
 [build-dependencies]
 protox        = "0.9"

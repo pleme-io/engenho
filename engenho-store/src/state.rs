@@ -305,9 +305,12 @@ impl ResourceCatalog {
                 expected,
                 ..
             } => self.apply_patch(key, patch, *patch_type, *expected, rev),
-            ResourceCommand::Delete { key, expected, .. } => {
-                self.apply_delete(key, *expected, rev)
-            }
+            ResourceCommand::Delete {
+                key,
+                expected,
+                deletion_timestamp,
+                ..
+            } => self.apply_delete(key, *expected, deletion_timestamp.as_deref(), rev),
         };
         self.last_applied_term = term;
         self.last_applied_index = index;
@@ -405,6 +408,19 @@ impl ResourceCatalog {
                     meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
                 }
             }
+        }
+
+        // Finalizer release: a Put that empties `metadata.finalizers` on a
+        // deletionTimestamp-bearing object is the trigger that ACTUALLY
+        // removes it (the finalizer gate kept it Terminating until now). The
+        // post-merge value IS the object that would be stored — if it is
+        // Terminating with no finalizers left, convert this Put into a
+        // removal (emit Deleted) instead of storing the no-finalizer
+        // Terminating object.
+        if let Some(outcome) =
+            self.finalizer_release_removal(key, &new_value, prior_value.as_ref(), rev)
+        {
+            return outcome;
         }
 
         self.resources
@@ -509,6 +525,17 @@ impl ResourceCatalog {
             }
         }
 
+        // Finalizer release (same rule as apply_put): a patch that empties
+        // `metadata.finalizers` on a deletionTimestamp-bearing object
+        // converts into a removal. THIS is what makes
+        // `kubectl patch …finalizers:null` actually delete a Terminating
+        // object.
+        if let Some(outcome) =
+            self.finalizer_release_removal(key, &merged, Some(&prior_value), rev)
+        {
+            return outcome;
+        }
+
         self.resources
             .insert(key.clone(), (merged.clone(), version_meta));
 
@@ -525,36 +552,175 @@ impl ResourceCatalog {
         )
     }
 
-    fn apply_delete(
+    /// Shared finalizer-release rule consumed by both [`Self::apply_put`]
+    /// and [`Self::apply_patch`]: if `post` is a Terminating object
+    /// (carries `metadata.deletionTimestamp`) whose `metadata.finalizers`
+    /// is now EMPTY, the mutation that produced `post` is the trigger that
+    /// actually removes the object. Returns `Some(Deleted outcome)` (and
+    /// removes the key) when the rule fires; `None` otherwise (the caller
+    /// proceeds with its normal store-and-emit).
+    ///
+    /// Only fires for an UPDATE (`prior.is_some()`): a fresh create can't
+    /// be Terminating, and we never want a first-create Put to vanish. The
+    /// Deleted change carries `post` as the tombstone (the last-known
+    /// object, finalizers already cleared) so watch consumers see the real
+    /// final object, never Null.
+    fn finalizer_release_removal(
         &mut self,
         key: &ResourceKey,
-        expected: Option<Revision>,
+        post: &ResourceValue,
+        prior: Option<&ResourceValue>,
         rev: Revision,
-    ) -> ApplyOutcome {
-        // Precondition (CAS) BEFORE the remove. A `Some(_)` precondition
-        // on a missing key, or one that mismatches the live mod_revision,
-        // is a Conflict; an unconditional delete-not-found stays NoOp.
-        // Both leave the catalog byte-identical (the `remove` only runs
-        // after the precondition passes).
-        let live_meta = self.resources.get(key).map(|(_, m)| *m);
-        if !check_precondition(expected, live_meta) {
-            return ApplyOutcome::no_change(ResourceOp::Conflict);
+    ) -> Option<ApplyOutcome> {
+        if prior.is_none() {
+            return None;
         }
-        let Some((removed_value, removed_meta)) = self.resources.remove(key) else {
-            return ApplyOutcome::no_change(ResourceOp::NoOp);
-        };
-        // The tombstone (post-image) IS the last-known object — so
-        // watch consumers see what was deleted. Both `value` and
-        // `prior` carry it; the Deleted event never carries Null.
-        ApplyOutcome::with_change(
+        if deletion_timestamp_of(post).is_none() || has_finalizers(post) {
+            return None;
+        }
+        // Terminating + finalizers cleared ⇒ remove now. The version_meta
+        // on the tombstone is the live key's metadata (it is being removed,
+        // so its mod_revision is whatever it last was — we surface `rev` as
+        // the change revision, matching apply_delete's removal shape).
+        let removed_meta = self
+            .resources
+            .remove(key)
+            .map(|(_, m)| m)
+            .unwrap_or_else(|| VersionMeta::created_at(rev));
+        Some(ApplyOutcome::with_change(
             ResourceOp::Deleted,
             Change {
                 revision: rev,
                 key: key.clone(),
                 kind: ChangeKind::Delete,
-                value: removed_value.clone(),
-                prior: Some(removed_value),
+                value: post.clone(),
+                prior: Some(post.clone()),
                 version_meta: removed_meta,
+            },
+        ))
+    }
+
+    /// The finalizer delete-gate (the deterministic replay site — runs
+    /// IDENTICALLY on every Raft replica).
+    ///
+    /// Behavior, in order:
+    ///
+    /// 1. CAS precondition (unchanged) — Conflict on mismatch; NoOp on
+    ///    unconditional delete-not-found. Both leave the catalog
+    ///    byte-identical.
+    /// 2. **No finalizers** ⇒ remove immediately, exactly as the historical
+    ///    behavior: same `remove`, same `ChangeKind::Delete`, same
+    ///    [`ResourceOp::Deleted`] (BEHAVIOR-PRESERVATION — a normal delete
+    ///    on a no-finalizer object is untouched).
+    /// 3. **Finalizers present + `deletionTimestamp` NOT yet set** ⇒ do NOT
+    ///    remove. Stamp `metadata.deletionTimestamp` from the REPLICATED
+    ///    `deletion_timestamp` scalar (never a per-node clock), bump the
+    ///    per-key version + global revision, and emit a `ChangeKind::Put`
+    ///    (Modified) event carrying the now-Terminating object. Returns
+    ///    [`ResourceOp::DeletionPending`].
+    /// 4. **Finalizers present + `deletionTimestamp` ALREADY set** ⇒
+    ///    idempotent [`ResourceOp::NoOp`] (no revision, no event) — repeated
+    ///    `kubectl delete` on a Terminating object does not churn.
+    ///
+    /// The object is removed ONLY later, when an update/patch empties
+    /// `metadata.finalizers` on a deletionTimestamp-bearing object (see
+    /// [`Self::apply_put`] / [`Self::apply_patch`]).
+    fn apply_delete(
+        &mut self,
+        key: &ResourceKey,
+        expected: Option<Revision>,
+        deletion_timestamp: Option<&str>,
+        rev: Revision,
+    ) -> ApplyOutcome {
+        // Precondition (CAS) BEFORE any mutation. A `Some(_)` precondition
+        // on a missing key, or one that mismatches the live mod_revision,
+        // is a Conflict; an unconditional delete-not-found stays NoOp.
+        // Both leave the catalog byte-identical.
+        let live_meta = self.resources.get(key).map(|(_, m)| *m);
+        if !check_precondition(expected, live_meta) {
+            return ApplyOutcome::no_change(ResourceOp::Conflict);
+        }
+
+        // Read the live object to inspect finalizers + an existing
+        // deletionTimestamp. Absent key (after the precondition passed —
+        // only possible for an unconditional delete) ⇒ NoOp, unchanged.
+        let Some((live_value, live_meta)) = self.resources.get(key).cloned() else {
+            return ApplyOutcome::no_change(ResourceOp::NoOp);
+        };
+
+        // ── BEHAVIOR-PRESERVATION: no finalizers ⇒ remove immediately. ──
+        if !has_finalizers(&live_value) {
+            let (removed_value, removed_meta) = self
+                .resources
+                .remove(key)
+                .expect("key present (just read above)");
+            return ApplyOutcome::with_change(
+                ResourceOp::Deleted,
+                Change {
+                    revision: rev,
+                    key: key.clone(),
+                    kind: ChangeKind::Delete,
+                    value: removed_value.clone(),
+                    prior: Some(removed_value),
+                    version_meta: removed_meta,
+                },
+            );
+        }
+
+        // ── Finalizers present. ──
+        // Idempotent: already Terminating ⇒ no churn (no revision, no event).
+        if deletion_timestamp_of(&live_value).is_some() {
+            return ApplyOutcome::no_change(ResourceOp::NoOp);
+        }
+
+        // First delete on a finalizer-bearing object: stamp
+        // deletionTimestamp from the REPLICATED scalar (deterministic).
+        // A None scalar here (an unconditional GC delete that didn't
+        // freeze a boundary clock) means we have no timestamp to stamp —
+        // leave the object untouched (NoOp) rather than invent a
+        // non-replicated value. The apiserver delete path always threads
+        // a frozen timestamp for finalizer-bearing objects, so the
+        // operator-driven path always reaches the Terminating stamp; a
+        // controller/GC pass that wants the stamp threads it too.
+        let Some(ts) = deletion_timestamp else {
+            return ApplyOutcome::no_change(ResourceOp::NoOp);
+        };
+
+        let version_meta = live_meta.bumped_at(rev);
+        // Pre-image (before the deletionTimestamp stamp) — the `prior` the
+        // Modified watch event carries.
+        let prior = live_value.clone();
+        let mut terminating = live_value;
+        stamp_deletion_timestamp(&mut terminating, ts);
+        // resourceVersion follows the bump (so a watcher's CAS sees the new
+        // rev); generation is spec-intent and unchanged by a metadata-only
+        // deletionTimestamp stamp, so it is preserved verbatim.
+        if let Some(meta_obj) = terminating
+            .as_object_mut()
+            .and_then(|o| o.get_mut("metadata"))
+            .and_then(|m| m.as_object_mut())
+        {
+            meta_obj.insert(
+                "resourceVersion".to_string(),
+                serde_json::Value::String(rev.to_string()),
+            );
+        }
+
+        self.resources
+            .insert(key.clone(), (terminating.clone(), version_meta));
+
+        // A Put (Modified) event, NOT a Delete — the object is still there,
+        // now Terminating. Watch consumers see a MODIFIED, kubectl sees the
+        // object with a deletionTimestamp.
+        ApplyOutcome::with_change(
+            ResourceOp::DeletionPending,
+            Change {
+                revision: rev,
+                key: key.clone(),
+                kind: ChangeKind::Put,
+                value: terminating,
+                prior: Some(prior),
+                version_meta,
             },
         )
     }
@@ -753,6 +919,46 @@ fn spec_of(value: &serde_json::Value) -> Option<&serde_json::Value> {
     value.get("spec")
 }
 
+/// `true` iff the object carries a NON-EMPTY `metadata.finalizers` array.
+/// An absent field, a non-array, or an empty array all count as "no
+/// finalizers" (the K8s contract: finalizers gate deletion only while the
+/// list is non-empty).
+fn has_finalizers(value: &serde_json::Value) -> bool {
+    value
+        .get("metadata")
+        .and_then(|m| m.get("finalizers"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+}
+
+/// Borrow the object's `metadata.deletionTimestamp` string when present
+/// and non-empty (Terminating marker). `None` when absent/empty/non-string.
+fn deletion_timestamp_of(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("metadata")
+        .and_then(|m| m.get("deletionTimestamp"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Set `metadata.deletionTimestamp` to the REPLICATED `ts` string,
+/// creating `metadata` if absent. Pure JSON mutation of the opaque body —
+/// the typed RFC3339 render already happened at the apiserver boundary
+/// (`engenho_types::time`); here we only thread the frozen scalar in.
+fn stamp_deletion_timestamp(value: &mut serde_json::Value, ts: &str) {
+    if let Some(obj) = value.as_object_mut() {
+        let metadata = obj
+            .entry("metadata".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            meta_obj.insert(
+                "deletionTimestamp".to_string(),
+                serde_json::Value::String(ts.to_string()),
+            );
+        }
+    }
+}
+
 /// Read `metadata.generation` off a stored object (the value already in
 /// hand). `0` (the "no generation" sentinel) when absent or non-integer —
 /// the very first create's prior is `None`, not a zero-generation object.
@@ -823,6 +1029,26 @@ mod tests {
                 key: key.clone(),
                 expected: None,
                 reason: Reason::Operator,
+                deletion_timestamp: None,
+            },
+            1,
+            index,
+        )
+    }
+
+    /// Delete carrying a frozen boundary timestamp (the apiserver-path shape).
+    fn delete_at(
+        cat: &mut ResourceCatalog,
+        key: &ResourceKey,
+        ts: &str,
+        index: u64,
+    ) -> ApplyOutcome {
+        cat.apply(
+            &ResourceCommand::Delete {
+                key: key.clone(),
+                expected: None,
+                reason: Reason::Operator,
+                deletion_timestamp: Some(ts.to_string()),
             },
             1,
             index,
@@ -1304,5 +1530,196 @@ mod tests {
             5,
         ); // NoOp — no revision
         assert_eq!(cat.revision(), Revision(3));
+    }
+
+    // ── Finalizer delete-gate ──────────────────────────────────────────
+
+    fn put_with_finalizer(
+        cat: &mut ResourceCatalog,
+        key: &ResourceKey,
+        index: u64,
+    ) -> ApplyOutcome {
+        put(
+            cat,
+            key,
+            serde_json::json!({
+                "spec": {"image": "v1"},
+                "metadata": {"finalizers": ["example.com/hold"]}
+            }),
+            index,
+        )
+    }
+
+    #[test]
+    fn delete_no_finalizer_removes_immediately_behavior_preserved() {
+        // (a) BEHAVIOR-PRESERVATION: a normal delete on a no-finalizer
+        // object removes it immediately + emits Deleted (UNCHANGED today).
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("plain");
+        put(&mut cat, &k, serde_json::json!({"spec": {}}), 1);
+        let out = delete(&mut cat, &k, 2);
+        assert_eq!(out.op, ResourceOp::Deleted);
+        assert_eq!(out.change.unwrap().kind, ChangeKind::Delete);
+        assert!(cat.get(&k).is_none(), "no-finalizer object is gone");
+        assert_eq!(cat.revision(), Revision(2));
+    }
+
+    #[test]
+    fn delete_with_finalizer_stamps_deletion_timestamp_keeps_object() {
+        // (b) finalizer-bearing delete with a replicated deletion_timestamp:
+        // stamps metadata.deletionTimestamp, KEEPS the object, emits a
+        // Put/Modified Change, consumes one revision.
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("held");
+        put_with_finalizer(&mut cat, &k, 1); // rev 1
+        let out = delete_at(&mut cat, &k, "2026-06-08T12:00:00Z", 2);
+        assert_eq!(out.op, ResourceOp::DeletionPending);
+        let change = out.change.expect("a change committed");
+        assert_eq!(change.kind, ChangeKind::Put, "Modified event, not Delete");
+        assert_eq!(change.revision, Revision(2), "one revision consumed");
+        assert_eq!(cat.revision(), Revision(2));
+        // The object is STILL present, now Terminating.
+        let live = cat.get(&k).expect("object kept (Terminating)");
+        assert_eq!(
+            live.get("metadata").unwrap().get("deletionTimestamp").unwrap(),
+            "2026-06-08T12:00:00Z"
+        );
+        // Finalizer preserved (still blocking removal).
+        assert!(
+            live.get("metadata")
+                .unwrap()
+                .get("finalizers")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "example.com/hold")
+        );
+    }
+
+    #[test]
+    fn second_delete_on_terminating_is_idempotent_noop() {
+        // (c) a second identical delete while already Terminating is an
+        // idempotent NoOp (no revision, no event).
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("held2");
+        put_with_finalizer(&mut cat, &k, 1); // rev 1
+        delete_at(&mut cat, &k, "2026-06-08T12:00:00Z", 2); // rev 2 (Terminating)
+        assert_eq!(cat.revision(), Revision(2));
+        let out = delete_at(&mut cat, &k, "2026-06-08T13:00:00Z", 3);
+        assert_eq!(out.op, ResourceOp::NoOp, "already Terminating → NoOp");
+        assert!(out.change.is_none(), "no event on idempotent re-delete");
+        assert_eq!(cat.revision(), Revision(2), "no revision consumed");
+        // deletionTimestamp unchanged (the FIRST one, not the second).
+        assert_eq!(
+            cat.get(&k)
+                .unwrap()
+                .get("metadata")
+                .unwrap()
+                .get("deletionTimestamp")
+                .unwrap(),
+            "2026-06-08T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn patch_clearing_finalizers_on_terminating_removes_object() {
+        // (d) a patch clearing finalizers on a deletionTimestamp-bearing
+        // object converts to a removal (Deleted emitted, key gone). THIS is
+        // `kubectl patch …finalizers:null`.
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("release");
+        put_with_finalizer(&mut cat, &k, 1); // rev 1
+        delete_at(&mut cat, &k, "2026-06-08T12:00:00Z", 2); // rev 2 → Terminating
+        assert!(cat.get(&k).is_some(), "still present while finalized");
+        // Merge-patch finalizers to [] (empty) — the release trigger.
+        let out = patch(
+            &mut cat,
+            &k,
+            serde_json::json!({"metadata": {"finalizers": []}}),
+            3,
+        );
+        assert_eq!(out.op, ResourceOp::Deleted, "finalizer-release → Deleted");
+        assert_eq!(out.change.unwrap().kind, ChangeKind::Delete);
+        assert!(cat.get(&k).is_none(), "object removed once finalizers cleared");
+    }
+
+    #[test]
+    fn put_clearing_finalizers_on_terminating_removes_object() {
+        // The apply_put sibling of the patch rule: a full replace that drops
+        // finalizers on a Terminating object also removes it.
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("release-put");
+        put_with_finalizer(&mut cat, &k, 1);
+        delete_at(&mut cat, &k, "2026-06-08T12:00:00Z", 2);
+        // Replace the whole object WITHOUT finalizers but carrying the
+        // deletionTimestamp (as a real client doing the final write would).
+        let out = put(
+            &mut cat,
+            &k,
+            serde_json::json!({
+                "spec": {"image": "v1"},
+                "metadata": {"deletionTimestamp": "2026-06-08T12:00:00Z"}
+            }),
+            3,
+        );
+        assert_eq!(out.op, ResourceOp::Deleted);
+        assert!(cat.get(&k).is_none());
+    }
+
+    #[test]
+    fn delete_with_finalizer_but_no_timestamp_is_noop() {
+        // A finalizer-bearing object deleted WITHOUT a replicated timestamp
+        // (an unconditional GC delete that didn't freeze a boundary clock):
+        // we don't invent a non-replicated value, so it's a NoOp (object
+        // kept, no churn). The apiserver path always threads a timestamp for
+        // finalizer-bearing objects, so this is only the controller/GC edge.
+        let mut cat = ResourceCatalog::default();
+        let k = pod_key("held-no-ts");
+        put_with_finalizer(&mut cat, &k, 1);
+        let out = delete(&mut cat, &k, 2);
+        assert_eq!(out.op, ResourceOp::NoOp);
+        assert!(out.change.is_none());
+        assert!(cat.get(&k).is_some(), "kept (no timestamp to stamp)");
+    }
+
+    #[test]
+    fn finalizer_gate_is_deterministic_across_two_replays() {
+        // DETERMINISM: two independent catalogs applying the SAME command
+        // sequence (with the SAME frozen deletion_timestamp) produce
+        // byte-identical objects — the property every Raft replica relies
+        // on. The deletion_timestamp is a replicated scalar; apply_delete
+        // never reads a clock.
+        let seq: Vec<ResourceCommand> = vec![
+            ResourceCommand::put(
+                pod_key("d"),
+                serde_json::json!({
+                    "spec": {"image": "v1"},
+                    "metadata": {"finalizers": ["example.com/hold"]}
+                }),
+                Reason::Operator,
+            ),
+            ResourceCommand::delete_at(
+                pod_key("d"),
+                None,
+                Reason::Operator,
+                Some("2026-06-08T12:34:56Z".to_string()),
+            ),
+        ];
+        let replay = |cmds: &[ResourceCommand]| {
+            let mut cat = ResourceCatalog::default();
+            for (i, cmd) in cmds.iter().enumerate() {
+                cat.apply(cmd, 1, (i + 1) as u64);
+            }
+            cat
+        };
+        let a = replay(&seq);
+        let b = replay(&seq);
+        // The two catalogs are equal (resources + revision), and the stored
+        // Terminating object is byte-identical.
+        assert_eq!(a, b, "two replays of the same sequence converge");
+        let va = serde_json::to_vec(a.get(&pod_key("d")).unwrap()).unwrap();
+        let vb = serde_json::to_vec(b.get(&pod_key("d")).unwrap()).unwrap();
+        assert_eq!(va, vb, "Terminating object is byte-identical across replays");
     }
 }

@@ -238,6 +238,7 @@ async fn gc_deletes_orphan_replicaset_when_deployment_is_removed() {
             key: dep_key,
             expected: None,
             reason: Reason::Operator,
+            deletion_timestamp: None,
         })
         .await
         .unwrap();
@@ -286,6 +287,7 @@ async fn gc_deletes_orphan_pods_when_replicaset_is_removed() {
             key: rs_key.clone(),
             expected: None,
             reason: Reason::Operator,
+            deletion_timestamp: None,
         })
         .await
         .unwrap();

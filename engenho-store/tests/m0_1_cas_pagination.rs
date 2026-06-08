@@ -57,6 +57,7 @@ fn delete_with(key: ResourceKey, expected: Option<Revision>) -> ResourceCommand 
         key,
         expected,
         reason: Reason::Operator,
+        deletion_timestamp: None,
     }
 }
 

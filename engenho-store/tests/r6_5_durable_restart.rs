@@ -76,6 +76,7 @@ async fn restart_preserves_resources_and_revision() {
                 key: pod_key("b"),
                 expected: None,
                 reason: Reason::Operator,
+                deletion_timestamp: None,
             })
             .await
             .unwrap();

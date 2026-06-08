@@ -719,6 +719,7 @@ async fn event_kinds_through_watch_from_memory() {
         key: pod_key("k"),
         expected: None,
         reason: Reason::Operator,
+        deletion_timestamp: None,
     })
     .await
     .unwrap();

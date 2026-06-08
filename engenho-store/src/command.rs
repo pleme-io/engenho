@@ -27,6 +27,15 @@ fn default_patch_type() -> PatchType {
     PatchType::Merge
 }
 
+/// The default `deletion_timestamp` for a replayed pre-field `Delete` log
+/// entry — historical `Delete` commands carried no timestamp, so an old
+/// serialized entry deserializes as `None` (no Terminating stamp),
+/// preserving its original immediate-remove semantics. Mirrors the
+/// [`default_patch_type`] forward-compat shape.
+fn default_deletion_timestamp() -> Option<String> {
+    None
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResourceCommand {
@@ -82,10 +91,27 @@ pub enum ResourceCommand {
     /// `expected` is the optimistic-concurrency precondition (K8s
     /// `Preconditions.resourceVersion`, surfaced as `?resourceVersion=`
     /// on DELETE) — see [`ResourceCommand::Put`].
+    ///
+    /// `deletion_timestamp` is the FROZEN RFC3339-UTC instant the
+    /// apiserver boundary captured for this delete (a CLOCK read, the one
+    /// non-deterministic input — see `engenho_types::time`). It is part of
+    /// the REPLICATED command so the finalizer delete-gate in
+    /// `state::apply_delete` stamps `metadata.deletionTimestamp` from this
+    /// replicated scalar (NOT a per-node clock), keeping every Raft
+    /// replica byte-identical. `None` ⇒ no timestamp threaded (the
+    /// boundary judged the object finalizer-free, OR a pre-field log entry
+    /// is being replayed): apply_delete removes immediately as before. The
+    /// gate decision (finalizers present ⇒ Terminating, else remove) is
+    /// made deterministically inside apply_delete; this scalar only
+    /// supplies the timestamp it would stamp.
     Delete {
         key: ResourceKey,
         expected: Option<Revision>,
         reason: Reason,
+        /// Frozen boundary timestamp (see variant docs). `#[serde(default)]`
+        /// so replayed pre-field log entries deserialize as `None`.
+        #[serde(default = "default_deletion_timestamp")]
+        deletion_timestamp: Option<String>,
     },
 }
 
@@ -131,13 +157,40 @@ impl ResourceCommand {
         Self::patch_typed(key, patch, PatchType::Merge, reason)
     }
 
-    /// Construct an UNCONDITIONAL `Delete` (no CAS precondition).
+    /// Construct an UNCONDITIONAL `Delete` (no CAS precondition, no frozen
+    /// timestamp). The common controller/GC shape — these don't read a
+    /// boundary clock; the finalizer gate falls back to "no timestamp to
+    /// stamp" which is correct for a no-finalizer object (immediate
+    /// remove) and for a finalizer-bearing one stamps nothing this pass
+    /// (the next pass with a threaded timestamp, or a `Put`-carried
+    /// timestamp, supplies it). Equivalent to the struct literal with
+    /// `expected: None, deletion_timestamp: None`.
     #[must_use]
     pub fn delete(key: ResourceKey, reason: Reason) -> Self {
         Self::Delete {
             key,
             expected: None,
             reason,
+            deletion_timestamp: None,
+        }
+    }
+
+    /// Construct a `Delete` carrying a FROZEN boundary `deletion_timestamp`
+    /// (and optional CAS precondition). The apiserver delete path uses
+    /// this so the finalizer gate stamps `metadata.deletionTimestamp` from
+    /// the replicated scalar — deterministic across replicas.
+    #[must_use]
+    pub fn delete_at(
+        key: ResourceKey,
+        expected: Option<Revision>,
+        reason: Reason,
+        deletion_timestamp: Option<String>,
+    ) -> Self {
+        Self::Delete {
+            key,
+            expected,
+            reason,
+            deletion_timestamp,
         }
     }
 }
@@ -171,6 +224,17 @@ pub enum ResourceOp {
     Patched,
     /// Existing resource removed.
     Deleted,
+    /// A delete on a FINALIZER-BEARING object: the object was NOT removed.
+    /// Instead `metadata.deletionTimestamp` was stamped (Terminating) and
+    /// the object kept; a `ChangeKind::Put` (Modified) watch event fired
+    /// carrying the now-Terminating object, and one revision was consumed.
+    /// The object is removed later, when an update/patch empties
+    /// `metadata.finalizers` (apply_put/apply_patch convert that mutation
+    /// into a removal). Idempotent: a second delete while already
+    /// Terminating is a [`Self::NoOp`] (no revision, no event). Maps to a
+    /// normal DELETE response in the apiserver — kubectl sees the object
+    /// still present with a `deletionTimestamp`, exactly like upstream.
+    DeletionPending,
     /// Optimistic-concurrency precondition failed: the caller's
     /// `expected` per-key `mod_revision` did not match the live one
     /// (or the key was absent for a `Some(_)` precondition). The
@@ -232,12 +296,50 @@ mod tests {
                 key: key.clone(),
                 expected: None,
                 reason: Reason::GarbageCollector,
+                deletion_timestamp: Some("2026-06-08T12:34:56Z".into()),
             },
         ];
         for cmd in cases {
             let s = serde_json::to_string(&cmd).unwrap();
             let back: ResourceCommand = serde_json::from_str(&s).unwrap();
             assert_eq!(back, cmd);
+        }
+    }
+
+    #[test]
+    fn delete_deserializes_pre_field_log_entry_as_no_timestamp() {
+        // Forward-compat: a serialized Delete from BEFORE deletion_timestamp
+        // existed (no such field) deserializes with deletion_timestamp ==
+        // None, preserving its original immediate-remove semantics — the
+        // same #[serde(default)] contract default_patch_type relies on.
+        let legacy = serde_json::json!({
+            "kind": "delete",
+            "key": ResourceKey::namespaced("", "v1", "ConfigMap", "default", "old"),
+            "expected": null,
+            "reason": "operator"
+        });
+        let cmd: ResourceCommand = serde_json::from_value(legacy).unwrap();
+        match cmd {
+            ResourceCommand::Delete {
+                deletion_timestamp, ..
+            } => assert_eq!(deletion_timestamp, None),
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_at_threads_the_frozen_timestamp() {
+        let cmd = ResourceCommand::delete_at(
+            ResourceKey::namespaced("", "v1", "ConfigMap", "default", "fz"),
+            None,
+            Reason::Operator,
+            Some("2026-06-08T00:00:00Z".into()),
+        );
+        match cmd {
+            ResourceCommand::Delete {
+                deletion_timestamp, ..
+            } => assert_eq!(deletion_timestamp.as_deref(), Some("2026-06-08T00:00:00Z")),
+            other => panic!("expected Delete, got {other:?}"),
         }
     }
 }

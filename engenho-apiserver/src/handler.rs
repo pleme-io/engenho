@@ -935,10 +935,27 @@ impl ResourceHandler for StoreBackedHandler {
         // Admission runs at the API boundary BEFORE any store proposal.
         // A Mutate replaces the body; a Deny short-circuits with 403. The
         // authenticated identity travels into AdmissionRequest.user_info.
-        let body = self
+        let mut body = self
             .admit(AdmissionAction::Put, &key, Some(body), user_info)
             .await?
             .expect("admit(Put, Some(_)) preserves Some on Allow/Mutate");
+        // ── creationTimestamp stamp (DETERMINISM boundary clock read). ──
+        // Inject `metadata.creationTimestamp` (if absent) from ONE typed
+        // RFC3339 render at the apiserver boundary — the frozen string
+        // travels inside the single replicated `Put`, so every Raft replica
+        // replays the identical value (the clock is NOT a replicated input,
+        // so it MUST be frozen here, never inside the deterministic
+        // store-apply path). kubectl AGE then renders a real duration
+        // instead of `<unknown>`.
+        stamp_creation_timestamp(&mut body);
+        // ── Namespace lifecycle stamp (Active + kubernetes finalizer). ──
+        // Real k8s seeds these via the namespace-lifecycle admission plugin;
+        // engenho stamps them at create so a Namespace is born Active with
+        // the `kubernetes` finalizer (so its delete goes Terminating + the
+        // NamespaceController cascade owns the teardown).
+        if self.kind == "Namespace" {
+            stamp_namespace_create_defaults(&mut body);
+        }
         // Optimistic-concurrency precondition from the (post-admission)
         // body's metadata.resourceVersion. For a CREATE (POST) of a NEW
         // object the rv is absent → None (unconditional create); a
@@ -1031,6 +1048,17 @@ impl ResourceHandler for StoreBackedHandler {
                 ApiError::BadRequest(msg)
             });
         }
+        // A patch that EMPTIED the finalizers on a Terminating object is
+        // converted by the store into a REMOVAL (the finalizer-release rule
+        // in apply_patch) — the object is intentionally gone now. The store
+        // reports `ResourceOp::Deleted` for that case; the read-back is
+        // (correctly) None. Return a typed Success Status, NOT an Internal
+        // error — this is `kubectl patch …finalizers:null` completing the
+        // delete. (A plain not-found read-back without a Deleted op stays
+        // the genuine "lost during commit" internal error.)
+        if result.op == ResourceOp::Deleted {
+            return Ok(crate::error::delete_status_success(name, &self.kind));
+        }
         let stored = self
             .store
             .get(&key)
@@ -1077,24 +1105,51 @@ impl ResourceHandler for StoreBackedHandler {
         // through `ApplyResult` is a larger store-layer change deferred to
         // a later brick.
         let prior = self.store.get(&key).await;
+        // DETERMINISM: freeze ONE boundary clock read into the replicated
+        // command IFF the live object bears finalizers (only then does the
+        // store's finalizer gate stamp `metadata.deletionTimestamp`). The
+        // timestamp is captured here, at the apiserver boundary, via the
+        // typed RFC3339 render (`engenho_types::time`) — the one
+        // non-deterministic input — so every Raft replica replays the
+        // identical bytes. A no-finalizer object threads `None` (the gate
+        // removes it immediately, BEHAVIOR-PRESERVATION).
+        let deletion_timestamp = prior
+            .as_ref()
+            .filter(|v| object_has_finalizers(v))
+            .map(|_| engenho_types::time::now_rfc3339_utc());
+        // Keep a clone for the DeletionPending re-read (the original is
+        // moved into the proposed command).
+        let key_for_reread = key.clone();
         let result = self
             .store
-            .propose(ResourceCommand::Delete {
+            .propose(ResourceCommand::delete_at(
                 key,
                 expected,
-                reason: Reason::Operator,
-            })
+                Reason::Operator,
+                deletion_timestamp,
+            ))
             .await
             .map_err(|e| ApiError::StorageError(e.to_string()))?;
         if result.op == ResourceOp::Conflict {
             return Err(self.rv_conflict(name, expected));
         }
         // Return the response BODY:
-        //   * object existed at delete time → the removed object exactly as
-        //     it was, through the SAME `inject_type_meta` path GET uses
+        //   * finalizer-blocked delete (DeletionPending) → re-read the LIVE
+        //     object so the body carries the freshly-stamped
+        //     `metadata.deletionTimestamp` (Terminating), exactly like
+        //     upstream returns the still-present object on a finalizer block.
+        //   * object existed + removed → the removed object exactly as it
+        //     was, through the SAME `inject_type_meta` path GET uses
         //     (renders cleanly as json OR protobuf — its GVK is in the pool).
         //   * object absent (idempotent no-op) → a typed
         //     `metav1.Status{status:"Success"}`. Never an empty body.
+        if result.op == ResourceOp::DeletionPending {
+            // The store kept the object Terminating; surface the live
+            // (stamped) object so kubectl shows the deletionTimestamp.
+            if let Some(live) = self.store.get(&key_for_reread).await {
+                return Ok(inject_type_meta(&live, self.api_version(), &self.kind));
+            }
+        }
         match prior {
             Some(v) => Ok(inject_type_meta(&v, self.api_version(), &self.kind)),
             None => Ok(crate::error::delete_status_success(name, &self.kind)),
@@ -1434,6 +1489,88 @@ fn inject_type_meta(v: &Value, api_version: String, kind: &str) -> Value {
             .or_insert_with(|| Value::String(api_version));
     }
     out
+}
+
+/// `true` iff the object carries a NON-EMPTY `metadata.finalizers` array —
+/// the apiserver-side gate that decides whether to freeze a boundary
+/// `deletionTimestamp` into the Delete command (mirrors the store-side
+/// `has_finalizers`; the two agree because both read the same opaque body).
+fn object_has_finalizers(value: &Value) -> bool {
+    value
+        .get("metadata")
+        .and_then(|m| m.get("finalizers"))
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+}
+
+/// Inject `metadata.creationTimestamp` (if absent) from the typed RFC3339
+/// boundary render. Idempotent: a body that already carries one (a re-PUT,
+/// or a client that set it) is left untouched. The store-apply path never
+/// touches creationTimestamp, so this single boundary stamp is the
+/// authoritative value carried into the replicated `Put`.
+fn stamp_creation_timestamp(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        let metadata = obj
+            .entry("metadata".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            if creation_timestamp_is_unset(meta_obj.get("creationTimestamp")) {
+                meta_obj.insert(
+                    "creationTimestamp".to_string(),
+                    Value::String(engenho_types::time::now_rfc3339_utc()),
+                );
+            }
+        }
+    }
+}
+
+/// `true` iff the `creationTimestamp` slot is effectively UNSET and should
+/// be stamped: absent, JSON `null`, an empty string, OR an EMPTY object
+/// `{}`. The empty-object case is load-bearing: the kubectl typed clientset
+/// posts a protobuf body whose `metav1.Time` (a message) decodes to `{}`
+/// when zero — without treating `{}` as unset, a protobuf `create` would
+/// leave `creationTimestamp: {}` and AGE would render `<unknown>`.
+fn creation_timestamp_is_unset(slot: Option<&Value>) -> bool {
+    match slot {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.is_empty(),
+        Some(Value::Object(m)) => m.is_empty(),
+        _ => false,
+    }
+}
+
+/// At Namespace create, stamp `status.phase = "Active"` and ensure the
+/// `kubernetes` finalizer is present on `metadata.finalizers` — the two
+/// the namespace-lifecycle admission plugin seeds upstream. Idempotent:
+/// an existing `kubernetes` finalizer / Active phase is left as-is.
+fn stamp_namespace_create_defaults(body: &mut Value) {
+    const KUBERNETES_FINALIZER: &str = "kubernetes";
+    if let Some(obj) = body.as_object_mut() {
+        // status.phase = Active
+        let status = obj
+            .entry("status".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(status_obj) = status.as_object_mut() {
+            status_obj
+                .entry("phase".to_string())
+                .or_insert_with(|| Value::String("Active".to_string()));
+        }
+        // metadata.finalizers += kubernetes (if not already present)
+        let metadata = obj
+            .entry("metadata".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            let finalizers = meta_obj
+                .entry("finalizers".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(arr) = finalizers.as_array_mut() {
+                let present = arr.iter().any(|v| v.as_str() == Some(KUBERNETES_FINALIZER));
+                if !present {
+                    arr.push(Value::String(KUBERNETES_FINALIZER.to_string()));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

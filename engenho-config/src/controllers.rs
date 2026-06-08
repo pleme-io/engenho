@@ -43,6 +43,14 @@ pub struct ControllerEnable {
     /// per served version into the live apiserver router table.
     #[serde(default = "default_true")]
     pub crd: bool,
+    /// Namespace → cascade-deletion controller. Watches Namespaces; for
+    /// each Terminating namespace holding the `kubernetes` finalizer it
+    /// lists+deletes every namespaced object in that namespace then clears
+    /// the finalizer (Background propagation). `#[serde(default)]` is
+    /// REQUIRED (the struct is `deny_unknown_fields`) so pre-existing
+    /// operator YAML written before this flag still deserializes.
+    #[serde(default = "default_true")]
+    pub namespace: bool,
 }
 
 /// serde default for the `statefulset` / `job` toggles — `true` so an
@@ -63,6 +71,7 @@ impl TieredConfig for ControllersConfig {
                 endpoints: false,
                 gc: false,
                 crd: false,
+                namespace: false,
             },
             namespace: String::new(),
             fallback_interval_seconds: 0,
@@ -80,6 +89,7 @@ impl TieredConfig for ControllersConfig {
                 endpoints: true,
                 gc: true,
                 crd: true,
+                namespace: true,
             },
             namespace: String::new(),
             fallback_interval_seconds: 30,
@@ -140,7 +150,30 @@ mod tests {
         assert!(cfg.enable.endpoints);
         assert!(cfg.enable.gc);
         assert!(cfg.enable.crd);
+        assert!(cfg.enable.namespace);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn pre_existing_yaml_without_namespace_flag_still_deserializes() {
+        // The serde default-true contract: an operator YAML written before
+        // `enable.namespace` existed (deny_unknown_fields struct) still
+        // deserializes, defaulting the flag on.
+        let yaml = r#"
+enable:
+  replicaset: true
+  deployment: true
+  statefulset: true
+  job: true
+  endpoints: true
+  gc: true
+  crd: true
+namespace: ""
+fallback_interval_seconds: 30
+debounce_milliseconds: 50
+"#;
+        let cfg: ControllersConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.enable.namespace, "missing flag defaults to true");
     }
 
     #[test]
