@@ -333,6 +333,10 @@ pub enum Subresource {
     /// `/scale` — get/patch/update the autoscaling/v1 Scale projection
     /// (`spec.replicas` only).
     Scale,
+    /// `/log` — GET a Pod container's stdout/stderr (`kubectl logs`). Read-only
+    /// (GET only). Pod-only; the router dispatches it to the kubelet
+    /// (single-node: in-process) which reads `backend.logs`.
+    Log,
 }
 
 /// One runtime row describing a routable/discoverable Kubernetes kind.
@@ -394,6 +398,12 @@ impl ResourceDescriptor {
     #[must_use]
     pub fn has_scale(&self) -> bool {
         self.subresources.contains(&Subresource::Scale)
+    }
+
+    /// `true` iff this kind serves the `/log` subresource (Pod only).
+    #[must_use]
+    pub fn has_log(&self) -> bool {
+        self.subresources.contains(&Subresource::Log)
     }
 
     /// The Group/Version/Kind triple for this descriptor.
@@ -503,6 +513,7 @@ fn render_subresources(items: &[Subresource]) -> String {
         .map(|s| match s {
             Subresource::Status => "Subresource::Status",
             Subresource::Scale => "Subresource::Scale",
+            Subresource::Log => "Subresource::Log",
         })
         .collect::<Vec<_>>()
         .join(", ");

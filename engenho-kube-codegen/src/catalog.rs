@@ -29,6 +29,10 @@ pub enum Subresource {
     /// `/scale` — get/patch/update the autoscaling/v1 Scale projection
     /// (`spec.replicas` only).
     Scale,
+    /// `/log` — GET a Pod container's stdout/stderr (`kubectl logs`). Read-only
+    /// (GET; no put/patch/delete). Pod-only; the router dispatches it to the
+    /// kubelet (single-node: in-process) which reads `backend.logs`.
+    Log,
 }
 
 /// One entry in the curated catalog: enough info to emit a typed
@@ -104,7 +108,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "pod",
         categories: &["all"],
         opaque: false,
-        subresources: &[Subresource::Status],
+        subresources: &[Subresource::Status, Subresource::Log],
     },
     KindEntry {
         kind: "Service",

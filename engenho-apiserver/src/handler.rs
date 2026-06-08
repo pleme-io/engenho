@@ -19,6 +19,7 @@ use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor, Subre
 
 use crate::error::ApiError;
 use crate::params::{ResumePoint, Selectors, body_precondition};
+use crate::pod_logs::{LogQuery, PodLogReader};
 use crate::scale::{Scale, project_scale};
 
 /// Bookmark cadence handed to `watch_from` when the client opted into
@@ -155,6 +156,17 @@ pub trait ResourceHandler: Send + Sync + 'static {
         _patch_type: engenho_types::patch::PatchType,
     ) -> Result<Value, ApiError> {
         Err(self.no_subresource("scale", name))
+    }
+
+    /// GET a Pod container's logs (`kubectl logs <pod> [-c <container>]`).
+    /// Default: a typed `NotFound` (this kind does not serve `/log`) — never a
+    /// panic, never a fake-empty Ok. The Pod handler overrides it: it routes to
+    /// the in-process kubelet (single-node) via an installed [`PodLogReader`].
+    ///
+    /// `query` carries the typed `?container=` + `?tailLines=` knobs. Returns
+    /// the raw log text (rendered as `text/plain`).
+    async fn logs(&self, _namespace: Option<&str>, name: &str, _query: &LogQuery) -> Result<String, ApiError> {
+        Err(self.no_subresource("log", name))
     }
 
     /// Build the typed `NotFound` a handler returns when asked for a
@@ -368,6 +380,12 @@ pub struct StoreBackedHandler {
     /// unaffected by the new field. Controller writes (`Reason::Controller`)
     /// do NOT flow through a handler, so they never hit admission.
     admission: Option<Arc<AdmissionChain>>,
+    /// Optional in-process Pod-log reader (the kubelet adapter). `None` for
+    /// every kind except Pod (and for Pod when no kubelet is wired — tests /
+    /// apiserver-only). When `Some`, the Pod handler's `logs` override
+    /// delegates to it; when `None`, `/log` returns a typed `NotFound` (no
+    /// fake-empty log). Installed by the runtime via [`Self::with_log_reader`].
+    log_reader: Option<Arc<dyn PodLogReader>>,
 }
 
 impl StoreBackedHandler {
@@ -398,7 +416,18 @@ impl StoreBackedHandler {
             // none at this brick.
             subresources: &[],
             admission: None,
+            log_reader: None,
         }
+    }
+
+    /// Install an in-process [`PodLogReader`] (the kubelet adapter) so this
+    /// handler's `/log` subresource serves real container logs. Builder style;
+    /// the runtime calls this on the Pod handler ONLY. A handler without a log
+    /// reader returns a typed `NotFound` for `/log` (no fake-empty log).
+    #[must_use]
+    pub fn with_log_reader(mut self, reader: Arc<dyn PodLogReader>) -> Self {
+        self.log_reader = Some(reader);
+        self
     }
 
     /// Attach the per-kind discovery registration metadata (short names,
@@ -721,6 +750,26 @@ impl ResourceHandler for StoreBackedHandler {
             .propose_scoped_patch(&key, name, scoped, expected)
             .await?;
         self.get_scale(namespace, name).await
+    }
+
+    async fn logs(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        query: &LogQuery,
+    ) -> Result<String, ApiError> {
+        // The Pod `/log` subresource. Delegate to the in-process kubelet log
+        // reader when one is installed; without it (apiserver-only / tests),
+        // serve a typed NotFound — never a fake-empty log.
+        let Some(reader) = &self.log_reader else {
+            return Err(self.no_subresource("log", name));
+        };
+        // A `/log` request is always namespaced (Pod is namespaced); the
+        // router already enforces the instance path. Default the namespace to
+        // "default" defensively (key() would have rejected a scope mismatch on
+        // any other verb).
+        let ns = namespace.unwrap_or("default");
+        reader.read_pod_logs(ns, name, query).await
     }
 
     async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {

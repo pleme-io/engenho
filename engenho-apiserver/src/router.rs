@@ -1122,6 +1122,7 @@ fn resolve_subresource(
     let parsed = match sub {
         "status" if h.subresources().contains(&Subresource::Status) => Subresource::Status,
         "scale" if h.subresources().contains(&Subresource::Scale) => Subresource::Scale,
+        "log" if h.subresources().contains(&Subresource::Log) => Subresource::Log,
         other => {
             return Err(ApiError::NotFound(format!(
                 "the server could not find the requested resource: {} does not serve subresource {:?}",
@@ -1189,6 +1190,29 @@ async fn do_get_scale(
     Ok((StatusCode::OK, Json(v)).into_response())
 }
 
+/// GET `<plural>/<name>/log` — the Pod-logs subresource. Takes the typed
+/// [`crate::pod_logs::LogQuery`] (already decoded by the verb handler's
+/// `Query` extractor from `?container=` / `?tailLines=` / `?timestamps=`), asks
+/// the handler, and renders the log text as `text/plain` (kubectl reads the
+/// streamed log body as plain text, NOT a JSON object). A typed
+/// `NotFound`/`Internal` from the handler renders as the usual K8s `Status`
+/// body via `ApiError::into_response`.
+async fn do_get_log(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    query: &crate::pod_logs::LogQuery,
+) -> Result<Response, ApiError> {
+    let text = h.logs(ns, name, query).await?;
+    // text/plain — the log stream body. kubectl reads stdout verbatim.
+    Ok((
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+        text,
+    )
+        .into_response())
+}
+
 async fn do_put_scale(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
@@ -1221,6 +1245,11 @@ async fn resource_get_or_list(
     State(state): State<RouterState>,
     coords: crate::coords::ResourceCoords,
     headers: HeaderMap,
+    // The `/log` subresource reads its typed `?container=&tailLines=&timestamps=`
+    // knobs from this extractor. axum parses the WHOLE query string into BOTH
+    // `LogQuery` and `ListWatchParams` independently — neither denies unknown
+    // fields, so each ignores the other's keys.
+    Query(log_query): Query<crate::pod_logs::LogQuery>,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     // Resolve the handler FIRST (the subresource is served by the parent
@@ -1237,6 +1266,10 @@ async fn resource_get_or_list(
                 do_get_status(&h, coords.namespace.as_deref(), name, codec).await
             }
             Subresource::Scale => do_get_scale(&h, coords.namespace.as_deref(), name).await,
+            // `/log` — read-only; the typed LogQuery is already decoded above.
+            Subresource::Log => {
+                do_get_log(&h, coords.namespace.as_deref(), name, &log_query).await
+            }
         };
     }
     match &coords.name {
@@ -1310,6 +1343,11 @@ async fn resource_put(
         Some(Subresource::Scale) => {
             do_put_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
         }
+        // `/log` is READ-ONLY (GET only) — PUT is a typed BadRequest, never a
+        // silent accept.
+        Some(Subresource::Log) => Err(ApiError::BadRequest(
+            "the log subresource is read-only (GET only)".into(),
+        )),
         // PUT on the main object (no subresource) — engenho uses POST/PATCH;
         // mirror upstream with a typed BadRequest.
         None => Err(ApiError::BadRequest(
@@ -1337,6 +1375,10 @@ async fn resource_patch(
         Some(Subresource::Scale) => {
             do_patch_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
         }
+        // `/log` is READ-ONLY (GET only) — PATCH is a typed BadRequest.
+        Some(Subresource::Log) => Err(ApiError::BadRequest(
+            "the log subresource is read-only (GET only)".into(),
+        )),
         None => {
             do_patch(
                 &h,

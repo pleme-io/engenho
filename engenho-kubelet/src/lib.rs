@@ -42,12 +42,18 @@ pub mod backend;
 pub mod config_bridge;
 pub mod error;
 pub mod kubelet;
+pub mod lifecycle;
 pub mod volume;
 
-pub use backend::{ContainerRuntime, ContainerStatus, FakeBackend, PodmanBackend, PullPolicy};
+pub use backend::{
+    ContainerRuntime, ContainerStatus, FakeBackend, LogOptions, PodmanBackend, PullPolicy,
+};
 pub use config_bridge::make_container_runtime;
 pub use error::KubeletError;
 pub use kubelet::Kubelet;
+pub use lifecycle::{
+    ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
+};
 pub use volume::{
     AccessMode, FakeVolumeBackend, FakeVolumeEvent, HostPathVolumeBackend, MountedVolume,
     VolumeError, VolumeRuntime, VolumeSpec,

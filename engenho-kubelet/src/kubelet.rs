@@ -45,18 +45,37 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::backend::{ContainerRuntime, ContainerSpec, ContainerStatus};
+use crate::backend::{ContainerRuntime, ContainerSpec, LogOptions};
 use crate::error::KubeletError;
+use crate::lifecycle::{
+    ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
+};
+
+/// What the kubelet remembers about ONE container of a Pod it started.
+#[derive(Clone, Debug)]
+struct ContainerRecord {
+    /// Opaque backend handle returned by `backend.start` for this container.
+    /// Re-assigned on a restart (the backend mints a new id).
+    container_id: String,
+    /// How many times this container has been (re)started. `0` on the first
+    /// start; bumped on each restart-policy-driven re-`start`.
+    restart_count: u32,
+}
 
 /// What the kubelet remembers about a Pod it started on this node.
 /// Keyed in [`Kubelet::local`] by the Pod's typed [`ResourceKey`] so
 /// delete-cleanup can reconstruct the Pod identity unambiguously (the
 /// `format!("{ns}_{name}")` container name is a lossy join — a `_` in
 /// either part can't be split back, so it MUST NOT be used as a key).
-#[derive(Clone, Debug)]
+///
+/// MULTI-CONTAINER: a Pod runs every `spec.containers[i]`, so the
+/// bookkeeping is a map keyed by CONTAINER NAME (`spec.containers[i].name`)
+/// → its [`ContainerRecord`]. The deterministic backend name per container is
+/// `<ns>_<pod>_<containerName>`.
+#[derive(Clone, Debug, Default)]
 struct LocalPod {
-    /// Opaque backend handle returned by `backend.start`.
-    container_id: String,
+    /// Per-container records keyed by the container's logical name.
+    containers: BTreeMap<String, ContainerRecord>,
 }
 
 /// Per-node kubelet. Implements [`Controller`] so it slots into the
@@ -101,12 +120,25 @@ impl Kubelet {
         self.backend.name()
     }
 
-    /// Extract the first container's spec from a Pod manifest.
-    fn pod_to_container_spec(
+    /// Extract a [`ContainerSpec`] for EVERY `spec.containers[i]` of a Pod
+    /// manifest, paired with that container's logical name (the local
+    /// bookkeeping key). The returned `(container_name, spec)` pairs preserve
+    /// `spec.containers` order.
+    ///
+    /// MULTI-CONTAINER: today the kubelet runs one [`ContainerSpec`] per
+    /// `spec.containers[i]` (init / ephemeral containers are a documented
+    /// no-op — see crate scope). The backend container name is the
+    /// deterministic `<ns>_<pod>_<containerName>` join so status/stop/remove
+    /// by-name is possible per container.
+    ///
+    /// Env + command + args are read per container: `command` →
+    /// `ContainerSpec.command` (the entrypoint override) followed by `args`
+    /// (appended, mirroring K8s where `args` are the entrypoint's arguments).
+    fn pod_to_container_specs(
         namespace: &str,
         name: &str,
         pod: &Value,
-    ) -> Result<ContainerSpec, KubeletError> {
+    ) -> Result<Vec<(String, ContainerSpec)>, KubeletError> {
         let containers = pod
             .get("spec")
             .and_then(|s| s.get("containers"))
@@ -115,53 +147,82 @@ impl Kubelet {
                 pod: format!("{namespace}/{name}"),
                 reason: "spec.containers missing".into(),
             })?;
-        let first = containers.first().ok_or_else(|| KubeletError::InvalidPod {
-            pod: format!("{namespace}/{name}"),
-            reason: "spec.containers is empty".into(),
-        })?;
-        let image = first
-            .get("image")
-            .and_then(|i| i.as_str())
-            .ok_or_else(|| KubeletError::InvalidPod {
+        if containers.is_empty() {
+            return Err(KubeletError::InvalidPod {
                 pod: format!("{namespace}/{name}"),
-                reason: "spec.containers[0].image missing".into(),
-            })?
-            .to_string();
-        let env = first
-            .get("env")
-            .and_then(|e| e.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|e| {
-                        let n = e.get("name")?.as_str()?.to_string();
-                        let v = e.get("value")?.as_str()?.to_string();
-                        Some((n, v))
+                reason: "spec.containers is empty".into(),
+            });
+        }
+        let mut out = Vec::with_capacity(containers.len());
+        for (i, c) in containers.iter().enumerate() {
+            // Container logical name: spec.containers[i].name, else a
+            // positional fallback (matches container_name()'s "main"/index
+            // shape so status names round-trip).
+            let cname = c
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| if i == 0 { "main".to_string() } else { format!("container-{i}") });
+            let image = c
+                .get("image")
+                .and_then(|im| im.as_str())
+                .ok_or_else(|| KubeletError::InvalidPod {
+                    pod: format!("{namespace}/{name}"),
+                    reason: format!("spec.containers[{i}].image missing"),
+                })?
+                .to_string();
+            let env = c
+                .get("env")
+                .and_then(|e| e.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| {
+                            let n = e.get("name")?.as_str()?.to_string();
+                            let v = e.get("value")?.as_str()?.to_string();
+                            Some((n, v))
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            // command = entrypoint override; args = appended arguments
+            // (K8s semantics). The container's run argv is command ++ args.
+            let str_array = |key: &str| -> Vec<String> {
+                c.get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect::<Vec<_>>()
                     })
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
-        let command = first
-            .get("command")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|c| c.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Ok(ContainerSpec {
-            // Container name = namespace_name to avoid collisions. This is
-            // the backend-facing (podman --name) handle, NOT a local key.
-            name: format!("{namespace}_{name}"),
-            image,
-            env,
-            command,
-            // Service-name DNS aliases are computed separately in
-            // `start_bound_pod` (it needs the live Service list from the
-            // store, which this pure manifest→spec map deliberately does
-            // not touch) and assigned onto the returned spec there.
-            network_aliases: Vec::new(),
-        })
+                    .unwrap_or_default()
+            };
+            let mut command = str_array("command");
+            command.extend(str_array("args"));
+            out.push((
+                cname.clone(),
+                ContainerSpec {
+                    // Backend (podman --name) handle: <ns>_<pod>_<cname>.
+                    name: format!("{namespace}_{name}_{cname}"),
+                    image,
+                    env,
+                    command,
+                    // Service-name DNS aliases are computed once per pod in
+                    // `start_bound_pod` and assigned onto each spec there.
+                    network_aliases: Vec::new(),
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Read the Pod's `spec.restartPolicy` into the typed [`RestartPolicy`].
+    /// Absent → the K8s default [`RestartPolicy::Always`].
+    fn pod_restart_policy(pod: &Value) -> RestartPolicy {
+        RestartPolicy::from_spec_str(
+            pod.get("spec")
+                .and_then(|s| s.get("restartPolicy"))
+                .and_then(|p| p.as_str()),
+        )
     }
 
     /// Compute the Service-name DNS aliases a Pod earns by matching
@@ -231,20 +292,6 @@ impl Kubelet {
         aliases
     }
 
-    /// First container's logical name, as it appears in
-    /// `status.containerStatuses[0].name` — `spec.containers[0].name`
-    /// when present, else falls back to `"main"`.
-    fn container_name(pod: &Value) -> String {
-        pod.get("spec")
-            .and_then(|s| s.get("containers"))
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("name"))
-            .and_then(|n| n.as_str())
-            .unwrap_or("main")
-            .to_string()
-    }
-
     /// `true` iff the Pod has already reached a terminal phase
     /// (`Succeeded` or `Failed`). A terminal Pod is never (re)started in
     /// the start phase, and a terminal Pod we've forgotten locally (after
@@ -268,70 +315,70 @@ impl Kubelet {
             .unwrap_or(false)
     }
 
-    /// Map a terminated container's exit code → terminal Pod phase.
-    /// `Some(0)` ⇒ `Succeeded`; any other code (or `None`, a terminated
-    /// container with no recorded code — defensively unhealthy) ⇒
-    /// `Failed`.
-    fn terminal_phase_for(exit_code: Option<i32>) -> &'static str {
-        match exit_code {
-            Some(0) => "Succeeded",
-            _ => "Failed",
-        }
-    }
-
-    /// Desired `status` for a Pod whose container the backend reports as
-    /// running. Carries `phase:Running`, `Ready=True`, the per-container
-    /// running state, and (when known) `podIP`.
-    ///
-    /// The field set is stable tick-to-tick so the idempotent-skip in
-    /// [`write_status_cas`] (full equality of live-vs-desired) yields
-    /// `NoChange` at steady state — no store write, no watch storm.
-    fn running_status(container_name: &str, s: &ContainerStatus) -> Value {
-        let mut status = json!({
-            "phase": "Running",
-            "conditions": [{ "type": "Ready", "status": "True" }],
-            "containerStatuses": [{
-                "name": container_name,
-                "ready": true,
-                "state": { "running": {} },
-                "containerID": s.container_id,
-            }],
-        });
-        if let Some(ip) = &s.pod_ip {
-            status["podIP"] = Value::String(ip.clone());
-        }
-        status
-    }
-
-    /// Desired `status` for a Pod whose container the backend reports as
-    /// terminated. Maps `exit_code → phase`, sets `Ready=False`, and
-    /// records the per-container terminated state. `podIP` is retained
-    /// when known (K8s keeps a terminated Pod's last IP) — and retaining
-    /// it ALSO keeps the field set stable across the Running→terminal
-    /// transition, so the post-merge live status equals this desired one
-    /// and the next tick is a `NoChange` (no hot loop).
-    fn terminated_status(container_name: &str, s: &ContainerStatus) -> Value {
-        let phase = Self::terminal_phase_for(s.exit_code);
-        let reason = if s.exit_code == Some(0) {
-            "Completed"
-        } else {
-            "Error"
+    /// Render a single [`ContainerStatusOut`] into its
+    /// `status.containerStatuses[]` JSON entry. The typed
+    /// [`ContainerState`] enum is the render surface; `json!` inside this impl
+    /// is the allowed TYPED EMISSION site (per ★★ TYPED EMISSION rule #1).
+    fn render_container_status(cs: &ContainerStatusOut) -> Value {
+        let state = match &cs.state {
+            ContainerState::Waiting { reason } => json!({ "waiting": { "reason": reason } }),
+            ContainerState::Running => json!({ "running": {} }),
+            ContainerState::Terminated { exit_code, reason } => json!({
+                "terminated": { "exitCode": exit_code, "reason": reason }
+            }),
         };
-        let mut status = json!({
-            "phase": phase,
-            "conditions": [{ "type": "Ready", "status": "False" }],
-            "containerStatuses": [{
-                "name": container_name,
-                "ready": false,
-                "state": { "terminated": {
-                    "exitCode": s.exit_code.unwrap_or(0),
-                    "reason": reason,
-                }},
-                "containerID": s.container_id,
-            }],
+        let mut entry = json!({
+            "name": cs.name,
+            "ready": cs.ready,
+            "state": state,
+            "restartCount": cs.restart_count,
         });
-        if let Some(ip) = &s.pod_ip {
-            status["podIP"] = Value::String(ip.clone());
+        if let Some(id) = &cs.container_id {
+            entry["containerID"] = Value::String(id.clone());
+        }
+        entry
+    }
+
+    /// Build the desired Pod `status` from the typed
+    /// `(PodPhase, Vec<ContainerStatusOut>)` fold output + the pod's IP.
+    ///
+    /// The pod-level `Ready` condition is `True` iff the phase is `Running`
+    /// AND every container is ready (running). Probes are deferred — see the
+    /// crate scope; Ready reflects container-running only, never a fake probe
+    /// pass.
+    ///
+    /// `pod_ip` is retained for a terminated Pod too (K8s keeps the last IP),
+    /// which ALSO keeps the field set stable across Running→terminal so the
+    /// idempotent-skip in [`write_status_cas`] yields `NoChange` at steady
+    /// state (no hot loop, no watch storm).
+    fn build_pod_status(
+        phase: engenho_types::curated_enums::PodPhase,
+        statuses: &[ContainerStatusOut],
+        pod_ip: Option<&str>,
+    ) -> Value {
+        use engenho_types::curated_enums::PodPhase;
+        let phase_str = match phase {
+            PodPhase::Pending => "Pending",
+            PodPhase::Running => "Running",
+            PodPhase::Succeeded => "Succeeded",
+            PodPhase::Failed => "Failed",
+            PodPhase::Unknown => "Unknown",
+        };
+        // Pod Ready = phase Running AND all containers ready. A non-running
+        // phase (Pending / terminal) is never Ready.
+        let ready = matches!(phase, PodPhase::Running) && statuses.iter().all(|c| c.ready);
+        let container_statuses: Vec<Value> =
+            statuses.iter().map(Self::render_container_status).collect();
+        let mut status = json!({
+            "phase": phase_str,
+            "conditions": [{
+                "type": "Ready",
+                "status": if ready { "True" } else { "False" },
+            }],
+            "containerStatuses": container_statuses,
+        });
+        if let Some(ip) = pod_ip {
+            status["podIP"] = Value::String(ip.to_string());
         }
         status
     }
@@ -370,14 +417,18 @@ impl Controller for Kubelet {
                 .collect()
         };
         for (key, lp) in orphaned {
-            match self.cleanup_container(&lp.container_id).await {
+            // MULTI-CONTAINER: stop THEN remove EVERY container of the pod.
+            // All-or-nothing: only drop the local entry if every container
+            // cleaned up; otherwise retain it so the next tick retries the
+            // stragglers (no silent leak).
+            match self.cleanup_pod_containers(&lp).await {
                 Ok(()) => {
                     self.local.lock().await.remove(&key);
                     report.objects_changed += 1;
                     debug!(
                         pod = %key.label(),
-                        container = %lp.container_id,
-                        "kubelet cleaned up orphaned container"
+                        containers = lp.containers.len(),
+                        "kubelet cleaned up orphaned pod containers"
                     );
                 }
                 Err(e) => {
@@ -385,7 +436,6 @@ impl Controller for Kubelet {
                     // silent leak.
                     warn!(
                         pod = %key.label(),
-                        container = %lp.container_id,
                         error = %e,
                         "kubelet cleanup failed; will retry next tick"
                     );
@@ -439,8 +489,27 @@ impl Kubelet {
         Ok(())
     }
 
-    /// (B) Start a bound Pod's container + write its initial Running
-    /// status via CAS, inserting the local bookkeeping entry on success.
+    /// MULTI-CONTAINER cleanup: stop THEN remove EVERY container of the pod.
+    /// Returns `Ok(())` only if all containers cleaned up; the FIRST failure
+    /// is surfaced (so the caller retains the local entry + retries). Each
+    /// container's stop-before-remove ordering is preserved.
+    async fn cleanup_pod_containers(&self, lp: &LocalPod) -> Result<(), KubeletError> {
+        for record in lp.containers.values() {
+            self.cleanup_container(&record.container_id).await?;
+        }
+        Ok(())
+    }
+
+    /// (B) Start a bound Pod's containers (one per `spec.containers[i]`) +
+    /// write its initial status via CAS, inserting the local bookkeeping on
+    /// success.
+    ///
+    /// MULTI-CONTAINER: computes the Service-name aliases ONCE for the pod,
+    /// applies them to every container's spec, then starts each container
+    /// with the deterministic backend name `<ns>_<pod>_<cname>`. A container
+    /// that fails to start leaves the pod Pending (the started siblings stay
+    /// in the record + the next tick re-attempts the missing one — the pod
+    /// converges).
     async fn start_bound_pod(
         &self,
         key: &ResourceKey,
@@ -448,7 +517,7 @@ impl Kubelet {
         report: &mut ReconcileReport,
     ) -> Result<(), ControllerError> {
         let namespace = key.namespace.as_deref().unwrap_or("default");
-        let mut spec = match Self::pod_to_container_spec(namespace, &key.name, value) {
+        let specs = match Self::pod_to_container_specs(namespace, &key.name, value) {
             Ok(s) => s,
             Err(e) => {
                 warn!(
@@ -461,53 +530,80 @@ impl Kubelet {
             }
         };
 
-        // (M0.3 cluster-DNS) Compute the Service-name aliases this Pod
-        // earns BEFORE building the run argv — `--network-alias` is a
-        // `podman run` flag and cannot be added to a running container. LIST
-        // Services in the pod's namespace from the store (the store-using
-        // step — mirrors EndpointsController::tick's Service LIST) and reuse
-        // the EndpointsController selector predicate to compute matches. A
-        // Service created AFTER this pod starts won't alias it until the pod
-        // is recreated (accepted M0.3 limitation; M0.4 engenho-dns removes
-        // it). aardvark-dns then resolves these names to the pod's IP.
+        // (M0.3 cluster-DNS) Compute the Service-name aliases this Pod earns
+        // ONCE (they're pod-level, not per-container) BEFORE building any run
+        // argv — `--network-alias` is a `podman run` flag and cannot be added
+        // to a running container. LIST Services in the pod's namespace + reuse
+        // the EndpointsController selector predicate. aardvark-dns resolves
+        // these names to the pod's IP.
         let services = self.store.list("", "v1", "Service", Some(namespace)).await;
-        spec.network_aliases =
+        let aliases =
             Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
 
-        debug!(
-            pod = %key.label(),
-            image = %spec.image,
-            backend = self.backend.name(),
-            aliases = spec.network_aliases.len(),
-            "kubelet starting container"
-        );
-
-        match self.backend.start(&spec).await {
-            Ok(status) => {
-                self.local.lock().await.insert(
-                    key.clone(),
-                    LocalPod {
-                        container_id: status.container_id.clone(),
-                    },
-                );
-                let desired = Self::running_status(&Self::container_name(value), &status);
-                self.write_pod_status(key, value, &desired, report).await?;
-                Ok(())
+        // Ensure a fresh local record exists, then start each container not
+        // yet recorded. (On a partial prior start the record already holds
+        // some containers; this is start-only-the-missing.)
+        let mut started_any = false;
+        for (cname, mut spec) in specs {
+            // Skip containers already started (membership guard — never a
+            // spurious restart).
+            if self
+                .local
+                .lock()
+                .await
+                .get(key)
+                .map(|lp| lp.containers.contains_key(&cname))
+                .unwrap_or(false)
+            {
+                continue;
             }
-            Err(e) => {
-                warn!(
-                    pod = %key.label(),
-                    error = %e,
-                    "container start failed; pod remains pending"
-                );
-                report.objects_skipped += 1;
-                Ok(())
+            spec.network_aliases = aliases.clone();
+            debug!(
+                pod = %key.label(),
+                container = %cname,
+                image = %spec.image,
+                backend = self.backend.name(),
+                aliases = spec.network_aliases.len(),
+                "kubelet starting container"
+            );
+            match self.backend.start(&spec).await {
+                Ok(status) => {
+                    let mut local = self.local.lock().await;
+                    let entry = local.entry(key.clone()).or_default();
+                    entry.containers.insert(
+                        cname.clone(),
+                        ContainerRecord {
+                            container_id: status.container_id.clone(),
+                            restart_count: 0,
+                        },
+                    );
+                    started_any = true;
+                }
+                Err(e) => {
+                    warn!(
+                        pod = %key.label(),
+                        container = %cname,
+                        error = %e,
+                        "container start failed; pod remains pending"
+                    );
+                    report.objects_skipped += 1;
+                }
             }
         }
+
+        // Reconcile the status from the freshly-started set (a partial start
+        // shows the started containers Running + the rest Waiting → Pending).
+        if started_any {
+            let lp = self.local.lock().await.get(key).cloned().unwrap_or_default();
+            self.reconcile_running(key, value, &lp, report).await?;
+        }
+        Ok(())
     }
 
-    /// (C) Poll the backend for a started Pod's container + reconcile the
-    /// observed running state into `status`.
+    /// (C) Poll the backend for EVERY container of a started Pod, fold the
+    /// observed states into the pod phase via [`reconcile_pod_phase`], apply
+    /// restartPolicy (restart an exited container under Always/OnFailure), and
+    /// write the multi-container status.
     async fn reconcile_running(
         &self,
         key: &ResourceKey,
@@ -515,50 +611,216 @@ impl Kubelet {
         lp: &LocalPod,
         report: &mut ReconcileReport,
     ) -> Result<(), ControllerError> {
-        let container_name = Self::container_name(value);
-        match self.backend.status(&lp.container_id).await {
-            Ok(Some(s)) if s.running => {
-                // Still running — do NOT restart (membership guard). The
-                // local-map membership is the "never spuriously restart a
-                // still-running pod" invariant; we never call start here.
-                let desired = Self::running_status(&container_name, &s);
-                self.write_pod_status(key, value, &desired, report).await
-            }
-            Ok(Some(s)) => {
-                // Terminated. Map exit_code → phase. Leave the local entry
-                // so later ticks keep reporting the terminal phase (via
-                // idempotent-skip) and never restart.
-                let desired = Self::terminated_status(&container_name, &s);
-                self.write_pod_status(key, value, &desired, report).await
-            }
-            Ok(None) => {
-                // The backend has no record though we hold a container_id:
-                // the container vanished out-of-band (host reboot, manual
-                // podman rm). Clear the local entry so the next tick
-                // re-creates it — a managed bound Pod with no live
-                // container converges back to running.
-                self.local.lock().await.remove(key);
-                debug!(
-                    pod = %key.label(),
-                    container = %lp.container_id,
-                    "backend lost the container; clearing local entry to re-create next tick"
-                );
-                report.objects_changed += 1;
-                Ok(())
-            }
+        let restart_policy = Self::pod_restart_policy(value);
+        let namespace = key.namespace.as_deref().unwrap_or("default");
+
+        // Re-derive the expected container set from the manifest so a
+        // not-yet-started container shows up as Waiting (the pod is Pending
+        // until every container has started at least once).
+        let specs = match Self::pod_to_container_specs(namespace, &key.name, value) {
+            Ok(s) => s,
             Err(e) => {
-                // Backend inspection failed — retain the local entry,
-                // count as skipped, retry next tick. Never silent.
-                warn!(
-                    pod = %key.label(),
-                    container = %lp.container_id,
-                    error = %e,
-                    "container status poll failed; retrying next tick"
-                );
+                warn!(pod = %key.label(), error = %e, "invalid manifest during reconcile");
                 report.objects_skipped += 1;
-                Ok(())
+                return Ok(());
+            }
+        };
+
+        let mut observations: Vec<ContainerObservation> = Vec::with_capacity(specs.len());
+        let mut pod_ip: Option<String> = None;
+        let mut vanished = false;
+        // Per-container poll. Collect the typed observations + handle restart.
+        for (cname, spec) in &specs {
+            let record = lp.containers.get(cname);
+            let Some(record) = record else {
+                // Recorded by neither start nor record → the container hasn't
+                // been started yet (partial start). Waiting → pod Pending.
+                observations.push(ContainerObservation::waiting(cname));
+                continue;
+            };
+            match self.backend.status(&record.container_id).await {
+                Ok(Some(s)) if s.running => {
+                    if let Some(ip) = &s.pod_ip {
+                        pod_ip.get_or_insert_with(|| ip.clone());
+                    }
+                    observations.push(ContainerObservation::running(
+                        cname,
+                        &record.container_id,
+                        record.restart_count,
+                    ));
+                }
+                Ok(Some(s)) => {
+                    // Terminated. Retain the last pod_ip (K8s keeps it).
+                    if let Some(ip) = &s.pod_ip {
+                        pod_ip.get_or_insert_with(|| ip.clone());
+                    }
+                    let exit = s.exit_code.unwrap_or(0);
+                    // restartPolicy: restart THIS one container if the policy
+                    // says so (Always, or OnFailure+nonzero). The pod stays
+                    // Running across the restart (reconcile_pod_phase folds a
+                    // restartable-terminated container to Running).
+                    if restart_policy.should_restart(s.exit_code) {
+                        let mut restart_spec = spec.clone();
+                        // Re-apply pod-level aliases for the restarted container.
+                        let services =
+                            self.store.list("", "v1", "Service", Some(namespace)).await;
+                        restart_spec.network_aliases = Self::service_aliases_for_pod(
+                            value,
+                            namespace,
+                            &services,
+                            DEFAULT_CLUSTER_DOMAIN,
+                        );
+                        match self.backend.start(&restart_spec).await {
+                            Ok(new_status) => {
+                                // Remove the old (exited) container so it
+                                // doesn't leak; best-effort (already exited).
+                                let _ = self.backend.remove(&record.container_id).await;
+                                let new_count = record.restart_count + 1;
+                                {
+                                    let mut local = self.local.lock().await;
+                                    if let Some(rec) = local
+                                        .get_mut(key)
+                                        .and_then(|p| p.containers.get_mut(cname))
+                                    {
+                                        rec.container_id = new_status.container_id.clone();
+                                        rec.restart_count = new_count;
+                                    }
+                                }
+                                if let Some(ip) = &new_status.pod_ip {
+                                    pod_ip.get_or_insert_with(|| ip.clone());
+                                }
+                                observations.push(ContainerObservation::running(
+                                    cname,
+                                    &new_status.container_id,
+                                    new_count,
+                                ));
+                                report.objects_changed += 1;
+                                debug!(
+                                    pod = %key.label(),
+                                    container = %cname,
+                                    restart_count = new_count,
+                                    "kubelet restarted exited container (restartPolicy)"
+                                );
+                            }
+                            Err(e) => {
+                                // Restart failed — report the terminated state
+                                // this tick; next tick retries. Never silent.
+                                warn!(
+                                    pod = %key.label(),
+                                    container = %cname,
+                                    error = %e,
+                                    "container restart failed; retrying next tick"
+                                );
+                                observations.push(ContainerObservation::terminated(
+                                    cname,
+                                    &record.container_id,
+                                    exit,
+                                    record.restart_count,
+                                ));
+                                report.objects_skipped += 1;
+                            }
+                        }
+                    } else {
+                        // restartPolicy:Never (or OnFailure+zero) → terminal
+                        // latch. Leave the local entry; later ticks keep
+                        // reporting the terminal phase (idempotent-skip).
+                        observations.push(ContainerObservation::terminated(
+                            cname,
+                            &record.container_id,
+                            exit,
+                            record.restart_count,
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    // The backend lost THIS container out-of-band. Clear the
+                    // whole pod's local entry so the next tick re-creates it
+                    // (a managed bound pod converges back to running). One
+                    // vanished container forces a full re-create — simplest
+                    // safe behavior at this brick.
+                    vanished = true;
+                }
+                Err(e) => {
+                    warn!(
+                        pod = %key.label(),
+                        container = %cname,
+                        error = %e,
+                        "container status poll failed; retrying next tick"
+                    );
+                    report.objects_skipped += 1;
+                    // Treat as Waiting so the pod doesn't flip terminal on a
+                    // transient inspect error.
+                    observations.push(ContainerObservation::waiting(cname));
+                }
             }
         }
+
+        if vanished {
+            self.local.lock().await.remove(key);
+            debug!(
+                pod = %key.label(),
+                "backend lost a container; clearing local entry to re-create next tick"
+            );
+            report.objects_changed += 1;
+            return Ok(());
+        }
+
+        // Fold the observations → pod phase + per-container statuses, render,
+        // and CAS-write. The pure reconcile_pod_phase is the interpreter; this
+        // is the I/O shell.
+        let (phase, statuses) = reconcile_pod_phase(restart_policy, &observations);
+        let desired = Self::build_pod_status(phase, &statuses, pod_ip.as_deref());
+        self.write_pod_status(key, value, &desired, report).await
+    }
+
+    /// Stream a container's logs. The apiserver's Pod `/log` subresource calls
+    /// this in-process (single-node) with the pod's namespace/name + optional
+    /// `-c <container>` selector.
+    ///
+    /// Resolves the container's backend id from the local bookkeeping, then
+    /// asks the backend. `container` selects which container; `None` defaults
+    /// to the FIRST container in the pod (deterministic — sorted by name in
+    /// the BTreeMap; kubectl defaults to the first container in spec order, and
+    /// for a single-container pod they coincide).
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::InvalidPod`] when the pod isn't tracked locally (not
+    /// running on this node) or the named container doesn't exist;
+    /// [`KubeletError::Backend`] on a backend log-read failure. NEVER an
+    /// empty-Ok for a missing container.
+    pub async fn container_logs(
+        &self,
+        namespace: &str,
+        name: &str,
+        container: Option<&str>,
+        opts: &LogOptions,
+    ) -> Result<String, KubeletError> {
+        let key = ResourceKey::namespaced("", "v1", "Pod", namespace, name);
+        let local = self.local.lock().await;
+        let lp = local.get(&key).ok_or_else(|| KubeletError::InvalidPod {
+            pod: format!("{namespace}/{name}"),
+            reason: "pod is not running on this node (no local container record)".into(),
+        })?;
+        let record = match container {
+            Some(c) => lp.containers.get(c).ok_or_else(|| KubeletError::InvalidPod {
+                pod: format!("{namespace}/{name}"),
+                reason: format!("container {c:?} not found in pod"),
+            })?,
+            // Default: the first container by name (BTreeMap iteration order).
+            None => lp
+                .containers
+                .values()
+                .next()
+                .ok_or_else(|| KubeletError::InvalidPod {
+                    pod: format!("{namespace}/{name}"),
+                    reason: "pod has no started containers".into(),
+                })?,
+        };
+        let container_id = record.container_id.clone();
+        // Drop the lock before the backend await (no lock held across I/O).
+        drop(local);
+        self.backend.logs(&container_id, opts).await
     }
 
     /// Write a computed Pod `status` via the shared item-5 CAS primitive.
@@ -601,7 +863,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pod_to_container_spec_extracts_image_and_env() {
+    fn pod_to_container_specs_extracts_image_and_env() {
         let pod = json!({
             "spec": {
                 "containers": [{
@@ -613,44 +875,87 @@ mod tests {
                 }]
             }
         });
-        let spec = Kubelet::pod_to_container_spec("default", "p1", &pod).unwrap();
-        assert_eq!(spec.name, "default_p1");
+        let specs = Kubelet::pod_to_container_specs("default", "p1", &pod).unwrap();
+        assert_eq!(specs.len(), 1);
+        let (cname, spec) = &specs[0];
+        assert_eq!(cname, "main");
+        // Backend name is <ns>_<pod>_<cname>.
+        assert_eq!(spec.name, "default_p1_main");
         assert_eq!(spec.image, "nginx:1.27");
         assert_eq!(spec.env.get("FOO").map(String::as_str), Some("bar"));
         assert!(spec.command.is_empty());
     }
 
     #[test]
-    fn pod_to_container_spec_extracts_command_when_present() {
+    fn pod_to_container_specs_extracts_command_and_args() {
         let pod = json!({
             "spec": {
                 "containers": [{
+                    "name": "c",
                     "image": "alpine",
-                    "command": ["sleep", "3600"]
+                    "command": ["sh", "-c"],
+                    "args": ["echo hi; sleep 3600"]
                 }]
             }
         });
-        let spec = Kubelet::pod_to_container_spec("ns", "x", &pod).unwrap();
-        assert_eq!(spec.command, vec!["sleep", "3600"]);
+        let specs = Kubelet::pod_to_container_specs("ns", "x", &pod).unwrap();
+        // command ++ args.
+        assert_eq!(specs[0].1.command, vec!["sh", "-c", "echo hi; sleep 3600"]);
     }
 
     #[test]
-    fn pod_to_container_spec_rejects_missing_image() {
-        let pod = json!({"spec": {"containers": [{}]}});
-        let err = Kubelet::pod_to_container_spec("ns", "p", &pod).unwrap_err();
+    fn pod_to_container_specs_multi_container() {
+        let pod = json!({
+            "spec": {
+                "containers": [
+                    {"name": "web", "image": "nginx"},
+                    {"name": "sidecar", "image": "busybox", "command": ["sleep", "300"]}
+                ]
+            }
+        });
+        let specs = Kubelet::pod_to_container_specs("default", "p", &pod).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].0, "web");
+        assert_eq!(specs[0].1.name, "default_p_web");
+        assert_eq!(specs[1].0, "sidecar");
+        assert_eq!(specs[1].1.name, "default_p_sidecar");
+        assert_eq!(specs[1].1.command, vec!["sleep", "300"]);
+    }
+
+    #[test]
+    fn pod_to_container_specs_rejects_missing_image() {
+        let pod = json!({"spec": {"containers": [{"name": "c"}]}});
+        let err = Kubelet::pod_to_container_specs("ns", "p", &pod).unwrap_err();
         assert_eq!(err.kind(), "invalid_pod");
     }
 
     #[test]
-    fn pod_to_container_spec_rejects_empty_containers() {
+    fn pod_to_container_specs_rejects_empty_containers() {
         let pod = json!({"spec": {"containers": []}});
-        assert!(Kubelet::pod_to_container_spec("n", "p", &pod).is_err());
+        assert!(Kubelet::pod_to_container_specs("n", "p", &pod).is_err());
     }
 
     #[test]
-    fn pod_to_container_spec_rejects_no_spec() {
+    fn pod_to_container_specs_rejects_no_spec() {
         let pod = json!({"metadata": {"name": "p"}});
-        assert!(Kubelet::pod_to_container_spec("n", "p", &pod).is_err());
+        assert!(Kubelet::pod_to_container_specs("n", "p", &pod).is_err());
+    }
+
+    #[test]
+    fn pod_restart_policy_reads_spec_with_always_default() {
+        assert_eq!(
+            Kubelet::pod_restart_policy(&json!({"spec": {"restartPolicy": "Never"}})),
+            RestartPolicy::Never
+        );
+        assert_eq!(
+            Kubelet::pod_restart_policy(&json!({"spec": {"restartPolicy": "OnFailure"}})),
+            RestartPolicy::OnFailure
+        );
+        // Absent → Always (K8s default).
+        assert_eq!(
+            Kubelet::pod_restart_policy(&json!({"spec": {}})),
+            RestartPolicy::Always
+        );
     }
 
     #[test]
@@ -667,21 +972,12 @@ mod tests {
     }
 
     #[test]
-    fn container_name_reads_first_container_or_defaults() {
-        let named = json!({"spec": {"containers": [{"name": "web", "image": "i"}]}});
-        assert_eq!(Kubelet::container_name(&named), "web");
-        let unnamed = json!({"spec": {"containers": [{"image": "i"}]}});
-        assert_eq!(Kubelet::container_name(&unnamed), "main");
-        let empty = json!({"spec": {}});
-        assert_eq!(Kubelet::container_name(&empty), "main");
-    }
-
-    #[test]
-    fn terminal_phase_for_maps_exit_code() {
-        assert_eq!(Kubelet::terminal_phase_for(Some(0)), "Succeeded");
-        assert_eq!(Kubelet::terminal_phase_for(Some(1)), "Failed");
-        assert_eq!(Kubelet::terminal_phase_for(Some(137)), "Failed");
-        assert_eq!(Kubelet::terminal_phase_for(None), "Failed");
+    fn pod_to_container_specs_names_default_main_then_index() {
+        // Unnamed first container → "main"; unnamed second → "container-1".
+        let pod = json!({"spec": {"containers": [{"image": "a"}, {"image": "b"}]}});
+        let specs = Kubelet::pod_to_container_specs("ns", "p", &pod).unwrap();
+        assert_eq!(specs[0].0, "main");
+        assert_eq!(specs[1].0, "container-1");
     }
 
     #[test]
@@ -702,9 +998,16 @@ mod tests {
     }
 
     #[test]
-    fn running_status_carries_ready_and_pod_ip() {
-        let s = ContainerStatus::running("fake-1", "10.42.0.5");
-        let status = Kubelet::running_status("web", &s);
+    fn build_pod_status_running_carries_ready_and_pod_ip() {
+        use engenho_types::curated_enums::PodPhase;
+        let statuses = vec![ContainerStatusOut {
+            name: "web".into(),
+            ready: true,
+            state: ContainerState::Running,
+            container_id: Some("fake-1".into()),
+            restart_count: 0,
+        }];
+        let status = Kubelet::build_pod_status(PodPhase::Running, &statuses, Some("10.42.0.5"));
         assert_eq!(status["phase"], "Running");
         assert_eq!(status["podIP"], "10.42.0.5");
         assert_eq!(status["conditions"][0]["type"], "Ready");
@@ -713,41 +1016,103 @@ mod tests {
         assert_eq!(status["containerStatuses"][0]["ready"], true);
         assert!(status["containerStatuses"][0]["state"]["running"].is_object());
         assert_eq!(status["containerStatuses"][0]["containerID"], "fake-1");
+        assert_eq!(status["containerStatuses"][0]["restartCount"], 0);
     }
 
     #[test]
-    fn terminated_status_maps_exit_zero_to_succeeded() {
-        let s = ContainerStatus {
-            container_id: "fake-2".into(),
-            running: false,
-            pod_ip: Some("10.42.0.9".into()),
-            exit_code: Some(0),
-        };
-        let status = Kubelet::terminated_status("web", &s);
+    fn build_pod_status_succeeded_retains_pod_ip() {
+        use engenho_types::curated_enums::PodPhase;
+        let statuses = vec![ContainerStatusOut {
+            name: "web".into(),
+            ready: false,
+            state: ContainerState::terminated(0),
+            container_id: Some("fake-2".into()),
+            restart_count: 0,
+        }];
+        let status = Kubelet::build_pod_status(PodPhase::Succeeded, &statuses, Some("10.42.0.9"));
         assert_eq!(status["phase"], "Succeeded");
         assert_eq!(status["conditions"][0]["status"], "False");
         let term = &status["containerStatuses"][0]["state"]["terminated"];
         assert_eq!(term["exitCode"], 0);
         assert_eq!(term["reason"], "Completed");
-        // Terminated pods retain their last IP (also keeps the field set
-        // stable across the Running→terminal transition → no hot loop).
+        // Terminated pods retain their last IP (keeps the field set stable
+        // across Running→terminal → no hot loop).
         assert_eq!(status["podIP"], "10.42.0.9");
     }
 
     #[test]
-    fn terminated_status_maps_nonzero_to_failed() {
-        let s = ContainerStatus {
-            container_id: "fake-3".into(),
-            running: false,
-            pod_ip: None,
-            exit_code: Some(137),
-        };
-        let status = Kubelet::terminated_status("web", &s);
+    fn build_pod_status_failed_nonzero() {
+        use engenho_types::curated_enums::PodPhase;
+        let statuses = vec![ContainerStatusOut {
+            name: "web".into(),
+            ready: false,
+            state: ContainerState::terminated(137),
+            container_id: Some("fake-3".into()),
+            restart_count: 0,
+        }];
+        let status = Kubelet::build_pod_status(PodPhase::Failed, &statuses, None);
         assert_eq!(status["phase"], "Failed");
         let term = &status["containerStatuses"][0]["state"]["terminated"];
         assert_eq!(term["exitCode"], 137);
         assert_eq!(term["reason"], "Error");
         assert!(status.get("podIP").is_none());
+    }
+
+    #[test]
+    fn build_pod_status_multi_container_array() {
+        use engenho_types::curated_enums::PodPhase;
+        let statuses = vec![
+            ContainerStatusOut {
+                name: "web".into(),
+                ready: true,
+                state: ContainerState::Running,
+                container_id: Some("id-web".into()),
+                restart_count: 0,
+            },
+            ContainerStatusOut {
+                name: "sidecar".into(),
+                ready: true,
+                state: ContainerState::Running,
+                container_id: Some("id-sc".into()),
+                restart_count: 2,
+            },
+        ];
+        let status = Kubelet::build_pod_status(PodPhase::Running, &statuses, Some("10.0.0.1"));
+        let arr = status["containerStatuses"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["name"], "web");
+        assert_eq!(arr[1]["name"], "sidecar");
+        assert_eq!(arr[1]["restartCount"], 2);
+        assert!(arr.iter().all(|c| c["state"]["running"].is_object()));
+    }
+
+    #[test]
+    fn build_pod_status_pending_with_waiting_container() {
+        use engenho_types::curated_enums::PodPhase;
+        let statuses = vec![
+            ContainerStatusOut {
+                name: "web".into(),
+                ready: true,
+                state: ContainerState::Running,
+                container_id: Some("id-web".into()),
+                restart_count: 0,
+            },
+            ContainerStatusOut {
+                name: "sidecar".into(),
+                ready: false,
+                state: ContainerState::creating(),
+                container_id: None,
+                restart_count: 0,
+            },
+        ];
+        let status = Kubelet::build_pod_status(PodPhase::Pending, &statuses, None);
+        assert_eq!(status["phase"], "Pending");
+        // Pod not Ready while a container is Waiting.
+        assert_eq!(status["conditions"][0]["status"], "False");
+        let arr = status["containerStatuses"].as_array().unwrap();
+        assert_eq!(arr[1]["state"]["waiting"]["reason"], "ContainerCreating");
+        // Waiting container has no containerID.
+        assert!(arr[1].get("containerID").is_none());
     }
 
     // ── M0.3 cluster-DNS: service_aliases_for_pod (pure, no podman/store) ─

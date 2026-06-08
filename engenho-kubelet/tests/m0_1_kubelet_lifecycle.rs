@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_controllers::Controller;
-use engenho_kubelet::{ContainerRuntime, FakeBackend, Kubelet};
+use engenho_kubelet::{ContainerRuntime, FakeBackend, Kubelet, LogOptions};
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
@@ -34,6 +34,21 @@ fn pod_key(name: &str) -> ResourceKey {
 }
 
 async fn put_pod(store: &StoreMesh, name: &str, image: &str, node_name: Option<&str>) {
+    // Default helper: restartPolicy:Never so a `set_exit` reaches the terminal
+    // latch (Succeeded/Failed). Under the K8s default (Always) an exited
+    // container is restarted + the pod stays Running — covered by the
+    // restartPolicy:Always tests below; the terminal-path tests use Never.
+    put_pod_with_policy(store, name, image, node_name, Some("Never")).await;
+}
+
+/// Put a Pod with an explicit `spec.restartPolicy` (or absent when `None`).
+async fn put_pod_with_policy(
+    store: &StoreMesh,
+    name: &str,
+    image: &str,
+    node_name: Option<&str>,
+    restart_policy: Option<&str>,
+) {
     let mut value = json!({
         "kind": "Pod",
         "apiVersion": "v1",
@@ -48,6 +63,41 @@ async fn put_pod(store: &StoreMesh, name: &str, image: &str, node_name: Option<&
     if let Some(node) = node_name {
         value["spec"]["nodeName"] = json!(node);
     }
+    if let Some(policy) = restart_policy {
+        value["spec"]["restartPolicy"] = json!(policy);
+    }
+    store
+        .propose(ResourceCommand::Put {
+            key: pod_key(name),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await
+        .unwrap();
+}
+
+/// Put a 2-container Pod (`web` + `sidecar`) bound to a node, with an explicit
+/// `spec.restartPolicy`. Used by the multi-container tests.
+async fn put_multi_pod(
+    store: &StoreMesh,
+    name: &str,
+    node_name: &str,
+    restart_policy: &str,
+) {
+    let value = json!({
+        "kind": "Pod",
+        "apiVersion": "v1",
+        "metadata": { "name": name },
+        "spec": {
+            "nodeName": node_name,
+            "restartPolicy": restart_policy,
+            "containers": [
+                { "name": "web", "image": "img-web" },
+                { "name": "sidecar", "image": "img-sidecar" },
+            ]
+        }
+    });
     store
         .propose(ResourceCommand::Put {
             key: pod_key(name),
@@ -114,6 +164,49 @@ fn count_starts(events: &[engenho_kubelet::backend::FakeEvent]) -> usize {
         .iter()
         .filter(|e| matches!(e, FakeEvent::Start(_)))
         .count()
+}
+
+/// Count `Start(spec_name)` events whose spec name equals `name`.
+fn count_starts_named(events: &[engenho_kubelet::backend::FakeEvent], name: &str) -> usize {
+    use engenho_kubelet::backend::FakeEvent;
+    events
+        .iter()
+        .filter(|e| matches!(e, FakeEvent::Start(n) if n == name))
+        .count()
+}
+
+fn count_stops(events: &[engenho_kubelet::backend::FakeEvent]) -> usize {
+    use engenho_kubelet::backend::FakeEvent;
+    events
+        .iter()
+        .filter(|e| matches!(e, FakeEvent::Stop(_)))
+        .count()
+}
+
+fn count_removes(events: &[engenho_kubelet::backend::FakeEvent]) -> usize {
+    use engenho_kubelet::backend::FakeEvent;
+    events
+        .iter()
+        .filter(|e| matches!(e, FakeEvent::Remove(_)))
+        .count()
+}
+
+/// The pod's `status.containerStatuses` array.
+fn container_statuses(pod: &Value) -> Vec<Value> {
+    pod.get("status")
+        .and_then(|s| s.get("containerStatuses"))
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// FakeBackend container_id assigned to the spec named `spec_name`, by
+/// scanning the events for the Start + correlating to the live container set.
+/// Simpler: the FakeBackend assigns ids in start order, so the Nth Start's id
+/// is the Nth tracked container. For these tests we resolve by querying the
+/// backend's live containers (ids are opaque but stable).
+async fn container_id_count(backend: &FakeBackend) -> usize {
+    backend.containers().await.len()
 }
 
 async fn teardown(store: Arc<StoreMesh>, kubelet: Kubelet) {
@@ -343,6 +436,255 @@ async fn vanished_container_is_recreated() {
         pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
         Some("Running")
     );
+
+    teardown(store, kubelet).await;
+}
+
+// ── Test 7 — MULTI-CONTAINER: N containers → N starts, all running ───────
+
+#[tokio::test]
+async fn multi_container_pod_starts_every_container() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    // 2-container pod (web + sidecar), restartPolicy:Always.
+    put_multi_pod(&store, "mp", "node-A", "Always").await;
+    kubelet.tick().await.unwrap();
+
+    // TWO starts (one per container), named <ns>_<pod>_<cname>.
+    assert_eq!(count_starts(&backend.events().await), 2, "2 containers → 2 starts");
+    assert_eq!(count_starts_named(&backend.events().await, "default_mp_web"), 1);
+    assert_eq!(count_starts_named(&backend.events().await, "default_mp_sidecar"), 1);
+    assert_eq!(backend.running_count().await, 2);
+
+    // Pod status: phase Running + a 2-element containerStatuses array, both
+    // running, both with containerIDs.
+    let pod = store.get(&pod_key("mp")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
+    let cs = container_statuses(&pod);
+    assert_eq!(cs.len(), 2, "two containerStatuses");
+    assert!(cs.iter().all(|c| c["state"]["running"].is_object()));
+    assert!(cs.iter().all(|c| c["containerID"].is_string()));
+    let names: Vec<&str> = cs.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert!(names.contains(&"web") && names.contains(&"sidecar"));
+    assert!(pod_ready_is_true(&pod), "all-running multi-container pod is Ready");
+
+    teardown(store, kubelet).await;
+}
+
+// ── Test 8 — MULTI-CONTAINER delete → N stops + N removes ────────────────
+
+#[tokio::test]
+async fn multi_container_delete_stops_and_removes_all() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_multi_pod(&store, "mp", "node-A", "Never").await;
+    kubelet.tick().await.unwrap();
+    assert_eq!(backend.running_count().await, 2);
+
+    // Hard-delete the pod → kubelet stops THEN removes BOTH containers.
+    delete_pod(&store, "mp").await;
+    let report = kubelet.tick().await.unwrap();
+    assert_eq!(report.objects_changed, 1, "one pod cleaned up");
+
+    let events = backend.events().await;
+    assert_eq!(count_stops(&events), 2, "2 containers → 2 stops");
+    assert_eq!(count_removes(&events), 2, "2 containers → 2 removes");
+    assert_eq!(backend.running_count().await, 0);
+    assert!(backend.containers().await.is_empty());
+
+    // local cleared: a second tick drives zero new backend calls.
+    let before = backend.events().await.len();
+    kubelet.tick().await.unwrap();
+    assert_eq!(backend.events().await.len(), before, "no new backend calls");
+
+    teardown(store, kubelet).await;
+}
+
+// ── Test 9 — restartPolicy:Always re-starts an exited container ──────────
+
+#[tokio::test]
+async fn restart_policy_always_restarts_exited_container() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    // Single-container pod, restartPolicy:Always.
+    put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("Always")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+    assert_eq!(count_starts(&backend.events().await), 1);
+    assert_eq!(
+        pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
+        Some("Running")
+    );
+
+    // The container self-exits (exit 0). Under Always, the kubelet restarts
+    // it on the next tick → a SECOND Start for the same container name; the
+    // pod stays Running.
+    backend.set_exit(&cid, 0).await;
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts_named(&backend.events().await, "default_p1_main"),
+        2,
+        "Always → container restarted (a second Start)"
+    );
+    assert_eq!(backend.running_count().await, 1, "the restarted container runs");
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        pod_phase(&pod).as_deref(),
+        Some("Running"),
+        "Always pod stays Running across an exit"
+    );
+    // restartCount bumped to 1 on the single container.
+    let cs = container_statuses(&pod);
+    assert_eq!(cs[0]["restartCount"], 1);
+
+    teardown(store, kubelet).await;
+}
+
+// ── Test 10 — restartPolicy:Never latches terminal (no restart) ──────────
+
+#[tokio::test]
+async fn restart_policy_never_latches_terminal() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("Never")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    // Exit nonzero → Failed (Never never restarts).
+    backend.set_exit(&cid, 5).await;
+    kubelet.tick().await.unwrap();
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "Never → exactly one Start ever"
+    );
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Failed"));
+
+    // Steady-state: a further tick does NOT restart + stays Failed.
+    kubelet.tick().await.unwrap();
+    assert_eq!(count_starts(&backend.events().await), 1);
+    assert_eq!(
+        pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
+        Some("Failed")
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── Test 11 — restartPolicy:OnFailure restarts nonzero, latches on zero ──
+
+#[tokio::test]
+async fn restart_policy_on_failure_restarts_only_nonzero() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("OnFailure")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    // Nonzero exit under OnFailure → restart, pod stays Running.
+    backend.set_exit(&cid, 1).await;
+    kubelet.tick().await.unwrap();
+    assert_eq!(count_starts(&backend.events().await), 2, "OnFailure restarts nonzero");
+    assert_eq!(
+        pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
+        Some("Running")
+    );
+
+    // The restarted container now exits ZERO → no restart → Succeeded.
+    let cid2 = first_container_id(&backend).await;
+    backend.set_exit(&cid2, 0).await;
+    kubelet.tick().await.unwrap();
+    assert_eq!(count_starts(&backend.events().await), 2, "OnFailure does NOT restart zero exit");
+    assert_eq!(
+        pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
+        Some("Succeeded")
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── Test 12 — kubectl-logs path returns the per-container fake buffer ─────
+
+#[tokio::test]
+async fn container_logs_returns_seeded_buffer() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    // Seed the exact stdout the started container will report.
+    backend.seed_log("default_p1_main", "hello-engenho\n").await;
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("Never")).await;
+    kubelet.tick().await.unwrap();
+
+    // The kubelet's in-process logs path resolves the container id from local
+    // bookkeeping + asks the backend.
+    let logs = kubelet
+        .container_logs("default", "p1", None, &LogOptions::all())
+        .await
+        .unwrap();
+    assert_eq!(logs, "hello-engenho\n");
+
+    // -c selecting the (only) container by name also works.
+    let logs_c = kubelet
+        .container_logs("default", "p1", Some("main"), &LogOptions::all())
+        .await
+        .unwrap();
+    assert_eq!(logs_c, "hello-engenho\n");
+
+    // A non-existent container → typed error (never empty-Ok).
+    let err = kubelet
+        .container_logs("default", "p1", Some("nope"), &LogOptions::all())
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), "invalid_pod");
+
+    // A pod not running on this node → typed error.
+    let err2 = kubelet
+        .container_logs("default", "ghost", None, &LogOptions::all())
+        .await
+        .unwrap_err();
+    assert_eq!(err2.kind(), "invalid_pod");
+
+    teardown(store, kubelet).await;
+}
+
+// ── Test 13 — multi-container partial start: Pending until all up ────────
+
+#[tokio::test]
+async fn multi_container_logs_select_per_container() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    backend.seed_log("default_mp_web", "from-web\n").await;
+    backend.seed_log("default_mp_sidecar", "from-sidecar\n").await;
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_multi_pod(&store, "mp", "node-A", "Always").await;
+    kubelet.tick().await.unwrap();
+    assert_eq!(container_id_count(&backend).await, 2);
+
+    // -c web vs -c sidecar select the right buffers.
+    let web = kubelet
+        .container_logs("default", "mp", Some("web"), &LogOptions::all())
+        .await
+        .unwrap();
+    assert_eq!(web, "from-web\n");
+    let side = kubelet
+        .container_logs("default", "mp", Some("sidecar"), &LogOptions::all())
+        .await
+        .unwrap();
+    assert_eq!(side, "from-sidecar\n");
 
     teardown(store, kubelet).await;
 }

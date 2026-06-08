@@ -67,6 +67,41 @@ impl ReplicaSetController {
     }
 }
 
+/// The set of `<rs>-<index>` suffix indices already in use among the owned
+/// pods. A pod whose name is `<rs_name>-<n>` (with `<n>` a parseable usize)
+/// contributes `n`; any other shape is ignored (it can't collide on an index).
+/// `rs_name = None` (a freshly-minted RS with no name) yields the empty set.
+fn used_indices(rs_name: Option<&str>, owned_pods: &[(ResourceKey, Value)]) -> std::collections::BTreeSet<usize> {
+    let mut used = std::collections::BTreeSet::new();
+    let Some(rs_name) = rs_name else {
+        return used;
+    };
+    let prefix = format!("{rs_name}-");
+    for (key, _) in owned_pods {
+        if let Some(suffix) = key.name.strip_prefix(&prefix) {
+            if let Ok(n) = suffix.parse::<usize>() {
+                used.insert(n);
+            }
+        }
+    }
+    used
+}
+
+/// The lowest `count` indices NOT in `used`, ascending. Fills freed slots
+/// first (so a middle delete recreates the freed index, never clobbering a
+/// surviving pod), then extends past the high-water mark.
+fn free_indices(used: &std::collections::BTreeSet<usize>, count: usize) -> Vec<usize> {
+    let mut out = Vec::with_capacity(count);
+    let mut idx = 0usize;
+    while out.len() < count {
+        if !used.contains(&idx) {
+            out.push(idx);
+        }
+        idx += 1;
+    }
+    out
+}
+
 #[async_trait]
 impl OwnedChildrenReconciler for ReplicaSetController {
     fn name(&self) -> &'static str {
@@ -114,11 +149,20 @@ impl OwnedChildrenReconciler for ReplicaSetController {
         let mut commands = Vec::new();
 
         if observed < desired {
-            // Create the difference. Index from observed+i so consecutive
-            // ticks don't collide on names.
-            let to_create = desired - observed;
-            for i in 0..to_create {
-                let idx = observed + i;
+            // Create the difference at the LOWEST FREE indices — NOT
+            // `observed + i`. The old `observed + i` basis CLOBBERED a
+            // surviving pod when a MIDDLE pod was deleted: deleting `<rs>-0`
+            // left `observed=1`, so the recreate targeted index 1 → the name
+            // `<rs>-1` COLLIDED with the surviving `<rs>-1` pod, and the
+            // `Put { expected: None }` overwrote it (resetting its
+            // scheduler-assigned `spec.nodeName` from the template → the
+            // kubelet then orphaned + removed its container → churn). Filling
+            // the lowest free index instead recreates `<rs>-0` (the freed
+            // slot), so the survivor `<rs>-1` is never touched. Names stay
+            // deterministic for tests; self-heal after a middle delete works.
+            let used = used_indices(rs_value.name(), owned_pods);
+            let free = free_indices(&used, desired - observed);
+            for idx in free {
                 let Some((pod_name, mut pod)) = Self::build_pod_from_template(rs_value, idx) else {
                     continue;
                 };
@@ -235,4 +279,61 @@ mod tests {
         assert!(owner_ref_for(&rs, "apps/v1", "ReplicaSet").is_none());
     }
 
+    // ── collision-free index allocation (middle-delete self-heal) ─────────
+
+    fn owned(rs: &str, idx: usize) -> (ResourceKey, Value) {
+        let name = format!("{rs}-{idx}");
+        (
+            ResourceKey::namespaced("", "v1", "Pod", "default", &name),
+            json!({"metadata": {"name": name}}),
+        )
+    }
+
+    #[test]
+    fn used_indices_extracts_suffix_numbers() {
+        let pods = vec![owned("rs1", 0), owned("rs1", 2), owned("rs1", 5)];
+        let used = used_indices(Some("rs1"), &pods);
+        assert_eq!(used.into_iter().collect::<Vec<_>>(), vec![0, 2, 5]);
+    }
+
+    #[test]
+    fn used_indices_ignores_foreign_names() {
+        // A pod whose name isn't `<rs>-<n>` contributes nothing.
+        let pods = vec![owned("rs1", 1), owned("other", 0)];
+        let used = used_indices(Some("rs1"), &pods);
+        assert_eq!(used.into_iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn free_indices_fills_freed_middle_slot_first() {
+        // The bug scenario: pods -0 deleted, survivor -1 in use → recreate
+        // must target the FREED index 0, NOT collide on 1.
+        let used: std::collections::BTreeSet<usize> = [1usize].into_iter().collect();
+        assert_eq!(free_indices(&used, 1), vec![0]);
+    }
+
+    #[test]
+    fn free_indices_extends_past_high_water_mark() {
+        // No freed slots → extend upward from the lowest unused index.
+        let used: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
+        assert_eq!(free_indices(&used, 2), vec![2, 3]);
+    }
+
+    #[test]
+    fn free_indices_mixed_freed_and_extend() {
+        // Freed 0 + survivors {1,3} → fill 0, then 2, then extend to 4.
+        let used: std::collections::BTreeSet<usize> = [1usize, 3].into_iter().collect();
+        assert_eq!(free_indices(&used, 3), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn middle_delete_recreates_freed_index_not_survivor() {
+        // End-to-end of the fix: RS desired=2, only `rs1-1` survives (the `-0`
+        // was deleted). The recreate must allocate index 0 (the freed slot),
+        // never re-Put `rs1-1` (which would clobber the survivor's nodeName).
+        let surviving = vec![owned("rs1", 1)];
+        let used = used_indices(Some("rs1"), &surviving);
+        let free = free_indices(&used, 2 - surviving.len());
+        assert_eq!(free, vec![0], "must recreate the freed index 0, not collide on 1");
+    }
 }

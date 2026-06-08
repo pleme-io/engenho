@@ -199,6 +199,19 @@ fn subresource_row(h: &dyn ResourceHandler, sub: Subresource) -> APIResource {
             group: Some("autoscaling".to_string()),
             version: Some("v1".to_string()),
         },
+        // `/log` is READ-ONLY — verbs `get` only (no patch/update). Kind is the
+        // parent's (`Pod`); group/version inherit the parent's GV.
+        Subresource::Log => APIResource {
+            name: format!("{}/log", h.plural()),
+            singular_name: String::new(),
+            namespaced: h.namespaced(),
+            kind: h.kind().to_string(),
+            verbs: vec!["get".to_string()],
+            short_names: Vec::new(),
+            categories: Vec::new(),
+            group: None,
+            version: None,
+        },
     }
 }
 

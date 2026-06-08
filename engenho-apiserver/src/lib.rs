@@ -40,6 +40,7 @@ pub mod health;
 pub mod openapi;
 pub mod params;
 pub mod pki;
+pub mod pod_logs;
 pub mod router;
 pub mod scale;
 pub mod server;
@@ -73,6 +74,7 @@ pub use pki::{
     client_verifier, issue_admin_client_material, issue_server_material, load_or_generate_ca,
     parse_client_cert,
 };
+pub use pod_logs::{LogQuery, PodLogReader};
 pub use router::{RouterState, build};
 pub use scale::{Scale, ScaleMeta, ScaleSpec, ScaleStatus, label_selector_to_string, project_scale};
 pub use server::{ApiServer, ServerError};

@@ -212,15 +212,15 @@ fn all_category_is_on_the_workload_kinds() {
 // ── subresource declarations (status / scale) ─────────────────────────────
 
 #[test]
-fn every_subresources_slice_is_a_subset_of_status_scale() {
+fn every_subresources_slice_is_a_subset_of_known_subresources() {
     // The typed enum makes a bad value unrepresentable, but pin that no row
     // somehow carries a duplicate or an unexpected combination — every slice
-    // is a subset of {Status, Scale}.
+    // is a subset of {Status, Scale, Log}.
     for d in RESOURCE_CATALOG {
         for s in d.subresources {
             assert!(
-                matches!(s, Subresource::Status | Subresource::Scale),
-                "{}: subresource must be Status or Scale",
+                matches!(s, Subresource::Status | Subresource::Scale | Subresource::Log),
+                "{}: subresource must be Status, Scale, or Log",
                 d.kind
             );
         }
@@ -232,6 +232,20 @@ fn every_subresources_slice_is_a_subset_of_status_scale() {
                 "{}: duplicate subresource in slice",
                 d.kind
             );
+        }
+    }
+}
+
+#[test]
+fn log_subresource_is_only_on_pod() {
+    // /log (kubectl logs) is served by EXACTLY the Pod kind. Any other kind
+    // declaring Log is a bug.
+    for d in RESOURCE_CATALOG {
+        let has_log = d.subresources.contains(&Subresource::Log);
+        if d.kind == "Pod" {
+            assert!(has_log, "Pod must serve the /log subresource");
+        } else {
+            assert!(!has_log, "{} must NOT serve /log (Pod-only)", d.kind);
         }
     }
 }

@@ -57,7 +57,7 @@ This collapses M0.0 from "build a codegen framework" to "add a backend."
 | **revoada** (distribution) | **most mature** — R0–R4.5 composed, 13k LoC, real libs, proptested | iroh content layer (R5); bridge to apiserver |
 | apiserver | M0.1 seed — full CRUD + OpenAPI v3, 8 r7 tests | watch streaming, authn, RBAC enforce, admission dispatch, CRD, SSA/SMP, API-group routing |
 | datastore | M0.1 seed — openraft + 3-node replication proven (r6) | **in-memory only** (no fjall persistence, no etcd-v3 gRPC, no revision-MVCC) |
-| kubelet + CRI | M0.1 seed — 1,551 LoC, ContainerRuntime trait (Podman/Fake), r10 tests | real containerd CRI client; probes; volumes; `/exec` `/log` `/portforward`; cgroup-v2 |
+| kubelet + CRI | **real kubelet — pods actually RUN (2026-06-08)** — `ContainerRuntime` trait (Podman/Fake) drives `podman run -d` per `spec.containers[i]` with the deterministic name `<ns>_<pod>_<cname>`; **MULTI-CONTAINER** (one `start` per container, N stops + N removes on delete); **real status** via a typed-spec triplet — closed `PodPhase`/`ContainerState`/`RestartPolicy` enums (the typed border) + a PURE `reconcile_pod_phase(restart_policy, &[ContainerObservation]) -> (PodPhase, Vec<ContainerStatusOut>)` interpreter (proptested: Always anti-latch, Never terminal-latch, any-Waiting→Pending) + `FakeBackend` as the mock environment — Pending→Running→Succeeded/Failed fold, per-container `containerStatuses[]` (running/waiting/terminated + restartCount), `podIP`, Ready condition; **`kubectl logs`** (real container stdout, `-c <container>` selector, `--tail`) via a new `ContainerRuntime::logs` + the `/log` subresource (catalog-declared on Pod, router-dispatched to the in-process kubelet through the apiserver `PodLogReader` seam); **restartPolicy Always + Never + OnFailure** (a terminated container is re-`start`ed under the policy, pod stays Running, restartCount bumps); delete = stop+remove ALL containers + RS self-heal (RS index-collision fix: recreate the FREED index, never clobber a surviving pod); fake backend stays config-selectable (`kubelet_backend: fake`) — all apiserver/daemon flows + the live real-podman POD_BAR green | real containerd CRI client; probes (liveness/readiness/startup); volumes (hostPath/Secret/ConfigMap/PVC); `/exec` `/portforward` (WebSocket-v5); cgroup-v2 limit enforcement; init/ephemeral containers; lifecycle hooks |
 | types catalog | **typed emission DONE (2026-06-06)** — 18 cataloged kinds GENERATED typed (typed spec/status + globally-deduped shared sub-struct module + curated-enum overrides) by in-tree `engenho-kube-codegen`; `--check` deterministic; zero hand-authored kinds | expand 18 → ~150 kinds across ~16 API groups (mechanical: add `KIND_CATALOG` rows + vendor the group's OpenAPI) |
 | controllers + scheduler | isolated library seeds (admission trait, crd scaffold) | 18-controller set, scheduler profile, apiserver-driven reconcile |
 | **networking** (CNI/DNS/kube-proxy/local-path/CA) | **M0.3 foundation + cluster-DNS bricks landed** — pods get real IPs on a shared `engenho-net` podman network, kubelet records `status.podIP`, EndpointsController populates Service Endpoints; **cluster-DNS now works headless-style** — at pod-start the kubelet computes the Services whose selector matches the pod (reusing the EndpointsController selector predicate) + feeds podman `--network-alias <svc>/<svc>.<ns>/<svc>.<ns>.svc.cluster.local`, so aardvark-dns (already running for the user network) resolves Service names to backend pod IPs (multi-A, no ClusterIP/kube-proxy) — ignore-gated real-podman e2e green: 2-replica Deployment → real IPs → Endpoints carry them → pod-to-pod TCP reachability → a separate client container resolves the Service name + connects to a backend BY NAME; the `dns.rs` zone-file/clusterIP controller stays a typed-surface seed for M0.4 | ClusterIP allocation + real kube-proxy apply, CNI bridge/IPAM, the M0.4 `engenho-dns` authority (hickory + KubernetesAuthority owning ClusterIP A-records + SRV + start-time-alias limitation removal), local-path, cluster CA (the M0.4 greenfield) |
@@ -126,12 +126,26 @@ reuse is wanted — not needed to ship M0.0). What actually landed:
 - **GATE:** Deployment→ReplicaSet→Pods→nodeName; Job→pending Pod; RBAC binding e2e.
 
 ### M0.3 — Kubelet + CRI *(pods RUN; ~10–14 wk)*
-- CRI v1 gRPC client to containerd (tonic); evented PLEG; pod-worker FSM
-  (proptested termination); volumes (hostPath + Secret-via-cofre + ConfigMap +
-  projected SA-token + PVC→PV); probes (http/tcp/exec); initContainers;
-  RestartPolicy; lifecycle hooks; `/exec` `/log` `/portforward` (WebSocket-v5);
-  cgroup-v2 via rustix; eviction; image pull + imagePullSecrets.
-- **GATE:** real-pod e2e; `kubectl logs/exec/port-forward`; Pending→Running→Ready→Terminated.
+- **DONE (2026-06-08):** pods actually RUN via `PodmanBackend` (single + MULTI
+  container, one `start` per `spec.containers[i]`); real status (Pending→Running→
+  Succeeded/Failed via the typed `PodPhase` fold + per-container
+  `containerStatuses`, `podIP`, Ready); `kubectl logs` (real stdout, `-c`
+  selector, `--tail`); `kubectl delete` (stop+remove all containers + RS
+  self-heal); `RestartPolicy` Always + Never + OnFailure; container
+  command/args/env. **GATE met:** real-podman POD_BAR (2-replica busybox
+  Deployment → 2 Running pods with real podIPs → `kubectl logs` → delete-pod
+  self-heal → delete-deployment clean → 2-container Pod) + fake-backend
+  regression.
+- **DEFERRED (typed-error / documented-no-op, NEVER a fake Running):** CRI v1
+  gRPC client to containerd (tonic); evented PLEG; volumes (hostPath +
+  Secret-via-cofre + ConfigMap + projected SA-token + PVC→PV); probes
+  (http/tcp/exec — Ready reflects container-running only); initContainers +
+  ephemeral containers; lifecycle hooks; `/exec` `/portforward` (WebSocket-v5,
+  typed `NotFound`); cgroup-v2 limit enforcement via rustix; eviction; image
+  pull + imagePullSecrets.
+- **GATE:** real-pod e2e; `kubectl logs` **(MET)**; `kubectl exec/port-forward`
+  (deferred); Pending→Running→Ready→Terminated **(MET for the run/restart
+  lifecycle; probes-driven Ready deferred)**.
 
 ### M0.4 — Data-plane networking *(single-node complete; rio-ready; ~6–8 wk)*
 - `engenho-cni` (bridge + host-local IPAM + portmap); `engenho-kubeproxy`
