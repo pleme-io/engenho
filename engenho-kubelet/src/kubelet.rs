@@ -51,6 +51,10 @@ use crate::error::KubeletError;
 use crate::lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
 };
+use crate::pod_volume::{
+    MountSource, PodVolumeSource, PodmanVolumeMaterializer, VolumeMaterializer, VolumeResolveError,
+    container_mounts, pod_volumes,
+};
 use crate::probe::{
     ProbeKind, ProbeRuntime, ProbeSpec, aggregate_container_readiness, fold_probe_observation,
     run_handler,
@@ -198,6 +202,14 @@ pub struct Kubelet {
     /// http/tcp target a routable IP (no container-namespace dependency) — see
     /// the [`NetProber`] doc.
     net_prober: Arc<dyn NetProber>,
+    /// The volume-materializer seam (configMap/secret → host files;
+    /// emptyDir → podman named volume). Defaults to
+    /// [`PodmanVolumeMaterializer`]; tests inject a `FakeVolumeMaterializer`
+    /// via [`Kubelet::with_volume_materializer`]. Held as a THIRD trait
+    /// object (alongside `backend` + `net_prober`) per the M0.7 kubelet-
+    /// volumes brick — the trait IS the testability contract, so volume
+    /// resolution is unit-testable WITHOUT real podman.
+    volume_materializer: Arc<dyn VolumeMaterializer>,
     /// The `now()` source (defaults to [`Instant::now`]; overridable for
     /// deterministic probe-cadence tests via [`Kubelet::with_clock`]).
     clock: Clock,
@@ -221,10 +233,21 @@ impl Kubelet {
             store,
             backend,
             net_prober: Arc::new(TokioNetProber::new()),
+            volume_materializer: Arc::new(PodmanVolumeMaterializer::new()),
             clock: Arc::new(Instant::now),
             node_name: node_name.into(),
             local: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Builder: override the [`VolumeMaterializer`] (configMap/secret/emptyDir
+    /// host-effecting seam). Tests pass a `FakeVolumeMaterializer` so volume
+    /// resolution is exercised without real podman / a real filesystem;
+    /// production keeps the default [`PodmanVolumeMaterializer`].
+    #[must_use]
+    pub fn with_volume_materializer(mut self, m: Arc<dyn VolumeMaterializer>) -> Self {
+        self.volume_materializer = m;
+        self
     }
 
     /// Builder: override the [`NetProber`] (httpGet/tcpSocket seam). Tests pass
@@ -351,6 +374,12 @@ impl Kubelet {
                     // Service-name DNS aliases are computed once per pod in
                     // `start_bound_pod` and assigned onto each spec there.
                     network_aliases: Vec::new(),
+                    // Volume mounts are resolved once per pod in
+                    // `start_bound_pod` (after alias compute, before the start
+                    // loop) and stamped onto each spec there. Empty here →
+                    // a no-volume pod produces `mounts: vec![]` → identical
+                    // argv to before the kubelet-volumes brick.
+                    mounts: Vec::new(),
                 },
             ));
         }
@@ -751,6 +780,153 @@ impl Kubelet {
         Ok(())
     }
 
+    /// Resolve the Pod's `spec.volumes[]` into a `volName → MountSource` map
+    /// (the M0.7 kubelet-volumes brick), reusing the SAME in-process store
+    /// read the kubelet already does for Services.
+    ///
+    /// Pre-fetches every referenced ConfigMap/Secret ASYNC from the store
+    /// (`self.store.get(ResourceKey::namespaced("","v1","ConfigMap"|"Secret",ns,name))`)
+    /// into a lookup map, then drives the PURE [`crate::pod_volume::resolve_pod_volumes`]
+    /// interpreter with a sync closure over that map + this kubelet's
+    /// [`VolumeMaterializer`]. The split keeps the resolver pure (mockable
+    /// without the store) while the store reads stay where the async lives.
+    ///
+    /// Empty / absent `spec.volumes` ⇒ `Ok(empty map)` (no store reads, no
+    /// materialization) — the no-volume fast path.
+    ///
+    /// # Errors
+    ///
+    /// Any [`VolumeResolveError`] (missing non-optional source, missing key,
+    /// multi/no/unsupported source, materializer failure). The caller maps
+    /// [`VolumeResolveError::pending_reason`] onto every container's
+    /// `waiting.reason` + keeps the pod Pending.
+    async fn resolve_pod_volume_mounts(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod: &Value,
+    ) -> Result<BTreeMap<String, MountSource>, VolumeResolveError> {
+        // No-volume fast path: skip ALL store reads + materialization.
+        let volumes = pod_volumes(pod)?;
+        if volumes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        // Pre-fetch every referenced ConfigMap/Secret ASYNC, keyed by
+        // (kind, name). Only the in-scope source arms need a fetch; deferred
+        // arms (hostPath/PVC/projected/downwardAPI) surface their typed error
+        // in the pure resolver without a store read.
+        let mut fetched: BTreeMap<(String, String), Value> = BTreeMap::new();
+        for vol in &volumes {
+            // from_volume errors (multi/no source) are re-detected by the pure
+            // resolver below; here we only need the (kind, name) to pre-fetch.
+            let source = match PodVolumeSource::from_volume(vol) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let (kind, name) = match source {
+                PodVolumeSource::ConfigMap { name, .. } => ("ConfigMap", name),
+                PodVolumeSource::Secret { name, .. } => ("Secret", name),
+                _ => continue,
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let key = ResourceKey::namespaced("", "v1", kind, namespace, &name);
+            if let Some(val) = self.store.get(&key).await {
+                fetched.insert((kind.to_string(), name), val);
+            }
+        }
+
+        // Drive the PURE interpreter with a sync closure over the pre-fetched
+        // map + this kubelet's materializer.
+        let fetch = |kind: &str, name: &str| -> Option<Value> {
+            fetched.get(&(kind.to_string(), name.to_string())).cloned()
+        };
+        crate::pod_volume::resolve_pod_volumes(
+            pod,
+            namespace,
+            pod_name,
+            fetch,
+            self.volume_materializer.as_ref(),
+        )
+        .await
+    }
+
+    /// Build + write a Pod `status` with EVERY container `Waiting{reason}` —
+    /// the no-silent-wrong-answer path for a volume-resolution failure. The
+    /// pod stays `Pending` with `containerStatuses[].state.waiting.reason`
+    /// set to the typed [`VolumeResolveError::pending_reason`] (e.g.
+    /// `ConfigMapNotFound`); NO container is started. The caller arms a
+    /// requeue so a later-created source converges the pod to Running.
+    async fn write_pod_volume_pending(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        container_names: &[String],
+        reason: &str,
+        report: &mut ReconcileReport,
+    ) -> Result<(), ControllerError> {
+        let statuses: Vec<ContainerStatusOut> = container_names
+            .iter()
+            .map(|name| ContainerStatusOut {
+                name: name.clone(),
+                ready: false,
+                state: ContainerState::Waiting {
+                    reason: reason.to_string(),
+                },
+                container_id: None,
+                restart_count: 0,
+            })
+            .collect();
+        let desired = Self::build_pod_status(
+            engenho_types::curated_enums::PodPhase::Pending,
+            &statuses,
+            None,
+        );
+        self.write_pod_status(key, value, &desired, report).await
+    }
+
+    /// Resolve `spec.volumes[]`, OR write the pod Pending with a typed
+    /// `waiting.reason` on failure. Returns `Ok(Some(map))` on success (the
+    /// `volName → MountSource` map to stamp onto specs); `Ok(None)` when a
+    /// resolution error already wrote the pod Pending + armed a requeue (the
+    /// caller returns without starting any container — the no-silent-wrong-
+    /// answer path).
+    async fn resolve_or_pending(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        namespace: &str,
+        container_names: &[String],
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<Option<BTreeMap<String, MountSource>>, ControllerError> {
+        match self
+            .resolve_pod_volume_mounts(namespace, &key.name, value)
+            .await
+        {
+            Ok(map) => Ok(Some(map)),
+            Err(e) => {
+                let reason = e.pending_reason();
+                warn!(
+                    pod = %key.label(),
+                    error = %e,
+                    reason = reason,
+                    "volume resolution failed; pod stays Pending (no container started)"
+                );
+                self.write_pod_volume_pending(key, value, container_names, reason, report)
+                    .await?;
+                // Arm a requeue so the next tick re-resolves once the source
+                // appears (mirrors the probe-cadence requeue).
+                let next = soonest_requeue.map_or(MIN_PROBE_REQUEUE, |d| d.min(MIN_PROBE_REQUEUE));
+                *soonest_requeue = Some(next);
+                report.objects_skipped += 1;
+                Ok(None)
+            }
+        }
+    }
+
     /// (B) Start a bound Pod's containers (one per `spec.containers[i]`) +
     /// write its initial status via CAS, inserting the local bookkeeping on
     /// success.
@@ -821,6 +997,30 @@ impl Kubelet {
         let aliases =
             Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
 
+        // (M0.7 kubelet-volumes) Resolve + materialize `spec.volumes[]` ONCE
+        // for the pod (configMap/secret → host files; emptyDir → a shared
+        // podman named volume) BEFORE building any run argv — `-v` is a
+        // `podman run` flag. The resolved `volName → MountSource` map is then
+        // mapped per-container via `volumeMounts[]` onto each spec's `mounts`.
+        //
+        // NO SILENT WRONG ANSWER: a missing non-optional source (or an
+        // unsupported source class) does NOT start any container + does NOT
+        // skip silently — it writes the pod Pending with EVERY container
+        // `Waiting{ reason: <typed> }` (e.g. ConfigMapNotFound) + arms a
+        // requeue so a later-created source converges the pod to Running on a
+        // future tick. A no-volume pod returns an empty map (no store reads,
+        // no materialization) → every spec keeps `mounts: vec![]` → identical
+        // behavior to before this brick.
+        let cnames: Vec<String> = specs.iter().map(|(c, _)| c.clone()).collect();
+        let Some(resolved) = self
+            .resolve_or_pending(key, value, namespace, &cnames, report, soonest_requeue)
+            .await?
+        else {
+            // A resolution error already wrote the pod Pending + armed a
+            // requeue; nothing else to do this tick.
+            return Ok(());
+        };
+
         // Ensure a fresh local record exists, then start each container not
         // yet recorded. (On a partial prior start the record already holds
         // some containers; this is start-only-the-missing.)
@@ -839,12 +1039,34 @@ impl Kubelet {
                 continue;
             }
             spec.network_aliases = aliases.clone();
+            // (M0.7 kubelet-volumes) Map this container's `volumeMounts[]`
+            // against the resolved `volName → MountSource` map onto its
+            // `spec.mounts`. A volumeMount naming an unknown volume is an
+            // invalid pod (NoSource) — skip the WHOLE pod (never a fake
+            // start). A container with no volumeMounts gets `mounts: vec![]`
+            // → identical argv to before this brick.
+            if let Some(cjson) = Self::container_json(value, &cname) {
+                match container_mounts(cjson, &resolved) {
+                    Ok(mounts) => spec.mounts = mounts,
+                    Err(e) => {
+                        warn!(
+                            pod = %key.label(),
+                            container = %cname,
+                            error = %e,
+                            "skipping pod: container references an undeclared volume"
+                        );
+                        report.objects_skipped += 1;
+                        return Ok(());
+                    }
+                }
+            }
             debug!(
                 pod = %key.label(),
                 container = %cname,
                 image = %spec.image,
                 backend = self.backend.name(),
                 aliases = spec.network_aliases.len(),
+                mounts = spec.mounts.len(),
                 "kubelet starting container"
             );
             match self.backend.start(&spec).await {

@@ -56,6 +56,29 @@ pub struct ContainerSpec {
     /// limitation entirely — named here so this interim is a conscious
     /// shortest-correct step toward that destination, not the easy path.
     pub network_aliases: Vec<String>,
+    /// Already-resolved volume mounts the kubelet computed from the Pod's
+    /// `spec.volumes[]` + this container's `volumeMounts[]` (the M0.7
+    /// kubelet-volumes brick). Each [`crate::pod_volume::ResolvedMount`]
+    /// becomes a `-v <src>:<mountPath>[:ro]` argv entry in [`PodmanBackend::run_argv`].
+    ///
+    /// Carried as a plain DATA field on [`ContainerSpec`] (NOT a new `start`
+    /// argument) — MIRRORING `network_aliases` — precisely so the
+    /// [`ContainerRuntime::start`] signature stays unchanged and [`FakeBackend`]
+    /// needs no new method: the Fake records the spec (mounts included), and a
+    /// test reads them back via [`FakeBackend::spec_of`] with ZERO new plumbing.
+    ///
+    /// Empty `Vec` (the default) ⇒ behavior-preserving: a pod with no volumes
+    /// produces `mounts: vec![]` ⇒ byte-identical `run_argv` to before this
+    /// brick.
+    ///
+    /// ## Start-time only (accepted M0.7 limitation)
+    ///
+    /// Like `network_aliases`, mounts are materialized + bound once at
+    /// pod-start (`-v` is a `podman run` flag). A configMap edited after a pod
+    /// starts does NOT re-project into the running container until the pod is
+    /// recreated — mirroring K8s' eventual re-projection is a named
+    /// typed-deferred follow-up, not a silent miss.
+    pub mounts: Vec<crate::pod_volume::ResolvedMount>,
 }
 
 /// Status the backend reports back.
@@ -365,6 +388,15 @@ impl FakeBackend {
     /// The current log buffer for a container_id (test inspection helper).
     pub async fn log_of(&self, container_id: &str) -> Option<String> {
         self.inner.lock().await.logs.get(container_id).cloned()
+    }
+
+    /// The [`ContainerSpec`] a container was started under (test inspection
+    /// helper, mirrors [`FakeBackend::log_of`]). Because `mounts` lives ON
+    /// `ContainerSpec`, this surfaces the resolved volume mounts the kubelet
+    /// stamped — a test asserts `fake.spec_of(id).unwrap().mounts == expected`
+    /// with ZERO new Fake plumbing.
+    pub async fn spec_of(&self, container_id: &str) -> Option<ContainerSpec> {
+        self.inner.lock().await.specs.get(container_id).cloned()
     }
 
     /// Test hook: program a SEQUENCE of [`ExecOutcome`]s that successive
@@ -775,6 +807,27 @@ impl PodmanBackend {
         argv.push(self.pull_policy.flag_value().to_string());
         argv.push("--name".to_string());
         argv.push(spec.name.clone());
+        // (M0.7 kubelet-volumes) Already-resolved volume mounts → `-v` pairs,
+        // emitted AFTER `--name` and BEFORE the `-e` env pairs (deterministic,
+        // unit-assertable position; preserved in `spec.mounts` order). A
+        // HostDir source uses the absolute host path; a NamedVolume uses the
+        // volume name. `:ro` is appended when the mount is read-only
+        // (configMap/secret default; emptyDir read-write). Empty `spec.mounts`
+        // (a pod with no volumes) emits nothing → byte-identical argv to before
+        // this brick.
+        for m in &spec.mounts {
+            let src = match &m.source {
+                crate::pod_volume::MountSource::HostDir(p) => p.display().to_string(),
+                crate::pod_volume::MountSource::NamedVolume(n) => n.clone(),
+            };
+            let spec_str = if m.read_only {
+                format!("{src}:{}:ro", m.mount_path)
+            } else {
+                format!("{src}:{}", m.mount_path)
+            };
+            argv.push("-v".to_string());
+            argv.push(spec_str);
+        }
         // BTreeMap iteration is sorted → deterministic env ordering.
         for (k, v) in &spec.env {
             argv.push("-e".to_string());
@@ -1609,6 +1662,7 @@ mod tests {
             env: BTreeMap::new(),
             command: command.iter().map(|c| (*c).to_string()).collect(),
             network_aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+            mounts: Vec::new(),
         }
     }
 

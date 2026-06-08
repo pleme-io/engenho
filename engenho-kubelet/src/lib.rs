@@ -43,6 +43,7 @@ pub mod config_bridge;
 pub mod error;
 pub mod kubelet;
 pub mod lifecycle;
+pub mod pod_volume;
 pub mod probe;
 pub mod volume;
 
@@ -55,6 +56,10 @@ pub use error::KubeletError;
 pub use kubelet::{Kubelet, TestClock};
 pub use lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
+};
+pub use pod_volume::{
+    FakeVolumeMaterializer, MountSource, PodVolumeSource, PodmanVolumeMaterializer, ResolvedMount,
+    VolumeMaterializer, VolumeResolveError, resolve_pod_volumes,
 };
 pub use probe::{
     HttpScheme, ProbeHandler, ProbeKind, ProbeObservation, ProbeParseError, ProbePort,
