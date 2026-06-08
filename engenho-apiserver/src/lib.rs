@@ -39,6 +39,7 @@ pub mod openapi;
 pub mod params;
 pub mod pki;
 pub mod router;
+pub mod scale;
 pub mod server;
 
 pub use coords::ResourceCoords;
@@ -61,4 +62,5 @@ pub use pki::{
     ClusterCa, PkiError, ServerSanInputs, TlsMaterial, issue_server_material, load_or_generate_ca,
 };
 pub use router::{RouterState, build};
+pub use scale::{Scale, ScaleMeta, ScaleSpec, ScaleStatus, label_selector_to_string, project_scale};
 pub use server::{ApiServer, ServerError};

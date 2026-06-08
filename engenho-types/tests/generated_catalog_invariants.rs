@@ -6,7 +6,7 @@
 //! change drifts the catalog from the per-type consts, this test fails —
 //! the single-source-of-truth guarantee is mechanical, not by convention.
 
-use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor};
+use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor, Subresource};
 use engenho_types::kind::{KubeResource, Scope};
 
 use engenho_types::generated_v1_34::apps_v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
@@ -206,6 +206,99 @@ fn all_category_is_on_the_workload_kinds() {
             row(kind).categories.is_empty(),
             "{kind} must be in no category"
         );
+    }
+}
+
+// ── subresource declarations (status / scale) ─────────────────────────────
+
+#[test]
+fn every_subresources_slice_is_a_subset_of_status_scale() {
+    // The typed enum makes a bad value unrepresentable, but pin that no row
+    // somehow carries a duplicate or an unexpected combination — every slice
+    // is a subset of {Status, Scale}.
+    for d in RESOURCE_CATALOG {
+        for s in d.subresources {
+            assert!(
+                matches!(s, Subresource::Status | Subresource::Scale),
+                "{}: subresource must be Status or Scale",
+                d.kind
+            );
+        }
+        // No duplicates within a row.
+        let mut seen = std::collections::HashSet::new();
+        for s in d.subresources {
+            assert!(
+                seen.insert(*s),
+                "{}: duplicate subresource in slice",
+                d.kind
+            );
+        }
+    }
+}
+
+#[test]
+fn scale_is_only_on_deployment_replicaset_statefulset() {
+    // /scale is served by EXACTLY the three scalable apps/v1 workloads
+    // (ReplicationController is not cataloged). Any other kind declaring
+    // Scale is a bug.
+    let want_scale = ["Deployment", "ReplicaSet", "StatefulSet"];
+    for d in RESOURCE_CATALOG {
+        if want_scale.contains(&d.kind) {
+            assert!(d.has_scale(), "{} must serve /scale", d.kind);
+        } else {
+            assert!(!d.has_scale(), "{} must NOT serve /scale", d.kind);
+        }
+    }
+}
+
+#[test]
+fn scale_bearing_kinds_also_bear_status() {
+    // Every scalable kind also has /status (scale ⊆ status-bearing). A
+    // kind with /scale but no /status would be an inconsistent catalog.
+    for d in RESOURCE_CATALOG {
+        if d.has_scale() {
+            assert!(
+                d.has_status(),
+                "{}: a /scale kind must also serve /status",
+                d.kind
+            );
+        }
+    }
+}
+
+#[test]
+fn status_is_on_the_expected_kinds() {
+    // The status-subresource kinds we declare: the workloads + Pod / PVC /
+    // Node / Namespace / Service. ConfigMap / Secret / Endpoints / RBAC /
+    // ServiceAccount / PersistentVolume / CRD have NO status subresource.
+    let want_status = [
+        "Pod",
+        "Service",
+        "Namespace",
+        "Node",
+        "PersistentVolumeClaim",
+        "Deployment",
+        "ReplicaSet",
+        "StatefulSet",
+        "DaemonSet",
+    ];
+    let no_status = [
+        "ConfigMap",
+        "Secret",
+        "Endpoints",
+        "ServiceAccount",
+        "PersistentVolume",
+        "Role",
+        "ClusterRole",
+        "RoleBinding",
+        "ClusterRoleBinding",
+        "CustomResourceDefinition",
+    ];
+    for kind in want_status {
+        assert!(row(kind).has_status(), "{kind} must serve /status");
+    }
+    for kind in no_status {
+        assert!(!row(kind).has_status(), "{kind} must NOT serve /status");
     }
 }
 

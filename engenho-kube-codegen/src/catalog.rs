@@ -14,6 +14,23 @@
 //! across ~16 API groups. This file's `KIND_CATALOG` is the M0.0.1
 //! subset (well-known kinds every test cluster uses).
 
+/// A K8s subresource a kind serves under `<plural>/<name>/<sub>`.
+///
+/// Typed — NOT a string — so a bad combination is unrepresentable: the
+/// discovery emitter, the router dispatch, and the store-scoping handler
+/// all `match` on this enum, and the compiler refuses any value outside the
+/// closed set. `Status` is the `/status` subresource (controller-written
+/// status, isolated from spec on write); `Scale` is the autoscaling/v1
+/// `/scale` subresource (the projected replica view).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Subresource {
+    /// `/status` — get/patch/update the `.status` only (spec untouched).
+    Status,
+    /// `/scale` — get/patch/update the autoscaling/v1 Scale projection
+    /// (`spec.replicas` only).
+    Scale,
+}
+
 /// One entry in the curated catalog: enough info to emit a typed
 /// struct + `KubeResource` impl.
 pub struct KindEntry {
@@ -59,6 +76,14 @@ pub struct KindEntry {
     /// catalog descriptor row, so routing + discovery light up exactly as
     /// for a schema-backed kind. Non-opaque kinds set this `false`.
     pub opaque: bool,
+    /// The subresources this kind serves under `<plural>/<name>/<sub>`
+    /// (`/status`, `/scale`). Typed — `&[Subresource::Status,
+    /// Subresource::Scale]` for the scalable workloads, `&[Subresource::Status]`
+    /// for status-only kinds, `&[]` for kinds with no subresource. The
+    /// catalog is the SINGLE source: the router dispatch, the store-scoping
+    /// handler, and discovery all read this slice — no kind is ever
+    /// special-cased by name in the router.
+    pub subresources: &'static [Subresource],
 }
 
 /// The curated set of M0.0.1 kinds.
@@ -79,6 +104,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "pod",
         categories: &["all"],
         opaque: false,
+        subresources: &[Subresource::Status],
     },
     KindEntry {
         kind: "Service",
@@ -92,6 +118,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "service",
         categories: &["all"],
         opaque: false,
+        subresources: &[Subresource::Status],
     },
     KindEntry {
         kind: "ConfigMap",
@@ -105,6 +132,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "configmap",
         categories: &[],
         opaque: false,
+        subresources: &[],
     },
     KindEntry {
         kind: "Secret",
@@ -118,6 +146,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "secret",
         categories: &[],
         opaque: false,
+        subresources: &[],
     },
     KindEntry {
         kind: "Namespace",
@@ -131,6 +160,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "namespace",
         categories: &[],
         opaque: false,
+        subresources: &[Subresource::Status],
     },
     KindEntry {
         kind: "ServiceAccount",
@@ -144,6 +174,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "serviceaccount",
         categories: &[],
         opaque: false,
+        subresources: &[],
     },
     KindEntry {
         kind: "Node",
@@ -157,6 +188,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "node",
         categories: &[],
         opaque: false,
+        subresources: &[Subresource::Status],
     },
     KindEntry {
         kind: "PersistentVolume",
@@ -170,6 +202,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "persistentvolume",
         categories: &[],
         opaque: false,
+        subresources: &[],
     },
     KindEntry {
         kind: "PersistentVolumeClaim",
@@ -183,6 +216,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "persistentvolumeclaim",
         categories: &[],
         opaque: false,
+        subresources: &[Subresource::Status],
     },
     KindEntry {
         kind: "Endpoints",
@@ -196,6 +230,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "endpoints",
         categories: &[],
         opaque: false,
+        subresources: &[],
     },
     // ── apps/v1 ─────────────────────────────────────────────────────
     KindEntry {
@@ -210,6 +245,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "deployment",
         categories: &["all"],
         opaque: false,
+        subresources: &[Subresource::Status, Subresource::Scale],
     },
     KindEntry {
         kind: "ReplicaSet",
@@ -223,6 +259,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "replicaset",
         categories: &["all"],
         opaque: false,
+        subresources: &[Subresource::Status, Subresource::Scale],
     },
     KindEntry {
         kind: "StatefulSet",
@@ -236,6 +273,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "statefulset",
         categories: &["all"],
         opaque: false,
+        subresources: &[Subresource::Status, Subresource::Scale],
     },
     KindEntry {
         kind: "DaemonSet",
@@ -249,6 +287,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "daemonset",
         categories: &["all"],
         opaque: false,
+        subresources: &[Subresource::Status],
     },
     // ── rbac.authorization.k8s.io/v1 ────────────────────────────────
     KindEntry {
@@ -263,6 +302,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "role",
         categories: &[],
         opaque: false,
+        subresources: &[],
     },
     KindEntry {
         kind: "ClusterRole",
@@ -276,6 +316,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "clusterrole",
         categories: &[],
         opaque: false,
+        subresources: &[],
     },
     KindEntry {
         kind: "RoleBinding",
@@ -289,6 +330,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "rolebinding",
         categories: &[],
         opaque: false,
+        subresources: &[],
     },
     KindEntry {
         kind: "ClusterRoleBinding",
@@ -302,6 +344,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "clusterrolebinding",
         categories: &[],
         opaque: false,
+        subresources: &[],
     },
     // ── apiextensions.k8s.io/v1 ─────────────────────────────────────
     //
@@ -330,5 +373,6 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "customresourcedefinition",
         categories: &["api-extensions"],
         opaque: true,
+        subresources: &[],
     },
 ];

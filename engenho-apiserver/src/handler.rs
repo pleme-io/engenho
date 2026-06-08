@@ -14,10 +14,11 @@ use engenho_store::{
     resource::ResourceKey,
     watch_backend::WATCH_CHANNEL_CAPACITY,
 };
-use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor};
+use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor, Subresource};
 
 use crate::error::ApiError;
 use crate::params::{ResumePoint, Selectors, body_precondition};
+use crate::scale::{Scale, project_scale};
 
 /// Bookmark cadence handed to `watch_from` when the client opted into
 /// bookmarks (`allowWatchBookmarks=true`). Mirrors the store default.
@@ -76,6 +77,97 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// `categories`. Empty default; `StoreBackedHandler` overrides it.
     fn categories(&self) -> &[&str] {
         &[]
+    }
+
+    /// The typed subresources this kind serves (`/status`, `/scale`),
+    /// sourced from the generated catalog descriptor. The router dispatch +
+    /// discovery fold both read this — advertised == routable. Empty default
+    /// (a handler with no descriptor serves no subresource); `StoreBackedHandler`
+    /// returns the descriptor's slice.
+    fn subresources(&self) -> &[Subresource] {
+        &[]
+    }
+
+    /// GET the parent object's `/status` view. Default: a typed `NotFound`
+    /// (this kind does not serve `/status`) — never a panic. `StoreBackedHandler`
+    /// overrides for status-bearing kinds: it reads the live object (the
+    /// whole object IS the `/status` GET body in K8s) through the same
+    /// `inject_type_meta` path GET uses.
+    async fn get_status(&self, _namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
+        Err(self.no_subresource("status", name))
+    }
+
+    /// PUT (full-object replace) the parent's `/status`. Default typed 404.
+    /// `StoreBackedHandler` writes ONLY `.status` from the incoming object
+    /// (spec/metadata preserved by the RFC7396 merge + generation preserved
+    /// by `compute_generation_on_put` on a status-only write).
+    async fn put_status(
+        &self,
+        _namespace: Option<&str>,
+        name: &str,
+        _incoming: Value,
+    ) -> Result<Value, ApiError> {
+        Err(self.no_subresource("status", name))
+    }
+
+    /// PATCH the parent's `/status`. Default typed 404. `StoreBackedHandler`
+    /// scopes the patch to `.status` only (merge/strategic: strip non-status
+    /// keys; json-patch: reject ops outside `/status`).
+    async fn patch_status(
+        &self,
+        _namespace: Option<&str>,
+        name: &str,
+        _patch: Value,
+        _patch_type: engenho_types::patch::PatchType,
+    ) -> Result<Value, ApiError> {
+        Err(self.no_subresource("status", name))
+    }
+
+    /// GET the parent's `/scale` as an `autoscaling/v1` Scale projection.
+    /// Default typed 404 (this kind is not scalable). `StoreBackedHandler`
+    /// projects `spec.replicas` / `status.replicas` / selector off the
+    /// live parent.
+    async fn get_scale(&self, _namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
+        Err(self.no_subresource("scale", name))
+    }
+
+    /// PUT (full-object replace) the parent's `/scale`. Default typed 404.
+    /// `StoreBackedHandler` deserializes the incoming Scale, takes
+    /// `spec.replicas`, and writes ONLY `spec.replicas` back to the parent.
+    async fn put_scale(
+        &self,
+        _namespace: Option<&str>,
+        name: &str,
+        _incoming: Value,
+    ) -> Result<Value, ApiError> {
+        Err(self.no_subresource("scale", name))
+    }
+
+    /// PATCH the parent's `/scale`. Default typed 404. `StoreBackedHandler`
+    /// translates the Scale-shaped patch's `spec.replicas` into a
+    /// `{"spec":{"replicas":N}}` merge patch on the parent.
+    async fn patch_scale(
+        &self,
+        _namespace: Option<&str>,
+        name: &str,
+        _patch: Value,
+        _patch_type: engenho_types::patch::PatchType,
+    ) -> Result<Value, ApiError> {
+        Err(self.no_subresource("scale", name))
+    }
+
+    /// Build the typed `NotFound` a handler returns when asked for a
+    /// subresource its kind does not serve — "the server could not find the
+    /// requested resource". This is the no-stub-Ok discipline: an
+    /// unimplemented subresource on a kind that lacks it is a typed 404 by
+    /// construction, never a panic / `todo!()`.
+    fn no_subresource(&self, sub: &str, name: &str) -> ApiError {
+        ApiError::NotFound(format!(
+            "the server could not find the requested resource: {} {:?} does not serve subresource {:?}",
+            self.kind(),
+            name,
+            sub
+        ))
     }
 
     async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError>;
@@ -244,6 +336,11 @@ pub struct StoreBackedHandler {
     short_names: &'static [&'static str],
     singular: &'static str,
     categories: &'static [&'static str],
+    /// The typed subresources this kind serves (`/status`, `/scale`),
+    /// sourced from the catalog descriptor. `&[]` for the legacy
+    /// constructors + dynamically-registered CRDs (CRs serve no
+    /// status/scale at this brick).
+    subresources: &'static [Subresource],
     store: Arc<StoreMesh>,
     /// Optional admission chain dispatched on the write path (create /
     /// patch / delete) at the API boundary. `None` = no admission — every
@@ -276,6 +373,10 @@ impl StoreBackedHandler {
             short_names: &[],
             singular: "",
             categories: &[],
+            // No subresources by default; set from the catalog descriptor in
+            // [`Self::from_descriptor`]. A dynamically-registered CR serves
+            // none at this brick.
+            subresources: &[],
             admission: None,
         }
     }
@@ -294,6 +395,16 @@ impl StoreBackedHandler {
         self.short_names = short_names;
         self.singular = singular;
         self.categories = categories;
+        self
+    }
+
+    /// Attach the typed subresource set (`/status`, `/scale`) sourced from
+    /// the generated catalog descriptor. Builder style; [`Self::from_descriptor`]
+    /// is the only production caller, so a cataloged kind serves exactly the
+    /// subresources its `KIND_CATALOG` row declares.
+    #[must_use]
+    pub fn with_subresources(mut self, subresources: &'static [Subresource]) -> Self {
+        self.subresources = subresources;
         self
     }
 
@@ -386,6 +497,7 @@ impl StoreBackedHandler {
     pub fn from_descriptor(store: Arc<StoreMesh>, d: &'static ResourceDescriptor) -> Self {
         Self::new(store, d.group, d.version, d.kind, d.plural, d.namespaced)
             .with_registration_metadata(d.short_names, d.singular, d.categories)
+            .with_subresources(d.subresources)
     }
 
     fn key(&self, namespace: Option<&str>, name: &str) -> Result<ResourceKey, ApiError> {
@@ -434,6 +546,153 @@ impl ResourceHandler for StoreBackedHandler {
     }
     fn categories(&self) -> &[&str] {
         self.categories
+    }
+
+    fn subresources(&self) -> &[Subresource] {
+        self.subresources
+    }
+
+    // ── subresource scoped writes (reuse ResourceCommand::Patch verbatim) ──
+    //
+    // Each method reads the LIVE object via `store.get`, builds a SCOPED
+    // patch, and proposes a `ResourceCommand::Patch` — no new store command.
+    // The scoping is what gives spec/status isolation: a /status write
+    // carries only `{"status": …}` so `apply_patch`'s RFC7396 merge preserves
+    // spec+metadata and `compute_generation_on_put` preserves generation; a
+    // /scale write carries only `{"spec":{"replicas":N}}`. CAS threads
+    // `expected` from the incoming object's metadata.resourceVersion (same
+    // `body_precondition` the main path uses) so concurrent writes conflict
+    // with a typed 409. This is the OPERATOR-facing peer of the
+    // controller-facing `write_status_cas`.
+
+    async fn get_status(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
+        // The whole object IS the /status GET body in K8s — same as GET.
+        self.get(namespace, name).await
+    }
+
+    async fn put_status(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        incoming: Value,
+    ) -> Result<Value, ApiError> {
+        let key = self.key(namespace, name)?;
+        // The object MUST exist (you can't set status on a missing object).
+        let live = self
+            .store
+            .get(&key)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
+        // CAS precondition: from the incoming object's
+        // metadata.resourceVersion (kubectl PUT /status round-trips the live
+        // rv); absent → fall back to the live rv so a no-rv PUT still
+        // conflicts on a concurrent change rather than blindly clobbering.
+        let expected = body_precondition(&incoming)?.or_else(|| revision_of(&live));
+        // Take ONLY the incoming object's `.status` — a /status PUT may not
+        // touch spec/metadata (K8s drops them on the /status endpoint). The
+        // scoped `{"status": …}` merge patch leaves spec+metadata intact and
+        // preserves generation (status-only writes don't bump it).
+        let incoming_status = incoming.get("status").cloned().unwrap_or(Value::Null);
+        let scoped = serde_json::json!({ "status": incoming_status });
+        self.propose_scoped_patch(&key, name, scoped, expected).await
+    }
+
+    async fn patch_status(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        patch: Value,
+        patch_type: engenho_types::patch::PatchType,
+    ) -> Result<Value, ApiError> {
+        let key = self.key(namespace, name)?;
+        if self.store.get(&key).await.is_none() {
+            return Err(ApiError::NotFound(format!("{}/{}", self.kind, name)));
+        }
+        // Scope the patch to `.status` per K8s /status semantics:
+        //   * merge/strategic: a /status patch that names `spec` is IGNORED —
+        //     keep only the `status` key from the patch body.
+        //   * json-patch: every op MUST target `/status...`; an op outside is
+        //     a typed rejection (no silent spec write through /status).
+        let scoped = scope_status_patch(&patch, patch_type)?;
+        let expected = body_precondition(&scoped)?;
+        self.propose_scoped_patch_typed(&key, name, scoped, patch_type, expected)
+            .await
+    }
+
+    async fn get_scale(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
+        let key = self.key(namespace, name)?;
+        let live = self
+            .store
+            .get(&key)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
+        // Project the parent into its autoscaling/v1 Scale view. Serde →
+        // Value (typed emission; no format! of the wire).
+        let scale = project_scale(&live);
+        serde_json::to_value(&scale)
+            .map_err(|e| ApiError::Internal(format!("scale projection serialize: {e}")))
+    }
+
+    async fn put_scale(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        incoming: Value,
+    ) -> Result<Value, ApiError> {
+        let key = self.key(namespace, name)?;
+        let live = self
+            .store
+            .get(&key)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
+        // Deserialize the incoming autoscaling/v1 Scale + take spec.replicas.
+        let scale: Scale = serde_json::from_value(incoming)
+            .map_err(|e| ApiError::BadRequest(format!("invalid Scale body: {e}")))?;
+        // CAS from the incoming Scale's metadata.resourceVersion (which is the
+        // parent's rv — see project_scale); absent → the live parent's rv.
+        let expected = scale
+            .metadata
+            .resource_version
+            .parse::<u64>()
+            .ok()
+            .map(engenho_store::Revision)
+            .or_else(|| revision_of(&live));
+        // Write ONLY spec.replicas. This bumps generation (a real spec
+        // change) — correct, scale IS a spec mutation.
+        let scoped = serde_json::json!({ "spec": { "replicas": scale.spec.replicas } });
+        let _ = self.propose_scoped_patch(&key, name, scoped, expected).await?;
+        // Re-project the now-updated parent for the Scale response.
+        self.get_scale(namespace, name).await
+    }
+
+    async fn patch_scale(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        patch: Value,
+        _patch_type: engenho_types::patch::PatchType,
+    ) -> Result<Value, ApiError> {
+        let key = self.key(namespace, name)?;
+        if self.store.get(&key).await.is_none() {
+            return Err(ApiError::NotFound(format!("{}/{}", self.kind, name)));
+        }
+        // Translate the Scale-shaped patch's spec.replicas into a scoped
+        // `{"spec":{"replicas":N}}` merge patch on the parent. A scale patch
+        // that doesn't carry spec.replicas is a no-op replica change → leave
+        // the parent's replicas alone (empty scoped patch).
+        let replicas = patch
+            .get("spec")
+            .and_then(|s| s.get("replicas"))
+            .and_then(Value::as_i64);
+        let scoped = match replicas {
+            Some(n) => serde_json::json!({ "spec": { "replicas": n } }),
+            None => serde_json::json!({}),
+        };
+        let expected = body_precondition(&patch)?;
+        let _ = self
+            .propose_scoped_patch(&key, name, scoped, expected)
+            .await?;
+        self.get_scale(namespace, name).await
     }
 
     async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
@@ -810,6 +1069,150 @@ impl StoreBackedHandler {
              expected resourceVersion {} did not match the live object",
             self.plural, name, expected_str
         ))
+    }
+
+    /// Propose a scoped RFC7396 merge `Patch` (the subresource write shape)
+    /// and read back the committed object. REUSES `ResourceCommand::Patch`
+    /// + the `patch_apply` interpreter verbatim — no new store command. The
+    /// `patch` is already scoped to `{"status":…}` or
+    /// `{"spec":{"replicas":N}}` by the caller, so the untouched half of the
+    /// object is preserved by the merge. A CAS failure → typed 409; a
+    /// rejected patch → the same typed Status the main patch path returns.
+    async fn propose_scoped_patch(
+        &self,
+        key: &ResourceKey,
+        name: &str,
+        patch: Value,
+        expected: Option<Revision>,
+    ) -> Result<Value, ApiError> {
+        self.propose_scoped_patch_typed(
+            key,
+            name,
+            patch,
+            engenho_types::patch::PatchType::Merge,
+            expected,
+        )
+        .await
+    }
+
+    /// Like [`Self::propose_scoped_patch`] but with an explicit
+    /// [`PatchType`] — used by `/status` PATCH where the request's typed
+    /// patch algorithm (merge / strategic / json-patch) flows through to the
+    /// interpreter after the body has been scoped to `.status`.
+    async fn propose_scoped_patch_typed(
+        &self,
+        key: &ResourceKey,
+        name: &str,
+        patch: Value,
+        patch_type: engenho_types::patch::PatchType,
+        expected: Option<Revision>,
+    ) -> Result<Value, ApiError> {
+        let result = self
+            .store
+            .propose(ResourceCommand::Patch {
+                key: key.clone(),
+                patch,
+                patch_type,
+                expected,
+                reason: Reason::Operator,
+            })
+            .await
+            .map_err(|e| ApiError::StorageError(e.to_string()))?;
+        if result.op == ResourceOp::Conflict {
+            return Err(self.rv_conflict(name, expected));
+        }
+        if result.op == ResourceOp::PatchRejected {
+            let msg = result
+                .patch_error
+                .unwrap_or_else(|| "patch rejected".to_string());
+            return Err(if msg.contains("server-side apply") {
+                ApiError::UnsupportedMediaType(format!(
+                    "the server does not yet implement server-side apply: {msg}"
+                ))
+            } else {
+                ApiError::BadRequest(msg)
+            });
+        }
+        let stored = self
+            .store
+            .get(key)
+            .await
+            .ok_or_else(|| ApiError::Internal("subresource patch lost during commit".into()))?;
+        Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
+    }
+}
+
+/// Read a stored object's `metadata.resourceVersion` as a [`Revision`] —
+/// the CAS `expected` fallback for a subresource write whose incoming body
+/// carried no rv. `None` when absent/unparseable.
+fn revision_of(value: &Value) -> Option<Revision> {
+    value
+        .get("metadata")
+        .and_then(|m| m.get("resourceVersion"))
+        .and_then(|rv| rv.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Revision)
+}
+
+/// Scope a `/status` PATCH body to the `.status` field, per K8s /status
+/// subresource semantics:
+///
+///   * **merge / strategic** — a `/status` patch that names `spec` (or any
+///     non-status key) is IGNORED. Keep ONLY the `status` key from the patch
+///     body; everything else is dropped so a `/status` write can never touch
+///     spec/metadata. Carrying `metadata.resourceVersion` through is allowed
+///     (it's the CAS precondition, not a mutated field).
+///   * **json-patch** — every RFC6902 op MUST target `/status...`. An op
+///     whose `path` does not start with `/status` is a typed `BadRequest`
+///     (no silent spec write through `/status`).
+///   * **apply** — server-side apply is typed-deferred; the body passes
+///     through unscoped and the store returns the typed SSA rejection.
+///
+/// Returns the scoped patch body to propose.
+fn scope_status_patch(
+    patch: &Value,
+    patch_type: engenho_types::patch::PatchType,
+) -> Result<Value, ApiError> {
+    use engenho_types::patch::PatchType;
+    match patch_type {
+        PatchType::Merge | PatchType::Strategic => {
+            // Keep only `status` (+ a metadata.resourceVersion precondition if
+            // present). Drop spec + any other top-level key.
+            let mut out = serde_json::Map::new();
+            if let Some(obj) = patch.as_object() {
+                if let Some(status) = obj.get("status") {
+                    out.insert("status".to_string(), status.clone());
+                }
+                // Preserve the CAS precondition (resourceVersion) only — never
+                // any other metadata field (a /status write can't rename/relabel).
+                if let Some(rv) = obj
+                    .get("metadata")
+                    .and_then(|m| m.get("resourceVersion"))
+                {
+                    out.insert(
+                        "metadata".to_string(),
+                        serde_json::json!({ "resourceVersion": rv.clone() }),
+                    );
+                }
+            }
+            Ok(Value::Object(out))
+        }
+        PatchType::Json => {
+            // Every op's `path` must be under `/status`.
+            let ops = patch.as_array().ok_or_else(|| {
+                ApiError::BadRequest("json-patch body must be an array of operations".into())
+            })?;
+            for op in ops {
+                let path = op.get("path").and_then(Value::as_str).unwrap_or("");
+                if !(path == "/status" || path.starts_with("/status/")) {
+                    return Err(ApiError::BadRequest(format!(
+                        "the status subresource patch may only target /status; got op path {path:?}"
+                    )));
+                }
+            }
+            Ok(patch.clone())
+        }
+        PatchType::Apply => Ok(patch.clone()),
     }
 }
 
