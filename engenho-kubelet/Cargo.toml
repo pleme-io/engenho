@@ -21,6 +21,10 @@ tokio              = { workspace = true }
 tracing            = { workspace = true }
 anyhow             = { workspace = true }
 reqwest            = { workspace = true }
+# Secret volume values are base64-encoded per K8s; decode them before
+# writing the materialized files. Same 0.22 line the apiserver + kube-client
+# already pin (single closure).
+base64             = "0.22"
 
 engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }

@@ -1546,6 +1546,7 @@ version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "engenho-config",
  "engenho-controllers",
  "engenho-store",
