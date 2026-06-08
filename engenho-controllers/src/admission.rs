@@ -69,6 +69,14 @@ pub struct AdmissionRequest {
     pub value: Option<Value>,
     /// The current stored value, if the resource already exists.
     pub current: Option<Value>,
+    /// The AUTHENTICATED identity behind the request — populated by the
+    /// apiserver from the request's `Extension<UserInfo>` (the authenticator
+    /// chain's output). `UserInfo: Default` so existing test constructors that
+    /// build the brace-literal directly can use `UserInfo::default()` (the
+    /// empty identity) without a behavior change; the production `admit()` path
+    /// threads the real authenticated identity in. Mirrors upstream
+    /// `AdmissionReview.request.userInfo`.
+    pub user_info: engenho_types::auth::UserInfo,
 }
 
 /// Admission errors.
@@ -193,6 +201,10 @@ struct FakeAdmissionState {
     decisions: BTreeMap<String, AdmissionDecision>,
     fail_with: Option<String>,
     call_log: Vec<(AdmissionAction, String)>,
+    /// The `user_info` observed on the MOST RECENT review — lets a test prove
+    /// the apiserver threaded the authenticated identity into
+    /// `AdmissionRequest.user_info` (not the empty default).
+    last_user_info: Option<engenho_types::auth::UserInfo>,
 }
 
 impl FakeAdmissionWebhook {
@@ -219,6 +231,13 @@ impl FakeAdmissionWebhook {
     pub async fn calls(&self) -> Vec<(AdmissionAction, String)> {
         self.inner.lock().await.call_log.clone()
     }
+
+    /// The `user_info` the webhook observed on the most recent review. `None`
+    /// until at least one review has run. Lets an integration test assert the
+    /// apiserver threaded the AUTHENTICATED identity into the admission request.
+    pub async fn last_user_info(&self) -> Option<engenho_types::auth::UserInfo> {
+        self.inner.lock().await.last_user_info.clone()
+    }
 }
 
 #[async_trait]
@@ -233,6 +252,7 @@ impl AdmissionWebhook for FakeAdmissionWebhook {
     ) -> Result<AdmissionDecision, AdmissionError> {
         let mut state = self.inner.lock().await;
         state.call_log.push((request.action, request.key.label()));
+        state.last_user_info = Some(request.user_info.clone());
         if let Some(msg) = state.fail_with.take() {
             return Err(AdmissionError::Backend(msg));
         }
@@ -255,6 +275,7 @@ mod tests {
             key: ResourceKey::namespaced("", "v1", "Pod", "default", name),
             value: Some(value),
             current: None,
+            user_info: engenho_types::auth::UserInfo::default(),
         }
     }
 
@@ -365,5 +386,32 @@ mod tests {
     #[test]
     fn admission_error_kind_is_stable() {
         assert_eq!(AdmissionError::Backend("x".into()).kind(), "backend");
+    }
+
+    #[tokio::test]
+    async fn webhook_observes_threaded_user_info() {
+        // A webhook records the `user_info` on the AdmissionRequest it reviews —
+        // the apiserver-side threading is proven end-to-end in the
+        // m0_authn.rs integration test; here we prove the webhook surface sees a
+        // non-default identity (the brace-literal default would be empty).
+        let hook = Arc::new(FakeAdmissionWebhook::new("observer"));
+        let chain = AdmissionChain::new(vec![hook.clone()], AdmissionMode::FailClosed);
+        let mut request = req(AdmissionAction::Put, "x", json!({}));
+        request.user_info = engenho_types::auth::UserInfo::admin();
+        let _ = chain.review(request).await;
+        let observed = hook.last_user_info().await.expect("a review ran");
+        assert_eq!(observed.username, "engenho-admin");
+        assert!(observed.groups.iter().any(|g| g == "system:masters"));
+    }
+
+    #[tokio::test]
+    async fn default_request_carries_empty_user_info() {
+        // The legacy brace-literal path (user_info: UserInfo::default()) is the
+        // empty identity — the existing test constructors are unchanged.
+        let hook = Arc::new(FakeAdmissionWebhook::new("observer"));
+        let chain = AdmissionChain::new(vec![hook.clone()], AdmissionMode::FailClosed);
+        let _ = chain.review(req(AdmissionAction::Put, "x", json!({}))).await;
+        let observed = hook.last_user_info().await.expect("a review ran");
+        assert_eq!(observed, engenho_types::auth::UserInfo::default());
     }
 }

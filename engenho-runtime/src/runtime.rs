@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_apiserver::{
-    ApiServer, RouterHandlerSink, RouterState, ServerSanInputs, TlsMaterial,
-    handlers_from_catalog_with_admission, issue_server_material, load_or_generate_ca,
+    ApiServer, ChainAuthenticator, ClientMaterial, RouterHandlerSink, RouterState, ServerSanInputs,
+    TlsMaterial, client_verifier, handlers_from_catalog_with_admission,
+    issue_admin_client_material, issue_server_material, load_or_generate_ca,
 };
-use engenho_kube_client::emit_kubeconfig;
+use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_config::{ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind};
 use engenho_controllers::{
     CrdController, DeploymentController, DynamicHandlerSink, EndpointsController, GcController,
@@ -116,7 +117,13 @@ impl Runtime {
         //     the concrete listen IP (skipping 0.0.0.0/:: which aren't
         //     valid SAN IPs — loopback access rides on 127.0.0.1/localhost).
         //     `ca_cert_pem` is captured for the boot-time kubeconfig write.
+        //
+        //     For authn: also issue + persist the admin CLIENT cert, build the
+        //     OPTIONAL client-cert verifier (rooted at the SAME CA), attach the
+        //     verifier to the server material, and capture the admin material
+        //     for the admin-cert kubeconfig.
         let mut ca_cert_pem: Option<String> = None;
+        let mut admin_material: Option<ClientMaterial> = None;
         let tls: Option<TlsMaterial> = if config.runtime.tls.enabled {
             let ca = load_or_generate_ca(&config.runtime.data_dir)
                 .map_err(|e| RuntimeError::Server(e.into()))?;
@@ -130,10 +137,36 @@ impl Runtime {
                 },
             )
             .map_err(|e| RuntimeError::Server(e.into()))?;
+            // OPTIONAL client-cert verifier (allow_unauthenticated): existing
+            // token/anonymous kubectl keeps connecting; a presented cert is
+            // verified against the CA before the handshake completes.
+            let verifier =
+                client_verifier(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
+            let material = material.with_client_verifier(verifier);
+            // Issue + persist the admin client cert (for the operator's
+            // kubeconfig + `kubectl auth whoami → engenho-admin`).
+            let admin = issue_admin_client_material(&ca)
+                .map_err(|e| RuntimeError::Server(e.into()))?;
+            persist_admin_material(&config.runtime.data_dir, &admin)?;
+            admin_material = Some(admin);
             Some(material)
         } else {
             None
         };
+
+        // Load-or-generate the bootstrap admin BEARER token (a second admin
+        // credential alongside the client cert). Persisted under
+        // data_dir/pki/admin.token (0600) + logged so the operator can
+        // `curl -H "Authorization: Bearer <token>"`. `None` for the plaintext
+        // floor (no PKI dir to persist into).
+        let admin_token: Option<String> = if config.runtime.tls.enabled {
+            Some(load_or_generate_admin_token(&config.runtime.data_dir)?)
+        } else {
+            None
+        };
+        if admin_token.is_some() {
+            info!("bootstrap admin bearer token available at data_dir/pki/admin.token");
+        }
 
         // Admission chain dispatched on every API-boundary create / patch
         // / delete. M0.1 starts with an EMPTY chain (admits everything);
@@ -142,6 +175,12 @@ impl Runtime {
         // never flow through a handler, so they bypass admission.
         let admission = Arc::new(AdmissionChain::new(Vec::new(), AdmissionMode::FailOpen));
 
+        // The typed authenticator chain (X509 → SA → admin-token → anonymous),
+        // carrying the configured bootstrap admin bearer token. Installed into
+        // the RouterState so the authn middleware resolves the admin bearer +
+        // admin client cert to the admin identity; everything else is unchanged.
+        let authenticator = Arc::new(ChainAuthenticator::bootstrap(admin_token));
+
         // Build the RouterState HERE (not inside ApiServer::start) so the
         // SAME table is shared with the CrdController's DynamicHandlerSink.
         // A controller-driven `register()` mutates this exact ArcSwap, and
@@ -149,7 +188,8 @@ impl Runtime {
         let router_state = RouterState::new(handlers_from_catalog_with_admission(
             store.clone(),
             admission.clone(),
-        ));
+        ))
+        .with_authenticator(authenticator);
         // The CRD handler sink: builds a StoreBackedHandler (admission-
         // dispatched, opaque-JSON) per served CRD version + registers it
         // into the SAME router_state. Shared (as Arc<dyn DynamicHandlerSink>)
@@ -167,8 +207,13 @@ impl Runtime {
         //     ACTUALLY-bound port so an ephemeral `:0` config still yields a
         //     usable kubeconfig, and the SAME CA the server cert chains to so
         //     kubectl's certificate-authority-data verifies the presented cert.
+        //
+        //     With the admin client cert issued, the kubeconfig embeds it as a
+        //     CLIENT-CERT user (→ `kubectl auth whoami` = engenho-admin /
+        //     system:masters). Without it (shouldn't happen when TLS is on) it
+        //     falls back to the anonymous-token kubeconfig.
         if let Some(ca_pem) = ca_cert_pem.as_deref() {
-            write_boot_kubeconfig(&config, bound_addr, ca_pem)?;
+            write_boot_kubeconfig(&config, bound_addr, ca_pem, admin_material.as_ref())?;
         }
 
         // 6. Construct the scheduling strategy from config. A
@@ -358,18 +403,127 @@ fn san_listen_ip(addr: SocketAddr) -> Option<std::net::IpAddr> {
 /// `kubectl --kubeconfig <data_dir>/kubeconfig get nodes`. server_url is
 /// `https://127.0.0.1:<bound_port>` (loopback SAN + the real bound port);
 /// `ca_pem` is the cluster CA the server cert chains to.
+///
+/// When `admin` is supplied, the kubeconfig embeds the admin CLIENT CERT (→
+/// `kubectl auth whoami` = engenho-admin / system:masters); otherwise it falls
+/// back to the anonymous-token kubeconfig (the plaintext / no-admin path).
 fn write_boot_kubeconfig(
     config: &EngenhoConfig,
     bound_addr: SocketAddr,
     ca_pem: &str,
+    admin: Option<&ClientMaterial>,
 ) -> Result<(), RuntimeError> {
     // Loopback server URL with the actually-bound port (handles `:0`).
     let server_url = loopback_server_url(bound_addr);
-    let yaml = emit_kubeconfig(&config.cluster.name, &server_url, ca_pem.as_bytes())
-        .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
+    let yaml = match admin {
+        Some(admin) => emit_kubeconfig_with_admin(
+            &config.cluster.name,
+            &server_url,
+            ca_pem.as_bytes(),
+            admin.cert_pem.as_bytes(),
+            admin.key_pem.as_bytes(),
+        ),
+        None => emit_kubeconfig(&config.cluster.name, &server_url, ca_pem.as_bytes()),
+    }
+    .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
     let path = config.runtime.data_dir.join("kubeconfig");
     write_mode_0644(&path, &yaml)?;
-    info!(path = %path.display(), server = %server_url, "kubeconfig written");
+    info!(path = %path.display(), server = %server_url, admin = admin.is_some(), "kubeconfig written");
+    Ok(())
+}
+
+/// Persist the admin client cert + key under `data_dir/pki/` (cert 0644, key
+/// 0600) so the operator's kubeconfig has a STABLE admin credential across
+/// boots (matches the server-cert / CA persistence shape).
+fn persist_admin_material(
+    data_dir: &std::path::Path,
+    admin: &ClientMaterial,
+) -> Result<(), RuntimeError> {
+    let pki = data_dir.join("pki");
+    std::fs::create_dir_all(&pki).map_err(|source| RuntimeError::KubeconfigIo {
+        path: pki.clone(),
+        source,
+    })?;
+    write_pki_file(&pki.join("admin.crt"), &admin.cert_pem, 0o644)?;
+    write_pki_file(&pki.join("admin.key"), &admin.key_pem, 0o600)?;
+    Ok(())
+}
+
+/// Load-or-generate the bootstrap admin BEARER token, persisted at
+/// `data_dir/pki/admin.token` (0600). Restart-stable: an already-distributed
+/// `Authorization: Bearer <token>` keeps working across reboots. The token is
+/// 32 random bytes hex-encoded (no external crate — uses `getrandom` via
+/// `rand`-free `std`-adjacent entropy from the OS).
+fn load_or_generate_admin_token(
+    data_dir: &std::path::Path,
+) -> Result<String, RuntimeError> {
+    let pki = data_dir.join("pki");
+    let token_path = pki.join("admin.token");
+    if let Ok(existing) = std::fs::read_to_string(&token_path) {
+        let trimmed = existing.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+    std::fs::create_dir_all(&pki).map_err(|source| RuntimeError::KubeconfigIo {
+        path: pki.clone(),
+        source,
+    })?;
+    let token = random_admin_token();
+    write_pki_file(&token_path, &token, 0o600)?;
+    Ok(token)
+}
+
+/// Generate a 32-byte random admin token as a 64-char lowercase hex string,
+/// seeded from OS entropy (`getrandom`). On the (effectively impossible) OS
+/// entropy failure, fall back to a process-+time-derived value so boot never
+/// hard-fails on the secret-mint path (the token is still 32 bytes; it just
+/// isn't CSPRNG-grade in that degenerate case — logged is acceptable for a
+/// single-node bootstrap admin token).
+fn random_admin_token() -> String {
+    let mut bytes = [0u8; 32];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Degenerate fallback: mix process id + nanos. Never expected.
+        let pid = std::process::id().to_le_bytes();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .to_le_bytes();
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = pid[i % pid.len()] ^ nanos[i % nanos.len()] ^ (i as u8);
+        }
+    }
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
+        out.push(char::from_digit(u32::from(b & 0xf), 16).unwrap());
+    }
+    out
+}
+
+/// Write a PKI-dir file with the given unix mode (no-op chmod elsewhere).
+fn write_pki_file(
+    path: &std::path::Path,
+    contents: &str,
+    mode: u32,
+) -> Result<(), RuntimeError> {
+    std::fs::write(path, contents.as_bytes()).map_err(|source| RuntimeError::KubeconfigIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(
+            |source| RuntimeError::KubeconfigIo {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     Ok(())
 }
 

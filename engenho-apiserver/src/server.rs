@@ -27,6 +27,8 @@ use crate::handler::ResourceHandler;
 use crate::pki::{PkiError, TlsMaterial};
 use crate::router::{RouterState, build};
 
+mod tls_acceptor;
+
 /// How long graceful shutdown waits for in-flight requests to drain
 /// before severing open long-poll watches.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -136,9 +138,20 @@ impl ApiServer {
         })
     }
 
-    /// TLS serve path (the production default). Builds a rustls
-    /// `ServerConfig` from the issued cert chain + key and serves via
-    /// `axum_server::bind_rustls`.
+    /// TLS serve path (the production default). Builds the rustls
+    /// `ServerConfig` OURSELVES (so the OPTIONAL client-cert verifier can be
+    /// injected — `RustlsConfig::from_pem` builds a no-client-auth config and
+    /// can't), then serves through a custom acceptor that threads the verified
+    /// peer cert into request extensions.
+    ///
+    /// When `material.client_verifier` is `Some`, the server REQUESTS a client
+    /// cert (verified against the cluster CA) but `allow_unauthenticated` keeps
+    /// the handshake completing for a no-cert client — so existing
+    /// token/anonymous kubectl keeps connecting. The custom acceptor reads
+    /// `peer_certificates()` post-handshake, parses the leaf into a
+    /// [`crate::pki::VerifiedClientCert`], and injects it as a request
+    /// extension; the authn middleware's X509 stage reads it. When `None`, the
+    /// server runs with no client auth (the pre-authn behavior).
     async fn start_tls(
         addr: SocketAddr,
         router: Router,
@@ -163,17 +176,23 @@ impl ApiServer {
             .map_err(ServerError::Bind)?;
         let bound_addr = std_listener.local_addr().map_err(ServerError::Bind)?;
 
-        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
-            material.cert_chain_pem.into_bytes(),
-            material.key_pem.into_bytes(),
-        )
-        .await
-        .map_err(ServerError::Tls)?;
+        // Build the ServerConfig ourselves so we can inject the OPTIONAL client
+        // verifier. The leaf chain + key are identical to the `from_pem` path
+        // (same DER, same single-cert call) — the only change is the client
+        // auth posture.
+        let server_config = build_server_config(&material)?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+
+        // Wrap the standard RustlsAcceptor so the verified peer cert is read
+        // post-handshake + injected into each request's extensions.
+        let acceptor = tls_acceptor::PeerCertAcceptor::new(rustls_config.clone());
 
         let handle = Handle::new();
         let serve_handle = handle.clone();
         let task = tokio::spawn(async move {
-            axum_server::from_tcp_rustls(std_listener, rustls_config)
+            axum_server::from_tcp(std_listener)
+                .acceptor(acceptor)
                 .handle(serve_handle)
                 .serve(router.into_make_service())
                 .await
@@ -223,4 +242,58 @@ impl ApiServer {
         }
         Ok(())
     }
+}
+
+/// Build the rustls [`rustls::ServerConfig`] from the issued cert chain + key,
+/// installing the OPTIONAL client-cert verifier when present.
+///
+/// This is the minimal hand-built equivalent of `RustlsConfig::from_pem` — it
+/// parses the SAME leaf chain + key DER, calls the SAME `with_single_cert`, and
+/// sets the SAME ALPN protocols — diverging only in the client-auth posture:
+///   * `Some(verifier)` → `with_client_cert_verifier` (OPTIONAL mTLS: requests
+///     a cert, verifies it against the cluster CA, but `allow_unauthenticated`
+///     keeps a no-cert client connecting).
+///   * `None`           → `with_no_client_auth` (the pre-authn behavior).
+fn build_server_config(material: &TlsMaterial) -> Result<rustls::ServerConfig, ServerError> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let cert_chain: Vec<CertificateDer<'static>> = {
+        let mut pem = material.cert_chain_pem.as_bytes();
+        rustls_pemfile::certs(&mut pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                ServerError::Tls(std::io::Error::other(format!("parse cert chain PEM: {e}")))
+            })?
+    };
+    if cert_chain.is_empty() {
+        return Err(ServerError::Tls(std::io::Error::other(
+            "no certificate found in cert_chain_pem",
+        )));
+    }
+
+    let key: PrivateKeyDer<'static> = {
+        let mut pem = material.key_pem.as_bytes();
+        rustls_pemfile::private_key(&mut pem)
+            .map_err(|e| {
+                ServerError::Tls(std::io::Error::other(format!("parse server key PEM: {e}")))
+            })?
+            .ok_or_else(|| {
+                ServerError::Tls(std::io::Error::other("no private key found in key_pem"))
+            })?
+    };
+
+    let builder = rustls::ServerConfig::builder();
+    let mut config = match &material.client_verifier {
+        // OPTIONAL mTLS — requests a client cert, verifies against the CA,
+        // allow_unauthenticated keeps no-cert clients connecting.
+        Some(verifier) => builder.with_client_cert_verifier(verifier.clone()),
+        // No client auth (the pre-authn floor).
+        None => builder.with_no_client_auth(),
+    }
+    .with_single_cert(cert_chain, key)
+    .map_err(|e| ServerError::Tls(std::io::Error::other(format!("with_single_cert: {e}"))))?;
+
+    // Same ALPN as `RustlsConfig::from_pem` so HTTP/2 + HTTP/1.1 both work.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
 }

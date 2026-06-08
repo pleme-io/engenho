@@ -22,6 +22,15 @@ pub enum ApiError {
     ResourceVersionConflict(String),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    /// Authentication failed on a typed-bad credential — the K8s 401
+    /// Unauthorized equivalent. Carries the human-readable reason rendered
+    /// into the `Status` body (reason "Unauthorized", code 401). This brick
+    /// the ONLY producer is a structurally-ServiceAccount bearer token that
+    /// engenho cannot validate yet (SA-token authn is tied to the kubelet
+    /// projection brick). Authorize-ALL is retained, so this is NOT an authz
+    /// denial — a no-credential request resolves to anonymous + proceeds.
+    #[error("{0}")]
+    Unauthorized(String),
     /// The request carried a `Content-Type` the apiserver does not accept
     /// for this verb — the K8s 415 Unsupported Media Type equivalent.
     /// Rendered as a proper K8s `Status` JSON body (reason
@@ -56,6 +65,7 @@ pub enum ErrorKind {
     Conflict,
     ResourceVersionConflict,
     BadRequest,
+    Unauthorized,
     UnsupportedMediaType,
     Forbidden,
     Gone,
@@ -71,6 +81,7 @@ impl ApiError {
             Self::Conflict(_, _) => ErrorKind::Conflict,
             Self::ResourceVersionConflict(_) => ErrorKind::ResourceVersionConflict,
             Self::BadRequest(_) => ErrorKind::BadRequest,
+            Self::Unauthorized(_) => ErrorKind::Unauthorized,
             Self::UnsupportedMediaType(_) => ErrorKind::UnsupportedMediaType,
             Self::Forbidden(_) => ErrorKind::Forbidden,
             Self::Gone(_) => ErrorKind::Gone,
@@ -84,6 +95,7 @@ impl ApiError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_, _) | Self::ResourceVersionConflict(_) => StatusCode::CONFLICT,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Gone(_) => StatusCode::GONE,
@@ -201,6 +213,7 @@ impl IntoResponse for ApiError {
             // create-already-exists "AlreadyExists" above.
             ApiError::ResourceVersionConflict(_) => "Conflict",
             ApiError::BadRequest(_) => "BadRequest",
+            ApiError::Unauthorized(_) => "Unauthorized",
             ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
             ApiError::Forbidden(_) => "Forbidden",
             ApiError::Gone(_) => "Expired",
@@ -301,6 +314,19 @@ mod tests {
         assert!(matches!(err.kind(), ErrorKind::Forbidden));
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn unauthorized_renders_401_status() {
+        // A structurally-SA bearer this brick can't validate → ApiError::
+        // Unauthorized → HTTP 401 + reason "Unauthorized".
+        let err = ApiError::Unauthorized(
+            "service account token authentication is not yet supported".into(),
+        );
+        assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
+        assert!(matches!(err.kind(), ErrorKind::Unauthorized));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

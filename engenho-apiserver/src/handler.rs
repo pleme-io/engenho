@@ -14,6 +14,7 @@ use engenho_store::{
     resource::ResourceKey,
     watch_backend::WATCH_CHANNEL_CAPACITY,
 };
+use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor, Subresource};
 
 use crate::error::ApiError;
@@ -237,7 +238,16 @@ pub trait ResourceHandler: Send + Sync + 'static {
         allow_bookmarks: bool,
     ) -> Result<WatchStream, ApiError>;
 
-    async fn create(&self, namespace: Option<&str>, body: Value) -> Result<Value, ApiError>;
+    /// CREATE a resource. `user_info` is the authenticated identity (threaded
+    /// from the request's `Extension<UserInfo>`); it travels into the
+    /// admission chain's `AdmissionRequest.user_info` so a webhook sees WHO is
+    /// creating.
+    async fn create(
+        &self,
+        namespace: Option<&str>,
+        body: Value,
+        user_info: &UserInfo,
+    ) -> Result<Value, ApiError>;
 
     /// Apply a PATCH. `patch_type` is the typed discriminant of the
     /// request's `Content-Type` (resolved by the router from the media type)
@@ -245,13 +255,15 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// deterministic apply path dispatches the correct algorithm (RFC 7396
     /// merge / RFC 6902 json-patch / strategic list-merge). The raw `patch`
     /// `Value` is the decoded body; for json-patch it is the RFC 6902 op
-    /// array.
+    /// array. `user_info` is the authenticated identity threaded into
+    /// admission.
     async fn patch(
         &self,
         namespace: Option<&str>,
         name: &str,
         patch: Value,
         patch_type: engenho_types::patch::PatchType,
+        user_info: &UserInfo,
     ) -> Result<Value, ApiError>;
 
     /// DELETE a resource. Returns the response BODY as the K8s wire
@@ -259,7 +271,13 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// can decode + discard it), or a `metav1.Status{status:"Success"}`
     /// when the name was already absent (idempotent no-op). NEVER `()`:
     /// an empty body crashes kubectl's `json.Unmarshal([]byte{})`.
-    async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError>;
+    /// `user_info` is the authenticated identity threaded into admission.
+    async fn delete(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        user_info: &UserInfo,
+    ) -> Result<Value, ApiError>;
 
     /// DELETE with an optimistic-concurrency precondition
     /// (`Preconditions.resourceVersion`, surfaced as `?resourceVersion=`).
@@ -270,11 +288,13 @@ pub trait ResourceHandler: Send + Sync + 'static {
     ///
     /// Returns the response BODY (deleted object, or Status-Success when
     /// the name was absent) — same contract as [`Self::delete`].
+    /// `user_info` is the authenticated identity threaded into admission.
     async fn delete_with_precondition(
         &self,
         namespace: Option<&str>,
         name: &str,
         expected: Option<Revision>,
+        user_info: &UserInfo,
     ) -> Result<Value, ApiError>;
 
     /// The `apiVersion` string for this kind — `"v1"` for the core
@@ -422,6 +442,12 @@ impl StoreBackedHandler {
     /// empty chain, returns `body` unchanged. A `Deny` becomes a typed
     /// [`ApiError::Forbidden`] (HTTP 403).
     ///
+    /// `user_info` is the AUTHENTICATED identity threaded from the request's
+    /// `Extension<UserInfo>` (the authenticator chain's output) — it lands on
+    /// `AdmissionRequest.user_info` so a webhook can policy-decide on WHO is
+    /// acting, not just WHAT. Authorize-ALL is retained: identity is carried
+    /// for webhooks, but no authn-driven deny is added here.
+    ///
     /// For Delete the body is `None`; the chain still runs (so a policy
     /// can block deletes) and the returned value is ignored by the
     /// caller.
@@ -430,6 +456,7 @@ impl StoreBackedHandler {
         action: AdmissionAction,
         key: &ResourceKey,
         body: Option<Value>,
+        user_info: &UserInfo,
     ) -> Result<Option<Value>, ApiError> {
         let Some(chain) = &self.admission else {
             return Ok(body);
@@ -440,6 +467,7 @@ impl StoreBackedHandler {
             key: key.clone(),
             value: body.clone(),
             current,
+            user_info: user_info.clone(),
         };
         match chain.review(request).await {
             AdmissionDecision::Allow => Ok(body),
@@ -891,7 +919,12 @@ impl ResourceHandler for StoreBackedHandler {
         self.store.watch_from(opts).await.map_err(gone_to_api_error)
     }
 
-    async fn create(&self, namespace: Option<&str>, body: Value) -> Result<Value, ApiError> {
+    async fn create(
+        &self,
+        namespace: Option<&str>,
+        body: Value,
+        user_info: &UserInfo,
+    ) -> Result<Value, ApiError> {
         let name = body
             .get("metadata")
             .and_then(|m| m.get("name"))
@@ -900,9 +933,10 @@ impl ResourceHandler for StoreBackedHandler {
             .to_string();
         let key = self.key(namespace, &name)?;
         // Admission runs at the API boundary BEFORE any store proposal.
-        // A Mutate replaces the body; a Deny short-circuits with 403.
+        // A Mutate replaces the body; a Deny short-circuits with 403. The
+        // authenticated identity travels into AdmissionRequest.user_info.
         let body = self
-            .admit(AdmissionAction::Put, &key, Some(body))
+            .admit(AdmissionAction::Put, &key, Some(body), user_info)
             .await?
             .expect("admit(Put, Some(_)) preserves Some on Allow/Mutate");
         // Optimistic-concurrency precondition from the (post-admission)
@@ -948,11 +982,13 @@ impl ResourceHandler for StoreBackedHandler {
         name: &str,
         patch: Value,
         patch_type: engenho_types::patch::PatchType,
+        user_info: &UserInfo,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
-        // Admission runs at the API boundary BEFORE the store proposal.
+        // Admission runs at the API boundary BEFORE the store proposal. The
+        // authenticated identity travels into AdmissionRequest.user_info.
         let patch = self
-            .admit(AdmissionAction::Patch, &key, Some(patch))
+            .admit(AdmissionAction::Patch, &key, Some(patch), user_info)
             .await?
             .expect("admit(Patch, Some(_)) preserves Some on Allow/Mutate");
         // Precondition from the (post-admission) patch body's
@@ -1003,10 +1039,16 @@ impl ResourceHandler for StoreBackedHandler {
         Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
     }
 
-    async fn delete(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
+    async fn delete(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        user_info: &UserInfo,
+    ) -> Result<Value, ApiError> {
         // Unconditional delete (no precondition). The precondition path
         // is [`Self::delete_with_precondition`], driven by `?resourceVersion=`.
-        self.delete_with_precondition(namespace, name, None).await
+        self.delete_with_precondition(namespace, name, None, user_info)
+            .await
     }
 
     async fn delete_with_precondition(
@@ -1014,12 +1056,16 @@ impl ResourceHandler for StoreBackedHandler {
         namespace: Option<&str>,
         name: &str,
         expected: Option<Revision>,
+        user_info: &UserInfo,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
         // Admission runs at the API boundary BEFORE the store proposal so
         // a policy can block deletes. The Delete body is None; any Mutate
-        // value is ignored (delete has no body to rewrite).
-        let _ = self.admit(AdmissionAction::Delete, &key, None).await?;
+        // value is ignored (delete has no body to rewrite). The authenticated
+        // identity travels into AdmissionRequest.user_info.
+        let _ = self
+            .admit(AdmissionAction::Delete, &key, None, user_info)
+            .await?;
         // Read the LIVE object BEFORE proposing the delete — this is the
         // body the K8s DELETE wire returns. The store's `ApplyResult`
         // carries only op+revision (NOT the removed object — see

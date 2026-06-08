@@ -44,6 +44,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
+use engenho_types::auth::UserInfo;
 use engenho_kube_proto::{
     self as kube_proto, CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type,
     response_wants_protobuf,
@@ -86,6 +87,12 @@ pub struct RouterState {
     /// SAME `ArcSwap`, so a `register()` from the controller task is seen by
     /// every per-request handler clone.
     pub handlers: Arc<arc_swap::ArcSwap<HashMap<HandlerKey, Arc<dyn ResourceHandler>>>>,
+    /// The typed authenticator chain (X509 → SA → admin-token → anonymous).
+    /// Shared (cheap `Arc` clone) into the authn middleware + the
+    /// SelfSubjectReview route. Defaults to the bootstrap chain with NO admin
+    /// token (every existing `RouterState::new` caller / test); the runtime
+    /// installs the configured admin token via [`Self::with_authenticator`].
+    pub authenticator: Arc<crate::authn::ChainAuthenticator>,
 }
 
 impl RouterState {
@@ -97,7 +104,24 @@ impl RouterState {
             .collect();
         Self {
             handlers: Arc::new(arc_swap::ArcSwap::from_pointee(map)),
+            // No admin token by default — an opaque bearer authenticates as
+            // anonymous (preserving the existing anonymous-kubeconfig path).
+            // The runtime overrides this with the configured admin token.
+            authenticator: Arc::new(crate::authn::ChainAuthenticator::bootstrap(None)),
         }
+    }
+
+    /// Install the typed authenticator chain (carrying the configured
+    /// bootstrap admin token). Builder style; the runtime calls this so the
+    /// admin bearer + admin client cert both resolve to the admin identity,
+    /// while every other request path is unchanged.
+    #[must_use]
+    pub fn with_authenticator(
+        mut self,
+        authenticator: Arc<crate::authn::ChainAuthenticator>,
+    ) -> Self {
+        self.authenticator = authenticator;
+        self
     }
 
     /// The dispatch key `(group, version, plural)` for a handler.
@@ -218,6 +242,28 @@ impl RouterState {
 }
 
 pub fn build(state: RouterState) -> Router {
+    // The authn middleware reads the verified client cert (from the TLS
+    // acceptor) + the Authorization header into the typed authenticator chain,
+    // writes the resolved `UserInfo` into request extensions, and lets the
+    // request proceed. Authorize-ALL is retained — it NEVER 401/403s on authn
+    // EXCEPT for a typed-bad credential (a structurally-SA bearer this brick
+    // can't validate → 401). The SelfSubjectReview route is registered FIRST so
+    // the layer wraps it too (kubectl auth whoami authenticates as anonymous
+    // and still gets a typed answer).
+    let authenticator = state.authenticator.clone();
+    let router = build_routes(state);
+    router.layer(axum::middleware::from_fn(
+        move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
+            let authenticator = authenticator.clone();
+            async move { authn_middleware(authenticator, req, next).await }
+        },
+    ))
+}
+
+/// The route table (without the authn layer). Split out from [`build`] so the
+/// authn middleware can wrap the WHOLE table — every route (incl. discovery /
+/// health / selfsubjectreviews) runs through authentication first.
+fn build_routes(state: RouterState) -> Router {
     Router::new()
         // ── resources: ONE coords→dispatch path, fed by two catch-alls ─
         //
@@ -276,6 +322,15 @@ pub fn build(state: RouterState) -> Router {
             "/openapi/v3/apis/:group/:version",
             get(openapi_v3_group),
         )
+        // ── authentication.k8s.io SelfSubjectReview (kubectl auth whoami) ──
+        // A discovery-light special route (NOT a store-backed kind): it echoes
+        // the authenticated identity from `Extension<UserInfo>` back as a typed
+        // SelfSubjectReview. POST per the upstream API; the body is ignored
+        // (the identity comes from the credential, not the body).
+        .route(
+            "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+            axum::routing::post(self_subject_review),
+        )
         // ── version + health (no RouterState; kubectl/client-go probe
         //    these before they will trust the server) ──────────────────
         .route("/version", get(health::version))
@@ -290,6 +345,128 @@ pub fn build(state: RouterState) -> Router {
 /// multi-face plan in docs/API-SURFACE.md.
 async fn openapi_spec() -> impl IntoResponse {
     Json(ApiDoc::openapi())
+}
+
+// ── authentication middleware + the typed UserInfo extractor ───────────────
+
+/// A per-request extractor that yields the authenticated [`UserInfo`] from
+/// request extensions (inserted by [`authn_middleware`]). Defaults to
+/// [`UserInfo::anonymous`] when absent — so a handler reached WITHOUT the authn
+/// layer (a direct-call test path) is robust, never a 500. Infallible.
+pub struct ExtractUserInfo(pub UserInfo);
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for ExtractUserInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let user = parts
+            .extensions
+            .get::<UserInfo>()
+            .cloned()
+            .unwrap_or_else(UserInfo::anonymous);
+        Ok(ExtractUserInfo(user))
+    }
+}
+
+/// The authn middleware — the thin axum adapter over the typed
+/// [`crate::authn::ChainAuthenticator`]. Extracts the request material into the
+/// chain's MOCKABLE [`crate::authn::RequestCreds`] input (the verified client
+/// cert from the TLS acceptor's extension + the `Authorization: Bearer` token),
+/// runs the chain, and writes the resolved [`UserInfo`] into request
+/// extensions for downstream handlers + admission.
+///
+/// Authorize-ALL is RETAINED: this NEVER 401/403s on authn EXCEPT a typed-bad
+/// credential (a structurally-SA bearer this brick can't validate → 401). A
+/// no-credential request resolves to anonymous and proceeds.
+async fn authn_middleware(
+    authenticator: Arc<crate::authn::ChainAuthenticator>,
+    mut req: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let creds = crate::authn::RequestCreds {
+        // The TLS acceptor injected the verified peer cert as an extension when
+        // the client presented one; absent for token/anonymous clients.
+        client_cert: req
+            .extensions()
+            .get::<crate::pki::VerifiedClientCert>()
+            .cloned(),
+        bearer: bearer_from_headers(req.headers()),
+    };
+    match authenticator.authenticate(&creds) {
+        Ok(user_info) => {
+            req.extensions_mut().insert(user_info);
+            next.run(req).await
+        }
+        // A typed-bad credential (e.g. a structurally-SA bearer this brick
+        // can't validate) → a typed 401 K8s Status. This is the ONLY authn
+        // rejection; everything else resolves to an identity + proceeds.
+        Err(e) => ApiError::Unauthorized(e.to_string()).into_response(),
+    }
+}
+
+/// Extract the `Authorization: Bearer <token>` value, if present. Case-
+/// insensitive on the `Bearer` scheme per RFC 6750.
+fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let rest = value.strip_prefix("Bearer ").or_else(|| {
+        // Case-insensitive scheme match for robustness.
+        value
+            .split_once(' ')
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, tok)| tok)
+    })?;
+    let token = rest.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+// ── authentication.k8s.io/v1 SelfSubjectReview (kubectl auth whoami) ────────
+
+/// The typed `authentication.k8s.io/v1.SelfSubjectReview` response — what
+/// `kubectl auth whoami` reads. Built with serde (TYPED EMISSION), never a
+/// `json!()` of the wire. `status.userInfo` echoes the authenticated identity.
+#[derive(serde::Serialize)]
+struct SelfSubjectReview {
+    #[serde(rename = "apiVersion")]
+    api_version: &'static str,
+    kind: &'static str,
+    status: SelfSubjectReviewStatus,
+}
+
+/// The `status` block of a [`SelfSubjectReview`] — carries the resolved
+/// [`UserInfo`] under `userInfo` (camelCase, matching authentication/v1).
+#[derive(serde::Serialize)]
+struct SelfSubjectReviewStatus {
+    #[serde(rename = "userInfo")]
+    user_info: UserInfo,
+}
+
+/// `POST /apis/authentication.k8s.io/v1/selfsubjectreviews` → echo the
+/// authenticated identity. The body is ignored (the identity comes from the
+/// credential, not the request body). Reached AFTER the authn layer, so
+/// `Extension<UserInfo>` is the resolved identity (admin / anonymous / cert).
+async fn self_subject_review(user_info: ExtractUserInfo) -> Result<Response, ApiError> {
+    let review = SelfSubjectReview {
+        api_version: "authentication.k8s.io/v1",
+        kind: "SelfSubjectReview",
+        status: SelfSubjectReviewStatus {
+            user_info: user_info.0,
+        },
+    };
+    Ok((StatusCode::CREATED, Json(review)).into_response())
 }
 
 // ── K8s OpenAPI-v3 discovery surface (/openapi/v3) ─────────────────────
@@ -551,9 +728,10 @@ async fn do_create(
     ns: Option<&str>,
     headers: &HeaderMap,
     raw: &[u8],
+    user_info: &UserInfo,
 ) -> Result<Response, ApiError> {
     let body = decode_write_body(headers, raw)?;
-    let v = h.create(ns, body).await?;
+    let v = h.create(ns, body, user_info).await?;
     let codec = ResponseCodec::from_headers(headers);
     render_object(codec, &handler_gvk(h), StatusCode::CREATED, v)
 }
@@ -564,13 +742,14 @@ async fn do_patch(
     name: &str,
     headers: &HeaderMap,
     raw: &[u8],
+    user_info: &UserInfo,
 ) -> Result<Response, ApiError> {
     let gvk = handler_gvk(h);
     // Resolve the typed patch algorithm from the Content-Type FIRST — the
     // media type is the load-bearing signal the store dispatches on. Erasing
     // it here (the old `decode_patch_body` did) made every patch a merge.
     let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
-    let v = h.patch(ns, name, patch, patch_type).await?;
+    let v = h.patch(ns, name, patch, patch_type, user_info).await?;
     let codec = ResponseCodec::from_headers(headers);
     render_object(codec, &gvk, StatusCode::OK, v)
 }
@@ -581,6 +760,7 @@ async fn do_delete(
     name: &str,
     headers: &HeaderMap,
     p: &ListWatchParams,
+    user_info: &UserInfo,
 ) -> Result<Response, ApiError> {
     // `?resourceVersion=N` is the K8s DELETE precondition
     // (`Preconditions.resourceVersion`); absent/"0" → unconditional.
@@ -590,7 +770,9 @@ async fn do_delete(
     // absent). An empty 200 crashes kubectl's `json.Unmarshal([]byte{})`
     // ("unexpected end of JSON input"). This is the SAME content-negotiated
     // emission chokepoint create/get use — zero new serialization code.
-    let obj = h.delete_with_precondition(ns, name, expected).await?;
+    let obj = h
+        .delete_with_precondition(ns, name, expected, user_info)
+        .await?;
     let codec = ResponseCodec::from_headers(headers);
     // PROTOBUF CAVEAT: the deleted-object branch encodes cleanly (its GVK
     // — Deployment, ConfigMap, … — is in the proto pool). The Status-Success
@@ -936,6 +1118,7 @@ async fn resource_get_or_list(
 /// that the legacy instance routes never accepted POST.
 async fn resource_create(
     State(state): State<RouterState>,
+    user_info: ExtractUserInfo,
     coords: crate::coords::ResourceCoords,
     headers: HeaderMap,
     raw: Bytes,
@@ -954,7 +1137,7 @@ async fn resource_create(
         ));
     }
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    do_create(&h, coords.namespace.as_deref(), &headers, &raw).await
+    do_create(&h, coords.namespace.as_deref(), &headers, &raw, &user_info.0).await
 }
 
 /// PUT on a resource path. PUT is the kubectl full-object-replace verb for
@@ -990,6 +1173,7 @@ async fn resource_put(
 /// PATCH on a resource path — PATCH a single instance (requires `name`).
 async fn resource_patch(
     State(state): State<RouterState>,
+    user_info: ExtractUserInfo,
     coords: crate::coords::ResourceCoords,
     headers: HeaderMap,
     raw: Bytes,
@@ -1005,13 +1189,24 @@ async fn resource_patch(
         Some(Subresource::Scale) => {
             do_patch_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
         }
-        None => do_patch(&h, coords.namespace.as_deref(), name, &headers, &raw).await,
+        None => {
+            do_patch(
+                &h,
+                coords.namespace.as_deref(),
+                name,
+                &headers,
+                &raw,
+                &user_info.0,
+            )
+            .await
+        }
     }
 }
 
 /// DELETE on a resource path — DELETE a single instance (requires `name`).
 async fn resource_delete(
     State(state): State<RouterState>,
+    user_info: ExtractUserInfo,
     coords: crate::coords::ResourceCoords,
     headers: HeaderMap,
     Query(p): Query<ListWatchParams>,
@@ -1028,7 +1223,15 @@ async fn resource_delete(
         ApiError::BadRequest("DELETE requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    do_delete(&h, coords.namespace.as_deref(), name, &headers, &p).await
+    do_delete(
+        &h,
+        coords.namespace.as_deref(),
+        name,
+        &headers,
+        &p,
+        &user_info.0,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1191,6 +1394,7 @@ mod tests {
             &self,
             _ns: Option<&str>,
             _body: serde_json::Value,
+            _user_info: &engenho_types::auth::UserInfo,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal("fake handler: create not exercised".into()))
         }
@@ -1200,6 +1404,7 @@ mod tests {
             _name: &str,
             _patch: serde_json::Value,
             _patch_type: engenho_types::patch::PatchType,
+            _user_info: &engenho_types::auth::UserInfo,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal("fake handler: patch not exercised".into()))
         }
@@ -1207,6 +1412,7 @@ mod tests {
             &self,
             _ns: Option<&str>,
             _name: &str,
+            _user_info: &engenho_types::auth::UserInfo,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal("fake handler: delete not exercised".into()))
         }
@@ -1215,6 +1421,7 @@ mod tests {
             _ns: Option<&str>,
             _name: &str,
             _expected: Option<engenho_store::Revision>,
+            _user_info: &engenho_types::auth::UserInfo,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal("fake handler: delete_with_precondition not exercised".into()))
         }

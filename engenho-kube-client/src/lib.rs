@@ -38,7 +38,7 @@ pub mod watcher;
 pub mod mock;
 
 pub use client::ReqwestKubeClient;
-pub use config::{Kubeconfig, emit_kubeconfig};
+pub use config::{Kubeconfig, emit_kubeconfig, emit_kubeconfig_with_admin};
 pub use connection::Connection;
 pub use url_builder::KubeUrlBuilder;
 pub use watcher::ReqwestWatcher;

@@ -271,6 +271,7 @@ mod tests {
                 "spec": {"containers": [{"image": image}]}
             })),
             current: None,
+            user_info: engenho_types::auth::UserInfo::default(),
         }
     }
 
@@ -286,6 +287,7 @@ mod tests {
                 }
             })),
             current: None,
+            user_info: engenho_types::auth::UserInfo::default(),
         }
     }
 
@@ -305,6 +307,7 @@ mod tests {
                 }
             })),
             current: None,
+            user_info: engenho_types::auth::UserInfo::default(),
         }
     }
 
@@ -358,6 +361,7 @@ mod tests {
                 key: ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm"),
                 value: Some(json!({})),
                 current: None,
+                user_info: engenho_types::auth::UserInfo::default(),
             })
             .await
             .unwrap();
@@ -378,6 +382,7 @@ mod tests {
                 key: ResourceKey::namespaced("", "v1", "Pod", "default", "x"),
                 value: None,
                 current: None,
+                user_info: engenho_types::auth::UserInfo::default(),
             })
             .await
             .unwrap();
@@ -395,6 +400,7 @@ mod tests {
                 key: ResourceKey::namespaced("", "v1", "Pod", "default", "x"),
                 value: Some(json!({"metadata": {"labels": {"new": "label"}}})),
                 current: None,
+                user_info: engenho_types::auth::UserInfo::default(),
             })
             .await
             .unwrap();
@@ -423,6 +429,7 @@ mod tests {
                 "spec": {"containers": [{"image": "good:1"}, {"image": "bad:1"}]}
             })),
             current: None,
+            user_info: engenho_types::auth::UserInfo::default(),
         };
         let r = w.review(&req).await.unwrap();
         assert!(matches!(r, AdmissionDecision::Deny(reason) if reason.contains("bad:1")));

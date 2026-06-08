@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use engenho_apiserver::load_or_generate_ca;
 use engenho_config::EngenhoConfig;
-use engenho_kube_client::emit_kubeconfig;
+use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
@@ -125,8 +125,24 @@ fn run_kubeconfig(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     // operator can override with --server for a non-loopback address.
     let server_url = server.unwrap_or_else(|| default_server_url(&config));
 
-    let yaml = emit_kubeconfig(&config.cluster.name, &server_url, ca.cert_pem().as_bytes())
-        .map_err(|e| anyhow::anyhow!("emit kubeconfig: {e}"))?;
+    // If the daemon already minted + persisted the admin client cert (it does
+    // at first TLS boot), emit a kubeconfig that authenticates as the admin
+    // identity (→ `kubectl auth whoami` = engenho-admin). Otherwise fall back
+    // to the anonymous-token kubeconfig (pre-first-boot / plaintext).
+    let pki = data_dir.join("pki");
+    let admin_cert = std::fs::read(pki.join("admin.crt")).ok();
+    let admin_key = std::fs::read(pki.join("admin.key")).ok();
+    let yaml = match (admin_cert, admin_key) {
+        (Some(cert), Some(key)) => emit_kubeconfig_with_admin(
+            &config.cluster.name,
+            &server_url,
+            ca.cert_pem().as_bytes(),
+            &cert,
+            &key,
+        ),
+        _ => emit_kubeconfig(&config.cluster.name, &server_url, ca.cert_pem().as_bytes()),
+    }
+    .map_err(|e| anyhow::anyhow!("emit kubeconfig: {e}"))?;
     print!("{yaml}");
     Ok(())
 }
