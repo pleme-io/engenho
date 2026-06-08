@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::catalog::KindEntry;
+use crate::catalog::{KindEntry, Subresource};
 use crate::emit_typed::{SchemaView, emit_fields, emit_struct};
 use crate::openapi::KindShape;
 
@@ -318,6 +318,23 @@ use crate::kind::{GroupVersionKind, GroupVersionResource, Scope};
 /// self-contained (the apiserver depends on `engenho-types`, never on the
 /// codegen crate) and byte-deterministic.
 const CATALOG_TYPE_DECL: &str = "\
+/// A K8s subresource a kind serves under `<plural>/<name>/<sub>`.
+///
+/// Typed — NOT a string — so a bad combination is unrepresentable: the
+/// discovery emitter, the router dispatch, and the store-scoping handler all
+/// `match` on this enum, and the compiler refuses any value outside the
+/// closed set. `Status` is the `/status` subresource (controller-written
+/// status, isolated from spec on write); `Scale` is the autoscaling/v1
+/// `/scale` subresource (the projected replica view).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Subresource {
+    /// `/status` — get/patch/update the `.status` only (spec untouched).
+    Status,
+    /// `/scale` — get/patch/update the autoscaling/v1 Scale projection
+    /// (`spec.replicas` only).
+    Scale,
+}
+
 /// One runtime row describing a routable/discoverable Kubernetes kind.
 ///
 /// `plural` is the curated URL segment (`KindEntry.resource`) — irregular
@@ -359,9 +376,26 @@ pub struct ResourceDescriptor {
     /// `--validate=false` (no schema to validate against); `kubectl explain`
     /// is unavailable. Non-opaque kinds are `false`.
     pub opaque: bool,
+    /// The subresources this kind serves under `<plural>/<name>/<sub>`
+    /// (`/status`, `/scale`). Typed slice — the SINGLE source the router
+    /// dispatch, the store-scoping handler, and discovery all read; no kind
+    /// is ever special-cased by name. `&[]` for kinds with no subresource.
+    pub subresources: &'static [Subresource],
 }
 
 impl ResourceDescriptor {
+    /// `true` iff this kind serves the `/status` subresource.
+    #[must_use]
+    pub fn has_status(&self) -> bool {
+        self.subresources.contains(&Subresource::Status)
+    }
+
+    /// `true` iff this kind serves the autoscaling/v1 `/scale` subresource.
+    #[must_use]
+    pub fn has_scale(&self) -> bool {
+        self.subresources.contains(&Subresource::Scale)
+    }
+
     /// The Group/Version/Kind triple for this descriptor.
     #[must_use]
     pub const fn to_gvk(&self) -> GroupVersionKind {
@@ -418,7 +452,7 @@ pub fn emit_catalog(catalog: &[KindEntry]) -> String {
             format!("{}/{}", e.group, e.version)
         };
         out.push_str(&format!(
-            "    ResourceDescriptor {{ group: {:?}, version: {:?}, kind: {:?}, plural: {:?}, namespaced: {}, api_version: {:?}, short_names: {}, singular: {:?}, categories: {}, opaque: {} }},\n",
+            "    ResourceDescriptor {{ group: {:?}, version: {:?}, kind: {:?}, plural: {:?}, namespaced: {}, api_version: {:?}, short_names: {}, singular: {:?}, categories: {}, opaque: {}, subresources: {} }},\n",
             e.group,
             e.version,
             e.kind,
@@ -429,6 +463,7 @@ pub fn emit_catalog(catalog: &[KindEntry]) -> String {
             e.singular,
             render_str_slice(e.categories),
             e.opaque,
+            render_subresources(e.subresources),
         ));
     }
     out.push_str("];\n");
@@ -448,6 +483,27 @@ fn render_str_slice(items: &[&str]) -> String {
     let joined = items
         .iter()
         .map(|s| format!("{s:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("&[{joined}]")
+}
+
+/// Render a `&'static [Subresource]` as the Rust slice literal that
+/// reconstructs it: `&[]` for empty, `&[Subresource::Status,
+/// Subresource::Scale]` otherwise. Each variant is rendered through a typed
+/// `match` (NOT a debug-format guess) so the emitted path is exactly the
+/// generated `Subresource` enum's variant name — the typed slice renderer
+/// the ★★ TYPED EMISSION rule requires (peer of [`render_str_slice`]).
+fn render_subresources(items: &[Subresource]) -> String {
+    if items.is_empty() {
+        return "&[]".to_string();
+    }
+    let joined = items
+        .iter()
+        .map(|s| match s {
+            Subresource::Status => "Subresource::Status",
+            Subresource::Scale => "Subresource::Scale",
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!("&[{joined}]")
@@ -495,6 +551,7 @@ mod tests {
             singular: "pod",
             categories: &["all"],
             opaque: false,
+            subresources: &[Subresource::Status],
         }
     }
 
@@ -688,6 +745,51 @@ mod tests {
     }
 
     #[test]
+    fn render_subresources_empty_status_and_both() {
+        assert_eq!(render_subresources(&[]), "&[]");
+        assert_eq!(
+            render_subresources(&[Subresource::Status]),
+            "&[Subresource::Status]"
+        );
+        assert_eq!(
+            render_subresources(&[Subresource::Status, Subresource::Scale]),
+            "&[Subresource::Status, Subresource::Scale]"
+        );
+    }
+
+    #[test]
+    fn emit_catalog_renders_subresource_slices() {
+        use crate::catalog::KIND_CATALOG;
+        let src = emit_catalog(KIND_CATALOG);
+        // Deployment carries Status + Scale (scalable workload).
+        assert!(
+            src.contains(r#"kind: "Deployment""#)
+                && src.contains("subresources: &[Subresource::Status, Subresource::Scale]"),
+            "Deployment row carries Status + Scale"
+        );
+        // DaemonSet carries Status only (not scalable).
+        assert!(
+            src.contains(
+                r#"kind: "DaemonSet", plural: "daemonsets", namespaced: true, api_version: "apps/v1", short_names: &["ds"], singular: "daemonset", categories: &["all"], opaque: false, subresources: &[Subresource::Status]"#
+            ),
+            "DaemonSet row carries Status only"
+        );
+        // ConfigMap carries no subresource (empty slice).
+        assert!(
+            src.contains(
+                r#"kind: "ConfigMap", plural: "configmaps", namespaced: true, api_version: "v1", short_names: &["cm"], singular: "configmap", categories: &[], opaque: false, subresources: &[]"#
+            ),
+            "ConfigMap row carries an empty subresources slice"
+        );
+        // The emitted enum decl is present (so the generated catalog compiles
+        // against its own typed Subresource).
+        assert!(
+            src.contains("pub enum Subresource"),
+            "the generated catalog emits the Subresource enum decl"
+        );
+    }
+
+    #[test]
     fn emit_module_lists_each_kind() {
         let entries: Vec<KindEntry> = vec![
             entry(),
@@ -703,6 +805,7 @@ mod tests {
                 singular: "service",
                 categories: &["all"],
                 opaque: false,
+                subresources: &[Subresource::Status],
             },
         ];
         let refs: Vec<&KindEntry> = entries.iter().collect();

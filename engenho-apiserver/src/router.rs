@@ -49,6 +49,7 @@ use engenho_kube_proto::{
     response_wants_protobuf,
 };
 use engenho_store::{WatchGone, WatchSignal, WatchStream};
+use engenho_types::generated_v1_34::Subresource;
 use engenho_types::patch::PatchType;
 use utoipa::OpenApi;
 
@@ -245,6 +246,7 @@ pub fn build(state: RouterState) -> Router {
             "/api/v1/*rest",
             get(resource_get_or_list)
                 .post(resource_create)
+                .put(resource_put)
                 .patch(resource_patch)
                 .delete(resource_delete),
         )
@@ -252,6 +254,7 @@ pub fn build(state: RouterState) -> Router {
             "/apis/:group/:version/*rest",
             get(resource_get_or_list)
                 .post(resource_create)
+                .put(resource_put)
                 .patch(resource_patch)
                 .delete(resource_delete),
         )
@@ -759,18 +762,126 @@ async fn watch_response(
 // exists today — a `Some(subresource)` returns a typed `NotFound` (no stub
 // Ok), reserved for the status/scale follow-up.
 
-/// Reject a subresource request until status/scale handlers land. Returns a
-/// typed K8s `Status` 404 (NOT a stub `Ok`, NOT axum's empty 404) so the
-/// gap surfaces mechanically. `None` (the only live case today) is a no-op.
-fn reject_subresource(coords: &crate::coords::ResourceCoords) -> Result<(), ApiError> {
-    match &coords.subresource {
-        None => Ok(()),
-        Some(sub) => Err(ApiError::NotFound(format!(
-            "subresource {sub:?} is not served for {}/{} (no status/scale handler registered yet)",
-            coords.plural,
-            coords.name.as_deref().unwrap_or("")
-        ))),
+/// Resolve `coords.subresource` against the resolved handler's catalog-
+/// declared subresource set. The router NEVER special-cases a kind by name:
+/// the handler's `descriptor.subresources` (sourced from `RESOURCE_CATALOG`)
+/// is the single authority for whether a subresource is served.
+///
+///   * `None`               → `Ok(None)` (the base-object verb path).
+///   * `Some("status")` + the kind declares `Subresource::Status`
+///                          → `Ok(Some(Subresource::Status))`.
+///   * `Some("scale")`  + the kind declares `Subresource::Scale`
+///                          → `Ok(Some(Subresource::Scale))`.
+///   * anything else, or a declared-absent subresource
+///                          → a typed K8s `Status` 404 (no stub Ok, no panic).
+///
+/// `name` is required for a subresource (a subresource always targets an
+/// instance) — a collection-path subresource is a typed `BadRequest`.
+fn resolve_subresource(
+    coords: &crate::coords::ResourceCoords,
+    h: &Arc<dyn ResourceHandler>,
+) -> Result<Option<Subresource>, ApiError> {
+    let Some(sub) = coords.subresource.as_deref() else {
+        return Ok(None);
+    };
+    if coords.name.is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "subresource {sub:?} requires a resource name (instance path)"
+        )));
     }
+    let parsed = match sub {
+        "status" if h.subresources().contains(&Subresource::Status) => Subresource::Status,
+        "scale" if h.subresources().contains(&Subresource::Scale) => Subresource::Scale,
+        other => {
+            return Err(ApiError::NotFound(format!(
+                "the server could not find the requested resource: {} does not serve subresource {:?}",
+                coords.plural, other
+            )));
+        }
+    };
+    Ok(Some(parsed))
+}
+
+// ── shared subresource do_* bodies (status/scale; both URL families) ────
+//
+// Each delegates to the matching `ResourceHandler` scoped-write method (the
+// store-side scoping lives there, reusing ResourceCommand::Patch). The verb
+// handlers pick the body by the typed `Subresource` resolved from the
+// catalog — no kind name is ever matched in the router.
+
+async fn do_get_status(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    codec: ResponseCodec,
+) -> Result<Response, ApiError> {
+    let v = h.get_status(ns, name).await?;
+    render_object(codec, &handler_gvk(h), StatusCode::OK, v)
+}
+
+async fn do_put_status(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    headers: &HeaderMap,
+    raw: &[u8],
+) -> Result<Response, ApiError> {
+    let body = decode_write_body(headers, raw)?;
+    let v = h.put_status(ns, name, body).await?;
+    let codec = ResponseCodec::from_headers(headers);
+    render_object(codec, &handler_gvk(h), StatusCode::OK, v)
+}
+
+async fn do_patch_status(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    headers: &HeaderMap,
+    raw: &[u8],
+) -> Result<Response, ApiError> {
+    let gvk = handler_gvk(h);
+    let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
+    let v = h.patch_status(ns, name, patch, patch_type).await?;
+    let codec = ResponseCodec::from_headers(headers);
+    render_object(codec, &gvk, StatusCode::OK, v)
+}
+
+async fn do_get_scale(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+) -> Result<Response, ApiError> {
+    // The Scale projection is autoscaling/v1 regardless of the parent's
+    // group, so it is rendered as JSON (its GVK is not in the parent's
+    // protobuf pool) — the upstream contract. Same as the Status-Success
+    // DELETE fallback's JSON-regardless rendering.
+    let v = h.get_scale(ns, name).await?;
+    Ok((StatusCode::OK, Json(v)).into_response())
+}
+
+async fn do_put_scale(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    headers: &HeaderMap,
+    raw: &[u8],
+) -> Result<Response, ApiError> {
+    let body = decode_write_body(headers, raw)?;
+    let v = h.put_scale(ns, name, body).await?;
+    Ok((StatusCode::OK, Json(v)).into_response())
+}
+
+async fn do_patch_scale(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    headers: &HeaderMap,
+    raw: &[u8],
+) -> Result<Response, ApiError> {
+    let gvk = handler_gvk(h);
+    let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
+    let v = h.patch_scale(ns, name, patch, patch_type).await?;
+    Ok((StatusCode::OK, Json(v)).into_response())
 }
 
 /// GET on a resource path — LIST/WATCH a collection (no `name`) or GET a
@@ -782,20 +893,31 @@ async fn resource_get_or_list(
     headers: HeaderMap,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
-    reject_subresource(&coords)?;
+    // Resolve the handler FIRST (the subresource is served by the parent
+    // kind's handler), then dispatch on the typed subresource resolved from
+    // the catalog.
+    let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    if let Some(sub) = resolve_subresource(&coords, &h)? {
+        // A subresource always targets an instance — `name` is present
+        // (resolve_subresource enforces it).
+        let name = coords.name.as_deref().expect("subresource requires a name");
+        let codec = ResponseCodec::from_headers(&headers);
+        return match sub {
+            Subresource::Status => {
+                do_get_status(&h, coords.namespace.as_deref(), name, codec).await
+            }
+            Subresource::Scale => do_get_scale(&h, coords.namespace.as_deref(), name).await,
+        };
+    }
     match &coords.name {
         // Collection GET → LIST or WATCH (the shared body branches on
         // `p.watch`). `lookup` already returns an owned `Arc` (the
         // ArcSwap-snapshot clone) — exactly what the watch unfold stream
         // needs, no extra `.clone()`.
-        None => {
-            let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-            do_list_or_watch(h, coords.namespace, p).await
-        }
+        None => do_list_or_watch(h, coords.namespace, p).await,
         // Instance GET → the shared `do_get` body. Bind the owned `Arc`,
         // pass it by reference (`do_get` takes `&Arc`).
         Some(name) => {
-            let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
             do_get(
                 &h,
                 coords.namespace.as_deref(),
@@ -818,7 +940,14 @@ async fn resource_create(
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
-    reject_subresource(&coords)?;
+    // POST on a subresource is not a K8s CREATE shape — no subresource
+    // supports create (status/scale are get/patch/update only). Typed
+    // BadRequest, never a stub Ok.
+    if let Some(sub) = &coords.subresource {
+        return Err(ApiError::BadRequest(format!(
+            "the {sub:?} subresource does not support create (POST)"
+        )));
+    }
     if coords.name.is_some() {
         return Err(ApiError::BadRequest(
             "POST is only valid on a collection path (no resource name)".into(),
@@ -828,6 +957,36 @@ async fn resource_create(
     do_create(&h, coords.namespace.as_deref(), &headers, &raw).await
 }
 
+/// PUT on a resource path. PUT is the kubectl full-object-replace verb for
+/// `/status` and `/scale` (kubectl writes both via PUT). On the MAIN object
+/// path (no subresource) engenho uses POST-create + PATCH, so a PUT there is
+/// a typed `BadRequest` mirroring the upstream contract — never a silent
+/// stub.
+async fn resource_put(
+    State(state): State<RouterState>,
+    coords: crate::coords::ResourceCoords,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    let name = coords.name.as_deref().ok_or_else(|| {
+        ApiError::BadRequest("PUT requires a resource name (instance path)".into())
+    })?;
+    let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    match resolve_subresource(&coords, &h)? {
+        Some(Subresource::Status) => {
+            do_put_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+        }
+        Some(Subresource::Scale) => {
+            do_put_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+        }
+        // PUT on the main object (no subresource) — engenho uses POST/PATCH;
+        // mirror upstream with a typed BadRequest.
+        None => Err(ApiError::BadRequest(
+            "PUT on the main object is not supported (use POST to create, PATCH to update)".into(),
+        )),
+    }
+}
+
 /// PATCH on a resource path — PATCH a single instance (requires `name`).
 async fn resource_patch(
     State(state): State<RouterState>,
@@ -835,12 +994,19 @@ async fn resource_patch(
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
-    reject_subresource(&coords)?;
     let name = coords.name.as_deref().ok_or_else(|| {
         ApiError::BadRequest("PATCH requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    do_patch(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+    match resolve_subresource(&coords, &h)? {
+        Some(Subresource::Status) => {
+            do_patch_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+        }
+        Some(Subresource::Scale) => {
+            do_patch_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+        }
+        None => do_patch(&h, coords.namespace.as_deref(), name, &headers, &raw).await,
+    }
 }
 
 /// DELETE on a resource path — DELETE a single instance (requires `name`).
@@ -850,7 +1016,14 @@ async fn resource_delete(
     headers: HeaderMap,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
-    reject_subresource(&coords)?;
+    // DELETE on a subresource is invalid — no subresource supports delete
+    // (status/scale are get/patch/update only). Typed BadRequest, never a
+    // stub Ok.
+    if let Some(sub) = &coords.subresource {
+        return Err(ApiError::BadRequest(format!(
+            "the {sub:?} subresource does not support delete"
+        )));
+    }
     let name = coords.name.as_deref().ok_or_else(|| {
         ApiError::BadRequest("DELETE requires a resource name (instance path)".into())
     })?;

@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
+use engenho_types::generated_v1_34::Subresource;
 use serde::Serialize;
 
 use crate::error::ApiError;
@@ -108,9 +109,26 @@ pub struct APIResource {
     /// Resource categories (e.g. `["all"]`). Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub categories: Vec<String>,
+    /// The API group a subresource row belongs to when it DIFFERS from the
+    /// parent's group — `Some("autoscaling")` for a `<plural>/scale` row
+    /// (the Scale projection is autoscaling/v1 regardless of the parent's
+    /// group). Omitted (None) for the base row + the `/status` row (which
+    /// inherit the parent's group/version). This is the K8s `group` field
+    /// on `APIResource`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The API version a subresource row belongs to when it differs from the
+    /// parent's — `Some("v1")` for a `<plural>/scale` row. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 // ── builders (fold the handler set; deterministic via BTree ordering) ───
+
+/// The verbs a subresource (`/status`, `/scale`) serves — get + the two
+/// write verbs (patch + update). NO list/watch/create/delete (a subresource
+/// is always an instance projection, never a collection).
+const SUBRESOURCE_VERBS: &[&str] = &["get", "patch", "update"];
 
 /// Project one handler into an `APIResource` discovery row. The
 /// registration metadata (singularName / shortNames / categories) flows
@@ -127,6 +145,60 @@ fn resource_of(h: &dyn ResourceHandler) -> APIResource {
         verbs: VERBS.iter().map(|v| (*v).to_string()).collect(),
         short_names: h.short_names().iter().map(|s| (*s).to_string()).collect(),
         categories: h.categories().iter().map(|c| (*c).to_string()).collect(),
+        // The base row inherits its own group/version (the list's
+        // groupVersion); these K8s fields are only set when a subresource
+        // diverges (the scale row).
+        group: None,
+        version: None,
+    }
+}
+
+/// Fold one handler into its discovery rows: the base resource row PLUS one
+/// row per catalog-declared subresource (so advertised == routable — the
+/// same handler set the router dispatches on drives discovery). The order
+/// is base-then-subresources; the caller sorts by `name` so
+/// `deployments` < `deployments/scale` < `deployments/status` is stable.
+fn rows_of(h: &dyn ResourceHandler) -> Vec<APIResource> {
+    let mut rows = vec![resource_of(h)];
+    for sub in h.subresources() {
+        rows.push(subresource_row(h, *sub));
+    }
+    rows
+}
+
+/// Build the `APIResource` discovery row for one subresource of `h`.
+///
+///   * **status** — `name: "<plural>/status"`, `singularName: ""`, parent's
+///     `kind` + scope, verbs `get/patch/update`, group/version OMITTED
+///     (inherits the parent's GV — same list).
+///   * **scale**  — `name: "<plural>/scale"`, `kind: "Scale"`,
+///     `group: "autoscaling"`, `version: "v1"`, parent's scope, verbs
+///     `get/patch/update`.
+fn subresource_row(h: &dyn ResourceHandler, sub: Subresource) -> APIResource {
+    let verbs = SUBRESOURCE_VERBS.iter().map(|v| (*v).to_string()).collect();
+    match sub {
+        Subresource::Status => APIResource {
+            name: format!("{}/status", h.plural()),
+            singular_name: String::new(),
+            namespaced: h.namespaced(),
+            kind: h.kind().to_string(),
+            verbs,
+            short_names: Vec::new(),
+            categories: Vec::new(),
+            group: None,
+            version: None,
+        },
+        Subresource::Scale => APIResource {
+            name: format!("{}/scale", h.plural()),
+            singular_name: String::new(),
+            namespaced: h.namespaced(),
+            kind: "Scale".to_string(),
+            verbs,
+            short_names: Vec::new(),
+            categories: Vec::new(),
+            group: Some("autoscaling".to_string()),
+            version: Some("v1".to_string()),
+        },
     }
 }
 
@@ -137,7 +209,7 @@ pub(crate) fn build_core_resources(state: &RouterState) -> APIResourceList {
         .handler_set()
         .into_iter()
         .filter(|h| h.group().is_empty() && h.version() == "v1")
-        .map(|h| resource_of(h.as_ref()))
+        .flat_map(|h| rows_of(h.as_ref()))
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     APIResourceList {
@@ -208,7 +280,7 @@ pub(crate) fn build_group_resources(
         .handler_set()
         .into_iter()
         .filter(|h| h.group() == group && h.version() == version)
-        .map(|h| resource_of(h.as_ref()))
+        .flat_map(|h| rows_of(h.as_ref()))
         .collect();
     if rows.is_empty() {
         return None;
