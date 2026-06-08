@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{PatchType, Reason, ResourceCommand},
+    command::{Reason, ResourceCommand},
 };
 use engenho_substrate::{
     DerivationCacheBackend, Drv, DrvHash, NarBlob, NarHash, OutputPath, Realisation,
@@ -259,18 +259,16 @@ impl Controller for DrvBuildController {
                 Err(e) => {
                     // Surface the failure into the CR status.
                     self.store
-                        .propose(ResourceCommand::Patch {
-                            key: cr_key.clone(),
-                            patch: json!({
+                        .propose(ResourceCommand::patch(
+                            cr_key.clone(),
+                            json!({
                                 "status": {
                                     "phase": "BuildFailed",
                                     "message": e.to_string(),
                                 }
                             }),
-                            patch_type: PatchType::Merge,
-                            expected: None,
-                            reason: Reason::Controller,
-                        })
+                            Reason::Controller,
+                        ))
                         .await?;
                     report.objects_changed += 1;
                     continue;

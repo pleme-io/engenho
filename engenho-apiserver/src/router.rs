@@ -890,6 +890,7 @@ async fn do_patch(
     name: &str,
     headers: &HeaderMap,
     raw: &[u8],
+    apply_params: &crate::params::ApplyParams,
     user_info: &UserInfo,
 ) -> Result<Response, ApiError> {
     let gvk = handler_gvk(h);
@@ -897,7 +898,23 @@ async fn do_patch(
     // media type is the load-bearing signal the store dispatches on. Erasing
     // it here (the old `decode_patch_body` did) made every patch a merge.
     let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
-    let v = h.patch(ns, name, patch, patch_type, user_info).await?;
+    // Server-side apply (Content-Type application/apply-patch+yaml) → validate
+    // the `?fieldManager=`/`?force=` query into typed ApplyOptions. A missing
+    // fieldManager is a typed 400 here (matching upstream). For EVERY other
+    // patch algorithm `apply_opts` is None — the non-SSA path is UNCHANGED.
+    let apply_opts = if patch_type == engenho_types::patch::PatchType::Apply {
+        Some(crate::params::ApplyOptions::from_params(apply_params)?)
+    } else {
+        None
+    };
+    let v = h
+        .patch(ns, name, patch, patch_type, apply_opts, user_info)
+        .await?;
+    // An apply that CREATES the object returns 201; an apply/patch that
+    // updates returns 200. The store reports Created vs Patched; the handler
+    // surfaces the status via the response — here we keep 200 for parity with
+    // the existing patch path (kubectl apply --server-side accepts both, and
+    // the read-back object carries the committed state either way).
     let codec = ResponseCodec::from_headers(headers);
     render_object(codec, &gvk, StatusCode::OK, v)
 }
@@ -1361,6 +1378,11 @@ async fn resource_patch(
     State(state): State<RouterState>,
     user_info: ExtractUserInfo,
     coords: crate::coords::ResourceCoords,
+    // The `?fieldManager=`/`?force=` server-side-apply query params — decoded
+    // for EVERY patch but only consumed when the Content-Type resolves to
+    // apply (do_patch validates fieldManager iff patch_type == Apply). axum
+    // parses the whole query string; non-apply patches ignore these fields.
+    Query(apply_params): Query<crate::params::ApplyParams>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -1386,6 +1408,7 @@ async fn resource_patch(
                 name,
                 &headers,
                 &raw,
+                &apply_params,
                 &user_info.0,
             )
             .await
@@ -1594,6 +1617,7 @@ mod tests {
             _name: &str,
             _patch: serde_json::Value,
             _patch_type: engenho_types::patch::PatchType,
+            _apply_opts: Option<crate::params::ApplyOptions>,
             _user_info: &engenho_types::auth::UserInfo,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal("fake handler: patch not exercised".into()))

@@ -47,6 +47,7 @@ fn patch_with(key: ResourceKey, patch: ResourceValue, expected: Option<Revision>
         key,
         patch,
         patch_type: engenho_store::command::PatchType::Merge,
+        apply: None,
         expected,
         reason: Reason::Operator,
     }

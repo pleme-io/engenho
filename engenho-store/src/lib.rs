@@ -66,6 +66,7 @@ pub mod pagination;
 pub mod patch_apply;
 pub mod resource;
 pub mod revision;
+pub mod ssa;
 pub mod state;
 pub mod store;
 pub mod type_config;
@@ -89,6 +90,7 @@ pub use patch_apply::{
 };
 pub use resource::{ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
+pub use ssa::{apply_ssa, ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome};
 pub use state::{check_precondition, ApplyOutcome, ResourceCatalog, DEFAULT_HISTORY_CAPACITY};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};

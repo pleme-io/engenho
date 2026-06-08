@@ -11,7 +11,8 @@
 //!   * `application/json-patch+json`             → RFC 6902 ops executed
 //!   * `application/strategic-merge-patch+json`  → list-merge-by-key
 //!   * (no Content-Type, kubectl default)        → strategic
-//!   * `application/apply-patch+yaml` (SSA)      → typed 415, NOT a silent merge
+//!   * `application/apply-patch+yaml` (SSA)      → field-managed apply
+//!     (full SSA coverage lives in r7_10_server_side_apply.rs)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -255,11 +256,13 @@ async fn no_content_type_defaults_to_strategic() {
     server.shutdown().await.unwrap();
 }
 
-/// `application/apply-patch+yaml` (server-side apply) → typed 415, NEVER a
-/// silent strategic/merge fallback that would lie about field-ownership /
-/// conflict semantics. The object is left BYTE-IDENTICAL.
+/// `application/apply-patch+yaml` (server-side apply) now MERGES + records
+/// field ownership (the 415 stub is gone). A fieldManager-bearing apply on
+/// an existing object updates the named field, records managedFields, and
+/// leaves un-applied fields intact. (Full SSA scenarios — conflict / force /
+/// removal / create — live in r7_10_server_side_apply.rs.)
 #[tokio::test]
-async fn server_side_apply_content_type_returns_415_not_silent_merge() {
+async fn server_side_apply_content_type_merges_and_records_ownership() {
     let (_s, server) = boot().await;
     let addr = server.local_addr().to_string();
     let client = reqwest::Client::new();
@@ -274,15 +277,24 @@ async fn server_side_apply_content_type_returns_415_not_silent_merge() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "SSA is typed-deferred → 415, not a silent merge"
-    );
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "SSA applies, no 415");
 
-    // The object must be untouched — the SSA was rejected, not partially
-    // applied as a merge.
     let got = get_deploy(&addr, &client).await;
-    assert_eq!(got["spec"]["replicas"], 1, "object byte-identical after 415");
+    assert_eq!(got["spec"]["replicas"], 9, "apply set replicas");
+    // managedFields records the manager owning .spec.replicas.
+    let mf = got["metadata"]["managedFields"].as_array().unwrap();
+    assert!(
+        mf.iter().any(|e| e["manager"] == "test" && e["operation"] == "Apply"),
+        "managedFields records the apply manager"
+    );
+    // The container list (not applied) is untouched.
+    assert_eq!(
+        got["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "un-applied containers preserved"
+    );
     server.shutdown().await.unwrap();
 }

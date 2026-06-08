@@ -85,6 +85,7 @@ async fn mark_owned_pods_ready(store: &StoreMesh, owner_uid: &str) -> usize {
                     }
                 }),
                 patch_type: engenho_store::command::PatchType::Merge,
+                apply: None,
                 expected: None,
                 reason: Reason::Operator,
             })
@@ -480,6 +481,7 @@ async fn status_write_succeeds_with_current_rv_then_noop_on_reissue() {
             key: rs_key.clone(),
             patch: json!({"status": {"readyReplicas": 1}}),
             patch_type: engenho_store::command::PatchType::Merge,
+            apply: None,
             expected: Some(rv),
             reason: Reason::Controller,
         })

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{PatchType, Reason, ResourceCommand},
+    command::{Reason, ResourceCommand},
 };
 use engenho_substrate::{DerivationCacheBackend, DrvHash};
 use serde_json::{Value, json};
@@ -158,18 +158,16 @@ impl Controller for DrvController {
             }
 
             self.store
-                .propose(ResourceCommand::Patch {
-                    key: cr_key.clone(),
-                    patch: json!({
+                .propose(ResourceCommand::patch(
+                    cr_key.clone(),
+                    json!({
                         "status": {
                             "phase": phase,
                             "realisations": realisations_json,
                         }
                     }),
-                    patch_type: PatchType::Merge,
-                    expected: None,
-                    reason: Reason::Controller,
-                })
+                    Reason::Controller,
+                ))
                 .await?;
             report.objects_changed += 1;
         }

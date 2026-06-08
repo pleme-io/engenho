@@ -23,7 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{PatchType, Reason, ResourceCommand},
+    command::{Reason, ResourceCommand},
 };
 use serde_json::{Value, json};
 
@@ -164,19 +164,17 @@ impl Controller for PodDisruptionBudgetController {
             }
 
             self.store
-                .propose(ResourceCommand::Patch {
-                    key: pdb_key.clone(),
-                    patch: json!({
+                .propose(ResourceCommand::patch(
+                    pdb_key.clone(),
+                    json!({
                         "status": {
                             "currentHealthy": healthy,
                             "expectedPods": total,
                             "disruptionsAllowed": allowed,
                         }
                     }),
-                    patch_type: PatchType::Merge,
-                    expected: None,
-                    reason: Reason::Controller,
-                })
+                    Reason::Controller,
+                ))
                 .await?;
             report.objects_changed += 1;
         }

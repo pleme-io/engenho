@@ -36,6 +36,29 @@ fn default_deletion_timestamp() -> Option<String> {
     None
 }
 
+/// The frozen, boundary-supplied server-side-apply metadata carried on a
+/// `Patch` command whose `patch_type == PatchType::Apply`. `None` for every
+/// non-apply patch (merge / strategic / json-patch) AND for a replayed
+/// pre-field log entry (`#[serde(default)]`), so those paths stay
+/// byte-identical — the BEHAVIOR-PRESERVATION seam.
+///
+/// `manager` is the `?fieldManager=` query param (REQUIRED on an apply
+/// request — a missing one is a typed 422 at the boundary, never reaching
+/// here). `force` is `?force=true|false` (default false). `time` is the
+/// boundary-frozen RFC3339 instant stamped onto the manager's
+/// managedFields entry — the one non-deterministic input, captured once at
+/// the apiserver boundary so every Raft replica replays identical bytes
+/// (the same discipline `deletion_timestamp` + `creationTimestamp` obey).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyMeta {
+    /// The field manager identity (`?fieldManager=`).
+    pub manager: String,
+    /// Take ownership of conflicting fields (`?force=`).
+    pub force: bool,
+    /// Frozen boundary RFC3339 instant for the managedFields entry.
+    pub time: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResourceCommand {
@@ -82,6 +105,15 @@ pub enum ResourceCommand {
         /// any persisted log entry.
         #[serde(default = "default_patch_type")]
         patch_type: PatchType,
+        /// Server-side-apply metadata (`fieldManager` / `force` / frozen
+        /// `time`). `Some` ONLY when `patch_type == PatchType::Apply`;
+        /// `None` for every other patch algorithm and for a replayed
+        /// pre-field log entry (`#[serde(default)]` → forward-compat). The
+        /// REPLICATED apply metadata so every Raft node runs the IDENTICAL
+        /// SSA decision (a leader-only `fieldManager`/clock read would
+        /// diverge replicas — same law `deletion_timestamp` obeys).
+        #[serde(default)]
+        apply: Option<ApplyMeta>,
         expected: Option<Revision>,
         reason: Reason,
     },
@@ -143,7 +175,31 @@ impl ResourceCommand {
             key,
             patch,
             patch_type,
+            apply: None,
             expected: None,
+            reason,
+        }
+    }
+
+    /// Construct a server-side-apply `Patch` (`patch_type ==
+    /// PatchType::Apply`) carrying the boundary-frozen [`ApplyMeta`]
+    /// (`fieldManager` / `force` / `time`). The apply body is the
+    /// (possibly partial) declared object. `expected` is the optional CAS
+    /// precondition (an apply may carry `metadata.resourceVersion`).
+    #[must_use]
+    pub fn apply_ssa(
+        key: ResourceKey,
+        body: ResourceValue,
+        apply: ApplyMeta,
+        expected: Option<Revision>,
+        reason: Reason,
+    ) -> Self {
+        Self::Patch {
+            key,
+            patch: body,
+            patch_type: PatchType::Apply,
+            apply: Some(apply),
+            expected,
             reason,
         }
     }
@@ -155,6 +211,27 @@ impl ResourceCommand {
     #[must_use]
     pub fn patch(key: ResourceKey, patch: ResourceValue, reason: Reason) -> Self {
         Self::patch_typed(key, patch, PatchType::Merge, reason)
+    }
+
+    /// Construct an RFC 7396 merge `Patch` carrying a CAS precondition
+    /// (`expected`) — the status-write shape that races a concurrent
+    /// writer. `apply` is `None` (non-SSA). Equivalent to the struct literal
+    /// with `patch_type: Merge, apply: None`.
+    #[must_use]
+    pub fn patch_cas(
+        key: ResourceKey,
+        patch: ResourceValue,
+        expected: Option<Revision>,
+        reason: Reason,
+    ) -> Self {
+        Self::Patch {
+            key,
+            patch,
+            patch_type: PatchType::Merge,
+            apply: None,
+            expected,
+            reason,
+        }
     }
 
     /// Construct an UNCONDITIONAL `Delete` (no CAS precondition, no frozen
@@ -243,14 +320,24 @@ pub enum ResourceOp {
     /// apiserver (distinct from create-already-exists "AlreadyExists").
     Conflict,
     /// The patch algorithm REFUSED the patch (RFC 6902 `test` failure,
-    /// a bad JSON-Pointer, a missing strategic merge-key, an unrecognized
-    /// `$patch` directive, or the typed-deferred server-side-apply path).
-    /// Like [`Self::Conflict`]: no mutation, no revision consumed, no
-    /// history entry, no watch event — the catalog is byte-identical. The
-    /// carried [`crate::patch_apply::PatchError`] is surfaced via
-    /// [`crate::ApplyOutcome::patch_error`] so the apiserver renders the
-    /// correct typed Status (415 for SSA, 422/400 for a bad patch).
+    /// a bad JSON-Pointer, a missing strategic merge-key, or an unrecognized
+    /// `$patch` directive). Like [`Self::Conflict`]: no mutation, no
+    /// revision consumed, no history entry, no watch event — the catalog is
+    /// byte-identical. The carried [`crate::patch_apply::PatchError`] is
+    /// surfaced via [`crate::ApplyOutcome::patch_error`] so the apiserver
+    /// renders the correct typed Status (422/400 for a bad patch).
     PatchRejected,
+    /// A server-side apply hit one or more field-ownership CONFLICTS that
+    /// `force` did not override — a path the apply wants is owned by a
+    /// DIFFERENT apply-manager with a differing value. Like
+    /// [`Self::Conflict`] / [`Self::PatchRejected`]: NO mutation, NO
+    /// revision consumed, NO history entry, NO watch event — the catalog is
+    /// byte-identical. The serialized `details.causes` array
+    /// ([`crate::ssa::ApplyConflicts::to_causes`]) rides on
+    /// [`crate::ApplyOutcome::patch_error`] so the apiserver renders the K8s
+    /// 409 `Status` (reason "Conflict" + per-field causes) — NEVER a silent
+    /// overwrite.
+    ApplyConflict,
     /// Idempotent no-op (delete-not-found, etc.).
     #[default]
     NoOp,
@@ -289,6 +376,7 @@ mod tests {
                 key: key.clone(),
                 patch: serde_json::json!({"data": {"k": "v2"}}),
                 patch_type: PatchType::Strategic,
+                apply: None,
                 expected: Some(crate::revision::Revision(3)),
                 reason: Reason::Admission,
             },
@@ -303,6 +391,56 @@ mod tests {
             let s = serde_json::to_string(&cmd).unwrap();
             let back: ResourceCommand = serde_json::from_str(&s).unwrap();
             assert_eq!(back, cmd);
+        }
+    }
+
+    #[test]
+    fn patch_deserializes_pre_apply_field_log_entry_as_none() {
+        // Forward-compat: a serialized Patch from BEFORE the `apply` field
+        // existed deserializes with apply == None — the same #[serde(default)]
+        // contract default_patch_type/deletion_timestamp rely on, keeping
+        // non-SSA patches byte-identical.
+        let legacy = serde_json::json!({
+            "kind": "patch",
+            "key": ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm"),
+            "patch": {"data": {"k": "v"}},
+            "patch_type": "strategic",
+            "expected": null,
+            "reason": "operator"
+        });
+        let cmd: ResourceCommand = serde_json::from_value(legacy).unwrap();
+        match cmd {
+            ResourceCommand::Patch { apply, .. } => assert_eq!(apply, None),
+            other => panic!("expected Patch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_ssa_constructor_round_trips() {
+        let cmd = ResourceCommand::apply_ssa(
+            ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm"),
+            serde_json::json!({"data": {"a": "1"}}),
+            ApplyMeta {
+                manager: "kubectl".into(),
+                force: true,
+                time: "2026-06-08T00:00:00Z".into(),
+            },
+            None,
+            Reason::Operator,
+        );
+        let s = serde_json::to_string(&cmd).unwrap();
+        let back: ResourceCommand = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, cmd);
+        match back {
+            ResourceCommand::Patch {
+                patch_type, apply, ..
+            } => {
+                assert_eq!(patch_type, PatchType::Apply);
+                let meta = apply.expect("apply meta present");
+                assert_eq!(meta.manager, "kubectl");
+                assert!(meta.force);
+            }
+            other => panic!("expected Patch, got {other:?}"),
         }
     }
 

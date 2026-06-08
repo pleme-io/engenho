@@ -28,7 +28,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{PatchType, Reason, ResourceCommand},
+    command::{Reason, ResourceCommand},
     resource::ResourceKey,
 };
 use serde_json::{Value, json};
@@ -279,13 +279,11 @@ impl Controller for HorizontalPodAutoscalerController {
                 "HPA scaling"
             );
             self.store
-                .propose(ResourceCommand::Patch {
-                    key: target_key,
-                    patch: json!({"spec": {"replicas": desired}}),
-                    patch_type: PatchType::Merge,
-                    expected: None,
-                    reason: Reason::Controller,
-                })
+                .propose(ResourceCommand::patch(
+                    target_key,
+                    json!({"spec": {"replicas": desired}}),
+                    Reason::Controller,
+                ))
                 .await?;
             report.objects_changed += 1;
         }

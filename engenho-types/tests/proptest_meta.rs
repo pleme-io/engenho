@@ -53,6 +53,7 @@ fn arb_object_meta() -> impl Strategy<Value = ObjectMeta> {
                 deletion_grace_period_seconds: None,
                 finalizers: fins,
                 generation: generation_val,
+                managed_fields: Vec::new(),
             },
         )
 }
