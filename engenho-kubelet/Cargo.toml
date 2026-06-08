@@ -20,6 +20,7 @@ thiserror          = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 anyhow             = { workspace = true }
+reqwest            = { workspace = true }
 
 engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }

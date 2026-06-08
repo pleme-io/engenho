@@ -6,15 +6,17 @@
 //! receive a typed `ContainerSpec` + return a typed
 //! `ContainerStatus`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::error::KubeletError;
+use crate::probe::HttpScheme;
 
 /// Spec describing what the kubelet wants the backend to run.
 /// Distilled from `engenho_types::core_v1::Pod.spec.containers[0]`.
@@ -115,6 +117,42 @@ impl LogOptions {
     }
 }
 
+/// The outcome of an `exec`-probe run inside a container — `podman exec
+/// <id> <argv...>` reduced to the typed result the prober consumes. Per K8s,
+/// `exit_code == 0` is the only success; the prober ignores stdout/stderr but
+/// they are captured for diagnostics. Serde-derived per TYPED EMISSION.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecOutcome {
+    /// Process exit code (`0` = success / healthy).
+    pub exit_code: i32,
+    /// Captured stdout (diagnostics).
+    pub stdout: String,
+    /// Captured stderr (diagnostics).
+    pub stderr: String,
+}
+
+impl ExecOutcome {
+    /// Convenience constructor for a clean exit (code 0, no output).
+    #[must_use]
+    pub fn success() -> Self {
+        Self {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    /// Convenience constructor for a failed exit with `code`.
+    #[must_use]
+    pub fn failure(code: i32) -> Self {
+        Self {
+            exit_code: code,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+}
+
 /// The pluggable container runtime trait. Pure runtime —
 /// host-effecting; no I/O in trait shape, but every method
 /// performs side-effecting work on the host.
@@ -122,6 +160,28 @@ impl LogOptions {
 pub trait ContainerRuntime: Send + Sync {
     /// Stable identifier for telemetry.
     fn name(&self) -> &'static str;
+
+    /// Run `argv` inside a previously-started container (`podman exec <id>
+    /// <argv...>`). The SOLE runtime capability the exec-probe path needs —
+    /// exec MUST go through the runtime because it requires the container's
+    /// namespace (unlike httpGet/tcpSocket, which target the routable pod IP
+    /// and go through the separate [`NetProber`] seam).
+    ///
+    /// Returns a typed [`ExecOutcome`] (`exit_code == 0` = healthy). A spawn /
+    /// I/O failure that prevents the exec from RUNNING is a typed
+    /// [`KubeletError::Backend`]; a process that ran and exited non-zero is a
+    /// successful call returning a non-zero `exit_code` (the prober maps that
+    /// to a probe failure, NOT a backend error).
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] if the runtime could not run the exec at all
+    /// (no such container, spawn failure).
+    async fn exec(
+        &self,
+        container_id: &str,
+        argv: &[String],
+    ) -> Result<ExecOutcome, KubeletError>;
 
     /// Start a container matching `spec`. Returns the new
     /// container's status (post-start; pod_ip may take a moment
@@ -206,6 +266,22 @@ struct FakeState {
     /// `"<name> log line\n"` is used. Lets a test pin exact stdout (e.g.
     /// `hello-engenho`) before the container starts.
     seeded_logs_by_name: BTreeMap<String, String>,
+    /// Programmable exec results keyed by CONTAINER NAME (the `spec.name`):
+    /// each `exec` call pops the FRONT of the queue. An empty / absent queue
+    /// for a container yields the default [`FakeBackend::default_exec`]
+    /// outcome so a probe with no seeding still gets a deterministic answer.
+    /// Seeded via [`FakeBackend::seed_exec`]. The exec call resolves the
+    /// container NAME from the started spec (so a test seeds by the
+    /// `<ns>_<pod>_<cname>` backend name, matching `seed_log`).
+    seeded_exec_by_name: BTreeMap<String, VecDeque<ExecOutcome>>,
+    /// The default exec outcome (used when a container has no seeded queue or
+    /// the queue is drained). Defaults to success (exit 0) so a probe with no
+    /// explicit seeding passes — tests opt into failure via `seed_exec` or
+    /// `set_default_exec`.
+    default_exec: Option<ExecOutcome>,
+    /// Maps a backend `container_id` → the spec NAME it was started under, so
+    /// `exec(container_id, ...)` can look up the name-keyed seeded queue.
+    id_to_name: BTreeMap<String, String>,
 }
 
 /// Operation log entry for `FakeBackend`. Tests assert this shape
@@ -290,12 +366,68 @@ impl FakeBackend {
     pub async fn log_of(&self, container_id: &str) -> Option<String> {
         self.inner.lock().await.logs.get(container_id).cloned()
     }
+
+    /// Test hook: program a SEQUENCE of [`ExecOutcome`]s that successive
+    /// `exec` calls against the container of name `container_name` (the
+    /// `spec.name`, i.e. `<ns>_<pod>_<cname>`) will return, FRONT first. Each
+    /// `exec` pops one; when the queue drains, the default exec outcome
+    /// applies (success unless [`FakeBackend::set_default_exec`] overrode it).
+    ///
+    /// This is the testability contract for the prober: seed
+    /// `[failure, failure, success]` and a readiness probe flips ready at the
+    /// right tick; seed all-failure and a liveness probe restarts — WITHOUT a
+    /// real container.
+    pub async fn seed_exec(
+        &self,
+        container_name: &str,
+        outcomes: impl IntoIterator<Item = ExecOutcome>,
+    ) {
+        let mut state = self.inner.lock().await;
+        state
+            .seeded_exec_by_name
+            .entry(container_name.to_string())
+            .or_default()
+            .extend(outcomes);
+    }
+
+    /// Test hook: set the DEFAULT exec outcome used when a container has no
+    /// seeded queue (or it has drained). Lets a test make EVERY exec fail
+    /// (e.g. always-failing liveness) with one call instead of seeding an
+    /// unbounded queue.
+    pub async fn set_default_exec(&self, outcome: ExecOutcome) {
+        self.inner.lock().await.default_exec = Some(outcome);
+    }
 }
 
 #[async_trait]
 impl ContainerRuntime for FakeBackend {
     fn name(&self) -> &'static str {
         "fake"
+    }
+
+    async fn exec(
+        &self,
+        container_id: &str,
+        _argv: &[String],
+    ) -> Result<ExecOutcome, KubeletError> {
+        let mut state = self.inner.lock().await;
+        // A not-tracked container is a typed backend error (never a fake pass).
+        if !state.containers.contains_key(container_id) {
+            return Err(KubeletError::Backend(format!(
+                "no such container for exec: {container_id}"
+            )));
+        }
+        // Resolve the spec NAME this id was started under, then pop the front
+        // of its seeded queue; fall back to the configured default (success).
+        let name = state.id_to_name.get(container_id).cloned();
+        let popped = name
+            .as_deref()
+            .and_then(|n| state.seeded_exec_by_name.get_mut(n))
+            .and_then(VecDeque::pop_front);
+        let outcome = popped
+            .or_else(|| state.default_exec.clone())
+            .unwrap_or_else(ExecOutcome::success);
+        Ok(outcome)
     }
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
@@ -317,6 +449,11 @@ impl ContainerRuntime for FakeBackend {
             .cloned()
             .unwrap_or_else(|| format!("{} log line\n", spec.name));
         state.logs.insert(container_id.clone(), log_content);
+        // Record id → spec-name so a later exec(container_id, ...) can resolve
+        // the name-keyed seeded exec queue.
+        state
+            .id_to_name
+            .insert(container_id.clone(), spec.name.clone());
         state.specs.insert(container_id, spec.clone());
         state.events.push(FakeEvent::Start(spec.name.clone()));
         Ok(status)
@@ -347,6 +484,7 @@ impl ContainerRuntime for FakeBackend {
         state.containers.remove(container_id);
         state.specs.remove(container_id);
         state.logs.remove(container_id);
+        state.id_to_name.remove(container_id);
         state
             .events
             .push(FakeEvent::Remove(container_id.to_string()));
@@ -700,6 +838,17 @@ impl PodmanBackend {
         ]
     }
 
+    /// `podman exec <id> <argv...>` for an exec-probe run. Pure (no podman) so
+    /// the argv is unit-testable. The probe `command` is an argv (no shell) —
+    /// each element is a separate token (TYPED EMISSION: `Command::arg` per
+    /// element, never a `format!()`-joined shell string).
+    #[must_use]
+    pub fn exec_argv(id: &str, argv: &[String]) -> Vec<String> {
+        let mut out = vec!["exec".to_string(), id.to_string()];
+        out.extend(argv.iter().cloned());
+        out
+    }
+
     /// `podman stop` argv for `id`.
     #[must_use]
     pub fn stop_argv(id: &str) -> Vec<String> {
@@ -848,6 +997,28 @@ impl ContainerRuntime for PodmanBackend {
         "podman"
     }
 
+    async fn exec(
+        &self,
+        container_id: &str,
+        argv: &[String],
+    ) -> Result<ExecOutcome, KubeletError> {
+        let cmd_argv = Self::exec_argv(container_id, argv);
+        let out = self
+            .command(&cmd_argv)
+            .output()
+            .await
+            .map_err(|e| KubeletError::Backend(format!("podman exec spawn: {e}")))?;
+        // A process that RAN and exited non-zero is a valid ExecOutcome (the
+        // prober maps non-zero → probe failure); only a missing exit status
+        // (signal-killed with no code) is treated as a non-zero failure here.
+        let exit_code = out.status.code().unwrap_or(-1);
+        Ok(ExecOutcome {
+            exit_code,
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        })
+    }
+
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
         // (M0.3 item a) Ensure the shared engenho network exists before the
         // first run so `--network <name>` resolves. Idempotent + cheap
@@ -979,6 +1150,275 @@ impl ContainerRuntime for PodmanBackend {
         // podman writes container stdout to its own stdout; stderr carries
         // podman diagnostics (empty on success). The container log is stdout.
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+}
+
+// =================================================================
+// NetProber — the SECOND injectable seam (httpGet + tcpSocket)
+// =================================================================
+//
+// exec goes through the ContainerRuntime (it needs the container namespace);
+// httpGet/tcpSocket target the routable pod IP and have NO container-namespace
+// dependency on a single node, so a separate NetProber keeps the runtime trait
+// minimal AND keeps http/tcp unit-testable without a real socket (the trait IS
+// the testability contract — FakeNetProber seeds verdicts).
+
+/// Target for an `httpGet` probe — the pod IP + the resolved port/path/scheme.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpProbeTarget {
+    /// The pod IP to connect to (the kubelet owns it from the status poll).
+    pub ip: String,
+    /// The resolved TCP port.
+    pub port: u16,
+    /// The request path.
+    pub path: String,
+    /// HTTP/HTTPS.
+    pub scheme: HttpScheme,
+    /// Optional `Host` header override (defaults to the IP when `None`).
+    pub host: Option<String>,
+    /// Custom request headers.
+    pub headers: Vec<(String, String)>,
+    /// The per-run timeout (`timeoutSeconds`).
+    pub timeout: Duration,
+}
+
+/// Target for a `tcpSocket` probe — the pod IP + resolved port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TcpProbeTarget {
+    /// The pod IP to connect to.
+    pub ip: String,
+    /// The resolved TCP port.
+    pub port: u16,
+    /// Optional host override (defaults to the IP when `None`).
+    pub host: Option<String>,
+    /// The per-run timeout (`timeoutSeconds`).
+    pub timeout: Duration,
+}
+
+/// Typed I/O failure for a network probe. The prober's `run_handler` maps ANY
+/// of these to a probe `Failure` (never aborts the tick) — so this error never
+/// escapes the prober, but it's typed for diagnostics + the mock contract.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ProbeIoError {
+    /// The connection was refused / reset / unreachable.
+    #[error("connect failed to {target}: {reason}")]
+    Connect {
+        /// `ip:port` label.
+        target: String,
+        /// Underlying reason.
+        reason: String,
+    },
+    /// The request timed out.
+    #[error("probe timed out to {target}")]
+    Timeout {
+        /// `ip:port` label.
+        target: String,
+    },
+    /// Any other I/O error (DNS, TLS, malformed response).
+    #[error("probe io error: {0}")]
+    Io(String),
+}
+
+/// The network-probe seam: httpGet + tcpSocket against the routable pod IP.
+/// Held by the [`Kubelet`](crate::Kubelet) as `Arc<dyn NetProber>`, defaulting
+/// to [`TokioNetProber`], overridable for tests with [`FakeNetProber`].
+#[async_trait]
+pub trait NetProber: Send + Sync {
+    /// Issue an HTTP GET against `target`; return the HTTP status code. The
+    /// prober treats 2xx/3xx as success.
+    ///
+    /// # Errors
+    ///
+    /// [`ProbeIoError`] on connect-refused / timeout / I/O error (the prober
+    /// maps any of these to a probe failure).
+    async fn http_get(&self, target: &HttpProbeTarget) -> Result<u16, ProbeIoError>;
+
+    /// Open a TCP connection to `target` (and immediately close it — proving
+    /// only that the port is listening).
+    ///
+    /// # Errors
+    ///
+    /// [`ProbeIoError`] on connect-refused / timeout.
+    async fn tcp_connect(&self, target: &TcpProbeTarget) -> Result<(), ProbeIoError>;
+}
+
+/// Real network prober. `tcpSocket` uses [`tokio::net::TcpStream::connect`];
+/// `httpGet` uses a minimal `reqwest` client. URLs are composed via a typed
+/// builder (never a `format!()` of URL syntax beyond the host:port authority,
+/// which `reqwest` re-parses) — per TYPED EMISSION.
+#[derive(Default)]
+pub struct TokioNetProber;
+
+impl TokioNetProber {
+    /// New real net prober.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl NetProber for TokioNetProber {
+    async fn http_get(&self, target: &HttpProbeTarget) -> Result<u16, ProbeIoError> {
+        // Compose the URL via reqwest's typed URL parser (host authority +
+        // path). The path is taken verbatim from the probe spec.
+        let authority = format!("{}:{}", target.ip, target.port);
+        let path = if target.path.starts_with('/') {
+            target.path.clone()
+        } else {
+            format!("/{}", target.path)
+        };
+        let url = reqwest::Url::parse(&format!("{}://{authority}{path}", target.scheme.as_str()))
+            .map_err(|e| ProbeIoError::Io(format!("bad probe url: {e}")))?;
+        let client = reqwest::Client::builder()
+            .timeout(target.timeout)
+            // Probes accept self-signed certs (K8s does not verify probe TLS).
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| ProbeIoError::Io(format!("http client build: {e}")))?;
+        let mut req = client.get(url);
+        // Host override → Host header; custom headers appended.
+        if let Some(host) = &target.host {
+            req = req.header("Host", host);
+        }
+        for (k, v) in &target.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        match req.send().await {
+            Ok(resp) => Ok(resp.status().as_u16()),
+            Err(e) if e.is_timeout() => Err(ProbeIoError::Timeout { target: authority }),
+            Err(e) if e.is_connect() => Err(ProbeIoError::Connect {
+                target: authority,
+                reason: e.to_string(),
+            }),
+            Err(e) => Err(ProbeIoError::Io(e.to_string())),
+        }
+    }
+
+    async fn tcp_connect(&self, target: &TcpProbeTarget) -> Result<(), ProbeIoError> {
+        let authority = format!("{}:{}", target.ip, target.port);
+        let connect = tokio::net::TcpStream::connect(&authority);
+        match tokio::time::timeout(target.timeout, connect).await {
+            Ok(Ok(_stream)) => Ok(()), // drop closes the stream immediately
+            Ok(Err(e)) => Err(ProbeIoError::Connect {
+                target: authority,
+                reason: e.to_string(),
+            }),
+            Err(_elapsed) => Err(ProbeIoError::Timeout { target: authority }),
+        }
+    }
+}
+
+/// Mock network prober for tests — seeds per-`(ip,port,path)` verdicts so
+/// http/tcp probe logic is unit-testable WITHOUT a real socket. The trait IS
+/// the testability contract.
+#[derive(Default, Clone)]
+pub struct FakeNetProber {
+    inner: Arc<Mutex<FakeNetState>>,
+}
+
+#[derive(Default)]
+struct FakeNetState {
+    /// Programmed HTTP status codes keyed by `(ip, port, path)`, popped FRONT
+    /// first; an absent / drained queue falls back to `default_http`.
+    http: BTreeMap<(String, u16, String), VecDeque<u16>>,
+    /// Programmed TCP connect verdicts keyed by `(ip, port)`, popped FRONT
+    /// first (`true` = connect ok); falls back to `default_tcp`.
+    tcp: BTreeMap<(String, u16), VecDeque<bool>>,
+    /// Default HTTP status when no queue applies (defaults to 503 = fail, so a
+    /// probe with no seeding does NOT spuriously pass).
+    default_http: u16,
+    /// Default TCP verdict when no queue applies (defaults to false = refused).
+    default_tcp: bool,
+}
+
+impl FakeNetProber {
+    /// Fresh prober: default HTTP 503 + default TCP refused (a probe with no
+    /// seeding fails, never a spurious pass).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(FakeNetState {
+                default_http: 503,
+                default_tcp: false,
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// Seed a SEQUENCE of HTTP status codes for `(ip, port, path)`, FRONT
+    /// first.
+    pub async fn seed_http(
+        &self,
+        ip: &str,
+        port: u16,
+        path: &str,
+        statuses: impl IntoIterator<Item = u16>,
+    ) {
+        let mut state = self.inner.lock().await;
+        state
+            .http
+            .entry((ip.to_string(), port, path.to_string()))
+            .or_default()
+            .extend(statuses);
+    }
+
+    /// Seed a SEQUENCE of TCP connect verdicts for `(ip, port)`, FRONT first
+    /// (`true` = connect ok).
+    pub async fn seed_tcp(
+        &self,
+        ip: &str,
+        port: u16,
+        verdicts: impl IntoIterator<Item = bool>,
+    ) {
+        let mut state = self.inner.lock().await;
+        state
+            .tcp
+            .entry((ip.to_string(), port))
+            .or_default()
+            .extend(verdicts);
+    }
+
+    /// Set the default HTTP status (used when a target has no seeded queue).
+    pub async fn set_default_http(&self, status: u16) {
+        self.inner.lock().await.default_http = status;
+    }
+
+    /// Set the default TCP verdict (used when a target has no seeded queue).
+    pub async fn set_default_tcp(&self, ok: bool) {
+        self.inner.lock().await.default_tcp = ok;
+    }
+}
+
+#[async_trait]
+impl NetProber for FakeNetProber {
+    async fn http_get(&self, target: &HttpProbeTarget) -> Result<u16, ProbeIoError> {
+        let mut state = self.inner.lock().await;
+        let key = (target.ip.clone(), target.port, target.path.clone());
+        let status = state
+            .http
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or(state.default_http);
+        Ok(status)
+    }
+
+    async fn tcp_connect(&self, target: &TcpProbeTarget) -> Result<(), ProbeIoError> {
+        let mut state = self.inner.lock().await;
+        let key = (target.ip.clone(), target.port);
+        let ok = state
+            .tcp
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or(state.default_tcp);
+        if ok {
+            Ok(())
+        } else {
+            Err(ProbeIoError::Connect {
+                target: format!("{}:{}", target.ip, target.port),
+                reason: "fake refused".to_string(),
+            })
+        }
     }
 }
 

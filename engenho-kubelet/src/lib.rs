@@ -43,16 +43,23 @@ pub mod config_bridge;
 pub mod error;
 pub mod kubelet;
 pub mod lifecycle;
+pub mod probe;
 pub mod volume;
 
 pub use backend::{
-    ContainerRuntime, ContainerStatus, FakeBackend, LogOptions, PodmanBackend, PullPolicy,
+    ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeNetProber, HttpProbeTarget,
+    LogOptions, NetProber, PodmanBackend, ProbeIoError, PullPolicy, TcpProbeTarget, TokioNetProber,
 };
 pub use config_bridge::make_container_runtime;
 pub use error::KubeletError;
-pub use kubelet::Kubelet;
+pub use kubelet::{Kubelet, TestClock};
 pub use lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
+};
+pub use probe::{
+    HttpScheme, ProbeHandler, ProbeKind, ProbeObservation, ProbeParseError, ProbePort,
+    ProbeRuntime, ProbeSpec, ProbeTiming, ProbeVerdict, aggregate_container_readiness,
+    fold_probe_observation, run_handler,
 };
 pub use volume::{
     AccessMode, FakeVolumeBackend, FakeVolumeEvent, HostPathVolumeBackend, MountedVolume,

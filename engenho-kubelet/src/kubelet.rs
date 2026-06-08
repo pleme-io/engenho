@@ -32,10 +32,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use engenho_controllers::{
-    Controller, ControllerError, ReconcileOutcome, ReconcileReport,
+    Controller, ControllerError, ReconcileOutcome, ReconcileReport, ReconcileResult,
     dns::DEFAULT_CLUSTER_DOMAIN,
     selector::{matches_labels, service_selector},
     status::{resource_version_of, write_status_cas},
@@ -45,14 +46,69 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::backend::{ContainerRuntime, ContainerSpec, LogOptions};
+use crate::backend::{ContainerRuntime, ContainerSpec, LogOptions, NetProber, TokioNetProber};
 use crate::error::KubeletError;
 use crate::lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
 };
+use crate::probe::{
+    ProbeKind, ProbeRuntime, ProbeSpec, aggregate_container_readiness, fold_probe_observation,
+    run_handler,
+};
+
+/// The lowest period the kubelet will requeue at — a 1s floor so a
+/// `periodSeconds: 1` probe does not spin the loop faster than the runtime can
+/// service it. Mirrors the K8s min period.
+const MIN_PROBE_REQUEUE: Duration = Duration::from_secs(1);
+
+/// The three probes (liveness/readiness/startup) a container may carry, each
+/// paired with its persistent [`ProbeRuntime`] counters. Lives on the
+/// per-container [`ContainerRecord`] so the counters persist across ticks (like
+/// `restart_count`) + reset on a container restart (fresh startup window).
+///
+/// `None` for a probe the container doesn't declare. An all-`None`
+/// `ContainerProbeState` is the behavior-preserving common case: no probe ⇒
+/// `aggregate_container_readiness` returns `ready = is_running`, byte-identical
+/// to the pre-probe kubelet.
+#[derive(Clone, Debug, Default)]
+struct ContainerProbeState {
+    liveness: Option<(ProbeSpec, ProbeRuntime)>,
+    readiness: Option<(ProbeSpec, ProbeRuntime)>,
+    startup: Option<(ProbeSpec, ProbeRuntime)>,
+}
+
+impl ContainerProbeState {
+    /// `true` iff the container declares NO probes (the behavior-preserving
+    /// common case — no requeue armed, ready mirrors is_running).
+    fn is_empty(&self) -> bool {
+        self.liveness.is_none() && self.readiness.is_none() && self.startup.is_none()
+    }
+
+    /// Reset all probe runtimes to a fresh window (called on a container
+    /// restart so the startup gate re-arms + counters zero). Preserves the
+    /// parsed specs.
+    fn reset(&mut self, now: Instant) {
+        for (_, rt) in [&mut self.liveness, &mut self.readiness, &mut self.startup]
+            .into_iter()
+            .flatten()
+        {
+            *rt = ProbeRuntime::new(now);
+        }
+    }
+}
+
+/// The aggregated probe decision for one running container this tick: its
+/// effective readiness + whether a liveness/startup verdict requests a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbeOutcome {
+    /// The container's effective `ready` (→ `containerStatuses[].ready`).
+    ready: bool,
+    /// `true` iff a liveness/startup verdict (post-gating) requests a restart.
+    needs_restart: bool,
+}
 
 /// What the kubelet remembers about ONE container of a Pod it started.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct ContainerRecord {
     /// Opaque backend handle returned by `backend.start` for this container.
     /// Re-assigned on a restart (the backend mints a new id).
@@ -60,6 +116,9 @@ struct ContainerRecord {
     /// How many times this container has been (re)started. `0` on the first
     /// start; bumped on each restart-policy-driven re-`start`.
     restart_count: u32,
+    /// Per-container probe specs + runtime counters (liveness/readiness/
+    /// startup). Default = all-None = no probes = behavior-preserving.
+    probes: ContainerProbeState,
 }
 
 /// What the kubelet remembers about a Pod it started on this node.
@@ -78,12 +137,70 @@ struct LocalPod {
     containers: BTreeMap<String, ContainerRecord>,
 }
 
+/// The kubelet's clock — a `now()` source. Defaults to [`Instant::now`];
+/// tests inject a controllable clock so probe `period` / `initialDelay`
+/// cadence is exercised deterministically without sleeping (the Environment
+/// trait discipline applied to time — the prober's period logic is testable
+/// WITHOUT wall-clock waits).
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// A controllable test clock: a shared [`Instant`] the test advances. Wrap in a
+/// [`Clock`] via [`TestClock::as_clock`].
+#[derive(Clone)]
+pub struct TestClock {
+    inner: Arc<std::sync::Mutex<Instant>>,
+}
+
+impl TestClock {
+    /// New test clock anchored at the current instant.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(Instant::now())),
+        }
+    }
+
+    /// Advance the clock by `delta`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while held) —
+    /// test-only, so a poisoned clock is a test bug to surface, not absorb.
+    pub fn advance(&self, delta: Duration) {
+        let mut g = self.inner.lock().unwrap();
+        *g += delta;
+    }
+
+    /// A [`Clock`] reading this test clock. The returned closure panics if the
+    /// internal mutex is poisoned (test-only).
+    #[must_use]
+    pub fn as_clock(&self) -> Clock {
+        let inner = self.inner.clone();
+        Arc::new(move || *inner.lock().unwrap())
+    }
+}
+
+impl Default for TestClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-node kubelet. Implements [`Controller`] so it slots into the
 /// standard [`engenho_controllers::ControllerRuntime`] + benefits from
 /// `WatchDriver` event-driven wakeup.
 pub struct Kubelet {
     store: Arc<StoreMesh>,
     backend: Arc<dyn ContainerRuntime>,
+    /// The network-probe seam (httpGet + tcpSocket against the pod IP).
+    /// Defaults to [`TokioNetProber`]; tests inject a `FakeNetProber` via
+    /// [`Kubelet::with_net_prober`]. Held separately from `backend` because
+    /// http/tcp target a routable IP (no container-namespace dependency) — see
+    /// the [`NetProber`] doc.
+    net_prober: Arc<dyn NetProber>,
+    /// The `now()` source (defaults to [`Instant::now`]; overridable for
+    /// deterministic probe-cadence tests via [`Kubelet::with_clock`]).
+    clock: Clock,
     node_name: String,
     /// Bookkeeping for every Pod we started, keyed by its typed
     /// [`ResourceKey`]. Persists for the kubelet's process lifetime; on
@@ -93,7 +210,7 @@ pub struct Kubelet {
 }
 
 impl Kubelet {
-    /// Construct a kubelet for `node_name`.
+    /// Construct a kubelet for `node_name` with the real [`TokioNetProber`].
     #[must_use]
     pub fn new(
         store: Arc<StoreMesh>,
@@ -103,9 +220,34 @@ impl Kubelet {
         Self {
             store,
             backend,
+            net_prober: Arc::new(TokioNetProber::new()),
+            clock: Arc::new(Instant::now),
             node_name: node_name.into(),
             local: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Builder: override the [`NetProber`] (httpGet/tcpSocket seam). Tests pass
+    /// a `FakeNetProber` so http/tcp probe logic is exercised without a real
+    /// socket; production keeps the default [`TokioNetProber`].
+    #[must_use]
+    pub fn with_net_prober(mut self, net_prober: Arc<dyn NetProber>) -> Self {
+        self.net_prober = net_prober;
+        self
+    }
+
+    /// Builder: override the clock (defaults to [`Instant::now`]). Tests inject
+    /// a [`TestClock`] so probe-cadence (`period` / `initialDelay`) is exercised
+    /// deterministically without sleeping.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The current instant per this kubelet's clock.
+    fn now(&self) -> Instant {
+        (self.clock)()
     }
 
     /// This kubelet's node name (telemetry helper).
@@ -213,6 +355,75 @@ impl Kubelet {
             ));
         }
         Ok(out)
+    }
+
+    /// Parse the three probes (`livenessProbe`/`readinessProbe`/
+    /// `startupProbe`) of a single `spec.containers[i]` JSON object into a
+    /// [`ContainerProbeState`], resolving named ports against the container's
+    /// own `ports[]`. The probe specs are parsed; their [`ProbeRuntime`]
+    /// counters are stamped from `now` (the container's start instant).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a [`ProbeParseError`](crate::probe::ProbeParseError) (mapped
+    /// to a typed [`KubeletError::InvalidPod`]) for a no-handler / grpc /
+    /// unresolved-port probe — the pod is skipped, NEVER a fake pass.
+    fn parse_container_probes(
+        container: &Value,
+        pod_label: &str,
+        now: Instant,
+    ) -> Result<ContainerProbeState, KubeletError> {
+        // Resolve the container's named ports once for port resolution.
+        let ports: Vec<(String, u16)> = container
+            .get("ports")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| {
+                        let name = p.get("name").and_then(|n| n.as_str())?.to_string();
+                        let number = p.get("containerPort").and_then(serde_json::Value::as_i64)?;
+                        u16::try_from(number).ok().map(|n| (name, n))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let parse_one = |field: &str, kind: ProbeKind| -> Result<Option<(ProbeSpec, ProbeRuntime)>, KubeletError> {
+            match container.get(field) {
+                None => Ok(None),
+                Some(probe) => {
+                    let spec = ProbeSpec::from_k8s(kind, probe, &ports).map_err(|e| {
+                        KubeletError::InvalidPod {
+                            pod: pod_label.to_string(),
+                            reason: format!("{field}: {e}"),
+                        }
+                    })?;
+                    Ok(Some((spec, ProbeRuntime::new(now))))
+                }
+            }
+        };
+
+        Ok(ContainerProbeState {
+            liveness: parse_one("livenessProbe", ProbeKind::Liveness)?,
+            readiness: parse_one("readinessProbe", ProbeKind::Readiness)?,
+            startup: parse_one("startupProbe", ProbeKind::Startup)?,
+        })
+    }
+
+    /// Look up a single `spec.containers[i]` JSON object by its logical name
+    /// (`spec.containers[i].name`, with the same positional fallback
+    /// `pod_to_container_specs` uses). Returns the raw `Value` so probe parsing
+    /// reads from the same JSON-driven source as the rest of the kubelet.
+    fn container_json<'a>(pod: &'a Value, cname: &str) -> Option<&'a Value> {
+        let containers = pod.get("spec")?.get("containers")?.as_array()?;
+        containers.iter().enumerate().find(|(i, c)| {
+            let name = c
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| if *i == 0 { "main".to_string() } else { format!("container-{i}") });
+            name == cname
+        }).map(|(_, c)| c)
     }
 
     /// Read the Pod's `spec.restartPolicy` into the typed [`RestartPolicy`].
@@ -342,10 +553,21 @@ impl Kubelet {
     /// Build the desired Pod `status` from the typed
     /// `(PodPhase, Vec<ContainerStatusOut>)` fold output + the pod's IP.
     ///
-    /// The pod-level `Ready` condition is `True` iff the phase is `Running`
-    /// AND every container is ready (running). Probes are deferred — see the
-    /// crate scope; Ready reflects container-running only, never a fake probe
-    /// pass.
+    /// The pod-level conditions are the standard K8s pair:
+    ///   * `ContainersReady = phase==Running AND all containerStatuses[].ready`
+    ///     — the readiness AND across containers. With the probe brick,
+    ///     `containerStatuses[].ready` sources from the readiness-probe verdict
+    ///     (or `is_running` when there is no readiness probe — behavior-
+    ///     preserving).
+    ///   * `Ready = ContainersReady AND all readinessGates`. No readinessGates
+    ///     today ⇒ `Ready == ContainersReady` whenever Running. Both are
+    ///     `False` while the phase is not `Running`.
+    ///
+    /// Emitting BOTH conditions (deterministically ordered: `ContainersReady`
+    /// then `Ready`) on EVERY write keeps the Running↔Running steady state
+    /// byte-identical → `write_status_cas` yields `NoChange` → no watch storm.
+    /// A probe that legitimately flips ready True→False→True produces a changed
+    /// status (the signal kubectl shows); steady-passing produces `NoChange`.
     ///
     /// `pod_ip` is retained for a terminated Pod too (K8s keeps the last IP),
     /// which ALSO keeps the field set stable across Running→terminal so the
@@ -364,17 +586,30 @@ impl Kubelet {
             PodPhase::Failed => "Failed",
             PodPhase::Unknown => "Unknown",
         };
-        // Pod Ready = phase Running AND all containers ready. A non-running
-        // phase (Pending / terminal) is never Ready.
-        let ready = matches!(phase, PodPhase::Running) && statuses.iter().all(|c| c.ready);
+        // ContainersReady = phase Running AND all containers ready. A non-running
+        // phase (Pending / terminal) is never ready.
+        let containers_ready =
+            matches!(phase, PodPhase::Running) && statuses.iter().all(|c| c.ready);
+        // Ready = ContainersReady AND all readinessGates (none today ⇒ mirrors
+        // ContainersReady).
+        let ready = containers_ready;
+        let status_str = |b: bool| if b { "True" } else { "False" };
         let container_statuses: Vec<Value> =
             statuses.iter().map(Self::render_container_status).collect();
+        // Deterministic order: ContainersReady then Ready (stable across writes
+        // → NoChange at steady state).
         let mut status = json!({
             "phase": phase_str,
-            "conditions": [{
-                "type": "Ready",
-                "status": if ready { "True" } else { "False" },
-            }],
+            "conditions": [
+                {
+                    "type": "ContainersReady",
+                    "status": status_str(containers_ready),
+                },
+                {
+                    "type": "Ready",
+                    "status": status_str(ready),
+                },
+            ],
             "containerStatuses": container_statuses,
         });
         if let Some(ip) = pod_ip {
@@ -445,6 +680,12 @@ impl Controller for Kubelet {
         }
 
         // ── (B)+(C) Start + running-status reconciliation over bound set ──
+        // `soonest_requeue` accumulates the smallest next-probe-due across all
+        // bound containers, so the kubelet wakes on its OWN probe clock (a
+        // one-shot Requeue) rather than only on Pod-watch events / the coarse
+        // fallback. None = no probes anywhere = no Requeue = today's wake
+        // behavior (the behavior-preserving guarantee for no-probe pods).
+        let mut soonest_requeue: Option<Duration> = None;
         for (key, value) in &bound {
             // Membership decides start (B) vs poll (C); compute it under a
             // short lock to avoid holding it across the backend await.
@@ -458,11 +699,13 @@ impl Controller for Kubelet {
                     if Self::pod_already_terminal(value) {
                         continue;
                     }
-                    self.start_bound_pod(key, value, &mut report).await?;
+                    self.start_bound_pod(key, value, &mut report, &mut soonest_requeue)
+                        .await?;
                 }
                 Some(lp) => {
                     // (C) Already started → poll + reconcile running status.
-                    self.reconcile_running(key, value, &lp, &mut report).await?;
+                    self.reconcile_running(key, value, &lp, &mut report, &mut soonest_requeue)
+                        .await?;
                 }
             }
         }
@@ -475,7 +718,15 @@ impl Controller for Kubelet {
                 "kubelet tick"
             );
         }
-        Ok(report.into())
+        // Arm a one-shot re-tick at the soonest next-probe-due (clamped to the
+        // 1s floor) so probes run on `periodSeconds`. A pod with NO probes
+        // contributes nothing → soonest_requeue stays None → ReconcileResult
+        // Done → same wake behavior as the pre-probe kubelet.
+        let result = match soonest_requeue {
+            Some(after) => ReconcileResult::Requeue(after.max(MIN_PROBE_REQUEUE)),
+            None => ReconcileResult::Done,
+        };
+        Ok(ReconcileOutcome::new(report, result))
     }
 }
 
@@ -515,6 +766,7 @@ impl Kubelet {
         key: &ResourceKey,
         value: &Value,
         report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
     ) -> Result<(), ControllerError> {
         let namespace = key.namespace.as_deref().unwrap_or("default");
         let specs = match Self::pod_to_container_specs(namespace, &key.name, value) {
@@ -529,6 +781,35 @@ impl Kubelet {
                 return Ok(());
             }
         };
+
+        // Parse the per-container probes BEFORE starting anything: a parse
+        // error (no-handler / grpc / unresolved port) skips the whole pod
+        // (NEVER a fake pass). Parsing here (not after start) means a bad probe
+        // never even starts a container. The ProbeRuntimes are stamped at the
+        // container's start instant below, but the spec parse is what can fail.
+        let now = self.now();
+        let pod_label = key.label().to_string();
+        let mut probe_state_by_cname: BTreeMap<String, ContainerProbeState> = BTreeMap::new();
+        for (cname, _spec) in &specs {
+            let Some(cjson) = Self::container_json(value, cname) else {
+                continue;
+            };
+            match Self::parse_container_probes(cjson, &pod_label, now) {
+                Ok(ps) => {
+                    probe_state_by_cname.insert(cname.clone(), ps);
+                }
+                Err(e) => {
+                    warn!(
+                        pod = %key.label(),
+                        container = %cname,
+                        error = %e,
+                        "skipping pod with invalid probe (never a fake pass)"
+                    );
+                    report.objects_skipped += 1;
+                    return Ok(());
+                }
+            }
+        }
 
         // (M0.3 cluster-DNS) Compute the Service-name aliases this Pod earns
         // ONCE (they're pod-level, not per-container) BEFORE building any run
@@ -575,6 +856,13 @@ impl Kubelet {
                         ContainerRecord {
                             container_id: status.container_id.clone(),
                             restart_count: 0,
+                            // Attach the parsed probe state (its runtimes are
+                            // stamped at `now`, the start instant). Default
+                            // (all-None) for a container with no probes.
+                            probes: probe_state_by_cname
+                                .get(&cname)
+                                .cloned()
+                                .unwrap_or_default(),
                         },
                     );
                     started_any = true;
@@ -595,21 +883,206 @@ impl Kubelet {
         // shows the started containers Running + the rest Waiting → Pending).
         if started_any {
             let lp = self.local.lock().await.get(key).cloned().unwrap_or_default();
-            self.reconcile_running(key, value, &lp, report).await?;
+            self.reconcile_running(key, value, &lp, report, soonest_requeue)
+                .await?;
         }
         Ok(())
     }
 
+    /// Run the DUE probes of one running container, fold their verdicts into
+    /// the per-container [`ProbeRuntime`]s (persisted back into `self.local`),
+    /// and return the aggregated `(ready, needs_restart)` decision via
+    /// [`ProbeOutcome`]. Also folds the container's soonest next-probe-due into
+    /// `soonest_requeue`.
+    ///
+    /// A container with NO probes short-circuits: `ready = is_running` (true,
+    /// since this is only called on a running container), `needs_restart =
+    /// false`, no requeue contributed — the behavior-preserving common case.
+    async fn run_container_probes(
+        &self,
+        record: &ContainerRecord,
+        _spec: &ContainerSpec,
+        container_id: &str,
+        pod_ip: Option<&str>,
+        now: Instant,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> ProbeOutcome {
+        // Fast path: no probes → behavior-preserving (ready = is_running).
+        if record.probes.is_empty() {
+            return ProbeOutcome {
+                ready: true,
+                needs_restart: false,
+            };
+        }
+
+        // Work on a clone of the probe state so we drive the I/O without
+        // holding the lock, then persist the advanced runtimes back.
+        let mut probes = record.probes.clone();
+
+        // Helper: for one probe slot, if due, run + fold; always fold the
+        // probe's next-due into soonest_requeue.
+        // We run them sequentially: startup first (it gates the others), then
+        // readiness + liveness. The verdicts are aggregated below.
+        let mut startup_done = true;
+        let mut has_startup = false;
+        let mut startup_needs_restart = false;
+
+        if let Some((spec, rt)) = probes.startup.as_mut() {
+            has_startup = true;
+            if rt.is_due(spec, now) {
+                let obs = run_handler(spec, &*self.backend, &*self.net_prober, container_id, pod_ip)
+                    .await;
+                let verdict = fold_probe_observation(spec, rt, obs, now);
+                startup_needs_restart = verdict.needs_restart;
+            }
+            startup_done = rt.gate_satisfied;
+            Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
+        }
+
+        let mut readiness_ready = false;
+        let mut has_readiness = false;
+        if let Some((spec, rt)) = probes.readiness.as_mut() {
+            has_readiness = true;
+            if rt.is_due(spec, now) {
+                let obs = run_handler(spec, &*self.backend, &*self.net_prober, container_id, pod_ip)
+                    .await;
+                let _ = fold_probe_observation(spec, rt, obs, now);
+            }
+            readiness_ready = rt.gate_satisfied;
+            Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
+        }
+
+        let mut liveness_needs_restart = false;
+        if let Some((spec, rt)) = probes.liveness.as_mut() {
+            if rt.is_due(spec, now) {
+                let obs = run_handler(spec, &*self.backend, &*self.net_prober, container_id, pod_ip)
+                    .await;
+                let verdict = fold_probe_observation(spec, rt, obs, now);
+                liveness_needs_restart = verdict.needs_restart;
+            }
+            Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
+        }
+
+        // Aggregate the per-kind gates into effective readiness + whether
+        // liveness restart may fire (startup window suppresses it).
+        let (effective_ready, may_run_liveness) = aggregate_container_readiness(
+            startup_done,
+            readiness_ready,
+            has_startup,
+            has_readiness,
+            /* is_running */ true,
+        );
+
+        // A startup probe that itself failed past threshold ALWAYS restarts (a
+        // container that never boots IS restarted), regardless of the gate.
+        // Liveness restart only fires once the startup window has passed.
+        let needs_restart =
+            startup_needs_restart || (may_run_liveness && liveness_needs_restart);
+
+        // Persist the advanced probe runtimes back into the local record.
+        {
+            let key_probes = &mut probes;
+            let mut local = self.local.lock().await;
+            // Find the record by container_id (the cname isn't threaded here,
+            // but container_id is stable for this tick). Iterate the pod's
+            // containers to locate it.
+            for pod in local.values_mut() {
+                if let Some(rec) = pod
+                    .containers
+                    .values_mut()
+                    .find(|r| r.container_id == container_id)
+                {
+                    rec.probes = key_probes.clone();
+                    break;
+                }
+            }
+        }
+
+        ProbeOutcome {
+            ready: effective_ready,
+            needs_restart,
+        }
+    }
+
+    /// Fold a candidate next-due `delay` into the running soonest minimum.
+    fn accumulate_requeue(soonest: &mut Option<Duration>, delay: Duration) {
+        *soonest = Some(match *soonest {
+            Some(cur) => cur.min(delay),
+            None => delay,
+        });
+    }
+
+    /// Restart ONE container (the existing stop→remove→start→record-update
+    /// sequence used by BOTH the exit-code restart path and the liveness/
+    /// startup probe restart path). Re-applies the pod-level Service aliases,
+    /// starts a fresh container, removes the old one (best-effort), bumps
+    /// `restart_count`, RESETS the container's probe runtimes (fresh startup
+    /// window), and returns the new container's status. The caller owns the
+    /// `ContainerObservation` it builds from the result.
+    ///
+    /// Errors from `start` are returned so the caller reports the failure +
+    /// retries next tick (never silent).
+    ///
+    /// ORDERING: stop THEN remove the OLD container BEFORE starting the
+    /// replacement. The new container reuses the deterministic `--name`
+    /// `<ns>_<pod>_<cname>`, so the old one (running for a liveness restart,
+    /// or exited-but-still-named for an exit-code restart) MUST be removed
+    /// first or `podman run --name` fails with "name already in use". (The
+    /// M0.2 exit-code path's start-then-remove only worked under FakeBackend,
+    /// which doesn't enforce name uniqueness — surfaced live by the liveness
+    /// restart bar.)
+    // The args are the precise restart inputs (key/value/namespace/cname/spec +
+    // old id + old restart count); threading them as one struct would add a
+    // single-use type for no clarity gain.
+    #[allow(clippy::too_many_arguments)]
+    async fn restart_container(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        namespace: &str,
+        cname: &str,
+        spec: &ContainerSpec,
+        old_container_id: &str,
+        old_restart_count: u32,
+    ) -> Result<crate::backend::ContainerStatus, KubeletError> {
+        let mut restart_spec = spec.clone();
+        let services = self.store.list("", "v1", "Service", Some(namespace)).await;
+        restart_spec.network_aliases =
+            Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
+        // Free the deterministic name first: stop THEN remove the old container
+        // (best-effort — an exited container is already stopped). Only then can
+        // the replacement reuse `--name`.
+        let _ = self.backend.stop(old_container_id).await;
+        let _ = self.backend.remove(old_container_id).await;
+        let new_status = self.backend.start(&restart_spec).await?;
+        let new_count = old_restart_count + 1;
+        let now = self.now();
+        {
+            let mut local = self.local.lock().await;
+            if let Some(rec) = local.get_mut(key).and_then(|p| p.containers.get_mut(cname)) {
+                rec.container_id.clone_from(&new_status.container_id);
+                rec.restart_count = new_count;
+                // Fresh startup window + zeroed probe counters on restart.
+                rec.probes.reset(now);
+            }
+        }
+        Ok(new_status)
+    }
+
     /// (C) Poll the backend for EVERY container of a started Pod, fold the
     /// observed states into the pod phase via [`reconcile_pod_phase`], apply
-    /// restartPolicy (restart an exited container under Always/OnFailure), and
-    /// write the multi-container status.
+    /// restartPolicy + probe verdicts (restart an exited / liveness-failing /
+    /// startup-failing container under the policy; source each container's
+    /// readiness from the readiness-probe verdict), and write the
+    /// multi-container status. The `soonest_requeue` accumulator collects the
+    /// smallest next-probe-due so `tick` can arm a one-shot re-tick.
     async fn reconcile_running(
         &self,
         key: &ResourceKey,
         value: &Value,
         lp: &LocalPod,
         report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
     ) -> Result<(), ControllerError> {
         let restart_policy = Self::pod_restart_policy(value);
         let namespace = key.namespace.as_deref().unwrap_or("default");
@@ -626,6 +1099,7 @@ impl Kubelet {
             }
         };
 
+        let now = self.now();
         let mut observations: Vec<ContainerObservation> = Vec::with_capacity(specs.len());
         let mut pod_ip: Option<String> = None;
         let mut vanished = false;
@@ -643,11 +1117,89 @@ impl Kubelet {
                     if let Some(ip) = &s.pod_ip {
                         pod_ip.get_or_insert_with(|| ip.clone());
                     }
-                    observations.push(ContainerObservation::running(
-                        cname,
-                        &record.container_id,
-                        record.restart_count,
-                    ));
+                    // ── PROBE TICK: run due probes, fold verdicts, decide the
+                    // container's effective readiness + whether liveness/startup
+                    // requests a restart. A container with NO probes short-
+                    // circuits to ready = is_running (behavior-preserving) +
+                    // contributes no requeue.
+                    let outcome = self
+                        .run_container_probes(
+                            record,
+                            spec,
+                            &record.container_id,
+                            s.pod_ip.as_deref().or(pod_ip.as_deref()),
+                            now,
+                            soonest_requeue,
+                        )
+                        .await;
+
+                    if outcome.needs_restart && restart_policy != RestartPolicy::Never {
+                        // Liveness/startup failed past threshold → restart THIS
+                        // container via the existing restart machinery
+                        // (restartPolicy:Never suppresses it — K8s semantics).
+                        match self
+                            .restart_container(
+                                key,
+                                value,
+                                namespace,
+                                cname,
+                                spec,
+                                &record.container_id,
+                                record.restart_count,
+                            )
+                            .await
+                        {
+                            Ok(new_status) => {
+                                if let Some(ip) = &new_status.pod_ip {
+                                    pod_ip.get_or_insert_with(|| ip.clone());
+                                }
+                                // A freshly-restarted container is not-ready
+                                // until its probes re-pass (startup gate / first
+                                // readiness success).
+                                observations.push(ContainerObservation {
+                                    name: cname.clone(),
+                                    state: ContainerState::Running,
+                                    container_id: Some(new_status.container_id.clone()),
+                                    restart_count: record.restart_count + 1,
+                                    ready: false,
+                                });
+                                report.objects_changed += 1;
+                                debug!(
+                                    pod = %key.label(),
+                                    container = %cname,
+                                    restart_count = record.restart_count + 1,
+                                    "kubelet restarted container (probe verdict)"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    pod = %key.label(),
+                                    container = %cname,
+                                    error = %e,
+                                    "probe-driven restart failed; retrying next tick"
+                                );
+                                observations.push(ContainerObservation {
+                                    name: cname.clone(),
+                                    state: ContainerState::Running,
+                                    container_id: Some(record.container_id.clone()),
+                                    restart_count: record.restart_count,
+                                    ready: outcome.ready,
+                                });
+                                report.objects_skipped += 1;
+                            }
+                        }
+                    } else {
+                        // No restart this tick → readiness sources from the
+                        // probe verdict (REPLACING the hard-`true`). A no-probe
+                        // container's outcome.ready == is_running (true here).
+                        observations.push(ContainerObservation {
+                            name: cname.clone(),
+                            state: ContainerState::Running,
+                            container_id: Some(record.container_id.clone()),
+                            restart_count: record.restart_count,
+                            ready: outcome.ready,
+                        });
+                    }
                 }
                 Ok(Some(s)) => {
                     // Terminated. Retain the last pod_ip (K8s keeps it).
@@ -658,47 +1210,36 @@ impl Kubelet {
                     // restartPolicy: restart THIS one container if the policy
                     // says so (Always, or OnFailure+nonzero). The pod stays
                     // Running across the restart (reconcile_pod_phase folds a
-                    // restartable-terminated container to Running).
+                    // restartable-terminated container to Running). Uses the
+                    // shared restart_container helper (same stop→remove→start→
+                    // record-update + probe-reset as the liveness path).
                     if restart_policy.should_restart(s.exit_code) {
-                        let mut restart_spec = spec.clone();
-                        // Re-apply pod-level aliases for the restarted container.
-                        let services =
-                            self.store.list("", "v1", "Service", Some(namespace)).await;
-                        restart_spec.network_aliases = Self::service_aliases_for_pod(
-                            value,
-                            namespace,
-                            &services,
-                            DEFAULT_CLUSTER_DOMAIN,
-                        );
-                        match self.backend.start(&restart_spec).await {
+                        match self
+                            .restart_container(
+                                key,
+                                value,
+                                namespace,
+                                cname,
+                                spec,
+                                &record.container_id,
+                                record.restart_count,
+                            )
+                            .await
+                        {
                             Ok(new_status) => {
-                                // Remove the old (exited) container so it
-                                // doesn't leak; best-effort (already exited).
-                                let _ = self.backend.remove(&record.container_id).await;
-                                let new_count = record.restart_count + 1;
-                                {
-                                    let mut local = self.local.lock().await;
-                                    if let Some(rec) = local
-                                        .get_mut(key)
-                                        .and_then(|p| p.containers.get_mut(cname))
-                                    {
-                                        rec.container_id = new_status.container_id.clone();
-                                        rec.restart_count = new_count;
-                                    }
-                                }
                                 if let Some(ip) = &new_status.pod_ip {
                                     pod_ip.get_or_insert_with(|| ip.clone());
                                 }
                                 observations.push(ContainerObservation::running(
                                     cname,
                                     &new_status.container_id,
-                                    new_count,
+                                    record.restart_count + 1,
                                 ));
                                 report.objects_changed += 1;
                                 debug!(
                                     pod = %key.label(),
                                     container = %cname,
-                                    restart_count = new_count,
+                                    restart_count = record.restart_count + 1,
                                     "kubelet restarted exited container (restartPolicy)"
                                 );
                             }
@@ -1010,8 +1551,12 @@ mod tests {
         let status = Kubelet::build_pod_status(PodPhase::Running, &statuses, Some("10.42.0.5"));
         assert_eq!(status["phase"], "Running");
         assert_eq!(status["podIP"], "10.42.0.5");
-        assert_eq!(status["conditions"][0]["type"], "Ready");
+        // Deterministic pair: ContainersReady then Ready, both True when Running
+        // + all containers ready.
+        assert_eq!(status["conditions"][0]["type"], "ContainersReady");
         assert_eq!(status["conditions"][0]["status"], "True");
+        assert_eq!(status["conditions"][1]["type"], "Ready");
+        assert_eq!(status["conditions"][1]["status"], "True");
         assert_eq!(status["containerStatuses"][0]["name"], "web");
         assert_eq!(status["containerStatuses"][0]["ready"], true);
         assert!(status["containerStatuses"][0]["state"]["running"].is_object());
@@ -1031,7 +1576,11 @@ mod tests {
         }];
         let status = Kubelet::build_pod_status(PodPhase::Succeeded, &statuses, Some("10.42.0.9"));
         assert_eq!(status["phase"], "Succeeded");
+        // Both conditions False for a terminal pod.
+        assert_eq!(status["conditions"][0]["type"], "ContainersReady");
         assert_eq!(status["conditions"][0]["status"], "False");
+        assert_eq!(status["conditions"][1]["type"], "Ready");
+        assert_eq!(status["conditions"][1]["status"], "False");
         let term = &status["containerStatuses"][0]["state"]["terminated"];
         assert_eq!(term["exitCode"], 0);
         assert_eq!(term["reason"], "Completed");
@@ -1107,8 +1656,11 @@ mod tests {
         ];
         let status = Kubelet::build_pod_status(PodPhase::Pending, &statuses, None);
         assert_eq!(status["phase"], "Pending");
-        // Pod not Ready while a container is Waiting.
+        // Pod not Ready / ContainersReady while a container is Waiting.
+        assert_eq!(status["conditions"][0]["type"], "ContainersReady");
         assert_eq!(status["conditions"][0]["status"], "False");
+        assert_eq!(status["conditions"][1]["type"], "Ready");
+        assert_eq!(status["conditions"][1]["status"], "False");
         let arr = status["containerStatuses"].as_array().unwrap();
         assert_eq!(arr[1]["state"]["waiting"]["reason"], "ContainerCreating");
         // Waiting container has no containerID.
