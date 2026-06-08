@@ -74,8 +74,12 @@ async fn modifying_a_file_emits_modified_change() {
     )
     .unwrap();
 
-    // Wait for the notify watcher to fire + Conduit to process.
-    let modified = tokio::time::timeout(Duration::from_secs(5), async {
+    // Wait for the notify watcher to fire + Conduit to process. The loop
+    // returns as soon as the event arrives, so a generous deadline costs
+    // nothing in the common case; it only adds slack for filesystem-notify
+    // delivery latency under heavy parallel `cargo test --workspace` load
+    // (a 5s bound flaked there — the notify event can lag past it).
+    let modified = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(Some(o)) = conduit.tick().await {
                 return o;
@@ -84,7 +88,7 @@ async fn modifying_a_file_emits_modified_change() {
         }
     })
     .await
-    .expect("modify notify within 5s");
+    .expect("modify notify within 30s");
     assert!(modified.revision > initial.revision);
 }
 
