@@ -23,7 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{Reason, ResourceCommand},
+    command::{PatchType, Reason, ResourceCommand},
 };
 use serde_json::{Value, json};
 
@@ -173,6 +173,7 @@ impl Controller for PodDisruptionBudgetController {
                             "disruptionsAllowed": allowed,
                         }
                     }),
+                    patch_type: PatchType::Merge,
                     expected: None,
                     reason: Reason::Controller,
                 })

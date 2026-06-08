@@ -120,12 +120,11 @@ async fn rs_controller_evicts_excess_when_replicas_decreases() {
     // Patch RS to replicas=1.
     let rs_key = ResourceKey::namespaced("apps", "v1", "ReplicaSet", "default", "shrink");
     store
-        .propose(ResourceCommand::Patch {
-            key: rs_key,
-            patch: json!({"spec": {"replicas": 1}}),
-            expected: None,
-            reason: Reason::Operator,
-        })
+        .propose(ResourceCommand::patch(
+            rs_key,
+            json!({"spec": {"replicas": 1}}),
+            Reason::Operator,
+        ))
         .await
         .unwrap();
 
@@ -151,12 +150,11 @@ async fn rs_controller_scales_up_after_increasing_replicas() {
     // Scale to 5.
     let rs_key = ResourceKey::namespaced("apps", "v1", "ReplicaSet", "default", "grow");
     store
-        .propose(ResourceCommand::Patch {
-            key: rs_key,
-            patch: json!({"spec": {"replicas": 5}}),
-            expected: None,
-            reason: Reason::Operator,
-        })
+        .propose(ResourceCommand::patch(
+            rs_key,
+            json!({"spec": {"replicas": 5}}),
+            Reason::Operator,
+        ))
         .await
         .unwrap();
 

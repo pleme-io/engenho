@@ -132,12 +132,11 @@ async fn patch_emits_modified_event() {
     let mut watch = store.watch().await.unwrap(); // subscribe AFTER the put
 
     store
-        .propose(ResourceCommand::Patch {
-            key: pod_key("p"),
-            patch: json!({"spec": {"v": 2}}),
-            expected: None,
-            reason: Reason::Operator,
-        })
+        .propose(ResourceCommand::patch(
+            pod_key("p"),
+            json!({"spec": {"v": 2}}),
+            Reason::Operator,
+        ))
         .await
         .unwrap();
 

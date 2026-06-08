@@ -84,6 +84,7 @@ async fn mark_owned_pods_ready(store: &StoreMesh, owner_uid: &str) -> usize {
                         "conditions": [{"type": "Ready", "status": "True"}]
                     }
                 }),
+                patch_type: engenho_store::command::PatchType::Merge,
                 expected: None,
                 reason: Reason::Operator,
             })
@@ -331,12 +332,11 @@ async fn job_status_tracks_phases_and_completes() {
         .find(|(_, p)| is_owned_by(p, &job_uid))
         .expect("owned job pod");
     store
-        .propose(ResourceCommand::Patch {
-            key: pod_key.clone(),
-            patch: json!({"status": {"phase": "Succeeded"}}),
-            expected: None,
-            reason: Reason::Operator,
-        })
+        .propose(ResourceCommand::patch(
+            pod_key.clone(),
+            json!({"status": {"phase": "Succeeded"}}),
+            Reason::Operator,
+        ))
         .await
         .unwrap();
 
@@ -388,12 +388,11 @@ async fn status_write_conflicts_with_concurrent_spec_change_and_does_not_clobber
     // A concurrent operator scale commits BEFORE the controller's status
     // write — advancing mod_revision so the stale rv no longer matches.
     store
-        .propose(ResourceCommand::Patch {
-            key: rs_key.clone(),
-            patch: json!({"spec": {"replicas": 5}}),
-            expected: None,
-            reason: Reason::Operator,
-        })
+        .propose(ResourceCommand::patch(
+            rs_key.clone(),
+            json!({"spec": {"replicas": 5}}),
+            Reason::Operator,
+        ))
         .await
         .unwrap();
 
@@ -480,6 +479,7 @@ async fn status_write_succeeds_with_current_rv_then_noop_on_reissue() {
         .propose(ResourceCommand::Patch {
             key: rs_key.clone(),
             patch: json!({"status": {"readyReplicas": 1}}),
+            patch_type: engenho_store::command::PatchType::Merge,
             expected: Some(rv),
             reason: Reason::Controller,
         })

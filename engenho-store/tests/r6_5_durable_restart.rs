@@ -63,12 +63,11 @@ async fn restart_preserves_resources_and_revision() {
         .await
         .unwrap();
         // Patch a (rev 3)
-        mesh.propose(ResourceCommand::Patch {
-            key: pod_key("a"),
-            patch: serde_json::json!({"spec": {"image": "a:v2"}}),
-            expected: None,
-            reason: Reason::Controller,
-        })
+        mesh.propose(ResourceCommand::patch(
+            pod_key("a"),
+            serde_json::json!({"spec": {"image": "a:v2"}}),
+            Reason::Controller,
+        ))
         .await
         .unwrap();
         // Delete b (rev 4)

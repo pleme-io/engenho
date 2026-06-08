@@ -674,21 +674,23 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
 
         for entry in entries {
             let log_id = entry.log_id;
-            let op = match entry.payload {
-                EntryPayload::Blank => crate::command::ResourceOp::NoOp,
+            let (op, patch_error) = match entry.payload {
+                EntryPayload::Blank => (crate::command::ResourceOp::NoOp, None),
                 EntryPayload::Normal(ref cmd) => {
                     let outcome = state
                         .catalog
                         .apply(cmd, log_id.leader_id.term, log_id.index);
+                    let op = outcome.op;
+                    let patch_error = outcome.patch_error.clone();
                     if let Some(change) = outcome.change {
                         committed.push(change);
                     }
-                    outcome.op
+                    (op, patch_error)
                 }
                 EntryPayload::Membership(m) => {
                     state.last_membership = StoredMembership::new(Some(log_id), m);
                     membership_changed = true;
-                    crate::command::ResourceOp::NoOp
+                    (crate::command::ResourceOp::NoOp, None)
                 }
             };
             state.last_applied = Some(log_id);
@@ -697,6 +699,7 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
                 applied_term: log_id.leader_id.term,
                 op,
                 revision: state.catalog.revision().get(),
+                patch_error,
             });
         }
 

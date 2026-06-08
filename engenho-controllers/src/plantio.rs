@@ -30,7 +30,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{Reason, ResourceCommand},
+    command::{PatchType, Reason, ResourceCommand},
 };
 use engenho_substrate::{
     JobTarget, MaterializationLedger, NodeId, Plantio, QuorumOutcome, StageId,
@@ -297,6 +297,7 @@ impl Controller for PlantioController {
                 .propose(ResourceCommand::Patch {
                     key: cr_key.clone(),
                     patch: new_status,
+                    patch_type: PatchType::Merge,
                     expected: None,
                     reason: Reason::Controller,
                 })

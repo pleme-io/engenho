@@ -142,12 +142,11 @@ impl Scheduler {
             );
             let patch = serde_json::json!({ "spec": { "nodeName": node_name } });
             self.store
-                .propose(ResourceCommand::Patch {
-                    key: pod_key.clone(),
+                .propose(ResourceCommand::patch(
+                    pod_key.clone(),
                     patch,
-                    expected: None,
-                    reason: Reason::Scheduler,
-                })
+                    Reason::Scheduler,
+                ))
                 .await?;
 
             // Decrement the chosen node's running free so a later pending
@@ -199,12 +198,11 @@ impl Scheduler {
             }
         });
         self.store
-            .propose(ResourceCommand::Patch {
-                key: pod_key.clone(),
+            .propose(ResourceCommand::patch(
+                pod_key.clone(),
                 patch,
-                expected: None,
-                reason: Reason::Scheduler,
-            })
+                Reason::Scheduler,
+            ))
             .await?;
         Ok(())
     }

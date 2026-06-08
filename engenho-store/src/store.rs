@@ -328,8 +328,8 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
         let mut results = Vec::new();
         for entry in entries {
             let log_id = entry.log_id;
-            let op = match entry.payload {
-                EntryPayload::Blank => crate::command::ResourceOp::NoOp,
+            let (op, patch_error) = match entry.payload {
+                EntryPayload::Blank => (crate::command::ResourceOp::NoOp, None),
                 EntryPayload::Normal(ref cmd) => {
                     let outcome = guard
                         .catalog
@@ -345,14 +345,16 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
                     // non-blocking try_send (overflow → typed Gone,
                     // never a silent drop, never a block on a slow
                     // consumer).
+                    let op = outcome.op;
+                    let patch_error = outcome.patch_error.clone();
                     if let Some(change) = outcome.change {
                         guard.watchers.fan_change(&change);
                     }
-                    outcome.op
+                    (op, patch_error)
                 }
                 EntryPayload::Membership(m) => {
                     guard.last_membership = StoredMembership::new(Some(log_id), m);
-                    crate::command::ResourceOp::NoOp
+                    (crate::command::ResourceOp::NoOp, None)
                 }
             };
             guard.last_applied = Some(log_id);
@@ -361,6 +363,7 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
                 applied_term: log_id.leader_id.term,
                 op,
                 revision: guard.catalog.revision().get(),
+                patch_error,
             });
         }
         Ok(results)

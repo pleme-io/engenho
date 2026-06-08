@@ -38,7 +38,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{Reason, ResourceCommand},
+    command::{PatchType, Reason, ResourceCommand},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -462,6 +462,7 @@ impl Controller for CrdController {
                             ]
                         }
                     }),
+                    patch_type: PatchType::Merge,
                     expected: None,
                     reason: Reason::Controller,
                 })

@@ -23,6 +23,12 @@ pub struct ApplyResult {
     /// index) — see [`crate::revision`]. Consumers use this for
     /// list-then-watch resume + optimistic concurrency.
     pub revision: u64,
+    /// The typed patch-interpreter error message when `op ==
+    /// [`ResourceOp::PatchRejected`]`; `None` otherwise. Carried so the
+    /// apiserver renders the correct typed Status (415 for server-side
+    /// apply, 422/400 for a bad patch body) rather than a generic error.
+    #[serde(default)]
+    pub patch_error: Option<String>,
 }
 
 openraft::declare_raft_types!(
