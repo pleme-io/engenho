@@ -307,9 +307,10 @@ async fn deployment_posted_over_http_converges_to_running_container() {
         .filter(|e| matches!(e, engenho_kubelet::backend::FakeEvent::Start(_)))
         .count();
     assert_eq!(start_count, 2, "exactly 2 Start events");
-    // Container names are namespace-prefixed: `default_<podname>`.
+    // Container backend names are `<ns>_<pod>_<containerName>` (multi-container
+    // brick); the podinfo template has a single container named `main`.
     for name in &pod_names {
-        let expected = format!("default_{name}");
+        let expected = format!("default_{name}_main");
         assert!(
             events.iter().any(|e| matches!(
                 e,

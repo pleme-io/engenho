@@ -526,7 +526,7 @@ async fn two_replica_deployment_gets_real_ips_endpoints_and_pod_to_pod_reachabil
     // Expected real container names = namespace-prefixed deterministic join.
     let container_names: Vec<String> = pod_names
         .iter()
-        .map(|p| format!("default_{p}"))
+        .map(|p| format!("default_{p}_main"))
         .collect();
     for cn in &container_names {
         cleanup.track(cn);
@@ -828,7 +828,7 @@ async fn service_name_resolves_via_aardvark_dns_and_client_connects_by_name() {
 
     let container_names: Vec<String> = pod_names
         .iter()
-        .map(|p| format!("default_{p}"))
+        .map(|p| format!("default_{p}_main"))
         .collect();
     for cn in &container_names {
         cleanup.track(cn);

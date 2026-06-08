@@ -1624,6 +1624,7 @@ dependencies = [
 name = "engenho-runtime"
 version = "0.1.4"
 dependencies = [
+ "async-trait",
  "engenho-apiserver",
  "engenho-config",
  "engenho-controllers",

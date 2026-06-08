@@ -22,7 +22,7 @@ use engenho_controllers::{
     admission::{AdmissionChain, AdmissionMode},
 };
 use engenho_kubelet::config_bridge::KubeletBackendKind;
-use engenho_kubelet::{ContainerRuntime, Kubelet, make_container_runtime};
+use engenho_kubelet::{ContainerRuntime, Kubelet, LogOptions, make_container_runtime};
 use engenho_scheduler::{Scheduler, make_scheduling_strategy};
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
@@ -220,6 +220,12 @@ impl Runtime {
         let handler_sink: Arc<dyn DynamicHandlerSink> =
             RouterHandlerSink::new(store.clone(), admission.clone(), router_state.clone())
                 .into_dyn();
+        // Keep a router_state clone so the Pod `/log` handler (which needs the
+        // kubelet, built later in spawn_drivers) can be registered after the
+        // kubelet exists. RouterState is Arc-backed: this clone shares the SAME
+        // handler ArcSwap the apiserver dispatches on, so a `register()` here is
+        // visible to in-flight requests (identical mechanism to the CRD sink).
+        let router_state_for_logs = router_state.clone();
 
         let apiserver = ApiServer::start_with_state(listen_addr, router_state, tls).await?;
         let bound_addr = apiserver.local_addr();
@@ -257,9 +263,26 @@ impl Runtime {
 
         // 7. Spawn the controller / scheduler / kubelet drivers (incl. the
         //    CrdController, which registers CR handlers into the shared
-        //    router table via handler_sink).
-        let drivers = spawn_drivers(&config, &store, &backend, strategy, &handler_sink);
+        //    router table via handler_sink). Returns the Arc<Kubelet> so the
+        //    Pod `/log` reader can be wired in.
+        let (drivers, kubelet) =
+            spawn_drivers(&config, &store, &backend, strategy, &handler_sink);
         info!(count = drivers.len(), "drivers spawned");
+
+        // 7b. Register the Pod `/log` handler — a StoreBackedHandler for the
+        //     Pod kind whose `logs` delegates to the in-process kubelet (the
+        //     KubeletLogReader adapter). This REPLACES the catalog-built Pod
+        //     handler (which had no log reader → /log returned NotFound) with
+        //     one that serves real container stdout. Single-node: the kubelet
+        //     IS this process's kubelet, so the read is in-process. `register`
+        //     keys on (group, version, plural) so it overwrites the Pod entry
+        //     atomically (same swap mechanism the CRD sink uses).
+        let log_reader: Arc<dyn engenho_apiserver::PodLogReader> =
+            Arc::new(KubeletLogReader { kubelet });
+        if let Some(pod_handler) = build_pod_log_handler(&store, &admission, log_reader) {
+            router_state_for_logs.register(pod_handler);
+            info!("registered Pod /log handler (in-process kubelet log reader)");
+        }
 
         Ok(Self {
             config,
@@ -327,6 +350,74 @@ impl Runtime {
         store.terminate().await?;
         Ok(())
     }
+}
+
+/// Adapter making the in-process [`Kubelet`] satisfy the apiserver's
+/// [`engenho_apiserver::PodLogReader`] seam (single-node: the apiserver +
+/// kubelet share one process, so the Pod `/log` subresource queries the
+/// kubelet's local bookkeeping directly). Translates the apiserver's typed
+/// [`engenho_apiserver::LogQuery`] → the kubelet's [`LogOptions`] and maps
+/// `KubeletError` → `ApiError`.
+///
+/// This adapter is the layering bridge: the apiserver (below the kubelet) only
+/// knows the `PodLogReader` trait; the runtime (above both) supplies the
+/// concrete kubelet behind it. A multi-node future swaps this for a node-proxy
+/// reader with no apiserver change.
+struct KubeletLogReader {
+    kubelet: Arc<Kubelet>,
+}
+
+#[async_trait::async_trait]
+impl engenho_apiserver::PodLogReader for KubeletLogReader {
+    async fn read_pod_logs(
+        &self,
+        namespace: &str,
+        name: &str,
+        query: &engenho_apiserver::LogQuery,
+    ) -> Result<String, engenho_apiserver::ApiError> {
+        let opts = LogOptions {
+            tail: query.tail_lines,
+            timestamps: query.timestamps,
+        };
+        self.kubelet
+            .container_logs(namespace, name, query.container.as_deref(), &opts)
+            .await
+            .map_err(|e| match e.kind() {
+                // A pod not on this node / a missing container → a typed 404
+                // (the K8s "could not find the requested resource" shape).
+                "invalid_pod" => engenho_apiserver::ApiError::NotFound(format!(
+                    "could not get logs for pod {namespace}/{name}: {e}"
+                )),
+                // A backend read failure → 500 (never a fake-empty log).
+                _ => engenho_apiserver::ApiError::Internal(format!(
+                    "log read failed for pod {namespace}/{name}: {e}"
+                )),
+            })
+    }
+}
+
+/// Build the Pod `/log`-capable handler: a `StoreBackedHandler` for the Pod
+/// kind (from the generated catalog descriptor) carrying the SAME admission
+/// chain as the catalog-built handlers PLUS the in-process kubelet log reader.
+/// Registered into the router (overwriting the no-log-reader Pod handler) so
+/// `kubectl logs` resolves the `/log` subresource to real container stdout.
+///
+/// Returns `None` only if the Pod descriptor is somehow absent from the
+/// catalog (impossible — Pod is always cataloged); the caller logs + continues
+/// (the existing no-log Pod handler stays, and `/log` returns NotFound — never
+/// a panic).
+fn build_pod_log_handler(
+    store: &Arc<StoreMesh>,
+    admission: &Arc<AdmissionChain>,
+    log_reader: Arc<dyn engenho_apiserver::PodLogReader>,
+) -> Option<Arc<dyn engenho_apiserver::ResourceHandler>> {
+    let pod_descriptor = engenho_types::generated_v1_34::RESOURCE_CATALOG
+        .iter()
+        .find(|d| d.kind == "Pod" && d.group.is_empty())?;
+    let handler = engenho_apiserver::StoreBackedHandler::from_descriptor(store.clone(), pod_descriptor)
+        .with_admission(admission.clone())
+        .with_log_reader(log_reader);
+    Some(Arc::new(handler))
 }
 
 /// Construct the container backend from the operator's config choice.
@@ -844,13 +935,19 @@ fn write_mode_0644(path: &std::path::Path, contents: &str) -> Result<(), Runtime
 /// scheduler + kubelet always run (a single-node runtime that can't
 /// schedule or run containers is useless); the four reconcilers are
 /// individually toggleable.
+///
+/// Returns `(handles, kubelet)` — the spawned driver tasks PLUS an
+/// `Arc<Kubelet>` clone. The kubelet is built once, shared (via the
+/// `Controller for Arc<C>` blanket impl) between its WatchDriver AND the
+/// apiserver's Pod `/log` reader, so the driver's ticks + the log queries see
+/// the SAME local bookkeeping.
 fn spawn_drivers(
     config: &EngenhoConfig,
     store: &Arc<StoreMesh>,
     backend: &Arc<dyn ContainerRuntime>,
     strategy: Box<dyn engenho_scheduler::SchedulingStrategy>,
     handler_sink: &Arc<dyn DynamicHandlerSink>,
-) -> Vec<JoinHandle<()>> {
+) -> (Vec<JoinHandle<()>>, Arc<Kubelet>) {
     let mut handles = Vec::new();
 
     // Namespace scope: empty string in config means "all namespaces".
@@ -963,17 +1060,20 @@ fn spawn_drivers(
         handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Pod", "Node"])).spawn());
     }
 
-    // Kubelet: bound Pod → container via the backend. Watches Pods.
-    {
-        let c = Kubelet::new(
-            store.clone(),
-            backend.clone(),
-            config.runtime.node_name.clone(),
-        );
-        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Pod"])).spawn());
-    }
+    // Kubelet: bound Pod → container via the backend. Watches Pods. Built
+    // ONCE as an Arc<Kubelet> so the SAME instance is shared between its
+    // WatchDriver (via the `Controller for Arc<C>` blanket impl) and the
+    // apiserver's Pod `/log` reader — both see one local bookkeeping map.
+    let kubelet = Arc::new(Kubelet::new(
+        store.clone(),
+        backend.clone(),
+        config.runtime.node_name.clone(),
+    ));
+    handles.push(
+        WatchDriver::new(kubelet.clone(), store.clone(), driver_config(&["Pod"])).spawn(),
+    );
 
-    handles
+    (handles, kubelet)
 }
 
 // `make_scheduling_strategy` returns `Result<Box<dyn SchedulingStrategy>,

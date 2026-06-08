@@ -41,6 +41,22 @@ pub trait Controller: Send + Sync {
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError>;
 }
 
+/// Blanket impl so an `Arc<C>` is itself a [`Controller`]. This lets a caller
+/// keep an `Arc<C>` handle (e.g. the kubelet, queried in-process by the
+/// apiserver's `/log` subresource) AND hand the SAME controller to a
+/// [`crate::WatchDriver`] (which takes its controller by value + re-wraps it in
+/// an Arc). Both share one instance — the driver's ticks and the out-of-band
+/// queries see the same internal state.
+#[async_trait]
+impl<C: Controller + ?Sized> Controller for std::sync::Arc<C> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+        (**self).tick().await
+    }
+}
+
 /// One reconciliation attempt's requeue decision.
 ///
 /// Moved here (was `engenho_types::reconciler::ReconcileResult`, a dead

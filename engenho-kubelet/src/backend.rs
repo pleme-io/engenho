@@ -82,6 +82,39 @@ impl ContainerStatus {
     }
 }
 
+/// Typed options for [`ContainerRuntime::logs`] — the `kubectl logs` knobs.
+///
+/// Typed (NOT a bare bool / string bag) so each option is a named field the
+/// podman `logs_argv` builder maps deterministically. M0.3 ships `tail`
+/// (kubectl `--tail`); `timestamps` / `since` are forward-compat fields the
+/// builder honors when set (off by default) so adding the kubectl flags later
+/// is a one-line argv addition, not a new method.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogOptions {
+    /// `--tail N` — return only the last `N` lines. `None` = all lines.
+    pub tail: Option<u32>,
+    /// `--timestamps` — prefix each line with an RFC3339 timestamp. Default
+    /// `false`. Forward-compat (kubectl `--timestamps`).
+    pub timestamps: bool,
+}
+
+impl LogOptions {
+    /// Options requesting all lines (the default).
+    #[must_use]
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Options requesting only the last `n` lines.
+    #[must_use]
+    pub fn tail(n: u32) -> Self {
+        Self {
+            tail: Some(n),
+            ..Self::default()
+        }
+    }
+}
+
 /// The pluggable container runtime trait. Pure runtime —
 /// host-effecting; no I/O in trait shape, but every method
 /// performs side-effecting work on the host.
@@ -121,6 +154,26 @@ pub trait ContainerRuntime: Send + Sync {
     ///
     /// Returns [`KubeletError::Backend`] on failure.
     async fn remove(&self, container_id: &str) -> Result<(), KubeletError>;
+
+    /// Stream a container's stdout/stderr log. The `kubectl logs <pod>
+    /// [-c <container>]` surface — the apiserver's Pod `/log` subresource
+    /// asks the kubelet which asks this method.
+    ///
+    /// [`FakeBackend`] returns a per-container in-memory buffer (seeded at
+    /// `start`) so tests assert exact stdout; [`PodmanBackend`] runs
+    /// `podman logs [--tail N] <id>` via the pure [`PodmanBackend::logs_argv`]
+    /// builder.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] if the backend cannot read the log (no such
+    /// container, podman spawn failure). A not-found container surfaces a
+    /// typed error — never a silently-empty success.
+    async fn logs(
+        &self,
+        container_id: &str,
+        opts: &LogOptions,
+    ) -> Result<String, KubeletError>;
 }
 
 // =================================================================
@@ -142,6 +195,17 @@ struct FakeState {
     specs: BTreeMap<String, ContainerSpec>,
     /// Operations log so tests can assert backend invocations.
     pub events: Vec<FakeEvent>,
+    /// Per-container stdout buffer keyed by container_id. Seeded at `start`
+    /// from the spec name (deterministic) so [`ContainerRuntime::logs`]
+    /// returns a known string a test can assert exactly; overridable per
+    /// container name via [`FakeBackend::seed_log`].
+    logs: BTreeMap<String, String>,
+    /// Pre-seeded log content keyed by CONTAINER NAME (the `spec.name`). When
+    /// `start` runs for a spec whose name has a seeded entry, that content is
+    /// copied into `logs[container_id]`; otherwise a default
+    /// `"<name> log line\n"` is used. Lets a test pin exact stdout (e.g.
+    /// `hello-engenho`) before the container starts.
+    seeded_logs_by_name: BTreeMap<String, String>,
 }
 
 /// Operation log entry for `FakeBackend`. Tests assert this shape
@@ -208,6 +272,24 @@ impl FakeBackend {
             s.exit_code = Some(exit_code);
         }
     }
+
+    /// Test hook: pre-seed the exact log content a container of name
+    /// `container_name` (the `spec.name`) will report. Must be called BEFORE
+    /// the container starts; at `start` the content is copied into the
+    /// container's log buffer keyed by its assigned `container_id`. Lets a
+    /// test assert `kubectl logs` returns a known string (e.g.
+    /// `"hello-engenho\n"`).
+    pub async fn seed_log(&self, container_name: &str, content: impl Into<String>) {
+        let mut state = self.inner.lock().await;
+        state
+            .seeded_logs_by_name
+            .insert(container_name.to_string(), content.into());
+    }
+
+    /// The current log buffer for a container_id (test inspection helper).
+    pub async fn log_of(&self, container_id: &str) -> Option<String> {
+        self.inner.lock().await.logs.get(container_id).cloned()
+    }
 }
 
 #[async_trait]
@@ -225,6 +307,16 @@ impl ContainerRuntime for FakeBackend {
         state
             .containers
             .insert(container_id.clone(), status.clone());
+        // Seed the log buffer: pre-seeded content for this container NAME if a
+        // test set it (FakeBackend::seed_log), else a deterministic default
+        // derived from the name so logs() always returns a non-empty,
+        // assertable string.
+        let log_content = state
+            .seeded_logs_by_name
+            .get(&spec.name)
+            .cloned()
+            .unwrap_or_else(|| format!("{} log line\n", spec.name));
+        state.logs.insert(container_id.clone(), log_content);
         state.specs.insert(container_id, spec.clone());
         state.events.push(FakeEvent::Start(spec.name.clone()));
         Ok(status)
@@ -254,10 +346,42 @@ impl ContainerRuntime for FakeBackend {
         let mut state = self.inner.lock().await;
         state.containers.remove(container_id);
         state.specs.remove(container_id);
+        state.logs.remove(container_id);
         state
             .events
             .push(FakeEvent::Remove(container_id.to_string()));
         Ok(())
+    }
+
+    async fn logs(
+        &self,
+        container_id: &str,
+        opts: &LogOptions,
+    ) -> Result<String, KubeletError> {
+        let state = self.inner.lock().await;
+        let buf = state.logs.get(container_id).ok_or_else(|| {
+            // No buffer → no such container. Typed error, never an empty Ok.
+            KubeletError::Backend(format!("no such container for logs: {container_id}"))
+        })?;
+        // Honor --tail by returning only the last N lines (mirrors podman's
+        // `--tail` line semantics) so the fake's behavior matches the real
+        // backend for the test assertions.
+        match opts.tail {
+            Some(n) if n > 0 => {
+                let lines: Vec<&str> = buf.lines().collect();
+                let start = lines.len().saturating_sub(n as usize);
+                let tail = lines[start..].join("\n");
+                // Preserve a trailing newline if the buffer had one.
+                if buf.ends_with('\n') && !tail.is_empty() {
+                    Ok(format!("{tail}\n"))
+                } else {
+                    Ok(tail)
+                }
+            }
+            // tail=0 returns nothing (podman --tail 0); None returns all.
+            Some(_) => Ok(String::new()),
+            None => Ok(buf.clone()),
+        }
     }
 }
 
@@ -590,6 +714,27 @@ impl PodmanBackend {
         vec!["rm".to_string(), "-f".to_string(), id.to_string()]
     }
 
+    /// `podman logs [--tail N] [--timestamps] <id>` argv for a container's
+    /// stdout/stderr. Pure (no podman) so the argv is unit-testable.
+    ///
+    /// `--tail N` is emitted only when [`LogOptions::tail`] is `Some(n)`;
+    /// `--timestamps` only when [`LogOptions::timestamps`] is set. The order is
+    /// deterministic (flags before the container id) so the argv is
+    /// assertable.
+    #[must_use]
+    pub fn logs_argv(id: &str, opts: &LogOptions) -> Vec<String> {
+        let mut argv = vec!["logs".to_string()];
+        if let Some(n) = opts.tail {
+            argv.push("--tail".to_string());
+            argv.push(n.to_string());
+        }
+        if opts.timestamps {
+            argv.push("--timestamps".to_string());
+        }
+        argv.push(id.to_string());
+        argv
+    }
+
     /// Parse the pipe-delimited `podman inspect --format` output into a
     /// typed [`ContainerStatus`]. Pure (no podman) so the parse is
     /// unit-testable. Expects `Running|ExitCode|IPAddress`.
@@ -810,6 +955,30 @@ impl ContainerRuntime for PodmanBackend {
             )));
         }
         Ok(())
+    }
+
+    async fn logs(
+        &self,
+        container_id: &str,
+        opts: &LogOptions,
+    ) -> Result<String, KubeletError> {
+        let argv = Self::logs_argv(container_id, opts);
+        let out = self
+            .command(&argv)
+            .output()
+            .await
+            .map_err(|e| KubeletError::Backend(format!("podman logs spawn: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // A not-found container is a typed error (the kubelet maps it to a
+            // 404 / empty response upstream), NOT a silently-empty Ok.
+            return Err(KubeletError::Backend(format!(
+                "podman logs failed for {container_id}: {stderr}"
+            )));
+        }
+        // podman writes container stdout to its own stdout; stderr carries
+        // podman diagnostics (empty on success). The container log is stdout.
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 }
 
@@ -1324,6 +1493,109 @@ mod tests {
     #[test]
     fn rm_argv_force_removes_id() {
         assert_eq!(PodmanBackend::rm_argv("abc123"), vec!["rm", "-f", "abc123"]);
+    }
+
+    // ── logs_argv (kubectl logs builder) ────────────────────────────────
+
+    #[test]
+    fn logs_argv_no_options_is_bare() {
+        assert_eq!(
+            PodmanBackend::logs_argv("abc123", &LogOptions::all()),
+            vec!["logs", "abc123"]
+        );
+    }
+
+    #[test]
+    fn logs_argv_tail_emits_flag() {
+        assert_eq!(
+            PodmanBackend::logs_argv("abc123", &LogOptions::tail(50)),
+            vec!["logs", "--tail", "50", "abc123"]
+        );
+    }
+
+    #[test]
+    fn logs_argv_timestamps_emits_flag() {
+        let opts = LogOptions {
+            tail: Some(10),
+            timestamps: true,
+        };
+        assert_eq!(
+            PodmanBackend::logs_argv("cid", &opts),
+            vec!["logs", "--tail", "10", "--timestamps", "cid"]
+        );
+    }
+
+    #[test]
+    fn log_options_default_is_all_lines() {
+        assert_eq!(LogOptions::default(), LogOptions::all());
+        assert!(LogOptions::all().tail.is_none());
+        assert_eq!(LogOptions::tail(5).tail, Some(5));
+    }
+
+    // ── FakeBackend logs buffer ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fake_backend_logs_returns_seeded_content() {
+        let backend = FakeBackend::new();
+        backend.seed_log("default_p", "hello-engenho\n").await;
+        let spec = ContainerSpec {
+            name: "default_p".into(),
+            image: "i".into(),
+            ..Default::default()
+        };
+        let s = backend.start(&spec).await.unwrap();
+        let logs = backend.logs(&s.container_id, &LogOptions::all()).await.unwrap();
+        assert_eq!(logs, "hello-engenho\n");
+    }
+
+    #[tokio::test]
+    async fn fake_backend_logs_default_buffer_is_name_derived() {
+        let backend = FakeBackend::new();
+        let spec = ContainerSpec {
+            name: "web".into(),
+            image: "i".into(),
+            ..Default::default()
+        };
+        let s = backend.start(&spec).await.unwrap();
+        let logs = backend.logs(&s.container_id, &LogOptions::all()).await.unwrap();
+        assert!(logs.contains("web"), "default log derives from name: {logs:?}");
+    }
+
+    #[tokio::test]
+    async fn fake_backend_logs_tail_trims_lines() {
+        let backend = FakeBackend::new();
+        backend.seed_log("c", "a\nb\nc\n").await;
+        let spec = ContainerSpec {
+            name: "c".into(),
+            image: "i".into(),
+            ..Default::default()
+        };
+        let s = backend.start(&spec).await.unwrap();
+        let last = backend.logs(&s.container_id, &LogOptions::tail(1)).await.unwrap();
+        assert_eq!(last, "c\n");
+    }
+
+    #[tokio::test]
+    async fn fake_backend_logs_missing_container_is_typed_error() {
+        let backend = FakeBackend::new();
+        let err = backend
+            .logs("nonexistent", &LogOptions::all())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "backend");
+    }
+
+    #[tokio::test]
+    async fn fake_backend_logs_cleared_on_remove() {
+        let backend = FakeBackend::new();
+        let spec = ContainerSpec {
+            name: "c".into(),
+            image: "i".into(),
+            ..Default::default()
+        };
+        let s = backend.start(&spec).await.unwrap();
+        backend.remove(&s.container_id).await.unwrap();
+        assert!(backend.logs(&s.container_id, &LogOptions::all()).await.is_err());
     }
 
     // ── parse_inspect (pure status parser) ──────────────────────────────

@@ -29,6 +29,10 @@ pub enum Subresource {
     /// `/scale` — get/patch/update the autoscaling/v1 Scale projection
     /// (`spec.replicas` only).
     Scale,
+    /// `/log` — GET a Pod container's stdout/stderr (`kubectl logs`). Read-only
+    /// (GET only). Pod-only; the router dispatches it to the kubelet
+    /// (single-node: in-process) which reads `backend.logs`.
+    Log,
 }
 
 /// One runtime row describing a routable/discoverable Kubernetes kind.
@@ -92,6 +96,12 @@ impl ResourceDescriptor {
         self.subresources.contains(&Subresource::Scale)
     }
 
+    /// `true` iff this kind serves the `/log` subresource (Pod only).
+    #[must_use]
+    pub fn has_log(&self) -> bool {
+        self.subresources.contains(&Subresource::Log)
+    }
+
     /// The Group/Version/Kind triple for this descriptor.
     #[must_use]
     pub const fn to_gvk(&self) -> GroupVersionKind {
@@ -125,7 +135,7 @@ impl ResourceDescriptor {
 
 /// Every routable/discoverable kind, in `KIND_CATALOG` order.
 pub const RESOURCE_CATALOG: &[ResourceDescriptor] = &[
-    ResourceDescriptor { group: "", version: "v1", kind: "Pod", plural: "pods", namespaced: true, api_version: "v1", short_names: &["po"], singular: "pod", categories: &["all"], opaque: false, subresources: &[Subresource::Status] },
+    ResourceDescriptor { group: "", version: "v1", kind: "Pod", plural: "pods", namespaced: true, api_version: "v1", short_names: &["po"], singular: "pod", categories: &["all"], opaque: false, subresources: &[Subresource::Status, Subresource::Log] },
     ResourceDescriptor { group: "", version: "v1", kind: "Service", plural: "services", namespaced: true, api_version: "v1", short_names: &["svc"], singular: "service", categories: &["all"], opaque: false, subresources: &[Subresource::Status] },
     ResourceDescriptor { group: "", version: "v1", kind: "ConfigMap", plural: "configmaps", namespaced: true, api_version: "v1", short_names: &["cm"], singular: "configmap", categories: &[], opaque: false, subresources: &[] },
     ResourceDescriptor { group: "", version: "v1", kind: "Secret", plural: "secrets", namespaced: true, api_version: "v1", short_names: &[], singular: "secret", categories: &[], opaque: false, subresources: &[] },

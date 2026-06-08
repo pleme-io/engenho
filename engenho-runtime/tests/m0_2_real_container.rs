@@ -366,8 +366,9 @@ async fn deployment_runs_a_real_podman_container_then_cleans_up() {
         .expect("pod name")
         .to_string();
 
-    // Expected real container name = namespace-prefixed deterministic join.
-    let container_name = format!("default_{pod_name}");
+    // Expected real container name = `<ns>_<pod>_<containerName>` (the
+    // multi-container deterministic join; busybox's single container is `main`).
+    let container_name = format!("default_{pod_name}_main");
     cleanup.track(&container_name);
 
     // ── ASSERT: a REAL podman container is running ──────────────────────
