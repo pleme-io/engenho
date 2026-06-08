@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-use crate::generated_v1_34::types::*;
+// The CANONICAL RBAC primitives (carry the `kind` discriminator the codegen
+// `types::{RoleRef,Subject}` drop).
+use super::policy::{RoleRef, Subject};
 
 /// RoleBinding references a role, but does not contain it.  It can reference a Role in the same namespace or a ClusterRole in the global namespace. It adds who information via Subjects and namespace information by which namespace it exists in.  RoleBindings in a given namespace only have effect in that namespace.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

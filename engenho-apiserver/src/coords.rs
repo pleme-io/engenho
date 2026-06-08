@@ -177,6 +177,151 @@ impl ResourceCoords {
     }
 }
 
+/// The typed RBAC request info — the shape the authz layer reduces a request
+/// to, built from the HTTP method + URL path WITHOUT the axum `RouterState`
+/// extractor (the authz middleware runs over `req.uri().path()` +
+/// `req.method()` directly). Either `resource` (a `/api`/`/apis` resource shape)
+/// or `non_resource_url` (everything else) is set; the verb is derived from the
+/// method + collection/instance shape + `?watch=`.
+///
+/// This mirrors kube-apiserver's `RequestInfo`. The resource-path decomposition
+/// reuses the SAME six-shape parse as [`ResourceCoords::parse`] (lifted into
+/// [`parse_resource_path`]) so the authz layer and the routing layer agree on
+/// what a URL means — no second parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestInfo {
+    /// The RBAC verb (`get` / `list` / `watch` / `create` / `update` / `patch`
+    /// / `delete` / `deletecollection`; for a non-resource path, the lowercased
+    /// HTTP method).
+    pub verb: String,
+    /// The API group (`""` core), for a resource request.
+    pub group: String,
+    /// The API version, for a resource request.
+    pub version: String,
+    /// The resource plural, for a resource request (empty for non-resource).
+    pub resource: String,
+    /// The subresource (`status`/`scale`), if targeted.
+    pub subresource: Option<String>,
+    /// The namespace, for a namespaced resource request.
+    pub namespace: Option<String>,
+    /// The instance name, for an instance-targeting request.
+    pub name: Option<String>,
+    /// The non-resource URL, for a non-resource request.
+    pub non_resource_url: Option<String>,
+}
+
+/// Decompose a `/api/v1/...` or `/apis/<g>/<v>/...` path into its
+/// `(group, version, ResourceCoords)` — the same six-shape parse the routing
+/// extractor uses, but driven off a raw path string instead of axum's
+/// `RawPathParams`. Returns `None` when the path is not a resource shape (the
+/// caller treats that as a non-resource request).
+///
+/// `path` is the request path (with leading slash). The leading `/api/v1` or
+/// `/apis/<g>/<v>` prefix is consumed; the rest is fed to
+/// [`ResourceCoords::parse`].
+#[must_use]
+pub fn parse_resource_path(path: &str) -> Option<ResourceCoords> {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // Core: /api/v1/<rest>
+    if segs.first() == Some(&"api") {
+        // Exactly `/api` or `/api/v1` (discovery) — not a resource shape.
+        if segs.len() <= 2 {
+            return None;
+        }
+        // segs[0]=="api", segs[1]==version ("v1"), segs[2..]==the rest tail.
+        let version = segs[1].to_string();
+        let rest = segs[2..].join("/");
+        return ResourceCoords::parse(None, Some(version), &rest).ok();
+    }
+    // Named group: /apis/<group>/<version>/<rest>
+    if segs.first() == Some(&"apis") {
+        // `/apis`, `/apis/<g>`, or `/apis/<g>/<v>` (discovery) — not a resource
+        // shape (no trailing plural).
+        if segs.len() <= 3 {
+            return None;
+        }
+        let group = segs[1].to_string();
+        let version = segs[2].to_string();
+        let rest = segs[3..].join("/");
+        return ResourceCoords::parse(Some(group), Some(version), &rest).ok();
+    }
+    None
+}
+
+impl RequestInfo {
+    /// Build the typed RBAC request info from the HTTP method + path + whether
+    /// the request carried `?watch=true`. The verb mapping mirrors
+    /// kube-apiserver's `RequestInfo`:
+    ///
+    ///   * GET   + collection (no name) → `list`; `?watch=true` → `watch`;
+    ///     GET + name → `get`.
+    ///   * POST  → `create`.
+    ///   * PUT   → `update`.
+    ///   * PATCH → `patch`.
+    ///   * DELETE + name → `delete`; DELETE + no name → `deletecollection`.
+    ///   * non-resource path → the lowercased HTTP method.
+    #[must_use]
+    pub fn from_method_path(method: &str, path: &str, is_watch: bool) -> Self {
+        match parse_resource_path(path) {
+            Some(coords) => {
+                let verb = resource_verb(method, coords.name.is_some(), is_watch);
+                RequestInfo {
+                    verb,
+                    group: coords.group_key().to_string(),
+                    version: coords.version_key().to_string(),
+                    resource: coords.plural,
+                    subresource: coords.subresource,
+                    namespace: coords.namespace,
+                    name: coords.name,
+                    non_resource_url: None,
+                }
+            }
+            None => RequestInfo {
+                // The RBAC verb for a non-resource path is the lowercased method.
+                verb: method.to_ascii_lowercase(),
+                group: String::new(),
+                version: String::new(),
+                resource: String::new(),
+                subresource: None,
+                namespace: None,
+                name: None,
+                non_resource_url: Some(path.to_string()),
+            },
+        }
+    }
+}
+
+/// Map an HTTP method on a RESOURCE path to the RBAC verb, given whether the
+/// path targets an instance (`has_name`) and whether `?watch=true` was set.
+#[must_use]
+pub fn resource_verb(method: &str, has_name: bool, is_watch: bool) -> String {
+    let m = method.to_ascii_uppercase();
+    match m.as_str() {
+        "GET" | "HEAD" => {
+            if is_watch {
+                "watch".to_string()
+            } else if has_name {
+                "get".to_string()
+            } else {
+                "list".to_string()
+            }
+        }
+        "POST" => "create".to_string(),
+        "PUT" => "update".to_string(),
+        "PATCH" => "patch".to_string(),
+        "DELETE" => {
+            if has_name {
+                "delete".to_string()
+            } else {
+                "deletecollection".to_string()
+            }
+        }
+        // Any other method on a resource path → the lowercased method (never a
+        // silent wrong verb).
+        other => other.to_ascii_lowercase(),
+    }
+}
+
 #[async_trait]
 impl FromRequestParts<RouterState> for ResourceCoords {
     type Rejection = ApiError;
@@ -368,6 +513,107 @@ mod tests {
         let c = core("namespaces/default").unwrap();
         assert_eq!(c.plural, "namespaces");
         assert_eq!(c.name.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn request_info_resource_verbs() {
+        // GET collection → list; GET instance → get; GET ?watch → watch.
+        let ri = RequestInfo::from_method_path("GET", "/api/v1/namespaces/default/pods", false);
+        assert_eq!(ri.verb, "list");
+        assert_eq!(ri.group, "");
+        assert_eq!(ri.resource, "pods");
+        assert_eq!(ri.namespace.as_deref(), Some("default"));
+        assert_eq!(ri.name, None);
+
+        let ri = RequestInfo::from_method_path("GET", "/api/v1/namespaces/default/pods/p1", false);
+        assert_eq!(ri.verb, "get");
+        assert_eq!(ri.name.as_deref(), Some("p1"));
+
+        let ri = RequestInfo::from_method_path("GET", "/api/v1/namespaces/default/pods", true);
+        assert_eq!(ri.verb, "watch");
+
+        // POST → create; PUT → update; PATCH → patch.
+        let ri = RequestInfo::from_method_path("POST", "/api/v1/namespaces/default/pods", false);
+        assert_eq!(ri.verb, "create");
+        let ri = RequestInfo::from_method_path(
+            "PUT",
+            "/api/v1/namespaces/default/pods/p1",
+            false,
+        );
+        assert_eq!(ri.verb, "update");
+        let ri = RequestInfo::from_method_path(
+            "PATCH",
+            "/api/v1/namespaces/default/pods/p1",
+            false,
+        );
+        assert_eq!(ri.verb, "patch");
+
+        // DELETE instance → delete; DELETE collection → deletecollection.
+        let ri = RequestInfo::from_method_path(
+            "DELETE",
+            "/api/v1/namespaces/default/pods/p1",
+            false,
+        );
+        assert_eq!(ri.verb, "delete");
+        let ri = RequestInfo::from_method_path("DELETE", "/api/v1/namespaces/default/pods", false);
+        assert_eq!(ri.verb, "deletecollection");
+    }
+
+    #[test]
+    fn request_info_subresource_and_grouped() {
+        let ri = RequestInfo::from_method_path(
+            "PUT",
+            "/apis/apps/v1/namespaces/default/deployments/web/scale",
+            false,
+        );
+        assert_eq!(ri.verb, "update");
+        assert_eq!(ri.group, "apps");
+        assert_eq!(ri.resource, "deployments");
+        assert_eq!(ri.subresource.as_deref(), Some("scale"));
+        assert_eq!(ri.name.as_deref(), Some("web"));
+    }
+
+    #[test]
+    fn request_info_non_resource_paths() {
+        // /healthz, /version, /metrics, /openapi/v3 → non-resource, verb =
+        // lowercased method.
+        for p in ["/healthz", "/version", "/metrics", "/openapi/v3", "/openapi/v3/apis/apps/v1"] {
+            let ri = RequestInfo::from_method_path("GET", p, false);
+            assert!(ri.non_resource_url.is_some(), "{p} is non-resource");
+            assert_eq!(ri.verb, "get");
+            assert_eq!(ri.non_resource_url.as_deref(), Some(p));
+        }
+    }
+
+    #[test]
+    fn request_info_discovery_paths_are_non_resource() {
+        // /api, /api/v1, /apis, /apis/<g>/<v> are discovery → non-resource.
+        for p in ["/api", "/api/v1", "/apis", "/apis/apps/v1"] {
+            let ri = RequestInfo::from_method_path("GET", p, false);
+            assert!(
+                ri.non_resource_url.is_some(),
+                "{p} is a discovery (non-resource) shape"
+            );
+            assert_eq!(ri.non_resource_url.as_deref(), Some(p));
+        }
+    }
+
+    #[test]
+    fn parse_resource_path_round_trips_core_and_grouped() {
+        let c = parse_resource_path("/api/v1/namespaces/default/pods/p1").unwrap();
+        assert_eq!(c.plural, "pods");
+        assert_eq!(c.name.as_deref(), Some("p1"));
+        assert_eq!(c.namespace.as_deref(), Some("default"));
+
+        let c = parse_resource_path("/apis/rbac.authorization.k8s.io/v1/clusterroles").unwrap();
+        assert_eq!(c.group.as_deref(), Some("rbac.authorization.k8s.io"));
+        assert_eq!(c.plural, "clusterroles");
+        assert_eq!(c.namespace, None);
+
+        // Discovery shapes → None.
+        assert!(parse_resource_path("/api/v1").is_none());
+        assert!(parse_resource_path("/apis/apps/v1").is_none());
+        assert!(parse_resource_path("/healthz").is_none());
     }
 
     #[test]

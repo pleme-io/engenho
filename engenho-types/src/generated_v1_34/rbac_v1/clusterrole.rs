@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
 use crate::generated_v1_34::types::*;
+// The CANONICAL RBAC primitive (carries the `kind` discriminator the codegen
+// `types::PolicyRule` drops). The explicit import shadows the glob above.
+// `AggregationRule` still comes from the `types::*` glob.
+use super::policy::PolicyRule;
 
 /// ClusterRole is a cluster level, logical grouping of PolicyRules that can be referenced as a unit by a RoleBinding or ClusterRoleBinding.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-use crate::generated_v1_34::types::*;
+// The CANONICAL RBAC primitives (carry the `kind` discriminator the codegen
+// `types::{RoleRef,Subject}` drop).
+use super::policy::{RoleRef, Subject};
 
 /// ClusterRoleBinding references a ClusterRole, but not contain it.  It can reference a ClusterRole in the global namespace, and adds who information via Subject.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

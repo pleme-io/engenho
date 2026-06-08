@@ -93,6 +93,14 @@ pub struct RouterState {
     /// token (every existing `RouterState::new` caller / test); the runtime
     /// installs the configured admin token via [`Self::with_authenticator`].
     pub authenticator: Arc<crate::authn::ChainAuthenticator>,
+    /// The typed RBAC authorizer (Brick B). Shared (cheap `Arc` clone) into the
+    /// authz middleware + the three SAR route handlers. Defaults to
+    /// [`crate::authz::AllowAllAuthorizer`] (authorize-ALL — byte-identical to
+    /// the pre-Brick-B behavior, so every existing `RouterState::new` caller /
+    /// test is unchanged); the runtime installs the real
+    /// [`crate::authz::RbacAuthorizer`] over the store via
+    /// [`Self::with_authorizer`].
+    pub authorizer: Arc<dyn crate::authz::Authorizer>,
 }
 
 impl RouterState {
@@ -108,6 +116,10 @@ impl RouterState {
             // anonymous (preserving the existing anonymous-kubeconfig path).
             // The runtime overrides this with the configured admin token.
             authenticator: Arc::new(crate::authn::ChainAuthenticator::bootstrap(None)),
+            // Authorize-ALL by default — byte-identical to the pre-Brick-B
+            // behavior so every existing caller/test is unchanged. The runtime
+            // installs the real RBAC authorizer via `with_authorizer`.
+            authorizer: Arc::new(crate::authz::AllowAllAuthorizer),
         }
     }
 
@@ -121,6 +133,17 @@ impl RouterState {
         authenticator: Arc<crate::authn::ChainAuthenticator>,
     ) -> Self {
         self.authenticator = authenticator;
+        self
+    }
+
+    /// Install the typed RBAC authorizer (Brick B). Builder style mirroring
+    /// [`Self::with_authenticator`]; the runtime calls this with
+    /// `RbacAuthorizer::new(StoreRbacEnv::new(store.clone()))` so authz enforces
+    /// the seeded bootstrap policy + bound roles. Until installed, the default
+    /// [`crate::authz::AllowAllAuthorizer`] keeps every request allowed.
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: Arc<dyn crate::authz::Authorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -251,13 +274,28 @@ pub fn build(state: RouterState) -> Router {
     // the layer wraps it too (kubectl auth whoami authenticates as anonymous
     // and still gets a typed answer).
     let authenticator = state.authenticator.clone();
+    let authorizer = state.authorizer.clone();
     let router = build_routes(state);
-    router.layer(axum::middleware::from_fn(
-        move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
-            let authenticator = authenticator.clone();
-            async move { authn_middleware(authenticator, req, next).await }
-        },
-    ))
+    // Layer order (axum: the LAST `.layer()` is OUTERMOST). The authz layer is
+    // applied FIRST so it is INNER to the authn layer — authn populates
+    // `Extension<UserInfo>` (outer), THEN authz reads it (inner). Both wrap the
+    // WHOLE route table (discovery + SAR + health), matching the authn layer's
+    // placement; the always-allow check is the first branch inside the authz
+    // middleware (health/version are pre-authz so they work with an unseeded
+    // RBAC store).
+    router
+        .layer(axum::middleware::from_fn(
+            move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
+                let authorizer = authorizer.clone();
+                async move { authz_middleware(authorizer, req, next).await }
+            },
+        ))
+        .layer(axum::middleware::from_fn(
+            move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
+                let authenticator = authenticator.clone();
+                async move { authn_middleware(authenticator, req, next).await }
+            },
+        ))
 }
 
 /// The route table (without the authn layer). Split out from [`build`] so the
@@ -330,6 +368,26 @@ fn build_routes(state: RouterState) -> Router {
         .route(
             "/apis/authentication.k8s.io/v1/selfsubjectreviews",
             axum::routing::post(self_subject_review),
+        )
+        // ── authorization.k8s.io SubjectAccessReview family (Brick B) ──────
+        // Discovery-light special routes (NOT store-backed kinds), modeled on
+        // the SelfSubjectReview route above. `kubectl auth can-i` POSTs to
+        // these; they build Attributes from the spec (SAR) or the caller
+        // (SelfSAR) + call the shared `state.authorizer`. They run AFTER authn
+        // (Extension<UserInfo> = the caller) and through the authz layer (a
+        // SubjectAccessReview create is itself authorized — granted to
+        // system:masters + via the system:basic-user policy for self-reviews).
+        .route(
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            axum::routing::post(crate::authz::sar::subject_access_review),
+        )
+        .route(
+            "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+            axum::routing::post(crate::authz::sar::self_subject_access_review),
+        )
+        .route(
+            "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+            axum::routing::post(crate::authz::sar::self_subject_rules_review),
         )
         // ── version + health (no RouterState; kubectl/client-go probe
         //    these before they will trust the server) ──────────────────
@@ -409,6 +467,96 @@ async fn authn_middleware(
         // rejection; everything else resolves to an identity + proceeds.
         Err(e) => ApiError::Unauthorized(e.to_string()).into_response(),
     }
+}
+
+// ── authorization middleware (Brick B) ─────────────────────────────────────
+
+/// The pre-authz TIER-1 always-allow set: `/healthz`, `/livez`, `/readyz`,
+/// `/version`. These are wired in [`build_routes`] with NO `RouterState`;
+/// kubectl/client-go probe them BEFORE trusting the server, so they MUST work
+/// even with an empty/unseeded RBAC store (e.g. during boot before
+/// `seed_bootstrap_rbac` lands). This is the load-bearing reason they are a
+/// fixed allow-list HERE (in the authz middleware) and NOT a binding.
+///
+/// Discovery (`/api`, `/apis`, `/openapi/v3`) is DELIBERATELY NOT here — it is
+/// TIER-2 (binding-driven via the `system:discovery` + `system:public-info-viewer`
+/// bootstrap ClusterRoleBindings), so anonymous discovery resolves THROUGH the
+/// authorizer, not pre-authz.
+fn is_always_allowed(path: &str) -> bool {
+    matches!(path, "/healthz" | "/livez" | "/readyz" | "/version")
+        // `/version/...` (e.g. a trailing slash) — kubectl hits `/version`
+        // exactly, but be defensive about a trailing segment.
+        || path.starts_with("/version/")
+}
+
+/// The authz middleware — the thin axum adapter over the typed
+/// [`crate::authz::Authorizer`]. Branch order:
+///
+///   1. [`is_always_allowed`] (`/healthz`, `/livez`, `/readyz`, `/version`)
+///      → proceed (pre-authz; works with an unseeded RBAC store).
+///   2. Build [`crate::authz::Attributes`] from `req.method()` + path (the
+///      shared [`crate::coords::RequestInfo`] parse) + the resolved
+///      [`UserInfo`] (inserted by the authn layer).
+///   3. `authorizer.authorize(&attrs)` →
+///      * [`crate::authz::Decision::Allow`] → `next.run(req)`.
+///      * `Deny` / `NoOpinion` → a typed [`ApiError::AuthzForbidden`] 403
+///        (the standard RBAC `Status` body via [`crate::error::forbidden_message`]).
+async fn authz_middleware(
+    authorizer: Arc<dyn crate::authz::Authorizer>,
+    req: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+
+    // TIER 1 — pre-authz always-allow (health/version). FIRST branch.
+    if is_always_allowed(&path) {
+        return next.run(req).await;
+    }
+
+    // Build the typed Attributes from method + path + the resolved identity.
+    let method = req.method().as_str().to_string();
+    let is_watch = req
+        .uri()
+        .query()
+        .map(query_has_watch)
+        .unwrap_or(false);
+    let user = req
+        .extensions()
+        .get::<UserInfo>()
+        .cloned()
+        .unwrap_or_else(UserInfo::anonymous);
+    let info = crate::coords::RequestInfo::from_method_path(&method, &path, is_watch);
+    let attrs = crate::authz::Attributes {
+        user,
+        verb: info.verb,
+        group: info.group,
+        version: info.version,
+        resource: info.resource,
+        subresource: info.subresource,
+        namespace: info.namespace,
+        name: info.name,
+        non_resource_url: info.non_resource_url,
+    };
+
+    match authorizer.authorize(&attrs).await {
+        crate::authz::Decision::Allow => next.run(req).await,
+        // NoOpinion (the RBAC default-deny) + an explicit Deny both render the
+        // standard RBAC 403 with the typed `forbidden: User ... cannot ...`
+        // message (NOT the admission `"admission denied:"` prefix).
+        crate::authz::Decision::Deny | crate::authz::Decision::NoOpinion => {
+            ApiError::AuthzForbidden(crate::error::forbidden_message(&attrs)).into_response()
+        }
+    }
+}
+
+/// `true` iff the raw query string carries `watch=true` / `watch=1` — the GET
+/// verb maps to `watch` when present. Parsed without a full decode (the values
+/// are simple flags).
+fn query_has_watch(query: &str) -> bool {
+    query.split('&').any(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        k == "watch" && (v == "true" || v == "1" || v.is_empty())
+    })
 }
 
 /// Extract the `Authorization: Bearer <token>` value, if present. Case-

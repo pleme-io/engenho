@@ -1631,6 +1631,7 @@ dependencies = [
  "engenho-scheduler",
  "engenho-store",
  "engenho-substrate",
+ "engenho-types",
  "getrandom 0.3.4",
  "reqwest 0.12.28",
  "serde_json",

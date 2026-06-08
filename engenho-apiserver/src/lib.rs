@@ -31,6 +31,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod authn;
+pub mod authz;
 pub mod coords;
 pub mod discovery;
 pub mod error;
@@ -47,12 +48,16 @@ pub use authn::{
     AnonymousAuthenticator, AuthnError, Authenticator, BootstrapAdminTokenAuthenticator,
     ChainAuthenticator, RequestCreds, ServiceAccountTokenAuthenticator, X509Authenticator,
 };
-pub use coords::ResourceCoords;
+pub use authz::{
+    AllowAllAuthorizer, Attributes, Authorizer, Decision, EffectiveRules, RbacAuthorizer,
+    RbacStoreEnv, into_dyn_authorizer, store_env::StoreRbacEnv,
+};
+pub use coords::{RequestInfo, ResourceCoords, parse_resource_path, resource_verb};
 pub use discovery::{
     APIGroup, APIGroupList, APIResource, APIResourceList, APIVersions, GroupVersionForDiscovery,
     ServerAddressByClientCIDR,
 };
-pub use error::{ApiError, ErrorKind, status_object};
+pub use error::{ApiError, ErrorKind, forbidden_message, status_object};
 pub use handler::{
     ResourceHandler, RouterHandlerSink, StoreBackedHandler, gone_to_api_error,
     handlers_from_catalog, handlers_from_catalog_with_admission,
