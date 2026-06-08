@@ -10,7 +10,7 @@ use engenho_controllers::admission::{
 };
 use engenho_store::{
     ContinueToken, Revision, StoreMesh, WatchGone, WatchOpts, WatchStream,
-    command::{Reason, ResourceCommand, ResourceOp},
+    command::{ApplyMeta, Reason, ResourceCommand, ResourceOp},
     resource::ResourceKey,
     watch_backend::WATCH_CHANNEL_CAPACITY,
 };
@@ -265,16 +265,22 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// request's `Content-Type` (resolved by the router from the media type)
     /// — it travels into the store's [`ResourceCommand::Patch`] so the
     /// deterministic apply path dispatches the correct algorithm (RFC 7396
-    /// merge / RFC 6902 json-patch / strategic list-merge). The raw `patch`
-    /// `Value` is the decoded body; for json-patch it is the RFC 6902 op
-    /// array. `user_info` is the authenticated identity threaded into
-    /// admission.
+    /// merge / RFC 6902 json-patch / strategic list-merge / server-side
+    /// apply). The raw `patch` `Value` is the decoded body; for json-patch
+    /// it is the RFC 6902 op array.
+    ///
+    /// `apply_opts` is `Some(_)` ONLY when `patch_type ==
+    /// PatchType::Apply` (server-side apply) — it carries the validated
+    /// `fieldManager` + `force`. For EVERY other patch algorithm it is
+    /// `None` and the path is byte-identical to before SSA landed.
+    /// `user_info` is the authenticated identity threaded into admission.
     async fn patch(
         &self,
         namespace: Option<&str>,
         name: &str,
         patch: Value,
         patch_type: engenho_types::patch::PatchType,
+        apply_opts: Option<crate::params::ApplyOptions>,
         user_info: &UserInfo,
     ) -> Result<Value, ApiError>;
 
@@ -1048,6 +1054,7 @@ impl ResourceHandler for StoreBackedHandler {
         name: &str,
         patch: Value,
         patch_type: engenho_types::patch::PatchType,
+        apply_opts: Option<crate::params::ApplyOptions>,
         user_info: &UserInfo,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
@@ -1063,6 +1070,67 @@ impl ResourceHandler for StoreBackedHandler {
         // op array has no precondition (the K8s wire never carries one on a
         // json-patch), so `body_precondition` over a non-object → None.
         let expected = body_precondition(&patch)?;
+
+        // ── Server-side apply branch ──────────────────────────────────────
+        //
+        // An apply is an UPSERT (create-if-absent + merge-if-present), so it
+        // does NOT take the not-found early-return below. The frozen RFC3339
+        // `time` is captured ONCE here at the apiserver boundary (the one
+        // non-deterministic input) and threaded into the replicated
+        // ApplyMeta, so every Raft replica stamps the identical managedFields
+        // `time`. NON-apply patches skip this entire block — byte-identical
+        // to before SSA landed (BEHAVIOR PRESERVATION).
+        if let Some(opts) = apply_opts {
+            let time = engenho_types::time::now_rfc3339_utc();
+            let result = self
+                .store
+                .propose(ResourceCommand::apply_ssa(
+                    key.clone(),
+                    patch,
+                    ApplyMeta {
+                        manager: opts.manager,
+                        force: opts.force,
+                        time,
+                    },
+                    expected,
+                    Reason::Operator,
+                ))
+                .await
+                .map_err(|e| ApiError::StorageError(e.to_string()))?;
+            if result.op == ResourceOp::Conflict {
+                return Err(self.rv_conflict(name, expected));
+            }
+            // Unforced field-ownership conflicts → typed 409 with
+            // details.causes (NEVER a silent overwrite). The serialized
+            // causes array rides on patch_error.
+            if result.op == ResourceOp::ApplyConflict {
+                let causes: Value = result
+                    .patch_error
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                return Err(ApiError::ApplyConflict(causes));
+            }
+            if result.op == ResourceOp::PatchRejected {
+                let msg = result
+                    .patch_error
+                    .unwrap_or_else(|| "apply rejected".to_string());
+                return Err(ApiError::BadRequest(msg));
+            }
+            // An apply that emptied finalizers on a Terminating object is
+            // converted to a removal by the store (same finalizer-release
+            // rule) — return the typed Success Status.
+            if result.op == ResourceOp::Deleted {
+                return Ok(crate::error::delete_status_success(name, &self.kind));
+            }
+            let stored = self
+                .store
+                .get(&key)
+                .await
+                .ok_or_else(|| ApiError::Internal("apply lost during commit".into()))?;
+            return Ok(inject_type_meta(&stored, self.api_version(), &self.kind));
+        }
+
         if self.store.get(&key).await.is_none() {
             return Err(ApiError::NotFound(format!("{}/{}", self.kind, name)));
         }
@@ -1072,6 +1140,7 @@ impl ResourceHandler for StoreBackedHandler {
                 key: key.clone(),
                 patch,
                 patch_type,
+                apply: None,
                 expected,
                 reason: Reason::Operator,
             })
@@ -1081,21 +1150,13 @@ impl ResourceHandler for StoreBackedHandler {
             return Err(self.rv_conflict(name, expected));
         }
         // The patch interpreter REFUSED the patch (RFC6902 test failure, bad
-        // pointer, missing strategic merge-key, bad $patch directive, or the
-        // typed-deferred server-side-apply path). Surface the typed Status —
-        // 415 for SSA (recognized-but-unimplemented content-type), 422 for a
-        // bad-but-valid patch body. NEVER a corrupted object.
+        // pointer, missing strategic merge-key, or a bad $patch directive).
+        // Surface the typed 422/400 Status. NEVER a corrupted object.
         if result.op == ResourceOp::PatchRejected {
             let msg = result
                 .patch_error
                 .unwrap_or_else(|| "patch rejected".to_string());
-            return Err(if msg.contains("server-side apply") {
-                ApiError::UnsupportedMediaType(format!(
-                    "the server does not yet implement server-side apply: {msg}"
-                ))
-            } else {
-                ApiError::BadRequest(msg)
-            });
+            return Err(ApiError::BadRequest(msg));
         }
         // A patch that EMPTIED the finalizers on a Terminating object is
         // converted by the store into a REMOVAL (the finalizer-release rule
@@ -1263,6 +1324,13 @@ impl StoreBackedHandler {
                 key: key.clone(),
                 patch,
                 patch_type,
+                // Subresource SSA (apply on `/status` or `/scale`) is a
+                // separate brick — subresource managedFields tracking isn't
+                // wired here, so an apply-typed subresource patch carries no
+                // ApplyMeta and the store returns a typed rejection (a 400,
+                // never a silent merge). The main-object apply path is the
+                // one this brick implements.
+                apply: None,
                 expected,
                 reason: Reason::Operator,
             })
@@ -1275,13 +1343,7 @@ impl StoreBackedHandler {
             let msg = result
                 .patch_error
                 .unwrap_or_else(|| "patch rejected".to_string());
-            return Err(if msg.contains("server-side apply") {
-                ApiError::UnsupportedMediaType(format!(
-                    "the server does not yet implement server-side apply: {msg}"
-                ))
-            } else {
-                ApiError::BadRequest(msg)
-            });
+            return Err(ApiError::BadRequest(msg));
         }
         let stored = self
             .store

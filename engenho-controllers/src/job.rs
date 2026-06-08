@@ -30,7 +30,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{PatchType, Reason, ResourceCommand},
+    command::{Reason, ResourceCommand},
     resource::ResourceKey,
 };
 use serde_json::{Value, json};
@@ -336,13 +336,11 @@ impl Controller for CronJobController {
                 .await?;
             // Patch CronJob status with lastRunUnix.
             self.store
-                .propose(ResourceCommand::Patch {
-                    key: cj_key.clone(),
-                    patch: json!({ "status": { "lastRunUnix": now } }),
-                    patch_type: PatchType::Merge,
-                    expected: None,
-                    reason: Reason::Controller,
-                })
+                .propose(ResourceCommand::patch(
+                    cj_key.clone(),
+                    json!({ "status": { "lastRunUnix": now } }),
+                    Reason::Controller,
+                ))
                 .await?;
             report.objects_changed += 2;
         }

@@ -148,6 +148,64 @@ impl ListWatchParams {
     }
 }
 
+/// The server-side-apply query params (`?fieldManager=` + `?force=`),
+/// parsed off the PATCH request when the Content-Type resolves to
+/// [`engenho_types::patch::PatchType::Apply`].
+///
+/// `fieldManager` is REQUIRED on an apply request — a missing/empty one is
+/// a typed 422/400 ([`ApplyOptions::from_params`]), matching upstream
+/// kube-apiserver. `force` defaults to false.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct ApplyParams {
+    /// `?fieldManager=<name>` — the manager's identity (REQUIRED for apply).
+    #[serde(rename = "fieldManager")]
+    pub field_manager: Option<String>,
+    /// `?force=true|1|yes` — take ownership of conflicting fields.
+    #[serde(deserialize_with = "de_bool")]
+    pub force: bool,
+}
+
+/// The validated, typed server-side-apply options threaded from the router
+/// into the handler. Construction enforces the `fieldManager` requirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyOptions {
+    /// The field-manager identity (non-empty by construction).
+    pub manager: String,
+    /// Whether to force-override conflicting fields.
+    pub force: bool,
+}
+
+impl ApplyOptions {
+    /// Validate the raw [`ApplyParams`] into typed [`ApplyOptions`]. A
+    /// missing / empty `fieldManager` is a typed
+    /// [`ApiError::BadRequest`] (the 400/422 kube-apiserver returns for an
+    /// apply request without a fieldManager) — never a silent default.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::BadRequest`] when `fieldManager` is absent or empty.
+    pub fn from_params(p: &ApplyParams) -> Result<Self, ApiError> {
+        let manager = p
+            .field_manager
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "fieldManager is required for an apply patch (Content-Type \
+                     application/apply-patch+yaml)"
+                        .to_string(),
+                )
+            })?
+            .to_string();
+        Ok(Self {
+            manager,
+            force: p.force,
+        })
+    }
+}
+
 /// Read the optimistic-concurrency precondition from an inbound resource
 /// BODY (create / patch): `metadata.resourceVersion`.
 ///
@@ -501,6 +559,41 @@ mod tests {
         // Non-string → BadRequest.
         assert!(matches!(
             body_precondition(&serde_json::json!({"metadata": {"resourceVersion": 5}})),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn apply_params_parse_field_manager_and_force() {
+        let p: ApplyParams =
+            serde_urlencoded::from_str("fieldManager=test&force=true").unwrap();
+        let opts = ApplyOptions::from_params(&p).unwrap();
+        assert_eq!(opts.manager, "test");
+        assert!(opts.force);
+
+        // force absent → false.
+        let p: ApplyParams = serde_urlencoded::from_str("fieldManager=test").unwrap();
+        let opts = ApplyOptions::from_params(&p).unwrap();
+        assert!(!opts.force);
+
+        // force=false explicit.
+        let p: ApplyParams =
+            serde_urlencoded::from_str("fieldManager=test&force=false").unwrap();
+        assert!(!ApplyOptions::from_params(&p).unwrap().force);
+    }
+
+    #[test]
+    fn apply_options_requires_field_manager() {
+        // Absent fieldManager → BadRequest (422/400).
+        let p: ApplyParams = serde_urlencoded::from_str("force=true").unwrap();
+        assert!(matches!(
+            ApplyOptions::from_params(&p),
+            Err(ApiError::BadRequest(_))
+        ));
+        // Empty fieldManager → BadRequest.
+        let p: ApplyParams = serde_urlencoded::from_str("fieldManager=").unwrap();
+        assert!(matches!(
+            ApplyOptions::from_params(&p),
             Err(ApiError::BadRequest(_))
         ));
     }

@@ -32,7 +32,7 @@
 
 use engenho_store::{
     StoreMesh,
-    command::{PatchType, Reason, ResourceCommand, ResourceOp},
+    command::{Reason, ResourceCommand, ResourceOp},
     resource::ResourceKey,
     revision::Revision,
 };
@@ -145,13 +145,12 @@ pub async fn write_status_cas(
     };
 
     let result = store
-        .propose(ResourceCommand::Patch {
-            key: key.clone(),
-            patch: serde_json::json!({ "status": desired_status }),
-            patch_type: PatchType::Merge,
-            expected: Some(expected),
-            reason: Reason::Controller,
-        })
+        .propose(ResourceCommand::patch_cas(
+            key.clone(),
+            serde_json::json!({ "status": desired_status }),
+            Some(expected),
+            Reason::Controller,
+        ))
         .await?;
 
     if result.op == ResourceOp::Conflict {

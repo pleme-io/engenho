@@ -57,6 +57,132 @@ pub struct ObjectMeta {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<i64>,
+
+    /// `metadata.managedFields` — the per-manager field-ownership ledger
+    /// server-side apply maintains. EMPTY for every object that has never
+    /// been touched by an Apply operation; `skip_serializing_if =
+    /// "Vec::is_empty"` keeps such objects byte-identical to their
+    /// pre-SSA serialization (the BEHAVIOR-PRESERVATION seam — no
+    /// non-SSA path ever stamps a managedFields entry, so its absence is
+    /// preserved on the wire). See [`ManagedFieldsEntry`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_fields: Vec<ManagedFieldsEntry>,
+}
+
+/// `meta/v1.ManagedFieldsEntry` — one manager's record of the fields it
+/// owns on this object, plus the operation + apiVersion it owned them at.
+///
+/// Server-side apply (SSA) maintains a `Vec<ManagedFieldsEntry>` on every
+/// object an Apply has touched: each manager's entry records EXACTLY the
+/// field paths that manager declared on its last apply (the
+/// [`fields_v1`](Self::fields_v1) trie). Conflict detection compares an
+/// incoming apply's fieldset against every OTHER manager's
+/// [`fields_v1`]; an unforced overlap with a differing value is a 409.
+///
+/// Wire shape: serde camelCase, `skip_serializing_if` matching upstream
+/// `metav1.ManagedFieldsEntry` so a minimal entry round-trips
+/// byte-compatibly. `BTreeMap`-backed [`FieldsV1`] under the hood ⇒
+/// byte-deterministic serialization (the ENGENHO determinism law —
+/// managedFields is replicated Raft state, must be identical on every
+/// replica).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedFieldsEntry {
+    /// The field manager's identity (e.g. `kubectl`, `engenho-scheduler`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub manager: String,
+
+    /// `Apply` (server-side apply) or `Update` (every other write). At
+    /// this brick only `Apply` entries are stamped (see the scope
+    /// boundary in the store's `ssa` module); `Update`-operation tracking
+    /// on non-apply writes is typed-deferred.
+    pub operation: ManagedFieldsOperation,
+
+    /// The apiVersion the fields were owned at. Cross-version field
+    /// conversion is typed-deferred (single-version objects: correct;
+    /// cross-version: the entry is treated as opaque-other-version).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_version: String,
+
+    /// The boundary-frozen RFC3339 instant this entry was last written
+    /// (the one non-deterministic input, captured at the apiserver
+    /// boundary + threaded into the replicated command — like
+    /// `creationTimestamp` / `deletionTimestamp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// Always `"FieldsV1"` — the discriminator naming the encoding of
+    /// [`fields_v1`](Self::fields_v1). Upstream `fieldsType`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fields_type: String,
+
+    /// The owned-field trie, serialized as the upstream `.`/`f:`/`k:`/
+    /// `v:`/`i:`-prefixed JSON object. See [`FieldsV1`].
+    #[serde(default, skip_serializing_if = "FieldsV1::is_empty")]
+    pub fields_v1: FieldsV1,
+
+    /// The subresource this entry's ownership applies to (e.g. `status`);
+    /// `None` for the main object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subresource: Option<String>,
+}
+
+/// `meta/v1.ManagedFieldsOperationType` — the operation an entry records.
+///
+/// The wire values are `PascalCase` literals (`"Apply"` / `"Update"`);
+/// serde `rename` pins them so the round-trip is byte-exact against
+/// upstream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ManagedFieldsOperation {
+    /// A server-side apply (`application/apply-patch+yaml`).
+    #[default]
+    #[serde(rename = "Apply")]
+    Apply,
+    /// Any non-apply write (create / PUT / non-apply patch). Recorded by
+    /// upstream on every write; typed-deferred at this engenho brick.
+    #[serde(rename = "Update")]
+    Update,
+}
+
+/// `meta/v1.FieldsV1` — the serialized projection of an owned-field set.
+///
+/// Upstream `FieldsV1` is a `RawExtension` whose wire form is a JSON
+/// object using the structured-merge-diff key prefixes:
+///
+///   * `f:<field>`         — a struct/map field (recurse into the value)
+///   * `k:{"<key>":"<v>"}` — an associative-list element keyed by the
+///     list-map-keys tuple (e.g. `k:{"name":"nginx"}` for a container)
+///   * `v:<scalar>`        — a set element addressed by its primitive value
+///   * `i:<index>`         — a list element addressed by index
+///   * `.`                 — the SENTINEL: "this node itself is owned"
+///
+/// Modeled as a newtype around the raw [`serde_json::Value`] object — the
+/// upstream type IS a raw JSON blob, so a `Value` newtype is the honest
+/// border that round-trips byte-exactly. The richer typed
+/// `engenho_store::ssa::FieldSet` trie is the INTERNAL representation; this
+/// is its serialized projection (`FieldSet ↔ FieldsV1` lives store-side).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct FieldsV1(pub serde_json::Value);
+
+impl FieldsV1 {
+    /// An empty fieldset (`{}`) — serializes to nothing under the
+    /// `skip_serializing_if` on [`ManagedFieldsEntry::fields_v1`].
+    #[must_use]
+    pub fn empty() -> Self {
+        Self(serde_json::Value::Object(serde_json::Map::new()))
+    }
+
+    /// `true` when the wrapped value carries no owned paths — either the
+    /// JSON `null`/non-object default OR an empty object.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match &self.0 {
+            serde_json::Value::Object(m) => m.is_empty(),
+            serde_json::Value::Null => true,
+            _ => false,
+        }
+    }
 }
 
 /// `meta/v1.TypeMeta` — apiVersion + kind, the discriminator on the wire.
@@ -109,6 +235,58 @@ mod tests {
         };
         let j = serde_json::to_string(&m).unwrap();
         assert!(j.contains("\"apiVersion\":\"v1\""));
+    }
+
+    #[test]
+    fn object_meta_without_managed_fields_serializes_byte_identically() {
+        // BEHAVIOR PRESERVATION: an object with no managedFields must
+        // serialize EXACTLY as it did pre-SSA (no `managedFields` key).
+        let m = ObjectMeta {
+            name: "foo".into(),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        assert_eq!(j, r#"{"name":"foo"}"#);
+        assert!(!j.contains("managedFields"));
+    }
+
+    #[test]
+    fn managed_fields_entry_round_trips_camel_case() {
+        let entry = ManagedFieldsEntry {
+            manager: "kubectl".into(),
+            operation: ManagedFieldsOperation::Apply,
+            api_version: "v1".into(),
+            time: None,
+            fields_type: "FieldsV1".into(),
+            fields_v1: FieldsV1(serde_json::json!({"f:data": {"f:a": {}}})),
+            subresource: None,
+        };
+        let j = serde_json::to_string(&entry).unwrap();
+        // Wire shape uses camelCase + PascalCase operation literal.
+        assert!(j.contains("\"operation\":\"Apply\""));
+        assert!(j.contains("\"fieldsType\":\"FieldsV1\""));
+        assert!(j.contains("\"fieldsV1\""));
+        let back: ManagedFieldsEntry = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn managed_fields_operation_wire_values_are_pascal_case() {
+        assert_eq!(
+            serde_json::to_string(&ManagedFieldsOperation::Apply).unwrap(),
+            "\"Apply\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ManagedFieldsOperation::Update).unwrap(),
+            "\"Update\""
+        );
+    }
+
+    #[test]
+    fn fields_v1_is_empty_distinguishes_empty_from_owned() {
+        assert!(FieldsV1::empty().is_empty());
+        assert!(FieldsV1::default().is_empty());
+        assert!(!FieldsV1(serde_json::json!({"f:a": {}})).is_empty());
     }
 
     #[test]

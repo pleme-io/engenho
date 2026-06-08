@@ -166,6 +166,7 @@ async fn deployment_rollout_creates_new_replicaset_for_template_change() {
                 }
             }),
             patch_type: engenho_store::command::PatchType::Merge,
+            apply: None,
             expected: None,
             reason: Reason::Operator,
         })

@@ -535,7 +535,18 @@ const RETAIN_KEYS_SENTINEL: &str = "$retainKeys";
 /// Strategic-merge `patch` into `current` at object path `path`. Object keys
 /// recurse; list keys consult the env for their [`ListMergeStrategy`]; the
 /// `$patch` directive sentinels override the default.
-fn strategic_merge(
+///
+/// `pub` because server-side apply ([`crate::ssa::apply_ssa`]) REUSES this
+/// exact engine — the apply config IS a strategic-merge patch over current,
+/// so SSA's merge step calls back here rather than forking a second merge
+/// engine.
+///
+/// # Errors
+///
+/// Any [`PatchError`] from the recursion (a key-less merge-by-key element /
+/// an unrecognized `$patch` directive). An apply config carries neither, so
+/// SSA's call is effectively total.
+pub fn strategic_merge(
     current: &Value,
     patch: &Value,
     env: &dyn PatchSchemaEnv,

@@ -62,6 +62,16 @@ pub enum ApiError {
     /// human-readable message rendered into the `Status` body.
     #[error("{0}")]
     Gone(String),
+    /// A server-side apply hit field-ownership conflicts `force` did not
+    /// override — the K8s 409 Conflict for apply. Renders the
+    /// `Apply failed with N conflict(s)` `Status` with reason "Conflict",
+    /// code 409, AND a `details.causes` array (one `FieldManagerConflict`
+    /// cause per field) — distinct from the plain
+    /// [`Self::ResourceVersionConflict`] (no causes). Carries the typed
+    /// causes array (built by [`engenho_store::ssa::ApplyConflicts::to_causes`])
+    /// so the body is serde-rendered, never `format!()`ed.
+    #[error("Apply failed with conflicts")]
+    ApplyConflict(serde_json::Value),
     #[error("internal error: {0}")]
     Internal(String),
     #[error("storage error: {0}")]
@@ -80,6 +90,7 @@ pub enum ErrorKind {
     Forbidden,
     AuthzForbidden,
     Gone,
+    ApplyConflict,
     Internal,
     StorageError,
 }
@@ -97,6 +108,7 @@ impl ApiError {
             Self::Forbidden(_) => ErrorKind::Forbidden,
             Self::AuthzForbidden(_) => ErrorKind::AuthzForbidden,
             Self::Gone(_) => ErrorKind::Gone,
+            Self::ApplyConflict(_) => ErrorKind::ApplyConflict,
             Self::Internal(_) => ErrorKind::Internal,
             Self::StorageError(_) => ErrorKind::StorageError,
         }
@@ -105,7 +117,9 @@ impl ApiError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Conflict(_, _) | Self::ResourceVersionConflict(_) => StatusCode::CONFLICT,
+            Self::Conflict(_, _)
+            | Self::ResourceVersionConflict(_)
+            | Self::ApplyConflict(_) => StatusCode::CONFLICT,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -152,6 +166,33 @@ struct K8sStatusSuccess {
 struct StatusDetails {
     name: String,
     kind: String,
+}
+
+/// A typed K8s `Status` FAILURE object carrying a `details.causes` array —
+/// the shape server-side apply returns on a field-ownership conflict
+/// (`Apply failed with N conflict(s)`, reason "Conflict", code 409, one
+/// `FieldManagerConflict` cause per conflicting field). DISTINCT from
+/// [`K8sStatus`] (which has no `details`). The `causes` array is the typed
+/// `serde_json::Value` built store-side by
+/// `engenho_store::ssa::ApplyConflicts::to_causes` — serde all the way
+/// (TYPED EMISSION; never `format!()` of the wire object).
+#[derive(Serialize)]
+struct K8sStatusWithCauses {
+    kind: &'static str,
+    #[serde(rename = "apiVersion")]
+    api_version: &'static str,
+    status: &'static str,
+    code: u16,
+    reason: String,
+    message: String,
+    details: StatusCauseDetails,
+}
+
+/// The `metav1.StatusDetails` block carrying `causes` — used by the
+/// apply-conflict 409.
+#[derive(Serialize)]
+struct StatusCauseDetails {
+    causes: serde_json::Value,
 }
 
 /// Build the typed `metav1.Status{status:"Success"}` value DELETE returns
@@ -249,13 +290,39 @@ pub fn forbidden_message(attrs: &crate::authz::Attributes) -> String {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let code = self.status_code();
+        // The apply-conflict path renders a Status WITH `details.causes` —
+        // a distinct body shape from every other error (which has no
+        // details). Handle it first; the message names the conflict count.
+        if let ApiError::ApplyConflict(causes) = &self {
+            let n = causes.as_array().map_or(0, Vec::len);
+            let message = if n == 1 {
+                "Apply failed with 1 conflict".to_string()
+            } else {
+                format!("Apply failed with {n} conflicts")
+            };
+            let payload = K8sStatusWithCauses {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                code: code.as_u16(),
+                reason: "Conflict".to_string(),
+                message,
+                details: StatusCauseDetails {
+                    causes: causes.clone(),
+                },
+            };
+            return (code, Json(payload)).into_response();
+        }
         let reason = match self {
             ApiError::NotFound(_) => "NotFound",
             ApiError::Conflict(_, _) => "AlreadyExists",
             // Optimistic-concurrency failure uses reason "Conflict"
             // (K8s uses `.details` for these) — distinct from the
-            // create-already-exists "AlreadyExists" above.
-            ApiError::ResourceVersionConflict(_) => "Conflict",
+            // create-already-exists "AlreadyExists" above. `ApplyConflict`
+            // is rendered by the early-return above (with `details.causes`)
+            // so its arm here is unreachable; it shares the "Conflict"
+            // reason for exhaustiveness.
+            ApiError::ResourceVersionConflict(_) | ApiError::ApplyConflict(_) => "Conflict",
             ApiError::BadRequest(_) => "BadRequest",
             ApiError::Unauthorized(_) => "Unauthorized",
             ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",

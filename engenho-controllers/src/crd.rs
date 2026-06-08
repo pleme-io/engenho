@@ -38,7 +38,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{PatchType, Reason, ResourceCommand},
+    command::{Reason, ResourceCommand},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -442,9 +442,9 @@ impl Controller for CrdController {
         // registered-set lock (no .await while holding a std Mutex).
         for crd_key in crds_to_establish {
             self.store
-                .propose(ResourceCommand::Patch {
-                    key: crd_key,
-                    patch: json!({
+                .propose(ResourceCommand::patch(
+                    crd_key,
+                    json!({
                         "status": {
                             "conditions": [
                                 {
@@ -462,10 +462,8 @@ impl Controller for CrdController {
                             ]
                         }
                     }),
-                    patch_type: PatchType::Merge,
-                    expected: None,
-                    reason: Reason::Controller,
-                })
+                    Reason::Controller,
+                ))
                 .await?;
         }
 

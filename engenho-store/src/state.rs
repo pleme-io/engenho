@@ -31,10 +31,11 @@ use std::sync::Arc;
 
 use engenho_types::patch::PatchType;
 
-use crate::command::{ResourceCommand, ResourceOp};
+use crate::command::{ApplyMeta, ResourceCommand, ResourceOp};
 use crate::pagination::ListPage;
 use crate::patch_apply::{self, Gvk, OpenApiPatchEnv, PatchBody, PatchError, PatchSchemaEnv};
 use crate::resource::{ResourceKey, ResourceValue};
+use crate::ssa;
 use crate::revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 
 /// Optimistic-concurrency precondition check (the CAS heart). Pure
@@ -119,6 +120,23 @@ impl ApplyOutcome {
             op: ResourceOp::PatchRejected,
             change: None,
             patch_error: Some(error),
+        }
+    }
+
+    /// A [`ResourceOp::ApplyConflict`] outcome carrying the serialized
+    /// `details.causes` JSON (from
+    /// [`crate::ssa::ApplyConflicts::to_causes`]) — a server-side apply hit
+    /// field-ownership conflicts `force` did not override. No mutation, no
+    /// revision consumed; the apiserver renders a 409 `Status` with reason
+    /// "Conflict" + the per-field causes. The causes JSON is carried as a
+    /// string (via [`Self::patch_error`]) so [`ApplyOutcome`] keeps its
+    /// derives, mirroring [`Self::patch_rejected`].
+    #[must_use]
+    pub fn apply_conflict(causes_json: String) -> Self {
+        Self {
+            op: ResourceOp::ApplyConflict,
+            change: None,
+            patch_error: Some(causes_json),
         }
     }
 }
@@ -302,9 +320,10 @@ impl ResourceCatalog {
                 key,
                 patch,
                 patch_type,
+                apply,
                 expected,
                 ..
-            } => self.apply_patch(key, patch, *patch_type, *expected, rev),
+            } => self.apply_patch(key, patch, *patch_type, apply.as_ref(), *expected, rev),
             ResourceCommand::Delete {
                 key,
                 expected,
@@ -449,9 +468,32 @@ impl ResourceCatalog {
         key: &ResourceKey,
         patch: &ResourceValue,
         patch_type: PatchType,
+        apply: Option<&ApplyMeta>,
         expected: Option<Revision>,
         rev: Revision,
     ) -> ApplyOutcome {
+        // ── Server-side apply branch ──────────────────────────────────────
+        //
+        // SSA is an UPSERT (create-if-absent + merge-if-present), so it must
+        // run BEFORE the missing-key early-return below (a plain patch on a
+        // missing key is a NoOp; an apply on a missing key CREATES). The
+        // frozen `ApplyMeta` (fieldManager/force/time) carries the
+        // replicated apply identity + clock, so every Raft node runs the
+        // identical SSA decision. Non-apply patches fall through to the
+        // existing typed-dispatch path UNCHANGED (BEHAVIOR PRESERVATION).
+        if patch_type == PatchType::Apply {
+            // An apply-typed command with NO ApplyMeta is a construction bug
+            // at the boundary (the boundary rejects a missing fieldManager
+            // with a 422 before proposing) — surface a typed rejection, never
+            // a silent wrong answer.
+            let Some(meta) = apply else {
+                return ApplyOutcome::patch_rejected(
+                    "server-side apply requires a fieldManager".to_string(),
+                );
+            };
+            return self.apply_ssa_command(key, patch, meta, expected, rev);
+        }
+
         let Some((existing_value, existing_meta)) = self.resources.get(key) else {
             // Missing key. A `Some(_)` precondition can't be satisfied
             // (cannot CAS a non-existent object) → Conflict; an
@@ -547,6 +589,110 @@ impl ResourceCatalog {
                 kind: ChangeKind::Put,
                 value: merged,
                 prior: Some(prior_value),
+                version_meta,
+            },
+        )
+    }
+
+    /// Server-side apply — the upsert path for an `application/apply-patch`
+    /// request. REUSES the strategic-merge engine via
+    /// [`crate::ssa::apply_ssa`] (no second merge engine) + the SAME
+    /// `patch_env` strategic-merge consults, and stamps the SAME
+    /// resourceVersion/generation/uid metadata the create/patch paths do.
+    ///
+    /// On an unforced field-ownership conflict → [`ResourceOp::ApplyConflict`]
+    /// (no mutation, catalog byte-identical) carrying the serialized
+    /// `details.causes`. Otherwise the merged object (with its updated
+    /// `metadata.managedFields`) is stored and a [`ResourceOp::Created`] /
+    /// [`ResourceOp::Patched`] change is emitted — the same store-and-emit
+    /// shape as the non-SSA paths.
+    fn apply_ssa_command(
+        &mut self,
+        key: &ResourceKey,
+        body: &ResourceValue,
+        meta: &ApplyMeta,
+        expected: Option<Revision>,
+        rev: Revision,
+    ) -> ApplyOutcome {
+        let prior_entry = self.resources.get(key).cloned();
+
+        // Optimistic-concurrency precondition (CAS) — checked BEFORE the
+        // merge, identical to apply_put/apply_patch. On conflict the catalog
+        // is untouched (no revision advance, no history, no fan-out).
+        if !check_precondition(expected, prior_entry.as_ref().map(|(_, m)| *m)) {
+            return ApplyOutcome::no_change(ResourceOp::Conflict);
+        }
+
+        let prior_value = prior_entry.as_ref().map(|(v, _)| v.clone());
+        let gvk = Gvk::from(key);
+
+        // Run the PURE SSA interpreter (reuses strategic_merge + the env).
+        let outcome = ssa::apply_ssa(
+            prior_value.as_ref(),
+            body,
+            &meta.manager,
+            meta.force,
+            &gvk,
+            &*self.patch_env,
+            &meta.time,
+        );
+        let ssa_out = match outcome {
+            Ok(o) => o,
+            Err(conflicts) => {
+                // Typed 409 — NEVER a silent overwrite. The serialized
+                // details.causes ride on patch_error.
+                let causes = conflicts.to_causes();
+                return ApplyOutcome::apply_conflict(causes.to_string());
+            }
+        };
+
+        let mut merged = ssa_out.merged().clone();
+
+        // Stamp resourceVersion + generation + uid — the SAME metadata the
+        // create/patch paths stamp, computed deterministically in the apply
+        // path so every Raft replica is byte-identical. (managedFields was
+        // already written by apply_ssa into the merged object.)
+        let version_meta = match &prior_entry {
+            Some((_, m)) => m.bumped_at(rev),
+            None => VersionMeta::created_at(rev),
+        };
+        let next_generation = compute_generation_on_put(prior_value.as_ref(), &merged);
+        stamp_object_metadata(
+            &mut merged,
+            key,
+            rev,
+            next_generation,
+            version_meta,
+            prior_entry.as_ref().map(|(v, _)| v),
+        );
+
+        // Finalizer release (same rule as apply_put/apply_patch): an apply
+        // that empties finalizers on a Terminating object converts to a
+        // removal. Only meaningful for an UPDATE (prior present).
+        if prior_value.is_some() {
+            if let Some(out) =
+                self.finalizer_release_removal(key, &merged, prior_value.as_ref(), rev)
+            {
+                return out;
+            }
+        }
+
+        self.resources
+            .insert(key.clone(), (merged.clone(), version_meta));
+
+        let op = if prior_value.is_some() {
+            ResourceOp::Patched
+        } else {
+            ResourceOp::Created
+        };
+        ApplyOutcome::with_change(
+            op,
+            Change {
+                revision: rev,
+                key: key.clone(),
+                kind: ChangeKind::Put,
+                value: merged,
+                prior: prior_value,
                 version_meta,
             },
         )
@@ -941,6 +1087,54 @@ fn deletion_timestamp_of(value: &serde_json::Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Stamp `metadata.resourceVersion` + `metadata.generation` + `metadata.uid`
+/// on `value` — the deterministic apiserver-owned-metadata pass shared by
+/// the SSA path (and modeled on the identical inline block in `apply_put`):
+/// resourceVersion from the global `rev`, generation from
+/// `compute_generation_on_put`, uid preserved from the prior object or minted
+/// deterministically (from key + create_revision) on first create. Pure JSON
+/// mutation — no clock, no RNG — so every Raft replica is byte-identical.
+fn stamp_object_metadata(
+    value: &mut serde_json::Value,
+    key: &ResourceKey,
+    rev: Revision,
+    next_generation: i64,
+    version_meta: VersionMeta,
+    prior_value: Option<&serde_json::Value>,
+) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let metadata = obj
+        .entry("metadata".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(meta_obj) = metadata.as_object_mut() else {
+        return;
+    };
+    meta_obj.insert(
+        "resourceVersion".to_string(),
+        serde_json::Value::String(rev.to_string()),
+    );
+    meta_obj.insert(
+        "generation".to_string(),
+        serde_json::Value::Number(next_generation.into()),
+    );
+    let prior_uid = prior_value
+        .and_then(|v| v.get("metadata"))
+        .and_then(|m| m.get("uid"))
+        .cloned();
+    if let Some(prior_uid) = prior_uid {
+        meta_obj.insert("uid".to_string(), prior_uid);
+    } else if !meta_obj.contains_key("uid") {
+        let uid = format!(
+            "uid-{}-{}",
+            key.label().replace('/', "-"),
+            version_meta.create_revision
+        );
+        meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
+    }
+}
+
 /// Set `metadata.deletionTimestamp` to the REPLICATED `ts` string,
 /// creating `metadata` if absent. Pure JSON mutation of the opaque body —
 /// the typed RFC3339 render already happened at the apiserver boundary
@@ -1166,6 +1360,7 @@ mod tests {
                 key: pod_key("ghost"),
                 patch: serde_json::json!({"x": 1}),
                 patch_type: PatchType::Merge,
+                apply: None,
                 expected: None,
                 reason: Reason::Operator,
             },
@@ -1194,6 +1389,7 @@ mod tests {
                 key: k.clone(),
                 patch: serde_json::json!({"spec": {"image": "v2"}}),
                 patch_type: PatchType::Merge,
+                apply: None,
                 expected: None,
                 reason: Reason::Operator,
             },
@@ -1303,6 +1499,7 @@ mod tests {
                 key: k.clone(),
                 patch: serde_json::json!({"spec": {"annotations": null}}),
                 patch_type: PatchType::Merge,
+                apply: None,
                 expected: None,
                 reason: Reason::Operator,
             },
@@ -1391,6 +1588,7 @@ mod tests {
                 key: key.clone(),
                 patch,
                 patch_type: PatchType::Merge,
+                apply: None,
                 expected: None,
                 reason: Reason::Operator,
             },
@@ -1523,6 +1721,7 @@ mod tests {
                 key: pod_key("ghost"),
                 patch: serde_json::json!({"y": 1}),
                 patch_type: PatchType::Merge,
+                apply: None,
                 expected: None,
                 reason: Reason::Operator,
             },
