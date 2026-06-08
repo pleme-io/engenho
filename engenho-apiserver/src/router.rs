@@ -49,6 +49,7 @@ use engenho_kube_proto::{
     response_wants_protobuf,
 };
 use engenho_store::{WatchGone, WatchSignal, WatchStream};
+use engenho_types::patch::PatchType;
 use utoipa::OpenApi;
 
 use crate::discovery;
@@ -443,46 +444,57 @@ fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Valu
     }
 }
 
-/// Decode a PATCH request body. The patch Content-Types
-/// (strategic/merge/json-patch) are all JSON-family and parse as JSON;
-/// only a full-object replace via protobuf goes through the codec. An
-/// unknown media type is a typed 415. (kubectl patch always sends a
-/// JSON-family patch body, so the JSON branch is the live path.)
-fn decode_patch_body(
+/// Decode a PATCH request body AND resolve the typed patch algorithm from the
+/// `Content-Type`. The media type is the load-bearing signal: it tells the
+/// store which of the four algorithms (merge / strategic / json-patch / apply)
+/// to run. The previous `decode_patch_body` discarded it, funnelling all four
+/// content-types into one untyped `Value` so every patch ran as RFC7396 merge
+/// — the first erasure point this fixes.
+///
+/// The four K8s patch content-types are all JSON-family and parse as JSON.
+/// A missing/empty Content-Type defaults to `Strategic` (kube-apiserver's
+/// default patch type). `application/apply-patch+yaml` resolves to
+/// [`PatchType::Apply`] (typed-deferred server-side apply — the store returns
+/// a typed 415, never a silent strategic/merge fallback). A protobuf
+/// full-object replace decodes via the codec (typed as `Merge`, the
+/// replace-shaped algorithm). An unrecognized media type is a typed 415.
+fn decode_patch(
     headers: &HeaderMap,
     raw: &[u8],
     gvk: &Gvk,
-) -> Result<serde_json::Value, ApiError> {
+) -> Result<(serde_json::Value, PatchType), ApiError> {
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let media = content_type.split(';').next().unwrap_or("").trim();
-    // Every JSON-family patch media type parses as JSON. K8s patch
-    // content-types: application/json-patch+json,
-    // application/merge-patch+json,
-    // application/strategic-merge-patch+json, application/apply-patch+yaml
-    // (the +json family + the JSON subset of apply-patch). All are
-    // JSON-decodable except apply-patch+yaml — which we accept as JSON too
-    // (kubectl apply --server-side sends JSON-shaped YAML; full SSA is a
-    // later phase). The default kubectl patch (no --type) is
-    // strategic-merge-patch+json.
-    if media.is_empty()
-        || media.eq_ignore_ascii_case("application/json")
-        || media.ends_with("+json")
-        || media.ends_with("+yaml")
-    {
-        serde_json::from_slice(raw)
-            .map_err(|e| ApiError::BadRequest(format!("invalid JSON patch body: {e}")))
-    } else if is_protobuf_content_type(content_type) {
-        // A protobuf full-object replace (rare): decode via the codec.
-        let _ = gvk;
-        Ok(kube_proto::decode_protobuf(raw)?)
-    } else {
-        Err(ApiError::UnsupportedMediaType(format!(
-            "the body of the patch request was in an unsupported format; got {media:?}"
-        )))
+
+    // Plain `application/json` is a full-object replace shape — treat it as a
+    // merge patch (RFC7396-merge of a full object is an idempotent replace).
+    if media.eq_ignore_ascii_case("application/json") {
+        let v = serde_json::from_slice(raw)
+            .map_err(|e| ApiError::BadRequest(format!("invalid JSON patch body: {e}")))?;
+        return Ok((v, PatchType::Merge));
     }
+
+    if is_protobuf_content_type(content_type) {
+        // A protobuf full-object replace (rare): decode via the codec, typed
+        // as a merge (full-object replace).
+        let _ = gvk;
+        let v = kube_proto::decode_protobuf(raw)?;
+        return Ok((v, PatchType::Merge));
+    }
+
+    // The four K8s patch content-types (+ the empty default) resolve through
+    // the typed inverse of `Patch::content_type`. An unknown media type → 415.
+    let Some(patch_type) = PatchType::from_content_type(media) else {
+        return Err(ApiError::UnsupportedMediaType(format!(
+            "the body of the patch request was in an unsupported format; got {media:?}"
+        )));
+    };
+    let v = serde_json::from_slice(raw)
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON patch body: {e}")))?;
+    Ok((v, patch_type))
 }
 
 /// Render a handler-returned `serde_json::Value` as the negotiated
@@ -551,8 +563,11 @@ async fn do_patch(
     raw: &[u8],
 ) -> Result<Response, ApiError> {
     let gvk = handler_gvk(h);
-    let patch = decode_patch_body(headers, raw, &gvk)?;
-    let v = h.patch(ns, name, patch).await?;
+    // Resolve the typed patch algorithm from the Content-Type FIRST — the
+    // media type is the load-bearing signal the store dispatches on. Erasing
+    // it here (the old `decode_patch_body` did) made every patch a merge.
+    let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
+    let v = h.patch(ns, name, patch, patch_type).await?;
     let codec = ResponseCodec::from_headers(headers);
     render_object(codec, &gvk, StatusCode::OK, v)
 }
@@ -1011,6 +1026,7 @@ mod tests {
             _ns: Option<&str>,
             _name: &str,
             _patch: serde_json::Value,
+            _patch_type: engenho_types::patch::PatchType,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal("fake handler: patch not exercised".into()))
         }

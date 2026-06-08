@@ -26,7 +26,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{Reason, ResourceCommand},
+    command::{PatchType, Reason, ResourceCommand},
 };
 use engenho_substrate::{DerivationCacheBackend, DrvHash};
 use serde_json::{Value, json};
@@ -166,6 +166,7 @@ impl Controller for DrvController {
                             "realisations": realisations_json,
                         }
                     }),
+                    patch_type: PatchType::Merge,
                     expected: None,
                     reason: Reason::Controller,
                 })

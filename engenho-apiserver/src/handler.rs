@@ -147,11 +147,19 @@ pub trait ResourceHandler: Send + Sync + 'static {
 
     async fn create(&self, namespace: Option<&str>, body: Value) -> Result<Value, ApiError>;
 
+    /// Apply a PATCH. `patch_type` is the typed discriminant of the
+    /// request's `Content-Type` (resolved by the router from the media type)
+    /// — it travels into the store's [`ResourceCommand::Patch`] so the
+    /// deterministic apply path dispatches the correct algorithm (RFC 7396
+    /// merge / RFC 6902 json-patch / strategic list-merge). The raw `patch`
+    /// `Value` is the decoded body; for json-patch it is the RFC 6902 op
+    /// array.
     async fn patch(
         &self,
         namespace: Option<&str>,
         name: &str,
         patch: Value,
+        patch_type: engenho_types::patch::PatchType,
     ) -> Result<Value, ApiError>;
 
     /// DELETE a resource. Returns the response BODY as the K8s wire
@@ -680,6 +688,7 @@ impl ResourceHandler for StoreBackedHandler {
         namespace: Option<&str>,
         name: &str,
         patch: Value,
+        patch_type: engenho_types::patch::PatchType,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
         // Admission runs at the API boundary BEFORE the store proposal.
@@ -688,7 +697,10 @@ impl ResourceHandler for StoreBackedHandler {
             .await?
             .expect("admit(Patch, Some(_)) preserves Some on Allow/Mutate");
         // Precondition from the (post-admission) patch body's
-        // metadata.resourceVersion (absent → unconditional).
+        // metadata.resourceVersion (absent → unconditional). Only a
+        // merge/strategic body is an object carrying metadata; a json-patch
+        // op array has no precondition (the K8s wire never carries one on a
+        // json-patch), so `body_precondition` over a non-object → None.
         let expected = body_precondition(&patch)?;
         if self.store.get(&key).await.is_none() {
             return Err(ApiError::NotFound(format!("{}/{}", self.kind, name)));
@@ -698,6 +710,7 @@ impl ResourceHandler for StoreBackedHandler {
             .propose(ResourceCommand::Patch {
                 key: key.clone(),
                 patch,
+                patch_type,
                 expected,
                 reason: Reason::Operator,
             })
@@ -705,6 +718,23 @@ impl ResourceHandler for StoreBackedHandler {
             .map_err(|e| ApiError::StorageError(e.to_string()))?;
         if result.op == ResourceOp::Conflict {
             return Err(self.rv_conflict(name, expected));
+        }
+        // The patch interpreter REFUSED the patch (RFC6902 test failure, bad
+        // pointer, missing strategic merge-key, bad $patch directive, or the
+        // typed-deferred server-side-apply path). Surface the typed Status —
+        // 415 for SSA (recognized-but-unimplemented content-type), 422 for a
+        // bad-but-valid patch body. NEVER a corrupted object.
+        if result.op == ResourceOp::PatchRejected {
+            let msg = result
+                .patch_error
+                .unwrap_or_else(|| "patch rejected".to_string());
+            return Err(if msg.contains("server-side apply") {
+                ApiError::UnsupportedMediaType(format!(
+                    "the server does not yet implement server-side apply: {msg}"
+                ))
+            } else {
+                ApiError::BadRequest(msg)
+            });
         }
         let stored = self
             .store

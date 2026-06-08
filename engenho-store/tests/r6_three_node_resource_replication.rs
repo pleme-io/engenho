@@ -76,12 +76,11 @@ async fn put_then_patch_then_delete_full_lifecycle() {
 
     // PATCH the image only
     let patched = mesh
-        .propose(ResourceCommand::Patch {
-            key: pod_key("p"),
-            patch: serde_json::json!({"spec": {"image": "v2"}}),
-            expected: None,
-            reason: Reason::Controller,
-        })
+        .propose(ResourceCommand::patch(
+            pod_key("p"),
+            serde_json::json!({"spec": {"image": "v2"}}),
+            Reason::Controller,
+        ))
         .await
         .unwrap();
     assert_eq!(patched.op, engenho_store::command::ResourceOp::Patched);

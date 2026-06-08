@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{Reason, ResourceCommand},
+    command::{PatchType, Reason, ResourceCommand},
 };
 use engenho_substrate::{
     DerivationCacheBackend, Drv, DrvHash, NarBlob, NarHash, OutputPath, Realisation,
@@ -267,6 +267,7 @@ impl Controller for DrvBuildController {
                                     "message": e.to_string(),
                                 }
                             }),
+                            patch_type: PatchType::Merge,
                             expected: None,
                             reason: Reason::Controller,
                         })

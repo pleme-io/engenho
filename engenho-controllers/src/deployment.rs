@@ -164,12 +164,11 @@ impl OwnedChildrenReconciler for DeploymentController {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
             if current_replicas != 0 {
-                commands.push(ResourceCommand::Patch {
-                    key: rs_key.clone(),
-                    patch: json!({"spec": {"replicas": 0}}),
-                    expected: None,
-                    reason: Reason::Controller,
-                });
+                commands.push(ResourceCommand::patch(
+                    rs_key.clone(),
+                    json!({"spec": {"replicas": 0}}),
+                    Reason::Controller,
+                ));
             }
         }
 
@@ -186,12 +185,11 @@ impl OwnedChildrenReconciler for DeploymentController {
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
                 if current_replicas != desired_replicas {
-                    commands.push(ResourceCommand::Patch {
-                        key: rs_key.clone(),
-                        patch: json!({"spec": {"replicas": desired_replicas}}),
-                        expected: None,
-                        reason: Reason::Controller,
-                    });
+                    commands.push(ResourceCommand::patch(
+                        rs_key.clone(),
+                        json!({"spec": {"replicas": desired_replicas}}),
+                        Reason::Controller,
+                    ));
                 }
             }
             None => {

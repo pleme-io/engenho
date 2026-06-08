@@ -27,9 +27,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
+use std::sync::Arc;
+
+use engenho_types::patch::PatchType;
 
 use crate::command::{ResourceCommand, ResourceOp};
 use crate::pagination::ListPage;
+use crate::patch_apply::{self, Gvk, OpenApiPatchEnv, PatchBody, PatchError, PatchSchemaEnv};
 use crate::resource::{ResourceKey, ResourceValue};
 use crate::revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 
@@ -68,13 +72,55 @@ pub const DEFAULT_HISTORY_CAPACITY: usize = 8192;
 /// mutation committed (or `None` for a no-op).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ApplyOutcome {
-    /// Created / Replaced / Patched / Deleted / NoOp.
+    /// Created / Replaced / Patched / Deleted / Conflict / PatchRejected /
+    /// NoOp.
     pub op: ResourceOp,
     /// The committed change — `Some` for every real mutation, `None`
     /// for a no-op. Carries the post-image, the prior object (so the
     /// Deleted event always has the real prior, never Null), the
     /// stamped revision, and the per-key version metadata.
     pub change: Option<Change>,
+    /// The typed patch-interpreter error string when `op ==
+    /// [`ResourceOp::PatchRejected`]`; `None` otherwise. The apiserver maps
+    /// it to the correct typed `ApiError` (415 for server-side apply,
+    /// 422/400 for a bad patch body). Carried as a `String` so
+    /// [`ApplyOutcome`] keeps its derives (the `PatchError` is rendered to a
+    /// stable message at the rejection site).
+    pub patch_error: Option<String>,
+}
+
+impl ApplyOutcome {
+    /// An outcome with no committed change (a Conflict / NoOp / etc.) and no
+    /// patch error.
+    #[must_use]
+    pub fn no_change(op: ResourceOp) -> Self {
+        Self {
+            op,
+            change: None,
+            patch_error: None,
+        }
+    }
+
+    /// An outcome carrying a committed [`Change`].
+    #[must_use]
+    pub fn with_change(op: ResourceOp, change: Change) -> Self {
+        Self {
+            op,
+            change: Some(change),
+            patch_error: None,
+        }
+    }
+
+    /// A [`ResourceOp::PatchRejected`] outcome carrying the typed patch
+    /// error's stable message — no mutation, no revision consumed.
+    #[must_use]
+    pub fn patch_rejected(error: String) -> Self {
+        Self {
+            op: ResourceOp::PatchRejected,
+            change: None,
+            patch_error: Some(error),
+        }
+    }
 }
 
 /// In-memory K8s resource catalog. Keyed by [`ResourceKey`] (which
@@ -85,7 +131,7 @@ pub struct ApplyOutcome {
 /// The catalog tracks `last_applied_index` (Raft log index, for
 /// read-after-write + snapshot resume) AND `current_revision` (the
 /// global MVCC counter consumers stamp resourceVersion from).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ResourceCatalog {
     /// Keyed store: value + per-key version metadata.
     pub resources: BTreeMap<ResourceKey, (ResourceValue, VersionMeta)>,
@@ -103,6 +149,36 @@ pub struct ResourceCatalog {
     /// Max entries retained in `history` before the oldest is evicted
     /// (advancing `compacted_revision`).
     pub history_capacity: usize,
+    /// Strategic-merge schema resolver — the [`PatchSchemaEnv`] the patch
+    /// interpreter consults for per-list merge strategies. NOT part of the
+    /// converged/serialized state (it's a stateless, deterministic lookup
+    /// over the `&'static` BLAKE3-pinned vendored OpenAPI docs — identical on
+    /// every node), so it's excluded from `Serialize`/`Deserialize`/`PartialEq`
+    /// and reconstructed via [`Default`] on deserialize. `Arc` so `Clone` is
+    /// a cheap refcount bump (the catalog is cloned on snapshot/read paths).
+    patch_env: Arc<dyn PatchSchemaEnv>,
+}
+
+impl std::fmt::Debug for ResourceCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceCatalog")
+            .field("resources", &self.resources)
+            .field("last_applied_term", &self.last_applied_term)
+            .field("last_applied_index", &self.last_applied_index)
+            .field("current_revision", &self.current_revision)
+            .field("history", &self.history)
+            .field("compacted_revision", &self.compacted_revision)
+            .field("history_capacity", &self.history_capacity)
+            // patch_env intentionally elided (trait object, no Debug).
+            .finish_non_exhaustive()
+    }
+}
+
+/// The default [`PatchSchemaEnv`] for a freshly-constructed catalog — the
+/// OpenAPI-backed real resolver over the vendored docs. Cheap to build (empty
+/// cache; documents are `&'static`).
+fn default_patch_env() -> Arc<dyn PatchSchemaEnv> {
+    Arc::new(OpenApiPatchEnv::new())
 }
 
 impl Default for ResourceCatalog {
@@ -115,6 +191,7 @@ impl Default for ResourceCatalog {
             history: VecDeque::new(),
             compacted_revision: Revision::ZERO,
             history_capacity: DEFAULT_HISTORY_CAPACITY,
+            patch_env: default_patch_env(),
         }
     }
 }
@@ -180,6 +257,7 @@ impl<'de> Deserialize<'de> for ResourceCatalog {
             history: VecDeque::new(),
             compacted_revision: h.compacted_revision,
             history_capacity: DEFAULT_HISTORY_CAPACITY,
+            patch_env: default_patch_env(),
         })
     }
 }
@@ -223,9 +301,10 @@ impl ResourceCatalog {
             ResourceCommand::Patch {
                 key,
                 patch,
+                patch_type,
                 expected,
                 ..
-            } => self.apply_patch(key, patch, *expected, rev),
+            } => self.apply_patch(key, patch, *patch_type, *expected, rev),
             ResourceCommand::Delete { key, expected, .. } => {
                 self.apply_delete(key, *expected, rev)
             }
@@ -271,10 +350,7 @@ impl ResourceCatalog {
         // the outer apply leaves the catalog byte-identical (no revision
         // advance, no history, no fan-out).
         if !check_precondition(expected, prior_entry.as_ref().map(|(_, m)| *m)) {
-            return ApplyOutcome {
-                op: ResourceOp::Conflict,
-                change: None,
-            };
+            return ApplyOutcome::no_change(ResourceOp::Conflict);
         }
 
         let prior_value = prior_entry.as_ref().map(|(v, _)| v.clone());
@@ -339,23 +415,24 @@ impl ResourceCatalog {
         } else {
             ResourceOp::Created
         };
-        ApplyOutcome {
+        ApplyOutcome::with_change(
             op,
-            change: Some(Change {
+            Change {
                 revision: rev,
                 key: key.clone(),
                 kind: ChangeKind::Put,
                 value: new_value,
                 prior: prior_value,
                 version_meta,
-            }),
-        }
+            },
+        )
     }
 
     fn apply_patch(
         &mut self,
         key: &ResourceKey,
         patch: &ResourceValue,
+        patch_type: PatchType,
         expected: Option<Revision>,
         rev: Revision,
     ) -> ApplyOutcome {
@@ -369,22 +446,46 @@ impl ResourceCatalog {
             } else {
                 ResourceOp::NoOp
             };
-            return ApplyOutcome { op, change: None };
+            return ApplyOutcome::no_change(op);
         };
         // Optimistic-concurrency precondition (CAS) on the existing key —
         // checked BEFORE the merge. On conflict the catalog is untouched.
         if !check_precondition(expected, Some(*existing_meta)) {
-            return ApplyOutcome {
-                op: ResourceOp::Conflict,
-                change: None,
-            };
+            return ApplyOutcome::no_change(ResourceOp::Conflict);
         }
         // Capture pre-image before the merge.
         let prior_value = existing_value.clone();
         let version_meta = existing_meta.bumped_at(rev);
 
-        let mut merged = existing_value.clone();
-        merge_json(&mut merged, patch);
+        // ── Typed patch dispatch (the load-bearing fix) ────────────────────
+        //
+        // Instead of unconditionally RFC7396-merging EVERY patch (which
+        // silently corrupted json-patch / strategic-merge), dispatch on the
+        // typed `patch_type` into the correct algorithm via the
+        // `patch_apply` interpreter. The `PatchSchemaEnv` (OpenAPI-backed by
+        // default) resolves strategic-merge list strategies. A typed
+        // `PatchError` (test failure, bad pointer, missing merge-key, SSA
+        // deferral) becomes a `PatchRejected` outcome — NO mutation, NO
+        // revision consumed, catalog byte-identical — surfaced to the
+        // apiserver as the correct typed Status.
+        let gvk = Gvk::from(key);
+        let body = match PatchBody::from_raw(patch_type, patch.clone()) {
+            Ok(b) => b,
+            Err(e) => return ApplyOutcome::patch_rejected(e.to_string()),
+        };
+        let merged_result =
+            patch_apply::apply(patch_type, existing_value, &body, &*self.patch_env, &gvk);
+        let mut merged = match merged_result {
+            Ok(m) => m,
+            Err(PatchError::Unsupported { what }) => {
+                // Typed-deferred (server-side apply) — surface as a typed
+                // rejection, NEVER a silent strategic/merge fallback.
+                return ApplyOutcome::patch_rejected(
+                    PatchError::Unsupported { what }.to_string(),
+                );
+            }
+            Err(e) => return ApplyOutcome::patch_rejected(e.to_string()),
+        };
         // generation bumps iff the MERGED `spec` differs from the prior
         // `spec`. A patch touching ONLY `status` (or only metadata) leaves
         // `spec` unchanged → generation preserved. This is the
@@ -411,17 +512,17 @@ impl ResourceCatalog {
         self.resources
             .insert(key.clone(), (merged.clone(), version_meta));
 
-        ApplyOutcome {
-            op: ResourceOp::Patched,
-            change: Some(Change {
+        ApplyOutcome::with_change(
+            ResourceOp::Patched,
+            Change {
                 revision: rev,
                 key: key.clone(),
                 kind: ChangeKind::Put,
                 value: merged,
                 prior: Some(prior_value),
                 version_meta,
-            }),
-        }
+            },
+        )
     }
 
     fn apply_delete(
@@ -437,31 +538,25 @@ impl ResourceCatalog {
         // after the precondition passes).
         let live_meta = self.resources.get(key).map(|(_, m)| *m);
         if !check_precondition(expected, live_meta) {
-            return ApplyOutcome {
-                op: ResourceOp::Conflict,
-                change: None,
-            };
+            return ApplyOutcome::no_change(ResourceOp::Conflict);
         }
         let Some((removed_value, removed_meta)) = self.resources.remove(key) else {
-            return ApplyOutcome {
-                op: ResourceOp::NoOp,
-                change: None,
-            };
+            return ApplyOutcome::no_change(ResourceOp::NoOp);
         };
         // The tombstone (post-image) IS the last-known object — so
         // watch consumers see what was deleted. Both `value` and
         // `prior` carry it; the Deleted event never carries Null.
-        ApplyOutcome {
-            op: ResourceOp::Deleted,
-            change: Some(Change {
+        ApplyOutcome::with_change(
+            ResourceOp::Deleted,
+            Change {
                 revision: rev,
                 key: key.clone(),
                 kind: ChangeKind::Delete,
                 value: removed_value.clone(),
                 prior: Some(removed_value),
                 version_meta: removed_meta,
-            }),
-        }
+            },
+        )
     }
 
     /// Read a single resource by key (value only).
@@ -695,28 +790,10 @@ fn compute_generation_on_put(prior: Option<&serde_json::Value>, next: &serde_jso
     }
 }
 
-/// Recursive JSON merge — fields in `patch` overwrite + null in
-/// patch deletes. Mirrors RFC 7396 (JSON Merge Patch).
-fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
-    if !patch.is_object() {
-        *target = patch.clone();
-        return;
-    }
-    if !target.is_object() {
-        *target = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let target_obj = target.as_object_mut().unwrap();
-    for (k, v) in patch.as_object().unwrap() {
-        if v.is_null() {
-            target_obj.remove(k);
-        } else {
-            let entry = target_obj
-                .entry(k.clone())
-                .or_insert_with(|| serde_json::Value::Null);
-            merge_json(entry, v);
-        }
-    }
-}
+// The RFC 7396 JSON Merge Patch implementation that previously lived here
+// (`merge_json`) is now the canonical `patch_apply::merge_rfc7396`, consumed
+// by the typed `Merge` arm of `patch_apply::apply`. apply_patch no longer
+// merges directly — it dispatches through the interpreter on `patch_type`.
 
 #[cfg(test)]
 mod tests {
@@ -862,6 +939,7 @@ mod tests {
             &ResourceCommand::Patch {
                 key: pod_key("ghost"),
                 patch: serde_json::json!({"x": 1}),
+                patch_type: PatchType::Merge,
                 expected: None,
                 reason: Reason::Operator,
             },
@@ -889,6 +967,7 @@ mod tests {
             &ResourceCommand::Patch {
                 key: k.clone(),
                 patch: serde_json::json!({"spec": {"image": "v2"}}),
+                patch_type: PatchType::Merge,
                 expected: None,
                 reason: Reason::Operator,
             },
@@ -997,6 +1076,7 @@ mod tests {
             &ResourceCommand::Patch {
                 key: k.clone(),
                 patch: serde_json::json!({"spec": {"annotations": null}}),
+                patch_type: PatchType::Merge,
                 expected: None,
                 reason: Reason::Operator,
             },
@@ -1084,6 +1164,7 @@ mod tests {
             &ResourceCommand::Patch {
                 key: key.clone(),
                 patch,
+                patch_type: PatchType::Merge,
                 expected: None,
                 reason: Reason::Operator,
             },
@@ -1215,6 +1296,7 @@ mod tests {
             &ResourceCommand::Patch {
                 key: pod_key("ghost"),
                 patch: serde_json::json!({"y": 1}),
+                patch_type: PatchType::Merge,
                 expected: None,
                 reason: Reason::Operator,
             },

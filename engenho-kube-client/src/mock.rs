@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use engenho_types::client::{DeleteOptions, KubeClient, List, ListOptions};
 use engenho_types::error::{ApiStatusKind, KubeError};
 use engenho_types::kind::KubeResource;
-use engenho_types::patch::Patch;
+use engenho_types::patch::{JsonPatchOp, Patch};
 use engenho_types::watch::{WatchEvent, Watcher};
 use futures_core::Stream;
 
@@ -179,10 +179,20 @@ impl KubeClient for MockKubeClient {
             .get(&key)
             .ok_or_else(|| KubeError::NotFound(format!("mock: {key:?}")))?
             .clone();
+        // Honestly dispatch on the patch algorithm. The previous mock FAKED
+        // every algorithm (strategic collapsed to RFC7386, json-patch ops
+        // SILENTLY DROPPED — a wrong Ok). Now:
+        //   * Merge / Strategic / Apply → RFC7396 merge (the test double has
+        //     no OpenAPI schema env, so strategic falls back to merge — but
+        //     this is an explicit, documented fallback, not a silent lie).
+        //   * Json → the RFC6902 ops are actually applied (never dropped). A
+        //     `test` failure / bad pointer surfaces as a typed `KubeError`,
+        //     never a silent wrong Ok.
         let merged = match patch {
             Patch::Merge(p) | Patch::Strategic(p) => merge_json(body, p.clone()),
             Patch::Apply { body: p, .. } => merge_json(body, p.clone()),
-            Patch::Json(_) => body, // skipping JSON Patch ops in mock
+            Patch::Json(ops) => apply_json_patch_ops(body, ops)
+                .map_err(|e| KubeError::Decode(format!("mock json-patch: {e}")))?,
         };
         s.counter += 1;
         let mut new_body = merged;
@@ -227,6 +237,132 @@ fn merge_json(mut base: serde_json::Value, patch: serde_json::Value) -> serde_js
             base
         }
         (_, p) => p,
+    }
+}
+
+/// Apply an RFC 6902 op list to `base` atomically (test-double impl). Ops are
+/// folded over a clone; the clone is returned only if EVERY op succeeds — a
+/// `test` mismatch or a bad JSON-Pointer rejects the whole document, NEVER a
+/// silent drop. (The canonical interpreter is
+/// `engenho_store::patch_apply::apply`; this small fold mirrors its json-patch
+/// arm so the client mock is honest without the store dependency. It is a
+/// candidate to re-home onto the canonical impl once that is promoted to
+/// engenho-types.)
+fn apply_json_patch_ops(
+    base: serde_json::Value,
+    ops: &[JsonPatchOp],
+) -> Result<serde_json::Value, String> {
+    let mut doc = base;
+    for op in ops {
+        match op {
+            JsonPatchOp::Add { path, value } => mock_ptr_add(&mut doc, path, value.clone())?,
+            JsonPatchOp::Remove { path } => {
+                mock_ptr_remove(&mut doc, path)?;
+            }
+            JsonPatchOp::Replace { path, value } => {
+                doc.pointer(path)
+                    .ok_or_else(|| format!("replace: missing pointer {path}"))?;
+                mock_ptr_remove(&mut doc, path)?;
+                mock_ptr_add(&mut doc, path, value.clone())?;
+            }
+            JsonPatchOp::Copy { from, path } => {
+                let v = doc
+                    .pointer(from)
+                    .ok_or_else(|| format!("copy: missing from {from}"))?
+                    .clone();
+                mock_ptr_add(&mut doc, path, v)?;
+            }
+            JsonPatchOp::Move { from, path } => {
+                let v = mock_ptr_remove(&mut doc, from)?;
+                mock_ptr_add(&mut doc, path, v)?;
+            }
+            JsonPatchOp::Test { path, value } => {
+                let actual = doc
+                    .pointer(path)
+                    .ok_or_else(|| format!("test: missing pointer {path}"))?;
+                if actual != value {
+                    return Err(format!("test failed at {path}"));
+                }
+            }
+        }
+    }
+    Ok(doc)
+}
+
+fn mock_ptr_tokens(path: &str) -> Vec<String> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+    path.split('/')
+        .skip(1)
+        .map(|t| t.replace("~1", "/").replace("~0", "~"))
+        .collect()
+}
+
+fn mock_ptr_add(doc: &mut serde_json::Value, path: &str, value: serde_json::Value) -> Result<(), String> {
+    let tokens = mock_ptr_tokens(path);
+    let Some((last, parents)) = tokens.split_last() else {
+        *doc = value;
+        return Ok(());
+    };
+    let mut cur = doc;
+    for t in parents {
+        cur = match cur {
+            serde_json::Value::Object(m) => m.get_mut(t).ok_or_else(|| format!("add: missing {path}"))?,
+            serde_json::Value::Array(a) => {
+                let i: usize = t.parse().map_err(|_| format!("add: bad index {path}"))?;
+                a.get_mut(i).ok_or_else(|| format!("add: missing {path}"))?
+            }
+            _ => return Err(format!("add: not a container {path}")),
+        };
+    }
+    match cur {
+        serde_json::Value::Object(m) => {
+            m.insert(last.clone(), value);
+            Ok(())
+        }
+        serde_json::Value::Array(a) => {
+            if last == "-" {
+                a.push(value);
+            } else {
+                let i: usize = last.parse().map_err(|_| format!("add: bad index {path}"))?;
+                if i > a.len() {
+                    return Err(format!("add: index out of range {path}"));
+                }
+                a.insert(i, value);
+            }
+            Ok(())
+        }
+        _ => Err(format!("add: not a container {path}")),
+    }
+}
+
+fn mock_ptr_remove(doc: &mut serde_json::Value, path: &str) -> Result<serde_json::Value, String> {
+    let tokens = mock_ptr_tokens(path);
+    let Some((last, parents)) = tokens.split_last() else {
+        return Ok(std::mem::replace(doc, serde_json::Value::Null));
+    };
+    let mut cur = doc;
+    for t in parents {
+        cur = match cur {
+            serde_json::Value::Object(m) => m.get_mut(t).ok_or_else(|| format!("remove: missing {path}"))?,
+            serde_json::Value::Array(a) => {
+                let i: usize = t.parse().map_err(|_| format!("remove: bad index {path}"))?;
+                a.get_mut(i).ok_or_else(|| format!("remove: missing {path}"))?
+            }
+            _ => return Err(format!("remove: not a container {path}")),
+        };
+    }
+    match cur {
+        serde_json::Value::Object(m) => m.remove(last).ok_or_else(|| format!("remove: missing {path}")),
+        serde_json::Value::Array(a) => {
+            let i: usize = last.parse().map_err(|_| format!("remove: bad index {path}"))?;
+            if i >= a.len() {
+                return Err(format!("remove: index out of range {path}"));
+            }
+            Ok(a.remove(i))
+        }
+        _ => Err(format!("remove: not a container {path}")),
     }
 }
 

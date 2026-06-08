@@ -63,6 +63,7 @@ pub mod nats_listener;
 pub mod nats_network;
 pub mod network;
 pub mod pagination;
+pub mod patch_apply;
 pub mod resource;
 pub mod revision;
 pub mod state;
@@ -82,6 +83,10 @@ pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
 pub use network::InProcessRouter;
 pub use pagination::{ContinueInvalid, ContinueToken, ListPage};
+pub use patch_apply::{
+    apply as apply_patch_algorithm, Gvk, JsonPath, ListMergeStrategy, MockPatchEnv,
+    OpenApiPatchEnv, PatchBody, PatchDirective, PatchError, PatchSchemaEnv,
+};
 pub use resource::{ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 pub use state::{check_precondition, ApplyOutcome, ResourceCatalog, DEFAULT_HISTORY_CAPACITY};
