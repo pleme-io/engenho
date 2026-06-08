@@ -5,9 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_apiserver::{
-    ApiServer, ChainAuthenticator, ClientMaterial, RouterHandlerSink, RouterState, ServerSanInputs,
-    TlsMaterial, client_verifier, handlers_from_catalog_with_admission,
-    issue_admin_client_material, issue_server_material, load_or_generate_ca,
+    ApiServer, ChainAuthenticator, ClientMaterial, RbacAuthorizer, RouterHandlerSink, RouterState,
+    ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
+    handlers_from_catalog_with_admission, issue_admin_client_material, issue_server_material,
+    load_or_generate_ca,
+};
+use engenho_types::generated_v1_34::rbac_v1::{
+    ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
 };
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_config::{ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind};
@@ -100,6 +104,15 @@ impl Runtime {
         //    target (the missing brick — no other code does this).
         register_node(&store, &config.runtime.node_name).await?;
 
+        // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +
+        //    system:discovery + system:basic-user + system:public-info-viewer
+        //    ClusterRoles + their ClusterRoleBindings — BEFORE the apiserver
+        //    binds, so the very first request authorizes against a seeded store.
+        //    Idempotent (Put preserves uid across restarts, same as
+        //    register_node). MUST precede step 5 so anonymous discovery + bound
+        //    roles resolve through real bindings from the first request.
+        seed_bootstrap_rbac(&store).await?;
+
         // 5. Bind the apiserver, backed by the same store.
         let listen_addr: SocketAddr =
             config
@@ -157,13 +170,14 @@ impl Runtime {
         // Load-or-generate the bootstrap admin BEARER token (a second admin
         // credential alongside the client cert). Persisted under
         // data_dir/pki/admin.token (0600) + logged so the operator can
-        // `curl -H "Authorization: Bearer <token>"`. `None` for the plaintext
-        // floor (no PKI dir to persist into).
-        let admin_token: Option<String> = if config.runtime.tls.enabled {
-            Some(load_or_generate_admin_token(&config.runtime.data_dir)?)
-        } else {
-            None
-        };
+        // `curl -H "Authorization: Bearer <token>"`. Minted REGARDLESS of TLS:
+        // the token is a bearer SECRET (an `Authorization:` header value), not
+        // TLS material — and with Brick B's default-deny it is the ONLY way a
+        // plaintext-mode operator/test gets an admin (system:masters) identity
+        // to write through the authorizer. (Pre-Brick-B the plaintext floor had
+        // no admin token because authorize-ALL made one unnecessary.)
+        let admin_token: Option<String> =
+            Some(load_or_generate_admin_token(&config.runtime.data_dir)?);
         if admin_token.is_some() {
             info!("bootstrap admin bearer token available at data_dir/pki/admin.token");
         }
@@ -185,11 +199,20 @@ impl Runtime {
         // SAME table is shared with the CrdController's DynamicHandlerSink.
         // A controller-driven `register()` mutates this exact ArcSwap, and
         // the swap is visible to in-flight requests this server dispatches.
+        // The typed RBAC authorizer (Brick B), over the SAME store. Default-deny
+        // for non-admin identities; the system:masters short-circuit keeps the
+        // admin kubeconfig allow-all so every existing live proof passes; the
+        // seeded bootstrap policy (step 4.5) grants anonymous discovery + the
+        // basic-user self-review surface through real bindings.
+        let authorizer: Arc<dyn engenho_apiserver::Authorizer> =
+            Arc::new(RbacAuthorizer::new(StoreRbacEnv::new(store.clone())));
+
         let router_state = RouterState::new(handlers_from_catalog_with_admission(
             store.clone(),
             admission.clone(),
         ))
-        .with_authenticator(authenticator);
+        .with_authenticator(authenticator)
+        .with_authorizer(authorizer);
         // The CRD handler sink: builds a StoreBackedHandler (admission-
         // dispatched, opaque-JSON) per served CRD version + registers it
         // into the SAME router_state. Shared (as Arc<dyn DynamicHandlerSink>)
@@ -370,6 +393,234 @@ async fn register_node(store: &StoreMesh, node_name: &str) -> Result<(), Runtime
         .await?;
     info!(node = %node_name, "registered schedulable node");
     Ok(())
+}
+
+/// The RBAC group + version every seed key carries.
+const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
+const RBAC_VERSION: &str = "v1";
+
+/// Seed the bootstrap RBAC policy (Brick B). Idempotently `Put`s the canonical
+/// bootstrap ClusterRoles + ClusterRoleBindings so:
+///
+///   * `system:masters` resolves `*.*` through a REAL binding (cluster-admin),
+///     belt-and-suspenders behind the authorizer's short-circuit — so
+///     `kubectl auth can-i --list` shows `*.*` via a binding too.
+///   * anonymous + authenticated DISCOVERY (`/api`, `/apis`, `/openapi/v3`, …)
+///     resolves through the `system:discovery` (authenticated) +
+///     `system:public-info-viewer` (anonymous) bindings — TIER-2 reachability,
+///     so kubectl's pre-auth discovery works without 403'ing.
+///   * every authenticated user gets the minimal `system:basic-user` self-review
+///     surface (selfsubject* creates).
+///
+/// Each seed is a TYPED Rust value (`ClusterRole`/`ClusterRoleBinding`) →
+/// `serde_json::to_value` → `ResourceCommand::Put` (TYPED EMISSION — no `json!()`
+/// of the policy bodies; only the Put envelope helper). Idempotent because Put
+/// preserves `metadata.uid` across restarts, exactly like `register_node`.
+async fn seed_bootstrap_rbac(store: &StoreMesh) -> Result<(), RuntimeError> {
+    // ── cluster-admin: full access to everything (resources + non-resource). ──
+    let cluster_admin = ClusterRole {
+        metadata: rbac_meta("cluster-admin"),
+        rules: vec![
+            PolicyRule {
+                verbs: vec!["*".into()],
+                api_groups: vec!["*".into()],
+                resources: vec!["*".into()],
+                ..Default::default()
+            },
+            PolicyRule {
+                verbs: vec!["*".into()],
+                non_resource_urls: vec!["*".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let cluster_admin_binding = ClusterRoleBinding {
+        metadata: rbac_meta("cluster-admin"),
+        role_ref: cluster_role_ref("cluster-admin"),
+        subjects: vec![group_subject("system:masters")],
+    };
+
+    // ── system:discovery: GET the discovery + openapi non-resource URLs. ──
+    let discovery = ClusterRole {
+        metadata: rbac_meta("system:discovery"),
+        rules: vec![PolicyRule {
+            verbs: vec!["get".into()],
+            non_resource_urls: vec![
+                "/api".into(),
+                "/api/*".into(),
+                "/apis".into(),
+                "/apis/*".into(),
+                "/openapi".into(),
+                "/openapi/*".into(),
+                "/version".into(),
+                "/version/*".into(),
+                "/healthz".into(),
+                "/livez".into(),
+                "/readyz".into(),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let discovery_binding = ClusterRoleBinding {
+        metadata: rbac_meta("system:discovery"),
+        role_ref: cluster_role_ref("system:discovery"),
+        subjects: vec![group_subject("system:authenticated")],
+    };
+
+    // ── system:basic-user: the minimal selfsubject* create surface. ──
+    let basic_user = ClusterRole {
+        metadata: rbac_meta("system:basic-user"),
+        rules: vec![
+            PolicyRule {
+                verbs: vec!["create".into()],
+                api_groups: vec!["authorization.k8s.io".into()],
+                resources: vec![
+                    "selfsubjectaccessreviews".into(),
+                    "selfsubjectrulesreviews".into(),
+                ],
+                ..Default::default()
+            },
+            PolicyRule {
+                verbs: vec!["create".into()],
+                api_groups: vec!["authentication.k8s.io".into()],
+                resources: vec!["selfsubjectreviews".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let basic_user_binding = ClusterRoleBinding {
+        metadata: rbac_meta("system:basic-user"),
+        role_ref: cluster_role_ref("system:basic-user"),
+        subjects: vec![group_subject("system:authenticated")],
+    };
+
+    // ── system:public-info-viewer: GET health/version for ALL (incl. anon). ──
+    let public_info = ClusterRole {
+        metadata: rbac_meta("system:public-info-viewer"),
+        rules: vec![PolicyRule {
+            verbs: vec!["get".into()],
+            non_resource_urls: vec![
+                "/healthz".into(),
+                "/livez".into(),
+                "/readyz".into(),
+                "/version".into(),
+                "/version/*".into(),
+                // Anonymous discovery: kubectl hits these before any
+                // authenticated call; granting them to BOTH authenticated +
+                // unauthenticated keeps the existing anonymous-kubeconfig path.
+                "/api".into(),
+                "/api/*".into(),
+                "/apis".into(),
+                "/apis/*".into(),
+                "/openapi".into(),
+                "/openapi/*".into(),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let public_info_binding = ClusterRoleBinding {
+        metadata: rbac_meta("system:public-info-viewer"),
+        role_ref: cluster_role_ref("system:public-info-viewer"),
+        subjects: vec![
+            group_subject("system:authenticated"),
+            group_subject("system:unauthenticated"),
+        ],
+    };
+
+    // Put each typed value. ClusterRole + ClusterRoleBinding are cluster-scoped.
+    put_cluster_role(store, &cluster_admin).await?;
+    put_cluster_role_binding(store, &cluster_admin_binding).await?;
+    put_cluster_role(store, &discovery).await?;
+    put_cluster_role_binding(store, &discovery_binding).await?;
+    put_cluster_role(store, &basic_user).await?;
+    put_cluster_role_binding(store, &basic_user_binding).await?;
+    put_cluster_role(store, &public_info).await?;
+    put_cluster_role_binding(store, &public_info_binding).await?;
+
+    info!("seeded bootstrap RBAC policy (cluster-admin + system:discovery + system:basic-user + system:public-info-viewer)");
+    Ok(())
+}
+
+/// Typed [`ObjectMeta`] carrying just a name — the shape every bootstrap RBAC
+/// object needs.
+fn rbac_meta(name: &str) -> engenho_types::meta::ObjectMeta {
+    engenho_types::meta::ObjectMeta {
+        name: name.to_string(),
+        ..Default::default()
+    }
+}
+
+/// A `RoleRef` pointing at a cluster-scoped `ClusterRole` by name.
+fn cluster_role_ref(name: &str) -> RoleRef {
+    RoleRef {
+        api_group: RBAC_GROUP.to_string(),
+        kind: "ClusterRole".to_string(),
+        name: name.to_string(),
+    }
+}
+
+/// A `Group` subject — the bootstrap bindings bind to groups
+/// (`system:masters`, `system:authenticated`, `system:unauthenticated`).
+fn group_subject(name: &str) -> Subject {
+    Subject {
+        kind: "Group".to_string(),
+        api_group: Some(RBAC_GROUP.to_string()),
+        name: name.to_string(),
+        namespace: None,
+    }
+}
+
+/// `Put` a typed `ClusterRole` (cluster-scoped) with `Reason::Operator`. The
+/// body is serialized from the typed value (TYPED EMISSION); only the Put
+/// envelope is hand-built.
+async fn put_cluster_role(store: &StoreMesh, cr: &ClusterRole) -> Result<(), RuntimeError> {
+    let value = serde_json::to_value(cr)
+        .map_err(|e| RuntimeError::Server(seed_serialize_err("ClusterRole", &e)))?;
+    let name = cr.metadata.name.clone();
+    store
+        .propose(ResourceCommand::Put {
+            key: ResourceKey::cluster_scoped(RBAC_GROUP, RBAC_VERSION, "ClusterRole", name),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await?;
+    Ok(())
+}
+
+/// `Put` a typed `ClusterRoleBinding` (cluster-scoped) with `Reason::Operator`.
+async fn put_cluster_role_binding(
+    store: &StoreMesh,
+    crb: &ClusterRoleBinding,
+) -> Result<(), RuntimeError> {
+    let value = serde_json::to_value(crb)
+        .map_err(|e| RuntimeError::Server(seed_serialize_err("ClusterRoleBinding", &e)))?;
+    let name = crb.metadata.name.clone();
+    store
+        .propose(ResourceCommand::Put {
+            key: ResourceKey::cluster_scoped(RBAC_GROUP, RBAC_VERSION, "ClusterRoleBinding", name),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await?;
+    Ok(())
+}
+
+/// A serialize-failure during seeding (effectively impossible for the concrete
+/// typed structs) becomes a typed apiserver ServerError so boot fails loudly —
+/// never a silent skip.
+fn seed_serialize_err(
+    kind: &str,
+    e: &serde_json::Error,
+) -> engenho_apiserver::ServerError {
+    engenho_apiserver::ServerError::Serve(std::io::Error::other(format!(
+        "failed to serialize bootstrap {kind}: {e}"
+    )))
 }
 
 /// Host capacity advertised on the self-registered Node: `(cpu, memory)`
@@ -700,11 +951,24 @@ mod tests {
         cfg.runtime.node_name = "node-A".into();
         cfg.runtime.kubelet_backend = CfgKind::Fake;
         cfg.runtime.leadership_timeout_seconds = 5;
-        // Plaintext: these unit tests assert subsystem assembly, not TLS,
-        // and the prescribed data_dir (/var/lib/engenho) isn't writable in
-        // CI. The dedicated TLS integration test (tests/m0_4_tls_kubectl.rs)
-        // exercises the HTTPS + kubeconfig path with a tempdir data_dir.
+        // Plaintext: these unit tests assert subsystem assembly, not TLS.
         cfg.runtime.tls.enabled = false;
+        // A WRITABLE data_dir under the system temp root — the prescribed
+        // `/var/lib/engenho` isn't writable in CI, and since Brick B the
+        // bootstrap admin BEARER token is minted (persisted under data_dir/pki)
+        // on EVERY boot (plaintext incl.), so a writable data_dir is required
+        // even for the ephemeral path. A unique per-test subdir avoids
+        // cross-test collisions; the small PKI dir is left for the OS temp
+        // sweeper (no cleanup handle needed for a unit test).
+        let unique = format!(
+            "engenho-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        cfg.runtime.data_dir = std::env::temp_dir().join(unique);
         cfg.controllers.fallback_interval_seconds = 1;
         cfg.controllers.debounce_milliseconds = 20;
         cfg

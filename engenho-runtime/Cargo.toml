@@ -17,6 +17,9 @@ workspace = true
 
 [dependencies]
 engenho-config      = { workspace = true }
+# Typed RBAC kinds (rbac_v1) — the bootstrap seeds are built as typed
+# ClusterRole/ClusterRoleBinding values, then serialized + Put into the store.
+engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }
 engenho-apiserver   = { workspace = true }
 engenho-controllers = { workspace = true }

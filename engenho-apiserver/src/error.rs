@@ -46,6 +46,16 @@ pub enum ApiError {
     /// [`crate::handler::AdmissionChain`]).
     #[error("admission denied: {0}")]
     Forbidden(String),
+    /// The RBAC authorizer DENIED the request — the same K8s 403 Forbidden
+    /// equivalent as [`Self::Forbidden`], but the message is the standard RBAC
+    /// `forbidden: User "<u>" cannot <verb> ...` string built by
+    /// [`forbidden_message`] (NOT the admission `"admission denied: "` prefix).
+    /// Distinct variant so authz-deny + admission-deny share the 403 `Status`
+    /// SHAPE while keeping their own message text. The message string is the
+    /// only composed text and goes in the typed `Status.message` field (the JSON
+    /// wire is built by serde, never `format!()`).
+    #[error("{0}")]
+    AuthzForbidden(String),
     /// The requested `resourceVersion` resume point has been compacted
     /// away — the K8s 410 Gone / Expired equivalent. The client must
     /// re-LIST + re-WATCH from the fresh list revision. Carries the
@@ -68,6 +78,7 @@ pub enum ErrorKind {
     Unauthorized,
     UnsupportedMediaType,
     Forbidden,
+    AuthzForbidden,
     Gone,
     Internal,
     StorageError,
@@ -84,6 +95,7 @@ impl ApiError {
             Self::Unauthorized(_) => ErrorKind::Unauthorized,
             Self::UnsupportedMediaType(_) => ErrorKind::UnsupportedMediaType,
             Self::Forbidden(_) => ErrorKind::Forbidden,
+            Self::AuthzForbidden(_) => ErrorKind::AuthzForbidden,
             Self::Gone(_) => ErrorKind::Gone,
             Self::Internal(_) => ErrorKind::Internal,
             Self::StorageError(_) => ErrorKind::StorageError,
@@ -97,7 +109,7 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Forbidden(_) | Self::AuthzForbidden(_) => StatusCode::FORBIDDEN,
             Self::Gone(_) => StatusCode::GONE,
             Self::Internal(_) | Self::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -202,6 +214,38 @@ impl From<engenho_kube_proto::CodecError> for ApiError {
     }
 }
 
+/// Build the standard Kubernetes RBAC forbidden message for a denied request —
+/// the exact `forbidden: User "<u>" cannot <verb> resource "<resource>" in API
+/// group "<group>" [in the namespace "<ns>"]` shape kube-apiserver renders. For
+/// a non-resource request it's `forbidden: User "<u>" cannot <verb> path
+/// "<path>"`. This is the ONLY composed text in the authz-deny path; it lands in
+/// the typed [`K8sStatus::message`] field (the JSON wire is built by serde, per
+/// TYPED EMISSION).
+#[must_use]
+pub fn forbidden_message(attrs: &crate::authz::Attributes) -> String {
+    let user = &attrs.user.username;
+    if let Some(path) = &attrs.non_resource_url {
+        return format!(
+            "forbidden: User \"{user}\" cannot {} path \"{path}\"",
+            attrs.verb
+        );
+    }
+    let group_clause = if attrs.group.is_empty() {
+        " in API group \"\"".to_string()
+    } else {
+        format!(" in API group \"{}\"", attrs.group)
+    };
+    let resource = attrs.resource_key();
+    let ns_clause = match &attrs.namespace {
+        Some(ns) => format!(" in the namespace \"{ns}\""),
+        None => String::new(),
+    };
+    format!(
+        "forbidden: User \"{user}\" cannot {} resource \"{resource}\"{group_clause}{ns_clause}",
+        attrs.verb
+    )
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let code = self.status_code();
@@ -215,7 +259,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(_) => "BadRequest",
             ApiError::Unauthorized(_) => "Unauthorized",
             ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
-            ApiError::Forbidden(_) => "Forbidden",
+            ApiError::Forbidden(_) | ApiError::AuthzForbidden(_) => "Forbidden",
             ApiError::Gone(_) => "Expired",
             ApiError::Internal(_) => "InternalError",
             ApiError::StorageError(_) => "ServiceUnavailable",

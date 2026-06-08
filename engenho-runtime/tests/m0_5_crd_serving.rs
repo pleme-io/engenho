@@ -32,7 +32,7 @@ use shikumi::TieredConfig;
 
 /// Ephemeral, plaintext, fast-fallback config so the CrdController converges
 /// quickly even if a single watch-wake is missed.
-fn crd_test_config() -> EngenhoConfig {
+fn crd_test_config(data_dir: &std::path::Path) -> EngenhoConfig {
     let mut cfg = EngenhoConfig::prescribed_default();
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
     cfg.runtime.durable = false;
@@ -40,12 +40,36 @@ fn crd_test_config() -> EngenhoConfig {
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;
     cfg.runtime.leadership_timeout_seconds = 5;
     cfg.runtime.tls.enabled = false;
+    // A WRITABLE data_dir — the bootstrap admin BEARER token is minted under
+    // data_dir/pki on every boot (Brick B), so the prescribed /var/lib/engenho
+    // (not writable in CI) won't do.
+    cfg.runtime.data_dir = data_dir.to_path_buf();
     // CRD controller on (default), plus a short fallback so registration
     // happens within ~1s of the CRD write even if the watch-wake is missed.
     cfg.controllers.enable.crd = true;
     cfg.controllers.fallback_interval_seconds = 1;
     cfg.controllers.debounce_milliseconds = 20;
     cfg
+}
+
+/// Build a reqwest client that authenticates as the bootstrap ADMIN
+/// (`system:masters`) — Brick B default-denies a non-admin write, so this CRD
+/// CRUD suite authenticates as admin via the minted bearer token under
+/// `data_dir/pki/admin.token`.
+fn admin_client(data_dir: &std::path::Path) -> reqwest::Client {
+    let token = std::fs::read_to_string(data_dir.join("pki/admin.token"))
+        .expect("runtime minted the admin bearer token")
+        .trim()
+        .to_string();
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .expect("valid bearer header");
+    auth.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("admin client builds")
 }
 
 /// Bounded poll: call `predicate` until it returns `Some(T)` or `timeout`.
@@ -109,11 +133,12 @@ fn widget_body() -> serde_json::Value {
 
 #[tokio::test]
 async fn crd_lifecycle_register_crud_discovery_unregister() {
-    let rt = Runtime::start(crd_test_config())
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = Runtime::start(crd_test_config(tmp.path()))
         .await
         .expect("runtime boots");
     let addr = rt.local_addr();
-    let client = reqwest::Client::new();
+    let client = admin_client(tmp.path());
     let base = format!("http://{addr}");
 
     // ── (1) the CRD kind itself is served out of the box ──────────────

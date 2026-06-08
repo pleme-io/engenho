@@ -160,6 +160,9 @@ fn package_for_api_version(api_version: &str) -> Option<&'static str> {
         "v1" => Some("k8s.io.api.core.v1"),
         "apps/v1" => Some("k8s.io.api.apps.v1"),
         "rbac.authorization.k8s.io/v1" => Some("k8s.io.api.rbac.v1"),
+        // The SubjectAccessReview family (kubectl `auth can-i` posts these as
+        // application/vnd.kubernetes.protobuf).
+        "authorization.k8s.io/v1" => Some("k8s.io.api.authorization.v1"),
         _ => None,
     }
 }

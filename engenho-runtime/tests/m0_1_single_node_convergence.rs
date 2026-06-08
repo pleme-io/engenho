@@ -51,6 +51,28 @@ fn durable_config(data_dir: &std::path::Path) -> EngenhoConfig {
     cfg
 }
 
+/// Build a reqwest client that authenticates as the bootstrap ADMIN
+/// (`system:masters`) on EVERY request — Brick B (RBAC) default-denies a
+/// non-admin write, so the convergence suite (which POSTs Deployments + reads
+/// objects) authenticates as admin via the bearer token the runtime mints under
+/// `data_dir/pki/admin.token`. The admin short-circuit keeps these exactly as
+/// permissive as the pre-RBAC authorize-ALL path.
+fn admin_client(data_dir: &std::path::Path) -> reqwest::Client {
+    let token = std::fs::read_to_string(data_dir.join("pki/admin.token"))
+        .expect("runtime minted the admin bearer token")
+        .trim()
+        .to_string();
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .expect("valid bearer header");
+    auth.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("admin client builds")
+}
+
 /// Bounded poll: call `predicate` every `interval` until it returns
 /// `Some(T)` or `timeout` elapses. Returns the value, or `None` on
 /// timeout (the caller dumps last-seen state + fails).
@@ -149,7 +171,7 @@ async fn deployment_posted_over_http_converges_to_running_container() {
         .await
         .expect("Runtime boots");
     let addr = rt.local_addr();
-    let client = reqwest::Client::new();
+    let client = admin_client(tmp.path());
 
     // ── ACT: POST the Deployment over real HTTP ─────────────────────
     let resp = client
@@ -341,7 +363,7 @@ async fn deployment_status_converges_then_reconcile_is_bounded() {
         .await
         .expect("Runtime boots");
     let addr = rt.local_addr();
-    let client = reqwest::Client::new();
+    let client = admin_client(tmp.path());
 
     // POST the Deployment.
     let resp = client
@@ -434,7 +456,6 @@ async fn durable_store_resumes_deployment_across_runtime_restart() {
     // seam (the durable StoreMesh restart is unit-tested in
     // engenho-store r6.5, but never at the Runtime layer).
     let tmp = tempfile::tempdir().unwrap();
-    let client = reqwest::Client::new();
 
     // ── First boot: POST + converge to a ReplicaSet, then shutdown ──
     {
@@ -444,6 +465,10 @@ async fn durable_store_resumes_deployment_across_runtime_restart() {
             .await
             .expect("first boot");
         let addr = rt.local_addr();
+        // The admin bearer token is minted on this first boot under the shared
+        // tempdir; build the admin client now (Brick B default-denies anonymous
+        // writes).
+        let client = admin_client(tmp.path());
 
         let resp = client
             .post(format!(
@@ -493,6 +518,10 @@ async fn durable_store_resumes_deployment_across_runtime_restart() {
             .await
             .expect("second boot (resume)");
         let addr = rt.local_addr();
+        // The admin token is restart-stable (load-or-generate reads the
+        // persisted one), so the resumed boot's admin client uses the same
+        // bearer.
+        let client = admin_client(tmp.path());
 
         // The Deployment persisted across the restart — readable over
         // HTTP from the resumed durable store.
