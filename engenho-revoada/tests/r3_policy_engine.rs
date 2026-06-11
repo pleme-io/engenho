@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_revoada::NodeId;
+use engenho_revoada::attestation::NodeIdentity;
 use engenho_revoada::consensus::{InProcessRouter, RaftMesh, default_config};
 use engenho_revoada::membership::{GossipConfig, GossipMesh, NodeCapacity, NodeRole, NodeState};
 use engenho_revoada::policy::{
@@ -66,11 +67,12 @@ async fn policy_engine_promotes_to_meet_target_topology() {
 
     // === Setup: 1 GossipMesh advertising itself ===
     let port = pick_port();
-    let node_id = NodeId::new([0xa1; 32]);
+    let key = Arc::new(NodeIdentity::from_seed([0xa1; 32]));
+    let node_id = key.node_id();
     let gossip = Arc::new(
         GossipMesh::start(
             GossipConfig::new(
-                node_id,
+                key.clone(),
                 format!("127.0.0.1:{port}").parse().unwrap(),
                 ns(node_id, port, &[NodeRole::Worker]),
             )
@@ -158,11 +160,12 @@ async fn policy_engine_handles_multiple_policies_in_order() {
     assert!(mesh.wait_for_leadership(Duration::from_secs(3)).await);
 
     let port = pick_port();
-    let node_id = NodeId::new([0xb2; 32]);
+    let key = Arc::new(NodeIdentity::from_seed([0xb2; 32]));
+    let node_id = key.node_id();
     let gossip = Arc::new(
         GossipMesh::start(
             GossipConfig::new(
-                node_id,
+                key.clone(),
                 format!("127.0.0.1:{port}").parse().unwrap(),
                 ns(node_id, port, &[]),
             )
