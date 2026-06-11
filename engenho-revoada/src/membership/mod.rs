@@ -46,11 +46,18 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 
 use crate::NodeId;
+use crate::attestation::{NodeIdentity, verify_signature};
 
 /// Operator-facing config to start a `GossipMesh`.
 #[derive(Clone, Debug)]
 pub struct GossipConfig {
-    /// This node's typed identity.
+    /// This node's ed25519 keypair. Signs every gossiped [`NodeState`];
+    /// `node_id` is *derived* from it (`identity.node_id()`), so a config
+    /// with a `node_id` it can't sign for is unrepresentable. Reuses the
+    /// Layer-D attestation [`NodeIdentity`] — membership is its second
+    /// consumer.
+    pub identity: Arc<NodeIdentity>,
+    /// This node's typed identity (= `identity.node_id()`, the ed25519 public key).
     pub node_id: NodeId,
     /// The UDP socket chitchat listens on + advertises.
     pub gossip_addr: SocketAddr,
@@ -79,10 +86,18 @@ pub struct GossipConfig {
 }
 
 impl GossipConfig {
-    /// Construct a config with sane defaults for an engenho node.
+    /// Construct a config with sane defaults for an engenho node. `node_id` is
+    /// derived from `identity` (the ed25519 public key), so it always matches the
+    /// key that will sign this node's gossip.
     #[must_use]
-    pub fn new(node_id: NodeId, gossip_addr: SocketAddr, initial_state: NodeState) -> Self {
+    pub fn new(
+        identity: Arc<NodeIdentity>,
+        gossip_addr: SocketAddr,
+        initial_state: NodeState,
+    ) -> Self {
+        let node_id = identity.node_id();
         Self {
+            identity,
             node_id,
             gossip_addr,
             seed_nodes: Vec::new(),
@@ -125,6 +140,56 @@ pub struct NodeState {
     /// Monotonic counter incremented on every confirmed role change.
     /// Lets stale gossip be detected during merge.
     pub membership_generation: u64,
+}
+
+impl NodeState {
+    /// Deterministic canonical bytes for signing/verification. serde_json over a
+    /// struct is field-order-stable and `BTreeSet<NodeRole>` serializes sorted, so
+    /// the same `NodeState` always produces the same bytes — sign-then-verify holds
+    /// across the gossip round-trip.
+    fn canonical_bytes(&self) -> Result<Vec<u8>, MembershipError> {
+        Ok(serde_json::to_vec(self)?)
+    }
+}
+
+/// The signed wire envelope every gossiped [`NodeState`] travels in. Carries the
+/// node's ed25519 signature (by its own identity key) over the state's canonical
+/// bytes. On ingest the signature is verified against `state.node_id` (which *is*
+/// the public key), so a peer cannot forge another node's state without that node's
+/// secret key — the load-bearing property for an untrusted mesh. Unsigned or
+/// wrongly-signed gossip is dropped at the deserialization boundary
+/// (parse-time-rejected; it never enters a [`MembershipView`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SignedNodeState {
+    state: NodeState,
+    /// ed25519 signature (64 bytes) over `state.canonical_bytes()`.
+    signature: Vec<u8>,
+}
+
+impl SignedNodeState {
+    /// Sign `state` with `identity`. The signer MUST be the identity named by
+    /// `state.node_id` (a node signs its own state under its own key); a debug
+    /// assertion guards the misuse.
+    fn sign(state: NodeState, identity: &NodeIdentity) -> Result<Self, MembershipError> {
+        debug_assert_eq!(
+            identity.node_id(),
+            state.node_id,
+            "a node must sign its own state under its own identity key"
+        );
+        let signature = identity.sign(&state.canonical_bytes()?).to_vec();
+        Ok(Self { state, signature })
+    }
+
+    /// Verify and unwrap. Returns the inner [`NodeState`] only if the signature is a
+    /// valid ed25519 signature, by `state.node_id`'s key, over the state's canonical
+    /// bytes. Any failure (wrong length, bad key, bad signature, re-encode error)
+    /// returns `None` — the entry is dropped, never trusted.
+    fn into_verified(self) -> Option<NodeState> {
+        let sig: [u8; 64] = self.signature.as_slice().try_into().ok()?;
+        let bytes = self.state.canonical_bytes().ok()?;
+        verify_signature(&self.state.node_id, &bytes, &sig).ok()?;
+        Some(self.state)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -198,6 +263,9 @@ pub struct GossipMesh {
     view_tx: Arc<Mutex<watch::Sender<MembershipView>>>,
     view_rx: watch::Receiver<MembershipView>,
     local_node_id: NodeId,
+    /// This node's signing identity — re-signs state on every
+    /// [`GossipMesh::update_local_state`].
+    identity: Arc<NodeIdentity>,
 }
 
 /// The chitchat KV key under which we publish the serde-JSON of `NodeState`.
@@ -252,7 +320,8 @@ impl GossipMesh {
             extra_liveness_predicate: None,
         };
 
-        let initial_blob = serde_json::to_string(&config.initial_state)?;
+        let signed_initial = SignedNodeState::sign(config.initial_state.clone(), &config.identity)?;
+        let initial_blob = serde_json::to_string(&signed_initial)?;
         let initial_kvs = vec![(STATE_KEY.to_string(), initial_blob)];
 
         let transport = UdpTransport;
@@ -293,6 +362,7 @@ impl GossipMesh {
             view_tx: view_tx_arc,
             view_rx,
             local_node_id: config.node_id,
+            identity: config.identity,
         })
     }
 
@@ -317,8 +387,9 @@ impl GossipMesh {
         let chitchat_id = cc.self_chitchat_id().clone();
         if let Some(node) = cc.node_state(&chitchat_id) {
             if let Some(blob) = node.get(STATE_KEY) {
-                let state: NodeState = serde_json::from_str(blob)?;
-                return Ok(Some(state));
+                let signed: SignedNodeState = serde_json::from_str(blob)?;
+                // Our own state must verify under our own key.
+                return Ok(signed.into_verified());
             }
         }
         Ok(None)
@@ -332,7 +403,8 @@ impl GossipMesh {
     /// Returns [`MembershipError::Encode`] if `state` doesn't
     /// serialize to JSON.
     pub async fn update_local_state(&self, state: &NodeState) -> Result<(), MembershipError> {
-        let blob = serde_json::to_string(state)?;
+        let signed = SignedNodeState::sign(state.clone(), &self.identity)?;
+        let blob = serde_json::to_string(&signed)?;
         let cc = self.handle.chitchat();
         let mut cc = cc.lock().await;
         cc.self_node_state().set(STATE_KEY, blob);
@@ -418,7 +490,13 @@ fn build_view(
         let Some(blob) = node.get(STATE_KEY) else {
             continue;
         };
-        let Ok(state) = serde_json::from_str::<NodeState>(blob) else {
+        // Deserialize the signed envelope and verify the ed25519 signature against
+        // the claimed node_id (= public key). Unsigned, wrongly-signed, or tampered
+        // gossip is dropped here — it never enters the MembershipView.
+        let Ok(signed) = serde_json::from_str::<SignedNodeState>(blob) else {
+            continue;
+        };
+        let Some(state) = signed.into_verified() else {
             continue;
         };
         members.push(MembershipEntry {
@@ -478,16 +556,71 @@ mod tests {
 
     #[test]
     fn gossip_config_builder() {
+        let identity = Arc::new(NodeIdentity::from_seed([1; 32]));
+        let node_id = identity.node_id();
         let cfg = GossipConfig::new(
-            NodeId::new([1; 32]),
+            identity,
             "127.0.0.1:7800".parse().unwrap(),
-            test_state(NodeId::new([1; 32])),
+            test_state(node_id),
         )
         .with_seeds(vec!["127.0.0.1:7801".into()])
         .with_cluster_id("test-cluster");
         assert_eq!(cfg.seed_nodes, vec!["127.0.0.1:7801".to_string()]);
         assert_eq!(cfg.cluster_id, "test-cluster");
         assert_eq!(cfg.phi_threshold, 8.0);
+        // node_id is derived from the identity — they can never disagree.
+        assert_eq!(cfg.node_id, node_id);
+    }
+
+    #[test]
+    fn signed_state_round_trips_and_verifies() {
+        let identity = NodeIdentity::from_seed([9; 32]);
+        let state = test_state(identity.node_id());
+        let signed = SignedNodeState::sign(state.clone(), &identity).unwrap();
+        // A faithfully-signed envelope verifies and yields the original state.
+        assert_eq!(signed.into_verified(), Some(state));
+    }
+
+    #[test]
+    fn tampered_state_is_rejected() {
+        let identity = NodeIdentity::from_seed([9; 32]);
+        let mut signed =
+            SignedNodeState::sign(test_state(identity.node_id()), &identity).unwrap();
+        // Mutate the state after signing — the signature no longer matches.
+        signed.state.uptime_sec = 999_999;
+        assert_eq!(signed.into_verified(), None, "tampered state must be dropped");
+    }
+
+    #[test]
+    fn forged_state_under_anothers_node_id_is_rejected() {
+        // Attacker (key A) publishes a state CLAIMING to be victim (node_id B),
+        // signing with their own key. Verification is against B's key, which the
+        // attacker does not hold — so it is dropped.
+        let attacker = NodeIdentity::from_seed([0xaa; 32]);
+        let victim = NodeIdentity::from_seed([0xbb; 32]);
+        let mut victim_state = test_state(victim.node_id());
+        victim_state.roles = [NodeRole::ApiServer, NodeRole::Etcd].into_iter().collect();
+        // Build the envelope by hand: claims node_id = victim, signed by attacker.
+        let bytes = victim_state.canonical_bytes().unwrap();
+        let forged = SignedNodeState {
+            state: victim_state,
+            signature: attacker.sign(&bytes).to_vec(),
+        };
+        assert_eq!(
+            forged.into_verified(),
+            None,
+            "a state signed by the wrong key must not verify against the claimed node_id"
+        );
+    }
+
+    #[test]
+    fn malformed_signature_is_rejected() {
+        let identity = NodeIdentity::from_seed([9; 32]);
+        let bad = SignedNodeState {
+            state: test_state(identity.node_id()),
+            signature: vec![0u8; 10], // wrong length
+        };
+        assert_eq!(bad.into_verified(), None);
     }
 
     pub(crate) fn test_state(node_id: NodeId) -> NodeState {

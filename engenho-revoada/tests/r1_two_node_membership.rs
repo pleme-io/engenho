@@ -8,9 +8,11 @@
 //! attestation) sits on this.
 
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_revoada::NodeId;
+use engenho_revoada::attestation::NodeIdentity;
 use engenho_revoada::membership::{GossipConfig, GossipMesh, NodeCapacity, NodeRole, NodeState};
 use engenho_types::primitives::Quantity;
 use tokio::time::timeout;
@@ -50,12 +52,14 @@ fn state(node_id: NodeId, port: u16, roles: &[NodeRole]) -> NodeState {
 #[tokio::test]
 async fn two_nodes_discover_each_other_through_gossip() {
     let (p1, p2) = pick_two_ports();
-    let id_a = NodeId::new([0xa1; 32]);
-    let id_b = NodeId::new([0xb2; 32]);
+    let key_a = Arc::new(NodeIdentity::from_seed([0xa1; 32]));
+    let key_b = Arc::new(NodeIdentity::from_seed([0xb2; 32]));
+    let id_a = key_a.node_id();
+    let id_b = key_b.node_id();
 
     let mesh_a = GossipMesh::start(
         GossipConfig::new(
-            id_a,
+            key_a.clone(),
             format!("127.0.0.1:{p1}").parse().unwrap(),
             state(id_a, p1, &[NodeRole::ApiServer, NodeRole::Worker]),
         )
@@ -67,7 +71,7 @@ async fn two_nodes_discover_each_other_through_gossip() {
 
     let mesh_b = GossipMesh::start(
         GossipConfig::new(
-            id_b,
+            key_b.clone(),
             format!("127.0.0.1:{p2}").parse().unwrap(),
             state(id_b, p2, &[NodeRole::Worker]),
         )
@@ -126,12 +130,14 @@ async fn two_nodes_discover_each_other_through_gossip() {
 #[tokio::test]
 async fn local_state_update_propagates_to_peer() {
     let (p1, p2) = pick_two_ports();
-    let id_a = NodeId::new([0xc3; 32]);
-    let id_b = NodeId::new([0xd4; 32]);
+    let key_a = Arc::new(NodeIdentity::from_seed([0xc3; 32]));
+    let key_b = Arc::new(NodeIdentity::from_seed([0xd4; 32]));
+    let id_a = key_a.node_id();
+    let id_b = key_b.node_id();
 
     let mesh_a = GossipMesh::start(
         GossipConfig::new(
-            id_a,
+            key_a.clone(),
             format!("127.0.0.1:{p1}").parse().unwrap(),
             state(id_a, p1, &[NodeRole::Observer]),
         )
@@ -142,7 +148,7 @@ async fn local_state_update_propagates_to_peer() {
 
     let mesh_b = GossipMesh::start(
         GossipConfig::new(
-            id_b,
+            key_b.clone(),
             format!("127.0.0.1:{p2}").parse().unwrap(),
             state(id_b, p2, &[NodeRole::Worker]),
         )
@@ -193,10 +199,11 @@ async fn local_state_update_propagates_to_peer() {
 #[tokio::test]
 async fn single_node_with_no_seeds_starts_cleanly() {
     let (p1, _) = pick_two_ports();
-    let id = NodeId::new([0xee; 32]);
+    let key = Arc::new(NodeIdentity::from_seed([0xee; 32]));
+    let id = key.node_id();
     let mesh = GossipMesh::start(
         GossipConfig::new(
-            id,
+            key.clone(),
             format!("127.0.0.1:{p1}").parse().unwrap(),
             state(id, p1, &[NodeRole::ApiServer, NodeRole::Worker]),
         )
