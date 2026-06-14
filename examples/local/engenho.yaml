@@ -1,0 +1,9 @@
+# Local single-node engenho bring-up config.
+# Overlays prescribed_default (kubelet_backend=Podman, TLS self-gen,
+# durable, the 18-controller set + scheduler). Discover it via:
+#   ENGENHO_CONFIG=examples/local/engenho.yaml  (or copy to
+#   ~/.config/engenho/engenho.yaml — the XDG tier).
+runtime:
+  listen_addr: "127.0.0.1:6443"
+  data_dir: "/Users/drzzln/.local/share/engenho-local"  # any writable dir
+  node_name: "engenho-local"
