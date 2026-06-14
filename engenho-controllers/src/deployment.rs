@@ -71,6 +71,13 @@ impl DeploymentController {
     /// debugging.
     fn build_replicaset_from(d: &Value, hash: &str) -> Option<(String, Value)> {
         let d_name = d.name()?;
+        // The child ReplicaSet lives in the SAME namespace as its parent
+        // Deployment — never the controller's scope namespace (an
+        // all-namespace controller has none). A namespaced Deployment with
+        // no metadata.namespace is impossible past admission, but default
+        // defensively so the key + the object can never disagree.
+        let d_namespace =
+            d.namespace().map_or_else(|| "default".to_string(), |c| c.to_owned());
         let template = d.get("spec").and_then(|s| s.get("template"))?.clone();
         let replicas = d.spec_i64("replicas", 1);
         let rs_name = format!("{d_name}-{hash}");
@@ -79,6 +86,7 @@ impl DeploymentController {
             "apiVersion": "apps/v1",
             "metadata": {
                 "name": rs_name,
+                "namespace": d_namespace,
                 "labels": {
                     "app.kubernetes.io/managed-by": "engenho-deployment-controller",
                     "pod-template-hash": hash
@@ -197,9 +205,18 @@ impl OwnedChildrenReconciler for DeploymentController {
                     Self::build_replicaset_from(d_value, &desired_hash)
                 {
                     set_owner_reference(&mut rs_value, owner_ref.clone());
-                    let rs_ns = ns.unwrap_or("default");
+                    // Key the RS under the PARENT Deployment's namespace —
+                    // the same namespace the blanket gathers `owned_rs` from
+                    // (by owner-ref). Using the controller's scope namespace
+                    // (`ns`, None→"default") keyed the RS where the owned-RS
+                    // query never looks → the controller never saw the RS it
+                    // created → recreate-every-tick hot loop + status thrash.
+                    let rs_ns = d_value.namespace().map_or_else(
+                        || ns.unwrap_or("default").to_string(),
+                        |c| c.to_owned(),
+                    );
                     let rs_key =
-                        ResourceKey::namespaced("apps", "v1", "ReplicaSet", rs_ns, &rs_name);
+                        ResourceKey::namespaced("apps", "v1", "ReplicaSet", &rs_ns, &rs_name);
                     commands.push(ResourceCommand::Put {
                         key: rs_key,
                         value: rs_value,
@@ -322,5 +339,39 @@ mod tests {
     fn rs_template_hash_none_when_label_missing() {
         let rs = json!({"metadata": {"labels": {}}});
         assert!(DeploymentController::rs_template_hash(&rs).is_none());
+    }
+
+    #[test]
+    fn build_replicaset_from_inherits_the_deployments_namespace() {
+        // The child ReplicaSet MUST land in the parent Deployment's
+        // namespace — not "default". Regression test for the bug where a
+        // Deployment in ns `team-a` produced an RS in `default`, which the
+        // owned-RS query (in `team-a`) never saw → recreate-every-tick loop.
+        let d = json!({
+            "kind": "Deployment", "apiVersion": "apps/v1",
+            "metadata": {"name": "web", "namespace": "team-a", "uid": "u1"},
+            "spec": {
+                "replicas": 3,
+                "selector": {"matchLabels": {"app": "web"}},
+                "template": {
+                    "metadata": {"labels": {"app": "web"}},
+                    "spec": {"containers": [{"name": "c", "image": "img"}]}
+                }
+            }
+        });
+        let (rs_name, rs) = DeploymentController::build_replicaset_from(&d, "hash01").unwrap();
+        assert_eq!(rs_name, "web-hash01");
+        assert_eq!(rs.get("metadata").unwrap().get("namespace").unwrap(), "team-a");
+        assert_eq!(rs.get("spec").unwrap().get("replicas").unwrap(), 3);
+    }
+
+    #[test]
+    fn build_replicaset_from_defaults_namespace_when_parent_has_none() {
+        let d = json!({
+            "metadata": {"name": "web"},
+            "spec": {"replicas": 1, "selector": {}, "template": {"spec": {"containers": []}}}
+        });
+        let (_, rs) = DeploymentController::build_replicaset_from(&d, "h").unwrap();
+        assert_eq!(rs.get("metadata").unwrap().get("namespace").unwrap(), "default");
     }
 }
