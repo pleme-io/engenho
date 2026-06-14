@@ -46,6 +46,11 @@ impl ReplicaSetController {
     /// for operators.
     fn build_pod_from_template(rs: &Value, index: usize) -> Option<(String, Value)> {
         let rs_name = rs.name()?;
+        // Pod lives in the SAME namespace as its parent ReplicaSet — the
+        // namespace the blanket gathers owned pods from. Never the
+        // controller's scope namespace (an all-namespace controller has none).
+        let rs_namespace =
+            rs.namespace().map_or_else(|| "default".to_string(), |c| c.to_owned());
         let template = rs.get("spec").and_then(|s| s.get("template"))?;
         let mut pod = template.clone();
         // Ensure pod is an object
@@ -63,6 +68,7 @@ impl ReplicaSetController {
             .or_insert_with(|| json!({}));
         let metadata_obj = metadata.as_object_mut()?;
         metadata_obj.insert("name".into(), Value::String(pod_name.clone()));
+        metadata_obj.insert("namespace".into(), Value::String(rs_namespace));
         Some((pod_name, pod))
     }
 }
@@ -144,8 +150,12 @@ impl OwnedChildrenReconciler for ReplicaSetController {
         let Some(owner_ref) = owner_ref_for(rs_value, "apps/v1", "ReplicaSet") else {
             return Ok(ReconcileDelta::none());
         };
-        let ns = self.namespace.as_deref();
-        let pod_ns = ns.unwrap_or("default");
+        // Pods go in the RS's OWN namespace (where owned-pod gathering
+        // looks), not the controller scope ns — same fix as deployment→RS.
+        let pod_ns = rs_value.namespace().map_or_else(
+            || self.namespace.as_deref().unwrap_or("default").to_string(),
+            |c| c.to_owned(),
+        );
         let mut commands = Vec::new();
 
         if observed < desired {
@@ -167,7 +177,7 @@ impl OwnedChildrenReconciler for ReplicaSetController {
                     continue;
                 };
                 set_owner_reference(&mut pod, owner_ref.clone());
-                let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
+                let pod_key = ResourceKey::namespaced("", "v1", "Pod", &pod_ns, &pod_name);
                 commands.push(ResourceCommand::Put {
                     key: pod_key,
                     value: pod,
@@ -247,6 +257,8 @@ mod tests {
         assert_eq!(pod.get("kind").unwrap(), "Pod");
         assert_eq!(pod.get("apiVersion").unwrap(), "v1");
         assert_eq!(pod.get("metadata").unwrap().get("name").unwrap(), "rs1-0");
+        // No RS namespace → the pod defaults to "default".
+        assert_eq!(pod.get("metadata").unwrap().get("namespace").unwrap(), "default");
         // Template labels survive.
         assert_eq!(
             pod.get("metadata")
@@ -257,6 +269,23 @@ mod tests {
                 .unwrap(),
             "rs1"
         );
+    }
+
+    #[test]
+    fn build_pod_from_template_inherits_the_replicasets_namespace() {
+        // The Pod MUST land in the parent RS's namespace — not "default".
+        // Regression test for the bug where an RS in ns `team-b` produced
+        // pods in `default`, breaking the owned-pod gathering + scheduling.
+        let rs = json!({
+            "metadata": {"name": "rs1", "namespace": "team-b"},
+            "spec": {"template": {
+                "metadata": {"labels": {"app": "rs1"}},
+                "spec": {"containers": [{"name": "c", "image": "img"}]}
+            }}
+        });
+        let (name, pod) = ReplicaSetController::build_pod_from_template(&rs, 2).unwrap();
+        assert_eq!(name, "rs1-2");
+        assert_eq!(pod.get("metadata").unwrap().get("namespace").unwrap(), "team-b");
     }
 
     #[test]
