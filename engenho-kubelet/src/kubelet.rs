@@ -137,8 +137,25 @@ struct ContainerRecord {
 /// `<ns>_<pod>_<containerName>`.
 #[derive(Clone, Debug, Default)]
 struct LocalPod {
-    /// Per-container records keyed by the container's logical name.
+    /// Per-container records keyed by the container's logical name. These are
+    /// the APP containers (`spec.containers[i]`); they are started only AFTER
+    /// every init container has Succeeded (`init_complete == true`).
     containers: BTreeMap<String, ContainerRecord>,
+    /// Per-INIT-container records keyed by the init container's logical name
+    /// (`spec.initContainers[i].name`). Init containers run ONE AT A TIME, in
+    /// order; this map holds only those the kubelet has started so far (one,
+    /// then the next once the prior Succeeds). Empty for a pod with no init
+    /// containers (the common case) — that pod's `init_complete` is true from
+    /// the first reconcile and the app-start path runs identically to before
+    /// the init-container brick. Init containers do NOT carry probes (K8s does
+    /// not run liveness/readiness/startup on init containers), so each
+    /// [`ContainerRecord::probes`] stays default (all-None).
+    init_containers: BTreeMap<String, ContainerRecord>,
+    /// `true` once every init container has Succeeded (or the pod declares no
+    /// init containers). Latched: once the init sequence is `Complete`, app
+    /// containers may start + the pod proceeds to the app reconcile. A pod with
+    /// no init containers reaches `init_complete = true` on its first start.
+    init_complete: bool,
     /// emptyDir volume NAMES (`spec.volumes[i].name`, NOT the backing podman
     /// volume name) this pod created. Recorded at start so delete-cleanup can
     /// reap each one via `volume_materializer.remove_empty_dir(ns, pod, name)`
@@ -298,44 +315,100 @@ impl Kubelet {
     /// bookkeeping key). The returned `(container_name, spec)` pairs preserve
     /// `spec.containers` order.
     ///
-    /// MULTI-CONTAINER: today the kubelet runs one [`ContainerSpec`] per
-    /// `spec.containers[i]`. INIT CONTAINERS: the pure sequencing interpreter
-    /// ([`crate::lifecycle::next_init_action`] +
-    /// [`crate::lifecycle::reconcile_pod_phase_with_init`]) is implemented +
-    /// unit-tested; the kubelet I/O driver that consumes it (sequential
-    /// init-then-app start, `initContainerStatuses`, the `Initialized`
-    /// condition) is the next brick. Ephemeral containers remain a documented
-    /// no-op. The backend container name is the
-    /// deterministic `<ns>_<pod>_<containerName>` join so status/stop/remove
-    /// by-name is possible per container.
+    /// MULTI-CONTAINER: the kubelet runs one [`ContainerSpec`] per
+    /// `spec.containers[i]`. INIT CONTAINERS are extracted separately by
+    /// [`Self::pod_to_init_container_specs`] (which consumes the pure
+    /// sequencing interpreter [`crate::lifecycle::next_init_action`]).
+    /// Ephemeral containers remain a documented no-op. The backend container
+    /// name is the deterministic `<ns>_<pod>_<containerName>` join so
+    /// status/stop/remove by-name is possible per container.
     ///
     /// Env + command + args are read per container: `command` →
     /// `ContainerSpec.command` (the entrypoint override) followed by `args`
     /// (appended, mirroring K8s where `args` are the entrypoint's arguments).
+    ///
+    /// `spec.containers` is REQUIRED (a pod with no app containers is invalid):
+    /// a missing / empty array is a typed [`KubeletError::InvalidPod`].
     fn pod_to_container_specs(
         namespace: &str,
         name: &str,
         pod: &Value,
     ) -> Result<Vec<(String, ContainerSpec)>, KubeletError> {
-        let containers = pod
+        Self::extract_container_specs(namespace, name, pod, "containers", false)
+    }
+
+    /// Extract a [`ContainerSpec`] for EVERY `spec.initContainers[i]`, in
+    /// `spec.initContainers` order — the I/O-side companion to the pure
+    /// [`crate::lifecycle::next_init_action`] sequencer.
+    ///
+    /// INIT-CONTAINER NAME DISAMBIGUATION: the backend `--name` for an init
+    /// container is `<ns>_<pod>_init-<cname>` (the `init-` prefix on the
+    /// container segment), NOT the app-container `<ns>_<pod>_<cname>`. K8s
+    /// permits an init container and an app container of a pod to share a
+    /// logical name; without the prefix their deterministic podman names would
+    /// collide ("name already in use"). The logical name returned in the
+    /// `(cname, spec)` pair is the RAW `spec.initContainers[i].name` (no
+    /// prefix) — it is the bookkeeping key under `LocalPod::init_containers`
+    /// and the `status.initContainerStatuses[].name`, matching the manifest.
+    ///
+    /// EMPTY / ABSENT `spec.initContainers` ⇒ `Ok(vec![])` WITHOUT error — the
+    /// common case (every pre-init-brick pod has zero init containers). This is
+    /// the behavior-preserving guarantee: no init containers → empty Vec → the
+    /// init sequencer returns `Complete` immediately → the app-start path runs
+    /// byte-identically to before this brick.
+    fn pod_to_init_container_specs(
+        namespace: &str,
+        name: &str,
+        pod: &Value,
+    ) -> Result<Vec<(String, ContainerSpec)>, KubeletError> {
+        Self::extract_container_specs(namespace, name, pod, "initContainers", true)
+    }
+
+    /// Shared container-extraction core, parameterized by the `spec` key
+    /// (`"containers"` | `"initContainers"`) and whether an absent / empty
+    /// array is allowed (`true` for init containers — the common no-init case;
+    /// `false` for app containers — a pod with no app containers is invalid).
+    ///
+    /// `optional` ALSO selects the backend `--name` shape: init containers
+    /// (`optional == true`) get the `<ns>_<pod>_init-<cname>` disambiguating
+    /// prefix so they never collide with a same-named app container's
+    /// `<ns>_<pod>_<cname>`. The RETURNED logical name is always the raw
+    /// `spec.<key>[i].name` (the bookkeeping key + status name).
+    fn extract_container_specs(
+        namespace: &str,
+        name: &str,
+        pod: &Value,
+        spec_key: &str,
+        optional: bool,
+    ) -> Result<Vec<(String, ContainerSpec)>, KubeletError> {
+        let containers = match pod
             .get("spec")
-            .and_then(|s| s.get("containers"))
+            .and_then(|s| s.get(spec_key))
             .and_then(|c| c.as_array())
-            .ok_or_else(|| KubeletError::InvalidPod {
-                pod: format!("{namespace}/{name}"),
-                reason: "spec.containers missing".into(),
-            })?;
+        {
+            Some(c) => c,
+            None if optional => return Ok(Vec::new()),
+            None => {
+                return Err(KubeletError::InvalidPod {
+                    pod: format!("{namespace}/{name}"),
+                    reason: format!("spec.{spec_key} missing"),
+                });
+            }
+        };
         if containers.is_empty() {
+            if optional {
+                return Ok(Vec::new());
+            }
             return Err(KubeletError::InvalidPod {
                 pod: format!("{namespace}/{name}"),
-                reason: "spec.containers is empty".into(),
+                reason: format!("spec.{spec_key} is empty"),
             });
         }
         let mut out = Vec::with_capacity(containers.len());
         for (i, c) in containers.iter().enumerate() {
-            // Container logical name: spec.containers[i].name, else a
-            // positional fallback (matches container_name()'s "main"/index
-            // shape so status names round-trip).
+            // Container logical name: spec.<key>[i].name, else a positional
+            // fallback (matches the "main"/index shape so status names
+            // round-trip).
             let cname = c
                 .get("name")
                 .and_then(|n| n.as_str())
@@ -346,7 +419,7 @@ impl Kubelet {
                 .and_then(|im| im.as_str())
                 .ok_or_else(|| KubeletError::InvalidPod {
                     pod: format!("{namespace}/{name}"),
-                    reason: format!("spec.containers[{i}].image missing"),
+                    reason: format!("spec.{spec_key}[{i}].image missing"),
                 })?
                 .to_string();
             let env = c
@@ -376,11 +449,18 @@ impl Kubelet {
             };
             let mut command = str_array("command");
             command.extend(str_array("args"));
+            // Backend (podman --name) handle. App containers: <ns>_<pod>_<cname>.
+            // Init containers: <ns>_<pod>_init-<cname> (the disambiguating
+            // prefix — see pod_to_init_container_specs).
+            let backend_name = if optional {
+                format!("{namespace}_{name}_init-{cname}")
+            } else {
+                format!("{namespace}_{name}_{cname}")
+            };
             out.push((
                 cname.clone(),
                 ContainerSpec {
-                    // Backend (podman --name) handle: <ns>_<pod>_<cname>.
-                    name: format!("{namespace}_{name}_{cname}"),
+                    name: backend_name,
                     image,
                     env,
                     command,
@@ -615,10 +695,44 @@ impl Kubelet {
     /// which ALSO keeps the field set stable across Running→terminal so the
     /// idempotent-skip in [`write_status_cas`] yields `NoChange` at steady
     /// state (no hot loop, no watch storm).
+    ///
+    /// NO-INIT path: this 3-arg form is the behavior-preserving entry for a pod
+    /// with zero init containers — it delegates to
+    /// [`Self::build_pod_status_with_init`] with `has_init = false`, which emits
+    /// NO `Initialized` condition + NO `initContainerStatuses`, so the rendered
+    /// status is byte-identical to before the init-container brick. The init
+    /// path uses the with-init form directly.
     fn build_pod_status(
         phase: engenho_types::curated_enums::PodPhase,
         statuses: &[ContainerStatusOut],
         pod_ip: Option<&str>,
+    ) -> Value {
+        Self::build_pod_status_with_init(phase, &[], statuses, pod_ip, true, false)
+    }
+
+    /// Build the desired Pod `status`, optionally carrying init-container state.
+    ///
+    /// When `has_init == false` the output is byte-identical to the pre-init
+    /// render (no `Initialized` condition, no `initContainerStatuses`) — the
+    /// no-init behavior-preserving guarantee. When `has_init == true` the
+    /// `Initialized` condition (`True`/`False` from `initialized`) is APPENDED
+    /// as the THIRD condition (after `ContainersReady`, `Ready`) and an
+    /// `initContainerStatuses` array (rendered like `containerStatuses`) is
+    /// added. Appending (not prepending) `Initialized` keeps the existing
+    /// `conditions[0] = ContainersReady` / `conditions[1] = Ready` indices
+    /// stable.
+    ///
+    /// `ContainersReady`/`Ready` fold over the APP `statuses` exactly as before
+    /// — while init runs (phase Pending) both are `False`; once init completes
+    /// and the app containers are up they become `True`. Init containers do NOT
+    /// contribute to `ContainersReady` (K8s excludes them).
+    fn build_pod_status_with_init(
+        phase: engenho_types::curated_enums::PodPhase,
+        init_statuses: &[ContainerStatusOut],
+        statuses: &[ContainerStatusOut],
+        pod_ip: Option<&str>,
+        initialized: bool,
+        has_init: bool,
     ) -> Value {
         use engenho_types::curated_enums::PodPhase;
         let phase_str = match phase {
@@ -628,8 +742,9 @@ impl Kubelet {
             PodPhase::Failed => "Failed",
             PodPhase::Unknown => "Unknown",
         };
-        // ContainersReady = phase Running AND all containers ready. A non-running
-        // phase (Pending / terminal) is never ready.
+        // ContainersReady = phase Running AND all (app) containers ready. A
+        // non-running phase (Pending / terminal) is never ready. Init
+        // containers are excluded (K8s does not count them toward readiness).
         let containers_ready =
             matches!(phase, PodPhase::Running) && statuses.iter().all(|c| c.ready);
         // Ready = ContainersReady AND all readinessGates (none today ⇒ mirrors
@@ -640,20 +755,35 @@ impl Kubelet {
             statuses.iter().map(Self::render_container_status).collect();
         // Deterministic order: ContainersReady then Ready (stable across writes
         // → NoChange at steady state).
+        let mut conditions = vec![
+            json!({
+                "type": "ContainersReady",
+                "status": status_str(containers_ready),
+            }),
+            json!({
+                "type": "Ready",
+                "status": status_str(ready),
+            }),
+        ];
+        // Append the Initialized condition ONLY for a pod with init containers.
+        // A no-init pod omits it entirely (byte-identical pre-init render).
+        if has_init {
+            conditions.push(json!({
+                "type": "Initialized",
+                "status": status_str(initialized),
+            }));
+        }
         let mut status = json!({
             "phase": phase_str,
-            "conditions": [
-                {
-                    "type": "ContainersReady",
-                    "status": status_str(containers_ready),
-                },
-                {
-                    "type": "Ready",
-                    "status": status_str(ready),
-                },
-            ],
+            "conditions": conditions,
             "containerStatuses": container_statuses,
         });
+        // initContainerStatuses ONLY for an init-bearing pod.
+        if has_init {
+            let init_container_statuses: Vec<Value> =
+                init_statuses.iter().map(Self::render_container_status).collect();
+            status["initContainerStatuses"] = Value::Array(init_container_statuses);
+        }
         if let Some(ip) = pod_ip {
             status["podIP"] = Value::String(ip.to_string());
         }
@@ -796,6 +926,14 @@ impl Kubelet {
         key: &ResourceKey,
         lp: &LocalPod,
     ) -> Result<(), KubeletError> {
+        // Reap the INIT containers too (a pod deleted mid-init, or after a
+        // completed init sequence, still has its init containers recorded — an
+        // exited init container retains its podman name until removed). stop is
+        // a no-op on an already-exited container; remove frees the
+        // `<ns>_<pod>_init-<cname>` name. Idempotent (already-gone is success).
+        for record in lp.init_containers.values() {
+            self.cleanup_container(&record.container_id).await?;
+        }
         for record in lp.containers.values() {
             self.cleanup_container(&record.container_id).await?;
         }
@@ -978,6 +1116,44 @@ impl Kubelet {
         soonest_requeue: &mut Option<Duration>,
     ) -> Result<(), ControllerError> {
         let namespace = key.namespace.as_deref().unwrap_or("default");
+
+        // INIT CONTAINERS: if the pod declares any init containers and they
+        // haven't all Succeeded yet, the kubelet runs the init sequence FIRST —
+        // one init container at a time, in order — and does NOT start any app
+        // container this pass. `reconcile_init` drives the sequence + renders
+        // status (Pending + initContainerStatuses + Initialized=False). Only
+        // once init is Complete does the app-start path below run. A pod with
+        // NO init containers returns an empty Vec here, so this whole block is
+        // skipped and the app-start path runs BYTE-IDENTICALLY to before the
+        // init-container brick (the behavior-preserving guarantee).
+        let init_specs = match Self::pod_to_init_container_specs(namespace, &key.name, value) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    pod = %key.label(),
+                    error = %e,
+                    "skipping pod with invalid init-container manifest"
+                );
+                report.objects_skipped += 1;
+                return Ok(());
+            }
+        };
+        if !init_specs.is_empty() {
+            let init_complete = self
+                .local
+                .lock()
+                .await
+                .get(key)
+                .map(|lp| lp.init_complete)
+                .unwrap_or(false);
+            if !init_complete {
+                // Drive the init sequence (starts init[0] on the first pass).
+                return self
+                    .reconcile_init(key, value, &init_specs, report, soonest_requeue)
+                    .await;
+            }
+        }
+
         let specs = match Self::pod_to_container_specs(namespace, &key.name, value) {
             Ok(s) => s,
             Err(e) => {
@@ -1357,6 +1533,28 @@ impl Kubelet {
         let restart_policy = Self::pod_restart_policy(value);
         let namespace = key.namespace.as_deref().unwrap_or("default");
 
+        // INIT CONTAINERS: if the pod has init containers and they haven't all
+        // Succeeded yet (`!init_complete`), route to the init reconcile —
+        // poll/advance the init sequence + render Pending + initContainerStatuses
+        // + Initialized=False, NEVER touching the app containers. A pod with no
+        // init containers (or one already init_complete) falls through to the
+        // app reconcile below, which itself renders initContainerStatuses +
+        // Initialized=True alongside the app status once init_complete.
+        let init_specs = match Self::pod_to_init_container_specs(namespace, &key.name, value) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(pod = %key.label(), error = %e, "invalid init manifest during reconcile");
+                report.objects_skipped += 1;
+                return Ok(());
+            }
+        };
+        let has_init = !init_specs.is_empty();
+        if has_init && !lp.init_complete {
+            return self
+                .reconcile_init(key, value, &init_specs, report, soonest_requeue)
+                .await;
+        }
+
         // Re-derive the expected container set from the manifest so a
         // not-yet-started container shows up as Waiting (the pod is Pending
         // until every container has started at least once).
@@ -1580,8 +1778,451 @@ impl Kubelet {
         // and CAS-write. The pure reconcile_pod_phase is the interpreter; this
         // is the I/O shell.
         let (phase, statuses) = reconcile_pod_phase(restart_policy, &observations);
-        let desired = Self::build_pod_status(phase, &statuses, pod_ip.as_deref());
+        let desired = if has_init {
+            // init_complete pod (we only reach here past the init route once
+            // init_complete): render initContainerStatuses (every init
+            // container Terminated exit 0) + Initialized=True alongside the app
+            // status. The init records hold the succeeded init containers; we
+            // build their typed statuses from the manifest order so a kubectl
+            // describe shows the completed init sequence.
+            let init_statuses = self.init_statuses_terminated(key, &init_specs).await;
+            Self::build_pod_status_with_init(
+                phase,
+                &init_statuses,
+                &statuses,
+                pod_ip.as_deref(),
+                /* initialized */ true,
+                /* has_init */ true,
+            )
+        } else {
+            Self::build_pod_status(phase, &statuses, pod_ip.as_deref())
+        };
         self.write_pod_status(key, value, &desired, report).await
+    }
+
+    /// Build the `initContainerStatuses` array for an init-complete pod — every
+    /// init container reported `Terminated{ exit 0 }` (Succeeded), in
+    /// `spec.initContainers` order. Reads the recorded init [`ContainerRecord`]
+    /// for each container's id + restart count; an init container missing from
+    /// the local record (shouldn't happen once init_complete, but defensively
+    /// handled) is rendered Terminated exit 0 with no id rather than dropped.
+    async fn init_statuses_terminated(
+        &self,
+        key: &ResourceKey,
+        init_specs: &[(String, ContainerSpec)],
+    ) -> Vec<ContainerStatusOut> {
+        let local = self.local.lock().await;
+        let init_recs = local.get(key).map(|lp| &lp.init_containers);
+        init_specs
+            .iter()
+            .map(|(cname, _)| {
+                let rec = init_recs.and_then(|m| m.get(cname));
+                ContainerStatusOut {
+                    name: cname.clone(),
+                    ready: false,
+                    state: ContainerState::terminated(0),
+                    container_id: rec.map(|r| r.container_id.clone()),
+                    restart_count: rec.map(|r| r.restart_count).unwrap_or(0),
+                }
+            })
+            .collect()
+    }
+
+    /// Build a single init container's [`ContainerSpec`] ready to start:
+    /// stamps the pod-level Service aliases + the resolved volume mounts (init
+    /// containers may mount volumes exactly like app containers). The base spec
+    /// already carries the disambiguating `<ns>_<pod>_init-<cname>` backend
+    /// name from [`Self::pod_to_init_container_specs`].
+    ///
+    /// Returns the populated spec, or a typed error if the container's
+    /// `volumeMounts[]` reference an undeclared volume (NoSource) — the caller
+    /// surfaces it (never a fake start).
+    fn build_init_spec(
+        value: &Value,
+        cname: &str,
+        base: &ContainerSpec,
+        aliases: &[String],
+        resolved: &BTreeMap<String, MountSource>,
+    ) -> Result<ContainerSpec, KubeletError> {
+        let mut spec = base.clone();
+        spec.network_aliases = aliases.to_vec();
+        if let Some(cjson) = Self::container_json_in(value, "initContainers", cname) {
+            spec.mounts = container_mounts(cjson, resolved).map_err(|e| KubeletError::InvalidPod {
+                pod: cname.to_string(),
+                reason: format!("init container volume: {e}"),
+            })?;
+        }
+        Ok(spec)
+    }
+
+    /// Start ONE init container (the spec already carries its name/aliases/
+    /// mounts) and record it under [`LocalPod::init_containers`] with a fresh
+    /// (zero) restart count + default (empty) probe state — init containers do
+    /// NOT carry probes. Returns the new container's status.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a [`KubeletError::Backend`] from the runtime `start`.
+    async fn start_init_container(
+        &self,
+        key: &ResourceKey,
+        cname: &str,
+        spec: &ContainerSpec,
+        restart_count: u32,
+    ) -> Result<crate::backend::ContainerStatus, KubeletError> {
+        let status = self.backend.start(spec).await?;
+        let mut local = self.local.lock().await;
+        let entry = local.entry(key.clone()).or_default();
+        entry.init_containers.insert(
+            cname.to_string(),
+            ContainerRecord {
+                container_id: status.container_id.clone(),
+                restart_count,
+                // Init containers never carry probes (K8s does not run
+                // liveness/readiness/startup on init containers).
+                probes: ContainerProbeState::default(),
+            },
+        );
+        Ok(status)
+    }
+
+    /// Look up a single `spec.<key>[i]` JSON object (generalized
+    /// [`Self::container_json`] over the spec key so init containers resolve
+    /// their `volumeMounts[]` from `spec.initContainers[i]`).
+    fn container_json_in<'a>(pod: &'a Value, spec_key: &str, cname: &str) -> Option<&'a Value> {
+        let containers = pod.get("spec")?.get(spec_key)?.as_array()?;
+        containers
+            .iter()
+            .enumerate()
+            .find(|(i, c)| {
+                let name = c
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        if *i == 0 {
+                            "main".to_string()
+                        } else {
+                            format!("container-{i}")
+                        }
+                    });
+                name == cname
+            })
+            .map(|(_, c)| c)
+    }
+
+    /// INIT reconcile — the I/O driver over the pure
+    /// [`crate::lifecycle::next_init_action`] sequencer. NO probes (K8s does
+    /// not run them on init containers). Polls each init container's recorded
+    /// state, builds the ORDERED `Vec<ContainerObservation>` (Waiting if not
+    /// yet recorded, Running if up, Terminated{exit} if exited), asks the pure
+    /// sequencer for the next [`InitAction`], and acts:
+    ///
+    ///   * `AwaitInit{index}` — ensure init[index] is started (start it if not
+    ///     in the record) or restarted (if it Terminated with a restartable
+    ///     exit under the policy: stop+remove the old, start fresh, bump the
+    ///     restart count). Status = Pending + initContainerStatuses +
+    ///     Initialized=False; arm a near requeue so the next tick advances.
+    ///   * `InitFailed` — phase Failed + initContainerStatuses +
+    ///     Initialized=False; latch (do NOT start app containers).
+    ///   * `Complete` — set `init_complete = true`, then start the app
+    ///     containers via the normal start path (which now routes past init)
+    ///     and render the full status.
+    async fn reconcile_init(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        init_specs: &[(String, ContainerSpec)],
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<(), ControllerError> {
+        let restart_policy = Self::pod_restart_policy(value);
+        let namespace = key.namespace.as_deref().unwrap_or("default");
+
+        // Compute pod-level Service aliases + resolve volume mounts ONCE (init
+        // containers earn the same aliases + may mount the pod's volumes). A
+        // volume-resolution error writes the pod Pending with the typed reason
+        // + arms a requeue (the no-silent-wrong-answer path), exactly like the
+        // app-start path.
+        let services = self.store.list("", "v1", "Service", Some(namespace)).await;
+        let aliases =
+            Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
+        let cnames: Vec<String> = init_specs.iter().map(|(c, _)| c.clone()).collect();
+        let Some(resolved) = self
+            .resolve_or_pending(key, value, namespace, &cnames, report, soonest_requeue)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        // Build the ORDERED observations from the recorded init state + a poll.
+        let lp = self.local.lock().await.get(key).cloned().unwrap_or_default();
+        let mut observations: Vec<ContainerObservation> = Vec::with_capacity(init_specs.len());
+        for (cname, _spec) in init_specs {
+            match lp.init_containers.get(cname) {
+                None => observations.push(ContainerObservation::waiting(cname)),
+                Some(record) => match self.backend.status(&record.container_id).await {
+                    Ok(Some(s)) if s.running => observations.push(ContainerObservation::running(
+                        cname,
+                        &record.container_id,
+                        record.restart_count,
+                    )),
+                    Ok(Some(s)) => observations.push(ContainerObservation::terminated(
+                        cname,
+                        &record.container_id,
+                        s.exit_code.unwrap_or(0),
+                        record.restart_count,
+                    )),
+                    Ok(None) => {
+                        // Backend lost this init container out-of-band → treat
+                        // as Waiting so it re-starts on the AwaitInit path.
+                        observations.push(ContainerObservation::waiting(cname));
+                    }
+                    Err(e) => {
+                        warn!(
+                            pod = %key.label(),
+                            container = %cname,
+                            error = %e,
+                            "init container status poll failed; treating as Waiting"
+                        );
+                        report.objects_skipped += 1;
+                        observations.push(ContainerObservation::waiting(cname));
+                    }
+                },
+            }
+        }
+
+        match crate::lifecycle::next_init_action(restart_policy, &observations) {
+            crate::lifecycle::InitAction::Complete => {
+                // Every init container Succeeded → latch init_complete, then
+                // run the app-start path (which now routes PAST init since
+                // init_complete is set) to start the app containers + render
+                // the full status (initContainerStatuses + Initialized=True).
+                {
+                    let mut local = self.local.lock().await;
+                    local.entry(key.clone()).or_default().init_complete = true;
+                }
+                report.objects_changed += 1;
+                debug!(
+                    pod = %key.label(),
+                    init_containers = init_specs.len(),
+                    "kubelet init sequence complete; starting app containers"
+                );
+                // Box the recursive call: reconcile_init → start_bound_pod →
+                // (init_complete now true) → app path. Boxing breaks the
+                // infinitely-sized async future (E0733).
+                Box::pin(self.start_bound_pod(key, value, report, soonest_requeue)).await
+            }
+            crate::lifecycle::InitAction::InitFailed { index, exit_code } => {
+                // Terminal init failure (non-zero exit under restartPolicy:Never)
+                // → pod Failed; app containers never start. Render the init
+                // statuses (the failed one Terminated non-zero) + Initialized
+                // False. Latch (no app start, init_complete stays false).
+                warn!(
+                    pod = %key.label(),
+                    index,
+                    exit_code,
+                    "init container failed terminally; pod Failed (app never starts)"
+                );
+                let init_statuses = self.init_statuses_observed(&observations);
+                let desired = Self::build_pod_status_with_init(
+                    engenho_types::curated_enums::PodPhase::Failed,
+                    &init_statuses,
+                    &[],
+                    None,
+                    /* initialized */ false,
+                    /* has_init */ true,
+                );
+                self.write_pod_status(key, value, &desired, report).await
+            }
+            crate::lifecycle::InitAction::AwaitInit { index } => {
+                // init[index] is the active one. Ensure it's started (start it
+                // if not recorded) or restarted (if it Terminated with a
+                // restartable exit under the policy).
+                let (cname, base_spec) = &init_specs[index];
+                let pod_ip = self
+                    .advance_active_init(key, value, index, cname, base_spec, &aliases, &resolved, &lp, report)
+                    .await?;
+
+                // Re-read the (possibly just-updated) init records so the
+                // rendered initContainerStatuses reflect the freshly-started /
+                // restarted container.
+                let init_statuses = self.init_statuses_current(key, init_specs).await;
+                let desired = Self::build_pod_status_with_init(
+                    engenho_types::curated_enums::PodPhase::Pending,
+                    &init_statuses,
+                    &[],
+                    pod_ip.as_deref(),
+                    /* initialized */ false,
+                    /* has_init */ true,
+                );
+                self.write_pod_status(key, value, &desired, report).await?;
+
+                // Arm a near requeue so the next tick advances the sequence
+                // (mirrors the probe-cadence / volume-pending requeue floor).
+                let next = soonest_requeue.map_or(MIN_PROBE_REQUEUE, |d| d.min(MIN_PROBE_REQUEUE));
+                *soonest_requeue = Some(next);
+                Ok(())
+            }
+        }
+    }
+
+    /// Ensure the active init container (`index`) is started or restarted.
+    ///
+    ///   * Not yet recorded → start it fresh (restart_count 0).
+    ///   * Recorded + Terminated with a restartable exit (the sequencer only
+    ///     returns `AwaitInit` for a Terminated init container when the policy
+    ///     restarts it) → stop+remove the old, start fresh, bump restart_count.
+    ///   * Recorded + Running → in flight: nothing to do (await its exit).
+    ///
+    /// Returns the active init container's pod IP when freshly started/restarted
+    /// (so the Pending status carries it), else `None`.
+    #[allow(clippy::too_many_arguments)]
+    async fn advance_active_init(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        index: usize,
+        cname: &str,
+        base_spec: &ContainerSpec,
+        aliases: &[String],
+        resolved: &BTreeMap<String, MountSource>,
+        lp: &LocalPod,
+        report: &mut ReconcileReport,
+    ) -> Result<Option<String>, ControllerError> {
+        let spec = match Self::build_init_spec(value, cname, base_spec, aliases, resolved) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(pod = %key.label(), container = %cname, error = %e,
+                    "skipping pod: init container references an undeclared volume");
+                report.objects_skipped += 1;
+                return Ok(None);
+            }
+        };
+
+        match lp.init_containers.get(cname) {
+            None => {
+                // Not yet started → start init[index] fresh.
+                debug!(
+                    pod = %key.label(),
+                    container = %cname,
+                    index,
+                    image = %spec.image,
+                    "kubelet starting init container"
+                );
+                match self.start_init_container(key, cname, &spec, 0).await {
+                    Ok(status) => {
+                        report.objects_changed += 1;
+                        Ok(status.pod_ip)
+                    }
+                    Err(e) => {
+                        warn!(pod = %key.label(), container = %cname, error = %e,
+                            "init container start failed; pod remains Pending");
+                        report.objects_skipped += 1;
+                        Ok(None)
+                    }
+                }
+            }
+            Some(record) => {
+                // Recorded. Poll once: a Terminated-but-restartable init
+                // container is restarted (stop+remove old, start fresh, bump
+                // count); a Running one is awaited (no-op).
+                match self.backend.status(&record.container_id).await {
+                    Ok(Some(s)) if s.running => Ok(s.pod_ip),
+                    Ok(Some(_)) | Ok(None) => {
+                        // Terminated (restartable — the sequencer said
+                        // AwaitInit for it) OR vanished → (re)start fresh.
+                        let new_count = record.restart_count + 1;
+                        let _ = self.backend.stop(&record.container_id).await;
+                        let _ = self.backend.remove(&record.container_id).await;
+                        match self.start_init_container(key, cname, &spec, new_count).await {
+                            Ok(status) => {
+                                report.objects_changed += 1;
+                                debug!(
+                                    pod = %key.label(),
+                                    container = %cname,
+                                    restart_count = new_count,
+                                    "kubelet restarted failed init container (restartPolicy)"
+                                );
+                                Ok(status.pod_ip)
+                            }
+                            Err(e) => {
+                                warn!(pod = %key.label(), container = %cname, error = %e,
+                                    "init container restart failed; retrying next tick");
+                                report.objects_skipped += 1;
+                                Ok(None)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(pod = %key.label(), container = %cname, error = %e,
+                            "init container status poll failed; retrying next tick");
+                        report.objects_skipped += 1;
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render `initContainerStatuses` from the freshly-built observations (used
+    /// on the InitFailed path so the failed container's exact non-zero exit is
+    /// reported).
+    fn init_statuses_observed(
+        &self,
+        observations: &[ContainerObservation],
+    ) -> Vec<ContainerStatusOut> {
+        observations
+            .iter()
+            .map(|o| ContainerStatusOut {
+                name: o.name.clone(),
+                ready: o.ready,
+                state: o.state.clone(),
+                container_id: o.container_id.clone(),
+                restart_count: o.restart_count,
+            })
+            .collect()
+    }
+
+    /// Render `initContainerStatuses` by re-reading the CURRENT init records +
+    /// polling each (used on the AwaitInit path so the just-started/restarted
+    /// active container shows Running, prior ones Terminated exit 0, later ones
+    /// Waiting). Order follows `init_specs`.
+    async fn init_statuses_current(
+        &self,
+        key: &ResourceKey,
+        init_specs: &[(String, ContainerSpec)],
+    ) -> Vec<ContainerStatusOut> {
+        let lp = self.local.lock().await.get(key).cloned().unwrap_or_default();
+        let mut out = Vec::with_capacity(init_specs.len());
+        for (cname, _spec) in init_specs {
+            let status_out = match lp.init_containers.get(cname) {
+                None => ContainerStatusOut {
+                    name: cname.clone(),
+                    ready: false,
+                    state: ContainerState::creating(),
+                    container_id: None,
+                    restart_count: 0,
+                },
+                Some(record) => {
+                    let state = match self.backend.status(&record.container_id).await {
+                        Ok(Some(s)) if s.running => ContainerState::Running,
+                        Ok(Some(s)) => ContainerState::terminated(s.exit_code.unwrap_or(0)),
+                        // Vanished / poll error → Waiting (will re-start).
+                        _ => ContainerState::creating(),
+                    };
+                    ContainerStatusOut {
+                        name: cname.clone(),
+                        ready: false,
+                        state,
+                        container_id: Some(record.container_id.clone()),
+                        restart_count: record.restart_count,
+                    }
+                }
+            };
+            out.push(status_out);
+        }
+        out
     }
 
     /// Stream a container's logs. The apiserver's Pod `/log` subresource calls
