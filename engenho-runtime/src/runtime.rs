@@ -19,7 +19,8 @@ use engenho_controllers::{
     CrdController, DaemonSetController, DeploymentController, DynamicHandlerSink,
     EndpointsController, GcController, JobController, KindFilter, NamespaceController,
     ReplicaSetController, StatefulSetController, WatchDriver, WatchDriverConfig,
-    admission::{AdmissionChain, AdmissionMode},
+    admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
+    cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
 };
 use engenho_kubelet::config_bridge::KubeletBackendKind;
 use engenho_kubelet::{ContainerRuntime, Kubelet, LogOptions, make_container_runtime};
@@ -183,11 +184,25 @@ impl Runtime {
         }
 
         // Admission chain dispatched on every API-boundary create / patch
-        // / delete. M0.1 starts with an EMPTY chain (admits everything);
-        // the wiring is the load-bearing part — registering a webhook is
-        // now a one-line change. Controller writes (Reason::Controller)
-        // never flow through a handler, so they bypass admission.
-        let admission = Arc::new(AdmissionChain::new(Vec::new(), AdmissionMode::FailOpen));
+        // / delete. Controller writes (Reason::Controller) never flow through
+        // a handler, so they bypass admission.
+        //
+        // The ClusterIP defaulting webhook is the FIRST registered hook: on
+        // Service create with no explicit `clusterIP` it allocates a free VIP
+        // from `networking.service_cidr` and stamps `spec.clusterIP` +
+        // `spec.clusterIPs`. It reads the live Service set off the SAME store
+        // (restart-persistent + collision-free — the Services are the ledger).
+        // FailClosed so a misconfigured CIDR / exhausted pool denies the
+        // create rather than admitting a half-built Service.
+        let cluster_ip_hook: Arc<dyn AdmissionWebhook> =
+            Arc::new(ClusterIpDefaultingWebhook::new(
+                config.networking.service_cidr.clone(),
+                Arc::new(StoreServiceIpSource::new(store.clone())),
+            ));
+        let admission = Arc::new(AdmissionChain::new(
+            vec![cluster_ip_hook],
+            AdmissionMode::FailClosed,
+        ));
 
         // The typed authenticator chain (X509 → SA → admin-token → anonymous),
         // carrying the configured bootstrap admin bearer token. Installed into
@@ -1007,7 +1022,7 @@ fn spawn_drivers(
             WatchDriver::new(
                 c,
                 store.clone(),
-                driver_config(&["Service", "Pod", "Endpoints"]),
+                driver_config(&["Service", "Pod", "Endpoints", "EndpointSlice"]),
             )
             .spawn(),
         );

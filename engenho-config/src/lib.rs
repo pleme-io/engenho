@@ -85,6 +85,7 @@ mod cluster;
 mod consistency;
 mod controllers;
 mod error;
+mod networking;
 mod revoada;
 mod runtime;
 mod scheduler;
@@ -95,6 +96,7 @@ pub use cluster::ClusterConfig;
 pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
 pub use controllers::{ControllerEnable, ControllersConfig};
 pub use error::ConfigError;
+pub use networking::{NetworkingConfig, parse_ipv4_cidr};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
 pub use runtime::{KubeletBackendKind, RuntimeConfig};
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
@@ -117,6 +119,12 @@ pub struct EngenhoConfig {
     pub controllers: ControllersConfig,
     /// Per-resource ConsistencyTier defaults.
     pub consistency: ConsistencyConfig,
+    /// Cluster networking — the Service ClusterIP CIDR. `#[serde(default)]`
+    /// is REQUIRED (the struct is `deny_unknown_fields`) so operator YAML
+    /// written before this section existed still deserializes; the default
+    /// is the upstream `10.96.0.0/12` range.
+    #[serde(default = "NetworkingConfig::prescribed_default")]
+    pub networking: NetworkingConfig,
     /// Single-process assembly knobs (listen addr, data dir, node
     /// name, kubelet backend, leadership timeout).
     pub runtime: RuntimeConfig,
@@ -131,6 +139,7 @@ impl TieredConfig for EngenhoConfig {
             scheduler: SchedulerConfig::bare(),
             controllers: ControllersConfig::bare(),
             consistency: ConsistencyConfig::bare(),
+            networking: NetworkingConfig::bare(),
             runtime: RuntimeConfig::bare(),
         }
     }
@@ -143,6 +152,7 @@ impl TieredConfig for EngenhoConfig {
             scheduler: SchedulerConfig::prescribed_default(),
             controllers: ControllersConfig::prescribed_default(),
             consistency: ConsistencyConfig::prescribed_default(),
+            networking: NetworkingConfig::prescribed_default(),
             runtime: RuntimeConfig::prescribed_default(),
         }
     }
@@ -155,6 +165,7 @@ impl TieredConfig for EngenhoConfig {
             scheduler: self.scheduler.extend(&base.scheduler),
             controllers: self.controllers.extend(&base.controllers),
             consistency: self.consistency.extend(&base.consistency),
+            networking: self.networking.extend(&base.networking),
             runtime: self.runtime.extend(&base.runtime),
         }
     }
@@ -185,6 +196,7 @@ impl EngenhoConfig {
         self.scheduler.validate()?;
         self.controllers.validate()?;
         self.consistency.validate()?;
+        self.networking.validate()?;
         self.runtime.validate()?;
 
         // Cross-section: quorum-requiring consensus needs >=3 nodes.

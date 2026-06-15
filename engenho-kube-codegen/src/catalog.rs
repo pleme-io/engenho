@@ -236,6 +236,27 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         opaque: false,
         subresources: &[],
     },
+    // ── discovery.k8s.io/v1 ─────────────────────────────────────────
+    // EndpointSlice — the modern endpoint-publishing kind kube-proxy +
+    // many controllers consume (the scalable successor to Endpoints).
+    // Served OPAQUE: engenho's EndpointsController emits the slice body as
+    // plain JSON alongside the legacy Endpoints object; there is no typed
+    // struct closure required for the store-backed CRUD + the controller
+    // build path (mirrors how CRD is served opaquely).
+    KindEntry {
+        kind: "EndpointSlice",
+        openapi_key: "",
+        group: "discovery.k8s.io",
+        version: "v1",
+        resource: "endpointslices",
+        cluster_scoped: false,
+        module: "",
+        short_names: &[],
+        singular: "endpointslice",
+        categories: &[],
+        opaque: true,
+        subresources: &[],
+    },
     // ── apps/v1 ─────────────────────────────────────────────────────
     KindEntry {
         kind: "Deployment",

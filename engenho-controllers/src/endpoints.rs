@@ -1,11 +1,23 @@
-//! `EndpointsController` — materializes Endpoints objects from
-//! Service selectors + matching Pod IPs.
+//! `EndpointsController` — materializes Endpoints **and** EndpointSlice
+//! objects from Service selectors + matching Pod IPs.
 //!
 //! K8s rule: for each Service, find Pods in the same namespace
 //! whose labels satisfy `service.spec.selector` AND are ready
 //! AND have a `status.podIP`. Materialize one Endpoints object
 //! (same name + namespace as the Service) with the Pod IPs in
 //! `subsets[].addresses`.
+//!
+//! ## EndpointSlice (discovery.k8s.io/v1)
+//!
+//! In addition to the legacy Endpoints object, the controller emits ONE
+//! `discovery.k8s.io/v1` EndpointSlice per Service — the modern endpoint-
+//! publishing kind kube-proxy + many controllers consume. Both objects
+//! are derived from the SAME selector→pod resolution (no fork): the slice
+//! is a parallel projection of the identical `(ip, pod_name)` set. The
+//! slice carries the upstream-required `kubernetes.io/service-name` label
+//! + an owner reference back to the Service, and is named `<service>`
+//! (engenho emits exactly one slice per Service; upstream shards into
+//! `<service>-<hash>` only above 1000 endpoints — a typed follow-up).
 //!
 //! This is the FIRST selector-based controller in engenho-controllers
 //! (vs the owner-ref-based ReplicaSet/Deployment/GC). It validates
@@ -121,6 +133,111 @@ impl EndpointsController {
             ]
         })
     }
+
+    /// Build the `discovery.k8s.io/v1` EndpointSlice body from the SAME
+    /// `(ip, pod_name)` set the Endpoints object uses. Parallel projection,
+    /// not a fork: the caller resolves the selector once and feeds both.
+    ///
+    /// The slice carries the required `kubernetes.io/service-name` label so
+    /// consumers (kube-proxy, the routing controller) can locate every
+    /// slice for a Service. `addressType: IPv4` (engenho's pods are IPv4
+    /// today; dual-stack is a typed follow-up). Each endpoint is marked
+    /// `conditions.ready = true` (the caller already filtered to ready,
+    /// ip-bearing pods).
+    fn build_endpoint_slice(svc: &Value, addresses: &[(String, String)]) -> Value {
+        let name = svc.name().unwrap_or("");
+        // EndpointSlice ports use the same `(name, port, protocol)` shape as
+        // the Service ports — projected verbatim (the Service's targetPort is
+        // the pod-side port the slice publishes; engenho's Endpoints carries
+        // the Service ports today, mirrored here for one source of truth).
+        let ports = svc
+            .get("spec")
+            .and_then(|s| s.get("ports"))
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|p| {
+                        let port_name = p.get("name").cloned().unwrap_or(Value::Null);
+                        // The slice publishes the pod-side port (targetPort);
+                        // default to the service port when targetPort is unset
+                        // (mirrors the routing controller's resolution).
+                        let port = p
+                            .get("targetPort")
+                            .or_else(|| p.get("port"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let protocol = p
+                            .get("protocol")
+                            .cloned()
+                            .unwrap_or_else(|| json!("TCP"));
+                        json!({ "name": port_name, "port": port, "protocol": protocol })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let endpoints: Vec<Value> = addresses
+            .iter()
+            .map(|(ip, pod_name)| {
+                json!({
+                    "addresses": [ip],
+                    "conditions": { "ready": true },
+                    "targetRef": { "kind": "Pod", "name": pod_name }
+                })
+            })
+            .collect();
+
+        json!({
+            "kind": "EndpointSlice",
+            "apiVersion": "discovery.k8s.io/v1",
+            "metadata": {
+                "name": name,
+                "labels": { "kubernetes.io/service-name": name }
+            },
+            "addressType": "IPv4",
+            "endpoints": endpoints,
+            "ports": ports
+        })
+    }
+
+    /// Reconcile the EndpointSlice for a Service: owner-ref it, stamp the
+    /// creationTimestamp on create, and write it only when the slice body
+    /// changed (idempotent). Mirrors the Endpoints reconcile shape so both
+    /// projections share one convergence discipline.
+    async fn reconcile_endpoint_slice(
+        &self,
+        namespace: &str,
+        svc_name: &str,
+        mut slice: Value,
+        owner_ref: crate::owner::OwnerReference,
+        report: &mut ReconcileReport,
+    ) -> Result<(), ControllerError> {
+        let slice_key =
+            ResourceKey::namespaced("discovery.k8s.io", "v1", "EndpointSlice", namespace, svc_name);
+        set_owner_reference(&mut slice, owner_ref);
+
+        let existing = self.store.get(&slice_key).await;
+        if let Some(ref current) = existing {
+            if slice_bodies_equivalent(current, &slice) {
+                return Ok(());
+            }
+        } else {
+            // First materialization: freeze the creationTimestamp from one
+            // boundary clock read (same discipline as Endpoints).
+            stamp_create_timestamp(&mut slice, self.create_clock);
+        }
+
+        self.store
+            .propose(ResourceCommand::Put {
+                key: slice_key,
+                value: slice,
+                expected: None,
+                reason: Reason::Controller,
+            })
+            .await?;
+        report.objects_changed += 1;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -168,18 +285,31 @@ impl Controller for EndpointsController {
             addresses.sort();
 
             let endpoints_ns = ns.unwrap_or("default");
-            let endpoints_key = ResourceKey::namespaced(
-                "",
-                "v1",
-                "Endpoints",
-                endpoints_ns,
-                svc_value.name().unwrap_or(""),
-            );
+            let svc_name = svc_value.name().unwrap_or("");
+            let endpoints_key =
+                ResourceKey::namespaced("", "v1", "Endpoints", endpoints_ns, svc_name);
+
+            // Build the EndpointSlice from the SAME resolved address set
+            // (borrowed before `addresses` is moved into build_endpoints).
+            let slice_body = Self::build_endpoint_slice(svc_value, &addresses);
 
             // Check if existing Endpoints already matches what we'd write.
             let existing = self.store.get(&endpoints_key).await;
             let mut new_endpoints = Self::build_endpoints(svc_value, addresses);
             set_owner_reference(&mut new_endpoints, owner_ref.clone());
+
+            // Emit the EndpointSlice (parallel projection). Done before the
+            // Endpoints early-return so the slice converges even when the
+            // Endpoints subsets are unchanged (e.g. first slice on an
+            // already-materialized Endpoints).
+            self.reconcile_endpoint_slice(
+                endpoints_ns,
+                svc_name,
+                slice_body,
+                owner_ref.clone(),
+                &mut report,
+            )
+            .await?;
 
             if let Some(ref current) = existing {
                 if subsets_equivalent(current, &new_endpoints) {
@@ -222,6 +352,16 @@ impl Controller for EndpointsController {
 /// metadata.resourceVersion, uid, etc. which the store auto-fills).
 fn subsets_equivalent(a: &Value, b: &Value) -> bool {
     a.get("subsets") == b.get("subsets")
+}
+
+/// Compare two EndpointSlice values for body equivalence — the
+/// `endpoints` + `ports` + `addressType` carry the load-bearing state;
+/// metadata.resourceVersion/uid (store-filled) is ignored so a re-tick
+/// with the same pods is a no-op.
+fn slice_bodies_equivalent(a: &Value, b: &Value) -> bool {
+    a.get("endpoints") == b.get("endpoints")
+        && a.get("ports") == b.get("ports")
+        && a.get("addressType") == b.get("addressType")
 }
 
 #[cfg(test)]
@@ -331,6 +471,60 @@ mod tests {
         // Port copied from the Service.
         let ports = subsets[0].get("ports").unwrap().as_array().unwrap();
         assert_eq!(ports[0].get("port").unwrap(), 80);
+    }
+
+    #[test]
+    fn build_endpoint_slice_projects_addresses_and_label() {
+        let svc = json!({
+            "metadata": {"name": "podinfo"},
+            "spec": {"selector": {"app": "podinfo"},
+                     "ports": [{"name": "http", "port": 80, "targetPort": 9898}]}
+        });
+        let addrs = vec![
+            ("10.0.0.1".to_string(), "p1".to_string()),
+            ("10.0.0.2".to_string(), "p2".to_string()),
+        ];
+        let slice = EndpointsController::build_endpoint_slice(&svc, &addrs);
+        assert_eq!(slice["kind"], "EndpointSlice");
+        assert_eq!(slice["apiVersion"], "discovery.k8s.io/v1");
+        assert_eq!(slice["addressType"], "IPv4");
+        // Required service-name label so consumers can find the slice.
+        assert_eq!(
+            slice["metadata"]["labels"]["kubernetes.io/service-name"],
+            "podinfo"
+        );
+        // One endpoint per address, each ready, with its pod targetRef.
+        let eps = slice["endpoints"].as_array().unwrap();
+        assert_eq!(eps.len(), 2);
+        assert_eq!(eps[0]["addresses"][0], "10.0.0.1");
+        assert_eq!(eps[0]["conditions"]["ready"], true);
+        assert_eq!(eps[0]["targetRef"]["name"], "p1");
+        // Port published is the pod-side targetPort (9898), not service 80.
+        let ports = slice["ports"].as_array().unwrap();
+        assert_eq!(ports[0]["name"], "http");
+        assert_eq!(ports[0]["port"], 9898);
+        assert_eq!(ports[0]["protocol"], "TCP");
+    }
+
+    #[test]
+    fn build_endpoint_slice_empty_when_no_addresses() {
+        let svc = json!({"metadata": {"name": "x"}, "spec": {"ports": [{"port": 80}]}});
+        let slice = EndpointsController::build_endpoint_slice(&svc, &[]);
+        assert!(slice["endpoints"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn slice_bodies_equivalent_ignores_metadata() {
+        let a = json!({"metadata": {"resourceVersion": "5"},
+                       "addressType": "IPv4", "endpoints": [{"addresses": ["10.0.0.1"]}],
+                       "ports": [{"port": 80}]});
+        let b = json!({"metadata": {"resourceVersion": "99"},
+                       "addressType": "IPv4", "endpoints": [{"addresses": ["10.0.0.1"]}],
+                       "ports": [{"port": 80}]});
+        assert!(slice_bodies_equivalent(&a, &b));
+        let c = json!({"addressType": "IPv4",
+                       "endpoints": [{"addresses": ["10.0.0.2"]}], "ports": [{"port": 80}]});
+        assert!(!slice_bodies_equivalent(&a, &c));
     }
 
     #[test]
@@ -450,5 +644,80 @@ mod tests {
             FIXED_TS,
             "creationTimestamp must be stable across the update (never bumped)"
         );
+    }
+
+    #[tokio::test]
+    async fn controller_emits_endpoint_slice_alongside_endpoints() {
+        let store = live_store().await;
+        // A Service with a selector + a ready, ip-bearing Pod matching it.
+        store
+            .propose(ResourceCommand::put(
+                ResourceKey::namespaced("", "v1", "Service", "ns1", "svc"),
+                json!({"kind": "Service", "apiVersion": "v1",
+                       "metadata": {"name": "svc", "namespace": "ns1",
+                                    "uid": "svc-uid"},
+                       "spec": {"selector": {"app": "x"},
+                                "ports": [{"name": "http", "port": 80, "targetPort": 9898}]}}),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+        store
+            .propose(ResourceCommand::put(
+                ResourceKey::namespaced("", "v1", "Pod", "ns1", "p"),
+                json!({"kind": "Pod", "apiVersion": "v1",
+                       "metadata": {"name": "p", "namespace": "ns1", "labels": {"app": "x"}},
+                       "status": {"podIP": "10.0.0.1",
+                                  "conditions": [{"type": "Ready", "status": "True"}]}}),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+
+        let c = EndpointsController::with_clock(store.clone(), None, fixed_clock);
+        c.tick().await.unwrap();
+
+        // The legacy Endpoints object exists.
+        let ep = store
+            .get(&ResourceKey::namespaced("", "v1", "Endpoints", "ns1", "svc"))
+            .await
+            .expect("Endpoints created");
+        assert_eq!(ep["subsets"][0]["addresses"][0]["ip"], "10.0.0.1");
+
+        // The EndpointSlice exists in parallel, derived from the SAME pod.
+        let slice = store
+            .get(&ResourceKey::namespaced(
+                "discovery.k8s.io",
+                "v1",
+                "EndpointSlice",
+                "ns1",
+                "svc",
+            ))
+            .await
+            .expect("EndpointSlice created");
+        assert_eq!(slice["kind"], "EndpointSlice");
+        assert_eq!(
+            slice["metadata"]["labels"]["kubernetes.io/service-name"],
+            "svc"
+        );
+        assert_eq!(slice["endpoints"][0]["addresses"][0], "10.0.0.1");
+        assert_eq!(slice["endpoints"][0]["conditions"]["ready"], true);
+        // The slice carries the frozen creationTimestamp + an owner ref.
+        assert_eq!(slice["metadata"]["creationTimestamp"], FIXED_TS);
+        assert_eq!(slice["metadata"]["ownerReferences"][0]["kind"], "Service");
+
+        // Idempotent: a re-tick with no pod change writes nothing new.
+        c.tick().await.unwrap();
+        let slice2 = store
+            .get(&ResourceKey::namespaced(
+                "discovery.k8s.io",
+                "v1",
+                "EndpointSlice",
+                "ns1",
+                "svc",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(slice2["endpoints"], slice["endpoints"], "stable across re-tick");
     }
 }
