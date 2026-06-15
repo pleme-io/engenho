@@ -44,6 +44,7 @@ pub mod pod_logs;
 pub mod router;
 pub mod scale;
 pub mod server;
+pub mod webhook_admission;
 
 pub use authn::{
     AnonymousAuthenticator, AuthnError, Authenticator, BootstrapAdminTokenAuthenticator,
@@ -78,3 +79,6 @@ pub use pod_logs::{LogQuery, PodLogReader};
 pub use router::{RouterState, build};
 pub use scale::{Scale, ScaleMeta, ScaleSpec, ScaleStatus, label_selector_to_string, project_scale};
 pub use server::{ApiServer, ServerError};
+pub use webhook_admission::{
+    ReqwestWebhookCaller, StoreWebhookConfigSource, catalog_pluralizer, mutating_webhook_plugin,
+};

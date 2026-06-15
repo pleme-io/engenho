@@ -35,6 +35,10 @@ rustls-pemfile     = { workspace = true }
 # tokio_rustls::server::TlsStream) to read the verified peer cert post-handshake.
 tokio-rustls       = { version = "0.26", default-features = false, features = ["ring"] }
 time               = { workspace = true }
+# Production WebhookCaller — POST the AdmissionReview to a mutating webhook over
+# HTTPS. The trait seam keeps engenho-controllers reqwest-free; the live impl
+# lives here next to the rest of the apiserver's HTTP surface.
+reqwest            = { workspace = true, features = ["json", "rustls-tls"] }
 
 engenho-types      = { workspace = true }
 engenho-store      = { workspace = true }

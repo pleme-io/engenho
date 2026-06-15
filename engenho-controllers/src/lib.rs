@@ -29,6 +29,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod admission;
+pub mod admission_webhook;
 pub mod attestation;
 pub mod build_backend_roceiro;
 pub mod controller;
@@ -71,6 +72,12 @@ pub mod watch_driver;
 pub use admission::{
     AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionError, AdmissionMode,
     AdmissionRequest, AdmissionWebhook, FakeAdmissionWebhook,
+};
+pub use admission_webhook::{
+    FailurePolicy, MockWebhookCaller, MutatingWebhook, MutatingWebhookPlugin, Pluralizer,
+    ReinvocationPolicy, RuleWithOperations, ServiceRef, StaticConfigSource, WebhookCaller,
+    WebhookClientConfig, WebhookConfigSource, WebhookError, build_admission_review,
+    parse_mutating_config, read_admission_review, rules_match,
 };
 pub use attestation::{
     FakeSignatureVerifier, SignatureVerifier, TameshiAttestationWebhook, VerifierError,
