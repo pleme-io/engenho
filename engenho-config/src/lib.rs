@@ -96,7 +96,7 @@ pub use cluster::ClusterConfig;
 pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
 pub use controllers::{ControllerEnable, ControllersConfig};
 pub use error::ConfigError;
-pub use networking::{NetworkingConfig, parse_ipv4_cidr};
+pub use networking::{DatapathMode, NetworkingConfig, ResolvedDatapath, parse_ipv4_cidr};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
 pub use runtime::{KubeletBackendKind, RuntimeConfig};
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};

@@ -1044,4 +1044,82 @@ mod tests {
         }
         assert_eq!(Fake.name(), "service_router");
     }
+
+    async fn live_store() -> Arc<StoreMesh> {
+        use engenho_store::{InProcessRouter, default_config};
+        use std::time::Duration;
+        let router = InProcessRouter::new();
+        let cfg = default_config("controllers-service-router").unwrap();
+        let store = Arc::new(
+            StoreMesh::start(1, "in-process://1".into(), router, cfg)
+                .await
+                .unwrap(),
+        );
+        store.initialize_singleton().await.unwrap();
+        assert!(store.wait_for_leadership(Duration::from_secs(3)).await);
+        store
+    }
+
+    /// The off-Linux dev path: a `FakeRouter` (compute-only) backend
+    /// reconciles a Service + Endpoints into a computed route WITHOUT any
+    /// kernel call (no iptables/ipvs binary touched), and its datapath
+    /// maturity is the typed `DatapathInstall::Computed`. This is exactly
+    /// the backend the runtime selects on a Darwin host (Auto → ComputeOnly),
+    /// so the local daemon keeps running fine.
+    #[tokio::test]
+    async fn compute_only_backend_reconciles_route_without_kernel_call() {
+        use engenho_store::{ResourceKey, command::Reason, command::ResourceCommand};
+
+        let store = live_store().await;
+        store
+            .propose(ResourceCommand::put(
+                ResourceKey::namespaced("", "v1", "Service", "default", "podinfo"),
+                serde_json::json!({
+                    "kind": "Service", "apiVersion": "v1",
+                    "metadata": {"name": "podinfo", "namespace": "default"},
+                    "spec": {"clusterIP": "10.96.0.10",
+                             "ports": [{"name": "http", "port": 80, "targetPort": 8080}]}
+                }),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+        store
+            .propose(ResourceCommand::put(
+                ResourceKey::namespaced("", "v1", "Endpoints", "default", "podinfo"),
+                serde_json::json!({
+                    "kind": "Endpoints", "apiVersion": "v1",
+                    "metadata": {"name": "podinfo", "namespace": "default"},
+                    "subsets": [{"addresses": [{"ip": "10.0.0.1"}, {"ip": "10.0.0.2"}]}]
+                }),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+
+        // The compute-only backend = the FakeRouter. Its datapath maturity
+        // is the typed Computed value — no kernel rule is installed.
+        let backend = Arc::new(FakeRouter::new());
+        assert_eq!(backend.datapath(), DatapathInstall::Computed);
+
+        let controller =
+            ServiceRoutingController::new(store.clone(), backend.clone(), Some("default".into()));
+        controller.tick().await.unwrap();
+
+        // The route was computed + tracked: one upsert event, one route,
+        // the right backends — proving the controller ran end-to-end with
+        // no real iptables shell-out.
+        assert_eq!(backend.route_count().await, 1);
+        let events = backend.events().await;
+        assert_eq!(events, vec![FakeRouterEvent::Upsert("default/podinfo".into())]);
+        let installed = backend.list().await.unwrap();
+        let route = installed.get("default/podinfo").expect("route computed");
+        assert_eq!(route.cluster_ip, "10.96.0.10");
+        assert_eq!(
+            route.endpoints,
+            ["10.0.0.1".to_string(), "10.0.0.2".to_string()]
+                .into_iter()
+                .collect()
+        );
+    }
 }

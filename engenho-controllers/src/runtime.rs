@@ -192,6 +192,7 @@ mod tests {
                 daemonset: true,
                 job: true,
                 endpoints: true,
+                service_routing: true,
                 gc: true,
                 crd: true,
                 namespace: true,
