@@ -1080,23 +1080,42 @@ impl ContainerRuntime for PodmanBackend {
         self.ensure_network().await?;
 
         let argv = self.run_argv(spec);
-        let out = self
+        let mut out = self
             .command(&argv)
             .output()
             .await
             .map_err(|e| KubeletError::Backend(format!("podman run spawn: {e}")))?;
+        if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("already in use") {
+            // Idempotent start: a name conflict means a leftover container from
+            // a crashed/killed prior daemon still holds this pod's deterministic
+            // name (`<namespace>_<pod>_<container>`). Because the kubelet is
+            // (re)starting this container, the apiserver pod spec is the source
+            // of truth and no live container is tracked under that name — so the
+            // leftover is safe to force-remove and recreate. Remove by name
+            // (`rm -f` accepts a name or id) and retry the run exactly ONCE; a
+            // second conflict is a genuine error surfaced below. This makes pod
+            // start survive daemon restarts without manual `podman rm`.
+            let _ = self
+                .command(&Self::rm_argv(&spec.name))
+                .output()
+                .await
+                .map_err(|e| KubeletError::Backend(format!("podman rm (stale name) spawn: {e}")))?;
+            out = self
+                .command(&argv)
+                .output()
+                .await
+                .map_err(|e| KubeletError::Backend(format!("podman run respawn: {e}")))?;
+        }
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            // Surface a name-conflict (a leftover container from a crashed
-            // prior run) as a recognizable typed error so the kubelet/test
-            // sees the specific class rather than an opaque failure. Full
-            // adopt-existing-by-name is out of M0.2 scope; the
-            // deterministic name <namespace>_<pod> makes by-name
-            // reconciliation possible in a future item.
+            // A name conflict that survived the remove+retry above is a real
+            // failure (e.g. a live container we don't own) — surface the
+            // specific class so the kubelet/test sees it rather than an opaque
+            // failure.
             if stderr.contains("already in use") {
                 return Err(KubeletError::Backend(format!(
                     "podman run name conflict for {:?}: a container with this name already exists \
-                     (leftover from a prior run); stderr: {stderr}",
+                     and could not be reclaimed by remove+retry; stderr: {stderr}",
                     spec.name
                 )));
             }
@@ -1987,6 +2006,18 @@ mod tests {
     #[test]
     fn rm_argv_force_removes_id() {
         assert_eq!(PodmanBackend::rm_argv("abc123"), vec!["rm", "-f", "abc123"]);
+    }
+
+    #[test]
+    fn rm_argv_reclaims_a_stale_container_by_deterministic_name() {
+        // The idempotent-start path removes a leftover container by its
+        // deterministic pod name (`<namespace>_<pod>_<container>`), not by id —
+        // `podman rm -f` accepts either. This is the argv that reclaims a name
+        // held by a crashed/killed prior daemon before the run is retried.
+        assert_eq!(
+            PodmanBackend::rm_argv("hello_busybox-ae425b811a-0_app"),
+            vec!["rm", "-f", "hello_busybox-ae425b811a-0_app"]
+        );
     }
 
     // ── logs_argv (kubectl logs builder) ────────────────────────────────
