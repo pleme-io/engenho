@@ -1,0 +1,69 @@
+# Vector — universal telemetry agent, one pod per node (DaemonSet). This
+# manifest is the live proof of two engenho data-plane bricks:
+#   * DaemonSet controller (one Pod per schedulable Node)
+#   * kubelet ConfigMap-volume materialization (the pipeline is mounted from a
+#     ConfigMap at /etc/vector/vector.toml)
+# Vector scrapes its own internal + host metrics and remote-writes them to
+# VictoriaMetrics, and ships a demo log stream to VictoriaLogs — both reached
+# pod-to-pod by service-name DNS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-config
+  namespace: observability
+data:
+  vector.toml: |
+    data_dir = "/vector-data"
+
+    [sources.internal]
+    type = "internal_metrics"
+
+    [sources.host]
+    type = "host_metrics"
+    collectors = ["cpu", "memory", "load", "filesystem"]
+    scrape_interval_secs = 10
+
+    [sinks.victoria_metrics]
+    type = "prometheus_remote_write"
+    inputs = ["internal", "host"]
+    endpoint = "http://victoria-metrics:8428/api/v1/write"
+    healthcheck.enabled = false
+
+    [sources.demo_logs]
+    type = "demo_logs"
+    format = "json"
+    interval = 1.0
+
+    [sinks.victoria_logs]
+    type = "http"
+    inputs = ["demo_logs"]
+    uri = "http://victoria-logs:9428/insert/jsonline?_stream_fields=source&_msg_field=message&_time_field=timestamp"
+    encoding.codec = "json"
+    framing.method = "newline_delimited"
+    healthcheck.enabled = false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vector
+  namespace: observability
+  labels: { app: vector }
+spec:
+  selector:
+    matchLabels: { app: vector }
+  template:
+    metadata:
+      labels: { app: vector }
+    spec:
+      containers:
+        - name: vector
+          image: docker.io/timberio/vector:0.41.1-debian
+          args: ["--config", "/etc/vector/vector.toml"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: vector-config
