@@ -252,10 +252,11 @@ fn log_subresource_is_only_on_pod() {
 
 #[test]
 fn scale_is_only_on_deployment_replicaset_statefulset() {
-    // /scale is served by EXACTLY the three scalable apps/v1 workloads
-    // (ReplicationController is not cataloged). Any other kind declaring
-    // Scale is a bug.
-    let want_scale = ["Deployment", "ReplicaSet", "StatefulSet"];
+    // /scale is served by EXACTLY the scalable workloads: the three apps/v1
+    // workloads + core/v1 ReplicationController (the legacy scalable kind,
+    // cataloged opaque since the M0.0.4 breadth expansion). Any other kind
+    // declaring Scale is a bug.
+    let want_scale = ["Deployment", "ReplicaSet", "StatefulSet", "ReplicationController"];
     for d in RESOURCE_CATALOG {
         if want_scale.contains(&d.kind) {
             assert!(d.has_scale(), "{} must serve /scale", d.kind);
@@ -369,4 +370,105 @@ fn served_openapi_tuples_equal_non_opaque_catalog_group_version_pairs() {
             .any(|d| d.group == "apiextensions.k8s.io"),
         "apiextensions.k8s.io is opaque — must NOT have a served OpenAPI doc"
     );
+}
+
+// ── M0.0.4 conformance-breadth catalog expansion ──────────────────────────
+//
+// The opaque-JSON catalog seam lets a kind go LIVE (routable + discoverable +
+// store-backed CRUD) from a single `RESOURCE_CATALOG` row, with no vendored
+// OpenAPI schema and no typed struct. The tests below pin the breadth the
+// expansion added so a future regression that drops a conformance kind fails
+// mechanically.
+
+/// Every group the catalog serves at least one kind in (core advertised as
+/// `""`). The conformance surface is "more groups + more kinds served".
+fn served_groups() -> std::collections::BTreeSet<&'static str> {
+    RESOURCE_CATALOG.iter().map(|d| d.group).collect()
+}
+
+#[test]
+fn catalog_serves_at_least_fifty_conformance_kinds() {
+    // The M0.0.4 breadth expansion took the served catalog from ~22 to 50+
+    // kinds (the conformance-relevant set across ~16 API groups). This is the
+    // single load-bearing "did the surface grow" gate — a regression that
+    // drops kinds below the conformance floor fails here.
+    assert!(
+        RESOURCE_CATALOG.len() >= 50,
+        "served catalog must carry >= 50 conformance kinds, got {}",
+        RESOURCE_CATALOG.len()
+    );
+}
+
+#[test]
+fn conformance_relevant_groups_are_all_served() {
+    // The ~16 API groups a conformant v1.34 cluster exposes. Each must have at
+    // least one cataloged kind so it appears in `/api` or `/apis` discovery.
+    let want_groups = [
+        "",                              // core/v1
+        "apps",                          // Deployment, …, ControllerRevision
+        "batch",                         // Job, CronJob
+        "autoscaling",                   // HorizontalPodAutoscaler
+        "policy",                        // PodDisruptionBudget
+        "networking.k8s.io",             // Ingress, IngressClass, NetworkPolicy
+        "storage.k8s.io",                // StorageClass, CSI*, VolumeAttachment
+        "node.k8s.io",                   // RuntimeClass
+        "scheduling.k8s.io",             // PriorityClass
+        "coordination.k8s.io",           // Lease
+        "rbac.authorization.k8s.io",     // Role, …
+        "authentication.k8s.io",         // TokenReview
+        "authorization.k8s.io",          // *AccessReview
+        "certificates.k8s.io",           // CertificateSigningRequest
+        "apiregistration.k8s.io",        // APIService
+        "flowcontrol.apiserver.k8s.io",  // FlowSchema, PriorityLevelConfiguration
+        "admissionregistration.k8s.io",  // *WebhookConfiguration
+        "apiextensions.k8s.io",          // CustomResourceDefinition
+        "discovery.k8s.io",              // EndpointSlice
+    ];
+    let served = served_groups();
+    for g in want_groups {
+        assert!(
+            served.contains(g),
+            "conformance group {g:?} must be served (have >= 1 cataloged kind)"
+        );
+    }
+}
+
+#[test]
+fn newly_added_conformance_kinds_carry_correct_metadata() {
+    // Spot-check the (kind → plural, namespaced, shortNames) registration for a
+    // representative sampling of the breadth-expansion kinds. These are the
+    // values discovery folds into `/api` + `/apis`, which is what lets
+    // `kubectl get <short>` resolve. Irregular plurals + cluster scope are the
+    // failure-prone fields, so they're pinned explicitly.
+    struct Expect {
+        kind: &'static str,
+        plural: &'static str,
+        namespaced: bool,
+        short_names: &'static [&'static str],
+    }
+    let cases = [
+        Expect { kind: "CronJob", plural: "cronjobs", namespaced: true, short_names: &["cj"] },
+        Expect { kind: "HorizontalPodAutoscaler", plural: "horizontalpodautoscalers", namespaced: true, short_names: &["hpa"] },
+        Expect { kind: "PodDisruptionBudget", plural: "poddisruptionbudgets", namespaced: true, short_names: &["pdb"] },
+        Expect { kind: "Ingress", plural: "ingresses", namespaced: true, short_names: &["ing"] },
+        Expect { kind: "NetworkPolicy", plural: "networkpolicies", namespaced: true, short_names: &["netpol"] },
+        Expect { kind: "StorageClass", plural: "storageclasses", namespaced: false, short_names: &["sc"] },
+        Expect { kind: "CSIStorageCapacity", plural: "csistoragecapacities", namespaced: true, short_names: &[] },
+        Expect { kind: "PriorityClass", plural: "priorityclasses", namespaced: false, short_names: &["pc"] },
+        Expect { kind: "Lease", plural: "leases", namespaced: true, short_names: &[] },
+        Expect { kind: "CertificateSigningRequest", plural: "certificatesigningrequests", namespaced: false, short_names: &["csr"] },
+        Expect { kind: "APIService", plural: "apiservices", namespaced: false, short_names: &[] },
+        Expect { kind: "PriorityLevelConfiguration", plural: "prioritylevelconfigurations", namespaced: false, short_names: &[] },
+    ];
+    for e in cases {
+        let d = row(e.kind);
+        assert_eq!(d.plural, e.plural, "{}: plural", e.kind);
+        assert_eq!(d.namespaced, e.namespaced, "{}: namespaced", e.kind);
+        assert_eq!(d.short_names, e.short_names, "{}: shortNames", e.kind);
+        // Every breadth-expansion kind is served OPAQUE (no vendored schema).
+        assert!(d.opaque, "{}: M0.0.4 breadth kinds are opaque", e.kind);
+        // singular == lowercased kind (already a global invariant, re-pinned
+        // here for the new rows specifically).
+        assert_eq!(d.singular, e.kind.to_lowercase(), "{}: singular", e.kind);
+    }
 }
