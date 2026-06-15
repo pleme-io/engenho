@@ -342,6 +342,138 @@ pub fn reconcile_pod_phase(
     (phase, statuses)
 }
 
+/// The kubelet's next action for a pod's **init-container** sequence — the pure
+/// result of folding the ordered init-container observations against the pod
+/// `restart_policy`. Init containers are the gating data-plane feature for
+/// service meshes (the SPIRE-agent / proxy-bootstrap pattern) and a large slice
+/// of workload conformance.
+///
+/// K8s init semantics this enum encodes: init containers run **one at a time,
+/// in order**; each must exit 0 before the next starts; app containers do not
+/// start until **every** init container has Succeeded. A failed init container
+/// is restarted under `Always`/`OnFailure` and is terminal under `Never`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InitAction {
+    /// Init container at `index` is the first not-yet-succeeded init container.
+    /// The kubelet must ensure it is started (if `Waiting`) or await its exit
+    /// (if `Running` / restartable-`Terminated`). App containers must NOT start
+    /// yet. This is the only arm that keeps the pod in `Pending`/initializing.
+    AwaitInit {
+        /// 0-based index into `spec.initContainers`.
+        index: usize,
+    },
+    /// Init container `index` terminated non-restartably with `exit_code` (a
+    /// non-zero exit under `restartPolicy: Never`) → the whole pod has **Failed**
+    /// during init; app containers never start.
+    InitFailed {
+        /// 0-based index into `spec.initContainers`.
+        index: usize,
+        /// The non-zero exit code that latched the failure.
+        exit_code: i32,
+    },
+    /// Every init container has Succeeded (exit 0), or there are no init
+    /// containers. App containers may start; the pod is `Initialized`.
+    Complete,
+}
+
+impl InitAction {
+    /// `true` iff initialization is finished (app containers may start).
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        matches!(self, InitAction::Complete)
+    }
+
+    /// `true` iff init has terminally failed (the pod is `Failed`).
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        matches!(self, InitAction::InitFailed { .. })
+    }
+}
+
+/// PURE init-sequence interpreter — the load-bearing core of init-container
+/// support. Given the pod `restart_policy` and the **ordered** init-container
+/// observations (`spec.initContainers` order), decide the next [`InitAction`].
+/// NO I/O, NO podman — unit-testable in isolation exactly like
+/// [`reconcile_pod_phase`].
+///
+/// Fold (first decisive init container wins, in order):
+///   * `Terminated` exit 0 → that init container Succeeded; continue to the next.
+///   * `Terminated` non-zero → restartable under the policy ⇒ `AwaitInit`
+///     (the kubelet re-starts it); else ⇒ `InitFailed` (terminal).
+///   * `Running` → `AwaitInit` (in flight; await its exit).
+///   * `Waiting` → `AwaitInit` (needs a fresh start).
+/// Empty slice (no init containers) → `Complete` — a pod with no init
+/// containers initializes immediately (the behavior-preserving default: every
+/// existing pod has zero init containers, so this returns `Complete` and the
+/// kubelet's app-container path is reached identically to before this brick).
+#[must_use]
+pub fn next_init_action(
+    restart_policy: RestartPolicy,
+    init_observations: &[ContainerObservation],
+) -> InitAction {
+    for (index, o) in init_observations.iter().enumerate() {
+        match &o.state {
+            // Succeeded → move on to the next init container.
+            ContainerState::Terminated { exit_code, .. } if *exit_code == 0 => continue,
+            // Failed init container: restart per policy, else terminal failure.
+            ContainerState::Terminated { exit_code, .. } => {
+                return if restart_policy.should_restart(Some(*exit_code)) {
+                    InitAction::AwaitInit { index }
+                } else {
+                    InitAction::InitFailed { index, exit_code: *exit_code }
+                };
+            }
+            // In flight or not yet started → this is the active init container.
+            ContainerState::Running | ContainerState::Waiting { .. } => {
+                return InitAction::AwaitInit { index };
+            }
+        }
+    }
+    // Every init container Succeeded (or there were none).
+    InitAction::Complete
+}
+
+/// PURE composition of init + app phase into the pod's reported
+/// `(PodPhase, init_statuses, app_statuses, initialized)`. While init is
+/// in-progress the pod is `Pending` and `initialized=false`; on terminal init
+/// failure the pod is `Failed`; once init is `Complete` the app-container fold
+/// ([`reconcile_pod_phase`]) decides the phase and `initialized=true`. The
+/// kubelet renders `status.initContainerStatuses` from `init_statuses` and the
+/// `Initialized` condition from `initialized`.
+#[must_use]
+pub fn reconcile_pod_phase_with_init(
+    restart_policy: RestartPolicy,
+    init_observations: &[ContainerObservation],
+    app_observations: &[ContainerObservation],
+) -> (PodPhase, Vec<ContainerStatusOut>, Vec<ContainerStatusOut>, bool) {
+    let to_status = |o: &ContainerObservation| ContainerStatusOut {
+        name: o.name.clone(),
+        ready: o.ready,
+        state: o.state.clone(),
+        container_id: o.container_id.clone(),
+        restart_count: o.restart_count,
+    };
+    let init_statuses: Vec<ContainerStatusOut> = init_observations.iter().map(to_status).collect();
+
+    match next_init_action(restart_policy, init_observations) {
+        InitAction::Complete => {
+            let (phase, app_statuses) = reconcile_pod_phase(restart_policy, app_observations);
+            (phase, init_statuses, app_statuses, true)
+        }
+        InitAction::InitFailed { .. } => {
+            // App containers never started → Waiting/empty app statuses.
+            let app_statuses: Vec<ContainerStatusOut> =
+                app_observations.iter().map(to_status).collect();
+            (PodPhase::Failed, init_statuses, app_statuses, false)
+        }
+        InitAction::AwaitInit { .. } => {
+            let app_statuses: Vec<ContainerStatusOut> =
+                app_observations.iter().map(to_status).collect();
+            (PodPhase::Pending, init_statuses, app_statuses, false)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,8 +659,138 @@ mod tests {
         assert_eq!(st[0].container_id.as_deref(), Some("cid-9"));
         assert_eq!(st[0].name, "web");
     }
-}
 
+    // ── next_init_action (pure init-container sequencer) ─────────────────
+
+    #[test]
+    fn no_init_containers_completes_immediately() {
+        // The behavior-preserving default: every pre-init-brick pod has zero
+        // init containers, so the fold returns Complete and the kubelet reaches
+        // the app-container path identically to before.
+        assert_eq!(next_init_action(RestartPolicy::Always, &[]), InitAction::Complete);
+        assert!(next_init_action(RestartPolicy::Never, &[]).is_complete());
+    }
+
+    #[test]
+    fn first_waiting_init_is_the_active_one() {
+        // init[0] not yet started → AwaitInit{0}; later ones are irrelevant.
+        let obs = vec![waiting("init-0"), waiting("init-1")];
+        assert_eq!(
+            next_init_action(RestartPolicy::Always, &obs),
+            InitAction::AwaitInit { index: 0 }
+        );
+    }
+
+    #[test]
+    fn running_init_is_awaited_not_skipped() {
+        // init[0] in flight → await it; init[1] must NOT start concurrently.
+        let obs = vec![running("init-0", "id0"), waiting("init-1")];
+        assert_eq!(
+            next_init_action(RestartPolicy::Always, &obs),
+            InitAction::AwaitInit { index: 0 }
+        );
+    }
+
+    #[test]
+    fn sequential_advance_after_success() {
+        // init[0] Succeeded (exit 0) → advance to init[1].
+        let obs = vec![terminated("init-0", "id0", 0), waiting("init-1")];
+        assert_eq!(
+            next_init_action(RestartPolicy::Always, &obs),
+            InitAction::AwaitInit { index: 1 }
+        );
+    }
+
+    #[test]
+    fn all_init_succeeded_completes() {
+        let obs = vec![terminated("init-0", "id0", 0), terminated("init-1", "id1", 0)];
+        assert_eq!(next_init_action(RestartPolicy::Never, &obs), InitAction::Complete);
+    }
+
+    #[test]
+    fn failed_init_under_never_is_terminal() {
+        // restartPolicy: Never + non-zero init exit → InitFailed (pod Failed).
+        let obs = vec![terminated("init-0", "id0", 7)];
+        assert_eq!(
+            next_init_action(RestartPolicy::Never, &obs),
+            InitAction::InitFailed { index: 0, exit_code: 7 }
+        );
+    }
+
+    #[test]
+    fn failed_init_under_always_restarts() {
+        // restartPolicy: Always restarts a failed init container (AwaitInit).
+        let obs = vec![terminated("init-0", "id0", 7)];
+        assert_eq!(
+            next_init_action(RestartPolicy::Always, &obs),
+            InitAction::AwaitInit { index: 0 }
+        );
+    }
+
+    #[test]
+    fn failed_init_under_onfailure_restarts_nonzero_but_advances_on_zero() {
+        // OnFailure: non-zero init exit restarts; a zero exit advances.
+        let nonzero = vec![terminated("init-0", "id0", 3)];
+        assert_eq!(
+            next_init_action(RestartPolicy::OnFailure, &nonzero),
+            InitAction::AwaitInit { index: 0 }
+        );
+        let zero = vec![terminated("init-0", "id0", 0), waiting("init-1")];
+        assert_eq!(
+            next_init_action(RestartPolicy::OnFailure, &zero),
+            InitAction::AwaitInit { index: 1 }
+        );
+    }
+
+    // ── reconcile_pod_phase_with_init (init + app composition) ───────────
+
+    #[test]
+    fn pod_is_pending_while_init_runs_and_app_untouched() {
+        let init = vec![running("init-0", "id0")];
+        let app = vec![waiting("app")];
+        let (phase, init_st, app_st, initialized) =
+            reconcile_pod_phase_with_init(RestartPolicy::Always, &init, &app);
+        assert_eq!(phase, PodPhase::Pending);
+        assert!(!initialized);
+        assert_eq!(init_st.len(), 1);
+        assert_eq!(app_st.len(), 1);
+    }
+
+    #[test]
+    fn pod_failed_when_init_fails_terminally() {
+        let init = vec![terminated("init-0", "id0", 9)];
+        let app = vec![waiting("app")];
+        let (phase, _, _, initialized) =
+            reconcile_pod_phase_with_init(RestartPolicy::Never, &init, &app);
+        assert_eq!(phase, PodPhase::Failed);
+        assert!(!initialized);
+    }
+
+    #[test]
+    fn app_phase_governs_once_init_complete() {
+        // All init Succeeded → initialized=true → app fold decides the phase.
+        let init = vec![terminated("init-0", "id0", 0)];
+        let app_running = vec![running("app", "appid")];
+        let (phase, _, _, initialized) =
+            reconcile_pod_phase_with_init(RestartPolicy::Always, &init, &app_running);
+        assert_eq!(phase, PodPhase::Running);
+        assert!(initialized);
+    }
+
+    #[test]
+    fn no_init_pod_phase_matches_bare_app_fold() {
+        // With no init containers, the composition is byte-equivalent to the
+        // existing reconcile_pod_phase over the app containers (regression
+        // guard for the behavior-preserving default).
+        let app = vec![running("app", "appid")];
+        let (p_with, _, app_st, initialized) =
+            reconcile_pod_phase_with_init(RestartPolicy::Always, &[], &app);
+        let (p_bare, bare_st) = reconcile_pod_phase(RestartPolicy::Always, &app);
+        assert_eq!(p_with, p_bare);
+        assert!(initialized);
+        assert_eq!(app_st, bare_st);
+    }
+}
 #[cfg(test)]
 mod proptests {
     use super::*;
