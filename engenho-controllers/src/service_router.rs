@@ -26,6 +26,35 @@
 //! 3. Diff against the backend's current table. Add/remove routes
 //!    to converge.
 //! 4. Idempotent — re-running with the same state is a no-op.
+//!
+//! ## Datapath scope (HONEST — the macOS-VM packet-install is a typed
+//!    deferral, NOT a silent gap)
+//!
+//! Three layers compose the kube-proxy datapath; engenho ships them at
+//! different maturities and is explicit about which:
+//!
+//!   1. **VIP allocation** — DONE (`crate::cluster_ip`): a Service gets a
+//!      real ClusterIP, so a route HAS a VIP to key on (before this the
+//!      VIP was `None` and every route degenerate).
+//!   2. **Desired-rule computation** — DONE (this module): the controller
+//!      resolves Service+Endpoints → typed [`ServiceRoute`]s, and the
+//!      [`IptablesRouter`]/[`IpvsRouter`] backends render the EXACT
+//!      `KUBE-SVC`/`KUBE-SEP` chain hierarchy (resp. ipvs virtual-server
+//!      table) kube-proxy installs — fully unit-tested via pure
+//!      `render_script`.
+//!   3. **Packet-routing INSTALL** — the actual `iptables-restore` /
+//!      `ipvsadm` apply on the node. On the bootstrap macOS topology the
+//!      engenho host process runs on Darwin while pods run in a podman
+//!      Linux VM, so the host cannot install the Linux VIP datapath the
+//!      way a Linux node would. The controller's backend selection is a
+//!      typed decision ([`DatapathInstall`]): `Computed` (default off-Linux
+//!      — routes are computed + observable via a [`FakeRouter`], but no
+//!      kernel rule is installed) vs `Installed` (Linux node — the
+//!      iptables/ipvs backend applies the rules). A `Computed` install is
+//!      NOT a silent skip: it is the named, fail-safe state the same way
+//!      the webhook caBundle deferral is — real progress (correct allocator
+//!      + correct computed rules + EndpointSlice) awaiting a Linux node for
+//!      the final kernel apply.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -83,12 +112,38 @@ engenho_substrate::impl_error_kind! {
     }
 }
 
+/// The datapath-install maturity a [`ServiceRouter`] backend provides —
+/// the typed name for "did we COMPUTE the rules, or did we INSTALL them in
+/// the kernel?" This makes the macOS-VM packet-install deferral a typed
+/// value, never a silent gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatapathInstall {
+    /// Routes are computed + tracked + observable, but NO kernel rule is
+    /// installed. The fail-safe state on a topology where the host cannot
+    /// install the Linux VIP datapath (e.g. engenho on Darwin with pods in
+    /// a podman Linux VM). Correct allocator + correct computed rules,
+    /// awaiting a Linux node for the kernel apply.
+    Computed,
+    /// The backend installs the VIP datapath in the node's kernel
+    /// (iptables / ipvs / eBPF) — a real Linux node.
+    Installed,
+}
+
 /// Pluggable routing backend trait. Implementations apply +
 /// remove routes on the local host (iptables, ipvs, ebpf, fake).
 #[async_trait]
 pub trait ServiceRouter: Send + Sync {
     /// Stable backend name.
     fn name(&self) -> &'static str;
+
+    /// The datapath-install maturity this backend provides. `Computed`
+    /// (FakeRouter / off-Linux topology) ⇒ routes are computed + tracked
+    /// but no kernel rule is installed; `Installed` (iptables / ipvs on a
+    /// Linux node) ⇒ the VIP datapath is applied. Defaults to `Installed`
+    /// (the kernel backends); the `FakeRouter` overrides to `Computed`.
+    fn datapath(&self) -> DatapathInstall {
+        DatapathInstall::Installed
+    }
 
     /// Install / refresh a route. Idempotent — if the route is
     /// already installed identically, this is a no-op.
@@ -161,6 +216,14 @@ impl FakeRouter {
 impl ServiceRouter for FakeRouter {
     fn name(&self) -> &'static str {
         "fake"
+    }
+
+    fn datapath(&self) -> DatapathInstall {
+        // Computes + tracks routes; installs nothing in the kernel. This is
+        // ALSO the honest default backend on the macOS-VM topology where the
+        // host can't install the Linux VIP datapath — routes are computed +
+        // observable, the kernel apply awaits a Linux node.
+        DatapathInstall::Computed
     }
 
     async fn upsert(&self, route: &ServiceRoute) -> Result<(), RouterError> {
@@ -936,6 +999,16 @@ mod tests {
     #[test]
     fn iptables_router_name_is_stable() {
         assert_eq!(IptablesRouter::new().name(), "iptables");
+    }
+
+    #[test]
+    fn datapath_install_maturity_is_typed_per_backend() {
+        // FakeRouter (and the macOS-VM topology it stands in for) COMPUTES
+        // routes but installs no kernel rule — the typed deferral.
+        assert_eq!(FakeRouter::new().datapath(), DatapathInstall::Computed);
+        // The kernel backends INSTALL the datapath (on a Linux node).
+        assert_eq!(IptablesRouter::new().datapath(), DatapathInstall::Installed);
+        assert_eq!(IpvsRouter::new().datapath(), DatapathInstall::Installed);
     }
 
     #[test]

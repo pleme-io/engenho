@@ -33,10 +33,15 @@
 //!
 //! ## Honest scope (deferred surfaces are TYPED, never silent)
 //!
-//!   * `clientConfig.url` is supported. `clientConfig.service` resolution to a
-//!     ClusterIP/endpoint is DEFERRED — a config that uses `service` without a
-//!     `url` yields a typed [`WebhookError::ServiceRefUnsupported`] the
-//!     `failurePolicy` then governs (it is NOT silently skipped).
+//!   * `clientConfig.url` is supported. `clientConfig.service` is ALSO
+//!     supported now: the plugin resolves `{namespace, name, port, path}`
+//!     to the Service's allocated ClusterIP via the [`ServiceResolver`]
+//!     seam and synthesizes `https://<clusterIP>:<port><path>`, which the
+//!     [`WebhookCaller`] then calls (this is the brick the ClusterIP
+//!     allocator unblocks). A Service that has NO ClusterIP yet (headless,
+//!     or not-yet-allocated) yields a typed
+//!     [`WebhookError::ServiceUnresolvable`] the `failurePolicy` governs —
+//!     never a silent skip.
 //!   * `clientConfig.caBundle` TLS verification is DEFERRED to the production
 //!     [`WebhookCaller`] impl in the apiserver crate; this module records the
 //!     caBundle on the typed [`WebhookClientConfig`] + passes it to the caller.
@@ -100,9 +105,11 @@ pub struct WebhookClientConfig {
     /// `clientConfig.url` — a fully-qualified `https://…/path` endpoint.
     /// `Some` is the supported path today.
     pub url: Option<String>,
-    /// `clientConfig.service` — an in-cluster Service ref. Present ⇒ DEFERRED
-    /// (typed [`WebhookError::ServiceRefUnsupported`] unless a `url` is also
-    /// set). Carried so the typed error names the exact service.
+    /// `clientConfig.service` — an in-cluster Service ref. Resolved to the
+    /// Service's allocated ClusterIP via a [`ServiceResolver`] when one is
+    /// wired (→ `https://<clusterIP>:<port><path>`); a Service with no VIP
+    /// yields a typed [`WebhookError::ServiceUnresolvable`]. A `url`, when
+    /// also set, takes precedence.
     pub service: Option<ServiceRef>,
     /// `clientConfig.caBundle` — base64 PEM CA bundle for verifying the
     /// webhook's serving cert. Threaded to the [`WebhookCaller`]; the actual
@@ -219,19 +226,24 @@ pub enum WebhookError {
         /// What failed.
         reason: String,
     },
-    /// The `clientConfig` uses a `service` ref with no `url`. DEFERRED:
-    /// Service→endpoint resolution is a typed follow-up. NOT silently skipped.
+    /// The `clientConfig.service` ref could not be resolved to a callable
+    /// `https://<clusterIP>:<port><path>` endpoint — the Service has no
+    /// allocated ClusterIP (it doesn't exist, is headless, or hasn't been
+    /// allocated yet). A typed deferral the `failurePolicy` governs — NOT a
+    /// silent skip.
     #[error(
-        "webhook {webhook:?} uses clientConfig.service ({namespace}/{name}) — \
-         service-ref resolution is unsupported; supply clientConfig.url"
+        "webhook {webhook:?} clientConfig.service ({namespace}/{name}) is \
+         unresolvable: {reason}"
     )]
-    ServiceRefUnsupported {
+    ServiceUnresolvable {
         /// The webhook's `name`.
         webhook: String,
         /// Service namespace.
         namespace: String,
         /// Service name.
         name: String,
+        /// Why resolution failed.
+        reason: String,
     },
     /// The `clientConfig` declared neither `url` nor `service` — invalid.
     #[error("webhook {webhook:?} clientConfig declares neither url nor service")]
@@ -276,6 +288,72 @@ pub trait WebhookCaller: Send + Sync {
         timeout_seconds: u32,
         review_request: &Value,
     ) -> Result<Value, String>;
+}
+
+/// Resolves a `clientConfig.service` ref to the Service's allocated
+/// ClusterIP. Production reads the store (the ClusterIP allocator stamps
+/// `spec.clusterIP`); tests pass a static map. The seam keeps the plugin
+/// unit-testable with ZERO store: a Service ref resolves to a VIP through
+/// a mock.
+#[async_trait]
+pub trait ServiceResolver: Send + Sync {
+    /// The allocated ClusterIP (`spec.clusterIP`) for the Service
+    /// `namespace/name`, or `None` when it has no VIP (absent, headless,
+    /// or not-yet-allocated).
+    async fn cluster_ip(&self, namespace: &str, name: &str) -> Option<String>;
+}
+
+/// Production [`ServiceResolver`] — reads `spec.clusterIP` off the live
+/// Service object in the store. A `"None"` (headless) ClusterIP resolves
+/// to `None` (a headless Service has no VIP to call).
+pub struct StoreServiceResolver {
+    store: Arc<engenho_store::StoreMesh>,
+}
+
+impl StoreServiceResolver {
+    /// New resolver over `store`.
+    #[must_use]
+    pub fn new(store: Arc<engenho_store::StoreMesh>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl ServiceResolver for StoreServiceResolver {
+    async fn cluster_ip(&self, namespace: &str, name: &str) -> Option<String> {
+        let key = engenho_store::resource::ResourceKey::namespaced(
+            "", "v1", "Service", namespace, name,
+        );
+        let svc = self.store.get(&key).await?;
+        let ip = svc
+            .get("spec")
+            .and_then(|s| s.get("clusterIP"))
+            .and_then(Value::as_str)?;
+        // Headless / empty has no callable VIP.
+        if ip == "None" || ip.is_empty() {
+            None
+        } else {
+            Some(ip.to_string())
+        }
+    }
+}
+
+/// Synthesize the `https://<clusterIP>:<port><path>` endpoint for a
+/// resolved Service ref. Pure — the typed pieces (`ip`, `port`, `path`)
+/// compose the canonical webhook URL (`clientConfig.service` defaults:
+/// port 443, path `/`). The `https://{ip}:{port}{path}` shape IS the
+/// value's render surface (★★ TYPED EMISSION — the URL builder).
+#[must_use]
+pub fn synthesize_service_endpoint(cluster_ip: &str, svc: &ServiceRef) -> String {
+    let port = svc.port.unwrap_or(443);
+    let path = svc.path.as_deref().unwrap_or("/");
+    // The path is expected to be absolute (`/mutate`); a missing leading
+    // slash is normalized so the URL is well-formed.
+    if path.starts_with('/') {
+        format!("https://{cluster_ip}:{port}{path}")
+    } else {
+        format!("https://{cluster_ip}:{port}/{path}")
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -585,6 +663,11 @@ pub type Pluralizer = Box<dyn Fn(&str, &str, &str) -> Option<String> + Send + Sy
 pub struct MutatingWebhookPlugin {
     source: Arc<dyn WebhookConfigSource>,
     caller: Arc<dyn WebhookCaller>,
+    /// Resolves a `clientConfig.service` ref to the Service's ClusterIP.
+    /// `None` ⇒ no resolver wired: a service ref yields a typed
+    /// [`WebhookError::ServiceUnresolvable`] (preserving the typed-deferral
+    /// for plugins constructed without store access).
+    resolver: Option<Arc<dyn ServiceResolver>>,
     /// Maps a kind to its plural resource for rule matching + the
     /// `AdmissionReview.request.resource`. Production wires the catalog
     /// pluralizer; tests pass a closure.
@@ -593,7 +676,10 @@ pub struct MutatingWebhookPlugin {
 
 impl MutatingWebhookPlugin {
     /// New plugin from the two seams + a pluralizer
-    /// `(group, version, kind) -> plural`.
+    /// `(group, version, kind) -> plural`. No [`ServiceResolver`] — a
+    /// `clientConfig.service` ref is a typed
+    /// [`WebhookError::ServiceUnresolvable`]. Use [`Self::with_resolver`] to
+    /// enable service-ref resolution against the allocated ClusterIPs.
     #[must_use]
     pub fn new(
         source: Arc<dyn WebhookConfigSource>,
@@ -603,8 +689,17 @@ impl MutatingWebhookPlugin {
         Self {
             source,
             caller,
+            resolver: None,
             pluralize,
         }
+    }
+
+    /// Builder: attach a [`ServiceResolver`] so `clientConfig.service` refs
+    /// resolve to `https://<clusterIP>:<port><path>`.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn ServiceResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     /// The full dispatch over the request's (possibly already-mutated) value.
@@ -692,13 +787,7 @@ impl MutatingWebhookPlugin {
     ) -> Result<WebhookResponse, WebhookError> {
         let endpoint = match (&webhook.client_config.url, &webhook.client_config.service) {
             (Some(url), _) => url.clone(),
-            (None, Some(svc)) => {
-                return Err(WebhookError::ServiceRefUnsupported {
-                    webhook: webhook.name.clone(),
-                    namespace: svc.namespace.clone(),
-                    name: svc.name.clone(),
-                });
-            }
+            (None, Some(svc)) => self.resolve_service_endpoint(&webhook.name, svc).await?,
             (None, None) => {
                 return Err(WebhookError::NoEndpoint {
                     webhook: webhook.name.clone(),
@@ -719,6 +808,36 @@ impl MutatingWebhookPlugin {
                 message,
             })?;
         read_admission_review(&webhook.name, &raw)
+    }
+
+    /// Resolve a `clientConfig.service` ref to a callable
+    /// `https://<clusterIP>:<port><path>` endpoint. Requires a wired
+    /// [`ServiceResolver`]; without one (or when the Service has no
+    /// allocated ClusterIP) returns a typed
+    /// [`WebhookError::ServiceUnresolvable`] the `failurePolicy` governs.
+    async fn resolve_service_endpoint(
+        &self,
+        webhook_name: &str,
+        svc: &ServiceRef,
+    ) -> Result<String, WebhookError> {
+        let Some(resolver) = &self.resolver else {
+            return Err(WebhookError::ServiceUnresolvable {
+                webhook: webhook_name.to_string(),
+                namespace: svc.namespace.clone(),
+                name: svc.name.clone(),
+                reason: "no service resolver wired (supply clientConfig.url instead)".to_string(),
+            });
+        };
+        match resolver.cluster_ip(&svc.namespace, &svc.name).await {
+            Some(ip) => Ok(synthesize_service_endpoint(&ip, svc)),
+            None => Err(WebhookError::ServiceUnresolvable {
+                webhook: webhook_name.to_string(),
+                namespace: svc.namespace.clone(),
+                name: svc.name.clone(),
+                reason: "Service has no allocated ClusterIP (absent, headless, or not yet allocated)"
+                    .to_string(),
+            }),
+        }
     }
 
     /// Best-effort `namespaceSelector` / `objectSelector` matching. An
@@ -926,6 +1045,36 @@ impl MockWebhookCaller {
                 "status": { "code": 403, "message": message }
             }
         })
+    }
+}
+
+/// A [`ServiceResolver`] backed by a static `namespace/name → clusterIP`
+/// map. Lets a test prove service-ref resolution WITHOUT a real store.
+#[derive(Clone, Default)]
+pub struct MockServiceResolver {
+    map: std::collections::BTreeMap<String, String>,
+}
+
+impl MockServiceResolver {
+    /// New empty resolver (every ref resolves to `None`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pin `namespace/name → clusterIP`.
+    #[must_use]
+    pub fn with(mut self, namespace: &str, name: &str, cluster_ip: &str) -> Self {
+        self.map
+            .insert(format!("{namespace}/{name}"), cluster_ip.to_string());
+        self
+    }
+}
+
+#[async_trait]
+impl ServiceResolver for MockServiceResolver {
+    async fn cluster_ip(&self, namespace: &str, name: &str) -> Option<String> {
+        self.map.get(&format!("{namespace}/{name}")).cloned()
     }
 }
 
@@ -1140,8 +1289,29 @@ mod tests {
         }
     }
 
+    /// A service-ref config matching Pod CREATE with the given
+    /// `{namespace, name, port, path}`.
+    fn service_ref_config(namespace: &str, name: &str, port: u64, path: &str) -> Value {
+        json!({
+            "kind": "MutatingWebhookConfiguration",
+            "webhooks": [{
+                "name": "svc.mesh.io",
+                "clientConfig": { "service": {
+                    "namespace": namespace, "name": name, "port": port, "path": path
+                } },
+                "rules": [{
+                    "operations": ["CREATE"], "apiGroups": [""],
+                    "apiVersions": ["v1"], "resources": ["pods"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        })
+    }
+
     #[tokio::test]
-    async fn service_ref_without_url_is_typed_deferral() {
+    async fn service_ref_without_resolver_is_typed_deferral() {
+        // No ServiceResolver wired → a service ref is a typed deferral,
+        // governed by failurePolicy=Fail → Deny (NOT a silent skip).
         let config = json!({
             "kind": "MutatingWebhookConfiguration",
             "webhooks": [{
@@ -1158,17 +1328,134 @@ mod tests {
         let caller = Arc::new(MockWebhookCaller::new());
         let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer());
 
-        let decision = plugin.review(&pod_request()).await.unwrap();
-        // service-ref unsupported → typed error → governed by failurePolicy=Fail
-        // → Deny (NOT a silent skip).
-        match decision {
+        match plugin.review(&pod_request()).await.unwrap() {
             AdmissionDecision::Deny(reason) => {
-                assert!(reason.contains("service-ref resolution is unsupported"));
+                assert!(reason.contains("unresolvable"));
                 assert!(reason.contains("mesh/injector"));
             }
             other => panic!("expected Deny, got {other:?}"),
         }
-        assert_eq!(caller.calls().await.len(), 0, "no HTTP call for a service ref");
+        assert_eq!(caller.calls().await.len(), 0, "no HTTP call for an unresolved service ref");
+    }
+
+    #[tokio::test]
+    async fn service_ref_resolves_to_clusterip_url_and_calls() {
+        // The injector Service has an allocated ClusterIP; the plugin
+        // synthesizes https://<vip>:<port><path> + calls it.
+        let cfg = service_ref_config("mesh", "injector", 8443, "/mutate");
+        let source = Arc::new(StaticConfigSource::new(vec![cfg]));
+        let caller = Arc::new(MockWebhookCaller::new());
+        let resolved_endpoint = "https://10.96.0.5:8443/mutate";
+        caller
+            .set_response(
+                resolved_endpoint,
+                MockWebhookCaller::json_patch_review("u", &sidecar_ops()),
+            )
+            .await;
+        let resolver = Arc::new(MockServiceResolver::new().with("mesh", "injector", "10.96.0.5"));
+        let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer())
+            .with_resolver(resolver);
+
+        let decision = plugin.review(&pod_request()).await.unwrap();
+        // The injection landed (the service ref resolved + the webhook ran).
+        let mutated = match decision {
+            AdmissionDecision::Mutate(v) => v,
+            other => panic!("expected Mutate, got {other:?}"),
+        };
+        assert!(mutated["spec"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "aresta-proxy"));
+        // The call went to the SYNTHESIZED ClusterIP URL.
+        let calls = caller.calls().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, resolved_endpoint);
+    }
+
+    #[tokio::test]
+    async fn service_ref_defaults_port_443_and_path_root() {
+        // No port/path on the ref → defaults: :443 and /.
+        let cfg = json!({
+            "kind": "MutatingWebhookConfiguration",
+            "webhooks": [{
+                "name": "svc.mesh.io",
+                "clientConfig": { "service": { "namespace": "mesh", "name": "injector" } },
+                "rules": [{
+                    "operations": ["CREATE"], "apiGroups": [""],
+                    "apiVersions": ["v1"], "resources": ["pods"]
+                }]
+            }]
+        });
+        let source = Arc::new(StaticConfigSource::new(vec![cfg]));
+        let caller = Arc::new(MockWebhookCaller::new());
+        let resolved_endpoint = "https://10.96.0.9:443/";
+        caller
+            .set_response(resolved_endpoint, MockWebhookCaller::allow_review("u"))
+            .await;
+        let resolver = Arc::new(MockServiceResolver::new().with("mesh", "injector", "10.96.0.9"));
+        let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer())
+            .with_resolver(resolver);
+
+        let _ = plugin.review(&pod_request()).await.unwrap();
+        assert_eq!(caller.calls().await[0].0, resolved_endpoint);
+    }
+
+    #[tokio::test]
+    async fn service_ref_with_no_clusterip_is_typed_deferral() {
+        // A resolver that has no VIP for the ref (headless / absent) →
+        // typed ServiceUnresolvable → governed by failurePolicy=Fail → Deny.
+        let cfg = service_ref_config("mesh", "injector", 8443, "/mutate");
+        let source = Arc::new(StaticConfigSource::new(vec![cfg]));
+        let caller = Arc::new(MockWebhookCaller::new());
+        let resolver = Arc::new(MockServiceResolver::new()); // empty
+        let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer())
+            .with_resolver(resolver);
+
+        match plugin.review(&pod_request()).await.unwrap() {
+            AdmissionDecision::Deny(reason) => {
+                assert!(reason.contains("unresolvable"));
+                assert!(reason.contains("no allocated ClusterIP"));
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+        assert_eq!(caller.calls().await.len(), 0);
+    }
+
+    #[test]
+    fn synthesize_endpoint_builds_https_url() {
+        let svc = ServiceRef {
+            namespace: "mesh".into(),
+            name: "injector".into(),
+            path: Some("/mutate".into()),
+            port: Some(8443),
+        };
+        assert_eq!(
+            synthesize_service_endpoint("10.96.0.5", &svc),
+            "https://10.96.0.5:8443/mutate"
+        );
+        // Defaults.
+        let bare = ServiceRef {
+            namespace: "mesh".into(),
+            name: "injector".into(),
+            path: None,
+            port: None,
+        };
+        assert_eq!(
+            synthesize_service_endpoint("10.96.0.9", &bare),
+            "https://10.96.0.9:443/"
+        );
+        // Path missing a leading slash is normalized.
+        let noslash = ServiceRef {
+            namespace: "m".into(),
+            name: "i".into(),
+            path: Some("mutate".into()),
+            port: Some(443),
+        };
+        assert_eq!(
+            synthesize_service_endpoint("10.0.0.1", &noslash),
+            "https://10.0.0.1:443/mutate"
+        );
     }
 
     #[tokio::test]

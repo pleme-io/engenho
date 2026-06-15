@@ -34,7 +34,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use engenho_controllers::admission_webhook::{Pluralizer, WebhookCaller, WebhookConfigSource};
+use engenho_controllers::admission_webhook::{
+    Pluralizer, StoreServiceResolver, WebhookCaller, WebhookConfigSource,
+};
 use engenho_controllers::MutatingWebhookPlugin;
 use engenho_store::StoreMesh;
 use engenho_types::generated_v1_34::RESOURCE_CATALOG;
@@ -156,18 +158,22 @@ pub fn catalog_pluralizer() -> Pluralizer {
 }
 
 /// Build a production [`MutatingWebhookPlugin`] wired to `store` (config
-/// source) + a reqwest caller + the catalog pluralizer. Add the returned
-/// `Arc<dyn AdmissionWebhook>` to the apiserver's `AdmissionChain`.
+/// source + service resolver) + a reqwest caller + the catalog pluralizer.
+/// The [`StoreServiceResolver`] resolves `clientConfig.service` refs to the
+/// Service's allocated ClusterIP (the ClusterIP allocator stamps it), so a
+/// mesh injector declared by `service` (not `url`) becomes callable. Add the
+/// returned `Arc<dyn AdmissionWebhook>` to the apiserver's `AdmissionChain`.
 #[must_use]
 pub fn mutating_webhook_plugin(
     store: Arc<StoreMesh>,
     allow_unverified_ca_bundle: bool,
 ) -> MutatingWebhookPlugin {
     MutatingWebhookPlugin::new(
-        Arc::new(StoreWebhookConfigSource::new(store)),
+        Arc::new(StoreWebhookConfigSource::new(store.clone())),
         Arc::new(ReqwestWebhookCaller::new(allow_unverified_ca_bundle)),
         catalog_pluralizer(),
     )
+    .with_resolver(Arc::new(StoreServiceResolver::new(store)))
 }
 
 #[cfg(test)]
