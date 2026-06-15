@@ -12,7 +12,85 @@ use shikumi::TieredConfig;
 
 use crate::error::ConfigError;
 
-/// Networking config — the Service `ClusterIP` CIDR.
+/// Which Service VIP datapath backend the `ServiceRoutingController`
+/// installs — the typed, operator-overridable selection of *how* a
+/// Service's computed routes reach the kernel (or whether they do).
+///
+/// `Auto` (the default) platform-detects: on a Linux node it resolves to
+/// `Iptables` (the kernel installs the `KUBE-SVC`/`KUBE-SEP` chains); on a
+/// non-Linux host (e.g. engenho on Darwin with pods in a podman Linux VM,
+/// the bootstrap dev topology) it resolves to `ComputeOnly`, where the
+/// controller still runs + computes + observes the desired rules but never
+/// shells to a non-existent `iptables-restore`. The explicit arms let an
+/// operator force a backend (or force compute-only) regardless of platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatapathMode {
+    /// Platform-detect: Linux → `Iptables`, non-Linux → `ComputeOnly`.
+    Auto,
+    /// Force the iptables kernel backend (a Linux node).
+    Iptables,
+    /// Force the ipvs kernel backend (a Linux node, scalable).
+    Ipvs,
+    /// Force compute-only: routes are computed + observable, no kernel
+    /// install attempted. The fail-safe state on a non-Linux host.
+    ComputeOnly,
+}
+
+/// The concrete datapath backend `Auto` (or an explicit arm) resolves to
+/// once the host platform is known — a kernel backend or compute-only.
+/// Pure output of [`DatapathMode::resolve`]; the runtime maps each arm to
+/// the matching `ServiceRouter` implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedDatapath {
+    /// Install the iptables kernel datapath.
+    Iptables,
+    /// Install the ipvs kernel datapath.
+    Ipvs,
+    /// Compute routes only; install nothing in the kernel.
+    ComputeOnly,
+}
+
+impl DatapathMode {
+    /// Resolve this mode against a host platform (`is_linux`) into the
+    /// concrete backend the runtime should construct.
+    ///
+    /// Pure — takes `is_linux` explicitly (rather than reading `cfg!`) so
+    /// the platform-selection logic is directly unit-testable for both
+    /// arms. The runtime calls `resolve(cfg!(target_os = "linux"))`.
+    ///
+    /// - `Auto` + Linux → `Iptables`; `Auto` + non-Linux → `ComputeOnly`.
+    /// - `Iptables` / `Ipvs` / `ComputeOnly` → the matching arm verbatim
+    ///   (an operator override is honored on any platform — forcing a
+    ///   kernel backend off-Linux is the operator's explicit choice, and
+    ///   the backend's own spawn would surface the missing binary as a
+    ///   typed `RouterError::Backend`, never a silent skip).
+    #[must_use]
+    pub fn resolve(self, is_linux: bool) -> ResolvedDatapath {
+        match self {
+            Self::Auto => {
+                if is_linux {
+                    ResolvedDatapath::Iptables
+                } else {
+                    ResolvedDatapath::ComputeOnly
+                }
+            }
+            Self::Iptables => ResolvedDatapath::Iptables,
+            Self::Ipvs => ResolvedDatapath::Ipvs,
+            Self::ComputeOnly => ResolvedDatapath::ComputeOnly,
+        }
+    }
+}
+
+/// serde default for `datapath_mode` — `Auto` so an operator YAML written
+/// before the field existed (a `deny_unknown_fields` struct) still
+/// deserializes, platform-detecting the backend (mirrors
+/// `prescribed_default`).
+fn default_datapath_mode() -> DatapathMode {
+    DatapathMode::Auto
+}
+
+/// Networking config — the Service `ClusterIP` CIDR + VIP datapath backend.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkingConfig {
@@ -21,12 +99,20 @@ pub struct NetworkingConfig {
     /// convention and never reuses a VIP held by a live Service.
     /// Default `10.96.0.0/12` (upstream parity).
     pub service_cidr: String,
+    /// Which Service VIP datapath backend the `ServiceRoutingController`
+    /// installs. Default `Auto` (platform-detect: Linux → iptables,
+    /// non-Linux → compute-only). `#[serde(default)]` is REQUIRED (the
+    /// struct is `deny_unknown_fields`) so pre-existing operator YAML
+    /// written before this field still deserializes.
+    #[serde(default = "default_datapath_mode")]
+    pub datapath_mode: DatapathMode,
 }
 
 impl TieredConfig for NetworkingConfig {
     fn bare() -> Self {
         Self {
             service_cidr: String::new(),
+            datapath_mode: DatapathMode::Auto,
         }
     }
 
@@ -34,16 +120,25 @@ impl TieredConfig for NetworkingConfig {
         Self {
             // Upstream kube-apiserver default service CIDR.
             service_cidr: "10.96.0.0/12".into(),
+            // Platform-detect: Linux installs the kernel datapath, a
+            // non-Linux dev host runs compute-only.
+            datapath_mode: DatapathMode::Auto,
         }
     }
 
     fn extend(self, base: &Self) -> Self {
+        // `datapath_mode` is `Copy` with a meaningful zero-arg default
+        // (`Auto`); an overlay always carries an explicit value, so take
+        // the overlay's verbatim (no "empty-means-inherit" sentinel exists
+        // for an enum — `Auto` IS the inherit-platform behavior).
+        let _ = base;
         Self {
             service_cidr: if self.service_cidr.is_empty() {
                 base.service_cidr.clone()
             } else {
                 self.service_cidr
             },
+            datapath_mode: self.datapath_mode,
         }
     }
 }
@@ -129,6 +224,7 @@ mod tests {
     fn extend_fills_empty_from_base() {
         let overlay = NetworkingConfig {
             service_cidr: String::new(),
+            datapath_mode: DatapathMode::Auto,
         };
         let base = NetworkingConfig::prescribed_default();
         let merged = overlay.extend(&base);
@@ -139,9 +235,67 @@ mod tests {
     fn extend_keeps_override() {
         let overlay = NetworkingConfig {
             service_cidr: "10.43.0.0/16".into(),
+            datapath_mode: DatapathMode::Ipvs,
         };
         let base = NetworkingConfig::prescribed_default();
-        assert_eq!(overlay.extend(&base).service_cidr, "10.43.0.0/16");
+        let merged = overlay.extend(&base);
+        assert_eq!(merged.service_cidr, "10.43.0.0/16");
+        // The overlay's explicit datapath_mode wins over the base default.
+        assert_eq!(merged.datapath_mode, DatapathMode::Ipvs);
+    }
+
+    #[test]
+    fn prescribed_default_datapath_mode_is_auto() {
+        assert_eq!(
+            NetworkingConfig::prescribed_default().datapath_mode,
+            DatapathMode::Auto
+        );
+    }
+
+    #[test]
+    fn datapath_auto_resolves_by_platform() {
+        // Auto on a Linux node installs the iptables kernel datapath.
+        assert_eq!(
+            DatapathMode::Auto.resolve(true),
+            ResolvedDatapath::Iptables
+        );
+        // Auto off-Linux (Darwin dev host) runs compute-only — no kernel
+        // install is attempted, so the local daemon keeps running fine.
+        assert_eq!(
+            DatapathMode::Auto.resolve(false),
+            ResolvedDatapath::ComputeOnly
+        );
+    }
+
+    #[test]
+    fn datapath_explicit_arms_ignore_platform() {
+        // An explicit override is honored regardless of host platform.
+        assert_eq!(
+            DatapathMode::Iptables.resolve(false),
+            ResolvedDatapath::Iptables
+        );
+        assert_eq!(DatapathMode::Ipvs.resolve(true), ResolvedDatapath::Ipvs);
+        assert_eq!(
+            DatapathMode::ComputeOnly.resolve(true),
+            ResolvedDatapath::ComputeOnly
+        );
+    }
+
+    #[test]
+    fn pre_existing_yaml_without_datapath_mode_still_deserializes() {
+        // The serde default contract: an operator YAML written before
+        // `datapath_mode` existed (deny_unknown_fields struct) still
+        // deserializes, defaulting to Auto.
+        let yaml = "service_cidr: \"10.96.0.0/12\"\n";
+        let cfg: NetworkingConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.datapath_mode, DatapathMode::Auto);
+    }
+
+    #[test]
+    fn datapath_mode_serde_snake_case() {
+        let yaml = "service_cidr: \"10.96.0.0/12\"\ndatapath_mode: compute_only\n";
+        let cfg: NetworkingConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.datapath_mode, DatapathMode::ComputeOnly);
     }
 
     #[test]
@@ -165,6 +319,7 @@ mod tests {
     fn validate_rejects_malformed_cidr() {
         let cfg = NetworkingConfig {
             service_cidr: "10.96.0.0".into(),
+            datapath_mode: DatapathMode::Auto,
         };
         assert!(cfg.validate().is_err());
     }

@@ -42,6 +42,15 @@ pub struct ControllerEnable {
     pub job: bool,
     /// Service → Endpoints controller.
     pub endpoints: bool,
+    /// Service VIP routing controller (`ServiceRoutingController`):
+    /// resolves Service + Endpoints → typed `ServiceRoute`s and drives the
+    /// platform-selected datapath backend (iptables/ipvs on Linux,
+    /// compute-only off-Linux per `networking.datapath_mode`).
+    /// `#[serde(default)]` is REQUIRED (the struct is
+    /// `deny_unknown_fields`) so pre-existing operator YAML written before
+    /// this flag still deserializes (defaults on).
+    #[serde(default = "default_true")]
+    pub service_routing: bool,
     /// Owner-reference garbage collector.
     pub gc: bool,
     /// CRD → dynamic CR-handler registration controller. Watches
@@ -76,6 +85,7 @@ impl TieredConfig for ControllersConfig {
                 daemonset: false,
                 job: false,
                 endpoints: false,
+                service_routing: false,
                 gc: false,
                 crd: false,
                 namespace: false,
@@ -95,6 +105,7 @@ impl TieredConfig for ControllersConfig {
                 daemonset: true,
                 job: true,
                 endpoints: true,
+                service_routing: true,
                 gc: true,
                 crd: true,
                 namespace: true,
@@ -156,6 +167,7 @@ mod tests {
         assert!(cfg.enable.statefulset);
         assert!(cfg.enable.job);
         assert!(cfg.enable.endpoints);
+        assert!(cfg.enable.service_routing);
         assert!(cfg.enable.gc);
         assert!(cfg.enable.crd);
         assert!(cfg.enable.namespace);
@@ -182,6 +194,12 @@ debounce_milliseconds: 50
 "#;
         let cfg: ControllersConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.enable.namespace, "missing flag defaults to true");
+        // The same default-true contract covers the later service_routing
+        // flag — pre-existing YAML lacking it still enables it.
+        assert!(
+            cfg.enable.service_routing,
+            "missing service_routing flag defaults to true"
+        );
     }
 
     #[test]

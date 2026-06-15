@@ -14,11 +14,14 @@ use engenho_types::generated_v1_34::rbac_v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
 };
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
-use engenho_config::{ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind};
+use engenho_config::{
+    ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind, ResolvedDatapath,
+};
 use engenho_controllers::{
     CrdController, DaemonSetController, DeploymentController, DynamicHandlerSink,
-    EndpointsController, GcController, JobController, KindFilter, NamespaceController,
-    ReplicaSetController, StatefulSetController, WatchDriver, WatchDriverConfig,
+    EndpointsController, FakeRouter, GcController, IptablesRouter, IpvsRouter, JobController,
+    KindFilter, NamespaceController, ReplicaSetController, ServiceRouter,
+    ServiceRoutingController, StatefulSetController, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
 };
@@ -1027,6 +1030,35 @@ fn spawn_drivers(
             .spawn(),
         );
     }
+    // Service routing: resolves Service + Endpoints → typed ServiceRoutes
+    // and drives the platform-selected datapath backend. The backend is
+    // chosen by `networking.datapath_mode` resolved against the host
+    // platform (Auto → iptables on Linux, compute-only off-Linux) so on a
+    // Darwin dev host the controller still runs + computes + observes the
+    // desired rules without ever shelling to a non-existent
+    // `iptables-restore`. Watches the same kinds the EndpointsController
+    // does (Service + Endpoints/EndpointSlice) plus the fallback tick.
+    if enable.service_routing {
+        let resolved = config
+            .networking
+            .datapath_mode
+            .resolve(cfg!(target_os = "linux"));
+        let backend = make_service_router(resolved);
+        info!(
+            datapath = backend.name(),
+            mode = ?config.networking.datapath_mode,
+            "service routing backend selected"
+        );
+        let c = ServiceRoutingController::new(store.clone(), backend, ns.clone());
+        handles.push(
+            WatchDriver::new(
+                c,
+                store.clone(),
+                driver_config(&["Service", "Endpoints", "EndpointSlice"]),
+            )
+            .spawn(),
+        );
+    }
     if enable.gc {
         let c = GcController::new(store.clone(), ns.clone());
         handles.push(
@@ -1098,6 +1130,24 @@ fn spawn_drivers(
     (handles, kubelet)
 }
 
+/// Construct the `ServiceRouter` backend for a resolved datapath choice.
+///
+/// Typed dispatch — `ResolvedDatapath` (the pure output of
+/// `DatapathMode::resolve`) maps 1:1 to a backend: `Iptables`/`Ipvs` are
+/// the kernel backends (a Linux node installs the VIP datapath), and
+/// `ComputeOnly` is the `FakeRouter` (routes computed + observable, nothing
+/// installed in the kernel — the fail-safe off-Linux dev path, surfacing
+/// `DatapathInstall::Computed`). No `cfg!` lives here: the platform was
+/// already folded into `resolved` by the caller, so this stays directly
+/// testable.
+fn make_service_router(resolved: ResolvedDatapath) -> Arc<dyn ServiceRouter> {
+    match resolved {
+        ResolvedDatapath::Iptables => Arc::new(IptablesRouter::new()),
+        ResolvedDatapath::Ipvs => Arc::new(IpvsRouter::new()),
+        ResolvedDatapath::ComputeOnly => Arc::new(FakeRouter::new()),
+    }
+}
+
 // `make_scheduling_strategy` returns `Result<Box<dyn SchedulingStrategy>,
 // SchedulerError>`; the boxed strategy is unwrapped fallibly in
 // `start_inner` (typed error for unimplemented strategies) and handed to
@@ -1153,9 +1203,10 @@ mod tests {
             node.get("spec").unwrap().get("unschedulable").unwrap(),
             false
         );
-        // Drivers: 9 reconcilers (deployment, replicaset, statefulset,
-        // daemonset, job, endpoints, gc, namespace, crd) + scheduler + kubelet = 11.
-        assert_eq!(rt.drivers.len(), 11);
+        // Drivers: 10 reconcilers (deployment, replicaset, statefulset,
+        // daemonset, job, endpoints, service_routing, gc, namespace, crd)
+        // + scheduler + kubelet = 12.
+        assert_eq!(rt.drivers.len(), 12);
         rt.shutdown().await.unwrap();
     }
 
@@ -1207,6 +1258,52 @@ mod tests {
             alloc.get("memory").and_then(|m| m.as_str()).is_some(),
             "allocatable.memory must be set; node={node:#}"
         );
+        rt.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn make_service_router_dispatches_by_resolved_datapath() {
+        // The typed backend dispatch: each ResolvedDatapath arm maps to the
+        // matching ServiceRouter implementation (by stable backend name).
+        assert_eq!(
+            make_service_router(ResolvedDatapath::Iptables).name(),
+            "iptables"
+        );
+        assert_eq!(make_service_router(ResolvedDatapath::Ipvs).name(), "ipvs");
+        assert_eq!(
+            make_service_router(ResolvedDatapath::ComputeOnly).name(),
+            "fake"
+        );
+    }
+
+    #[test]
+    fn datapath_auto_selects_compute_only_off_linux() {
+        // The platform-selection contract, exercised through the config
+        // resolve + backend construction the runtime uses — tested with an
+        // explicit platform arg (not cfg!): Auto off-Linux is compute-only
+        // (so a Darwin dev host never shells to iptables), Auto on Linux
+        // installs the iptables kernel datapath.
+        let mode = engenho_config::DatapathMode::Auto;
+        assert_eq!(
+            make_service_router(mode.resolve(false)).name(),
+            "fake",
+            "Auto off-Linux must be the compute-only FakeRouter"
+        );
+        assert_eq!(
+            make_service_router(mode.resolve(true)).name(),
+            "iptables",
+            "Auto on Linux installs the iptables kernel datapath"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_service_routing_drops_one_driver() {
+        // Gating works: turning off enable.service_routing removes exactly
+        // one spawned driver (12 → 11).
+        let mut cfg = ephemeral_test_config();
+        cfg.controllers.enable.service_routing = false;
+        let rt = Runtime::start(cfg).await.unwrap();
+        assert_eq!(rt.drivers.len(), 11);
         rt.shutdown().await.unwrap();
     }
 }
