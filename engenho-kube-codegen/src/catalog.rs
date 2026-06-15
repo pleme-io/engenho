@@ -379,4 +379,41 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         opaque: true,
         subresources: &[],
     },
+    // ── admissionregistration.k8s.io/v1 — dynamic admission config ──────
+    //
+    // Both webhook-configuration kinds are CLUSTER-SCOPED, opaque JSON (no
+    // vendored schema / typed struct today — they are stored + read by the
+    // apiserver's webhook-admission plugin as plain JSON). Serving them makes
+    // `kubectl apply -f mutatingwebhookconfiguration.yaml` land a config the
+    // `WebhookAdmissionPlugin` then dispatches on the write path. Vendoring the
+    // admissionregistration schema doc + typed structs is DEFERRED (apply works;
+    // only `kubectl explain mutatingwebhookconfiguration` needs the schema doc).
+    KindEntry {
+        kind: "MutatingWebhookConfiguration",
+        openapi_key: "",
+        group: "admissionregistration.k8s.io",
+        version: "v1",
+        resource: "mutatingwebhookconfigurations",
+        cluster_scoped: true,
+        module: "",
+        short_names: &[],
+        singular: "mutatingwebhookconfiguration",
+        categories: &["api-extensions"],
+        opaque: true,
+        subresources: &[],
+    },
+    KindEntry {
+        kind: "ValidatingWebhookConfiguration",
+        openapi_key: "",
+        group: "admissionregistration.k8s.io",
+        version: "v1",
+        resource: "validatingwebhookconfigurations",
+        cluster_scoped: true,
+        module: "",
+        short_names: &[],
+        singular: "validatingwebhookconfiguration",
+        categories: &["api-extensions"],
+        opaque: true,
+        subresources: &[],
+    },
 ];

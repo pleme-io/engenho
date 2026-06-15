@@ -30,6 +30,9 @@ engenho-substrate  = { workspace = true }
 # hand-rolled fork. Same crate engenho-types already re-exports FailureKind from.
 shigoto-types      = { workspace = true }
 blake3             = "1"
+# base64 decode of a mutating webhook's RFC6902 JSONPatch response (the
+# AdmissionReview v1 wire carries the patch base64-encoded).
+base64             = "0.22"
 
 [dev-dependencies]
 proptest = "1"
