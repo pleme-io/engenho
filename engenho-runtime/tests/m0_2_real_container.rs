@@ -473,3 +473,145 @@ async fn deployment_runs_a_real_podman_container_then_cleans_up() {
     // `cleanup` Drop runs here (best-effort rm -f; container already gone).
     drop(cleanup);
 }
+
+/// A Namespace + a busybox Deployment in that NON-default namespace.
+fn namespace_body(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": { "name": name }
+    })
+}
+
+// =====================================================================
+// The non-default-namespace peer (Part A item 4)
+// =====================================================================
+
+/// The real-container peer of `m0_6_namespaced_reconcile.rs`: prove the
+/// FULL chain (Deployment → RS → Pod → kubelet → real podman container)
+/// lands in a NON-default namespace, and that the deterministic container
+/// name carries that namespace (`<ns>_<pod>_<container>` =
+/// `team-c_<pod>_main`, NOT `default_…`). Regression guard for the
+/// namespace-propagation bug at the REAL-runtime layer. Same `#[ignore]`
+/// gating as the default-namespace test (needs podman + cached busybox +
+/// REGISTRY_AUTH_FILE).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-container: needs podman + cached busybox + REGISTRY_AUTH_FILE"]
+async fn deployment_in_nondefault_namespace_runs_a_real_container() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _authfile = set_empty_registry_auth(tmp.path());
+    let ns = "team-c";
+
+    let dep_name = format!(
+        "m0-2-ns-bb-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    let mut cleanup = PodmanCleanup::new();
+
+    let rt = Runtime::start(durable_podman_config(tmp.path()))
+        .await
+        .expect("Runtime boots with Podman backend");
+    let addr = rt.local_addr();
+    let client = reqwest::Client::new();
+
+    // POST the Namespace then the Deployment INTO it.
+    let ns_resp = client
+        .post(format!("http://{addr}/api/v1/namespaces"))
+        .json(&namespace_body(ns))
+        .send()
+        .await
+        .expect("POST namespace");
+    assert_eq!(ns_resp.status(), reqwest::StatusCode::CREATED);
+
+    let resp = client
+        .post(format!("http://{addr}/apis/apps/v1/namespaces/{ns}/deployments"))
+        .json(&busybox_deployment_body(&dep_name))
+        .send()
+        .await
+        .expect("POST deployment");
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    let dep_uid = created
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|u| u.as_str())
+        .expect("deployment uid")
+        .to_string();
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    const INTERVAL: Duration = Duration::from_millis(250);
+
+    // RS in team-c (NOT default).
+    let rs = poll_until(TIMEOUT, INTERVAL, || async {
+        let items = http_list(&client, addr, &format!("/apis/apps/v1/namespaces/{ns}/replicasets")).await;
+        items.into_iter().find(|r| is_owned_by(r, &dep_uid))
+    })
+    .await
+    .expect("ReplicaSet created in team-c");
+    assert_eq!(
+        rs.get("metadata").and_then(|m| m.get("namespace")).and_then(|n| n.as_str()),
+        Some(ns),
+        "RS must carry metadata.namespace=team-c"
+    );
+    let rs_uid = rs
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|u| u.as_str())
+        .expect("RS uid")
+        .to_string();
+
+    // Pod in team-c.
+    let pod = poll_until(TIMEOUT, INTERVAL, || async {
+        let items = http_list(&client, addr, &format!("/api/v1/namespaces/{ns}/pods")).await;
+        items.into_iter().find(|p| is_owned_by(p, &rs_uid))
+    })
+    .await
+    .expect("Pod created in team-c");
+    assert_eq!(
+        pod.get("metadata").and_then(|m| m.get("namespace")).and_then(|n| n.as_str()),
+        Some(ns),
+        "Pod must carry metadata.namespace=team-c"
+    );
+    let pod_name = pod
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(|n| n.as_str())
+        .expect("pod name")
+        .to_string();
+
+    // The deterministic container name carries the team-c namespace.
+    let container_name = format!("{ns}_{pod_name}_main");
+    cleanup.track(&container_name);
+
+    // NEGATIVELY: nothing leaked into `default`.
+    let default_pods = http_list(&client, addr, "/api/v1/namespaces/default/pods").await;
+    assert!(default_pods.is_empty(), "no Pod may land in default");
+
+    let running = poll_until_blocking(TIMEOUT, INTERVAL, || {
+        podman_container_exists(&container_name) && podman_container_running(&container_name)
+    });
+    assert!(
+        running,
+        "expected a real podman container named {container_name} (namespace-prefixed) Running"
+    );
+
+    // Teardown: delete the Deployment + Pod, await the container gone.
+    let _ = client
+        .delete(format!("http://{addr}/apis/apps/v1/namespaces/{ns}/deployments/{dep_name}"))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("http://{addr}/api/v1/namespaces/{ns}/pods/{pod_name}"))
+        .send()
+        .await;
+    let gone = poll_until_blocking(Duration::from_secs(30), INTERVAL, || {
+        !podman_container_exists(&container_name)
+    });
+    assert!(gone, "container {container_name} should be removed after delete");
+
+    rt.shutdown().await.expect("graceful shutdown");
+    drop(cleanup);
+}

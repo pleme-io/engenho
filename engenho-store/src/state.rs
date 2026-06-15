@@ -426,6 +426,20 @@ impl ResourceCatalog {
                     );
                     meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
                 }
+                // Preserve creationTimestamp across updates (K8s: a create-
+                // time, IMMUTABLE field — like uid). A Put of a fresh body
+                // that drops the field (controllers re-Put a rebuilt object)
+                // must NOT lose it: thread the prior object's value back in.
+                // First create leaves whatever the (boundary-stamped) body
+                // carries.
+                let prior_creation = prior_entry
+                    .as_ref()
+                    .and_then(|(v, _)| v.get("metadata"))
+                    .and_then(|m| m.get("creationTimestamp"))
+                    .cloned();
+                if let Some(prior_creation) = prior_creation {
+                    meta_obj.insert("creationTimestamp".to_string(), prior_creation);
+                }
             }
         }
 
@@ -1132,6 +1146,16 @@ fn stamp_object_metadata(
             version_meta.create_revision
         );
         meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
+    }
+    // Preserve creationTimestamp across updates (K8s create-time IMMUTABLE
+    // field — mirrors the uid preservation above + the inline `apply_put`
+    // block). A re-Put that dropped the field must not lose it.
+    let prior_creation = prior_value
+        .and_then(|v| v.get("metadata"))
+        .and_then(|m| m.get("creationTimestamp"))
+        .cloned();
+    if let Some(prior_creation) = prior_creation {
+        meta_obj.insert("creationTimestamp".to_string(), prior_creation);
     }
 }
 

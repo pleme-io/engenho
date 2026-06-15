@@ -44,6 +44,7 @@ use engenho_store::{StoreMesh, command::ResourceCommand, resource::ResourceKey};
 use serde_json::Value;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport, ReconcileResult};
+use crate::create_stamp::{CreateClock, stamp_create_timestamp, wall_clock};
 use crate::error::ControllerError;
 use crate::meta::ObjectMeta;
 use crate::owner::is_owned_by;
@@ -151,6 +152,15 @@ pub trait OwnedChildrenReconciler: Send + Sync {
     /// Optional namespace scope (`None` = all namespaces).
     fn namespace(&self) -> Option<&str>;
 
+    /// The boundary clock the blanket reads ONCE per created child to
+    /// freeze `metadata.creationTimestamp` into the replicated `Put`
+    /// (see [`crate::create_stamp`]). Defaults to the production
+    /// wall-clock; unit tests override it to pin a fixed instant so the
+    /// reconcile stays deterministic + the stamped bytes are assertable.
+    fn create_clock(&self) -> CreateClock {
+        wall_clock
+    }
+
     /// The ONLY per-controller child-reconcile logic: given one live
     /// parent + the owned children gathered BEFORE this delta, return
     /// the typed child delta (creates / evictions / scales). The blanket
@@ -239,8 +249,20 @@ impl<T: OwnedChildrenReconciler> Controller for T {
 
             // S5 — the ONLY per-controller child reconcile. Propose each
             // typed command in order, bumping objects_changed per commit.
+            //
+            // creationTimestamp boundary stamp (★★ determinism): a `Put`
+            // of a key NOT yet in the store is a CREATE — freeze
+            // `metadata.creationTimestamp` from ONE clock read HERE (the
+            // leader boundary, before propose) so every Raft replica
+            // replays identical bytes. An update-shaped `Put` (key exists)
+            // is left untouched: the field is create-time, never bumped.
             let delta = self.reconcile_one(parent_value, &owned).await?;
-            for command in delta.commands {
+            for mut command in delta.commands {
+                if let ResourceCommand::Put { key, value, .. } = &mut command {
+                    if store.get(key).await.is_none() {
+                        stamp_create_timestamp(value, self.create_clock());
+                    }
+                }
                 store.propose(command).await?;
                 report.objects_changed += 1;
             }
@@ -270,6 +292,169 @@ impl<T: OwnedChildrenReconciler> Controller for T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engenho_store::command::{Reason, ResourceCommand};
+    use engenho_store::{InProcessRouter, default_config};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const FIXED_TS: &str = "2026-06-14T12:00:00Z";
+    fn fixed_clock() -> String {
+        FIXED_TS.to_string()
+    }
+
+    async fn test_store() -> Arc<StoreMesh> {
+        let router = InProcessRouter::new();
+        let cfg = default_config("controllers-owned-children").unwrap();
+        let store = Arc::new(
+            StoreMesh::start(1, "in-process://1".into(), router, cfg)
+                .await
+                .unwrap(),
+        );
+        store.initialize_singleton().await.unwrap();
+        assert!(store.wait_for_leadership(Duration::from_secs(3)).await);
+        store
+    }
+
+    /// A minimal owned-children controller: a "Widget" parent owns one
+    /// "Gadget" child it creates (a single child per parent, never
+    /// updated). The fixed clock proves the blanket stamps
+    /// creationTimestamp on the CREATE Put, frozen at the boundary.
+    struct WidgetReconciler {
+        store: Arc<StoreMesh>,
+    }
+
+    #[async_trait]
+    impl OwnedChildrenReconciler for WidgetReconciler {
+        fn name(&self) -> &'static str {
+            "widget"
+        }
+        fn parent_gvk(&self) -> ParentGvk {
+            ParentGvk::new("demo", "v1", "Widget", "demo/v1")
+        }
+        fn child_kinds(&self) -> &'static [ChildKind] {
+            const CK: &[ChildKind] = &[ChildKind::new("demo", "v1", "Gadget")];
+            CK
+        }
+        fn store(&self) -> &StoreMesh {
+            &self.store
+        }
+        fn namespace(&self) -> Option<&str> {
+            None
+        }
+        fn create_clock(&self) -> CreateClock {
+            fixed_clock
+        }
+        async fn reconcile_one(
+            &self,
+            parent: &Value,
+            owned: &[(ResourceKey, Value)],
+        ) -> Result<ReconcileDelta, ControllerError> {
+            if !owned.is_empty() {
+                return Ok(ReconcileDelta::none());
+            }
+            let ns = parent.namespace().unwrap_or("default").to_string();
+            let owner = crate::owner::owner_ref_for(parent, "demo/v1", "Widget").unwrap();
+            let mut child = json!({
+                "kind": "Gadget", "apiVersion": "demo/v1",
+                "metadata": {"name": "g", "namespace": ns}
+            });
+            crate::owner::set_owner_reference(&mut child, owner);
+            let key = ResourceKey::namespaced("demo", "v1", "Gadget", &ns, "g");
+            Ok(ReconcileDelta::from_commands(vec![ResourceCommand::Put {
+                key,
+                value: child,
+                expected: None,
+                reason: Reason::Controller,
+            }]))
+        }
+        fn compute_status(
+            &self,
+            _parent: &Value,
+            _owned_after: &[(ResourceKey, Value)],
+        ) -> Option<Value> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn blanket_stamps_creation_timestamp_on_created_child() {
+        let store = test_store().await;
+        // Seed a parent Widget (the apiserver path would stamp its uid; here
+        // we propose it as Operator so the store mints uid deterministically).
+        let parent_key = ResourceKey::namespaced("demo", "v1", "Widget", "team-x", "w");
+        store
+            .propose(ResourceCommand::put(
+                parent_key,
+                json!({"kind": "Widget", "apiVersion": "demo/v1",
+                       "metadata": {"name": "w", "namespace": "team-x"}}),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+
+        let c = WidgetReconciler { store: store.clone() };
+        let out = c.tick().await.unwrap();
+        assert!(out.objects_changed >= 1, "the child was created");
+
+        // The created child carries the FROZEN creationTimestamp.
+        let child = store
+            .get(&ResourceKey::namespaced("demo", "v1", "Gadget", "team-x", "g"))
+            .await
+            .expect("child Gadget exists");
+        assert_eq!(
+            child.get("metadata").unwrap().get("creationTimestamp").unwrap(),
+            FIXED_TS,
+            "controller-created child must carry the boundary-frozen creationTimestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn blanket_does_not_bump_creation_timestamp_on_subsequent_ticks() {
+        let store = test_store().await;
+        let parent_key = ResourceKey::namespaced("demo", "v1", "Widget", "team-y", "w");
+        store
+            .propose(ResourceCommand::put(
+                parent_key,
+                json!({"kind": "Widget", "apiVersion": "demo/v1",
+                       "metadata": {"name": "w", "namespace": "team-y"}}),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+
+        let c = WidgetReconciler { store: store.clone() };
+        // First tick creates the child + stamps the timestamp.
+        c.tick().await.unwrap();
+        let key = ResourceKey::namespaced("demo", "v1", "Gadget", "team-y", "g");
+        let ts1 = store
+            .get(&key)
+            .await
+            .unwrap()
+            .get("metadata")
+            .unwrap()
+            .get("creationTimestamp")
+            .unwrap()
+            .clone();
+        assert_eq!(ts1, FIXED_TS);
+
+        // Several more ticks: the child already exists (reconcile_one returns
+        // none), and even if a Put were re-issued the store-get-is-none guard
+        // prevents a re-stamp. The timestamp is STABLE — never bumped.
+        for _ in 0..3 {
+            c.tick().await.unwrap();
+        }
+        let ts2 = store
+            .get(&key)
+            .await
+            .unwrap()
+            .get("metadata")
+            .unwrap()
+            .get("creationTimestamp")
+            .unwrap()
+            .clone();
+        assert_eq!(ts1, ts2, "creationTimestamp must be stable across reconciles");
+    }
 
     #[test]
     fn parent_gvk_carries_four_fields() {
