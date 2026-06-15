@@ -16,9 +16,9 @@ use engenho_types::generated_v1_34::rbac_v1::{
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_config::{ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind};
 use engenho_controllers::{
-    CrdController, DeploymentController, DynamicHandlerSink, EndpointsController, GcController,
-    JobController, KindFilter, NamespaceController, ReplicaSetController, StatefulSetController,
-    WatchDriver, WatchDriverConfig,
+    CrdController, DaemonSetController, DeploymentController, DynamicHandlerSink,
+    EndpointsController, GcController, JobController, KindFilter, NamespaceController,
+    ReplicaSetController, StatefulSetController, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode},
 };
 use engenho_kubelet::config_bridge::KubeletBackendKind;
@@ -990,6 +990,13 @@ fn spawn_drivers(
             WatchDriver::new(c, store.clone(), driver_config(&["StatefulSet", "Pod"])).spawn(),
         );
     }
+    if enable.daemonset {
+        let c = DaemonSetController::new(store.clone(), ns.clone());
+        handles.push(
+            WatchDriver::new(c, store.clone(), driver_config(&["DaemonSet", "Pod", "Node"]))
+                .spawn(),
+        );
+    }
     if enable.job {
         let c = JobController::new(store.clone(), ns.clone());
         handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Job", "Pod"])).spawn());
@@ -1131,9 +1138,9 @@ mod tests {
             node.get("spec").unwrap().get("unschedulable").unwrap(),
             false
         );
-        // Drivers: 8 reconcilers (deployment, replicaset, statefulset,
-        // job, endpoints, gc, namespace, crd) + scheduler + kubelet = 10.
-        assert_eq!(rt.drivers.len(), 10);
+        // Drivers: 9 reconcilers (deployment, replicaset, statefulset,
+        // daemonset, job, endpoints, gc, namespace, crd) + scheduler + kubelet = 11.
+        assert_eq!(rt.drivers.len(), 11);
         rt.shutdown().await.unwrap();
     }
 

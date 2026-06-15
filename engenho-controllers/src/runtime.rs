@@ -189,6 +189,7 @@ mod tests {
                 replicaset: true,
                 deployment: true,
                 statefulset: true,
+                daemonset: true,
                 job: true,
                 endpoints: true,
                 gc: true,

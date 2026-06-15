@@ -31,6 +31,12 @@ pub struct ControllerEnable {
     /// StatefulSet → ordered Pod controller.
     #[serde(default = "default_true")]
     pub statefulset: bool,
+    /// DaemonSet → one node-pinned Pod per schedulable node.
+    /// `#[serde(default)]` is REQUIRED (the struct is
+    /// `deny_unknown_fields`) so pre-existing operator YAML written
+    /// before this flag still deserializes (defaults on).
+    #[serde(default = "default_true")]
+    pub daemonset: bool,
     /// Job → Pod-to-completion controller.
     #[serde(default = "default_true")]
     pub job: bool,
@@ -67,6 +73,7 @@ impl TieredConfig for ControllersConfig {
                 replicaset: false,
                 deployment: false,
                 statefulset: false,
+                daemonset: false,
                 job: false,
                 endpoints: false,
                 gc: false,
@@ -85,6 +92,7 @@ impl TieredConfig for ControllersConfig {
                 replicaset: true,
                 deployment: true,
                 statefulset: true,
+                daemonset: true,
                 job: true,
                 endpoints: true,
                 gc: true,
