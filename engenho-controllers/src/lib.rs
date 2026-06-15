@@ -32,6 +32,7 @@ pub mod admission;
 pub mod attestation;
 pub mod build_backend_roceiro;
 pub mod controller;
+pub mod create_stamp;
 pub mod crd;
 pub mod crd_validator;
 pub mod deployment;
@@ -77,6 +78,9 @@ pub use attestation::{
 pub use build_backend_roceiro::BuildBackendRoceiro;
 pub use controller::{
     Controller, ReconcileOutcome, ReconcileReport, ReconcileResult,
+};
+pub use create_stamp::{
+    CreateClock, creation_timestamp_is_unset, stamp_create_timestamp, wall_clock,
 };
 pub use crd::{
     CrdController, CrdEntry, CrdError, CrdHandlerSpec, CrdNames, CrdScope, CrdSpec, CrdVersion,

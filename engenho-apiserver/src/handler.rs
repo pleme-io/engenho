@@ -1003,6 +1003,20 @@ impl ResourceHandler for StoreBackedHandler {
         // store-apply path). kubectl AGE then renders a real duration
         // instead of `<unknown>`.
         stamp_creation_timestamp(&mut body);
+        // ── metadata.namespace stamp (K8s namespaced-object invariant). ──
+        // A namespaced object's `metadata.namespace` ALWAYS reflects the
+        // namespace it lives in — upstream k8s defaults it from the request
+        // namespace at create (and rejects a body whose metadata.namespace
+        // disagrees with the URL). Without this, the stored body carried the
+        // KEY's namespace but NO `metadata.namespace`, so a controller that
+        // reads `metadata.namespace` (the deployment→RS / RS→Pod namespace
+        // inheritance) saw `None` and fell back to "default" — the workload
+        // landed in the wrong namespace. Stamp it from the request namespace
+        // (the `self.namespaced` handlers only; cluster-scoped objects have
+        // no namespace).
+        if let Some(ns) = namespace {
+            stamp_namespace(&mut body, ns);
+        }
         // ── Namespace lifecycle stamp (Active + kubernetes finalizer). ──
         // Real k8s seeds these via the namespace-lifecycle admission plugin;
         // engenho stamps them at create so a Namespace is born Active with
@@ -1635,6 +1649,29 @@ fn stamp_creation_timestamp(body: &mut Value) {
     }
 }
 
+/// Stamp `metadata.namespace` from the request (URL) namespace on a
+/// namespaced create. The URL namespace is the routing authority (the
+/// `ResourceKey` is already built from it); upstream k8s likewise defaults
+/// `metadata.namespace` from the request namespace, so the stored body's
+/// `metadata.namespace` always reflects where the object lives. Idempotent:
+/// a body already carrying the same namespace is unchanged; a body carrying
+/// a DIFFERENT one is corrected to the URL authority (k8s would 400, but
+/// correcting-to-authority keeps the key + body in agreement and never
+/// strands a workload in the wrong namespace). Pure JSON mutation.
+fn stamp_namespace(body: &mut Value, namespace: &str) {
+    if let Some(obj) = body.as_object_mut() {
+        let metadata = obj
+            .entry("metadata".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            meta_obj.insert(
+                "namespace".to_string(),
+                Value::String(namespace.to_string()),
+            );
+        }
+    }
+}
+
 /// `true` iff the `creationTimestamp` slot is effectively UNSET and should
 /// be stamped: absent, JSON `null`, an empty string, OR an EMPTY object
 /// `{}`. The empty-object case is load-bearing: the kubectl typed clientset
@@ -1763,5 +1800,65 @@ mod tests {
         };
         let err = gone_to_api_error(gone);
         assert!(matches!(err, ApiError::Gone(_)));
+    }
+
+    // ── metadata.namespace stamp (K8s namespaced-object invariant) ────────
+
+    #[test]
+    fn stamp_namespace_sets_from_request_when_absent() {
+        // A namespaced create whose body carries NO metadata.namespace must
+        // be stamped from the request (URL) namespace — the fix that
+        // unblocked controller namespace inheritance.
+        let mut body = serde_json::json!({"metadata": {"name": "web"}});
+        stamp_namespace(&mut body, "team-x");
+        assert_eq!(
+            body.get("metadata").unwrap().get("namespace").unwrap(),
+            "team-x"
+        );
+    }
+
+    #[test]
+    fn stamp_namespace_creates_metadata_when_missing() {
+        let mut body = serde_json::json!({"kind": "Deployment"});
+        stamp_namespace(&mut body, "team-x");
+        assert_eq!(
+            body.get("metadata").unwrap().get("namespace").unwrap(),
+            "team-x"
+        );
+    }
+
+    #[test]
+    fn stamp_namespace_corrects_to_url_authority() {
+        // The URL is the routing authority (the ResourceKey is built from
+        // it); a body claiming a DIFFERENT namespace is corrected so the key
+        // + body never disagree (never strands a workload in the wrong ns).
+        let mut body = serde_json::json!({"metadata": {"name": "web", "namespace": "wrong"}});
+        stamp_namespace(&mut body, "team-x");
+        assert_eq!(
+            body.get("metadata").unwrap().get("namespace").unwrap(),
+            "team-x"
+        );
+    }
+
+    #[test]
+    fn stamp_creation_timestamp_is_idempotent() {
+        // Stamped when absent; never bumped when present.
+        let mut body = serde_json::json!({"metadata": {"name": "x"}});
+        stamp_creation_timestamp(&mut body);
+        let first = body
+            .get("metadata")
+            .unwrap()
+            .get("creationTimestamp")
+            .unwrap()
+            .clone();
+        assert!(first.as_str().unwrap().ends_with('Z'));
+        stamp_creation_timestamp(&mut body);
+        let second = body
+            .get("metadata")
+            .unwrap()
+            .get("creationTimestamp")
+            .unwrap()
+            .clone();
+        assert_eq!(first, second, "creationTimestamp must not be bumped");
     }
 }

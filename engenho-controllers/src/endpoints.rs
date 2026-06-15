@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::create_stamp::{CreateClock, stamp_create_timestamp, wall_clock};
 use crate::error::ControllerError;
 use crate::meta::ObjectMeta;
 use crate::owner::{owner_ref_for, set_owner_reference};
@@ -33,12 +34,32 @@ use crate::selector::{matches_labels, service_selector};
 pub struct EndpointsController {
     store: Arc<StoreMesh>,
     namespace: Option<String>,
+    /// Boundary clock read ONCE per created Endpoints object to freeze
+    /// `metadata.creationTimestamp` into the replicated `Put` (see
+    /// [`crate::create_stamp`]). Production = [`wall_clock`]; unit tests
+    /// pin a fixed instant via [`Self::with_clock`].
+    create_clock: CreateClock,
 }
 
 impl EndpointsController {
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
-        Self { store, namespace }
+        Self {
+            store,
+            namespace,
+            create_clock: wall_clock,
+        }
+    }
+
+    /// Construct with a pinned [`Clock`] — the unit-test determinism seam
+    /// for the `creationTimestamp` boundary stamp.
+    #[must_use]
+    pub fn with_clock(store: Arc<StoreMesh>, namespace: Option<String>, clock: CreateClock) -> Self {
+        Self {
+            store,
+            namespace,
+            create_clock: clock,
+        }
     }
 
     /// Pod's IP from `status.podIP`. Returns None for unbound
@@ -164,6 +185,11 @@ impl Controller for EndpointsController {
                 if subsets_equivalent(current, &new_endpoints) {
                     continue;
                 }
+            } else {
+                // CREATE (no existing Endpoints): freeze creationTimestamp
+                // from ONE boundary clock read so kubectl AGE renders. An
+                // UPDATE (existing) is left untouched — never bumped.
+                stamp_create_timestamp(&mut new_endpoints, self.create_clock);
             }
 
             debug!(
@@ -329,5 +355,100 @@ mod tests {
             }
         }
         assert_eq!(Fake.name(), "endpoints");
+    }
+
+    // ── creationTimestamp on controller-created Endpoints (Part B) ────────
+
+    const FIXED_TS: &str = "2026-06-14T09:00:00Z";
+    fn fixed_clock() -> String {
+        FIXED_TS.to_string()
+    }
+
+    async fn live_store() -> Arc<StoreMesh> {
+        use engenho_store::{InProcessRouter, default_config};
+        use std::time::Duration;
+        let router = InProcessRouter::new();
+        let cfg = default_config("controllers-endpoints").unwrap();
+        let store = Arc::new(
+            StoreMesh::start(1, "in-process://1".into(), router, cfg)
+                .await
+                .unwrap(),
+        );
+        store.initialize_singleton().await.unwrap();
+        assert!(store.wait_for_leadership(Duration::from_secs(3)).await);
+        store
+    }
+
+    #[tokio::test]
+    async fn created_endpoints_carries_frozen_creation_timestamp() {
+        let store = live_store().await;
+        // A Service with a selector + a ready, ip-bearing Pod matching it.
+        store
+            .propose(ResourceCommand::put(
+                ResourceKey::namespaced("", "v1", "Service", "ns1", "svc"),
+                json!({"kind": "Service", "apiVersion": "v1",
+                       "metadata": {"name": "svc", "namespace": "ns1"},
+                       "spec": {"selector": {"app": "x"},
+                                "ports": [{"port": 80, "targetPort": 80}]}}),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+        store
+            .propose(ResourceCommand::put(
+                ResourceKey::namespaced("", "v1", "Pod", "ns1", "p"),
+                json!({"kind": "Pod", "apiVersion": "v1",
+                       "metadata": {"name": "p", "namespace": "ns1", "labels": {"app": "x"}},
+                       "status": {"podIP": "10.0.0.1",
+                                  "conditions": [{"type": "Ready", "status": "True"}]}}),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+
+        let c = EndpointsController::with_clock(store.clone(), None, fixed_clock);
+        c.tick().await.unwrap();
+
+        let ep = store
+            .get(&ResourceKey::namespaced("", "v1", "Endpoints", "ns1", "svc"))
+            .await
+            .expect("Endpoints created");
+        assert_eq!(
+            ep.get("metadata").unwrap().get("creationTimestamp").unwrap(),
+            FIXED_TS,
+            "controller-created Endpoints must carry the frozen creationTimestamp"
+        );
+
+        // A subsequent tick that re-writes the subsets (e.g. a new pod) must
+        // NOT bump creationTimestamp — it is preserved from the prior object.
+        store
+            .propose(ResourceCommand::put(
+                ResourceKey::namespaced("", "v1", "Pod", "ns1", "p2"),
+                json!({"kind": "Pod", "apiVersion": "v1",
+                       "metadata": {"name": "p2", "namespace": "ns1", "labels": {"app": "x"}},
+                       "status": {"podIP": "10.0.0.2",
+                                  "conditions": [{"type": "Ready", "status": "True"}]}}),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+        // Use a DIFFERENT clock to prove the update path never stamps.
+        let c2 = EndpointsController::with_clock(store.clone(), None, || {
+            "2099-01-01T00:00:00Z".to_string()
+        });
+        c2.tick().await.unwrap();
+        let ep2 = store
+            .get(&ResourceKey::namespaced("", "v1", "Endpoints", "ns1", "svc"))
+            .await
+            .unwrap();
+        // The Endpoints was updated (now 2 addresses) but the timestamp held.
+        // NOTE: the store preserves metadata.creationTimestamp across an
+        // update Put (it carries the prior object's value); the controller's
+        // create-only stamp simply never fires on the update path.
+        assert_eq!(
+            ep2.get("metadata").unwrap().get("creationTimestamp").unwrap(),
+            FIXED_TS,
+            "creationTimestamp must be stable across the update (never bumped)"
+        );
     }
 }
