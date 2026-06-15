@@ -440,33 +440,41 @@ fn newly_added_conformance_kinds_carry_correct_metadata() {
     // values discovery folds into `/api` + `/apis`, which is what lets
     // `kubectl get <short>` resolve. Irregular plurals + cluster scope are the
     // failure-prone fields, so they're pinned explicitly.
+    //
+    // The `opaque` column tracks the M0.0.4 typed-promotion: the conformance
+    // groups whose OpenAPI is now vendored (batch / networking / policy /
+    // storage / scheduling / coordination / node / autoscaling) flipped from
+    // opaque → typed (a `/openapi/v3` schema + `kubectl explain` + validated
+    // apply). The groups still without a vendored schema (apiregistration,
+    // flowcontrol, …) stay opaque.
     struct Expect {
         kind: &'static str,
         plural: &'static str,
         namespaced: bool,
         short_names: &'static [&'static str],
+        opaque: bool,
     }
     let cases = [
-        Expect { kind: "CronJob", plural: "cronjobs", namespaced: true, short_names: &["cj"] },
-        Expect { kind: "HorizontalPodAutoscaler", plural: "horizontalpodautoscalers", namespaced: true, short_names: &["hpa"] },
-        Expect { kind: "PodDisruptionBudget", plural: "poddisruptionbudgets", namespaced: true, short_names: &["pdb"] },
-        Expect { kind: "Ingress", plural: "ingresses", namespaced: true, short_names: &["ing"] },
-        Expect { kind: "NetworkPolicy", plural: "networkpolicies", namespaced: true, short_names: &["netpol"] },
-        Expect { kind: "StorageClass", plural: "storageclasses", namespaced: false, short_names: &["sc"] },
-        Expect { kind: "CSIStorageCapacity", plural: "csistoragecapacities", namespaced: true, short_names: &[] },
-        Expect { kind: "PriorityClass", plural: "priorityclasses", namespaced: false, short_names: &["pc"] },
-        Expect { kind: "Lease", plural: "leases", namespaced: true, short_names: &[] },
-        Expect { kind: "CertificateSigningRequest", plural: "certificatesigningrequests", namespaced: false, short_names: &["csr"] },
-        Expect { kind: "APIService", plural: "apiservices", namespaced: false, short_names: &[] },
-        Expect { kind: "PriorityLevelConfiguration", plural: "prioritylevelconfigurations", namespaced: false, short_names: &[] },
+        Expect { kind: "CronJob", plural: "cronjobs", namespaced: true, short_names: &["cj"], opaque: false },
+        Expect { kind: "HorizontalPodAutoscaler", plural: "horizontalpodautoscalers", namespaced: true, short_names: &["hpa"], opaque: false },
+        Expect { kind: "PodDisruptionBudget", plural: "poddisruptionbudgets", namespaced: true, short_names: &["pdb"], opaque: false },
+        Expect { kind: "Ingress", plural: "ingresses", namespaced: true, short_names: &["ing"], opaque: false },
+        Expect { kind: "NetworkPolicy", plural: "networkpolicies", namespaced: true, short_names: &["netpol"], opaque: false },
+        Expect { kind: "StorageClass", plural: "storageclasses", namespaced: false, short_names: &["sc"], opaque: false },
+        Expect { kind: "CSIStorageCapacity", plural: "csistoragecapacities", namespaced: true, short_names: &[], opaque: false },
+        Expect { kind: "PriorityClass", plural: "priorityclasses", namespaced: false, short_names: &["pc"], opaque: false },
+        Expect { kind: "Lease", plural: "leases", namespaced: true, short_names: &[], opaque: false },
+        // Still opaque — no vendored OpenAPI for these groups yet.
+        Expect { kind: "CertificateSigningRequest", plural: "certificatesigningrequests", namespaced: false, short_names: &["csr"], opaque: true },
+        Expect { kind: "APIService", plural: "apiservices", namespaced: false, short_names: &[], opaque: true },
+        Expect { kind: "PriorityLevelConfiguration", plural: "prioritylevelconfigurations", namespaced: false, short_names: &[], opaque: true },
     ];
     for e in cases {
         let d = row(e.kind);
         assert_eq!(d.plural, e.plural, "{}: plural", e.kind);
         assert_eq!(d.namespaced, e.namespaced, "{}: namespaced", e.kind);
         assert_eq!(d.short_names, e.short_names, "{}: shortNames", e.kind);
-        // Every breadth-expansion kind is served OPAQUE (no vendored schema).
-        assert!(d.opaque, "{}: M0.0.4 breadth kinds are opaque", e.kind);
+        assert_eq!(d.opaque, e.opaque, "{}: opaque (typed-promotion state)", e.kind);
         // singular == lowercased kind (already a global invariant, re-pinned
         // here for the new rows specifically).
         assert_eq!(d.singular, e.kind.to_lowercase(), "{}: singular", e.kind);

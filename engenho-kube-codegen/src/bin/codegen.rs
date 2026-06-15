@@ -47,6 +47,14 @@ fn schema_path_for_group(schema_dir: &std::path::Path, group: &str) -> PathBuf {
         "" => "api__v1_openapi.json",
         "apps" => "apis__apps__v1_openapi.json",
         "rbac.authorization.k8s.io" => "apis__rbac.authorization.k8s.io__v1_openapi.json",
+        "batch" => "apis__batch__v1_openapi.json",
+        "networking.k8s.io" => "apis__networking.k8s.io__v1_openapi.json",
+        "policy" => "apis__policy__v1_openapi.json",
+        "storage.k8s.io" => "apis__storage.k8s.io__v1_openapi.json",
+        "scheduling.k8s.io" => "apis__scheduling.k8s.io__v1_openapi.json",
+        "coordination.k8s.io" => "apis__coordination.k8s.io__v1_openapi.json",
+        "node.k8s.io" => "apis__node.k8s.io__v1_openapi.json",
+        "autoscaling" => "apis__autoscaling__v2_openapi.json",
         other => panic!(
             "no vendored OpenAPI schema for group {other:?} — extend codegen::schema_path_for_group"
         ),

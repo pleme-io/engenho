@@ -123,6 +123,69 @@ pub struct AzureFileVolumeSource {
     pub share_name: String,
 }
 
+/// CSIDriverSpec is the specification of a CSIDriver.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CSIDriverSpec {
+    /// attachRequired indicates this CSI volume driver requires an attach operation (because it implements the CSI ControllerPublishVolume() method), and that the Kubernetes attach detach controller should call the attach volume interface which checks the volumeattachment status and waits until the volume is attached before proceeding to mounting. The CSI external-attacher coordinates with CSI volume driver and updates the volumeattachment status when the attach operation is complete. If the value is specified to false, the attach operation will be skipped. Otherwise the attach operation will be called.
+    #[serde(default, rename = "attachRequired", skip_serializing_if = "Option::is_none")]
+    pub attach_required: Option<bool>,
+    /// fsGroupPolicy defines if the underlying volume supports changing ownership and permission of the volume before being mounted. Refer to the specific FSGroupPolicy values for additional details.
+    #[serde(default, rename = "fsGroupPolicy", skip_serializing_if = "Option::is_none")]
+    pub fs_group_policy: Option<String>,
+    /// nodeAllocatableUpdatePeriodSeconds specifies the interval between periodic updates of the CSINode allocatable capacity for this driver. When set, both periodic updates and updates triggered by capacity-related failures are enabled. If not set, no updates occur (neither periodic nor upon detecting capacity-related failures), and the allocatable.count remains static. The minimum allowed value for this field is 10 seconds.
+    #[serde(default, rename = "nodeAllocatableUpdatePeriodSeconds", skip_serializing_if = "Option::is_none")]
+    pub node_allocatable_update_period_seconds: Option<i64>,
+    /// podInfoOnMount indicates this CSI volume driver requires additional pod information (like podName, podUID, etc.) during mount operations, if set to true. If set to false, pod information will not be passed on mount. Default is false.
+    #[serde(default, rename = "podInfoOnMount", skip_serializing_if = "Option::is_none")]
+    pub pod_info_on_mount: Option<bool>,
+    /// requiresRepublish indicates the CSI driver wants `NodePublishVolume` being periodically called to reflect any possible change in the mounted volume. This field defaults to false.
+    #[serde(default, rename = "requiresRepublish", skip_serializing_if = "Option::is_none")]
+    pub requires_republish: Option<bool>,
+    /// seLinuxMount specifies if the CSI driver supports "-o context" mount option.
+    #[serde(default, rename = "seLinuxMount", skip_serializing_if = "Option::is_none")]
+    pub se_linux_mount: Option<bool>,
+    /// storageCapacity indicates that the CSI volume driver wants pod scheduling to consider the storage capacity that the driver deployment will report by creating CSIStorageCapacity objects with capacity information, if set to true.
+    #[serde(default, rename = "storageCapacity", skip_serializing_if = "Option::is_none")]
+    pub storage_capacity: Option<bool>,
+    /// tokenRequests indicates the CSI driver needs pods' service account tokens it is mounting volume for to do necessary authentication. Kubelet will pass the tokens in VolumeContext in the CSI NodePublishVolume calls. The CSI driver should parse and validate the following VolumeContext: "csi.storage.k8s.io/serviceAccount.tokens": {
+    /// "<audience>": {
+    /// "token": <token>,
+    /// "expirationTimestamp": <expiration timestamp in RFC3339>,
+    /// },
+    /// ...
+    /// }
+    #[serde(default, rename = "tokenRequests", skip_serializing_if = "Vec::is_empty")]
+    pub token_requests: Vec<TokenRequest>,
+    /// volumeLifecycleModes defines what kind of volumes this CSI volume driver supports. The default if the list is empty is "Persistent", which is the usage defined by the CSI specification and implemented in Kubernetes via the usual PV/PVC mechanism.
+    #[serde(default, rename = "volumeLifecycleModes", skip_serializing_if = "Vec::is_empty")]
+    pub volume_lifecycle_modes: Vec<String>,
+}
+
+/// CSINodeDriver holds information about the specification of one CSI driver installed on a node
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CSINodeDriver {
+    /// allocatable represents the volume resources of a node that are available for scheduling. This field is beta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocatable: Option<VolumeNodeResources>,
+    /// name represents the name of the CSI driver that this object refers to. This MUST be the same name returned by the CSI GetPluginName() call for that driver.
+    #[serde(default)]
+    pub name: String,
+    /// nodeID of the node from the driver point of view. This field enables Kubernetes to communicate with storage systems that do not share the same nomenclature for nodes. For example, Kubernetes may refer to a given node as "node1", but the storage system may refer to the same node as "nodeA". When Kubernetes issues a command to the storage system to attach a volume to a specific node, it can use this field to refer to the node name using the ID that the storage system will understand, e.g. "nodeA" instead of "node1". This field is required.
+    #[serde(default, rename = "nodeID")]
+    pub node_id: String,
+    /// topologyKeys is the list of keys supported by the driver. When a driver is initialized on a cluster, it provides a set of topology keys that it understands (e.g. "company.com/zone", "company.com/region"). When a driver is initialized on a node, it provides the same topology keys along with values. Kubelet will expose these topology keys as labels on its own node object. When Kubernetes does topology aware provisioning, it can use this list to determine which labels it should retrieve from the node object and pass back to the driver. It is possible for different nodes to use different topology keys. This can be empty if driver does not support topology.
+    #[serde(default, rename = "topologyKeys", skip_serializing_if = "Vec::is_empty")]
+    pub topology_keys: Vec<String>,
+}
+
+/// CSINodeSpec holds information about the specification of all CSI drivers installed on a node
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CSINodeSpec {
+    /// drivers is a list of information of all CSI Drivers existing on a node. If all drivers in the list are uninstalled, this can become empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drivers: Vec<CSINodeDriver>,
+}
+
 /// Represents storage that is managed by an external CSI volume driver
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CSIPersistentVolumeSource {
@@ -532,6 +595,34 @@ pub struct ContainerResizePolicy {
     pub restart_policy: String,
 }
 
+/// ContainerResourceMetricSource indicates how to scale on a resource metric known to Kubernetes, as specified in requests and limits, describing each pod in the current scale target (e.g. CPU or memory).  The values will be averaged together before being compared to the target.  Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.  Only one "target" type should be set.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContainerResourceMetricSource {
+    /// container is the name of the container in the pods of the scaling target
+    #[serde(default)]
+    pub container: String,
+    /// name is the name of the resource in question.
+    #[serde(default)]
+    pub name: String,
+    /// target specifies the target value for the given metric
+    #[serde(default)]
+    pub target: MetricTarget,
+}
+
+/// ContainerResourceMetricStatus indicates the current value of a resource metric known to Kubernetes, as specified in requests and limits, describing a single container in each pod in the current scale target (e.g. CPU or memory).  Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContainerResourceMetricStatus {
+    /// container is the name of the container in the pods of the scaling target
+    #[serde(default)]
+    pub container: String,
+    /// current contains the current value for the given metric
+    #[serde(default)]
+    pub current: MetricValueStatus,
+    /// name is the name of the resource in question.
+    #[serde(default)]
+    pub name: String,
+}
+
 /// ContainerRestartRule describes how a container exit is handled.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerRestartRule {
@@ -672,6 +763,57 @@ pub struct ContainerUser {
     /// Linux holds user identity information initially attached to the first process of the containers in Linux. Note that the actual running identity can be changed if the process has enough privilege to do so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux: Option<LinuxContainerUser>,
+}
+
+/// CronJobSpec describes how the job execution will look like and when it will actually run.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CronJobSpec {
+    /// Specifies how to treat concurrent executions of a Job. Valid values are:
+    #[serde(default, rename = "concurrencyPolicy", skip_serializing_if = "Option::is_none")]
+    pub concurrency_policy: Option<String>,
+    /// The number of failed finished jobs to retain. Value must be non-negative integer. Defaults to 1.
+    #[serde(default, rename = "failedJobsHistoryLimit", skip_serializing_if = "Option::is_none")]
+    pub failed_jobs_history_limit: Option<i32>,
+    /// Specifies the job that will be created when executing a CronJob.
+    #[serde(default, rename = "jobTemplate")]
+    pub job_template: JobTemplateSpec,
+    /// The schedule in Cron format, see https://en.wikipedia.org/wiki/Cron.
+    #[serde(default)]
+    pub schedule: String,
+    /// Optional deadline in seconds for starting the job if it misses scheduled time for any reason.  Missed jobs executions will be counted as failed ones.
+    #[serde(default, rename = "startingDeadlineSeconds", skip_serializing_if = "Option::is_none")]
+    pub starting_deadline_seconds: Option<i64>,
+    /// The number of successful finished jobs to retain. Value must be non-negative integer. Defaults to 3.
+    #[serde(default, rename = "successfulJobsHistoryLimit", skip_serializing_if = "Option::is_none")]
+    pub successful_jobs_history_limit: Option<i32>,
+    /// This flag tells the controller to suspend subsequent executions, it does not apply to already started executions.  Defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend: Option<bool>,
+    /// The time zone name for the given schedule, see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones. If not specified, this will default to the time zone of the kube-controller-manager process. The set of valid time zone names and the time zone offset is loaded from the system-wide time zone database by the API server during CronJob validation and the controller manager during execution. If no system-wide time zone database can be found a bundled version of the database is used instead. If the time zone name becomes invalid during the lifetime of a CronJob or due to a change in host configuration, the controller will stop creating new new Jobs and will create a system event with the reason UnknownTimeZone. More information can be found in https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/#time-zones
+    #[serde(default, rename = "timeZone", skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+}
+
+/// CronJobStatus represents the current state of a cron job.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CronJobStatus {
+    /// A list of pointers to currently running jobs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active: Vec<ObjectReference>,
+    /// Information when was the last time the job was successfully scheduled.
+    #[serde(default, rename = "lastScheduleTime", skip_serializing_if = "Option::is_none")]
+    pub last_schedule_time: Option<Time>,
+    /// Information when was the last time the job successfully completed.
+    #[serde(default, rename = "lastSuccessfulTime", skip_serializing_if = "Option::is_none")]
+    pub last_successful_time: Option<Time>,
+}
+
+/// CrossVersionObjectReference contains enough information to let you identify the referred resource.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CrossVersionObjectReference {
+    /// name is the name of the referent; More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+    #[serde(default)]
+    pub name: String,
 }
 
 /// DaemonEndpoint contains information about a single Daemon endpoint.
@@ -1097,12 +1239,56 @@ pub struct EphemeralVolumeSource {
     pub volume_claim_template: Option<PersistentVolumeClaimTemplate>,
 }
 
+/// EventSeries contain information on series of events, i.e. thing that was/is happening continuously for some time.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventSeries {
+    /// Number of occurrences in this series up to the last heartbeat time
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<i32>,
+    /// Time of the last occurrence observed
+    #[serde(default, rename = "lastObservedTime", skip_serializing_if = "Option::is_none")]
+    pub last_observed_time: Option<MicroTime>,
+}
+
+/// EventSource contains information for an event.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EventSource {
+    /// Component from which the event is generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    /// Node name on which the event is generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
 /// ExecAction describes a "run in container" action.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExecAction {
     /// Command is the command line to execute inside the container, the working directory for the command  is root ('/') in the container's filesystem. The command is simply exec'd, it is not run inside a shell, so traditional shell instructions ('|', etc) won't work. To use a shell, you need to explicitly call out to that shell. Exit status of 0 is treated as live/healthy and non-zero is unhealthy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
+}
+
+/// ExternalMetricSource indicates how to scale on a metric not associated with any Kubernetes object (for example length of queue in cloud messaging service, or QPS from loadbalancer running outside of cluster).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExternalMetricSource {
+    /// metric identifies the target metric by name and selector
+    #[serde(default)]
+    pub metric: MetricIdentifier,
+    /// target specifies the target value for the given metric
+    #[serde(default)]
+    pub target: MetricTarget,
+}
+
+/// ExternalMetricStatus indicates the current value of a global metric not associated with any Kubernetes object.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExternalMetricStatus {
+    /// current contains the current value for the given metric
+    #[serde(default)]
+    pub current: MetricValueStatus,
+    /// metric identifies the target metric by name and selector
+    #[serde(default)]
+    pub metric: MetricIdentifier,
 }
 
 /// Represents a Fibre Channel volume. Fibre Channel volumes can only be mounted as read/write once. Fibre Channel volumes support ownership management and SELinux relabeling.
@@ -1266,6 +1452,37 @@ pub struct GlusterfsVolumeSource {
     pub read_only: Option<bool>,
 }
 
+/// HPAScalingPolicy is a single policy which must hold true for a specified past interval.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HPAScalingPolicy {
+    /// periodSeconds specifies the window of time for which the policy should hold true. PeriodSeconds must be greater than zero and less than or equal to 1800 (30 min).
+    #[serde(default, rename = "periodSeconds")]
+    pub period_seconds: i32,
+    /// type is used to specify the scaling policy.
+    #[serde(default, rename = "type")]
+    pub r#type: String,
+    /// value contains the amount of change which is permitted by the policy. It must be greater than zero
+    #[serde(default)]
+    pub value: i32,
+}
+
+/// HPAScalingRules configures the scaling behavior for one direction via scaling Policy Rules and a configurable metric tolerance.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HPAScalingRules {
+    /// policies is a list of potential scaling polices which can be used during scaling. If not set, use the default values: - For scale up: allow doubling the number of pods, or an absolute change of 4 pods in a 15s window. - For scale down: allow all pods to be removed in a 15s window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<HPAScalingPolicy>,
+    /// selectPolicy is used to specify which policy should be used. If not set, the default value Max is used.
+    #[serde(default, rename = "selectPolicy", skip_serializing_if = "Option::is_none")]
+    pub select_policy: Option<String>,
+    /// stabilizationWindowSeconds is the number of seconds for which past recommendations should be considered while scaling up or scaling down. StabilizationWindowSeconds must be greater than or equal to zero and less than or equal to 3600 (one hour). If not set, use the default values: - For scale up: 0 (i.e. no stabilization is done). - For scale down: 300 (i.e. the stabilization window is 300 seconds long).
+    #[serde(default, rename = "stabilizationWindowSeconds", skip_serializing_if = "Option::is_none")]
+    pub stabilization_window_seconds: Option<i32>,
+    /// tolerance is the tolerance on the ratio between the current and desired metric value under which no updates are made to the desired number of replicas (e.g. 0.01 for 1%). Must be greater than or equal to zero. If not set, the default cluster-wide tolerance is applied (by default 10%).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<Quantity>,
+}
+
 /// HTTPGetAction describes an action based on HTTP Get requests.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HTTPGetAction {
@@ -1297,6 +1514,115 @@ pub struct HTTPHeader {
     pub value: String,
 }
 
+/// HTTPIngressPath associates a path with a backend. Incoming urls matching the path are forwarded to the backend.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HTTPIngressPath {
+    /// backend defines the referenced service endpoint to which the traffic will be forwarded to.
+    #[serde(default)]
+    pub backend: IngressBackend,
+    /// path is matched against the path of an incoming request. Currently it can contain characters disallowed from the conventional "path" part of a URL as defined by RFC 3986. Paths must begin with a '/' and must be present when using PathType with value "Exact" or "Prefix".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// pathType determines the interpretation of the path matching. PathType can be one of the following values: * Exact: Matches the URL path exactly. * Prefix: Matches based on a URL path prefix split by '/'. Matching is
+    /// done on a path element by element basis. A path element refers is the
+    /// list of labels in the path split by the '/' separator. A request is a
+    /// match for path p if every p is an element-wise prefix of p of the
+    /// request path. Note that if the last element of the path is a substring
+    /// of the last element in request path, it is not a match (e.g. /foo/bar
+    /// matches /foo/bar/baz, but does not match /foo/barbaz).
+    /// * ImplementationSpecific: Interpretation of the Path matching is up to
+    /// the IngressClass. Implementations can treat this as a separate PathType
+    /// or treat it identically to Prefix or Exact path types.
+    /// Implementations are required to support all path types.
+    #[serde(default, rename = "pathType")]
+    pub path_type: String,
+}
+
+/// HTTPIngressRuleValue is a list of http selectors pointing to backends. In the example: http://<host>/<path>?<searchpart> -> backend where where parts of the url correspond to RFC 3986, this resource will be used to match against everything after the last '/' and before the first '?' or '#'.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HTTPIngressRuleValue {
+    /// paths is a collection of paths that map requests to backends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<HTTPIngressPath>,
+}
+
+/// HorizontalPodAutoscalerBehavior configures the scaling behavior of the target in both Up and Down directions (scaleUp and scaleDown fields respectively).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HorizontalPodAutoscalerBehavior {
+    /// scaleDown is scaling policy for scaling Down. If not set, the default value is to allow to scale down to minReplicas pods, with a 300 second stabilization window (i.e., the highest recommendation for the last 300sec is used).
+    #[serde(default, rename = "scaleDown", skip_serializing_if = "Option::is_none")]
+    pub scale_down: Option<HPAScalingRules>,
+    /// scaleUp is scaling policy for scaling Up. If not set, the default value is the higher of:
+    /// * increase no more than 4 pods per 60 seconds
+    /// * double the number of pods per 60 seconds
+    /// No stabilization is used.
+    #[serde(default, rename = "scaleUp", skip_serializing_if = "Option::is_none")]
+    pub scale_up: Option<HPAScalingRules>,
+}
+
+/// HorizontalPodAutoscalerCondition describes the state of a HorizontalPodAutoscaler at a certain point.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HorizontalPodAutoscalerCondition {
+    /// lastTransitionTime is the last time the condition transitioned from one status to another
+    #[serde(default, rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<Time>,
+    /// message is a human-readable explanation containing details about the transition
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// reason is the reason for the condition's last transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// status is the status of the condition (True, False, Unknown)
+    #[serde(default)]
+    pub status: String,
+    /// type describes the current condition
+    #[serde(default, rename = "type")]
+    pub r#type: String,
+}
+
+/// HorizontalPodAutoscalerSpec describes the desired functionality of the HorizontalPodAutoscaler.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HorizontalPodAutoscalerSpec {
+    /// behavior configures the scaling behavior of the target in both Up and Down directions (scaleUp and scaleDown fields respectively). If not set, the default HPAScalingRules for scale up and scale down are used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<HorizontalPodAutoscalerBehavior>,
+    /// maxReplicas is the upper limit for the number of replicas to which the autoscaler can scale up. It cannot be less that minReplicas.
+    #[serde(default, rename = "maxReplicas")]
+    pub max_replicas: i32,
+    /// metrics contains the specifications for which to use to calculate the desired replica count (the maximum replica count across all metrics will be used).  The desired replica count is calculated multiplying the ratio between the target value and the current value by the current number of pods.  Ergo, metrics used must decrease as the pod count is increased, and vice-versa.  See the individual metric source types for more information about how each type of metric must respond. If not set, the default metric will be set to 80% average CPU utilization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricSpec>,
+    /// minReplicas is the lower limit for the number of replicas to which the autoscaler can scale down.  It defaults to 1 pod.  minReplicas is allowed to be 0 if the alpha feature gate HPAScaleToZero is enabled and at least one Object or External metric is configured.  Scaling is active as long as at least one metric value is available.
+    #[serde(default, rename = "minReplicas", skip_serializing_if = "Option::is_none")]
+    pub min_replicas: Option<i32>,
+    /// scaleTargetRef points to the target resource to scale, and is used to the pods for which metrics should be collected, as well as to actually change the replica count.
+    #[serde(default, rename = "scaleTargetRef")]
+    pub scale_target_ref: CrossVersionObjectReference,
+}
+
+/// HorizontalPodAutoscalerStatus describes the current status of a horizontal pod autoscaler.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HorizontalPodAutoscalerStatus {
+    /// conditions is the set of conditions required for this autoscaler to scale its target, and indicates whether or not those conditions are met.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<HorizontalPodAutoscalerCondition>,
+    /// currentMetrics is the last read state of the metrics used by this autoscaler.
+    #[serde(default, rename = "currentMetrics", skip_serializing_if = "Vec::is_empty")]
+    pub current_metrics: Vec<MetricStatus>,
+    /// currentReplicas is current number of replicas of pods managed by this autoscaler, as last seen by the autoscaler.
+    #[serde(default, rename = "currentReplicas", skip_serializing_if = "Option::is_none")]
+    pub current_replicas: Option<i32>,
+    /// desiredReplicas is the desired number of replicas of pods managed by this autoscaler, as last calculated by the autoscaler.
+    #[serde(default, rename = "desiredReplicas")]
+    pub desired_replicas: i32,
+    /// lastScaleTime is the last time the HorizontalPodAutoscaler scaled the number of pods, used by the autoscaler to control how often the number of pods is changed.
+    #[serde(default, rename = "lastScaleTime", skip_serializing_if = "Option::is_none")]
+    pub last_scale_time: Option<Time>,
+    /// observedGeneration is the most recent generation observed by this autoscaler.
+    #[serde(default, rename = "observedGeneration", skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+}
+
 /// HostAlias holds the mapping between IP and hostnames that will be injected as an entry in the pod's hosts file.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostAlias {
@@ -1325,6 +1651,17 @@ pub struct HostPathVolumeSource {
     /// type for HostPath Volume Defaults to "" More info: https://kubernetes.io/docs/concepts/storage/volumes#hostpath
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
+}
+
+/// IPBlock describes a particular CIDR (Ex. "192.168.1.0/24","2001:db8::/64") that is allowed to the pods matched by a NetworkPolicySpec's podSelector. The except entry describes CIDRs that should not be included within this rule.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IPBlock {
+    /// cidr is a string representing the IPBlock Valid examples are "192.168.1.0/24" or "2001:db8::/64"
+    #[serde(default)]
+    pub cidr: String,
+    /// except is a slice of CIDRs that should not be included within an IPBlock Valid examples are "192.168.1.0/24" or "2001:db8::/64" Except values will be rejected if they are outside the cidr range
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except: Vec<String>,
 }
 
 /// ISCSIPersistentVolumeSource represents an ISCSI disk. ISCSI volumes can only be mounted as read/write once. ISCSI volumes support ownership management and SELinux relabeling.
@@ -1414,9 +1751,277 @@ pub struct ImageVolumeSource {
     pub reference: Option<String>,
 }
 
+/// IngressBackend describes all endpoints for a given service and port.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressBackend {
+    /// resource is an ObjectRef to another Kubernetes resource in the namespace of the Ingress object. If resource is specified, a service.Name and service.Port must not be specified. This is a mutually exclusive setting with "Service".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<TypedLocalObjectReference>,
+    /// service references a service as a backend. This is a mutually exclusive setting with "Resource".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<IngressServiceBackend>,
+}
+
+/// IngressClassParametersReference identifies an API object. This can be used to specify a cluster or namespace-scoped resource.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressClassParametersReference {
+    /// apiGroup is the group for the resource being referenced. If APIGroup is not specified, the specified Kind must be in the core API group. For any other third-party types, APIGroup is required.
+    #[serde(default, rename = "apiGroup", skip_serializing_if = "Option::is_none")]
+    pub api_group: Option<String>,
+    /// name is the name of resource being referenced.
+    #[serde(default)]
+    pub name: String,
+    /// namespace is the namespace of the resource being referenced. This field is required when scope is set to "Namespace" and must be unset when scope is set to "Cluster".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// scope represents if this refers to a cluster or namespace scoped resource. This may be set to "Cluster" (default) or "Namespace".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+/// IngressClassSpec provides information about the class of an Ingress.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressClassSpec {
+    /// controller refers to the name of the controller that should handle this class. This allows for different "flavors" that are controlled by the same controller. For example, you may have different parameters for the same implementing controller. This should be specified as a domain-prefixed path no more than 250 characters in length, e.g. "acme.io/ingress-controller". This field is immutable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<String>,
+    /// parameters is a link to a custom resource containing additional configuration for the controller. This is optional if the controller does not require extra parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<IngressClassParametersReference>,
+}
+
+/// IngressLoadBalancerIngress represents the status of a load-balancer ingress point.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressLoadBalancerIngress {
+    /// hostname is set for load-balancer ingress points that are DNS based.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// ip is set for load-balancer ingress points that are IP based.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    /// ports provides information about the ports exposed by this LoadBalancer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<IngressPortStatus>,
+}
+
+/// IngressLoadBalancerStatus represents the status of a load-balancer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressLoadBalancerStatus {
+    /// ingress is a list containing ingress points for the load-balancer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingress: Vec<IngressLoadBalancerIngress>,
+}
+
+/// IngressPortStatus represents the error condition of a service port
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressPortStatus {
+    /// error is to record the problem with the service port The format of the error shall comply with the following rules: - built-in error values shall be specified in this file and those shall use
+    /// CamelCase names
+    /// - cloud provider specific error values must have names that comply with the
+    /// format foo.example.com/CamelCase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// port is the port number of the ingress port.
+    #[serde(default)]
+    pub port: i32,
+    /// protocol is the protocol of the ingress port. The supported values are: "TCP", "UDP", "SCTP"
+    #[serde(default)]
+    pub protocol: String,
+}
+
+/// IngressRule represents the rules mapping the paths under a specified host to the related backend services. Incoming requests are first evaluated for a host match, then routed to the backend associated with the matching IngressRuleValue.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressRule {
+    /// host is the fully qualified domain name of a network host, as defined by RFC 3986. Note the following deviations from the "host" part of the URI as defined in RFC 3986: 1. IPs are not allowed. Currently an IngressRuleValue can only apply to
+    /// the IP in the Spec of the parent Ingress.
+    /// 2. The `:` delimiter is not respected because ports are not allowed.
+    /// Currently the port of an Ingress is implicitly :80 for http and
+    /// :443 for https.
+    /// Both these may change in the future. Incoming requests are matched against the host before the IngressRuleValue. If the host is unspecified, the Ingress routes all traffic based on the specified IngressRuleValue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HTTPIngressRuleValue>,
+}
+
+/// IngressServiceBackend references a Kubernetes Service as a Backend.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressServiceBackend {
+    /// name is the referenced service. The service must exist in the same namespace as the Ingress object.
+    #[serde(default)]
+    pub name: String,
+    /// port of the referenced service. A port name or port number is required for a IngressServiceBackend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<ServiceBackendPort>,
+}
+
+/// IngressSpec describes the Ingress the user wishes to exist.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressSpec {
+    /// defaultBackend is the backend that should handle requests that don't match any rule. If Rules are not specified, DefaultBackend must be specified. If DefaultBackend is not set, the handling of requests that do not match any of the rules will be up to the Ingress controller.
+    #[serde(default, rename = "defaultBackend", skip_serializing_if = "Option::is_none")]
+    pub default_backend: Option<IngressBackend>,
+    /// ingressClassName is the name of an IngressClass cluster resource. Ingress controller implementations use this field to know whether they should be serving this Ingress resource, by a transitive connection (controller -> IngressClass -> Ingress resource). Although the `kubernetes.io/ingress.class` annotation (simple constant name) was never formally defined, it was widely supported by Ingress controllers to create a direct binding between Ingress controller and Ingress resources. Newly created Ingress resources should prefer using the field. However, even though the annotation is officially deprecated, for backwards compatibility reasons, ingress controllers should still honor that annotation if present.
+    #[serde(default, rename = "ingressClassName", skip_serializing_if = "Option::is_none")]
+    pub ingress_class_name: Option<String>,
+    /// rules is a list of host rules used to configure the Ingress. If unspecified, or no rule matches, all traffic is sent to the default backend.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<IngressRule>,
+    /// tls represents the TLS configuration. Currently the Ingress only supports a single TLS port, 443. If multiple members of this list specify different hosts, they will be multiplexed on the same port according to the hostname specified through the SNI TLS extension, if the ingress controller fulfilling the ingress supports SNI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls: Vec<IngressTLS>,
+}
+
+/// IngressStatus describe the current state of the Ingress.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressStatus {
+    /// loadBalancer contains the current status of the load-balancer.
+    #[serde(default, rename = "loadBalancer", skip_serializing_if = "Option::is_none")]
+    pub load_balancer: Option<IngressLoadBalancerStatus>,
+}
+
+/// IngressTLS describes the transport layer security associated with an ingress.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressTLS {
+    /// hosts is a list of hosts included in the TLS certificate. The values in this list must match the name/s used in the tlsSecret. Defaults to the wildcard host setting for the loadbalancer controller fulfilling this Ingress, if left unspecified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    /// secretName is the name of the secret used to terminate TLS traffic on port 443. Field is left optional to allow TLS routing based on SNI hostname alone. If the SNI host in a listener conflicts with the "Host" header field used by an IngressRule, the SNI host is used for termination and value of the "Host" header is used for routing.
+    #[serde(default, rename = "secretName", skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+}
+
 /// IntOrString is a type that can hold an int32 or a string.  When used in JSON or YAML marshalling and unmarshalling, it produces or consumes the inner type.  This allows you to have, for example, a JSON field that can accept a name or number.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IntOrString {
+}
+
+/// JobCondition describes current state of a job.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobCondition {
+    /// Last time the condition was checked.
+    #[serde(default, rename = "lastProbeTime", skip_serializing_if = "Option::is_none")]
+    pub last_probe_time: Option<Time>,
+    /// Last time the condition transit from one status to another.
+    #[serde(default, rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<Time>,
+    /// Human readable message indicating details about last transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// (brief) reason for the condition's last transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Status of the condition, one of True, False, Unknown.
+    #[serde(default)]
+    pub status: String,
+    /// Type of job condition, Complete or Failed.
+    #[serde(default, rename = "type")]
+    pub r#type: String,
+}
+
+/// JobSpec describes how the job execution will look like.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobSpec {
+    /// Specifies the duration in seconds relative to the startTime that the job may be continuously active before the system tries to terminate it; value must be positive integer. If a Job is suspended (at creation or through an update), this timer will effectively be stopped and reset when the Job is resumed again.
+    #[serde(default, rename = "activeDeadlineSeconds", skip_serializing_if = "Option::is_none")]
+    pub active_deadline_seconds: Option<i64>,
+    /// Specifies the number of retries before marking this job failed. Defaults to 6, unless backoffLimitPerIndex (only Indexed Job) is specified. When backoffLimitPerIndex is specified, backoffLimit defaults to 2147483647.
+    #[serde(default, rename = "backoffLimit", skip_serializing_if = "Option::is_none")]
+    pub backoff_limit: Option<i32>,
+    /// Specifies the limit for the number of retries within an index before marking this index as failed. When enabled the number of failures per index is kept in the pod's batch.kubernetes.io/job-index-failure-count annotation. It can only be set when Job's completionMode=Indexed, and the Pod's restart policy is Never. The field is immutable.
+    #[serde(default, rename = "backoffLimitPerIndex", skip_serializing_if = "Option::is_none")]
+    pub backoff_limit_per_index: Option<i32>,
+    /// completionMode specifies how Pod completions are tracked. It can be `NonIndexed` (default) or `Indexed`.
+    #[serde(default, rename = "completionMode", skip_serializing_if = "Option::is_none")]
+    pub completion_mode: Option<String>,
+    /// Specifies the desired number of successfully finished pods the job should be run with.  Setting to null means that the success of any pod signals the success of all pods, and allows parallelism to have any positive value.  Setting to 1 means that parallelism is limited to 1 and the success of that pod signals the success of the job. More info: https://kubernetes.io/docs/concepts/workloads/controllers/jobs-run-to-completion/
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completions: Option<i32>,
+    /// ManagedBy field indicates the controller that manages a Job. The k8s Job controller reconciles jobs which don't have this field at all or the field value is the reserved string `kubernetes.io/job-controller`, but skips reconciling Jobs with a custom value for this field. The value must be a valid domain-prefixed path (e.g. acme.io/foo) - all characters before the first "/" must be a valid subdomain as defined by RFC 1123. All characters trailing the first "/" must be valid HTTP Path characters as defined by RFC 3986. The value cannot exceed 63 characters. This field is immutable.
+    #[serde(default, rename = "managedBy", skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<String>,
+    /// manualSelector controls generation of pod labels and pod selectors. Leave `manualSelector` unset unless you are certain what you are doing. When false or unset, the system pick labels unique to this job and appends those labels to the pod template.  When true, the user is responsible for picking unique labels and specifying the selector.  Failure to pick a unique label may cause this and other jobs to not function correctly.  However, You may see `manualSelector=true` in jobs that were created with the old `extensions/v1beta1` API. More info: https://kubernetes.io/docs/concepts/workloads/controllers/jobs-run-to-completion/#specifying-your-own-pod-selector
+    #[serde(default, rename = "manualSelector", skip_serializing_if = "Option::is_none")]
+    pub manual_selector: Option<bool>,
+    /// Specifies the maximal number of failed indexes before marking the Job as failed, when backoffLimitPerIndex is set. Once the number of failed indexes exceeds this number the entire Job is marked as Failed and its execution is terminated. When left as null the job continues execution of all of its indexes and is marked with the `Complete` Job condition. It can only be specified when backoffLimitPerIndex is set. It can be null or up to completions. It is required and must be less than or equal to 10^4 when is completions greater than 10^5.
+    #[serde(default, rename = "maxFailedIndexes", skip_serializing_if = "Option::is_none")]
+    pub max_failed_indexes: Option<i32>,
+    /// Specifies the maximum desired number of pods the job should run at any given time. The actual number of pods running in steady state will be less than this number when ((.spec.completions - .status.successful) < .spec.parallelism), i.e. when the work left to do is less than max parallelism. More info: https://kubernetes.io/docs/concepts/workloads/controllers/jobs-run-to-completion/
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<i32>,
+    /// Specifies the policy of handling failed pods. In particular, it allows to specify the set of actions and conditions which need to be satisfied to take the associated action. If empty, the default behaviour applies - the counter of failed pods, represented by the jobs's .status.failed field, is incremented and it is checked against the backoffLimit. This field cannot be used in combination with restartPolicy=OnFailure.
+    #[serde(default, rename = "podFailurePolicy", skip_serializing_if = "Option::is_none")]
+    pub pod_failure_policy: Option<PodFailurePolicy>,
+    /// podReplacementPolicy specifies when to create replacement Pods. Possible values are: - TerminatingOrFailed means that we recreate pods
+    /// when they are terminating (has a metadata.deletionTimestamp) or failed.
+    /// - Failed means to wait until a previously created Pod is fully terminated (has phase
+    /// Failed or Succeeded) before creating a replacement Pod.
+    #[serde(default, rename = "podReplacementPolicy", skip_serializing_if = "Option::is_none")]
+    pub pod_replacement_policy: Option<String>,
+    /// A label query over pods that should match the pod count. Normally, the system sets this field for you. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<LabelSelector>,
+    /// successPolicy specifies the policy when the Job can be declared as succeeded. If empty, the default behavior applies - the Job is declared as succeeded only when the number of succeeded pods equals to the completions. When the field is specified, it must be immutable and works only for the Indexed Jobs. Once the Job meets the SuccessPolicy, the lingering pods are terminated.
+    #[serde(default, rename = "successPolicy", skip_serializing_if = "Option::is_none")]
+    pub success_policy: Option<SuccessPolicy>,
+    /// suspend specifies whether the Job controller should create Pods or not. If a Job is created with suspend set to true, no Pods are created by the Job controller. If a Job is suspended after creation (i.e. the flag goes from false to true), the Job controller will delete all active Pods associated with this Job. Users must design their workload to gracefully handle this. Suspending a Job will reset the StartTime field of the Job, effectively resetting the ActiveDeadlineSeconds timer too. Defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend: Option<bool>,
+    /// Describes the pod that will be created when executing a job. The only allowed template.spec.restartPolicy values are "Never" or "OnFailure". More info: https://kubernetes.io/docs/concepts/workloads/controllers/jobs-run-to-completion/
+    #[serde(default)]
+    pub template: PodTemplateSpec,
+    /// ttlSecondsAfterFinished limits the lifetime of a Job that has finished execution (either Complete or Failed). If this field is set, ttlSecondsAfterFinished after the Job finishes, it is eligible to be automatically deleted. When the Job is being deleted, its lifecycle guarantees (e.g. finalizers) will be honored. If this field is unset, the Job won't be automatically deleted. If this field is set to zero, the Job becomes eligible to be deleted immediately after it finishes.
+    #[serde(default, rename = "ttlSecondsAfterFinished", skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds_after_finished: Option<i32>,
+}
+
+/// JobStatus represents the current state of a Job.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobStatus {
+    /// The number of pending and running pods which are not terminating (without a deletionTimestamp). The value is zero for finished jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<i32>,
+    /// completedIndexes holds the completed indexes when .spec.completionMode = "Indexed" in a text format. The indexes are represented as decimal integers separated by commas. The numbers are listed in increasing order. Three or more consecutive numbers are compressed and represented by the first and last element of the series, separated by a hyphen. For example, if the completed indexes are 1, 3, 4, 5 and 7, they are represented as "1,3-5,7".
+    #[serde(default, rename = "completedIndexes", skip_serializing_if = "Option::is_none")]
+    pub completed_indexes: Option<String>,
+    /// Represents time when the job was completed. It is not guaranteed to be set in happens-before order across separate operations. It is represented in RFC3339 form and is in UTC. The completion time is set when the job finishes successfully, and only then. The value cannot be updated or removed. The value indicates the same or later point in time as the startTime field.
+    #[serde(default, rename = "completionTime", skip_serializing_if = "Option::is_none")]
+    pub completion_time: Option<Time>,
+    /// The latest available observations of an object's current state. When a Job fails, one of the conditions will have type "Failed" and status true. When a Job is suspended, one of the conditions will have type "Suspended" and status true; when the Job is resumed, the status of this condition will become false. When a Job is completed, one of the conditions will have type "Complete" and status true.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<JobCondition>,
+    /// The number of pods which reached phase Failed. The value increases monotonically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<i32>,
+    /// FailedIndexes holds the failed indexes when spec.backoffLimitPerIndex is set. The indexes are represented in the text format analogous as for the `completedIndexes` field, ie. they are kept as decimal integers separated by commas. The numbers are listed in increasing order. Three or more consecutive numbers are compressed and represented by the first and last element of the series, separated by a hyphen. For example, if the failed indexes are 1, 3, 4, 5 and 7, they are represented as "1,3-5,7". The set of failed indexes cannot overlap with the set of completed indexes.
+    #[serde(default, rename = "failedIndexes", skip_serializing_if = "Option::is_none")]
+    pub failed_indexes: Option<String>,
+    /// The number of active pods which have a Ready condition and are not terminating (without a deletionTimestamp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<i32>,
+    /// Represents time when the job controller started processing a job. When a Job is created in the suspended state, this field is not set until the first time it is resumed. This field is reset every time a Job is resumed from suspension. It is represented in RFC3339 form and is in UTC.
+    #[serde(default, rename = "startTime", skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<Time>,
+    /// The number of pods which reached phase Succeeded. The value increases monotonically for a given spec. However, it may decrease in reaction to scale down of elastic indexed jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub succeeded: Option<i32>,
+    /// The number of pods which are terminating (in phase Pending or Running and have a deletionTimestamp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminating: Option<i32>,
+    /// uncountedTerminatedPods holds the UIDs of Pods that have terminated but the job controller hasn't yet accounted for in the status counters.
+    #[serde(default, rename = "uncountedTerminatedPods", skip_serializing_if = "Option::is_none")]
+    pub uncounted_terminated_pods: Option<UncountedTerminatedPods>,
+}
+
+/// JobTemplateSpec describes the data a Job should have when created from a template
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobTemplateSpec {
+    /// Standard object's metadata of the jobs created from this template. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+    #[serde(default, skip_serializing_if = "is_empty_meta")]
+    pub metadata: crate::meta::ObjectMeta,
+    /// Specification of the desired behavior of the job. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<JobSpec>,
 }
 
 /// Maps a string key to a path within a volume.
@@ -1458,6 +2063,32 @@ pub struct LabelSelectorRequirement {
     pub values: Vec<String>,
 }
 
+/// LeaseSpec is a specification of a Lease.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LeaseSpec {
+    /// acquireTime is a time when the current lease was acquired.
+    #[serde(default, rename = "acquireTime", skip_serializing_if = "Option::is_none")]
+    pub acquire_time: Option<MicroTime>,
+    /// holderIdentity contains the identity of the holder of a current lease. If Coordinated Leader Election is used, the holder identity must be equal to the elected LeaseCandidate.metadata.name field.
+    #[serde(default, rename = "holderIdentity", skip_serializing_if = "Option::is_none")]
+    pub holder_identity: Option<String>,
+    /// leaseDurationSeconds is a duration that candidates for a lease need to wait to force acquire it. This is measured against the time of last observed renewTime.
+    #[serde(default, rename = "leaseDurationSeconds", skip_serializing_if = "Option::is_none")]
+    pub lease_duration_seconds: Option<i32>,
+    /// leaseTransitions is the number of transitions of a lease between holders.
+    #[serde(default, rename = "leaseTransitions", skip_serializing_if = "Option::is_none")]
+    pub lease_transitions: Option<i32>,
+    /// PreferredHolder signals to a lease holder that the lease has a more optimal holder and should be given up. This field can only be set if Strategy is also set.
+    #[serde(default, rename = "preferredHolder", skip_serializing_if = "Option::is_none")]
+    pub preferred_holder: Option<String>,
+    /// renewTime is a time when the current holder of a lease has last updated the lease.
+    #[serde(default, rename = "renewTime", skip_serializing_if = "Option::is_none")]
+    pub renew_time: Option<MicroTime>,
+    /// Strategy indicates the strategy for picking the leader for coordinated leader election. If the field is not specified, there is no active coordination for this lease. (Alpha) Using this field requires the CoordinatedLeaderElection feature gate to be enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+}
+
 /// Lifecycle describes actions that the management system should take in response to container lifecycle events. For the PostStart and PreStop lifecycle handlers, management of the container blocks until the action is complete, unless the container process fails, in which case the handler is aborted.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Lifecycle {
@@ -1487,6 +2118,37 @@ pub struct LifecycleHandler {
     /// Deprecated. TCPSocket is NOT supported as a LifecycleHandler and kept for backward compatibility. There is no validation of this field and lifecycle hooks will fail at runtime when it is specified.
     #[serde(default, rename = "tcpSocket", skip_serializing_if = "Option::is_none")]
     pub tcp_socket: Option<TCPSocketAction>,
+}
+
+/// LimitRangeItem defines a min/max usage limit for any resource that matches on kind.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LimitRangeItem {
+    /// Default resource requirement limit value by resource name if resource limit is omitted.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub default: std::collections::BTreeMap<String, Quantity>,
+    /// DefaultRequest is the default resource requirement request value by resource name if resource request is omitted.
+    #[serde(default, rename = "defaultRequest", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub default_request: std::collections::BTreeMap<String, Quantity>,
+    /// Max usage constraints on this kind by resource name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub max: std::collections::BTreeMap<String, Quantity>,
+    /// MaxLimitRequestRatio if specified, the named resource must have a request and limit that are both non-zero where limit divided by request is less than or equal to the enumerated value; this represents the max burst for the named resource.
+    #[serde(default, rename = "maxLimitRequestRatio", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub max_limit_request_ratio: std::collections::BTreeMap<String, Quantity>,
+    /// Min usage constraints on this kind by resource name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub min: std::collections::BTreeMap<String, Quantity>,
+    /// Type of resource that this limit applies to.
+    #[serde(default, rename = "type")]
+    pub r#type: String,
+}
+
+/// LimitRangeSpec defines a min/max usage limit for resources that match on kind.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LimitRangeSpec {
+    /// Limits is the list of LimitRangeItem objects that are enforced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<LimitRangeItem>,
 }
 
 /// LinuxContainerUser represents user identity information in Linux containers
@@ -1545,6 +2207,99 @@ pub struct LocalVolumeSource {
     /// path of the full path to the volume on the node. It can be either a directory or block device (disk, partition, ...).
     #[serde(default)]
     pub path: String,
+}
+
+/// MetricIdentifier defines the name and optionally selector for a metric
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricIdentifier {
+    /// name is the name of the given metric
+    #[serde(default)]
+    pub name: String,
+    /// selector is the string-encoded form of a standard kubernetes label selector for the given metric When set, it is passed as an additional parameter to the metrics server for more specific metrics scoping. When unset, just the metricName will be used to gather metrics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<LabelSelector>,
+}
+
+/// MetricSpec specifies how to scale based on a single metric (only `type` and one other matching field should be set at once).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricSpec {
+    /// containerResource refers to a resource metric (such as those specified in requests and limits) known to Kubernetes describing a single container in each pod of the current scale target (e.g. CPU or memory). Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.
+    #[serde(default, rename = "containerResource", skip_serializing_if = "Option::is_none")]
+    pub container_resource: Option<ContainerResourceMetricSource>,
+    /// external refers to a global metric that is not associated with any Kubernetes object. It allows autoscaling based on information coming from components running outside of cluster (for example length of queue in cloud messaging service, or QPS from loadbalancer running outside of cluster).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalMetricSource>,
+    /// object refers to a metric describing a single kubernetes object (for example, hits-per-second on an Ingress object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<ObjectMetricSource>,
+    /// pods refers to a metric describing each pod in the current scale target (for example, transactions-processed-per-second).  The values will be averaged together before being compared to the target value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pods: Option<PodsMetricSource>,
+    /// resource refers to a resource metric (such as those specified in requests and limits) known to Kubernetes describing each pod in the current scale target (e.g. CPU or memory). Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<ResourceMetricSource>,
+    /// type is the type of metric source.  It should be one of "ContainerResource", "External", "Object", "Pods" or "Resource", each mapping to a matching field in the object.
+    #[serde(default, rename = "type")]
+    pub r#type: String,
+}
+
+/// MetricStatus describes the last-read state of a single metric.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricStatus {
+    /// container resource refers to a resource metric (such as those specified in requests and limits) known to Kubernetes describing a single container in each pod in the current scale target (e.g. CPU or memory). Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.
+    #[serde(default, rename = "containerResource", skip_serializing_if = "Option::is_none")]
+    pub container_resource: Option<ContainerResourceMetricStatus>,
+    /// external refers to a global metric that is not associated with any Kubernetes object. It allows autoscaling based on information coming from components running outside of cluster (for example length of queue in cloud messaging service, or QPS from loadbalancer running outside of cluster).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalMetricStatus>,
+    /// object refers to a metric describing a single kubernetes object (for example, hits-per-second on an Ingress object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<ObjectMetricStatus>,
+    /// pods refers to a metric describing each pod in the current scale target (for example, transactions-processed-per-second).  The values will be averaged together before being compared to the target value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pods: Option<PodsMetricStatus>,
+    /// resource refers to a resource metric (such as those specified in requests and limits) known to Kubernetes describing each pod in the current scale target (e.g. CPU or memory). Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<ResourceMetricStatus>,
+    /// type is the type of metric source.  It will be one of "ContainerResource", "External", "Object", "Pods" or "Resource", each corresponds to a matching field in the object.
+    #[serde(default, rename = "type")]
+    pub r#type: String,
+}
+
+/// MetricTarget defines the target value, average value, or average utilization of a specific metric
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricTarget {
+    /// averageUtilization is the target value of the average of the resource metric across all relevant pods, represented as a percentage of the requested value of the resource for the pods. Currently only valid for Resource metric source type
+    #[serde(default, rename = "averageUtilization", skip_serializing_if = "Option::is_none")]
+    pub average_utilization: Option<i32>,
+    /// averageValue is the target value of the average of the metric across all relevant pods (as a quantity)
+    #[serde(default, rename = "averageValue", skip_serializing_if = "Option::is_none")]
+    pub average_value: Option<Quantity>,
+    /// type represents whether the metric type is Utilization, Value, or AverageValue
+    #[serde(default, rename = "type")]
+    pub r#type: String,
+    /// value is the target value of the metric (as a quantity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Quantity>,
+}
+
+/// MetricValueStatus holds the current value for a metric
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricValueStatus {
+    /// currentAverageUtilization is the current value of the average of the resource metric across all relevant pods, represented as a percentage of the requested value of the resource for the pods.
+    #[serde(default, rename = "averageUtilization", skip_serializing_if = "Option::is_none")]
+    pub average_utilization: Option<i32>,
+    /// averageValue is the current value of the average of the metric across all relevant pods (as a quantity)
+    #[serde(default, rename = "averageValue", skip_serializing_if = "Option::is_none")]
+    pub average_value: Option<Quantity>,
+    /// value is the current value of the metric (as a quantity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Quantity>,
+}
+
+/// MicroTime is version of Time with microsecond level precision.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MicroTime {
 }
 
 /// ModifyVolumeStatus represents the status object of ControllerModifyVolume operation
@@ -1618,6 +2373,73 @@ pub struct NamespaceStatus {
     /// Phase is the current lifecycle phase of the namespace. More info: https://kubernetes.io/docs/tasks/administer-cluster/namespaces/
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+}
+
+/// NetworkPolicyEgressRule describes a particular set of traffic that is allowed out of pods matched by a NetworkPolicySpec's podSelector. The traffic must match both ports and to. This type is beta-level in 1.8
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetworkPolicyEgressRule {
+    /// ports is a list of destination ports for outgoing traffic. Each item in this list is combined using a logical OR. If this field is empty or missing, this rule matches all ports (traffic not restricted by port). If this field is present and contains at least one item, then this rule allows traffic only if the traffic matches at least one port in the list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<NetworkPolicyPort>,
+    /// to is a list of destinations for outgoing traffic of pods selected for this rule. Items in this list are combined using a logical OR operation. If this field is empty or missing, this rule matches all destinations (traffic not restricted by destination). If this field is present and contains at least one item, this rule allows traffic only if the traffic matches at least one item in the to list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub to: Vec<NetworkPolicyPeer>,
+}
+
+/// NetworkPolicyIngressRule describes a particular set of traffic that is allowed to the pods matched by a NetworkPolicySpec's podSelector. The traffic must match both ports and from.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetworkPolicyIngressRule {
+    /// from is a list of sources which should be able to access the pods selected for this rule. Items in this list are combined using a logical OR operation. If this field is empty or missing, this rule matches all sources (traffic not restricted by source). If this field is present and contains at least one item, this rule allows traffic only if the traffic matches at least one item in the from list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from: Vec<NetworkPolicyPeer>,
+    /// ports is a list of ports which should be made accessible on the pods selected for this rule. Each item in this list is combined using a logical OR. If this field is empty or missing, this rule matches all ports (traffic not restricted by port). If this field is present and contains at least one item, then this rule allows traffic only if the traffic matches at least one port in the list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<NetworkPolicyPort>,
+}
+
+/// NetworkPolicyPeer describes a peer to allow traffic to/from. Only certain combinations of fields are allowed
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetworkPolicyPeer {
+    /// ipBlock defines policy on a particular IPBlock. If this field is set then neither of the other fields can be.
+    #[serde(default, rename = "ipBlock", skip_serializing_if = "Option::is_none")]
+    pub ip_block: Option<IPBlock>,
+    /// namespaceSelector selects namespaces using cluster-scoped labels. This field follows standard label selector semantics; if present but empty, it selects all namespaces.
+    #[serde(default, rename = "namespaceSelector", skip_serializing_if = "Option::is_none")]
+    pub namespace_selector: Option<LabelSelector>,
+    /// podSelector is a label selector which selects pods. This field follows standard label selector semantics; if present but empty, it selects all pods.
+    #[serde(default, rename = "podSelector", skip_serializing_if = "Option::is_none")]
+    pub pod_selector: Option<LabelSelector>,
+}
+
+/// NetworkPolicyPort describes a port to allow traffic on
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetworkPolicyPort {
+    /// endPort indicates that the range of ports from port to endPort if set, inclusive, should be allowed by the policy. This field cannot be defined if the port field is not defined or if the port field is defined as a named (string) port. The endPort must be equal or greater than port.
+    #[serde(default, rename = "endPort", skip_serializing_if = "Option::is_none")]
+    pub end_port: Option<i32>,
+    /// port represents the port on the given protocol. This can either be a numerical or named port on a pod. If this field is not provided, this matches all port names and numbers. If present, only traffic on the specified protocol AND port will be matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<IntOrString>,
+    /// protocol represents the protocol (TCP, UDP, or SCTP) which traffic must match. If not specified, this field defaults to TCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+/// NetworkPolicySpec provides the specification of a NetworkPolicy
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetworkPolicySpec {
+    /// egress is a list of egress rules to be applied to the selected pods. Outgoing traffic is allowed if there are no NetworkPolicies selecting the pod (and cluster policy otherwise allows the traffic), OR if the traffic matches at least one egress rule across all of the NetworkPolicy objects whose podSelector matches the pod. If this field is empty then this NetworkPolicy limits all outgoing traffic (and serves solely to ensure that the pods it selects are isolated by default). This field is beta-level in 1.8
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress: Vec<NetworkPolicyEgressRule>,
+    /// ingress is a list of ingress rules to be applied to the selected pods. Traffic is allowed to a pod if there are no NetworkPolicies selecting the pod (and cluster policy otherwise allows the traffic), OR if the traffic source is the pod's local node, OR if the traffic matches at least one ingress rule across all of the NetworkPolicy objects whose podSelector matches the pod. If this field is empty then this NetworkPolicy does not allow any traffic (and serves solely to ensure that the pods it selects are isolated by default)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingress: Vec<NetworkPolicyIngressRule>,
+    /// podSelector selects the pods to which this NetworkPolicy object applies. The array of rules is applied to any pods selected by this field. An empty selector matches all pods in the policy's namespace. Multiple network policies can select the same set of pods. In this case, the ingress rules for each are combined additively. This field is optional. If it is not specified, it defaults to an empty selector.
+    #[serde(default, rename = "podSelector", skip_serializing_if = "Option::is_none")]
+    pub pod_selector: Option<LabelSelector>,
+    /// policyTypes is a list of rule types that the NetworkPolicy relates to. Valid options are ["Ingress"], ["Egress"], or ["Ingress", "Egress"]. If this field is not specified, it will default based on the existence of ingress or egress rules; policies that contain an egress section are assumed to affect egress, and all policies (whether or not they contain an ingress section) are assumed to affect ingress. If you want to write an egress-only policy, you must explicitly specify policyTypes [ "Egress" ]. Likewise, if you want to write a policy that specifies that no egress is allowed, you must specify a policyTypes value that include "Egress" (since such a policy would not include an egress section and would otherwise default to just [ "Ingress" ]). This field is beta-level in 1.8
+    #[serde(default, rename = "policyTypes", skip_serializing_if = "Vec::is_empty")]
+    pub policy_types: Vec<String>,
 }
 
 /// NodeAddress contains information for the node's address.
@@ -1885,6 +2707,34 @@ pub struct ObjectFieldSelector {
     pub field_path: String,
 }
 
+/// ObjectMetricSource indicates how to scale on a metric describing a kubernetes object (for example, hits-per-second on an Ingress object).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ObjectMetricSource {
+    /// describedObject specifies the descriptions of a object,such as kind,name apiVersion
+    #[serde(default, rename = "describedObject")]
+    pub described_object: CrossVersionObjectReference,
+    /// metric identifies the target metric by name and selector
+    #[serde(default)]
+    pub metric: MetricIdentifier,
+    /// target specifies the target value for the given metric
+    #[serde(default)]
+    pub target: MetricTarget,
+}
+
+/// ObjectMetricStatus indicates the current value of a metric describing a kubernetes object (for example, hits-per-second on an Ingress object).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ObjectMetricStatus {
+    /// current contains the current value for the given metric
+    #[serde(default)]
+    pub current: MetricValueStatus,
+    /// DescribedObject specifies the descriptions of a object,such as kind,name apiVersion
+    #[serde(default, rename = "describedObject")]
+    pub described_object: CrossVersionObjectReference,
+    /// metric identifies the target metric by name and selector
+    #[serde(default)]
+    pub metric: MetricIdentifier,
+}
+
 /// ObjectReference contains enough information to let you inspect or modify the referred object.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObjectReference {
@@ -1903,6 +2753,14 @@ pub struct ObjectReference {
     /// UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
+}
+
+/// Overhead structure represents the resource overhead associated with running a pod.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Overhead {
+    /// podFixed represents the fixed resource overhead associated with running a pod.
+    #[serde(default, rename = "podFixed", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pod_fixed: std::collections::BTreeMap<String, Quantity>,
 }
 
 /// PersistentVolumeClaimCondition contains details about state of pvc
@@ -2271,6 +3129,57 @@ pub struct PodDNSConfigOption {
     pub value: Option<String>,
 }
 
+/// PodDisruptionBudgetSpec is a description of a PodDisruptionBudget.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PodDisruptionBudgetSpec {
+    /// An eviction is allowed if at most "maxUnavailable" pods selected by "selector" are unavailable after the eviction, i.e. even in absence of the evicted pod. For example, one can prevent all voluntary evictions by specifying 0. This is a mutually exclusive setting with "minAvailable".
+    #[serde(default, rename = "maxUnavailable", skip_serializing_if = "Option::is_none")]
+    pub max_unavailable: Option<IntOrString>,
+    /// An eviction is allowed if at least "minAvailable" pods selected by "selector" will still be available after the eviction, i.e. even in the absence of the evicted pod.  So for example you can prevent all voluntary evictions by specifying "100%".
+    #[serde(default, rename = "minAvailable", skip_serializing_if = "Option::is_none")]
+    pub min_available: Option<IntOrString>,
+    /// Label query over pods whose evictions are managed by the disruption budget. A null selector will match no pods, while an empty ({}) selector will select all pods within the namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<LabelSelector>,
+    /// UnhealthyPodEvictionPolicy defines the criteria for when unhealthy pods should be considered for eviction. Current implementation considers healthy pods, as pods that have status.conditions item with type="Ready",status="True".
+    #[serde(default, rename = "unhealthyPodEvictionPolicy", skip_serializing_if = "Option::is_none")]
+    pub unhealthy_pod_eviction_policy: Option<String>,
+}
+
+/// PodDisruptionBudgetStatus represents information about the status of a PodDisruptionBudget. Status may trail the actual state of a system.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PodDisruptionBudgetStatus {
+    /// Conditions contain conditions for PDB. The disruption controller sets the DisruptionAllowed condition. The following are known values for the reason field (additional reasons could be added in the future): - SyncFailed: The controller encountered an error and wasn't able to compute
+    /// the number of allowed disruptions. Therefore no disruptions are
+    /// allowed and the status of the condition will be False.
+    /// - InsufficientPods: The number of pods are either at or below the number
+    /// required by the PodDisruptionBudget. No disruptions are
+    /// allowed and the status of the condition will be False.
+    /// - SufficientPods: There are more pods than required by the PodDisruptionBudget.
+    /// The condition will be True, and the number of allowed
+    /// disruptions are provided by the disruptionsAllowed property.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+    /// current number of healthy pods
+    #[serde(default, rename = "currentHealthy")]
+    pub current_healthy: i32,
+    /// minimum desired number of healthy pods
+    #[serde(default, rename = "desiredHealthy")]
+    pub desired_healthy: i32,
+    /// DisruptedPods contains information about pods whose eviction was processed by the API server eviction subresource handler but has not yet been observed by the PodDisruptionBudget controller. A pod will be in this map from the time when the API server processed the eviction request to the time when the pod is seen by PDB controller as having been marked for deletion (or after a timeout). The key in the map is the name of the pod and the value is the time when the API server processed the eviction request. If the deletion didn't occur and a pod is still there it will be removed from the list automatically by PodDisruptionBudget controller after some time. If everything goes smooth this map should be empty for the most of the time. Large number of entries in the map may indicate problems with pod deletions.
+    #[serde(default, rename = "disruptedPods", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub disrupted_pods: std::collections::BTreeMap<String, Time>,
+    /// Number of pod disruptions that are currently allowed.
+    #[serde(default, rename = "disruptionsAllowed")]
+    pub disruptions_allowed: i32,
+    /// total number of pods counted by this disruption budget
+    #[serde(default, rename = "expectedPods")]
+    pub expected_pods: i32,
+    /// Most recent generation observed when updating this PDB status. DisruptionsAllowed and other status information is valid only if observedGeneration equals to PDB's object generation.
+    #[serde(default, rename = "observedGeneration", skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+}
+
 /// PodExtendedResourceClaimStatus is stored in the PodStatus for the extended resource requests backed by DRA. It stores the generated name for the corresponding special ResourceClaim created by the scheduler.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodExtendedResourceClaimStatus {
@@ -2280,6 +3189,53 @@ pub struct PodExtendedResourceClaimStatus {
     /// ResourceClaimName is the name of the ResourceClaim that was generated for the Pod in the namespace of the Pod.
     #[serde(default, rename = "resourceClaimName")]
     pub resource_claim_name: String,
+}
+
+/// PodFailurePolicy describes how failed pods influence the backoffLimit.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PodFailurePolicy {
+    /// A list of pod failure policy rules. The rules are evaluated in order. Once a rule matches a Pod failure, the remaining of the rules are ignored. When no rule matches the Pod failure, the default handling applies - the counter of pod failures is incremented and it is checked against the backoffLimit. At most 20 elements are allowed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<PodFailurePolicyRule>,
+}
+
+/// PodFailurePolicyOnExitCodesRequirement describes the requirement for handling a failed pod based on its container exit codes. In particular, it lookups the .state.terminated.exitCode for each app container and init container status, represented by the .status.containerStatuses and .status.initContainerStatuses fields in the Pod status, respectively. Containers completed with success (exit code 0) are excluded from the requirement check.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PodFailurePolicyOnExitCodesRequirement {
+    /// Restricts the check for exit codes to the container with the specified name. When null, the rule applies to all containers. When specified, it should match one the container or initContainer names in the pod template.
+    #[serde(default, rename = "containerName", skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    /// Represents the relationship between the container exit code(s) and the specified values. Containers completed with success (exit code 0) are excluded from the requirement check. Possible values are:
+    #[serde(default)]
+    pub operator: String,
+    /// Specifies the set of values. Each returned container exit code (might be multiple in case of multiple containers) is checked against this set of values with respect to the operator. The list of values must be ordered and must not contain duplicates. Value '0' cannot be used for the In operator. At least one element is required. At most 255 elements are allowed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<i32>,
+}
+
+/// PodFailurePolicyOnPodConditionsPattern describes a pattern for matching an actual pod condition type.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PodFailurePolicyOnPodConditionsPattern {
+    /// Specifies the required Pod condition status. To match a pod condition it is required that the specified status equals the pod condition status. Defaults to True.
+    #[serde(default)]
+    pub status: String,
+    /// Specifies the required Pod condition type. To match a pod condition it is required that specified type equals the pod condition type.
+    #[serde(default, rename = "type")]
+    pub r#type: String,
+}
+
+/// PodFailurePolicyRule describes how a pod failure is handled when the requirements are met. One of onExitCodes and onPodConditions, but not both, can be used in each rule.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PodFailurePolicyRule {
+    /// Specifies the action taken on a pod failure when the requirements are satisfied. Possible values are:
+    #[serde(default)]
+    pub action: String,
+    /// Represents the requirement on the container exit codes.
+    #[serde(default, rename = "onExitCodes", skip_serializing_if = "Option::is_none")]
+    pub on_exit_codes: Option<PodFailurePolicyOnExitCodesRequirement>,
+    /// Represents the requirement on the pod conditions. The requirement is represented as a list of pod condition patterns. The requirement is satisfied if at least one pattern matches an actual pod condition. At most 20 elements are allowed.
+    #[serde(default, rename = "onPodConditions", skip_serializing_if = "Vec::is_empty")]
+    pub on_pod_conditions: Vec<PodFailurePolicyOnPodConditionsPattern>,
 }
 
 /// PodIP represents a single IP address allocated to the pod.
@@ -2581,6 +3537,28 @@ pub struct PodTemplateSpec {
     pub spec: Option<PodSpec>,
 }
 
+/// PodsMetricSource indicates how to scale on a metric describing each pod in the current scale target (for example, transactions-processed-per-second). The values will be averaged together before being compared to the target value.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PodsMetricSource {
+    /// metric identifies the target metric by name and selector
+    #[serde(default)]
+    pub metric: MetricIdentifier,
+    /// target specifies the target value for the given metric
+    #[serde(default)]
+    pub target: MetricTarget,
+}
+
+/// PodsMetricStatus indicates the current value of a metric describing each pod in the current scale target (for example, transactions-processed-per-second).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PodsMetricStatus {
+    /// current contains the current value for the given metric
+    #[serde(default)]
+    pub current: MetricValueStatus,
+    /// metric identifies the target metric by name and selector
+    #[serde(default)]
+    pub metric: MetricIdentifier,
+}
+
 /// PolicyRule holds information that describes a policy rule, but does not contain information about who the rule applies to or which namespace the rule applies to.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PolicyRule {
@@ -2775,6 +3753,11 @@ pub struct RBDVolumeSource {
     pub user: Option<String>,
 }
 
+/// RawExtension is used to hold extensions in external versions.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RawExtension {
+}
+
 /// ReplicaSetCondition describes the state of a replica set at a certain point.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReplicaSetCondition {
@@ -2838,6 +3821,66 @@ pub struct ReplicaSetStatus {
     pub terminating_replicas: Option<i32>,
 }
 
+/// ReplicationControllerCondition describes the state of a replication controller at a certain point.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplicationControllerCondition {
+    /// The last time the condition transitioned from one status to another.
+    #[serde(default, rename = "lastTransitionTime", skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<Time>,
+    /// A human readable message indicating details about the transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The reason for the condition's last transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Status of the condition, one of True, False, Unknown.
+    #[serde(default)]
+    pub status: String,
+    /// Type of replication controller condition.
+    #[serde(default, rename = "type")]
+    pub r#type: String,
+}
+
+/// ReplicationControllerSpec is the specification of a replication controller.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplicationControllerSpec {
+    /// Minimum number of seconds for which a newly created pod should be ready without any of its container crashing, for it to be considered available. Defaults to 0 (pod will be considered available as soon as it is ready)
+    #[serde(default, rename = "minReadySeconds", skip_serializing_if = "Option::is_none")]
+    pub min_ready_seconds: Option<i32>,
+    /// Replicas is the number of desired replicas. This is a pointer to distinguish between explicit zero and unspecified. Defaults to 1. More info: https://kubernetes.io/docs/concepts/workloads/controllers/replicationcontroller#what-is-a-replicationcontroller
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i32>,
+    /// Selector is a label query over pods that should match the Replicas count. If Selector is empty, it is defaulted to the labels present on the Pod template. Label keys and values that must match in order to be controlled by this replication controller, if empty defaulted to labels on Pod template. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub selector: std::collections::BTreeMap<String, String>,
+    /// Template is the object that describes the pod that will be created if insufficient replicas are detected. This takes precedence over a TemplateRef. The only allowed template.spec.restartPolicy value is "Always". More info: https://kubernetes.io/docs/concepts/workloads/controllers/replicationcontroller#pod-template
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<PodTemplateSpec>,
+}
+
+/// ReplicationControllerStatus represents the current status of a replication controller.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplicationControllerStatus {
+    /// The number of available replicas (ready for at least minReadySeconds) for this replication controller.
+    #[serde(default, rename = "availableReplicas", skip_serializing_if = "Option::is_none")]
+    pub available_replicas: Option<i32>,
+    /// Represents the latest available observations of a replication controller's current state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<ReplicationControllerCondition>,
+    /// The number of pods that have labels matching the labels of the pod template of the replication controller.
+    #[serde(default, rename = "fullyLabeledReplicas", skip_serializing_if = "Option::is_none")]
+    pub fully_labeled_replicas: Option<i32>,
+    /// ObservedGeneration reflects the generation of the most recently observed replication controller.
+    #[serde(default, rename = "observedGeneration", skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    /// The number of ready replicas for this replication controller.
+    #[serde(default, rename = "readyReplicas", skip_serializing_if = "Option::is_none")]
+    pub ready_replicas: Option<i32>,
+    /// Replicas is the most recently observed number of replicas. More info: https://kubernetes.io/docs/concepts/workloads/controllers/replicationcontroller#what-is-a-replicationcontroller
+    #[serde(default)]
+    pub replicas: i32,
+}
+
 /// ResourceClaim references one entry in PodSpec.ResourceClaims.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceClaim {
@@ -2878,6 +3921,53 @@ pub struct ResourceHealth {
     /// ResourceID is the unique identifier of the resource. See the ResourceID type for more information.
     #[serde(default, rename = "resourceID")]
     pub resource_id: String,
+}
+
+/// ResourceMetricSource indicates how to scale on a resource metric known to Kubernetes, as specified in requests and limits, describing each pod in the current scale target (e.g. CPU or memory).  The values will be averaged together before being compared to the target.  Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.  Only one "target" type should be set.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceMetricSource {
+    /// name is the name of the resource in question.
+    #[serde(default)]
+    pub name: String,
+    /// target specifies the target value for the given metric
+    #[serde(default)]
+    pub target: MetricTarget,
+}
+
+/// ResourceMetricStatus indicates the current value of a resource metric known to Kubernetes, as specified in requests and limits, describing each pod in the current scale target (e.g. CPU or memory).  Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceMetricStatus {
+    /// current contains the current value for the given metric
+    #[serde(default)]
+    pub current: MetricValueStatus,
+    /// name is the name of the resource in question.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// ResourceQuotaSpec defines the desired hard limits to enforce for Quota.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceQuotaSpec {
+    /// hard is the set of desired hard limits for each named resource. More info: https://kubernetes.io/docs/concepts/policy/resource-quotas/
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub hard: std::collections::BTreeMap<String, Quantity>,
+    /// scopeSelector is also a collection of filters like scopes that must match each object tracked by a quota but expressed using ScopeSelectorOperator in combination with possible values. For a resource to match, both scopes AND scopeSelector (if specified in spec), must be matched.
+    #[serde(default, rename = "scopeSelector", skip_serializing_if = "Option::is_none")]
+    pub scope_selector: Option<ScopeSelector>,
+    /// A collection of filters that must match each object tracked by a quota. If not specified, the quota matches all objects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
+/// ResourceQuotaStatus defines the enforced hard limits and observed use.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResourceQuotaStatus {
+    /// Hard is the set of enforced hard limits for each named resource. More info: https://kubernetes.io/docs/concepts/policy/resource-quotas/
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub hard: std::collections::BTreeMap<String, Quantity>,
+    /// Used is the current observed total usage of the resource in the namespace.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub used: std::collections::BTreeMap<String, Quantity>,
 }
 
 /// ResourceRequirements describes the compute resource requirements.
@@ -3036,6 +4126,39 @@ pub struct ScaleIOVolumeSource {
     pub volume_name: Option<String>,
 }
 
+/// Scheduling specifies the scheduling constraints for nodes supporting a RuntimeClass.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Scheduling {
+    /// nodeSelector lists labels that must be present on nodes that support this RuntimeClass. Pods using this RuntimeClass can only be scheduled to a node matched by this selector. The RuntimeClass nodeSelector is merged with a pod's existing nodeSelector. Any conflicts will cause the pod to be rejected in admission.
+    #[serde(default, rename = "nodeSelector", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub node_selector: std::collections::BTreeMap<String, String>,
+    /// tolerations are appended (excluding duplicates) to pods running with this RuntimeClass during admission, effectively unioning the set of nodes tolerated by the pod and the RuntimeClass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<Toleration>,
+}
+
+/// A scope selector represents the AND of the selectors represented by the scoped-resource selector requirements.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScopeSelector {
+    /// A list of scope selector requirements by scope of the resources.
+    #[serde(default, rename = "matchExpressions", skip_serializing_if = "Vec::is_empty")]
+    pub match_expressions: Vec<ScopedResourceSelectorRequirement>,
+}
+
+/// A scoped-resource selector requirement is a selector that contains values, a scope name, and an operator that relates the scope name and values.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScopedResourceSelectorRequirement {
+    /// Represents a scope's relationship to a set of values. Valid operators are In, NotIn, Exists, DoesNotExist.
+    #[serde(default)]
+    pub operator: String,
+    /// The name of the scope that the selector applies to.
+    #[serde(default, rename = "scopeName")]
+    pub scope_name: String,
+    /// An array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+}
+
 /// SeccompProfile defines a pod/container's seccomp profile settings. Only one profile source may be set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SeccompProfile {
@@ -3167,6 +4290,17 @@ pub struct ServiceAccountTokenProjection {
     /// path is the path relative to the mount point of the file to project the token into.
     #[serde(default)]
     pub path: String,
+}
+
+/// ServiceBackendPort is the service port being referenced.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServiceBackendPort {
+    /// name is the name of the port on the Service. This is a mutually exclusive setting with "Number".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// number is the numerical port number (e.g. 80) on the Service. This is a mutually exclusive setting with "Name".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<i32>,
 }
 
 /// ServicePort contains information on service's port.
@@ -3464,6 +4598,25 @@ pub struct Subject {
     pub namespace: Option<String>,
 }
 
+/// SuccessPolicy describes when a Job can be declared as succeeded based on the success of some indexes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SuccessPolicy {
+    /// rules represents the list of alternative rules for the declaring the Jobs as successful before `.status.succeeded >= .spec.completions`. Once any of the rules are met, the "SuccessCriteriaMet" condition is added, and the lingering pods are removed. The terminal state for such a Job has the "Complete" condition. Additionally, these rules are evaluated in order; Once the Job meets one of the rules, other rules are ignored. At most 20 elements are allowed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<SuccessPolicyRule>,
+}
+
+/// SuccessPolicyRule describes rule for declaring a Job as succeeded. Each rule must have at least one of the "succeededIndexes" or "succeededCount" specified.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SuccessPolicyRule {
+    /// succeededCount specifies the minimal required size of the actual set of the succeeded indexes for the Job. When succeededCount is used along with succeededIndexes, the check is constrained only to the set of indexes specified by succeededIndexes. For example, given that succeededIndexes is "1-4", succeededCount is "3", and completed indexes are "1", "3", and "5", the Job isn't declared as succeeded because only "1" and "3" indexes are considered in that rules. When this field is null, this doesn't default to any value and is never evaluated at any time. When specified it needs to be a positive integer.
+    #[serde(default, rename = "succeededCount", skip_serializing_if = "Option::is_none")]
+    pub succeeded_count: Option<i32>,
+    /// succeededIndexes specifies the set of indexes which need to be contained in the actual set of the succeeded indexes for the Job. The list of indexes must be within 0 to ".spec.completions-1" and must not contain duplicates. At least one element is required. The indexes are represented as intervals separated by commas. The intervals can be a decimal integer or a pair of decimal integers separated by a hyphen. The number are listed in represented by the first and last element of the series, separated by a hyphen. For example, if the completed indexes are 1, 3, 4, 5 and 7, they are represented as "1,3-5,7". When this field is null, this field doesn't default to any value and is never evaluated at any time.
+    #[serde(default, rename = "succeededIndexes", skip_serializing_if = "Option::is_none")]
+    pub succeeded_indexes: Option<String>,
+}
+
 /// Sysctl defines a kernel parameter to be set
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Sysctl {
@@ -3508,6 +4661,17 @@ pub struct Taint {
 pub struct Time {
 }
 
+/// TokenRequest contains parameters of a service account token.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenRequest {
+    /// audience is the intended audience of the token in "TokenRequestSpec". It will default to the audiences of kube apiserver.
+    #[serde(default)]
+    pub audience: String,
+    /// expirationSeconds is the duration of validity of the token in "TokenRequestSpec". It has the same default value of "ExpirationSeconds" in "TokenRequestSpec".
+    #[serde(default, rename = "expirationSeconds", skip_serializing_if = "Option::is_none")]
+    pub expiration_seconds: Option<i64>,
+}
+
 /// The pod this Toleration is attached to tolerates any taint that matches the triple <key,value,effect> using the matching operator <operator>.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Toleration {
@@ -3526,6 +4690,25 @@ pub struct Toleration {
     /// Value is the taint value the toleration matches to. If the operator is Exists, the value should be empty, otherwise just a regular string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+}
+
+/// A topology selector requirement is a selector that matches given label. This is an alpha feature and may change in the future.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TopologySelectorLabelRequirement {
+    /// The label key that the selector applies to.
+    #[serde(default)]
+    pub key: String,
+    /// An array of string values. One value must match the label to be selected. Each entry in Values is ORed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+}
+
+/// A topology selector term represents the result of label queries. A null or empty topology selector term matches no objects. The requirements of them are ANDed. It provides a subset of functionality as NodeSelectorTerm. This is an alpha feature and may change in the future.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct TopologySelectorTerm {
+    /// A list of topology selector requirements by labels.
+    #[serde(default, rename = "matchLabelExpressions", skip_serializing_if = "Vec::is_empty")]
+    pub match_label_expressions: Vec<TopologySelectorLabelRequirement>,
 }
 
 /// TopologySpreadConstraint specifies how to spread matching pods among the given topology.
@@ -3583,6 +4766,17 @@ pub struct TypedObjectReference {
     /// Namespace is the namespace of resource being referenced Note that when a namespace is specified, a gateway.networking.k8s.io/ReferenceGrant object is required in the referent namespace to allow that namespace's owner to accept the reference. See the ReferenceGrant documentation for details. (Alpha) This field requires the CrossNamespaceVolumeDataSource feature gate to be enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+}
+
+/// UncountedTerminatedPods holds UIDs of Pods that have terminated but haven't been accounted in Job status counters.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct UncountedTerminatedPods {
+    /// failed holds UIDs of failed Pods.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<String>,
+    /// succeeded holds UIDs of succeeded Pods.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub succeeded: Vec<String>,
 }
 
 /// Volume represents a named volume in a pod that may be accessed by any container in the pod.
@@ -3683,6 +4877,48 @@ pub struct Volume {
     pub vsphere_volume: Option<VsphereVirtualDiskVolumeSource>,
 }
 
+/// VolumeAttachmentSource represents a volume that should be attached. Right now only PersistentVolumes can be attached via external attacher, in the future we may allow also inline volumes in pods. Exactly one member can be set.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeAttachmentSource {
+    /// inlineVolumeSpec contains all the information necessary to attach a persistent volume defined by a pod's inline VolumeSource. This field is populated only for the CSIMigration feature. It contains translated fields from a pod's inline VolumeSource to a PersistentVolumeSpec. This field is beta-level and is only honored by servers that enabled the CSIMigration feature.
+    #[serde(default, rename = "inlineVolumeSpec", skip_serializing_if = "Option::is_none")]
+    pub inline_volume_spec: Option<PersistentVolumeSpec>,
+    /// persistentVolumeName represents the name of the persistent volume to attach.
+    #[serde(default, rename = "persistentVolumeName", skip_serializing_if = "Option::is_none")]
+    pub persistent_volume_name: Option<String>,
+}
+
+/// VolumeAttachmentSpec is the specification of a VolumeAttachment request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeAttachmentSpec {
+    /// attacher indicates the name of the volume driver that MUST handle this request. This is the name returned by GetPluginName().
+    #[serde(default)]
+    pub attacher: String,
+    /// nodeName represents the node that the volume should be attached to.
+    #[serde(default, rename = "nodeName")]
+    pub node_name: String,
+    /// source represents the volume that should be attached.
+    #[serde(default)]
+    pub source: VolumeAttachmentSource,
+}
+
+/// VolumeAttachmentStatus is the status of a VolumeAttachment request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeAttachmentStatus {
+    /// attachError represents the last error encountered during attach operation, if any. This field must only be set by the entity completing the attach operation, i.e. the external-attacher.
+    #[serde(default, rename = "attachError", skip_serializing_if = "Option::is_none")]
+    pub attach_error: Option<VolumeError>,
+    /// attached indicates the volume is successfully attached. This field must only be set by the entity completing the attach operation, i.e. the external-attacher.
+    #[serde(default)]
+    pub attached: bool,
+    /// attachmentMetadata is populated with any information returned by the attach operation, upon successful attach, that must be passed into subsequent WaitForAttach or Mount calls. This field must only be set by the entity completing the attach operation, i.e. the external-attacher.
+    #[serde(default, rename = "attachmentMetadata", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub attachment_metadata: std::collections::BTreeMap<String, String>,
+    /// detachError represents the last error encountered during detach operation, if any. This field must only be set by the entity completing the detach operation, i.e. the external-attacher.
+    #[serde(default, rename = "detachError", skip_serializing_if = "Option::is_none")]
+    pub detach_error: Option<VolumeError>,
+}
+
 /// volumeDevice describes a mapping of a raw block device within a container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeDevice {
@@ -3692,6 +4928,20 @@ pub struct VolumeDevice {
     /// name must match the name of a persistentVolumeClaim in the pod
     #[serde(default)]
     pub name: String,
+}
+
+/// VolumeError captures an error encountered during a volume operation.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeError {
+    /// errorCode is a numeric gRPC code representing the error encountered during Attach or Detach operations.
+    #[serde(default, rename = "errorCode", skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<i32>,
+    /// message represents the error encountered during Attach or Detach operation. This string may be logged, so it should not contain sensitive information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// time represents the time the error was encountered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<Time>,
 }
 
 /// VolumeMount describes a mounting of a Volume within a container.
@@ -3743,6 +4993,14 @@ pub struct VolumeNodeAffinity {
     /// required specifies hard node constraints that must be met.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<NodeSelector>,
+}
+
+/// VolumeNodeResources is a set of resource limits for scheduling of volumes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolumeNodeResources {
+    /// count indicates the maximum number of unique volumes managed by the CSI driver that can be used on a node. A volume that is both attached and mounted on a node is considered to be used once, not twice. The same rule applies for a unique volume that is shared among multiple pods on the same node. If this field is not specified, then the supported number of volumes on this node is unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<i32>,
 }
 
 /// Projection that may be projected along with other supported volume types. Exactly one of these fields must be set.

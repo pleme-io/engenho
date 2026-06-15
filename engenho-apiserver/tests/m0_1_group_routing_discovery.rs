@@ -618,8 +618,10 @@ async fn openapi_v3_discovery_index_and_documents() {
     let addr = server.local_addr();
     let client = reqwest::Client::new();
 
-    // GET /openapi/v3 → discovery index. paths keys == the three cataloged
-    // groups, each with a serverRelativeURL.
+    // GET /openapi/v3 → discovery index. paths keys == the served (non-opaque)
+    // cataloged groups, each with a serverRelativeURL. Derived from the
+    // `SERVED` table (the single source of truth) so the assertion stays
+    // mechanical as typed groups are added — never a hand-maintained list.
     let resp = client
         .get(format!("http://{addr}/openapi/v3"))
         .send()
@@ -628,11 +630,40 @@ async fn openapi_v3_discovery_index_and_documents() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let idx: serde_json::Value = resp.json().await.unwrap();
     let paths = idx.get("paths").unwrap().as_object().unwrap();
-    let keys: std::collections::BTreeSet<&str> = paths.keys().map(String::as_str).collect();
-    let want: std::collections::BTreeSet<&str> = ["api/v1", "apis/apps/v1", "apis/rbac.authorization.k8s.io/v1"]
-        .into_iter()
+    let keys: std::collections::BTreeSet<String> = paths.keys().cloned().collect();
+    let want: std::collections::BTreeSet<String> = engenho_types::openapi_v3::SERVED
+        .iter()
+        .map(engenho_types::openapi_v3::ServedDoc::index_key)
         .collect();
-    assert_eq!(keys, want, "discovery index keys == cataloged groups");
+    assert_eq!(
+        keys, want,
+        "discovery index keys == served (non-opaque) cataloged groups"
+    );
+    // The core + apps + rbac trio (the original schema-backed groups) are
+    // always present; the typed-promotion groups (batch, networking, …) joined
+    // them. Pin the originals so a regression that drops them fails clearly.
+    for original in [
+        "api/v1",
+        "apis/apps/v1",
+        "apis/rbac.authorization.k8s.io/v1",
+    ] {
+        assert!(
+            keys.contains(original),
+            "served index must carry {original}"
+        );
+    }
+    // The typed-promotion groups are now served too (CronJob/Ingress/… get
+    // `kubectl explain` + validated apply).
+    for promoted in [
+        "apis/batch/v1",
+        "apis/networking.k8s.io/v1",
+        "apis/autoscaling/v2",
+    ] {
+        assert!(
+            keys.contains(promoted),
+            "served index must carry promoted group {promoted}"
+        );
+    }
     // Each entry carries a serverRelativeURL.
     for (_k, item) in paths {
         let url = item

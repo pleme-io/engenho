@@ -50,3 +50,55 @@ files:
     description: "RBAC API — Role, ClusterRole, RoleBinding, ClusterRoleBinding"
     blake3: "d4ee15fa2165bfa334aa39722f84f1cc0f80fbe9e4fc7190559e6de94e9f5309"
     bytes: 385226
+  # ── M0.0.4 typed-promotion groups — vendored to type the conformance
+  #    kinds that were previously served OPAQUE (CronJob, Ingress*,
+  #    NetworkPolicy, PodDisruptionBudget, StorageClass + CSI*,
+  #    PriorityClass, Lease, RuntimeClass, HorizontalPodAutoscaler).
+  - path: apis__batch__v1_openapi.json
+    group: batch
+    version: v1
+    description: "Batch API — Job, CronJob"
+    blake3: "22cf4a19be81fe87ca2f81db66865ee8b9f22c8ba604d3f12df4d52733b15579"
+    bytes: 531221
+  - path: apis__networking.k8s.io__v1_openapi.json
+    group: networking.k8s.io
+    version: v1
+    description: "Networking API — Ingress, IngressClass, NetworkPolicy, IPAddress, ServiceCIDR"
+    blake3: "9ec72a7c7eecbd5c9d979ae4b5fb96231b49cf8e94d5e6bcdc10cf2640723856"
+    bytes: 510988
+  - path: apis__policy__v1_openapi.json
+    group: policy
+    version: v1
+    description: "Policy API — PodDisruptionBudget"
+    blake3: "51b97b1f84d1ace1928016e27ee23b3704aca19939d7476cd507ba7e735ff115"
+    bytes: 172705
+  - path: apis__storage.k8s.io__v1_openapi.json
+    group: storage.k8s.io
+    version: v1
+    description: "Storage API — StorageClass, CSINode, CSIDriver, VolumeAttachment, CSIStorageCapacity"
+    blake3: "5e696a939eeea0817be84b881bab309fe982ce387074cf364c8cfa520e0ef60a"
+    bytes: 598175
+  - path: apis__scheduling.k8s.io__v1_openapi.json
+    group: scheduling.k8s.io
+    version: v1
+    description: "Scheduling API — PriorityClass"
+    blake3: "8e0fb9ed304a7195c504e6db33ddfb0d2c917a98dcc5704c7723ce7f5476cb92"
+    bytes: 126553
+  - path: apis__coordination.k8s.io__v1_openapi.json
+    group: coordination.k8s.io
+    version: v1
+    description: "Coordination API — Lease"
+    blake3: "47db299aebd28c76a39b3180def778184f92aa3edad2ad1c261ad971f70f47dc"
+    bytes: 148498
+  - path: apis__node.k8s.io__v1_openapi.json
+    group: node.k8s.io
+    version: v1
+    description: "Node API — RuntimeClass"
+    blake3: "bcae475e24b86173dccf1c9fbe4212548cac2d24d8c8285608db5fab7628b529"
+    bytes: 132934
+  - path: apis__autoscaling__v2_openapi.json
+    group: autoscaling
+    version: v2
+    description: "Autoscaling API — HorizontalPodAutoscaler"
+    blake3: "c9985c686485a5d03bf250b32ac48d73d287e56e3493242f5b354565d8e5d396"
+    bytes: 201301
