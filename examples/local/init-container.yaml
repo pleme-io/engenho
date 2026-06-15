@@ -1,0 +1,32 @@
+# Init-container proof: the `setup` init container must run to completion
+# (exit 0) BEFORE the `app` container starts. Demonstrates engenho's kubelet
+# init-container driver — the gating data-plane feature for the tatara-mesh
+# (SPIRE-agent / proxy-bootstrap pattern).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: init-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: initdemo
+  namespace: init-demo
+  labels: { app: initdemo }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: initdemo }
+  template:
+    metadata:
+      labels: { app: initdemo }
+    spec:
+      restartPolicy: Always
+      initContainers:
+        - name: setup
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c", "echo init-ran-first; sleep 2; echo init-done; exit 0"]
+      containers:
+        - name: app
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c", "echo app-started-after-init; sleep 3600"]
