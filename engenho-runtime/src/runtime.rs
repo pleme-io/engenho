@@ -20,8 +20,9 @@ use engenho_config::{
 use engenho_controllers::{
     CrdController, CronJobController, DaemonSetController, DeploymentController, DynamicHandlerSink,
     EndpointsController, FakeRouter, GcController, IptablesRouter, IpvsRouter, JobController,
-    KindFilter, NamespaceController, PvBinderController, ReplicaSetController, ServiceRouter,
-    ServiceRoutingController, StatefulSetController, WallClock, WatchDriver, WatchDriverConfig,
+    KindFilter, NamespaceController, PodDisruptionBudgetController, PvBinderController,
+    ReplicaSetController, ServiceRouter, ServiceRoutingController, StatefulSetController, WallClock,
+    WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
 };
@@ -1031,6 +1032,17 @@ fn spawn_drivers(
             WatchDriver::new(c, store.clone(), driver_config(&["CronJob", "Job"])).spawn(),
         );
     }
+    if enable.pdb {
+        let c = PodDisruptionBudgetController::new(store.clone(), ns.clone());
+        handles.push(
+            WatchDriver::new(
+                c,
+                store.clone(),
+                driver_config(&["PodDisruptionBudget", "Pod"]),
+            )
+            .spawn(),
+        );
+    }
     if enable.endpoints {
         let c = EndpointsController::new(store.clone(), ns.clone());
         handles.push(
@@ -1247,9 +1259,9 @@ mod tests {
             false
         );
         // Drivers: 12 reconcilers (deployment, replicaset, statefulset,
-        // daemonset, job, cronjob, endpoints, service_routing, gc, namespace,
-        // pv_binder, crd) + scheduler + kubelet = 14.
-        assert_eq!(rt.drivers.len(), 14);
+        // daemonset, job, cronjob, endpoints, pdb, service_routing, gc,
+        // namespace, pv_binder, crd) + scheduler + kubelet = 15.
+        assert_eq!(rt.drivers.len(), 15);
         rt.shutdown().await.unwrap();
     }
 
@@ -1342,11 +1354,11 @@ mod tests {
     #[tokio::test]
     async fn disabling_service_routing_drops_one_driver() {
         // Gating works: turning off enable.service_routing removes exactly
-        // one spawned driver (14 → 13).
+        // one spawned driver (15 → 14).
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(rt.drivers.len(), 13);
+        assert_eq!(rt.drivers.len(), 14);
         rt.shutdown().await.unwrap();
     }
 }
