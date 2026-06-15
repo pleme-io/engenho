@@ -348,13 +348,17 @@ async fn discovery_apis_group_list_shape() {
     );
     // Core group is NOT in /apis.
     assert!(!names.contains(&""), "core group is not advertised under /apis");
-    // Each group's preferredVersion.version == "v1".
+    // Each group's preferredVersion.version is its served version. Every group
+    // serves "v1" EXCEPT autoscaling, whose conformant HorizontalPodAutoscaler
+    // lives in v2 (the M0.0.4 breadth expansion added it at v2, matching
+    // upstream).
     for g in groups {
+        let name = g.get("name").unwrap().as_str().unwrap();
+        let want_version = if name == "autoscaling" { "v2" } else { "v1" };
         assert_eq!(
             g.get("preferredVersion").unwrap().get("version").unwrap(),
-            "v1",
-            "preferredVersion.version == v1 for {:?}",
-            g.get("name")
+            want_version,
+            "preferredVersion.version == {want_version} for {name:?}"
         );
     }
 
@@ -686,6 +690,155 @@ async fn openapi_v3_discovery_index_and_documents() {
         resp.status(),
         reqwest::StatusCode::NOT_FOUND,
         "uncataloged OpenAPI v3 group → 404"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+// ── M0.0.4 conformance-breadth opaque kinds — live CRUD + discovery ───────
+//
+// The breadth expansion added ~30 opaque kinds across 12 API groups. The
+// opaque seam means each kind goes live (routable + discoverable + store-
+// backed CRUD) from a single `RESOURCE_CATALOG` row with no vendored schema.
+// These tests prove a representative namespaced kind (batch/v1 CronJob) and a
+// representative cluster-scoped kind (storage.k8s.io/v1 StorageClass) actually
+// serve full CRUD through the same catalog-driven path as the typed kinds, and
+// that the new groups appear in `/apis` discovery.
+
+#[tokio::test]
+async fn breadth_opaque_namespaced_cronjob_full_crud() {
+    let (_store, server) = boot().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/apis/batch/v1/namespaces/default/cronjobs");
+
+    // POST → 201 (apply lands the opaque body verbatim — no schema to validate).
+    let body = serde_json::json!({
+        "apiVersion": "batch/v1",
+        "kind": "CronJob",
+        "metadata": { "name": "nightly" },
+        "spec": { "schedule": "0 0 * * *" }
+    });
+    let resp = client.post(&base).json(&body).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "batch/v1 CronJob POST 201");
+
+    // GET → 200, the opaque spec round-trips byte-for-byte.
+    let resp = client.get(format!("{base}/nightly")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(got.get("kind").unwrap(), "CronJob");
+    assert_eq!(got.get("apiVersion").unwrap(), "batch/v1");
+    assert_eq!(got.get("spec").unwrap().get("schedule").unwrap(), "0 0 * * *");
+
+    // LIST → 200, CronJobList.
+    let resp = client.get(&base).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(list.get("kind").unwrap(), "CronJobList");
+    assert_eq!(list.get("items").unwrap().as_array().unwrap().len(), 1);
+
+    // DELETE → 200, then GET → 404.
+    let resp = client.delete(format!("{base}/nightly")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = client.get(format!("{base}/nightly")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn breadth_opaque_cluster_scoped_storageclass_full_crud() {
+    let (_store, server) = boot().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/apis/storage.k8s.io/v1/storageclasses");
+
+    // Cluster-scoped path (no /namespaces/<ns>/ segment).
+    let body = serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "StorageClass",
+        "metadata": { "name": "fast" },
+        "provisioner": "engenho.io/local"
+    });
+    let resp = client.post(&base).json(&body).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "storage.k8s.io StorageClass POST 201");
+
+    let resp = client.get(format!("{base}/fast")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(got.get("kind").unwrap(), "StorageClass");
+    assert_eq!(got.get("provisioner").unwrap(), "engenho.io/local");
+
+    let resp = client.delete(format!("{base}/fast")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = client.get(format!("{base}/fast")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn breadth_new_groups_appear_in_discovery() {
+    let (_store, server) = boot().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    // GET /apis → APIGroupList must now advertise the breadth-expansion groups.
+    let resp = client.get(format!("http://{addr}/apis")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let gl: serde_json::Value = resp.json().await.unwrap();
+    let names: Vec<&str> = gl
+        .get("groups")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g.get("name").unwrap().as_str().unwrap())
+        .collect();
+    for want in [
+        "batch",
+        "autoscaling",
+        "policy",
+        "networking.k8s.io",
+        "storage.k8s.io",
+        "node.k8s.io",
+        "scheduling.k8s.io",
+        "coordination.k8s.io",
+        "certificates.k8s.io",
+        "apiregistration.k8s.io",
+        "flowcontrol.apiserver.k8s.io",
+    ] {
+        assert!(names.contains(&want), "breadth group {want:?} advertised: {names:?}");
+    }
+
+    // GET /apis/batch/v1 → CronJob + Job rows present with the right plurals
+    // and shortNames (what lets `kubectl get cj` resolve).
+    let resp = client
+        .get(format!("http://{addr}/apis/batch/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let rl: serde_json::Value = resp.json().await.unwrap();
+    let resources = rl.get("resources").unwrap().as_array().unwrap();
+    let cj = resources
+        .iter()
+        .find(|r| r.get("name").unwrap() == "cronjobs")
+        .expect("cronjobs advertised in batch/v1 discovery");
+    assert_eq!(cj.get("kind").unwrap(), "CronJob");
+    assert_eq!(cj.get("namespaced").unwrap(), true);
+    let short: Vec<&str> = cj
+        .get("shortNames")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(short, vec!["cj"]);
+    assert!(
+        resources.iter().any(|r| r.get("name").unwrap() == "jobs"),
+        "jobs advertised in batch/v1 discovery"
     );
 
     server.shutdown().await.unwrap();
