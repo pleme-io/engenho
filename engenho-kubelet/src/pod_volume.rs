@@ -358,6 +358,24 @@ pub trait VolumeMaterializer: Send + Sync {
         pod: &str,
         volume: &str,
     ) -> Result<MountSource, VolumeResolveError>;
+
+    /// Idempotently remove the named volume backing the emptyDir `volume` of
+    /// pod `<namespace>/<pod>` — the pod-delete counterpart of
+    /// [`ensure_empty_dir`](VolumeMaterializer::ensure_empty_dir). emptyDir is
+    /// pod-lifetime scratch, so its named volume is reaped alongside the pod's
+    /// containers (after they stop+remove). An already-absent volume is
+    /// SUCCESS (idempotent — a re-run never errors).
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeResolveError::Materialize`] on a `podman volume rm` failure that
+    /// is NOT "no such volume" (a genuine host error the cleanup must retry).
+    async fn remove_empty_dir(
+        &self,
+        namespace: &str,
+        pod: &str,
+        volume: &str,
+    ) -> Result<(), VolumeResolveError>;
 }
 
 /// Read the typed `Vec<Volume>` from a Pod's raw `spec.volumes` JSON. Absent
@@ -734,6 +752,13 @@ impl PodmanVolumeMaterializer {
         vec!["volume".to_string(), "create".to_string(), name.to_string()]
     }
 
+    /// `podman volume rm <name>` argv (pure, unit-assertable). Used by
+    /// [`remove_empty_dir`](VolumeMaterializer::remove_empty_dir) at pod-delete.
+    #[must_use]
+    pub fn volume_rm_argv(name: &str) -> Vec<String> {
+        vec!["volume".to_string(), "rm".to_string(), name.to_string()]
+    }
+
     /// The deterministic emptyDir named-volume name:
     /// `engenho-empty-<ns>_<pod>_<volume>`.
     #[must_use]
@@ -801,6 +826,36 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
         }
         Ok(MountSource::NamedVolume(vol_name))
     }
+
+    async fn remove_empty_dir(
+        &self,
+        namespace: &str,
+        pod: &str,
+        volume: &str,
+    ) -> Result<(), VolumeResolveError> {
+        let vol_name = Self::empty_dir_volume_name(namespace, pod, volume);
+        // `podman volume rm` of an absent volume exits non-zero with a "no
+        // such volume" stderr — idempotent SUCCESS for the delete path (a
+        // re-run after a partial cleanup, or a volume that never got created
+        // because the pod failed to start, must NOT wedge cleanup).
+        let argv = Self::volume_rm_argv(&vol_name);
+        let out = tokio::process::Command::new(&self.binary)
+            .args(&argv)
+            .output()
+            .await
+            .map_err(|e| {
+                VolumeResolveError::Materialize(format!("podman volume rm spawn: {e}"))
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.contains("no such volume") && !stderr.contains("not found") {
+                return Err(VolumeResolveError::Materialize(format!(
+                    "podman volume rm {vol_name}: {stderr}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 // =================================================================
@@ -824,6 +879,8 @@ struct FakeMatState {
     files: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     /// emptyDir volumes the materializer was asked to ensure.
     empty_dirs: Vec<String>,
+    /// emptyDir volumes the materializer was asked to remove (delete path).
+    removed_empty_dirs: Vec<String>,
 }
 
 impl FakeVolumeMaterializer {
@@ -842,6 +899,12 @@ impl FakeVolumeMaterializer {
     /// order).
     pub async fn ensured_empty_dirs(&self) -> Vec<String> {
         self.inner.lock().await.empty_dirs.clone()
+    }
+
+    /// The list of emptyDir volumes the mock was asked to remove (in call
+    /// order) — the pod-delete cleanup surface.
+    pub async fn removed_empty_dirs(&self) -> Vec<String> {
+        self.inner.lock().await.removed_empty_dirs.clone()
     }
 }
 
@@ -874,6 +937,20 @@ impl VolumeMaterializer for FakeVolumeMaterializer {
     ) -> Result<MountSource, VolumeResolveError> {
         self.inner.lock().await.empty_dirs.push(volume.to_string());
         Ok(MountSource::NamedVolume(format!("fake-{volume}")))
+    }
+
+    async fn remove_empty_dir(
+        &self,
+        _namespace: &str,
+        _pod: &str,
+        volume: &str,
+    ) -> Result<(), VolumeResolveError> {
+        self.inner
+            .lock()
+            .await
+            .removed_empty_dirs
+            .push(volume.to_string());
+        Ok(())
     }
 }
 
@@ -1010,6 +1087,35 @@ mod tests {
         // Proves the decode happened — the materializer saw the DECODED bytes.
         let files = mat.files_for("sec").await.unwrap();
         assert_eq!(files.get("token"), Some(&b"s3cr3t-value".to_vec()));
+    }
+
+    #[test]
+    fn volume_create_and_rm_argv_are_exact() {
+        assert_eq!(
+            PodmanVolumeMaterializer::volume_create_argv("v"),
+            vec!["volume".to_string(), "create".to_string(), "v".to_string()]
+        );
+        assert_eq!(
+            PodmanVolumeMaterializer::volume_rm_argv("v"),
+            vec!["volume".to_string(), "rm".to_string(), "v".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_dir_volume_name_is_deterministic() {
+        assert_eq!(
+            PodmanVolumeMaterializer::empty_dir_volume_name("default", "p1", "scratch"),
+            "engenho-empty-default_p1_scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_records_remove_empty_dir_calls() {
+        let mat = FakeVolumeMaterializer::new();
+        mat.ensure_empty_dir("default", "p1", "scratch").await.unwrap();
+        assert!(mat.removed_empty_dirs().await.is_empty());
+        mat.remove_empty_dir("default", "p1", "scratch").await.unwrap();
+        assert_eq!(mat.removed_empty_dirs().await, vec!["scratch".to_string()]);
     }
 
     #[tokio::test]

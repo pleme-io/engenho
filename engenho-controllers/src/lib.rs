@@ -35,6 +35,7 @@ pub mod controller;
 pub mod create_stamp;
 pub mod crd;
 pub mod crd_validator;
+pub mod daemonset;
 pub mod deployment;
 pub mod dns;
 pub mod drv;
@@ -87,6 +88,7 @@ pub use crd::{
     DynamicHandlerSink,
 };
 pub use crd_validator::{CrdValidationWebhook, ValidationRegistry, crd_validation_webhook};
+pub use daemonset::DaemonSetController;
 pub use deployment::DeploymentController;
 pub use dns::{
     DEFAULT_CLUSTER_DOMAIN, DnsBackend, DnsController, DnsError, DnsEvent, DnsRecord,

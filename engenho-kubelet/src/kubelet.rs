@@ -139,6 +139,14 @@ struct ContainerRecord {
 struct LocalPod {
     /// Per-container records keyed by the container's logical name.
     containers: BTreeMap<String, ContainerRecord>,
+    /// emptyDir volume NAMES (`spec.volumes[i].name`, NOT the backing podman
+    /// volume name) this pod created. Recorded at start so delete-cleanup can
+    /// reap each one via `volume_materializer.remove_empty_dir(ns, pod, name)`
+    /// — emptyDir is pod-lifetime scratch, so its named volume dies with the
+    /// pod (alongside the container stop+remove). configMap/secret HostDir
+    /// sources are NOT recorded here — they're plain files under the data root,
+    /// reaped by the pod-dir GC, not a podman named volume.
+    empty_dir_volumes: Vec<String>,
 }
 
 /// The kubelet's clock — a `now()` source. Defaults to [`Instant::now`];
@@ -685,7 +693,7 @@ impl Controller for Kubelet {
             // All-or-nothing: only drop the local entry if every container
             // cleaned up; otherwise retain it so the next tick retries the
             // stragglers (no silent leak).
-            match self.cleanup_pod_containers(&lp).await {
+            match self.cleanup_pod_containers(&key, &lp).await {
                 Ok(()) => {
                     self.local.lock().await.remove(&key);
                     report.objects_changed += 1;
@@ -769,13 +777,33 @@ impl Kubelet {
         Ok(())
     }
 
-    /// MULTI-CONTAINER cleanup: stop THEN remove EVERY container of the pod.
-    /// Returns `Ok(())` only if all containers cleaned up; the FIRST failure
-    /// is surfaced (so the caller retains the local entry + retries). Each
-    /// container's stop-before-remove ordering is preserved.
-    async fn cleanup_pod_containers(&self, lp: &LocalPod) -> Result<(), KubeletError> {
+    /// MULTI-CONTAINER cleanup: stop THEN remove EVERY container of the pod,
+    /// THEN reap each emptyDir named volume the pod created. Returns `Ok(())`
+    /// only if all containers AND all emptyDir volumes cleaned up; the FIRST
+    /// failure is surfaced (so the caller retains the local entry + retries).
+    /// Each container's stop-before-remove ordering is preserved; volume
+    /// removal happens AFTER all containers are gone (a volume still in use by
+    /// a live container can't be removed). emptyDir-volume removal is
+    /// idempotent (already-absent is success), so a retry after a partial
+    /// failure converges.
+    async fn cleanup_pod_containers(
+        &self,
+        key: &ResourceKey,
+        lp: &LocalPod,
+    ) -> Result<(), KubeletError> {
         for record in lp.containers.values() {
             self.cleanup_container(&record.container_id).await?;
+        }
+        // emptyDir is pod-lifetime scratch → reap its backing podman named
+        // volume now that every container is stopped+removed. The volume name
+        // recorded on the LocalPod is the logical `spec.volumes[i].name`; the
+        // materializer maps it to the deterministic backing volume.
+        let namespace = key.namespace.as_deref().unwrap_or("default");
+        for vol in &lp.empty_dir_volumes {
+            self.volume_materializer
+                .remove_empty_dir(namespace, &key.name, vol)
+                .await
+                .map_err(|e| KubeletError::Backend(format!("remove emptyDir {vol}: {e}")))?;
         }
         Ok(())
     }
@@ -1073,6 +1101,21 @@ impl Kubelet {
                 Ok(status) => {
                     let mut local = self.local.lock().await;
                     let entry = local.entry(key.clone()).or_default();
+                    // Record this pod's emptyDir volume names ONCE so
+                    // delete-cleanup can reap the backing podman named volumes.
+                    // emptyDir sources resolve to MountSource::NamedVolume;
+                    // configMap/secret (HostDir files) are NOT recorded — they
+                    // aren't podman named volumes. Idempotent: only set on the
+                    // first container start (when the list is still empty).
+                    if entry.empty_dir_volumes.is_empty() {
+                        entry.empty_dir_volumes = resolved
+                            .iter()
+                            .filter(|(_, src)| {
+                                matches!(src, crate::pod_volume::MountSource::NamedVolume(_))
+                            })
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                    }
                     entry.containers.insert(
                         cname.clone(),
                         ContainerRecord {

@@ -33,6 +33,13 @@ use engenho_store::{
     command::{Reason, ResourceCommand},
     default_config,
 };
+
+async fn delete_pod(store: &StoreMesh, name: &str) {
+    store
+        .propose(ResourceCommand::delete(pod_key(name), Reason::Operator))
+        .await
+        .unwrap();
+}
 use serde_json::{Value, json};
 
 async fn boot_store(name: &str) -> Arc<StoreMesh> {
@@ -256,6 +263,63 @@ async fn empty_dir_named_volume_shared_across_containers() {
     }
     assert_eq!(sources[0], sources[1], "both containers share one named volume");
     assert!(matches!(sources[0], MountSource::NamedVolume(_)));
+
+    teardown(store, kubelet).await;
+}
+
+// ── (c2) emptyDir named volume is reaped on pod delete ─────────────────────
+
+#[tokio::test]
+async fn empty_dir_named_volume_reaped_on_pod_delete() {
+    let store = boot_store("vol-emptydir-reap").await;
+    let backend = Arc::new(FakeBackend::new());
+    let mat = Arc::new(FakeVolumeMaterializer::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_volume_materializer(mat.clone() as Arc<dyn VolumeMaterializer>);
+
+    put(
+        &store,
+        pod_key("p1"),
+        json!({
+            "kind": "Pod", "apiVersion": "v1",
+            "metadata": { "name": "p1" },
+            "spec": {
+                "nodeName": "node-A",
+                "volumes": [
+                    { "name": "scratch", "emptyDir": {} },
+                    // A configMap-less optional vol to prove configMap/secret
+                    // HostDir sources are NOT reaped as named volumes.
+                    { "name": "cfg-vol", "configMap": { "name": "absent", "optional": true } }
+                ],
+                "containers": [ {
+                    "name": "main", "image": "busybox",
+                    "volumeMounts": [
+                        { "name": "scratch", "mountPath": "/data" },
+                        { "name": "cfg-vol", "mountPath": "/etc/cfg" }
+                    ]
+                } ]
+            }
+        }),
+    )
+    .await;
+
+    // Start tick: emptyDir ensured, container started, nothing reaped yet.
+    kubelet.tick().await.unwrap();
+    assert_eq!(mat.ensured_empty_dirs().await, vec!["scratch".to_string()]);
+    assert!(mat.removed_empty_dirs().await.is_empty(), "no reap before delete");
+    assert_eq!(count_starts(&backend.events().await), 1);
+
+    // Hard-delete the pod → next tick reaps the orphan's containers AND its
+    // emptyDir named volume (the configMap HostDir is NOT a named volume → not
+    // reaped here).
+    delete_pod(&store, "p1").await;
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        mat.removed_empty_dirs().await,
+        vec!["scratch".to_string()],
+        "exactly the emptyDir volume is reaped on pod delete"
+    );
 
     teardown(store, kubelet).await;
 }
