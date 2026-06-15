@@ -299,8 +299,13 @@ impl Kubelet {
     /// `spec.containers` order.
     ///
     /// MULTI-CONTAINER: today the kubelet runs one [`ContainerSpec`] per
-    /// `spec.containers[i]` (init / ephemeral containers are a documented
-    /// no-op — see crate scope). The backend container name is the
+    /// `spec.containers[i]`. INIT CONTAINERS: the pure sequencing interpreter
+    /// ([`crate::lifecycle::next_init_action`] +
+    /// [`crate::lifecycle::reconcile_pod_phase_with_init`]) is implemented +
+    /// unit-tested; the kubelet I/O driver that consumes it (sequential
+    /// init-then-app start, `initContainerStatuses`, the `Initialized`
+    /// condition) is the next brick. Ephemeral containers remain a documented
+    /// no-op. The backend container name is the
     /// deterministic `<ns>_<pod>_<containerName>` join so status/stop/remove
     /// by-name is possible per container.
     ///
