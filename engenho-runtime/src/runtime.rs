@@ -18,10 +18,10 @@ use engenho_config::{
     ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind, ResolvedDatapath,
 };
 use engenho_controllers::{
-    CrdController, DaemonSetController, DeploymentController, DynamicHandlerSink,
+    CrdController, CronJobController, DaemonSetController, DeploymentController, DynamicHandlerSink,
     EndpointsController, FakeRouter, GcController, IptablesRouter, IpvsRouter, JobController,
     KindFilter, NamespaceController, ReplicaSetController, ServiceRouter,
-    ServiceRoutingController, StatefulSetController, WatchDriver, WatchDriverConfig,
+    ServiceRoutingController, StatefulSetController, WallClock, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
 };
@@ -1019,6 +1019,18 @@ fn spawn_drivers(
         let c = JobController::new(store.clone(), ns.clone());
         handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Job", "Pod"])).spawn());
     }
+    // CronJob: parses spec.schedule (5-field cron) against the WallClock and
+    // creates a batch/v1 Job from the jobTemplate on schedule; the
+    // JobController above then runs that Job's Pods. Watches CronJob (its own
+    // kind) + Job (to observe owned-Job activity for the concurrency policy);
+    // the fallback tick is what actually drives the time-based firing (a
+    // CronJob has no spec edit each minute to wake a pure event watch).
+    if enable.cronjob {
+        let c = CronJobController::new(store.clone(), Arc::new(WallClock), ns.clone());
+        handles.push(
+            WatchDriver::new(c, store.clone(), driver_config(&["CronJob", "Job"])).spawn(),
+        );
+    }
     if enable.endpoints {
         let c = EndpointsController::new(store.clone(), ns.clone());
         handles.push(
@@ -1203,10 +1215,10 @@ mod tests {
             node.get("spec").unwrap().get("unschedulable").unwrap(),
             false
         );
-        // Drivers: 10 reconcilers (deployment, replicaset, statefulset,
-        // daemonset, job, endpoints, service_routing, gc, namespace, crd)
-        // + scheduler + kubelet = 12.
-        assert_eq!(rt.drivers.len(), 12);
+        // Drivers: 11 reconcilers (deployment, replicaset, statefulset,
+        // daemonset, job, cronjob, endpoints, service_routing, gc, namespace,
+        // crd) + scheduler + kubelet = 13.
+        assert_eq!(rt.drivers.len(), 13);
         rt.shutdown().await.unwrap();
     }
 
@@ -1299,11 +1311,11 @@ mod tests {
     #[tokio::test]
     async fn disabling_service_routing_drops_one_driver() {
         // Gating works: turning off enable.service_routing removes exactly
-        // one spawned driver (12 → 11).
+        // one spawned driver (13 → 12).
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(rt.drivers.len(), 11);
+        assert_eq!(rt.drivers.len(), 12);
         rt.shutdown().await.unwrap();
     }
 }

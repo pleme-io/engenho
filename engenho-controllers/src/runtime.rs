@@ -191,6 +191,7 @@ mod tests {
                 statefulset: true,
                 daemonset: true,
                 job: true,
+                cronjob: true,
                 endpoints: true,
                 service_routing: true,
                 gc: true,

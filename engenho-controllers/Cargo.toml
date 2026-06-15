@@ -33,6 +33,11 @@ blake3             = "1"
 # base64 decode of a mutating webhook's RFC6902 JSONPatch response (the
 # AdmissionReview v1 wire carries the patch base64-encoded).
 base64             = "0.22"
+# Calendar decomposition for the 5-field cron parser (CronJobController):
+# unix-seconds → UTC (minute/hour/day/month/weekday) + RFC3339 round-trip of
+# status.lastScheduleTime. Same crate (+ version) engenho-types already pulls;
+# no new dependency closure (already in Cargo.lock).
+chrono             = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 proptest = "1"
