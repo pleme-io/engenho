@@ -73,6 +73,16 @@ pub struct ControllerEnable {
     /// operator YAML written before this flag still deserializes.
     #[serde(default = "default_true")]
     pub namespace: bool,
+    /// PV/PVC binder + local-path dynamic provisioner
+    /// (`PvBinderController`). Binds Pending PersistentVolumeClaims to
+    /// matching Available PersistentVolumes (capacity/accessModes/SC/
+    /// volumeName) and dynamically provisions a node-local hostPath PV via
+    /// the local-path provisioner / default StorageClass when no PV matches.
+    /// `#[serde(default)]` is REQUIRED (the struct is `deny_unknown_fields`)
+    /// so pre-existing operator YAML written before this flag still
+    /// deserializes (defaults on).
+    #[serde(default = "default_true")]
+    pub pv_binder: bool,
 }
 
 /// serde default for the `statefulset` / `job` toggles — `true` so an
@@ -97,6 +107,7 @@ impl TieredConfig for ControllersConfig {
                 gc: false,
                 crd: false,
                 namespace: false,
+                pv_binder: false,
             },
             namespace: String::new(),
             fallback_interval_seconds: 0,
@@ -118,6 +129,7 @@ impl TieredConfig for ControllersConfig {
                 gc: true,
                 crd: true,
                 namespace: true,
+                pv_binder: true,
             },
             namespace: String::new(),
             fallback_interval_seconds: 30,
@@ -181,6 +193,7 @@ mod tests {
         assert!(cfg.enable.gc);
         assert!(cfg.enable.crd);
         assert!(cfg.enable.namespace);
+        assert!(cfg.enable.pv_binder);
         cfg.validate().unwrap();
     }
 
@@ -213,6 +226,11 @@ debounce_milliseconds: 50
         // Same default-true contract covers the later cronjob flag — the
         // YAML above omits it, so it must default on.
         assert!(cfg.enable.cronjob, "missing cronjob flag defaults to true");
+        // And the later pv_binder flag — omitted above, must default on.
+        assert!(
+            cfg.enable.pv_binder,
+            "missing pv_binder flag defaults to true"
+        );
     }
 
     #[test]

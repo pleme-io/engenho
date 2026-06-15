@@ -197,6 +197,7 @@ mod tests {
                 gc: true,
                 crd: true,
                 namespace: true,
+                pv_binder: true,
             },
             namespace: String::new(),
             fallback_interval_seconds: 45,
