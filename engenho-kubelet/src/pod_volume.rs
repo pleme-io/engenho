@@ -63,9 +63,24 @@ use engenho_types::generated_v1_34::{
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MountSource {
     /// An absolute host-filesystem directory (or file) to bind-mount.
+    /// configMap / secret sources — default read-only (K8s semantics).
     HostDir(PathBuf),
     /// A named podman volume (created via `podman volume create`).
+    /// emptyDir sources — default read-write, shared across the pod.
     NamedVolume(String),
+    /// A bound-PVC backing directory bind-mounted from the PV's node-local
+    /// `hostPath`/`local` source — `-v <pv path>:<mountPath>`. Distinct from
+    /// [`MountSource::HostDir`] only in its DEFAULT read-write semantics
+    /// (a PVC is read-write unless the volume/volumeMount forces read-only),
+    /// where configMap/secret default read-only. `read_only` carries the
+    /// `persistentVolumeClaim.readOnly` flag (forces RO regardless of the
+    /// volumeMount).
+    PvcHostDir {
+        /// Absolute host path of the bound PV's `hostPath`/`local` source dir.
+        path: PathBuf,
+        /// `persistentVolumeClaim.readOnly` — forces the mount read-only.
+        read_only: bool,
+    },
 }
 
 /// One fully-resolved mount: the materialized source + the container's
@@ -101,10 +116,16 @@ pub struct ResolvedMount {
 ///
 ///   * [`PodVolumeSource::DownwardApi`] → `"DownwardApiUnsupported"`
 ///   * [`PodVolumeSource::Projected`] → `"ProjectedUnsupported"`
-///   * [`PodVolumeSource::Pvc`] → `"PvcUnsupported"` (owned by the storage
-///     brick — see [`crate::volume`])
 ///   * [`PodVolumeSource::HostPath`] → `"HostPathUnsupported"` (host-fs
 ///     exposure risk; deferred until an explicit allowlist lands)
+///
+/// The [`PodVolumeSource::Pvc`] arm is LIVE: it resolves the PVC's bound PV
+/// (via the `fetch` seam) to the PV's node-local `hostPath`/`local` source
+/// path and produces a [`MountSource::HostDir`]. An unbound PVC keeps the
+/// pod Pending (`"PvcNotBound"`); a PVC bound to a PV with an unsupported
+/// source class (CSI/nfs/…) keeps it Pending (`"PvcSourceUnsupported"`) —
+/// never a fake mount. See [`crate::volume`] for the CSI-style storage trait
+/// (independent lifecycle).
 ///
 /// `PartialEq` only (not `Eq`): the `items: Vec<KeyToPath>` payload mirrors
 /// the upstream `KeyToPath` struct, which derives `PartialEq` but not `Eq`.
@@ -138,9 +159,16 @@ pub enum PodVolumeSource {
     DownwardApi,
     /// `projected` — typed-deferred (`"ProjectedUnsupported"`).
     Projected,
-    /// `persistentVolumeClaim` — owned by the storage brick
-    /// (`"PvcUnsupported"` here; no fork of [`crate::volume`]).
-    Pvc,
+    /// `persistentVolumeClaim` — resolved to the bound PV's node-local
+    /// `hostPath`/`local` source dir (a [`MountSource::HostDir`]). An unbound
+    /// PVC / unsupported-source PV stay Pending (never a fake mount).
+    Pvc {
+        /// Referenced `PersistentVolumeClaim` name (`persistentVolumeClaim.claimName`),
+        /// in the pod's namespace.
+        claim_name: String,
+        /// `persistentVolumeClaim.readOnly` — forces the mount read-only.
+        read_only: bool,
+    },
     /// `hostPath` — typed-deferred (`"HostPathUnsupported"`; host-fs risk).
     HostPath,
 }
@@ -185,9 +213,12 @@ impl PodVolumeSource {
             populated += 1;
             found = Some(PodVolumeSource::Projected);
         }
-        if vol.persistent_volume_claim.is_some() {
+        if let Some(pvc) = &vol.persistent_volume_claim {
             populated += 1;
-            found = Some(PodVolumeSource::Pvc);
+            found = Some(PodVolumeSource::Pvc {
+                claim_name: pvc.claim_name.clone(),
+                read_only: pvc.read_only.unwrap_or(false),
+            });
         }
         if vol.host_path.is_some() {
             populated += 1;
@@ -262,16 +293,40 @@ pub enum VolumeResolveError {
         /// The offending volume's name.
         vol: String,
     },
-    /// A typed-deferred source class (hostPath / PVC / projected /
-    /// downwardAPI / emptyDir medium nuance). Carries the named K8s-style
-    /// Pending reason verbatim — the source is NOT served, surfaced
-    /// honestly rather than mis-materialized.
+    /// A typed-deferred source class (hostPath / projected / downwardAPI /
+    /// emptyDir medium nuance). Carries the named K8s-style Pending reason
+    /// verbatim — the source is NOT served, surfaced honestly rather than
+    /// mis-materialized.
     #[error("volume {vol} uses unsupported source ({reason})")]
     Unsupported {
         /// The offending volume's name.
         vol: String,
         /// The typed Pending reason (e.g. `"HostPathUnsupported"`).
         reason: &'static str,
+    },
+    /// A `persistentVolumeClaim` volume references a PVC that is not yet
+    /// `Bound` (absent, `status.phase != Bound`, or no `spec.volumeName`).
+    /// The pod waits — like the `ConfigMapNotFound` path — until the
+    /// PV/PVC binder converges it. Pending reason `"PvcNotBound"`.
+    #[error("PVC not bound: {claim} (vol {vol})")]
+    PvcNotBound {
+        /// The offending volume's name.
+        vol: String,
+        /// The referenced claim name (in the pod's namespace).
+        claim: String,
+    },
+    /// A `persistentVolumeClaim` is `Bound` but its PV carries a source class
+    /// the kubelet can't mount node-locally (CSI / NFS / cloud disk / …; only
+    /// `hostPath` + `local` are served). Pending reason
+    /// `"PvcSourceUnsupported"` — never a fake mount.
+    #[error("PVC {claim} bound PV {pv} has unsupported source (vol {vol})")]
+    PvcSourceUnsupported {
+        /// The offending volume's name.
+        vol: String,
+        /// The referenced claim name.
+        claim: String,
+        /// The bound PV's name.
+        pv: String,
     },
     /// The materializer's host-side work (mkdir / file write / `podman
     /// volume create`) failed. Pending reason `"VolumeMaterializeError"`.
@@ -292,6 +347,8 @@ impl VolumeResolveError {
             VolumeResolveError::MultipleSources { .. }
             | VolumeResolveError::NoSource { .. } => "InvalidVolumeSource",
             VolumeResolveError::Unsupported { reason, .. } => reason,
+            VolumeResolveError::PvcNotBound { .. } => "PvcNotBound",
+            VolumeResolveError::PvcSourceUnsupported { .. } => "PvcSourceUnsupported",
             VolumeResolveError::Materialize(_) => "VolumeMaterializeError",
         }
     }
@@ -305,6 +362,8 @@ engenho_substrate::impl_error_kind! {
         { MultipleSources { .. } } => "multiple_sources",
         { NoSource { .. } } => "no_source",
         { Unsupported { .. } } => "unsupported",
+        { PvcNotBound { .. } } => "pvc_not_bound",
+        { PvcSourceUnsupported { .. } } => "pvc_source_unsupported",
         (Materialize(_)) => "materialize",
     }
 }
@@ -524,12 +583,10 @@ where
                     reason: "ProjectedUnsupported",
                 });
             }
-            PodVolumeSource::Pvc => {
-                return Err(VolumeResolveError::Unsupported {
-                    vol: vol.name.clone(),
-                    reason: "PvcUnsupported",
-                });
-            }
+            PodVolumeSource::Pvc {
+                claim_name,
+                read_only,
+            } => resolve_pvc_volume(&vol.name, &claim_name, read_only, &fetch)?,
             PodVolumeSource::HostPath => {
                 return Err(VolumeResolveError::Unsupported {
                     vol: vol.name.clone(),
@@ -632,6 +689,94 @@ fn secret_files(
     Ok(files)
 }
 
+/// Resolve a `persistentVolumeClaim` volume to its bound PV's node-local
+/// source dir, producing a [`MountSource::PvcHostDir`].
+///
+/// The resolution honors the PV/PVC binder's contract (commit 69c5415): a
+/// dynamically-provisioned local-path PV carries `spec.hostPath.path =
+/// <data_dir>/local-path/<ns>-<name>`; a statically-authored PV may carry
+/// either `spec.hostPath.path` or `spec.local.path`. We read whichever is
+/// present (preferring `hostPath`). The kubelet does NOT re-`mkdir` the dir —
+/// the binder's `HostProvisionerEnv` created it at provision time, and a
+/// statically-authored hostPath/local PV's path is the operator's contract;
+/// re-ensuring it here would mask a genuinely-missing volume.
+///
+/// `fetch` is the SAME `(kind, name) → Option<Value>` store seam the
+/// configMap/secret arms use — the kubelet pre-fetches the PVC (namespaced)
+/// and the bound PV (cluster-scoped) into the lookup map; tests pass a
+/// closure over in-memory objects (no real cluster).
+///
+/// # Errors
+///
+///   * [`VolumeResolveError::PvcNotBound`] — the PVC is absent, not `Bound`,
+///     or has no `spec.volumeName` (the pod waits, like ConfigMapNotFound).
+///   * [`VolumeResolveError::PvcNotBound`] — the bound PV named by the PVC is
+///     itself absent from the store (binder hasn't created/written it yet).
+///   * [`VolumeResolveError::PvcSourceUnsupported`] — the bound PV carries a
+///     source class the kubelet can't mount node-locally (CSI / NFS / cloud
+///     disk); only `hostPath` + `local` are served. Never a fake mount.
+fn resolve_pvc_volume<F>(
+    vol_name: &str,
+    claim_name: &str,
+    pvc_read_only: bool,
+    fetch: &F,
+) -> Result<MountSource, VolumeResolveError>
+where
+    F: Fn(&str, &str) -> Option<Value>,
+{
+    let not_bound = || VolumeResolveError::PvcNotBound {
+        vol: vol_name.to_string(),
+        claim: claim_name.to_string(),
+    };
+
+    // 1. GET the PVC (in the pod's namespace) — absent ⇒ Pending (waits).
+    let pvc = fetch("PersistentVolumeClaim", claim_name).ok_or_else(not_bound)?;
+
+    // 2. PVC must be Bound with a spec.volumeName naming its PV.
+    let phase = pvc
+        .get("status")
+        .and_then(|s| s.get("phase"))
+        .and_then(Value::as_str);
+    if phase != Some("Bound") {
+        return Err(not_bound());
+    }
+    let pv_name = pvc
+        .get("spec")
+        .and_then(|s| s.get("volumeName"))
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(not_bound)?;
+
+    // 3. GET the bound PV (cluster-scoped) — absent ⇒ still Pending (the
+    //    binder may not have written it yet; converges on a later tick).
+    let pv = fetch("PersistentVolume", pv_name).ok_or_else(not_bound)?;
+
+    // 4. Extract the node-local source path. Only hostPath + local are
+    //    served; any other source class is a typed Pending (never faked).
+    let spec = pv.get("spec");
+    let host_path = spec
+        .and_then(|s| s.get("hostPath"))
+        .and_then(|h| h.get("path"))
+        .and_then(Value::as_str);
+    let local_path = spec
+        .and_then(|s| s.get("local"))
+        .and_then(|l| l.get("path"))
+        .and_then(Value::as_str);
+
+    let path = host_path.or(local_path).ok_or_else(|| {
+        VolumeResolveError::PvcSourceUnsupported {
+            vol: vol_name.to_string(),
+            claim: claim_name.to_string(),
+            pv: pv_name.to_string(),
+        }
+    })?;
+
+    Ok(MountSource::PvcHostDir {
+        path: PathBuf::from(path),
+        read_only: pvc_read_only,
+    })
+}
+
 /// Build the per-container [`ResolvedMount`] list from a container's
 /// `volumeMounts[]` + the resolved `volName → MountSource` map.
 ///
@@ -661,10 +806,15 @@ pub fn container_mounts(
             });
         };
         // configMap/secret are HostDir + default read-only; emptyDir is a
-        // NamedVolume + default read-write. An explicit readOnly:true forces
-        // read-only regardless.
-        let default_ro = matches!(source, MountSource::HostDir(_));
-        let read_only = vm.read_only.unwrap_or(false) || default_ro;
+        // NamedVolume + default read-write; a bound-PVC (PvcHostDir) defaults
+        // read-write but the PVC-source `readOnly` flag forces read-only. An
+        // explicit volumeMount.readOnly:true forces read-only in every case.
+        let (source_ro, source_default_ro) = match source {
+            MountSource::HostDir(_) => (false, true),
+            MountSource::NamedVolume(_) => (false, false),
+            MountSource::PvcHostDir { read_only, .. } => (*read_only, false),
+        };
+        let read_only = vm.read_only.unwrap_or(false) || source_ro || source_default_ro;
         out.push(ResolvedMount {
             source: source.clone(),
             mount_path: vm.mount_path.clone(),
@@ -1219,6 +1369,279 @@ mod tests {
         let files = configmap_files("cm", &cm, &items).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files.get("renamed-a"), Some(&b"AAA".to_vec()));
+    }
+
+    // ── PVC → bound PV → node-local hostPath resolution ───────────────
+
+    /// `fetch` closure over a set of (kind, name) → Value objects — the same
+    /// seam the kubelet pre-fetch builds, here in-memory (no cluster).
+    fn pvc_fetch(objs: Vec<(&'static str, &'static str, Value)>) -> impl Fn(&str, &str) -> Option<Value> {
+        move |kind: &str, name: &str| {
+            objs.iter()
+                .find(|(k, n, _)| *k == kind && *n == name)
+                .map(|(_, _, v)| v.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn pvc_bound_to_local_path_pv_resolves_to_hostdir() {
+        let pod = json!({
+            "spec": { "volumes": [
+                { "name": "data", "persistentVolumeClaim": { "claimName": "myclaim" } }
+            ] }
+        });
+        // Bound PVC → PV "pvc-xyz"; PV carries the binder's hostPath.
+        let pvc = json!({
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "myclaim", "namespace": "default" },
+            "spec": { "volumeName": "pvc-xyz" },
+            "status": { "phase": "Bound" }
+        });
+        let pv = json!({
+            "kind": "PersistentVolume",
+            "metadata": { "name": "pvc-xyz" },
+            "spec": { "hostPath": { "path": "/data/local-path/default-myclaim" } }
+        });
+        let mat = FakeVolumeMaterializer::new();
+        let fetch = pvc_fetch(vec![
+            ("PersistentVolumeClaim", "myclaim", pvc),
+            ("PersistentVolume", "pvc-xyz", pv),
+        ]);
+        let map = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
+            .await
+            .unwrap();
+        assert_eq!(
+            map.get("data"),
+            Some(&MountSource::PvcHostDir {
+                path: PathBuf::from("/data/local-path/default-myclaim"),
+                read_only: false,
+            })
+        );
+        // The container sees the PV path at its mountPath, default read-write.
+        let container = json!({
+            "name": "c",
+            "volumeMounts": [ { "name": "data", "mountPath": "/var/data" } ]
+        });
+        let mounts = container_mounts(&container, &map).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mount_path, "/var/data");
+        assert!(!mounts[0].read_only); // PVC defaults read-write
+    }
+
+    #[tokio::test]
+    async fn pvc_bound_to_local_source_pv_resolves() {
+        // A statically-authored PV may use `spec.local.path` instead of hostPath.
+        let pod = json!({
+            "spec": { "volumes": [
+                { "name": "data", "persistentVolumeClaim": { "claimName": "c" } }
+            ] }
+        });
+        let pvc = json!({
+            "spec": { "volumeName": "pv-local" }, "status": { "phase": "Bound" }
+        });
+        let pv = json!({
+            "spec": { "local": { "path": "/mnt/disks/ssd1" } }
+        });
+        let mat = FakeVolumeMaterializer::new();
+        let fetch = pvc_fetch(vec![
+            ("PersistentVolumeClaim", "c", pvc),
+            ("PersistentVolume", "pv-local", pv),
+        ]);
+        let map = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
+            .await
+            .unwrap();
+        assert_eq!(
+            map.get("data"),
+            Some(&MountSource::PvcHostDir {
+                path: PathBuf::from("/mnt/disks/ssd1"),
+                read_only: false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_pvc_stays_pending_not_mounted() {
+        let pod = json!({
+            "spec": { "volumes": [
+                { "name": "data", "persistentVolumeClaim": { "claimName": "pending" } }
+            ] }
+        });
+        // PVC present but not Bound (no volumeName, phase=Pending).
+        let pvc = json!({
+            "spec": {}, "status": { "phase": "Pending" }
+        });
+        let mat = FakeVolumeMaterializer::new();
+        let fetch = pvc_fetch(vec![("PersistentVolumeClaim", "pending", pvc)]);
+        let err = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
+            .await
+            .unwrap_err();
+        assert_eq!(err.pending_reason(), "PvcNotBound");
+        assert!(matches!(err, VolumeResolveError::PvcNotBound { .. }));
+    }
+
+    #[tokio::test]
+    async fn absent_pvc_stays_pending() {
+        let pod = json!({
+            "spec": { "volumes": [
+                { "name": "data", "persistentVolumeClaim": { "claimName": "ghost" } }
+            ] }
+        });
+        let mat = FakeVolumeMaterializer::new();
+        let fetch = pvc_fetch(vec![]); // PVC not in store
+        let err = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
+            .await
+            .unwrap_err();
+        assert_eq!(err.pending_reason(), "PvcNotBound");
+    }
+
+    #[tokio::test]
+    async fn bound_pvc_with_absent_pv_stays_pending() {
+        let pod = json!({
+            "spec": { "volumes": [
+                { "name": "data", "persistentVolumeClaim": { "claimName": "c" } }
+            ] }
+        });
+        let pvc = json!({
+            "spec": { "volumeName": "pv-missing" }, "status": { "phase": "Bound" }
+        });
+        let mat = FakeVolumeMaterializer::new();
+        // PVC says Bound but the PV is not in the store yet.
+        let fetch = pvc_fetch(vec![("PersistentVolumeClaim", "c", pvc)]);
+        let err = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
+            .await
+            .unwrap_err();
+        assert_eq!(err.pending_reason(), "PvcNotBound");
+    }
+
+    #[tokio::test]
+    async fn pvc_bound_to_unsupported_source_pv_stays_pending() {
+        let pod = json!({
+            "spec": { "volumes": [
+                { "name": "data", "persistentVolumeClaim": { "claimName": "c" } }
+            ] }
+        });
+        let pvc = json!({
+            "spec": { "volumeName": "pv-csi" }, "status": { "phase": "Bound" }
+        });
+        // CSI-backed PV — no hostPath/local source the kubelet can mount.
+        let pv = json!({
+            "spec": { "csi": { "driver": "ebs.csi.aws.com", "volumeHandle": "vol-123" } }
+        });
+        let mat = FakeVolumeMaterializer::new();
+        let fetch = pvc_fetch(vec![
+            ("PersistentVolumeClaim", "c", pvc),
+            ("PersistentVolume", "pv-csi", pv),
+        ]);
+        let err = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
+            .await
+            .unwrap_err();
+        assert_eq!(err.pending_reason(), "PvcSourceUnsupported");
+        assert!(matches!(err, VolumeResolveError::PvcSourceUnsupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn pvc_read_only_propagates_to_mount() {
+        let pod = json!({
+            "spec": { "volumes": [
+                { "name": "data", "persistentVolumeClaim": { "claimName": "c", "readOnly": true } }
+            ] }
+        });
+        let pvc = json!({
+            "spec": { "volumeName": "pv1" }, "status": { "phase": "Bound" }
+        });
+        let pv = json!({ "spec": { "hostPath": { "path": "/data/ro" } } });
+        let mat = FakeVolumeMaterializer::new();
+        let fetch = pvc_fetch(vec![
+            ("PersistentVolumeClaim", "c", pvc),
+            ("PersistentVolume", "pv1", pv),
+        ]);
+        let map = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
+            .await
+            .unwrap();
+        assert_eq!(
+            map.get("data"),
+            Some(&MountSource::PvcHostDir {
+                path: PathBuf::from("/data/ro"),
+                read_only: true,
+            })
+        );
+        // readOnly on the PVC source forces the mount read-only even though
+        // the volumeMount itself didn't request it.
+        let container = json!({
+            "name": "c",
+            "volumeMounts": [ { "name": "data", "mountPath": "/var/data" } ]
+        });
+        let mounts = container_mounts(&container, &map).unwrap();
+        assert!(mounts[0].read_only);
+    }
+
+    #[tokio::test]
+    async fn volume_mount_read_only_forces_ro_on_writable_pvc() {
+        // PVC is RW, but the volumeMount declares readOnly:true → RO mount.
+        let mut resolved = BTreeMap::new();
+        resolved.insert(
+            "data".to_string(),
+            MountSource::PvcHostDir {
+                path: PathBuf::from("/data/rw"),
+                read_only: false,
+            },
+        );
+        let container = json!({
+            "name": "c",
+            "volumeMounts": [ { "name": "data", "mountPath": "/var/data", "readOnly": true } ]
+        });
+        let mounts = container_mounts(&container, &resolved).unwrap();
+        assert!(mounts[0].read_only);
+    }
+
+    #[test]
+    fn pvc_pending_reasons_and_kinds_are_stable() {
+        assert_eq!(
+            VolumeResolveError::PvcNotBound {
+                vol: "v".into(),
+                claim: "c".into()
+            }
+            .pending_reason(),
+            "PvcNotBound"
+        );
+        assert_eq!(
+            VolumeResolveError::PvcSourceUnsupported {
+                vol: "v".into(),
+                claim: "c".into(),
+                pv: "p".into()
+            }
+            .pending_reason(),
+            "PvcSourceUnsupported"
+        );
+        assert_eq!(
+            VolumeResolveError::PvcNotBound {
+                vol: "v".into(),
+                claim: "c".into()
+            }
+            .kind(),
+            "pvc_not_bound"
+        );
+        assert_eq!(
+            VolumeResolveError::PvcSourceUnsupported {
+                vol: "v".into(),
+                claim: "c".into(),
+                pv: "p".into()
+            }
+            .kind(),
+            "pvc_source_unsupported"
+        );
+    }
+
+    #[test]
+    fn from_volume_dispatches_pvc_arm() {
+        let v: Volume = serde_json::from_value(json!({
+            "name": "data", "persistentVolumeClaim": { "claimName": "myclaim", "readOnly": true }
+        }))
+        .unwrap();
+        assert!(matches!(
+            PodVolumeSource::from_volume(&v).unwrap(),
+            PodVolumeSource::Pvc { read_only: true, .. }
+        ));
     }
 
     #[test]
