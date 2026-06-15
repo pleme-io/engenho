@@ -983,10 +983,13 @@ impl Kubelet {
             return Ok(BTreeMap::new());
         }
 
-        // Pre-fetch every referenced ConfigMap/Secret ASYNC, keyed by
-        // (kind, name). Only the in-scope source arms need a fetch; deferred
-        // arms (hostPath/PVC/projected/downwardAPI) surface their typed error
-        // in the pure resolver without a store read.
+        // Pre-fetch every referenced source object ASYNC, keyed by (kind,
+        // name). ConfigMap/Secret are namespaced; a persistentVolumeClaim
+        // fetches the namespaced PVC AND — when the PVC is Bound — its
+        // cluster-scoped bound PV, so the pure resolver can map PVC → PV →
+        // node-local hostPath without a store read. Deferred arms
+        // (hostPath/projected/downwardAPI) surface their typed error in the
+        // pure resolver without a fetch.
         let mut fetched: BTreeMap<(String, String), Value> = BTreeMap::new();
         for vol in &volumes {
             // from_volume errors (multi/no source) are re-detected by the pure
@@ -995,17 +998,56 @@ impl Kubelet {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let (kind, name) = match source {
-                PodVolumeSource::ConfigMap { name, .. } => ("ConfigMap", name),
-                PodVolumeSource::Secret { name, .. } => ("Secret", name),
-                _ => continue,
-            };
-            if name.is_empty() {
-                continue;
-            }
-            let key = ResourceKey::namespaced("", "v1", kind, namespace, &name);
-            if let Some(val) = self.store.get(&key).await {
-                fetched.insert((kind.to_string(), name), val);
+            match source {
+                PodVolumeSource::ConfigMap { name, .. } | PodVolumeSource::Secret { name, .. }
+                    if name.is_empty() =>
+                {
+                    let _ = name;
+                }
+                PodVolumeSource::ConfigMap { name, .. } => {
+                    let key =
+                        ResourceKey::namespaced("", "v1", "ConfigMap", namespace, &name);
+                    if let Some(val) = self.store.get(&key).await {
+                        fetched.insert(("ConfigMap".to_string(), name), val);
+                    }
+                }
+                PodVolumeSource::Secret { name, .. } => {
+                    let key = ResourceKey::namespaced("", "v1", "Secret", namespace, &name);
+                    if let Some(val) = self.store.get(&key).await {
+                        fetched.insert(("Secret".to_string(), name), val);
+                    }
+                }
+                PodVolumeSource::Pvc { claim_name, .. } => {
+                    if claim_name.is_empty() {
+                        continue;
+                    }
+                    // The PVC lives in the pod's namespace.
+                    let pvc_key = ResourceKey::namespaced(
+                        "",
+                        "v1",
+                        "PersistentVolumeClaim",
+                        namespace,
+                        &claim_name,
+                    );
+                    let Some(pvc_val) = self.store.get(&pvc_key).await else {
+                        continue; // resolver emits PvcNotBound
+                    };
+                    // If Bound, pre-fetch the cluster-scoped bound PV too.
+                    if let Some(pv_name) = pvc_val
+                        .get("spec")
+                        .and_then(|s| s.get("volumeName"))
+                        .and_then(Value::as_str)
+                        .filter(|n| !n.is_empty())
+                    {
+                        let pv_key =
+                            ResourceKey::cluster_scoped("", "v1", "PersistentVolume", pv_name);
+                        if let Some(pv_val) = self.store.get(&pv_key).await {
+                            fetched.insert(("PersistentVolume".to_string(), pv_name.to_string()), pv_val);
+                        }
+                    }
+                    fetched.insert(("PersistentVolumeClaim".to_string(), claim_name), pvc_val);
+                }
+                _ => {}
             }
         }
 
