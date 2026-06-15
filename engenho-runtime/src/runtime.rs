@@ -20,7 +20,7 @@ use engenho_config::{
 use engenho_controllers::{
     CrdController, CronJobController, DaemonSetController, DeploymentController, DynamicHandlerSink,
     EndpointsController, FakeRouter, GcController, IptablesRouter, IpvsRouter, JobController,
-    KindFilter, NamespaceController, ReplicaSetController, ServiceRouter,
+    KindFilter, NamespaceController, PvBinderController, ReplicaSetController, ServiceRouter,
     ServiceRoutingController, StatefulSetController, WallClock, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
@@ -1099,6 +1099,37 @@ fn spawn_drivers(
         );
     }
 
+    // PV/PVC binder: binds Pending PersistentVolumeClaims to matching
+    // Available PersistentVolumes (capacity ≥ request, accessModes ⊇ requested,
+    // storageClassName equal, volumeName pre-bind) and dynamically provisions a
+    // node-local hostPath PV (under data_dir/local-path) via the local-path
+    // provisioner / default StorageClass when no static PV matches. Watches the
+    // three storage kinds; the fallback tick covers a PV/SC that appears after
+    // the PVC (and vice versa). The host effect (mkdir of the local-path
+    // backing dir) is the HostProvisionerEnv default; gated on
+    // controllers.enable.pv_binder.
+    if enable.pv_binder {
+        let local_path_root = config
+            .runtime
+            .data_dir
+            .join("local-path")
+            .to_string_lossy()
+            .into_owned();
+        let c = PvBinderController::new(store.clone(), ns.clone(), local_path_root);
+        handles.push(
+            WatchDriver::new(
+                c,
+                store.clone(),
+                driver_config(&[
+                    "PersistentVolumeClaim",
+                    "PersistentVolume",
+                    "StorageClass",
+                ]),
+            )
+            .spawn(),
+        );
+    }
+
     // CRD: CustomResourceDefinition → dynamic CR-handler registration. The
     // controller registers a StoreBackedHandler per served CRD version into
     // the shared RouterState via `handler_sink`, so CR instances become
@@ -1215,10 +1246,10 @@ mod tests {
             node.get("spec").unwrap().get("unschedulable").unwrap(),
             false
         );
-        // Drivers: 11 reconcilers (deployment, replicaset, statefulset,
+        // Drivers: 12 reconcilers (deployment, replicaset, statefulset,
         // daemonset, job, cronjob, endpoints, service_routing, gc, namespace,
-        // crd) + scheduler + kubelet = 13.
-        assert_eq!(rt.drivers.len(), 13);
+        // pv_binder, crd) + scheduler + kubelet = 14.
+        assert_eq!(rt.drivers.len(), 14);
         rt.shutdown().await.unwrap();
     }
 
@@ -1311,11 +1342,11 @@ mod tests {
     #[tokio::test]
     async fn disabling_service_routing_drops_one_driver() {
         // Gating works: turning off enable.service_routing removes exactly
-        // one spawned driver (13 → 12).
+        // one spawned driver (14 → 13).
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(rt.drivers.len(), 12);
+        assert_eq!(rt.drivers.len(), 13);
         rt.shutdown().await.unwrap();
     }
 }
