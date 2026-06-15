@@ -35,6 +35,7 @@ pub mod build_backend_roceiro;
 pub mod cluster_ip;
 pub mod controller;
 pub mod create_stamp;
+pub mod cron;
 pub mod crd;
 pub mod crd_validator;
 pub mod daemonset;
@@ -116,7 +117,10 @@ pub use ingress::{
     FakeIngressBackend, FakeIngressEvent, IngressBackend, IngressController, IngressError,
     IngressRoute, NginxIngressBackend, PathType, TraefikIngressBackend,
 };
-pub use job::{Clock, CronJobController, JobController, SystemClock, WallClock, fixed_clock};
+pub use job::{
+    Clock, ConcurrencyPolicy, CronJobController, JobController, SystemClock, WallClock,
+    fixed_clock,
+};
 // Backwards-compat alias for any external consumer that referenced the
 // old name. Substrate's FrozenClock is the canonical replacement.
 pub use engenho_substrate::FrozenClock;

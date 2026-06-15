@@ -40,6 +40,13 @@ pub struct ControllerEnable {
     /// Job → Pod-to-completion controller.
     #[serde(default = "default_true")]
     pub job: bool,
+    /// CronJob → Job factory controller. Parses `spec.schedule` (5-field
+    /// cron) and creates a `batch/v1` Job from the jobTemplate on schedule;
+    /// the JobController then runs that Job's Pods. `#[serde(default)]` is
+    /// REQUIRED (the struct is `deny_unknown_fields`) so pre-existing
+    /// operator YAML written before this flag still deserializes (on).
+    #[serde(default = "default_true")]
+    pub cronjob: bool,
     /// Service → Endpoints controller.
     pub endpoints: bool,
     /// Service VIP routing controller (`ServiceRoutingController`):
@@ -84,6 +91,7 @@ impl TieredConfig for ControllersConfig {
                 statefulset: false,
                 daemonset: false,
                 job: false,
+                cronjob: false,
                 endpoints: false,
                 service_routing: false,
                 gc: false,
@@ -104,6 +112,7 @@ impl TieredConfig for ControllersConfig {
                 statefulset: true,
                 daemonset: true,
                 job: true,
+                cronjob: true,
                 endpoints: true,
                 service_routing: true,
                 gc: true,
@@ -166,6 +175,7 @@ mod tests {
         assert!(cfg.enable.deployment);
         assert!(cfg.enable.statefulset);
         assert!(cfg.enable.job);
+        assert!(cfg.enable.cronjob);
         assert!(cfg.enable.endpoints);
         assert!(cfg.enable.service_routing);
         assert!(cfg.enable.gc);
@@ -200,6 +210,9 @@ debounce_milliseconds: 50
             cfg.enable.service_routing,
             "missing service_routing flag defaults to true"
         );
+        // Same default-true contract covers the later cronjob flag — the
+        // YAML above omits it, so it must default on.
+        assert!(cfg.enable.cronjob, "missing cronjob flag defaults to true");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! R16 — Job + R16b CronJob controllers.
 //!
 //! Job: runs N pods to completion. Tracks completions/failures.
-//! CronJob: time-triggered Job factory. Schedule expressed as
-//! seconds-since-epoch tick threshold (engenho doesn't bundle a
-//! cron parser yet — operator wires a Schedule provider).
+//! CronJob: time-triggered Job factory driven by a real 5-field cron
+//! parser ([`crate::cron::CronSchedule`]) against an injected
+//! [`Clock`] — so the whole CronJob → Job → Pod workload chain
+//! functions end-to-end (the JobController then runs the created Job's
+//! Pods via the kubelet).
 //!
 //! ## Job reconcile rule
 //!
@@ -17,13 +19,27 @@
 //!
 //! ## CronJob reconcile rule
 //!
-//! For each CronJob whose `spec.nextRunUnix <= now`:
-//!   * create a Job from spec.jobTemplate with name
-//!     `{cronjob}-{unix_ts}`
-//!   * patch the CronJob's status.lastRunUnix
+//! Each tick, for every CronJob:
+//!   * skip when `spec.suspend == true`
+//!   * parse `spec.schedule` (a 5-field cron expression); a malformed
+//!     schedule is a typed skip, never a panic
+//!   * compute the most recent scheduled minute strictly after the last
+//!     run anchor (`status.lastScheduleTime`, else the CronJob's
+//!     creationTimestamp, else now) and at-or-before `clock.now()`
+//!   * honour `spec.startingDeadlineSeconds` — a due time older than the
+//!     deadline is missed and skipped
+//!   * apply `spec.concurrencyPolicy` (default `Allow`):
+//!       - `Forbid`  → skip when an active owned Job exists
+//!       - `Replace` → delete the active owned Job(s), then create
+//!       - `Allow`   → always create
+//!   * create a Job named `{cronjob}-{unix_ts}` from `spec.jobTemplate`,
+//!     owner-referenced back to the CronJob + labelled
+//!   * patch `status.lastScheduleTime` + `status.active`
 //!
-//! Skips for now: failure-backoff windows, time-zone aware
-//! schedules. R16c adds those.
+//! Deferred (named typed follow-ups): history GC
+//! (`successfulJobsHistoryLimit` / `failedJobsHistoryLimit`),
+//! timezone-aware schedules (`spec.timeZone` — evaluated against UTC),
+//! and the missed-start catch-up bound beyond a single run.
 
 use std::sync::Arc;
 
@@ -248,11 +264,38 @@ impl OwnedChildrenReconciler for JobController {
 // CronJobController — R16b
 // =================================================================
 
-/// CronJob controller — creates Jobs at scheduled times.
+/// Concurrency policy for a CronJob's overlapping executions.
 ///
-/// `spec.nextRunUnix` is the trigger; when `clock.unix_secs() >=
-/// nextRunUnix`, a Job is created + the CronJob's status is
-/// patched with `lastRunUnix`.
+/// Parsed from `spec.concurrencyPolicy`; unknown / absent values default
+/// to [`ConcurrencyPolicy::Allow`] (the Kubernetes default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyPolicy {
+    /// Allow concurrent Jobs (default).
+    Allow,
+    /// Skip the new run while a prior run is still active.
+    Forbid,
+    /// Delete the active run, then start the new one.
+    Replace,
+}
+
+impl ConcurrencyPolicy {
+    /// Parse from the wire string; anything unrecognised is `Allow`.
+    #[must_use]
+    pub fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("Forbid") => Self::Forbid,
+            Some("Replace") => Self::Replace,
+            _ => Self::Allow,
+        }
+    }
+}
+
+/// CronJob controller — parses `spec.schedule` (5-field cron) and creates
+/// `batch/v1` Jobs at scheduled times against an injected [`Clock`].
+///
+/// The clock is the testability contract: tests construct a
+/// [`FrozenClock`], advance it, and assert a Job appears exactly when due
+/// — no wall-clock sleeps.
 pub struct CronJobController {
     store: Arc<StoreMesh>,
     clock: Arc<dyn Clock>,
@@ -270,28 +313,77 @@ impl CronJobController {
         }
     }
 
-    fn next_run_unix(cj: &Value) -> Option<u64> {
-        cj.get("spec")
-            .and_then(|s| s.get("nextRunUnix"))
-            .and_then(|n| n.as_u64())
+    /// The last-schedule anchor (unix seconds) the next-due search starts
+    /// strictly after: `status.lastScheduleTime` if present, else the
+    /// CronJob's `metadata.creationTimestamp`, else `now` (a CronJob with
+    /// no creation stamp never back-fires for past minutes).
+    fn last_schedule_anchor(cj: &Value, now: u64) -> u64 {
+        if let Some(last) = cj
+            .get("status")
+            .and_then(|s| s.get("lastScheduleTime"))
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_unix)
+        {
+            return last;
+        }
+        cj.get("metadata")
+            .and_then(|m| m.get("creationTimestamp"))
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_unix)
+            .unwrap_or(now)
     }
 
-    /// Construct a Job from the CronJob's `spec.jobTemplate.spec`.
+    /// Construct a Job from the CronJob's `spec.jobTemplate` (both its
+    /// `spec` AND any template metadata labels/annotations are carried
+    /// over). `ts` is the scheduled time in unix seconds — it names the
+    /// Job `{cronjob}-{ts}`.
     fn build_job(cj: &Value, ts: u64) -> Option<(String, Value)> {
         let cj_name = cj.name()?;
-        let job_spec = cj
+        let template = cj
             .get("spec")
-            .and_then(|s| s.get("jobTemplate"))
-            .and_then(|t| t.get("spec"))?
-            .clone();
+            .and_then(|s| s.get("jobTemplate"))?;
+        let job_spec = template.get("spec").cloned().unwrap_or_else(|| json!({}));
         let job_name = format!("{cj_name}-{ts}");
+        // Carry over the jobTemplate's metadata.labels (if any) onto the
+        // Job, plus a controller-uid-free convenience label so a human can
+        // `kubectl get jobs -l engenho.io/cronjob=<name>`.
+        let mut labels = template
+            .get("metadata")
+            .and_then(|m| m.get("labels"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if let Some(obj) = labels.as_object_mut() {
+            obj.entry("engenho.io/cronjob".to_string())
+                .or_insert_with(|| Value::String(cj_name.to_string()));
+        }
         let job = json!({
             "kind": "Job",
             "apiVersion": "batch/v1",
-            "metadata": {"name": job_name},
+            "metadata": {"name": job_name, "labels": labels},
             "spec": job_spec,
         });
         Some((job_name, job))
+    }
+
+    /// Jobs in `owned` that are still active (no `Complete`/`Failed`
+    /// terminal condition) — used by the concurrency policy.
+    fn active_jobs(owned: &[(ResourceKey, Value)]) -> Vec<&(ResourceKey, Value)> {
+        owned.iter().filter(|(_, j)| !job_is_terminal(j)).collect()
+    }
+
+    /// All Jobs owned (controller-ref) by `cj_uid`, in this CronJob's
+    /// namespace.
+    async fn owned_jobs(
+        &self,
+        cj_uid: &str,
+        job_ns: &str,
+    ) -> Vec<(ResourceKey, Value)> {
+        self.store
+            .list("batch", "v1", "Job", Some(job_ns))
+            .await
+            .into_iter()
+            .filter(|(_, j)| owned_by(j, cj_uid))
+            .collect()
     }
 }
 
@@ -306,46 +398,245 @@ impl Controller for CronJobController {
             .store
             .list("batch", "v1", "CronJob", self.namespace.as_deref())
             .await;
-        let mut report = ReconcileReport::default();
-        report.objects_examined = cjs.len();
-
         let now = self.clock.unix_secs();
-        // `now` is unix seconds — `spec.nextRunUnix` is in the same unit.
-
+        let mut report = ReconcileReport {
+            objects_examined: cjs.len(),
+            ..ReconcileReport::default()
+        };
         for (cj_key, cj_value) in &cjs {
-            let Some(next) = Self::next_run_unix(cj_value) else {
-                report.objects_skipped += 1;
-                continue;
-            };
-            if now < next {
-                continue;
+            match self.reconcile_one_cronjob(cj_key, cj_value, now).await? {
+                CronTickOutcome::Fired => report.objects_changed += 2,
+                CronTickOutcome::Skipped => report.objects_skipped += 1,
+                CronTickOutcome::NotDue => {}
             }
-            let Some((job_name, job)) = Self::build_job(cj_value, now) else {
-                report.objects_skipped += 1;
-                continue;
-            };
-            let job_ns = cj_key.namespace.as_deref().unwrap_or("default");
-            let job_key = ResourceKey::namespaced("batch", "v1", "Job", job_ns, &job_name);
-            self.store
-                .propose(ResourceCommand::Put {
-                    key: job_key,
-                    value: job,
-                    expected: None,
-                    reason: Reason::Controller,
-                })
-                .await?;
-            // Patch CronJob status with lastRunUnix.
-            self.store
-                .propose(ResourceCommand::patch(
-                    cj_key.clone(),
-                    json!({ "status": { "lastRunUnix": now } }),
-                    Reason::Controller,
-                ))
-                .await?;
-            report.objects_changed += 2;
         }
         Ok(report.into())
     }
+}
+
+/// One CronJob's per-tick outcome — drives the aggregate report counters.
+enum CronTickOutcome {
+    /// A Job was created (+ status patched): two store writes.
+    Fired,
+    /// The slot was deliberately skipped (suspended / bad schedule /
+    /// Forbid-with-active / missed-deadline): recorded as a skip.
+    Skipped,
+    /// No scheduled slot has come due since the anchor: a no-op.
+    NotDue,
+}
+
+impl CronJobController {
+    /// Reconcile a single CronJob at `now` (unix seconds). Pure decision
+    /// logic + store writes; returns the typed [`CronTickOutcome`] so
+    /// [`Self::tick`] stays a thin aggregator.
+    async fn reconcile_one_cronjob(
+        &self,
+        cj_key: &ResourceKey,
+        cj_value: &Value,
+        now: u64,
+    ) -> Result<CronTickOutcome, ControllerError> {
+        // Suspended CronJobs never fire.
+        let suspended = cj_value
+            .get("spec")
+            .and_then(|s| s.get("suspend"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if suspended {
+            return Ok(CronTickOutcome::Skipped);
+        }
+
+        // Parse the schedule; a malformed expression is a typed skip.
+        let schedule_str = cj_value
+            .get("spec")
+            .and_then(|s| s.get("schedule"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Ok(schedule) = crate::cron::CronSchedule::parse(schedule_str) else {
+            return Ok(CronTickOutcome::Skipped);
+        };
+
+        // Most-recent due minute strictly after the anchor + at-or-before now.
+        let anchor = Self::last_schedule_anchor(cj_value, now);
+        let Some(due) = most_recent_due(&schedule, anchor, now) else {
+            return Ok(CronTickOutcome::NotDue);
+        };
+
+        // startingDeadlineSeconds: a due time older than the deadline is
+        // "missed" — record the skip (advance lastScheduleTime) + no Job.
+        if let Some(deadline) = cj_value
+            .get("spec")
+            .and_then(|s| s.get("startingDeadlineSeconds"))
+            .and_then(Value::as_i64)
+        {
+            let deadline = u64::try_from(deadline.max(0)).unwrap_or(0);
+            if now.saturating_sub(due) > deadline {
+                self.patch_last_schedule(cj_key, due, None).await?;
+                return Ok(CronTickOutcome::Skipped);
+            }
+        }
+
+        let cj_uid = cj_value
+            .get("metadata")
+            .and_then(|m| m.get("uid"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let job_ns = cj_key.namespace.as_deref().unwrap_or("default");
+
+        // Concurrency policy gate.
+        let policy = ConcurrencyPolicy::parse(
+            cj_value
+                .get("spec")
+                .and_then(|s| s.get("concurrencyPolicy"))
+                .and_then(Value::as_str),
+        );
+        let owned = self.owned_jobs(cj_uid, job_ns).await;
+        let active = CronJobController::active_jobs(&owned);
+        match policy {
+            ConcurrencyPolicy::Forbid if !active.is_empty() => {
+                // A prior run is still active → skip, but record the skip.
+                self.patch_last_schedule(cj_key, due, None).await?;
+                return Ok(CronTickOutcome::Skipped);
+            }
+            ConcurrencyPolicy::Replace => {
+                // Delete every active owned Job before creating the new one.
+                for (k, _) in &active {
+                    self.store
+                        .propose(ResourceCommand::delete(k.clone(), Reason::Controller))
+                        .await?;
+                }
+            }
+            ConcurrencyPolicy::Allow | ConcurrencyPolicy::Forbid => {}
+        }
+
+        // Build + create the Job, owner-referenced back to the CronJob.
+        let Some((job_name, mut job)) = Self::build_job(cj_value, due) else {
+            return Ok(CronTickOutcome::Skipped);
+        };
+        if let Some(owner_ref) = owner_ref_for(cj_value, "batch/v1", "CronJob") {
+            set_owner_reference(&mut job, owner_ref);
+        }
+        let job_key = ResourceKey::namespaced("batch", "v1", "Job", job_ns, &job_name);
+        self.store
+            .propose(ResourceCommand::Put {
+                key: job_key,
+                value: job,
+                expected: None,
+                reason: Reason::Controller,
+            })
+            .await?;
+
+        // Patch status: lastScheduleTime + an active ref to the new Job.
+        let active_ref = json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "name": job_name,
+            "namespace": job_ns,
+        });
+        self.patch_last_schedule(cj_key, due, Some(active_ref)).await?;
+        Ok(CronTickOutcome::Fired)
+    }
+
+    /// Patch the CronJob's `status.lastScheduleTime` (always) and — when a
+    /// Job was created — its `status.active` list with the new Job's ref.
+    async fn patch_last_schedule(
+        &self,
+        cj_key: &ResourceKey,
+        due: u64,
+        active_ref: Option<Value>,
+    ) -> Result<(), ControllerError> {
+        let status = match active_ref {
+            Some(r) => json!({
+                "lastScheduleTime": unix_to_rfc3339(due),
+                "active": [r],
+            }),
+            None => json!({ "lastScheduleTime": unix_to_rfc3339(due) }),
+        };
+        self.store
+            .propose(ResourceCommand::patch(
+                cj_key.clone(),
+                json!({ "status": status }),
+                Reason::Controller,
+            ))
+            .await?;
+        Ok(())
+    }
+}
+
+/// The most-recent cron-due minute strictly after `anchor` and at-or-
+/// before `now`. `None` when no slot has come due since the anchor.
+///
+/// We walk forward from the anchor (the search is bounded by
+/// [`crate::cron::CronSchedule::next_after_unix`]'s horizon) and keep the
+/// last slot ≤ now. This fires AT MOST ONCE per tick even when several
+/// slots elapsed between ticks (no catch-up storm) — the missed slots are
+/// collapsed to the latest, matching the Kubernetes single-fire-per-tick
+/// behaviour for a CronJob with no backlog policy.
+fn most_recent_due(
+    schedule: &crate::cron::CronSchedule,
+    anchor: u64,
+    now: u64,
+) -> Option<u64> {
+    let mut candidate = schedule.next_after_unix(anchor)?;
+    if candidate > now {
+        return None;
+    }
+    // Advance to the latest slot ≤ now.
+    while let Some(next) = schedule.next_after_unix(candidate) {
+        if next > now {
+            break;
+        }
+        candidate = next;
+    }
+    Some(candidate)
+}
+
+/// Is this Job in a terminal state (a `Complete` or `Failed` condition is
+/// True)? Used by the concurrency policy to decide what counts as active.
+fn job_is_terminal(job: &Value) -> bool {
+    job.get("status")
+        .and_then(|s| s.get("conditions"))
+        .and_then(Value::as_array)
+        .is_some_and(|conds| {
+            conds.iter().any(|c| {
+                let t = c.get("type").and_then(Value::as_str);
+                let s = c.get("status").and_then(Value::as_str);
+                matches!(t, Some("Complete" | "Failed")) && s == Some("True")
+            })
+        })
+}
+
+/// Is `child` controller-owned by an object with uid `owner_uid`?
+fn owned_by(child: &Value, owner_uid: &str) -> bool {
+    if owner_uid.is_empty() {
+        return false;
+    }
+    child
+        .get("metadata")
+        .and_then(|m| m.get("ownerReferences"))
+        .and_then(Value::as_array)
+        .is_some_and(|refs| {
+            refs.iter().any(|r| {
+                r.get("uid").and_then(Value::as_str) == Some(owner_uid)
+                    && r.get("controller").and_then(Value::as_bool) == Some(true)
+            })
+        })
+}
+
+/// Parse an RFC3339 timestamp string → unix seconds. `None` on malformed
+/// input (a skip-safe read of `status.lastScheduleTime` /
+/// `creationTimestamp`).
+fn parse_rfc3339_unix(s: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+}
+
+/// Render unix seconds → the Kubernetes-wire RFC3339 UTC string (typed
+/// emission via engenho-types' `time` surface — no hand-`format!()`).
+fn unix_to_rfc3339(unix_secs: u64) -> String {
+    let secs = i64::try_from(unix_secs).unwrap_or(i64::MAX);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map_or_else(String::new, engenho_types::time::to_rfc3339_utc)
 }
 
 #[cfg(test)]
@@ -433,18 +724,68 @@ mod tests {
         assert_eq!(job.get("apiVersion").unwrap(), "batch/v1");
         assert_eq!(job.get("metadata").unwrap().get("name").unwrap(), &name);
         assert!(job.get("spec").unwrap().get("template").is_some());
+        // The convenience cronjob label is stamped on the built Job.
+        assert_eq!(
+            job["metadata"]["labels"]["engenho.io/cronjob"],
+            json!("nightly")
+        );
     }
 
     #[test]
-    fn cronjob_next_run_unix_reads_spec_field() {
-        let cj = json!({"spec": {"nextRunUnix": 42_u64}});
-        assert_eq!(CronJobController::next_run_unix(&cj), Some(42));
+    fn concurrency_policy_parse() {
+        assert_eq!(ConcurrencyPolicy::parse(Some("Forbid")), ConcurrencyPolicy::Forbid);
+        assert_eq!(ConcurrencyPolicy::parse(Some("Replace")), ConcurrencyPolicy::Replace);
+        assert_eq!(ConcurrencyPolicy::parse(Some("Allow")), ConcurrencyPolicy::Allow);
+        // Unknown / absent → Allow (the K8s default).
+        assert_eq!(ConcurrencyPolicy::parse(Some("Bogus")), ConcurrencyPolicy::Allow);
+        assert_eq!(ConcurrencyPolicy::parse(None), ConcurrencyPolicy::Allow);
     }
 
     #[test]
-    fn cronjob_next_run_unix_none_when_missing() {
-        let cj = json!({"spec": {}});
-        assert_eq!(CronJobController::next_run_unix(&cj), None);
+    fn job_is_terminal_detects_complete_and_failed() {
+        let complete = json!({"status": {"conditions": [{"type": "Complete", "status": "True"}]}});
+        let failed = json!({"status": {"conditions": [{"type": "Failed", "status": "True"}]}});
+        let running = json!({"status": {"active": 1}});
+        let complete_false =
+            json!({"status": {"conditions": [{"type": "Complete", "status": "False"}]}});
+        assert!(job_is_terminal(&complete));
+        assert!(job_is_terminal(&failed));
+        assert!(!job_is_terminal(&running));
+        assert!(!job_is_terminal(&complete_false));
+    }
+
+    #[test]
+    fn owned_by_matches_controller_ref() {
+        let child = json!({"metadata": {"ownerReferences": [
+            {"uid": "cj-uid", "controller": true}
+        ]}});
+        assert!(owned_by(&child, "cj-uid"));
+        assert!(!owned_by(&child, "other-uid"));
+        // A non-controller owner ref does not count.
+        let non_ctrl = json!({"metadata": {"ownerReferences": [{"uid": "cj-uid"}]}});
+        assert!(!owned_by(&non_ctrl, "cj-uid"));
+        // Empty uid never matches.
+        assert!(!owned_by(&child, ""));
+    }
+
+    #[test]
+    fn rfc3339_round_trips_unix() {
+        // 1_700_000_000 = 2023-11-14T22:13:20Z.
+        let s = unix_to_rfc3339(1_700_000_000);
+        assert_eq!(s, "2023-11-14T22:13:20Z");
+        assert_eq!(parse_rfc3339_unix(&s), Some(1_700_000_000));
+        assert_eq!(parse_rfc3339_unix("not-a-time"), None);
+    }
+
+    #[test]
+    fn most_recent_due_collapses_missed_slots_to_latest() {
+        // Every-minute schedule. Anchor at t=0, now at t=600 (10 min later)
+        // → the latest due slot is t=600 itself (minute-aligned, ≤ now).
+        let s = crate::cron::CronSchedule::parse("* * * * *").unwrap();
+        assert_eq!(most_recent_due(&s, 0, 600), Some(600));
+        // Nothing due yet when now is before the first slot after anchor.
+        // anchor=100 → first slot 120; now=110 < 120 → None.
+        assert_eq!(most_recent_due(&s, 100, 110), None);
     }
 
     #[test]
@@ -485,5 +826,239 @@ mod tests {
             }
         }
         assert_eq!(F.name(), "cronjob");
+    }
+
+    // ── CronJob live-store reconcile (mockable clock, NO wall-clock) ──
+
+    use engenho_store::{InProcessRouter, default_config};
+    use std::time::Duration;
+
+    /// Single-node in-memory StoreMesh — the controller-test rig the
+    /// other reconciler tests use.
+    async fn test_store(name: &str) -> Arc<StoreMesh> {
+        let router = InProcessRouter::new();
+        let cfg = default_config(name).unwrap();
+        let store = Arc::new(
+            StoreMesh::start(1, "in-process://1".into(), router, cfg)
+                .await
+                .unwrap(),
+        );
+        store.initialize_singleton().await.unwrap();
+        assert!(store.wait_for_leadership(Duration::from_secs(3)).await);
+        store
+    }
+
+    async fn put(store: &StoreMesh, key: ResourceKey, value: Value) {
+        store
+            .propose(ResourceCommand::put(key, value, Reason::Operator))
+            .await
+            .expect("put");
+    }
+
+    /// Seed a CronJob at `default/<name>` with the given schedule + a
+    /// jobTemplate that runs one container. The creationTimestamp is the
+    /// search anchor; pin it so a frozen clock can advance past a slot.
+    fn cronjob_value(name: &str, schedule: &str, created: u64) -> Value {
+        json!({
+            "kind": "CronJob",
+            "apiVersion": "batch/v1",
+            "metadata": {
+                "name": name,
+                "namespace": "default",
+                "uid": format!("{name}-uid"),
+                "creationTimestamp": unix_to_rfc3339(created),
+            },
+            "spec": {
+                "schedule": schedule,
+                "jobTemplate": {
+                    "spec": {
+                        "template": {"spec": {"containers": [{"image": "alpine"}]}}
+                    }
+                }
+            }
+        })
+    }
+
+    async fn list_jobs(store: &StoreMesh) -> Vec<(ResourceKey, Value)> {
+        store.list("batch", "v1", "Job", Some("default")).await
+    }
+
+    #[tokio::test]
+    async fn cronjob_creates_one_job_when_a_minute_is_due() {
+        let store = test_store("cronjob-due").await;
+        // creationTimestamp at t=0; clock at t=120 (one whole minute past
+        // the first due slot of an every-minute schedule).
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cronjob_value("every", "* * * * *", 0),
+        )
+        .await;
+        let clock = Arc::new(FrozenClock::at(120_000)); // 120s
+        let c = CronJobController::new(store.clone(), clock.clone(), None);
+
+        let out = c.tick().await.unwrap();
+        assert_eq!(out.objects_changed, 2, "one Job create + one status patch");
+
+        let jobs = list_jobs(&store).await;
+        assert_eq!(jobs.len(), 1, "exactly one Job created");
+        let (jk, jv) = &jobs[0];
+        // Name = {cronjob}-{due_ts}; due is the latest slot ≤ now (120).
+        assert_eq!(jk.name, "every-120");
+        // ownerRef points back at the CronJob (controller=true).
+        assert!(owned_by(jv, "every-uid"), "Job owner-referenced to CronJob");
+        assert_eq!(jk.namespace.as_deref(), Some("default"));
+        // jobTemplate.spec.template was copied into the Job.
+        assert!(jv["spec"]["template"]["spec"]["containers"].is_array());
+
+        // status.lastScheduleTime updated on the CronJob.
+        let cj = store
+            .get(&ResourceKey::namespaced(
+                "batch", "v1", "CronJob", "default", "every",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_rfc3339_unix(cj["status"]["lastScheduleTime"].as_str().unwrap()),
+            Some(120)
+        );
+        assert_eq!(cj["status"]["active"][0]["name"], json!("every-120"));
+    }
+
+    #[tokio::test]
+    async fn cronjob_not_due_yet_creates_nothing() {
+        let store = test_store("cronjob-notdue").await;
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cronjob_value("every", "* * * * *", 100),
+        )
+        .await;
+        // Anchor at t=100 → first due slot is t=120; clock at t=110 < 120.
+        let clock = Arc::new(FrozenClock::at(110_000));
+        let c = CronJobController::new(store.clone(), clock, None);
+        let out = c.tick().await.unwrap();
+        assert_eq!(out.objects_changed, 0);
+        assert!(list_jobs(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cronjob_suspend_never_fires() {
+        let store = test_store("cronjob-suspend").await;
+        let mut cj = cronjob_value("every", "* * * * *", 0);
+        cj["spec"]["suspend"] = json!(true);
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cj,
+        )
+        .await;
+        let clock = Arc::new(FrozenClock::at(600_000)); // way past several slots
+        let c = CronJobController::new(store.clone(), clock, None);
+        let out = c.tick().await.unwrap();
+        assert_eq!(out.objects_skipped, 1);
+        assert!(list_jobs(&store).await.is_empty(), "suspended → no Job ever");
+    }
+
+    #[tokio::test]
+    async fn cronjob_forbid_skips_when_active_job_exists() {
+        let store = test_store("cronjob-forbid").await;
+        let mut cj = cronjob_value("every", "* * * * *", 0);
+        cj["spec"]["concurrencyPolicy"] = json!("Forbid");
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cj,
+        )
+        .await;
+        // Seed an ALREADY-active owned Job (no terminal condition).
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "Job", "default", "every-60"),
+            json!({
+                "kind": "Job", "apiVersion": "batch/v1",
+                "metadata": {"name": "every-60", "namespace": "default",
+                    "ownerReferences": [{"uid": "every-uid", "controller": true}]},
+                "status": {"active": 1}
+            }),
+        )
+        .await;
+        let clock = Arc::new(FrozenClock::at(120_000));
+        let c = CronJobController::new(store.clone(), clock, None);
+        let out = c.tick().await.unwrap();
+        assert_eq!(out.objects_skipped, 1);
+        // No NEW Job — still just the seeded one.
+        assert_eq!(list_jobs(&store).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cronjob_replace_deletes_active_then_creates() {
+        let store = test_store("cronjob-replace").await;
+        let mut cj = cronjob_value("every", "* * * * *", 0);
+        cj["spec"]["concurrencyPolicy"] = json!("Replace");
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cj,
+        )
+        .await;
+        // An active owned Job from a previous slot.
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "Job", "default", "every-60"),
+            json!({
+                "kind": "Job", "apiVersion": "batch/v1",
+                "metadata": {"name": "every-60", "namespace": "default",
+                    "ownerReferences": [{"uid": "every-uid", "controller": true}]},
+                "status": {"active": 1}
+            }),
+        )
+        .await;
+        let clock = Arc::new(FrozenClock::at(120_000));
+        let c = CronJobController::new(store.clone(), clock, None);
+        c.tick().await.unwrap();
+        let jobs = list_jobs(&store).await;
+        // The old active Job was deleted; the new one created.
+        let names: Vec<&str> = jobs.iter().map(|(k, _)| k.name.as_str()).collect();
+        assert!(!names.contains(&"every-60"), "active Job replaced (deleted)");
+        assert!(names.contains(&"every-120"), "new Job created");
+    }
+
+    #[tokio::test]
+    async fn cronjob_starting_deadline_skips_stale_slot() {
+        let store = test_store("cronjob-deadline").await;
+        let mut cj = cronjob_value("every", "* * * * *", 0);
+        // Deadline of 10s — the latest due slot must be within 10s of now.
+        cj["spec"]["startingDeadlineSeconds"] = json!(10);
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cj,
+        )
+        .await;
+        // now=125 → latest slot ≤ now is 120, which is 5s old (≤ 10s) → fires.
+        let clock = Arc::new(FrozenClock::at(125_000));
+        let c = CronJobController::new(store.clone(), clock, None);
+        c.tick().await.unwrap();
+        assert_eq!(list_jobs(&store).await.len(), 1, "within deadline → fires");
+    }
+
+    #[tokio::test]
+    async fn cronjob_idempotent_on_repeated_tick_same_minute() {
+        let store = test_store("cronjob-idem").await;
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cronjob_value("every", "* * * * *", 0),
+        )
+        .await;
+        let clock = Arc::new(FrozenClock::at(120_000));
+        let c = CronJobController::new(store.clone(), clock.clone(), None);
+        c.tick().await.unwrap();
+        // Second tick with the SAME clock: lastScheduleTime now == 120, so
+        // the next-due search finds no NEW slot ≤ now → no second Job.
+        let out2 = c.tick().await.unwrap();
+        assert_eq!(out2.objects_changed, 0, "no double-fire within a minute");
+        assert_eq!(list_jobs(&store).await.len(), 1);
     }
 }
