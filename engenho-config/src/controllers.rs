@@ -83,6 +83,13 @@ pub struct ControllerEnable {
     /// deserializes (defaults on).
     #[serde(default = "default_true")]
     pub pv_binder: bool,
+    /// PodDisruptionBudget controller: computes `status.{currentHealthy,
+    /// desiredHealthy,expectedPods,disruptionsAllowed,observedGeneration}`
+    /// from the pods its selector matches vs minAvailable/maxUnavailable.
+    /// `#[serde(default)]` REQUIRED (deny_unknown_fields) so pre-existing
+    /// operator YAML still deserializes (defaults on).
+    #[serde(default = "default_true")]
+    pub pdb: bool,
 }
 
 /// serde default for the `statefulset` / `job` toggles — `true` so an
@@ -108,6 +115,7 @@ impl TieredConfig for ControllersConfig {
                 crd: false,
                 namespace: false,
                 pv_binder: false,
+                pdb: false,
             },
             namespace: String::new(),
             fallback_interval_seconds: 0,
@@ -130,6 +138,7 @@ impl TieredConfig for ControllersConfig {
                 crd: true,
                 namespace: true,
                 pv_binder: true,
+                pdb: true,
             },
             namespace: String::new(),
             fallback_interval_seconds: 30,
