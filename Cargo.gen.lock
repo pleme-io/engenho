@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cargo_lock_sha256": "35528f01ec5a91a0f2e507cb8188510148119d33d94e520bd74c3465ce6d7605",
+  "cargo_lock_sha256": "75408401901e04d082fd1099e96458bdcc7ab6e4c07f74a55b0778d9c7381276",
   "target_resolves": {
     "base": {
       "adler2-2.0.1": {
@@ -3655,6 +3655,8 @@
         "build_dependencies": [],
         "features": [
           "alloc",
+          "pem",
+          "pkcs8",
           "serde",
           "std"
         ]
@@ -3748,6 +3750,8 @@
           "default",
           "digest",
           "fast",
+          "pem",
+          "pkcs8",
           "rand_core",
           "serde",
           "signature",
@@ -3959,8 +3963,28 @@
             "tree": "target"
           },
           {
+            "name": "blake3",
+            "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "bytes",
             "package_key": "bytes-1.11.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "ed25519_dalek",
+            "package_key": "ed25519-dalek-2.2.0",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
