@@ -129,6 +129,10 @@ axum-server            = { version = "0.7", default-features = false, features =
 rustls                 = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pemfile         = "2"
 time                   = "0.3"
+# Deterministic cluster PKI: a BLAKE3-derived seed → an ed25519 key, so a
+# fresh engenho produces a byte-identical CA / kubeconfig (no random keygen).
+blake3                 = "1"
+ed25519-dalek          = { version = "2", features = ["pkcs8", "pem"] }
 
 [workspace.lints]
 

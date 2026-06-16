@@ -150,10 +150,16 @@ async fn untrusted_ca_fails_the_handshake() {
     // silently-insecure server.
     let (base, _ca_pem, server, _dir) = boot_tls_server().await;
 
-    // A second, independent CA (a different data_dir mints a different CA).
-    let other_dir = tempfile::tempdir().unwrap();
-    let other_ca = load_or_generate_ca(other_dir.path()).unwrap();
-    let bad_client = client_trusting(other_ca.cert_pem());
+    // A genuinely DIFFERENT CA. The cluster CA is now DETERMINISTIC, so a
+    // second `load_or_generate_ca` would mint the SAME CA — the untrusted-CA
+    // negative needs a real foreign root, so build a one-off random one.
+    let other_ca_pem = {
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().pem()
+    };
+    let bad_client = client_trusting(&other_ca_pem);
 
     let result = bad_client.get(format!("{base}/version")).send().await;
     assert!(

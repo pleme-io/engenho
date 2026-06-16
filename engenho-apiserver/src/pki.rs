@@ -26,9 +26,11 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, DnValue,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
 };
 use rustls::pki_types::CertificateDer;
 use rustls::server::WebPkiClientVerifier;
@@ -68,6 +70,11 @@ pub enum PkiError {
     /// silent insecure fall-through to no-client-auth.
     #[error("client verifier build error: {0}")]
     ClientVerifier(String),
+
+    /// Deriving the deterministic ed25519 key from its BLAKE3 seed failed at
+    /// the PKCS#8 encode step. Should never happen for a valid 32-byte seed.
+    #[error("deterministic key derivation error: {0}")]
+    DeterministicKey(#[from] ed25519_dalek::pkcs8::Error),
 }
 
 engenho_substrate::impl_error_kind! {
@@ -76,7 +83,34 @@ engenho_substrate::impl_error_kind! {
         (Crypto(_)) => "crypto",
         { San { .. } } => "san",
         (ClientVerifier(_)) => "client_verifier",
+        (DeterministicKey(_)) => "deterministic_key",
     }
+}
+
+/// Fixed per-role BLAKE3 derivation contexts — distinct so the CA, server,
+/// and admin-client keys are independent yet each fully deterministic.
+const CTX_CA: &str = "engenho cluster-ca v1";
+const CTX_SERVER: &str = "engenho apiserver-cert v1";
+const CTX_CLIENT: &str = "engenho admin-client-cert v1";
+
+/// The base key material every role-seed is derived from. For a LOCAL
+/// single-node engenho this is a fixed constant, so a fresh cluster's CA /
+/// kubeconfig is byte-identical (the operator's "a new engenho can't result in
+/// a different kubectl configuration"). An EXPOSED cluster MUST mix in a
+/// per-cluster secret here (a cofre value) so the admin key isn't derivable
+/// from public knowledge — tracked as a follow-up.
+const PKI_BASE: &[u8] = b"engenho deterministic cluster identity v1";
+
+/// A deterministic ed25519 [`KeyPair`] for a PKI role. The seed is
+/// `BLAKE3::derive_key(ctx, PKI_BASE)`, so the same role always yields the same
+/// key — hence a byte-identical CA / server / client cert (and kubeconfig)
+/// across fresh boots, replacing rcgen's random `KeyPair::generate`.
+fn deterministic_keypair(ctx: &str) -> Result<KeyPair, PkiError> {
+    let seed = blake3::derive_key(ctx, PKI_BASE);
+    let signing = SigningKey::from_bytes(&seed);
+    let der = signing.to_pkcs8_der()?;
+    let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(der.as_bytes().to_vec());
+    Ok(KeyPair::try_from(&pkcs8)?)
 }
 
 /// ~10-year CA validity in days. The CA is the long-lived root that an
@@ -228,8 +262,11 @@ fn generate_and_persist_ca(
         .distinguished_name
         .push(DnType::CommonName, "engenho-ca");
     set_validity(&mut params, CA_VALIDITY_DAYS);
+    // Fixed serial (rcgen randomizes by default) — the last randomness source
+    // after the key + validity, so the CA cert is fully deterministic.
+    params.serial_number = Some(SerialNumber::from(1u64));
 
-    let key = KeyPair::generate()?;
+    let key = deterministic_keypair(CTX_CA)?;
     let cert = params.clone().self_signed(&key)?;
     let ca_cert_pem = cert.pem();
     let ca_key_pem = key.serialize_pem();
@@ -273,8 +310,9 @@ pub fn issue_server_material(
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     set_validity(&mut params, SERVER_VALIDITY_DAYS);
     params.subject_alt_names = build_sans(san)?;
+    params.serial_number = Some(SerialNumber::from(2u64));
 
-    let leaf_key = KeyPair::generate()?;
+    let leaf_key = deterministic_keypair(CTX_SERVER)?;
     let issuer = ca.issuer()?;
     let leaf_cert = params.signed_by(&leaf_key, &issuer, &ca.key)?;
 
@@ -341,8 +379,9 @@ pub fn issue_admin_client_material(ca: &ClusterCa) -> Result<ClientMaterial, Pki
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     set_validity(&mut params, CLIENT_VALIDITY_DAYS);
     // No SANs: a client cert is identified by its Subject, not a SAN.
+    params.serial_number = Some(SerialNumber::from(3u64));
 
-    let leaf_key = KeyPair::generate()?;
+    let leaf_key = deterministic_keypair(CTX_CLIENT)?;
     let issuer = ca.issuer()?;
     let leaf_cert = params.signed_by(&leaf_key, &issuer, &ca.key)?;
 
@@ -484,10 +523,21 @@ fn build_sans(san: &ServerSanInputs<'_>) -> Result<Vec<SanType>, PkiError> {
 }
 
 /// Set `not_before` = now, `not_after` = now + `days`.
-fn set_validity(params: &mut CertificateParams, days: i64) {
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now;
-    params.not_after = now + time::Duration::days(days);
+fn set_validity(params: &mut CertificateParams, _days: i64) {
+    // Deterministic FIXED window — NOT `now()`-relative — so the emitted certs
+    // (and therefore the kubeconfig) are byte-identical on every fresh boot.
+    // A wide fixed span [2020-01-01 .. 2100-01-01] keeps every cert valid for
+    // the realistic life of a local cluster. The per-role `_days` horizon is
+    // intentionally unused: a deterministic local cluster re-derives identical
+    // certs each boot, so staggered expiry would only break the determinism
+    // (a `now()+days` not_after differs every boot). An EXPOSED cluster that
+    // wants rotation drives it through cofre + a re-seed, not a clock here.
+    let not_before = time::OffsetDateTime::from_unix_timestamp(1_577_836_800)
+        .expect("2020-01-01T00:00:00Z is a valid timestamp");
+    let not_after = time::OffsetDateTime::from_unix_timestamp(4_102_444_800)
+        .expect("2100-01-01T00:00:00Z is a valid timestamp");
+    params.not_before = not_before;
+    params.not_after = not_after;
 }
 
 // ── filesystem helpers (typed io errors, unix perms) ───────────────────
@@ -565,6 +615,38 @@ mod tests {
     }
 
     #[test]
+    fn pki_is_deterministic_across_fresh_clusters() {
+        // Two brand-new clusters (separate data dirs) must produce a
+        // BYTE-IDENTICAL CA + server cert + admin client cert — so a fresh
+        // engenho yields the same kubeconfig ("a new engenho can't result in
+        // a different kubectl configuration").
+        let (_d1, ca1) = ca_in_tempdir();
+        let (_d2, ca2) = ca_in_tempdir();
+        assert_eq!(ca1.cert_pem(), ca2.cert_pem(), "CA cert must be deterministic");
+
+        let san = ServerSanInputs { node_name: "engenho-local", listen_ip: None };
+        let s1 = issue_server_material(&ca1, &san).unwrap();
+        let s2 = issue_server_material(&ca2, &san).unwrap();
+        assert_eq!(s1.cert_chain_pem, s2.cert_chain_pem, "server cert must be deterministic");
+
+        let c1 = issue_admin_client_material(&ca1).unwrap();
+        let c2 = issue_admin_client_material(&ca2).unwrap();
+        assert_eq!(c1.cert_pem, c2.cert_pem, "admin client cert must be deterministic");
+        assert_eq!(c1.key_pem, c2.key_pem, "admin client key must be deterministic");
+
+        // Same role → same key; distinct roles → distinct keys.
+        assert_eq!(
+            deterministic_keypair(CTX_CA).unwrap().serialize_pem(),
+            deterministic_keypair(CTX_CA).unwrap().serialize_pem(),
+        );
+        assert_ne!(
+            deterministic_keypair(CTX_CA).unwrap().serialize_pem(),
+            deterministic_keypair(CTX_SERVER).unwrap().serialize_pem(),
+            "CA and server keys must be independent",
+        );
+    }
+
+    #[test]
     fn generated_ca_persists_with_locked_down_key() {
         let dir = tempfile::tempdir().unwrap();
         let _ca = load_or_generate_ca(dir.path()).unwrap();
@@ -601,13 +683,16 @@ mod tests {
     }
 
     #[test]
-    fn fresh_tempdir_generates_a_different_ca() {
+    fn fresh_tempdir_generates_the_same_ca() {
+        // Determinism (changed 2026-06): independent data_dirs now mint a
+        // BYTE-IDENTICAL CA — a fresh engenho yields the same kubeconfig. (Was
+        // `assert_ne!` under the old random `KeyPair::generate` keygen.)
         let (_d1, ca1) = ca_in_tempdir();
         let (_d2, ca2) = ca_in_tempdir();
-        assert_ne!(
+        assert_eq!(
             ca1.cert_pem(),
             ca2.cert_pem(),
-            "independent data_dirs must mint independent CAs"
+            "deterministic PKI: independent data_dirs mint the SAME CA"
         );
     }
 
