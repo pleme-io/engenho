@@ -10,6 +10,11 @@
 //! * `engenho` (no args) — boot the daemon: init tracing → discover
 //!   config → boot the Runtime → wait for ctrl-c → graceful shutdown.
 //!   On boot (TLS-enabled) the daemon writes `data_dir/kubeconfig`.
+//! * `engenho daemon` — explicit alias for the bare no-arg form. Runs
+//!   the EXACT same `run_daemon` path. This is the verb the substrate
+//!   `mkModuleTrio` factory invokes (`daemonSubcommand = "daemon"`) when
+//!   it generates the systemd / launchd unit; the bare form stays
+//!   working for back-compat and interactive use.
 //! * `engenho kubeconfig [--data-dir <d>] [--server <url>]` — print the
 //!   kubeconfig for the persisted cluster CA to stdout. Use this to
 //!   re-emit a kubeconfig after the daemon is up, or to point kubectl at
@@ -23,18 +28,47 @@ use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
+/// The parsed top-level command. Splitting the argv classification out of
+/// `main` keeps it unit-testable without booting the daemon or touching
+/// the process environment — `Command::parse` is a pure function over the
+/// argument stream.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    /// Boot the daemon — the bare no-arg form AND the explicit `daemon`
+    /// verb both resolve here, so `engenho` == `engenho daemon`.
+    Daemon,
+    /// `kubeconfig [flags...]` — carries the trailing flags verbatim for
+    /// `run_kubeconfig` to parse.
+    Kubeconfig(Vec<String>),
+}
+
+impl Command {
+    /// Classify `engenho`'s argv (already skipping argv[0]).
+    ///
+    /// * no args → [`Command::Daemon`]
+    /// * `daemon` → [`Command::Daemon`] (explicit alias — same path)
+    /// * `kubeconfig …` → [`Command::Kubeconfig`] with the remaining args
+    /// * anything else → an error naming the supported verbs
+    fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
+        match args.next().as_deref() {
+            None | Some("daemon") => Ok(Command::Daemon),
+            Some("kubeconfig") => Ok(Command::Kubeconfig(args.collect())),
+            Some(other) => Err(anyhow::anyhow!(
+                "unknown subcommand {other:?} (supported: daemon [or no args] to boot the daemon, kubeconfig)"
+            )),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Minimal arg parsing — the binary has exactly one optional
-    // subcommand (`kubeconfig`); everything else is the daemon. We avoid
-    // pulling clap for a single verb (the daemon path stays the default).
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("kubeconfig") => run_kubeconfig(args),
-        Some(other) => Err(anyhow::anyhow!(
-            "unknown subcommand {other:?} (supported: kubeconfig, or no args to boot the daemon)"
-        )),
-        None => run_daemon().await,
+    // Minimal arg parsing — the binary has exactly two optional verbs
+    // (`daemon`, an explicit alias for the bare form, and `kubeconfig`).
+    // We avoid pulling clap for two verbs (the daemon path stays the
+    // default).
+    match Command::parse(std::env::args().skip(1))? {
+        Command::Daemon => run_daemon().await,
+        Command::Kubeconfig(flags) => run_kubeconfig(flags.into_iter()),
     }
 }
 
@@ -162,4 +196,55 @@ fn default_server_url(config: &EngenhoConfig) -> String {
     let mut url = String::from("https://127.0.0.1:");
     url.push_str(&port.to_string());
     url
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+
+    fn parse(argv: &[&str]) -> anyhow::Result<Command> {
+        Command::parse(argv.iter().map(|s| (*s).to_string()))
+    }
+
+    /// The bare no-arg form boots the daemon.
+    #[test]
+    fn bare_no_args_is_daemon() {
+        assert_eq!(parse(&[]).unwrap(), Command::Daemon);
+    }
+
+    /// `engenho daemon` is an explicit alias that resolves to the SAME
+    /// daemon path as the bare form — this is the verb the substrate
+    /// `mkModuleTrio` factory wires into the systemd/launchd unit.
+    #[test]
+    fn daemon_subcommand_is_daemon() {
+        assert_eq!(parse(&["daemon"]).unwrap(), Command::Daemon);
+    }
+
+    /// `engenho` and `engenho daemon` classify identically — back-compat
+    /// with the bare form is preserved alongside the explicit verb.
+    #[test]
+    fn bare_and_daemon_subcommand_agree() {
+        assert_eq!(parse(&[]).unwrap(), parse(&["daemon"]).unwrap());
+    }
+
+    /// `kubeconfig` carries its trailing flags through verbatim.
+    #[test]
+    fn kubeconfig_subcommand_carries_flags() {
+        assert_eq!(
+            parse(&["kubeconfig", "--data-dir", "/var/lib/engenho-rio"]).unwrap(),
+            Command::Kubeconfig(vec![
+                "--data-dir".to_string(),
+                "/var/lib/engenho-rio".to_string(),
+            ]),
+        );
+    }
+
+    /// An unrecognized verb is an error naming the supported verbs.
+    #[test]
+    fn unknown_subcommand_errors() {
+        let err = parse(&["frobnicate"]).unwrap_err().to_string();
+        assert!(err.contains("frobnicate"), "error should name the bad verb: {err}");
+        assert!(err.contains("daemon"), "error should list `daemon`: {err}");
+        assert!(err.contains("kubeconfig"), "error should list `kubeconfig`: {err}");
+    }
 }
