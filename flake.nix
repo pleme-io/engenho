@@ -38,6 +38,87 @@
       packageName = "engenho";
       src         = self;
       repo        = "pleme-io/engenho";
+
+      # Self-emit the NixOS / nix-darwin / home-manager module trio so an
+      # isolated engenho instance can be declared from a node config (the
+      # `nix` private repo). Substrate's `mkModuleTrio` factory generates:
+      #
+      #   * a system-level systemd service (NixOS) / launchd daemon (Darwin)
+      #     running `engenho daemon` — Type=simple, Restart=always, long-lived
+      #     (see `daemonSubcommand` + `withSystemDaemon`), and
+      #   * a typed shikumi config surface (`services.engenho.<group>.<field>`,
+      #     HM) that renders to YAML pointed at by `ENGENHO_CONFIG`.
+      #
+      # The node consumer wires the load-bearing isolation knobs
+      # (dedicated `engenho` system user, StateDirectory, CPUQuota /
+      # MemoryMax caps, `Environment=ENGENHO_CONFIG=<rendered yaml>`) via
+      # `systemd.services.engenho-daemon` overrides + the daemon
+      # `environment` option — the factory already exposes
+      # `services.engenho.daemon.{enable,extraArgs,environment}`.
+      module = {
+        description = "engenho — typed, attested, Rust-native Kubernetes runtime (Pillar 7)";
+
+        # System-level daemon: `engenho daemon` is an explicit alias for the
+        # bare no-arg daemon path (engenho/src/main.rs Command::parse). The
+        # factory's `mkNixOSService` emits Type=simple + Restart=always +
+        # Environment from `services.engenho.daemon.environment` — exactly a
+        # long-lived daemon with an env-pointed config.
+        withSystemDaemon = true;
+        daemonSubcommand = "daemon";
+
+        # Typed config surface — renders to a partial YAML that
+        # `EngenhoConfig::from_yaml_with_defaults` deep-merges onto the
+        # prescribed defaults (operators specify only overrides). The unit
+        # points `ENGENHO_CONFIG` at this file. Groups mirror the
+        # `cluster` + `runtime` sections of EngenhoConfig 1:1 so the
+        # rendered keys round-trip through serde (`deny_unknown_fields`).
+        withShikumiConfig = true;
+        shikumiConfigPath = ".config/engenho/engenho.yaml";
+
+        shikumiTypedGroups = {
+          # cluster.name — the cluster identity (rejects dots/spaces).
+          cluster = {
+            name = {
+              type = "str";
+              default = "engenho-local";
+              description = "Cluster identity name (no dots or spaces).";
+            };
+          };
+
+          # runtime.* — the process-level assembly knobs. These are the
+          # load-bearing isolation surface: a co-resident instance pins
+          # listen_addr to loopback, a dedicated data_dir, and the fake
+          # kubelet backend (zero container/network activity).
+          runtime = {
+            listen_addr = {
+              type = "str";
+              default = "0.0.0.0:6443";
+              description = "Apiserver bind address. A co-resident instance MUST use a non-default loopback port (e.g. 127.0.0.1:16443) so it never collides with another apiserver.";
+            };
+            data_dir = {
+              type = "str";
+              default = "/var/lib/engenho";
+              description = "Durable-store + PKI keyspace root. Co-resident instances each need their own (e.g. /var/lib/engenho-rio).";
+            };
+            node_name = {
+              type = "str";
+              default = "engenho-node";
+              description = "This node's name. The kubelet binds Pods whose spec.nodeName matches; the Runtime self-registers Node/<node_name> at boot.";
+            };
+            kubelet_backend = {
+              type = "enum";
+              values = [ "podman" "fake" ];
+              default = "fake";
+              description = "Container backend the kubelet drives. `fake` = in-memory deterministic (zero containers / networking — cannot touch cni0/flannel/iptables). `podman` = real shell-out.";
+            };
+            durable = {
+              type = "bool";
+              default = true;
+              description = "true = durable restart-safe fjall store; false = ephemeral in-memory (tests/dev).";
+            };
+          };
+        };
+      };
     };
 
     # Per-system slim package for the cluster-config renderer. Built
@@ -199,10 +280,19 @@
       );
 
       # Overlay so downstream consumers (pleme-io/nix/parts/overlays.nix)
-      # drop in `inputs.engenho.overlays.default` and get engenho-mcp +
-      # the cluster-config renderer on every system. Mirrors zoekt-mcp /
-      # amimori / kurage pattern.
+      # drop in `inputs.engenho.overlays.default` and get the main engenho
+      # binary + engenho-mcp + the cluster-config renderer on every system.
+      # Mirrors zoekt-mcp / amimori / kurage pattern.
+      #
+      # NOTE: this `overlays.default` REPLACES the one
+      # rust-workspace-release-flake.nix auto-emits (which only carried
+      # `engenho`). We re-export `engenho` here so the emitted module trio's
+      # default package option (`pkgs.engenho`) resolves downstream AND the
+      # MCP / render siblings stay available — without it `pkgs.engenho`
+      # would be undefined wherever the module's `services.engenho.package`
+      # default (`pkgs.engenho`) is forced.
       overlays.default = final: _prev: {
+        engenho = (standardFlake.packages.${final.stdenv.hostPlatform.system}.default);
         engenho-mcp = mcpBinFor final.stdenv.hostPlatform.system;
         engenho-cluster-config-render =
           renderBinFor final.stdenv.hostPlatform.system;
