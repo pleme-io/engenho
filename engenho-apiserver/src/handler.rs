@@ -1791,12 +1791,31 @@ fn creation_timestamp_is_unset(slot: Option<&Value>) -> bool {
     }
 }
 
-/// At Namespace create, stamp `status.phase = "Active"` and ensure the
-/// `kubernetes` finalizer is present on `metadata.finalizers` — the two
-/// the namespace-lifecycle admission plugin seeds upstream. Idempotent:
-/// an existing `kubernetes` finalizer / Active phase is left as-is.
+/// At Namespace create, seed the three server-side defaults the
+/// namespace-lifecycle admission plugin stamps upstream:
+///
+///   * `status.phase = "Active"`.
+///   * `spec.finalizers += "kubernetes"` — the namespace finalizer lives on
+///     the typed `Namespace.spec.finalizers` (the legacy per-namespace
+///     finalize mechanism the NamespaceController clears via `/finalize`),
+///     NOT on the generic `metadata.finalizers`. Upstream k8s never seeds a
+///     `metadata.finalizers` on a Namespace.
+///   * `metadata.labels["kubernetes.io/metadata.name"] = <name>` — the
+///     auto-label every namespace carries so a field-less selector can pin a
+///     namespace by name.
+///
+/// Idempotent: an existing Active phase / `kubernetes` finalizer / name label
+/// is left as-is.
 fn stamp_namespace_create_defaults(body: &mut Value) {
     const KUBERNETES_FINALIZER: &str = "kubernetes";
+    const NAME_LABEL: &str = "kubernetes.io/metadata.name";
+    // The namespace name is `metadata.name` (the create path already
+    // extracted + validated it before this stamp runs).
+    let name = body
+        .get("metadata")
+        .and_then(|m| m.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if let Some(obj) = body.as_object_mut() {
         // status.phase = Active
         let status = obj
@@ -1807,18 +1826,34 @@ fn stamp_namespace_create_defaults(body: &mut Value) {
                 .entry("phase".to_string())
                 .or_insert_with(|| Value::String("Active".to_string()));
         }
-        // metadata.finalizers += kubernetes (if not already present)
-        let metadata = obj
-            .entry("metadata".to_string())
+        // spec.finalizers += kubernetes (if not already present)
+        let spec = obj
+            .entry("spec".to_string())
             .or_insert_with(|| serde_json::json!({}));
-        if let Some(meta_obj) = metadata.as_object_mut() {
-            let finalizers = meta_obj
+        if let Some(spec_obj) = spec.as_object_mut() {
+            let finalizers = spec_obj
                 .entry("finalizers".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()));
             if let Some(arr) = finalizers.as_array_mut() {
                 let present = arr.iter().any(|v| v.as_str() == Some(KUBERNETES_FINALIZER));
                 if !present {
                     arr.push(Value::String(KUBERNETES_FINALIZER.to_string()));
+                }
+            }
+        }
+        // metadata.labels["kubernetes.io/metadata.name"] = <name>
+        if let Some(name) = name {
+            let metadata = obj
+                .entry("metadata".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(meta_obj) = metadata.as_object_mut() {
+                let labels = meta_obj
+                    .entry("labels".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(labels_obj) = labels.as_object_mut() {
+                    labels_obj
+                        .entry(NAME_LABEL.to_string())
+                        .or_insert_with(|| Value::String(name));
                 }
             }
         }
@@ -1942,6 +1977,44 @@ mod tests {
             body.get("metadata").unwrap().get("namespace").unwrap(),
             "team-x"
         );
+    }
+
+    #[test]
+    fn stamp_namespace_defaults_are_conformant() {
+        // Namespace server-side defaulting must match kube-apiserver:
+        //   * spec.finalizers = ["kubernetes"]  (NOT metadata.finalizers)
+        //   * metadata.labels["kubernetes.io/metadata.name"] = <name>
+        //   * status.phase = "Active"
+        let mut body = serde_json::json!({"metadata": {"name": "team-a"}});
+        stamp_namespace_create_defaults(&mut body);
+        assert_eq!(
+            body.pointer("/spec/finalizers"),
+            Some(&serde_json::json!(["kubernetes"])),
+            "kubernetes finalizer lives on spec.finalizers"
+        );
+        assert!(
+            body.pointer("/metadata/finalizers").is_none(),
+            "no generic metadata.finalizers is seeded on a Namespace"
+        );
+        assert_eq!(
+            body.pointer("/metadata/labels/kubernetes.io~1metadata.name"),
+            Some(&Value::String("team-a".to_string())),
+            "the name auto-label is present"
+        );
+        assert_eq!(body.pointer("/status/phase"), Some(&Value::String("Active".to_string())));
+    }
+
+    #[test]
+    fn stamp_namespace_defaults_are_idempotent() {
+        // A body already carrying the defaults is left byte-identical.
+        let mut body = serde_json::json!({
+            "metadata": {"name": "team-a", "labels": {"kubernetes.io/metadata.name": "team-a"}},
+            "spec": {"finalizers": ["kubernetes"]},
+            "status": {"phase": "Active"},
+        });
+        let before = body.clone();
+        stamp_namespace_create_defaults(&mut body);
+        assert_eq!(body, before, "defaulting is idempotent");
     }
 
     #[test]
