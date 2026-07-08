@@ -32,6 +32,9 @@ spec:
               value: "{{ include "engenho.fullname" . }}-store.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.store.raft.port }}"
             - name: ENGENHO_HTTP_PORT
               value: {{ .Values.apiserver.http.port | quote }}
+            {{- /* tieredConfig env tier (<PREFIX>_ overrides) + discovered tier
+                   (POD_NAMESPACE/POD_NAME downward API) — declared, not assumed. */}}
+            {{- include "pleme-lib.tieredConfig.env" . | nindent 12 }}
           ports:
             - name: http
               containerPort: {{ .Values.apiserver.http.port }}
@@ -48,6 +51,12 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.apiserver.resources | nindent 12 }}
+          {{- if (((.Values.config).file).enabled) }}
+          volumeMounts:
+            {{- /* mount the file-tier ConfigMap at /etc/engenho so the
+                   engenho-config ConfigStore discovers /etc/engenho/engenho.yaml */}}
+            {{- include "pleme-lib.tieredConfig.volumeMount" . | nindent 12 }}
+          {{- end }}
           readinessProbe:
             httpGet:
               path: /openapi.json
@@ -60,6 +69,10 @@ spec:
               port: http
             initialDelaySeconds: 30
             periodSeconds: 10
+      {{- if (((.Values.config).file).enabled) }}
+      volumes:
+        {{- include "pleme-lib.tieredConfig.volume" . | nindent 8 }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
