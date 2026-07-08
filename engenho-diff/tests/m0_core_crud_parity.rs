@@ -52,10 +52,26 @@ const KNOWN_DIVERGENCES: &[&str] = &[
     //    old `ExtraField:.apiVersion:engenho` / `ExtraField:.kind:engenho`
     //    signatures are intentionally absent — the ratchet goes RED if they
     //    regress. ──
-    // ── D4. DELETE response shape. k3s returns a metav1.Status
-    //    {kind:Status, status:Success, details:{...}} for a ConfigMap
-    //    delete; engenho returns the DELETED OBJECT (kind:ConfigMap +
-    //    data). (engenho's own r7 tests assert object-return.) ──
+    // ── D4. DELETE response shape — BASELINED (gated on the deletion
+    //    lifecycle; needs a design decision, NOT a bounded parity tweak).
+    //    The k8s DELETE return shape is PER-RESOURCE, not uniform (verified
+    //    against the oracle 2026-07-08):
+    //      * an IMMEDIATELY-removed object (ConfigMap / Secret — no grace
+    //        period, no finalizer) ⇒ metav1.Status{status:Success,
+    //        details:{name,kind,uid}};
+    //      * an object that survives the call as Terminating (a Pod's default
+    //        30s grace period; anything with a finalizer / deletionTimestamp)
+    //        ⇒ the OBJECT itself (kind:Pod, status.phase advanced).
+    //    engenho has no grace-period / graceful-deletion lifecycle, so it
+    //    removes every object immediately and returns the pre-image
+    //    uniformly. That happens to be CONFORMANT for the graceful kinds
+    //    (Pod delete returns a Pod — engenho's r7 delete test asserts exactly
+    //    this, and k8s agrees) but WRONG for the immediate kinds (ConfigMap
+    //    should be Status). A uniform switch to Status-return would both
+    //    break the r7 Pod-object contract AND be non-conformant for Pods.
+    //    The load-bearing fix is the pod deletion lifecycle (grace period →
+    //    Terminating → kubelet-confirmed removal + immediate-vs-graceful
+    //    dispatch), a real milestone — so D4 stays baselined until then. ──
     "FieldDiff:.kind",
     "MissingDefault:.details",
     "ExtraField:.metadata.name:engenho",
