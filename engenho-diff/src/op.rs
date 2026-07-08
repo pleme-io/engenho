@@ -219,6 +219,31 @@ impl Operation {
         )
     }
 
+    /// POST a ConfigMap carrying `labels` (the selector-test vehicle). The
+    /// labels drive `labelSelector` matching; the trivial `data` keeps the
+    /// object valid.
+    #[must_use]
+    pub fn create_labeled_configmap(ns: &str, name: &str, labels: &[(&str, &str)]) -> Self {
+        let labels: serde_json::Map<String, Value> = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
+            .collect();
+        Self::object(
+            Self::ident("create_configmap/", name),
+            HttpMethod::Post,
+            Self::ns_configmaps(ns).render(),
+        )
+        .with_body(
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": name, "labels": Value::Object(labels)},
+                "data": {"a": "b"},
+            }),
+            "application/json",
+        )
+    }
+
     /// LIST ConfigMaps filtered to a single name via `fieldSelector`
     /// (isolates the diff from cluster-auto-created objects like
     /// `kube-root-ca.crt`). The `=` in the selector is percent-encoded.
