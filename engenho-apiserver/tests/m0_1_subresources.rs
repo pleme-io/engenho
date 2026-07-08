@@ -241,6 +241,65 @@ async fn status_patch_ignores_spec() {
 }
 
 #[tokio::test]
+async fn main_put_preserves_status() {
+    // The REVERSE of `status_put_preserves_spec`: a MAIN-object PUT on a
+    // status-bearing kind MUST NOT change `.status` (k8s writes status only
+    // through `/status`). engenho's `replace()` preserves the live status for
+    // any kind declaring a Status subresource.
+    let (_store, server) = boot().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+    let base = create_web(addr, &client).await;
+
+    // Seed a status via /status (so the live object HAS a status to protect).
+    let status_body = serde_json::json!({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": { "name": "web", "namespace": "default" },
+        "status": { "observedGeneration": 5, "replicas": 3 }
+    });
+    let resp = client
+        .put(format!("{base}/web/status"))
+        .json(&status_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // MAIN PUT: change spec.replicas (a real spec edit) AND carry a bogus
+    // status. The spec edit MUST land; the status edit MUST be dropped.
+    let main_body = serde_json::json!({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": { "name": "web", "namespace": "default" },
+        "spec": { "replicas": 8, "selector": { "matchLabels": { "app": "web" } } },
+        "status": { "observedGeneration": 999, "replicas": 999 }
+    });
+    let resp = client
+        .put(format!("{base}/web"))
+        .json(&main_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let parent = get_json(&client, &format!("{base}/web")).await;
+    // The spec edit landed.
+    assert_eq!(replicas(&parent), 8, "main PUT applied the spec edit");
+    // The status edit was DROPPED — the live status (observedGeneration 5)
+    // survives, NOT the 999 the client tried to write through the main object.
+    assert_eq!(
+        parent
+            .get("status")
+            .unwrap()
+            .get("observedGeneration")
+            .unwrap(),
+        5,
+        "main PUT must NOT clobber status (status is /status-only)"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn scale_on_kind_without_scale_is_typed_404() {
     let (_store, server) = boot().await;
     let addr = server.local_addr();

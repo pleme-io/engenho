@@ -1166,6 +1166,15 @@ impl ResourceHandler for StoreBackedHandler {
         // stored value, but these are assigned once at create and must never
         // be rewritten by a client PUT.
         preserve_immutable_meta(&mut body, &existing);
+        // A main-object PUT on a status-bearing kind MUST NOT change `.status`
+        // — k8s writes status only through `/status`. Preserve the live status
+        // so a client PUT that carries a status cannot clobber it (the
+        // symmetric peer of `put_status` scoping the /status endpoint to
+        // `.status` only). Kinds without a Status subresource (ConfigMap,
+        // Secret) are unaffected — the whole body is written as before.
+        if self.subresources.contains(&Subresource::Status) {
+            preserve_status(&mut body, &existing);
+        }
         // Optimistic-concurrency precondition from the (post-admission) body's
         // metadata.resourceVersion. A body carrying an rv threads CAS into the
         // proposal (a stale rv → typed 409); an absent rv → unconditional
@@ -1835,6 +1844,27 @@ fn preserve_immutable_meta(body: &mut Value, existing: &Value) {
                 if let Some(v) = existing_meta.and_then(|m| m.get(field)) {
                     meta_obj.insert(field.to_string(), v.clone());
                 }
+            }
+        }
+    }
+}
+
+/// For a kind that declares a `/status` subresource, a main-object PUT MUST
+/// NOT change `.status` — k8s writes status ONLY through `/status` and drops
+/// any status a client sends to the base-object endpoint. Preserve the LIVE
+/// status into the incoming REPLACE body: copy the live `.status` in when the
+/// object has one, otherwise drop whatever status the client sent. The
+/// symmetric peer of [`StoreBackedHandler::put_status`] scoping a status write
+/// to `.status` only — together they enforce the spec/status write-split in
+/// both directions. Pure JSON mutation; idempotent.
+fn preserve_status(body: &mut Value, existing: &Value) {
+    if let Some(obj) = body.as_object_mut() {
+        match existing.get("status") {
+            Some(live_status) => {
+                obj.insert("status".to_string(), live_status.clone());
+            }
+            None => {
+                obj.remove("status");
             }
         }
     }
