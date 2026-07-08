@@ -90,6 +90,17 @@ pub trait ResourceHandler: Send + Sync + 'static {
         &[]
     }
 
+    /// Whether this kind serves the `deletecollection` verb (a `DELETE` on the
+    /// collection path with no object name). kube-apiserver exposes it for
+    /// every resource whose REST storage implements `rest.CollectionDeleter`
+    /// — in the core group that is everything EXCEPT the three cluster-special
+    /// kinds `namespaces`, `bindings`, `componentstatuses`. Both the router
+    /// dispatch AND the discovery verb fold read this, so advertised ==
+    /// routable. Default `true`; `StoreBackedHandler` overrides the exceptions.
+    fn supports_delete_collection(&self) -> bool {
+        true
+    }
+
     /// GET the parent object's `/status` view. Default: a typed `NotFound`
     /// (this kind does not serve `/status`) — never a panic. `StoreBackedHandler`
     /// overrides for status-bearing kinds: it reads the live object (the
@@ -337,6 +348,34 @@ pub trait ResourceHandler: Send + Sync + 'static {
         expected: Option<Revision>,
         user_info: &UserInfo,
     ) -> Result<Value, ApiError>;
+
+    /// DELETECOLLECTION — delete every object matching `sel` in `namespace`
+    /// (all objects when `sel` is empty). The K8s wire contract returns the
+    /// `<Kind>List` of the objects that were selected for deletion (their
+    /// pre-delete images), with HTTP 200.
+    ///
+    /// Composed from the two primitives every store-backed kind already has:
+    /// [`Self::list_at`] captures the matched pre-images atomically (with the
+    /// snapshot rv that becomes the envelope's `resourceVersion`), then each
+    /// is deleted by name through [`Self::delete_with_precondition`] (so every
+    /// item passes the same per-object admission a single DELETE does). A kind
+    /// that does not serve the verb ([`Self::supports_delete_collection`] ⇒
+    /// `false`) is never routed here.
+    async fn delete_collection(
+        &self,
+        namespace: Option<&str>,
+        sel: &Selectors,
+        user_info: &UserInfo,
+    ) -> Result<Value, ApiError> {
+        let (items, rv) = self.list_at(namespace, sel).await?;
+        for item in &items {
+            if let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) {
+                self.delete_with_precondition(namespace, name, None, user_info)
+                    .await?;
+            }
+        }
+        Ok(self.list_response(items, rv, None, None))
+    }
 
     /// The `apiVersion` string for this kind — `"v1"` for the core
     /// group, `"<group>/<version>"` otherwise.
@@ -636,6 +675,16 @@ impl ResourceHandler for StoreBackedHandler {
 
     fn subresources(&self) -> &[Subresource] {
         self.subresources
+    }
+
+    fn supports_delete_collection(&self) -> bool {
+        // The core-group kinds whose REST storage has no CollectionDeleter.
+        // Everything else (ConfigMap, Pod, Secret, Deployment, …) serves
+        // deletecollection.
+        !matches!(
+            self.kind.as_str(),
+            "Namespace" | "Binding" | "ComponentStatus"
+        )
     }
 
     // ── subresource scoped writes (reuse ResourceCommand::Patch verbatim) ──

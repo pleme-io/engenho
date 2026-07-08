@@ -659,3 +659,60 @@ async fn put_replace_absent_pod_is_404() {
 
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn deletecollection_configmaps_removes_all_and_returns_list() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1/namespaces/default/configmaps");
+
+    // Create three configmaps.
+    for name in ["a", "b", "c"] {
+        let body = serde_json::json!({"metadata": {"name": name}, "data": {"k": "v"}});
+        let resp = client.post(&base).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    }
+
+    // DELETE the collection (no object name) → deletecollection.
+    let resp = client.delete(&base).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    // The wire contract is the <Kind>List of the deleted pre-images.
+    assert_eq!(list.get("kind").unwrap(), "ConfigMapList");
+    assert_eq!(list.get("apiVersion").unwrap(), "v1");
+    let items = list.get("items").unwrap().as_array().unwrap();
+    assert_eq!(items.len(), 3, "the three matched configmaps are returned");
+    // List items are TypeMeta-less (the envelope carries the GVK).
+    assert!(items[0].get("kind").is_none());
+    assert!(items[0].get("apiVersion").is_none());
+
+    // The collection is now empty.
+    let resp = client.get(&base).send().await.unwrap();
+    let after: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        after.get("items").unwrap().as_array().unwrap().len(),
+        0,
+        "deletecollection removed every object"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deletecollection_on_namespaces_is_rejected() {
+    // Namespaces have no CollectionDeleter — a collection-path DELETE is a
+    // typed BadRequest, and discovery never advertises the verb for them.
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("http://{addr}/api/v1/namespaces"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.shutdown().await.unwrap();
+}
