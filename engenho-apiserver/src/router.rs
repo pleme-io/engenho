@@ -975,6 +975,22 @@ fn is_status_value(v: &serde_json::Value) -> bool {
     v.get("kind").and_then(serde_json::Value::as_str) == Some("Status")
 }
 
+/// DELETE on a collection path (no object name) — deletecollection. The K8s
+/// wire returns the `<Kind>List` of the objects selected for deletion (their
+/// pre-delete images) with HTTP 200. Selectors (`?labelSelector=` /
+/// `?fieldSelector=`) narrow the collection just as they do for LIST. The
+/// list body is rendered JSON — the same shape [`do_list_or_watch`] emits.
+async fn do_delete_collection(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    p: &ListWatchParams,
+    user_info: &UserInfo,
+) -> Result<Response, ApiError> {
+    let sel = p.selectors()?;
+    let list = h.delete_collection(ns, &sel, user_info).await?;
+    Ok(Json(list).into_response())
+}
+
 /// The shared LIST/WATCH body for both the core + grouped cases.
 ///
 ///   * `p.watch == false` → the atomic-rv LIST envelope (selectors
@@ -1448,10 +1464,18 @@ async fn resource_delete(
             "the {sub:?} subresource does not support delete"
         )));
     }
-    let name = coords.name.as_deref().ok_or_else(|| {
-        ApiError::BadRequest("DELETE requires a resource name (instance path)".into())
-    })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    // Collection path (no object name) → deletecollection when the kind
+    // serves it; otherwise the name-required BadRequest is preserved (a
+    // kind like Namespace has no CollectionDeleter).
+    let Some(name) = coords.name.as_deref() else {
+        if h.supports_delete_collection() {
+            return do_delete_collection(&h, coords.namespace.as_deref(), &p, &user_info.0).await;
+        }
+        return Err(ApiError::BadRequest(
+            "DELETE requires a resource name (instance path)".into(),
+        ));
+    };
     do_delete(
         &h,
         coords.namespace.as_deref(),

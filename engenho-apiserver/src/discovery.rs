@@ -33,6 +33,20 @@ const VERBS: &[&str] = &[
     "get", "list", "watch", "create", "update", "patch", "delete",
 ];
 
+/// The base-row verb list for a handler: the always-served [`VERBS`] plus
+/// `deletecollection` when the kind serves it
+/// ([`ResourceHandler::supports_delete_collection`]). Keeps discovery's
+/// advertised verb set == the router's routable verb set (a
+/// deletecollection-serving kind advertises it; `namespaces` / `bindings` /
+/// `componentstatuses` do not).
+fn base_verbs(h: &dyn ResourceHandler) -> Vec<String> {
+    let mut verbs: Vec<String> = VERBS.iter().map(|v| (*v).to_string()).collect();
+    if h.supports_delete_collection() {
+        verbs.push("deletecollection".to_string());
+    }
+    verbs
+}
+
 // ── typed meta/v1 discovery structs ────────────────────────────────────
 
 /// `GET /api` — `APIVersions` listing the core legacy versions.
@@ -142,7 +156,7 @@ fn resource_of(h: &dyn ResourceHandler) -> APIResource {
         singular_name: h.singular_name().to_string(),
         namespaced: h.namespaced(),
         kind: h.kind().to_string(),
-        verbs: VERBS.iter().map(|v| (*v).to_string()).collect(),
+        verbs: base_verbs(h),
         short_names: h.short_names().iter().map(|s| (*s).to_string()).collect(),
         categories: h.categories().iter().map(|c| (*c).to_string()).collect(),
         // The base row inherits its own group/version (the list's

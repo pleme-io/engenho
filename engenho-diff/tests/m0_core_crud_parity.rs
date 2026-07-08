@@ -61,10 +61,20 @@ const KNOWN_DIVERGENCES: &[&str] = &[
     "ExtraField:.metadata.name:engenho",
     "ExtraField:.metadata.namespace:engenho",
     "ExtraField:.data:engenho",
-    // ── D5. Discovery (core/v1 APIResourceList): engenho lacks the
-    //    deletecollection verb on configmaps + the namespaces/finalize
-    //    subresource. ──
-    "DiscoveryDiff:/v1:configmaps: engenho missing verbs [deletecollection]",
+    // ── D5a. configmaps deletecollection verb — IRONED OUT. engenho now
+    //    serves deletecollection (router collection-DELETE →
+    //    ResourceHandler::delete_collection, list-then-delete-each returning
+    //    the <Kind>List of pre-images) and advertises it in discovery for
+    //    every kind that has a CollectionDeleter (all but namespaces /
+    //    bindings / componentstatuses). The old
+    //    `DiscoveryDiff:/v1:configmaps: engenho missing verbs
+    //    [deletecollection]` signature is intentionally absent. ──
+    // ── D5b. namespaces/finalize subresource — still absent. k3s exposes
+    //    `namespaces/finalize` (verbs [update]), used by the
+    //    NamespaceController to clear spec.finalizers during Terminating.
+    //    engenho has no namespace-GC controller wired, so the subresource
+    //    route + handler are gated on that controller (adding the route
+    //    without the controller would advertise a no-op). Baselined. ──
     "MissingSubresource:v1/namespaces:finalize:k3s",
 ];
 
