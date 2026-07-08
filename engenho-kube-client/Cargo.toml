@@ -33,6 +33,13 @@ tokio         = { version = "1", features = ["rt", "macros", "io-util"] }
 reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 base64        = "0.22"
 
+[features]
+# Exposes the in-memory `MockKubeClient` to downstream consumers (e.g.
+# engenho-diff's differ unit tests). The module is already gated on
+# `cfg(any(test, feature = "mock"))`; this declares the flag so external
+# crates can opt in without pulling a live cluster.
+mock = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "io-util"] }
 proptest = "1"

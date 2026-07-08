@@ -1449,6 +1449,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-diff"
+version = "0.1.4"
+dependencies = [
+ "async-trait",
+ "engenho-apiserver",
+ "engenho-kube-client",
+ "engenho-store",
+ "engenho-types",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "engenho-fonte"
 version = "0.1.4"
 dependencies = [

@@ -24,6 +24,7 @@ members = [
   "engenho-fonte",
   "engenho-fonte-cli",
   "engenho-machines",
+  "engenho-diff",
 ]
 
 [workspace.package]

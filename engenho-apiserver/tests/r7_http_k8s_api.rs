@@ -567,3 +567,95 @@ async fn unknown_kind_returns_404() {
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     server.shutdown().await.unwrap();
 }
+
+/// PUT on the MAIN object replaces it (the kubectl `replace`/update verb).
+/// engenho used to reject this with a typed 400; it now does a real
+/// optimistic-concurrency replace via the store's `ResourceCommand::Put`.
+/// A body with no `resourceVersion` is an unconditional replace; the
+/// server-owned `creationTimestamp` is preserved from the live object.
+/// (This is the divergence engenho-diff caught against k3s and flipped to
+/// parity.)
+#[tokio::test]
+async fn put_replaces_existing_pod_main_object() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "rp" },
+        "spec": { "containers": [{"name": "a", "image": "img:1"}] }
+    });
+    let created = client
+        .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let created_ts = created["metadata"]["creationTimestamp"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!created_ts.is_empty());
+
+    // PUT (replace) with a new image, no resourceVersion → unconditional.
+    let put = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "rp" },
+        "spec": { "containers": [{"name": "a", "image": "img:2"}] }
+    });
+    let resp = client
+        .put(format!("http://{addr}/api/v1/namespaces/default/pods/rp"))
+        .json(&put)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let obj: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(obj["kind"], "Pod");
+    assert_eq!(obj["apiVersion"], "v1");
+    assert_eq!(obj["spec"]["containers"][0]["image"], "img:2");
+    // creationTimestamp is server-owned + preserved across the replace.
+    assert_eq!(obj["metadata"]["creationTimestamp"], created_ts);
+    // The stored object reflects the replace on a follow-up GET.
+    let got = client
+        .get(format!("http://{addr}/api/v1/namespaces/default/pods/rp"))
+        .send()
+        .await
+        .unwrap();
+    let got: serde_json::Value = got.json().await.unwrap();
+    assert_eq!(got["spec"]["containers"][0]["image"], "img:2");
+
+    server.shutdown().await.unwrap();
+}
+
+/// PUT (replace) of a never-created name is a typed 404 — `replace` requires
+/// the object to already exist (unlike an apply, which upserts).
+#[tokio::test]
+async fn put_replace_absent_pod_is_404() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let put = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": "ghost" },
+        "spec": {}
+    });
+    let resp = client
+        .put(format!("http://{addr}/api/v1/namespaces/default/pods/ghost"))
+        .json(&put)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let err: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(err["reason"], "NotFound");
+
+    server.shutdown().await.unwrap();
+}

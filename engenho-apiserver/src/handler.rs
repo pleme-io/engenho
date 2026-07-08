@@ -261,6 +261,29 @@ pub trait ResourceHandler: Send + Sync + 'static {
         user_info: &UserInfo,
     ) -> Result<Value, ApiError>;
 
+    /// REPLACE (PUT) the whole object — the kubectl `replace` / update verb.
+    ///
+    /// The default is UNSUPPORTED (a typed 400 mirroring the pre-M0 router
+    /// contract), so a handler that hasn't wired a store-backed replace keeps
+    /// the old behavior. [`StoreBackedHandler`] overrides it with a real
+    /// optimistic-concurrency replace over [`ResourceCommand::Put`]:
+    /// existence-required (404 otherwise), server-owned metadata
+    /// (creationTimestamp/uid) preserved, CAS on `metadata.resourceVersion`
+    /// when present (absent → unconditional). `user_info` is the
+    /// authenticated identity threaded into admission.
+    async fn replace(
+        &self,
+        _namespace: Option<&str>,
+        _name: &str,
+        _body: Value,
+        _user_info: &UserInfo,
+    ) -> Result<Value, ApiError> {
+        Err(ApiError::BadRequest(
+            "PUT on the main object is not supported (use POST to create, PATCH to update)"
+                .to_string(),
+        ))
+    }
+
     /// Apply a PATCH. `patch_type` is the typed discriminant of the
     /// request's `Content-Type` (resolved by the router from the media type)
     /// — it travels into the store's [`ResourceCommand::Patch`] so the
@@ -1062,6 +1085,66 @@ impl ResourceHandler for StoreBackedHandler {
         Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
     }
 
+    async fn replace(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        body: Value,
+        user_info: &UserInfo,
+    ) -> Result<Value, ApiError> {
+        let key = self.key(namespace, name)?;
+        // A PUT/replace of an absent name is a 404 — `kubectl replace`
+        // requires the object to exist (unlike an apply, which upserts).
+        let existing = self
+            .store
+            .get(&key)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
+        // Admission (Put) at the API boundary BEFORE any store proposal. A
+        // Mutate replaces the body, a Deny short-circuits with 403. The
+        // authenticated identity travels into AdmissionRequest.user_info.
+        let mut body = self
+            .admit(AdmissionAction::Put, &key, Some(body), user_info)
+            .await?
+            .expect("admit(Put, Some(_)) preserves Some on Allow/Mutate");
+        // A namespaced object's metadata.namespace ALWAYS reflects the ns it
+        // lives in (same invariant the create path stamps).
+        if let Some(ns) = namespace {
+            stamp_namespace(&mut body, ns);
+        }
+        // Preserve the server-owned immutable metadata (creationTimestamp +
+        // uid) from the LIVE object — a replace wholesale-overwrites the
+        // stored value, but these are assigned once at create and must never
+        // be rewritten by a client PUT.
+        preserve_immutable_meta(&mut body, &existing);
+        // Optimistic-concurrency precondition from the (post-admission) body's
+        // metadata.resourceVersion. A body carrying an rv threads CAS into the
+        // proposal (a stale rv → typed 409); an absent rv → unconditional
+        // replace. This reuses the SAME `ResourceCommand::Put` the create path
+        // proposes — extend the primitive, don't fork it.
+        let expected = body_precondition(&body)?;
+        let result = self
+            .store
+            .propose(ResourceCommand::Put {
+                key: key.clone(),
+                value: body,
+                expected,
+                reason: Reason::Operator,
+            })
+            .await
+            .map_err(|e| ApiError::StorageError(e.to_string()))?;
+        if result.op == ResourceOp::Conflict {
+            return Err(self.rv_conflict(name, expected));
+        }
+        // Read back the committed resource (with the bumped resourceVersion).
+        let stored = self
+            .store
+            .get(&key)
+            .await
+            .ok_or_else(|| ApiError::Internal("replaced but not readable".into()))?;
+        Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
+    }
+
     async fn patch(
         &self,
         namespace: Option<&str>,
@@ -1668,6 +1751,27 @@ fn stamp_namespace(body: &mut Value, namespace: &str) {
                 "namespace".to_string(),
                 Value::String(namespace.to_string()),
             );
+        }
+    }
+}
+
+/// Preserve the server-owned immutable metadata (`creationTimestamp`, `uid`)
+/// from the live object into an incoming REPLACE body. A PUT replaces the
+/// whole object, but these two fields are assigned once at create and must
+/// survive a replace unchanged — a client PUT that omits or alters them must
+/// not win. Pure JSON mutation; idempotent when the live object lacks a field.
+fn preserve_immutable_meta(body: &mut Value, existing: &Value) {
+    let existing_meta = existing.get("metadata");
+    if let Some(obj) = body.as_object_mut() {
+        let metadata = obj
+            .entry("metadata".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            for field in ["creationTimestamp", "uid"] {
+                if let Some(v) = existing_meta.and_then(|m| m.get(field)) {
+                    meta_obj.insert(field.to_string(), v.clone());
+                }
+            }
         }
     }
 }
