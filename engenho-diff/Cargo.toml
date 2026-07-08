@@ -1,0 +1,37 @@
+[package]
+name = "engenho-diff"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+homepage.workspace     = true
+readme.workspace       = true
+categories.workspace   = true
+keywords.workspace     = true
+description = "Differential integration-test harness: detect where engenho's Kubernetes surface diverges from a live k3s reference oracle. Fires one authored set of typed Operations at two DiffTargets, folds each paired response through a typed Normalizer + recursive JSON differ into a typed Verdict. engenho's path to CNCF conformance."
+
+[dependencies]
+engenho-types       = { workspace = true }
+# The boot seam (EngenhoTarget::boot_in_process) + the raw() escape hatch
+# are LIBRARY APIs of this harness, so the apiserver + store are normal
+# (not dev) deps — the crate's whole purpose is to stand engenho up
+# in-process and diff it against a live cluster.
+engenho-apiserver   = { workspace = true }
+engenho-store       = { workspace = true }
+engenho-kube-client = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+thiserror           = { workspace = true }
+async-trait         = "0.1"
+reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio               = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+# `mock` exposes MockKubeClient for the differ's zero-cluster unit tests.
+engenho-kube-client = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

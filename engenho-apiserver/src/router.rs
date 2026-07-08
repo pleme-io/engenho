@@ -884,6 +884,20 @@ async fn do_create(
     render_object(codec, &handler_gvk(h), StatusCode::CREATED, v)
 }
 
+async fn do_replace(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    headers: &HeaderMap,
+    raw: &[u8],
+    user_info: &UserInfo,
+) -> Result<Response, ApiError> {
+    let body = decode_write_body(headers, raw)?;
+    let v = h.replace(ns, name, body, user_info).await?;
+    let codec = ResponseCodec::from_headers(headers);
+    render_object(codec, &handler_gvk(h), StatusCode::OK, v)
+}
+
 async fn do_patch(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
@@ -1345,6 +1359,7 @@ async fn resource_create(
 /// stub.
 async fn resource_put(
     State(state): State<RouterState>,
+    user_info: ExtractUserInfo,
     coords: crate::coords::ResourceCoords,
     headers: HeaderMap,
     raw: Bytes,
@@ -1365,11 +1380,12 @@ async fn resource_put(
         Some(Subresource::Log) => Err(ApiError::BadRequest(
             "the log subresource is read-only (GET only)".into(),
         )),
-        // PUT on the main object (no subresource) — engenho uses POST/PATCH;
-        // mirror upstream with a typed BadRequest.
-        None => Err(ApiError::BadRequest(
-            "PUT on the main object is not supported (use POST to create, PATCH to update)".into(),
-        )),
+        // PUT on the main object (no subresource) — the kubectl `replace` /
+        // update verb. Store-backed handlers do a real optimistic-concurrency
+        // replace; handlers that don't override `replace` keep the typed 400.
+        None => {
+            do_replace(&h, coords.namespace.as_deref(), name, &headers, &raw, &user_info.0).await
+        }
     }
 }
 
