@@ -836,7 +836,7 @@ impl ResourceHandler for StoreBackedHandler {
         let items: Vec<Value> = entries
             .into_iter()
             .filter(|(_, v)| sel.matches(v))
-            .map(|(_, v)| inject_type_meta(&v, self.api_version(), &self.kind))
+            .map(|(_, v)| strip_type_meta(&v))
             .collect();
         Ok((items, rv))
     }
@@ -875,7 +875,7 @@ impl ResourceHandler for StoreBackedHandler {
             let items: Vec<Value> = entries
                 .into_iter()
                 .filter(|(_, v)| sel.matches(v))
-                .map(|(_, v)| inject_type_meta(&v, self.api_version(), &self.kind))
+                .map(|(_, v)| strip_type_meta(&v))
                 .collect();
             return Ok((items, rv, None, None));
         }
@@ -921,7 +921,7 @@ impl ResourceHandler for StoreBackedHandler {
             let store_page_empty = entries.is_empty();
             for (k, v) in entries {
                 if sel.matches(&v) {
-                    accepted.push(inject_type_meta(&v, self.api_version(), &self.kind));
+                    accepted.push(strip_type_meta(&v));
                     last_emitted_key = Some(k);
                     if accepted.len() == limit {
                         break;
@@ -1686,6 +1686,21 @@ struct ListMeta {
     remaining_item_count: Option<i64>,
 }
 
+/// Remove `kind` + `apiVersion` from a LIST item. The `<Kind>List` envelope
+/// carries the GVK (`ConfigMapList` / `v1`); each item is TypeMeta-less on
+/// the wire — kube-apiserver's codec clears item-level TypeMeta when encoding
+/// a list. A stored object may carry TypeMeta (a create/PUT body includes it),
+/// so list emission STRIPS rather than merely skips injection. (Single-object
+/// GET keeps TypeMeta via [`inject_type_meta`] — that IS conformant.)
+fn strip_type_meta(v: &Value) -> Value {
+    let mut out = v.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("kind");
+        obj.remove("apiVersion");
+    }
+    out
+}
+
 /// Add `kind` + `apiVersion` to a resource if missing. Matches
 /// what kubectl expects in single-resource GET responses.
 fn inject_type_meta(v: &Value, api_version: String, kind: &str) -> Value {
@@ -1908,6 +1923,25 @@ mod tests {
         // Existing kind / apiVersion survive.
         assert_eq!(out.get("kind").unwrap(), "Pod");
         assert_eq!(out.get("apiVersion").unwrap(), "v1");
+    }
+
+    #[test]
+    fn strip_type_meta_removes_list_item_gvk() {
+        // A stored object carrying TypeMeta (a create body includes it) is
+        // emitted TypeMeta-less as a list item — the <Kind>List envelope
+        // carries the GVK, each item does not.
+        let v = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "x"},
+            "data": {"k": "v"},
+        });
+        let out = strip_type_meta(&v);
+        assert!(out.get("kind").is_none(), "item kind stripped");
+        assert!(out.get("apiVersion").is_none(), "item apiVersion stripped");
+        // Everything else survives untouched.
+        assert_eq!(out.pointer("/metadata/name"), Some(&Value::String("x".into())));
+        assert_eq!(out.pointer("/data/k"), Some(&Value::String("v".into())));
     }
 
     #[test]

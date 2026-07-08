@@ -45,10 +45,13 @@ const KNOWN_DIVERGENCES: &[&str] = &[
     //    `ExtraField:.metadata.finalizers:engenho` /
     //    `MissingDefault:.metadata.labels` signatures are intentionally
     //    absent — the ratchet goes RED if they regress. ──
-    // ── D3. LIST items carry TypeMeta. engenho stamps apiVersion+kind on
-    //    every list item; k3s omits them (list items are TypeMeta-less). ──
-    "ExtraField:.apiVersion:engenho",
-    "ExtraField:.kind:engenho",
+    // ── D3. LIST items carry TypeMeta — IRONED OUT. The handler's list
+    //    emission now STRIPS item-level apiVersion+kind (handler.rs
+    //    `strip_type_meta`); the <Kind>List envelope carries the GVK, each
+    //    item is TypeMeta-less on the wire (matching kube-apiserver). The
+    //    old `ExtraField:.apiVersion:engenho` / `ExtraField:.kind:engenho`
+    //    signatures are intentionally absent — the ratchet goes RED if they
+    //    regress. ──
     // ── D4. DELETE response shape. k3s returns a metav1.Status
     //    {kind:Status, status:Success, details:{...}} for a ConfigMap
     //    delete; engenho returns the DELETED OBJECT (kind:ConfigMap +
