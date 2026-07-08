@@ -18,6 +18,11 @@ serde_json         = { workspace = true }
 serde_yaml         = { workspace = true }
 thiserror          = { workspace = true }
 shikumi            = { git = "https://github.com/pleme-io/shikumi", version = "0.1.0" }
+# The `discovered()` tier is wired through shikumi's `DiscoveryLayer` seam,
+# whose `discover()` returns a `figment::value::Dict`; the operator-file
+# overlay in the progressive fold parses YAML into a `Dict` via figment's
+# Yaml provider. Same figment (0.10) shikumi already pins — one closure.
+figment            = { version = "0.10", features = ["yaml"] }
 
 [dev-dependencies]
 tempfile = "3"

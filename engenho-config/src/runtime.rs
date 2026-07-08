@@ -87,15 +87,40 @@ impl TieredConfig for RuntimeConfig {
         }
     }
 
+    /// Tier 1 — environment auto-detect wired through the shikumi
+    /// [`shikumi::DiscoveryLayer`] seam (never a hand-rolled struct literal).
+    /// The only genuinely-detected process-level field is `node_name` (this
+    /// host's name via [`crate::discovery::HostnameLayer`]); every other field
+    /// stays at its `bare()` floor here so the curated
+    /// [`Self::prescribed_default`] shows through in the progressive fold.
+    ///
+    /// An undetectable host (`$HOSTNAME` unset) makes the layer contribute an
+    /// empty dict, so `node_name` degenerates cleanly to the `bare()` empty
+    /// string and `prescribed_default()` supplies the fallback.
+    fn discovered() -> Self {
+        let hostname = crate::discovery::HostnameLayer::from_env();
+        Self::discovered_from_layers(&[&hostname])
+    }
+
     fn prescribed_default() -> Self {
+        // `node_name` is built ON the discovered() tier: when the environment
+        // detected a hostname we re-emit it here, so the change-aware
+        // progressive fold credits that leaf to the *Discovered* tier (it sees
+        // the same value at Default and skips re-attribution). When discovery
+        // couldn't answer (empty), we supply the documented axis fallback. The
+        // effective value — detected hostname, else "engenho-node" — is
+        // byte-identical to the pre-seam `discovered_hostname()` behavior.
+        let discovered_node = Self::discovered().node_name;
+        let node_name = if discovered_node.is_empty() {
+            crate::discovery::NODE_NAME_FALLBACK.to_string()
+        } else {
+            discovered_node
+        };
         Self {
             listen_addr: "0.0.0.0:6443".into(),
             data_dir: PathBuf::from("/var/lib/engenho"),
             durable: true,
-            // Best-effort hostname; falls back to "engenho-node" when
-            // the host doesn't expose $HOSTNAME (containers without it,
-            // some CI). The operator overrides this in YAML.
-            node_name: discovered_hostname(),
+            node_name,
             kubelet_backend: KubeletBackendKind::Podman,
             podman_binary: None,
             leadership_timeout_seconds: 10,
@@ -192,25 +217,36 @@ impl RuntimeConfig {
     }
 }
 
-/// Best-effort hostname for the prescribed-default node name. Reads
-/// `$HOSTNAME`; falls back to a stable placeholder when unset. NOT a
-/// `discovered()` tier override (those would need the hostname syscall)
-/// — just a convenience default so `cargo run` produces a usable node
-/// name without operator YAML.
-fn discovered_hostname() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "engenho-node".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{HostnameLayer, NODE_NAME_FALLBACK};
 
     #[test]
     fn prescribed_default_validates() {
         RuntimeConfig::prescribed_default().validate().unwrap();
+    }
+
+    #[test]
+    fn discovered_tier_picks_up_hostname_via_the_seam() {
+        // The discovered() tier resolves node_name through the DiscoveryLayer
+        // seam (kanchi-shaped), NOT the old hand-rolled `discovered_hostname`
+        // fn: a layer that reports a host name lands it on `node_name`.
+        let cfg = RuntimeConfig::discovered_from_layers(&[&HostnameLayer::from_raw(Some(
+            "node-Z".into(),
+        ))]);
+        assert_eq!(cfg.node_name, "node-Z");
+    }
+
+    #[test]
+    fn discovered_tier_is_bare_when_hostname_undetectable() {
+        // Discovery totality: an undetectable host leaves node_name at the
+        // bare() floor (empty) — prescribed_default() then supplies the
+        // documented fallback.
+        let cfg = RuntimeConfig::discovered_from_layers(&[&HostnameLayer::from_raw(None)]);
+        assert!(cfg.node_name.is_empty());
+        // And the fallback the prescribed tier applies is the axis fallback.
+        assert_eq!(NODE_NAME_FALLBACK, "engenho-node");
     }
 
     #[test]

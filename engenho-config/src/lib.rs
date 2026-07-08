@@ -78,12 +78,25 @@
 #![warn(missing_docs)]
 #![allow(clippy::module_name_repetitions)]
 
+use figment::{
+    Figment,
+    providers::{Format, Yaml},
+    value::Dict,
+};
 use serde::{Deserialize, Serialize};
-use shikumi::TieredConfig;
+use shikumi::ProgressiveLayer;
+
+// The shikumi config surface the operator CLI (engenho `config-show` /
+// `config-diff`) consumes, re-exported so the thin binary depends only on
+// engenho-config, not on shikumi directly.
+pub use shikumi::{
+    ConfigTier, ConfigTierKind, ProgressiveResolution, Provenance, ProvenanceMap, TieredConfig,
+};
 
 mod cluster;
 mod consistency;
 mod controllers;
+mod discovery;
 mod error;
 mod networking;
 mod revoada;
@@ -95,6 +108,7 @@ mod tls;
 pub use cluster::ClusterConfig;
 pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
 pub use controllers::{ControllerEnable, ControllersConfig};
+pub use discovery::{HostnameLayer, NODE_NAME_FALLBACK};
 pub use error::ConfigError;
 pub use networking::{DatapathMode, NetworkingConfig, ResolvedDatapath, parse_ipv4_cidr};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
@@ -141,6 +155,25 @@ impl TieredConfig for EngenhoConfig {
             consistency: ConsistencyConfig::bare(),
             networking: NetworkingConfig::bare(),
             runtime: RuntimeConfig::bare(),
+        }
+    }
+
+    /// Tier 1 — the composed environment-discovery tier. Each sub-struct owns
+    /// its own `discovered()` (most default to `bare()`); the only genuinely
+    /// detected process-level field today is `runtime.node_name` (the host's
+    /// name via [`RuntimeConfig::discovered`] → [`HostnameLayer`]). Composing
+    /// here is what lets a detected hostname flow through the sealed
+    /// progressive fold at the Discovered tier and be credited there.
+    fn discovered() -> Self {
+        Self {
+            cluster: ClusterConfig::discovered(),
+            revoada: RevoadaConfig::discovered(),
+            teia: TeiaConfig::discovered(),
+            scheduler: SchedulerConfig::discovered(),
+            controllers: ControllersConfig::discovered(),
+            consistency: ConsistencyConfig::discovered(),
+            networking: NetworkingConfig::discovered(),
+            runtime: RuntimeConfig::discovered(),
         }
     }
 
@@ -293,6 +326,127 @@ impl EngenhoConfig {
         cfg.validate()?;
         Ok(cfg)
     }
+
+    /// **The progressive-fold resolution — the first-class default.**
+    ///
+    /// Resolves the effective config through shikumi's sealed progressive
+    /// fold — `bare() → discovered()[DiscoveryLayer seam] → prescribed_default()
+    /// → operator-file overlay` — stamping every effective leaf with its typed
+    /// [`shikumi::Provenance`] (which tier produced it). This is the resolution
+    /// the daemon boots on: unlike [`TieredConfig::resolve_tier`]`(Default)`
+    /// (which returns `prescribed_default()` alone and silently skips
+    /// discovery), the fold composes the discovered tier *underneath* the
+    /// curated defaults, so a detected value (e.g. the host's name) shows
+    /// through and is credited to Discovered.
+    ///
+    /// The operator file (via the shikumi discovery cascade — `$ENGENHO_CONFIG`
+    /// → XDG → `/etc/engenho/engenho.yaml`) is folded in as the top
+    /// `Custom`/`File` overlay, so `config-show` can report which leaves came
+    /// from the file vs the prescribed defaults vs discovery.
+    ///
+    /// The returned value is always `validate()`d. The legacy
+    /// [`Self::discover`] / [`TieredConfig::resolve_tier`] paths are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Parse`] if a discovered file can't be read or is
+    /// malformed / carries an unknown field, and [`ConfigError::Incoherent`] /
+    /// [`ConfigError::InvalidField`] on a validation failure — the same strict
+    /// surface [`Self::discover`] enforces (no silent fallback).
+    pub fn resolve_progressively() -> Result<ProgressiveResolution<Self>, ConfigError> {
+        let overlays = Self::file_overlay_layers()?;
+        let resolution = <Self as TieredConfig>::resolve_progressive_with(&overlays);
+        resolution.value().validate()?;
+        Ok(resolution)
+    }
+
+    /// The progressively-resolved config value alone (drops provenance) —
+    /// the convenience wrapper for call sites that just need the config.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_progressively`].
+    pub fn resolve() -> Result<Self, ConfigError> {
+        Ok(Self::resolve_progressively()?.into_value())
+    }
+
+    /// Render this config as YAML — the operator-facing `config-show` body.
+    /// Typed serialization (serde), never a `format!()` of config syntax.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Parse`] if serialization fails (a struct-shaped
+    /// config never does in practice).
+    pub fn to_yaml(&self) -> Result<String, ConfigError> {
+        serde_yaml::to_string(self)
+            .map_err(|e| ConfigError::Parse(format!("serialize config: {e}")))
+    }
+
+    /// Build the operator-file overlay layer(s) for the progressive fold from
+    /// the shikumi discovery cascade. Empty when no config file is found (the
+    /// fold then resolves to the three trait tiers alone).
+    ///
+    /// The discovered file is first run through the proven
+    /// [`Self::from_yaml_with_defaults`] path as a **strict gate**, so a
+    /// malformed / unknown-field / cross-section-invalid overlay errors here
+    /// exactly as [`Self::discover`] would — never a silent fallback. The
+    /// overlay itself is the *partial* operator dict (only the keys the
+    /// operator set), stamped with `File` provenance.
+    fn file_overlay_layers() -> Result<Vec<ProgressiveLayer>, ConfigError> {
+        let Some(path) = Self::discover_path() else {
+            return Ok(Vec::new());
+        };
+        let yaml = std::fs::read_to_string(&path)
+            .map_err(|e| ConfigError::Parse(format!("reading {}: {e}", path.display())))?;
+        // Strict gate — reuse the deny_unknown_fields + cross-section validate
+        // path so a bad overlay surfaces the same error the legacy loader does.
+        Self::from_yaml_with_defaults(&yaml)?;
+        let dict = yaml_to_dict(&yaml)?;
+        Ok(vec![ProgressiveLayer::file(path, dict)])
+    }
+}
+
+/// Parse partial operator YAML into a figment [`Dict`] for the progressive
+/// fold's `File` overlay. Empty / whitespace-only YAML yields an empty dict
+/// (a no-op overlay). Uses figment's canonical Yaml provider so the produced
+/// dict shape matches the tiers the fold merges it against.
+fn yaml_to_dict(yaml: &str) -> Result<Dict, ConfigError> {
+    if yaml.trim().is_empty() {
+        return Ok(Dict::new());
+    }
+    Figment::new()
+        .merge(Yaml::string(yaml))
+        .extract::<Dict>()
+        .map_err(|e| ConfigError::Parse(format!("operator YAML overlay dict: {e}")))
+}
+
+/// Render a per-leaf provenance summary for the operator `config-show`
+/// output — one comment line per effective leaf
+/// (`#   <dotted.path>  <-  <tier>[ (source)]`), preceded by a header naming
+/// the contributing tiers. Each value routes through the typed
+/// [`shikumi::Provenance`] `Display` (typed emission; no `format!()` of the
+/// body) — mirroring shikumi's own `ConfigDiff::render_unified` builder style.
+#[must_use]
+pub fn render_provenance(prov: &ProvenanceMap) -> String {
+    let mut out = String::new();
+    out.push_str("# provenance: ");
+    out.push_str(&prov.len().to_string());
+    out.push_str(" leaves; tiers: ");
+    let tiers: Vec<&str> = prov
+        .contributing_tiers()
+        .iter()
+        .map(|t| t.as_str())
+        .collect();
+    out.push_str(&tiers.join(", "));
+    out.push('\n');
+    for (path, provenance) in prov.entries() {
+        out.push_str("#   ");
+        out.push_str(&path.join("."));
+        out.push_str("  <-  ");
+        out.push_str(&provenance.to_string());
+        out.push('\n');
+    }
+    out
 }
 
 /// Deep-merge `overlay` onto `base`. Maps merge key-by-key; other
@@ -383,5 +537,186 @@ cluster:
         let merged = overlay.extend(&base);
         // Cluster name took the overlay's value...
         assert_eq!(merged.cluster.name, "override");
+    }
+
+    // ── progressive-discovery resolution ────────────────────────────────
+
+    use shikumi::ConfigTierKind;
+
+    /// Collect the dotted paths of every non-null leaf of a serialized config.
+    /// Mappings recurse; arrays + scalars are wholesale leaves (matching the
+    /// shikumi fold's per-leaf attribution); `null` (a `None` option) is
+    /// skipped (it carries no effective value and no provenance entry).
+    fn non_null_leaf_paths(v: &serde_yaml::Value, prefix: &[String], out: &mut Vec<Vec<String>>) {
+        match v {
+            serde_yaml::Value::Mapping(m) => {
+                for (k, val) in m {
+                    let mut p = prefix.to_vec();
+                    p.push(k.as_str().unwrap_or_default().to_string());
+                    non_null_leaf_paths(val, &p, out);
+                }
+            }
+            serde_yaml::Value::Null => {}
+            _ => out.push(prefix.to_vec()),
+        }
+    }
+
+    fn leaf_paths_of(cfg: &EngenhoConfig) -> Vec<Vec<String>> {
+        let value = serde_yaml::to_value(cfg).unwrap();
+        let mut out = Vec::new();
+        non_null_leaf_paths(&value, &[], &mut out);
+        out
+    }
+
+    #[test]
+    fn resolve_progressive_folds_to_default_and_validates() {
+        // The progressive fold (bare → discovered → prescribed) resolves to the
+        // curated defaults where discovery has no opinion, and always validates.
+        let r = EngenhoConfig::resolve_progressive();
+        r.value().validate().unwrap();
+        assert_eq!(r.value().cluster.name, "engenho-local");
+        assert_eq!(r.value().scheduler.tick_interval_seconds, 5);
+    }
+
+    #[test]
+    fn progressive_provenance_credits_prescribed_leaves() {
+        // A leaf only the prescribed_default tier sets is credited to Default.
+        let r = EngenhoConfig::resolve_progressive();
+        let prov = r.provenance();
+        for path in [
+            ["cluster", "name"].as_slice(),
+            ["runtime", "listen_addr"].as_slice(),
+            ["scheduler", "tick_interval_seconds"].as_slice(),
+            ["controllers", "fallback_interval_seconds"].as_slice(),
+        ] {
+            let p = prov
+                .provenance_of(path)
+                .unwrap_or_else(|| panic!("no provenance for {path:?}"));
+            assert_eq!(p.tier(), ConfigTierKind::Default, "for leaf {path:?}");
+        }
+    }
+
+    #[test]
+    fn node_name_provenance_matches_ambient_hostname() {
+        // The discovered() tier shows through the fold for node_name. This
+        // reads (never mutates) the ambient $HOSTNAME and asserts the correct
+        // branch: detected ⇒ value shows through, credited Discovered; absent
+        // ⇒ prescribed fallback, credited Default. Deterministic per-env, no
+        // process-environment mutation (edition-2024 `set_var` is unsafe).
+        let r = EngenhoConfig::resolve_progressive();
+        let p = r
+            .provenance()
+            .provenance_of(&["runtime", "node_name"])
+            .expect("node_name has provenance");
+        match std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()) {
+            Some(host) => {
+                assert_eq!(r.value().runtime.node_name, host);
+                assert_eq!(p.tier(), ConfigTierKind::Discovered);
+            }
+            None => {
+                assert_eq!(r.value().runtime.node_name, NODE_NAME_FALLBACK);
+                assert_eq!(p.tier(), ConfigTierKind::Default);
+            }
+        }
+    }
+
+    #[test]
+    fn progressive_provenance_complete_over_every_non_null_leaf() {
+        // I5 (provenance completeness) over the whole EngenhoConfig leaf-set:
+        // every effective non-null leaf of the resolved config carries a
+        // provenance entry (the fold seeds from bare(), which enumerates all).
+        let r = EngenhoConfig::resolve_progressive();
+        let prov = r.provenance();
+        let paths = leaf_paths_of(r.value());
+        assert!(!paths.is_empty());
+        for path in paths {
+            assert!(
+                prov.provenance_of_owned(&path).is_some(),
+                "leaf {path:?} has no provenance"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_enumerates_every_field() {
+        // The shikumi progressive fold seeds provenance from bare(); this holds
+        // only if bare() enumerates every field. Prove it: bare() and
+        // prescribed_default() expose the identical non-null leaf-path set.
+        let mut bare = leaf_paths_of(&EngenhoConfig::bare());
+        let mut pd = leaf_paths_of(&EngenhoConfig::prescribed_default());
+        bare.sort();
+        pd.sort();
+        assert_eq!(bare, pd, "bare() must enumerate every prescribed field");
+    }
+
+    #[test]
+    fn file_overlay_wins_and_is_credited_custom() {
+        // The operator-file overlay (Custom/File tier) beats prescribed defaults
+        // and is credited accordingly; untouched leaves stay Default. Built as a
+        // partial dict directly (what `file_overlay_layers` produces from YAML)
+        // so the fold is exercised with no filesystem / env dependency.
+        let mut cluster = Dict::new();
+        cluster.insert("name".into(), figment::value::Value::from("rio"));
+        let mut root = Dict::new();
+        root.insert("cluster".into(), figment::value::Value::from(cluster));
+        let overlay = ProgressiveLayer::file("/tmp/engenho.yaml", root);
+
+        let r = <EngenhoConfig as TieredConfig>::resolve_progressive_with(&[overlay]);
+        assert_eq!(r.value().cluster.name, "rio");
+        assert_eq!(
+            r.provenance()
+                .provenance_of(&["cluster", "name"])
+                .unwrap()
+                .tier(),
+            ConfigTierKind::Custom
+        );
+        // A leaf the overlay didn't touch stays credited to the default tier.
+        assert_eq!(r.value().cluster.region, "homelab");
+        assert_eq!(
+            r.provenance()
+                .provenance_of(&["cluster", "region"])
+                .unwrap()
+                .tier(),
+            ConfigTierKind::Default
+        );
+    }
+
+    #[test]
+    fn resolve_progressively_produces_valid_config() {
+        // The daemon/CLI entry point resolves end-to-end (folding in any
+        // discovered operator file) and always returns a validated config.
+        let cfg = EngenhoConfig::resolve().unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.cluster.name.is_empty());
+        assert!(!cfg.runtime.node_name.is_empty());
+    }
+
+    #[test]
+    fn config_diff_bare_to_default_is_nonempty() {
+        // The `config-diff` CLI path: shikumi ConfigDiff between two tiers.
+        let diff = EngenhoConfig::prescribed_default().diff_against(&EngenhoConfig::bare());
+        assert!(!diff.is_empty_diff());
+        assert!(diff.render_unified().contains("engenho-local"));
+    }
+
+    #[test]
+    fn to_yaml_round_trips() {
+        // The `config-show` body renderer produces YAML that re-parses to the
+        // same config.
+        let cfg = EngenhoConfig::prescribed_default();
+        let yaml = cfg.to_yaml().unwrap();
+        let back: EngenhoConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn render_provenance_names_leaves_and_tiers() {
+        // The `config-show` provenance summary names the contributing tiers and
+        // one line per leaf, routed through the typed Provenance Display.
+        let r = EngenhoConfig::resolve_progressive();
+        let rendered = render_provenance(r.provenance());
+        assert!(rendered.contains("# provenance:"));
+        assert!(rendered.contains("default"));
+        assert!(rendered.contains("cluster.name  <-  default"));
     }
 }
