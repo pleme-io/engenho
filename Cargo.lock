@@ -1418,6 +1418,7 @@ dependencies = [
 name = "engenho-config"
 version = "0.1.4"
 dependencies = [
+ "figment",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1808,7 +1809,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2104,8 +2105,8 @@ dependencies = [
 
 [[package]]
 name = "gen-macros"
-version = "0.1.9"
-source = "git+https://github.com/pleme-io/gen#6d82c9d3885c781e923ec46330d05d7eca469a3b"
+version = "0.1.18"
+source = "git+https://github.com/pleme-io/gen#8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2114,8 +2115,8 @@ dependencies = [
 
 [[package]]
 name = "gen-platform"
-version = "0.1.9"
-source = "git+https://github.com/pleme-io/gen#6d82c9d3885c781e923ec46330d05d7eca469a3b"
+version = "0.1.18"
+source = "git+https://github.com/pleme-io/gen#8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2"
 dependencies = [
  "gen-macros",
  "gen-types",
@@ -2127,8 +2128,8 @@ dependencies = [
 
 [[package]]
 name = "gen-types"
-version = "0.1.9"
-source = "git+https://github.com/pleme-io/gen#6d82c9d3885c781e923ec46330d05d7eca469a3b"
+version = "0.1.18"
+source = "git+https://github.com/pleme-io/gen#8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2"
 dependencies = [
  "blake3",
  "chrono",
@@ -2591,7 +2592,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -3191,9 +3192,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "hashlink"
@@ -5130,7 +5128,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5674,7 +5672,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5755,7 +5753,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6365,8 +6363,8 @@ dependencies = [
 
 [[package]]
 name = "shikumi"
-version = "0.1.2"
-source = "git+https://github.com/pleme-io/shikumi#61e5f97ad2f61205599b8679a4ff7b2075506003"
+version = "0.1.166"
+source = "git+https://github.com/pleme-io/shikumi#c232ca27180d1aa33ea2ae5874def1e339690add"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -7087,7 +7085,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7979,7 +7977,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
