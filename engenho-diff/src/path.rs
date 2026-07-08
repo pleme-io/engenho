@@ -58,6 +58,39 @@ impl JsonPath {
         self
     }
 
+    /// Return `self` with `tail`'s segments appended — the FOCUS re-rooting
+    /// operation: a divergence found at `tail` within a focused subtree is
+    /// re-rooted at `focus.concat(tail)` so its report + ratchet signature
+    /// name the true location.
+    #[must_use]
+    pub fn concat(&self, tail: &JsonPath) -> Self {
+        let mut segs = self.0.clone();
+        segs.extend(tail.0.iter().cloned());
+        Self(segs)
+    }
+
+    /// Resolve this path against `v`, returning the subtree it points at
+    /// (or `None` when any segment is absent / mistyped). A [`PathSeg::Wildcard`]
+    /// is not resolvable to a single node, so it yields `None`.
+    ///
+    /// Used by the differ's FOCUS mode: an [`Operation`](crate::op::Operation)
+    /// carrying a `focus` path restricts the object diff to this subtree, so a
+    /// field-level invariant (e.g. "a `/status` PUT left `spec.containers[0].image`
+    /// unchanged") is compared in isolation from a kind's unrelated
+    /// server-side-defaulting divergence.
+    #[must_use]
+    pub fn get<'a>(&self, v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+        let mut cur = v;
+        for seg in &self.0 {
+            cur = match seg {
+                PathSeg::Key(k) => cur.get(k)?,
+                PathSeg::Index(i) => cur.get(i)?,
+                PathSeg::Wildcard => return None,
+            };
+        }
+        Some(cur)
+    }
+
     /// Parse a dotted spec into a typed path. Supports `.key`, `[*]`
     /// (wildcard) and `[N]` (index) segments — e.g.
     /// `"metadata.managedFields[*].time"` or `"spec.clusterIPs"`.
