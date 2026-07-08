@@ -1,0 +1,21 @@
+{{/*
+engenho tiered-config file tier (enjulho: config-as-reconciled-Helm).
+
+Renders the shikumi EngenhoConfig FILE tier as a reconciled ConfigMap via the
+pleme-lib.tieredConfig mixin. The engenho-config ConfigStore discovers +
+hot-reloads it at /etc/engenho/engenho.yaml (shikumi Tier 3) once mounted (see
+apiserver-deployment.yaml).
+
+`cluster` is injected here from global.cluster so the file tier's cluster
+identity always tracks the umbrella chart's single source of truth — no drift.
+The mixin never renders a secret (see its header).
+*/}}
+{{- $ctx := deepCopy . }}
+{{- $cfg := $ctx.Values.config | default dict }}
+{{- $file := $cfg.file | default dict }}
+{{- $data := $file.data | default dict }}
+{{- $_ := set $data "cluster" (dict "name" .Values.global.cluster.name "region" .Values.global.cluster.region) }}
+{{- $_ := set $file "data" $data }}
+{{- $_ := set $cfg "file" $file }}
+{{- $_ := set $ctx.Values "config" $cfg }}
+{{- include "pleme-lib.tieredConfig.configMap" $ctx }}

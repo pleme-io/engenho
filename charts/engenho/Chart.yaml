@@ -17,7 +17,7 @@ description: |
 
   Companion docs: docs/FABRIC.md, docs/DISTRIBUTED.md, docs/API-SURFACE.md
 type: application
-version: 0.6.0
+version: 0.6.1
 appVersion: "0.6.0"
 keywords:
   - kubernetes
@@ -41,3 +41,10 @@ dependencies:
     version: "0.40.x"
     repository: https://helm.vector.dev
     condition: vector.enabled
+  # pleme-lib provides the tieredConfig mixin (config-as-reconciled-Helm):
+  # the file-tier ConfigMap the engenho-config ConfigStore discovers +
+  # hot-reloads at /etc/engenho/engenho.yaml. Floor-only pin; resolved at
+  # release time from the pleme-io OCI registry.
+  - name: pleme-lib
+    version: ">=0.39.0"
+    repository: "oci://ghcr.io/pleme-io/charts"

@@ -24,6 +24,43 @@ global:
     region: "default"
 
 # ============================================================
+#   config — tiered progressive-discovery config
+#   (enjulho: config-as-reconciled-Helm)
+# ============================================================
+# The pleme-lib.tieredConfig mixin renders engenho's shikumi EngenhoConfig
+# FILE tier as a reconciled ConfigMap the engenho-config ConfigStore
+# discovers + hot-reloads at /etc/engenho/engenho.yaml (shikumi Tier 3).
+# Mounted on the apiserver at that canonical discovery path (no env change);
+# the discovered tier (POD_NAMESPACE/POD_NAME) is declared via downward API.
+#
+# `config.file.data` is schema-shaped to EngenhoConfig
+# (engenho-config/src/lib.rs). `cluster` is injected by templates/config.yaml
+# from global.cluster (single source of truth — no drift). SECRETS ARE NEVER
+# rendered here; they flow through cofre / secretKeyRef.
+config:
+  app: engenho
+  configMapName: engenho-config
+  file:
+    enabled: true
+    mountPath: /etc/engenho          # → /etc/engenho/engenho.yaml (Tier 3)
+    data:
+      scheduler:
+        strategy: round_robin
+        tick_interval_seconds: 5
+      controllers:
+        enable:
+          replicaset: true
+          deployment: true
+          endpoints: true
+          gc: true
+        fallback_interval_seconds: 30
+      consistency:
+        default_tier: strong
+  discovered:
+    podNamespace: true
+    podName: true
+
+# ============================================================
 #   NATS — fabric carrier (engenho-teia rides this)
 # ============================================================
 nats:
