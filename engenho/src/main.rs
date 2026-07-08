@@ -23,7 +23,7 @@
 use std::path::PathBuf;
 
 use engenho_apiserver::load_or_generate_ca;
-use engenho_config::EngenhoConfig;
+use engenho_config::{ConfigTier, EngenhoConfig, TieredConfig, render_provenance};
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_runtime::Runtime;
 use tracing_subscriber::EnvFilter;
@@ -40,6 +40,12 @@ enum Command {
     /// `kubeconfig [flags...]` — carries the trailing flags verbatim for
     /// `run_kubeconfig` to parse.
     Kubeconfig(Vec<String>),
+    /// `config-show [tier]` — print the resolved config (and, for the
+    /// `default` tier, its per-leaf provenance). The optional tier arg
+    /// overrides `$ENGENHO_TIER`.
+    ConfigShow(Option<String>),
+    /// `config-diff <from> <to>` — unified diff between two resolved tiers.
+    ConfigDiff(String, String),
 }
 
 impl Command {
@@ -48,13 +54,22 @@ impl Command {
     /// * no args → [`Command::Daemon`]
     /// * `daemon` → [`Command::Daemon`] (explicit alias — same path)
     /// * `kubeconfig …` → [`Command::Kubeconfig`] with the remaining args
+    /// * `config-show [tier]` → [`Command::ConfigShow`]
+    /// * `config-diff <from> <to>` → [`Command::ConfigDiff`]
     /// * anything else → an error naming the supported verbs
     fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
         match args.next().as_deref() {
             None | Some("daemon") => Ok(Command::Daemon),
             Some("kubeconfig") => Ok(Command::Kubeconfig(args.collect())),
+            Some("config-show") => Ok(Command::ConfigShow(args.next())),
+            Some("config-diff") => match (args.next(), args.next()) {
+                (Some(from), Some(to)) => Ok(Command::ConfigDiff(from, to)),
+                _ => Err(anyhow::anyhow!(
+                    "config-diff requires two tier args: config-diff <from> <to> (bare|discovered|default|<yaml-path>)"
+                )),
+            },
             Some(other) => Err(anyhow::anyhow!(
-                "unknown subcommand {other:?} (supported: daemon [or no args] to boot the daemon, kubeconfig)"
+                "unknown subcommand {other:?} (supported: daemon [or no args] to boot the daemon, kubeconfig, config-show [tier], config-diff <from> <to>)"
             )),
         }
     }
@@ -69,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
     match Command::parse(std::env::args().skip(1))? {
         Command::Daemon => run_daemon().await,
         Command::Kubeconfig(flags) => run_kubeconfig(flags.into_iter()),
+        Command::ConfigShow(tier) => run_config_show(tier),
+        Command::ConfigDiff(from, to) => run_config_diff(&from, &to),
     }
 }
 
@@ -88,9 +105,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         "engenho — typed, attested, Rust-native Kubernetes runtime"
     );
 
-    // 2. Config via the shikumi discovery cascade
-    //    ($ENGENHO_CONFIG → XDG → /etc → prescribed_default).
-    let config = EngenhoConfig::discover()?;
+    // 2. Config via the sealed progressive-discovery fold
+    //    (bare → discovered[DiscoveryLayer] → prescribed_default → operator
+    //    file overlay), each effective leaf carrying typed Provenance.
+    let (config, provenance) = EngenhoConfig::resolve_progressively()?.into_parts();
     tracing::info!(
         cluster = %config.cluster.name,
         node = %config.runtime.node_name,
@@ -98,6 +116,23 @@ async fn run_daemon() -> anyhow::Result<()> {
         durable = config.runtime.durable,
         tls = config.runtime.tls.enabled,
         "loaded config"
+    );
+    // Surface provenance: which tiers contributed, and where the node name
+    // came from (Discovered when the host reported a name, else the Default
+    // fallback). `engenho config-show` prints the full per-leaf breakdown.
+    let node_name_tier = provenance
+        .provenance_of(&["runtime", "node_name"])
+        .map_or("?", |p| p.tier().as_str());
+    tracing::info!(
+        leaves = provenance.len(),
+        tiers = %provenance
+            .contributing_tiers()
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        node_name_from = node_name_tier,
+        "config provenance",
     );
 
     // 3. Boot every subsystem over one StoreMesh. On boot the Runtime
@@ -198,6 +233,42 @@ fn default_server_url(config: &EngenhoConfig) -> String {
     url
 }
 
+/// `engenho config-show [bare|discovered|default|<yaml-path>]` — resolve the
+/// named config tier and print its YAML to stdout. With no arg the tier comes
+/// from `$ENGENHO_TIER` (default: `default`). The `default` tier resolves
+/// through the sealed progressive fold and additionally prints a per-leaf
+/// provenance summary (which tier produced each effective value).
+fn run_config_show(tier_arg: Option<String>) -> anyhow::Result<()> {
+    let tier = match tier_arg {
+        Some(s) => ConfigTier::from_str_or_default(&s),
+        None => ConfigTier::from_env("ENGENHO_TIER"),
+    };
+    match tier {
+        ConfigTier::Default => {
+            // The rich default: the progressive fold with typed provenance.
+            let resolution = EngenhoConfig::resolve_progressively()?;
+            print!("{}", resolution.value().to_yaml()?);
+            print!("{}", render_provenance(resolution.provenance()));
+        }
+        other => {
+            // Bare / Discovered / Custom(path): a single tier, no fold.
+            print!("{}", EngenhoConfig::resolve_tier(other).to_yaml()?);
+        }
+    }
+    Ok(())
+}
+
+/// `engenho config-diff <from> <to>` — resolve two config tiers
+/// (`bare|discovered|default|<yaml-path>`) and print a unified diff of their
+/// YAML (shikumi `ConfigDiff`). Answers "what changes between these tiers?".
+fn run_config_diff(from: &str, to: &str) -> anyhow::Result<()> {
+    let from_cfg = EngenhoConfig::resolve_tier(ConfigTier::from_str_or_default(from));
+    let to_cfg = EngenhoConfig::resolve_tier(ConfigTier::from_str_or_default(to));
+    // diff_against(baseline): from → to.
+    print!("{}", to_cfg.diff_against(&from_cfg).render_unified());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::Command;
@@ -246,5 +317,38 @@ mod tests {
         assert!(err.contains("frobnicate"), "error should name the bad verb: {err}");
         assert!(err.contains("daemon"), "error should list `daemon`: {err}");
         assert!(err.contains("kubeconfig"), "error should list `kubeconfig`: {err}");
+        assert!(err.contains("config-show"), "error should list `config-show`: {err}");
+        assert!(err.contains("config-diff"), "error should list `config-diff`: {err}");
+    }
+
+    /// `config-show` with no tier arg honors `$ENGENHO_TIER` at run time.
+    #[test]
+    fn config_show_without_tier() {
+        assert_eq!(parse(&["config-show"]).unwrap(), Command::ConfigShow(None));
+    }
+
+    /// `config-show <tier>` carries the tier selector through.
+    #[test]
+    fn config_show_with_tier() {
+        assert_eq!(
+            parse(&["config-show", "bare"]).unwrap(),
+            Command::ConfigShow(Some("bare".to_string())),
+        );
+    }
+
+    /// `config-diff <from> <to>` carries both tier selectors through.
+    #[test]
+    fn config_diff_carries_two_tiers() {
+        assert_eq!(
+            parse(&["config-diff", "bare", "default"]).unwrap(),
+            Command::ConfigDiff("bare".to_string(), "default".to_string()),
+        );
+    }
+
+    /// `config-diff` with fewer than two args is a usage error.
+    #[test]
+    fn config_diff_requires_two_args() {
+        assert!(parse(&["config-diff", "bare"]).is_err());
+        assert!(parse(&["config-diff"]).is_err());
     }
 }
