@@ -37,13 +37,14 @@ const KNOWN_DIVERGENCES: &[&str] = &[
     //    op is now PARITY. The old
     //    `MissingVerb:v1/configmaps:update:k3s` signature is intentionally
     //    absent from this baseline — the ratchet would go RED if it regressed.
-    // ── D2. Namespace server-side defaulting. engenho seeds the
-    //    `kubernetes` finalizer on metadata.finalizers + never adds
-    //    spec.finalizers; k3s seeds spec.finalizers + the
-    //    kubernetes.io/metadata.name auto-label. ──
-    "MissingDefault:.spec",
-    "ExtraField:.metadata.finalizers:engenho",
-    "MissingDefault:.metadata.labels",
+    // ── D2. Namespace server-side defaulting — IRONED OUT.
+    //    `stamp_namespace_create_defaults` now seeds the `kubernetes`
+    //    finalizer on `spec.finalizers` (not metadata.finalizers) and adds
+    //    the `kubernetes.io/metadata.name` auto-label, matching
+    //    kube-apiserver. The old `MissingDefault:.spec` /
+    //    `ExtraField:.metadata.finalizers:engenho` /
+    //    `MissingDefault:.metadata.labels` signatures are intentionally
+    //    absent — the ratchet goes RED if they regress. ──
     // ── D3. LIST items carry TypeMeta. engenho stamps apiVersion+kind on
     //    every list item; k3s omits them (list items are TypeMeta-less). ──
     "ExtraField:.apiVersion:engenho",
