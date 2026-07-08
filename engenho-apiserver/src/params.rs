@@ -83,11 +83,12 @@ impl ListWatchParams {
     ///
     /// # Errors
     ///
-    /// [`ApiError::BadRequest`] when a selector clause is not `k=v`.
+    /// [`ApiError::BadRequest`] when a selector clause is malformed (a bad
+    /// label requirement grammar / a field clause that is not `k=v` / `k!=v`).
     pub fn selectors(&self) -> Result<Selectors, ApiError> {
         Ok(Selectors {
-            labels: parse_kv(self.label_selector.as_deref(), "labelSelector")?,
-            fields: parse_kv(self.field_selector.as_deref(), "fieldSelector")?,
+            labels: parse_label_selector(self.label_selector.as_deref())?,
+            fields: parse_field_selector(self.field_selector.as_deref())?,
         })
     }
 
@@ -252,51 +253,106 @@ pub enum ResumePoint {
     At(Revision),
 }
 
-/// Typed label + field selectors. At M0.1 the only field selectors are
-/// `metadata.name` + `metadata.namespace`.
+/// One typed label-selector requirement — the FULL K8s label selector
+/// grammar (equality-based `=`/`==`/`!=` + set-based `in`/`notin`/exists/
+/// not-exists). Before this typed model the parser handled ONLY `k=v`, so
+/// `k!=v`, `k in (a,b)`, `!k`, and bare-`k` (exists) were mis-parsed or
+/// rejected (a `,` inside `(a,b)` split the clause and 400'd) — diverging from
+/// every apiserver a controller / kubectl talks to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelRequirement {
+    /// `k=v` / `k==v` — label `k` present and equal to `v`.
+    Equals(String, String),
+    /// `k!=v` — label `k` absent OR present-but-not-`v` (k8s includes
+    /// objects LACKING the key).
+    NotEquals(String, String),
+    /// `k in (a,b,…)` — label `k` present and IN the set.
+    In(String, Vec<String>),
+    /// `k notin (a,b,…)` — label `k` absent OR present-but-NOT-in the set.
+    NotIn(String, Vec<String>),
+    /// `k` — label `k` present (any value).
+    Exists(String),
+    /// `!k` — label `k` absent.
+    NotExists(String),
+}
+
+impl LabelRequirement {
+    /// `true` when `labels` (the object's `metadata.labels`) satisfies this
+    /// requirement. A missing labels map is treated as "no labels".
+    fn satisfied_by(&self, labels: Option<&serde_json::Value>) -> bool {
+        let have = |k: &str| labels.and_then(|l| l.get(k)).and_then(serde_json::Value::as_str);
+        match self {
+            Self::Equals(k, v) => have(k) == Some(v.as_str()),
+            Self::NotEquals(k, v) => have(k) != Some(v.as_str()),
+            Self::In(k, set) => have(k).is_some_and(|h| set.iter().any(|s| s == h)),
+            Self::NotIn(k, set) => have(k).is_none_or(|h| !set.iter().any(|s| s == h)),
+            Self::Exists(k) => have(k).is_some(),
+            Self::NotExists(k) => have(k).is_none(),
+        }
+    }
+}
+
+/// One typed field-selector requirement. K8s field selectors are equality-
+/// based only (`=`/`==`/`!=`); the SUPPORTED keys are `metadata.name` +
+/// `metadata.namespace` (the two every kind honors). An unsupported field key
+/// (`status.phase`, `spec.nodeName`, …) needs per-kind field-selector
+/// registration engenho does not yet have — such a requirement matches nothing
+/// (the object is filtered out), a divergence recorded in the diff harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldRequirement {
+    /// `k=v` / `k==v`.
+    Equals(String, String),
+    /// `k!=v`.
+    NotEquals(String, String),
+}
+
+impl FieldRequirement {
+    fn key(&self) -> &str {
+        match self {
+            Self::Equals(k, _) | Self::NotEquals(k, _) => k,
+        }
+    }
+
+    /// `true` when `obj` satisfies this field requirement. Returns `false`
+    /// for an unsupported field key (filter the object out — the safe
+    /// default until per-kind field-selector registration lands).
+    fn satisfied_by(&self, obj: &serde_json::Value) -> bool {
+        let metadata = obj.get("metadata");
+        let have = match self.key() {
+            "metadata.name" => metadata
+                .and_then(|m| m.get("name"))
+                .and_then(serde_json::Value::as_str),
+            "metadata.namespace" => metadata
+                .and_then(|m| m.get("namespace"))
+                .and_then(serde_json::Value::as_str),
+            _ => return false, // unsupported field key → no match
+        };
+        match self {
+            Self::Equals(_, v) => have == Some(v.as_str()),
+            Self::NotEquals(_, v) => have != Some(v.as_str()),
+        }
+    }
+}
+
+/// Typed label + field selectors (the full label grammar; equality field
+/// selectors on `metadata.name`/`metadata.namespace`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Selectors {
-    pub labels: Vec<(String, String)>,
-    pub fields: Vec<(String, String)>,
+    pub labels: Vec<LabelRequirement>,
+    pub fields: Vec<FieldRequirement>,
 }
 
 impl Selectors {
-    /// `true` when `obj` satisfies EVERY label + field clause.
-    ///
-    /// Labels match `obj.metadata.labels.<k> == v`; fields match
-    /// `metadata.name` / `metadata.namespace` (the only field selectors
-    /// supported at M0.1). An unsupported field key never matches (the
-    /// object is filtered out), which is the safe default.
+    /// `true` when `obj` satisfies EVERY label + field requirement (the
+    /// requirements are ANDed, matching k8s).
     #[must_use]
     pub fn matches(&self, obj: &serde_json::Value) -> bool {
-        let metadata = obj.get("metadata");
-        for (k, want) in &self.labels {
-            let have = metadata
-                .and_then(|m| m.get("labels"))
-                .and_then(|l| l.get(k))
-                .and_then(serde_json::Value::as_str);
-            if have != Some(want.as_str()) {
-                return false;
-            }
-        }
-        for (k, want) in &self.fields {
-            let have = match k.as_str() {
-                "metadata.name" => metadata
-                    .and_then(|m| m.get("name"))
-                    .and_then(serde_json::Value::as_str),
-                "metadata.namespace" => metadata
-                    .and_then(|m| m.get("namespace"))
-                    .and_then(serde_json::Value::as_str),
-                _ => return false, // unsupported field selector → no match
-            };
-            if have != Some(want.as_str()) {
-                return false;
-            }
-        }
-        true
+        let labels = obj.get("metadata").and_then(|m| m.get("labels"));
+        self.labels.iter().all(|r| r.satisfied_by(labels))
+            && self.fields.iter().all(|r| r.satisfied_by(obj))
     }
 
-    /// `true` when there are no clauses (everything passes).
+    /// `true` when there are no requirements (everything passes).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.labels.is_empty() && self.fields.is_empty()
@@ -433,22 +489,169 @@ fn de_bool_default_true<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool,
     Ok(!matches!(s.as_str(), "false" | "0" | "no"))
 }
 
-/// Parse `k1=v1,k2=v2` into `Vec<(k, v)>`. Empty / absent → empty.
-fn parse_kv(s: Option<&str>, what: &str) -> Result<Vec<(String, String)>, ApiError> {
-    let Some(s) = s else { return Ok(Vec::new()) };
-    if s.is_empty() {
-        return Ok(Vec::new());
+/// Split a selector string into its top-level clauses on `,`, treating commas
+/// INSIDE `(...)` as part of a set-based value list (so `k in (a,b),m=n` splits
+/// into `["k in (a,b)", "m=n"]`, NOT `["k in (a", "b)", "m=n"]`). This is the
+/// load-bearing fix for the old naive `split(',')` that shattered a set-based
+/// clause and 400'd it.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
     }
-    s.split(',')
-        .map(|clause| {
-            clause
-                .split_once('=')
-                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-                .ok_or_else(|| {
-                    ApiError::BadRequest(format!("invalid {what} clause {clause:?}: expected k=v"))
-                })
-        })
-        .collect()
+    out.push(cur);
+    out
+}
+
+/// Parse a `labelSelector=` string into typed [`LabelRequirement`]s (the full
+/// K8s grammar). Empty / absent → empty. A malformed clause → a typed 400.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] on a malformed clause (empty key, a set clause
+/// with no `in`/`notin` operator, …).
+fn parse_label_selector(s: Option<&str>) -> Result<Vec<LabelRequirement>, ApiError> {
+    let Some(s) = s.filter(|s| !s.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for clause in split_top_level(s) {
+        if let Some(req) = parse_label_clause(clause.trim())? {
+            out.push(req);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_label_clause(c: &str) -> Result<Option<LabelRequirement>, ApiError> {
+    if c.is_empty() {
+        return Ok(None);
+    }
+    // not-exists: `!key`.
+    if let Some(key) = c.strip_prefix('!') {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(bad_selector("labelSelector", c, "empty key after '!'"));
+        }
+        return Ok(Some(LabelRequirement::NotExists(key.to_string())));
+    }
+    // set-based: `key in (a,b)` / `key notin (a,b)`.
+    if let Some(open) = c.find('(') {
+        let close = c
+            .rfind(')')
+            .filter(|&r| r > open)
+            .ok_or_else(|| bad_selector("labelSelector", c, "unterminated '(' set"))?;
+        let head = c[..open].trim();
+        let inner = &c[open + 1..close];
+        let values: Vec<String> = inner
+            .split(',')
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        let mut toks = head.split_whitespace();
+        let key = toks
+            .next()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| bad_selector("labelSelector", c, "empty key before set"))?;
+        let op = toks.next().unwrap_or("");
+        if toks.next().is_some() {
+            return Err(bad_selector("labelSelector", c, "extra tokens before set"));
+        }
+        return match op {
+            "in" => Ok(Some(LabelRequirement::In(key.to_string(), values))),
+            "notin" => Ok(Some(LabelRequirement::NotIn(key.to_string(), values))),
+            _ => Err(bad_selector(
+                "labelSelector",
+                c,
+                "set requires 'in' or 'notin'",
+            )),
+        };
+    }
+    // equality-based: `k!=v` / `k==v` / `k=v` (check `!=`/`==` before `=`).
+    if let Some((k, v)) = c.split_once("!=") {
+        return Ok(Some(LabelRequirement::NotEquals(
+            trim_key(k, c, "labelSelector")?,
+            v.trim().to_string(),
+        )));
+    }
+    if let Some((k, v)) = c.split_once("==") {
+        return Ok(Some(LabelRequirement::Equals(
+            trim_key(k, c, "labelSelector")?,
+            v.trim().to_string(),
+        )));
+    }
+    if let Some((k, v)) = c.split_once('=') {
+        return Ok(Some(LabelRequirement::Equals(
+            trim_key(k, c, "labelSelector")?,
+            v.trim().to_string(),
+        )));
+    }
+    // bare key → exists.
+    Ok(Some(LabelRequirement::Exists(c.to_string())))
+}
+
+/// Parse a `fieldSelector=` string into typed [`FieldRequirement`]s (equality
+/// only). Empty / absent → empty; a malformed clause → a typed 400.
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] on a clause that is not `k=v` / `k==v` / `k!=v`.
+fn parse_field_selector(s: Option<&str>) -> Result<Vec<FieldRequirement>, ApiError> {
+    let Some(s) = s.filter(|s| !s.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for clause in split_top_level(s) {
+        let c = clause.trim();
+        if c.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = c.split_once("!=") {
+            out.push(FieldRequirement::NotEquals(
+                trim_key(k, c, "fieldSelector")?,
+                v.trim().to_string(),
+            ));
+        } else if let Some((k, v)) = c.split_once("==") {
+            out.push(FieldRequirement::Equals(
+                trim_key(k, c, "fieldSelector")?,
+                v.trim().to_string(),
+            ));
+        } else if let Some((k, v)) = c.split_once('=') {
+            out.push(FieldRequirement::Equals(
+                trim_key(k, c, "fieldSelector")?,
+                v.trim().to_string(),
+            ));
+        } else {
+            return Err(bad_selector("fieldSelector", c, "expected k=v / k!=v"));
+        }
+    }
+    Ok(out)
+}
+
+/// Trim a selector clause's key + reject an empty one.
+fn trim_key(k: &str, clause: &str, what: &str) -> Result<String, ApiError> {
+    let k = k.trim();
+    if k.is_empty() {
+        return Err(bad_selector(what, clause, "empty key"));
+    }
+    Ok(k.to_string())
+}
+
+fn bad_selector(what: &str, clause: &str, why: &str) -> ApiError {
+    ApiError::BadRequest(format!("invalid {what} clause {clause:?}: {why}"))
 }
 
 #[cfg(test)]
@@ -676,11 +879,83 @@ mod tests {
 
     #[test]
     fn malformed_selector_is_bad_request() {
+        // An empty KEY is malformed (a bare `app` is now a valid Exists
+        // selector — see `label_selector_full_grammar`).
         let p = ListWatchParams {
-            label_selector: Some("app".into()),
+            label_selector: Some("=web".into()),
             ..Default::default()
         };
         assert!(matches!(p.selectors(), Err(ApiError::BadRequest(_))));
+        // A set clause with a bad operator is malformed.
+        let p = ListWatchParams {
+            label_selector: Some("k blah (a,b)".into()),
+            ..Default::default()
+        };
+        assert!(matches!(p.selectors(), Err(ApiError::BadRequest(_))));
+    }
+
+    /// The FULL K8s label-selector grammar the typed parser + matcher now
+    /// honor (equality `=`/`==`/`!=` + set-based `in`/`notin`/exists/
+    /// not-exists), matching how kubectl + every controller select objects.
+    #[test]
+    fn label_selector_full_grammar() {
+        let parse = |s: &str| {
+            ListWatchParams {
+                label_selector: Some(s.into()),
+                ..Default::default()
+            }
+            .selectors()
+            .unwrap()
+        };
+        let web = serde_json::json!({"metadata": {"labels": {"tier": "web", "env": "prod"}}});
+        let api = serde_json::json!({"metadata": {"labels": {"tier": "api"}}});
+        let bare = serde_json::json!({"metadata": {"name": "x"}}); // no labels
+
+        // exists / not-exists.
+        assert!(parse("tier").matches(&web));
+        assert!(!parse("tier").matches(&bare));
+        assert!(parse("!tier").matches(&bare));
+        assert!(!parse("!tier").matches(&web));
+
+        // set-based in / notin (the comma inside (...) is NOT a clause split).
+        assert!(parse("tier in (web,api)").matches(&web));
+        assert!(parse("tier in (web,api)").matches(&api));
+        assert!(!parse("tier notin (web)").matches(&web));
+        assert!(parse("tier notin (web)").matches(&api));
+        // notin includes objects LACKING the key (k8s semantics).
+        assert!(parse("tier notin (web)").matches(&bare));
+
+        // inequality includes objects LACKING the key.
+        assert!(parse("tier!=web").matches(&api));
+        assert!(parse("tier!=web").matches(&bare));
+        assert!(!parse("tier!=web").matches(&web));
+
+        // ANDed multi-clause spanning a set + an equality.
+        let sel = parse("tier in (web,api),env=prod");
+        assert_eq!(sel.labels.len(), 2);
+        assert!(sel.matches(&web)); // tier=web ∈ set AND env=prod
+        assert!(!sel.matches(&api)); // api lacks env=prod
+    }
+
+    /// Field selectors: equality on the two core keys; `!=` supported; an
+    /// unsupported key filters the object out (per-kind registration pending).
+    #[test]
+    fn field_selector_grammar() {
+        let parse = |s: &str| {
+            ListWatchParams {
+                field_selector: Some(s.into()),
+                ..Default::default()
+            }
+            .selectors()
+            .unwrap()
+        };
+        let p1 = serde_json::json!({"metadata": {"name": "p1", "namespace": "ns1"}});
+        assert!(parse("metadata.name=p1").matches(&p1));
+        assert!(!parse("metadata.name=p2").matches(&p1));
+        assert!(parse("metadata.name!=p2").matches(&p1));
+        assert!(parse("metadata.namespace=ns1").matches(&p1));
+        // Unsupported field key → filtered out (no match).
+        assert!(!parse("status.phase=Running").matches(&p1));
     }
 
     #[test]

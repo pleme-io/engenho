@@ -654,10 +654,21 @@ async fn malformed_resource_version_is_400() {
     assert_eq!(err.get("kind").unwrap(), "Status");
     assert_eq!(err.get("reason").unwrap(), "BadRequest");
 
-    // Same for a non-watch LIST with a malformed selector.
+    // A bare key is a VALID set-based EXISTS selector (`?labelSelector=oops`
+    // means "objects that HAVE label `oops`") — it must NOT 400.
     let resp = client
         .get(format!(
             "http://{addr}/api/v1/namespaces/default/pods?labelSelector=oops"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "bare key = exists selector");
+
+    // A genuinely malformed selector (empty KEY, `=v`) → 400.
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/v1/namespaces/default/pods?labelSelector=%3Doops"
         ))
         .send()
         .await
