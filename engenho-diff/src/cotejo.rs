@@ -87,13 +87,41 @@ pub fn diff_observations(
     }
     // 2. Body layer — dispatch on the surface class.
     match op.kind {
-        OpKind::Object => diff_object(
+        OpKind::Object => diff_object_focused(
             &norm.apply(&eng.json),
             &norm.apply(&k3s.json),
+            op.focus.as_ref(),
             Severity::Hard,
         ),
         OpKind::List => diff_list(&eng.json, &k3s.json, norm, Severity::Hard),
         OpKind::Discovery => diff_discovery(&eng.json, &k3s.json),
+    }
+}
+
+/// Diff two (already-normalized) objects, optionally restricted to the
+/// subtree at `focus`. FOCUS mode isolates a field-level invariant from a
+/// kind's unrelated server-side-defaulting divergence: the diff runs on the
+/// focused subtree of BOTH sides (an absent focus on one side surfaces
+/// naturally as a `MissingDefault`/`ExtraField` at the focus root). Without a
+/// focus it is exactly [`diff_object`] over the whole object.
+fn diff_object_focused(
+    eng: &Value,
+    k3s: &Value,
+    focus: Option<&JsonPath>,
+    sev: Severity,
+) -> Vec<Divergence> {
+    match focus {
+        None => diff_object(eng, k3s, sev),
+        Some(p) => {
+            let en = p.get(eng).cloned().unwrap_or(Value::Null);
+            let kn = p.get(k3s).cloned().unwrap_or(Value::Null);
+            // Re-root the divergence paths at the focus so the report + ratchet
+            // signature name the real location, not `.`.
+            diff_object(&en, &kn, sev)
+                .into_iter()
+                .map(|d| d.reroot(p))
+                .collect()
+        }
     }
 }
 
@@ -111,7 +139,9 @@ fn cosmetic_divergences(
         return Vec::new();
     }
     let raw = match op.kind {
-        OpKind::Object => diff_object(&eng.json, &k3s.json, Severity::Cosmetic),
+        OpKind::Object => {
+            diff_object_focused(&eng.json, &k3s.json, op.focus.as_ref(), Severity::Cosmetic)
+        }
         OpKind::List => diff_list_raw(&eng.json, &k3s.json, Severity::Cosmetic),
         OpKind::Discovery => Vec::new(),
     };

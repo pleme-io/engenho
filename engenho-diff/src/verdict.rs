@@ -232,6 +232,53 @@ impl Divergence {
         }
     }
 
+    /// Re-root a path-carrying divergence under `focus` — used by the
+    /// differ's FOCUS mode so a divergence found within a focused subtree
+    /// reports (and ratchets) at its TRUE location (`focus + inner-path`),
+    /// not at the subtree-local `.`. Arms without a [`JsonPath`] are returned
+    /// unchanged.
+    #[must_use]
+    pub fn reroot(self, focus: &JsonPath) -> Self {
+        match self {
+            Self::MissingResource { path, present_on } => Self::MissingResource {
+                path: focus.concat(&path),
+                present_on,
+            },
+            Self::FieldDiff {
+                path,
+                engenho,
+                k3s,
+                severity,
+            } => Self::FieldDiff {
+                path: focus.concat(&path),
+                engenho,
+                k3s,
+                severity,
+            },
+            Self::MissingDefault {
+                path,
+                k3s_value,
+                severity,
+            } => Self::MissingDefault {
+                path: focus.concat(&path),
+                k3s_value,
+                severity,
+            },
+            Self::ExtraField {
+                path,
+                side,
+                value,
+                severity,
+            } => Self::ExtraField {
+                path: focus.concat(&path),
+                side,
+                value,
+                severity,
+            },
+            other => other,
+        }
+    }
+
     /// A stable signature — the divergence's *location* + *kind*,
     /// independent of the concrete values or severity. This is the ratchet
     /// key: a baseline records signatures, and the test fails only when a
