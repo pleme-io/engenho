@@ -29,8 +29,65 @@
         (base.packages.${system} or { }) // {
           engenho-mcp = mcpBase.packages.${system}.default;
         });
+
+      # ============================================================
+      # OCI images — Nix-native, Pillar 8 (no Dockerfiles). Restores
+      # `packages.<system>.<toolName>-image-<arch>`, the attrs
+      # `.github/workflows/release.yml`'s `image-push.yml` calls
+      # expect (`nix build .#engenho-mcp-image-amd64` etc.) and which
+      # every release since v0.7.1 has failed to find (the
+      # crate2nix → gen-pattern flake migrations dropped them).
+      #
+      # Root cause of the CVEs a trivy scan found in the last
+      # successfully-published tag (ghcr.io/pleme-io/engenho-mcp:0.7.0,
+      # commit 3c1432e): that image was built from a Dockerfile
+      # (`FROM gcr.io/distroless/cc-debian12`, deleted in 78be81e) —
+      # the libssl3 CVEs were the Debian base image's package, not
+      # anything engenho pins (`cargo tree -p engenho-mcp` shows zero
+      # openssl-sys/native-tls; engenho-kube-client's reqwest is
+      # `rustls-tls` only). This dockerTools image carries no distro
+      # base and no dpkg package database at all — the whole libssl3
+      # CVE class is structurally absent, not merely patched.
+      #
+      # `genBuild = true` drives substrate's lockfile-builder (the
+      # same gen-based engine `base`/`mcpBase` already use above) —
+      # no crate2nix, no Cargo.nix, consistent with the workspace's
+      # 2026-07-17 migration off crate2nix (Cargo.nix regen was
+      # failing in the auto-release bump job).
+      mkToolImage = import "${substrate}/lib/build/rust/tool-image.nix" {
+        inherit nixpkgs;
+        # Only gates the native-binary/devShell side of tool-image.nix
+        # (unused here — we only read `.packages.dockerImage-{amd64,arm64}`
+        # below); `mkImage` always targets x86_64-linux/aarch64-linux
+        # for the actual container regardless of this value.
+        system = "x86_64-linux";
+      };
+
+      mkToolImages = toolName: (mkToolImage {
+        inherit toolName;
+        packageName = toolName;
+        src = ./.;
+        repo = "pleme-io/engenho";
+        genBuild = true;
+        architectures = [ "amd64" "arm64" ];
+      }).packages;
+
+      mcpImages = mkToolImages "engenho-mcp";
+      renderImages = mkToolImages "engenho-cluster-config-render";
+
+      imageAttrs = {
+        engenho-mcp-image-amd64 = mcpImages.dockerImage-amd64;
+        engenho-mcp-image-arm64 = mcpImages.dockerImage-arm64;
+        engenho-cluster-config-render-image-amd64 = renderImages.dockerImage-amd64;
+        engenho-cluster-config-render-image-arm64 = renderImages.dockerImage-arm64;
+      };
+      # Linux-only — dockerTools images have no meaning on darwin systems.
+      imageSystems = [ "x86_64-linux" "aarch64-linux" ];
     in
     base // {
-      packages = withMcp;
+      packages = nixpkgs.lib.genAttrs mcpSystems (system:
+        withMcp.${system} // (
+          if builtins.elem system imageSystems then imageAttrs else { }
+        ));
     };
 }

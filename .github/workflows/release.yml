@@ -70,6 +70,13 @@ jobs:
       imageAttr: engenho-mcp-image-arm64
       imageName: pleme-io/engenho-mcp
       tag: ${{ github.ref_name }}-arm64
+      # Native aarch64-linux runner — `nix build` targets the runner's
+      # own system, so this resolves `packages.aarch64-linux.*` (a real
+      # derivation) instead of `packages.x86_64-linux.*` on the default
+      # amd64 runner, which would need a foreign aarch64-linux builder
+      # this repo has none configured for. Same runner label already
+      # proven by this workflow's own linux-arm64 binary release job.
+      runner: ubuntu-24.04-arm
     secrets: inherit
 
   image-engenho-cluster-config-render-amd64:
@@ -88,6 +95,9 @@ jobs:
       imageAttr: engenho-cluster-config-render-image-arm64
       imageName: pleme-io/engenho-cluster-config-render
       tag: ${{ github.ref_name }}-arm64
+      # See image-engenho-mcp-arm64's comment — native aarch64-linux
+      # runner so `nix build` resolves `packages.aarch64-linux.*`.
+      runner: ubuntu-24.04-arm
     secrets: inherit
 
   # ============================================================
