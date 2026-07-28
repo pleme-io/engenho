@@ -1,9 +1,22 @@
 name: ci
 
-# Thin shim. Delegates the canonical cargo + nix flake check to
-# substrate's reusable cargo-ci.yml. Per the prime directive (org
-# CLAUDE.md), hand-authored composite actions are drift; this
-# workflow is just edge config triggering the substrate primitive.
+# Thin shim onto substrate's reusable cargo-ci.yml.
+#
+# ⚠ THIS WORKFLOW COMPILES NOTHING. Do not read it as a test gate.
+# `cargo-ci.yml`'s entire body is `nix flake check`, which builds only
+# `checks.<system>.*` — and engenho's flake declares NONE (it is
+# `substrate.rust.workspace` plus image grafts). An earlier version of
+# CLAUDE.md claimed this file ran `cargo fmt --check` + `cargo test
+# --workspace` + `nix flake check` + `nix build .#default`; it runs
+# none of those four.
+#
+# THE REAL GATE IS `.github/workflows/test.yml`. It carries the full
+# diagnosis, the verified evidence that exposing real `checks` is
+# blocked outside substrate, and the substrate follow-up that would
+# let this shim become meaningful again.
+#
+# Kept (rather than deleted) so the flake still evaluates on every PR —
+# a flake eval error is worth catching even though no crate is built.
 
 on:
   push:

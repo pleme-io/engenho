@@ -1,0 +1,42 @@
+# ci/live-oracle-tests.txt — the ENUMERATED exclusion list for `test.yml`.
+#
+# WHAT THIS IS. Every test named here needs a LIVE k3s cluster to compare
+# against (engenho-diff is a differential suite: it drives the same operation
+# against engenho-in-process AND a real k3s "oracle", then diffs the two
+# responses). They are not stale, not broken, and not skipped to buy green —
+# they are unrunnable on a CI runner because no oracle exists there.
+#
+# WHY AN ENUMERATED FILE AND NOT `#[ignore]` / `continue-on-error`.
+# `#[ignore]` would hide them from the OPERATOR too, where the oracle DOES
+# exist and these tests are the whole point. `continue-on-error` would make
+# the job green while swallowing genuinely new failures. An enumerated list
+# excludes exactly these four by name, in the open, and everything else in
+# the workspace still fails the build.
+#
+# THE CRATE IS STILL GATED. test.yml runs `cargo test -p engenho-diff
+# --no-run` as its own step, so this code must still COMPILE on every PR.
+# Only its EXECUTION is deferred. That is the half that catches the failure
+# shape this repo actually had — a crate quietly falling out of every build
+# path and rotting (see CLAUDE.md § CI + gating).
+#
+# HOW THE EXCLUSION IS APPLIED. Crate-level: `--exclude engenho-diff`.
+# Every test in the crate is a live-oracle test, so excluding the crate and
+# excluding the four names are the same set today. If a MOCKED test is ever
+# added to engenho-diff, switch test.yml to per-name `--skip` so the new
+# test runs — do not silently let it ride the crate exclusion.
+#
+# ORACLE, FOR A LOCAL RUN:
+#   ssh -f -N -L 16443:127.0.0.1:6443 root@<k3s-node>
+#   kubectl --kubeconfig ~/.kube/engenho-local-tunnel.yaml \
+#           --tls-server-name 127.0.0.1 get ns
+#   cargo test -p engenho-diff --all-features
+#
+# Resolution path: engenho-diff/tests/common/mod.rs :: oracle_kubeconfig()
+#   -> $HOME/.kube/engenho-local-tunnel.yaml   (hardcoded; no env override)
+#
+# Format: one `crate::test_name` per line. Comments and blanks ignored.
+
+engenho-diff::m0_core_crud_parity
+engenho-diff::patch_parity
+engenho-diff::selector_parity
+engenho-diff::status_subresource_parity

@@ -1,0 +1,182 @@
+name: test
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE REAL GATE. This is the workflow that actually COMPILES AND RUNS engenho.
+#
+# WHY IT EXISTS (read before "simplifying" it back into ci.yml).
+#
+# `ci.yml` is a shim onto substrate's `cargo-ci.yml`, whose entire body is
+# `nix flake check`. `nix flake check` builds only `checks.<system>.*`, and
+# engenho's flake declares NONE (it is `substrate.rust.workspace` + image
+# grafts — see flake.nix). So ci.yml compiles nothing. On the sibling repo
+# `forge` this was proven by probe: a clean tree exited 0, a `compile_error!`
+# in a test module exited 0, and LITERAL NON-RUST GARBAGE in a function body
+# ALSO exited 0 — every run printing "(build skipped)". The crate was never
+# compiled, not merely untested.
+#
+# WHY NOT FIX IT AT THE LOAD-BEARING LAYER INSTEAD (Operating Principle #2).
+# The right fix is for the flake to expose real `checks` so `nix flake check`
+# compiles + tests hermetically. That is BLOCKED OUTSIDE SUBSTRATE, and the
+# block was verified here rather than assumed:
+#   * `runTests` is a crate2nix-generated-Cargo.nix concept. nixpkgs'
+#     `buildRustCrate` has no such argument.
+#   * `substrate/lib/build/rust/lockfile-builder.nix` — the engine engenho
+#     actually uses — has ZERO occurrences of `runTests`. (The single fleet
+#     occurrence is `crate2nix-builders.nix:240`, and it reads `= false`.)
+#   * engenho's flake.nix calls `substrate.rust.workspace`, which routes
+#     `mk-rust-workspace.nix` -> `lockfile-builder.nix`. Confirmed, not
+#     inferred. There is no committed `Cargo.nix` under the gen delta-only
+#     doctrine, so the crate2nix path is not available either.
+# Building an in-repo `checks` would mean a SECOND, divergent Rust build path
+# next to the gen/lockfile-builder one. Operating Principle #1 forbids that.
+#
+# THE SUBSTRATE FOLLOW-UP, RECORDED HERE RATHER THAN ROUTED AROUND SILENTLY:
+#   substrate/lib/build/rust/lockfile-builder.nix should grow a `runTests`
+#   (or a sibling `mkWorkspaceChecks`) so `substrate.rust.workspace` can
+#   expose `checks.<system>.test`. Until it does, `nix flake check` remains
+#   structurally incapable of compiling any gen-pattern consumer, and THIS
+#   workflow is what stands between engenho and an un-compiled merge.
+#   When that lands, this workflow's cargo steps can collapse into the flake.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠ KNOWN BLOCKER — THIS GATE CANNOT GO GREEN UNTIL AN OPERATOR ACTS.
+#
+# engenho's Cargo.lock has git dependencies on FIVE PRIVATE pleme-io repos:
+#   tameshi · cofre · promessa · sui · tatara      (verified via `gh repo view`)
+# Cargo resolves the WHOLE lock graph regardless of which features are on, so
+# EVERY cargo command — even `cargo test -p engenho-types` — must fetch them.
+#
+# `pleme-io` is on the GitHub FREE plan (`gh api orgs/pleme-io` -> plan: free,
+# 747 private repos). On Free, an ORG secret reaches PUBLIC repos only.
+# engenho is PRIVATE and has NO repo-level secrets (`gh secret list` -> empty).
+# Therefore `secrets.BOT_PAT` arrives EMPTY here, `git-credentials` falls back
+# to the repo-scoped GITHUB_TOKEN, and GITHUB_TOKEN cannot read a sibling
+# private repo. Result:
+#
+#   fatal: could not read Username for 'https://github.com'
+#   error: failed to get `tameshi` as a dependency of package `engenho-fonte`
+#
+# THE FIX IS ONE OPERATOR ACTION, NOT A CODE CHANGE:
+#   gh secret set BOT_PAT --repo pleme-io/engenho --body '<org PAT>'
+# This is the same repo-level-BOT_PAT workaround pangea-operator already
+# carries for exactly this reason. The wiring below is already correct and
+# needs NO edit once that secret exists.
+#
+# This is wired red-but-correct ON PURPOSE. A gate that is honest about being
+# blocked beats a shim that prints green over an un-compiled crate.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Load-bearing: makes cargo shell out to the real git binary, which honours
+  # the `url.insteadOf` rewrite that `git-credentials` installs. Cargo's
+  # bundled libgit2 backend does NOT honour it, so without this the private
+  # deps stay unfetchable even with a valid PAT.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # The gate. One job, whole workspace, compiled AND executed.
+  # ───────────────────────────────────────────────────────────────────────────
+  test:
+    name: cargo test (workspace, all-features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reuse of the fleet primitive, not a hand-rolled two-liner. It owns the
+      # BOT_PAT > GITHUB_TOKEN order AND the checkout-`extraheader` unset that
+      # actually makes the rewrite take effect — getting that second part wrong
+      # looks identical to having no fix at all.
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-ubuntu
+
+      # ── Compile-only leg for the live-oracle crate ──────────────────────
+      # engenho-diff's four tests all drive a REAL k3s cluster to diff against
+      # (see ci/live-oracle-tests.txt). No oracle exists on a runner, so they
+      # are excluded from EXECUTION below — but their code must still compile
+      # on every PR. This step is what makes that true, and it is deliberately
+      # FIRST: it is the exact check that catches a crate silently falling out
+      # of every build path and rotting, which is the failure shape this repo
+      # already had (see CLAUDE.md § CI + gating).
+      - name: compile engenho-diff (live-oracle crate — compiled, not run)
+        run: cargo test -p engenho-diff --all-targets --all-features --locked --no-run
+
+      # ── The executing gate ──────────────────────────────────────────────
+      # --all-features is LOAD-BEARING here, not decoration. engenho gates real
+      # code behind with-tameshi / with-sui-eval / with-shikumi / with-revoada /
+      # with-engenho-kube-client / openapi-roundtrip / bit-repro / mock. Default
+      # features leave all of it uncompiled and unrun.
+      # --locked ensures a drifted Cargo.lock fails loudly instead of being
+      # silently re-resolved.
+      # --no-fail-fast is REQUIRED for an honest count: without it cargo stops
+      # at the first failing BINARY. Measured here: the run aborted at
+      # `engenho-diff` (alphabetical) reporting 881 tests; the true figure with
+      # --no-fail-fast is 3,169.
+      - name: cargo test --workspace --all-targets --all-features
+        run: |
+          cargo test --workspace --exclude engenho-diff \
+            --all-targets --all-features --locked --no-fail-fast
+
+      # ── Doctests — a SEPARATE leg, on purpose ───────────────────────────
+      # `--all-targets` EXCLUDES doctests. A gate built only on the line above
+      # ships green over a broken doctest; the sibling repo iac-forge had
+      # exactly one real failure this week and the doctest leg alone caught it
+      # (an inverted assert_ne! in a module example).
+      # HONEST SCOPE, engenho as measured: 42 doctests, of which 41 are
+      # ```ignore``` and exactly 1 executes. This leg is therefore close to a
+      # vacuous guard TODAY — it is wired anyway so the next real doctest lands
+      # guarded rather than unguarded, and so the 41 are visible as debt rather
+      # than as coverage.
+      - name: cargo test --doc
+        run: cargo test --workspace --all-features --locked --doc --no-fail-fast
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Format + lint. Separate jobs so a fmt nit and a real test failure are
+  # distinguishable at a glance instead of collapsing into one red X.
+  # ───────────────────────────────────────────────────────────────────────────
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # No credentials needed: rustfmt parses source, it does not resolve deps.
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (pedantic + format-ban)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy-ubuntu
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
