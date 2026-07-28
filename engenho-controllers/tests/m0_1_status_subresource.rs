@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use engenho_controllers::{
     Controller, DeploymentController, JobController, ReplicaSetController, StatefulSetController,
-    is_owned_by, status::{StatusWriteOutcome, write_status_cas},
+    is_owned_by,
+    status::{StatusWriteOutcome, write_status_cas},
 };
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
@@ -144,7 +145,10 @@ async fn replicaset_status_reflects_live_ready_pods() {
     assert_eq!(status_i64(&rs, "fullyLabeledReplicas"), 3);
     // observedGeneration tracks metadata.generation (status writes don't
     // bump generation, so they stay aligned).
-    assert_eq!(status_i64(&rs, "observedGeneration"), metadata_generation(&rs));
+    assert_eq!(
+        status_i64(&rs, "observedGeneration"),
+        metadata_generation(&rs)
+    );
 
     // Mark pods Ready → readyReplicas/availableReplicas converge to 3.
     assert_eq!(mark_owned_pods_ready(&store, &rs_uid).await, 3);
@@ -153,7 +157,10 @@ async fn replicaset_status_reflects_live_ready_pods() {
     assert_eq!(status_i64(&rs, "replicas"), 3);
     assert_eq!(status_i64(&rs, "readyReplicas"), 3);
     assert_eq!(status_i64(&rs, "availableReplicas"), 3);
-    assert_eq!(status_i64(&rs, "observedGeneration"), metadata_generation(&rs));
+    assert_eq!(
+        status_i64(&rs, "observedGeneration"),
+        metadata_generation(&rs)
+    );
 
     drop(rc);
     teardown(store).await;
@@ -181,10 +188,7 @@ async fn replicaset_status_write_is_idempotent_at_fixpoint() {
     let rev_before = store.current_catalog().await.revision();
     let report = rc.tick().await.unwrap();
     let rev_after = store.current_catalog().await.revision();
-    assert_eq!(
-        report.objects_changed, 0,
-        "fixpoint tick proposes nothing"
-    );
+    assert_eq!(report.objects_changed, 0, "fixpoint tick proposes nothing");
     assert_eq!(
         rev_before, rev_after,
         "no revision advance on a no-op status tick (the hot-loop defense)"
@@ -225,7 +229,9 @@ async fn deployment_status_aggregates_replicaset_status() {
 
     // Find the RS uid + mark its pods Ready, RS tick again → RS status
     // readyReplicas:2.
-    let rs_list = store.list("apps", "v1", "ReplicaSet", Some("default")).await;
+    let rs_list = store
+        .list("apps", "v1", "ReplicaSet", Some("default"))
+        .await;
     let (_, rs_value) = rs_list
         .iter()
         .find(|(_, r)| is_owned_by(r, &dep_uid))
@@ -292,7 +298,10 @@ async fn statefulset_status_reflects_ordinal_pods() {
     let sts = store.get(&sts_key).await.unwrap();
     assert_eq!(status_i64(&sts, "readyReplicas"), 3);
     assert_eq!(status_i64(&sts, "availableReplicas"), 3);
-    assert_eq!(status_i64(&sts, "observedGeneration"), metadata_generation(&sts));
+    assert_eq!(
+        status_i64(&sts, "observedGeneration"),
+        metadata_generation(&sts)
+    );
 
     drop(sc);
     teardown(store).await;
@@ -356,7 +365,10 @@ async fn job_status_tracks_phases_and_completes() {
                     && c.get("status").and_then(|s| s.as_str()) == Some("True")
             })
         });
-    assert!(complete, "Job should carry Complete=True once succeeded >= completions");
+    assert!(
+        complete,
+        "Job should carry Complete=True once succeeded >= completions"
+    );
 
     drop(jc);
     teardown(store).await;

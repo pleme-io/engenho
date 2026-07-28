@@ -394,7 +394,13 @@ impl IptablesScript {
     }
 
     /// Append a `-A <chain_ep> … -j DNAT --to-destination …` rule.
-    pub fn dnat(&mut self, chain_ep: &str, protocol: &str, pod_ip: &str, target_port: u16) -> &mut Self {
+    pub fn dnat(
+        &mut self,
+        chain_ep: &str,
+        protocol: &str,
+        pod_ip: &str,
+        target_port: u16,
+    ) -> &mut Self {
         let mut line = String::new();
         let _ = write!(
             line,
@@ -703,8 +709,7 @@ mod tests {
 
     #[test]
     fn cilium_egress_yaml_uses_egress_key() {
-        let policy =
-            CiliumNetworkPolicy::new("x", cilium_selector(), CiliumDirection::Egress);
+        let policy = CiliumNetworkPolicy::new("x", cilium_selector(), CiliumDirection::Egress);
         let yaml = policy.to_yaml();
         assert!(yaml.contains("egress:"));
         assert!(!yaml.contains("ingress:"));
@@ -781,7 +786,10 @@ mod tests {
             v["spec"]["routes"][0]["services"][0]["port"],
             serde_yaml::Value::from(80)
         );
-        assert_eq!(v["spec"]["routes"][0]["kind"], serde_yaml::Value::from("Rule"));
+        assert_eq!(
+            v["spec"]["routes"][0]["kind"],
+            serde_yaml::Value::from("Rule")
+        );
     }
 
     // ── NginxServerBlock ──────────────────────────────────────

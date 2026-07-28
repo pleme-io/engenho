@@ -343,11 +343,7 @@ impl<E: RbacStoreEnv> RbacAuthorizer<E> {
     /// valid from a `RoleBinding`, so `binding_ns` is always `Some` there). A
     /// dangling ref → an empty rule set (NoOpinion contribution + a warn — never
     /// a hard error, matching upstream's tolerant resolution).
-    async fn resolve_rules(
-        &self,
-        role_ref: &RoleRef,
-        binding_ns: Option<&str>,
-    ) -> Vec<PolicyRule> {
+    async fn resolve_rules(&self, role_ref: &RoleRef, binding_ns: Option<&str>) -> Vec<PolicyRule> {
         match role_ref.kind.as_str() {
             "ClusterRole" => match self.env.get_cluster_role(&role_ref.name).await {
                 Some(cr) => cr.rules,
@@ -403,11 +399,7 @@ fn subjects_match(subjects: &[Subject], user: &UserInfo, default_sa_ns: Option<&
         "User" => s.name == user.username,
         "Group" => user.groups.iter().any(|g| g == &s.name),
         "ServiceAccount" => {
-            let ns = s
-                .namespace
-                .as_deref()
-                .or(default_sa_ns)
-                .unwrap_or_default();
+            let ns = s.namespace.as_deref().or(default_sa_ns).unwrap_or_default();
             let sa_user = ["system:serviceaccount:", ns, ":", &s.name].concat();
             sa_user == user.username
         }
@@ -622,7 +614,11 @@ mod tests {
         assert_eq!(d2, Decision::Allow);
 
         // ZERO store reads — the short-circuit never touched the env.
-        assert_eq!(authz.env.reads(), 0, "system:masters short-circuit reads nothing");
+        assert_eq!(
+            authz.env.reads(),
+            0,
+            "system:masters short-circuit reads nothing"
+        );
     }
 
     #[tokio::test]
@@ -662,21 +658,42 @@ mod tests {
         // Granted verb → Allow.
         assert_eq!(
             authz
-                .authorize(&attrs_resource(u(), "get", "", "pods", Some("default"), Some("p1")))
+                .authorize(&attrs_resource(
+                    u(),
+                    "get",
+                    "",
+                    "pods",
+                    Some("default"),
+                    Some("p1")
+                ))
                 .await,
             Decision::Allow
         );
         // Ungranted verb → NoOpinion (→ deny).
         assert_eq!(
             authz
-                .authorize(&attrs_resource(u(), "delete", "", "pods", Some("default"), Some("p1")))
+                .authorize(&attrs_resource(
+                    u(),
+                    "delete",
+                    "",
+                    "pods",
+                    Some("default"),
+                    Some("p1")
+                ))
                 .await,
             Decision::NoOpinion
         );
         // Ungranted resource → NoOpinion.
         assert_eq!(
             authz
-                .authorize(&attrs_resource(u(), "get", "", "secrets", Some("default"), None))
+                .authorize(&attrs_resource(
+                    u(),
+                    "get",
+                    "",
+                    "secrets",
+                    Some("default"),
+                    None
+                ))
                 .await,
             Decision::NoOpinion
         );
@@ -715,7 +732,14 @@ mod tests {
         let u = user("alice", &["power-users", "system:authenticated"]);
         assert_eq!(
             authz
-                .authorize(&attrs_resource(u, "patch", "apps", "deployments", Some("x"), Some("d")))
+                .authorize(&attrs_resource(
+                    u,
+                    "patch",
+                    "apps",
+                    "deployments",
+                    Some("x"),
+                    Some("d")
+                ))
                 .await,
             Decision::Allow
         );
@@ -756,14 +780,28 @@ mod tests {
         // get cm "foo" → Allow.
         assert_eq!(
             authz
-                .authorize(&attrs_resource(u(), "get", "", "configmaps", Some("default"), Some("foo")))
+                .authorize(&attrs_resource(
+                    u(),
+                    "get",
+                    "",
+                    "configmaps",
+                    Some("default"),
+                    Some("foo")
+                ))
                 .await,
             Decision::Allow
         );
         // get cm "bar" → NoOpinion (not in resource_names).
         assert_eq!(
             authz
-                .authorize(&attrs_resource(u(), "get", "", "configmaps", Some("default"), Some("bar")))
+                .authorize(&attrs_resource(
+                    u(),
+                    "get",
+                    "",
+                    "configmaps",
+                    Some("default"),
+                    Some("bar")
+                ))
                 .await,
             Decision::NoOpinion
         );
@@ -860,7 +898,14 @@ mod tests {
         // A resource URL is NOT granted by this non-resource rule.
         assert_eq!(
             authz
-                .authorize(&attrs_resource(u(), "get", "", "secrets", Some("kube-system"), None))
+                .authorize(&attrs_resource(
+                    u(),
+                    "get",
+                    "",
+                    "secrets",
+                    Some("kube-system"),
+                    None
+                ))
                 .await,
             Decision::NoOpinion
         );
@@ -960,11 +1005,18 @@ mod tests {
         let authz = RbacAuthorizer::new(env);
         let admin = user("engenho-admin", &["system:masters"]);
         let rules = authz.rules_for(&admin, None).await;
-        assert!(rules.resource_rules.iter().any(|r| r.verbs.contains(&"*".to_string())
-            && r.resources.contains(&"*".to_string())));
-        assert!(rules
-            .non_resource_rules
-            .iter()
-            .any(|r| r.non_resource_urls.contains(&"*".to_string())));
+        assert!(
+            rules
+                .resource_rules
+                .iter()
+                .any(|r| r.verbs.contains(&"*".to_string())
+                    && r.resources.contains(&"*".to_string()))
+        );
+        assert!(
+            rules
+                .non_resource_rules
+                .iter()
+                .any(|r| r.non_resource_urls.contains(&"*".to_string()))
+        );
     }
 }

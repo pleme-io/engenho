@@ -40,10 +40,7 @@ fn main() {
     // Rebuild only when a vendored proto or this script changes.
     println!("cargo:rerun-if-changed=build.rs");
     for f in &files {
-        println!(
-            "cargo:rerun-if-changed={}",
-            proto_root.join(f).display()
-        );
+        println!("cargo:rerun-if-changed={}", proto_root.join(f).display());
     }
 
     // Compile to a FileDescriptorSet (pure-Rust; no protoc).

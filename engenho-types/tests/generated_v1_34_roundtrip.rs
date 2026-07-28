@@ -171,9 +171,27 @@ roundtrip_property_test!(
     "ReplicationController",
     "replicationcontrollers"
 );
-roundtrip_property_test!(podtemplate_roundtrip, PodTemplate, "", "PodTemplate", "podtemplates");
-roundtrip_property_test!(limitrange_roundtrip, LimitRange, "", "LimitRange", "limitranges");
-roundtrip_property_test!(resourcequota_roundtrip, ResourceQuota, "", "ResourceQuota", "resourcequotas");
+roundtrip_property_test!(
+    podtemplate_roundtrip,
+    PodTemplate,
+    "",
+    "PodTemplate",
+    "podtemplates"
+);
+roundtrip_property_test!(
+    limitrange_roundtrip,
+    LimitRange,
+    "",
+    "LimitRange",
+    "limitranges"
+);
+roundtrip_property_test!(
+    resourcequota_roundtrip,
+    ResourceQuota,
+    "",
+    "ResourceQuota",
+    "resourcequotas"
+);
 roundtrip_property_test!(event_roundtrip, Event, "", "Event", "events");
 
 // apps/v1
@@ -190,7 +208,13 @@ roundtrip_property_test!(job_roundtrip, Job, "batch", "Job", "jobs");
 roundtrip_property_test!(cronjob_roundtrip, CronJob, "batch", "CronJob", "cronjobs");
 
 // networking.k8s.io/v1
-roundtrip_property_test!(ingress_roundtrip, Ingress, "networking.k8s.io", "Ingress", "ingresses");
+roundtrip_property_test!(
+    ingress_roundtrip,
+    Ingress,
+    "networking.k8s.io",
+    "Ingress",
+    "ingresses"
+);
 roundtrip_property_test!(
     ingressclass_roundtrip,
     IngressClass,
@@ -223,8 +247,20 @@ roundtrip_property_test!(
     "StorageClass",
     "storageclasses"
 );
-roundtrip_property_test!(csinode_roundtrip, CSINode, "storage.k8s.io", "CSINode", "csinodes");
-roundtrip_property_test!(csidriver_roundtrip, CSIDriver, "storage.k8s.io", "CSIDriver", "csidrivers");
+roundtrip_property_test!(
+    csinode_roundtrip,
+    CSINode,
+    "storage.k8s.io",
+    "CSINode",
+    "csinodes"
+);
+roundtrip_property_test!(
+    csidriver_roundtrip,
+    CSIDriver,
+    "storage.k8s.io",
+    "CSIDriver",
+    "csidrivers"
+);
 roundtrip_property_test!(
     volumeattachment_roundtrip,
     VolumeAttachment,
@@ -250,7 +286,13 @@ roundtrip_property_test!(
 );
 
 // coordination.k8s.io/v1
-roundtrip_property_test!(lease_roundtrip, Lease, "coordination.k8s.io", "Lease", "leases");
+roundtrip_property_test!(
+    lease_roundtrip,
+    Lease,
+    "coordination.k8s.io",
+    "Lease",
+    "leases"
+);
 
 // node.k8s.io/v1
 roundtrip_property_test!(
@@ -308,7 +350,9 @@ fn real_cronjob_manifest_deserializes_into_typed_struct() {
     // Round-trips back to an equivalent value.
     let back = serde_json::to_value(&cj).expect("re-serialize");
     assert_eq!(
-        back.get("spec").and_then(|s| s.get("schedule")).and_then(|v| v.as_str()),
+        back.get("spec")
+            .and_then(|s| s.get("schedule"))
+            .and_then(|v| v.as_str()),
         Some("0 0 * * *"),
     );
 }
@@ -330,7 +374,10 @@ fn real_ingress_manifest_deserializes_into_typed_struct() {
     let ing: Ingress = serde_json::from_value(manifest).expect("typed Ingress deserialize");
     assert_eq!(ing.metadata.name, "web");
     let spec = ing.spec.as_ref().expect("Ingress has a spec");
-    assert_eq!(spec.rules.first().and_then(|r| r.host.as_deref()), Some("example.com"));
+    assert_eq!(
+        spec.rules.first().and_then(|r| r.host.as_deref()),
+        Some("example.com")
+    );
 }
 
 /// Every newly-typed group now serves a `/openapi/v3` document carrying the
@@ -344,13 +391,29 @@ fn promoted_kinds_have_openapi_v3_schema_documents() {
     // newly-vendored group.
     let cases = [
         ("batch", "v1", "io.k8s.api.batch.v1.CronJob"),
-        ("networking.k8s.io", "v1", "io.k8s.api.networking.v1.Ingress"),
+        (
+            "networking.k8s.io",
+            "v1",
+            "io.k8s.api.networking.v1.Ingress",
+        ),
         ("policy", "v1", "io.k8s.api.policy.v1.PodDisruptionBudget"),
         ("storage.k8s.io", "v1", "io.k8s.api.storage.v1.StorageClass"),
-        ("scheduling.k8s.io", "v1", "io.k8s.api.scheduling.v1.PriorityClass"),
-        ("coordination.k8s.io", "v1", "io.k8s.api.coordination.v1.Lease"),
+        (
+            "scheduling.k8s.io",
+            "v1",
+            "io.k8s.api.scheduling.v1.PriorityClass",
+        ),
+        (
+            "coordination.k8s.io",
+            "v1",
+            "io.k8s.api.coordination.v1.Lease",
+        ),
         ("node.k8s.io", "v1", "io.k8s.api.node.v1.RuntimeClass"),
-        ("autoscaling", "v2", "io.k8s.api.autoscaling.v2.HorizontalPodAutoscaler"),
+        (
+            "autoscaling",
+            "v2",
+            "io.k8s.api.autoscaling.v2.HorizontalPodAutoscaler",
+        ),
     ];
     for (group, version, key) in cases {
         let doc = document_for(group, version)

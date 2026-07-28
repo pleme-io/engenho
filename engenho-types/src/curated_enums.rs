@@ -77,7 +77,10 @@ mod tests {
 
     #[test]
     fn pod_phase_round_trips_canonical_strings() {
-        assert_eq!(serde_json::to_string(&PodPhase::Running).unwrap(), "\"Running\"");
+        assert_eq!(
+            serde_json::to_string(&PodPhase::Running).unwrap(),
+            "\"Running\""
+        );
         assert_eq!(
             serde_json::from_str::<PodPhase>("\"Succeeded\"").unwrap(),
             PodPhase::Succeeded
@@ -87,7 +90,8 @@ mod tests {
     #[test]
     fn secret_type_serializes_canonical_and_custom() {
         assert_eq!(
-            serde_json::to_string(&SecretType::Known(KnownSecretType::ServiceAccountToken)).unwrap(),
+            serde_json::to_string(&SecretType::Known(KnownSecretType::ServiceAccountToken))
+                .unwrap(),
             "\"kubernetes.io/service-account-token\""
         );
         assert_eq!(

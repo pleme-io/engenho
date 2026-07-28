@@ -10,22 +10,19 @@ use engenho_apiserver::{
     handlers_from_catalog_with_admission, issue_admin_client_material, issue_server_material,
     load_or_generate_ca,
 };
-use engenho_types::generated_v1_34::rbac_v1::{
-    ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
-};
-use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_config::{
     ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind, ResolvedDatapath,
 };
 use engenho_controllers::{
-    CrdController, CronJobController, DaemonSetController, DeploymentController, DynamicHandlerSink,
-    EndpointsController, FakeRouter, GcController, IptablesRouter, IpvsRouter, JobController,
-    KindFilter, NamespaceController, PodDisruptionBudgetController, PvBinderController,
-    ReplicaSetController, ServiceRouter, ServiceRoutingController, StatefulSetController, WallClock,
-    WatchDriver, WatchDriverConfig,
+    CrdController, CronJobController, DaemonSetController, DeploymentController,
+    DynamicHandlerSink, EndpointsController, FakeRouter, GcController, IptablesRouter, IpvsRouter,
+    JobController, KindFilter, NamespaceController, PodDisruptionBudgetController,
+    PvBinderController, ReplicaSetController, ServiceRouter, ServiceRoutingController,
+    StatefulSetController, WallClock, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
 };
+use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_kubelet::config_bridge::KubeletBackendKind;
 use engenho_kubelet::{ContainerRuntime, Kubelet, LogOptions, make_container_runtime};
 use engenho_scheduler::{Scheduler, make_scheduling_strategy};
@@ -33,6 +30,9 @@ use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
     default_config,
+};
+use engenho_types::generated_v1_34::rbac_v1::{
+    ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
 };
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -158,13 +158,12 @@ impl Runtime {
             // OPTIONAL client-cert verifier (allow_unauthenticated): existing
             // token/anonymous kubectl keeps connecting; a presented cert is
             // verified against the CA before the handshake completes.
-            let verifier =
-                client_verifier(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
+            let verifier = client_verifier(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
             let material = material.with_client_verifier(verifier);
             // Issue + persist the admin client cert (for the operator's
             // kubeconfig + `kubectl auth whoami → engenho-admin`).
-            let admin = issue_admin_client_material(&ca)
-                .map_err(|e| RuntimeError::Server(e.into()))?;
+            let admin =
+                issue_admin_client_material(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
             persist_admin_material(&config.runtime.data_dir, &admin)?;
             admin_material = Some(admin);
             Some(material)
@@ -198,11 +197,10 @@ impl Runtime {
         // (restart-persistent + collision-free — the Services are the ledger).
         // FailClosed so a misconfigured CIDR / exhausted pool denies the
         // create rather than admitting a half-built Service.
-        let cluster_ip_hook: Arc<dyn AdmissionWebhook> =
-            Arc::new(ClusterIpDefaultingWebhook::new(
-                config.networking.service_cidr.clone(),
-                Arc::new(StoreServiceIpSource::new(store.clone())),
-            ));
+        let cluster_ip_hook: Arc<dyn AdmissionWebhook> = Arc::new(ClusterIpDefaultingWebhook::new(
+            config.networking.service_cidr.clone(),
+            Arc::new(StoreServiceIpSource::new(store.clone())),
+        ));
         let admission = Arc::new(AdmissionChain::new(
             vec![cluster_ip_hook],
             AdmissionMode::FailClosed,
@@ -284,8 +282,7 @@ impl Runtime {
         //    CrdController, which registers CR handlers into the shared
         //    router table via handler_sink). Returns the Arc<Kubelet> so the
         //    Pod `/log` reader can be wired in.
-        let (drivers, kubelet) =
-            spawn_drivers(&config, &store, &backend, strategy, &handler_sink);
+        let (drivers, kubelet) = spawn_drivers(&config, &store, &backend, strategy, &handler_sink);
         info!(count = drivers.len(), "drivers spawned");
 
         // 7b. Register the Pod `/log` handler — a StoreBackedHandler for the
@@ -433,9 +430,10 @@ fn build_pod_log_handler(
     let pod_descriptor = engenho_types::generated_v1_34::RESOURCE_CATALOG
         .iter()
         .find(|d| d.kind == "Pod" && d.group.is_empty())?;
-    let handler = engenho_apiserver::StoreBackedHandler::from_descriptor(store.clone(), pod_descriptor)
-        .with_admission(admission.clone())
-        .with_log_reader(log_reader);
+    let handler =
+        engenho_apiserver::StoreBackedHandler::from_descriptor(store.clone(), pod_descriptor)
+            .with_admission(admission.clone())
+            .with_log_reader(log_reader);
     Some(Arc::new(handler))
 }
 
@@ -678,7 +676,9 @@ async fn seed_bootstrap_rbac(store: &StoreMesh) -> Result<(), RuntimeError> {
     put_cluster_role(store, &public_info).await?;
     put_cluster_role_binding(store, &public_info_binding).await?;
 
-    info!("seeded bootstrap RBAC policy (cluster-admin + system:discovery + system:basic-user + system:public-info-viewer)");
+    info!(
+        "seeded bootstrap RBAC policy (cluster-admin + system:discovery + system:basic-user + system:public-info-viewer)"
+    );
     Ok(())
 }
 
@@ -756,10 +756,7 @@ async fn put_cluster_role_binding(
 /// A serialize-failure during seeding (effectively impossible for the concrete
 /// typed structs) becomes a typed apiserver ServerError so boot fails loudly —
 /// never a silent skip.
-fn seed_serialize_err(
-    kind: &str,
-    e: &serde_json::Error,
-) -> engenho_apiserver::ServerError {
+fn seed_serialize_err(kind: &str, e: &serde_json::Error) -> engenho_apiserver::ServerError {
     engenho_apiserver::ServerError::Serve(std::io::Error::other(format!(
         "failed to serialize bootstrap {kind}: {e}"
     )))
@@ -847,9 +844,7 @@ fn persist_admin_material(
 /// `Authorization: Bearer <token>` keeps working across reboots. The token is
 /// 32 random bytes hex-encoded (no external crate — uses `getrandom` via
 /// `rand`-free `std`-adjacent entropy from the OS).
-fn load_or_generate_admin_token(
-    data_dir: &std::path::Path,
-) -> Result<String, RuntimeError> {
+fn load_or_generate_admin_token(data_dir: &std::path::Path) -> Result<String, RuntimeError> {
     let pki = data_dir.join("pki");
     let token_path = pki.join("admin.token");
     if let Ok(existing) = std::fs::read_to_string(&token_path) {
@@ -896,11 +891,7 @@ fn random_admin_token() -> String {
 }
 
 /// Write a PKI-dir file with the given unix mode (no-op chmod elsewhere).
-fn write_pki_file(
-    path: &std::path::Path,
-    contents: &str,
-    mode: u32,
-) -> Result<(), RuntimeError> {
+fn write_pki_file(path: &std::path::Path, contents: &str, mode: u32) -> Result<(), RuntimeError> {
     std::fs::write(path, contents.as_bytes()).map_err(|source| RuntimeError::KubeconfigIo {
         path: path.to_path_buf(),
         source,
@@ -935,7 +926,10 @@ fn loopback_server_url(bound_addr: SocketAddr) -> String {
 fn write_mode_0644(path: &std::path::Path, contents: &str) -> Result<(), RuntimeError> {
     let io_err = |p: &std::path::Path| {
         let p = p.to_path_buf();
-        move |source: std::io::Error| RuntimeError::KubeconfigIo { path: p.clone(), source }
+        move |source: std::io::Error| RuntimeError::KubeconfigIo {
+            path: p.clone(),
+            source,
+        }
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io_err(parent))?;
@@ -1012,8 +1006,12 @@ fn spawn_drivers(
     if enable.daemonset {
         let c = DaemonSetController::new(store.clone(), ns.clone());
         handles.push(
-            WatchDriver::new(c, store.clone(), driver_config(&["DaemonSet", "Pod", "Node"]))
-                .spawn(),
+            WatchDriver::new(
+                c,
+                store.clone(),
+                driver_config(&["DaemonSet", "Pod", "Node"]),
+            )
+            .spawn(),
         );
     }
     if enable.job {
@@ -1028,9 +1026,8 @@ fn spawn_drivers(
     // CronJob has no spec edit each minute to wake a pure event watch).
     if enable.cronjob {
         let c = CronJobController::new(store.clone(), Arc::new(WallClock), ns.clone());
-        handles.push(
-            WatchDriver::new(c, store.clone(), driver_config(&["CronJob", "Job"])).spawn(),
-        );
+        handles
+            .push(WatchDriver::new(c, store.clone(), driver_config(&["CronJob", "Job"])).spawn());
     }
     if enable.pdb {
         let c = PodDisruptionBudgetController::new(store.clone(), ns.clone());
@@ -1106,9 +1103,7 @@ fn spawn_drivers(
     // the gc block; gated on controllers.enable.namespace.
     if enable.namespace {
         let c = NamespaceController::new(store.clone(), ns.clone());
-        handles.push(
-            WatchDriver::new(c, store.clone(), driver_config(&["Namespace"])).spawn(),
-        );
+        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Namespace"])).spawn());
     }
 
     // PV/PVC binder: binds Pending PersistentVolumeClaims to matching
@@ -1132,11 +1127,7 @@ fn spawn_drivers(
             WatchDriver::new(
                 c,
                 store.clone(),
-                driver_config(&[
-                    "PersistentVolumeClaim",
-                    "PersistentVolume",
-                    "StorageClass",
-                ]),
+                driver_config(&["PersistentVolumeClaim", "PersistentVolume", "StorageClass"]),
             )
             .spawn(),
         );
@@ -1178,9 +1169,7 @@ fn spawn_drivers(
         backend.clone(),
         config.runtime.node_name.clone(),
     ));
-    handles.push(
-        WatchDriver::new(kubelet.clone(), store.clone(), driver_config(&["Pod"])).spawn(),
-    );
+    handles.push(WatchDriver::new(kubelet.clone(), store.clone(), driver_config(&["Pod"])).spawn());
 
     (handles, kubelet)
 }

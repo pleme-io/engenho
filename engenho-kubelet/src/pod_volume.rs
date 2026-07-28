@@ -344,8 +344,9 @@ impl VolumeResolveError {
             VolumeResolveError::ConfigMapNotFound { .. } => "ConfigMapNotFound",
             VolumeResolveError::SecretNotFound { .. } => "SecretNotFound",
             VolumeResolveError::KeyNotFound { .. } => "InvalidVolumeKey",
-            VolumeResolveError::MultipleSources { .. }
-            | VolumeResolveError::NoSource { .. } => "InvalidVolumeSource",
+            VolumeResolveError::MultipleSources { .. } | VolumeResolveError::NoSource { .. } => {
+                "InvalidVolumeSource"
+            }
             VolumeResolveError::Unsupported { reason, .. } => reason,
             VolumeResolveError::PvcNotBound { .. } => "PvcNotBound",
             VolumeResolveError::PvcSourceUnsupported { .. } => "PvcSourceUnsupported",
@@ -620,23 +621,31 @@ fn configmap_files(
         for (k, v) in &cm.binary_data {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(v)
-                .map_err(|e| VolumeResolveError::Materialize(format!(
-                    "decode binaryData[{k}] of ConfigMap {name}: {e}"
-                )))?;
+                .map_err(|e| {
+                    VolumeResolveError::Materialize(format!(
+                        "decode binaryData[{k}] of ConfigMap {name}: {e}"
+                    ))
+                })?;
             files.insert(k.clone(), bytes);
         }
     } else {
         for it in items {
-            let path = if it.path.is_empty() { it.key.clone() } else { it.path.clone() };
+            let path = if it.path.is_empty() {
+                it.key.clone()
+            } else {
+                it.path.clone()
+            };
             if let Some(v) = cm.data.get(&it.key) {
                 files.insert(path, v.clone().into_bytes());
             } else if let Some(v) = cm.binary_data.get(&it.key) {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(v)
-                    .map_err(|e| VolumeResolveError::Materialize(format!(
-                        "decode binaryData[{}] of ConfigMap {name}: {e}",
-                        it.key
-                    )))?;
+                    .map_err(|e| {
+                        VolumeResolveError::Materialize(format!(
+                            "decode binaryData[{}] of ConfigMap {name}: {e}",
+                            it.key
+                        ))
+                    })?;
                 files.insert(path, bytes);
             } else {
                 return Err(VolumeResolveError::KeyNotFound {
@@ -661,9 +670,9 @@ fn secret_files(
     let decode = |key: &str, v: &str| -> Result<Vec<u8>, VolumeResolveError> {
         base64::engine::general_purpose::STANDARD
             .decode(v)
-            .map_err(|e| VolumeResolveError::Materialize(format!(
-                "decode data[{key}] of Secret {name}: {e}"
-            )))
+            .map_err(|e| {
+                VolumeResolveError::Materialize(format!("decode data[{key}] of Secret {name}: {e}"))
+            })
     };
     let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     if items.is_empty() {
@@ -672,7 +681,11 @@ fn secret_files(
         }
     } else {
         for it in items {
-            let path = if it.path.is_empty() { it.key.clone() } else { it.path.clone() };
+            let path = if it.path.is_empty() {
+                it.key.clone()
+            } else {
+                it.path.clone()
+            };
             match sec.data.get(&it.key) {
                 Some(v) => {
                     files.insert(path, decode(&it.key, v)?);
@@ -763,13 +776,14 @@ where
         .and_then(|l| l.get("path"))
         .and_then(Value::as_str);
 
-    let path = host_path.or(local_path).ok_or_else(|| {
-        VolumeResolveError::PvcSourceUnsupported {
-            vol: vol_name.to_string(),
-            claim: claim_name.to_string(),
-            pv: pv_name.to_string(),
-        }
-    })?;
+    let path =
+        host_path
+            .or(local_path)
+            .ok_or_else(|| VolumeResolveError::PvcSourceUnsupported {
+                vol: vol_name.to_string(),
+                claim: claim_name.to_string(),
+                pv: pv_name.to_string(),
+            })?;
 
     Ok(MountSource::PvcHostDir {
         path: PathBuf::from(path),
@@ -861,7 +875,10 @@ impl Default for PodmanVolumeMaterializer {
 /// to a relative `./engenho/volumes` only if `$HOME` is unset (never panics).
 fn default_data_root() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    home.join(".local").join("share").join("engenho").join("volumes")
+    home.join(".local")
+        .join("share")
+        .join("engenho")
+        .join("volumes")
 }
 
 impl PodmanVolumeMaterializer {
@@ -993,9 +1010,7 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
             .args(&argv)
             .output()
             .await
-            .map_err(|e| {
-                VolumeResolveError::Materialize(format!("podman volume rm spawn: {e}"))
-            })?;
+            .map_err(|e| VolumeResolveError::Materialize(format!("podman volume rm spawn: {e}")))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !stderr.contains("no such volume") && !stderr.contains("not found") {
@@ -1076,7 +1091,9 @@ impl VolumeMaterializer for FakeVolumeMaterializer {
             .await
             .files
             .insert(volume.to_string(), files.clone());
-        Ok(MountSource::HostDir(PathBuf::from(format!("/fake/{volume}"))))
+        Ok(MountSource::HostDir(PathBuf::from(format!(
+            "/fake/{volume}"
+        ))))
     }
 
     async fn ensure_empty_dir(
@@ -1206,12 +1223,19 @@ mod tests {
         });
         let mat = FakeVolumeMaterializer::new();
         let fetch = |kind: &str, name: &str| -> Option<Value> {
-            if kind == "ConfigMap" && name == "cm" { Some(cm.clone()) } else { None }
+            if kind == "ConfigMap" && name == "cm" {
+                Some(cm.clone())
+            } else {
+                None
+            }
         };
         let map = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
             .await
             .unwrap();
-        assert_eq!(map.get("cfg"), Some(&MountSource::HostDir(PathBuf::from("/fake/cfg"))));
+        assert_eq!(
+            map.get("cfg"),
+            Some(&MountSource::HostDir(PathBuf::from("/fake/cfg")))
+        );
         let files = mat.files_for("cfg").await.unwrap();
         assert_eq!(files.get("greeting"), Some(&b"hello".to_vec()));
         assert_eq!(files.get("other"), Some(&b"world".to_vec()));
@@ -1229,7 +1253,11 @@ mod tests {
         });
         let mat = FakeVolumeMaterializer::new();
         let fetch = |kind: &str, name: &str| -> Option<Value> {
-            if kind == "Secret" && name == "s" { Some(secret.clone()) } else { None }
+            if kind == "Secret" && name == "s" {
+                Some(secret.clone())
+            } else {
+                None
+            }
         };
         resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
             .await
@@ -1262,9 +1290,13 @@ mod tests {
     #[tokio::test]
     async fn fake_records_remove_empty_dir_calls() {
         let mat = FakeVolumeMaterializer::new();
-        mat.ensure_empty_dir("default", "p1", "scratch").await.unwrap();
+        mat.ensure_empty_dir("default", "p1", "scratch")
+            .await
+            .unwrap();
         assert!(mat.removed_empty_dirs().await.is_empty());
-        mat.remove_empty_dir("default", "p1", "scratch").await.unwrap();
+        mat.remove_empty_dir("default", "p1", "scratch")
+            .await
+            .unwrap();
         assert_eq!(mat.removed_empty_dirs().await, vec!["scratch".to_string()]);
     }
 
@@ -1309,7 +1341,10 @@ mod tests {
         let map = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
             .await
             .unwrap();
-        assert_eq!(map.get("cfg"), Some(&MountSource::HostDir(PathBuf::from("/fake/cfg"))));
+        assert_eq!(
+            map.get("cfg"),
+            Some(&MountSource::HostDir(PathBuf::from("/fake/cfg")))
+        );
         // Materialized with NO files (empty volume).
         assert_eq!(mat.files_for("cfg").await.unwrap().len(), 0);
     }
@@ -1328,8 +1363,14 @@ mod tests {
     #[test]
     fn container_mounts_maps_read_only_defaults() {
         let mut resolved = BTreeMap::new();
-        resolved.insert("cfg".to_string(), MountSource::HostDir(PathBuf::from("/fake/cfg")));
-        resolved.insert("scratch".to_string(), MountSource::NamedVolume("fake-scratch".into()));
+        resolved.insert(
+            "cfg".to_string(),
+            MountSource::HostDir(PathBuf::from("/fake/cfg")),
+        );
+        resolved.insert(
+            "scratch".to_string(),
+            MountSource::NamedVolume("fake-scratch".into()),
+        );
         let container = json!({
             "name": "c",
             "volumeMounts": [
@@ -1365,7 +1406,11 @@ mod tests {
             "data": { "a": "AAA", "b": "BBB" }
         }))
         .unwrap();
-        let items = vec![KeyToPath { key: "a".into(), path: "renamed-a".into(), mode: None }];
+        let items = vec![KeyToPath {
+            key: "a".into(),
+            path: "renamed-a".into(),
+            mode: None,
+        }];
         let files = configmap_files("cm", &cm, &items).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files.get("renamed-a"), Some(&b"AAA".to_vec()));
@@ -1375,7 +1420,9 @@ mod tests {
 
     /// `fetch` closure over a set of (kind, name) → Value objects — the same
     /// seam the kubelet pre-fetch builds, here in-memory (no cluster).
-    fn pvc_fetch(objs: Vec<(&'static str, &'static str, Value)>) -> impl Fn(&str, &str) -> Option<Value> {
+    fn pvc_fetch(
+        objs: Vec<(&'static str, &'static str, Value)>,
+    ) -> impl Fn(&str, &str) -> Option<Value> {
         move |kind: &str, name: &str| {
             objs.iter()
                 .find(|(k, n, _)| *k == kind && *n == name)
@@ -1536,7 +1583,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.pending_reason(), "PvcSourceUnsupported");
-        assert!(matches!(err, VolumeResolveError::PvcSourceUnsupported { .. }));
+        assert!(matches!(
+            err,
+            VolumeResolveError::PvcSourceUnsupported { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1640,7 +1690,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             PodVolumeSource::from_volume(&v).unwrap(),
-            PodVolumeSource::Pvc { read_only: true, .. }
+            PodVolumeSource::Pvc {
+                read_only: true,
+                ..
+            }
         ));
     }
 
@@ -1651,7 +1704,11 @@ mod tests {
             "data": { "a": "AAA" }
         }))
         .unwrap();
-        let items = vec![KeyToPath { key: "nope".into(), path: String::new(), mode: None }];
+        let items = vec![KeyToPath {
+            key: "nope".into(),
+            path: String::new(),
+            mode: None,
+        }];
         let err = configmap_files("cm", &cm, &items).unwrap_err();
         assert_eq!(err.pending_reason(), "InvalidVolumeKey");
     }

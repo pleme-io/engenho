@@ -379,10 +379,9 @@ fn meta_get_json<T: serde::de::DeserializeOwned>(
     meta: &fjall::PartitionHandle,
     key: &[u8],
 ) -> Result<Option<T>, StoreError> {
-    match meta
-        .get(key)
-        .map_err(|e| StoreError::Fatal(format!("read meta {}: {e}", String::from_utf8_lossy(key))))?
-    {
+    match meta.get(key).map_err(|e| {
+        StoreError::Fatal(format!("read meta {}: {e}", String::from_utf8_lossy(key)))
+    })? {
         Some(bytes) => {
             let v = serde_json::from_slice(&bytes).map_err(|e| {
                 StoreError::Fatal(format!("decode meta {}: {e}", String::from_utf8_lossy(key)))
@@ -624,9 +623,12 @@ impl RaftSnapshotBuilder<TypeConfig> for FjallSnapshotBuilder {
             last_membership,
             snapshot_id,
         };
-        meta_put_json(&self.store.inner.meta, META_SNAPSHOT_INDEX, &snapshot_index, |e| {
-            write_snapshot_err(None, &io_to_anyerror_dyn(e))
-        })?;
+        meta_put_json(
+            &self.store.inner.meta,
+            META_SNAPSHOT_INDEX,
+            &snapshot_index,
+            |e| write_snapshot_err(None, &io_to_anyerror_dyn(e)),
+        )?;
         meta_put_json(&self.store.inner.meta, META_SNAPSHOT_META, &meta, |e| {
             write_snapshot_err(None, &io_to_anyerror_dyn(e))
         })?;
@@ -708,15 +710,17 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         // cheap for small clusters; batched-delta is a future
         // optimization, not pre-optimized here) + last_applied (+
         // last_membership on membership entries), then fsync ONCE.
-        let catalog_bytes =
-            serde_json::to_vec(&state.catalog).map_err(|e| write_sm_err(&e))?;
+        let catalog_bytes = serde_json::to_vec(&state.catalog).map_err(|e| write_sm_err(&e))?;
         self.inner
             .catalog
             .insert(CATALOG_KEY, catalog_bytes)
             .map_err(|e| write_sm_err(&e))?;
-        meta_put_json(&self.inner.meta, META_LAST_APPLIED, &state.last_applied, |e| {
-            write_sm_err(&io_to_anyerror_dyn(e))
-        })?;
+        meta_put_json(
+            &self.inner.meta,
+            META_LAST_APPLIED,
+            &state.last_applied,
+            |e| write_sm_err(&io_to_anyerror_dyn(e)),
+        )?;
         if membership_changed {
             meta_put_json(
                 &self.inner.meta,
@@ -766,9 +770,12 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
             .catalog
             .insert(CATALOG_KEY, bytes.clone())
             .map_err(|e| write_snapshot_err(Some(meta.signature()), &e))?;
-        meta_put_json(&self.inner.meta, META_LAST_APPLIED, &meta.last_log_id, |e| {
-            write_snapshot_err(Some(meta.signature()), &io_to_anyerror_dyn(e))
-        })?;
+        meta_put_json(
+            &self.inner.meta,
+            META_LAST_APPLIED,
+            &meta.last_log_id,
+            |e| write_snapshot_err(Some(meta.signature()), &io_to_anyerror_dyn(e)),
+        )?;
         meta_put_json(
             &self.inner.meta,
             META_LAST_MEMBERSHIP,
@@ -996,7 +1003,9 @@ mod tests {
         // Source store: apply a few puts so revision advances.
         let mut src = FjallStore::open(&dir_a).unwrap();
         for i in 2..=5u64 {
-            src.apply(vec![put_entry(i, &format!("p{i}"))]).await.unwrap();
+            src.apply(vec![put_entry(i, &format!("p{i}"))])
+                .await
+                .unwrap();
         }
         let src_cat = src.current_catalog().await;
         let src_rev = src_cat.current_revision;

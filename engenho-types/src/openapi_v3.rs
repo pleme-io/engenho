@@ -26,20 +26,17 @@
 //! hand-wired route.
 
 /// The vendored core (`""`/v1) OpenAPI v3 document.
-pub const CORE_V1: &str =
-    include_str!("../vendor/openapi/v1.34.0/api__v1_openapi.json");
+pub const CORE_V1: &str = include_str!("../vendor/openapi/v1.34.0/api__v1_openapi.json");
 
 /// The vendored apps/v1 OpenAPI v3 document.
-pub const APPS_V1: &str =
-    include_str!("../vendor/openapi/v1.34.0/apis__apps__v1_openapi.json");
+pub const APPS_V1: &str = include_str!("../vendor/openapi/v1.34.0/apis__apps__v1_openapi.json");
 
 /// The vendored rbac.authorization.k8s.io/v1 OpenAPI v3 document.
 pub const RBAC_V1: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__rbac.authorization.k8s.io__v1_openapi.json");
 
 /// The vendored batch/v1 OpenAPI v3 document (Job, CronJob).
-pub const BATCH_V1: &str =
-    include_str!("../vendor/openapi/v1.34.0/apis__batch__v1_openapi.json");
+pub const BATCH_V1: &str = include_str!("../vendor/openapi/v1.34.0/apis__batch__v1_openapi.json");
 
 /// The vendored networking.k8s.io/v1 OpenAPI v3 document (Ingress,
 /// IngressClass, NetworkPolicy).
@@ -47,8 +44,7 @@ pub const NETWORKING_V1: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__networking.k8s.io__v1_openapi.json");
 
 /// The vendored policy/v1 OpenAPI v3 document (PodDisruptionBudget).
-pub const POLICY_V1: &str =
-    include_str!("../vendor/openapi/v1.34.0/apis__policy__v1_openapi.json");
+pub const POLICY_V1: &str = include_str!("../vendor/openapi/v1.34.0/apis__policy__v1_openapi.json");
 
 /// The vendored storage.k8s.io/v1 OpenAPI v3 document (StorageClass, CSINode,
 /// CSIDriver, VolumeAttachment, CSIStorageCapacity).

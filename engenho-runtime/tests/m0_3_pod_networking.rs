@@ -126,15 +126,7 @@ fn podman_start_listener(container: &str, port: u16) {
 fn podman_tcp_reachable(from_container: &str, to_ip: &str, port: u16) -> bool {
     let port_s = port.to_string();
     Command::new("podman")
-        .args([
-            "exec",
-            from_container,
-            "nc",
-            "-z",
-            "-w3",
-            to_ip,
-            &port_s,
-        ])
+        .args(["exec", from_container, "nc", "-z", "-w3", to_ip, &port_s])
         .output()
         .ok()
         .map(|o| o.status.success())
@@ -156,7 +148,13 @@ fn podman_tcp_reachable(from_container: &str, to_ip: &str, port: u16) -> bool {
 fn resolve_via_client(network: &str, name: &str) -> Vec<String> {
     let out = Command::new("podman")
         .args([
-            "run", "--rm", "--network", network, "docker.io/library/busybox", "nslookup", name,
+            "run",
+            "--rm",
+            "--network",
+            network,
+            "docker.io/library/busybox",
+            "nslookup",
+            name,
         ])
         .output();
     let Ok(out) = out else {
@@ -164,7 +162,8 @@ fn resolve_via_client(network: &str, name: &str) -> Vec<String> {
     };
     // Parse stdout even on non-zero exit (search-domain NXDOMAIN noise).
     let text = String::from_utf8_lossy(&out.stdout);
-    let is_ipv4 = |s: &str| s.split('.').count() == 4 && s.split('.').all(|o| o.parse::<u8>().is_ok());
+    let is_ipv4 =
+        |s: &str| s.split('.').count() == 4 && s.split('.').all(|o| o.parse::<u8>().is_ok());
     let mut ips: Vec<String> = text
         .lines()
         .filter(|line| line.contains("Address"))
@@ -187,8 +186,16 @@ fn client_connect_by_name(network: &str, name: &str, port: u16) -> bool {
     let port_s = port.to_string();
     Command::new("podman")
         .args([
-            "run", "--rm", "--network", network, "docker.io/library/busybox", "nc", "-z", "-w3",
-            name, &port_s,
+            "run",
+            "--rm",
+            "--network",
+            network,
+            "docker.io/library/busybox",
+            "nc",
+            "-z",
+            "-w3",
+            name,
+            &port_s,
         ])
         .output()
         .ok()
@@ -225,7 +232,11 @@ async fn http_get(
     addr: SocketAddr,
     path: &str,
 ) -> Option<serde_json::Value> {
-    let resp = client.get(format!("http://{addr}{path}")).send().await.ok()?;
+    let resp = client
+        .get(format!("http://{addr}{path}"))
+        .send()
+        .await
+        .ok()?;
     if resp.status() != reqwest::StatusCode::OK {
         return None;
     }
@@ -492,7 +503,12 @@ async fn two_replica_deployment_gets_real_ips_endpoints_and_pod_to_pod_reachabil
     // ── Resolve the RS-generated pod names via HTTP ─────────────────────
     // 1. ReplicaSet owned by the Deployment.
     let rs = poll_until(TIMEOUT, INTERVAL, || async {
-        let items = http_list(&client, addr, "/apis/apps/v1/namespaces/default/replicasets").await;
+        let items = http_list(
+            &client,
+            addr,
+            "/apis/apps/v1/namespaces/default/replicasets",
+        )
+        .await;
         items.into_iter().find(|r| is_owned_by(r, &dep_uid))
     })
     .await
@@ -656,7 +672,9 @@ async fn two_replica_deployment_gets_real_ips_endpoints_and_pod_to_pod_reachabil
     // ── ASSERT: both real containers are gone (kubelet stop-then-remove) ─
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(45);
     let gone = poll_until_blocking(CLEANUP_TIMEOUT, INTERVAL, || {
-        container_names.iter().all(|cn| !podman_container_exists(cn))
+        container_names
+            .iter()
+            .all(|cn| !podman_container_exists(cn))
     });
     assert!(
         gone,
@@ -796,7 +814,12 @@ async fn service_name_resolves_via_aardvark_dns_and_client_connects_by_name() {
 
     // ── Resolve the RS-generated pod names via HTTP ─────────────────────
     let rs = poll_until(TIMEOUT, INTERVAL, || async {
-        let items = http_list(&client, addr, "/apis/apps/v1/namespaces/default/replicasets").await;
+        let items = http_list(
+            &client,
+            addr,
+            "/apis/apps/v1/namespaces/default/replicasets",
+        )
+        .await;
         items.into_iter().find(|r| is_owned_by(r, &dep_uid))
     })
     .await
@@ -1014,7 +1037,9 @@ async fn service_name_resolves_via_aardvark_dns_and_client_connects_by_name() {
     // ── ASSERT: both real containers gone (kubelet stop-then-remove) ─────
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(45);
     let gone = poll_until_blocking(CLEANUP_TIMEOUT, INTERVAL, || {
-        container_names.iter().all(|cn| !podman_container_exists(cn))
+        container_names
+            .iter()
+            .all(|cn| !podman_container_exists(cn))
     });
     assert!(
         gone,

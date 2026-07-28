@@ -223,9 +223,7 @@ async fn post_namespace_and_deployment(
         "deployment {dep} in {ns} POST should 201"
     );
     let created: serde_json::Value = resp.json().await.unwrap();
-    obj_uid(&created)
-        .expect("deployment got a uid")
-        .to_string()
+    obj_uid(&created).expect("deployment got a uid").to_string()
 }
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -245,8 +243,15 @@ async fn await_owned_rs(
             &format!("/apis/apps/v1/namespaces/{ns}/replicasets"),
         )
         .await;
-        let owned: Vec<_> = items.into_iter().filter(|r| is_owned_by(r, dep_uid)).collect();
-        if owned.len() == 1 { Some(owned[0].clone()) } else { None }
+        let owned: Vec<_> = items
+            .into_iter()
+            .filter(|r| is_owned_by(r, dep_uid))
+            .collect();
+        if owned.len() == 1 {
+            Some(owned[0].clone())
+        } else {
+            None
+        }
     })
     .await
     .unwrap_or_else(|| panic!("exactly 1 RS owned by {dep_uid} never appeared in ns {ns}"))
@@ -261,7 +266,10 @@ async fn await_owned_pods(
 ) -> Vec<serde_json::Value> {
     poll_until(TIMEOUT, INTERVAL, || async {
         let items = http_list(client, addr, &format!("/api/v1/namespaces/{ns}/pods")).await;
-        let owned: Vec<_> = items.into_iter().filter(|p| is_owned_by(p, rs_uid)).collect();
+        let owned: Vec<_> = items
+            .into_iter()
+            .filter(|p| is_owned_by(p, rs_uid))
+            .collect();
         if owned.len() == 2 { Some(owned) } else { None }
     })
     .await
@@ -369,7 +377,12 @@ async fn namespaced_chain_lands_in_parent_namespace() {
     // The whole point of the bug fix. Give the chain time to (incorrectly)
     // leak into default before asserting it didn't.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let default_rs = http_list(&client, addr, "/apis/apps/v1/namespaces/default/replicasets").await;
+    let default_rs = http_list(
+        &client,
+        addr,
+        "/apis/apps/v1/namespaces/default/replicasets",
+    )
+    .await;
     assert!(
         default_rs.is_empty(),
         "NO ReplicaSet may land in default; found {}: {:?}",

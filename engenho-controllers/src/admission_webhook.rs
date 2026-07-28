@@ -58,7 +58,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use engenho_store::patch_apply::{Gvk, MockPatchEnv, PatchBody, PatchSchemaEnv, apply as apply_patch};
+use engenho_store::patch_apply::{
+    Gvk, MockPatchEnv, PatchBody, PatchSchemaEnv, apply as apply_patch,
+};
 use engenho_types::patch::PatchType;
 
 use crate::admission::{
@@ -321,9 +323,8 @@ impl StoreServiceResolver {
 #[async_trait]
 impl ServiceResolver for StoreServiceResolver {
     async fn cluster_ip(&self, namespace: &str, name: &str) -> Option<String> {
-        let key = engenho_store::resource::ResourceKey::namespaced(
-            "", "v1", "Service", namespace, name,
-        );
+        let key =
+            engenho_store::resource::ResourceKey::namespaced("", "v1", "Service", namespace, name);
         let svc = self.store.get(&key).await?;
         let ip = svc
             .get("spec")
@@ -377,7 +378,10 @@ fn parse_one_webhook(hook: &Value) -> Option<MutatingWebhook> {
     let client_config = WebhookClientConfig {
         url: cc.get("url").and_then(Value::as_str).map(str::to_string),
         service: cc.get("service").and_then(parse_service_ref),
-        ca_bundle: cc.get("caBundle").and_then(Value::as_str).map(str::to_string),
+        ca_bundle: cc
+            .get("caBundle")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     };
     let rules = hook
         .get("rules")
@@ -495,11 +499,7 @@ pub fn rules_match(
 /// Build a v1 `AdmissionReview` request object for `request` targeting
 /// `resource` (the plural). `uid` is the per-call correlation id.
 #[must_use]
-pub fn build_admission_review(
-    request: &AdmissionRequest,
-    resource: &str,
-    uid: &str,
-) -> Value {
+pub fn build_admission_review(request: &AdmissionRequest, resource: &str, uid: &str) -> Value {
     let key = &request.key;
     let user = &request.user_info;
     json!({
@@ -558,21 +558,24 @@ pub fn read_admission_review(
     webhook_name: &str,
     review: &Value,
 ) -> Result<WebhookResponse, WebhookError> {
-    let resp = review.get("response").ok_or_else(|| WebhookError::BadResponse {
-        webhook: webhook_name.to_string(),
-        reason: "missing `response`".into(),
-    })?;
+    let resp = review
+        .get("response")
+        .ok_or_else(|| WebhookError::BadResponse {
+            webhook: webhook_name.to_string(),
+            reason: "missing `response`".into(),
+        })?;
     let uid = resp
         .get("uid")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let allowed = resp.get("allowed").and_then(Value::as_bool).ok_or_else(|| {
-        WebhookError::BadResponse {
+    let allowed = resp
+        .get("allowed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| WebhookError::BadResponse {
             webhook: webhook_name.to_string(),
             reason: "missing/non-bool `response.allowed`".into(),
-        }
-    })?;
+        })?;
     let message = resp
         .get("status")
         .and_then(|s| s.get("message"))
@@ -628,11 +631,12 @@ pub fn apply_webhook_patch(
     ops: &Value,
     gvk: &Gvk,
 ) -> Result<Value, WebhookError> {
-    let body =
-        PatchBody::from_raw(PatchType::Json, ops.clone()).map_err(|e| WebhookError::PatchApply {
+    let body = PatchBody::from_raw(PatchType::Json, ops.clone()).map_err(|e| {
+        WebhookError::PatchApply {
             webhook: webhook_name.to_string(),
             reason: e.to_string(),
-        })?;
+        }
+    })?;
     // json-patch is pure (touches no schema env) — the mock env is never
     // consulted; pass one to satisfy the signature.
     let env: &dyn PatchSchemaEnv = &MockPatchEnv::new();
@@ -753,8 +757,7 @@ impl MutatingWebhookPlugin {
                                     mutated = true;
                                 }
                                 Err(e) => {
-                                    if let Some(d) =
-                                        Self::govern_failure(&webhook, &e.to_string())
+                                    if let Some(d) = Self::govern_failure(&webhook, &e.to_string())
                                     {
                                         return d;
                                     }
@@ -834,8 +837,9 @@ impl MutatingWebhookPlugin {
                 webhook: webhook_name.to_string(),
                 namespace: svc.namespace.clone(),
                 name: svc.name.clone(),
-                reason: "Service has no allocated ClusterIP (absent, headless, or not yet allocated)"
-                    .to_string(),
+                reason:
+                    "Service has no allocated ClusterIP (absent, headless, or not yet allocated)"
+                        .to_string(),
             }),
         }
     }
@@ -905,7 +909,10 @@ fn namespace_labels(request: &AdmissionRequest) -> std::collections::BTreeMap<St
         .map(|pairs| {
             pairs
                 .iter()
-                .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+                .filter_map(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -1088,9 +1095,11 @@ impl WebhookCaller for MockWebhookCaller {
         review_request: &Value,
     ) -> Result<Value, String> {
         let mut state = self.inner.lock().await;
-        state
-            .calls
-            .push((endpoint.to_string(), timeout_seconds, review_request.clone()));
+        state.calls.push((
+            endpoint.to_string(),
+            timeout_seconds,
+            review_request.clone(),
+        ));
         if let Some(msg) = state.errors.get(endpoint) {
             return Err(msg.clone());
         }
@@ -1110,12 +1119,14 @@ mod tests {
 
     fn pluralizer() -> Pluralizer {
         Box::new(|_g, _v, kind| {
-            Some(match kind {
-                "Pod" => "pods",
-                "Deployment" => "deployments",
-                other => return Some(format!("{}s", other.to_lowercase())),
-            }
-            .to_string())
+            Some(
+                match kind {
+                    "Pod" => "pods",
+                    "Deployment" => "deployments",
+                    other => return Some(format!("{}s", other.to_lowercase())),
+                }
+                .to_string(),
+            )
         })
     }
 
@@ -1170,7 +1181,9 @@ mod tests {
     #[tokio::test]
     async fn sidecar_is_injected_into_the_object() {
         let endpoint = "https://inject.tatara-mesh.svc/mutate";
-        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(endpoint)]));
+        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(
+            endpoint,
+        )]));
         let caller = Arc::new(MockWebhookCaller::new());
         caller
             .set_response(
@@ -1224,14 +1237,19 @@ mod tests {
         let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer());
 
         let decision = plugin.review(&pod_request()).await.unwrap();
-        assert!(matches!(decision, AdmissionDecision::Allow), "no rule match → admit unchanged");
+        assert!(
+            matches!(decision, AdmissionDecision::Allow),
+            "no rule match → admit unchanged"
+        );
         assert_eq!(caller.calls().await.len(), 0, "webhook NOT called");
     }
 
     #[tokio::test]
     async fn failure_policy_fail_rejects_on_call_error() {
         let endpoint = "https://flaky.svc/mutate";
-        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(endpoint)]));
+        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(
+            endpoint,
+        )]));
         let caller = Arc::new(MockWebhookCaller::new());
         caller.set_error(endpoint, "connection refused").await;
         let plugin = MutatingWebhookPlugin::new(source, caller, pluralizer());
@@ -1269,7 +1287,9 @@ mod tests {
     #[tokio::test]
     async fn webhook_deny_short_circuits() {
         let endpoint = "https://policy.svc/mutate";
-        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(endpoint)]));
+        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(
+            endpoint,
+        )]));
         let caller = Arc::new(MockWebhookCaller::new());
         caller
             .set_response(
@@ -1335,7 +1355,11 @@ mod tests {
             }
             other => panic!("expected Deny, got {other:?}"),
         }
-        assert_eq!(caller.calls().await.len(), 0, "no HTTP call for an unresolved service ref");
+        assert_eq!(
+            caller.calls().await.len(),
+            0,
+            "no HTTP call for an unresolved service ref"
+        );
     }
 
     #[tokio::test]
@@ -1362,11 +1386,13 @@ mod tests {
             AdmissionDecision::Mutate(v) => v,
             other => panic!("expected Mutate, got {other:?}"),
         };
-        assert!(mutated["spec"]["containers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| c["name"] == "aresta-proxy"));
+        assert!(
+            mutated["spec"]["containers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == "aresta-proxy")
+        );
         // The call went to the SYNTHESIZED ClusterIP URL.
         let calls = caller.calls().await;
         assert_eq!(calls.len(), 1);
@@ -1514,7 +1540,10 @@ mod tests {
         // B was called with the object A already mutated.
         let calls = caller.calls().await;
         let b_call = calls.iter().find(|(e, _, _)| e == ep_b).unwrap();
-        assert_eq!(b_call.2["request"]["object"]["metadata"]["labels"]["mutated-by-a"], "yes");
+        assert_eq!(
+            b_call.2["request"]["object"]["metadata"]["labels"]["mutated-by-a"],
+            "yes"
+        );
     }
 
     #[tokio::test]
@@ -1527,7 +1556,10 @@ mod tests {
         let source = Arc::new(StaticConfigSource::new(vec![config]));
         let caller = Arc::new(MockWebhookCaller::new());
         caller
-            .set_response(endpoint, MockWebhookCaller::json_patch_review("u", &sidecar_ops()))
+            .set_response(
+                endpoint,
+                MockWebhookCaller::json_patch_review("u", &sidecar_ops()),
+            )
             .await;
         let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer());
 
@@ -1547,7 +1579,9 @@ mod tests {
     #[tokio::test]
     async fn unsupported_patch_type_is_governed_by_failure_policy() {
         let endpoint = "https://badtype.svc/mutate";
-        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(endpoint)]));
+        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(
+            endpoint,
+        )]));
         let caller = Arc::new(MockWebhookCaller::new());
         // Response declares a patchType engenho doesn't support.
         caller
@@ -1573,7 +1607,9 @@ mod tests {
     #[tokio::test]
     async fn delete_is_admit_through() {
         let endpoint = "https://x.svc/mutate";
-        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(endpoint)]));
+        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(
+            endpoint,
+        )]));
         let caller = Arc::new(MockWebhookCaller::new());
         let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer());
 
@@ -1582,14 +1618,22 @@ mod tests {
         req.value = None;
         let decision = plugin.review(&req).await.unwrap();
         assert!(matches!(decision, AdmissionDecision::Allow));
-        assert_eq!(caller.calls().await.len(), 0, "mutating plugin doesn't call on delete");
+        assert_eq!(
+            caller.calls().await.len(),
+            0,
+            "mutating plugin doesn't call on delete"
+        );
     }
 
     #[test]
     fn rules_match_wildcards() {
         let wh = MutatingWebhook {
             name: "w".into(),
-            client_config: WebhookClientConfig { url: Some("u".into()), service: None, ca_bundle: None },
+            client_config: WebhookClientConfig {
+                url: Some("u".into()),
+                service: None,
+                ca_bundle: None,
+            },
             rules: vec![RuleWithOperations {
                 operations: vec!["*".into()],
                 api_groups: vec!["*".into()],

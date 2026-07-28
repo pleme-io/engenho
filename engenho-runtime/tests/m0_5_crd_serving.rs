@@ -159,8 +159,9 @@ async fn crd_lifecycle_register_crud_discovery_unregister() {
         .and_then(|r| r.as_array())
         .expect("apiextensions group resource list");
     assert!(
-        crd_res.iter().any(|r| r.get("name").and_then(|n| n.as_str())
-            == Some("customresourcedefinitions")),
+        crd_res
+            .iter()
+            .any(|r| r.get("name").and_then(|n| n.as_str()) == Some("customresourcedefinitions")),
         "apiextensions.k8s.io/v1 advertises customresourcedefinitions: {disc}"
     );
 
@@ -254,7 +255,9 @@ async fn crd_lifecycle_register_crud_discovery_unregister() {
     //
     // POST a Widget → 201 with resourceVersion + uid (TypeMeta inherited).
     let resp = client
-        .post(format!("{base}/apis/example.com/v1/namespaces/default/widgets"))
+        .post(format!(
+            "{base}/apis/example.com/v1/namespaces/default/widgets"
+        ))
         .json(&widget_body())
         .send()
         .await
@@ -279,7 +282,9 @@ async fn crd_lifecycle_register_crud_discovery_unregister() {
 
     // GET it back.
     let got: serde_json::Value = client
-        .get(format!("{base}/apis/example.com/v1/namespaces/default/widgets/w1"))
+        .get(format!(
+            "{base}/apis/example.com/v1/namespaces/default/widgets/w1"
+        ))
         .send()
         .await
         .unwrap()
@@ -287,28 +292,39 @@ async fn crd_lifecycle_register_crud_discovery_unregister() {
         .await
         .unwrap();
     assert_eq!(
-        got.get("spec").and_then(|s| s.get("color")).and_then(|c| c.as_str()),
+        got.get("spec")
+            .and_then(|s| s.get("color"))
+            .and_then(|c| c.as_str()),
         Some("blue")
     );
 
     // LIST widgets in the namespace.
     let list: serde_json::Value = client
-        .get(format!("{base}/apis/example.com/v1/namespaces/default/widgets"))
+        .get(format!(
+            "{base}/apis/example.com/v1/namespaces/default/widgets"
+        ))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(list.get("kind").and_then(|k| k.as_str()), Some("WidgetList"));
     assert_eq!(
-        list.get("items").and_then(|i| i.as_array()).map(|a| a.len()),
+        list.get("kind").and_then(|k| k.as_str()),
+        Some("WidgetList")
+    );
+    assert_eq!(
+        list.get("items")
+            .and_then(|i| i.as_array())
+            .map(|a| a.len()),
         Some(1)
     );
 
     // DELETE the Widget instance.
     let resp = client
-        .delete(format!("{base}/apis/example.com/v1/namespaces/default/widgets/w1"))
+        .delete(format!(
+            "{base}/apis/example.com/v1/namespaces/default/widgets/w1"
+        ))
         .send()
         .await
         .unwrap();
@@ -330,7 +346,9 @@ async fn crd_lifecycle_register_crud_discovery_unregister() {
         let base = base.clone();
         async move {
             let resp = client
-                .get(format!("{base}/apis/example.com/v1/namespaces/default/widgets"))
+                .get(format!(
+                    "{base}/apis/example.com/v1/namespaces/default/widgets"
+                ))
                 .send()
                 .await
                 .ok()?;

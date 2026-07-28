@@ -40,7 +40,9 @@ pub fn gone_to_api_error(gone: WatchGone) -> ApiError {
         WatchGone::CompactedTooOld {
             requested,
             compacted,
-        } => ApiError::Gone(format!("too old resource version: {requested} ({compacted})")),
+        } => ApiError::Gone(format!(
+            "too old resource version: {requested} ({compacted})"
+        )),
         WatchGone::Overflow { last_seen, .. } => ApiError::Gone(format!(
             "watch buffer overflowed at registration; resume from {last_seen}"
         )),
@@ -176,7 +178,12 @@ pub trait ResourceHandler: Send + Sync + 'static {
     ///
     /// `query` carries the typed `?container=` + `?tailLines=` knobs. Returns
     /// the raw log text (rendered as `text/plain`).
-    async fn logs(&self, _namespace: Option<&str>, name: &str, _query: &LogQuery) -> Result<String, ApiError> {
+    async fn logs(
+        &self,
+        _namespace: Option<&str>,
+        name: &str,
+        _query: &LogQuery,
+    ) -> Result<String, ApiError> {
         Err(self.no_subresource("log", name))
     }
 
@@ -729,7 +736,8 @@ impl ResourceHandler for StoreBackedHandler {
         // preserves generation (status-only writes don't bump it).
         let incoming_status = incoming.get("status").cloned().unwrap_or(Value::Null);
         let scoped = serde_json::json!({ "status": incoming_status });
-        self.propose_scoped_patch(&key, name, scoped, expected).await
+        self.propose_scoped_patch(&key, name, scoped, expected)
+            .await
     }
 
     async fn patch_status(
@@ -795,7 +803,9 @@ impl ResourceHandler for StoreBackedHandler {
         // Write ONLY spec.replicas. This bumps generation (a real spec
         // change) — correct, scale IS a spec mutation.
         let scoped = serde_json::json!({ "spec": { "replicas": scale.spec.replicas } });
-        let _ = self.propose_scoped_patch(&key, name, scoped, expected).await?;
+        let _ = self
+            .propose_scoped_patch(&key, name, scoped, expected)
+            .await?;
         // Re-project the now-updated parent for the Scale response.
         self.get_scale(namespace, name).await
     }
@@ -1008,8 +1018,7 @@ impl ResourceHandler for StoreBackedHandler {
         let (continue_str, remaining_out) = if page_full && store_tail_remaining > 0 {
             // More GVK items remain after the last store page; resume
             // strictly after the last EMITTED key at the series snapshot.
-            let token = last_emitted_key
-                .map(|k| ContinueToken::new(rv, k).encode());
+            let token = last_emitted_key.map(|k| ContinueToken::new(rv, k).encode());
             (token, Some(store_tail_remaining))
         } else {
             (None, None)
@@ -1552,10 +1561,7 @@ fn scope_status_patch(
                 }
                 // Preserve the CAS precondition (resourceVersion) only — never
                 // any other metadata field (a /status write can't rename/relabel).
-                if let Some(rv) = obj
-                    .get("metadata")
-                    .and_then(|m| m.get("resourceVersion"))
-                {
+                if let Some(rv) = obj.get("metadata").and_then(|m| m.get("resourceVersion")) {
                     out.insert(
                         "metadata".to_string(),
                         serde_json::json!({ "resourceVersion": rv.clone() }),
@@ -2019,7 +2025,10 @@ mod tests {
         assert!(out.get("kind").is_none(), "item kind stripped");
         assert!(out.get("apiVersion").is_none(), "item apiVersion stripped");
         // Everything else survives untouched.
-        assert_eq!(out.pointer("/metadata/name"), Some(&Value::String("x".into())));
+        assert_eq!(
+            out.pointer("/metadata/name"),
+            Some(&Value::String("x".into()))
+        );
         assert_eq!(out.pointer("/data/k"), Some(&Value::String("v".into())));
     }
 
@@ -2034,7 +2043,10 @@ mod tests {
         let err = gone_to_api_error(gone);
         assert!(matches!(err, ApiError::Gone(_)));
         let msg = err.to_string();
-        assert!(msg.contains('2') && msg.contains('5'), "carries req + compacted: {msg}");
+        assert!(
+            msg.contains('2') && msg.contains('5'),
+            "carries req + compacted: {msg}"
+        );
         // Renders HTTP 410.
         use axum::response::IntoResponse;
         assert_eq!(
@@ -2114,7 +2126,10 @@ mod tests {
             Some(&Value::String("team-a".to_string())),
             "the name auto-label is present"
         );
-        assert_eq!(body.pointer("/status/phase"), Some(&Value::String("Active".to_string())));
+        assert_eq!(
+            body.pointer("/status/phase"),
+            Some(&Value::String("Active".to_string()))
+        );
     }
 
     #[test]

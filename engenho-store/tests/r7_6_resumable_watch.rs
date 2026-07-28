@@ -122,7 +122,12 @@ async fn resumability_case(mesh: Arc<StoreMesh>) {
     assert_eq!(next_event_rev(&mut w).await, 7, "contiguous live tail");
 
     drop(w);
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -193,7 +198,12 @@ async fn gap_freedom_memory() {
     for _ in 0..50 {
         gap_freedom_iteration(&mesh, 20).await;
     }
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -206,7 +216,12 @@ async fn gap_freedom_fjall() {
     for _ in 0..15 {
         gap_freedom_iteration(&mesh, 10).await;
     }
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -229,11 +244,7 @@ async fn gap_freedom_fjall() {
 // range (from, final] — no reorder, no gap, no dup. FAILS before the
 // structural fix (replay fed under the lock), PASSES after.
 
-async fn nonempty_replay_boundary_iteration(
-    mesh: &Arc<StoreMesh>,
-    backlog: u64,
-    live: u64,
-) {
+async fn nonempty_replay_boundary_iteration(mesh: &Arc<StoreMesh>, backlog: u64, live: u64) {
     // (1) Build a NON-EMPTY backlog: put `backlog` revisions, then pick
     // a resume point `from` partway through so the replay is non-empty.
     let base = mesh.current_catalog().await.revision().get();
@@ -250,7 +261,10 @@ async fn nonempty_replay_boundary_iteration(
     // the old spawned-feeder path, an apply at boundary+1 could `fan` its
     // event into the channel BEFORE the feeder task drained the replay —
     // delivering it ahead of the replay revisions (the [6,3,4,5] defect).
-    let mut w = mesh.watch_from(WatchOpts::from_revision(from)).await.unwrap();
+    let mut w = mesh
+        .watch_from(WatchOpts::from_revision(from))
+        .await
+        .unwrap();
 
     let writer = {
         let mesh = mesh.clone();
@@ -298,7 +312,12 @@ async fn nonempty_replay_boundary_ordering_memory() {
     for _ in 0..40 {
         nonempty_replay_boundary_iteration(&mesh, 20, 10).await;
     }
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -310,7 +329,12 @@ async fn nonempty_replay_boundary_ordering_fjall() {
     for _ in 0..12 {
         nonempty_replay_boundary_iteration(&mesh, 12, 6).await;
     }
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -391,10 +415,18 @@ async fn boundary_single_event_delivered_exactly_once_memory() {
         // No second copy of the same revision is queued.
         // (Drain a brief window — must be empty.)
         let dup = tokio::time::timeout(Duration::from_millis(30), w.next()).await;
-        assert!(dup.is_err(), "the boundary event must be delivered exactly once");
+        assert!(
+            dup.is_err(),
+            "the boundary event must be delivered exactly once"
+        );
         drop(w);
     }
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 // =================================================================
@@ -498,7 +530,12 @@ async fn bookmark_case(mesh: Arc<StoreMesh>) {
     );
 
     drop((w, w2));
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 /// Wait for the next Bookmark (ignoring events).
@@ -595,7 +632,10 @@ async fn overflow_case(mesh: Arc<StoreMesh>) {
         {
             Some(Ok(WatchSignal::Event(ev))) => slow_revs.push(ev.resource_version),
             Some(Ok(WatchSignal::Bookmark(_))) => {}
-            Some(Err(WatchGone::Overflow { capacity, last_seen })) => {
+            Some(Err(WatchGone::Overflow {
+                capacity,
+                last_seen,
+            })) => {
                 assert_eq!(capacity, 4, "overflow reports the watcher's buffer");
                 overflow_last_seen = last_seen;
                 break;
@@ -644,7 +684,12 @@ async fn overflow_case(mesh: Arc<StoreMesh>) {
 
     fast_task.abort();
     drop((slow, resumed, fast));
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -677,11 +722,8 @@ async fn lock_held_send_bound_case(mesh: Arc<StoreMesh>) {
         .unwrap();
 
     for i in 1..=20u64 {
-        let res = tokio::time::timeout(
-            Duration::from_secs(2),
-            put(&mesh, &format!("bound{i}"), i),
-        )
-        .await;
+        let res =
+            tokio::time::timeout(Duration::from_secs(2), put(&mesh, &format!("bound{i}"), i)).await;
         assert!(
             res.is_ok(),
             "propose #{i} must return within the timeout even with a stalled watcher"
@@ -689,7 +731,12 @@ async fn lock_held_send_bound_case(mesh: Arc<StoreMesh>) {
     }
 
     drop(_stalled);
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -749,5 +796,10 @@ async fn event_kinds_through_watch_from_memory() {
     );
 
     drop(w);
-    Arc::try_unwrap(mesh).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(mesh)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }

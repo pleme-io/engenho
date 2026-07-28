@@ -118,7 +118,11 @@ async fn scale_put_writes_only_spec_replicas() {
 
     // The parent's spec.replicas is now 5.
     let parent = get_json(&client, &format!("{base}/web")).await;
-    assert_eq!(replicas(&parent), 5, "scale PUT updated parent spec.replicas");
+    assert_eq!(
+        replicas(&parent),
+        5,
+        "scale PUT updated parent spec.replicas"
+    );
     // The selector (other spec content) is preserved.
     assert_eq!(
         parent
@@ -315,7 +319,11 @@ async fn scale_on_kind_without_scale_is_typed_404() {
     let resp = client.post(&cm_base).json(&cm).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
 
-    let resp = client.get(format!("{cm_base}/x/scale")).send().await.unwrap();
+    let resp = client
+        .get(format!("{cm_base}/x/scale"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::NOT_FOUND,
@@ -335,8 +343,7 @@ async fn discovery_advertises_subresource_rows() {
     let client = reqwest::Client::new();
 
     // apps/v1: deployments + deployments/scale + deployments/status.
-    let apps: serde_json::Value =
-        get_json(&client, &format!("http://{addr}/apis/apps/v1")).await;
+    let apps: serde_json::Value = get_json(&client, &format!("http://{addr}/apis/apps/v1")).await;
     let names: Vec<&str> = apps
         .get("resources")
         .unwrap()
@@ -347,7 +354,10 @@ async fn discovery_advertises_subresource_rows() {
         .collect();
     assert!(names.contains(&"deployments"));
     assert!(names.contains(&"deployments/scale"), "scale row advertised");
-    assert!(names.contains(&"deployments/status"), "status row advertised");
+    assert!(
+        names.contains(&"deployments/status"),
+        "status row advertised"
+    );
 
     // The scale row carries autoscaling/v1/Scale.
     let scale_row = apps
@@ -393,7 +403,10 @@ async fn discovery_advertises_subresource_rows() {
         .iter()
         .map(|r| r.get("name").unwrap().as_str().unwrap())
         .collect();
-    assert!(core_names.contains(&"pods/status"), "pods/status advertised");
+    assert!(
+        core_names.contains(&"pods/status"),
+        "pods/status advertised"
+    );
     assert!(
         !core_names.contains(&"pods/scale"),
         "pods/scale must NOT be advertised (Pod has no scale)"
@@ -404,9 +417,18 @@ async fn discovery_advertises_subresource_rows() {
 
     // Rows sort stable: deployments < deployments/scale < deployments/status.
     let dep_idx = names.iter().position(|n| *n == "deployments").unwrap();
-    let scale_idx = names.iter().position(|n| *n == "deployments/scale").unwrap();
-    let status_idx = names.iter().position(|n| *n == "deployments/status").unwrap();
-    assert!(dep_idx < scale_idx && scale_idx < status_idx, "rows sorted by name");
+    let scale_idx = names
+        .iter()
+        .position(|n| *n == "deployments/scale")
+        .unwrap();
+    let status_idx = names
+        .iter()
+        .position(|n| *n == "deployments/status")
+        .unwrap();
+    assert!(
+        dep_idx < scale_idx && scale_idx < status_idx,
+        "rows sorted by name"
+    );
 
     server.shutdown().await.unwrap();
 }

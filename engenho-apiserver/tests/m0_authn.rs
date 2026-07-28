@@ -61,22 +61,24 @@ async fn boot_authn_server(
     .unwrap()
     .with_client_verifier(verifier);
 
-    let state = RouterState::new(handlers)
-        .with_authenticator(Arc::new(ChainAuthenticator::bootstrap(Some(
-            ADMIN_TOKEN.to_string(),
-        ))));
-    let server = ApiServer::start_with_state(
-        "127.0.0.1:0".parse().unwrap(),
-        state,
-        Some(material),
-    )
-    .await
-    .unwrap();
+    let state = RouterState::new(handlers).with_authenticator(Arc::new(
+        ChainAuthenticator::bootstrap(Some(ADMIN_TOKEN.to_string())),
+    ));
+    let server = ApiServer::start_with_state("127.0.0.1:0".parse().unwrap(), state, Some(material))
+        .await
+        .unwrap();
     let addr = server.local_addr();
     let base = format!("https://127.0.0.1:{}", addr.port());
 
     drop(store);
-    (base, ca_pem, admin.cert_pem, admin.key_pem, server, data_dir)
+    (
+        base,
+        ca_pem,
+        admin.cert_pem,
+        admin.key_pem,
+        server,
+        data_dir,
+    )
 }
 
 /// A reqwest client trusting ONLY the cluster CA, presenting the admin client
@@ -120,8 +122,7 @@ fn ssr_url(base: &str) -> String {
 #[tokio::test]
 async fn self_subject_review_with_admin_cert_is_engenho_admin() {
     let store = boot_store_handlers().await;
-    let (base, ca_pem, cert_pem, key_pem, server, _dir) =
-        boot_authn_server(store).await;
+    let (base, ca_pem, cert_pem, key_pem, server, _dir) = boot_authn_server(store).await;
     let client = client_with_admin_cert(&ca_pem, &cert_pem, &key_pem);
 
     let resp = client
@@ -136,7 +137,10 @@ async fn self_subject_review_with_admin_cert_is_engenho_admin() {
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let v: serde_json::Value = resp.json().await.unwrap();
     let user = &v["status"]["userInfo"];
-    assert_eq!(user["username"], "engenho-admin", "admin cert → engenho-admin: {v}");
+    assert_eq!(
+        user["username"], "engenho-admin",
+        "admin cert → engenho-admin: {v}"
+    );
     let groups: Vec<String> = serde_json::from_value(user["groups"].clone()).unwrap();
     assert!(
         groups.iter().any(|g| g == "system:masters"),
@@ -221,7 +225,10 @@ async fn admission_observes_authenticated_user_info() {
     // default).
     let store = boot_store().await;
     let hook = Arc::new(FakeAdmissionWebhook::new("observer"));
-    let chain = Arc::new(AdmissionChain::new(vec![hook.clone()], AdmissionMode::FailOpen));
+    let chain = Arc::new(AdmissionChain::new(
+        vec![hook.clone()],
+        AdmissionMode::FailOpen,
+    ));
     let handlers = handlers_from_catalog_with_admission(store.clone(), chain);
 
     let (base, ca_pem, _cert, _key, server, _dir) = boot_authn_server(handlers).await;
@@ -239,7 +246,11 @@ async fn admission_observes_authenticated_user_info() {
         .send()
         .await
         .expect("admin-bearer create");
-    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "create succeeds");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "create succeeds"
+    );
 
     let observed = hook
         .last_user_info()
@@ -256,7 +267,13 @@ async fn admission_observes_authenticated_user_info() {
     // The committed object exists (sanity).
     assert!(
         store
-            .get(&ResourceKey::namespaced("", "v1", "Pod", "default", "authn-pod"))
+            .get(&ResourceKey::namespaced(
+                "",
+                "v1",
+                "Pod",
+                "default",
+                "authn-pod"
+            ))
             .await
             .is_some()
     );

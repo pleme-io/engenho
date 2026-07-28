@@ -115,7 +115,11 @@ async fn non_core_deployment_full_crud() {
         "spec": { "replicas": 3, "selector": { "matchLabels": { "app": "web" } } }
     });
     let resp = client.post(&base).json(&body).send().await.unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "apps/v1 POST must 201");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "apps/v1 POST must 201"
+    );
     let created: serde_json::Value = resp.json().await.unwrap();
     let rv = created
         .get("metadata")
@@ -124,7 +128,10 @@ async fn non_core_deployment_full_crud() {
         .unwrap()
         .as_str()
         .unwrap();
-    assert!(!rv.is_empty(), "created Deployment carries a resourceVersion");
+    assert!(
+        !rv.is_empty(),
+        "created Deployment carries a resourceVersion"
+    );
 
     // GET → 200, kind/apiVersion/spec correct
     let resp = client.get(format!("{base}/web")).send().await.unwrap();
@@ -144,7 +151,12 @@ async fn non_core_deployment_full_crud() {
 
     // PATCH replicas → 5
     let patch = serde_json::json!({ "spec": { "replicas": 5 } });
-    let resp = client.patch(format!("{base}/web")).json(&patch).send().await.unwrap();
+    let resp = client
+        .patch(format!("{base}/web"))
+        .json(&patch)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let patched: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(patched.get("spec").unwrap().get("replicas").unwrap(), 5);
@@ -170,7 +182,14 @@ async fn non_core_deployment_list_then_watch() {
     let dep_base = format!("http://{addr}/apis/apps/v1/namespaces/default/deployments");
 
     // LIST → capture snapshot rv N.
-    let list: serde_json::Value = client.get(&dep_base).send().await.unwrap().json().await.unwrap();
+    let list: serde_json::Value = client
+        .get(&dep_base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let n: u64 = list
         .get("metadata")
         .unwrap()
@@ -187,7 +206,11 @@ async fn non_core_deployment_list_then_watch() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "grouped watch should 200");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "grouped watch should 200"
+    );
     let mut watch = NdjsonReader::new(resp);
 
     // POST a NEW Deployment + a core Pod (the Pod must NOT appear).
@@ -244,7 +267,11 @@ async fn rbac_second_group_both_scopes() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "ClusterRole POST 201");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "ClusterRole POST 201"
+    );
     let resp = client
         .get(format!("http://{addr}/apis/{g}/clusterroles/viewer"))
         .send()
@@ -307,7 +334,9 @@ async fn scope_mismatch_is_bad_request() {
         "metadata": { "name": "oops2" }, "rules": []
     });
     let resp = client
-        .post(format!("http://{addr}/apis/{g}/namespaces/default/clusterroles"))
+        .post(format!(
+            "http://{addr}/apis/{g}/namespaces/default/clusterroles"
+        ))
         .json(&cr)
         .send()
         .await
@@ -332,7 +361,11 @@ async fn discovery_apis_group_list_shape() {
     let client = reqwest::Client::new();
 
     // GET /apis → APIGroupList containing apps + rbac.
-    let resp = client.get(format!("http://{addr}/apis")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://{addr}/apis"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let gl: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(gl.get("kind").unwrap(), "APIGroupList");
@@ -347,7 +380,10 @@ async fn discovery_apis_group_list_shape() {
         "rbac group advertised: {names:?}"
     );
     // Core group is NOT in /apis.
-    assert!(!names.contains(&""), "core group is not advertised under /apis");
+    assert!(
+        !names.contains(&""),
+        "core group is not advertised under /apis"
+    );
     // Each group's preferredVersion.version is its served version. Every group
     // serves "v1" EXCEPT autoscaling, whose conformant HorizontalPodAutoscaler
     // lives in v2 (the M0.0.4 breadth expansion added it at v2, matching
@@ -371,7 +407,11 @@ async fn discovery_apps_v1_resource_list_shape() {
     let addr = server.local_addr();
     let client = reqwest::Client::new();
 
-    let resp = client.get(format!("http://{addr}/apis/apps/v1")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://{addr}/apis/apps/v1"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let rl: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(rl.get("kind").unwrap(), "APIResourceList");
@@ -435,7 +475,11 @@ async fn discovery_core_api_and_api_v1() {
     let client = reqwest::Client::new();
 
     // GET /api → APIVersions { versions: ["v1"] }.
-    let resp = client.get(format!("http://{addr}/api")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let av: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(av.get("kind").unwrap(), "APIVersions");
@@ -450,7 +494,11 @@ async fn discovery_core_api_and_api_v1() {
     assert_eq!(versions, vec!["v1"]);
 
     // GET /api/v1 → APIResourceList groupVersion "v1" containing pods.
-    let resp = client.get(format!("http://{addr}/api/v1")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://{addr}/api/v1"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let rl: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(rl.get("kind").unwrap(), "APIResourceList");
@@ -512,9 +560,15 @@ async fn irregular_plural_endpoints_routes_and_discovers() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "endpoints POST 201");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "endpoints POST 201"
+    );
     let resp = client
-        .get(format!("http://{addr}/api/v1/namespaces/default/endpoints/svc"))
+        .get(format!(
+            "http://{addr}/api/v1/namespaces/default/endpoints/svc"
+        ))
         .send()
         .await
         .unwrap();
@@ -539,12 +593,20 @@ async fn irregular_plural_endpoints_routes_and_discovers() {
         .iter()
         .map(|r| r.get("name").unwrap().as_str().unwrap())
         .collect();
-    assert!(names.contains(&"endpoints"), "discovery lists endpoints: {names:?}");
-    assert!(!names.contains(&"endpointss"), "no naive +s plural in discovery");
+    assert!(
+        names.contains(&"endpoints"),
+        "discovery lists endpoints: {names:?}"
+    );
+    assert!(
+        !names.contains(&"endpointss"),
+        "no naive +s plural in discovery"
+    );
 
     // The naive plural is NOT a valid route → 404.
     let resp = client
-        .get(format!("http://{addr}/api/v1/namespaces/default/endpointss"))
+        .get(format!(
+            "http://{addr}/api/v1/namespaces/default/endpointss"
+        ))
         .send()
         .await
         .unwrap();
@@ -582,15 +644,31 @@ async fn core_pod_crud_regression() {
     assert_eq!(pod.get("kind").unwrap(), "Pod");
     assert_eq!(pod.get("apiVersion").unwrap(), "v1");
 
-    let list: serde_json::Value = client.get(&base).send().await.unwrap().json().await.unwrap();
+    let list: serde_json::Value = client
+        .get(&base)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(list.get("kind").unwrap(), "PodList");
     assert_eq!(list.get("items").unwrap().as_array().unwrap().len(), 1);
 
     let patch = serde_json::json!({"spec": {"nodeName": "n1"}});
-    let resp = client.patch(format!("{base}/podinfo")).json(&patch).send().await.unwrap();
+    let resp = client
+        .patch(format!("{base}/podinfo"))
+        .json(&patch)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    let resp = client.delete(format!("{base}/podinfo")).send().await.unwrap();
+    let resp = client
+        .delete(format!("{base}/podinfo"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let resp = client.get(format!("{base}/podinfo")).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
@@ -751,7 +829,11 @@ async fn breadth_opaque_namespaced_cronjob_full_crud() {
         "spec": { "schedule": "0 0 * * *" }
     });
     let resp = client.post(&base).json(&body).send().await.unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "batch/v1 CronJob POST 201");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "batch/v1 CronJob POST 201"
+    );
 
     // GET → 200, the opaque spec round-trips byte-for-byte.
     let resp = client.get(format!("{base}/nightly")).send().await.unwrap();
@@ -759,7 +841,10 @@ async fn breadth_opaque_namespaced_cronjob_full_crud() {
     let got: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(got.get("kind").unwrap(), "CronJob");
     assert_eq!(got.get("apiVersion").unwrap(), "batch/v1");
-    assert_eq!(got.get("spec").unwrap().get("schedule").unwrap(), "0 0 * * *");
+    assert_eq!(
+        got.get("spec").unwrap().get("schedule").unwrap(),
+        "0 0 * * *"
+    );
 
     // LIST → 200, CronJobList.
     let resp = client.get(&base).send().await.unwrap();
@@ -769,7 +854,11 @@ async fn breadth_opaque_namespaced_cronjob_full_crud() {
     assert_eq!(list.get("items").unwrap().as_array().unwrap().len(), 1);
 
     // DELETE → 200, then GET → 404.
-    let resp = client.delete(format!("{base}/nightly")).send().await.unwrap();
+    let resp = client
+        .delete(format!("{base}/nightly"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let resp = client.get(format!("{base}/nightly")).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
@@ -792,7 +881,11 @@ async fn breadth_opaque_cluster_scoped_storageclass_full_crud() {
         "provisioner": "engenho.io/local"
     });
     let resp = client.post(&base).json(&body).send().await.unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "storage.k8s.io StorageClass POST 201");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "storage.k8s.io StorageClass POST 201"
+    );
 
     let resp = client.get(format!("{base}/fast")).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -815,7 +908,11 @@ async fn breadth_new_groups_appear_in_discovery() {
     let client = reqwest::Client::new();
 
     // GET /apis → APIGroupList must now advertise the breadth-expansion groups.
-    let resp = client.get(format!("http://{addr}/apis")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://{addr}/apis"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let gl: serde_json::Value = resp.json().await.unwrap();
     let names: Vec<&str> = gl
@@ -839,7 +936,10 @@ async fn breadth_new_groups_appear_in_discovery() {
         "apiregistration.k8s.io",
         "flowcontrol.apiserver.k8s.io",
     ] {
-        assert!(names.contains(&want), "breadth group {want:?} advertised: {names:?}");
+        assert!(
+            names.contains(&want),
+            "breadth group {want:?} advertised: {names:?}"
+        );
     }
 
     // GET /apis/batch/v1 → CronJob + Job rows present with the right plurals

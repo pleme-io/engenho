@@ -141,7 +141,10 @@ async fn json_patch_content_type_executes_ops() {
     assert_eq!(got["spec"]["replicas"], 5, "RFC6902 replace executed");
     // CRUCIALLY: the literal op object was NOT deep-merged in. There is no
     // `op`/`path`/`value` key floating in the resource.
-    assert!(got.get("op").is_none(), "op object not merged into resource");
+    assert!(
+        got.get("op").is_none(),
+        "op object not merged into resource"
+    );
     assert!(got.get("path").is_none());
     server.shutdown().await.unwrap();
 }
@@ -181,7 +184,10 @@ async fn json_patch_remove_op_executes() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let got = get_deploy(&addr, &client).await;
-    assert!(got["metadata"]["labels"].get("env").is_none(), "env removed");
+    assert!(
+        got["metadata"]["labels"].get("env").is_none(),
+        "env removed"
+    );
     assert_eq!(got["metadata"]["labels"]["team"], "x", "team preserved");
     server.shutdown().await.unwrap();
 }
@@ -252,7 +258,10 @@ async fn no_content_type_defaults_to_strategic() {
         .unwrap();
     assert_eq!(containers.len(), 2, "default=strategic merges by key");
     let sidecar = containers.iter().find(|c| c["name"] == "sidecar").unwrap();
-    assert_eq!(sidecar["image"], "envoy:1.30", "sidecar untouched under default");
+    assert_eq!(
+        sidecar["image"], "envoy:1.30",
+        "sidecar untouched under default"
+    );
     server.shutdown().await.unwrap();
 }
 
@@ -277,14 +286,19 @@ async fn server_side_apply_content_type_merges_and_records_ownership() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "SSA applies, no 415");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "SSA applies, no 415"
+    );
 
     let got = get_deploy(&addr, &client).await;
     assert_eq!(got["spec"]["replicas"], 9, "apply set replicas");
     // managedFields records the manager owning .spec.replicas.
     let mf = got["metadata"]["managedFields"].as_array().unwrap();
     assert!(
-        mf.iter().any(|e| e["manager"] == "test" && e["operation"] == "Apply"),
+        mf.iter()
+            .any(|e| e["manager"] == "test" && e["operation"] == "Apply"),
         "managedFields records the apply manager"
     );
     // The container list (not applied) is untouched.

@@ -35,8 +35,8 @@ use crate::command::{ApplyMeta, ResourceCommand, ResourceOp};
 use crate::pagination::ListPage;
 use crate::patch_apply::{self, Gvk, OpenApiPatchEnv, PatchBody, PatchError, PatchSchemaEnv};
 use crate::resource::{ResourceKey, ResourceValue};
-use crate::ssa;
 use crate::revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
+use crate::ssa;
 
 /// Optimistic-concurrency precondition check (the CAS heart). Pure
 /// function over the caller's expected revision + the key's live
@@ -390,10 +390,8 @@ impl ResourceCatalog {
         // common via Patch) thus leaves generation untouched. Computed in
         // the deterministic apply path so every Raft node stamps the
         // identical value.
-        let next_generation = compute_generation_on_put(
-            prior_entry.as_ref().map(|(v, _)| v),
-            value,
-        );
+        let next_generation =
+            compute_generation_on_put(prior_entry.as_ref().map(|(v, _)| v), value);
 
         let mut new_value = value.clone();
         if let Some(obj) = new_value.as_object_mut() {
@@ -552,9 +550,7 @@ impl ResourceCatalog {
             Err(PatchError::Unsupported { what }) => {
                 // Typed-deferred (server-side apply) — surface as a typed
                 // rejection, NEVER a silent strategic/merge fallback.
-                return ApplyOutcome::patch_rejected(
-                    PatchError::Unsupported { what }.to_string(),
-                );
+                return ApplyOutcome::patch_rejected(PatchError::Unsupported { what }.to_string());
             }
             Err(e) => return ApplyOutcome::patch_rejected(e.to_string()),
         };
@@ -586,8 +582,7 @@ impl ResourceCatalog {
         // converts into a removal. THIS is what makes
         // `kubectl patch …finalizers:null` actually delete a Terminating
         // object.
-        if let Some(outcome) =
-            self.finalizer_release_removal(key, &merged, Some(&prior_value), rev)
+        if let Some(outcome) = self.finalizer_release_removal(key, &merged, Some(&prior_value), rev)
         {
             return outcome;
         }
@@ -1228,7 +1223,12 @@ mod tests {
         ResourceKey::namespaced("", "v1", "Pod", "default", name)
     }
 
-    fn put(cat: &mut ResourceCatalog, key: &ResourceKey, value: serde_json::Value, index: u64) -> ApplyOutcome {
+    fn put(
+        cat: &mut ResourceCatalog,
+        key: &ResourceKey,
+        value: serde_json::Value,
+        index: u64,
+    ) -> ApplyOutcome {
         cat.apply(
             &ResourceCommand::Put {
                 key: key.clone(),
@@ -1277,11 +1277,21 @@ mod tests {
     fn put_creates_then_replaces() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("podinfo");
-        let op = put(&mut cat, &k, serde_json::json!({"spec": {"image": "v1"}}), 1);
+        let op = put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"image": "v1"}}),
+            1,
+        );
         assert_eq!(op.op, ResourceOp::Created);
         assert_eq!(cat.len(), 1);
 
-        let op = put(&mut cat, &k, serde_json::json!({"spec": {"image": "v2"}}), 2);
+        let op = put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"image": "v2"}}),
+            2,
+        );
         assert_eq!(op.op, ResourceOp::Replaced);
         assert_eq!(cat.len(), 1);
     }
@@ -1313,7 +1323,12 @@ mod tests {
         assert_eq!(m1.mod_revision, Revision(1));
         assert_eq!(m1.version, 1);
 
-        put(&mut cat, &k, serde_json::json!({"spec": {"replaced": true}}), 6);
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replaced": true}}),
+            6,
+        );
         let (_, m2) = cat.get_with_meta(&k).unwrap();
         assert_eq!(m2.create_revision, Revision(1), "create_revision stable");
         assert_eq!(m2.mod_revision, Revision(2), "mod_revision advances");
@@ -1407,7 +1422,12 @@ mod tests {
     fn patch_merges_into_existing_and_bumps_version() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("podinfo");
-        put(&mut cat, &k, serde_json::json!({"spec": {"image": "v1", "replicas": 2}}), 1);
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"image": "v1", "replicas": 2}}),
+            1,
+        );
         let op = cat.apply(
             &ResourceCommand::Patch {
                 key: k.clone(),
@@ -1462,7 +1482,12 @@ mod tests {
         // I5: 5 puts (rev 1..5); changes_since(2) yields revs 3,4,5.
         let mut cat = ResourceCatalog::default();
         for i in 1..=5 {
-            put(&mut cat, &pod_key(&format!("p{i}")), serde_json::json!({"i": i}), i);
+            put(
+                &mut cat,
+                &pod_key(&format!("p{i}")),
+                serde_json::json!({"i": i}),
+                i,
+            );
         }
         let tail = cat.changes_since(Revision(2)).unwrap();
         let revs: Vec<u64> = tail.iter().map(|c| c.revision.0).collect();
@@ -1478,7 +1503,12 @@ mod tests {
         // I5: force compaction with tiny capacity; below-watermark → CompactedTooOld.
         let mut cat = ResourceCatalog::with_history_capacity(2);
         for i in 1..=5 {
-            put(&mut cat, &pod_key(&format!("p{i}")), serde_json::json!({"i": i}), i);
+            put(
+                &mut cat,
+                &pod_key(&format!("p{i}")),
+                serde_json::json!({"i": i}),
+                i,
+            );
         }
         // Only the last 2 changes (rev 4, 5) are retained; compacted at rev 3.
         assert_eq!(cat.history.len(), 2);
@@ -1496,12 +1526,27 @@ mod tests {
         let mut idx = 0;
         for name in ["a", "b", "c"] {
             idx += 1;
-            put(&mut cat, &ResourceKey::namespaced("", "v1", "Pod", "default", name), serde_json::json!({}), idx);
+            put(
+                &mut cat,
+                &ResourceKey::namespaced("", "v1", "Pod", "default", name),
+                serde_json::json!({}),
+                idx,
+            );
         }
         idx += 1;
-        put(&mut cat, &ResourceKey::namespaced("", "v1", "Pod", "kube-system", "coredns"), serde_json::json!({}), idx);
+        put(
+            &mut cat,
+            &ResourceKey::namespaced("", "v1", "Pod", "kube-system", "coredns"),
+            serde_json::json!({}),
+            idx,
+        );
         idx += 1;
-        put(&mut cat, &ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm-1"), serde_json::json!({}), idx);
+        put(
+            &mut cat,
+            &ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm-1"),
+            serde_json::json!({}),
+            idx,
+        );
 
         assert_eq!(cat.list("", "v1", "Pod", Some("default")).len(), 3);
         assert_eq!(cat.list("", "v1", "ConfigMap", Some("default")).len(), 1);
@@ -1556,7 +1601,12 @@ mod tests {
         // 5 puts → current_revision 5; capacity 2 forces compaction so
         // compacted_revision advances to 3 (last two changes retained).
         for i in 1..=5u64 {
-            put(&mut cat, &pod_key(&format!("p{i}")), serde_json::json!({"i": i}), i);
+            put(
+                &mut cat,
+                &pod_key(&format!("p{i}")),
+                serde_json::json!({"i": i}),
+                i,
+            );
         }
         // One more put on a tracked key so we can assert its meta.
         put(&mut cat, &k, serde_json::json!({"spec": {}}), 6); // rev 6 (create)
@@ -1625,7 +1675,12 @@ mod tests {
     fn put_first_create_stamps_generation_1() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("gen-create");
-        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 1}}), 1);
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replicas": 1}}),
+            1,
+        );
         assert_eq!(live_generation(&cat, &k), 1, "first create → generation 1");
     }
 
@@ -1633,9 +1688,19 @@ mod tests {
     fn put_replace_with_changed_spec_bumps_generation() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("gen-bump");
-        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 1}}), 1);
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replicas": 1}}),
+            1,
+        );
         assert_eq!(live_generation(&cat, &k), 1);
-        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 2}}), 2);
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replicas": 2}}),
+            2,
+        );
         assert_eq!(
             live_generation(&cat, &k),
             2,
@@ -1647,7 +1712,12 @@ mod tests {
     fn put_replace_with_identical_spec_preserves_generation() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("gen-stable");
-        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 3}}), 1);
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replicas": 3}}),
+            1,
+        );
         assert_eq!(live_generation(&cat, &k), 1);
         // Replace with the SAME spec but a changed status — generation
         // must NOT bump (status is not spec-intent).
@@ -1671,7 +1741,12 @@ mod tests {
         // converge against it.
         let mut cat = ResourceCatalog::default();
         let k = pod_key("gen-status-patch");
-        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 2}}), 1);
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replicas": 2}}),
+            1,
+        );
         assert_eq!(live_generation(&cat, &k), 1);
         let out = patch(
             &mut cat,
@@ -1687,7 +1762,12 @@ mod tests {
         );
         // The status landed.
         assert_eq!(
-            cat.get(&k).unwrap().get("status").unwrap().get("readyReplicas").unwrap(),
+            cat.get(&k)
+                .unwrap()
+                .get("status")
+                .unwrap()
+                .get("readyReplicas")
+                .unwrap(),
             2
         );
     }
@@ -1696,7 +1776,12 @@ mod tests {
     fn patch_spec_change_bumps_generation() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("gen-spec-patch");
-        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 2}}), 1);
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replicas": 2}}),
+            1,
+        );
         assert_eq!(live_generation(&cat, &k), 1);
         let out = patch(
             &mut cat,
@@ -1716,7 +1801,12 @@ mod tests {
     fn patch_metadata_only_does_not_bump_generation() {
         let mut cat = ResourceCatalog::default();
         let k = pod_key("gen-meta-patch");
-        put(&mut cat, &k, serde_json::json!({"spec": {"replicas": 1}}), 1);
+        put(
+            &mut cat,
+            &k,
+            serde_json::json!({"spec": {"replicas": 1}}),
+            1,
+        );
         let out = patch(
             &mut cat,
             &k,
@@ -1804,7 +1894,10 @@ mod tests {
         // The object is STILL present, now Terminating.
         let live = cat.get(&k).expect("object kept (Terminating)");
         assert_eq!(
-            live.get("metadata").unwrap().get("deletionTimestamp").unwrap(),
+            live.get("metadata")
+                .unwrap()
+                .get("deletionTimestamp")
+                .unwrap(),
             "2026-06-08T12:00:00Z"
         );
         // Finalizer preserved (still blocking removal).
@@ -1864,7 +1957,10 @@ mod tests {
         );
         assert_eq!(out.op, ResourceOp::Deleted, "finalizer-release → Deleted");
         assert_eq!(out.change.unwrap().kind, ChangeKind::Delete);
-        assert!(cat.get(&k).is_none(), "object removed once finalizers cleared");
+        assert!(
+            cat.get(&k).is_none(),
+            "object removed once finalizers cleared"
+        );
     }
 
     #[test]
@@ -1943,6 +2039,9 @@ mod tests {
         assert_eq!(a, b, "two replays of the same sequence converge");
         let va = serde_json::to_vec(a.get(&pod_key("d")).unwrap()).unwrap();
         let vb = serde_json::to_vec(b.get(&pod_key("d")).unwrap()).unwrap();
-        assert_eq!(va, vb, "Terminating object is byte-identical across replays");
+        assert_eq!(
+            va, vb,
+            "Terminating object is byte-identical across replays"
+        );
     }
 }

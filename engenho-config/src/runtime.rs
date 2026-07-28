@@ -317,10 +317,7 @@ mod tests {
     fn ca_paths_derive_from_data_dir_when_unset() {
         let mut cfg = RuntimeConfig::prescribed_default();
         cfg.data_dir = PathBuf::from("/srv/engenho");
-        assert_eq!(
-            cfg.ca_cert_path(),
-            PathBuf::from("/srv/engenho/pki/ca.crt")
-        );
+        assert_eq!(cfg.ca_cert_path(), PathBuf::from("/srv/engenho/pki/ca.crt"));
         assert_eq!(cfg.ca_key_path(), PathBuf::from("/srv/engenho/pki/ca.key"));
     }
 

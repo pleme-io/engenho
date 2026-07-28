@@ -278,9 +278,7 @@ mod tests {
     fn sa_token() -> String {
         // A structurally-SA JWT: header.payload.sig with an SA-shaped `sub`.
         use base64::Engine as _;
-        let b64 = |s: &str| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes())
-        };
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes());
         let header = b64(r#"{"alg":"RS256","typ":"JWT"}"#);
         let payload = b64(
             r#"{"iss":"https://kubernetes.default.svc","sub":"system:serviceaccount:default:builder"}"#,

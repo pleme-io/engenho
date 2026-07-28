@@ -451,10 +451,7 @@ impl Controller for PvBinderController {
             .store
             .list("", "v1", "PersistentVolumeClaim", self.namespace.as_deref())
             .await;
-        let pvs = self
-            .store
-            .list("", "v1", "PersistentVolume", None)
-            .await;
+        let pvs = self.store.list("", "v1", "PersistentVolume", None).await;
         let storage_classes = self
             .store
             .list("storage.k8s.io", "v1", "StorageClass", None)
@@ -532,20 +529,17 @@ impl Controller for PvBinderController {
                 // WaitForFirstConsumer: leave Pending until a Pod references the
                 // PVC. TYPED-DEFERRED (named follow-up) — never provision early.
                 report.objects_skipped += 1;
-                report.note = Some(
-                    "WaitForFirstConsumer PVC left Pending (deferred)".to_string(),
-                );
+                report.note = Some("WaitForFirstConsumer PVC left Pending (deferred)".to_string());
                 continue;
             }
 
             // Immediate binding mode: provision now.
-            let (pv_name, host_path, dyn_pv) =
-                self.build_dynamic_pv(pvc, pvc_ns, pvc_name, sc);
+            let (pv_name, host_path, dyn_pv) = self.build_dynamic_pv(pvc, pvc_ns, pvc_name, sc);
             // The ONE host effect — create the backing dir before the PV is
             // visible so the kubelet can bind-mount it.
-            self.env.ensure_dir(&host_path).map_err(|e| {
-                ControllerError::Internal(format!("provision local-path dir: {e}"))
-            })?;
+            self.env
+                .ensure_dir(&host_path)
+                .map_err(|e| ControllerError::Internal(format!("provision local-path dir: {e}")))?;
             let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
             self.put(pv_key, dyn_pv).await?;
             // Bind the PVC to the freshly-provisioned PV.
@@ -665,12 +659,18 @@ mod tests {
     fn storage_class_must_match_nil_eq_empty() {
         let pvc_nil = json!({"spec": {}});
         let pv_empty = json!({"spec": {"storageClassName": ""}});
-        assert!(PvBinderController::storage_class_matches(&pvc_nil, &pv_empty));
+        assert!(PvBinderController::storage_class_matches(
+            &pvc_nil, &pv_empty
+        ));
         let pvc_fast = json!({"spec": {"storageClassName": "fast"}});
         let pv_slow = json!({"spec": {"storageClassName": "slow"}});
-        assert!(!PvBinderController::storage_class_matches(&pvc_fast, &pv_slow));
+        assert!(!PvBinderController::storage_class_matches(
+            &pvc_fast, &pv_slow
+        ));
         let pv_fast = json!({"spec": {"storageClassName": "fast"}});
-        assert!(PvBinderController::storage_class_matches(&pvc_fast, &pv_fast));
+        assert!(PvBinderController::storage_class_matches(
+            &pvc_fast, &pv_fast
+        ));
     }
 
     #[test]
@@ -739,20 +739,32 @@ mod tests {
         )
         .await;
         // Too small.
-        put_op(&store, pv_key("small"),
+        put_op(
+            &store,
+            pv_key("small"),
             json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"small"},
                    "spec":{"capacity":{"storage":"1Gi"},"accessModes":["ReadWriteMany"],
-                           "storageClassName":"manual"},"status":{"phase":"Available"}})).await;
+                           "storageClassName":"manual"},"status":{"phase":"Available"}}),
+        )
+        .await;
         // Wrong class.
-        put_op(&store, pv_key("wrongclass"),
+        put_op(
+            &store,
+            pv_key("wrongclass"),
             json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"wrongclass"},
                    "spec":{"capacity":{"storage":"100Gi"},"accessModes":["ReadWriteMany"],
-                           "storageClassName":"other"},"status":{"phase":"Available"}})).await;
+                           "storageClassName":"other"},"status":{"phase":"Available"}}),
+        )
+        .await;
         // Wrong access mode (RWO can't serve RWX).
-        put_op(&store, pv_key("wrongmode"),
+        put_op(
+            &store,
+            pv_key("wrongmode"),
             json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"wrongmode"},
                    "spec":{"capacity":{"storage":"100Gi"},"accessModes":["ReadWriteOnce"],
-                           "storageClassName":"manual"},"status":{"phase":"Available"}})).await;
+                           "storageClassName":"manual"},"status":{"phase":"Available"}}),
+        )
+        .await;
 
         binder(store.clone()).tick().await.unwrap();
 
@@ -760,12 +772,14 @@ mod tests {
         // Left untouched: phase never advanced to Bound (a Pending PVC the
         // binder can't satisfy is not re-stamped — phase stays unset).
         assert_ne!(pvc["status"]["phase"], "Bound");
-        assert!(pvc["spec"].get("volumeName").is_none()
-            || pvc["spec"]["volumeName"].is_null());
+        assert!(pvc["spec"].get("volumeName").is_none() || pvc["spec"]["volumeName"].is_null());
         // No PV was claimed.
         for n in ["small", "wrongclass", "wrongmode"] {
             let pv = store.get(&pv_key(n)).await.unwrap();
-            assert_eq!(pv["status"]["phase"], "Available", "{n} must stay available");
+            assert_eq!(
+                pv["status"]["phase"], "Available",
+                "{n} must stay available"
+            );
         }
     }
 
@@ -795,12 +809,7 @@ mod tests {
         .await;
 
         let env = Arc::new(FakeProvisionerEnv::new());
-        let c = PvBinderController::with_env(
-            store.clone(),
-            None,
-            "/data/local-path",
-            env.clone(),
-        );
+        let c = PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone());
         c.tick().await.unwrap();
 
         // A PV was provisioned + the PVC bound to it.
@@ -812,11 +821,12 @@ mod tests {
         assert_eq!(pv["spec"]["capacity"]["storage"], "2Gi");
         assert_eq!(pv["spec"]["hostPath"]["path"], "/data/local-path/ns1-dyn");
         assert_eq!(pv["spec"]["claimRef"]["name"], "dyn");
-        assert_eq!(
-            pv["spec"]["persistentVolumeReclaimPolicy"], "Delete"
-        );
+        assert_eq!(pv["spec"]["persistentVolumeReclaimPolicy"], "Delete");
         // The host effect: the backing dir was ensured.
-        assert_eq!(env.ensured_dirs(), vec!["/data/local-path/ns1-dyn".to_string()]);
+        assert_eq!(
+            env.ensured_dirs(),
+            vec!["/data/local-path/ns1-dyn".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -846,10 +856,11 @@ mod tests {
         let pvc = store.get(&pvc_key("ns1", "wfc")).await.unwrap();
         // WaitForFirstConsumer: never provisioned/bound — phase stays unset
         // (i.e. still Pending), and no volumeName was stamped.
-        assert_ne!(pvc["status"]["phase"], "Bound",
-            "WaitForFirstConsumer PVC must NOT be bound (no early provision)");
-        assert!(pvc["spec"].get("volumeName").is_none()
-            || pvc["spec"]["volumeName"].is_null());
+        assert_ne!(
+            pvc["status"]["phase"], "Bound",
+            "WaitForFirstConsumer PVC must NOT be bound (no early provision)"
+        );
+        assert!(pvc["spec"].get("volumeName").is_none() || pvc["spec"]["volumeName"].is_null());
         // No PV was dynamically provisioned for it.
         let pvs = store.list("", "v1", "PersistentVolume", None).await;
         assert!(pvs.is_empty(), "no PV provisioned for a WFC claim");
@@ -872,14 +883,22 @@ mod tests {
         .await;
         // A different available PV that ALSO matches on capacity/class —
         // must NOT be chosen.
-        put_op(&store, pv_key("vol-other"),
+        put_op(
+            &store,
+            pv_key("vol-other"),
             json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"vol-other"},
                    "spec":{"capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"],
-                           "storageClassName":"manual"},"status":{"phase":"Available"}})).await;
-        put_op(&store, pv_key("vol-named"),
+                           "storageClassName":"manual"},"status":{"phase":"Available"}}),
+        )
+        .await;
+        put_op(
+            &store,
+            pv_key("vol-named"),
             json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"vol-named"},
                    "spec":{"capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"],
-                           "storageClassName":"manual"},"status":{"phase":"Available"}})).await;
+                           "storageClassName":"manual"},"status":{"phase":"Available"}}),
+        )
+        .await;
 
         binder(store.clone()).tick().await.unwrap();
 
@@ -907,13 +926,20 @@ mod tests {
         )
         .await;
         // An Available PV that WOULD match if the PVC were Pending.
-        put_op(&store, pv_key("vol-free"),
+        put_op(
+            &store,
+            pv_key("vol-free"),
             json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"vol-free"},
                    "spec":{"capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"],
-                           "storageClassName":"manual"},"status":{"phase":"Available"}})).await;
+                           "storageClassName":"manual"},"status":{"phase":"Available"}}),
+        )
+        .await;
 
         let outcome = binder(store.clone()).tick().await.unwrap();
-        assert_eq!(outcome.objects_changed, 0, "no re-bind on an already-Bound PVC");
+        assert_eq!(
+            outcome.objects_changed, 0,
+            "no re-bind on an already-Bound PVC"
+        );
         // The PVC's volumeName is unchanged; the free PV is untouched.
         let pvc = store.get(&pvc_key("ns1", "bound")).await.unwrap();
         assert_eq!(pvc["spec"]["volumeName"], "vol-x");
@@ -937,10 +963,14 @@ mod tests {
             .await;
         }
         // Only ONE available PV.
-        put_op(&store, pv_key("only"),
+        put_op(
+            &store,
+            pv_key("only"),
             json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"only"},
                    "spec":{"capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"],
-                           "storageClassName":"manual"},"status":{"phase":"Available"}})).await;
+                           "storageClassName":"manual"},"status":{"phase":"Available"}}),
+        )
+        .await;
 
         binder(store.clone()).tick().await.unwrap();
 

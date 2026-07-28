@@ -49,8 +49,9 @@ impl ReplicaSetController {
         // Pod lives in the SAME namespace as its parent ReplicaSet — the
         // namespace the blanket gathers owned pods from. Never the
         // controller's scope namespace (an all-namespace controller has none).
-        let rs_namespace =
-            rs.namespace().map_or_else(|| "default".to_string(), |c| c.to_owned());
+        let rs_namespace = rs
+            .namespace()
+            .map_or_else(|| "default".to_string(), |c| c.to_owned());
         let template = rs.get("spec").and_then(|s| s.get("template"))?;
         let mut pod = template.clone();
         // Ensure pod is an object
@@ -77,7 +78,10 @@ impl ReplicaSetController {
 /// pods. A pod whose name is `<rs_name>-<n>` (with `<n>` a parseable usize)
 /// contributes `n`; any other shape is ignored (it can't collide on an index).
 /// `rs_name = None` (a freshly-minted RS with no name) yields the empty set.
-fn used_indices(rs_name: Option<&str>, owned_pods: &[(ResourceKey, Value)]) -> std::collections::BTreeSet<usize> {
+fn used_indices(
+    rs_name: Option<&str>,
+    owned_pods: &[(ResourceKey, Value)],
+) -> std::collections::BTreeSet<usize> {
     let mut used = std::collections::BTreeSet::new();
     let Some(rs_name) = rs_name else {
         return used;
@@ -212,9 +216,8 @@ impl OwnedChildrenReconciler for ReplicaSetController {
         // == readyReplicas at M0.1 (no minReadySeconds);
         // fullyLabeledReplicas == replicas.
         let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
-        let ready =
-            i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
-                .unwrap_or(i64::MAX);
+        let ready = i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
+            .unwrap_or(i64::MAX);
         Some(json!({
             "replicas": replicas,
             "readyReplicas": ready,
@@ -258,7 +261,10 @@ mod tests {
         assert_eq!(pod.get("apiVersion").unwrap(), "v1");
         assert_eq!(pod.get("metadata").unwrap().get("name").unwrap(), "rs1-0");
         // No RS namespace → the pod defaults to "default".
-        assert_eq!(pod.get("metadata").unwrap().get("namespace").unwrap(), "default");
+        assert_eq!(
+            pod.get("metadata").unwrap().get("namespace").unwrap(),
+            "default"
+        );
         // Template labels survive.
         assert_eq!(
             pod.get("metadata")
@@ -285,7 +291,10 @@ mod tests {
         });
         let (name, pod) = ReplicaSetController::build_pod_from_template(&rs, 2).unwrap();
         assert_eq!(name, "rs1-2");
-        assert_eq!(pod.get("metadata").unwrap().get("namespace").unwrap(), "team-b");
+        assert_eq!(
+            pod.get("metadata").unwrap().get("namespace").unwrap(),
+            "team-b"
+        );
     }
 
     #[test]
@@ -363,6 +372,10 @@ mod tests {
         let surviving = vec![owned("rs1", 1)];
         let used = used_indices(Some("rs1"), &surviving);
         let free = free_indices(&used, 2 - surviving.len());
-        assert_eq!(free, vec![0], "must recreate the freed index 0, not collide on 1");
+        assert_eq!(
+            free,
+            vec![0],
+            "must recreate the freed index 0, not collide on 1"
+        );
     }
 }

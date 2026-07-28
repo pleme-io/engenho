@@ -13,9 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_apiserver::{ApiServer, ResourceHandler, StoreBackedHandler, handlers_from_catalog};
-use engenho_controllers::{
-    AdmissionChain, AdmissionDecision, AdmissionMode, FakeAdmissionWebhook,
-};
+use engenho_controllers::{AdmissionChain, AdmissionDecision, AdmissionMode, FakeAdmissionWebhook};
 use engenho_store::{InProcessRouter, ResourceKey, StoreMesh, default_config};
 
 async fn boot_store() -> Arc<StoreMesh> {
@@ -62,8 +60,9 @@ async fn admission_mutate_injects_label_into_stored_object() {
     .await;
     let chain = Arc::new(AdmissionChain::new(vec![hook], AdmissionMode::FailClosed));
 
-    let handler: Arc<dyn ResourceHandler> =
-        Arc::new(StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain));
+    let handler: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain),
+    );
     let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![handler], None)
         .await
         .unwrap();
@@ -106,8 +105,9 @@ async fn admission_deny_returns_403_and_commits_nothing() {
     .await;
     let chain = Arc::new(AdmissionChain::new(vec![hook], AdmissionMode::FailClosed));
 
-    let handler: Arc<dyn ResourceHandler> =
-        Arc::new(StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain));
+    let handler: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain),
+    );
     let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![handler], None)
         .await
         .unwrap();

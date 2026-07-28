@@ -246,7 +246,9 @@ async fn delete_pod_returns_object_json() {
         .unwrap();
 
     let resp = client
-        .delete(format!("http://{addr}/api/v1/namespaces/default/pods/byebye"))
+        .delete(format!(
+            "http://{addr}/api/v1/namespaces/default/pods/byebye"
+        ))
         .header("Accept", "application/json")
         .send()
         .await
@@ -315,8 +317,8 @@ async fn delete_returns_object_protobuf() {
     );
     let raw = resp.bytes().await.unwrap();
     assert!(!raw.is_empty(), "protobuf DELETE body must not be empty");
-    let decoded = engenho_kube_proto::decode_protobuf(&raw)
-        .expect("DELETE protobuf body round-trips");
+    let decoded =
+        engenho_kube_proto::decode_protobuf(&raw).expect("DELETE protobuf body round-trips");
     assert_eq!(
         decoded.get("metadata").unwrap().get("name").unwrap(),
         "web",
@@ -503,7 +505,10 @@ async fn openapi_spec_is_served_at_canonical_paths() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let spec: serde_json::Value = resp.json().await.unwrap();
     let v = spec.get("openapi").unwrap().as_str().unwrap();
-    assert!(v.starts_with("3."), "/openapi.json returned non-v3 spec: {v}");
+    assert!(
+        v.starts_with("3."),
+        "/openapi.json returned non-v3 spec: {v}"
+    );
     assert_eq!(
         spec.get("info").unwrap().get("title").unwrap(),
         "engenho-apiserver — K8s REST API"
@@ -536,7 +541,11 @@ async fn openapi_spec_is_served_at_canonical_paths() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let idx: serde_json::Value = resp.json().await.unwrap();
     let idx_paths = idx.get("paths").unwrap().as_object().unwrap();
-    for key in ["api/v1", "apis/apps/v1", "apis/rbac.authorization.k8s.io/v1"] {
+    for key in [
+        "api/v1",
+        "apis/apps/v1",
+        "apis/rbac.authorization.k8s.io/v1",
+    ] {
         let item = idx_paths
             .get(key)
             .unwrap_or_else(|| panic!("discovery index missing key {key}"));
@@ -648,7 +657,9 @@ async fn put_replace_absent_pod_is_404() {
         "spec": {}
     });
     let resp = client
-        .put(format!("http://{addr}/api/v1/namespaces/default/pods/ghost"))
+        .put(format!(
+            "http://{addr}/api/v1/namespaces/default/pods/ghost"
+        ))
         .json(&put)
         .send()
         .await

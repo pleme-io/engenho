@@ -16,9 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{ResourceKey, StoreMesh};
-use engenho_types::generated_v1_34::rbac_v1::{
-    ClusterRole, ClusterRoleBinding, Role, RoleBinding,
-};
+use engenho_types::generated_v1_34::rbac_v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding};
 
 use super::RbacStoreEnv;
 

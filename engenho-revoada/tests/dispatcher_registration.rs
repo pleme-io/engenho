@@ -11,7 +11,7 @@
 //! and scheduler failure handling.
 
 use engenho_revoada::PlacementPolicy;
-use gen_platform::{catalog, TypedDispatcherTrait};
+use gen_platform::{TypedDispatcherTrait, catalog};
 
 #[test]
 fn placement_policy_registers_into_fleet_catalog() {

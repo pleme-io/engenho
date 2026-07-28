@@ -329,7 +329,8 @@ impl ProbeSpec {
         let mut t = ProbeTiming::k8s_defaults();
         // i64 reads tolerate either JSON integer width; negatives clamp to the
         // floor below.
-        let secs = |key: &str| -> Option<i64> { probe.get(key).and_then(serde_json::Value::as_i64) };
+        let secs =
+            |key: &str| -> Option<i64> { probe.get(key).and_then(serde_json::Value::as_i64) };
 
         if let Some(d) = secs("initialDelaySeconds") {
             // initialDelay floor is 0 (a 0 / negative value = run from start).
@@ -369,7 +370,10 @@ fn resolve_port(
     };
     // Integer port: must be 1..=65535.
     if let Some(n) = port.as_i64() {
-        if let Ok(p) = u16::try_from(n).map_err(|_| ()).and_then(|p| if p >= 1 { Ok(p) } else { Err(()) }) {
+        if let Ok(p) = u16::try_from(n)
+            .map_err(|_| ())
+            .and_then(|p| if p >= 1 { Ok(p) } else { Err(()) })
+        {
             return Ok(ProbePort(p));
         }
         return Err(ProbeParseError::InvalidPort {
@@ -779,10 +783,16 @@ mod tests {
         let mut rt = ProbeRuntime::new(now);
 
         // Two failures: below threshold 3 → no restart.
-        assert!(!fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart);
-        assert!(!fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart);
+        assert!(
+            !fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+        );
+        assert!(
+            !fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+        );
         // Third consecutive failure → needs_restart.
-        assert!(fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart);
+        assert!(
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+        );
     }
 
     #[test]
@@ -796,8 +806,12 @@ mod tests {
         let _ = fold_probe_observation(&spec, &mut rt, ProbeObservation::Success, now);
         assert_eq!(rt.consecutive_failures, 0);
         // One more failure is NOT enough now (need 2 consecutive again).
-        assert!(!fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart);
-        assert!(fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart);
+        assert!(
+            !fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+        );
+        assert!(
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+        );
     }
 
     // ── fold_probe_observation: startup ────────────────────────────────────
@@ -809,7 +823,9 @@ mod tests {
         // constructor that already forces it.
         let spec = exec_spec(ProbeKind::Startup, 1, 3);
         let mut rt = ProbeRuntime::new(now);
-        assert!(fold_probe_observation(&spec, &mut rt, ProbeObservation::Success, now).startup_done);
+        assert!(
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Success, now).startup_done
+        );
     }
 
     #[test]
@@ -817,8 +833,12 @@ mod tests {
         let now = t0();
         let spec = exec_spec(ProbeKind::Startup, 1, 2);
         let mut rt = ProbeRuntime::new(now);
-        assert!(!fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart);
-        assert!(fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart);
+        assert!(
+            !fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+        );
+        assert!(
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+        );
     }
 
     // ── aggregate_container_readiness ──────────────────────────────────────
@@ -826,13 +846,11 @@ mod tests {
     #[test]
     fn aggregate_no_readiness_probe_is_is_running() {
         // The behavior-preserving lemma: no readiness probe → ready==is_running.
-        let (ready, may_restart) =
-            aggregate_container_readiness(true, false, false, false, true);
+        let (ready, may_restart) = aggregate_container_readiness(true, false, false, false, true);
         assert!(ready, "no readiness probe → ready mirrors is_running");
         assert!(may_restart);
 
-        let (ready_down, _) =
-            aggregate_container_readiness(true, false, false, false, false);
+        let (ready_down, _) = aggregate_container_readiness(true, false, false, false, false);
         assert!(!ready_down, "not running → not ready");
     }
 
@@ -840,8 +858,7 @@ mod tests {
     fn aggregate_startup_unsatisfied_forces_not_ready_and_suppresses_liveness() {
         // has_startup=true, startup_done=false → ready forced false +
         // may_run_restart_probes false (liveness suppressed during the window).
-        let (ready, may_restart) =
-            aggregate_container_readiness(false, true, true, true, true);
+        let (ready, may_restart) = aggregate_container_readiness(false, true, true, true, true);
         assert!(!ready, "startup not done → readiness forced false");
         assert!(!may_restart, "startup window suppresses liveness restart");
     }
@@ -850,21 +867,21 @@ mod tests {
     fn aggregate_startup_done_lets_readiness_and_liveness_through() {
         // startup_done=true → readiness sources from the readiness gate + may
         // restart.
-        let (ready, may_restart) =
-            aggregate_container_readiness(true, true, true, true, true);
+        let (ready, may_restart) = aggregate_container_readiness(true, true, true, true, true);
         assert!(ready, "startup done → readiness gate applies");
         assert!(may_restart, "startup done → liveness active");
 
-        let (not_ready, _) =
-            aggregate_container_readiness(true, false, true, true, true);
-        assert!(!not_ready, "startup done but readiness gate false → not ready");
+        let (not_ready, _) = aggregate_container_readiness(true, false, true, true, true);
+        assert!(
+            !not_ready,
+            "startup done but readiness gate false → not ready"
+        );
     }
 
     #[test]
     fn aggregate_no_startup_probe_active_from_start() {
         // No startup probe → readiness gate applies + liveness active.
-        let (ready, may_restart) =
-            aggregate_container_readiness(true, true, false, true, true);
+        let (ready, may_restart) = aggregate_container_readiness(true, true, false, true, true);
         assert!(ready);
         assert!(may_restart);
     }
@@ -950,7 +967,9 @@ mod tests {
         let probe = json!({ "httpGet": { "path": "/healthz", "port": 8080 } });
         let spec = ProbeSpec::from_k8s(ProbeKind::Readiness, &probe, &[]).unwrap();
         match spec.handler {
-            ProbeHandler::HttpGet { port, path, scheme, .. } => {
+            ProbeHandler::HttpGet {
+                port, path, scheme, ..
+            } => {
                 assert_eq!(port, ProbePort(8080));
                 assert_eq!(path, "/healthz");
                 assert_eq!(scheme, HttpScheme::Http);
@@ -975,7 +994,9 @@ mod tests {
         let probe = json!({ "tcpSocket": { "port": "nope" } });
         assert_eq!(
             ProbeSpec::from_k8s(ProbeKind::Readiness, &probe, &[]).unwrap_err(),
-            ProbeParseError::UnresolvedPort { name: "nope".to_string() }
+            ProbeParseError::UnresolvedPort {
+                name: "nope".to_string()
+            }
         );
     }
 
@@ -995,7 +1016,10 @@ mod tests {
         let spec = ProbeSpec::from_k8s(ProbeKind::Readiness, &probe, &[]).unwrap();
         assert!(matches!(
             spec.handler,
-            ProbeHandler::TcpSocket { port: ProbePort(6379), .. }
+            ProbeHandler::TcpSocket {
+                port: ProbePort(6379),
+                ..
+            }
         ));
     }
 

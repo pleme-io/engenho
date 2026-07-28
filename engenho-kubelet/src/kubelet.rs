@@ -413,7 +413,13 @@ impl Kubelet {
                 .get("name")
                 .and_then(|n| n.as_str())
                 .map(String::from)
-                .unwrap_or_else(|| if i == 0 { "main".to_string() } else { format!("container-{i}") });
+                .unwrap_or_else(|| {
+                    if i == 0 {
+                        "main".to_string()
+                    } else {
+                        format!("container-{i}")
+                    }
+                });
             let image = c
                 .get("image")
                 .and_then(|im| im.as_str())
@@ -510,7 +516,9 @@ impl Kubelet {
             })
             .unwrap_or_default();
 
-        let parse_one = |field: &str, kind: ProbeKind| -> Result<Option<(ProbeSpec, ProbeRuntime)>, KubeletError> {
+        let parse_one = |field: &str,
+                         kind: ProbeKind|
+         -> Result<Option<(ProbeSpec, ProbeRuntime)>, KubeletError> {
             match container.get(field) {
                 None => Ok(None),
                 Some(probe) => {
@@ -538,14 +546,24 @@ impl Kubelet {
     /// reads from the same JSON-driven source as the rest of the kubelet.
     fn container_json<'a>(pod: &'a Value, cname: &str) -> Option<&'a Value> {
         let containers = pod.get("spec")?.get("containers")?.as_array()?;
-        containers.iter().enumerate().find(|(i, c)| {
-            let name = c
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| if *i == 0 { "main".to_string() } else { format!("container-{i}") });
-            name == cname
-        }).map(|(_, c)| c)
+        containers
+            .iter()
+            .enumerate()
+            .find(|(i, c)| {
+                let name = c
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        if *i == 0 {
+                            "main".to_string()
+                        } else {
+                            format!("container-{i}")
+                        }
+                    });
+                name == cname
+            })
+            .map(|(_, c)| c)
     }
 
     /// Read the Pod's `spec.restartPolicy` into the typed [`RestartPolicy`].
@@ -780,8 +798,10 @@ impl Kubelet {
         });
         // initContainerStatuses ONLY for an init-bearing pod.
         if has_init {
-            let init_container_statuses: Vec<Value> =
-                init_statuses.iter().map(Self::render_container_status).collect();
+            let init_container_statuses: Vec<Value> = init_statuses
+                .iter()
+                .map(Self::render_container_status)
+                .collect();
             status["initContainerStatuses"] = Value::Array(init_container_statuses);
         }
         if let Some(ip) = pod_ip {
@@ -1005,8 +1025,7 @@ impl Kubelet {
                     let _ = name;
                 }
                 PodVolumeSource::ConfigMap { name, .. } => {
-                    let key =
-                        ResourceKey::namespaced("", "v1", "ConfigMap", namespace, &name);
+                    let key = ResourceKey::namespaced("", "v1", "ConfigMap", namespace, &name);
                     if let Some(val) = self.store.get(&key).await {
                         fetched.insert(("ConfigMap".to_string(), name), val);
                     }
@@ -1042,7 +1061,10 @@ impl Kubelet {
                         let pv_key =
                             ResourceKey::cluster_scoped("", "v1", "PersistentVolume", pv_name);
                         if let Some(pv_val) = self.store.get(&pv_key).await {
-                            fetched.insert(("PersistentVolume".to_string(), pv_name.to_string()), pv_val);
+                            fetched.insert(
+                                ("PersistentVolume".to_string(), pv_name.to_string()),
+                                pv_val,
+                            );
                         }
                     }
                     fetched.insert(("PersistentVolumeClaim".to_string(), claim_name), pvc_val);
@@ -1370,7 +1392,13 @@ impl Kubelet {
         // Reconcile the status from the freshly-started set (a partial start
         // shows the started containers Running + the rest Waiting → Pending).
         if started_any {
-            let lp = self.local.lock().await.get(key).cloned().unwrap_or_default();
+            let lp = self
+                .local
+                .lock()
+                .await
+                .get(key)
+                .cloned()
+                .unwrap_or_default();
             self.reconcile_running(key, value, &lp, report, soonest_requeue)
                 .await?;
         }
@@ -1418,8 +1446,14 @@ impl Kubelet {
         if let Some((spec, rt)) = probes.startup.as_mut() {
             has_startup = true;
             if rt.is_due(spec, now) {
-                let obs = run_handler(spec, &*self.backend, &*self.net_prober, container_id, pod_ip)
-                    .await;
+                let obs = run_handler(
+                    spec,
+                    &*self.backend,
+                    &*self.net_prober,
+                    container_id,
+                    pod_ip,
+                )
+                .await;
                 let verdict = fold_probe_observation(spec, rt, obs, now);
                 startup_needs_restart = verdict.needs_restart;
             }
@@ -1432,8 +1466,14 @@ impl Kubelet {
         if let Some((spec, rt)) = probes.readiness.as_mut() {
             has_readiness = true;
             if rt.is_due(spec, now) {
-                let obs = run_handler(spec, &*self.backend, &*self.net_prober, container_id, pod_ip)
-                    .await;
+                let obs = run_handler(
+                    spec,
+                    &*self.backend,
+                    &*self.net_prober,
+                    container_id,
+                    pod_ip,
+                )
+                .await;
                 let _ = fold_probe_observation(spec, rt, obs, now);
             }
             readiness_ready = rt.gate_satisfied;
@@ -1443,8 +1483,14 @@ impl Kubelet {
         let mut liveness_needs_restart = false;
         if let Some((spec, rt)) = probes.liveness.as_mut() {
             if rt.is_due(spec, now) {
-                let obs = run_handler(spec, &*self.backend, &*self.net_prober, container_id, pod_ip)
-                    .await;
+                let obs = run_handler(
+                    spec,
+                    &*self.backend,
+                    &*self.net_prober,
+                    container_id,
+                    pod_ip,
+                )
+                .await;
                 let verdict = fold_probe_observation(spec, rt, obs, now);
                 liveness_needs_restart = verdict.needs_restart;
             }
@@ -1464,8 +1510,7 @@ impl Kubelet {
         // A startup probe that itself failed past threshold ALWAYS restarts (a
         // container that never boots IS restarted), regardless of the gate.
         // Liveness restart only fires once the startup window has passed.
-        let needs_restart =
-            startup_needs_restart || (may_run_liveness && liveness_needs_restart);
+        let needs_restart = startup_needs_restart || (may_run_liveness && liveness_needs_restart);
 
         // Persist the advanced probe runtimes back into the local record.
         {
@@ -1889,10 +1934,11 @@ impl Kubelet {
         let mut spec = base.clone();
         spec.network_aliases = aliases.to_vec();
         if let Some(cjson) = Self::container_json_in(value, "initContainers", cname) {
-            spec.mounts = container_mounts(cjson, resolved).map_err(|e| KubeletError::InvalidPod {
-                pod: cname.to_string(),
-                reason: format!("init container volume: {e}"),
-            })?;
+            spec.mounts =
+                container_mounts(cjson, resolved).map_err(|e| KubeletError::InvalidPod {
+                    pod: cname.to_string(),
+                    reason: format!("init container volume: {e}"),
+                })?;
         }
         Ok(spec)
     }
@@ -1998,7 +2044,13 @@ impl Kubelet {
         };
 
         // Build the ORDERED observations from the recorded init state + a poll.
-        let lp = self.local.lock().await.get(key).cloned().unwrap_or_default();
+        let lp = self
+            .local
+            .lock()
+            .await
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
         let mut observations: Vec<ContainerObservation> = Vec::with_capacity(init_specs.len());
         for (cname, _spec) in init_specs {
             match lp.init_containers.get(cname) {
@@ -2083,7 +2135,9 @@ impl Kubelet {
                 // restartable exit under the policy).
                 let (cname, base_spec) = &init_specs[index];
                 let pod_ip = self
-                    .advance_active_init(key, value, index, cname, base_spec, &aliases, &resolved, &lp, report)
+                    .advance_active_init(
+                        key, value, index, cname, base_spec, &aliases, &resolved, &lp, report,
+                    )
                     .await?;
 
                 // Re-read the (possibly just-updated) init records so the
@@ -2177,7 +2231,10 @@ impl Kubelet {
                         let new_count = record.restart_count + 1;
                         let _ = self.backend.stop(&record.container_id).await;
                         let _ = self.backend.remove(&record.container_id).await;
-                        match self.start_init_container(key, cname, &spec, new_count).await {
+                        match self
+                            .start_init_container(key, cname, &spec, new_count)
+                            .await
+                        {
                             Ok(status) => {
                                 report.objects_changed += 1;
                                 debug!(
@@ -2235,7 +2292,13 @@ impl Kubelet {
         key: &ResourceKey,
         init_specs: &[(String, ContainerSpec)],
     ) -> Vec<ContainerStatusOut> {
-        let lp = self.local.lock().await.get(key).cloned().unwrap_or_default();
+        let lp = self
+            .local
+            .lock()
+            .await
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
         let mut out = Vec::with_capacity(init_specs.len());
         for (cname, _spec) in init_specs {
             let status_out = match lp.init_containers.get(cname) {
@@ -2297,10 +2360,13 @@ impl Kubelet {
             reason: "pod is not running on this node (no local container record)".into(),
         })?;
         let record = match container {
-            Some(c) => lp.containers.get(c).ok_or_else(|| KubeletError::InvalidPod {
-                pod: format!("{namespace}/{name}"),
-                reason: format!("container {c:?} not found in pod"),
-            })?,
+            Some(c) => lp
+                .containers
+                .get(c)
+                .ok_or_else(|| KubeletError::InvalidPod {
+                    pod: format!("{namespace}/{name}"),
+                    reason: format!("container {c:?} not found in pod"),
+                })?,
             // Default: the first container by name (BTreeMap iteration order).
             None => lp
                 .containers
@@ -2705,7 +2771,10 @@ mod tests {
         let pod = json!({"metadata": {"labels": {"app": "web"}}});
         let services = vec![svc("web", "default", json!({}))];
         let aliases = Kubelet::service_aliases_for_pod(&pod, "default", &services, "cluster.local");
-        assert!(aliases.is_empty(), "empty selector → no aliases: {aliases:?}");
+        assert!(
+            aliases.is_empty(),
+            "empty selector → no aliases: {aliases:?}"
+        );
     }
 
     #[test]
@@ -2720,7 +2789,10 @@ mod tests {
         });
         let services = vec![(key, value)];
         let aliases = Kubelet::service_aliases_for_pod(&pod, "default", &services, "cluster.local");
-        assert!(aliases.is_empty(), "absent selector → no aliases: {aliases:?}");
+        assert!(
+            aliases.is_empty(),
+            "absent selector → no aliases: {aliases:?}"
+        );
     }
 
     #[test]
@@ -2728,7 +2800,10 @@ mod tests {
         let pod = json!({"metadata": {"name": "p"}});
         let services = vec![svc("web", "default", json!({"app": "web"}))];
         let aliases = Kubelet::service_aliases_for_pod(&pod, "default", &services, "cluster.local");
-        assert!(aliases.is_empty(), "no labels → no Service matches: {aliases:?}");
+        assert!(
+            aliases.is_empty(),
+            "no labels → no Service matches: {aliases:?}"
+        );
     }
 
     #[test]

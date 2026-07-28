@@ -273,11 +273,10 @@ impl PatchBody {
             PatchType::Strategic => Self::Strategic(raw),
             PatchType::Apply => Self::Apply(raw),
             PatchType::Json => {
-                let ops: Vec<JsonPatchOp> = serde_json::from_value(raw).map_err(|e| {
-                    PatchError::BadDirective {
+                let ops: Vec<JsonPatchOp> =
+                    serde_json::from_value(raw).map_err(|e| PatchError::BadDirective {
                         raw: format!("invalid RFC6902 op array: {e}"),
-                    }
-                })?;
+                    })?;
                 Self::Json(ops)
             }
         })
@@ -395,8 +394,8 @@ fn apply_one_op(doc: &mut Value, op: &JsonPatchOp) -> Result<(), PatchError> {
             pointer_add(doc, path, v)
         }
         JsonPatchOp::Test { path, value } => {
-            let actual =
-                pointer_get(doc, path).ok_or_else(|| PatchError::TestFailed { path: path.clone() })?;
+            let actual = pointer_get(doc, path)
+                .ok_or_else(|| PatchError::TestFailed { path: path.clone() })?;
             if actual == value {
                 Ok(())
             } else {
@@ -448,17 +447,22 @@ fn pointer_add(doc: &mut Value, path: &str, value: Value) -> Result<(), PatchErr
     let mut cur = doc;
     for t in parents {
         cur = match cur {
-            Value::Object(m) => m
-                .get_mut(t)
-                .ok_or_else(|| PatchError::JsonPointer { path: path.to_string() })?,
+            Value::Object(m) => m.get_mut(t).ok_or_else(|| PatchError::JsonPointer {
+                path: path.to_string(),
+            })?,
             Value::Array(a) => {
-                let idx: usize = t
-                    .parse()
-                    .map_err(|_| PatchError::JsonPointer { path: path.to_string() })?;
-                a.get_mut(idx)
-                    .ok_or_else(|| PatchError::JsonPointer { path: path.to_string() })?
+                let idx: usize = t.parse().map_err(|_| PatchError::JsonPointer {
+                    path: path.to_string(),
+                })?;
+                a.get_mut(idx).ok_or_else(|| PatchError::JsonPointer {
+                    path: path.to_string(),
+                })?
             }
-            _ => return Err(PatchError::JsonPointer { path: path.to_string() }),
+            _ => {
+                return Err(PatchError::JsonPointer {
+                    path: path.to_string(),
+                });
+            }
         };
     }
     match cur {
@@ -471,17 +475,21 @@ fn pointer_add(doc: &mut Value, path: &str, value: Value) -> Result<(), PatchErr
                 a.push(value);
                 Ok(())
             } else {
-                let idx: usize = last
-                    .parse()
-                    .map_err(|_| PatchError::JsonPointer { path: path.to_string() })?;
+                let idx: usize = last.parse().map_err(|_| PatchError::JsonPointer {
+                    path: path.to_string(),
+                })?;
                 if idx > a.len() {
-                    return Err(PatchError::JsonPointer { path: path.to_string() });
+                    return Err(PatchError::JsonPointer {
+                        path: path.to_string(),
+                    });
                 }
                 a.insert(idx, value);
                 Ok(())
             }
         }
-        _ => Err(PatchError::JsonPointer { path: path.to_string() }),
+        _ => Err(PatchError::JsonPointer {
+            path: path.to_string(),
+        }),
     }
 }
 
@@ -497,33 +505,42 @@ fn pointer_remove(doc: &mut Value, path: &str) -> Result<Value, PatchError> {
     let mut cur = doc;
     for t in parents {
         cur = match cur {
-            Value::Object(m) => m
-                .get_mut(t)
-                .ok_or_else(|| PatchError::JsonPointer { path: path.to_string() })?,
+            Value::Object(m) => m.get_mut(t).ok_or_else(|| PatchError::JsonPointer {
+                path: path.to_string(),
+            })?,
             Value::Array(a) => {
-                let idx: usize = t
-                    .parse()
-                    .map_err(|_| PatchError::JsonPointer { path: path.to_string() })?;
-                a.get_mut(idx)
-                    .ok_or_else(|| PatchError::JsonPointer { path: path.to_string() })?
+                let idx: usize = t.parse().map_err(|_| PatchError::JsonPointer {
+                    path: path.to_string(),
+                })?;
+                a.get_mut(idx).ok_or_else(|| PatchError::JsonPointer {
+                    path: path.to_string(),
+                })?
             }
-            _ => return Err(PatchError::JsonPointer { path: path.to_string() }),
+            _ => {
+                return Err(PatchError::JsonPointer {
+                    path: path.to_string(),
+                });
+            }
         };
     }
     match cur {
-        Value::Object(m) => m
-            .remove(last)
-            .ok_or_else(|| PatchError::JsonPointer { path: path.to_string() }),
+        Value::Object(m) => m.remove(last).ok_or_else(|| PatchError::JsonPointer {
+            path: path.to_string(),
+        }),
         Value::Array(a) => {
-            let idx: usize = last
-                .parse()
-                .map_err(|_| PatchError::JsonPointer { path: path.to_string() })?;
+            let idx: usize = last.parse().map_err(|_| PatchError::JsonPointer {
+                path: path.to_string(),
+            })?;
             if idx >= a.len() {
-                return Err(PatchError::JsonPointer { path: path.to_string() });
+                return Err(PatchError::JsonPointer {
+                    path: path.to_string(),
+                });
             }
             Ok(a.remove(idx))
         }
-        _ => Err(PatchError::JsonPointer { path: path.to_string() }),
+        _ => Err(PatchError::JsonPointer {
+            path: path.to_string(),
+        }),
     }
 }
 
@@ -606,19 +623,17 @@ pub fn strategic_merge(
         if pv.is_array() {
             // List field — consult the env for the merge strategy.
             let strat = env.merge_strategy(gvk, &field_path);
-            let existing_list = existing.and_then(Value::as_array).cloned().unwrap_or_default();
+            let existing_list = existing
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let patch_list = pv.as_array().expect("checked is_array");
-            let merged = merge_list(
-                &existing_list,
-                patch_list,
-                &strat,
-                env,
-                gvk,
-                &field_path,
-            )?;
+            let merged = merge_list(&existing_list, patch_list, &strat, env, gvk, &field_path)?;
             out.insert(k.clone(), Value::Array(merged));
         } else if pv.is_object() {
-            let base = existing.cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+            let base = existing
+                .cloned()
+                .unwrap_or(Value::Object(serde_json::Map::new()));
             let merged = strategic_merge(&base, pv, env, gvk, &field_path)?;
             out.insert(k.clone(), merged);
         } else {
@@ -641,8 +656,7 @@ fn merge_list(
     match strat {
         ListMergeStrategy::Replace => Ok(patch.to_vec()),
         ListMergeStrategy::Set => Ok(set_union(existing, patch)),
-        ListMergeStrategy::MergeByKey(keys)
-        | ListMergeStrategy::MergeByKeyRetainKeys(keys) => {
+        ListMergeStrategy::MergeByKey(keys) | ListMergeStrategy::MergeByKeyRetainKeys(keys) => {
             merge_list_by_key(existing, patch, keys, env, gvk, path)
         }
     }
@@ -825,9 +839,7 @@ fn resolve_from_openapi(gvk: &Gvk, json_path: &JsonPath) -> Option<ListMergeStra
 /// Read the `x-kubernetes-*` list extensions on a list-field schema node and
 /// resolve the typed [`ListMergeStrategy`].
 fn strategy_from_field(field: &Value) -> Option<ListMergeStrategy> {
-    let list_type = field
-        .get("x-kubernetes-list-type")
-        .and_then(Value::as_str);
+    let list_type = field.get("x-kubernetes-list-type").and_then(Value::as_str);
     let patch_strategy = field
         .get("x-kubernetes-patch-strategy")
         .and_then(Value::as_str);
@@ -992,7 +1004,10 @@ mod tests {
 
     #[test]
     fn merge_scalar_replace() {
-        let out = merge(json!({"spec": {"replicas": 1}}), json!({"spec": {"replicas": 3}}));
+        let out = merge(
+            json!({"spec": {"replicas": 1}}),
+            json!({"spec": {"replicas": 3}}),
+        );
         assert_eq!(out["spec"]["replicas"], 3);
     }
 
@@ -1149,7 +1164,12 @@ mod tests {
             }],
         )
         .unwrap_err();
-        assert_eq!(err, PatchError::JsonPointer { path: "/nope".into() });
+        assert_eq!(
+            err,
+            PatchError::JsonPointer {
+                path: "/nope".into()
+            }
+        );
     }
 
     #[test]
@@ -1162,7 +1182,12 @@ mod tests {
             }],
         )
         .unwrap_err();
-        assert_eq!(err, PatchError::JsonPointer { path: "/nope".into() });
+        assert_eq!(
+            err,
+            PatchError::JsonPointer {
+                path: "/nope".into()
+            }
+        );
     }
 
     #[test]
@@ -1305,11 +1330,8 @@ mod tests {
 
     #[test]
     fn strategic_primitive_set_union() {
-        let env = MockPatchEnv::new().seed(
-            deploy_gvk(),
-            "metadata.finalizers",
-            ListMergeStrategy::Set,
-        );
+        let env =
+            MockPatchEnv::new().seed(deploy_gvk(), "metadata.finalizers", ListMergeStrategy::Set);
         let out = strategic(
             &env,
             json!({"metadata": {"finalizers": ["a", "b"]}}),
@@ -1486,6 +1508,9 @@ mod tests {
             .unwrap();
         assert_eq!(containers.len(), 2);
         let sidecar = containers.iter().find(|c| c["name"] == "sidecar").unwrap();
-        assert_eq!(sidecar["image"], "envoy:1.30", "sidecar untouched via real OpenAPI env");
+        assert_eq!(
+            sidecar["image"], "envoy:1.30",
+            "sidecar untouched via real OpenAPI env"
+        );
     }
 }

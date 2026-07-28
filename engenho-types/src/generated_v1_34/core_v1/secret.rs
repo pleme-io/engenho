@@ -8,8 +8,8 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
@@ -27,7 +27,11 @@ pub struct Secret {
     #[serde(default, skip_serializing_if = "is_empty_meta")]
     pub metadata: crate::meta::ObjectMeta,
     /// stringData allows specifying non-binary secret data in string form. It is provided as a write-only input field for convenience. All keys and values are merged into the data field on write, overwriting any existing values. The stringData field is never output when reading from the API.
-    #[serde(default, rename = "stringData", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(
+        default,
+        rename = "stringData",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
     pub string_data: std::collections::BTreeMap<String, String>,
     /// Used to facilitate programmatic handling of secret data. More info: https://kubernetes.io/docs/concepts/configuration/secret/#secret-types
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
@@ -35,31 +39,33 @@ pub struct Secret {
 }
 
 impl KubeResource for Secret {
-const GVK: GroupVersionKind = GroupVersionKind {
-group:   "",
-version: "v1",
-kind:    "Secret",
-};
-const GVR: GroupVersionResource = GroupVersionResource {
-group:    "",
-version:  "v1",
-resource: "secrets",
-};
-const SCOPE: Scope = Scope::Namespaced;
+    const GVK: GroupVersionKind = GroupVersionKind {
+        group: "",
+        version: "v1",
+        kind: "Secret",
+    };
+    const GVR: GroupVersionResource = GroupVersionResource {
+        group: "",
+        version: "v1",
+        resource: "secrets",
+    };
+    const SCOPE: Scope = Scope::Namespaced;
 
-fn name(&self) -> Cow<'_, str> {
-Cow::Borrowed(self.metadata.name.as_str())
-}
-fn namespace(&self) -> Option<Cow<'_, str>> {
-self.metadata.namespace.as_deref().map(Cow::Borrowed)
-}
-fn resource_version(&self) -> Option<Cow<'_, str>> {
-if self.metadata.resource_version.is_empty() {
-None
-} else {
-Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-}
-}
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.metadata.name.as_str())
+    }
+    fn namespace(&self) -> Option<Cow<'_, str>> {
+        self.metadata.namespace.as_deref().map(Cow::Borrowed)
+    }
+    fn resource_version(&self) -> Option<Cow<'_, str>> {
+        if self.metadata.resource_version.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+        }
+    }
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }
+fn is_empty_meta(m: &ObjectMeta) -> bool {
+    m == &ObjectMeta::default()
+}

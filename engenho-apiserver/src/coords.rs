@@ -137,11 +137,7 @@ impl ResourceCoords {
         // `{plural}/{name}/{sub}`.
         let (plural, name, subresource) = match rest_segs {
             [plural] => ((*plural).to_string(), None, None),
-            [plural, name] => (
-                (*plural).to_string(),
-                Some((*name).to_string()),
-                None,
-            ),
+            [plural, name] => ((*plural).to_string(), Some((*name).to_string()), None),
             [plural, name, sub] => (
                 (*plural).to_string(),
                 Some((*name).to_string()),
@@ -535,25 +531,15 @@ mod tests {
         // POST → create; PUT → update; PATCH → patch.
         let ri = RequestInfo::from_method_path("POST", "/api/v1/namespaces/default/pods", false);
         assert_eq!(ri.verb, "create");
-        let ri = RequestInfo::from_method_path(
-            "PUT",
-            "/api/v1/namespaces/default/pods/p1",
-            false,
-        );
+        let ri = RequestInfo::from_method_path("PUT", "/api/v1/namespaces/default/pods/p1", false);
         assert_eq!(ri.verb, "update");
-        let ri = RequestInfo::from_method_path(
-            "PATCH",
-            "/api/v1/namespaces/default/pods/p1",
-            false,
-        );
+        let ri =
+            RequestInfo::from_method_path("PATCH", "/api/v1/namespaces/default/pods/p1", false);
         assert_eq!(ri.verb, "patch");
 
         // DELETE instance → delete; DELETE collection → deletecollection.
-        let ri = RequestInfo::from_method_path(
-            "DELETE",
-            "/api/v1/namespaces/default/pods/p1",
-            false,
-        );
+        let ri =
+            RequestInfo::from_method_path("DELETE", "/api/v1/namespaces/default/pods/p1", false);
         assert_eq!(ri.verb, "delete");
         let ri = RequestInfo::from_method_path("DELETE", "/api/v1/namespaces/default/pods", false);
         assert_eq!(ri.verb, "deletecollection");
@@ -577,7 +563,13 @@ mod tests {
     fn request_info_non_resource_paths() {
         // /healthz, /version, /metrics, /openapi/v3 → non-resource, verb =
         // lowercased method.
-        for p in ["/healthz", "/version", "/metrics", "/openapi/v3", "/openapi/v3/apis/apps/v1"] {
+        for p in [
+            "/healthz",
+            "/version",
+            "/metrics",
+            "/openapi/v3",
+            "/openapi/v3/apis/apps/v1",
+        ] {
             let ri = RequestInfo::from_method_path("GET", p, false);
             assert!(ri.non_resource_url.is_some(), "{p} is non-resource");
             assert_eq!(ri.verb, "get");

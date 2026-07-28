@@ -299,7 +299,11 @@ fn mock_ptr_tokens(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn mock_ptr_add(doc: &mut serde_json::Value, path: &str, value: serde_json::Value) -> Result<(), String> {
+fn mock_ptr_add(
+    doc: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
     let tokens = mock_ptr_tokens(path);
     let Some((last, parents)) = tokens.split_last() else {
         *doc = value;
@@ -308,7 +312,9 @@ fn mock_ptr_add(doc: &mut serde_json::Value, path: &str, value: serde_json::Valu
     let mut cur = doc;
     for t in parents {
         cur = match cur {
-            serde_json::Value::Object(m) => m.get_mut(t).ok_or_else(|| format!("add: missing {path}"))?,
+            serde_json::Value::Object(m) => {
+                m.get_mut(t).ok_or_else(|| format!("add: missing {path}"))?
+            }
             serde_json::Value::Array(a) => {
                 let i: usize = t.parse().map_err(|_| format!("add: bad index {path}"))?;
                 a.get_mut(i).ok_or_else(|| format!("add: missing {path}"))?
@@ -345,18 +351,25 @@ fn mock_ptr_remove(doc: &mut serde_json::Value, path: &str) -> Result<serde_json
     let mut cur = doc;
     for t in parents {
         cur = match cur {
-            serde_json::Value::Object(m) => m.get_mut(t).ok_or_else(|| format!("remove: missing {path}"))?,
+            serde_json::Value::Object(m) => m
+                .get_mut(t)
+                .ok_or_else(|| format!("remove: missing {path}"))?,
             serde_json::Value::Array(a) => {
                 let i: usize = t.parse().map_err(|_| format!("remove: bad index {path}"))?;
-                a.get_mut(i).ok_or_else(|| format!("remove: missing {path}"))?
+                a.get_mut(i)
+                    .ok_or_else(|| format!("remove: missing {path}"))?
             }
             _ => return Err(format!("remove: not a container {path}")),
         };
     }
     match cur {
-        serde_json::Value::Object(m) => m.remove(last).ok_or_else(|| format!("remove: missing {path}")),
+        serde_json::Value::Object(m) => m
+            .remove(last)
+            .ok_or_else(|| format!("remove: missing {path}")),
         serde_json::Value::Array(a) => {
-            let i: usize = last.parse().map_err(|_| format!("remove: bad index {path}"))?;
+            let i: usize = last
+                .parse()
+                .map_err(|_| format!("remove: bad index {path}"))?;
             if i >= a.len() {
                 return Err(format!("remove: index out of range {path}"));
             }

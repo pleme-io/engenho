@@ -8,12 +8,12 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
+use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-use crate::generated_v1_34::types::*;
 // The CANONICAL RBAC primitive (carries the `kind` discriminator the codegen
 // `types::PolicyRule` drops). The explicit import shadows the glob above.
 // `AggregationRule` still comes from the `types::*` glob.
@@ -23,7 +23,11 @@ use super::policy::PolicyRule;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClusterRole {
     /// AggregationRule is an optional field that describes how to build the Rules for this ClusterRole. If AggregationRule is set, then the Rules are controller managed and direct changes to Rules will be stomped by the controller.
-    #[serde(default, rename = "aggregationRule", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "aggregationRule",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub aggregation_rule: Option<AggregationRule>,
     /// Standard object's metadata.
     #[serde(default, skip_serializing_if = "is_empty_meta")]
@@ -34,31 +38,33 @@ pub struct ClusterRole {
 }
 
 impl KubeResource for ClusterRole {
-const GVK: GroupVersionKind = GroupVersionKind {
-group:   "rbac.authorization.k8s.io",
-version: "v1",
-kind:    "ClusterRole",
-};
-const GVR: GroupVersionResource = GroupVersionResource {
-group:    "rbac.authorization.k8s.io",
-version:  "v1",
-resource: "clusterroles",
-};
-const SCOPE: Scope = Scope::Cluster;
+    const GVK: GroupVersionKind = GroupVersionKind {
+        group: "rbac.authorization.k8s.io",
+        version: "v1",
+        kind: "ClusterRole",
+    };
+    const GVR: GroupVersionResource = GroupVersionResource {
+        group: "rbac.authorization.k8s.io",
+        version: "v1",
+        resource: "clusterroles",
+    };
+    const SCOPE: Scope = Scope::Cluster;
 
-fn name(&self) -> Cow<'_, str> {
-Cow::Borrowed(self.metadata.name.as_str())
-}
-fn namespace(&self) -> Option<Cow<'_, str>> {
-self.metadata.namespace.as_deref().map(Cow::Borrowed)
-}
-fn resource_version(&self) -> Option<Cow<'_, str>> {
-if self.metadata.resource_version.is_empty() {
-None
-} else {
-Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-}
-}
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.metadata.name.as_str())
+    }
+    fn namespace(&self) -> Option<Cow<'_, str>> {
+        self.metadata.namespace.as_deref().map(Cow::Borrowed)
+    }
+    fn resource_version(&self) -> Option<Cow<'_, str>> {
+        if self.metadata.resource_version.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+        }
+    }
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }
+fn is_empty_meta(m: &ObjectMeta) -> bool {
+    m == &ObjectMeta::default()
+}

@@ -60,11 +60,17 @@ fn bad_magic_is_a_typed_error_not_a_panic() {
 fn uncataloged_kind_is_a_typed_error() {
     let gvk = Gvk::new("v1", "NoSuchKind");
     let err = message_for_gvk(&gvk).unwrap_err();
-    assert!(matches!(err, CodecError::UncatalogedKind { .. }), "got {err:?}");
+    assert!(
+        matches!(err, CodecError::UncatalogedKind { .. }),
+        "got {err:?}"
+    );
 
     let gvk = Gvk::new("made.up/v9", "Pod");
     let err = message_for_gvk(&gvk).unwrap_err();
-    assert!(matches!(err, CodecError::UncatalogedKind { .. }), "got {err:?}");
+    assert!(
+        matches!(err, CodecError::UncatalogedKind { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -114,24 +120,96 @@ fn meta(name: &str) -> serde_json::Value {
 }
 
 const MATRIX: &[MatrixRow] = &[
-    MatrixRow { api_version: "v1", kind: "Pod", body: || meta("p") },
-    MatrixRow { api_version: "v1", kind: "Service", body: || meta("s") },
-    MatrixRow { api_version: "v1", kind: "ConfigMap", body: || json!({"metadata":{"name":"cm"},"data":{"k":"v"}}) },
-    MatrixRow { api_version: "v1", kind: "Secret", body: || json!({"metadata":{"name":"sec"},"type":"Opaque"}) },
-    MatrixRow { api_version: "v1", kind: "Namespace", body: || meta("ns") },
-    MatrixRow { api_version: "v1", kind: "ServiceAccount", body: || meta("sa") },
-    MatrixRow { api_version: "v1", kind: "Node", body: || meta("node") },
-    MatrixRow { api_version: "v1", kind: "PersistentVolume", body: || meta("pv") },
-    MatrixRow { api_version: "v1", kind: "PersistentVolumeClaim", body: || meta("pvc") },
-    MatrixRow { api_version: "v1", kind: "Endpoints", body: || meta("ep") },
-    MatrixRow { api_version: "apps/v1", kind: "Deployment", body: || meta("dep") },
-    MatrixRow { api_version: "apps/v1", kind: "ReplicaSet", body: || meta("rs") },
-    MatrixRow { api_version: "apps/v1", kind: "StatefulSet", body: || meta("ss") },
-    MatrixRow { api_version: "apps/v1", kind: "DaemonSet", body: || meta("ds") },
-    MatrixRow { api_version: "rbac.authorization.k8s.io/v1", kind: "Role", body: || meta("role") },
-    MatrixRow { api_version: "rbac.authorization.k8s.io/v1", kind: "ClusterRole", body: || meta("crole") },
-    MatrixRow { api_version: "rbac.authorization.k8s.io/v1", kind: "RoleBinding", body: || json!({"metadata":{"name":"rb"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"role"}}) },
-    MatrixRow { api_version: "rbac.authorization.k8s.io/v1", kind: "ClusterRoleBinding", body: || json!({"metadata":{"name":"crb"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"crole"}}) },
+    MatrixRow {
+        api_version: "v1",
+        kind: "Pod",
+        body: || meta("p"),
+    },
+    MatrixRow {
+        api_version: "v1",
+        kind: "Service",
+        body: || meta("s"),
+    },
+    MatrixRow {
+        api_version: "v1",
+        kind: "ConfigMap",
+        body: || json!({"metadata":{"name":"cm"},"data":{"k":"v"}}),
+    },
+    MatrixRow {
+        api_version: "v1",
+        kind: "Secret",
+        body: || json!({"metadata":{"name":"sec"},"type":"Opaque"}),
+    },
+    MatrixRow {
+        api_version: "v1",
+        kind: "Namespace",
+        body: || meta("ns"),
+    },
+    MatrixRow {
+        api_version: "v1",
+        kind: "ServiceAccount",
+        body: || meta("sa"),
+    },
+    MatrixRow {
+        api_version: "v1",
+        kind: "Node",
+        body: || meta("node"),
+    },
+    MatrixRow {
+        api_version: "v1",
+        kind: "PersistentVolume",
+        body: || meta("pv"),
+    },
+    MatrixRow {
+        api_version: "v1",
+        kind: "PersistentVolumeClaim",
+        body: || meta("pvc"),
+    },
+    MatrixRow {
+        api_version: "v1",
+        kind: "Endpoints",
+        body: || meta("ep"),
+    },
+    MatrixRow {
+        api_version: "apps/v1",
+        kind: "Deployment",
+        body: || meta("dep"),
+    },
+    MatrixRow {
+        api_version: "apps/v1",
+        kind: "ReplicaSet",
+        body: || meta("rs"),
+    },
+    MatrixRow {
+        api_version: "apps/v1",
+        kind: "StatefulSet",
+        body: || meta("ss"),
+    },
+    MatrixRow {
+        api_version: "apps/v1",
+        kind: "DaemonSet",
+        body: || meta("ds"),
+    },
+    MatrixRow {
+        api_version: "rbac.authorization.k8s.io/v1",
+        kind: "Role",
+        body: || meta("role"),
+    },
+    MatrixRow {
+        api_version: "rbac.authorization.k8s.io/v1",
+        kind: "ClusterRole",
+        body: || meta("crole"),
+    },
+    MatrixRow {
+        api_version: "rbac.authorization.k8s.io/v1",
+        kind: "RoleBinding",
+        body: || json!({"metadata":{"name":"rb"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"role"}}),
+    },
+    MatrixRow {
+        api_version: "rbac.authorization.k8s.io/v1",
+        kind: "ClusterRoleBinding",
+        body: || json!({"metadata":{"name":"crb"},"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"ClusterRole","name":"crole"}}),
+    },
 ];
 
 #[test]
@@ -155,7 +233,11 @@ fn every_cataloged_kind_has_a_descriptor() {
 
 #[test]
 fn matrix_covers_all_eighteen_cataloged_kinds() {
-    assert_eq!(MATRIX.len(), 18, "the codec matrix must cover all 18 cataloged kinds");
+    assert_eq!(
+        MATRIX.len(),
+        18,
+        "the codec matrix must cover all 18 cataloged kinds"
+    );
 }
 
 #[test]
@@ -204,7 +286,8 @@ fn json_inner_content_type_is_parsed_directly() {
     // Build an Unknown wrapper with contentType=application/json and the
     // raw being literal JSON — the codec must parse it directly without
     // touching the per-kind descriptor.
-    let inner = br#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"j"},"data":{"a":"b"}}"#;
+    let inner =
+        br#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"j"},"data":{"a":"b"}}"#;
     let unknown_desc = unknown_descriptor().unwrap();
     let mut unknown = DynamicMessage::new(unknown_desc.clone());
     let tm_field = unknown_desc.get_field_by_name("typeMeta").unwrap();
@@ -213,7 +296,10 @@ fn json_inner_content_type_is_parsed_directly() {
     tm.set_field_by_name("apiVersion", prost_reflect::Value::String("v1".into()));
     tm.set_field_by_name("kind", prost_reflect::Value::String("ConfigMap".into()));
     unknown.set_field_by_name("typeMeta", prost_reflect::Value::Message(tm));
-    unknown.set_field_by_name("raw", prost_reflect::Value::Bytes(Bytes::from(inner.to_vec())));
+    unknown.set_field_by_name(
+        "raw",
+        prost_reflect::Value::Bytes(Bytes::from(inner.to_vec())),
+    );
     unknown.set_field_by_name(
         "contentType",
         prost_reflect::Value::String("application/json".into()),

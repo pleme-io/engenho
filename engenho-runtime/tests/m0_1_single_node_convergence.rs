@@ -219,7 +219,11 @@ async fn deployment_posted_over_http_converges_to_running_container() {
             .filter(|r| is_owned_by(r, &dep_uid))
             .cloned()
             .collect();
-        if owned.len() == 1 { Some(owned[0].clone()) } else { None }
+        if owned.len() == 1 {
+            Some(owned[0].clone())
+        } else {
+            None
+        }
     })
     .await;
     let rs = rs.unwrap_or_else(|| {
@@ -251,9 +255,8 @@ async fn deployment_posted_over_http_converges_to_running_container() {
         if owned.len() == 2 { Some(owned) } else { None }
     })
     .await;
-    let pods = pods.unwrap_or_else(|| {
-        panic!("expected 2 Pods owned by RS {rs_uid}; never reached 2")
-    });
+    let pods =
+        pods.unwrap_or_else(|| panic!("expected 2 Pods owned by RS {rs_uid}; never reached 2"));
     let pod_names: Vec<String> = pods
         .iter()
         .filter_map(|p| {
@@ -268,8 +271,12 @@ async fn deployment_posted_over_http_converges_to_running_container() {
     // 3. Scheduler binds each Pod to node-A (poll the GET).
     for name in &pod_names {
         let bound = poll_until(TIMEOUT, INTERVAL, || async {
-            let pod =
-                http_get(&client, addr, &format!("/api/v1/namespaces/default/pods/{name}")).await?;
+            let pod = http_get(
+                &client,
+                addr,
+                &format!("/api/v1/namespaces/default/pods/{name}"),
+            )
+            .await?;
             let node = pod
                 .get("spec")
                 .and_then(|s| s.get("nodeName"))
@@ -290,7 +297,11 @@ async fn deployment_posted_over_http_converges_to_running_container() {
     let started = poll_until(TIMEOUT, INTERVAL, || {
         let backend = backend.clone();
         async move {
-            if backend.running_count().await == 2 { Some(()) } else { None }
+            if backend.running_count().await == 2 {
+                Some(())
+            } else {
+                None
+            }
         }
     })
     .await;
@@ -323,8 +334,12 @@ async fn deployment_posted_over_http_converges_to_running_container() {
     // Each Pod's status phase=Running + a Ready=True condition (HTTP).
     for name in &pod_names {
         let ok = poll_until(TIMEOUT, INTERVAL, || async {
-            let pod =
-                http_get(&client, addr, &format!("/api/v1/namespaces/default/pods/{name}")).await?;
+            let pod = http_get(
+                &client,
+                addr,
+                &format!("/api/v1/namespaces/default/pods/{name}"),
+            )
+            .await?;
             let status = pod.get("status")?;
             let phase = status.get("phase").and_then(|p| p.as_str());
             let ready = status
@@ -336,7 +351,11 @@ async fn deployment_posted_over_http_converges_to_running_container() {
                             && c.get("status").and_then(|s| s.as_str()) == Some("True")
                     })
                 });
-            if phase == Some("Running") && ready { Some(()) } else { None }
+            if phase == Some("Running") && ready {
+                Some(())
+            } else {
+                None
+            }
         })
         .await;
         assert!(
@@ -394,7 +413,10 @@ async fn deployment_status_converges_then_reconcile_is_bounded() {
         let status = dep.get("status")?;
         let generation = dep.get("metadata")?.get("generation")?.as_i64()?;
         let observed = status.get("observedGeneration")?.as_i64()?;
-        let ready = status.get("readyReplicas").and_then(|r| r.as_i64()).unwrap_or(0);
+        let ready = status
+            .get("readyReplicas")
+            .and_then(|r| r.as_i64())
+            .unwrap_or(0);
         if observed == generation && ready == 2 {
             Some(())
         } else {
@@ -421,7 +443,10 @@ async fn deployment_status_converges_then_reconcile_is_bounded() {
         if ready == 2 { Some(()) } else { None }
     })
     .await;
-    assert!(rs_ready.is_some(), "RS status.readyReplicas should converge to 2");
+    assert!(
+        rs_ready.is_some(),
+        "RS status.readyReplicas should converge to 2"
+    );
 
     // ── BOUNDED RECONCILE: capture the revision at the fixpoint, idle
     // past several fallback intervals with NO external mutation, re-read.
@@ -492,19 +517,23 @@ async fn durable_store_resumes_deployment_across_runtime_restart() {
 
         // Wait until at least the RS is created (proves the chain ran
         // before we tear down, so the store holds real converged state).
-        let converged = poll_until(Duration::from_secs(15), Duration::from_millis(50), || async {
-            let items = http_list(
-                &client,
-                addr,
-                "/apis/apps/v1/namespaces/default/replicasets",
-            )
-            .await;
-            if items.iter().any(|r| is_owned_by(r, &dep_uid)) {
-                Some(())
-            } else {
-                None
-            }
-        })
+        let converged = poll_until(
+            Duration::from_secs(15),
+            Duration::from_millis(50),
+            || async {
+                let items = http_list(
+                    &client,
+                    addr,
+                    "/apis/apps/v1/namespaces/default/replicasets",
+                )
+                .await;
+                if items.iter().any(|r| is_owned_by(r, &dep_uid)) {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+        )
         .await;
         assert!(converged.is_some(), "first boot should converge to an RS");
 
@@ -526,21 +555,22 @@ async fn durable_store_resumes_deployment_across_runtime_restart() {
 
         // The Deployment persisted across the restart — readable over
         // HTTP from the resumed durable store.
-        let dep = poll_until(Duration::from_secs(10), Duration::from_millis(50), || async {
-            http_get(
-                &client,
-                addr,
-                "/apis/apps/v1/namespaces/default/deployments/podinfo",
-            )
-            .await
-        })
+        let dep = poll_until(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            || async {
+                http_get(
+                    &client,
+                    addr,
+                    "/apis/apps/v1/namespaces/default/deployments/podinfo",
+                )
+                .await
+            },
+        )
         .await;
         let dep = dep.expect("Deployment should survive Runtime restart");
         assert_eq!(dep.get("kind").unwrap(), "Deployment");
-        assert_eq!(
-            dep.get("spec").and_then(|s| s.get("replicas")).unwrap(),
-            2
-        );
+        assert_eq!(dep.get("spec").and_then(|s| s.get("replicas")).unwrap(), 2);
 
         rt.shutdown().await.expect("second shutdown");
     }

@@ -24,9 +24,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use engenho_apiserver::{
-    ApiServer, ResumePoint, ResourceHandler, Selectors, StoreBackedHandler,
-};
+use engenho_apiserver::{ApiServer, ResourceHandler, ResumePoint, Selectors, StoreBackedHandler};
 use engenho_store::{InProcessRouter, Revision, StoreMesh, WatchSignal, default_config};
 
 // ── boot helpers ──────────────────────────────────────────────────
@@ -46,8 +44,11 @@ async fn boot_store() -> Arc<StoreMesh> {
 
 async fn boot_store_and_server() -> (Arc<StoreMesh>, ApiServer) {
     let store = boot_store().await;
-    let pod_handler: Arc<dyn ResourceHandler> =
-        Arc::new(StoreBackedHandler::for_core_kind(store.clone(), "Pod", true));
+    let pod_handler: Arc<dyn ResourceHandler> = Arc::new(StoreBackedHandler::for_core_kind(
+        store.clone(),
+        "Pod",
+        true,
+    ));
     let cm_handler: Arc<dyn ResourceHandler> = Arc::new(StoreBackedHandler::for_core_kind(
         store.clone(),
         "ConfigMap",
@@ -71,14 +72,23 @@ fn pod_body_labeled(name: &str, key: &str, val: &str) -> serde_json::Value {
     serde_json::json!({ "metadata": { "name": name, "labels": { key: val } }, "spec": {} })
 }
 
-async fn post_pod(client: &reqwest::Client, addr: std::net::SocketAddr, ns: &str, body: &serde_json::Value) {
+async fn post_pod(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    ns: &str,
+    body: &serde_json::Value,
+) {
     let resp = client
         .post(format!("http://{addr}/api/v1/namespaces/{ns}/pods"))
         .json(body)
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "POST pod failed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "POST pod failed"
+    );
 }
 
 async fn post_cm(client: &reqwest::Client, addr: std::net::SocketAddr, ns: &str, name: &str) {
@@ -296,7 +306,10 @@ async fn watch_from_list_rv_is_gap_and_dup_free() {
         let ev = watch.next_event().await;
         assert_eq!(ev.get("type").unwrap(), "ADDED");
         let rv = ev_rv(&ev);
-        assert!(rv > n, "no event at rv<=N (no dup of listed items): {rv} <= {n}");
+        assert!(
+            rv > n,
+            "no event at rv<=N (no dup of listed items): {rv} <= {n}"
+        );
         delivered.push(rv);
     }
     assert_eq!(
@@ -393,7 +406,12 @@ async fn compacted_too_old_maps_to_gone_410() {
     );
 
     drop(h);
-    Arc::try_unwrap(store).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 // =================================================================
@@ -456,8 +474,20 @@ async fn label_selector_filters_list_and_watch() {
     let client = reqwest::Client::new();
 
     // Two pods up-front: one matching app=web, one not.
-    post_pod(&client, addr, "default", &pod_body_labeled("web1", "app", "web")).await;
-    post_pod(&client, addr, "default", &pod_body_labeled("api1", "app", "api")).await;
+    post_pod(
+        &client,
+        addr,
+        "default",
+        &pod_body_labeled("web1", "app", "web"),
+    )
+    .await;
+    post_pod(
+        &client,
+        addr,
+        "default",
+        &pod_body_labeled("api1", "app", "api"),
+    )
+    .await;
 
     // LIST ?labelSelector=app=web → only web1.
     let resp = client
@@ -485,8 +515,20 @@ async fn label_selector_filters_list_and_watch() {
 
     // Create one matching + one non-matching pod; only the matching one
     // streams.
-    post_pod(&client, addr, "default", &pod_body_labeled("web2", "app", "web")).await;
-    post_pod(&client, addr, "default", &pod_body_labeled("api2", "app", "api")).await;
+    post_pod(
+        &client,
+        addr,
+        "default",
+        &pod_body_labeled("web2", "app", "web"),
+    )
+    .await;
+    post_pod(
+        &client,
+        addr,
+        "default",
+        &pod_body_labeled("api2", "app", "api"),
+    )
+    .await;
 
     let ev = watch.next_event().await;
     assert_eq!(
@@ -569,7 +611,12 @@ async fn bookmark_passthrough_and_optout() {
     assert!(none.is_err(), "ZERO cadence → no bookmark");
 
     drop((bm_stream, resumed, no_bm));
-    Arc::try_unwrap(store).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -587,7 +634,12 @@ async fn watch_stream_disables_bookmarks_when_not_requested() {
     assert!(none.is_err(), "no bookmark with allow_bookmarks=false");
     drop(stream);
     drop(h);
-    Arc::try_unwrap(store).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }
 
 // =================================================================
@@ -606,12 +658,7 @@ async fn watch_most_recent_does_not_replay_existing() {
     }
 
     // WATCH ?watch=true (no resourceVersion) → MostRecent, NO replay.
-    let mut watch = open_watch(
-        &client,
-        addr,
-        "/api/v1/namespaces/default/pods?watch=true",
-    )
-    .await;
+    let mut watch = open_watch(&client, addr, "/api/v1/namespaces/default/pods?watch=true").await;
 
     // Create a 4th pod.
     post_pod(&client, addr, "default", &pod_body("e4")).await;
@@ -663,7 +710,11 @@ async fn malformed_resource_version_is_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "bare key = exists selector");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "bare key = exists selector"
+    );
 
     // A genuinely malformed selector (empty KEY, `=v`) → 400.
     let resp = client
@@ -699,11 +750,19 @@ async fn handler_list_at_returns_items_and_current_revision() {
             .unwrap();
     }
 
-    let (items, rv) = h.list_at(Some("default"), &Selectors::default()).await.unwrap();
+    let (items, rv) = h
+        .list_at(Some("default"), &Selectors::default())
+        .await
+        .unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(rv, store.current_catalog().await.revision());
     assert_eq!(rv, Revision(2));
 
     drop(h);
-    Arc::try_unwrap(store).ok().unwrap().terminate().await.unwrap();
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
 }

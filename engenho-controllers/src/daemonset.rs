@@ -90,8 +90,9 @@ impl DaemonSetController {
     /// none). Mirrors `ReplicaSetController::build_pod_from_template`.
     fn build_pod_for_node(ds: &Value, node_name: &str) -> Option<(String, Value)> {
         let ds_name = ds.name()?;
-        let ds_namespace =
-            ds.namespace().map_or_else(|| "default".to_string(), |c| c.to_owned());
+        let ds_namespace = ds
+            .namespace()
+            .map_or_else(|| "default".to_string(), |c| c.to_owned());
         let template = ds.get("spec").and_then(|s| s.get("template"))?;
         let mut pod = template.clone();
         let pod_obj = pod.as_object_mut()?;
@@ -209,8 +210,8 @@ impl OwnedChildrenReconciler for DaemonSetController {
         // (node removed → pod GC'd). Owner-ref GC covers DS deletion; this
         // covers the per-node case.
         for (pod_key, pod_value) in owned {
-            let on_scheduled_node = Self::pod_node(pod_value)
-                .is_some_and(|n| schedulable.contains(n));
+            let on_scheduled_node =
+                Self::pod_node(pod_value).is_some_and(|n| schedulable.contains(n));
             if !on_scheduled_node {
                 debug!(pod = %pod_key.label(), "deleting daemon pod on missing/unschedulable node");
                 commands.push(ResourceCommand::delete(pod_key.clone(), Reason::Controller));
@@ -233,9 +234,8 @@ impl OwnedChildrenReconciler for DaemonSetController {
         //     `currentNumberScheduled` == owned pod count (one per node);
         //     `numberReady` counts Ready=True owned pods.
         let scheduled = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
-        let ready =
-            i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
-                .unwrap_or(i64::MAX);
+        let ready = i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
+            .unwrap_or(i64::MAX);
         Some(json!({
             "desiredNumberScheduled": scheduled,
             "currentNumberScheduled": scheduled,
@@ -312,7 +312,9 @@ mod tests {
 
     #[test]
     fn node_is_schedulable_default_and_cordon() {
-        assert!(DaemonSetController::node_is_schedulable(&json!({"spec": {}})));
+        assert!(DaemonSetController::node_is_schedulable(
+            &json!({"spec": {}})
+        ));
         assert!(DaemonSetController::node_is_schedulable(&json!({})));
         assert!(DaemonSetController::node_is_schedulable(
             &json!({"spec": {"unschedulable": false}})
@@ -340,13 +342,15 @@ mod tests {
             "observability"
         );
         // Node-pinned: spec.nodeName pre-set (scheduler bypassed).
-        assert_eq!(
-            pod.get("spec").unwrap().get("nodeName").unwrap(),
-            "node-A"
-        );
+        assert_eq!(pod.get("spec").unwrap().get("nodeName").unwrap(), "node-A");
         // Template labels survive.
         assert_eq!(
-            pod.get("metadata").unwrap().get("labels").unwrap().get("app").unwrap(),
+            pod.get("metadata")
+                .unwrap()
+                .get("labels")
+                .unwrap()
+                .get("app")
+                .unwrap(),
             "vector"
         );
     }
@@ -358,7 +362,10 @@ mod tests {
             "spec": {"template": {"spec": {"containers": []}}}
         });
         let (_, pod) = DaemonSetController::build_pod_for_node(&ds, "n1").unwrap();
-        assert_eq!(pod.get("metadata").unwrap().get("namespace").unwrap(), "default");
+        assert_eq!(
+            pod.get("metadata").unwrap().get("namespace").unwrap(),
+            "default"
+        );
     }
 
     // ── integration over the store ────────────────────────────────────
@@ -371,7 +378,10 @@ mod tests {
         seed_node(&store, "node-C", false).await; // cordoned → no pod
         let uid = seed_ds(&store, "observability", "vector").await;
 
-        let c = DaemonSetController { store: store.clone(), namespace: None };
+        let c = DaemonSetController {
+            store: store.clone(),
+            namespace: None,
+        };
         c.tick().await.unwrap();
 
         // Exactly 2 pods (one per schedulable node), both in the DS namespace,
@@ -386,11 +396,16 @@ mod tests {
         for (key, pod) in &owned {
             assert_eq!(key.namespace.as_deref(), Some("observability"));
             let node = DaemonSetController::pod_node(pod).unwrap();
-            assert!(node == "node-A" || node == "node-B", "pinned to a schedulable node");
+            assert!(
+                node == "node-A" || node == "node-B",
+                "pinned to a schedulable node"
+            );
         }
         // No pod on the cordoned node-C.
         assert!(
-            !owned.iter().any(|(_, p)| DaemonSetController::pod_node(p) == Some("node-C")),
+            !owned
+                .iter()
+                .any(|(_, p)| DaemonSetController::pod_node(p) == Some("node-C")),
             "cordoned node must get no daemon pod"
         );
     }
@@ -401,10 +416,16 @@ mod tests {
         seed_node(&store, "node-A", true).await;
         let uid = seed_ds(&store, "default", "ds").await;
 
-        let c = DaemonSetController { store: store.clone(), namespace: None };
+        let c = DaemonSetController {
+            store: store.clone(),
+            namespace: None,
+        };
         c.tick().await.unwrap();
         let pod_key = ResourceKey::namespaced("", "v1", "Pod", "default", "ds-node-A");
-        assert!(store.get(&pod_key).await.is_some(), "first tick creates the pod");
+        assert!(
+            store.get(&pod_key).await.is_some(),
+            "first tick creates the pod"
+        );
 
         // Operator/chaos deletes the pod.
         store
@@ -427,9 +448,23 @@ mod tests {
         seed_node(&store, "node-B", true).await;
         let _uid = seed_ds(&store, "default", "ds").await;
 
-        let c = DaemonSetController { store: store.clone(), namespace: None };
+        let c = DaemonSetController {
+            store: store.clone(),
+            namespace: None,
+        };
         c.tick().await.unwrap();
-        assert!(store.get(&ResourceKey::namespaced("", "v1", "Pod", "default", "ds-node-B")).await.is_some());
+        assert!(
+            store
+                .get(&ResourceKey::namespaced(
+                    "",
+                    "v1",
+                    "Pod",
+                    "default",
+                    "ds-node-B"
+                ))
+                .await
+                .is_some()
+        );
 
         // node-B disappears (drained / removed from the cluster).
         store
@@ -443,11 +478,29 @@ mod tests {
         // Next tick deletes the orphaned pod on node-B (node A's stays).
         c.tick().await.unwrap();
         assert!(
-            store.get(&ResourceKey::namespaced("", "v1", "Pod", "default", "ds-node-B")).await.is_none(),
+            store
+                .get(&ResourceKey::namespaced(
+                    "",
+                    "v1",
+                    "Pod",
+                    "default",
+                    "ds-node-B"
+                ))
+                .await
+                .is_none(),
             "pod on removed node must be GC'd"
         );
         assert!(
-            store.get(&ResourceKey::namespaced("", "v1", "Pod", "default", "ds-node-A")).await.is_some(),
+            store
+                .get(&ResourceKey::namespaced(
+                    "",
+                    "v1",
+                    "Pod",
+                    "default",
+                    "ds-node-A"
+                ))
+                .await
+                .is_some(),
             "pod on surviving node stays"
         );
     }
@@ -459,7 +512,10 @@ mod tests {
         seed_node(&store, "node-B", true).await;
         let _uid = seed_ds(&store, "default", "ds").await;
 
-        let c = DaemonSetController { store: store.clone(), namespace: None };
+        let c = DaemonSetController {
+            store: store.clone(),
+            namespace: None,
+        };
         c.tick().await.unwrap();
         let rev_a = store.current_catalog().await.revision();
         // Several idle ticks: at the fixpoint nothing is proposed.
@@ -477,11 +533,20 @@ mod tests {
         seed_node(&store, "node-B", true).await;
         seed_ds(&store, "default", "ds").await;
 
-        let c = DaemonSetController { store: store.clone(), namespace: None };
+        let c = DaemonSetController {
+            store: store.clone(),
+            namespace: None,
+        };
         c.tick().await.unwrap();
 
         let ds = store
-            .get(&ResourceKey::namespaced("apps", "v1", "DaemonSet", "default", "ds"))
+            .get(&ResourceKey::namespaced(
+                "apps",
+                "v1",
+                "DaemonSet",
+                "default",
+                "ds",
+            ))
             .await
             .unwrap();
         let status = ds.get("status").expect("status written");

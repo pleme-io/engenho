@@ -235,7 +235,10 @@ impl ApiServer {
             }
         }
         let abort = self.task.abort_handle();
-        if tokio::time::timeout(SHUTDOWN_GRACE, self.task).await.is_err() {
+        if tokio::time::timeout(SHUTDOWN_GRACE, self.task)
+            .await
+            .is_err()
+        {
             // Open long-poll watches didn't drain within the grace —
             // sever them by aborting the serve task (no leaked task).
             abort.abort();

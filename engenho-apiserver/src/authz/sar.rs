@@ -16,12 +16,12 @@
 //!   * `POST .../selfsubjectrulesreviews`   → enumerate the caller's applicable
 //!     rules; `kubectl auth can-i --list`.
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use engenho_kube_proto::{self as kube_proto, is_protobuf_content_type};
 use engenho_types::auth::UserInfo;
 use serde::de::DeserializeOwned;
@@ -106,7 +106,11 @@ pub struct SubjectAccessReviewStatus {
     pub denied: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    #[serde(default, rename = "evaluationError", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "evaluationError",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub evaluation_error: String,
 }
 
@@ -120,7 +124,11 @@ pub struct ResourceRule {
     pub api_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<String>,
-    #[serde(default, rename = "resourceNames", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "resourceNames",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub resource_names: Vec<String>,
 }
 
@@ -130,7 +138,11 @@ pub struct ResourceRule {
 pub struct NonResourceRule {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verbs: Vec<String>,
-    #[serde(default, rename = "nonResourceURLs", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "nonResourceURLs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub non_resource_urls: Vec<String>,
 }
 
@@ -148,7 +160,11 @@ pub struct SubjectRulesReviewStatus {
 /// `SubjectAccessReview` — the full POST request/response envelope.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubjectAccessReview {
-    #[serde(default, rename = "apiVersion", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "apiVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub api_version: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
@@ -161,7 +177,11 @@ pub struct SubjectAccessReview {
 /// `SelfSubjectAccessReview` — the full POST envelope for the caller's SAR.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SelfSubjectAccessReview {
-    #[serde(default, rename = "apiVersion", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "apiVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub api_version: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
@@ -174,7 +194,11 @@ pub struct SelfSubjectAccessReview {
 /// `SelfSubjectRulesReview` — the full POST envelope for the rules review.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SelfSubjectRulesReview {
-    #[serde(default, rename = "apiVersion", skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        rename = "apiVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub api_version: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
@@ -396,8 +420,7 @@ pub async fn self_subject_rules_review(
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
-    let review: SelfSubjectRulesReview =
-        decode_sar_body(&headers, &raw, "SelfSubjectRulesReview")?;
+    let review: SelfSubjectRulesReview = decode_sar_body(&headers, &raw, "SelfSubjectRulesReview")?;
     let rules = state
         .authorizer
         .rules_for(&user_info.0, review.spec.namespace.as_deref())

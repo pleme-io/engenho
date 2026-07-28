@@ -99,10 +99,7 @@ pub fn stamp_create_timestamp(value: &mut Value, clock: CreateClock) -> bool {
         return false;
     };
     if creation_timestamp_is_unset(meta_obj.get("creationTimestamp")) {
-        meta_obj.insert(
-            "creationTimestamp".to_string(),
-            Value::String(clock()),
-        );
+        meta_obj.insert("creationTimestamp".to_string(), Value::String(clock()));
         true
     } else {
         false
@@ -189,7 +186,9 @@ mod tests {
         assert!(creation_timestamp_is_unset(Some(&Value::Null)));
         assert!(creation_timestamp_is_unset(Some(&json!(""))));
         assert!(creation_timestamp_is_unset(Some(&json!({}))));
-        assert!(!creation_timestamp_is_unset(Some(&json!("2026-01-01T00:00:00Z"))));
+        assert!(!creation_timestamp_is_unset(Some(&json!(
+            "2026-01-01T00:00:00Z"
+        ))));
     }
 
     #[test]

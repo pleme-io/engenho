@@ -274,13 +274,10 @@ pub(crate) fn build_api_groups(state: &RouterState) -> APIGroupList {
                 .collect();
             // preferredVersion = the highest-sorted version present (one
             // version per group at M0.1, so this is unambiguous).
-            let preferred = gvs
-                .last()
-                .cloned()
-                .unwrap_or(GroupVersionForDiscovery {
-                    group_version: name.clone(),
-                    version: String::new(),
-                });
+            let preferred = gvs.last().cloned().unwrap_or(GroupVersionForDiscovery {
+                group_version: name.clone(),
+                version: String::new(),
+            });
             APIGroup {
                 name,
                 versions: gvs,

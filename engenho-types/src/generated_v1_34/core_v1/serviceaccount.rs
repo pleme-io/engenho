@@ -8,21 +8,29 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
+use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-use crate::generated_v1_34::types::*;
 
 /// ServiceAccount binds together: * a name, understood by users, and perhaps by peripheral systems, for an identity * a principal that can be authenticated and authorized * a set of secrets
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServiceAccount {
     /// AutomountServiceAccountToken indicates whether pods running as this service account should have an API token automatically mounted. Can be overridden at the pod level.
-    #[serde(default, rename = "automountServiceAccountToken", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "automountServiceAccountToken",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub automount_service_account_token: Option<bool>,
     /// ImagePullSecrets is a list of references to secrets in the same namespace to use for pulling any images in pods that reference this ServiceAccount. ImagePullSecrets are distinct from Secrets because Secrets can be mounted in the pod, but ImagePullSecrets are only accessed by the kubelet. More info: https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod
-    #[serde(default, rename = "imagePullSecrets", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "imagePullSecrets",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub image_pull_secrets: Vec<LocalObjectReference>,
     /// Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
     #[serde(default, skip_serializing_if = "is_empty_meta")]
@@ -33,31 +41,33 @@ pub struct ServiceAccount {
 }
 
 impl KubeResource for ServiceAccount {
-const GVK: GroupVersionKind = GroupVersionKind {
-group:   "",
-version: "v1",
-kind:    "ServiceAccount",
-};
-const GVR: GroupVersionResource = GroupVersionResource {
-group:    "",
-version:  "v1",
-resource: "serviceaccounts",
-};
-const SCOPE: Scope = Scope::Namespaced;
+    const GVK: GroupVersionKind = GroupVersionKind {
+        group: "",
+        version: "v1",
+        kind: "ServiceAccount",
+    };
+    const GVR: GroupVersionResource = GroupVersionResource {
+        group: "",
+        version: "v1",
+        resource: "serviceaccounts",
+    };
+    const SCOPE: Scope = Scope::Namespaced;
 
-fn name(&self) -> Cow<'_, str> {
-Cow::Borrowed(self.metadata.name.as_str())
-}
-fn namespace(&self) -> Option<Cow<'_, str>> {
-self.metadata.namespace.as_deref().map(Cow::Borrowed)
-}
-fn resource_version(&self) -> Option<Cow<'_, str>> {
-if self.metadata.resource_version.is_empty() {
-None
-} else {
-Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-}
-}
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.metadata.name.as_str())
+    }
+    fn namespace(&self) -> Option<Cow<'_, str>> {
+        self.metadata.namespace.as_deref().map(Cow::Borrowed)
+    }
+    fn resource_version(&self) -> Option<Cow<'_, str>> {
+        if self.metadata.resource_version.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+        }
+    }
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }
+fn is_empty_meta(m: &ObjectMeta) -> bool {
+    m == &ObjectMeta::default()
+}

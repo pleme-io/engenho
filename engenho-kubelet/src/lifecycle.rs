@@ -182,7 +182,11 @@ pub struct ContainerObservation {
 impl ContainerObservation {
     /// A `Running` observation for a started container.
     #[must_use]
-    pub fn running(name: impl Into<String>, container_id: impl Into<String>, restart_count: u32) -> Self {
+    pub fn running(
+        name: impl Into<String>,
+        container_id: impl Into<String>,
+        restart_count: u32,
+    ) -> Self {
         Self {
             name: name.into(),
             state: ContainerState::Running,
@@ -299,7 +303,9 @@ pub fn reconcile_pod_phase(
         return (PodPhase::Pending, statuses);
     }
 
-    let any_waiting = observations.iter().any(|o| matches!(o.state, ContainerState::Waiting { .. }));
+    let any_waiting = observations
+        .iter()
+        .any(|o| matches!(o.state, ContainerState::Waiting { .. }));
     if any_waiting {
         // Not every container is up yet → Pending. Never a fake Running.
         return (PodPhase::Pending, statuses);
@@ -335,10 +341,12 @@ pub fn reconcile_pod_phase(
 
     // All containers terminated, none restartable → terminal phase. Worst-case
     // fold: Succeeded iff every container exited 0, else Failed.
-    let all_zero = observations
-        .iter()
-        .all(|o| o.state.exit_code() == Some(0));
-    let phase = if all_zero { PodPhase::Succeeded } else { PodPhase::Failed };
+    let all_zero = observations.iter().all(|o| o.state.exit_code() == Some(0));
+    let phase = if all_zero {
+        PodPhase::Succeeded
+    } else {
+        PodPhase::Failed
+    };
     (phase, statuses)
 }
 
@@ -420,7 +428,10 @@ pub fn next_init_action(
                 return if restart_policy.should_restart(Some(*exit_code)) {
                     InitAction::AwaitInit { index }
                 } else {
-                    InitAction::InitFailed { index, exit_code: *exit_code }
+                    InitAction::InitFailed {
+                        index,
+                        exit_code: *exit_code,
+                    }
                 };
             }
             // In flight or not yet started → this is the active init container.
@@ -445,7 +456,12 @@ pub fn reconcile_pod_phase_with_init(
     restart_policy: RestartPolicy,
     init_observations: &[ContainerObservation],
     app_observations: &[ContainerObservation],
-) -> (PodPhase, Vec<ContainerStatusOut>, Vec<ContainerStatusOut>, bool) {
+) -> (
+    PodPhase,
+    Vec<ContainerStatusOut>,
+    Vec<ContainerStatusOut>,
+    bool,
+) {
     let to_status = |o: &ContainerObservation| ContainerStatusOut {
         name: o.name.clone(),
         ready: o.ready,
@@ -494,15 +510,27 @@ mod tests {
     fn restart_policy_default_is_always() {
         assert_eq!(RestartPolicy::default(), RestartPolicy::Always);
         assert_eq!(RestartPolicy::from_spec_str(None), RestartPolicy::Always);
-        assert_eq!(RestartPolicy::from_spec_str(Some("Always")), RestartPolicy::Always);
+        assert_eq!(
+            RestartPolicy::from_spec_str(Some("Always")),
+            RestartPolicy::Always
+        );
         // Unrecognized → Always (K8s default), never a panic.
-        assert_eq!(RestartPolicy::from_spec_str(Some("Bogus")), RestartPolicy::Always);
+        assert_eq!(
+            RestartPolicy::from_spec_str(Some("Bogus")),
+            RestartPolicy::Always
+        );
     }
 
     #[test]
     fn restart_policy_parses_never_and_onfailure() {
-        assert_eq!(RestartPolicy::from_spec_str(Some("Never")), RestartPolicy::Never);
-        assert_eq!(RestartPolicy::from_spec_str(Some("OnFailure")), RestartPolicy::OnFailure);
+        assert_eq!(
+            RestartPolicy::from_spec_str(Some("Never")),
+            RestartPolicy::Never
+        );
+        assert_eq!(
+            RestartPolicy::from_spec_str(Some("OnFailure")),
+            RestartPolicy::OnFailure
+        );
     }
 
     #[test]
@@ -549,16 +577,14 @@ mod tests {
 
     #[test]
     fn single_terminated_zero_never_is_succeeded() {
-        let (phase, st) =
-            reconcile_pod_phase(RestartPolicy::Never, &[terminated("a", "id-a", 0)]);
+        let (phase, st) = reconcile_pod_phase(RestartPolicy::Never, &[terminated("a", "id-a", 0)]);
         assert_eq!(phase, PodPhase::Succeeded);
         assert_eq!(st[0].state.exit_code(), Some(0));
     }
 
     #[test]
     fn single_terminated_nonzero_never_is_failed() {
-        let (phase, _) =
-            reconcile_pod_phase(RestartPolicy::Never, &[terminated("a", "id-a", 137)]);
+        let (phase, _) = reconcile_pod_phase(RestartPolicy::Never, &[terminated("a", "id-a", 137)]);
         assert_eq!(phase, PodPhase::Failed);
     }
 
@@ -566,11 +592,9 @@ mod tests {
     fn single_terminated_under_always_stays_running() {
         // restartPolicy:Always — an exited container is about to be
         // restarted, so the pod is still Running (recovers). Even exit 0.
-        let (phase, _) =
-            reconcile_pod_phase(RestartPolicy::Always, &[terminated("a", "id-a", 0)]);
+        let (phase, _) = reconcile_pod_phase(RestartPolicy::Always, &[terminated("a", "id-a", 0)]);
         assert_eq!(phase, PodPhase::Running);
-        let (phase, _) =
-            reconcile_pod_phase(RestartPolicy::Always, &[terminated("a", "id-a", 1)]);
+        let (phase, _) = reconcile_pod_phase(RestartPolicy::Always, &[terminated("a", "id-a", 1)]);
         assert_eq!(phase, PodPhase::Running);
     }
 
@@ -602,10 +626,8 @@ mod tests {
     #[test]
     fn one_running_one_waiting_is_pending() {
         // Until ALL containers have started, the pod is Pending.
-        let (phase, _) = reconcile_pod_phase(
-            RestartPolicy::Always,
-            &[running("a", "id-a"), waiting("b")],
-        );
+        let (phase, _) =
+            reconcile_pod_phase(RestartPolicy::Always, &[running("a", "id-a"), waiting("b")]);
         assert_eq!(phase, PodPhase::Pending);
     }
 
@@ -667,7 +689,10 @@ mod tests {
         // The behavior-preserving default: every pre-init-brick pod has zero
         // init containers, so the fold returns Complete and the kubelet reaches
         // the app-container path identically to before.
-        assert_eq!(next_init_action(RestartPolicy::Always, &[]), InitAction::Complete);
+        assert_eq!(
+            next_init_action(RestartPolicy::Always, &[]),
+            InitAction::Complete
+        );
         assert!(next_init_action(RestartPolicy::Never, &[]).is_complete());
     }
 
@@ -703,8 +728,14 @@ mod tests {
 
     #[test]
     fn all_init_succeeded_completes() {
-        let obs = vec![terminated("init-0", "id0", 0), terminated("init-1", "id1", 0)];
-        assert_eq!(next_init_action(RestartPolicy::Never, &obs), InitAction::Complete);
+        let obs = vec![
+            terminated("init-0", "id0", 0),
+            terminated("init-1", "id1", 0),
+        ];
+        assert_eq!(
+            next_init_action(RestartPolicy::Never, &obs),
+            InitAction::Complete
+        );
     }
 
     #[test]
@@ -713,7 +744,10 @@ mod tests {
         let obs = vec![terminated("init-0", "id0", 7)];
         assert_eq!(
             next_init_action(RestartPolicy::Never, &obs),
-            InitAction::InitFailed { index: 0, exit_code: 7 }
+            InitAction::InitFailed {
+                index: 0,
+                exit_code: 7
+            }
         );
     }
 
@@ -801,8 +835,12 @@ mod proptests {
     fn obs_strategy() -> impl Strategy<Value = ContainerObservation> {
         prop_oneof![
             (any::<u32>()).prop_map(|rc| ContainerObservation::running("c", "id", rc % 10)),
-            (-5i32..5, any::<u32>())
-                .prop_map(|(code, rc)| ContainerObservation::terminated("c", "id", code, rc % 10)),
+            (-5i32..5, any::<u32>()).prop_map(|(code, rc)| ContainerObservation::terminated(
+                "c",
+                "id",
+                code,
+                rc % 10
+            )),
             Just(ContainerObservation::waiting("c")),
         ]
     }

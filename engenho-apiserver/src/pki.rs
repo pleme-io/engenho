@@ -32,10 +32,10 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, DnValue,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
 };
+use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;
-use rustls::RootCertStore;
 
 /// Everything that can go wrong building or loading the cluster PKI.
 #[derive(Debug, thiserror::Error)]
@@ -499,12 +499,10 @@ fn build_sans(san: &ServerSanInputs<'_>) -> Result<Vec<SanType>, PkiError> {
         dns_names.push(san.node_name);
     }
     for name in dns_names {
-        let ia5 = name
-            .try_into()
-            .map_err(|source| PkiError::San {
-                value: name.to_string(),
-                source,
-            })?;
+        let ia5 = name.try_into().map_err(|source| PkiError::San {
+            value: name.to_string(),
+            source,
+        })?;
         sans.push(SanType::DnsName(ia5));
     }
 
@@ -622,17 +620,33 @@ mod tests {
         // a different kubectl configuration").
         let (_d1, ca1) = ca_in_tempdir();
         let (_d2, ca2) = ca_in_tempdir();
-        assert_eq!(ca1.cert_pem(), ca2.cert_pem(), "CA cert must be deterministic");
+        assert_eq!(
+            ca1.cert_pem(),
+            ca2.cert_pem(),
+            "CA cert must be deterministic"
+        );
 
-        let san = ServerSanInputs { node_name: "engenho-local", listen_ip: None };
+        let san = ServerSanInputs {
+            node_name: "engenho-local",
+            listen_ip: None,
+        };
         let s1 = issue_server_material(&ca1, &san).unwrap();
         let s2 = issue_server_material(&ca2, &san).unwrap();
-        assert_eq!(s1.cert_chain_pem, s2.cert_chain_pem, "server cert must be deterministic");
+        assert_eq!(
+            s1.cert_chain_pem, s2.cert_chain_pem,
+            "server cert must be deterministic"
+        );
 
         let c1 = issue_admin_client_material(&ca1).unwrap();
         let c2 = issue_admin_client_material(&ca2).unwrap();
-        assert_eq!(c1.cert_pem, c2.cert_pem, "admin client cert must be deterministic");
-        assert_eq!(c1.key_pem, c2.key_pem, "admin client key must be deterministic");
+        assert_eq!(
+            c1.cert_pem, c2.cert_pem,
+            "admin client cert must be deterministic"
+        );
+        assert_eq!(
+            c1.key_pem, c2.key_pem,
+            "admin client key must be deterministic"
+        );
 
         // Same role → same key; distinct roles → distinct keys.
         assert_eq!(
@@ -707,16 +721,8 @@ mod tests {
         let dir_b = tempfile::tempdir().unwrap();
         let pki_b = dir_b.path().join("pki");
         std::fs::create_dir_all(&pki_b).unwrap();
-        std::fs::copy(
-            dir_a.path().join("pki/ca.crt"),
-            pki_b.join("ca.crt"),
-        )
-        .unwrap();
-        std::fs::copy(
-            dir_a.path().join("pki/ca.key"),
-            pki_b.join("ca.key"),
-        )
-        .unwrap();
+        std::fs::copy(dir_a.path().join("pki/ca.crt"), pki_b.join("ca.crt")).unwrap();
+        std::fs::copy(dir_a.path().join("pki/ca.key"), pki_b.join("ca.key")).unwrap();
 
         let loaded = load_or_generate_ca(dir_b.path()).unwrap();
         assert_eq!(loaded.cert_pem(), seeded_pem);

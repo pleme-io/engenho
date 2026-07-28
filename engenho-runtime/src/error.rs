@@ -42,7 +42,9 @@ pub enum RuntimeError {
     /// store `Arc` (a driver task or apiserver handler still holds a
     /// clone). `terminate` consumes `StoreMesh` and requires the only
     /// strong ref; this surfaces the leak rather than hanging.
-    #[error("could not acquire sole store ownership for terminate ({strong_count} strong refs remain)")]
+    #[error(
+        "could not acquire sole store ownership for terminate ({strong_count} strong refs remain)"
+    )]
     StoreStillShared {
         /// How many strong refs remained when `try_unwrap` failed.
         strong_count: usize,

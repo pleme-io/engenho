@@ -93,7 +93,8 @@ async fn apply_creates_records_ownership_then_reapply_updates() {
     assert_eq!(got["data"]["a"], "1");
     let mf = got["metadata"]["managedFields"].as_array().unwrap();
     assert!(
-        mf.iter().any(|e| e["manager"] == "mgr" && e["operation"] == "Apply"),
+        mf.iter()
+            .any(|e| e["manager"] == "mgr" && e["operation"] == "Apply"),
         "managedFields records the apply manager"
     );
 
@@ -245,7 +246,9 @@ async fn apply_without_field_manager_is_bad_request() {
     let resp = client
         .patch(&url) // no ?fieldManager=
         .header("Content-Type", "application/apply-patch+yaml")
-        .body(r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm5"},"data":{"a":"1"}}"#)
+        .body(
+            r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm5"},"data":{"a":"1"}}"#,
+        )
         .send()
         .await
         .unwrap();

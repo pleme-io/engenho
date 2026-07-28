@@ -341,7 +341,13 @@ mod tests {
         );
         assert!(
             store
-                .get(&ResourceKey::namespaced("apps", "v1", "Deployment", "demo", "d"))
+                .get(&ResourceKey::namespaced(
+                    "apps",
+                    "v1",
+                    "Deployment",
+                    "demo",
+                    "d"
+                ))
                 .await
                 .is_none(),
             "deployment cascade-deleted"
@@ -395,7 +401,10 @@ mod tests {
         // First sweep: the child is given a deletionTimestamp (Terminating),
         // NOT removed; the namespace stays (child still present).
         c.tick().await.unwrap();
-        let child = store.get(&child_key).await.expect("child still present (Terminating)");
+        let child = store
+            .get(&child_key)
+            .await
+            .expect("child still present (Terminating)");
         assert!(
             child
                 .get("metadata")
@@ -404,7 +413,10 @@ mod tests {
                 .is_some(),
             "finalizer-bearing child got a deletionTimestamp (Terminating)"
         );
-        assert!(store.get(&ns_key).await.is_some(), "ns held while child present");
+        assert!(
+            store.get(&ns_key).await.is_some(),
+            "ns held while child present"
+        );
 
         // Clear the child's finalizer → it is removed by the store rule.
         store
@@ -415,7 +427,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(store.get(&child_key).await.is_none(), "child removed after finalizer clear");
+        assert!(
+            store.get(&child_key).await.is_none(),
+            "child removed after finalizer clear"
+        );
 
         // Next sweep: namespace now empty → finalizer cleared → removed.
         c.tick().await.unwrap();

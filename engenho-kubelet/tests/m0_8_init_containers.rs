@@ -95,7 +95,9 @@ fn condition_status(pod: &Value, ty: &str) -> Option<String> {
         .and_then(|s| s.get("conditions"))
         .and_then(|c| c.as_array())
         .and_then(|conds| {
-            conds.iter().find(|c| c.get("type").and_then(|t| t.as_str()) == Some(ty))
+            conds
+                .iter()
+                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some(ty))
         })
         .and_then(|c| c.get("status").and_then(|s| s.as_str()))
         .map(String::from)
@@ -182,7 +184,10 @@ async fn one_init_succeeds_then_app_runs() {
     // container Running (not yet exited).
     let pod = store.get(&pod_key("p1")).await.unwrap();
     assert_eq!(pod_phase(&pod).as_deref(), Some("Pending"));
-    assert_eq!(condition_status(&pod, "Initialized").as_deref(), Some("False"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("False")
+    );
     let ics = init_container_statuses(&pod);
     assert_eq!(ics.len(), 1);
     assert_eq!(ics[0]["name"], "setup");
@@ -211,7 +216,10 @@ async fn one_init_succeeds_then_app_runs() {
 
     let pod = store.get(&pod_key("p1")).await.unwrap();
     assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
-    assert_eq!(condition_status(&pod, "Initialized").as_deref(), Some("True"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("True")
+    );
     // initContainerStatuses: the init Terminated exit 0.
     let ics = init_container_statuses(&pod);
     assert_eq!(ics.len(), 1);
@@ -258,7 +266,10 @@ async fn init_failure_under_never_fails_pod_app_never_starts() {
 
     let pod = store.get(&pod_key("p2")).await.unwrap();
     assert_eq!(pod_phase(&pod).as_deref(), Some("Failed"));
-    assert_eq!(condition_status(&pod, "Initialized").as_deref(), Some("False"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("False")
+    );
     let ics = init_container_statuses(&pod);
     assert_eq!(ics[0]["state"]["terminated"]["exitCode"], 7);
 
@@ -332,7 +343,10 @@ async fn two_init_containers_run_in_order_then_app() {
     // (init-0 Terminated 0, init-1 Running).
     let pod = store.get(&pod_key("p3")).await.unwrap();
     assert_eq!(pod_phase(&pod).as_deref(), Some("Pending"));
-    assert_eq!(condition_status(&pod, "Initialized").as_deref(), Some("False"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("False")
+    );
     let ics = init_container_statuses(&pod);
     assert_eq!(ics.len(), 2);
     assert_eq!(ics[0]["name"], "init-0");
@@ -356,10 +370,16 @@ async fn two_init_containers_run_in_order_then_app() {
     );
     let pod = store.get(&pod_key("p3")).await.unwrap();
     assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
-    assert_eq!(condition_status(&pod, "Initialized").as_deref(), Some("True"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("True")
+    );
     let ics = init_container_statuses(&pod);
     assert_eq!(ics.len(), 2);
-    assert!(ics.iter().all(|s| s["state"]["terminated"]["exitCode"] == 0));
+    assert!(
+        ics.iter()
+            .all(|s| s["state"]["terminated"]["exitCode"] == 0)
+    );
 
     teardown(store, kubelet).await;
 }
@@ -373,15 +393,7 @@ async fn no_init_pod_starts_app_immediately_initialized_true() {
     let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
 
     // A pod with NO init containers — the behavior-preserving common case.
-    put_pod_with_init(
-        &store,
-        "p4",
-        "node-A",
-        "Always",
-        &[],
-        &[("web", "img-web")],
-    )
-    .await;
+    put_pod_with_init(&store, "p4", "node-A", "Always", &[], &[("web", "img-web")]).await;
 
     // Tick 1: the app container starts immediately (no init gate).
     kubelet.tick().await.unwrap();
@@ -404,7 +416,9 @@ async fn no_init_pod_starts_app_immediately_initialized_true() {
     // behavior-preserving guarantee — the no-init status must match the
     // pre-init-brick render exactly.
     assert!(
-        pod.get("status").and_then(|s| s.get("initContainerStatuses")).is_none(),
+        pod.get("status")
+            .and_then(|s| s.get("initContainerStatuses"))
+            .is_none(),
         "no-init pod has NO initContainerStatuses field"
     );
     let conds = pod["status"]["conditions"].as_array().unwrap();

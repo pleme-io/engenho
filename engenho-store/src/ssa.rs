@@ -43,9 +43,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::patch_apply::{
-    strategic_merge, Gvk, JsonPath, ListMergeStrategy, PatchSchemaEnv,
-};
+use crate::patch_apply::{Gvk, JsonPath, ListMergeStrategy, PatchSchemaEnv, strategic_merge};
 
 // ─── the internal typed ownership representation ────────────────────────────
 
@@ -95,10 +93,8 @@ impl PathElement {
             Self::Key(keys) => {
                 // serde over a BTreeMap renders keys in ascending order →
                 // deterministic. (The map is already a BTreeMap.)
-                let obj: Map<String, Value> = keys
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let obj: Map<String, Value> =
+                    keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 format!("k:{}", Value::Object(obj))
             }
             Self::Value(v) => format!("v:{v}"),
@@ -289,14 +285,20 @@ fn build_fieldset(
                 // Skip apiserver-owned metadata leaves so a manager never
                 // claims ownership of resourceVersion/uid/managedFields/etc.
                 if path.segments().is_empty() && k == "metadata" {
-                    let child = out.children.entry(PathElement::Field(k.clone())).or_default();
+                    let child = out
+                        .children
+                        .entry(PathElement::Field(k.clone()))
+                        .or_default();
                     build_metadata_fieldset(v, gvk, env, &path.child(k), child);
                     if child.is_empty() {
                         out.children.remove(&PathElement::Field(k.clone()));
                     }
                     continue;
                 }
-                let child = out.children.entry(PathElement::Field(k.clone())).or_default();
+                let child = out
+                    .children
+                    .entry(PathElement::Field(k.clone()))
+                    .or_default();
                 build_fieldset(v, gvk, env, &path.child(k), child);
             }
         }
@@ -327,7 +329,10 @@ fn build_metadata_fieldset(
         if APISERVER_OWNED_METADATA.contains(&k.as_str()) {
             continue;
         }
-        let child = out.children.entry(PathElement::Field(k.clone())).or_default();
+        let child = out
+            .children
+            .entry(PathElement::Field(k.clone()))
+            .or_default();
         build_fieldset(v, gvk, env, &path.child(k), child);
     }
 }
@@ -381,10 +386,7 @@ fn build_list_fieldset(
                         tuple.insert(key.clone(), v.clone());
                     }
                 }
-                let child = out
-                    .children
-                    .entry(PathElement::Key(tuple))
-                    .or_default();
+                let child = out.children.entry(PathElement::Key(tuple)).or_default();
                 build_fieldset(el, gvk, env, path, child);
             }
         }
@@ -896,7 +898,6 @@ fn is_empty_container(v: &Value) -> bool {
     }
 }
 
-
 /// Render a `PathElement` path into the upstream conflict-cause field
 /// form: `.spec.template.spec.containers[name="nginx"].image`. Emission
 /// goes through `write!` into the accumulator (the typed `fmt::Write`
@@ -917,8 +918,7 @@ fn render_field_path(path: &[PathElement]) -> String {
                 let _ = write!(out, "[{v}]");
             }
             PathElement::Key(keys) => {
-                let inner: Vec<String> =
-                    keys.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                let inner: Vec<String> = keys.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 let _ = write!(out, "[{}]", inner.join(","));
             }
         }
@@ -1043,8 +1043,14 @@ mod tests {
         assert_eq!(out.merged()["data"]["a"], "2");
         assert_eq!(out.merged()["data"]["b"], "3");
         let fs = owned(&out, "mgr");
-        assert!(fs.owns(&[PathElement::Field("data".into()), PathElement::Field("a".into())]));
-        assert!(fs.owns(&[PathElement::Field("data".into()), PathElement::Field("b".into())]));
+        assert!(fs.owns(&[
+            PathElement::Field("data".into()),
+            PathElement::Field("a".into())
+        ]));
+        assert!(fs.owns(&[
+            PathElement::Field("data".into()),
+            PathElement::Field("b".into())
+        ]));
     }
 
     // ── FIELD REMOVAL ───────────────────────────────────────────────────
@@ -1082,7 +1088,10 @@ mod tests {
             "data.b removed on re-apply that drops it"
         );
         let fs = owned(&out, "mgr");
-        assert!(!fs.owns(&[PathElement::Field("data".into()), PathElement::Field("b".into())]));
+        assert!(!fs.owns(&[
+            PathElement::Field("data".into()),
+            PathElement::Field("b".into())
+        ]));
     }
 
     // ── CONFLICT ────────────────────────────────────────────────────────
@@ -1183,7 +1192,10 @@ mod tests {
         assert_eq!(out.merged()["data"]["a"], "2", "force applied the value");
         // mgr-b now owns .data.a.
         let fs_b = owned(&out, "mgr-b");
-        assert!(fs_b.owns(&[PathElement::Field("data".into()), PathElement::Field("a".into())]));
+        assert!(fs_b.owns(&[
+            PathElement::Field("data".into()),
+            PathElement::Field("a".into())
+        ]));
         // mgr-a's entry was emptied (only owned .data.a) → dropped.
         assert!(
             out.managed_fields()

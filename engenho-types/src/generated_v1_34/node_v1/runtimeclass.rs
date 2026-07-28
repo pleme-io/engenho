@@ -8,12 +8,12 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
+use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-use crate::generated_v1_34::types::*;
 
 /// RuntimeClass defines a class of container runtime supported in the cluster. The RuntimeClass is used to determine which container runtime is used to run all containers in a pod. RuntimeClasses are manually defined by a user or cluster provisioner, and referenced in the PodSpec. The Kubelet is responsible for resolving the RuntimeClassName reference before running the pod.  For more details, see https://kubernetes.io/docs/concepts/containers/runtime-class/
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -34,31 +34,33 @@ pub struct RuntimeClass {
 }
 
 impl KubeResource for RuntimeClass {
-const GVK: GroupVersionKind = GroupVersionKind {
-group:   "node.k8s.io",
-version: "v1",
-kind:    "RuntimeClass",
-};
-const GVR: GroupVersionResource = GroupVersionResource {
-group:    "node.k8s.io",
-version:  "v1",
-resource: "runtimeclasses",
-};
-const SCOPE: Scope = Scope::Cluster;
+    const GVK: GroupVersionKind = GroupVersionKind {
+        group: "node.k8s.io",
+        version: "v1",
+        kind: "RuntimeClass",
+    };
+    const GVR: GroupVersionResource = GroupVersionResource {
+        group: "node.k8s.io",
+        version: "v1",
+        resource: "runtimeclasses",
+    };
+    const SCOPE: Scope = Scope::Cluster;
 
-fn name(&self) -> Cow<'_, str> {
-Cow::Borrowed(self.metadata.name.as_str())
-}
-fn namespace(&self) -> Option<Cow<'_, str>> {
-self.metadata.namespace.as_deref().map(Cow::Borrowed)
-}
-fn resource_version(&self) -> Option<Cow<'_, str>> {
-if self.metadata.resource_version.is_empty() {
-None
-} else {
-Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-}
-}
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.metadata.name.as_str())
+    }
+    fn namespace(&self) -> Option<Cow<'_, str>> {
+        self.metadata.namespace.as_deref().map(Cow::Borrowed)
+    }
+    fn resource_version(&self) -> Option<Cow<'_, str>> {
+        if self.metadata.resource_version.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+        }
+    }
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }
+fn is_empty_meta(m: &ObjectMeta) -> bool {
+    m == &ObjectMeta::default()
+}

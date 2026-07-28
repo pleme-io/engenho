@@ -34,10 +34,10 @@ pub mod attestation;
 pub mod build_backend_roceiro;
 pub mod cluster_ip;
 pub mod controller;
-pub mod create_stamp;
-pub mod cron;
 pub mod crd;
 pub mod crd_validator;
+pub mod create_stamp;
+pub mod cron;
 pub mod daemonset;
 pub mod deployment;
 pub mod dns;
@@ -87,17 +87,15 @@ pub use attestation::{
     tameshi_attestation_webhook,
 };
 pub use build_backend_roceiro::BuildBackendRoceiro;
-pub use controller::{
-    Controller, ReconcileOutcome, ReconcileReport, ReconcileResult,
-};
-pub use create_stamp::{
-    CreateClock, creation_timestamp_is_unset, stamp_create_timestamp, wall_clock,
-};
+pub use controller::{Controller, ReconcileOutcome, ReconcileReport, ReconcileResult};
 pub use crd::{
     CrdController, CrdEntry, CrdError, CrdHandlerSpec, CrdNames, CrdScope, CrdSpec, CrdVersion,
     DynamicHandlerSink,
 };
 pub use crd_validator::{CrdValidationWebhook, ValidationRegistry, crd_validation_webhook};
+pub use create_stamp::{
+    CreateClock, creation_timestamp_is_unset, stamp_create_timestamp, wall_clock,
+};
 pub use daemonset::DaemonSetController;
 pub use deployment::DeploymentController;
 pub use dns::{
@@ -119,8 +117,7 @@ pub use ingress::{
     IngressRoute, NginxIngressBackend, PathType, TraefikIngressBackend,
 };
 pub use job::{
-    Clock, ConcurrencyPolicy, CronJobController, JobController, SystemClock, WallClock,
-    fixed_clock,
+    Clock, ConcurrencyPolicy, CronJobController, JobController, SystemClock, WallClock, fixed_clock,
 };
 // Backwards-compat alias for any external consumer that referenced the
 // old name. Substrate's FrozenClock is the canonical replacement.
@@ -130,16 +127,16 @@ pub use engenho_substrate::FrozenClock;
     note = "use engenho_substrate::FrozenClock directly (ms precision)"
 )]
 pub type FixedClock = engenho_substrate::FrozenClock;
+pub use meta::ObjectMeta;
+pub use namespace::{NamespaceController, namespaced_kinds};
 pub use network_policy::{
     CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,
     NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,
 };
-pub use meta::ObjectMeta;
-pub use namespace::{NamespaceController, namespaced_kinds};
-pub use owned_children::{
-    ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta,
+pub use owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
+pub use owner::{
+    OwnerReference, controlling_owner, is_owned_by, owner_ref_for, set_owner_reference,
 };
-pub use owner::{OwnerReference, controlling_owner, is_owned_by, owner_ref_for, set_owner_reference};
 pub use pdb::PodDisruptionBudgetController;
 pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};
 pub use plantio_pipeline::{
@@ -147,8 +144,8 @@ pub use plantio_pipeline::{
     RoceiroChoice, bootstrap_pipeline,
 };
 pub use pv_binder::{
-    ENGENHO_LOCAL_PATH_PROVISIONER, FakeProvisionerEnv, HostProvisionerEnv,
-    LOCAL_PATH_PROVISIONER, ProvisionerEnv, PvBinderController,
+    ENGENHO_LOCAL_PATH_PROVISIONER, FakeProvisionerEnv, HostProvisionerEnv, LOCAL_PATH_PROVISIONER,
+    ProvisionerEnv, PvBinderController,
 };
 pub use replicaset::ReplicaSetController;
 pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};

@@ -410,7 +410,9 @@ mod tests {
         // empty identity — the existing test constructors are unchanged.
         let hook = Arc::new(FakeAdmissionWebhook::new("observer"));
         let chain = AdmissionChain::new(vec![hook.clone()], AdmissionMode::FailClosed);
-        let _ = chain.review(req(AdmissionAction::Put, "x", json!({}))).await;
+        let _ = chain
+            .review(req(AdmissionAction::Put, "x", json!({})))
+            .await;
         let observed = hook.last_user_info().await.expect("a review ran");
         assert_eq!(observed, engenho_types::auth::UserInfo::default());
     }

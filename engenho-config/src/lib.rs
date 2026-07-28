@@ -269,9 +269,8 @@ impl EngenhoConfig {
     pub fn discover() -> Result<Self, ConfigError> {
         match Self::discover_path() {
             Some(path) => {
-                let yaml = std::fs::read_to_string(&path).map_err(|e| {
-                    ConfigError::Parse(format!("reading {}: {e}", path.display()))
-                })?;
+                let yaml = std::fs::read_to_string(&path)
+                    .map_err(|e| ConfigError::Parse(format!("reading {}: {e}", path.display())))?;
                 Self::from_yaml_with_defaults(&yaml)
             }
             None => {

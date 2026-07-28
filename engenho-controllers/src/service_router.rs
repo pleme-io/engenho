@@ -325,12 +325,7 @@ impl IptablesRouter {
         for port in &route.ports {
             let proto = port.protocol.to_lowercase();
             // Hit the per-service chain from KUBE-SERVICES.
-            script.jump_to_service_chain(
-                &route.cluster_ip,
-                &proto,
-                port.service_port,
-                &chain_svc,
-            );
+            script.jump_to_service_chain(&route.cluster_ip, &proto, port.service_port, &chain_svc);
             // For each pod IP, install a per-endpoint chain.
             for (i, pod_ip) in route.endpoints.iter().enumerate() {
                 let chain_ep =
@@ -1111,7 +1106,10 @@ mod tests {
         // no real iptables shell-out.
         assert_eq!(backend.route_count().await, 1);
         let events = backend.events().await;
-        assert_eq!(events, vec![FakeRouterEvent::Upsert("default/podinfo".into())]);
+        assert_eq!(
+            events,
+            vec![FakeRouterEvent::Upsert("default/podinfo".into())]
+        );
         let installed = backend.list().await.unwrap();
         let route = installed.get("default/podinfo").expect("route computed");
         assert_eq!(route.cluster_ip, "10.96.0.10");

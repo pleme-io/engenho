@@ -117,9 +117,9 @@ impl ApiError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Conflict(_, _)
-            | Self::ResourceVersionConflict(_)
-            | Self::ApplyConflict(_) => StatusCode::CONFLICT,
+            Self::Conflict(_, _) | Self::ResourceVersionConflict(_) | Self::ApplyConflict(_) => {
+                StatusCode::CONFLICT
+            }
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -377,10 +377,7 @@ mod tests {
             ApiError::StorageError("x".into()).kind(),
             ErrorKind::StorageError
         ));
-        assert!(matches!(
-            ApiError::Gone("x".into()).kind(),
-            ErrorKind::Gone
-        ));
+        assert!(matches!(ApiError::Gone("x".into()).kind(), ErrorKind::Gone));
     }
 
     #[test]

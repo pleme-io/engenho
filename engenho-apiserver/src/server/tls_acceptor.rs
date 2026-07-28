@@ -56,11 +56,8 @@ where
 {
     type Stream = TlsStream<TcpStream>;
     type Service = CertInjectingService<S>;
-    type Future = Pin<
-        Box<
-            dyn Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
-        >,
-    >;
+    type Future =
+        Pin<Box<dyn Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
         let inner = self.inner.clone();
