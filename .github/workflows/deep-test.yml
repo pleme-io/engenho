@@ -1,33 +1,72 @@
 name: deep-test
 
-# Fans every substrate concern into a separate GitHub Actions job
-# so the free public-repo tier runs the entire validation matrix
-# in parallel. Per the operator directive — "fully leverage all
-# pleme-io actions landscape and open source for computing power
-# on github actions free public tier to deeply test and validate
-# everything" — this workflow:
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEDULED BREADTH. Not a merge gate — `test.yml` is the merge gate.
 #
-#   * Per-crate parallel test jobs (one per workspace crate)
-#   * Cross-OS matrix (ubuntu-latest + macos-latest)
-#   * Property-test stress run (PROPTEST_CASES=4096 — 4× default)
-#   * Doc tests across every crate
-#   * Coverage report via cargo-llvm-cov
-#   * Workspace-wide cargo-audit + cargo-deny
-#   * Clippy pedantic gates
+# WHY THE SPLIT IS REAL AND NOT JUST TWO OVERLAPPING WORKFLOWS.
+# The two answer different questions:
+#   test.yml   — "does this CHANGE compile and pass?"  Fast, ubuntu, blocking,
+#                runs on every push + PR.
+#   deep-test  — "has the WORLD moved under us?"       Slow, cross-OS, stress,
+#                coverage, advisories. Time-triggered, NON-blocking by trigger.
+# Concretely deep-test owns four things test.yml deliberately does not: a
+# macOS leg, a 4x proptest case count, a coverage artifact, and a RustSec
+# advisory scan. None of those belong on the PR critical path; all of them
+# rot silently if nobody ever runs them.
 #
-# Compounds the canonical `ci.yml` (which runs the fast path);
-# this workflow runs on every PR for deep validation. Free-tier
-# minutes are unlimited for public repos — fan-out is free.
+# ─────────────────────────────────────────────────────────────────────────────
+# THIS WORKFLOW HAS NEVER ONCE BEEN GREEN. That is why it was rewritten.
+# `gh run list --workflow=deep-test.yml` over its entire history: 21 runs,
+# 21 failures, first run 2026-05-23, last 2026-07-18. Zero successes, ever.
+# A gate whose signal is constant carries zero information, and while it ran
+# on every PR it MASKED the fact that nothing else compiled the crate at all.
+#
+# Two successive root causes, both now dead:
+#
+#   RC-1 (2026-05 -> 2026-07-17) — sibling-directory path dependency.
+#     engenho-sui-typescape depended on `../sui/sui-eval`, resolving to
+#     /home/runner/work/engenho/sui/sui-eval/Cargo.toml — a path that exists
+#     only on a workstation with pleme-io/sui checked out NEXT TO engenho.
+#     cargo could not even LOAD the workspace manifest:
+#       failed to load manifest for workspace member `engenho-sui-typescape`
+#       failed to read `.../sui/sui-eval/Cargo.toml`: No such file (os error 2)
+#     Already fixed in-tree — it is a git dep now, and a repo-wide grep for
+#     `path = "../../` returns 0 hits. Recorded so it is not reintroduced.
+#
+#   RC-2 (2026-07-17 -> now) — private git deps, no credential. THE LIVE ONE.
+#     See test.yml's header for the full diagnosis and the one-line operator
+#     fix (a REPO-level BOT_PAT). Both workflows are blocked on that same
+#     secret; both are wired correctly to work the moment it exists.
+#
+# THREE FALSE CLAIMS IN THE PREVIOUS VERSION OF THIS FILE, ALL REMOVED:
+#
+#   1. "free public-repo tier ... fan-out is free". engenho is PRIVATE
+#      (`gh repo view pleme-io/engenho` -> PRIVATE). Its Actions minutes are
+#      BILLABLE, and the macOS half of the old 30-job matrix billed at the
+#      10x macOS multiplier. The fan-out was not free; it was the most
+#      expensive possible way to produce no signal.
+#   2. The hardcoded 15-crate matrix claimed to be "one job per workspace
+#      crate". The workspace has 24 members. NINE were in no test path at
+#      all — including `engenho`, the main binary, and `engenho-fonte`, the
+#      crate whose own dependency broke the build:
+#        engenho · engenho-diff · engenho-fonte · engenho-fonte-cli
+#        engenho-kube-proto · engenho-machines · engenho-runtime
+#        engenho-substrate-props · engenho-sui-typescape
+#      A hand-maintained list of crates is a drift class. `--workspace` is
+#      not, so the matrix is gone.
+#   3. Every job ran default features only, leaving with-tameshi /
+#      with-sui-eval / with-shikumi / with-revoada / openapi-roundtrip /
+#      bit-repro / mock uncompiled and unrun.
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Deliberately NO `push:` and NO `pull_request:`. This workflow ran on every
+  # PR while permanently red, which is precisely how a never-green gate came to
+  # sit next to a shim that compiled nothing and nobody noticed either. Breadth
+  # checks report; they do not block.
   workflow_dispatch: {}
   schedule:
-    # Nightly: catch toolchain drift even if no PR landed.
-    - cron: '0 7 * * *'  # 07:00 UTC daily
+    - cron: '0 7 * * *'  # 07:00 UTC daily — catches toolchain + advisory drift
 
 permissions:
   contents: read
@@ -35,49 +74,44 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
-  # ──────────────────────────────────────────────────────────────
-  # Per-crate parallel test matrix — one job per workspace member
-  # ──────────────────────────────────────────────────────────────
-  per-crate-tests:
-    name: test ${{ matrix.crate }} on ${{ matrix.os }}
+  # ── Cross-OS: the one axis test.yml genuinely does not cover ─────────────
+  # Whole workspace per OS, NOT a hand-listed per-crate matrix. `--workspace`
+  # cannot drift out of date; a literal crate list demonstrably did.
+  # engenho-diff is excluded for the live-k3s-oracle reason documented in
+  # ci/live-oracle-tests.txt, and is still compiled below.
+  cross-os:
+    name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        crate:
-          - engenho-types
-          - engenho-cluster-config
-          - engenho-cluster-config-render
-          - engenho-kube-client
-          - engenho-kube-codegen
-          - engenho-mcp
-          - engenho-revoada
-          - engenho-store
-          - engenho-apiserver
-          - engenho-teia
-          - engenho-scheduler
-          - engenho-controllers
-          - engenho-config
-          - engenho-kubelet
-          - engenho-substrate
     steps:
       - uses: actions/checkout@v4
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: deep-test-${{ matrix.os }}
-      - name: test
-        run: cargo test -p ${{ matrix.crate }} --lib --bins --tests
+          shared-key: deep-${{ matrix.os }}
+      - name: compile engenho-diff (live-oracle crate — compiled, not run)
+        run: cargo test -p engenho-diff --all-targets --all-features --locked --no-run
+      - name: cargo test --workspace --all-targets --all-features
+        run: |
+          cargo test --workspace --exclude engenho-diff \
+            --all-targets --all-features --locked --no-fail-fast
+      # `--all-targets` excludes doctests; kept as its own leg for the same
+      # reason as in test.yml.
+      - name: cargo test --doc
+        run: cargo test --workspace --all-features --locked --doc --no-fail-fast
 
-  # ──────────────────────────────────────────────────────────────
-  # Property-test stress run — 4× default case count
-  # Substrate has 1536 proptest cases at default; this raises to
-  # 4096 cases per property → ~6k cases total per run, run once
-  # nightly + on each PR. Catches edge cases the default misses.
-  # ──────────────────────────────────────────────────────────────
+  # ── Property-test stress: 4x the default case count ─────────────────────
+  # Distinct scope from test.yml, which runs proptest at its default budget.
   property-stress:
     name: proptest stress (4k cases)
     runs-on: ubuntu-latest
@@ -85,125 +119,68 @@ jobs:
       PROPTEST_CASES: '4096'
     steps:
       - uses: actions/checkout@v4
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: proptest-stress
       - name: proptest stress
-        run: cargo test --workspace --release -- proptest
+        run: |
+          cargo test --workspace --exclude engenho-diff \
+            --all-features --locked --release --no-fail-fast -- proptest
 
-  # ──────────────────────────────────────────────────────────────
-  # Doc tests — every // example in /// rustdoc + every README
-  # snippet that lands in a doctest block. Catches doc rot
-  # before merge.
-  # ──────────────────────────────────────────────────────────────
-  doc-tests:
-    name: doc tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: doctests
-      - name: doc tests
-        run: cargo test --workspace --doc
-
-  # ──────────────────────────────────────────────────────────────
-  # Clippy pedantic + TYPED EMISSION (with-format-ban) gate.
-  #
-  # `cargo clippy --workspace -- -D warnings` enforces every lint the
-  # workspace.lints opted in AND the per-crate `disallowed-macros`
-  # ban on `std::format`. The ban is SCOPED via crate-local
-  # `clippy.toml` files (see ./clippy.toml for the rationale + the
-  # list of crates still being migrated). Today the ban is active on
-  # the `engenho` binary crate (format!()-clean); the workspace-root
-  # clippy.toml deliberately does NOT ban so the rest of the
-  # workspace stays green while the emission crates are converted to
-  # typed surfaces. Per pleme-io/theory/TYPED-EMISSION.md.
-  # ──────────────────────────────────────────────────────────────
-  clippy:
-    name: clippy pedantic + format-ban
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: clippy
-      - name: clippy (pedantic + with-format-ban)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  # ──────────────────────────────────────────────────────────────
-  # Format gate.
-  # ──────────────────────────────────────────────────────────────
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: fmt --check
-        run: cargo fmt --all -- --check
-
-  # ──────────────────────────────────────────────────────────────
-  # Coverage report — cargo-llvm-cov produces lcov + html.
-  # Uploaded as artifact + (optional) coverage badge target.
-  # ──────────────────────────────────────────────────────────────
+  # ── Coverage artifact ───────────────────────────────────────────────────
   coverage:
     name: coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: coverage
-      - name: install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
       - name: coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: |
+          cargo llvm-cov --workspace --exclude engenho-diff \
+            --all-features --locked --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov
           path: lcov.info
 
-  # ──────────────────────────────────────────────────────────────
-  # Supply-chain audit — cargo-audit (rustsec) + cargo-deny.
-  # ──────────────────────────────────────────────────────────────
+  # ── Supply-chain advisories ─────────────────────────────────────────────
+  # Scheduled, NOT on the PR path, and that placement is a deliberate scope
+  # call rather than leniency. `cargo audit` fails on advisories published
+  # against the dependency tree — i.e. on the calendar, with no change to
+  # this repo. Measured on the 2026-07-18 run it was already red on
+  # RUSTSEC-2026-0190 (anyhow `Error::downcast_mut` unsoundness),
+  # RUSTSEC-2026-0186 (memmap2 unchecked pointer offset) and a yanked
+  # `spin 0.9.8`. Wiring that to block merges manufactures exactly the
+  # permanently-red gate this rewrite exists to remove. Here it is a daily
+  # alert someone can act on.
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
-      - name: install cargo-audit
-        uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
-      - name: audit
-        run: cargo audit
-
-  # ──────────────────────────────────────────────────────────────
-  # Build all targets — catches "this crate doesn't compile under
-  # --all-targets" even when the lib does.
-  # ──────────────────────────────────────────────────────────────
-  build-all-targets:
-    name: build --all-targets
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: build-all
-      - name: build
-        run: cargo build --workspace --all-targets --release
+      - run: cargo audit
