@@ -70,14 +70,20 @@ mod tests {
         let s = now_rfc3339_utc();
         // `…:56Z` — the char before the trailing Z is a digit, and there
         // is no fractional-second dot anywhere in the string.
-        assert!(!s.contains('.'), "second precision must drop subseconds: {s}");
+        assert!(
+            !s.contains('.'),
+            "second precision must drop subseconds: {s}"
+        );
     }
 
     #[test]
     fn deterministic_render_of_fixed_datetime() {
         // A fixed instant renders to a fixed, known string — the property
         // the determinism contract relies on (same DateTime ⇒ same bytes).
-        let t = Utc.with_ymd_and_hms(2026, 6, 8, 12, 34, 56).single().unwrap();
+        let t = Utc
+            .with_ymd_and_hms(2026, 6, 8, 12, 34, 56)
+            .single()
+            .unwrap();
         assert_eq!(to_rfc3339_utc(t), "2026-06-08T12:34:56Z");
     }
 
@@ -86,10 +92,7 @@ mod tests {
         // An instant carrying sub-second nanos renders truncated to the
         // second (SecondsFormat::Secs) — deterministic regardless of the
         // sub-second tail.
-        let t = Utc
-            .with_ymd_and_hms(2026, 1, 2, 3, 4, 5)
-            .single()
-            .unwrap()
+        let t = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).single().unwrap()
             + chrono::Duration::nanoseconds(987_654_321);
         assert_eq!(to_rfc3339_utc(t), "2026-01-02T03:04:05Z");
     }

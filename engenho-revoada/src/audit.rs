@@ -743,7 +743,8 @@ mod tests {
     #[test]
     fn auditing_backend_dispatches_through_store_backend_trait_object() {
         let inner = InMemoryStore::new("inner");
-        let backend: Box<dyn StoreBackend> = Box::new(AuditingBackend::new(inner, NoopAuditLog::new()));
+        let backend: Box<dyn StoreBackend> =
+            Box::new(AuditingBackend::new(inner, NoopAuditLog::new()));
         backend.apply(ResourceFormat::Yaml, &yaml()).unwrap();
         assert_eq!(backend.resource_count(), 1);
     }

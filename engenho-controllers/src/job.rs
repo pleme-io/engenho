@@ -339,9 +339,7 @@ impl CronJobController {
     /// Job `{cronjob}-{ts}`.
     fn build_job(cj: &Value, ts: u64) -> Option<(String, Value)> {
         let cj_name = cj.name()?;
-        let template = cj
-            .get("spec")
-            .and_then(|s| s.get("jobTemplate"))?;
+        let template = cj.get("spec").and_then(|s| s.get("jobTemplate"))?;
         let job_spec = template.get("spec").cloned().unwrap_or_else(|| json!({}));
         let job_name = format!("{cj_name}-{ts}");
         // Carry over the jobTemplate's metadata.labels (if any) onto the
@@ -373,11 +371,7 @@ impl CronJobController {
 
     /// All Jobs owned (controller-ref) by `cj_uid`, in this CronJob's
     /// namespace.
-    async fn owned_jobs(
-        &self,
-        cj_uid: &str,
-        job_ns: &str,
-    ) -> Vec<(ResourceKey, Value)> {
+    async fn owned_jobs(&self, cj_uid: &str, job_ns: &str) -> Vec<(ResourceKey, Value)> {
         self.store
             .list("batch", "v1", "Job", Some(job_ns))
             .await
@@ -532,7 +526,8 @@ impl CronJobController {
             "name": job_name,
             "namespace": job_ns,
         });
-        self.patch_last_schedule(cj_key, due, Some(active_ref)).await?;
+        self.patch_last_schedule(cj_key, due, Some(active_ref))
+            .await?;
         Ok(CronTickOutcome::Fired)
     }
 
@@ -571,11 +566,7 @@ impl CronJobController {
 /// slots elapsed between ticks (no catch-up storm) — the missed slots are
 /// collapsed to the latest, matching the Kubernetes single-fire-per-tick
 /// behaviour for a CronJob with no backlog policy.
-fn most_recent_due(
-    schedule: &crate::cron::CronSchedule,
-    anchor: u64,
-    now: u64,
-) -> Option<u64> {
+fn most_recent_due(schedule: &crate::cron::CronSchedule, anchor: u64, now: u64) -> Option<u64> {
     let mut candidate = schedule.next_after_unix(anchor)?;
     if candidate > now {
         return None;
@@ -733,11 +724,23 @@ mod tests {
 
     #[test]
     fn concurrency_policy_parse() {
-        assert_eq!(ConcurrencyPolicy::parse(Some("Forbid")), ConcurrencyPolicy::Forbid);
-        assert_eq!(ConcurrencyPolicy::parse(Some("Replace")), ConcurrencyPolicy::Replace);
-        assert_eq!(ConcurrencyPolicy::parse(Some("Allow")), ConcurrencyPolicy::Allow);
+        assert_eq!(
+            ConcurrencyPolicy::parse(Some("Forbid")),
+            ConcurrencyPolicy::Forbid
+        );
+        assert_eq!(
+            ConcurrencyPolicy::parse(Some("Replace")),
+            ConcurrencyPolicy::Replace
+        );
+        assert_eq!(
+            ConcurrencyPolicy::parse(Some("Allow")),
+            ConcurrencyPolicy::Allow
+        );
         // Unknown / absent → Allow (the K8s default).
-        assert_eq!(ConcurrencyPolicy::parse(Some("Bogus")), ConcurrencyPolicy::Allow);
+        assert_eq!(
+            ConcurrencyPolicy::parse(Some("Bogus")),
+            ConcurrencyPolicy::Allow
+        );
         assert_eq!(ConcurrencyPolicy::parse(None), ConcurrencyPolicy::Allow);
     }
 
@@ -957,7 +960,10 @@ mod tests {
         let c = CronJobController::new(store.clone(), clock, None);
         let out = c.tick().await.unwrap();
         assert_eq!(out.objects_skipped, 1);
-        assert!(list_jobs(&store).await.is_empty(), "suspended → no Job ever");
+        assert!(
+            list_jobs(&store).await.is_empty(),
+            "suspended → no Job ever"
+        );
     }
 
     #[tokio::test]
@@ -1020,7 +1026,10 @@ mod tests {
         let jobs = list_jobs(&store).await;
         // The old active Job was deleted; the new one created.
         let names: Vec<&str> = jobs.iter().map(|(k, _)| k.name.as_str()).collect();
-        assert!(!names.contains(&"every-60"), "active Job replaced (deleted)");
+        assert!(
+            !names.contains(&"every-60"),
+            "active Job replaced (deleted)"
+        );
         assert!(names.contains(&"every-120"), "new Job created");
     }
 

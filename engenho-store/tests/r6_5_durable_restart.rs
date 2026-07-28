@@ -19,10 +19,7 @@ fn pod_key(name: &str) -> ResourceKey {
 }
 
 fn temp_dir(suffix: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "engenho-fjall-it-{}-{suffix}",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("engenho-fjall-it-{}-{suffix}", std::process::id()))
 }
 
 /// Test 1 — resources + revision state survive a restart.
@@ -94,11 +91,13 @@ async fn restart_preserves_resources_and_revision() {
     // ── Second lifetime: reopen the SAME dir WITHOUT re-init. ──────
     let router = InProcessRouter::new();
     let cfg = default_config("durable-resources-2").unwrap();
-    let (mesh2, fresh) =
-        StoreMesh::start_or_resume(1, "in-process://1".into(), router, cfg, &dir)
-            .await
-            .unwrap();
-    assert!(!fresh, "reopen of an initialized dir does NOT re-initialize");
+    let (mesh2, fresh) = StoreMesh::start_or_resume(1, "in-process://1".into(), router, cfg, &dir)
+        .await
+        .unwrap();
+    assert!(
+        !fresh,
+        "reopen of an initialized dir does NOT re-initialize"
+    );
     assert!(mesh2.wait_for_leadership(Duration::from_secs(3)).await);
 
     // a survived + has the patched value.
@@ -155,10 +154,9 @@ async fn restart_preserves_raft_log_and_does_not_reinitialize() {
     // Reopen: the store reports initialized BEFORE raft starts driving.
     let router = InProcessRouter::new();
     let cfg = default_config("durable-log-2").unwrap();
-    let (mesh2, fresh) =
-        StoreMesh::start_or_resume(2, "in-process://2".into(), router, cfg, &dir)
-            .await
-            .unwrap();
+    let (mesh2, fresh) = StoreMesh::start_or_resume(2, "in-process://2".into(), router, cfg, &dir)
+        .await
+        .unwrap();
     // initialize_if_fresh saw persisted state and SKIPPED initialize.
     assert!(!fresh, "resume does not re-initialize the cluster");
     assert!(mesh2.is_initialized().await, "store reports initialized");
@@ -233,10 +231,9 @@ async fn restart_preserves_high_revision_and_per_key_meta() {
 
     let router = InProcessRouter::new();
     let cfg = default_config("durable-high-2").unwrap();
-    let (mesh2, fresh) =
-        StoreMesh::start_or_resume(3, "in-process://3".into(), router, cfg, &dir)
-            .await
-            .unwrap();
+    let (mesh2, fresh) = StoreMesh::start_or_resume(3, "in-process://3".into(), router, cfg, &dir)
+        .await
+        .unwrap();
     assert!(!fresh);
     assert!(mesh2.wait_for_leadership(Duration::from_secs(3)).await);
 
@@ -258,10 +255,9 @@ async fn empty_store_first_boot_initializes() {
 
     let router = InProcessRouter::new();
     let cfg = default_config("durable-fresh").unwrap();
-    let (mesh, fresh) =
-        StoreMesh::start_or_resume(4, "in-process://4".into(), router, cfg, &dir)
-            .await
-            .unwrap();
+    let (mesh, fresh) = StoreMesh::start_or_resume(4, "in-process://4".into(), router, cfg, &dir)
+        .await
+        .unwrap();
     assert!(fresh, "fresh dir DOES initialize");
     assert!(mesh.wait_for_leadership(Duration::from_secs(3)).await);
 
@@ -287,7 +283,11 @@ async fn empty_store_first_boot_initializes() {
         .unwrap();
     assert_eq!(meta, VersionMeta::created_at(Revision(1)));
     assert_eq!(
-        stored.get("metadata").unwrap().get("resourceVersion").unwrap(),
+        stored
+            .get("metadata")
+            .unwrap()
+            .get("resourceVersion")
+            .unwrap(),
         &serde_json::json!("1")
     );
 

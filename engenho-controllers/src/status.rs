@@ -99,7 +99,10 @@ pub fn generation_of(value: &Value) -> i64 {
 /// empty status (any non-empty desired status differs → first write).
 #[must_use]
 fn live_status(value: &Value) -> Value {
-    value.get("status").cloned().unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+    value
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
 }
 
 /// Write a controller-computed `.status` onto `parent` via an
@@ -220,7 +223,10 @@ mod tests {
     #[test]
     fn live_status_defaults_to_empty_object() {
         assert_eq!(live_status(&json!({})), json!({}));
-        assert_eq!(live_status(&json!({"status": {"replicas": 2}})), json!({"replicas": 2}));
+        assert_eq!(
+            live_status(&json!({"status": {"replicas": 2}})),
+            json!({"replicas": 2})
+        );
     }
 
     #[test]

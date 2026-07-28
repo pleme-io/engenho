@@ -34,10 +34,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use engenho_controllers::MutatingWebhookPlugin;
 use engenho_controllers::admission_webhook::{
     Pluralizer, StoreServiceResolver, WebhookCaller, WebhookConfigSource,
 };
-use engenho_controllers::MutatingWebhookPlugin;
 use engenho_store::StoreMesh;
 use engenho_types::generated_v1_34::RESOURCE_CATALOG;
 
@@ -184,7 +184,10 @@ mod tests {
     fn pluralizer_uses_catalog() {
         let p = catalog_pluralizer();
         assert_eq!(p("", "v1", "Pod").as_deref(), Some("pods"));
-        assert_eq!(p("apps", "v1", "Deployment").as_deref(), Some("deployments"));
+        assert_eq!(
+            p("apps", "v1", "Deployment").as_deref(),
+            Some("deployments")
+        );
         // Irregular plural is curated, not `+s`.
         assert_eq!(p("", "v1", "Endpoints").as_deref(), Some("endpoints"));
         // The new admissionregistration kinds are cataloged.
@@ -203,7 +206,10 @@ mod tests {
             .call("https://x/y", Some("Zm9v"), 5, &serde_json::json!({}))
             .await
             .unwrap_err();
-        assert!(err.contains("caBundle"), "caBundle refusal is surfaced: {err}");
+        assert!(
+            err.contains("caBundle"),
+            "caBundle refusal is surfaced: {err}"
+        );
         assert!(err.contains("never silently skipped"));
     }
 }

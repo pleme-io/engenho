@@ -146,7 +146,11 @@ async fn http_get(
     addr: SocketAddr,
     path: &str,
 ) -> Option<serde_json::Value> {
-    let resp = client.get(format!("http://{addr}{path}")).send().await.ok()?;
+    let resp = client
+        .get(format!("http://{addr}{path}"))
+        .send()
+        .await
+        .ok()?;
     if resp.status() != reqwest::StatusCode::OK {
         return None;
     }
@@ -340,7 +344,12 @@ async fn deployment_runs_a_real_podman_container_then_cleans_up() {
     // ── Resolve the RS-generated pod name via HTTP (mirror convergence) ─
     // 1. ReplicaSet owned by the Deployment.
     let rs = poll_until(TIMEOUT, INTERVAL, || async {
-        let items = http_list(&client, addr, "/apis/apps/v1/namespaces/default/replicasets").await;
+        let items = http_list(
+            &client,
+            addr,
+            "/apis/apps/v1/namespaces/default/replicasets",
+        )
+        .await;
         items.into_iter().find(|r| is_owned_by(r, &dep_uid))
     })
     .await
@@ -527,7 +536,9 @@ async fn deployment_in_nondefault_namespace_runs_a_real_container() {
     assert_eq!(ns_resp.status(), reqwest::StatusCode::CREATED);
 
     let resp = client
-        .post(format!("http://{addr}/apis/apps/v1/namespaces/{ns}/deployments"))
+        .post(format!(
+            "http://{addr}/apis/apps/v1/namespaces/{ns}/deployments"
+        ))
         .json(&busybox_deployment_body(&dep_name))
         .send()
         .await
@@ -546,13 +557,20 @@ async fn deployment_in_nondefault_namespace_runs_a_real_container() {
 
     // RS in team-c (NOT default).
     let rs = poll_until(TIMEOUT, INTERVAL, || async {
-        let items = http_list(&client, addr, &format!("/apis/apps/v1/namespaces/{ns}/replicasets")).await;
+        let items = http_list(
+            &client,
+            addr,
+            &format!("/apis/apps/v1/namespaces/{ns}/replicasets"),
+        )
+        .await;
         items.into_iter().find(|r| is_owned_by(r, &dep_uid))
     })
     .await
     .expect("ReplicaSet created in team-c");
     assert_eq!(
-        rs.get("metadata").and_then(|m| m.get("namespace")).and_then(|n| n.as_str()),
+        rs.get("metadata")
+            .and_then(|m| m.get("namespace"))
+            .and_then(|n| n.as_str()),
         Some(ns),
         "RS must carry metadata.namespace=team-c"
     );
@@ -571,7 +589,9 @@ async fn deployment_in_nondefault_namespace_runs_a_real_container() {
     .await
     .expect("Pod created in team-c");
     assert_eq!(
-        pod.get("metadata").and_then(|m| m.get("namespace")).and_then(|n| n.as_str()),
+        pod.get("metadata")
+            .and_then(|m| m.get("namespace"))
+            .and_then(|n| n.as_str()),
         Some(ns),
         "Pod must carry metadata.namespace=team-c"
     );
@@ -600,17 +620,24 @@ async fn deployment_in_nondefault_namespace_runs_a_real_container() {
 
     // Teardown: delete the Deployment + Pod, await the container gone.
     let _ = client
-        .delete(format!("http://{addr}/apis/apps/v1/namespaces/{ns}/deployments/{dep_name}"))
+        .delete(format!(
+            "http://{addr}/apis/apps/v1/namespaces/{ns}/deployments/{dep_name}"
+        ))
         .send()
         .await;
     let _ = client
-        .delete(format!("http://{addr}/api/v1/namespaces/{ns}/pods/{pod_name}"))
+        .delete(format!(
+            "http://{addr}/api/v1/namespaces/{ns}/pods/{pod_name}"
+        ))
         .send()
         .await;
     let gone = poll_until_blocking(Duration::from_secs(30), INTERVAL, || {
         !podman_container_exists(&container_name)
     });
-    assert!(gone, "container {container_name} should be removed after delete");
+    assert!(
+        gone,
+        "container {container_name} should be removed after delete"
+    );
 
     rt.shutdown().await.expect("graceful shutdown");
     drop(cleanup);

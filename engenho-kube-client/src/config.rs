@@ -221,8 +221,7 @@ pub fn emit_kubeconfig(
         }],
     };
 
-    serde_yaml::to_string(&config)
-        .map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
+    serde_yaml::to_string(&config).map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
 }
 
 /// User name + context name for the admin-client-cert kubeconfig.
@@ -293,8 +292,7 @@ pub fn emit_kubeconfig_with_admin(
         }],
     };
 
-    serde_yaml::to_string(&config)
-        .map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
+    serde_yaml::to_string(&config).map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
 }
 
 impl Kubeconfig {
@@ -554,8 +552,7 @@ contexts: []
         // the client; the apiserver has no authn yet and ignores the value,
         // serving anonymous-root. The full `resolve_connection` (verifying
         // reqwest Client, real CA) is exercised by the apiserver m0_4 test.
-        let yaml =
-            emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
+        let yaml = emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
         let kc = Kubeconfig::from_yaml(&yaml).expect("parse");
         // The placeholder token is on the user (so kubectl never prompts) …
         assert_eq!(kc.users[0].user.token.as_deref(), Some(ANONYMOUS_TOKEN));
@@ -573,12 +570,15 @@ contexts: []
         // The placeholder-token posture: the ANONYMOUS_TOKEN bearer token and
         // NOTHING else (no token-file, no client cert/key) — a complete auth
         // method so kubectl proceeds, but no real credential material.
-        let yaml =
-            emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
+        let yaml = emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
         let kc = Kubeconfig::from_yaml(&yaml).expect("parse");
         assert_eq!(kc.users.len(), 1);
         let u = &kc.users[0].user;
-        assert_eq!(u.token.as_deref(), Some(ANONYMOUS_TOKEN), "placeholder bearer token present");
+        assert_eq!(
+            u.token.as_deref(),
+            Some(ANONYMOUS_TOKEN),
+            "placeholder bearer token present"
+        );
         assert!(u.token_file.is_none());
         assert!(
             u.client_certificate_data.is_none() && u.client_certificate.is_none(),
@@ -620,10 +620,7 @@ contexts: []
             .client_certificate_data
             .as_ref()
             .expect("client-certificate-data present");
-        let key_b64 = u
-            .client_key_data
-            .as_ref()
-            .expect("client-key-data present");
+        let key_b64 = u.client_key_data.as_ref().expect("client-key-data present");
         let cert = base64::engine::general_purpose::STANDARD
             .decode(cert_b64)
             .unwrap();
@@ -661,8 +658,7 @@ contexts: []
     #[test]
     fn emitted_kubeconfig_is_valid_yaml() {
         // serde_yaml round-trips the emitted document (no structural junk).
-        let yaml =
-            emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
+        let yaml = emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
         let _v: serde_yaml::Value =
             serde_yaml::from_str(&yaml).expect("emitted kubeconfig is valid YAML");
     }

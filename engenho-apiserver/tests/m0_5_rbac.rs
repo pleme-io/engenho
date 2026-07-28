@@ -119,7 +119,14 @@ async fn seed_bootstrap(store: &StoreMesh) {
         role_ref: cr_ref("system:basic-user"),
         subjects: vec![group_subj("system:authenticated")],
     };
-    put(store, "ClusterRoleBinding", None, "system:basic-user", &basic_b).await;
+    put(
+        store,
+        "ClusterRoleBinding",
+        None,
+        "system:basic-user",
+        &basic_b,
+    )
+    .await;
 
     // system:public-info-viewer — anonymous discovery + health.
     let public = ClusterRole {
@@ -143,7 +150,14 @@ async fn seed_bootstrap(store: &StoreMesh) {
         }],
         ..Default::default()
     };
-    put(store, "ClusterRole", None, "system:public-info-viewer", &public).await;
+    put(
+        store,
+        "ClusterRole",
+        None,
+        "system:public-info-viewer",
+        &public,
+    )
+    .await;
     let public_b = ClusterRoleBinding {
         metadata: meta("system:public-info-viewer"),
         role_ref: cr_ref("system:public-info-viewer"),
@@ -152,7 +166,14 @@ async fn seed_bootstrap(store: &StoreMesh) {
             group_subj("system:unauthenticated"),
         ],
     };
-    put(store, "ClusterRoleBinding", None, "system:public-info-viewer", &public_b).await;
+    put(
+        store,
+        "ClusterRoleBinding",
+        None,
+        "system:public-info-viewer",
+        &public_b,
+    )
+    .await;
 }
 
 /// Seed Role(get,list pods, ns default) + RoleBinding(test-user).
@@ -182,7 +203,14 @@ async fn seed_test_role(store: &StoreMesh) {
             namespace: None,
         }],
     };
-    put(store, "RoleBinding", Some("default"), "bind-pod-reader", &binding).await;
+    put(
+        store,
+        "RoleBinding",
+        Some("default"),
+        "bind-pod-reader",
+        &binding,
+    )
+    .await;
 }
 
 /// `Put` a typed RBAC value into the store (Reason::Operator).
@@ -219,11 +247,7 @@ fn self_rules_url(base: &str) -> String {
 }
 
 /// POST a SubjectAccessReview for ANOTHER subject and return `status.allowed`.
-async fn sar_allowed(
-    client: &reqwest::Client,
-    base: &str,
-    spec: serde_json::Value,
-) -> bool {
+async fn sar_allowed(client: &reqwest::Client, base: &str, spec: serde_json::Value) -> bool {
     let body = serde_json::json!({
         "apiVersion": "authorization.k8s.io/v1",
         "kind": "SubjectAccessReview",
@@ -340,8 +364,12 @@ async fn admin_self_review_is_allowed_and_rules_are_wildcard() {
         .as_array()
         .map(|rules| {
             rules.iter().any(|r| {
-                r["verbs"].as_array().is_some_and(|vs| vs.iter().any(|x| x == "*"))
-                    && r["resources"].as_array().is_some_and(|rs| rs.iter().any(|x| x == "*"))
+                r["verbs"]
+                    .as_array()
+                    .is_some_and(|vs| vs.iter().any(|x| x == "*"))
+                    && r["resources"]
+                        .as_array()
+                        .is_some_and(|rs| rs.iter().any(|x| x == "*"))
             })
         })
         .unwrap_or(false);

@@ -584,11 +584,14 @@ mod tests {
     #[test]
     fn tampered_state_is_rejected() {
         let identity = NodeIdentity::from_seed([9; 32]);
-        let mut signed =
-            SignedNodeState::sign(test_state(identity.node_id()), &identity).unwrap();
+        let mut signed = SignedNodeState::sign(test_state(identity.node_id()), &identity).unwrap();
         // Mutate the state after signing — the signature no longer matches.
         signed.state.uptime_sec = 999_999;
-        assert_eq!(signed.into_verified(), None, "tampered state must be dropped");
+        assert_eq!(
+            signed.into_verified(),
+            None,
+            "tampered state must be dropped"
+        );
     }
 
     #[test]

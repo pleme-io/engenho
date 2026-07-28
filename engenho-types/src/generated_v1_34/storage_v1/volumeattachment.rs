@@ -8,12 +8,12 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
+use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-use crate::generated_v1_34::types::*;
 
 /// VolumeAttachment captures the intent to attach or detach the specified volume to/from the specified node.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -30,31 +30,33 @@ pub struct VolumeAttachment {
 }
 
 impl KubeResource for VolumeAttachment {
-const GVK: GroupVersionKind = GroupVersionKind {
-group:   "storage.k8s.io",
-version: "v1",
-kind:    "VolumeAttachment",
-};
-const GVR: GroupVersionResource = GroupVersionResource {
-group:    "storage.k8s.io",
-version:  "v1",
-resource: "volumeattachments",
-};
-const SCOPE: Scope = Scope::Cluster;
+    const GVK: GroupVersionKind = GroupVersionKind {
+        group: "storage.k8s.io",
+        version: "v1",
+        kind: "VolumeAttachment",
+    };
+    const GVR: GroupVersionResource = GroupVersionResource {
+        group: "storage.k8s.io",
+        version: "v1",
+        resource: "volumeattachments",
+    };
+    const SCOPE: Scope = Scope::Cluster;
 
-fn name(&self) -> Cow<'_, str> {
-Cow::Borrowed(self.metadata.name.as_str())
-}
-fn namespace(&self) -> Option<Cow<'_, str>> {
-self.metadata.namespace.as_deref().map(Cow::Borrowed)
-}
-fn resource_version(&self) -> Option<Cow<'_, str>> {
-if self.metadata.resource_version.is_empty() {
-None
-} else {
-Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-}
-}
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.metadata.name.as_str())
+    }
+    fn namespace(&self) -> Option<Cow<'_, str>> {
+        self.metadata.namespace.as_deref().map(Cow::Borrowed)
+    }
+    fn resource_version(&self) -> Option<Cow<'_, str>> {
+        if self.metadata.resource_version.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+        }
+    }
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }
+fn is_empty_meta(m: &ObjectMeta) -> bool {
+    m == &ObjectMeta::default()
+}

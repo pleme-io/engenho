@@ -29,7 +29,15 @@ async fn no_version_falls_back_to_latest_tag() {
         name: "x".into(),
         version: None,
     });
-    let c = &dep.spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0];
+    let c = &dep
+        .spec
+        .as_ref()
+        .unwrap()
+        .template
+        .spec
+        .as_ref()
+        .unwrap()
+        .containers[0];
     assert_eq!(c.image.as_deref(), Some("x:latest"));
 }
 
@@ -108,7 +116,15 @@ async fn reconcile_records_manifest_in_audit_log() {
     assert_eq!(&emitted[0].metadata.name, "first");
     assert_eq!(&emitted[1].metadata.name, "second");
     assert_eq!(
-        emitted[1].spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0]
+        emitted[1]
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
             .image
             .as_deref(),
         Some("second:1.0")
@@ -174,7 +190,15 @@ async fn kube_reconciler_plugs_into_system_controller() {
     assert_eq!(emitted.len(), 1);
     assert_eq!(&emitted[0].metadata.name, "podinfo");
     assert_eq!(
-        emitted[0].spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0]
+        emitted[0]
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
             .image
             .as_deref(),
         Some("podinfo:6.4.1")

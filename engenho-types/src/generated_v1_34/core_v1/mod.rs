@@ -1,35 +1,35 @@
 //! GENERATED — `core_v1` typed kinds. Source: engenho-kube-codegen.
 
-mod pod;
-mod service;
 mod configmap;
-mod secret;
+mod endpoints;
+mod event;
+mod limitrange;
 mod namespace;
-mod serviceaccount;
 mod node;
 mod persistentvolume;
 mod persistentvolumeclaim;
-mod endpoints;
-mod replicationcontroller;
+mod pod;
 mod podtemplate;
-mod limitrange;
+mod replicationcontroller;
 mod resourcequota;
-mod event;
+mod secret;
+mod service;
+mod serviceaccount;
 
-pub use pod::Pod;
-pub use service::Service;
 pub use configmap::ConfigMap;
-pub use secret::Secret;
+pub use endpoints::Endpoints;
+pub use event::Event;
+pub use limitrange::LimitRange;
 pub use namespace::Namespace;
-pub use serviceaccount::ServiceAccount;
 pub use node::Node;
 pub use persistentvolume::PersistentVolume;
 pub use persistentvolumeclaim::PersistentVolumeClaim;
-pub use endpoints::Endpoints;
-pub use replicationcontroller::ReplicationController;
+pub use pod::Pod;
 pub use podtemplate::PodTemplate;
-pub use limitrange::LimitRange;
+pub use replicationcontroller::ReplicationController;
 pub use resourcequota::ResourceQuota;
-pub use event::Event;
+pub use secret::Secret;
+pub use service::Service;
+pub use serviceaccount::ServiceAccount;
 
 pub use crate::generated_v1_34::types::*;

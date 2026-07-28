@@ -118,8 +118,7 @@ impl ClusterIpAllocator {
     /// [`AllocatorError::InvalidCidr`] when `cidr` is not a parseable
     /// IPv4 CIDR.
     pub fn new(cidr: &str) -> Result<Self, AllocatorError> {
-        let (base, prefix) =
-            parse_ipv4_cidr(cidr).map_err(AllocatorError::InvalidCidr)?;
+        let (base, prefix) = parse_ipv4_cidr(cidr).map_err(AllocatorError::InvalidCidr)?;
         // Host bits = 32 - prefix. The assignable host range is
         // (network+1)..=(broadcast-1) for the common case; for a /31 or
         // /32 the whole block is assignable (no separate net/broadcast).
@@ -422,9 +421,11 @@ impl AdmissionWebhook for ClusterIpDefaultingWebhook {
         // Stamp the VIP onto a clone of the proposed object: spec.clusterIP
         // (legacy single) + spec.clusterIPs[0] (dual-stack-aware list).
         let mut mutated = svc.clone();
-        let spec = mutated
-            .as_object_mut()
-            .and_then(|o| o.entry("spec").or_insert_with(|| Value::Object(Default::default())).as_object_mut());
+        let spec = mutated.as_object_mut().and_then(|o| {
+            o.entry("spec")
+                .or_insert_with(|| Value::Object(Default::default()))
+                .as_object_mut()
+        });
         let Some(spec) = spec else {
             // A non-object spec is malformed — surface it, don't paper over.
             return Ok(AdmissionDecision::Deny(
@@ -556,9 +557,15 @@ mod tests {
     #[test]
     fn classify_default_service_needs_allocation() {
         let svc = json!({"spec": {"ports": [{"port": 80}]}});
-        assert_eq!(classify_service(&svc), ServiceVipDisposition::NeedsAllocation);
+        assert_eq!(
+            classify_service(&svc),
+            ServiceVipDisposition::NeedsAllocation
+        );
         let svc2 = json!({"spec": {"type": "ClusterIP", "clusterIP": ""}});
-        assert_eq!(classify_service(&svc2), ServiceVipDisposition::NeedsAllocation);
+        assert_eq!(
+            classify_service(&svc2),
+            ServiceVipDisposition::NeedsAllocation
+        );
     }
 
     #[test]
@@ -576,7 +583,10 @@ mod tests {
     #[test]
     fn classify_already_assigned() {
         let svc = json!({"spec": {"clusterIP": "10.96.5.5"}});
-        assert_eq!(classify_service(&svc), ServiceVipDisposition::AlreadyAssigned);
+        assert_eq!(
+            classify_service(&svc),
+            ServiceVipDisposition::AlreadyAssigned
+        );
     }
 
     // ── defaulting webhook ───────────────────────────────────────────
@@ -641,7 +651,10 @@ mod tests {
             "spec": {"clusterIP": "None", "selector": {"app": "x"}}
         }));
         // Headless → Allow (unchanged); clusterIP stays None.
-        assert!(matches!(wh.review(&req).await.unwrap(), AdmissionDecision::Allow));
+        assert!(matches!(
+            wh.review(&req).await.unwrap(),
+            AdmissionDecision::Allow
+        ));
     }
 
     #[tokio::test]
@@ -653,7 +666,10 @@ mod tests {
             "metadata": {"name": "ext"},
             "spec": {"type": "ExternalName", "externalName": "db.example.com"}
         }));
-        assert!(matches!(wh.review(&req).await.unwrap(), AdmissionDecision::Allow));
+        assert!(matches!(
+            wh.review(&req).await.unwrap(),
+            AdmissionDecision::Allow
+        ));
     }
 
     #[tokio::test]
@@ -666,7 +682,10 @@ mod tests {
             "spec": {"clusterIP": "10.96.7.7", "ports": [{"port": 80}]}
         }));
         // Already-assigned → Allow (honored as-is, never reallocated).
-        assert!(matches!(wh.review(&req).await.unwrap(), AdmissionDecision::Allow));
+        assert!(matches!(
+            wh.review(&req).await.unwrap(),
+            AdmissionDecision::Allow
+        ));
     }
 
     #[tokio::test]
@@ -680,7 +699,10 @@ mod tests {
             current: None,
             user_info: engenho_types::auth::UserInfo::default(),
         };
-        assert!(matches!(wh.review(&req).await.unwrap(), AdmissionDecision::Allow));
+        assert!(matches!(
+            wh.review(&req).await.unwrap(),
+            AdmissionDecision::Allow
+        ));
     }
 
     #[tokio::test]
@@ -727,7 +749,10 @@ mod tests {
     #[test]
     fn u32_ip_roundtrip() {
         assert_eq!(u32_to_ip(ip_to_u32("10.96.0.1").unwrap()), "10.96.0.1");
-        assert_eq!(u32_to_ip(ip_to_u32("255.255.255.255").unwrap()), "255.255.255.255");
+        assert_eq!(
+            u32_to_ip(ip_to_u32("255.255.255.255").unwrap()),
+            "255.255.255.255"
+        );
         assert_eq!(u32_to_ip(0), "0.0.0.0");
     }
 }

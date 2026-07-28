@@ -43,7 +43,10 @@ pub struct ListWatchParams {
     #[serde(rename = "fieldSelector")]
     pub field_selector: Option<String>,
     /// `allowWatchBookmarks=true` — K8s opt-in; defaults to `true` here.
-    #[serde(rename = "allowWatchBookmarks", deserialize_with = "de_bool_default_true")]
+    #[serde(
+        rename = "allowWatchBookmarks",
+        deserialize_with = "de_bool_default_true"
+    )]
     pub allow_watch_bookmarks: bool,
     /// Accepted + parsed, no-op at M0.1 (informer long-poll timeout).
     #[serde(rename = "timeoutSeconds")]
@@ -71,11 +74,14 @@ impl ListWatchParams {
     pub fn resume_point(&self) -> Result<ResumePoint, ApiError> {
         match self.resource_version.as_deref() {
             None | Some("") | Some("0") => Ok(ResumePoint::MostRecent),
-            Some(s) => s.parse::<u64>().map(|n| ResumePoint::At(Revision(n))).map_err(|_| {
-                ApiError::BadRequest(format!(
-                    "invalid resourceVersion: {s:?} (must be a non-negative integer)"
-                ))
-            }),
+            Some(s) => s
+                .parse::<u64>()
+                .map(|n| ResumePoint::At(Revision(n)))
+                .map_err(|_| {
+                    ApiError::BadRequest(format!(
+                        "invalid resourceVersion: {s:?} (must be a non-negative integer)"
+                    ))
+                }),
         }
     }
 
@@ -221,9 +227,7 @@ impl ApplyOptions {
 /// [`ApiError::BadRequest`] when `metadata.resourceVersion` is present
 /// but not a base-10 unsigned integer.
 pub fn body_precondition(body: &serde_json::Value) -> Result<Option<Revision>, ApiError> {
-    let rv = body
-        .get("metadata")
-        .and_then(|m| m.get("resourceVersion"));
+    let rv = body.get("metadata").and_then(|m| m.get("resourceVersion"));
     match rv {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(s)) if s.is_empty() => Ok(None),
@@ -280,7 +284,11 @@ impl LabelRequirement {
     /// `true` when `labels` (the object's `metadata.labels`) satisfies this
     /// requirement. A missing labels map is treated as "no labels".
     fn satisfied_by(&self, labels: Option<&serde_json::Value>) -> bool {
-        let have = |k: &str| labels.and_then(|l| l.get(k)).and_then(serde_json::Value::as_str);
+        let have = |k: &str| {
+            labels
+                .and_then(|l| l.get(k))
+                .and_then(serde_json::Value::as_str)
+        };
         match self {
             Self::Equals(k, v) => have(k) == Some(v.as_str()),
             Self::NotEquals(k, v) => have(k) != Some(v.as_str()),
@@ -691,7 +699,10 @@ mod tests {
         assert_eq!(p(Some("")).limit().unwrap(), 0);
         assert_eq!(p(Some("0")).limit().unwrap(), 0);
         assert_eq!(p(Some("25")).limit().unwrap(), 25);
-        assert!(matches!(p(Some("nope")).limit(), Err(ApiError::BadRequest(_))));
+        assert!(matches!(
+            p(Some("nope")).limit(),
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -708,10 +719,7 @@ mod tests {
         assert_eq!(p.continue_token().unwrap(), Some(token));
 
         // Absent / empty → None.
-        assert_eq!(
-            ListWatchParams::default().continue_token().unwrap(),
-            None
-        );
+        assert_eq!(ListWatchParams::default().continue_token().unwrap(), None);
 
         // Garbage → Gone (410).
         let bad = ListWatchParams {
@@ -768,8 +776,7 @@ mod tests {
 
     #[test]
     fn apply_params_parse_field_manager_and_force() {
-        let p: ApplyParams =
-            serde_urlencoded::from_str("fieldManager=test&force=true").unwrap();
+        let p: ApplyParams = serde_urlencoded::from_str("fieldManager=test&force=true").unwrap();
         let opts = ApplyOptions::from_params(&p).unwrap();
         assert_eq!(opts.manager, "test");
         assert!(opts.force);
@@ -780,8 +787,7 @@ mod tests {
         assert!(!opts.force);
 
         // force=false explicit.
-        let p: ApplyParams =
-            serde_urlencoded::from_str("fieldManager=test&force=false").unwrap();
+        let p: ApplyParams = serde_urlencoded::from_str("fieldManager=test&force=false").unwrap();
         assert!(!ApplyOptions::from_params(&p).unwrap().force);
     }
 
@@ -822,14 +828,11 @@ mod tests {
         // present. Absent key → struct default (false) is interpreted by
         // the router as "use the param as-is". We test the DESERIALIZE
         // default-true behavior here.
-        let p: ListWatchParams =
-            serde_urlencoded::from_str("allowWatchBookmarks=").unwrap();
+        let p: ListWatchParams = serde_urlencoded::from_str("allowWatchBookmarks=").unwrap();
         assert!(p.allow_watch_bookmarks);
-        let p: ListWatchParams =
-            serde_urlencoded::from_str("allowWatchBookmarks=false").unwrap();
+        let p: ListWatchParams = serde_urlencoded::from_str("allowWatchBookmarks=false").unwrap();
         assert!(!p.allow_watch_bookmarks);
-        let p: ListWatchParams =
-            serde_urlencoded::from_str("allowWatchBookmarks=true").unwrap();
+        let p: ListWatchParams = serde_urlencoded::from_str("allowWatchBookmarks=true").unwrap();
         assert!(p.allow_watch_bookmarks);
     }
 
@@ -861,12 +864,10 @@ mod tests {
         });
         assert!(sel.matches(&yes));
 
-        let wrong_label =
-            serde_json::json!({"metadata": {"name": "p1", "labels": {"app": "api"}}});
+        let wrong_label = serde_json::json!({"metadata": {"name": "p1", "labels": {"app": "api"}}});
         assert!(!sel.matches(&wrong_label));
 
-        let wrong_name =
-            serde_json::json!({"metadata": {"name": "p2", "labels": {"app": "web", "tier": "front"}}});
+        let wrong_name = serde_json::json!({"metadata": {"name": "p2", "labels": {"app": "web", "tier": "front"}}});
         assert!(!sel.matches(&wrong_name));
     }
 
@@ -963,7 +964,13 @@ mod tests {
         let pod = ResourceKey::namespaced("", "v1", "Pod", "default", "p");
         assert!(gvk_ns_matches(&pod, "", "v1", "Pod", Some("default")));
         // wrong kind
-        assert!(!gvk_ns_matches(&pod, "", "v1", "ConfigMap", Some("default")));
+        assert!(!gvk_ns_matches(
+            &pod,
+            "",
+            "v1",
+            "ConfigMap",
+            Some("default")
+        ));
         // wrong namespace
         assert!(!gvk_ns_matches(&pod, "", "v1", "Pod", Some("kube-system")));
         // cluster-scoped request (namespace None) matches any ns

@@ -89,14 +89,14 @@ fn waiting_reason(pod: &Value, idx: usize) -> Option<String> {
 }
 
 fn phase(pod: &Value) -> Option<String> {
-    pod.get("status")?
-        .get("phase")?
-        .as_str()
-        .map(String::from)
+    pod.get("status")?.get("phase")?.as_str().map(String::from)
 }
 
 fn count_starts(events: &[FakeEvent]) -> usize {
-    events.iter().filter(|e| matches!(e, FakeEvent::Start(_))).count()
+    events
+        .iter()
+        .filter(|e| matches!(e, FakeEvent::Start(_)))
+        .count()
 }
 
 async fn teardown(store: Arc<StoreMesh>, kubelet: Kubelet) {
@@ -157,7 +157,10 @@ async fn configmap_volume_materializes_files_and_mounts_read_only() {
     let spec = backend.spec_of(id).await.unwrap();
     assert_eq!(spec.mounts.len(), 1);
     assert_eq!(spec.mounts[0].mount_path, "/etc/cfg");
-    assert!(spec.mounts[0].read_only, "configMap mount defaults read-only");
+    assert!(
+        spec.mounts[0].read_only,
+        "configMap mount defaults read-only"
+    );
     assert!(matches!(spec.mounts[0].source, MountSource::HostDir(_)));
 
     teardown(store, kubelet).await;
@@ -261,7 +264,10 @@ async fn empty_dir_named_volume_shared_across_containers() {
         assert!(!spec.mounts[0].read_only);
         sources.push(spec.mounts[0].source.clone());
     }
-    assert_eq!(sources[0], sources[1], "both containers share one named volume");
+    assert_eq!(
+        sources[0], sources[1],
+        "both containers share one named volume"
+    );
     assert!(matches!(sources[0], MountSource::NamedVolume(_)));
 
     teardown(store, kubelet).await;
@@ -306,7 +312,10 @@ async fn empty_dir_named_volume_reaped_on_pod_delete() {
     // Start tick: emptyDir ensured, container started, nothing reaped yet.
     kubelet.tick().await.unwrap();
     assert_eq!(mat.ensured_empty_dirs().await, vec!["scratch".to_string()]);
-    assert!(mat.removed_empty_dirs().await.is_empty(), "no reap before delete");
+    assert!(
+        mat.removed_empty_dirs().await.is_empty(),
+        "no reap before delete"
+    );
     assert_eq!(count_starts(&backend.events().await), 1);
 
     // Hard-delete the pod → next tick reaps the orphan's containers AND its
@@ -358,8 +367,15 @@ async fn missing_configmap_keeps_pod_pending_no_start() {
     // Pod is Pending with the typed waiting reason; NO container started.
     let pod = store.get(&pod_key("p1")).await.unwrap();
     assert_eq!(phase(&pod).as_deref(), Some("Pending"));
-    assert_eq!(waiting_reason(&pod, 0).as_deref(), Some("ConfigMapNotFound"));
-    assert_eq!(count_starts(&backend.events().await), 0, "no backend start on missing source");
+    assert_eq!(
+        waiting_reason(&pod, 0).as_deref(),
+        Some("ConfigMapNotFound")
+    );
+    assert_eq!(
+        count_starts(&backend.events().await),
+        0,
+        "no backend start on missing source"
+    );
 
     // Now CREATE the configMap → next tick resolves + the pod proceeds.
     put(
@@ -374,7 +390,11 @@ async fn missing_configmap_keeps_pod_pending_no_start() {
     .await;
     kubelet.tick().await.unwrap();
     let pod = store.get(&pod_key("p1")).await.unwrap();
-    assert_eq!(phase(&pod).as_deref(), Some("Running"), "pod converges once source exists");
+    assert_eq!(
+        phase(&pod).as_deref(),
+        Some("Running"),
+        "pod converges once source exists"
+    );
     assert_eq!(count_starts(&backend.events().await), 1);
 
     teardown(store, kubelet).await;
@@ -413,7 +433,10 @@ async fn no_volume_pod_runs_with_empty_mounts() {
     assert_eq!(containers.len(), 1);
     let (id, _) = &containers[0];
     let spec = backend.spec_of(id).await.unwrap();
-    assert!(spec.mounts.is_empty(), "no-volume pod produces empty mounts");
+    assert!(
+        spec.mounts.is_empty(),
+        "no-volume pod produces empty mounts"
+    );
     assert!(mat.ensured_empty_dirs().await.is_empty());
 
     teardown(store, kubelet).await;
@@ -448,7 +471,10 @@ fn run_argv_emits_volume_flags_in_order() {
     // The two `-v` pairs appear in spec.mounts order, AFTER `--name <name>`
     // and BEFORE the image. HostDir read-only → `:ro`; NamedVolume rw → none.
     let name_idx = argv.iter().position(|a| a == "default_p1_main").unwrap();
-    let cfg_idx = argv.iter().position(|a| a == "/home/u/vols/cfg:/etc/cfg:ro").unwrap();
+    let cfg_idx = argv
+        .iter()
+        .position(|a| a == "/home/u/vols/cfg:/etc/cfg:ro")
+        .unwrap();
     let scratch_idx = argv
         .iter()
         .position(|a| a == "engenho-empty-default_p1_scratch:/data")

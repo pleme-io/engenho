@@ -38,9 +38,7 @@ fn pod_key(name: &str) -> ResourceKey {
 }
 
 /// Drain one Event from the stream (skipping any bookmarks).
-async fn next_event(
-    stream: &mut engenho_store::WatchStream,
-) -> engenho_store::WatchEvent {
+async fn next_event(stream: &mut engenho_store::WatchStream) -> engenho_store::WatchEvent {
     loop {
         match tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await

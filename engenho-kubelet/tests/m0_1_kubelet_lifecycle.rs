@@ -79,12 +79,7 @@ async fn put_pod_with_policy(
 
 /// Put a 2-container Pod (`web` + `sidecar`) bound to a node, with an explicit
 /// `spec.restartPolicy`. Used by the multi-container tests.
-async fn put_multi_pod(
-    store: &StoreMesh,
-    name: &str,
-    node_name: &str,
-    restart_policy: &str,
-) {
+async fn put_multi_pod(store: &StoreMesh, name: &str, node_name: &str, restart_policy: &str) {
     let value = json!({
         "kind": "Pod",
         "apiVersion": "v1",
@@ -315,17 +310,26 @@ async fn exit_zero_drives_succeeded() {
     put_pod(&store, "p1", "img", Some("node-A")).await;
     kubelet.tick().await.unwrap();
     let cid = first_container_id(&backend).await;
-    assert_eq!(pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(), Some("Running"));
+    assert_eq!(
+        pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
+        Some("Running")
+    );
 
     // Container exits cleanly.
     backend.set_exit(&cid, 0).await;
 
     let report = kubelet.tick().await.unwrap();
-    assert!(report.objects_changed >= 1, "terminal transition is a write");
+    assert!(
+        report.objects_changed >= 1,
+        "terminal transition is a write"
+    );
 
     let pod = store.get(&pod_key("p1")).await.unwrap();
     assert_eq!(pod_phase(&pod).as_deref(), Some("Succeeded"));
-    assert!(!pod_ready_is_true(&pod), "Ready must not be True for a terminal pod");
+    assert!(
+        !pod_ready_is_true(&pod),
+        "Ready must not be True for a terminal pod"
+    );
     let term = &pod["status"]["containerStatuses"][0]["state"]["terminated"];
     assert_eq!(term["exitCode"], 0);
 
@@ -335,7 +339,10 @@ async fn exit_zero_drives_succeeded() {
 
     // Third tick: idempotent-skip → no restart, phase still Succeeded.
     let report3 = kubelet.tick().await.unwrap();
-    assert_eq!(report3.objects_changed, 0, "terminal pod is steady-state NoChange");
+    assert_eq!(
+        report3.objects_changed, 0,
+        "terminal pod is steady-state NoChange"
+    );
     assert_eq!(count_starts(&backend.events().await), 1);
     assert_eq!(
         pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
@@ -365,7 +372,11 @@ async fn exit_nonzero_drives_failed() {
     let term = &pod["status"]["containerStatuses"][0]["state"]["terminated"];
     assert_eq!(term["exitCode"], 137);
 
-    assert_eq!(count_starts(&backend.events().await), 1, "exactly one Start ever");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "exactly one Start ever"
+    );
     assert_eq!(backend.running_count().await, 0);
 
     teardown(store, kubelet).await;
@@ -392,7 +403,10 @@ async fn still_running_stays_running_no_extra_start() {
     for _ in 0..2 {
         let report = kubelet.tick().await.unwrap();
         // write_status_cas NoChange → no store write, no watch storm.
-        assert_eq!(report.objects_changed, 0, "steady-state running tick is a no-op");
+        assert_eq!(
+            report.objects_changed, 0,
+            "steady-state running tick is a no-op"
+        );
         assert_eq!(
             pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
             Some("Running")
@@ -430,7 +444,11 @@ async fn vanished_container_is_recreated() {
     // back to running.
     let report = kubelet.tick().await.unwrap();
     assert!(report.objects_changed >= 1);
-    assert_eq!(count_starts(&backend.events().await), 2, "container re-created");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "container re-created"
+    );
     assert_eq!(backend.running_count().await, 1);
     assert_eq!(
         pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
@@ -453,9 +471,19 @@ async fn multi_container_pod_starts_every_container() {
     kubelet.tick().await.unwrap();
 
     // TWO starts (one per container), named <ns>_<pod>_<cname>.
-    assert_eq!(count_starts(&backend.events().await), 2, "2 containers → 2 starts");
-    assert_eq!(count_starts_named(&backend.events().await, "default_mp_web"), 1);
-    assert_eq!(count_starts_named(&backend.events().await, "default_mp_sidecar"), 1);
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "2 containers → 2 starts"
+    );
+    assert_eq!(
+        count_starts_named(&backend.events().await, "default_mp_web"),
+        1
+    );
+    assert_eq!(
+        count_starts_named(&backend.events().await, "default_mp_sidecar"),
+        1
+    );
     assert_eq!(backend.running_count().await, 2);
 
     // Pod status: phase Running + a 2-element containerStatuses array, both
@@ -468,7 +496,10 @@ async fn multi_container_pod_starts_every_container() {
     assert!(cs.iter().all(|c| c["containerID"].is_string()));
     let names: Vec<&str> = cs.iter().filter_map(|c| c["name"].as_str()).collect();
     assert!(names.contains(&"web") && names.contains(&"sidecar"));
-    assert!(pod_ready_is_true(&pod), "all-running multi-container pod is Ready");
+    assert!(
+        pod_ready_is_true(&pod),
+        "all-running multi-container pod is Ready"
+    );
 
     teardown(store, kubelet).await;
 }
@@ -533,7 +564,11 @@ async fn restart_policy_always_restarts_exited_container() {
         2,
         "Always → container restarted (a second Start)"
     );
-    assert_eq!(backend.running_count().await, 1, "the restarted container runs");
+    assert_eq!(
+        backend.running_count().await,
+        1,
+        "the restarted container runs"
+    );
     let pod = store.get(&pod_key("p1")).await.unwrap();
     assert_eq!(
         pod_phase(&pod).as_deref(),
@@ -596,7 +631,11 @@ async fn restart_policy_on_failure_restarts_only_nonzero() {
     // Nonzero exit under OnFailure → restart, pod stays Running.
     backend.set_exit(&cid, 1).await;
     kubelet.tick().await.unwrap();
-    assert_eq!(count_starts(&backend.events().await), 2, "OnFailure restarts nonzero");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "OnFailure restarts nonzero"
+    );
     assert_eq!(
         pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
         Some("Running")
@@ -606,7 +645,11 @@ async fn restart_policy_on_failure_restarts_only_nonzero() {
     let cid2 = first_container_id(&backend).await;
     backend.set_exit(&cid2, 0).await;
     kubelet.tick().await.unwrap();
-    assert_eq!(count_starts(&backend.events().await), 2, "OnFailure does NOT restart zero exit");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "OnFailure does NOT restart zero exit"
+    );
     assert_eq!(
         pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
         Some("Succeeded")
@@ -667,7 +710,9 @@ async fn multi_container_logs_select_per_container() {
     let store = boot_store().await;
     let backend = Arc::new(FakeBackend::new());
     backend.seed_log("default_mp_web", "from-web\n").await;
-    backend.seed_log("default_mp_sidecar", "from-sidecar\n").await;
+    backend
+        .seed_log("default_mp_sidecar", "from-sidecar\n")
+        .await;
     let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
 
     put_multi_pod(&store, "mp", "node-A", "Always").await;

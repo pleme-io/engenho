@@ -160,10 +160,22 @@ async fn readiness_exec_flips_ready_after_success_threshold() {
     // (initialDelay 0): a Fail → not ready.
     kubelet.tick().await.unwrap();
     let pod = store.get(&pod_key("p1")).await.unwrap();
-    assert_eq!(pod.get("status").and_then(|s| s.get("phase")).and_then(|p| p.as_str()), Some("Running"));
-    assert_eq!(container_ready(&pod, 0), Some(false), "first probe failed → not ready");
+    assert_eq!(
+        pod.get("status")
+            .and_then(|s| s.get("phase"))
+            .and_then(|p| p.as_str()),
+        Some("Running")
+    );
+    assert_eq!(
+        container_ready(&pod, 0),
+        Some(false),
+        "first probe failed → not ready"
+    );
     assert_eq!(condition_status(&pod, "Ready").as_deref(), Some("False"));
-    assert_eq!(condition_status(&pod, "ContainersReady").as_deref(), Some("False"));
+    assert_eq!(
+        condition_status(&pod, "ContainersReady").as_deref(),
+        Some("False")
+    );
 
     // Drive ticks: advance the clock past the period each time so the probe is
     // DUE on the next tick (the TestClock stands in for the Requeue cadence,
@@ -178,11 +190,17 @@ async fn readiness_exec_flips_ready_after_success_threshold() {
             became_ready = true;
             // Ready + ContainersReady conditions both True.
             assert_eq!(condition_status(&pod, "Ready").as_deref(), Some("True"));
-            assert_eq!(condition_status(&pod, "ContainersReady").as_deref(), Some("True"));
+            assert_eq!(
+                condition_status(&pod, "ContainersReady").as_deref(),
+                Some("True")
+            );
             break;
         }
     }
-    assert!(became_ready, "readiness must flip true after two consecutive exec successes");
+    assert!(
+        became_ready,
+        "readiness must flip true after two consecutive exec successes"
+    );
     // Exactly one Start ever — readiness never restarts.
     assert_eq!(count_starts(&backend.events().await), 1);
 
@@ -215,9 +233,7 @@ async fn liveness_exec_restarts_after_failure_threshold() {
     put_pod_container(&store, "p1", container, "Always").await;
 
     // Every exec FAILS (/tmp/alive never created).
-    backend
-        .set_default_exec(ExecOutcome::failure(1))
-        .await;
+    backend.set_default_exec(ExecOutcome::failure(1)).await;
 
     // First tick: start + first probe (Fail, threshold 1) → restart THIS tick.
     kubelet.tick().await.unwrap();
@@ -231,9 +247,15 @@ async fn liveness_exec_restarts_after_failure_threshold() {
 
     let pod = store.get(&pod_key("p1")).await.unwrap();
     let rc = restart_count(&pod, 0).unwrap_or(0);
-    assert!(rc >= 1, "failing liveness must restart (restartCount >= 1), got {rc}");
+    assert!(
+        rc >= 1,
+        "failing liveness must restart (restartCount >= 1), got {rc}"
+    );
     // More than one Start: the original + at least one restart.
-    assert!(count_starts(&backend.events().await) >= 2, "liveness restart re-creates the container");
+    assert!(
+        count_starts(&backend.events().await) >= 2,
+        "liveness restart re-creates the container"
+    );
 
     teardown(store, kubelet).await;
 }
@@ -363,9 +385,16 @@ async fn no_probe_pod_is_ready_immediately_and_arms_no_requeue() {
     let outcome = kubelet.tick().await.unwrap();
     // Byte-identical-to-today: Ready 1/1 on the first running tick.
     let pod = store.get(&pod_key("p1")).await.unwrap();
-    assert_eq!(container_ready(&pod, 0), Some(true), "no-probe container ready once Running");
+    assert_eq!(
+        container_ready(&pod, 0),
+        Some(true),
+        "no-probe container ready once Running"
+    );
     assert_eq!(condition_status(&pod, "Ready").as_deref(), Some("True"));
-    assert_eq!(condition_status(&pod, "ContainersReady").as_deref(), Some("True"));
+    assert_eq!(
+        condition_status(&pod, "ContainersReady").as_deref(),
+        Some("True")
+    );
     // AND the tick arms NO Requeue (a no-probe pod contributes no probe clock).
     assert_eq!(
         outcome.result,
@@ -375,7 +404,10 @@ async fn no_probe_pod_is_ready_immediately_and_arms_no_requeue() {
 
     // Steady-state: a further tick is a NoChange + still Done.
     let outcome2 = kubelet.tick().await.unwrap();
-    assert_eq!(outcome2.report.objects_changed, 0, "steady running tick is a no-op");
+    assert_eq!(
+        outcome2.report.objects_changed, 0,
+        "steady running tick is a no-op"
+    );
     assert_eq!(outcome2.result, ReconcileResult::Done);
 
     teardown(store, kubelet).await;
@@ -453,7 +485,10 @@ async fn tcp_socket_readiness_becomes_ready_when_port_up() {
         }
         clock.advance(Duration::from_millis(1100));
     }
-    assert!(became_ready, "tcpSocket readiness flips ready when the port is up");
+    assert!(
+        became_ready,
+        "tcpSocket readiness flips ready when the port is up"
+    );
     teardown(store, kubelet).await;
 }
 
@@ -495,7 +530,10 @@ async fn http_get_readiness_passes_on_2xx_fails_on_5xx() {
         }
         clock.advance(Duration::from_millis(1100));
     }
-    assert!(became_ready, "httpGet readiness flips ready on a 2xx status");
+    assert!(
+        became_ready,
+        "httpGet readiness flips ready on a 2xx status"
+    );
 
     teardown(store, kubelet).await;
 }
@@ -519,9 +557,16 @@ async fn invalid_probe_skips_pod_never_a_fake_pass() {
     put_pod_container(&store, "p1", container, "Always").await;
 
     let report = kubelet.tick().await.unwrap();
-    assert!(report.report.objects_skipped >= 1, "invalid probe → pod skipped");
+    assert!(
+        report.report.objects_skipped >= 1,
+        "invalid probe → pod skipped"
+    );
     // No container was started (the bad probe is rejected BEFORE start).
-    assert_eq!(count_starts(&backend.events().await), 0, "never starts a pod with an invalid probe");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        0,
+        "never starts a pod with an invalid probe"
+    );
     // No fake Running status written.
     let pod = store.get(&pod_key("p1")).await.unwrap();
     assert!(
@@ -549,7 +594,10 @@ async fn grpc_probe_is_unsupported_skips_pod() {
     put_pod_container(&store, "p1", container, "Always").await;
 
     let report = kubelet.tick().await.unwrap();
-    assert!(report.report.objects_skipped >= 1, "grpc probe → pod skipped (documented deferral)");
+    assert!(
+        report.report.objects_skipped >= 1,
+        "grpc probe → pod skipped (documented deferral)"
+    );
     assert_eq!(count_starts(&backend.events().await), 0);
 
     teardown(store, kubelet).await;

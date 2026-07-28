@@ -75,10 +75,7 @@ impl UserInfo {
         Self {
             username: "engenho-admin".to_string(),
             uid: String::new(),
-            groups: vec![
-                GROUP_MASTERS.to_string(),
-                GROUP_AUTHENTICATED.to_string(),
-            ],
+            groups: vec![GROUP_MASTERS.to_string(), GROUP_AUTHENTICATED.to_string()],
             extra: BTreeMap::new(),
         }
     }
@@ -248,10 +245,7 @@ mod tests {
 
     #[test]
     fn from_client_cert_maps_orgs_to_groups_plus_authenticated() {
-        let u = UserInfo::from_client_cert(
-            "engenho-admin",
-            &["system:masters".to_string()],
-        );
+        let u = UserInfo::from_client_cert("engenho-admin", &["system:masters".to_string()]);
         assert_eq!(u.username, "engenho-admin");
         assert_eq!(
             u.groups,

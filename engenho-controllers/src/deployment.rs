@@ -76,8 +76,9 @@ impl DeploymentController {
         // all-namespace controller has none). A namespaced Deployment with
         // no metadata.namespace is impossible past admission, but default
         // defensively so the key + the object can never disagree.
-        let d_namespace =
-            d.namespace().map_or_else(|| "default".to_string(), |c| c.to_owned());
+        let d_namespace = d
+            .namespace()
+            .map_or_else(|| "default".to_string(), |c| c.to_owned());
         let template = d.get("spec").and_then(|s| s.get("template"))?.clone();
         let replicas = d.spec_i64("replicas", 1);
         let rs_name = format!("{d_name}-{hash}");
@@ -211,10 +212,9 @@ impl OwnedChildrenReconciler for DeploymentController {
                     // (`ns`, None→"default") keyed the RS where the owned-RS
                     // query never looks → the controller never saw the RS it
                     // created → recreate-every-tick hot loop + status thrash.
-                    let rs_ns = d_value.namespace().map_or_else(
-                        || ns.unwrap_or("default").to_string(),
-                        |c| c.to_owned(),
-                    );
+                    let rs_ns = d_value
+                        .namespace()
+                        .map_or_else(|| ns.unwrap_or("default").to_string(), |c| c.to_owned());
                     let rs_key =
                         ResourceKey::namespaced("apps", "v1", "ReplicaSet", &rs_ns, &rs_name);
                     commands.push(ResourceCommand::Put {
@@ -361,7 +361,10 @@ mod tests {
         });
         let (rs_name, rs) = DeploymentController::build_replicaset_from(&d, "hash01").unwrap();
         assert_eq!(rs_name, "web-hash01");
-        assert_eq!(rs.get("metadata").unwrap().get("namespace").unwrap(), "team-a");
+        assert_eq!(
+            rs.get("metadata").unwrap().get("namespace").unwrap(),
+            "team-a"
+        );
         assert_eq!(rs.get("spec").unwrap().get("replicas").unwrap(), 3);
     }
 
@@ -372,6 +375,9 @@ mod tests {
             "spec": {"replicas": 1, "selector": {}, "template": {"spec": {"containers": []}}}
         });
         let (_, rs) = DeploymentController::build_replicaset_from(&d, "h").unwrap();
-        assert_eq!(rs.get("metadata").unwrap().get("namespace").unwrap(), "default");
+        assert_eq!(
+            rs.get("metadata").unwrap().get("namespace").unwrap(),
+            "default"
+        );
     }
 }

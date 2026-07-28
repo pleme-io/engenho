@@ -275,8 +275,7 @@ mod tests {
     fn min_available_reads_spec_field() {
         let pdb = json!({"spec": {"minAvailable": 2}});
         assert_eq!(
-            PodDisruptionBudgetController::min_available(&pdb)
-                .and_then(serde_json::Value::as_i64),
+            PodDisruptionBudgetController::min_available(&pdb).and_then(serde_json::Value::as_i64),
             Some(2)
         );
     }
@@ -364,8 +363,7 @@ mod tests {
     #[test]
     fn compute_status_min_available_int() {
         // minAvailable=2, 3 ready / 3 total → desired=2, allowed=1.
-        let s =
-            PodDisruptionBudgetController::compute_status(Some(&json!(2)), None, 3, 3, 7);
+        let s = PodDisruptionBudgetController::compute_status(Some(&json!(2)), None, 3, 3, 7);
         assert_eq!(s.expected_pods, 3);
         assert_eq!(s.current_healthy, 3);
         assert_eq!(s.desired_healthy, 2);
@@ -376,13 +374,7 @@ mod tests {
     #[test]
     fn compute_status_min_available_percent() {
         // minAvailable="50%", 3 ready / 4 total → desired=ceil(2.0)=2, allowed=1.
-        let s = PodDisruptionBudgetController::compute_status(
-            Some(&json!("50%")),
-            None,
-            3,
-            4,
-            1,
-        );
+        let s = PodDisruptionBudgetController::compute_status(Some(&json!("50%")), None, 3, 4, 1);
         assert_eq!(s.expected_pods, 4);
         assert_eq!(s.current_healthy, 3);
         assert_eq!(s.desired_healthy, 2);
@@ -392,8 +384,7 @@ mod tests {
     #[test]
     fn compute_status_max_unavailable_int() {
         // maxUnavailable=1, 3 ready / 3 total → desired = 3-1 = 2, allowed=1.
-        let s =
-            PodDisruptionBudgetController::compute_status(None, Some(&json!(1)), 3, 3, 1);
+        let s = PodDisruptionBudgetController::compute_status(None, Some(&json!(1)), 3, 3, 1);
         assert_eq!(s.desired_healthy, 2);
         assert_eq!(s.disruptions_allowed, 1);
     }
@@ -402,13 +393,7 @@ mod tests {
     fn compute_status_max_unavailable_percent() {
         // maxUnavailable="25%" of 4 → ceil(1.0)=1; desired = 4-1 = 3.
         // 4 ready / 4 total → allowed = 4-3 = 1.
-        let s = PodDisruptionBudgetController::compute_status(
-            None,
-            Some(&json!("25%")),
-            4,
-            4,
-            1,
-        );
+        let s = PodDisruptionBudgetController::compute_status(None, Some(&json!("25%")), 4, 4, 1);
         assert_eq!(s.desired_healthy, 3);
         assert_eq!(s.disruptions_allowed, 1);
     }
@@ -416,21 +401,18 @@ mod tests {
     #[test]
     fn compute_status_clamps_disruptions_allowed_at_zero() {
         // minAvailable=3, only 2 healthy → desired=3, allowed=max(0,2-3)=0.
-        let s =
-            PodDisruptionBudgetController::compute_status(Some(&json!(3)), None, 2, 3, 1);
+        let s = PodDisruptionBudgetController::compute_status(Some(&json!(3)), None, 2, 3, 1);
         assert_eq!(s.desired_healthy, 3);
         assert_eq!(s.disruptions_allowed, 0);
         // currentHealthy == desiredHealthy → also 0.
-        let s =
-            PodDisruptionBudgetController::compute_status(Some(&json!(2)), None, 2, 2, 1);
+        let s = PodDisruptionBudgetController::compute_status(Some(&json!(2)), None, 2, 2, 1);
         assert_eq!(s.disruptions_allowed, 0);
     }
 
     #[test]
     fn compute_status_max_unavailable_cannot_drive_desired_negative() {
         // maxUnavailable=5 but only 3 pods → desired = max(0, 3-5) = 0.
-        let s =
-            PodDisruptionBudgetController::compute_status(None, Some(&json!(5)), 3, 3, 1);
+        let s = PodDisruptionBudgetController::compute_status(None, Some(&json!(5)), 3, 3, 1);
         assert_eq!(s.desired_healthy, 0);
         assert_eq!(s.disruptions_allowed, 3);
     }
@@ -699,9 +681,11 @@ mod tests {
 
         // Re-tick with no pod change: status already matches → NoChange.
         let second = c.tick().await.unwrap();
-        assert_eq!(second.objects_changed, 0, "idempotent re-tick writes nothing");
-        let rv_after_second =
-            store.get(&key).await.unwrap()["metadata"]["resourceVersion"].clone();
+        assert_eq!(
+            second.objects_changed, 0,
+            "idempotent re-tick writes nothing"
+        );
+        let rv_after_second = store.get(&key).await.unwrap()["metadata"]["resourceVersion"].clone();
         assert_eq!(
             rv_after_first, rv_after_second,
             "no status churn on a steady re-tick"

@@ -182,12 +182,7 @@ fn unix_to_utc(unix_secs: u64) -> Option<DateTime<Utc>> {
 }
 
 /// Parse one cron field into its admissible value set.
-fn parse_field(
-    field: &str,
-    index: usize,
-    min: u32,
-    max: u32,
-) -> Result<CronField, CronParseError> {
+fn parse_field(field: &str, index: usize, min: u32, max: u32) -> Result<CronField, CronParseError> {
     let err = || CronParseError::Field {
         index,
         token: field.to_string(),
@@ -245,11 +240,7 @@ fn parse_part(
     } else {
         // A bare number. With a step (`N/k`) it means "from N, stepping".
         let n = fold_dow(range_spec.parse().map_err(|_| err())?, index);
-        if step == 1 {
-            (n, n)
-        } else {
-            (n, max)
-        }
+        if step == 1 { (n, n) } else { (n, max) }
     };
 
     if lo < min || hi > max {

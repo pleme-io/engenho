@@ -149,7 +149,11 @@ fn noop_neutrality_explicit() {
     assert_eq!(cat.history.len(), 1);
 
     // patch-missing
-    let o = cat.apply(&patch_cmd(pod_key("ghost"), serde_json::json!({"x": 1})), 1, 2);
+    let o = cat.apply(
+        &patch_cmd(pod_key("ghost"), serde_json::json!({"x": 1})),
+        1,
+        2,
+    );
     assert_eq!(o.op, engenho_store::ResourceOp::NoOp);
     assert!(o.change.is_none());
     assert_eq!(cat.revision(), Revision(1));
@@ -224,7 +228,9 @@ fn delete_change_is_a_tombstone_with_prior() {
         1,
     );
     let outcome = cat.apply(&delete_cmd(k.clone()), 1, 2);
-    let change = outcome.change.expect("delete of existing key emits a change");
+    let change = outcome
+        .change
+        .expect("delete of existing key emits a change");
     assert_eq!(change.kind, ChangeKind::Delete);
     assert!(!change.value.is_null());
     assert_eq!(
@@ -242,27 +248,55 @@ fn create_mod_version_semantics() {
     let mut cat = ResourceCatalog::default();
     let k = pod_key("svc");
 
-    cat.apply(&put_cmd(k.clone(), serde_json::json!({"spec": {"v": 1}})), 1, 1); // rev 1
+    cat.apply(
+        &put_cmd(k.clone(), serde_json::json!({"spec": {"v": 1}})),
+        1,
+        1,
+    ); // rev 1
     let (_, m) = cat.get_with_meta(&k).unwrap();
     assert_eq!(m.create_revision, Revision(1));
     assert_eq!(m.version, 1);
 
-    cat.apply(&put_cmd(k.clone(), serde_json::json!({"spec": {"v": 2}})), 1, 2); // rev 2 (replace)
+    cat.apply(
+        &put_cmd(k.clone(), serde_json::json!({"spec": {"v": 2}})),
+        1,
+        2,
+    ); // rev 2 (replace)
     let (_, m) = cat.get_with_meta(&k).unwrap();
-    assert_eq!(m.create_revision, Revision(1), "create_revision stable across replace");
+    assert_eq!(
+        m.create_revision,
+        Revision(1),
+        "create_revision stable across replace"
+    );
     assert_eq!(m.mod_revision, Revision(2));
     assert_eq!(m.version, 2);
 
-    cat.apply(&patch_cmd(k.clone(), serde_json::json!({"spec": {"w": 9}})), 1, 3); // rev 3 (patch)
+    cat.apply(
+        &patch_cmd(k.clone(), serde_json::json!({"spec": {"w": 9}})),
+        1,
+        3,
+    ); // rev 3 (patch)
     let (_, m) = cat.get_with_meta(&k).unwrap();
-    assert_eq!(m.create_revision, Revision(1), "create_revision stable across patch");
+    assert_eq!(
+        m.create_revision,
+        Revision(1),
+        "create_revision stable across patch"
+    );
     assert_eq!(m.mod_revision, Revision(3));
     assert_eq!(m.version, 3);
 
     cat.apply(&delete_cmd(k.clone()), 1, 4); // rev 4
-    cat.apply(&put_cmd(k.clone(), serde_json::json!({"spec": {"v": 100}})), 1, 5); // rev 5 (recreate)
+    cat.apply(
+        &put_cmd(k.clone(), serde_json::json!({"spec": {"v": 100}})),
+        1,
+        5,
+    ); // rev 5 (recreate)
     let (_, m) = cat.get_with_meta(&k).unwrap();
-    assert_eq!(m.create_revision, Revision(5), "recreate yields NEW create_revision");
+    assert_eq!(
+        m.create_revision,
+        Revision(5),
+        "recreate yields NEW create_revision"
+    );
     assert_eq!(m.mod_revision, Revision(5));
     assert_eq!(m.version, 1, "version resets on recreate");
 }

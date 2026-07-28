@@ -8,17 +8,17 @@
 //! RBAC Authorizer dispatches on `Subject.kind` / `RoleRef.kind`). The `policy`
 //! module is the single canonical source; the kind structs reference it.
 
+mod clusterrole;
+mod clusterrolebinding;
 mod policy;
 mod role;
-mod clusterrole;
 mod rolebinding;
-mod clusterrolebinding;
 
+pub use clusterrole::ClusterRole;
+pub use clusterrolebinding::ClusterRoleBinding;
 pub use policy::{PolicyRule, RoleRef, Subject};
 pub use role::Role;
-pub use clusterrole::ClusterRole;
 pub use rolebinding::RoleBinding;
-pub use clusterrolebinding::ClusterRoleBinding;
 
 // Re-export the rest of the generated types EXCEPT the broken RBAC primitives
 // (PolicyRule / RoleRef / Subject) — the explicit `pub use policy::{…}` above

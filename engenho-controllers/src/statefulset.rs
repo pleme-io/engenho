@@ -70,8 +70,9 @@ impl StatefulSetController {
     /// land — no rename needed.
     fn build_pod(sts: &Value, ordinal: usize) -> Option<(String, Value)> {
         let sts_name = sts.name()?;
-        let sts_namespace =
-            sts.namespace().map_or_else(|| "default".to_string(), |c| c.to_owned());
+        let sts_namespace = sts
+            .namespace()
+            .map_or_else(|| "default".to_string(), |c| c.to_owned());
         let template = sts.get("spec").and_then(|s| s.get("template"))?;
         let mut pod = template.clone();
         let pod_obj = pod.as_object_mut()?;
@@ -137,9 +138,9 @@ impl StatefulSetController {
             };
             // Idempotence: a template that already declares this volume name
             // (operator pre-wired it) is left untouched.
-            let already = arr.iter().any(|v| {
-                v.get("name").and_then(|n| n.as_str()) == Some(tmpl_name)
-            });
+            let already = arr
+                .iter()
+                .any(|v| v.get("name").and_then(|n| n.as_str()) == Some(tmpl_name));
             if already {
                 continue;
             }
@@ -267,9 +268,8 @@ impl OwnedChildrenReconciler for StatefulSetController {
         // = ready owned pods; `updatedReplicas`/`currentReplicas` ==
         // replicas (single revision at M0.1).
         let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
-        let ready =
-            i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
-                .unwrap_or(i64::MAX);
+        let ready = i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
+            .unwrap_or(i64::MAX);
         Some(json!({
             "replicas": replicas,
             "readyReplicas": ready,
@@ -357,7 +357,10 @@ mod tests {
         });
         let (name, pod) = StatefulSetController::build_pod(&sts, 0).unwrap();
         assert_eq!(name, "vm-0");
-        assert_eq!(pod.get("metadata").unwrap().get("namespace").unwrap(), "monitoring");
+        assert_eq!(
+            pod.get("metadata").unwrap().get("namespace").unwrap(),
+            "monitoring"
+        );
     }
 
     #[test]
@@ -367,7 +370,10 @@ mod tests {
             "spec": {"template": {"spec": {"containers": []}}}
         });
         let (_, pod) = StatefulSetController::build_pod(&sts, 0).unwrap();
-        assert_eq!(pod.get("metadata").unwrap().get("namespace").unwrap(), "default");
+        assert_eq!(
+            pod.get("metadata").unwrap().get("namespace").unwrap(),
+            "default"
+        );
     }
 
     // ── volumeClaimTemplates → deterministic per-pod PVC volume name ───
@@ -510,7 +516,10 @@ mod tests {
     async fn ordinal_naming_and_namespace_inherited() {
         let store = test_store().await;
         let uid = seed_sts(&store, "monitoring", "vm", 3).await;
-        let c = StatefulSetController { store: store.clone(), namespace: None };
+        let c = StatefulSetController {
+            store: store.clone(),
+            namespace: None,
+        };
         c.tick().await.unwrap();
 
         let names = owned_pod_names(&store, "monitoring", &uid).await;
@@ -525,7 +534,10 @@ mod tests {
     async fn scale_up_adds_the_next_highest_ordinal() {
         let store = test_store().await;
         let uid = seed_sts(&store, "default", "vm", 1).await;
-        let c = StatefulSetController { store: store.clone(), namespace: None };
+        let c = StatefulSetController {
+            store: store.clone(),
+            namespace: None,
+        };
         c.tick().await.unwrap();
         assert_eq!(owned_pod_names(&store, "default", &uid).await, vec!["vm-0"]);
 
@@ -549,7 +561,10 @@ mod tests {
     async fn scale_down_removes_the_highest_ordinals() {
         let store = test_store().await;
         let uid = seed_sts(&store, "default", "vm", 3).await;
-        let c = StatefulSetController { store: store.clone(), namespace: None };
+        let c = StatefulSetController {
+            store: store.clone(),
+            namespace: None,
+        };
         c.tick().await.unwrap();
         assert_eq!(
             owned_pod_names(&store, "default", &uid).await,
@@ -573,7 +588,10 @@ mod tests {
     async fn statefulset_no_thrash_stable_across_ticks() {
         let store = test_store().await;
         let _uid = seed_sts(&store, "default", "vm", 2).await;
-        let c = StatefulSetController { store: store.clone(), namespace: None };
+        let c = StatefulSetController {
+            store: store.clone(),
+            namespace: None,
+        };
         c.tick().await.unwrap();
         let rev_a = store.current_catalog().await.revision();
         for _ in 0..3 {

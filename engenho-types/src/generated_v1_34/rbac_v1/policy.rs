@@ -26,11 +26,19 @@ pub struct PolicyRule {
     pub resources: Vec<String>,
 
     /// `ResourceNames` — restrict to specific resource names.
-    #[serde(default, rename = "resourceNames", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "resourceNames",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub resource_names: Vec<String>,
 
     /// `NonResourceURLs` — for non-resource endpoints like `/healthz`.
-    #[serde(default, rename = "nonResourceURLs", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "nonResourceURLs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub non_resource_urls: Vec<String>,
 }
 

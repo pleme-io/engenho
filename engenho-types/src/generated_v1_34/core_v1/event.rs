@@ -8,12 +8,12 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
+use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-use crate::generated_v1_34::types::*;
 
 /// Event is a report of an event somewhere in the cluster.  Events have a limited retention time and triggers and messages may evolve with time.  Event consumers should not rely on the timing of an event with a given Reason reflecting a consistent underlying trigger, or the continued existence of events with that Reason.  Events should be treated as informative, best-effort, supplemental data.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -28,13 +28,21 @@ pub struct Event {
     #[serde(default, rename = "eventTime", skip_serializing_if = "Option::is_none")]
     pub event_time: Option<MicroTime>,
     /// The time at which the event was first recorded. (Time of server receipt is in TypeMeta.)
-    #[serde(default, rename = "firstTimestamp", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "firstTimestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub first_timestamp: Option<Time>,
     /// The object that this event is about.
     #[serde(default, rename = "involvedObject")]
     pub involved_object: ObjectReference,
     /// The time at which the most recent occurrence of this event was recorded.
-    #[serde(default, rename = "lastTimestamp", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastTimestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_timestamp: Option<Time>,
     /// A human-readable description of the status of this operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,10 +57,18 @@ pub struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub related: Option<ObjectReference>,
     /// Name of the controller that emitted this Event, e.g. `kubernetes.io/kubelet`.
-    #[serde(default, rename = "reportingComponent", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "reportingComponent",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reporting_component: Option<String>,
     /// ID of the controller instance, e.g. `kubelet-xyzf`.
-    #[serde(default, rename = "reportingInstance", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "reportingInstance",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reporting_instance: Option<String>,
     /// Data about the Event series this event represents or nil if it's a singleton Event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,31 +82,33 @@ pub struct Event {
 }
 
 impl KubeResource for Event {
-const GVK: GroupVersionKind = GroupVersionKind {
-group:   "",
-version: "v1",
-kind:    "Event",
-};
-const GVR: GroupVersionResource = GroupVersionResource {
-group:    "",
-version:  "v1",
-resource: "events",
-};
-const SCOPE: Scope = Scope::Namespaced;
+    const GVK: GroupVersionKind = GroupVersionKind {
+        group: "",
+        version: "v1",
+        kind: "Event",
+    };
+    const GVR: GroupVersionResource = GroupVersionResource {
+        group: "",
+        version: "v1",
+        resource: "events",
+    };
+    const SCOPE: Scope = Scope::Namespaced;
 
-fn name(&self) -> Cow<'_, str> {
-Cow::Borrowed(self.metadata.name.as_str())
-}
-fn namespace(&self) -> Option<Cow<'_, str>> {
-self.metadata.namespace.as_deref().map(Cow::Borrowed)
-}
-fn resource_version(&self) -> Option<Cow<'_, str>> {
-if self.metadata.resource_version.is_empty() {
-None
-} else {
-Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
-}
-}
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.metadata.name.as_str())
+    }
+    fn namespace(&self) -> Option<Cow<'_, str>> {
+        self.metadata.namespace.as_deref().map(Cow::Borrowed)
+    }
+    fn resource_version(&self) -> Option<Cow<'_, str>> {
+        if self.metadata.resource_version.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(self.metadata.resource_version.as_str()))
+        }
+    }
 }
 
-fn is_empty_meta(m: &ObjectMeta) -> bool { m == &ObjectMeta::default() }
+fn is_empty_meta(m: &ObjectMeta) -> bool {
+    m == &ObjectMeta::default()
+}

@@ -179,7 +179,10 @@ async fn mutating_webhook_injects_sidecar_into_persisted_pod() {
     assert_eq!(calls[0].0, ENDPOINT);
     assert_eq!(calls[0].2["request"]["operation"], "CREATE");
     assert_eq!(calls[0].2["request"]["resource"]["resource"], "pods");
-    assert_eq!(calls[0].2["request"]["object"]["metadata"]["name"], "podinfo");
+    assert_eq!(
+        calls[0].2["request"]["object"]["metadata"]["name"],
+        "podinfo"
+    );
 
     server.shutdown().await.unwrap();
     drop(store);

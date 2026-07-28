@@ -91,7 +91,9 @@ pub enum WatchGone {
     /// The watcher overflowed its per-watcher buffer. `last_seen` is
     /// the highest revision actually delivered — the consumer resumes
     /// gap-free via `watch_from(last_seen)` WITHOUT re-listing.
-    #[error("watcher overflowed its buffer (capacity {capacity}); resume from last_seen {last_seen}")]
+    #[error(
+        "watcher overflowed its buffer (capacity {capacity}); resume from last_seen {last_seen}"
+    )]
     Overflow {
         capacity: usize,
         last_seen: Revision,
@@ -554,8 +556,7 @@ impl WatcherRegistry {
     /// Reap any handles whose receivers have been dropped. Cheap O(n)
     /// sweep; safe to call opportunistically.
     pub fn reap_closed(&mut self) {
-        self.handles
-            .retain(|h| !h.overflowed && !h.tx.is_closed());
+        self.handles.retain(|h| !h.overflowed && !h.tx.is_closed());
     }
 }
 
@@ -705,13 +706,10 @@ impl WatchStream {
             Ok(signal) => Ok(self.account(signal)),
             Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
                 // Buffer drained → emit the terminal reason exactly once.
-                let gone = self
-                    .gone
-                    .take()
-                    .unwrap_or(WatchGone::Overflow {
-                        capacity: 0,
-                        last_seen: self.last_seen,
-                    });
+                let gone = self.gone.take().unwrap_or(WatchGone::Overflow {
+                    capacity: 0,
+                    last_seen: self.last_seen,
+                });
                 self.terminal_emitted = true;
                 Err(gone)
             }
@@ -971,7 +969,8 @@ mod tests {
             replay.iter().map(|c| c.revision.0).collect::<Vec<_>>(),
             vec![3, 4, 5]
         );
-        let mut stream = reg.register_captured(replay, boundary, &WatchOpts::from_revision(Revision(2)));
+        let mut stream =
+            reg.register_captured(replay, boundary, &WatchOpts::from_revision(Revision(2)));
 
         // Fan the live event at boundary+1 (== 6) WITHOUT polling first.
         reg.fan_change(&change_at(6, "p6", ChangeKind::Put));
@@ -1026,12 +1025,18 @@ mod tests {
                 None => panic!("stream closed without surfacing Overflow"),
             }
         };
-        assert!(!prefix.is_empty(), "delivered an in-order prefix: {prefix:?}");
+        assert!(
+            !prefix.is_empty(),
+            "delivered an in-order prefix: {prefix:?}"
+        );
         let mut sorted = prefix.clone();
         sorted.sort_unstable();
         assert_eq!(prefix, sorted, "prefix is in revision order");
         match gone {
-            WatchGone::Overflow { capacity, last_seen } => {
+            WatchGone::Overflow {
+                capacity,
+                last_seen,
+            } => {
                 assert_eq!(capacity, 3);
                 assert_eq!(
                     last_seen.get(),
@@ -1041,7 +1046,10 @@ mod tests {
             }
             other => panic!("expected Overflow, got {other:?}"),
         }
-        assert!(stream.next().await.is_none(), "stream ends after the terminal");
+        assert!(
+            stream.next().await.is_none(),
+            "stream ends after the terminal"
+        );
     }
 
     #[tokio::test]
@@ -1122,7 +1130,10 @@ mod tests {
         }
         assert!(slow_revs.len() >= 2, "slow got a prefix: {slow_revs:?}");
         match slow_gone.expect("slow terminated with Gone") {
-            WatchGone::Overflow { capacity, last_seen } => {
+            WatchGone::Overflow {
+                capacity,
+                last_seen,
+            } => {
                 assert_eq!(capacity, 2);
                 assert_eq!(last_seen.get(), *slow_revs.last().unwrap());
             }
@@ -1228,7 +1239,10 @@ mod tests {
         let mut stream = reg
             .register(&cat, &WatchOpts::live_tail(Revision(0), 8))
             .unwrap();
-        reg.tick_bookmarks(Revision(5), tokio::time::Instant::now() + Duration::from_secs(60));
+        reg.tick_bookmarks(
+            Revision(5),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        );
         // Nothing delivered — cadence ZERO disables bookmarks.
         let res = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
         assert!(res.is_err(), "no bookmark should arrive with ZERO cadence");

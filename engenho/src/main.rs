@@ -93,11 +93,9 @@ async fn main() -> anyhow::Result<()> {
 async fn run_daemon() -> anyhow::Result<()> {
     // 1. Tracing — env-filtered, info default for our crates.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                EnvFilter::new("engenho=info,engenho_runtime=info,engenho_store=info")
-            }),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("engenho=info,engenho_runtime=info,engenho_store=info")
+        }))
         .init();
 
     tracing::info!(
@@ -187,8 +185,7 @@ fn run_kubeconfig(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     // The persisted CA. `load_or_generate_ca` LOADS when the CA already
     // exists (the daemon minted it at first boot); it only generates if
     // absent — handing out the kubeconfig before the daemon's first boot.
-    let ca =
-        load_or_generate_ca(&data_dir).map_err(|e| anyhow::anyhow!("load cluster CA: {e}"))?;
+    let ca = load_or_generate_ca(&data_dir).map_err(|e| anyhow::anyhow!("load cluster CA: {e}"))?;
 
     // Default server URL: loopback + the configured listen port. The
     // operator can override with --server for a non-loopback address.
@@ -314,11 +311,23 @@ mod tests {
     #[test]
     fn unknown_subcommand_errors() {
         let err = parse(&["frobnicate"]).unwrap_err().to_string();
-        assert!(err.contains("frobnicate"), "error should name the bad verb: {err}");
+        assert!(
+            err.contains("frobnicate"),
+            "error should name the bad verb: {err}"
+        );
         assert!(err.contains("daemon"), "error should list `daemon`: {err}");
-        assert!(err.contains("kubeconfig"), "error should list `kubeconfig`: {err}");
-        assert!(err.contains("config-show"), "error should list `config-show`: {err}");
-        assert!(err.contains("config-diff"), "error should list `config-diff`: {err}");
+        assert!(
+            err.contains("kubeconfig"),
+            "error should list `kubeconfig`: {err}"
+        );
+        assert!(
+            err.contains("config-show"),
+            "error should list `config-show`: {err}"
+        );
+        assert!(
+            err.contains("config-diff"),
+            "error should list `config-diff`: {err}"
+        );
     }
 
     /// `config-show` with no tier arg honors `$ENGENHO_TIER` at run time.

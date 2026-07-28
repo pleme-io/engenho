@@ -14,9 +14,7 @@ use engenho_types::generated_v1_34::core_v1::{
     ConfigMap, Endpoints, Namespace, Node, PersistentVolume, PersistentVolumeClaim, Pod, Secret,
     Service, ServiceAccount,
 };
-use engenho_types::generated_v1_34::rbac_v1::{
-    ClusterRole, ClusterRoleBinding, Role, RoleBinding,
-};
+use engenho_types::generated_v1_34::rbac_v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding};
 
 /// Look up a catalog row by kind. Panics with a clear message if the kind
 /// is absent — a missing row is a real failure (the per-type const exists
@@ -25,7 +23,9 @@ fn row(kind: &str) -> &'static ResourceDescriptor {
     RESOURCE_CATALOG
         .iter()
         .find(|d| d.kind == kind)
-        .unwrap_or_else(|| panic!("kind {kind:?} present as a generated type but absent from RESOURCE_CATALOG"))
+        .unwrap_or_else(|| {
+            panic!("kind {kind:?} present as a generated type but absent from RESOURCE_CATALOG")
+        })
 }
 
 /// Assert one kind's catalog row matches its `KubeResource` consts exactly:
@@ -34,18 +34,33 @@ fn row(kind: &str) -> &'static ResourceDescriptor {
 fn assert_row_matches<K: KubeResource>() {
     let d = row(K::GVK.kind);
     assert!(!d.plural.is_empty(), "{}: plural is non-empty", K::GVK.kind);
-    assert_eq!(d.plural, K::GVR.resource, "{}: catalog plural == GVR.resource", K::GVK.kind);
+    assert_eq!(
+        d.plural,
+        K::GVR.resource,
+        "{}: catalog plural == GVR.resource",
+        K::GVK.kind
+    );
     assert_eq!(d.group, K::GVK.group, "{}: group", K::GVK.kind);
     assert_eq!(d.version, K::GVK.version, "{}: version", K::GVK.kind);
     let want_namespaced = matches!(K::SCOPE, Scope::Namespaced);
-    assert_eq!(d.namespaced, want_namespaced, "{}: namespaced == SCOPE", K::GVK.kind);
+    assert_eq!(
+        d.namespaced,
+        want_namespaced,
+        "{}: namespaced == SCOPE",
+        K::GVK.kind
+    );
     // api_version is precomputed; cross-check it against the GVK.
     let want_api_version = if K::GVK.group.is_empty() {
         K::GVK.version.to_string()
     } else {
         format!("{}/{}", K::GVK.group, K::GVK.version)
     };
-    assert_eq!(d.api_version, want_api_version, "{}: api_version", K::GVK.kind);
+    assert_eq!(
+        d.api_version,
+        want_api_version,
+        "{}: api_version",
+        K::GVK.kind
+    );
 }
 
 #[test]
@@ -83,7 +98,10 @@ fn every_catalog_plural_is_non_empty() {
 #[test]
 fn endpoints_uses_curated_irregular_plural() {
     let d = row("Endpoints");
-    assert_eq!(d.plural, "endpoints", "Endpoints → endpoints (NOT endpointss)");
+    assert_eq!(
+        d.plural, "endpoints",
+        "Endpoints → endpoints (NOT endpointss)"
+    );
     assert_eq!(d.plural, Endpoints::GVR.resource);
 }
 
@@ -172,7 +190,13 @@ fn every_kind_has_singular_equal_to_lowercase_kind() {
 fn secret_and_rbac_kinds_have_no_short_names() {
     // Secret + every RBAC kind have NO upstream short name — empty by
     // construction (we mirror upstream, never invent).
-    for kind in ["Secret", "Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding"] {
+    for kind in [
+        "Secret",
+        "Role",
+        "ClusterRole",
+        "RoleBinding",
+        "ClusterRoleBinding",
+    ] {
         let d = row(kind);
         assert!(
             d.short_names.is_empty(),
@@ -219,7 +243,10 @@ fn every_subresources_slice_is_a_subset_of_known_subresources() {
     for d in RESOURCE_CATALOG {
         for s in d.subresources {
             assert!(
-                matches!(s, Subresource::Status | Subresource::Scale | Subresource::Log),
+                matches!(
+                    s,
+                    Subresource::Status | Subresource::Scale | Subresource::Log
+                ),
                 "{}: subresource must be Status, Scale, or Log",
                 d.kind
             );
@@ -256,7 +283,12 @@ fn scale_is_only_on_deployment_replicaset_statefulset() {
     // workloads + core/v1 ReplicationController (the legacy scalable kind,
     // cataloged opaque since the M0.0.4 breadth expansion). Any other kind
     // declaring Scale is a bug.
-    let want_scale = ["Deployment", "ReplicaSet", "StatefulSet", "ReplicationController"];
+    let want_scale = [
+        "Deployment",
+        "ReplicaSet",
+        "StatefulSet",
+        "ReplicationController",
+    ];
     for d in RESOURCE_CATALOG {
         if want_scale.contains(&d.kind) {
             assert!(d.has_scale(), "{} must serve /scale", d.kind);
@@ -323,8 +355,7 @@ fn status_is_on_the_expected_kinds() {
 fn openapi_v3_document_for_apps_is_openapi_3() {
     let doc = engenho_types::openapi_v3::document_for("apps", "v1")
         .expect("apps/v1 OpenAPI v3 document served");
-    let parsed: serde_json::Value =
-        serde_json::from_str(doc).expect("apps/v1 doc parses as JSON");
+    let parsed: serde_json::Value = serde_json::from_str(doc).expect("apps/v1 doc parses as JSON");
     assert_eq!(
         parsed.get("openapi").and_then(|v| v.as_str()),
         Some("3.0.0"),
@@ -404,25 +435,25 @@ fn conformance_relevant_groups_are_all_served() {
     // The ~16 API groups a conformant v1.34 cluster exposes. Each must have at
     // least one cataloged kind so it appears in `/api` or `/apis` discovery.
     let want_groups = [
-        "",                              // core/v1
-        "apps",                          // Deployment, …, ControllerRevision
-        "batch",                         // Job, CronJob
-        "autoscaling",                   // HorizontalPodAutoscaler
-        "policy",                        // PodDisruptionBudget
-        "networking.k8s.io",             // Ingress, IngressClass, NetworkPolicy
-        "storage.k8s.io",                // StorageClass, CSI*, VolumeAttachment
-        "node.k8s.io",                   // RuntimeClass
-        "scheduling.k8s.io",             // PriorityClass
-        "coordination.k8s.io",           // Lease
-        "rbac.authorization.k8s.io",     // Role, …
-        "authentication.k8s.io",         // TokenReview
-        "authorization.k8s.io",          // *AccessReview
-        "certificates.k8s.io",           // CertificateSigningRequest
-        "apiregistration.k8s.io",        // APIService
-        "flowcontrol.apiserver.k8s.io",  // FlowSchema, PriorityLevelConfiguration
-        "admissionregistration.k8s.io",  // *WebhookConfiguration
-        "apiextensions.k8s.io",          // CustomResourceDefinition
-        "discovery.k8s.io",              // EndpointSlice
+        "",                             // core/v1
+        "apps",                         // Deployment, …, ControllerRevision
+        "batch",                        // Job, CronJob
+        "autoscaling",                  // HorizontalPodAutoscaler
+        "policy",                       // PodDisruptionBudget
+        "networking.k8s.io",            // Ingress, IngressClass, NetworkPolicy
+        "storage.k8s.io",               // StorageClass, CSI*, VolumeAttachment
+        "node.k8s.io",                  // RuntimeClass
+        "scheduling.k8s.io",            // PriorityClass
+        "coordination.k8s.io",          // Lease
+        "rbac.authorization.k8s.io",    // Role, …
+        "authentication.k8s.io",        // TokenReview
+        "authorization.k8s.io",         // *AccessReview
+        "certificates.k8s.io",          // CertificateSigningRequest
+        "apiregistration.k8s.io",       // APIService
+        "flowcontrol.apiserver.k8s.io", // FlowSchema, PriorityLevelConfiguration
+        "admissionregistration.k8s.io", // *WebhookConfiguration
+        "apiextensions.k8s.io",         // CustomResourceDefinition
+        "discovery.k8s.io",             // EndpointSlice
     ];
     let served = served_groups();
     for g in want_groups {
@@ -455,26 +486,102 @@ fn newly_added_conformance_kinds_carry_correct_metadata() {
         opaque: bool,
     }
     let cases = [
-        Expect { kind: "CronJob", plural: "cronjobs", namespaced: true, short_names: &["cj"], opaque: false },
-        Expect { kind: "HorizontalPodAutoscaler", plural: "horizontalpodautoscalers", namespaced: true, short_names: &["hpa"], opaque: false },
-        Expect { kind: "PodDisruptionBudget", plural: "poddisruptionbudgets", namespaced: true, short_names: &["pdb"], opaque: false },
-        Expect { kind: "Ingress", plural: "ingresses", namespaced: true, short_names: &["ing"], opaque: false },
-        Expect { kind: "NetworkPolicy", plural: "networkpolicies", namespaced: true, short_names: &["netpol"], opaque: false },
-        Expect { kind: "StorageClass", plural: "storageclasses", namespaced: false, short_names: &["sc"], opaque: false },
-        Expect { kind: "CSIStorageCapacity", plural: "csistoragecapacities", namespaced: true, short_names: &[], opaque: false },
-        Expect { kind: "PriorityClass", plural: "priorityclasses", namespaced: false, short_names: &["pc"], opaque: false },
-        Expect { kind: "Lease", plural: "leases", namespaced: true, short_names: &[], opaque: false },
+        Expect {
+            kind: "CronJob",
+            plural: "cronjobs",
+            namespaced: true,
+            short_names: &["cj"],
+            opaque: false,
+        },
+        Expect {
+            kind: "HorizontalPodAutoscaler",
+            plural: "horizontalpodautoscalers",
+            namespaced: true,
+            short_names: &["hpa"],
+            opaque: false,
+        },
+        Expect {
+            kind: "PodDisruptionBudget",
+            plural: "poddisruptionbudgets",
+            namespaced: true,
+            short_names: &["pdb"],
+            opaque: false,
+        },
+        Expect {
+            kind: "Ingress",
+            plural: "ingresses",
+            namespaced: true,
+            short_names: &["ing"],
+            opaque: false,
+        },
+        Expect {
+            kind: "NetworkPolicy",
+            plural: "networkpolicies",
+            namespaced: true,
+            short_names: &["netpol"],
+            opaque: false,
+        },
+        Expect {
+            kind: "StorageClass",
+            plural: "storageclasses",
+            namespaced: false,
+            short_names: &["sc"],
+            opaque: false,
+        },
+        Expect {
+            kind: "CSIStorageCapacity",
+            plural: "csistoragecapacities",
+            namespaced: true,
+            short_names: &[],
+            opaque: false,
+        },
+        Expect {
+            kind: "PriorityClass",
+            plural: "priorityclasses",
+            namespaced: false,
+            short_names: &["pc"],
+            opaque: false,
+        },
+        Expect {
+            kind: "Lease",
+            plural: "leases",
+            namespaced: true,
+            short_names: &[],
+            opaque: false,
+        },
         // Still opaque — no vendored OpenAPI for these groups yet.
-        Expect { kind: "CertificateSigningRequest", plural: "certificatesigningrequests", namespaced: false, short_names: &["csr"], opaque: true },
-        Expect { kind: "APIService", plural: "apiservices", namespaced: false, short_names: &[], opaque: true },
-        Expect { kind: "PriorityLevelConfiguration", plural: "prioritylevelconfigurations", namespaced: false, short_names: &[], opaque: true },
+        Expect {
+            kind: "CertificateSigningRequest",
+            plural: "certificatesigningrequests",
+            namespaced: false,
+            short_names: &["csr"],
+            opaque: true,
+        },
+        Expect {
+            kind: "APIService",
+            plural: "apiservices",
+            namespaced: false,
+            short_names: &[],
+            opaque: true,
+        },
+        Expect {
+            kind: "PriorityLevelConfiguration",
+            plural: "prioritylevelconfigurations",
+            namespaced: false,
+            short_names: &[],
+            opaque: true,
+        },
     ];
     for e in cases {
         let d = row(e.kind);
         assert_eq!(d.plural, e.plural, "{}: plural", e.kind);
         assert_eq!(d.namespaced, e.namespaced, "{}: namespaced", e.kind);
         assert_eq!(d.short_names, e.short_names, "{}: shortNames", e.kind);
-        assert_eq!(d.opaque, e.opaque, "{}: opaque (typed-promotion state)", e.kind);
+        assert_eq!(
+            d.opaque, e.opaque,
+            "{}: opaque (typed-promotion state)",
+            e.kind
+        );
         // singular == lowercased kind (already a global invariant, re-pinned
         // here for the new rows specifically).
         assert_eq!(d.singular, e.kind.to_lowercase(), "{}: singular", e.kind);

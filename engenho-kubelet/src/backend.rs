@@ -200,11 +200,7 @@ pub trait ContainerRuntime: Send + Sync {
     ///
     /// [`KubeletError::Backend`] if the runtime could not run the exec at all
     /// (no such container, spawn failure).
-    async fn exec(
-        &self,
-        container_id: &str,
-        argv: &[String],
-    ) -> Result<ExecOutcome, KubeletError>;
+    async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError>;
 
     /// Start a container matching `spec`. Returns the new
     /// container's status (post-start; pod_ip may take a moment
@@ -252,11 +248,7 @@ pub trait ContainerRuntime: Send + Sync {
     /// [`KubeletError::Backend`] if the backend cannot read the log (no such
     /// container, podman spawn failure). A not-found container surfaces a
     /// typed error — never a silently-empty success.
-    async fn logs(
-        &self,
-        container_id: &str,
-        opts: &LogOptions,
-    ) -> Result<String, KubeletError>;
+    async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError>;
 }
 
 // =================================================================
@@ -523,11 +515,7 @@ impl ContainerRuntime for FakeBackend {
         Ok(())
     }
 
-    async fn logs(
-        &self,
-        container_id: &str,
-        opts: &LogOptions,
-    ) -> Result<String, KubeletError> {
+    async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError> {
         let state = self.inner.lock().await;
         let buf = state.logs.get(container_id).ok_or_else(|| {
             // No buffer → no such container. Typed error, never an empty Ok.
@@ -949,10 +937,7 @@ impl PodmanBackend {
     /// [`KubeletError::Backend`] when the output has fewer than 3
     /// pipe-separated fields (an unexpected podman shape — surfaced, never
     /// silently mis-parsed).
-    pub fn parse_inspect(
-        container_id: &str,
-        text: &str,
-    ) -> Result<ContainerStatus, KubeletError> {
+    pub fn parse_inspect(container_id: &str, text: &str) -> Result<ContainerStatus, KubeletError> {
         let text = text.trim();
         let parts: Vec<&str> = text.split('|').collect();
         if parts.len() < 3 {
@@ -1053,11 +1038,7 @@ impl ContainerRuntime for PodmanBackend {
         "podman"
     }
 
-    async fn exec(
-        &self,
-        container_id: &str,
-        argv: &[String],
-    ) -> Result<ExecOutcome, KubeletError> {
+    async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
         let cmd_argv = Self::exec_argv(container_id, argv);
         let out = self
             .command(&cmd_argv)
@@ -1088,7 +1069,8 @@ impl ContainerRuntime for PodmanBackend {
             .output()
             .await
             .map_err(|e| KubeletError::Backend(format!("podman run spawn: {e}")))?;
-        if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("already in use") {
+        if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("already in use")
+        {
             // Idempotent start: a name conflict means a leftover container from
             // a crashed/killed prior daemon still holds this pod's deterministic
             // name (`<namespace>_<pod>_<container>`). Because the kubelet is
@@ -1203,11 +1185,7 @@ impl ContainerRuntime for PodmanBackend {
         Ok(())
     }
 
-    async fn logs(
-        &self,
-        container_id: &str,
-        opts: &LogOptions,
-    ) -> Result<String, KubeletError> {
+    async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError> {
         let argv = Self::logs_argv(container_id, opts);
         let out = self
             .command(&argv)
@@ -1440,12 +1418,7 @@ impl FakeNetProber {
 
     /// Seed a SEQUENCE of TCP connect verdicts for `(ip, port)`, FRONT first
     /// (`true` = connect ok).
-    pub async fn seed_tcp(
-        &self,
-        ip: &str,
-        port: u16,
-        verdicts: impl IntoIterator<Item = bool>,
-    ) {
+    pub async fn seed_tcp(&self, ip: &str, port: u16, verdicts: impl IntoIterator<Item = bool>) {
         let mut state = self.inner.lock().await;
         state
             .tcp
@@ -1723,12 +1696,24 @@ mod tests {
         let backend = PodmanBackend::new();
         let s = spec("c", "img", &[], &["echo", "hi"]);
         let argv = backend.run_argv(&s);
-        assert!(!argv.iter().any(|a| a == "-e"), "no -e for empty env: {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "-e"),
+            "no -e for empty env: {argv:?}"
+        );
         assert_eq!(
             argv,
             vec![
-                "run", "-d", "--network", "engenho-net", "--pull", "never", "--name", "c", "img",
-                "echo", "hi"
+                "run",
+                "-d",
+                "--network",
+                "engenho-net",
+                "--pull",
+                "never",
+                "--name",
+                "c",
+                "img",
+                "echo",
+                "hi"
             ]
         );
     }
@@ -1739,7 +1724,17 @@ mod tests {
         let s = spec("c", "img", &[], &[]);
         assert_eq!(
             backend.run_argv(&s),
-            vec!["run", "-d", "--network", "engenho-net", "--pull", "never", "--name", "c", "img"]
+            vec![
+                "run",
+                "-d",
+                "--network",
+                "engenho-net",
+                "--pull",
+                "never",
+                "--name",
+                "c",
+                "img"
+            ]
         );
     }
 
@@ -1749,12 +1744,29 @@ mod tests {
         // -e pairs are emitted in deterministic key order regardless of
         // insertion order.
         let backend = PodmanBackend::new();
-        let s = spec("c", "img", &[("ZED", "9"), ("ALPHA", "1"), ("MID", "5")], &[]);
+        let s = spec(
+            "c",
+            "img",
+            &[("ZED", "9"), ("ALPHA", "1"), ("MID", "5")],
+            &[],
+        );
         assert_eq!(
             backend.run_argv(&s),
             vec![
-                "run", "-d", "--network", "engenho-net", "--pull", "never", "--name", "c", //
-                "-e", "ALPHA=1", "-e", "MID=5", "-e", "ZED=9", //
+                "run",
+                "-d",
+                "--network",
+                "engenho-net",
+                "--pull",
+                "never",
+                "--name",
+                "c", //
+                "-e",
+                "ALPHA=1",
+                "-e",
+                "MID=5",
+                "-e",
+                "ZED=9", //
                 "img",
             ]
         );
@@ -1909,7 +1921,17 @@ mod tests {
         // The base shape is unchanged from the no-alias case.
         assert_eq!(
             argv,
-            vec!["run", "-d", "--network", "engenho-net", "--pull", "never", "--name", "c", "img"]
+            vec![
+                "run",
+                "-d",
+                "--network",
+                "engenho-net",
+                "--pull",
+                "never",
+                "--name",
+                "c",
+                "img"
+            ]
         );
     }
 
@@ -2072,7 +2094,10 @@ mod tests {
             ..Default::default()
         };
         let s = backend.start(&spec).await.unwrap();
-        let logs = backend.logs(&s.container_id, &LogOptions::all()).await.unwrap();
+        let logs = backend
+            .logs(&s.container_id, &LogOptions::all())
+            .await
+            .unwrap();
         assert_eq!(logs, "hello-engenho\n");
     }
 
@@ -2085,8 +2110,14 @@ mod tests {
             ..Default::default()
         };
         let s = backend.start(&spec).await.unwrap();
-        let logs = backend.logs(&s.container_id, &LogOptions::all()).await.unwrap();
-        assert!(logs.contains("web"), "default log derives from name: {logs:?}");
+        let logs = backend
+            .logs(&s.container_id, &LogOptions::all())
+            .await
+            .unwrap();
+        assert!(
+            logs.contains("web"),
+            "default log derives from name: {logs:?}"
+        );
     }
 
     #[tokio::test]
@@ -2099,7 +2130,10 @@ mod tests {
             ..Default::default()
         };
         let s = backend.start(&spec).await.unwrap();
-        let last = backend.logs(&s.container_id, &LogOptions::tail(1)).await.unwrap();
+        let last = backend
+            .logs(&s.container_id, &LogOptions::tail(1))
+            .await
+            .unwrap();
         assert_eq!(last, "c\n");
     }
 
@@ -2123,7 +2157,12 @@ mod tests {
         };
         let s = backend.start(&spec).await.unwrap();
         backend.remove(&s.container_id).await.unwrap();
-        assert!(backend.logs(&s.container_id, &LogOptions::all()).await.is_err());
+        assert!(
+            backend
+                .logs(&s.container_id, &LogOptions::all())
+                .await
+                .is_err()
+        );
     }
 
     // ── parse_inspect (pure status parser) ──────────────────────────────

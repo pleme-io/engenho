@@ -178,12 +178,11 @@ fn package_for_api_version(api_version: &str) -> Option<&'static str> {
 /// cataloged groups OR the `<package>.<kind>` message is absent from the
 /// compiled pool.
 pub fn message_for_gvk(gvk: &Gvk) -> Result<MessageDescriptor, CodecError> {
-    let pkg = package_for_api_version(&gvk.api_version).ok_or_else(|| {
-        CodecError::UncatalogedKind {
+    let pkg =
+        package_for_api_version(&gvk.api_version).ok_or_else(|| CodecError::UncatalogedKind {
             api_version: gvk.api_version.clone(),
             kind: gvk.kind.clone(),
-        }
-    })?;
+        })?;
     let full_name = format!("{pkg}.{}", gvk.kind);
     pool()
         .get_message_by_name(&full_name)
@@ -295,11 +294,12 @@ pub fn decode_protobuf(bytes: &[u8]) -> Result<serde_json::Value, CodecError> {
 
     // Select the per-kind message descriptor and decode the raw object.
     let msg_desc = message_for_gvk(&gvk)?;
-    let dynamic =
-        DynamicMessage::decode(msg_desc, raw.as_ref()).map_err(|source| CodecError::DecodeObject {
+    let dynamic = DynamicMessage::decode(msg_desc, raw.as_ref()).map_err(|source| {
+        CodecError::DecodeObject {
             kind: gvk.kind.clone(),
             source,
-        })?;
+        }
+    })?;
 
     // DynamicMessage -> serde_json::Value via the descriptor json_name
     // (== K8s camelCase).
@@ -382,11 +382,12 @@ pub fn encode_response(gvk: &Gvk, value: &serde_json::Value) -> Result<Bytes, Co
     let value = normalize_metadata_times(value);
     let serialized = value.to_string();
     let mut de = serde_json::Deserializer::from_str(&serialized);
-    let dynamic = DynamicMessage::deserialize_with_options(msg_desc, &mut de, &deserialize_options())
-        .map_err(|source| CodecError::FromJson {
-            kind: gvk.kind.clone(),
-            source,
-        })?;
+    let dynamic =
+        DynamicMessage::deserialize_with_options(msg_desc, &mut de, &deserialize_options())
+            .map_err(|source| CodecError::FromJson {
+                kind: gvk.kind.clone(),
+                source,
+            })?;
     de.end().map_err(|source| CodecError::FromJson {
         kind: gvk.kind.clone(),
         source,

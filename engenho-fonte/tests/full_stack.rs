@@ -136,7 +136,14 @@ async fn full_stack_convergence_loop_typed_end_to_end() {
     let dep = &apps.emitted()[0];
     assert_eq!(&dep.metadata.name, "podinfo");
     assert_eq!(
-        dep.spec.as_ref().unwrap().template.spec.as_ref().unwrap().containers[0]
+        dep.spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
             .image
             .as_deref(),
         Some("podinfo:6.4.1")

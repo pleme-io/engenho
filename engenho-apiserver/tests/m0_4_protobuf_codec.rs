@@ -59,7 +59,10 @@ async fn protobuf_create_returns_201_and_protobuf_body() {
         .post(format!("{base}/api/v1/namespaces/default/configmaps"))
         .header("Content-Type", CONTENT_TYPE_PROTOBUF)
         // typed clientset Accept: protobuf first, json fallback.
-        .header("Accept", format!("{CONTENT_TYPE_PROTOBUF},application/json"))
+        .header(
+            "Accept",
+            format!("{CONTENT_TYPE_PROTOBUF},application/json"),
+        )
         .body(GOLDEN_CONFIGMAP.to_vec())
         .send()
         .await
@@ -227,7 +230,9 @@ async fn protobuf_deployment_create_round_trips() {
     let bytes = encode_response(&gvk, &dep).expect("encode deployment protobuf");
 
     let resp = client
-        .post(format!("{base}/apis/apps/v1/namespaces/default/deployments"))
+        .post(format!(
+            "{base}/apis/apps/v1/namespaces/default/deployments"
+        ))
         .header("Content-Type", CONTENT_TYPE_PROTOBUF)
         .header("Accept", CONTENT_TYPE_PROTOBUF)
         .body(bytes.to_vec())

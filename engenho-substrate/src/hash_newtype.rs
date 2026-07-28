@@ -256,7 +256,9 @@ macro_rules! __hash_newtype_from_hex_strict {
         /// # Errors
         /// Returns [`$crate::hash_newtype::HashNewtypeError`] on a
         /// wrong-length or non-hex input.
-        pub fn from_hex(s: &str) -> ::core::result::Result<Self, $crate::hash_newtype::HashNewtypeError> {
+        pub fn from_hex(
+            s: &str,
+        ) -> ::core::result::Result<Self, $crate::hash_newtype::HashNewtypeError> {
             $crate::hash_newtype::parse_hex_32_strict(s).map(Self)
         }
     };
@@ -273,7 +275,9 @@ macro_rules! __hash_newtype_from_hex_padded {
         /// # Errors
         /// Returns [`$crate::hash_newtype::HashNewtypeError`] on an
         /// empty, over-long, or non-hex input.
-        pub fn from_hex(s: &str) -> ::core::result::Result<Self, $crate::hash_newtype::HashNewtypeError> {
+        pub fn from_hex(
+            s: &str,
+        ) -> ::core::result::Result<Self, $crate::hash_newtype::HashNewtypeError> {
             $crate::hash_newtype::parse_hex_32_padded(s).map(Self)
         }
     };
@@ -349,7 +353,10 @@ mod tests {
         let h = SampleHash::new([0xab; 32]);
         let hex = h.to_hex();
         assert_eq!(hex.len(), 64);
-        assert!(hex.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        );
         assert_eq!(hex, "ab".repeat(32));
     }
 
@@ -372,7 +379,10 @@ mod tests {
     fn from_hex_strict_rejects_short_and_nonhex() {
         assert!(matches!(
             SampleHash::from_hex("ab"),
-            Err(HashNewtypeError::Length { expected: 64, got: 2 })
+            Err(HashNewtypeError::Length {
+                expected: 64,
+                got: 2
+            })
         ));
         let bad = "zz".to_string() + &"00".repeat(31);
         assert!(matches!(
@@ -430,14 +440,21 @@ mod tests {
         let over = "a".repeat(65);
         assert!(matches!(
             SampleNode::from_hex(&over),
-            Err(HashNewtypeError::Length { expected: 64, got: 65 })
+            Err(HashNewtypeError::Length {
+                expected: 64,
+                got: 65
+            })
         ));
     }
 
     #[test]
     fn hash_newtype_error_kind_tags() {
         assert_eq!(
-            (HashNewtypeError::Length { expected: 64, got: 2 }).kind(),
+            (HashNewtypeError::Length {
+                expected: 64,
+                got: 2
+            })
+            .kind(),
             "length"
         );
         assert_eq!((HashNewtypeError::Digit { index: 0 }).kind(), "digit");

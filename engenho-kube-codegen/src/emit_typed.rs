@@ -19,11 +19,7 @@ use crate::types::{RustType, map_schema, type_name_from_ref};
 /// apimachinery / engenho-types-provided types: referenced by generated
 /// code, never emitted (they are hand-authored in engenho-types). Keyed by
 /// the BARE Rust name (last dotted segment of the OpenAPI key).
-const PROVIDED: &[&str] = &[
-    "ObjectMeta",
-    "ListMeta",
-    "TypeMeta",
-];
+const PROVIDED: &[&str] = &["ObjectMeta", "ListMeta", "TypeMeta"];
 
 /// Field-type overrides for prose-only enums: upstream types these as a plain
 /// `string` but the value set is closed (described only in prose, no `enum`
@@ -104,8 +100,8 @@ pub fn snake_case(camel: &str) -> String {
             // is lower/digit (`pod|IP`), OR an acronym run ends at a following
             // lowercase (`IP|Address`). This keeps acronyms intact: `podIP` →
             // `pod_ip`, `clusterIP` → `cluster_ip`, `IPAddress` → `ip_address`.
-            let prev_lower_or_digit = i > 0
-                && (chars[i - 1].is_ascii_lowercase() || chars[i - 1].is_ascii_digit());
+            let prev_lower_or_digit =
+                i > 0 && (chars[i - 1].is_ascii_lowercase() || chars[i - 1].is_ascii_digit());
             let acronym_end = i > 0
                 && chars[i - 1].is_ascii_uppercase()
                 && i + 1 < chars.len()
@@ -201,7 +197,10 @@ pub fn emit_fields(
                 ", skip_serializing_if = \"std::collections::BTreeMap::is_empty\"",
             ),
             (_, true) => (ty.render(), ""),
-            (_, false) => (format!("Option<{}>", ty.render()), ", skip_serializing_if = \"Option::is_none\""),
+            (_, false) => (
+                format!("Option<{}>", ty.render()),
+                ", skip_serializing_if = \"Option::is_none\"",
+            ),
         };
         out.push_str(&doc);
         out.push_str(&format!("    #[serde(default{rename}{skip})]\n"));
@@ -326,7 +325,10 @@ mod tests {
 
     #[test]
     fn snake_case_handles_k8s_camel() {
-        assert_eq!(snake_case("automountServiceAccountToken"), "automount_service_account_token");
+        assert_eq!(
+            snake_case("automountServiceAccountToken"),
+            "automount_service_account_token"
+        );
         assert_eq!(snake_case("metadata"), "metadata");
         // Acronyms stay intact (K8s podIP/clusterIP/hostIP/IPAddress).
         assert_eq!(snake_case("clusterIP"), "cluster_ip");
@@ -338,15 +340,27 @@ mod tests {
     #[test]
     fn rust_keyword_fields_become_raw_or_suffixed_with_rename() {
         // `type` (K8s ServicePort.protocol-ish, EndpointPort, etc.) → r#type.
-        assert_eq!(field_ident("type"), ("r#type".to_string(), Some("type".to_string())));
+        assert_eq!(
+            field_ident("type"),
+            ("r#type".to_string(), Some("type".to_string()))
+        );
         // `continue` → r#continue.
-        assert_eq!(field_ident("continue"), ("r#continue".to_string(), Some("continue".to_string())));
+        assert_eq!(
+            field_ident("continue"),
+            ("r#continue".to_string(), Some("continue".to_string()))
+        );
         // non-raw-able keyword → suffixed.
-        assert_eq!(field_ident("self"), ("self_".to_string(), Some("self".to_string())));
+        assert_eq!(
+            field_ident("self"),
+            ("self_".to_string(), Some("self".to_string()))
+        );
         // plain field → no rename.
         assert_eq!(field_ident("name"), ("name".to_string(), None));
         // camelCase → rename.
-        assert_eq!(field_ident("nodeName"), ("node_name".to_string(), Some("nodeName".to_string())));
+        assert_eq!(
+            field_ident("nodeName"),
+            ("node_name".to_string(), Some("nodeName".to_string()))
+        );
     }
 
     #[test]
@@ -443,7 +457,11 @@ mod tests {
         let mut refs = BTreeSet::new();
         let f = emit_fields(
             "",
-            &view(json!({"replicas": {"type": "integer", "format": "int32"}}), &["replicas"]).properties,
+            &view(
+                json!({"replicas": {"type": "integer", "format": "int32"}}),
+                &["replicas"],
+            )
+            .properties,
             &["replicas".to_string()],
             &mut refs,
         );
@@ -460,7 +478,9 @@ mod tests {
         );
         assert!(src.contains("pub struct LocalObjectReference {"));
         assert!(src.contains("pub name: Option<String>"));
-        assert!(src.contains("#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]"));
+        assert!(
+            src.contains("#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]")
+        );
         assert!(refs.is_empty());
     }
 

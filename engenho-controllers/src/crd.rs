@@ -173,7 +173,11 @@ impl CrdEntry {
     /// the `RouterState` handler map is keyed on.
     #[must_use]
     pub fn route_key(&self) -> (String, String, String) {
-        (self.group.clone(), self.version.clone(), self.plural.clone())
+        (
+            self.group.clone(),
+            self.version.clone(),
+            self.plural.clone(),
+        )
     }
 }
 
@@ -408,7 +412,10 @@ impl Controller for CrdController {
         let mut crds_to_establish: std::collections::BTreeSet<engenho_store::ResourceKey> =
             std::collections::BTreeSet::new();
         {
-            let mut reg = self.registered.lock().expect("registered mutex not poisoned");
+            let mut reg = self
+                .registered
+                .lock()
+                .expect("registered mutex not poisoned");
             for (key, entry) in &desired {
                 let needs_register = reg.get(key) != Some(entry);
                 if needs_register {
@@ -553,7 +560,14 @@ mod tests {
         assert_eq!(e.singular, "widget");
         assert_eq!(e.short_names, vec!["wd".to_string()]);
         assert_eq!(e.scope, CrdScope::Namespaced);
-        assert_eq!(e.schema.get("openAPIV3Schema").unwrap().get("type").unwrap(), "object");
+        assert_eq!(
+            e.schema
+                .get("openAPIV3Schema")
+                .unwrap()
+                .get("type")
+                .unwrap(),
+            "object"
+        );
     }
 
     #[test]
@@ -572,7 +586,10 @@ mod tests {
             assert_eq!(e.kind, "Gizmo");
             assert_eq!(e.plural, "gizmos");
             assert_eq!(e.singular, "gizmo", "singular defaults to lowercased kind");
-            assert_eq!(e.list_kind, "GizmoList", "listKind defaults to {{kind}}List");
+            assert_eq!(
+                e.list_kind, "GizmoList",
+                "listKind defaults to {{kind}}List"
+            );
             assert_eq!(e.short_names, vec!["gz".to_string()]);
             assert_eq!(e.scope, CrdScope::Cluster);
         }
@@ -766,8 +783,15 @@ mod tests {
         assert_eq!(unregs.len(), 1);
         assert_eq!(
             unregs[0],
-            ("example.com".to_string(), "v1".to_string(), "widgets".to_string())
+            (
+                "example.com".to_string(),
+                "v1".to_string(),
+                "widgets".to_string()
+            )
         );
-        assert!(ctrl.registered_entries().is_empty(), "bookkeeping cleared on GC");
+        assert!(
+            ctrl.registered_entries().is_empty(),
+            "bookkeeping cleared on GC"
+        );
     }
 }

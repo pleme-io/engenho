@@ -44,12 +44,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
-use engenho_types::auth::UserInfo;
 use engenho_kube_proto::{
     self as kube_proto, CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type,
     response_wants_protobuf,
 };
 use engenho_store::{WatchGone, WatchSignal, WatchStream};
+use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::Subresource;
 use engenho_types::patch::PatchType;
 use utoipa::OpenApi;
@@ -356,10 +356,7 @@ fn build_routes(state: RouterState) -> Router {
         .route("/openapi.json", get(openapi_spec))
         .route("/openapi/v3", get(openapi_v3_index))
         .route("/openapi/v3/api/v1", get(openapi_v3_core))
-        .route(
-            "/openapi/v3/apis/:group/:version",
-            get(openapi_v3_group),
-        )
+        .route("/openapi/v3/apis/:group/:version", get(openapi_v3_group))
         // ── authentication.k8s.io SelfSubjectReview (kubectl auth whoami) ──
         // A discovery-light special route (NOT a store-backed kind): it echoes
         // the authenticated identity from `Extension<UserInfo>` back as a typed
@@ -515,11 +512,7 @@ async fn authz_middleware(
 
     // Build the typed Attributes from method + path + the resolved identity.
     let method = req.method().as_str().to_string();
-    let is_watch = req
-        .uri()
-        .query()
-        .map(query_has_watch)
-        .unwrap_or(false);
+    let is_watch = req.uri().query().map(query_has_watch).unwrap_or(false);
     let user = req
         .extensions()
         .get::<UserInfo>()
@@ -686,12 +679,9 @@ async fn openapi_v3_group(
 /// re-serialized.
 fn serve_openapi_v3_document(group: &str, version: &str) -> Result<Response, ApiError> {
     match engenho_types::openapi_v3::document_for(group, version) {
-        Some(body) => Ok((
-            StatusCode::OK,
-            [(CONTENT_TYPE, "application/json")],
-            body,
-        )
-            .into_response()),
+        Some(body) => {
+            Ok((StatusCode::OK, [(CONTENT_TYPE, "application/json")], body).into_response())
+        }
         None => Err(ApiError::NotFound(format!(
             "no OpenAPI v3 document for group/version {group}/{version}"
         ))),
@@ -844,12 +834,7 @@ fn render_object(
             // descriptor from `gvk` (the handler's GVK), so the response
             // wraps correctly even if the stored object omitted TypeMeta.
             let bytes = kube_proto::encode_response(gvk, &value)?;
-            Ok((
-                status,
-                [(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)],
-                bytes,
-            )
-                .into_response())
+            Ok((status, [(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)], bytes).into_response())
         }
     }
 }
@@ -1314,9 +1299,7 @@ async fn resource_get_or_list(
             }
             Subresource::Scale => do_get_scale(&h, coords.namespace.as_deref(), name).await,
             // `/log` — read-only; the typed LogQuery is already decoded above.
-            Subresource::Log => {
-                do_get_log(&h, coords.namespace.as_deref(), name, &log_query).await
-            }
+            Subresource::Log => do_get_log(&h, coords.namespace.as_deref(), name, &log_query).await,
         };
     }
     match &coords.name {
@@ -1365,7 +1348,14 @@ async fn resource_create(
         ));
     }
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    do_create(&h, coords.namespace.as_deref(), &headers, &raw, &user_info.0).await
+    do_create(
+        &h,
+        coords.namespace.as_deref(),
+        &headers,
+        &raw,
+        &user_info.0,
+    )
+    .await
 }
 
 /// PUT on a resource path. PUT is the kubectl full-object-replace verb for
@@ -1400,7 +1390,15 @@ async fn resource_put(
         // update verb. Store-backed handlers do a real optimistic-concurrency
         // replace; handlers that don't override `replace` keep the typed 400.
         None => {
-            do_replace(&h, coords.namespace.as_deref(), name, &headers, &raw, &user_info.0).await
+            do_replace(
+                &h,
+                coords.namespace.as_deref(),
+                name,
+                &headers,
+                &raw,
+                &user_info.0,
+            )
+            .await
         }
     }
 }
@@ -1525,7 +1523,8 @@ mod tests {
         // on `group.is_empty()` is what makes the fold behavior-preserving.
         let grouped = msg(state.lookup("apps", "v1", "deployments"));
         assert_eq!(
-            grouped, "resource not found: unknown kind: apps/v1/deployments",
+            grouped,
+            "resource not found: unknown kind: apps/v1/deployments",
         );
         assert_ne!(grouped, via_core);
     }
@@ -1616,14 +1615,18 @@ mod tests {
             Err(ApiError::Internal("fake handler: get not exercised".into()))
         }
         async fn list(&self, _ns: Option<&str>) -> Result<serde_json::Value, ApiError> {
-            Err(ApiError::Internal("fake handler: list not exercised".into()))
+            Err(ApiError::Internal(
+                "fake handler: list not exercised".into(),
+            ))
         }
         async fn list_at(
             &self,
             _ns: Option<&str>,
             _sel: &crate::params::Selectors,
         ) -> Result<(Vec<serde_json::Value>, engenho_store::Revision), ApiError> {
-            Err(ApiError::Internal("fake handler: list_at not exercised".into()))
+            Err(ApiError::Internal(
+                "fake handler: list_at not exercised".into(),
+            ))
         }
         async fn list_page(
             &self,
@@ -1631,9 +1634,18 @@ mod tests {
             _sel: &crate::params::Selectors,
             _limit: usize,
             _continue_token: Option<engenho_store::ContinueToken>,
-        ) -> Result<(Vec<serde_json::Value>, engenho_store::Revision, Option<String>, Option<u64>), ApiError>
-        {
-            Err(ApiError::Internal("fake handler: list_page not exercised".into()))
+        ) -> Result<
+            (
+                Vec<serde_json::Value>,
+                engenho_store::Revision,
+                Option<String>,
+                Option<u64>,
+            ),
+            ApiError,
+        > {
+            Err(ApiError::Internal(
+                "fake handler: list_page not exercised".into(),
+            ))
         }
         async fn watch_stream(
             &self,
@@ -1641,7 +1653,9 @@ mod tests {
             _from: crate::params::ResumePoint,
             _allow_bookmarks: bool,
         ) -> Result<engenho_store::WatchStream, ApiError> {
-            Err(ApiError::Internal("fake handler: watch_stream not exercised".into()))
+            Err(ApiError::Internal(
+                "fake handler: watch_stream not exercised".into(),
+            ))
         }
         async fn create(
             &self,
@@ -1649,7 +1663,9 @@ mod tests {
             _body: serde_json::Value,
             _user_info: &engenho_types::auth::UserInfo,
         ) -> Result<serde_json::Value, ApiError> {
-            Err(ApiError::Internal("fake handler: create not exercised".into()))
+            Err(ApiError::Internal(
+                "fake handler: create not exercised".into(),
+            ))
         }
         async fn patch(
             &self,
@@ -1660,7 +1676,9 @@ mod tests {
             _apply_opts: Option<crate::params::ApplyOptions>,
             _user_info: &engenho_types::auth::UserInfo,
         ) -> Result<serde_json::Value, ApiError> {
-            Err(ApiError::Internal("fake handler: patch not exercised".into()))
+            Err(ApiError::Internal(
+                "fake handler: patch not exercised".into(),
+            ))
         }
         async fn delete(
             &self,
@@ -1668,7 +1686,9 @@ mod tests {
             _name: &str,
             _user_info: &engenho_types::auth::UserInfo,
         ) -> Result<serde_json::Value, ApiError> {
-            Err(ApiError::Internal("fake handler: delete not exercised".into()))
+            Err(ApiError::Internal(
+                "fake handler: delete not exercised".into(),
+            ))
         }
         async fn delete_with_precondition(
             &self,
@@ -1677,7 +1697,9 @@ mod tests {
             _expected: Option<engenho_store::Revision>,
             _user_info: &engenho_types::auth::UserInfo,
         ) -> Result<serde_json::Value, ApiError> {
-            Err(ApiError::Internal("fake handler: delete_with_precondition not exercised".into()))
+            Err(ApiError::Internal(
+                "fake handler: delete_with_precondition not exercised".into(),
+            ))
         }
     }
 
@@ -1687,7 +1709,13 @@ mod tests {
         // Empty table → a NotFound miss.
         assert!(state.lookup("example.com", "v1", "widgets").is_err());
 
-        state.register(FakeHandler::arc("example.com", "v1", "Widget", "widgets", true));
+        state.register(FakeHandler::arc(
+            "example.com",
+            "v1",
+            "Widget",
+            "widgets",
+            true,
+        ));
 
         let h = state
             .lookup("example.com", "v1", "widgets")
@@ -1700,7 +1728,13 @@ mod tests {
     #[test]
     fn unregister_then_lookup_is_notfound() {
         let state = RouterState::new(Vec::new());
-        state.register(FakeHandler::arc("example.com", "v1", "Widget", "widgets", true));
+        state.register(FakeHandler::arc(
+            "example.com",
+            "v1",
+            "Widget",
+            "widgets",
+            true,
+        ));
         assert!(state.lookup("example.com", "v1", "widgets").is_ok());
 
         let removed = state.unregister("example.com", "v1", "widgets");
@@ -1725,7 +1759,13 @@ mod tests {
     fn handler_set_reflects_post_register_snapshot() {
         let state = RouterState::new(Vec::new());
         assert!(state.handler_set().is_empty());
-        state.register(FakeHandler::arc("example.com", "v1", "Widget", "widgets", true));
+        state.register(FakeHandler::arc(
+            "example.com",
+            "v1",
+            "Widget",
+            "widgets",
+            true,
+        ));
         let set = state.handler_set();
         assert_eq!(set.len(), 1);
         assert_eq!(set[0].group(), "example.com");
@@ -1770,7 +1810,11 @@ mod tests {
         t2.await.unwrap();
 
         // All 100 distinct registrations survived (no lost write).
-        assert_eq!(state.handler_set().len(), 100, "no lost write under racing rcu");
+        assert_eq!(
+            state.handler_set().len(),
+            100,
+            "no lost write under racing rcu"
+        );
         assert!(state.lookup("a.example.com", "v1", "widgets0").is_ok());
         assert!(state.lookup("b.example.com", "v1", "gadgets49").is_ok());
     }

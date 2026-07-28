@@ -184,7 +184,10 @@ mod tests {
             "type": "array",
             "items": {"$ref": "#/components/schemas/io.k8s.api.core.v1.LocalObjectReference"}
         }));
-        assert_eq!(t, RustType::Vec(Box::new(RustType::Ref("LocalObjectReference".into()))));
+        assert_eq!(
+            t,
+            RustType::Vec(Box::new(RustType::Ref("LocalObjectReference".into())))
+        );
         assert_eq!(t.render(), "Vec<LocalObjectReference>");
         assert!(refs.contains("io.k8s.api.core.v1.LocalObjectReference"));
         assert!(t.has_ref());
@@ -210,9 +213,15 @@ mod tests {
     #[test]
     fn int_or_string_and_freeform_fall_back_to_json() {
         // x-kubernetes-int-or-string (no `type`).
-        assert_eq!(map(json!({"x-kubernetes-int-or-string": true})).0, RustType::Json);
+        assert_eq!(
+            map(json!({"x-kubernetes-int-or-string": true})).0,
+            RustType::Json
+        );
         // additionalProperties: true.
-        assert_eq!(map(json!({"type": "object", "additionalProperties": true})).0, RustType::Json);
+        assert_eq!(
+            map(json!({"type": "object", "additionalProperties": true})).0,
+            RustType::Json
+        );
         // genuinely empty.
         assert_eq!(map(json!({})).0, RustType::Json);
         assert_eq!(RustType::Json.render(), "serde_json::Value");
@@ -242,6 +251,9 @@ mod tests {
             type_name_from_ref("#/components/schemas/io.k8s.api.core.v1.PodSpec"),
             "PodSpec"
         );
-        assert_eq!(type_name_from_ref("io.k8s.api.apps.v1.DeploymentStatus"), "DeploymentStatus");
+        assert_eq!(
+            type_name_from_ref("io.k8s.api.apps.v1.DeploymentStatus"),
+            "DeploymentStatus"
+        );
     }
 }

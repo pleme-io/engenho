@@ -255,10 +255,7 @@ mod tests {
     #[test]
     fn datapath_auto_resolves_by_platform() {
         // Auto on a Linux node installs the iptables kernel datapath.
-        assert_eq!(
-            DatapathMode::Auto.resolve(true),
-            ResolvedDatapath::Iptables
-        );
+        assert_eq!(DatapathMode::Auto.resolve(true), ResolvedDatapath::Iptables);
         // Auto off-Linux (Darwin dev host) runs compute-only — no kernel
         // install is attempted, so the local daemon keeps running fine.
         assert_eq!(

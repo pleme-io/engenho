@@ -185,7 +185,8 @@ pub trait OwnedChildrenReconciler: Send + Sync {
     /// `owned_after` is the post-delta owned-children set; the status
     /// math is the per-controller logic (replica counting, phase
     /// aggregation, …).
-    fn compute_status(&self, parent: &Value, owned_after: &[(ResourceKey, Value)]) -> Option<Value>;
+    fn compute_status(&self, parent: &Value, owned_after: &[(ResourceKey, Value)])
+    -> Option<Value>;
 }
 
 /// Gather the owned children of `parent_uid` across every kind in
@@ -393,17 +394,25 @@ mod tests {
             .await
             .unwrap();
 
-        let c = WidgetReconciler { store: store.clone() };
+        let c = WidgetReconciler {
+            store: store.clone(),
+        };
         let out = c.tick().await.unwrap();
         assert!(out.objects_changed >= 1, "the child was created");
 
         // The created child carries the FROZEN creationTimestamp.
         let child = store
-            .get(&ResourceKey::namespaced("demo", "v1", "Gadget", "team-x", "g"))
+            .get(&ResourceKey::namespaced(
+                "demo", "v1", "Gadget", "team-x", "g",
+            ))
             .await
             .expect("child Gadget exists");
         assert_eq!(
-            child.get("metadata").unwrap().get("creationTimestamp").unwrap(),
+            child
+                .get("metadata")
+                .unwrap()
+                .get("creationTimestamp")
+                .unwrap(),
             FIXED_TS,
             "controller-created child must carry the boundary-frozen creationTimestamp"
         );
@@ -423,7 +432,9 @@ mod tests {
             .await
             .unwrap();
 
-        let c = WidgetReconciler { store: store.clone() };
+        let c = WidgetReconciler {
+            store: store.clone(),
+        };
         // First tick creates the child + stamps the timestamp.
         c.tick().await.unwrap();
         let key = ResourceKey::namespaced("demo", "v1", "Gadget", "team-y", "g");
@@ -453,7 +464,10 @@ mod tests {
             .get("creationTimestamp")
             .unwrap()
             .clone();
-        assert_eq!(ts1, ts2, "creationTimestamp must be stable across reconciles");
+        assert_eq!(
+            ts1, ts2,
+            "creationTimestamp must be stable across reconciles"
+        );
     }
 
     #[test]

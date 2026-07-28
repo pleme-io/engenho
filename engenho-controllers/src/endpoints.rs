@@ -66,7 +66,11 @@ impl EndpointsController {
     /// Construct with a pinned [`Clock`] — the unit-test determinism seam
     /// for the `creationTimestamp` boundary stamp.
     #[must_use]
-    pub fn with_clock(store: Arc<StoreMesh>, namespace: Option<String>, clock: CreateClock) -> Self {
+    pub fn with_clock(
+        store: Arc<StoreMesh>,
+        namespace: Option<String>,
+        clock: CreateClock,
+    ) -> Self {
         Self {
             store,
             namespace,
@@ -166,10 +170,7 @@ impl EndpointsController {
                             .or_else(|| p.get("port"))
                             .cloned()
                             .unwrap_or(Value::Null);
-                        let protocol = p
-                            .get("protocol")
-                            .cloned()
-                            .unwrap_or_else(|| json!("TCP"));
+                        let protocol = p.get("protocol").cloned().unwrap_or_else(|| json!("TCP"));
                         json!({ "name": port_name, "port": port, "protocol": protocol })
                     })
                     .collect::<Vec<_>>()
@@ -212,8 +213,13 @@ impl EndpointsController {
         owner_ref: crate::owner::OwnerReference,
         report: &mut ReconcileReport,
     ) -> Result<(), ControllerError> {
-        let slice_key =
-            ResourceKey::namespaced("discovery.k8s.io", "v1", "EndpointSlice", namespace, svc_name);
+        let slice_key = ResourceKey::namespaced(
+            "discovery.k8s.io",
+            "v1",
+            "EndpointSlice",
+            namespace,
+            svc_name,
+        );
         set_owner_reference(&mut slice, owner_ref);
 
         let existing = self.store.get(&slice_key).await;
@@ -604,11 +610,20 @@ mod tests {
         c.tick().await.unwrap();
 
         let ep = store
-            .get(&ResourceKey::namespaced("", "v1", "Endpoints", "ns1", "svc"))
+            .get(&ResourceKey::namespaced(
+                "",
+                "v1",
+                "Endpoints",
+                "ns1",
+                "svc",
+            ))
             .await
             .expect("Endpoints created");
         assert_eq!(
-            ep.get("metadata").unwrap().get("creationTimestamp").unwrap(),
+            ep.get("metadata")
+                .unwrap()
+                .get("creationTimestamp")
+                .unwrap(),
             FIXED_TS,
             "controller-created Endpoints must carry the frozen creationTimestamp"
         );
@@ -632,7 +647,13 @@ mod tests {
         });
         c2.tick().await.unwrap();
         let ep2 = store
-            .get(&ResourceKey::namespaced("", "v1", "Endpoints", "ns1", "svc"))
+            .get(&ResourceKey::namespaced(
+                "",
+                "v1",
+                "Endpoints",
+                "ns1",
+                "svc",
+            ))
             .await
             .unwrap();
         // The Endpoints was updated (now 2 addresses) but the timestamp held.
@@ -640,7 +661,10 @@ mod tests {
         // update Put (it carries the prior object's value); the controller's
         // create-only stamp simply never fires on the update path.
         assert_eq!(
-            ep2.get("metadata").unwrap().get("creationTimestamp").unwrap(),
+            ep2.get("metadata")
+                .unwrap()
+                .get("creationTimestamp")
+                .unwrap(),
             FIXED_TS,
             "creationTimestamp must be stable across the update (never bumped)"
         );
@@ -679,7 +703,13 @@ mod tests {
 
         // The legacy Endpoints object exists.
         let ep = store
-            .get(&ResourceKey::namespaced("", "v1", "Endpoints", "ns1", "svc"))
+            .get(&ResourceKey::namespaced(
+                "",
+                "v1",
+                "Endpoints",
+                "ns1",
+                "svc",
+            ))
             .await
             .expect("Endpoints created");
         assert_eq!(ep["subsets"][0]["addresses"][0]["ip"], "10.0.0.1");
@@ -718,6 +748,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(slice2["endpoints"], slice["endpoints"], "stable across re-tick");
+        assert_eq!(
+            slice2["endpoints"], slice["endpoints"],
+            "stable across re-tick"
+        );
     }
 }

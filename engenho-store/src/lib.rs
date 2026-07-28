@@ -85,13 +85,13 @@ pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope}
 pub use network::InProcessRouter;
 pub use pagination::{ContinueInvalid, ContinueToken, ListPage};
 pub use patch_apply::{
-    apply as apply_patch_algorithm, Gvk, JsonPath, ListMergeStrategy, MockPatchEnv,
-    OpenApiPatchEnv, PatchBody, PatchDirective, PatchError, PatchSchemaEnv,
+    Gvk, JsonPath, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody, PatchDirective,
+    PatchError, PatchSchemaEnv, apply as apply_patch_algorithm,
 };
 pub use resource::{ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
-pub use ssa::{apply_ssa, ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome};
-pub use state::{check_precondition, ApplyOutcome, ResourceCatalog, DEFAULT_HISTORY_CAPACITY};
+pub use ssa::{ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome, apply_ssa};
+pub use state::{ApplyOutcome, DEFAULT_HISTORY_CAPACITY, ResourceCatalog, check_precondition};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
 pub use watch::{WatchEvent, WatchEventKind};

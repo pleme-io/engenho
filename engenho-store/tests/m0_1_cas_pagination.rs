@@ -42,7 +42,11 @@ fn put_with(key: ResourceKey, value: ResourceValue, expected: Option<Revision>) 
     }
 }
 
-fn patch_with(key: ResourceKey, patch: ResourceValue, expected: Option<Revision>) -> ResourceCommand {
+fn patch_with(
+    key: ResourceKey,
+    patch: ResourceValue,
+    expected: Option<Revision>,
+) -> ResourceCommand {
     ResourceCommand::Patch {
         key,
         patch,
@@ -105,18 +109,40 @@ fn cas_stale_rv_conflicts_and_leaves_state_unchanged() {
         let expected_bytes = serde_json::to_vec(&expected_after).unwrap();
 
         let cmd = match variant {
-            "put" => put_with(k.clone(), serde_json::json!({"spec": {"x": 1}}), Some(Revision(99))),
-            "patch" => patch_with(k.clone(), serde_json::json!({"spec": {"x": 1}}), Some(Revision(99))),
+            "put" => put_with(
+                k.clone(),
+                serde_json::json!({"spec": {"x": 1}}),
+                Some(Revision(99)),
+            ),
+            "patch" => patch_with(
+                k.clone(),
+                serde_json::json!({"spec": {"x": 1}}),
+                Some(Revision(99)),
+            ),
             "delete" => delete_with(k.clone(), Some(Revision(99))),
             _ => unreachable!(),
         };
         let out = cat.apply(&cmd, 1, 2);
 
-        assert_eq!(out.op, ResourceOp::Conflict, "{variant}: stale rv → Conflict");
-        assert!(out.change.is_none(), "{variant}: conflict carries no Change");
-        assert_eq!(cat.revision(), snapshot_rev, "{variant}: revision UNCHANGED");
+        assert_eq!(
+            out.op,
+            ResourceOp::Conflict,
+            "{variant}: stale rv → Conflict"
+        );
+        assert!(
+            out.change.is_none(),
+            "{variant}: conflict carries no Change"
+        );
+        assert_eq!(
+            cat.revision(),
+            snapshot_rev,
+            "{variant}: revision UNCHANGED"
+        );
         assert_eq!(cat.revision(), Revision(1), "{variant}: revision still 1");
-        assert_eq!(cat.resources, snapshot_resources, "{variant}: resources UNCHANGED");
+        assert_eq!(
+            cat.resources, snapshot_resources,
+            "{variant}: resources UNCHANGED"
+        );
         assert_eq!(
             cat.history.iter().cloned().collect::<Vec<_>>(),
             snapshot_history,
@@ -140,7 +166,11 @@ fn cas_current_rv_succeeds_and_advances() {
 
     // Put with expected = current mod_revision (1) → succeeds, advances.
     let out = cat.apply(
-        &put_with(k.clone(), serde_json::json!({"spec": {"x": 1}}), Some(Revision(1))),
+        &put_with(
+            k.clone(),
+            serde_json::json!({"spec": {"x": 1}}),
+            Some(Revision(1)),
+        ),
         1,
         2,
     );
@@ -151,7 +181,11 @@ fn cas_current_rv_succeeds_and_advances() {
 
     // Patch with the NEW current mod_revision (2) → succeeds → rev 3.
     let out = cat.apply(
-        &patch_with(k.clone(), serde_json::json!({"spec": {"y": 2}}), Some(Revision(2))),
+        &patch_with(
+            k.clone(),
+            serde_json::json!({"spec": {"y": 2}}),
+            Some(Revision(2)),
+        ),
         1,
         3,
     );
@@ -172,8 +206,16 @@ fn cas_absent_rv_is_unconditional() {
     let mut cat = ResourceCatalog::default();
     let k = pod_key("podinfo");
     seed_pod(&mut cat, "podinfo", 1);
-    cat.apply(&put_with(k.clone(), serde_json::json!({"spec": {"x": 1}}), None), 1, 2); // rev 2
-    cat.apply(&put_with(k.clone(), serde_json::json!({"spec": {"x": 2}}), None), 1, 3); // rev 3
+    cat.apply(
+        &put_with(k.clone(), serde_json::json!({"spec": {"x": 1}}), None),
+        1,
+        2,
+    ); // rev 2
+    cat.apply(
+        &put_with(k.clone(), serde_json::json!({"spec": {"x": 2}}), None),
+        1,
+        3,
+    ); // rev 3
     assert_eq!(cat.revision(), Revision(3));
     let (_, meta) = cat.get_with_meta(&k).unwrap();
     assert_eq!(meta.mod_revision, Revision(3));
@@ -190,13 +232,25 @@ fn cas_expected_on_missing_key_conflicts() {
         assert_eq!(cat.revision(), Revision(0));
 
         let cmd = match variant {
-            "put" => put_with(k.clone(), serde_json::json!({"spec": {}}), Some(Revision(1))),
-            "patch" => patch_with(k.clone(), serde_json::json!({"spec": {}}), Some(Revision(1))),
+            "put" => put_with(
+                k.clone(),
+                serde_json::json!({"spec": {}}),
+                Some(Revision(1)),
+            ),
+            "patch" => patch_with(
+                k.clone(),
+                serde_json::json!({"spec": {}}),
+                Some(Revision(1)),
+            ),
             "delete" => delete_with(k.clone(), Some(Revision(1))),
             _ => unreachable!(),
         };
         let out = cat.apply(&cmd, 1, 1);
-        assert_eq!(out.op, ResourceOp::Conflict, "{variant}: CAS on missing key → Conflict");
+        assert_eq!(
+            out.op,
+            ResourceOp::Conflict,
+            "{variant}: CAS on missing key → Conflict"
+        );
         assert!(out.change.is_none());
         assert_eq!(cat.revision(), Revision(0), "{variant}: revision unchanged");
         assert!(cat.is_empty(), "{variant}: catalog stays empty (no create)");
@@ -210,9 +264,17 @@ fn cas_conflict_is_deterministic() {
     // (replica-divergence guard — the CAS decision is deterministic).
     let seq = [
         put_with(pod_key("a"), serde_json::json!({"spec": {"v": 1}}), None), // rev 1
-        put_with(pod_key("a"), serde_json::json!({"spec": {"v": 2}}), Some(Revision(1))), // rev 2 ok
+        put_with(
+            pod_key("a"),
+            serde_json::json!({"spec": {"v": 2}}),
+            Some(Revision(1)),
+        ), // rev 2 ok
         // Conflicting CAS: expected the now-stale rev 1 → Conflict, no advance.
-        put_with(pod_key("a"), serde_json::json!({"spec": {"v": 3}}), Some(Revision(1))),
+        put_with(
+            pod_key("a"),
+            serde_json::json!({"spec": {"v": 3}}),
+            Some(Revision(1)),
+        ),
         put_with(pod_key("b"), serde_json::json!({"spec": {"v": 9}}), None), // rev 3
         delete_with(pod_key("a"), Some(Revision(99))), // Conflict (stale) → no advance
     ];
@@ -241,7 +303,11 @@ fn cas_conflict_is_deterministic() {
         serde_json::to_vec(&cat2).unwrap(),
         "byte-identical catalogs (no replica divergence)"
     );
-    assert_eq!(cat1.revision(), Revision(3), "only 3 real mutations advanced");
+    assert_eq!(
+        cat1.revision(),
+        Revision(3),
+        "only 3 real mutations advanced"
+    );
 }
 
 // =================================================================
@@ -309,7 +375,11 @@ fn pagination_remaining_count_accurate() {
     assert_eq!(page.items.len(), 3);
     assert_eq!(page.remaining, 7, "10 - 3 = 7 remaining after first page");
     assert!(page.next.is_some());
-    assert_eq!(page.next.as_ref().unwrap().name, "p02", "next cursor = last emitted key");
+    assert_eq!(
+        page.next.as_ref().unwrap().name,
+        "p02",
+        "next cursor = last emitted key"
+    );
 }
 
 #[test]
@@ -324,8 +394,14 @@ fn pagination_exact_multiple_has_no_trailing_empty_page() {
 
     let page2 = cat.list_page("", "v1", "Pod", Some("default"), Some(&cursor), 3);
     assert_eq!(page_names(&page2), vec!["p03", "p04", "p05"]);
-    assert_eq!(page2.remaining, 0, "nothing after the exact-fill final page");
-    assert!(page2.next.is_none(), "no continuation on the exact-fill final page");
+    assert_eq!(
+        page2.remaining, 0,
+        "nothing after the exact-fill final page"
+    );
+    assert!(
+        page2.next.is_none(),
+        "no continuation on the exact-fill final page"
+    );
 }
 
 #[test]
@@ -349,10 +425,16 @@ fn continue_token_round_trips_and_rejects_tamper() {
     let pos = 22; // past version(2) + digest(16) hex chars
     chars[pos] = if chars[pos] == 'a' { 'b' } else { 'a' };
     let flipped: String = chars.into_iter().collect();
-    assert!(ContinueToken::decode(&flipped).is_err(), "flipped nibble rejected");
+    assert!(
+        ContinueToken::decode(&flipped).is_err(),
+        "flipped nibble rejected"
+    );
 
     // Truncate → ContinueInvalid.
-    assert!(ContinueToken::decode(&encoded[..encoded.len() - 6]).is_err(), "truncation rejected");
+    assert!(
+        ContinueToken::decode(&encoded[..encoded.len() - 6]).is_err(),
+        "truncation rejected"
+    );
 
     // Wrong version tag → ContinueInvalid (reason bad_version).
     let mut raw_token = ContinueToken::new(Revision(1), pod_key("p00"));
@@ -442,16 +524,16 @@ fn pagination_excludes_pre_cursor_late_insert() {
 
     // Resume strictly after the cursor → p03,p04,p05 (the inserted p00a,
     // which sorts before the cursor, is NOT in the continued range).
-    let page2 = cat.list_page(
-        "",
-        "v1",
-        "Pod",
-        Some("default"),
-        Some(&decoded.last_key),
-        3,
-    );
+    let page2 = cat.list_page("", "v1", "Pod", Some("default"), Some(&decoded.last_key), 3);
     let names = page_names(&page2);
-    assert!(!names.contains(&"p00a".to_string()), "pre-cursor insert not retroactively paged");
-    assert_eq!(names, vec!["p03", "p04", "p05"], "continued range is contiguous after cursor");
+    assert!(
+        !names.contains(&"p00a".to_string()),
+        "pre-cursor insert not retroactively paged"
+    );
+    assert_eq!(
+        names,
+        vec!["p03", "p04", "p05"],
+        "continued range is contiguous after cursor"
+    );
     assert!(page2.next.is_none(), "last page has no continuation");
 }
