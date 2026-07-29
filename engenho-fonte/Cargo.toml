@@ -76,7 +76,7 @@ tameshi                = { git = "https://github.com/pleme-io/tameshi", optional
 promessa-types         = { git = "https://github.com/pleme-io/promessa", optional = true }
 # Optional — enabled by `with-tatara-lisp`. Cross-workspace path
 # dep to pleme-io/tatara for the `(defsistema …)` Lisp keyword.
-tatara-lisp            = { git = "https://github.com/pleme-io/tatara", optional = true }
+tatara-lisp            = { git = "https://github.com/pleme-io/tatara", rev = "fb6dfcc1bad6880c06b774164882ad845522e84a", optional = true }
 # Optional — enabled by `with-caixa`. Cross-workspace path deps
 # to pleme-io/caixa for typed Servico chart rendering.
 caixa-core             = { git = "https://github.com/pleme-io/caixa", optional = true }
