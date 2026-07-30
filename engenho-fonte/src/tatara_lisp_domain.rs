@@ -15,22 +15,47 @@
 //! (list-of-records for apps/infra/promises) that the derive macro
 //! handles for flat structs but not for typed enum slugs +
 //! per-record kwarg shapes. The hand-roll is ~80 LoC; the macro
-//! shape is the future path once tatara-lisp-derive supports
-//! nested keyword-forms.
+//! shape is the future path once the derive supports nested
+//! keyword-forms — reached as `tatara_lisp::DeriveTataraDomain`
+//! (the lib re-exports the macros under `Derive*` names, so a
+//! consumer never names `tatara-lisp-derive` in its own manifest).
 //!
 //! Gated `with-tatara-lisp`.
 
 use crate::{AppRef, InfraBackend, InfraRef, PromessaKind, PromessaRef, Sistema, TopologyRef};
 use std::sync::Arc;
-use tatara_lisp::domain::{kwarg_form, parse_kwargs, reject_unknown_kwargs, required};
-use tatara_lisp::{LispError, Sexp, TataraDomain, read};
+use tatara_lisp::domain::{Kwargs, parse_kwargs, required};
+use tatara_lisp::{LispError, Sexp, TataraDomain};
 type LispResult<T> = std::result::Result<T, LispError>;
 
-/// `LispError::Compile { form, message }` expects `form: String` but
-/// `kwarg_form()` returns a typed `KwargPath`. This thin shim renders
-/// the typed path to its display form before handing it to Compile.
+/// Canonical `form:` label for a kwarg-scoped failure — `:apps`,
+/// `:topology`. `LispError::Compile { form, message }` takes a plain
+/// `String`, so every diagnostic in this module renders its path through
+/// this one helper and the `:`-prefix convention cannot drift between
+/// call sites.
 fn kwarg_form_string(key: &str) -> String {
-    kwarg_form(key).to_string()
+    let mut form = String::with_capacity(key.len() + 1);
+    form.push(':');
+    form.push_str(key);
+    form
+}
+
+/// Closed-set kwarg gate: every key parsed out of a `(defsistema …)` form
+/// (or one of its nested records) must sit in `allowed`, else the form is
+/// rejected before the value exists. Returns the structural
+/// `LispError::Unknown` variant so consumers bind to a variant rather
+/// than substring-matching a `Compile`-shaped message.
+fn reject_unknown_kwargs(kw: &Kwargs<'_>, allowed: &[&str]) -> LispResult<()> {
+    for key in kw.keys() {
+        if allowed.contains(&key.as_str()) {
+            continue;
+        }
+        return Err(LispError::Unknown {
+            category: "keyword argument",
+            value: kwarg_form_string(key),
+        });
+    }
+    Ok(())
 }
 
 impl TataraDomain for Sistema {

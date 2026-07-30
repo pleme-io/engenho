@@ -38,8 +38,8 @@ with-tameshi = ["dep:tameshi"]
 # Cross-workspace path dep to pleme-io/promessa.
 with-promessa = ["dep:promessa-types"]
 # tatara-lisp authoring surface — register Sistema as a typed
-# (defsistema …) keyword via #[derive(TataraDomain)]. Cross-
-# workspace path dep to pleme-io/tatara.
+# (defsistema …) keyword. Pulls the canonical crates.io
+# `tatara-lisp` (pleme-io/tatara-lisp).
 with-tatara-lisp = ["dep:tatara-lisp"]
 # caixa renderer integration — CaixaAppReconciler wraps
 # caixa-helm's chart renderer. Cross-workspace path deps to
@@ -74,9 +74,9 @@ tameshi                = { git = "https://github.com/pleme-io/tameshi", optional
 # Optional — enabled by `with-promessa`. Cross-workspace path dep
 # to pleme-io/promessa for typed promise reconciliation.
 promessa-types         = { git = "https://github.com/pleme-io/promessa", optional = true }
-# Optional — enabled by `with-tatara-lisp`. Cross-workspace path
-# dep to pleme-io/tatara for the `(defsistema …)` Lisp keyword.
-tatara-lisp            = { git = "https://github.com/pleme-io/tatara", rev = "fb6dfcc1bad6880c06b774164882ad845522e84a", optional = true }
+# Optional — enabled by `with-tatara-lisp`. The canonical published
+# Lisp crate (pleme-io/tatara-lisp) for the `(defsistema …)` keyword.
+tatara-lisp            = { version = "0.3.3", optional = true }
 # Optional — enabled by `with-caixa`. Cross-workspace path deps
 # to pleme-io/caixa for typed Servico chart rendering.
 caixa-core             = { git = "https://github.com/pleme-io/caixa", optional = true }

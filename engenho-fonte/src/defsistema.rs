@@ -2,10 +2,10 @@
 //! + JSON serde helpers for the typed `Sistema` value.
 //!
 //! Full tatara-lisp `(defsistema …)` keyword registration via
-//! `#[derive(TataraDomain)]` is the eventual destination — but
-//! requires a cross-workspace tatara-lisp dep + macro crate
-//! (substantial closure pull-in). This module ships the
-//! always-on operator-facing API that exercises the same shape:
+//! `#[derive(DeriveTataraDomain)]` is the eventual destination —
+//! but requires the optional `tatara-lisp` dep (feature-gated
+//! `with-tatara-lisp`). This module ships the always-on
+//! operator-facing API that exercises the same shape:
 //!
 //!   * [`parse_json`] — typed Sistema from a JSON declaration
 //!   * [`parse_nix`] — typed Sistema from a Nix declaration
