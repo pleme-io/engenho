@@ -846,6 +846,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "cofre-fs"
+version = "0.1.0"
+source = "git+https://github.com/pleme-io/cofre#4f70b8fa025f2b78b7ca062fb0feb31188a8d31a"
+
+[[package]]
 name = "cofre-types"
 version = "0.1.0"
 source = "git+https://github.com/pleme-io/cofre?branch=main#bb1c98752c507278fea937a4fdd2940dd216ae59"
@@ -1648,6 +1653,7 @@ name = "engenho-runtime"
 version = "0.1.5"
 dependencies = [
  "async-trait",
+ "cofre-fs",
  "engenho-apiserver",
  "engenho-config",
  "engenho-controllers",
