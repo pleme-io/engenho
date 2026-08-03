@@ -789,7 +789,7 @@ fn san_listen_ip(addr: SocketAddr) -> Option<std::net::IpAddr> {
     if ip.is_unspecified() { None } else { Some(ip) }
 }
 
-/// Write `data_dir/kubeconfig` (mode 0644) so an operator can immediately
+/// Write `data_dir/kubeconfig` (mode 0600) so an operator can immediately
 /// `kubectl --kubeconfig <data_dir>/kubeconfig get nodes`. server_url is
 /// `https://127.0.0.1:<bound_port>` (loopback SAN + the real bound port);
 /// `ca_pem` is the cluster CA the server cert chains to.
@@ -797,6 +797,13 @@ fn san_listen_ip(addr: SocketAddr) -> Option<std::net::IpAddr> {
 /// When `admin` is supplied, the kubeconfig embeds the admin CLIENT CERT (→
 /// `kubectl auth whoami` = engenho-admin / system:masters); otherwise it falls
 /// back to the anonymous-token kubeconfig (the plaintext / no-admin path).
+///
+/// The admin form embeds `client-key-data` — the admin private key, verbatim —
+/// so the file IS a credential and is owner-only. The operator reaching for
+/// `kubectl --kubeconfig` is the owner, so 0600 costs that path nothing. The
+/// anonymous form carries only a public placeholder token, but it is written
+/// through the same path at the same mode rather than branching: one mode for
+/// one filename means the admin case cannot inherit the laxer one.
 fn write_boot_kubeconfig(
     config: &EngenhoConfig,
     bound_addr: SocketAddr,
@@ -817,7 +824,7 @@ fn write_boot_kubeconfig(
     }
     .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
     let path = config.runtime.data_dir.join("kubeconfig");
-    write_mode_0644(&path, &yaml)?;
+    write_kubeconfig_file(&path, &yaml)?;
     info!(path = %path.display(), server = %server_url, admin = admin.is_some(), "kubeconfig written");
     Ok(())
 }
@@ -830,12 +837,9 @@ fn persist_admin_material(
     admin: &ClientMaterial,
 ) -> Result<(), RuntimeError> {
     let pki = data_dir.join("pki");
-    std::fs::create_dir_all(&pki).map_err(|source| RuntimeError::KubeconfigIo {
-        path: pki.clone(),
-        source,
-    })?;
-    write_pki_file(&pki.join("admin.crt"), &admin.cert_pem, 0o644)?;
-    write_pki_file(&pki.join("admin.key"), &admin.key_pem, 0o600)?;
+    create_pki_dir(&pki)?;
+    write_at_mode(&pki.join("admin.crt"), &admin.cert_pem, 0o644)?;
+    write_at_mode(&pki.join("admin.key"), &admin.key_pem, 0o600)?;
     Ok(())
 }
 
@@ -853,12 +857,9 @@ fn load_or_generate_admin_token(data_dir: &std::path::Path) -> Result<String, Ru
             return Ok(trimmed);
         }
     }
-    std::fs::create_dir_all(&pki).map_err(|source| RuntimeError::KubeconfigIo {
-        path: pki.clone(),
-        source,
-    })?;
+    create_pki_dir(&pki)?;
     let token = random_admin_token();
-    write_pki_file(&token_path, &token, 0o600)?;
+    write_at_mode(&token_path, &token, 0o600)?;
     Ok(token)
 }
 
@@ -890,25 +891,53 @@ fn random_admin_token() -> String {
     out
 }
 
-/// Write a PKI-dir file with the given unix mode (no-op chmod elsewhere).
-fn write_pki_file(path: &std::path::Path, contents: &str, mode: u32) -> Result<(), RuntimeError> {
+/// Create `data_dir/pki` at 0700 — it holds the admin private key and the
+/// admin bearer token, and a 0600 file inside a 0755 directory is still
+/// listable. Matches the mode `engenho-apiserver`'s PKI loader already gives
+/// the same directory, whichever of the two reaches it first.
+#[cfg(unix)]
+fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
+    cofre_fs::create_secret_dir(pki, 0o700).map_err(|source| RuntimeError::KubeconfigIo {
+        path: pki.to_path_buf(),
+        source,
+    })
+}
+
+/// Non-unix: no modes to set.
+#[cfg(not(unix))]
+fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
+    std::fs::create_dir_all(pki).map_err(|source| RuntimeError::KubeconfigIo {
+        path: pki.to_path_buf(),
+        source,
+    })
+}
+
+/// Create `path` holding `contents` with exactly `mode`, set by `open(2)`
+/// itself rather than by a follow-up `chmod`.
+///
+/// `cofre_fs::write_secret` owns that property: the bits land in the syscall
+/// that creates the inode, so there is no interval during which the admin key
+/// or the bearer token is 0644-and-world-readable, and `create_new` after an
+/// unlink means a pre-placed symlink is not written through. The mode is a
+/// required argument there, which is why it stays one here.
+#[cfg(unix)]
+fn write_at_mode(path: &std::path::Path, contents: &str, mode: u32) -> Result<(), RuntimeError> {
+    cofre_fs::write_secret(path, contents.as_bytes(), mode).map_err(|source| {
+        RuntimeError::KubeconfigIo {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+/// Non-unix: file modes don't apply, so this is a plain write. cofre-fs is
+/// `#![cfg(unix)]` for the same reason.
+#[cfg(not(unix))]
+fn write_at_mode(path: &std::path::Path, contents: &str, _mode: u32) -> Result<(), RuntimeError> {
     std::fs::write(path, contents.as_bytes()).map_err(|source| RuntimeError::KubeconfigIo {
         path: path.to_path_buf(),
         source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(
-            |source| RuntimeError::KubeconfigIo {
-                path: path.to_path_buf(),
-                source,
-            },
-        )?;
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    Ok(())
+    })
 }
 
 /// `https://127.0.0.1:<port>` — the loopback URL kubectl targets. We use
@@ -920,28 +949,18 @@ fn loopback_server_url(bound_addr: SocketAddr) -> String {
     url
 }
 
-/// Write `contents` to `path` with mode 0644 on unix (no-op chmod
-/// elsewhere). Creates the parent dir if missing (it normally exists —
-/// the durable store already opened `data_dir/store`).
-fn write_mode_0644(path: &std::path::Path, contents: &str) -> Result<(), RuntimeError> {
-    let io_err = |p: &std::path::Path| {
-        let p = p.to_path_buf();
-        move |source: std::io::Error| RuntimeError::KubeconfigIo {
-            path: p.clone(),
-            source,
-        }
-    };
+/// Write the kubeconfig at mode 0600 (see [`write_boot_kubeconfig`] for why
+/// owner-only). Creates the parent dir if missing (it normally exists — the
+/// durable store already opened `data_dir/store`); the parent is `data_dir`
+/// itself, which holds non-secret state too, so its mode is left alone.
+fn write_kubeconfig_file(path: &std::path::Path, contents: &str) -> Result<(), RuntimeError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+        std::fs::create_dir_all(parent).map_err(|source| RuntimeError::KubeconfigIo {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
-    std::fs::write(path, contents.as_bytes()).map_err(io_err(path))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
-            .map_err(io_err(path))?;
-    }
-    Ok(())
+    write_at_mode(path, contents, 0o600)
 }
 
 /// Build + spawn every driver gated on `controllers.enable.*`. The
@@ -1220,13 +1239,21 @@ mod tests {
         // even for the ephemeral path. A unique per-test subdir avoids
         // cross-test collisions; the small PKI dir is left for the OS temp
         // sweeper (no cleanup handle needed for a unit test).
+        //
+        // pid + a process-local COUNTER, not a timestamp. `SystemTime` here
+        // resolves to microseconds on macOS (the nanos always end in `000`),
+        // so two `#[tokio::test]`s entering this function in the same
+        // microsecond got the SAME data_dir and raced over
+        // `pki/admin.token`. That was invisible while the token was written
+        // with `fs::write` (last writer wins); `cofre_fs::write_secret` uses
+        // `create_new`, which reports the collision as `AlreadyExists`
+        // instead of absorbing it. The counter makes the name unique by
+        // construction rather than by clock luck.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = format!(
             "engenho-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         cfg.runtime.data_dir = std::env::temp_dir().join(unique);
         cfg.controllers.fallback_interval_seconds = 1;

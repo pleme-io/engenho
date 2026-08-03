@@ -38,6 +38,11 @@ async-trait         = { workspace = true }
 # OS entropy for the bootstrap admin bearer token (no plaintext secret in the
 # tree; the token is minted + persisted 0600 at first boot).
 getrandom           = "0.3"
+# Credential files created AT their final mode by open(2) rather than
+# chmod'ed afterwards: the kubeconfig (embeds client-key-data), admin.key,
+# admin.token. Dependency-free; `#![cfg(unix)]`, so the non-unix arms of
+# write_at_mode / create_pki_dir don't reference it.
+cofre-fs            = { git = "https://github.com/pleme-io/cofre" }
 
 [dev-dependencies]
 reqwest = { workspace = true }
