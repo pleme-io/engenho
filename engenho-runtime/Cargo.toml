@@ -15,6 +15,14 @@ keywords.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Real secure file permissions via cofre-fs (open(2) with mode, no
+# chmod-after-write race). Off by default; integration sites enable
+# when they need the full cofre security guarantee. The fallback
+# uses std::fs + chmod, which has a brief window at default perms.
+with-cofre = ["dep:cofre-fs"]
+
 [dependencies]
 engenho-config      = { workspace = true }
 # Typed RBAC kinds (rbac_v1) — the bootstrap seeds are built as typed
@@ -42,7 +50,10 @@ getrandom           = "0.3"
 # chmod'ed afterwards: the kubeconfig (embeds client-key-data), admin.key,
 # admin.token. Dependency-free; `#![cfg(unix)]`, so the non-unix arms of
 # write_at_mode / create_pki_dir don't reference it.
-cofre-fs            = { git = "https://github.com/pleme-io/cofre" }
+# Optional — enabled by `with-cofre`. Secure file creation via open(2)
+# with mode (no chmod-after-write race). Cross-workspace git dep to
+# pleme-io/cofre.
+cofre-fs            = { git = "https://github.com/pleme-io/cofre", optional = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }

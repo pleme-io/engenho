@@ -895,12 +895,27 @@ fn random_admin_token() -> String {
 /// admin bearer token, and a 0600 file inside a 0755 directory is still
 /// listable. Matches the mode `engenho-apiserver`'s PKI loader already gives
 /// the same directory, whichever of the two reaches it first.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "with-cofre"))]
 fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
     cofre_fs::create_secret_dir(pki, 0o700).map_err(|source| RuntimeError::KubeconfigIo {
         path: pki.to_path_buf(),
         source,
     })
+}
+
+/// Unix without cofre: create dir then set mode via chmod.
+#[cfg(all(unix, not(feature = "with-cofre")))]
+fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
+    std::fs::create_dir_all(pki).map_err(|source| RuntimeError::KubeconfigIo {
+        path: pki.to_path_buf(),
+        source,
+    })?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(pki, std::fs::Permissions::from_mode(0o700))
+        .map_err(|source| RuntimeError::KubeconfigIo {
+            path: pki.to_path_buf(),
+            source,
+        })
 }
 
 /// Non-unix: no modes to set.
@@ -920,7 +935,7 @@ fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
 /// or the bearer token is 0644-and-world-readable, and `create_new` after an
 /// unlink means a pre-placed symlink is not written through. The mode is a
 /// required argument there, which is why it stays one here.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "with-cofre"))]
 fn write_at_mode(path: &std::path::Path, contents: &str, mode: u32) -> Result<(), RuntimeError> {
     cofre_fs::write_secret(path, contents.as_bytes(), mode).map_err(|source| {
         RuntimeError::KubeconfigIo {
@@ -928,6 +943,21 @@ fn write_at_mode(path: &std::path::Path, contents: &str, mode: u32) -> Result<()
             source,
         }
     })
+}
+
+/// Unix without cofre: write then chmod. Has a brief window at default perms.
+#[cfg(all(unix, not(feature = "with-cofre")))]
+fn write_at_mode(path: &std::path::Path, contents: &str, mode: u32) -> Result<(), RuntimeError> {
+    std::fs::write(path, contents.as_bytes()).map_err(|source| RuntimeError::KubeconfigIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|source| RuntimeError::KubeconfigIo {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 /// Non-unix: file modes don't apply, so this is a plain write. cofre-fs is
