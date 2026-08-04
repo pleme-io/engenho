@@ -1,16 +1,16 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "e82bea091c7815c5b335413d0e17f2642f6fb7ca9c00b121b05cfff33d998901",
+  "cargo_lock_sha256": "4b5de0564d9985d51dce85d386dc73f8e50e2ee659a6a7e470001a84b4e7a583",
   "manifest_sha256": {
-    "Cargo.toml": "9ccd1655c032f9e9401c4bf9f777ee6c1305678b6fe1d7189a7a938b77973ada",
+    "Cargo.toml": "09436c166529b1eb0b52f4635e0728b0f5f552c53b929174d1c7568798b83dc1",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
-    "engenho-config/Cargo.toml": "5fe0a3688b205b7ec7dc2ca587b7ca78b33fd19b1efd8f805958516b1f845044",
+    "engenho-config/Cargo.toml": "acac5dca96df501884e341c1c7103a4569bf470a3b15d156e3eec1fb786621df",
     "engenho-controllers/Cargo.toml": "d7e6db6f9b70d927029a5f5436736b8d139de75867c5379362f23245960b0462",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
     "engenho-fonte-cli/Cargo.toml": "650eb2c143e2d16dd0f02a56a9f73035f83652349b83daf33f9caa582c8ca8a7",
-    "engenho-fonte/Cargo.toml": "05f44e9932bfeab5f135e359251bc34cdadc8a2bb872c059444cf4d46d8b317d",
+    "engenho-fonte/Cargo.toml": "a074bc92449afc5b002c35965f1c0e8f86754064d7bf7e6d86cb7c496c5bfd1e",
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "b46b05226d557291f9c293ce8d483ffadc4d72e7ad4ab8c50a36c15337fd206e",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
@@ -18,12 +18,12 @@
     "engenho-machines/Cargo.toml": "7722f5b1de0b7af3d290f6b36bdea89e36ab888853f23a6432792ddd9640c442",
     "engenho-mcp/Cargo.toml": "8f63f75ec7e2dd3d6f5a7ba938c6bf5960562e4efd7050be0a6fea73453f09fd",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "8281680c0098f6cb631c91029d9b43eb90adb3b5bbd5070cbebd5aa3c80d450d",
+    "engenho-runtime/Cargo.toml": "b9acfdbfa5af8ada11cd7ec1cb3d900aef7d4876e4c539786d5a210cdf41d776",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-store/Cargo.toml": "90fc000b817605e80df052790c359fb79e171a49f68eb39a34c79122f776ead3",
     "engenho-substrate-props/Cargo.toml": "6f95b92f74fa8ac52030f06626f6af99c00c7939722497de0e91f8074fc0c52a",
     "engenho-substrate/Cargo.toml": "042f3a24f99aa6b97723db699cfdcfb4e5817acb068b85963912766c1c4a4718",
-    "engenho-sui-typescape/Cargo.toml": "5e05c5375671d0e09551767ddd3da9720e8075408c6c08e8b9b51d2fb81a958b",
+    "engenho-sui-typescape/Cargo.toml": "30fde1a3a1db010241fa2d2c10c14a4953dcbb9979d760cf0843622f3b694207",
     "engenho-teia/Cargo.toml": "5f49fb93d3d30e02eea21bec4cb5cbe8b972bd40d3db3b8c29ce3c3f5f79c6fb",
     "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
     "engenho/Cargo.toml": "4a6b88432fea4ff0c2c3a8490d9b4393999440875d6a5f2010980dde7e78f13d"
@@ -2671,11 +2671,6 @@
         "build_dependencies": [],
         "features": []
       },
-      "cofre-fs-0.1.0-4f70b8fa025f2b78b7ca062fb0feb31188a8d31a": {
-        "runtime_dependencies": [],
-        "build_dependencies": [],
-        "features": []
-      },
       "colorchoice-1.0.5": {
         "runtime_dependencies": [],
         "build_dependencies": [],
@@ -3810,7 +3805,7 @@
           "default"
         ]
       },
-      "engenho-0.1.5": {
+      "engenho-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -3824,7 +3819,7 @@
           },
           {
             "name": "engenho_apiserver",
-            "package_key": "engenho-apiserver-0.1.5",
+            "package_key": "engenho-apiserver-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3834,7 +3829,7 @@
           },
           {
             "name": "engenho_config",
-            "package_key": "engenho-config-0.1.5",
+            "package_key": "engenho-config-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3844,7 +3839,7 @@
           },
           {
             "name": "engenho_kube_client",
-            "package_key": "engenho-kube-client-0.1.5",
+            "package_key": "engenho-kube-client-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3854,7 +3849,7 @@
           },
           {
             "name": "engenho_runtime",
-            "package_key": "engenho-runtime-0.1.5",
+            "package_key": "engenho-runtime-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3864,7 +3859,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3910,7 +3905,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-apiserver-0.1.5": {
+      "engenho-apiserver-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -4009,7 +4004,7 @@
           },
           {
             "name": "engenho_controllers",
-            "package_key": "engenho-controllers-0.1.5",
+            "package_key": "engenho-controllers-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4019,7 +4014,7 @@
           },
           {
             "name": "engenho_kube_proto",
-            "package_key": "engenho-kube-proto-0.1.5",
+            "package_key": "engenho-kube-proto-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4029,7 +4024,7 @@
           },
           {
             "name": "engenho_store",
-            "package_key": "engenho-store-0.1.5",
+            "package_key": "engenho-store-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4039,7 +4034,7 @@
           },
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4049,7 +4044,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4219,7 +4214,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-cluster-config-0.1.5": {
+      "engenho-cluster-config-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "indoc",
@@ -4277,7 +4272,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-cluster-config-render-0.1.5": {
+      "engenho-cluster-config-render-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -4303,7 +4298,7 @@
           },
           {
             "name": "engenho_cluster_config",
-            "package_key": "engenho-cluster-config-0.1.5",
+            "package_key": "engenho-cluster-config-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4347,7 +4342,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-config-0.1.5": {
+      "engenho-config-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "figment",
@@ -4395,7 +4390,7 @@
           },
           {
             "name": "shikumi",
-            "package_key": "shikumi-0.1.166-c232ca27180d1aa33ea2ae5874def1e339690add",
+            "package_key": "shikumi-0.1.345",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4417,7 +4412,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-controllers-0.1.5": {
+      "engenho-controllers-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -4473,7 +4468,7 @@
           },
           {
             "name": "engenho_config",
-            "package_key": "engenho-config-0.1.5",
+            "package_key": "engenho-config-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4483,7 +4478,7 @@
           },
           {
             "name": "engenho_store",
-            "package_key": "engenho-store-0.1.5",
+            "package_key": "engenho-store-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4493,7 +4488,7 @@
           },
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4503,7 +4498,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4535,7 +4530,7 @@
           },
           {
             "name": "shigoto_types",
-            "package_key": "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22",
+            "package_key": "shigoto-types-0.1.13",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4579,7 +4574,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-diff-0.1.5": {
+      "engenho-diff-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -4593,7 +4588,7 @@
           },
           {
             "name": "engenho_apiserver",
-            "package_key": "engenho-apiserver-0.1.5",
+            "package_key": "engenho-apiserver-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4603,7 +4598,7 @@
           },
           {
             "name": "engenho_kube_client",
-            "package_key": "engenho-kube-client-0.1.5",
+            "package_key": "engenho-kube-client-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4613,7 +4608,7 @@
           },
           {
             "name": "engenho_store",
-            "package_key": "engenho-store-0.1.5",
+            "package_key": "engenho-store-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4623,7 +4618,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4692,7 +4687,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-fonte-0.1.5": {
+      "engenho-fonte-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -4716,7 +4711,7 @@
           },
           {
             "name": "engenho_revoada",
-            "package_key": "engenho-revoada-0.1.5",
+            "package_key": "engenho-revoada-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4726,7 +4721,7 @@
           },
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4736,7 +4731,7 @@
           },
           {
             "name": "engenho_sui_typescape",
-            "package_key": "engenho-sui-typescape-0.1.5",
+            "package_key": "engenho-sui-typescape-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4746,7 +4741,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4799,7 +4794,7 @@
           },
           {
             "name": "shikumi",
-            "package_key": "shikumi-0.1.166-c232ca27180d1aa33ea2ae5874def1e339690add",
+            "package_key": "shikumi-0.1.345",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4842,7 +4837,7 @@
           "with-sui-eval"
         ]
       },
-      "engenho-fonte-cli-0.1.5": {
+      "engenho-fonte-cli-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -4868,7 +4863,7 @@
           },
           {
             "name": "engenho_fonte",
-            "package_key": "engenho-fonte-0.1.5",
+            "package_key": "engenho-fonte-0.53.3",
             "kind": "normal",
             "features": [
               "with-revoada",
@@ -4882,7 +4877,7 @@
           },
           {
             "name": "engenho_revoada",
-            "package_key": "engenho-revoada-0.1.5",
+            "package_key": "engenho-revoada-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4935,7 +4930,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-kube-client-0.1.5": {
+      "engenho-kube-client-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "async_stream",
@@ -4979,7 +4974,7 @@
           },
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4989,7 +4984,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5103,7 +5098,7 @@
           "mock"
         ]
       },
-      "engenho-kube-codegen-0.1.5": {
+      "engenho-kube-codegen-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -5163,7 +5158,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-kube-proto-0.1.5": {
+      "engenho-kube-proto-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "bytes",
@@ -5264,7 +5259,7 @@
         ],
         "features": []
       },
-      "engenho-kubelet-0.1.5": {
+      "engenho-kubelet-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -5298,7 +5293,7 @@
           },
           {
             "name": "engenho_config",
-            "package_key": "engenho-config-0.1.5",
+            "package_key": "engenho-config-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5308,7 +5303,7 @@
           },
           {
             "name": "engenho_controllers",
-            "package_key": "engenho-controllers-0.1.5",
+            "package_key": "engenho-controllers-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5318,7 +5313,7 @@
           },
           {
             "name": "engenho_store",
-            "package_key": "engenho-store-0.1.5",
+            "package_key": "engenho-store-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5328,7 +5323,7 @@
           },
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5338,7 +5333,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5417,11 +5412,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-machines-0.1.5": {
+      "engenho-machines-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5431,7 +5426,7 @@
           },
           {
             "name": "engenho_sui_typescape",
-            "package_key": "engenho-sui-typescape-0.1.5",
+            "package_key": "engenho-sui-typescape-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5465,7 +5460,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-mcp-0.1.5": {
+      "engenho-mcp-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -5489,7 +5484,7 @@
           },
           {
             "name": "engenho_cluster_config",
-            "package_key": "engenho-cluster-config-0.1.5",
+            "package_key": "engenho-cluster-config-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5499,7 +5494,7 @@
           },
           {
             "name": "engenho_kube_client",
-            "package_key": "engenho-kube-client-0.1.5",
+            "package_key": "engenho-kube-client-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5509,7 +5504,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5611,7 +5606,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-revoada-0.1.5": {
+      "engenho-revoada-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -5678,7 +5673,7 @@
           },
           {
             "name": "engenho_config",
-            "package_key": "engenho-config-0.1.5",
+            "package_key": "engenho-config-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5688,7 +5683,7 @@
           },
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5698,7 +5693,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5708,7 +5703,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2",
+            "package_key": "gen-platform-0.1.33",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5718,7 +5713,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2",
+            "package_key": "gen-types-0.1.33",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5793,7 +5788,7 @@
           },
           {
             "name": "shigoto_types",
-            "package_key": "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22",
+            "package_key": "shigoto-types-0.1.13",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5837,7 +5832,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-runtime-0.1.5": {
+      "engenho-runtime-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -5850,18 +5845,8 @@
             "tree": "host"
           },
           {
-            "name": "cofre_fs",
-            "package_key": "cofre-fs-0.1.0-4f70b8fa025f2b78b7ca062fb0feb31188a8d31a",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
             "name": "engenho_apiserver",
-            "package_key": "engenho-apiserver-0.1.5",
+            "package_key": "engenho-apiserver-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5871,7 +5856,7 @@
           },
           {
             "name": "engenho_config",
-            "package_key": "engenho-config-0.1.5",
+            "package_key": "engenho-config-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5881,7 +5866,7 @@
           },
           {
             "name": "engenho_controllers",
-            "package_key": "engenho-controllers-0.1.5",
+            "package_key": "engenho-controllers-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5891,7 +5876,7 @@
           },
           {
             "name": "engenho_kube_client",
-            "package_key": "engenho-kube-client-0.1.5",
+            "package_key": "engenho-kube-client-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5901,7 +5886,7 @@
           },
           {
             "name": "engenho_kubelet",
-            "package_key": "engenho-kubelet-0.1.5",
+            "package_key": "engenho-kubelet-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5911,7 +5896,7 @@
           },
           {
             "name": "engenho_scheduler",
-            "package_key": "engenho-scheduler-0.1.5",
+            "package_key": "engenho-scheduler-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5921,7 +5906,7 @@
           },
           {
             "name": "engenho_store",
-            "package_key": "engenho-store-0.1.5",
+            "package_key": "engenho-store-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5931,7 +5916,7 @@
           },
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5941,7 +5926,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6003,9 +5988,11 @@
           }
         ],
         "build_dependencies": [],
-        "features": []
+        "features": [
+          "default"
+        ]
       },
-      "engenho-scheduler-0.1.5": {
+      "engenho-scheduler-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -6029,7 +6016,7 @@
           },
           {
             "name": "engenho_config",
-            "package_key": "engenho-config-0.1.5",
+            "package_key": "engenho-config-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6039,7 +6026,7 @@
           },
           {
             "name": "engenho_controllers",
-            "package_key": "engenho-controllers-0.1.5",
+            "package_key": "engenho-controllers-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6049,7 +6036,7 @@
           },
           {
             "name": "engenho_store",
-            "package_key": "engenho-store-0.1.5",
+            "package_key": "engenho-store-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6059,7 +6046,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6125,7 +6112,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-store-0.1.5": {
+      "engenho-store-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -6159,7 +6146,7 @@
           },
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6169,7 +6156,7 @@
           },
           {
             "name": "engenho_teia",
-            "package_key": "engenho-teia-0.1.5",
+            "package_key": "engenho-teia-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6179,7 +6166,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6278,7 +6265,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-substrate-0.1.5": {
+      "engenho-substrate-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -6371,11 +6358,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-substrate-props-0.1.5": {
+      "engenho-substrate-props-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6410,11 +6397,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-sui-typescape-0.1.5": {
+      "engenho-sui-typescape-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6447,7 +6434,7 @@
           },
           {
             "name": "sui_eval",
-            "package_key": "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-eval-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6472,7 +6459,7 @@
           "with-sui-eval"
         ]
       },
-      "engenho-teia-0.1.5": {
+      "engenho-teia-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -6506,7 +6493,7 @@
           },
           {
             "name": "engenho_config",
-            "package_key": "engenho-config-0.1.5",
+            "package_key": "engenho-config-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6516,7 +6503,7 @@
           },
           {
             "name": "engenho_types",
-            "package_key": "engenho-types-0.1.5",
+            "package_key": "engenho-types-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6592,7 +6579,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "engenho-types-0.1.5": {
+      "engenho-types-0.53.3": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -6628,7 +6615,7 @@
           },
           {
             "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.1.5",
+            "package_key": "engenho-substrate-0.53.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6692,7 +6679,7 @@
           },
           {
             "name": "shigoto_types",
-            "package_key": "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22",
+            "package_key": "shigoto-types-0.1.13",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -7637,7 +7624,7 @@
           "std"
         ]
       },
-      "gen-macros-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2": {
+      "gen-macros-0.1.33": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -7676,11 +7663,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-platform-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2": {
+      "gen-platform-0.1.33": {
         "runtime_dependencies": [
           {
             "name": "gen_macros",
-            "package_key": "gen-macros-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2",
+            "package_key": "gen-macros-0.1.33",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -7690,7 +7677,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2",
+            "package_key": "gen-types-0.1.33",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -7744,7 +7731,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-types-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2": {
+      "gen-types-0.1.33": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -14975,6 +14962,34 @@
           "std"
         ]
       },
+      "irodori-0.2.0": {
+        "runtime_dependencies": [
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
       "is_executable-1.0.5": {
         "runtime_dependencies": [],
         "build_dependencies": [],
@@ -17411,6 +17426,52 @@
       },
       "pkg-config-0.3.33": {
         "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
+      "pleme-io-kazari-0.1.3": {
+        "runtime_dependencies": [
+          {
+            "name": "anstyle",
+            "package_key": "anstyle-1.0.14",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "irodori",
+            "package_key": "irodori-0.2.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "terminal_size",
+            "package_key": "terminal_size-0.4.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "unicode_width",
+            "package_key": "unicode-width-0.2.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
         "build_dependencies": [],
         "features": []
       },
@@ -22891,7 +22952,7 @@
           "std"
         ]
       },
-      "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22": {
+      "shigoto-types-0.1.13": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -22902,6 +22963,16 @@
             "optional": false,
             "target": null,
             "tree": "host"
+          },
+          {
+            "name": "blake3",
+            "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
           },
           {
             "name": "chrono",
@@ -22917,7 +22988,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2",
+            "package_key": "gen-platform-0.1.33",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22927,7 +22998,17 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2",
+            "package_key": "gen-types-0.1.33",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "hex",
+            "package_key": "hex-0.4.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -22983,7 +23064,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "shikumi-0.1.166-c232ca27180d1aa33ea2ae5874def1e339690add": {
+      "shikumi-0.1.345": {
         "runtime_dependencies": [
           {
             "name": "arc_swap",
@@ -23021,7 +23102,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2",
+            "package_key": "gen-platform-0.1.33",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -23031,7 +23112,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2",
+            "package_key": "gen-types-0.1.33",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25256,7 +25337,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-bytecode-0.1.153": {
         "runtime_dependencies": [
           {
             "name": "rnix",
@@ -25300,7 +25381,7 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-compat-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25310,7 +25391,7 @@
           },
           {
             "name": "sui_intern",
-            "package_key": "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-intern-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25320,7 +25401,7 @@
           },
           {
             "name": "sui_spec",
-            "package_key": "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-spec-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25342,7 +25423,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-compat-0.1.153": {
         "runtime_dependencies": [
           {
             "name": "base64",
@@ -25423,7 +25504,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-eval-0.1.153": {
         "runtime_dependencies": [
           {
             "name": "base64",
@@ -25485,6 +25566,16 @@
           {
             "name": "im_rc",
             "package_key": "im-rc-15.1.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "libc",
+            "package_key": "libc-0.2.186",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25648,7 +25739,7 @@
           },
           {
             "name": "sui_bytecode",
-            "package_key": "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-bytecode-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25658,7 +25749,7 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-compat-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25668,7 +25759,7 @@
           },
           {
             "name": "sui_graph_store",
-            "package_key": "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-graph-store-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25678,7 +25769,17 @@
           },
           {
             "name": "sui_intern",
-            "package_key": "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-intern-0.1.153",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "sui_resolve",
+            "package_key": "sui-resolve-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25688,7 +25789,7 @@
           },
           {
             "name": "sui_spec",
-            "package_key": "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-spec-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25698,7 +25799,7 @@
           },
           {
             "name": "sui_store",
-            "package_key": "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-store-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -25772,7 +25873,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-graph-store-0.1.153": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -25862,8 +25963,18 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-intern-0.1.153": {
         "runtime_dependencies": [
+          {
+            "name": "blake3",
+            "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
           {
             "name": "rustc_hash",
             "package_key": "rustc-hash-2.1.2",
@@ -25878,7 +25989,53 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-resolve-0.1.153": {
+        "runtime_dependencies": [
+          {
+            "name": "rnix",
+            "package_key": "rnix-0.14.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rowan",
+            "package_key": "rowan-0.16.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rustc_hash",
+            "package_key": "rustc-hash-2.1.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "sui_intern",
+            "package_key": "sui-intern-0.1.153",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "sui-spec-0.1.153": {
         "runtime_dependencies": [
           {
             "name": "base64",
@@ -25928,6 +26085,16 @@
             "uses_default_features": true,
             "optional": false,
             "target": "cfg(unix)",
+            "tree": "target"
+          },
+          {
+            "name": "kazari",
+            "package_key": "pleme-io-kazari-0.1.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
             "tree": "target"
           },
           {
@@ -26008,7 +26175,7 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-compat-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -26028,23 +26195,13 @@
           },
           {
             "name": "tatara_lisp",
-            "package_key": "tatara-lisp-0.2.2",
+            "package_key": "tatara-lisp-0.3.27",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
             "optional": false,
             "target": null,
             "tree": "target"
-          },
-          {
-            "name": "tatara_lisp_derive",
-            "package_key": "tatara-lisp-derive-0.2.2",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "host"
           },
           {
             "name": "thiserror",
@@ -26080,7 +26237,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+      "sui-store-0.1.153": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -26177,7 +26334,17 @@
           },
           {
             "name": "sui_compat",
-            "package_key": "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66",
+            "package_key": "sui-compat-0.1.153",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "sui_graph_store",
+            "package_key": "sui-graph-store-0.1.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -26239,7 +26406,9 @@
           }
         ],
         "build_dependencies": [],
-        "features": []
+        "features": [
+          "default"
+        ]
       },
       "symlink-0.1.0": {
         "runtime_dependencies": [],
@@ -26448,7 +26617,61 @@
           "xattr"
         ]
       },
-      "tatara-lisp-0.2.2": {
+      "tatara-closed-set-0.3.27": {
+        "runtime_dependencies": [
+          {
+            "name": "tatara_closed_set_derive",
+            "package_key": "tatara-closed-set-derive-0.3.27",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "tatara-closed-set-derive-0.3.27": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.45",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.117",
+            "kind": "normal",
+            "features": [
+              "full"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "tatara-lisp-0.3.27": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -26483,8 +26706,18 @@
             "tree": "target"
           },
           {
+            "name": "tatara_closed_set",
+            "package_key": "tatara-closed-set-0.3.27",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "tatara_lisp_derive",
-            "package_key": "tatara-lisp-derive-0.2.2",
+            "package_key": "tatara-lisp-derive-0.3.27",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -26508,7 +26741,7 @@
           "default"
         ]
       },
-      "tatara-lisp-derive-0.2.2": {
+      "tatara-lisp-derive-0.3.27": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -26598,6 +26831,24 @@
           "default",
           "getrandom"
         ]
+      },
+      "terminal_size-0.4.4": {
+        "runtime_dependencies": [
+          {
+            "name": "rustix",
+            "package_key": "rustix-1.1.4",
+            "kind": "normal",
+            "features": [
+              "termios"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": "cfg(unix)",
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
       },
       "text-size-1.1.1": {
         "runtime_dependencies": [],
@@ -28295,6 +28546,14 @@
         ]
       },
       "unicode-width-0.1.14": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": [
+          "cjk",
+          "default"
+        ]
+      },
+      "unicode-width-0.2.2": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
@@ -36700,9 +36959,6 @@
     "cmake-0.1.58": {
       "edition": "2021"
     },
-    "cofre-fs-0.1.0-4f70b8fa025f2b78b7ca062fb0feb31188a8d31a": {
-      "edition": "2024"
-    },
     "colorchoice-1.0.5": {
       "edition": "2021"
     },
@@ -36859,7 +37115,7 @@
     "encoding_rs-0.8.35": {
       "edition": "2018"
     },
-    "engenho-0.1.5": {
+    "engenho-0.53.3": {
       "edition": "2024",
       "binaries": [
         {
@@ -36868,21 +37124,21 @@
         }
       ]
     },
-    "engenho-apiserver-0.1.5": {
+    "engenho-apiserver-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_apiserver",
         "path": "src/lib.rs"
       }
     },
-    "engenho-cluster-config-0.1.5": {
+    "engenho-cluster-config-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_cluster_config",
         "path": "src/lib.rs"
       }
     },
-    "engenho-cluster-config-render-0.1.5": {
+    "engenho-cluster-config-render-0.53.3": {
       "edition": "2024",
       "binaries": [
         {
@@ -36891,35 +37147,35 @@
         }
       ]
     },
-    "engenho-config-0.1.5": {
+    "engenho-config-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_config",
         "path": "src/lib.rs"
       }
     },
-    "engenho-controllers-0.1.5": {
+    "engenho-controllers-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_controllers",
         "path": "src/lib.rs"
       }
     },
-    "engenho-diff-0.1.5": {
+    "engenho-diff-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_diff",
         "path": "src/lib.rs"
       }
     },
-    "engenho-fonte-0.1.5": {
+    "engenho-fonte-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_fonte",
         "path": "src/lib.rs"
       }
     },
-    "engenho-fonte-cli-0.1.5": {
+    "engenho-fonte-cli-0.53.3": {
       "edition": "2024",
       "binaries": [
         {
@@ -36928,14 +37184,14 @@
         }
       ]
     },
-    "engenho-kube-client-0.1.5": {
+    "engenho-kube-client-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_kube_client",
         "path": "src/lib.rs"
       }
     },
-    "engenho-kube-codegen-0.1.5": {
+    "engenho-kube-codegen-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_kube_codegen",
@@ -36948,7 +37204,7 @@
         }
       ]
     },
-    "engenho-kube-proto-0.1.5": {
+    "engenho-kube-proto-0.53.3": {
       "edition": "2024",
       "build_script": "build.rs",
       "lib_target": {
@@ -36956,21 +37212,21 @@
         "path": "src/lib.rs"
       }
     },
-    "engenho-kubelet-0.1.5": {
+    "engenho-kubelet-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_kubelet",
         "path": "src/lib.rs"
       }
     },
-    "engenho-machines-0.1.5": {
+    "engenho-machines-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_machines",
         "path": "src/lib.rs"
       }
     },
-    "engenho-mcp-0.1.5": {
+    "engenho-mcp-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_mcp",
@@ -36983,63 +37239,63 @@
         }
       ]
     },
-    "engenho-revoada-0.1.5": {
+    "engenho-revoada-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_revoada",
         "path": "src/lib.rs"
       }
     },
-    "engenho-runtime-0.1.5": {
+    "engenho-runtime-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_runtime",
         "path": "src/lib.rs"
       }
     },
-    "engenho-scheduler-0.1.5": {
+    "engenho-scheduler-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_scheduler",
         "path": "src/lib.rs"
       }
     },
-    "engenho-store-0.1.5": {
+    "engenho-store-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_store",
         "path": "src/lib.rs"
       }
     },
-    "engenho-substrate-0.1.5": {
+    "engenho-substrate-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_substrate",
         "path": "src/lib.rs"
       }
     },
-    "engenho-substrate-props-0.1.5": {
+    "engenho-substrate-props-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_substrate_props",
         "path": "src/lib.rs"
       }
     },
-    "engenho-sui-typescape-0.1.5": {
+    "engenho-sui-typescape-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_sui_typescape",
         "path": "src/lib.rs"
       }
     },
-    "engenho-teia-0.1.5": {
+    "engenho-teia-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_teia",
         "path": "src/lib.rs"
       }
     },
-    "engenho-types-0.1.5": {
+    "engenho-types-0.53.3": {
       "edition": "2024",
       "lib_target": {
         "name": "engenho_types",
@@ -37150,14 +37406,14 @@
     "futures-util-0.3.32": {
       "edition": "2018"
     },
-    "gen-macros-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2": {
+    "gen-macros-0.1.33": {
       "edition": "2024",
       "proc_macro": true
     },
-    "gen-platform-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2": {
+    "gen-platform-0.1.33": {
       "edition": "2024"
     },
-    "gen-types-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2": {
+    "gen-types-0.1.33": {
       "edition": "2024"
     },
     "generic-array-0.14.7": {
@@ -37513,6 +37769,9 @@
     "ipnet-2.12.0": {
       "edition": "2018"
     },
+    "irodori-0.2.0": {
+      "edition": "2024"
+    },
     "is_executable-1.0.5": {
       "edition": "2021"
     },
@@ -37845,6 +38104,13 @@
     },
     "pkg-config-0.3.33": {
       "edition": "2018"
+    },
+    "pleme-io-kazari-0.1.3": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "kazari",
+        "path": "src/lib.rs"
+      }
     },
     "portable-atomic-1.13.1": {
       "edition": "2018",
@@ -38271,10 +38537,10 @@
     "shell-words-1.1.1": {
       "edition": "2015"
     },
-    "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22": {
+    "shigoto-types-0.1.13": {
       "edition": "2024"
     },
-    "shikumi-0.1.166-c232ca27180d1aa33ea2ae5874def1e339690add": {
+    "shikumi-0.1.345": {
       "edition": "2024"
     },
     "shlex-1.3.0": {
@@ -38366,22 +38632,25 @@
     "subtle-2.6.1": {
       "edition": "2018"
     },
-    "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-bytecode-0.1.153": {
       "edition": "2024"
     },
-    "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-compat-0.1.153": {
       "edition": "2024"
     },
-    "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-eval-0.1.153": {
       "edition": "2024"
     },
-    "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-graph-store-0.1.153": {
       "edition": "2024"
     },
-    "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-intern-0.1.153": {
       "edition": "2024"
     },
-    "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-resolve-0.1.153": {
+      "edition": "2024"
+    },
+    "sui-spec-0.1.153": {
       "edition": "2024",
       "binaries": [
         {
@@ -38394,7 +38663,7 @@
         }
       ]
     },
-    "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": {
+    "sui-store-0.1.153": {
       "edition": "2024"
     },
     "symlink-0.1.0": {
@@ -38426,14 +38695,24 @@
     "tar-0.4.46": {
       "edition": "2021"
     },
-    "tatara-lisp-0.2.2": {
+    "tatara-closed-set-0.3.27": {
       "edition": "2021"
     },
-    "tatara-lisp-derive-0.2.2": {
+    "tatara-closed-set-derive-0.3.27": {
+      "edition": "2021",
+      "proc_macro": true
+    },
+    "tatara-lisp-0.3.27": {
+      "edition": "2021"
+    },
+    "tatara-lisp-derive-0.3.27": {
       "edition": "2021",
       "proc_macro": true
     },
     "tempfile-3.27.0": {
+      "edition": "2021"
+    },
+    "terminal_size-0.4.4": {
       "edition": "2021"
     },
     "text-size-1.1.1": {
@@ -38583,6 +38862,9 @@
       "edition": "2021"
     },
     "unicode-width-0.1.14": {
+      "edition": "2021"
+    },
+    "unicode-width-0.2.2": {
       "edition": "2021"
     },
     "unicode-xid-0.2.6": {
@@ -38774,20 +39056,6 @@
       "links": "zstd"
     }
   },
-  "git_nar_sha256": {
-    "cofre-fs-0.1.0-4f70b8fa025f2b78b7ca062fb0feb31188a8d31a": "sha256-6zDJ/dwsxZgb3KL2RuZFWMfcsQqKp7XAJvDDJgiyzrA=",
-    "gen-macros-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2": "sha256-lPsm5o3j8A0d8wzeD/DwZdJOaSnddTkLAISAp/7gPk4=",
-    "gen-platform-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2": "sha256-lPsm5o3j8A0d8wzeD/DwZdJOaSnddTkLAISAp/7gPk4=",
-    "gen-types-0.1.18-8ff43f2c8fae5d7b46a499eac0dc7c3f96481ae2": "sha256-lPsm5o3j8A0d8wzeD/DwZdJOaSnddTkLAISAp/7gPk4=",
-    "shigoto-types-0.1.0-417bf9d538a1741c5576b29a4d71673e92cf5d22": "sha256-KaNUnx3IpQFGdlox6zK3vHHiGVXiy+fHyb4BxOxHQn4=",
-    "shikumi-0.1.166-c232ca27180d1aa33ea2ae5874def1e339690add": "sha256-rwNekY+zvV1Qywzpcoj3fMbB/3GrwwkR4qfFgwG00mY=",
-    "sui-bytecode-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-compat-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-eval-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-graph-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-intern-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-spec-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc=",
-    "sui-store-0.1.12-cd18f45c16c7191d68378884364256f9d58d3b66": "sha256-qlze1HkrK6VdjodE24laU1glASgXPSS61WJMlyv1Buc="
-  },
+  "git_nar_sha256": {},
   "flake_metadata": {}
 }
