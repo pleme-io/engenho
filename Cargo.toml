@@ -67,8 +67,8 @@ engenho-revoada        = { path = "engenho-revoada", version = "0.53.2" }
 
 # Pleme-io sibling-directory path deps for typed-dispatcher
 # catalog integration (theory/UNIFIED-COMPUTING-MODEL.md §VI).
-gen-platform = { git = "https://github.com/pleme-io/gen" }
-gen-types = { git = "https://github.com/pleme-io/gen" }
+gen-platform = { git = "https://github.com/pleme-io/gen", version = "0.1" }
+gen-types = { git = "https://github.com/pleme-io/gen", version = "0.1" }
 
 # Convergence primitive — engenho-types' KubeError::classify consumes the
 # canonical Transient/Declarative split (theory/CONVERGENCE-ADOPTION.md;
