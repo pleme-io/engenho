@@ -67,17 +67,13 @@ engenho-revoada        = { path = "engenho-revoada", version = "0.53.3" }
 
 # Pleme-io sibling-directory path deps for typed-dispatcher
 # catalog integration (theory/UNIFIED-COMPUTING-MODEL.md §VI).
-gen-platform = { git = "https://github.com/pleme-io/gen", version = "0.1" }
-gen-types = { git = "https://github.com/pleme-io/gen", version = "0.1" }
+gen-platform = "0.1"
+gen-types = "0.1"
 
 # Convergence primitive — engenho-types' KubeError::classify consumes the
 # canonical Transient/Declarative split (theory/CONVERGENCE-ADOPTION.md;
 # theory/FAILURE-CLASSIFICATION.md) instead of hand-rolling FailureClass.
-# version+git: `version` keeps engenho-types crates.io-publishable
-# (FailureKind ships in shigoto-types 0.1.0); `git`+`rev` resolve the
-# local build against the re-home commit, whose transitive gen-platform
-# unifies with engenho's own git gen-platform (single closure).
-shigoto-types = { version = "0.1", git = "https://github.com/pleme-io/shigoto", rev = "417bf9d538a1741c5576b29a4d71673e92cf5d22" }
+shigoto-types = "0.1"
 
 axum                   = "0.7"
 # Lock-free runtime-mutable handler table for the apiserver dispatch map.
