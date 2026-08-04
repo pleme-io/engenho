@@ -53,11 +53,11 @@ getrandom           = "0.3"
 # Optional — enabled by `with-cofre`. Secure file creation via open(2)
 # with mode (no chmod-after-write race). Cross-workspace git dep to
 # pleme-io/cofre.
-cofre-fs            = { git = "https://github.com/pleme-io/cofre", version = "0.1.0", optional = true }
+cofre-fs            = { version = "0.1.0", optional = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
 serde_json = { workspace = true }
-shikumi = { git = "https://github.com/pleme-io/shikumi", version = "0.1.0" }
+shikumi = "0.1.0"
 tempfile = "3"
 tokio = { workspace = true }
