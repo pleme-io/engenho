@@ -911,11 +911,12 @@ fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
         source,
     })?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(pki, std::fs::Permissions::from_mode(0o700))
-        .map_err(|source| RuntimeError::KubeconfigIo {
+    std::fs::set_permissions(pki, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
+        RuntimeError::KubeconfigIo {
             path: pki.to_path_buf(),
             source,
-        })
+        }
+    })
 }
 
 /// Non-unix: no modes to set.
@@ -953,11 +954,12 @@ fn write_at_mode(path: &std::path::Path, contents: &str, mode: u32) -> Result<()
         source,
     })?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(|source| RuntimeError::KubeconfigIo {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|source| {
+        RuntimeError::KubeconfigIo {
             path: path.to_path_buf(),
             source,
-        })
+        }
+    })
 }
 
 /// Non-unix: file modes don't apply, so this is a plain write. cofre-fs is
