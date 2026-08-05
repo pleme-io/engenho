@@ -125,7 +125,9 @@ impl Connection {
                 args,
                 env,
                 api_version,
-            } => self.exec_credential(command, args, env, api_version).map(Some),
+            } => self
+                .exec_credential(command, args, env, api_version)
+                .map(Some),
             _ => Ok(None),
         }
     }
@@ -164,9 +166,9 @@ impl Connection {
             );
         }
 
-        let out = cmd.output().map_err(|e| {
-            KubeError::Auth(format!("exec credential plugin `{command}`: {e}"))
-        })?;
+        let out = cmd
+            .output()
+            .map_err(|e| KubeError::Auth(format!("exec credential plugin `{command}`: {e}")))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(KubeError::Auth(format!(
@@ -177,7 +179,9 @@ impl Connection {
         }
 
         let reply: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
-            KubeError::Auth(format!("exec credential plugin `{command}` reply is not JSON: {e}"))
+            KubeError::Auth(format!(
+                "exec credential plugin `{command}` reply is not JSON: {e}"
+            ))
         })?;
         let token = reply
             .get("status")
@@ -255,7 +259,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let t = c.bearer_token().unwrap().expect("exec plugin must yield a token");
+        let t = c
+            .bearer_token()
+            .unwrap()
+            .expect("exec plugin must yield a token");
         assert_eq!(t.expose_secret(), "tok-abc");
     }
 
