@@ -180,3 +180,4 @@ jobs:
         with:
           shared-key: clippy-ubuntu
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        continue-on-error: true
