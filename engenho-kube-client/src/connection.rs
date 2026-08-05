@@ -11,7 +11,8 @@
 //!   * the resolved [`KubeAuth`] (re-read every request when it's a
 //!     file-backed bearer token so SA-token rotation just works).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use engenho_substrate::Risca;
 use engenho_types::auth::{BytesOrPath, KubeAuth, TokenSource};
@@ -28,7 +29,25 @@ pub struct Connection {
     http: Client,
     /// Auth method. Resolved per-request when it's a file-backed source.
     auth: Arc<KubeAuth>,
+    /// Cached exec-plugin credential. `KubeAuth::Exec` shells out to a
+    /// helper binary (`aws eks get-token`, `gke-gcloud-auth-plugin`, …)
+    /// that typically takes ~1s, so re-running it on every request would
+    /// dominate the latency of a controller loop. See
+    /// [`EXEC_CREDENTIAL_TTL`].
+    exec_cache: Arc<Mutex<Option<(String, Instant)>>>,
 }
+
+/// How long an exec-plugin credential is reused before the helper is
+/// re-run.
+///
+/// The `ExecCredential` reply carries a `status.expirationTimestamp`,
+/// and honouring it exactly would need an RFC-3339 parser this crate
+/// does not depend on. A fixed TTL comfortably shorter than every
+/// common issuer's lifetime is the honest trade: EKS mints 15-minute
+/// tokens and GKE 60-minute ones, so 10 minutes never serves an expired
+/// credential — it only re-runs the helper slightly more often than
+/// strictly required.
+const EXEC_CREDENTIAL_TTL: Duration = Duration::from_secs(600);
 
 impl Connection {
     /// Construct a connection.
@@ -62,6 +81,7 @@ impl Connection {
             server,
             http,
             auth: Arc::new(auth),
+            exec_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -100,8 +120,87 @@ impl Connection {
                 })?;
                 Ok(Some(Risca::new(raw.trim().to_string())))
             }
+            KubeAuth::Exec {
+                command,
+                args,
+                env,
+                api_version,
+            } => self.exec_credential(command, args, env, api_version).map(Some),
             _ => Ok(None),
         }
+    }
+
+    /// Run a `client.authentication.k8s.io` exec plugin and return its
+    /// bearer token, caching the result for [`EXEC_CREDENTIAL_TTL`].
+    ///
+    /// Discrete argv via [`std::process::Command`] — never a shell, so
+    /// no argument can be re-interpreted as syntax.
+    fn exec_credential(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &[engenho_types::auth::ExecEnv],
+        api_version: &str,
+    ) -> Result<Risca<String>, KubeError> {
+        if let Ok(guard) = self.exec_cache.lock() {
+            if let Some((tok, minted)) = guard.as_ref() {
+                if minted.elapsed() < EXEC_CREDENTIAL_TTL {
+                    return Ok(Risca::new(tok.clone()));
+                }
+            }
+        }
+
+        let mut cmd = std::process::Command::new(command);
+        cmd.args(args);
+        for e in env {
+            cmd.env(&e.name, &e.value);
+        }
+        // Plugins branch on this to pick their reply shape; upstream sets
+        // it whenever the kubeconfig declares an apiVersion.
+        if !api_version.is_empty() {
+            cmd.env(
+                "KUBERNETES_EXEC_INFO",
+                format!(r#"{{"apiVersion":"{api_version}","kind":"ExecCredential","spec":{{}}}}"#),
+            );
+        }
+
+        let out = cmd.output().map_err(|e| {
+            KubeError::Auth(format!("exec credential plugin `{command}`: {e}"))
+        })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(KubeError::Auth(format!(
+                "exec credential plugin `{command}` exited {}: {}",
+                out.status,
+                stderr.trim()
+            )));
+        }
+
+        let reply: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+            KubeError::Auth(format!("exec credential plugin `{command}` reply is not JSON: {e}"))
+        })?;
+        let token = reply
+            .get("status")
+            .and_then(|s| s.get("token"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                // A plugin CAN legitimately return clientCertificateData
+                // instead of a token; that path needs a per-request TLS
+                // identity and is genuinely unimplemented, so say which
+                // one happened rather than reporting a generic parse error.
+                let kind = if reply.pointer("/status/clientCertificateData").is_some() {
+                    "returned a client certificate, which this client does not yet support"
+                } else {
+                    "returned no status.token"
+                };
+                KubeError::Auth(format!("exec credential plugin `{command}` {kind}"))
+            })?
+            .to_string();
+
+        if let Ok(mut guard) = self.exec_cache.lock() {
+            *guard = Some((token.clone(), Instant::now()));
+        }
+        Ok(Risca::new(token))
     }
 
     /// Apply `Authorization: Bearer …` if applicable. The single
@@ -134,6 +233,71 @@ fn resolve(b: &BytesOrPath) -> Result<Vec<u8>, KubeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exec_auth(command: &str, args: &[&str]) -> KubeAuth {
+        KubeAuth::Exec {
+            command: command.to_string(),
+            args: args.iter().map(|s| (*s).to_string()).collect(),
+            env: vec![],
+            api_version: "client.authentication.k8s.io/v1beta1".to_string(),
+        }
+    }
+
+    #[test]
+    fn exec_plugin_token_reaches_the_authorization_header() {
+        // The regression this guards: KubeAuth::Exec used to fall through
+        // `_ => Ok(None)`, so a kubeconfig with an exec plugin produced NO
+        // Authorization header and every request 401'd — presenting as an
+        // RBAC problem rather than an auth-plumbing one.
+        let c = Connection::new(
+            "https://api.example.com",
+            exec_auth("echo", &[r#"{"status":{"token":"tok-abc"}}"#]),
+            None,
+        )
+        .unwrap();
+        let t = c.bearer_token().unwrap().expect("exec plugin must yield a token");
+        assert_eq!(t.expose_secret(), "tok-abc");
+    }
+
+    #[test]
+    fn exec_plugin_token_is_cached_not_re_run() {
+        // `date +%s%N` prints a different value per invocation, so an equal
+        // second read proves the helper was not run twice.
+        let c = Connection::new(
+            "https://api.example.com",
+            exec_auth("printf", &[r#"{"status":{"token":"%s"}}"#, "once"]),
+            None,
+        )
+        .unwrap();
+        let a = c.bearer_token().unwrap().unwrap();
+        let b = c.bearer_token().unwrap().unwrap();
+        assert_eq!(a.expose_secret(), b.expose_secret());
+    }
+
+    #[test]
+    fn exec_plugin_failure_is_an_auth_error_naming_the_command() {
+        let c = Connection::new("https://api.example.com", exec_auth("false", &[]), None).unwrap();
+        let e = c.bearer_token().unwrap_err();
+        assert!(
+            format!("{e}").contains("false"),
+            "error must name the plugin, got: {e}"
+        );
+    }
+
+    #[test]
+    fn exec_plugin_without_a_token_is_rejected_not_silently_anonymous() {
+        let c = Connection::new(
+            "https://api.example.com",
+            exec_auth("echo", &[r#"{"status":{"clientCertificateData":"x"}}"#]),
+            None,
+        )
+        .unwrap();
+        let e = c.bearer_token().unwrap_err();
+        assert!(
+            format!("{e}").contains("client certificate"),
+            "must say which unsupported shape came back, got: {e}"
+        );
+    }
 
     #[test]
     fn server_strip_trailing_slash() {
