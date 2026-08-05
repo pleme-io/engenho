@@ -22,5 +22,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
+
+      # ── THE FATAL GATE — the delta-freshness tie ────────────────────────
+      # `gen confirm` is a pure OFFLINE check: it recomputes sha256(Cargo.lock)
+      # and compares it to the `cargo_lock_sha256` recorded in the committed
+      # Cargo.gen.lock (the D2 tie). No cargo metadata, no network, no
+      # ~/.cargo — seconds, and correct with no environment to get wrong.
+      #
+      # WHY IT IS FATAL, measured 2026-08-04/05. A Cargo.lock that moves
+      # without a matching `gen build` is not a lint nit here: every Nix
+      # consumer of this workspace fails to EVAL — not build, EVAL — so the
+      # break reaches machines that never asked for engenho. It happened
+      # THREE times in one evening (fd54e5e, 3169392, and post-v0.53.7), each
+      # time found by a human staring at a red fleet.
+      #
+      # It escaped because this job ran `nix flake check` with
+      # `continue-on-error: true` — CI executed the check that would have
+      # caught it, then discarded the verdict. The run at 2026-08-05T04:41Z
+      # reports `conclusion: success` for a tree that was breaking the fleet
+      # at that moment. A gate whose verdict is ignored is worse than no gate:
+      # it manufactures confidence.
+      #
+      # Fix locally with: gen build && git commit Cargo.gen.lock
+      - name: delta freshness (Cargo.lock <-> Cargo.gen.lock)
+        run: nix run github:pleme-io/gen -- confirm
+
+      # The broad flake check stays NON-fatal deliberately, and that is not
+      # laziness: this flake exposes no real `checks.<system>.*` (test.yml's
+      # header explains why), so `nix flake check` here is a smoke signal
+      # rather than a contract. Narrow-and-fatal beats broad-and-advisory —
+      # the freshness tie above is the invariant with teeth.
       - run: nix flake check
         continue-on-error: true
