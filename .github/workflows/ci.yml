@@ -27,7 +27,16 @@ jobs:
       # `gen confirm` is a pure OFFLINE check: it recomputes sha256(Cargo.lock)
       # and compares it to the `cargo_lock_sha256` recorded in the committed
       # Cargo.gen.lock (the D2 tie). No cargo metadata, no network, no
-      # ~/.cargo — seconds, and correct with no environment to get wrong.
+      # ~/.cargo, nothing environmental to get wrong.
+      #
+      # COST, measured rather than assumed: the CHECK is instant, but OBTAINING
+      # it is not — `pleme-io/gen` publishes no release binaries, and this
+      # runner has no pleme binary cache, so `nix run` compiles gen from source
+      # on a cold runner (observed building anstyle-parse, arc-swap, … before
+      # being cut off). Budget minutes, not seconds. That is still the right
+      # trade against a defect that broke four machines in one evening — but it
+      # is a real cost, and the honest fix is to publish gen binaries via
+      # auto-release and pin one here, at which point this step is instant.
       #
       # WHY IT IS FATAL, measured 2026-08-04/05. A Cargo.lock that moves
       # without a matching `gen build` is not a lint nit here: every Nix
