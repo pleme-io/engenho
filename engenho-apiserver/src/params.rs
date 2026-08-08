@@ -13,6 +13,8 @@
 //! JSON. The on-wire shape is K8s newline-delimited JSON: each line is a
 //! `WatchEvent` `{"type":...,"object":...}` followed by a `\n`.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +50,22 @@ pub struct ListWatchParams {
         deserialize_with = "de_bool_default_true"
     )]
     pub allow_watch_bookmarks: bool,
+    /// `sendInitialEvents=true` — Kubernetes 1.27 **streaming lists**. The
+    /// server replays current state as `ADDED` events, then emits a BOOKMARK
+    /// annotated [`INITIAL_EVENTS_END_ANNOTATION`]; the client never issues a
+    /// separate LIST.
+    ///
+    /// This is the DEFAULT path for `kube-rs`'s `watcher` under
+    /// `Config::streaming_lists()`. Until 2026-08-08 engenho parsed no such
+    /// param and silently ignored it, so a streaming-list client received a
+    /// lone bookmark, zero objects, and never left its initializing state.
+    #[serde(rename = "sendInitialEvents", deserialize_with = "de_bool")]
+    pub send_initial_events: bool,
+    /// `resourceVersionMatch=NotOlderThan` — required by K8s alongside
+    /// `sendInitialEvents`. Accepted and recorded; engenho always serves the
+    /// most recent revision, which satisfies `NotOlderThan` by construction.
+    #[serde(rename = "resourceVersionMatch")]
+    pub resource_version_match: Option<String>,
     /// Accepted + parsed, no-op at M0.1 (informer long-poll timeout).
     #[serde(rename = "timeoutSeconds")]
     pub timeout_seconds: Option<String>,
@@ -405,10 +423,37 @@ struct K8sWatchLine<'a> {
     object: &'a serde_json::Value,
 }
 
+/// The `(apiVersion, kind)` a watch stream stamps onto every object it
+/// emits.
+///
+/// A watch object is serialized **standalone**, so — unlike a LIST item,
+/// whose TypeMeta the `<Kind>List` envelope carries — it MUST carry its own
+/// `apiVersion`/`kind`. This is not cosmetic: `kube_core::watch::Bookmark`
+/// holds a `#[serde(flatten)] TypeMeta`, so a bookmark without `apiVersion`
+/// fails to deserialize with `missing field 'apiVersion'` and takes the whole
+/// stream down with it. Measured 2026-08-08 against banken.
+#[derive(Debug, Clone, Copy)]
+pub struct WatchGvk<'a> {
+    /// `"v1"` for the core group, `"<group>/<version>"` otherwise.
+    pub api_version: &'a str,
+    /// The singular kind — `"Pod"`, `"ConfigMap"`, …
+    pub kind: &'a str,
+}
+
+/// The annotation kube-apiserver sets on the final initial-events BOOKMARK
+/// to tell a streaming-list client that the replay is complete. A client
+/// (kube-rs `watcher`, client-go reflector) stays in its "initializing"
+/// state until it sees this, so omitting it means the informer never
+/// becomes ready even when every object was delivered.
+pub const INITIAL_EVENTS_END_ANNOTATION: &str = "k8s.io/initial-events-end";
+
 /// The synthetic object a BOOKMARK line carries:
-/// `{"metadata":{"resourceVersion":"N"}}`.
+/// `{"kind":..,"apiVersion":..,"metadata":{"resourceVersion":"N"}}`.
 #[derive(Serialize)]
-struct K8sBookmarkObject {
+struct K8sBookmarkObject<'a> {
+    kind: &'a str,
+    #[serde(rename = "apiVersion")]
+    api_version: &'a str,
     metadata: K8sBookmarkMeta,
 }
 
@@ -416,6 +461,11 @@ struct K8sBookmarkObject {
 struct K8sBookmarkMeta {
     #[serde(rename = "resourceVersion")]
     resource_version: String,
+    /// Omitted entirely unless this is the initial-events terminator —
+    /// an empty annotations map on every ordinary bookmark would be noise
+    /// on the wire that kube-apiserver does not emit either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<BTreeMap<&'static str, &'static str>>,
 }
 
 /// Encode a watch `Event` as a newline-terminated K8s watch line —
@@ -423,21 +473,53 @@ struct K8sBookmarkMeta {
 /// ONLY `{type, object}`; `object` is `ev.object`, which already carries
 /// `metadata.resourceVersion` stamped by the catalog.
 #[must_use]
-pub fn to_k8s_watch_line(ev: &WatchEvent) -> Bytes {
+pub fn to_k8s_watch_line(ev: &WatchEvent, gvk: WatchGvk<'_>) -> Bytes {
+    event_line(ev.kind, &ev.object, gvk)
+}
+
+/// Encode one `{"type":..,"object":..}` line, stamping `gvk` onto the object
+/// when it does not already carry its own TypeMeta.
+///
+/// Shared by the live-stream path and the `sendInitialEvents` replay, so the
+/// two cannot drift into emitting different shapes for the same object — the
+/// replay is exactly what the live stream would have said.
+#[must_use]
+pub fn event_line(kind: WatchEventKind, object: &serde_json::Value, gvk: WatchGvk<'_>) -> Bytes {
+    let stamped = stamp_type_meta(object, gvk);
     let line = K8sWatchLine {
-        kind: ev.kind,
-        object: &ev.object,
+        kind,
+        object: &stamped,
     };
     encode_ndjson(&line)
+}
+
+/// Add `kind` + `apiVersion` to `v` if absent, leaving an object that already
+/// declares its own TypeMeta untouched (a stored create/PUT body carries one).
+fn stamp_type_meta(v: &serde_json::Value, gvk: WatchGvk<'_>) -> serde_json::Value {
+    let mut out = v.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.entry("kind".to_string())
+            .or_insert_with(|| serde_json::Value::String(gvk.kind.to_owned()));
+        obj.entry("apiVersion".to_string())
+            .or_insert_with(|| serde_json::Value::String(gvk.api_version.to_owned()));
+    }
+    out
 }
 
 /// Encode a BOOKMARK line —
 /// `{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"N"}}}\n`.
 #[must_use]
-pub fn bookmark_line(rev: Revision) -> Bytes {
+pub fn bookmark_line(rev: Revision, gvk: WatchGvk<'_>, initial_events_end: bool) -> Bytes {
     let object = K8sBookmarkObject {
+        kind: gvk.kind,
+        api_version: gvk.api_version,
         metadata: K8sBookmarkMeta {
             resource_version: rev.to_string(),
+            annotations: initial_events_end.then(|| {
+                let mut m = BTreeMap::new();
+                m.insert(INITIAL_EVENTS_END_ANNOTATION, "true");
+                m
+            }),
         },
     };
     let line = K8sWatchLine {
@@ -985,7 +1067,7 @@ mod tests {
             key: ResourceKey::namespaced("", "v1", "Pod", "default", "p"),
             resource_version: 7,
         };
-        let bytes = to_k8s_watch_line(&ev);
+        let bytes = to_k8s_watch_line(&ev, test_gvk());
         let s = std::str::from_utf8(&bytes).unwrap();
         assert!(s.ends_with('\n'), "line is newline-terminated");
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
@@ -999,9 +1081,87 @@ mod tests {
         assert!(v.get("key").is_none(), "no internal key field on the wire");
     }
 
+    /// The core-group Pod GVK every watch-wire test stamps with.
+    fn test_gvk() -> WatchGvk<'static> {
+        WatchGvk {
+            api_version: "v1",
+            kind: "Pod",
+        }
+    }
+
+    /// A watch object is serialized standalone, so it MUST carry its own
+    /// TypeMeta — `kube_core::watch::Bookmark` flattens a `TypeMeta`, and a
+    /// bookmark without `apiVersion` fails client deserialization outright.
+    #[test]
+    fn every_watch_object_carries_its_type_meta() {
+        // An object with no TypeMeta of its own gets the stream's stamped on.
+        let ev = WatchEvent {
+            kind: WatchEventKind::Added,
+            object: serde_json::json!({"metadata": {"resourceVersion": "7"}}),
+            key: ResourceKey::namespaced("", "v1", "Pod", "default", "p"),
+            resource_version: 7,
+        };
+        let bytes = to_k8s_watch_line(&ev, test_gvk());
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
+        let obj = v.get("object").unwrap();
+        assert_eq!(obj.get("apiVersion").unwrap(), "v1");
+        assert_eq!(obj.get("kind").unwrap(), "Pod");
+
+        // And so does a BOOKMARK — the case that actually broke kube-rs.
+        let bytes = bookmark_line(Revision(99), test_gvk(), false);
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
+        let obj = v.get("object").unwrap();
+        assert_eq!(obj.get("apiVersion").unwrap(), "v1");
+        assert_eq!(obj.get("kind").unwrap(), "Pod");
+    }
+
+    /// Only the initial-events terminator carries the annotation; an
+    /// ordinary periodic bookmark must NOT, or a client would treat every
+    /// bookmark as "the replay finished".
+    #[test]
+    fn only_the_initial_events_terminator_is_annotated() {
+        let terminator = bookmark_line(Revision(5), test_gvk(), true);
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&terminator).unwrap().trim_end()).unwrap();
+        assert_eq!(
+            v.pointer("/object/metadata/annotations")
+                .and_then(|a| a.get(INITIAL_EVENTS_END_ANNOTATION))
+                .and_then(serde_json::Value::as_str),
+            Some("true"),
+        );
+
+        let ordinary = bookmark_line(Revision(5), test_gvk(), false);
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&ordinary).unwrap().trim_end()).unwrap();
+        assert!(
+            v.pointer("/object/metadata/annotations").is_none(),
+            "an ordinary bookmark must carry no annotations at all",
+        );
+    }
+
+    #[test]
+    fn send_initial_events_is_parsed() {
+        let p: ListWatchParams = serde_urlencoded::from_str(
+            "watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan",
+        )
+        .expect("streaming-list params parse");
+        assert!(p.send_initial_events, "sendInitialEvents=true must parse");
+        assert_eq!(p.resource_version_match.as_deref(), Some("NotOlderThan"));
+
+        let p: ListWatchParams =
+            serde_urlencoded::from_str("watch=true").expect("plain watch params parse");
+        assert!(
+            !p.send_initial_events,
+            "absent sendInitialEvents must default false — a plain watch must \
+             not silently become a streaming list",
+        );
+    }
+
     #[test]
     fn bookmark_line_shape() {
-        let bytes = bookmark_line(Revision(99));
+        let bytes = bookmark_line(Revision(99), test_gvk(), false);
         let s = std::str::from_utf8(&bytes).unwrap();
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(v.get("type").unwrap(), "BOOKMARK");

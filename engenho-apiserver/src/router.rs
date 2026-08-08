@@ -48,7 +48,7 @@ use engenho_kube_proto::{
     self as kube_proto, CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type,
     response_wants_protobuf,
 };
-use engenho_store::{WatchGone, WatchSignal, WatchStream};
+use engenho_store::{WatchEventKind, WatchGone, WatchSignal, WatchStream};
 use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::Subresource;
 use engenho_types::patch::PatchType;
@@ -60,8 +60,8 @@ use crate::handler::ResourceHandler;
 use crate::health;
 use crate::openapi::ApiDoc;
 use crate::params::{
-    ListWatchParams, ResumePoint, Selectors, bookmark_line, gvk_ns_matches, status_410_line,
-    to_k8s_watch_line,
+    ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, event_line, gvk_ns_matches,
+    status_410_line, to_k8s_watch_line,
 };
 
 /// The dispatch key for a registered handler: `(group, version, plural)`.
@@ -1034,7 +1034,35 @@ async fn watch_response(
     p: ListWatchParams,
     sel: Selectors,
 ) -> Result<Response, ApiError> {
-    let from: ResumePoint = p.resume_point()?;
+    let mut from: ResumePoint = p.resume_point()?;
+
+    // ── streaming lists (K8s 1.27 `sendInitialEvents`) ──
+    //
+    // The client asked for the current state to arrive AS watch events
+    // instead of issuing a separate LIST. Snapshot first, then open the
+    // stream AT that snapshot's revision — opening the stream first would
+    // leave a window in which a change lands after the stream registers but
+    // before the snapshot is taken, and the client would see it twice; the
+    // reverse order can only ever REPLAY, never drop.
+    let mut prelude: Vec<Bytes> = Vec::new();
+    if p.send_initial_events {
+        let (items, rv) = h.list_at(namespace.as_deref(), &sel).await?;
+        let api_version = h.api_version();
+        let gvk = WatchGvk {
+            api_version: &api_version,
+            kind: h.kind(),
+        };
+        prelude.reserve(items.len() + 1);
+        for item in &items {
+            prelude.push(event_line(WatchEventKind::Added, item, gvk));
+        }
+        // The terminator. Without this annotation a kube-rs `watcher` /
+        // client-go reflector stays in its initializing state forever even
+        // though every object above was delivered.
+        prelude.push(bookmark_line(rv, gvk, true));
+        from = ResumePoint::At(rv);
+    }
+
     // CompactedTooOld AT REGISTRATION → a real HTTP 410 (the client
     // re-LISTs). Once we have a stream, the response is 200 and any
     // later loss is in-band.
@@ -1050,7 +1078,7 @@ async fn watch_response(
         allow_bookmarks: p.allow_watch_bookmarks,
     };
 
-    let body = Body::from_stream(futures::stream::unfold(init, |mut st| async move {
+    let live = futures::stream::unfold(init, |mut st| async move {
         loop {
             match st.stream.next().await {
                 Some(Ok(WatchSignal::Event(ev))) => {
@@ -1068,12 +1096,24 @@ async fn watch_response(
                     {
                         continue;
                     }
-                    let line = to_k8s_watch_line(&ev);
+                    let api_version = st.handler.api_version();
+                    let line = to_k8s_watch_line(
+                        &ev,
+                        WatchGvk {
+                            api_version: &api_version,
+                            kind: st.handler.kind(),
+                        },
+                    );
                     return Some((Ok::<Bytes, Infallible>(line), st));
                 }
                 Some(Ok(WatchSignal::Bookmark(rev))) => {
                     if st.allow_bookmarks {
-                        return Some((Ok(bookmark_line(rev)), st));
+                        let api_version = st.handler.api_version();
+                        let gvk = WatchGvk {
+                            api_version: &api_version,
+                            kind: st.handler.kind(),
+                        };
+                        return Some((Ok(bookmark_line(rev, gvk, false)), st));
                     }
                     // Bookmarks not requested → drop + keep streaming.
                     continue;
@@ -1097,7 +1137,15 @@ async fn watch_response(
                 None => return None, // store dropped / clean close → end.
             }
         }
-    }));
+    });
+
+    // The initial-events replay, then the live stream. `prelude` is empty
+    // unless `sendInitialEvents=true`, so the ordinary watch path is
+    // byte-for-byte what it was.
+    let body = Body::from_stream(futures::StreamExt::chain(
+        futures::stream::iter(prelude.into_iter().map(Ok::<Bytes, Infallible>)),
+        live,
+    ));
 
     // 200 the instant the response starts. The body is an unbounded
     // stream with no Content-Length, so hyper frames it as HTTP/1.1
