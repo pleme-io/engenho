@@ -190,9 +190,15 @@ fn sort_array_by_key(v: &mut Value, key: &str) {
 ///
 /// Deliberately does NOT mask `spec.finalizers`, `metadata.finalizers`,
 /// `metadata.labels`, or `data` — those carry the real conformance signal
-/// (server-side defaulting). `status` IS masked (pod status, phase, and
-/// friends are genuinely time-varying); strict mode re-surfaces anything
-/// notable it hides as `Cosmetic`.
+/// (server-side defaulting).
+///
+/// `status` is **collapsed to a presence marker, not dropped** (corrected
+/// 2026-08-08). Its contents are genuinely time-varying, so they stay out of
+/// the diff; but dropping the subtree outright made the harness unable to see
+/// that engenho returns **no `status` at all** — its single largest
+/// divergence. A mask that hides the biggest gap is not a mask, it is a
+/// blindfold. Strict mode still re-surfaces what any mask suppressed as
+/// `Cosmetic`.
 #[must_use]
 pub fn volatile_meta() -> Normalizer {
     Normalizer::new()
@@ -206,8 +212,24 @@ pub fn volatile_meta() -> Normalizer {
         // k3s stamps it on every write). The timestamps within are the
         // volatile part; the whole block is dropped for a clean diff.
         .with(Mask::Drop(JsonPath::parse("metadata.managedFields")))
-        // Whole status subtree — time-varying by construction.
-        .with(Mask::Drop(JsonPath::parse("status")))
+        // Status: COLLAPSED to a presence marker, never dropped.
+        //
+        // This used to be `Mask::Drop(status)` with the note "time-varying by
+        // construction". The volatility is real — podIP, conditions,
+        // lastTransitionTime and phase all move under you — but dropping the
+        // whole subtree made the harness blind to the single largest
+        // divergence engenho has: **it returns no `status` key at all**
+        // (measured 2026-08-08: a created Pod's top-level keys are
+        // [apiVersion, kind, metadata, spec] against a conformant server's
+        // [apiVersion, kind, metadata, spec, status]).
+        //
+        // An instrument that cannot see the biggest gap is not an instrument.
+        // Collapsing to a constant keeps every volatile leaf out of the diff
+        // while leaving PRESENCE observable: both sides having a status is
+        // parity, one side missing it is a divergence.
+        .with(Mask::Canonicalize(JsonPath::parse("status"), |_| {
+            Value::String("<present>".to_owned())
+        }))
         // Allocated network identity (Service).
         .with(Mask::Drop(JsonPath::parse("spec.clusterIP")))
         .with(Mask::Drop(JsonPath::parse("spec.clusterIPs")))
@@ -264,7 +286,36 @@ mod tests {
         assert!(out["metadata"]["finalizers"].is_array());
         assert!(out["spec"]["finalizers"].is_array());
         assert_eq!(out["data"]["k"], json!("v"));
-        assert!(out.get("status").is_none());
+        // Status is COLLAPSED, not dropped: its volatile contents are gone but
+        // its PRESENCE survives, so "engenho returned no status at all" is a
+        // divergence the harness can see. Asserting `is_none()` here was the
+        // unit-test half of the blindness — it pinned the very behaviour that
+        // made the largest gap unobservable.
+        assert_eq!(
+            out["status"],
+            json!("<present>"),
+            "a present status must collapse to the marker, never vanish",
+        );
         assert!(out["metadata"].get("uid").is_none());
+    }
+
+    /// The point of the collapse, stated as a test: an object WITHOUT a status
+    /// must not normalize to the same value as one WITH a status.
+    ///
+    /// Measured 2026-08-08: engenho returns `[apiVersion, kind, metadata,
+    /// spec]` for a created Pod where a conformant server returns those plus
+    /// `status`. Under the old `Mask::Drop("status")` both sides normalized
+    /// identically and the harness reported parity — it could not have failed.
+    #[test]
+    fn a_missing_status_is_distinguishable_from_a_present_one() {
+        let norm = volatile_meta();
+        let with = norm.apply(&json!({"kind":"Pod","status":{"phase":"Running"}}));
+        let without = norm.apply(&json!({"kind":"Pod"}));
+        assert_ne!(
+            with, without,
+            "an absent status MUST diverge from a present one — this is the \
+             single largest engenho gap and the harness has to be able to see it",
+        );
+        assert!(without.get("status").is_none());
     }
 }
