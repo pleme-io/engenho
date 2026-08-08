@@ -25,6 +25,17 @@ use engenho_diff::{
 /// The live k3s oracle kubeconfig (`~/.kube/engenho-local-tunnel.yaml`).
 #[must_use]
 pub fn oracle_kubeconfig() -> PathBuf {
+    // ENGENHO_ORACLE_KUBECONFIG first. The path was hardcoded to a hand-built
+    // k3s VM's tunnel, and that VM is GONE (192.168.64.10 unreachable
+    // 2026-08-08) — which is why all four engenho-diff binaries fail with
+    // `Verdict::ReferenceUnreachable` rather than for any engenho defect. A
+    // harness whose oracle cannot be repointed dies with the machine that
+    // built it; `k3d cluster create` is reproducible where that VM was not.
+    if let Ok(p) = std::env::var("ENGENHO_ORACLE_KUBECONFIG") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     let home = std::env::var("HOME").expect("HOME set");
     PathBuf::from(home).join(".kube/engenho-local-tunnel.yaml")
 }
