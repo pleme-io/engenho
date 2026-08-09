@@ -180,6 +180,56 @@ impl ListWatchParams {
 /// `fieldManager` is REQUIRED on an apply request — a missing/empty one is
 /// a typed 422/400 ([`ApplyOptions::from_params`]), matching upstream
 /// kube-apiserver. `force` defaults to false.
+/// `?dryRun=` — whether a write is EVALUATED but never persisted.
+///
+/// # Why this is a typed two-variant enum and not a `bool`
+///
+/// Kubernetes defines exactly one legal value, `All`. Anything else is a 400,
+/// **not** a silent "false" — and that distinction is the whole safety
+/// property. Until 2026-08-09 engenho did not parse this parameter at all
+/// (`rg dry_run` over the apiserver and store returned ZERO hits), so a
+/// `?dryRun=All` write was COMMITTED: measured, `kubectl create --dry-run=server`
+/// persisted the pod, and the follow-up real create failed `AlreadyExists`.
+/// The same hole meant a dry-run DELETE really deleted.
+///
+/// An unparseable value returning `Off` would rebuild exactly that hole for
+/// anyone who typos `?dryRun=true`, so [`DryRun::parse`] refuses instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DryRun {
+    /// Persist normally.
+    #[default]
+    Off,
+    /// Run every check, persist NOTHING, return the object that would have
+    /// been written.
+    All,
+}
+
+impl DryRun {
+    /// Interpret the raw `?dryRun=` value.
+    ///
+    /// Absent or empty → [`DryRun::Off`]. `All` → [`DryRun::All`]. Anything
+    /// else is a typed 400 — never a silent downgrade to a real write.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::BadRequest`] for any value other than `All`.
+    pub fn parse(raw: Option<&str>) -> Result<Self, ApiError> {
+        match raw {
+            None | Some("") => Ok(Self::Off),
+            Some("All") => Ok(Self::All),
+            Some(other) => Err(ApiError::BadRequest(format!(
+                "invalid dryRun value {other:?}: the only supported value is \"All\""
+            ))),
+        }
+    }
+
+    /// True when nothing may be persisted.
+    #[must_use]
+    pub fn is_dry(self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ApplyParams {
@@ -189,6 +239,10 @@ pub struct ApplyParams {
     /// `?force=true|1|yes` — take ownership of conflicting fields.
     #[serde(deserialize_with = "de_bool")]
     pub force: bool,
+    /// `?dryRun=All` — evaluate, persist nothing. Interpreted by
+    /// [`DryRun::parse`], which REFUSES any value other than `All`.
+    #[serde(rename = "dryRun")]
+    pub dry_run: Option<String>,
 }
 
 /// The validated, typed server-side-apply options threaded from the router
@@ -1139,6 +1193,29 @@ mod tests {
             v.pointer("/object/metadata/annotations").is_none(),
             "an ordinary bookmark must carry no annotations at all",
         );
+    }
+
+    /// `dryRun` accepts EXACTLY `All`. A typo must be a 400, never a silent
+    /// real write — that silence is the whole defect this type closes.
+    #[test]
+    fn dry_run_accepts_only_all_and_refuses_typos() {
+        assert_eq!(DryRun::parse(None).unwrap(), DryRun::Off);
+        assert_eq!(DryRun::parse(Some("")).unwrap(), DryRun::Off);
+        assert_eq!(DryRun::parse(Some("All")).unwrap(), DryRun::All);
+        assert!(DryRun::parse(Some("All")).unwrap().is_dry());
+        assert!(!DryRun::parse(None).unwrap().is_dry());
+
+        // The dangerous cases: anything else REFUSES rather than falling back
+        // to Off, which would persist a write the operator asked to rehearse.
+        for typo in ["true", "all", "ALL", "1", "yes", "None"] {
+            let err = DryRun::parse(Some(typo)).expect_err(
+                "a non-`All` dryRun value must be refused, not treated as a real write",
+            );
+            assert!(
+                matches!(err, ApiError::BadRequest(_)),
+                "{typo:?} must be a 400, got {err:?}"
+            );
+        }
     }
 
     #[test]

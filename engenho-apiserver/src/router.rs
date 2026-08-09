@@ -60,8 +60,8 @@ use crate::handler::ResourceHandler;
 use crate::health;
 use crate::openapi::ApiDoc;
 use crate::params::{
-    ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, event_line, gvk_ns_matches,
-    status_410_line, to_k8s_watch_line,
+    DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, event_line,
+    gvk_ns_matches, status_410_line, to_k8s_watch_line,
 };
 
 /// The dispatch key for a registered handler: `(group, version, plural)`.
@@ -862,9 +862,10 @@ async fn do_create(
     headers: &HeaderMap,
     raw: &[u8],
     user_info: &UserInfo,
+    dry_run: DryRun,
 ) -> Result<Response, ApiError> {
     let body = decode_write_body(headers, raw)?;
-    let v = h.create(ns, body, user_info).await?;
+    let v = h.create(ns, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers);
     render_object(codec, &handler_gvk(h), StatusCode::CREATED, v)
 }
@@ -1375,13 +1376,25 @@ async fn resource_get_or_list(
 /// have no body slot for it under the legacy routes (POST was only wired on
 /// the collection routes), so reject it with a typed `BadRequest` mirroring
 /// that the legacy instance routes never accepted POST.
+/// Query params common to every WRITE verb. Today it carries `?dryRun=`;
+/// it is a struct rather than a bare Option so the next write-time option
+/// (`fieldValidation`) lands in ONE place instead of a sixth signature.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct WriteParams {
+    #[serde(rename = "dryRun")]
+    pub dry_run: Option<String>,
+}
+
 async fn resource_create(
     State(state): State<RouterState>,
     user_info: ExtractUserInfo,
     coords: crate::coords::ResourceCoords,
+    Query(write): Query<WriteParams>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
+    let dry_run = DryRun::parse(write.dry_run.as_deref())?;
     // POST on a subresource is not a K8s CREATE shape — no subresource
     // supports create (status/scale are get/patch/update only). Typed
     // BadRequest, never a stub Ok.
@@ -1402,6 +1415,7 @@ async fn resource_create(
         &headers,
         &raw,
         &user_info.0,
+        dry_run,
     )
     .await
 }
@@ -1710,6 +1724,7 @@ mod tests {
             _ns: Option<&str>,
             _body: serde_json::Value,
             _user_info: &engenho_types::auth::UserInfo,
+            _dry_run: crate::params::DryRun,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal(
                 "fake handler: create not exercised".into(),
