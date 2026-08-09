@@ -74,6 +74,24 @@ const KNOWN_DIVERGENCES: &[&str] = &[
     //    dispatch), a real milestone — so D4 stays baselined until then. ──
     "FieldDiff:.kind",
     "MissingDefault:.details",
+    // ── D4a. NO OBJECT CARRIES A STATUS. The single largest conformance gap
+    //    engenho has, and until 2026-08-08 this harness was STRUCTURALLY
+    //    INCAPABLE of seeing it: `volatile_meta()` dropped the whole `status`
+    //    subtree, so "engenho returns no status key" normalized IDENTICALLY to
+    //    "engenho returns a full status" and the differ reported parity.
+    //
+    //    Status is now collapsed to a presence marker instead of dropped
+    //    (normalize.rs), and this signature is the very first thing the
+    //    un-blindfolded harness reported — measured against a real upstream
+    //    kind v1.34.0 apiserver, the first time this differential has ever run
+    //    against one.
+    //
+    //    Recorded here so the ratchet is usable, NOT because it is acceptable.
+    //    A created Pod's top-level keys are [apiVersion, kind, metadata, spec]
+    //    where a conformant server returns those plus `status`. DELETE THIS
+    //    LINE when the status subresource lands — the ratchet will then hold
+    //    it closed.
+    "MissingDefault:.status",
     "ExtraField:.metadata.name:engenho",
     "ExtraField:.metadata.namespace:engenho",
     "ExtraField:.data:engenho",

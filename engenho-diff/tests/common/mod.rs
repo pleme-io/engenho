@@ -1,6 +1,31 @@
 //! Shared differential-run scaffold for the per-operation-class parity tests
 //! (`patch_parity`, `status_subresource_parity`, `selector_parity`, …).
 //!
+//! # RUN THESE SERIALLY — the suite is not parallel-safe
+//!
+//! ```text
+//! ENGENHO_ORACLE_KUBECONFIG=<path> cargo test -p engenho-diff --jobs 1 -- --test-threads=1
+//! ```
+//!
+//! Cargo runs test BINARIES concurrently, and these four share one oracle
+//! cluster and one in-process engenho. Measured 2026-08-09 against a real
+//! upstream kind v1.34.0 oracle: all four pass individually and serially, and
+//! running them the default (parallel) way fails one with a spurious
+//! `MissingResource:.:engenho` — one binary observing state another had
+//! already torn down. That is a harness artifact, **not** an engenho
+//! divergence, and it is exactly the kind of false red that gets a real gate
+//! disabled. Isolation (per-binary namespaces) is the durable fix;
+//! until then, serial.
+//!
+//! # The oracle
+//!
+//! `ENGENHO_ORACLE_KUBECONFIG` selects it, defaulting to the historical
+//! `~/.kube/engenho-local-tunnel.yaml`. That default points at a hand-built
+//! k3s VM that no longer exists, which is why these binaries reported
+//! `Verdict::ReferenceUnreachable` for months — the oracle was dead, not
+//! engenho. Any conformant apiserver works; a disposable `kind` cluster
+//! pinned to the target version is the reproducible choice.
+//!
 //! The m0 test predates this module and inlines the same shape; the new
 //! per-class files route through here so the boot → preflight → run → report →
 //! RATCHET pipeline lives in ONE place (★ ruthless standardization). The
