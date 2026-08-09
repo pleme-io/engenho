@@ -28,7 +28,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.53.10"
+version = "0.53.11"
 edition = "2024"
 rust-version = "1.89.0"
 license = "MIT"
@@ -47,23 +47,23 @@ keywords = ["kubernetes", "engenho", "pleme-io"]
 # entry and resolves the dep against the registry. Operators
 # building locally always use `path`; downstream crates pulling
 # us from crates.io use `version`.
-engenho-types          = { path = "engenho-types", version = "0.53.10" }
-engenho-cluster-config = { path = "engenho-cluster-config", version = "0.53.10" }
-engenho-kube-client    = { path = "engenho-kube-client", version = "0.53.10" }
-engenho-kube-proto     = { path = "engenho-kube-proto", version = "0.53.10" }
-engenho-store          = { path = "engenho-store", version = "0.53.10" }
-engenho-apiserver      = { path = "engenho-apiserver", version = "0.53.10" }
-engenho-runtime        = { path = "engenho-runtime", version = "0.53.10" }
-engenho-scheduler      = { path = "engenho-scheduler", version = "0.53.10" }
-engenho-controllers    = { path = "engenho-controllers", version = "0.53.10" }
-engenho-config         = { path = "engenho-config", version = "0.53.10" }
-engenho-kubelet        = { path = "engenho-kubelet", version = "0.53.10" }
-engenho-teia           = { path = "engenho-teia", version = "0.53.10" }
-engenho-substrate      = { path = "engenho-substrate", version = "0.53.10" }
-engenho-substrate-props = { path = "engenho-substrate-props", version = "0.53.10" }
-engenho-sui-typescape  = { path = "engenho-sui-typescape", version = "0.53.10" }
-engenho-fonte          = { path = "engenho-fonte", version = "0.53.10" }
-engenho-revoada        = { path = "engenho-revoada", version = "0.53.10" }
+engenho-types          = { path = "engenho-types", version = "0.53.11" }
+engenho-cluster-config = { path = "engenho-cluster-config", version = "0.53.11" }
+engenho-kube-client    = { path = "engenho-kube-client", version = "0.53.11" }
+engenho-kube-proto     = { path = "engenho-kube-proto", version = "0.53.11" }
+engenho-store          = { path = "engenho-store", version = "0.53.11" }
+engenho-apiserver      = { path = "engenho-apiserver", version = "0.53.11" }
+engenho-runtime        = { path = "engenho-runtime", version = "0.53.11" }
+engenho-scheduler      = { path = "engenho-scheduler", version = "0.53.11" }
+engenho-controllers    = { path = "engenho-controllers", version = "0.53.11" }
+engenho-config         = { path = "engenho-config", version = "0.53.11" }
+engenho-kubelet        = { path = "engenho-kubelet", version = "0.53.11" }
+engenho-teia           = { path = "engenho-teia", version = "0.53.11" }
+engenho-substrate      = { path = "engenho-substrate", version = "0.53.11" }
+engenho-substrate-props = { path = "engenho-substrate-props", version = "0.53.11" }
+engenho-sui-typescape  = { path = "engenho-sui-typescape", version = "0.53.11" }
+engenho-fonte          = { path = "engenho-fonte", version = "0.53.11" }
+engenho-revoada        = { path = "engenho-revoada", version = "0.53.11" }
 
 # Pleme-io sibling-directory path deps for typed-dispatcher
 # catalog integration (theory/UNIFIED-COMPUTING-MODEL.md §VI).
