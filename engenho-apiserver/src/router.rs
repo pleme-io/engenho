@@ -877,9 +877,10 @@ async fn do_replace(
     headers: &HeaderMap,
     raw: &[u8],
     user_info: &UserInfo,
+    dry_run: DryRun,
 ) -> Result<Response, ApiError> {
     let body = decode_write_body(headers, raw)?;
-    let v = h.replace(ns, name, body, user_info).await?;
+    let v = h.replace(ns, name, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers);
     render_object(codec, &handler_gvk(h), StatusCode::OK, v)
 }
@@ -908,7 +909,15 @@ async fn do_patch(
         None
     };
     let v = h
-        .patch(ns, name, patch, patch_type, apply_opts, user_info)
+        .patch(
+            ns,
+            name,
+            patch,
+            patch_type,
+            apply_opts,
+            user_info,
+            DryRun::parse(apply_params.dry_run.as_deref())?,
+        )
         .await?;
     // An apply that CREATES the object returns 201; an apply/patch that
     // updates returns 200. The store reports Created vs Patched; the handler
@@ -926,6 +935,7 @@ async fn do_delete(
     headers: &HeaderMap,
     p: &ListWatchParams,
     user_info: &UserInfo,
+    dry_run: DryRun,
 ) -> Result<Response, ApiError> {
     // `?resourceVersion=N` is the K8s DELETE precondition
     // (`Preconditions.resourceVersion`); absent/"0" → unconditional.
@@ -936,7 +946,7 @@ async fn do_delete(
     // ("unexpected end of JSON input"). This is the SAME content-negotiated
     // emission chokepoint create/get use — zero new serialization code.
     let obj = h
-        .delete_with_precondition(ns, name, expected, user_info)
+        .delete_with_precondition(ns, name, expected, user_info, dry_run)
         .await?;
     let codec = ResponseCodec::from_headers(headers);
     // PROTOBUF CAVEAT: the deleted-object branch encodes cleanly (its GVK
@@ -971,9 +981,10 @@ async fn do_delete_collection(
     ns: Option<&str>,
     p: &ListWatchParams,
     user_info: &UserInfo,
+    dry_run: DryRun,
 ) -> Result<Response, ApiError> {
     let sel = p.selectors()?;
-    let list = h.delete_collection(ns, &sel, user_info).await?;
+    let list = h.delete_collection(ns, &sel, user_info, dry_run).await?;
     Ok(Json(list).into_response())
 }
 
@@ -1429,6 +1440,7 @@ async fn resource_put(
     State(state): State<RouterState>,
     user_info: ExtractUserInfo,
     coords: crate::coords::ResourceCoords,
+    Query(write): Query<WriteParams>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -1459,6 +1471,7 @@ async fn resource_put(
                 &headers,
                 &raw,
                 &user_info.0,
+                DryRun::parse(write.dry_run.as_deref())?,
             )
             .await
         }
@@ -1515,7 +1528,13 @@ async fn resource_delete(
     coords: crate::coords::ResourceCoords,
     headers: HeaderMap,
     Query(p): Query<ListWatchParams>,
+    Query(write): Query<WriteParams>,
+    // DELETE carries its dry-run in a `DeleteOptions` BODY, not the query
+    // string — see [`DryRun::for_delete`]. Extracted LAST because a body
+    // extractor consumes the request.
+    raw: Bytes,
 ) -> Result<Response, ApiError> {
+    let dry_run = DryRun::for_delete(write.dry_run.as_deref(), &raw)?;
     // DELETE on a subresource is invalid — no subresource supports delete
     // (status/scale are get/patch/update only). Typed BadRequest, never a
     // stub Ok.
@@ -1530,7 +1549,14 @@ async fn resource_delete(
     // kind like Namespace has no CollectionDeleter).
     let Some(name) = coords.name.as_deref() else {
         if h.supports_delete_collection() {
-            return do_delete_collection(&h, coords.namespace.as_deref(), &p, &user_info.0).await;
+            return do_delete_collection(
+                &h,
+                coords.namespace.as_deref(),
+                &p,
+                &user_info.0,
+                dry_run,
+            )
+            .await;
         }
         return Err(ApiError::BadRequest(
             "DELETE requires a resource name (instance path)".into(),
@@ -1543,6 +1569,7 @@ async fn resource_delete(
         &headers,
         &p,
         &user_info.0,
+        dry_run,
     )
     .await
 }
@@ -1738,6 +1765,7 @@ mod tests {
             _patch_type: engenho_types::patch::PatchType,
             _apply_opts: Option<crate::params::ApplyOptions>,
             _user_info: &engenho_types::auth::UserInfo,
+            _dry_run: crate::params::DryRun,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal(
                 "fake handler: patch not exercised".into(),
@@ -1748,6 +1776,7 @@ mod tests {
             _ns: Option<&str>,
             _name: &str,
             _user_info: &engenho_types::auth::UserInfo,
+            _dry_run: crate::params::DryRun,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal(
                 "fake handler: delete not exercised".into(),
@@ -1759,6 +1788,7 @@ mod tests {
             _name: &str,
             _expected: Option<engenho_store::Revision>,
             _user_info: &engenho_types::auth::UserInfo,
+            _dry_run: crate::params::DryRun,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal(
                 "fake handler: delete_with_precondition not exercised".into(),

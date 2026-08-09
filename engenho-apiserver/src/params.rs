@@ -228,6 +228,51 @@ impl DryRun {
     pub fn is_dry(self) -> bool {
         matches!(self, Self::All)
     }
+
+    /// Resolve dry-run for a **DELETE**, which carries it in the request BODY
+    /// rather than (only) the query string.
+    ///
+    /// `kubectl delete --dry-run=server` sends `DeleteOptions` as the body and
+    /// **no** `?dryRun=` at all — measured with `-v=8`:
+    ///
+    /// ```text
+    /// Request Body: {"propagationPolicy":"Background","dryRun":["All"]}
+    /// url="https://…/api/v1/namespaces/dr2/configmaps/keep"
+    /// ```
+    ///
+    /// A query-parameter-only implementation therefore looks correct, compiles,
+    /// passes its unit tests, and **still really deletes** — measured exactly
+    /// that way on 2026-08-09 before this existed. `DeleteOptions.dryRun` is a
+    /// `[]string`, so `["All"]` is the shape, and per K8s any entry other than
+    /// `All` is invalid.
+    ///
+    /// Either source may set it; the query string is honoured too because a
+    /// raw client may use it.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::BadRequest`] when either source carries a value that is not
+    /// `All`. A malformed body is NOT an error here — DELETE bodies are
+    /// optional and a non-`DeleteOptions` body simply carries no dry-run.
+    pub fn for_delete(query: Option<&str>, body: &[u8]) -> Result<Self, ApiError> {
+        if Self::parse(query)?.is_dry() {
+            return Ok(Self::All);
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Ok(Self::Off);
+        };
+        let Some(entries) = v.get("dryRun").and_then(serde_json::Value::as_array) else {
+            return Ok(Self::Off);
+        };
+        let mut out = Self::Off;
+        for e in entries {
+            let raw = e.as_str().unwrap_or_default();
+            if Self::parse(Some(raw))?.is_dry() {
+                out = Self::All;
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1197,6 +1242,36 @@ mod tests {
 
     /// `dryRun` accepts EXACTLY `All`. A typo must be a 400, never a silent
     /// real write — that silence is the whole defect this type closes.
+    /// DELETE carries dry-run in the BODY. A query-only implementation looks
+    /// right, compiles, passes its own unit tests — and really deletes.
+    /// Measured exactly that way before `for_delete` existed.
+    #[test]
+    fn a_delete_reads_dry_run_from_the_delete_options_body() {
+        // The literal body kubectl -v=8 showed.
+        let body = br#"{"propagationPolicy":"Background","dryRun":["All"]}"#;
+        assert!(
+            DryRun::for_delete(None, body).unwrap().is_dry(),
+            "DeleteOptions.dryRun MUST be honoured — the query string is empty \
+             on a kubectl dry-run delete",
+        );
+
+        // An ordinary delete body carries no dryRun.
+        let plain = br#"{"propagationPolicy":"Background"}"#;
+        assert!(!DryRun::for_delete(None, plain).unwrap().is_dry());
+
+        // A DELETE with no body at all is legal and is not a dry run.
+        assert!(!DryRun::for_delete(None, b"").unwrap().is_dry());
+        // Nor is a non-DeleteOptions body an error — DELETE bodies are optional.
+        assert!(!DryRun::for_delete(None, b"not json").unwrap().is_dry());
+
+        // The query string still works for a raw client.
+        assert!(DryRun::for_delete(Some("All"), b"").unwrap().is_dry());
+
+        // And a bogus value in EITHER source is still refused.
+        assert!(DryRun::for_delete(Some("true"), b"").is_err());
+        assert!(DryRun::for_delete(None, br#"{"dryRun":["true"]}"#).is_err());
+    }
+
     #[test]
     fn dry_run_accepts_only_all_and_refuses_typos() {
         assert_eq!(DryRun::parse(None).unwrap(), DryRun::Off);

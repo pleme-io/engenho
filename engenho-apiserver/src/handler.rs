@@ -296,6 +296,7 @@ pub trait ResourceHandler: Send + Sync + 'static {
         _name: &str,
         _body: Value,
         _user_info: &UserInfo,
+        _dry_run: DryRun,
     ) -> Result<Value, ApiError> {
         Err(ApiError::BadRequest(
             "PUT on the main object is not supported (use POST to create, PATCH to update)"
@@ -324,6 +325,7 @@ pub trait ResourceHandler: Send + Sync + 'static {
         patch_type: engenho_types::patch::PatchType,
         apply_opts: Option<crate::params::ApplyOptions>,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError>;
 
     /// DELETE a resource. Returns the response BODY as the K8s wire
@@ -337,6 +339,7 @@ pub trait ResourceHandler: Send + Sync + 'static {
         namespace: Option<&str>,
         name: &str,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError>;
 
     /// DELETE with an optimistic-concurrency precondition
@@ -355,6 +358,7 @@ pub trait ResourceHandler: Send + Sync + 'static {
         name: &str,
         expected: Option<Revision>,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError>;
 
     /// DELETECOLLECTION — delete every object matching `sel` in `namespace`
@@ -374,11 +378,12 @@ pub trait ResourceHandler: Send + Sync + 'static {
         namespace: Option<&str>,
         sel: &Selectors,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError> {
         let (items, rv) = self.list_at(namespace, sel).await?;
         for item in &items {
             if let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) {
-                self.delete_with_precondition(namespace, name, None, user_info)
+                self.delete_with_precondition(namespace, name, None, user_info, dry_run)
                     .await?;
             }
         }
@@ -1160,6 +1165,7 @@ impl ResourceHandler for StoreBackedHandler {
         name: &str,
         body: Value,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
         // A PUT/replace of an absent name is a 404 — `kubectl replace`
@@ -1201,6 +1207,11 @@ impl ResourceHandler for StoreBackedHandler {
         // replace. This reuses the SAME `ResourceCommand::Put` the create path
         // proposes — extend the primitive, don't fork it.
         let expected = body_precondition(&body)?;
+        // DRY-RUN GATE — existence, admission and the CAS precondition all
+        // ran above; only the persist is skipped.
+        if dry_run.is_dry() {
+            return Ok(inject_type_meta(&body, self.api_version(), &self.kind));
+        }
         let result = self
             .store
             .propose(ResourceCommand::Put {
@@ -1231,6 +1242,7 @@ impl ResourceHandler for StoreBackedHandler {
         patch_type: engenho_types::patch::PatchType,
         apply_opts: Option<crate::params::ApplyOptions>,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
         // Admission runs at the API boundary BEFORE the store proposal. The
@@ -1256,6 +1268,21 @@ impl ResourceHandler for StoreBackedHandler {
         // `time`. NON-apply patches skip this entire block — byte-identical
         // to before SSA landed (BEHAVIOR PRESERVATION).
         if let Some(opts) = apply_opts {
+            // DRY-RUN GATE. The persist is refused — which is the safety
+            // property — but unlike create/replace/delete the WOULD-BE object
+            // is not computable here: the SSA merge needs the store's
+            // field-ownership state and a `PatchSchemaEnv` the handler does
+            // not hold. Returning the unmodified current object would be a
+            // wrong answer dressed as a right one, so this refuses BY NAME.
+            // `pending-engenho: dryrun-patch-result`.
+            if dry_run.is_dry() {
+                return Err(ApiError::BadRequest(
+                    "dryRun=All on server-side apply is not yet supported: the \
+                     merged result cannot be computed without persisting. The \
+                     write was NOT performed."
+                        .into(),
+                ));
+            }
             let time = engenho_types::time::now_rfc3339_utc();
             let result = self
                 .store
@@ -1309,6 +1336,16 @@ impl ResourceHandler for StoreBackedHandler {
         if self.store.get(&key).await.is_none() {
             return Err(ApiError::NotFound(format!("{}/{}", self.kind, name)));
         }
+        // DRY-RUN GATE — same reasoning as the apply arm above: nothing is
+        // persisted, and the merged result is not invented.
+        if dry_run.is_dry() {
+            return Err(ApiError::BadRequest(
+                "dryRun=All on PATCH is not yet supported: the merged result \
+                 cannot be computed without persisting. The write was NOT \
+                 performed."
+                    .into(),
+            ));
+        }
         let result = self
             .store
             .propose(ResourceCommand::Patch {
@@ -1357,10 +1394,11 @@ impl ResourceHandler for StoreBackedHandler {
         namespace: Option<&str>,
         name: &str,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError> {
         // Unconditional delete (no precondition). The precondition path
         // is [`Self::delete_with_precondition`], driven by `?resourceVersion=`.
-        self.delete_with_precondition(namespace, name, None, user_info)
+        self.delete_with_precondition(namespace, name, None, user_info, dry_run)
             .await
     }
 
@@ -1370,6 +1408,7 @@ impl ResourceHandler for StoreBackedHandler {
         name: &str,
         expected: Option<Revision>,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
         // Admission runs at the API boundary BEFORE the store proposal so
@@ -1404,6 +1443,16 @@ impl ResourceHandler for StoreBackedHandler {
             .map(|_| engenho_types::time::now_rfc3339_utc());
         // Keep a clone for the DeletionPending re-read (the original is
         // moved into the proposed command).
+        // DRY-RUN GATE. THE dangerous one: before this existed a
+        // `kubectl delete --dry-run=server` really deleted. The pre-delete
+        // image is exactly what a real delete returns, so the dry response is
+        // truthful rather than approximated.
+        if dry_run.is_dry() {
+            return Ok(match &prior {
+                Some(obj) => inject_type_meta(obj, self.api_version(), &self.kind),
+                None => crate::error::delete_status_success(name, &self.kind),
+            });
+        }
         let key_for_reread = key.clone();
         let result = self
             .store
