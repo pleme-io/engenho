@@ -18,7 +18,7 @@ use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor, Subresource};
 
 use crate::error::ApiError;
-use crate::params::{ResumePoint, Selectors, body_precondition};
+use crate::params::{DryRun, ResumePoint, Selectors, body_precondition};
 use crate::pod_logs::{LogQuery, PodLogReader};
 use crate::scale::{Scale, project_scale};
 
@@ -277,6 +277,7 @@ pub trait ResourceHandler: Send + Sync + 'static {
         namespace: Option<&str>,
         body: Value,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError>;
 
     /// REPLACE (PUT) the whole object — the kubectl `replace` / update verb.
@@ -1060,6 +1061,7 @@ impl ResourceHandler for StoreBackedHandler {
         namespace: Option<&str>,
         body: Value,
         user_info: &UserInfo,
+        dry_run: DryRun,
     ) -> Result<Value, ApiError> {
         let name = body
             .get("metadata")
@@ -1118,6 +1120,15 @@ impl ResourceHandler for StoreBackedHandler {
                 format!("{}/{}", self.kind, name),
                 "resource already exists".into(),
             ));
+        }
+        // DRY-RUN GATE. Everything above ran — decode, admission, the
+        // already-exists conflict check, the CAS precondition — because that
+        // is exactly what makes a dry run worth asking for. Only the PERSIST
+        // is skipped, and the would-be object is returned instead of a
+        // read-back. Before 2026-08-09 this parameter was not parsed at all
+        // and a `--dry-run=server` create was COMMITTED.
+        if dry_run.is_dry() {
+            return Ok(inject_type_meta(&body, self.api_version(), &self.kind));
         }
         let result = self
             .store
