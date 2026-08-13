@@ -36,42 +36,50 @@ impl MockClusterReader {
 #[async_trait]
 impl ClusterReader for MockClusterReader {
     async fn cluster_status(&self, cluster: &str) -> Result<ClusterStatus, ReaderError> {
-        self.state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        state
             .get(cluster)
             .map(|s| s.status.clone())
-            .ok_or_else(|| ReaderError::UnknownCluster(cluster.to_string()))
+            .ok_or_else(|| ReaderError::UnknownCluster {
+                requested: cluster.to_string(),
+                known: state.keys().cloned().collect(),
+            })
     }
 
     async fn cluster_config(&self, cluster: &str) -> Result<ClusterConfigView, ReaderError> {
-        self.state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        state
             .get(cluster)
             .map(|s| s.config.clone())
-            .ok_or_else(|| ReaderError::UnknownCluster(cluster.to_string()))
+            .ok_or_else(|| ReaderError::UnknownCluster {
+                requested: cluster.to_string(),
+                known: state.keys().cloned().collect(),
+            })
     }
 
     async fn kubeconfig_descriptor(
         &self,
         cluster: &str,
     ) -> Result<KubeAuthDescriptor, ReaderError> {
-        self.state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        state
             .get(cluster)
             .map(|s| s.auth.clone())
-            .ok_or_else(|| ReaderError::UnknownCluster(cluster.to_string()))
+            .ok_or_else(|| ReaderError::UnknownCluster {
+                requested: cluster.to_string(),
+                known: state.keys().cloned().collect(),
+            })
     }
 
     async fn snapshot_meta(&self, cluster: &str) -> Result<Option<SnapshotMetaView>, ReaderError> {
-        self.state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        state
             .get(cluster)
             .map(|s| s.snapshot.clone())
-            .ok_or_else(|| ReaderError::UnknownCluster(cluster.to_string()))
+            .ok_or_else(|| ReaderError::UnknownCluster {
+                requested: cluster.to_string(),
+                known: state.keys().cloned().collect(),
+            })
     }
 }
 

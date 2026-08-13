@@ -301,14 +301,36 @@ fn to_pretty_json<T: Serialize>(value: &T) -> String {
     })
 }
 
-/// Typed error response — clients can pattern-match on `kind`
-/// without parsing the prose `message`. Stable shape.
+/// Typed error response, rendered in kotae's four-arm vocabulary.
+///
+/// `kind()` already told a client WHICH failure occurred; what it could not
+/// say is what the client should DO, because every kind rendered under the
+/// same `error` key. The two are genuinely different situations:
+///
+/// * `UnknownCluster` is a **refusal** — the reader worked perfectly and the
+///   caller named something that does not exist. It is the caller's move, and
+///   the error now carries the clusters that DO exist, so the retry costs one
+///   call instead of a conversation.
+/// * `Io` / `Parse` / `InvalidState` are **blindness** — the reader could not
+///   put the question. The caller must conclude nothing about the cluster,
+///   only about the attempt. Retrying the same call is reasonable here and is
+///   pointless above; that is the distinction the old shape erased.
+///
+/// `kind` is kept alongside so existing pattern-matching clients keep working.
 fn to_pretty_error(err: &ReaderError) -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
-        "error": err.kind(),
-        "message": err.to_string(),
-    }))
-    .unwrap_or_else(|_| String::from("{\"error\":\"unknown\"}"))
+    let answer = match err {
+        ReaderError::UnknownCluster { requested, known } => kotae::Answer::refused(
+            format!("unknown cluster: {requested}"),
+            known.iter().cloned(),
+        ),
+        other => kotae::Answer::blind(other.to_string()),
+    };
+    let mut v = answer.to_value();
+    if let serde_json::Value::Object(ref mut m) = v {
+        m.insert("kind".into(), serde_json::Value::String(err.kind().into()));
+    }
+    serde_json::to_string_pretty(&v)
+        .unwrap_or_else(|_| kotae::Answer::blind("render failure").render())
 }
 
 #[cfg(test)]
@@ -377,10 +399,48 @@ mod tests {
             }))
             .await;
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // Clients pattern-match on the `error` field — stable kind
-        // identifier, NOT the prose message.
-        assert_eq!(v["error"], "unknown_cluster");
-        assert!(v["message"].is_string());
+        // `kind` is unchanged and still the stable identifier clients
+        // pattern-match on — NOT the prose message.
+        assert_eq!(v["kind"], "unknown_cluster");
+
+        // What is new: the answer says what the caller should DO. Naming a
+        // cluster that does not exist is a REFUSAL — the reader worked
+        // perfectly and the argument was wrong — which is a different
+        // situation from an unreadable state file, where retrying is
+        // reasonable. Both used to render under one `error` key.
+        assert_eq!(v["outcome"], "refused");
+
+        // And the refusal carries the clusters that DO exist, so a typo costs
+        // one more call instead of ending the conversation.
+        let legal: Vec<&str> = v["legal"]
+            .as_array()
+            .expect("a refusal names its legal set")
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            legal,
+            vec!["demo"],
+            "the known clusters must be handed back verbatim"
+        );
+    }
+
+    /// The counterpart, and the distinction the old shape erased: a failure
+    /// that is NOT the caller's fault renders as blindness, so nothing about
+    /// the cluster may be concluded from it.
+    #[tokio::test]
+    async fn an_unreadable_state_file_is_blind_not_refused() {
+        let answer = to_pretty_error(&ReaderError::Io {
+            what: "/nonexistent/clusters.yaml".into(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "nope"),
+        });
+        let v: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(v["outcome"], "blind");
+        assert_eq!(v["kind"], "io");
+        assert!(
+            v["legal"].is_null(),
+            "blindness has no legal set — there is nothing for the caller to fix"
+        );
     }
 
     #[tokio::test]
