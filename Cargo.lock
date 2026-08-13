@@ -1623,6 +1623,7 @@ dependencies = [
  "engenho-cluster-config",
  "engenho-kube-client",
  "engenho-types",
+ "kotae",
  "rmcp",
  "serde",
  "serde_json",
@@ -2617,7 +2618,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3217,6 +3218,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashlink"
@@ -3869,6 +3873,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
 dependencies = [
  "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "kotae"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1194689d317921722f9793d9d803d96801777c0359784ab33f2870ac9c040b04"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -8057,7 +8071,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

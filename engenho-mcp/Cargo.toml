@@ -17,6 +17,12 @@ name = "engenho-mcp"
 path = "src/main.rs"
 
 [dependencies]
+# kotae — the typed answer vocabulary. This surface already classified its
+# failures (`ReaderError::kind()`), which is more than most; what it could not
+# express is the DIFFERENCE between them. A typo'd cluster name and an
+# unreadable state file both rendered as `{"error": ...}`, so an agent could
+# not tell "fix your argument" from "the tool cannot see".
+kotae = "0.1"
 anyhow             = { workspace = true }
 async-trait        = { workspace = true }
 engenho-cluster-config = { workspace = true }

@@ -36,8 +36,17 @@ pub struct ListSpec {
 /// in `Io` / `Parse` variants so consumers can distinguish.
 #[derive(Debug, thiserror::Error)]
 pub enum ReaderError {
-    #[error("unknown cluster: {0}")]
-    UnknownCluster(String),
+    /// The named cluster is not one this reader knows.
+    ///
+    /// Carries the set that IS known, because that is what the caller needs to
+    /// retry and both raise sites already hold it. Without it a typo ends the
+    /// conversation; with it the retry costs one call. This is the payload
+    /// kotae's `Refused` arm renders as its `legal` set.
+    #[error("unknown cluster: {requested} (known: {})", known.join(", "))]
+    UnknownCluster {
+        requested: String,
+        known: Vec<String>,
+    },
 
     #[error("io error reading {what}: {source}")]
     Io {
@@ -62,7 +71,7 @@ impl ReaderError {
     /// MCP error payload). Order-independent + lowercase snake.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::UnknownCluster(_) => "unknown_cluster",
+            Self::UnknownCluster { .. } => "unknown_cluster",
             Self::Io { .. } => "io",
             Self::Parse { .. } => "parse",
             Self::InvalidState(_) => "invalid_state",
@@ -152,7 +161,13 @@ mod tests {
     #[test]
     fn reader_error_kind_is_stable() {
         let cases = [
-            (ReaderError::UnknownCluster("x".into()), "unknown_cluster"),
+            (
+                ReaderError::UnknownCluster {
+                    requested: "x".into(),
+                    known: vec!["a".into()],
+                },
+                "unknown_cluster",
+            ),
             (
                 ReaderError::Io {
                     what: "x".into(),

@@ -86,10 +86,14 @@ impl KikaiClusterReader {
                 what: path.display().to_string(),
                 source,
             })?;
+        let known: Vec<String> = all.keys().cloned().collect();
         all.into_iter()
             .find(|(k, _)| k == cluster)
             .map(|(_, v)| v)
-            .ok_or_else(|| ReaderError::UnknownCluster(cluster.to_string()))
+            .ok_or_else(|| ReaderError::UnknownCluster {
+                requested: cluster.to_string(),
+                known,
+            })
     }
 }
 
