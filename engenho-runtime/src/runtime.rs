@@ -826,7 +826,57 @@ fn write_boot_kubeconfig(
     let path = config.runtime.data_dir.join("kubeconfig");
     write_kubeconfig_file(&path, &yaml)?;
     info!(path = %path.display(), server = %server_url, admin = admin.is_some(), "kubeconfig written");
+
+    // ── ★ ALSO PUBLISH WHERE ORDINARY TOOLING ACTUALLY LOOKS ──────────
+    // The `data_dir` copy above is self-contained and nothing reads it:
+    // kubectl, k9s and flux resolve through `$KUBECONFIG`, which the fleet
+    // composes from `~/.kube/configs/*` via the typed `pleme.kubeconfigs`
+    // list (nix: `modules/shared/kubeconfig-paths.nix`). Publishing here is
+    // what makes "every node has its own engenho and the tools just work"
+    // true without an operator copying a file.
+    //
+    // A publish FAILURE is deliberately not fatal. The daemon is already
+    // serving; refusing to boot because `$HOME` is read-only (or absent, as
+    // under launchd) would trade a working cluster for a missing
+    // convenience. It is logged at WARN so the reason is visible.
+    if let Some(publish) = resolve_publish_path(&config.runtime.kubeconfig_publish_path) {
+        match write_kubeconfig_file(&publish, &yaml) {
+            Ok(()) => {
+                info!(path = %publish.display(), "kubeconfig published for kubectl/k9s/flux");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %publish.display(),
+                    error = %e,
+                    "kubeconfig publish failed — the daemon is serving; \
+                     `$KUBECONFIG` will not see this cluster until the path is writable"
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+/// Expand the configured publish path, or `None` when publishing is off.
+///
+/// Handles a leading `~/` because the default is written as a portable
+/// string in config (`~/.kube/configs/engenho`) rather than a resolved
+/// path — the config layer must stay a pure value with no `$HOME` baked
+/// into it, or a rendered config would only be valid for the user who
+/// generated it.
+fn resolve_publish_path(raw: &str) -> Option<std::path::PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        // `HOME` unset (some launchd contexts) means there is no home to
+        // publish into — skip rather than write to a relative path that
+        // would land wherever the daemon happens to be running.
+        let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+        return Some(std::path::PathBuf::from(home).join(rest));
+    }
+    Some(std::path::PathBuf::from(raw))
 }
 
 /// Persist the admin client cert + key under `data_dir/pki/` (cert 0644, key
@@ -1251,6 +1301,43 @@ fn make_service_router(resolved: ResolvedDatapath) -> Arc<dyn ServiceRouter> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Empty disables publishing — the escape hatch tests and headless
+    /// contexts use to stay out of `$HOME`.
+    #[test]
+    fn empty_publish_path_disables_publishing() {
+        assert!(super::resolve_publish_path("").is_none());
+        assert!(super::resolve_publish_path("   ").is_none());
+    }
+
+    /// An absolute path is taken verbatim — nix renders one when it wants
+    /// the file somewhere other than the convention.
+    #[test]
+    fn absolute_publish_path_is_verbatim() {
+        assert_eq!(
+            super::resolve_publish_path("/etc/engenho/kubeconfig"),
+            Some(std::path::PathBuf::from("/etc/engenho/kubeconfig"))
+        );
+    }
+
+    /// ★ `~/` IS EXPANDED HERE, NOT BAKED INTO CONFIG.
+    ///
+    /// The default is the portable string `~/.kube/configs/engenho`. If
+    /// the config layer resolved `$HOME` instead, a rendered config would
+    /// be valid only for the user who generated it — which breaks the
+    /// nix path, where the config is built once and used by whoever runs
+    /// the daemon.
+    #[test]
+    fn tilde_expands_against_home_at_write_time() {
+        let Ok(home) = std::env::var("HOME") else {
+            return; // no HOME in this environment; the None case is covered below
+        };
+        assert_eq!(
+            super::resolve_publish_path("~/.kube/configs/engenho"),
+            Some(std::path::PathBuf::from(home).join(".kube/configs/engenho"))
+        );
+    }
+
     use super::*;
     use engenho_config::KubeletBackendKind as CfgKind;
     use shikumi::TieredConfig;

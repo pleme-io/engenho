@@ -59,6 +59,32 @@ pub struct RuntimeConfig {
     /// schedulable `Node/<node_name>` at boot so the scheduler has a
     /// target.
     pub node_name: String,
+    /// Where the boot kubeconfig is ALSO published, so ordinary tooling
+    /// finds it without being told.
+    ///
+    /// ── ★ WHY A SECOND PATH AND NOT JUST `data_dir/kubeconfig` ───────
+    /// The daemon has always written `data_dir/kubeconfig`, and nothing
+    /// reads it: kubectl, k9s and flux resolve through `$KUBECONFIG`,
+    /// which the fleet composes from `~/.kube/configs/*` (nix:
+    /// `modules/shared/kubeconfig-paths.nix`, the typed
+    /// `pleme.kubeconfigs` list). A kubeconfig nobody looks at is a
+    /// kubeconfig that does not exist.
+    ///
+    /// ── ★ WHY THE PATH IS STABLE AND THE *NAME* CARRIES THE NODE ─────
+    /// The cluster NAME is per-node and hashed
+    /// ([`crate::cluster::default_cluster_name`]), but the PATH is not —
+    /// and that asymmetry is deliberate. Nix has to declare this file in
+    /// `pleme.kubeconfigs` at BUILD time, and `builtins.hashString`
+    /// offers md5/sha1/sha256/sha512 — **no blake3**. Nix therefore
+    /// cannot reproduce `engenho-<node>-<hash>` to name the file it
+    /// declares. A stable path removes the need: nix declares one
+    /// literal, and the per-node identity lives in the cluster/context
+    /// name INSIDE the file, where kubectl shows it. Each node runs one
+    /// engenho, so the path needs no hash to disambiguate.
+    ///
+    /// Empty string disables the publish (the `data_dir` copy is always
+    /// written), which is what tests use to stay out of `$HOME`.
+    pub kubeconfig_publish_path: String,
     /// Which container runtime the kubelet drives.
     pub kubelet_backend: KubeletBackendKind,
     /// Optional explicit podman binary path (ignored unless
@@ -80,6 +106,7 @@ impl TieredConfig for RuntimeConfig {
             data_dir: PathBuf::new(),
             durable: false,
             node_name: String::new(),
+            kubeconfig_publish_path: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             leadership_timeout_seconds: 0,
@@ -121,6 +148,11 @@ impl TieredConfig for RuntimeConfig {
             data_dir: PathBuf::from("/var/lib/engenho"),
             durable: true,
             node_name,
+            // The fleet convention (`~/.kube/configs/<name>`), which
+            // `modules/shared/kubeconfig-paths.nix` folds into KUBECONFIG.
+            // `$HOME` is resolved at write time, not here, so the default
+            // stays a pure value.
+            kubeconfig_publish_path: "~/.kube/configs/engenho".into(),
             kubelet_backend: KubeletBackendKind::Podman,
             podman_binary: None,
             leadership_timeout_seconds: 10,
@@ -148,6 +180,11 @@ impl TieredConfig for RuntimeConfig {
                 base.node_name.clone()
             } else {
                 self.node_name
+            },
+            kubeconfig_publish_path: if self.kubeconfig_publish_path.is_empty() {
+                base.kubeconfig_publish_path.clone()
+            } else {
+                self.kubeconfig_publish_path
             },
             kubelet_backend: self.kubelet_backend,
             podman_binary: self.podman_binary.or_else(|| base.podman_binary.clone()),
