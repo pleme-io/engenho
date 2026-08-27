@@ -23,6 +23,11 @@ shikumi            = "0.1.0"
 # overlay in the progressive fold parses YAML into a `Dict` via figment's
 # Yaml provider. Same figment (0.10) shikumi already pins — one closure.
 figment            = { version = "0.10", features = ["yaml"] }
+# Per-node deterministic cluster identity (see cluster.rs). `blake3` is
+# the fleet's standard content hash; `gethostname` is a single-function
+# crate rather than a subprocess, per the NO SHELL law.
+blake3             = { workspace = true }
+gethostname        = "1"
 
 [dev-dependencies]
 tempfile = "3"
