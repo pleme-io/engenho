@@ -65,7 +65,10 @@ fn node_token(raw: &str) -> String {
 /// tracking them.
 #[must_use]
 pub fn default_cluster_name() -> String {
-    let raw = gethostname::gethostname().to_string_lossy().into_owned();
+    // THE SINGLE HOSTNAME SOURCE — see `crate::discovery::detected_node_name`.
+    // Reading the host a second way here would let a node's `Node` object and
+    // its cluster name disagree about which machine this is.
+    let raw = crate::discovery::detected_node_name().unwrap_or_else(|| "node".into());
     cluster_name_for_host(&raw)
 }
 
