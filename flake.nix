@@ -111,5 +111,68 @@
         withMcp.${system} // (
           if builtins.elem system imageSystems then imageAttrs else { }
         ));
-    };
+    } // (
+      # ── The module trio ────────────────────────────────────────────────
+      # engenho's `main.rs` has documented this integration since it was
+      # written ("the verb the substrate `mkModuleTrio` factory invokes"),
+      # but no module existed: the whole repo contained ONE .nix file, and
+      # `nixosModules` / `darwinModules` / `homeManagerModules` were all
+      # absent. So "every node runs its own engenho by default" had no way
+      # to actually start one.
+      #
+      # `hmNamespace = "services"` (not the "programs" default) is
+      # deliberate: it puts the option path at `services.engenho.*` on ALL
+      # THREE arms, which is what lets one typed-config module serve them
+      # all instead of three copies with three chances to drift.
+      let
+        trio = (import "${substrate}/lib/module-trio.nix" {
+          inherit (nixpkgs) lib;
+        }).mkModuleTrio {
+          name = "engenho";
+          description = "engenho — typed, attested, Rust-native Kubernetes runtime";
+          binaryName = "engenho";
+          packageAttr = "engenho";
+          hmNamespace = "services";
+
+          # Both arms, because engenho is legitimately either: a per-user
+          # local cluster on a workstation (HM user agent), or the node
+          # runtime on a server (system daemon). `daemonSubcommand` matches
+          # engenho's actual CLI verb — the bare form boots the daemon too,
+          # but naming it keeps the generated unit self-describing.
+          withSystemDaemon = true;
+          withUserDaemon = true;
+          daemonSubcommand = "daemon";
+
+          # engenho reads shikumi TieredConfig, so the YAML the trio deploys
+          # IS its file tier. Defaults stay EMPTY on purpose: engenho's own
+          # progressive fold already supplies prescribed defaults, and a key
+          # written here would be read as an explicit operator opinion that
+          # SUPPRESSES that fold — including the derived per-node cluster
+          # name. See nix/typed-config.nix's `prune`.
+          withShikumiConfig = true;
+          shikumiDefaults = { };
+        };
+        # The typed surface rides with every arm, so a consumer gets one
+        # import and gets eval-time type checking with it.
+        withTyped = m: { imports = [ m ./nix/typed-config.nix ]; };
+      in
+      {
+        # Eval-time proof for the typed surface (IFD-free — it stubs the
+        # trio's `settings` option rather than building engenho, so it runs
+        # anywhere `nix flake check` does). Red-run verified: weakening the
+        # kubeletBackend enum, and disabling the null-prune, each turn it red.
+        checks = nixpkgs.lib.genAttrs mcpSystems (system: {
+          typed-config = import ./nix/tests/typed-config-test.nix {
+            pkgs = import nixpkgs { inherit system; };
+          };
+        });
+
+        nixosModules.default = withTyped trio.nixosModule;
+        nixosModules.engenho = withTyped trio.nixosModule;
+        darwinModules.default = withTyped trio.darwinModule;
+        darwinModules.engenho = withTyped trio.darwinModule;
+        homeManagerModules.default = withTyped trio.homeManagerModule;
+        homeManagerModules.engenho = withTyped trio.homeManagerModule;
+      }
+    );
 }
