@@ -573,7 +573,21 @@ cluster:
         // curated defaults where discovery has no opinion, and always validates.
         let r = EngenhoConfig::resolve_progressive();
         r.value().validate().unwrap();
-        assert_eq!(r.value().cluster.name, "engenho-local");
+        // The cluster name is now DERIVED per node (see
+        // `cluster::default_cluster_name`), so it is no longer a constant
+        // this test can pin — asserting `"engenho-local"` here would pass
+        // on exactly one machine. Assert the SHAPE and the determinism
+        // instead, which is what the default actually promises.
+        let name = &r.value().cluster.name;
+        assert!(
+            name.starts_with("engenho-"),
+            "derived cluster name must carry the prefix, got {name}"
+        );
+        assert_eq!(
+            *name,
+            crate::cluster::default_cluster_name(),
+            "the resolved default must equal the derived name for THIS node"
+        );
         assert_eq!(r.value().scheduler.tick_interval_seconds, 5);
     }
 
