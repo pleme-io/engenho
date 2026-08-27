@@ -319,6 +319,9 @@ mod tests {
             data_dir: PathBuf::new(),
             durable: false,
             node_name: "node-A".into(),
+            // Empty ⇒ `extend` must fill it from the base, which is
+            // precisely what this test asserts for every other field.
+            kubeconfig_publish_path: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             leadership_timeout_seconds: 0,

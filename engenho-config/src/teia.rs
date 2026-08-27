@@ -34,7 +34,20 @@ impl TieredConfig for TeiaConfig {
     fn prescribed_default() -> Self {
         Self {
             servers: vec!["nats://127.0.0.1:4222".into()],
-            cluster: "engenho-local".into(),
+            // ── ★ ONE CLUSTER IDENTITY, DERIVED IN ONE PLACE ──────────
+            // This was the literal `"engenho-local"` — a SECOND hardcoded
+            // copy of the cluster name, independent of `cluster.name`.
+            // Once `cluster.name` became per-node
+            // (`engenho-<node>-<hash8>`), the two silently disagreed: the
+            // cluster called itself one thing and published its teia
+            // subjects under another, so two nodes' meshes collided on
+            // `engenho-local` exactly as the per-node naming was meant to
+            // prevent.
+            //
+            // Both now call `cluster::default_cluster_name()`, so the
+            // defaults agree BY CONSTRUCTION rather than by two authors
+            // remembering to edit two files.
+            cluster: crate::cluster::default_cluster_name(),
             credentials_path: None,
             connect_timeout_seconds: 10,
         }

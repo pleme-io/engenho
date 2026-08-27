@@ -715,12 +715,49 @@ cluster:
         assert!(!cfg.runtime.node_name.is_empty());
     }
 
+    /// ★ ONE CLUSTER IDENTITY — the invariant, not just today's values.
+    ///
+    /// `teia.cluster` used to be its own hardcoded `"engenho-local"`,
+    /// independent of `cluster.name`. That was invisible while both were
+    /// the same literal, and became a real split the moment `cluster.name`
+    /// went per-node: the cluster called itself one thing and published
+    /// its teia subjects under another, so two nodes' meshes collided on
+    /// `engenho-local` exactly as per-node naming was meant to prevent.
+    ///
+    /// Asserting they are EQUAL (rather than asserting either value) is
+    /// what stops a future edit to one default from silently re-splitting
+    /// them.
+    #[test]
+    fn teia_subject_namespace_matches_the_cluster_identity() {
+        let d = EngenhoConfig::prescribed_default();
+        assert_eq!(
+            d.teia.cluster, d.cluster.name,
+            "teia.cluster and cluster.name must not diverge — a second \
+             hardcoded copy of the cluster identity is how they last did"
+        );
+        assert!(
+            d.cluster.name.starts_with("engenho-"),
+            "and both must be the DERIVED per-node name, got {}",
+            d.cluster.name
+        );
+    }
+
     #[test]
     fn config_diff_bare_to_default_is_nonempty() {
         // The `config-diff` CLI path: shikumi ConfigDiff between two tiers.
         let diff = EngenhoConfig::prescribed_default().diff_against(&EngenhoConfig::bare());
         assert!(!diff.is_empty_diff());
-        assert!(diff.render_unified().contains("engenho-local"));
+        // Was `contains("engenho-local")` — a literal that only held while
+        // the cluster name was HARDCODED. Both `cluster.name` and
+        // `teia.cluster` now derive per node, so that string is gone and
+        // pinning today's derived value would pass on one machine only.
+        // Assert what the test's name actually claims: the rendered diff
+        // carries the cluster identity.
+        let rendered = diff.render_unified();
+        assert!(
+            rendered.contains(&crate::cluster::default_cluster_name()),
+            "the bare→default diff must show the derived cluster name; got:\n{rendered}"
+        );
     }
 
     #[test]
