@@ -621,7 +621,18 @@ cluster:
             .provenance()
             .provenance_of(&["runtime", "node_name"])
             .expect("node_name has provenance");
-        match std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()) {
+        // ── ★ DETECTION IS NO LONGER `$HOSTNAME`-ONLY ────────────────
+        // This used to branch on `$HOSTNAME` alone, because that was the
+        // only signal `detected_node_name()` read. It now falls back to a
+        // real `gethostname(2)` — which MATTERS, because `$HOSTNAME` is
+        // not exported by default on macOS, so the old code took the
+        // "absent" branch on every Mac and every node answered to the
+        // same fallback name.
+        //
+        // So the branch is on the DETECTOR, not on one of its inputs.
+        // Asserting `$HOSTNAME` here would now be asserting an
+        // implementation detail that is no longer the whole mechanism.
+        match crate::discovery::detected_node_name() {
             Some(host) => {
                 assert_eq!(r.value().runtime.node_name, host);
                 assert_eq!(p.tier(), ConfigTierKind::Discovered);

@@ -97,12 +97,32 @@ impl DiscoveryLayer for HostnameLayer {
 /// signal the pre-seam `discovered_hostname()` read, so the effective
 /// `prescribed_default()` node name is byte-preserved across the refactor.
 ///
-/// Follow-on: this belongs in `kanchi::probe` as a real `gethostname(2)` probe
-/// (its OS-FFI home); a local read keeps engenho-config free of a new git dep
-/// until that probe lands.
+/// ── ★ NOW A REAL `gethostname(2)`, WITH `$HOSTNAME` AS THE OVERRIDE ──
+/// This used to read `$HOSTNAME` and nothing else, and its own comment named
+/// the gap: *"this belongs in `kanchi::probe` as a real `gethostname(2)`
+/// probe; a local read keeps engenho-config free of a new git dep until that
+/// probe lands."* The dep now exists (`gethostname`, a one-function crate —
+/// not a subprocess, per NO SHELL), so the stated blocker is gone.
+///
+/// It matters beyond tidiness: **`$HOSTNAME` is not exported by default on
+/// macOS**, so an env-only read degenerated to the `"engenho-node"` fallback
+/// on every Mac. Every node would have answered to the same name — which is
+/// precisely what [`crate::cluster::default_cluster_name`] must not do.
+///
+/// `$HOSTNAME` still wins when set, so an operator (or a test) can override
+/// the detected value without patching code.
+///
+/// THIS IS THE SINGLE HOSTNAME SOURCE. `node_name` discovery and cluster
+/// naming both resolve through here; a second reader would let a node's
+/// Node object and its cluster name disagree about what host this is.
 #[must_use]
 pub(crate) fn detected_node_name() -> Option<String> {
-    std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty())
+    if let Some(h) = std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()) {
+        return Some(h);
+    }
+    let os = gethostname::gethostname();
+    let s = os.to_string_lossy().trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 #[cfg(test)]
