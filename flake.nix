@@ -24,10 +24,32 @@
         src = ./.;
         member = "engenho-mcp";
       };
+      # `engenho-cluster-config-render` — the SAME graft, for the same
+      # reason, and it was missing.
+      #
+      # ── ★ WHY THIS IS A BUG FIX, NOT A NEW FEATURE ──────────────────
+      # `kindling-profiles`' `profiles/nixos-k3s-vm/default.nix:37` reads
+      # `inputs.engenho.packages.${system}.engenho-cluster-config-render`
+      # to render a cluster's config into the VM image. That attribute did
+      # not exist: `member = "engenho"` builds one member, and the only
+      # `engenho-cluster-config-render` outputs here were the two OCI
+      # IMAGES (`-image-amd64`/`-image-arm64`) — an image cannot be a
+      # NixOS `environment.etc` input.
+      #
+      # Measured 2026-08-27: every `kikai up --cluster engenho-local`
+      # failed in PREFLIGHT with `attribute
+      # 'engenho-cluster-config-render' missing`, so the local k3s VM
+      # could not be built at all. The images built fine, which is why
+      # nothing else flagged it.
+      renderBase = substrate.rust.workspace {
+        src = ./.;
+        member = "engenho-cluster-config-render";
+      };
       mcpSystems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
       withMcp = nixpkgs.lib.genAttrs mcpSystems (system:
         (base.packages.${system} or { }) // {
           engenho-mcp = mcpBase.packages.${system}.default;
+          engenho-cluster-config-render = renderBase.packages.${system}.default;
         });
 
       # ============================================================
