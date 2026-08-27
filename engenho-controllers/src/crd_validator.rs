@@ -266,6 +266,9 @@ mod tests {
             short_names: Vec::new(),
             categories: Vec::new(),
             scope,
+            // These fixtures exercise SCHEMA validation, not the
+            // subresource surface — false keeps them at the old behaviour.
+            serves_status: false,
             schema,
         }
     }

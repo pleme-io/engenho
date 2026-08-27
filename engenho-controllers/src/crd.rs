@@ -96,6 +96,23 @@ pub struct CrdNames {
     pub categories: Vec<String>,
 }
 
+/// `spec.versions[].subresources` — which subresources a CRD version serves.
+///
+/// kube declares an enabled subresource as an EMPTY OBJECT
+/// (`subresources: {status: {}}`), so presence is the signal and there is no
+/// boolean to read. `Option<serde_json::Value>` therefore models it exactly:
+/// `Some` ⇒ served, `None` ⇒ not.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrdSubresources {
+    /// Present ⇒ this version serves `/status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<serde_json::Value>,
+    /// Present ⇒ this version serves `/scale`. Captured so it round-trips;
+    /// engenho does not serve it for CRDs yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<serde_json::Value>,
+}
+
 /// One entry in `spec.versions[]`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrdVersion {
@@ -110,6 +127,14 @@ pub struct CrdVersion {
     /// the same stored object at its own GVK).
     #[serde(default)]
     pub storage: bool,
+    /// `subresources` as the CRD declares them.
+    ///
+    /// Only the PRESENCE of `status` is read: kube's schema models it as
+    /// `subresources.status: {}` — an empty object whose existence is the
+    /// whole signal. Captured opaque so `scale` (unsupported here) round-trips
+    /// without being silently dropped.
+    #[serde(default)]
+    pub subresources: Option<CrdSubresources>,
     /// The OpenAPI v3 schema (`schema.openAPIV3Schema`) — captured opaque;
     /// structural validation against it is DEFERRED (CR creates are accepted
     /// as-is via `--validate=false`).
@@ -164,6 +189,10 @@ pub struct CrdEntry {
     pub categories: Vec<String>,
     /// Namespace scope.
     pub scope: CrdScope,
+    /// Does THIS version serve `/status`? Read from the CRD's own
+    /// `subresources.status`, never assumed — a CRD that declares no
+    /// status subresource must keep 404-ing, exactly as kube does.
+    pub serves_status: bool,
     /// The opaque openAPIV3Schema for this version (validation DEFERRED).
     pub schema: Value,
 }
@@ -251,6 +280,8 @@ pub struct CrdHandlerSpec {
     pub categories: Vec<String>,
     /// `true` ⇒ namespaced.
     pub namespaced: bool,
+    /// `true` ⇒ register the `/status` subresource for this version.
+    pub serves_status: bool,
 }
 
 impl From<&CrdEntry> for CrdHandlerSpec {
@@ -264,6 +295,7 @@ impl From<&CrdEntry> for CrdHandlerSpec {
             short_names: e.short_names.clone(),
             categories: e.categories.clone(),
             namespaced: e.scope.is_namespaced(),
+            serves_status: e.serves_status,
         }
     }
 }
@@ -346,6 +378,10 @@ impl CrdController {
                 short_names: spec.names.short_names.clone(),
                 categories: spec.names.categories.clone(),
                 scope: spec.scope,
+                serves_status: v
+                    .subresources
+                    .as_ref()
+                    .is_some_and(|sr| sr.status.is_some()),
                 schema: v.schema.clone(),
             })
             .collect()

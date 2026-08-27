@@ -1774,6 +1774,32 @@ impl DynamicHandlerSink for RouterHandlerSink {
                 spec.namespaced,
             )
             .with_registration_metadata(short_names, singular, categories)
+            // ── ★ A CRD'S DECLARED `/status` IS NOW SERVED ──────────────
+            // Dynamically-registered CRs used to serve NO subresource
+            // (`subresources: &[]` in `new`), so a controller writing
+            // `.status` — which is what every controller does — got
+            // `does not serve subresource` and could never record an
+            // outcome. Measured against pangea-operator on 2026-08-27:
+            // it reconciled correctly and then failed writing status,
+            // so the CR sat at `Pending` forever with the real result
+            // discarded.
+            //
+            // No type change was needed. `subresources` is `&'static`
+            // because the cataloged path sources it from the static
+            // RESOURCE_CATALOG — but the VALUE here is a constant, so
+            // the dynamic decision is only WHICH static slice to point
+            // at. That keeps CRDs off the metadata-leak path the rest of
+            // this function uses for genuinely per-CRD strings.
+            .with_subresources(if spec.serves_status {
+                const STATUS_ONLY: &[Subresource] = &[Subresource::Status];
+                STATUS_ONLY
+            } else {
+                // A CRD that declares no status subresource must keep
+                // 404-ing, exactly as kube does — serving it anyway would
+                // let a controller silently write a field the CRD author
+                // never opted into.
+                &[]
+            })
             .with_admission(self.admission.clone()),
         );
         self.router.register(handler);
