@@ -575,3 +575,96 @@ async fn durable_store_resumes_deployment_across_runtime_restart() {
         rt.shutdown().await.expect("second shutdown");
     }
 }
+
+/// **A freshly booted engenho has the four system namespaces.**
+///
+/// Regression test for the defect that opened this whole investigation.
+/// Measured 2026-08-28 on the live daemon: `GET /api/v1/namespaces` returned
+/// `{"items":[]}`. Not one namespace — not even `default`. So k9s showed an
+/// empty screen, correctly, because the cluster genuinely contained nothing,
+/// and there was nowhere to schedule a workload.
+///
+/// Upstream's kube-apiserver seeds these during bootstrap. Asserted over real
+/// HTTP against a booted `Runtime`, because the thing that was broken is what
+/// a CLIENT sees — an in-process store assertion would not have caught the
+/// class (the store was fine; nothing ever wrote to it).
+#[tokio::test]
+async fn boot_seeds_the_four_system_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = Arc::new(FakeBackend::new());
+    let backend_dyn: Arc<dyn ContainerRuntime> = backend.clone();
+
+    let rt = Runtime::start_with_backend(durable_config(tmp.path()), backend_dyn)
+        .await
+        .expect("Runtime boots");
+    let addr = rt.local_addr();
+    let client = admin_client(tmp.path());
+
+    let resp = client
+        .get(format!("http://{addr}/api/v1/namespaces"))
+        .send()
+        .await
+        .expect("GET namespaces");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    let items = list
+        .get("items")
+        .and_then(|i| i.as_array())
+        .expect("NamespaceList carries items");
+
+    let names: std::collections::BTreeSet<&str> = items
+        .iter()
+        .filter_map(|n| n.get("metadata")?.get("name")?.as_str())
+        .collect();
+
+    for want in ["default", "kube-system", "kube-public", "kube-node-lease"] {
+        assert!(
+            names.contains(want),
+            "a booted cluster MUST have the `{want}` namespace; got {names:?}"
+        );
+    }
+
+    // Shape, not just presence: a seeded namespace must look exactly like a
+    // client-created one, because a direct store Put bypasses the apiserver's
+    // create path and a divergence there is invisible until something reads it.
+    let default_ns = items
+        .iter()
+        .find(|n| {
+            n.get("metadata").and_then(|m| m.get("name")).and_then(|v| v.as_str()) == Some("default")
+        })
+        .expect("default namespace present");
+
+    assert_eq!(
+        default_ns
+            .get("status")
+            .and_then(|s| s.get("phase"))
+            .and_then(|p| p.as_str()),
+        Some("Active"),
+        "a seeded namespace is Active — clients read phase to tell Active from Terminating: {default_ns:#}"
+    );
+    assert_eq!(
+        default_ns
+            .get("metadata")
+            .and_then(|m| m.get("labels"))
+            .and_then(|l| l.get("kubernetes.io/metadata.name"))
+            .and_then(|v| v.as_str()),
+        Some("default"),
+        "upstream guarantees the kubernetes.io/metadata.name label; selectors rely on it"
+    );
+    assert!(
+        default_ns
+            .get("spec")
+            .and_then(|s| s.get("finalizers"))
+            .and_then(|f| f.as_array())
+            .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("kubernetes"))),
+        "spec.finalizers carries the kubernetes finalizer: {default_ns:#}"
+    );
+    assert!(
+        default_ns
+            .get("metadata")
+            .and_then(|m| m.get("creationTimestamp"))
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| !t.is_empty()),
+        "seeded through the boundary stamp, so AGE works in kubectl/k9s"
+    );
+}

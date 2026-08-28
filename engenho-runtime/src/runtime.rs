@@ -31,6 +31,8 @@ use engenho_store::{
     command::{Reason, ResourceCommand},
     default_config,
 };
+use engenho_types::generated_v1_34::core_v1::Namespace;
+use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
 use engenho_types::generated_v1_34::rbac_v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
 };
@@ -116,6 +118,10 @@ impl Runtime {
         //    Idempotent (Put preserves uid across restarts, same as
         //    register_node). MUST precede step 5 so anonymous discovery + bound
         //    roles resolve through real bindings from the first request.
+        //    Seed the four system namespaces FIRST: a namespace must exist
+        //    before anything namespaced can live in it, and `default` is what
+        //    every client opens to.
+        seed_system_namespaces(&store).await?;
         seed_bootstrap_rbac(&store).await?;
 
         // 5. Bind the apiserver, backed by the same store.
@@ -551,6 +557,95 @@ const RBAC_VERSION: &str = "v1";
 /// `serde_json::to_value` → `ResourceCommand::Put` (TYPED EMISSION — no `json!()`
 /// of the policy bodies; only the Put envelope helper). Idempotent because Put
 /// preserves `metadata.uid` across restarts, exactly like `register_node`.
+/// The four namespaces every conformant control plane has at first boot.
+///
+/// Upstream's kube-apiserver creates these during bootstrap, and their absence
+/// is not subtle: with zero namespaces `kubectl get ns` prints nothing, every
+/// namespaced list is empty, and there is nowhere to schedule a workload. On
+/// 2026-08-28 a live engenho served `{"items":[]}` from `/api/v1/namespaces`,
+/// so k9s showed an empty screen — correctly, because the cluster genuinely
+/// contained nothing.
+///
+/// * `default` — where an unqualified client request lands.
+/// * `kube-system` — control-plane workloads.
+/// * `kube-public` — world-readable cluster info.
+/// * `kube-node-lease` — Node heartbeat Leases (`coordination.k8s.io`).
+///
+/// Idempotent across restarts for the same reason [`register_node`] is: the
+/// apply path preserves `metadata.uid` and `creationTimestamp` on a Put over
+/// an existing key, so re-seeding an unchanged namespace is a no-op rather
+/// than a new object identity.
+///
+/// Each is built as a TYPED [`Namespace`] rather than a `json!()` literal, so
+/// a field that does not exist is a compile error — the shape
+/// `seed_bootstrap_rbac` established and the one `register_node` still
+/// predates.
+async fn seed_system_namespaces(store: &StoreMesh) -> Result<(), RuntimeError> {
+    for name in SYSTEM_NAMESPACES {
+        let ns = system_namespace(name);
+        put_namespace(store, &ns).await?;
+    }
+    info!(
+        count = SYSTEM_NAMESPACES.len(),
+        "seeded system namespaces (default, kube-system, kube-public, kube-node-lease)"
+    );
+    Ok(())
+}
+
+/// The bootstrap namespace set, in creation order. A closed list: adding one
+/// is a deliberate edit here, never a call site somewhere else.
+const SYSTEM_NAMESPACES: &[&str] = &["default", "kube-system", "kube-public", "kube-node-lease"];
+
+/// One system [`Namespace`], shaped exactly as the apiserver's own create path
+/// shapes a namespace — because a direct store `Put` BYPASSES that path, and a
+/// seeded namespace that differs from a client-created one is precisely the
+/// kind of divergence a differential is built to catch.
+///
+/// Carries all three things upstream guarantees:
+/// * the `kubernetes.io/metadata.name` label (upstream's NamespaceDefaultLabelName
+///   admission plugin adds it; selectors in the wild rely on it),
+/// * `spec.finalizers = ["kubernetes"]`, the namespace-controller's hook,
+/// * `status.phase = "Active"`, which clients read to tell Active from Terminating.
+fn system_namespace(name: &str) -> Namespace {
+    let mut metadata = engenho_types::meta::ObjectMeta {
+        name: name.to_string(),
+        ..Default::default()
+    };
+    metadata.labels.insert(
+        "kubernetes.io/metadata.name".to_string(),
+        name.to_string(),
+    );
+    Namespace {
+        metadata,
+        spec: Some(NamespaceSpec {
+            finalizers: vec!["kubernetes".to_string()],
+        }),
+        status: Some(NamespaceStatus {
+            phase: Some("Active".to_string()),
+            ..Default::default()
+        }),
+    }
+}
+
+/// `Put` a typed [`Namespace`] (cluster-scoped) with `Reason::Operator`,
+/// routed through the same boundary stamp every other seeder uses so the
+/// object carries a real `creationTimestamp`.
+async fn put_namespace(store: &StoreMesh, ns: &Namespace) -> Result<(), RuntimeError> {
+    let mut value = serde_json::to_value(ns)
+        .map_err(|e| RuntimeError::Server(seed_serialize_err("Namespace", &e)))?;
+    stamp_creation_timestamp_value(&mut value);
+    let name = ns.metadata.name.clone();
+    store
+        .propose(ResourceCommand::Put {
+            key: ResourceKey::cluster_scoped("", "v1", "Namespace", name),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await?;
+    Ok(())
+}
+
 async fn seed_bootstrap_rbac(store: &StoreMesh) -> Result<(), RuntimeError> {
     // ── cluster-admin: full access to everything (resources + non-resource). ──
     let cluster_admin = ClusterRole {
