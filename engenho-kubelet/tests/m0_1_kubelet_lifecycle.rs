@@ -733,3 +733,74 @@ async fn multi_container_logs_select_per_container() {
 
     teardown(store, kubelet).await;
 }
+
+/// **A pod whose containers ALL fail to start must still get a status.**
+///
+/// Regression test for a defect measured on the live daemon 2026-08-28. The
+/// status reconcile was guarded on `started_any`, so when every container
+/// failed to start the kubelet wrote NO status at all — no `phase`, no
+/// conditions, no `containerStatuses`. The API served a pod with a `nodeName`
+/// and literally nothing else.
+///
+/// That is worse than a wrong status: a permanent, total failure became
+/// **indistinguishable from "not yet processed"** to every client. On the
+/// operator's machine the real cause was the launchd agent having no `podman`
+/// on PATH, so every start returned `spawn: No such file or directory` on
+/// every tick for hours — and k9s showed an empty screen with no error
+/// anywhere. Upstream ALWAYS reports such a pod as `Pending` with each
+/// container `Waiting`.
+///
+/// The `FakeBackend::seed_start_failure` seam this test needs did not exist
+/// either, which is precisely why the class shipped: a fake that can only
+/// succeed cannot prove what happens when the runtime refuses.
+#[tokio::test]
+async fn total_start_failure_still_writes_pending_status() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    // The kubelet names containers `<ns>_<pod>_<cname>`; seed the failure on
+    // that backend-facing name, the same convention `seed_log` uses.
+    backend
+        .seed_start_failure(
+            "default_p1_main",
+            "podman network exists spawn: No such file or directory (os error 2)",
+        )
+        .await;
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_pod(&store, "p1", "img", Some("node-A")).await;
+    kubelet.tick().await.unwrap();
+
+    // Nothing started — that is the premise, not the assertion.
+    assert_eq!(
+        backend.running_count().await,
+        0,
+        "premise: the seeded failure means no container started"
+    );
+
+    let pod = store.get(&pod_key("p1")).await.expect("pod still stored");
+    let status = pod
+        .get("status")
+        .unwrap_or_else(|| panic!("pod MUST carry a status after a failed start, got: {pod}"));
+
+    assert_eq!(
+        status.get("phase").and_then(Value::as_str),
+        Some("Pending"),
+        "a pod whose containers cannot start is Pending, never status-less: {status}"
+    );
+
+    let cs = status
+        .get("containerStatuses")
+        .and_then(Value::as_array)
+        .expect("containerStatuses present");
+    assert_eq!(cs.len(), 1, "one container declared, one status reported");
+    assert!(
+        cs[0].get("state").and_then(|s| s.get("waiting")).is_some(),
+        "the un-started container reports Waiting: {:#}",
+        cs[0]
+    );
+    assert_eq!(
+        cs[0].get("ready").and_then(Value::as_bool),
+        Some(false),
+        "an un-started container is not ready"
+    );
+}

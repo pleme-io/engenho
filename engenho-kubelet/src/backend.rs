@@ -297,6 +297,14 @@ struct FakeState {
     /// Maps a backend `container_id` → the spec NAME it was started under, so
     /// `exec(container_id, ...)` can look up the name-keyed seeded queue.
     id_to_name: BTreeMap<String, String>,
+    /// Container NAMES whose `start` must FAIL, with the backend message to
+    /// fail with. Seeded via [`FakeBackend::seed_start_failure`].
+    ///
+    /// Without this seam the "the container runtime will not start anything"
+    /// class was UNTESTABLE — which is exactly how a kubelet that wrote no pod
+    /// status at all on a total start failure shipped. A fake that can only
+    /// succeed cannot prove what happens when reality refuses.
+    seeded_start_failures: BTreeMap<String, String>,
 }
 
 /// Operation log entry for `FakeBackend`. Tests assert this shape
@@ -370,6 +378,20 @@ impl FakeBackend {
     /// container's log buffer keyed by its assigned `container_id`. Lets a
     /// test assert `kubectl logs` returns a known string (e.g.
     /// `"hello-engenho\n"`).
+    /// Make `start` FAIL for `container_name` with `message`, as a podman
+    /// spawn failure would.
+    ///
+    /// Models the real, measured failure: the launchd agent had no `podman` on
+    /// PATH, so every start returned `spawn: No such file or directory` — for
+    /// hours, on every tick, with no pod status ever written.
+    pub async fn seed_start_failure(&self, container_name: &str, message: impl Into<String>) {
+        self.inner
+            .lock()
+            .await
+            .seeded_start_failures
+            .insert(container_name.to_string(), message.into());
+    }
+
     pub async fn seed_log(&self, container_name: &str, content: impl Into<String>) {
         let mut state = self.inner.lock().await;
         state
@@ -456,6 +478,12 @@ impl ContainerRuntime for FakeBackend {
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
         let mut state = self.inner.lock().await;
+        // A seeded start failure short-circuits BEFORE any state mutation, so
+        // a failed start leaves no container, no id, and no log — exactly as a
+        // real spawn failure does.
+        if let Some(msg) = state.seeded_start_failures.get(&spec.name) {
+            return Err(KubeletError::Backend(msg.clone()));
+        }
         state.next_id += 1;
         let container_id = format!("fake-{:08x}", state.next_id);
         let pod_ip = format!("10.42.0.{}", state.next_id % 250);

@@ -1389,19 +1389,44 @@ impl Kubelet {
             }
         }
 
-        // Reconcile the status from the freshly-started set (a partial start
-        // shows the started containers Running + the rest Waiting → Pending).
-        if started_any {
-            let lp = self
-                .local
-                .lock()
-                .await
-                .get(key)
-                .cloned()
-                .unwrap_or_default();
-            self.reconcile_running(key, value, &lp, report, soonest_requeue)
-                .await?;
+        // Reconcile the status UNCONDITIONALLY — including when NOTHING
+        // started.
+        //
+        // This used to be guarded on `started_any`, which meant a pod whose
+        // containers ALL failed to start had no status written at all: no
+        // `phase`, no conditions, no containerStatuses. Measured 2026-08-28 on
+        // the live daemon, where every container start was failing with
+        // `podman … spawn: No such file or directory` (the launchd agent has
+        // no podman on PATH) — the API showed pods with a `nodeName` and
+        // literally nothing else, so a total, permanent failure was
+        // indistinguishable from "not yet processed" to every client. The
+        // operator saw an empty k9s screen and no error anywhere.
+        //
+        // Upstream ALWAYS reports such a pod as `Pending` with each container
+        // `Waiting{reason}`, plus an Event. `reconcile_running` already
+        // renders exactly that for a container with no local record (see its
+        // `ContainerObservation::waiting` arm — "partial start. Waiting → pod
+        // Pending"), so the zero-started case needs no special handling; the
+        // guard was pure loss of signal.
+        //
+        // `started_any` is retained for the log line below: "nothing started"
+        // is worth saying once per tick at debug, and it keeps the variable
+        // meaningful rather than deleting information.
+        if !started_any {
+            debug!(
+                pod = %key.label(),
+                "no container started this tick; rendering Pending/Waiting status"
+            );
         }
+        let lp = self
+            .local
+            .lock()
+            .await
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
+        self.reconcile_running(key, value, &lp, report, soonest_requeue)
+            .await?;
         Ok(())
     }
 
