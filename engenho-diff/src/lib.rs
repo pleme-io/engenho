@@ -32,6 +32,7 @@
 //! rendered only through `Display` (★★ TYPED EMISSION).
 
 pub mod cotejo;
+pub mod junkyo;
 pub mod normalize;
 pub mod observe;
 pub mod op;
@@ -40,6 +41,7 @@ pub mod target;
 pub mod verdict;
 
 pub use cotejo::{diff_observations, run, run_strict};
+pub use junkyo::{DivergenceClass, Expect, MatrixReport, Outcome, adjudicate};
 pub use normalize::{Mask, Normalizer, volatile_meta};
 pub use observe::{DiffError, HttpMethod, Observation};
 pub use op::{OpKind, Operation, RestPath};
