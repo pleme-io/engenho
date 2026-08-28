@@ -668,3 +668,108 @@ async fn boot_seeds_the_four_system_namespaces() {
         "seeded through the boundary stamp, so AGE works in kubectl/k9s"
     );
 }
+
+/// **An invalid object name is rejected with 422 Invalid, over real HTTP.**
+///
+/// Measured 2026-08-28 on the live daemon: `UPPERCASE`, `has spaces`,
+/// `-leading-dash`, `has_underscore` and a 64-character name were **all
+/// accepted with 201**. There was no name validation anywhere in the
+/// workspace, so `kubectl get ns` listed a namespace literally called
+/// `has spaces`.
+///
+/// Asserted over HTTP rather than against the validator, because a validator
+/// nobody calls is not a fix — the class here is "the boundary does not run
+/// the check", and only a request can prove the boundary runs it.
+#[tokio::test]
+async fn invalid_object_names_are_rejected_with_422() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = Arc::new(FakeBackend::new());
+    let backend_dyn: Arc<dyn ContainerRuntime> = backend.clone();
+
+    let rt = Runtime::start_with_backend(durable_config(tmp.path()), backend_dyn)
+        .await
+        .expect("Runtime boots");
+    let addr = rt.local_addr();
+    let client = admin_client(tmp.path());
+
+    // Every name the live daemon wrongly accepted, plus the 64-char one.
+    let sixty_four = "b".repeat(64);
+    for bad in [
+        "UPPERCASE",
+        "has spaces",
+        "-leading-dash",
+        "trailing-dash-",
+        "has_underscore",
+        sixty_four.as_str(),
+    ] {
+        let resp = client
+            .post(format!("http://{addr}/api/v1/namespaces"))
+            .json(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": bad },
+            }))
+            .send()
+            .await
+            .expect("POST namespace");
+
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "name {bad:?} must be rejected 422; the live daemon returned 201 for it"
+        );
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // The envelope matters as much as the code: client-go's
+        // `apierrors::IsInvalid` keys on reason "Invalid", and a controller
+        // that cannot tell "permanently invalid" from "transient" retries a
+        // doomed object forever.
+        assert_eq!(
+            body.get("kind").and_then(|k| k.as_str()),
+            Some("Status"),
+            "a rejection is a metav1.Status: {body:#}"
+        );
+        assert_eq!(
+            body.get("reason").and_then(|r| r.as_str()),
+            Some("Invalid"),
+            "reason must be Invalid (not BadRequest) for {bad:?}: {body:#}"
+        );
+        assert_eq!(body.get("code").and_then(serde_json::Value::as_u64), Some(422));
+    }
+
+    // A VALID name still works — the guard must not have become a wall.
+    let ok = client
+        .post(format!("http://{addr}/api/v1/namespaces"))
+        .json(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "a-legal-name" },
+        }))
+        .send()
+        .await
+        .expect("POST valid namespace");
+    assert_eq!(
+        ok.status(),
+        reqwest::StatusCode::CREATED,
+        "a legal DNS-1123 label must still be accepted"
+    );
+
+    // A Pod MAY carry dots (subdomain rule) where a Namespace may not —
+    // proving the per-kind rule is live, not a single global regex.
+    let dotted = client
+        .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
+        .json(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "a.dotted.pod" },
+            "spec": { "containers": [{ "name": "c", "image": "img" }] },
+        }))
+        .send()
+        .await
+        .expect("POST dotted pod");
+    assert_eq!(
+        dotted.status(),
+        reqwest::StatusCode::CREATED,
+        "a Pod takes the DNS-1123 SUBDOMAIN rule, so dots are legal for it"
+    );
+}

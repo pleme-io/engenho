@@ -22,6 +22,15 @@ pub enum ApiError {
     ResourceVersionConflict(String),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    /// The request body failed VALIDATION — the K8s 422 Invalid equivalent
+    /// (reason "Invalid"). DISTINCT from [`Self::BadRequest`] (400): a 400
+    /// means the request could not be understood, a 422 means it was
+    /// understood and is not a legal object. client-go's `apierrors::IsInvalid`
+    /// keys on reason "Invalid", so a controller's retry logic reads the two
+    /// differently — collapsing them would make a permanently-invalid object
+    /// look like a transient protocol error and be retried forever.
+    #[error("{0}")]
+    Invalid(String),
     /// Authentication failed on a typed-bad credential — the K8s 401
     /// Unauthorized equivalent. Carries the human-readable reason rendered
     /// into the `Status` body (reason "Unauthorized", code 401). This brick
@@ -85,6 +94,7 @@ pub enum ErrorKind {
     Conflict,
     ResourceVersionConflict,
     BadRequest,
+    Invalid,
     Unauthorized,
     UnsupportedMediaType,
     Forbidden,
@@ -103,6 +113,7 @@ impl ApiError {
             Self::Conflict(_, _) => ErrorKind::Conflict,
             Self::ResourceVersionConflict(_) => ErrorKind::ResourceVersionConflict,
             Self::BadRequest(_) => ErrorKind::BadRequest,
+            Self::Invalid(_) => ErrorKind::Invalid,
             Self::Unauthorized(_) => ErrorKind::Unauthorized,
             Self::UnsupportedMediaType(_) => ErrorKind::UnsupportedMediaType,
             Self::Forbidden(_) => ErrorKind::Forbidden,
@@ -121,6 +132,7 @@ impl ApiError {
                 StatusCode::CONFLICT
             }
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Forbidden(_) | Self::AuthzForbidden(_) => StatusCode::FORBIDDEN,
@@ -324,6 +336,7 @@ impl IntoResponse for ApiError {
             // reason for exhaustiveness.
             ApiError::ResourceVersionConflict(_) | ApiError::ApplyConflict(_) => "Conflict",
             ApiError::BadRequest(_) => "BadRequest",
+            ApiError::Invalid(_) => "Invalid",
             ApiError::Unauthorized(_) => "Unauthorized",
             ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
             ApiError::Forbidden(_) | ApiError::AuthzForbidden(_) => "Forbidden",
