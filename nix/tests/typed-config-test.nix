@@ -25,6 +25,7 @@ let
         })
         userConfig
       ];
+      specialArgs = { inherit pkgs; };
     }).config.services.engenho.settings;
 
   # Same, but with a home-manager-shaped context: `config.home.homeDirectory`
@@ -44,6 +45,7 @@ let
         })
         userConfig
       ];
+      specialArgs = { inherit pkgs; };
     }).config.services.engenho.settings;
 
   # ── 1. Absence, not null ────────────────────────────────────────────────
@@ -70,9 +72,29 @@ let
   };
 
   checks = [
-    { name = "unset-config-renders-empty";
-      ok = empty == { };
+    # An empty config renders EXACTLY ONE key, and that exception is
+    # deliberate. `podman_binary` is derived rather than deferred because
+    # engenho's own fold resolves `podman` from `$PATH`, and the launchd agent
+    # this module generates has no podman on its PATH — measured 2026-08-28,
+    # where every pod sat with no status for hours and the only symptom was an
+    # empty k9s screen. nix knows the store path; the running daemon does not.
+    #
+    # Asserted as an EXACT equality rather than a "contains" so the exception
+    # cannot quietly grow a second member: any other leaf that starts leaking
+    # into an empty config still fails this check.
+    { name = "unset-config-renders-only-the-derived-podman-binary";
+      ok = empty == { runtime.podman_binary = "${pkgs.podman}/bin/podman"; };
       got = builtins.toJSON empty; }
+
+    # And the exception is SCOPED: a node that drives no containers names no
+    # container runtime, so the `fake` backend renders empty after all.
+    { name = "fake-backend-renders-no-podman-binary";
+      ok = !((evalWith {
+               services.engenho.config.runtime.kubeletBackend = "fake";
+             }).runtime ? podman_binary);
+      got = builtins.toJSON (evalWith {
+              services.engenho.config.runtime.kubeletBackend = "fake";
+            }); }
 
     { name = "no-null-leaks-into-yaml";
       ok = !(lib.hasInfix "null" (builtins.toJSON populated));
@@ -126,7 +148,14 @@ let
     { name = "system-arm-leaves-data_dir-to-engenho";
       # No `config.home` => system arm => stay out of the way, so engenho's
       # own /var/lib default still applies.
-      ok = !((evalWith { }) ? runtime);
+      #
+      # Asserts the ABSENCE OF data_dir specifically, not the absence of the
+      # whole `runtime` block. It used the coarser proxy until `podman_binary`
+      # became a derived leaf (see the exception above) and put a legitimate
+      # key in `runtime` — at which point the proxy failed while the property
+      # it stood for still held. Testing the actual claim is both correct now
+      # and more honest about what this check is for.
+      ok = !(((evalWith { }).runtime or { }) ? data_dir);
       got = builtins.toJSON (evalWith { }); }
 
     { name = "home-manager-arm-derives-data_dir-under-HOME";
