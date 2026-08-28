@@ -37,7 +37,7 @@ use engenho_types::generated_v1_34::rbac_v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
 };
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::RuntimeError;
 
@@ -125,6 +125,11 @@ impl Runtime {
         //    before anything namespaced can live in it, and `default` is what
         //    every client opens to.
         seed_system_namespaces(&store).await?;
+        //    Then the `kubernetes` Service in `default`. It must follow the
+        //    namespaces (it lives in one) and precede the apiserver bind, so
+        //    the ClusterIP allocator sees .1 as held before any user Service
+        //    can be created.
+        seed_kubernetes_service(&store, &config).await?;
         seed_bootstrap_rbac(&store).await?;
 
         // 5. Bind the apiserver, backed by the same store.
@@ -630,6 +635,93 @@ async fn seed_system_namespaces(store: &StoreMesh) -> Result<(), RuntimeError> {
         count = SYSTEM_NAMESPACES.len(),
         "seeded system namespaces (default, kube-system, kube-public, kube-node-lease)"
     );
+    Ok(())
+}
+
+/// The `kubernetes` Service in `default` — the in-cluster address of the
+/// apiserver itself, and the object that RESERVES the first address of the
+/// service CIDR.
+///
+/// Two defects in one, both measured 2026-08-28:
+///
+/// 1. The Service did not exist. `kubernetes.default.svc` is how an in-cluster
+///    client reaches the apiserver; every client-go `InClusterConfig()` and
+///    every ServiceAccount-mounted kubeconfig resolves it.
+/// 2. Because it did not exist, the ClusterIP allocator handed **10.96.0.1**
+///    — the address upstream reserves for exactly this Service — to the first
+///    user Service that asked. A workload could take the apiserver's address.
+///
+/// The second is fixed *by* the first, with no allocator change, because the
+/// allocator reseeds its in-use set from the live Service set on every
+/// allocation ("the Services ARE the ledger", `cluster_ip.rs`). Seeding this
+/// Service with the first host address makes every later allocation skip it by
+/// construction rather than by a hardcoded exception — which is the difference
+/// between a rule and a special case.
+async fn seed_kubernetes_service(
+    store: &StoreMesh,
+    config: &EngenhoConfig,
+) -> Result<(), RuntimeError> {
+    // The CIDR may legitimately be empty (a control-plane-only node that
+    // allocates no VIPs). Nothing to reserve, nothing to seed.
+    if config.networking.service_cidr.is_empty() {
+        return Ok(());
+    }
+    let mut allocator =
+        match engenho_controllers::cluster_ip::ClusterIpAllocator::new(&config.networking.service_cidr)
+        {
+            Ok(a) => a,
+            Err(e) => {
+                // A malformed CIDR is the allocator's problem to report at its
+                // own boundary, not a reason to refuse to boot the whole node.
+                warn!(
+                    cidr = %config.networking.service_cidr,
+                    error = %e,
+                    "service_cidr unparseable; skipping the kubernetes Service seed"
+                );
+                return Ok(());
+            }
+        };
+    let Ok(vip) = allocator.allocate() else {
+        warn!("service CIDR has no assignable address; skipping the kubernetes Service seed");
+        return Ok(());
+    };
+
+    let port = config
+        .runtime
+        .listen_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<i64>().ok())
+        .unwrap_or(6443);
+
+    let value = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "kubernetes",
+            "namespace": "default",
+            "labels": { "component": "apiserver", "provider": "kubernetes" },
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "clusterIP": vip,
+            "clusterIPs": [vip],
+            "ports": [{ "name": "https", "port": 443, "protocol": "TCP", "targetPort": port }],
+            "sessionAffinity": "None",
+        },
+        "status": { "loadBalancer": {} }
+    });
+    let mut value = value;
+    stamp_creation_timestamp_value(&mut value);
+    store
+        .propose(ResourceCommand::Put {
+            key: ResourceKey::namespaced("", "v1", "Service", "default", "kubernetes"),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await?;
+    info!(%vip, port, "seeded the kubernetes Service (reserves the first service VIP)");
     Ok(())
 }
 

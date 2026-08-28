@@ -919,3 +919,80 @@ async fn create_into_a_nonexistent_namespace_is_rejected() {
         "the seeded `default` namespace accepts creates"
     );
 }
+
+/// **The `kubernetes` Service exists, and it holds the first service VIP.**
+///
+/// Two defects measured 2026-08-28, and the second is fixed BY the first:
+///
+/// 1. `default/kubernetes` did not exist. It is how an in-cluster client
+///    reaches the apiserver — every `InClusterConfig()` resolves it.
+/// 2. Because it did not exist, the ClusterIP allocator handed **10.96.0.1**,
+///    the address upstream reserves for it, to the first user Service that
+///    asked. A workload could take the apiserver's own address.
+///
+/// No allocator change was needed: it reseeds its in-use set from the live
+/// Service set on every allocation, so seeding this Service makes every later
+/// allocation skip the address by construction rather than by a hardcoded
+/// exception. This test pins that mechanism, not just the object.
+#[tokio::test]
+async fn kubernetes_service_exists_and_holds_the_first_vip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = Arc::new(FakeBackend::new());
+    let backend_dyn: Arc<dyn ContainerRuntime> = backend.clone();
+
+    let rt = Runtime::start_with_backend(durable_config(tmp.path()), backend_dyn)
+        .await
+        .expect("Runtime boots");
+    let addr = rt.local_addr();
+    let client = admin_client(tmp.path());
+
+    let svc: serde_json::Value = client
+        .get(format!(
+            "http://{addr}/api/v1/namespaces/default/services/kubernetes"
+        ))
+        .send()
+        .await
+        .expect("GET default/kubernetes")
+        .json()
+        .await
+        .unwrap();
+
+    let vip = svc
+        .get("spec")
+        .and_then(|s| s.get("clusterIP"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("the kubernetes Service must exist and hold a VIP: {svc:#}"));
+    assert!(
+        vip.ends_with(".1"),
+        "it must hold the FIRST host of the service CIDR, the address upstream \
+         reserves for it; got {vip}"
+    );
+
+    // The mechanism, not just the object: a user Service must now get a
+    // DIFFERENT address. Before the seed, this one took .1.
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/namespaces/default/services"))
+        .json(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "vip-probe" },
+            "spec": { "ports": [{ "port": 80 }] },
+        }))
+        .send()
+        .await
+        .expect("POST user service")
+        .json()
+        .await
+        .unwrap();
+
+    let user_vip = created
+        .get("spec")
+        .and_then(|s| s.get("clusterIP"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("a user Service gets an allocated VIP: {created:#}"));
+    assert_ne!(
+        user_vip, vip,
+        "a user Service MUST NOT be handed the apiserver's reserved address \
+         — this is exactly what the live daemon did"
+    );
+}
