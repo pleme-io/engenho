@@ -32,7 +32,7 @@
 # string: it would REJECT the two spellings that are actually correct while
 # looking authoritative. The four unambiguous ones are named in the
 # description; when the wire encoding is measured, this becomes an enum.
-{ lib, config, ... }:
+{ lib, config, pkgs, ... }:
 let
   inherit (lib) mkOption mkEnableOption types;
 
@@ -128,8 +128,34 @@ in
         On macOS `podman` is itself a Linux VM, so neither option yet gives
         real pods on baremetal.
       '';
-      podmanBinary = optional types.path
-        "Explicit podman path. Unset resolves it from `$PATH`.";
+      podmanPackage = mkOption {
+        type = types.nullOr types.package;
+        default = pkgs.podman or null;
+        defaultText = lib.literalExpression "pkgs.podman";
+        description = ''
+          The podman package the kubelet drives. `podmanBinary` is DERIVED
+          from it, so the store path is a projection of a package rather than
+          a hand-copied string.
+
+          Defaulted rather than left null because the failure it prevents is
+          SILENT, and was measured in the field (2026-08-28): engenho's Rust
+          `prescribed_default` selects the Podman backend, an unset
+          `podmanBinary` means "resolve `podman` from $PATH", and a launchd
+          agent's PATH is `/usr/bin:/bin:/usr/sbin:/sbin` — which has no
+          podman. The daemon logged `spawn: No such file or directory` once
+          per reconcile tick, forever, while every pod sat with no status at
+          all. Nothing failed loudly; the operator just saw an empty k9s.
+
+          Set to `null` only on a node that genuinely has no podman — e.g. a
+          control-plane-only node running `kubeletBackend = "fake"`.
+        '';
+      };
+      podmanBinary = optional types.path ''
+        Explicit podman path, OVERRIDING the one derived from
+        `podmanPackage`. With both this and `podmanPackage` null, engenho
+        falls back to resolving `podman` from `$PATH` — precisely the case
+        that fails silently under launchd. Prefer `podmanPackage`.
+      '';
       leadershipTimeoutSeconds = optional types.ints.unsigned
         "Leadership lease timeout.";
       tls = {
@@ -236,7 +262,30 @@ in
         node_name = cfg.runtime.nodeName;
         kubeconfig_publish_path = cfg.runtime.kubeconfigPublishPath;
         kubelet_backend = cfg.runtime.kubeletBackend;
-        podman_binary = cfg.runtime.podmanBinary;
+        # DERIVED, never a second hand-list: an explicit `podmanBinary` wins,
+        # else the package's own bin path. So "kubelet drives podman, with no
+        # resolvable podman" is not constructible by default — reaching it now
+        # takes deliberately setting `podmanPackage = null` AND leaving
+        # `podmanBinary` unset, which is the honest way to say "this node has
+        # no podman".
+        #
+        # DELIBERATE EXCEPTION to this module's "an unset leaf is ABSENT"
+        # rule, and the only one. Everywhere else, absence defers to engenho's
+        # own tiered fold. Here the fold's answer is *wrong by construction*:
+        # it resolves `podman` from `$PATH`, and nix knows something engenho
+        # cannot — the store path, and that the launchd agent it generates has
+        # no podman on PATH at all. So this leaf is emitted rather than
+        # deferred. The `fake` arm still emits nothing, because a node that
+        # drives no containers has no business naming a container runtime.
+        podman_binary =
+          if cfg.runtime.kubeletBackend == "fake" then
+            null
+          else if cfg.runtime.podmanBinary != null then
+            cfg.runtime.podmanBinary
+          else if cfg.runtime.podmanPackage != null then
+            "${cfg.runtime.podmanPackage}/bin/podman"
+          else
+            null;
         leadership_timeout_seconds = cfg.runtime.leadershipTimeoutSeconds;
         tls = {
           enabled = cfg.runtime.tls.enabled;
