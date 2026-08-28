@@ -27,6 +27,25 @@ let
       ];
     }).config.services.engenho.settings;
 
+  # Same, but with a home-manager-shaped context: `config.home.homeDirectory`
+  # exists. This is what `dataDir`'s default keys off to tell a per-user agent
+  # from a system daemon.
+  evalAsHomeManager = userConfig:
+    (lib.evalModules {
+      modules = [
+        ../typed-config.nix
+        ({ lib, ... }: {
+          options.services.engenho.settings = lib.mkOption {
+            type = lib.types.attrs;
+            default = { };
+          };
+          options.home.homeDirectory = lib.mkOption { type = lib.types.str; };
+          config.home.homeDirectory = "/Users/probe";
+        })
+        userConfig
+      ];
+    }).config.services.engenho.settings;
+
   # ── 1. Absence, not null ────────────────────────────────────────────────
   # THE property this module exists for. engenho's tiered fold supplies its
   # own prescribed defaults — including the DERIVED per-node cluster name. A
@@ -97,6 +116,35 @@ let
         (evalWith { services.engenho.config.scheduler.strategy = "random"; })
       ).success;
       got = "expected eval failure for scheduler.strategy=random"; }
+
+    # ── 4. data_dir is user-appropriate ON THE HM ARM ONLY ──────────────
+    # The defect this pins: `/var/lib/engenho` is engenho's own prescribed
+    # default and is RIGHT for a system daemon, but an unprivileged user
+    # launchd agent cannot write it. Nothing catches that at eval or at
+    # activation -- the daemon boots, logs a correct-looking config, and
+    # dies on `fjall open ... PermissionDenied`, restarting every 10s.
+    { name = "system-arm-leaves-data_dir-to-engenho";
+      # No `config.home` => system arm => stay out of the way, so engenho's
+      # own /var/lib default still applies.
+      ok = !((evalWith { }) ? runtime);
+      got = builtins.toJSON (evalWith { }); }
+
+    { name = "home-manager-arm-derives-data_dir-under-HOME";
+      # `or null` deliberately: without it a regression that drops the key
+      # throws `attribute 'runtime' missing` from inside builtins.filter,
+      # which fails the build but never names the row. A gate should say
+      # WHICH invariant broke.
+      ok = ((evalAsHomeManager { }).runtime or { }).data_dir or null
+        == "/Users/probe/.local/share/engenho";
+      got = builtins.toJSON ((evalAsHomeManager { }).runtime or { }); }
+
+    { name = "explicit-data_dir-still-wins-on-the-hm-arm";
+      ok = ((evalAsHomeManager {
+             services.engenho.config.runtime.dataDir = "/tmp/elsewhere";
+           }).runtime or { }).data_dir or null == "/tmp/elsewhere";
+      got = builtins.toJSON ((evalAsHomeManager {
+             services.engenho.config.runtime.dataDir = "/tmp/elsewhere";
+           }).runtime or { }); }
   ];
 
   failed = builtins.filter (c: !c.ok) checks;

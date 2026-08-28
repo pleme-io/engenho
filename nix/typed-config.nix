@@ -70,8 +70,41 @@ in
     runtime = {
       listenAddr = optional types.str
         "apiserver bind address. `127.0.0.1:6443` keeps it node-local.";
-      dataDir = optional types.path
-        "Durable store root. The fjall store lives at `<dataDir>/store`.";
+      # ── NOT `optional`: an unprivileged agent CANNOT use the default ──
+      # engenho's own prescribed default is `/var/lib/engenho`, which is
+      # right for a system daemon and impossible for a per-user launchd
+      # agent. Leaving it unset does not fail at eval or at activation --
+      # the daemon starts, loads a config that looks entirely correct,
+      # then dies on the store open:
+      #
+      #   raft fatal: fjall open /var/lib/engenho/store:
+      #     Io(Os { code: 13, kind: PermissionDenied })
+      #
+      # and `KeepAlive` restarts it every 10s forever. Measured on cid:
+      # a green rebuild, a loaded agent, and 2.1 MB of identical errors.
+      #
+      # So on the home-manager arm the default is derived from the user's
+      # own home directory, making the unprivileged case correct by
+      # construction rather than by every consumer remembering. On the
+      # NixOS/darwin SYSTEM arms `config.home` does not exist, the default
+      # stays null, and engenho's `/var/lib` default -- correct there --
+      # is preserved.
+      dataDir = mkOption {
+        type = types.nullOr types.path;
+        default =
+          if config ? home && config.home ? homeDirectory
+          then "${config.home.homeDirectory}/.local/share/engenho"
+          else null;
+        defaultText = lib.literalExpression
+          "\"\${config.home.homeDirectory}/.local/share/engenho\" on home-manager, null (engenho's /var/lib default) on system arms";
+        description = ''
+          Durable store root. The fjall store lives at `<dataDir>/store`.
+
+          Defaults under `$HOME` on the home-manager arm because a user
+          agent cannot write `/var/lib`; unset on the system arms, where
+          engenho's own `/var/lib/engenho` is correct.
+        '';
+      };
       durable = optional types.bool
         "`false` uses an ephemeral in-memory store — tests and dev only.";
       nodeName = optional types.str ''
