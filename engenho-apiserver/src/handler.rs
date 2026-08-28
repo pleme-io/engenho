@@ -1074,6 +1074,33 @@ impl ResourceHandler for StoreBackedHandler {
             .and_then(|n| n.as_str())
             .ok_or_else(|| ApiError::BadRequest("missing metadata.name in request body".into()))?
             .to_string();
+        // ── NAME VALIDATION (DNS-1123). ────────────────────────────────
+        // Measured 2026-08-28: `UPPERCASE`, `has spaces`, `-leading-dash`,
+        // `has_underscore` and a 64-char name were ALL accepted with 201 —
+        // there was no name validation anywhere in the workspace. A name is
+        // the primary key of the REST path, so `has spaces` is addressable
+        // only through percent-encoding and `UPPERCASE` collides with
+        // `uppercase` for any consumer that case-folds.
+        //
+        // The rule is chosen by KIND (Namespace/Service take the stricter
+        // DNS-1123 LABEL because their names become DNS labels), so a call
+        // site cannot pick the wrong strictness. 422 Invalid, not 400: the
+        // request was understood and is simply not a legal object, and
+        // client-go's `IsInvalid` keys on that reason — collapsing the two
+        // would make a permanently-invalid object look transient and be
+        // retried forever.
+        if let Err(e) = engenho_types::name::ResourceName::parse_for_kind(&name, &self.kind) {
+            return Err(ApiError::Invalid(
+                [
+                    &self.kind,
+                    " \"",
+                    name.as_str(),
+                    "\" is invalid: metadata.name: ",
+                    &e.to_string(),
+                ]
+                .concat(),
+            ));
+        }
         let key = self.key(namespace, &name)?;
         // Admission runs at the API boundary BEFORE any store proposal.
         // A Mutate replaces the body; a Deny short-circuits with 403. The

@@ -53,6 +53,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod name;
 pub mod api;
 pub mod auth;
 pub mod client;
