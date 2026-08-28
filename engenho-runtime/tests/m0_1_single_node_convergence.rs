@@ -773,3 +773,60 @@ async fn invalid_object_names_are_rejected_with_422() {
         "a Pod takes the DNS-1123 SUBDOMAIN rule, so dots are legal for it"
     );
 }
+
+/// **An unresolvable container runtime fails at BOOT, loudly.**
+///
+/// The failure this replaces was silent for hours. Measured 2026-08-28: the
+/// launchd agent had no `podman` on its PATH, so every container start
+/// returned `spawn: No such file or directory` — one WARN per reconcile tick,
+/// forever — while every pod sat with no status at all. A permanently-broken
+/// node was indistinguishable from a slow one, and the operator's only symptom
+/// was an empty k9s screen.
+///
+/// A control plane that cannot run a container must say so ONCE, at boot,
+/// fatally. Uses `Runtime::start` (not `start_with_backend`) because the
+/// preflight is exactly the path a real daemon takes.
+#[tokio::test]
+async fn unresolvable_container_runtime_fails_at_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = durable_config(tmp.path());
+    // The real shape of the defect: the Podman backend selected, and a binary
+    // that does not resolve.
+    cfg.runtime.kubelet_backend = KubeletBackendKind::Podman;
+    cfg.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
+
+    let err = engenho_runtime::Runtime::start(cfg)
+        .await
+        .err()
+        .expect("boot MUST fail when the configured runtime cannot be resolved");
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("could not be \nresolved") || rendered.contains("could not be"),
+        "the error must name the failure: {rendered}"
+    );
+    assert!(
+        rendered.contains("/nonexistent/definitely-not-podman"),
+        "the error must name the BINARY it could not resolve, or the operator \
+         cannot act on it: {rendered}"
+    );
+    assert!(
+        rendered.contains("kubelet_backend") || rendered.contains("fake"),
+        "the error must name the way OUT (set a path, or use the fake backend): {rendered}"
+    );
+}
+
+/// The `fake` backend needs no container runtime, so preflight must not block
+/// a control-plane-only node. The guard must not have become a wall.
+#[tokio::test]
+async fn fake_backend_boots_without_any_container_runtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = durable_config(tmp.path());
+    cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;
+    cfg.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
+
+    let rt = engenho_runtime::Runtime::start(cfg)
+        .await
+        .expect("a fake-backend node boots with no container runtime present");
+    assert!(rt.local_addr().port() > 0, "apiserver bound");
+}
