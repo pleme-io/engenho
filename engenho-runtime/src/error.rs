@@ -50,6 +50,30 @@ pub enum RuntimeError {
         strong_count: usize,
     },
 
+    /// The kubelet is configured to drive a container runtime whose binary
+    /// could not be resolved at boot.
+    ///
+    /// This exists because the failure it replaces was SILENT for hours.
+    /// Measured 2026-08-28: an unresolvable `podman` produced one WARN per
+    /// reconcile tick (`spawn: No such file or directory`) while every pod sat
+    /// with no status, and the operator's only symptom was an empty k9s
+    /// screen. A control plane that cannot run a container must say so once,
+    /// loudly, at boot — not whisper it forever into a log nobody tails.
+    #[error(
+        "kubelet backend {backend:?} is configured but its binary {binary:?} could not be \
+         resolved or executed: {source}. Set runtime.podman_binary to an absolute path (the \
+         nix module derives it from runtime.podmanPackage), or set runtime.kubelet_backend \
+         to \"fake\" on a node that runs no containers."
+    )]
+    ContainerRuntimeUnavailable {
+        /// The configured backend name.
+        backend: String,
+        /// The binary path (or bare name) that failed to resolve.
+        binary: String,
+        /// The underlying spawn error.
+        source: std::io::Error,
+    },
+
     /// Failed to build or persist the boot-time kubeconfig
     /// (`data_dir/kubeconfig`). Carries the emitter / io message.
     #[error("kubeconfig emission failed: {0}")]
@@ -74,6 +98,7 @@ engenho_substrate::impl_error_kind! {
         { LeadershipTimeout { .. } } => "leadership_timeout",
         { ListenAddr { .. } } => "listen_addr",
         { StoreStillShared { .. } } => "store_still_shared",
+        { ContainerRuntimeUnavailable { .. } } => "container_runtime_unavailable",
         (Kubeconfig(_)) => "kubeconfig",
         { KubeconfigIo { .. } } => "kubeconfig_io",
     }

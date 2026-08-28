@@ -66,6 +66,9 @@ impl Runtime {
     /// See [`RuntimeError`] — config invalid, store start / leadership
     /// failure, apiserver bind failure, or an unparseable listen addr.
     pub async fn start(config: EngenhoConfig) -> Result<Self, RuntimeError> {
+        // Fail LOUDLY here if the configured runtime cannot be reached, rather
+        // than discovering it one warn-per-tick at a time forever.
+        preflight_backend(&config)?;
         let backend = build_backend(&config);
         Self::start_inner(config, backend).await
     }
@@ -441,6 +444,44 @@ fn build_pod_log_handler(
             .with_admission(admission.clone())
             .with_log_reader(log_reader);
     Some(Arc::new(handler))
+}
+
+/// Verify at BOOT that a configured container runtime is actually usable.
+///
+/// The `Fake` backend needs nothing. For `Podman` this spawns the resolved
+/// binary with `--version` and requires it to launch — a cheap, read-only
+/// probe that distinguishes "the binary is missing from my PATH" from "podman
+/// is present but the machine is down" (the latter starts fine and fails later
+/// with a real podman error, which is legible).
+///
+/// Deliberately at boot, once, fatal. The failure this replaces emitted one
+/// WARN per reconcile tick forever while the API showed pods with no status at
+/// all: a permanently-broken node was indistinguishable from a slow one.
+fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
+    if matches!(config.runtime.kubelet_backend, CfgBackendKind::Fake) {
+        return Ok(());
+    }
+    let binary = config
+        .runtime
+        .podman_binary
+        .clone()
+        .unwrap_or_else(|| "podman".to_string());
+    match std::process::Command::new(&binary)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(_) => {
+            info!(backend = "podman", %binary, "container runtime resolved");
+            Ok(())
+        }
+        Err(source) => Err(RuntimeError::ContainerRuntimeUnavailable {
+            backend: "podman".to_string(),
+            binary,
+            source,
+        }),
+    }
 }
 
 /// Construct the container backend from the operator's config choice.
