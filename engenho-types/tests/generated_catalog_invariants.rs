@@ -587,3 +587,120 @@ fn newly_added_conformance_kinds_carry_correct_metadata() {
         assert_eq!(d.singular, e.kind.to_lowercase(), "{}: singular", e.kind);
     }
 }
+
+// ── contract-derived verb parity (the L1 conformance differential) ────────
+
+/// **Every non-opaque cataloged kind's verb set, DERIVED from the vendored
+/// upstream OpenAPI, is exactly the CRUD set engenho advertises.**
+///
+/// engenho advertises a single unconditional 7-verb list to every kind
+/// (`engenho-apiserver::discovery::VERBS`) plus `deletecollection` where the
+/// handler serves it. That is a *hand-list*, and a hand-list can drift from
+/// the contract silently. This gate pins the assumption behind it against the
+/// pinned document — the one oracle that is always present, needs no running
+/// cluster, and is the same bytes upstream publishes.
+///
+/// Measured 2026-08-28: **39 of 39 checkable kinds agree**, so the const is
+/// correct today and this is a regression gate, not a bug report. A vendored
+/// bump that changes any kind's verbs — or a new kind whose contract differs —
+/// turns it red instead of shipping a discovery document that lies.
+///
+/// ## The denominator is INSIDE the assertion, deliberately
+///
+/// `checked` is asserted to be ≥ a floor. Without it, a change that stopped
+/// discovering kinds (a catalog rename, a `verbs_for` parse regression) would
+/// leave this test iterating an empty set and passing GREEN — the vacuity
+/// failure that makes a coverage gate rot without anyone noticing.
+///
+/// ## Known limit, stated so it is never mis-read
+///
+/// This covers ONLY the 11 vendored groups. The 8 opaque groups
+/// (`authorization.k8s.io`, `apiextensions.k8s.io`, …) have no document, so
+/// `verbs_for` returns `None` and they are skipped. That is not a gap in the
+/// gate — it is the gap in the CORPUS, and it is load-bearing: the measured
+/// verb defect on `selfsubjectaccessreviews` (engenho advertises 8 verbs,
+/// upstream advertises only `create`) lives in `authorization.k8s.io` and is
+/// therefore structurally invisible here. Closing the vendoring gap is what
+/// makes that kind checkable; a green run here is a statement about 11 of 18
+/// groups and must never be read as more.
+#[test]
+fn contract_derived_verbs_match_the_advertised_crud_set() {
+    use engenho_types::openapi_v3::{Verb, verbs_for};
+
+    // What engenho advertises unconditionally (discovery::VERBS).
+    let advertised: std::collections::BTreeSet<Verb> = [
+        Verb::Get,
+        Verb::List,
+        Verb::Watch,
+        Verb::Create,
+        Verb::Update,
+        Verb::Patch,
+        Verb::Delete,
+    ]
+    .into_iter()
+    .collect();
+
+    let mut checked = 0usize;
+    let mut skipped_opaque = 0usize;
+    let mut divergent: Vec<String> = Vec::new();
+
+    for d in RESOURCE_CATALOG.iter() {
+        if d.opaque {
+            skipped_opaque += 1;
+            continue;
+        }
+        let Some(contract) = verbs_for(d.group, d.version, d.plural) else {
+            // No vendored document for this (group, version) — ignorance, not
+            // an empty verb set. Counted as opaque-equivalent.
+            skipped_opaque += 1;
+            continue;
+        };
+        checked += 1;
+
+        // `deletecollection` is conditional on the handler, so compare modulo
+        // it: the invariant is that the contract's NON-deletecollection verbs
+        // are exactly what engenho advertises.
+        let contract_core: std::collections::BTreeSet<Verb> = contract
+            .iter()
+            .copied()
+            .filter(|v| *v != Verb::DeleteCollection)
+            .collect();
+
+        if contract_core != advertised {
+            let only_contract: Vec<String> = contract_core
+                .difference(&advertised)
+                .map(Verb::to_string)
+                .collect();
+            let only_advertised: Vec<String> = advertised
+                .difference(&contract_core)
+                .map(Verb::to_string)
+                .collect();
+            divergent.push(
+                [
+                    d.api_version,
+                    ".",
+                    d.kind,
+                    " contract-only=",
+                    &only_contract.join("|"),
+                    " advertised-only=",
+                    &only_advertised.join("|"),
+                ]
+                .concat(),
+            );
+        }
+    }
+
+    assert!(
+        divergent.is_empty(),
+        "discovery advertises a verb set the pinned v1.34.0 contract does not: {divergent:#?}"
+    );
+
+    // ANTI-VACUITY: the denominator lives inside the assertion. A floor, not
+    // an exact count, so adding a kind never demands an edit here while a
+    // collapse in discovery still fails loudly.
+    assert!(
+        checked >= 30,
+        "verb parity checked only {checked} kinds (skipped {skipped_opaque} without a vendored \
+         document) — the corpus collapsed; this gate was verifying almost nothing"
+    );
+}

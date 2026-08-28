@@ -25,6 +25,8 @@
 //! one catalog change + one vendored file + one [`SERVED`] row, never a
 //! hand-wired route.
 
+use std::collections::BTreeSet;
+
 /// The vendored core (`""`/v1) OpenAPI v3 document.
 pub const CORE_V1: &str = include_str!("../vendor/openapi/v1.34.0/api__v1_openapi.json");
 
@@ -260,5 +262,193 @@ mod tests {
                 d.group, d.version, d.blake3
             );
         }
+    }
+}
+
+// ── Verb derivation — the contract, not a hand-list ───────────────────────
+
+/// A Kubernetes API verb, as advertised in discovery's `verbs` array.
+///
+/// Closed by construction: the set of verbs upstream advertises is fixed by
+/// the API contract, so a new one is a deliberate widening here rather than a
+/// string appearing somewhere in a handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Verb {
+    /// Read one object by name.
+    Get,
+    /// Read the collection.
+    List,
+    /// Stream changes.
+    Watch,
+    /// Create into the collection.
+    Create,
+    /// Replace one object (HTTP PUT).
+    Update,
+    /// Merge into one object (HTTP PATCH).
+    Patch,
+    /// Remove one object by name.
+    Delete,
+    /// Remove the whole collection (HTTP DELETE on the collection path).
+    DeleteCollection,
+}
+
+impl Verb {
+    /// The discovery wire string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::List => "list",
+            Self::Watch => "watch",
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Patch => "patch",
+            Self::Delete => "delete",
+            Self::DeleteCollection => "deletecollection",
+        }
+    }
+}
+
+impl core::fmt::Display for Verb {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Derive the verb set upstream advertises for `plural` in `group`/`version`,
+/// **read out of the vendored OpenAPI document** rather than hand-listed.
+///
+/// This is the L1 half of the conformance differential: the pinned document is
+/// an oracle that is always present, needs no running cluster, and is the same
+/// bytes upstream publishes. A hand-written verb table can drift from it
+/// silently; a derivation cannot.
+///
+/// The mapping is upstream's own REST convention:
+///
+/// | OpenAPI path | method | verb |
+/// |---|---|---|
+/// | `…/{plural}` | `get` | `list` |
+/// | `…/{plural}` | `post` | `create` |
+/// | `…/{plural}` | `delete` | `deletecollection` |
+/// | `…/{plural}/{name}` | `get` | `get` |
+/// | `…/{plural}/{name}` | `put` | `update` |
+/// | `…/{plural}/{name}` | `patch` | `patch` |
+/// | `…/{plural}/{name}` | `delete` | `delete` |
+/// | `…/watch/{plural}` | `get` | `watch` |
+///
+/// Returns `None` when the group/version has no vendored document — the eight
+/// opaque groups. `None` is a *statement of ignorance*, never an empty set:
+/// an empty set would read as "upstream advertises no verbs", which is the
+/// vacuity failure this distinction exists to prevent.
+///
+/// Namespaced kinds appear under both `/namespaces/{namespace}/{plural}` and
+/// a cluster-wide `…/{plural}` list path; both are scanned, and the verbs are
+/// unioned, because discovery advertises one verb set per resource.
+#[must_use]
+pub fn verbs_for(group: &str, version: &str, plural: &str) -> Option<BTreeSet<Verb>> {
+    let body = document_for(group, version)?;
+    let doc: serde_json::Value = serde_json::from_str(body).ok()?;
+    let paths = doc.get("paths")?.as_object()?;
+
+    let mut verbs = BTreeSet::new();
+    for (path, item) in paths {
+        let Some(methods) = item.as_object() else {
+            continue;
+        };
+        // Trailing segment analysis. `{name}` is upstream's path-parameter
+        // spelling for the item path.
+        let trimmed = path.trim_end_matches('/');
+        let is_watch = trimmed.contains("/watch/");
+        let ends_with_plural = trimmed.ends_with(&["/", plural].concat());
+        let ends_with_item = trimmed.ends_with(&["/", plural, "/{name}"].concat());
+
+        if !ends_with_plural && !ends_with_item {
+            continue;
+        }
+
+        for method in methods.keys() {
+            let verb = match (method.as_str(), is_watch, ends_with_item) {
+                // The deprecated /watch/ paths are how the document spells
+                // the watch capability; discovery still advertises `watch`.
+                ("get", true, _) => Some(Verb::Watch),
+                ("get", false, false) => Some(Verb::List),
+                ("post", false, false) => Some(Verb::Create),
+                ("delete", false, false) => Some(Verb::DeleteCollection),
+                ("get", false, true) => Some(Verb::Get),
+                ("put", false, true) => Some(Verb::Update),
+                ("patch", false, true) => Some(Verb::Patch),
+                ("delete", false, true) => Some(Verb::Delete),
+                _ => None,
+            };
+            if let Some(v) = verb {
+                verbs.insert(v);
+            }
+        }
+    }
+
+    // A document that mentions the plural but yields no verb is a parse
+    // failure, not a resource with no verbs — report ignorance.
+    if verbs.is_empty() { None } else { Some(verbs) }
+}
+
+#[cfg(test)]
+mod verb_tests {
+    use super::*;
+
+    /// A full-CRUD kind derives the complete upstream verb set.
+    #[test]
+    fn clusterroles_derive_full_crud() {
+        let v = verbs_for("rbac.authorization.k8s.io", "v1", "clusterroles")
+            .expect("rbac/v1 is vendored");
+        for want in [
+            Verb::Get,
+            Verb::List,
+            Verb::Watch,
+            Verb::Create,
+            Verb::Update,
+            Verb::Patch,
+            Verb::Delete,
+            Verb::DeleteCollection,
+        ] {
+            assert!(v.contains(&want), "clusterroles must advertise {want}");
+        }
+    }
+
+    /// Namespaced kinds union their namespaced and cluster-wide list paths.
+    #[test]
+    fn namespaced_kind_derives_verbs() {
+        let v = verbs_for("apps", "v1", "deployments").expect("apps/v1 is vendored");
+        assert!(v.contains(&Verb::List) && v.contains(&Verb::Create) && v.contains(&Verb::Watch));
+    }
+
+    /// The core group derives too (group is the empty string).
+    #[test]
+    fn core_group_derives_verbs() {
+        let v = verbs_for("", "v1", "configmaps").expect("core/v1 is vendored");
+        assert!(v.contains(&Verb::DeleteCollection), "configmaps support deletecollection");
+    }
+
+    /// **Ignorance is not an empty set.** An unvendored group returns `None`,
+    /// which callers must not read as "advertises nothing".
+    #[test]
+    fn unvendored_group_is_none_not_empty() {
+        assert_eq!(
+            verbs_for("authorization.k8s.io", "v1", "selfsubjectaccessreviews"),
+            None,
+            "the 8 opaque groups have no vendored document — report ignorance"
+        );
+        assert_eq!(verbs_for("no.such.group", "v1", "widgets"), None);
+    }
+
+    /// A plural that does not appear in a vendored doc is also ignorance.
+    #[test]
+    fn unknown_plural_in_a_vendored_group_is_none() {
+        assert_eq!(verbs_for("apps", "v1", "notathing"), None);
+    }
+
+    #[test]
+    fn verb_wire_strings_are_the_discovery_spellings() {
+        assert_eq!(Verb::DeleteCollection.as_str(), "deletecollection");
+        assert_eq!(Verb::List.to_string(), "list");
     }
 }
