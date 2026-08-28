@@ -417,11 +417,7 @@ impl ResourceCatalog {
                 if let Some(prior_uid) = prior_uid {
                     meta_obj.insert("uid".to_string(), prior_uid);
                 } else if !meta_obj.contains_key("uid") {
-                    let uid = format!(
-                        "uid-{}-{}",
-                        key.label().replace('/', "-"),
-                        version_meta.create_revision
-                    );
+                    let uid = mint_uid(&key.label(), version_meta.create_revision);
                     meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
                 }
                 // Preserve creationTimestamp across updates (K8s: a create-
@@ -1135,11 +1131,7 @@ fn stamp_object_metadata(
     if let Some(prior_uid) = prior_uid {
         meta_obj.insert("uid".to_string(), prior_uid);
     } else if !meta_obj.contains_key("uid") {
-        let uid = format!(
-            "uid-{}-{}",
-            key.label().replace('/', "-"),
-            version_meta.create_revision
-        );
+        let uid = mint_uid(&key.label(), version_meta.create_revision);
         meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
     }
     // Preserve creationTimestamp across updates (K8s create-time IMMUTABLE
@@ -1350,7 +1342,16 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(uid_1.starts_with("uid-"));
+        // The uid is an RFC-4122 UUID, NOT the old `uid-<label>-<rev>` string
+        // this assertion used to pin. Upstream guarantees the UUID shape, and
+        // anything that PARSES a uid (ownership graphs, CSI volume handles,
+        // audit correlation) breaks on the old form.
+        assert_eq!(uid_1.len(), 36, "metadata.uid is an RFC-4122 UUID: {uid_1}");
+        assert!(
+            uid_1.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "uid is lowercase hex + dashes: {uid_1}"
+        );
+        assert!(!uid_1.starts_with("uid-"), "the non-UUID prefix must not return");
         put(&mut cat, &k, serde_json::json!({"spec": {"x": true}}), 2);
         let uid_2 = cat
             .get(&k)
@@ -2043,5 +2044,158 @@ mod tests {
             va, vb,
             "Terminating object is byte-identical across replays"
         );
+    }
+}
+
+// ── metadata.uid — one deterministic minter, RFC-4122 shaped ──────────────
+
+/// The engenho UID namespace. A fixed random constant, so the derivation is
+/// domain-separated from any other BLAKE3 use in the fleet — two different
+/// subsystems hashing the same label must not collide into one identifier.
+const UID_NAMESPACE: &str = "engenho.pleme.io/resource-uid/v1";
+
+/// Mint `metadata.uid` for a newly-created object.
+///
+/// ## Why this is derived and not random
+///
+/// engenho's store is attested (`theory/ENGENHO.md` §VI.1, the determinism
+/// contract): replaying the same command sequence must reproduce the same
+/// bytes. A `uuid::new_v4()` would break that — the uid is part of the object,
+/// the object is part of the hash chain, so a random uid makes every replay
+/// diverge. The uid is therefore a **pure function of (key, create_revision)**,
+/// which is also why it is safe for the two call sites to mint independently:
+/// they cannot disagree.
+///
+/// ## Why the old format was a conformance defect
+///
+/// It emitted `uid-v1-v1-ConfigMap-default-x-640` — not a UUID at all, and
+/// with a doubled `v1-v1` because [`ResourceKey::label`] renders an empty core
+/// group as the literal `"v1"` and then formats `{group}/{version}`. Upstream
+/// guarantees `metadata.uid` is an RFC-4122 UUID; client-go's `types.UID` is a
+/// bare string so most clients tolerate it, but anything that PARSES a uid
+/// (`kubectl` ownership graphs, CSI volume handles, audit correlation) breaks
+/// on a non-UUID, and it is a straightforward conformance divergence.
+///
+/// ## The shape
+///
+/// An RFC 9562 **version-8** UUID — the variant explicitly reserved for
+/// custom/vendor-defined derivations, which is exactly what this is. Honest by
+/// construction: a v4 would claim randomness this value does not have, and a
+/// v5 would claim SHA-1. The 128 bits are the first 16 bytes of
+/// `BLAKE3(namespace || key-label || create-revision)`, with the version and
+/// variant nibbles overwritten per the RFC.
+///
+/// BLAKE3 is already this crate's dependency and the fleet's attestation hash,
+/// so this adds no dependency and reuses the primitive the determinism
+/// contract is already stated in terms of.
+#[must_use]
+pub fn mint_uid(key_label: &str, create_revision: crate::revision::Revision) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(UID_NAMESPACE.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(key_label.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(&create_revision.get().to_be_bytes());
+    let digest = hasher.finalize();
+    let b = digest.as_bytes();
+
+    let mut u = [0u8; 16];
+    u.copy_from_slice(&b[..16]);
+    // RFC 9562 §4.1: version in the high nibble of octet 6.
+    u[6] = (u[6] & 0x0F) | 0x80; // version 8 (custom)
+    // RFC 9562 §4.1: variant `10xx` in the high bits of octet 8.
+    u[8] = (u[8] & 0x3F) | 0x80;
+
+    let mut out = String::with_capacity(36);
+    for (i, byte) in u.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        // Lowercase hex, two digits — upstream renders uids lowercase.
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod uid_tests {
+    use super::mint_uid;
+    use crate::revision::Revision;
+
+    /// Shape: 8-4-4-4-12 lowercase hex, 36 chars.
+    #[test]
+    fn is_rfc4122_shaped() {
+        let u = mint_uid("v1/v1/ConfigMap/default/x", Revision(640));
+        assert_eq!(u.len(), 36, "a UUID renders as 36 chars: {u}");
+        let parts: Vec<&str> = u.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "8-4-4-4-12 grouping: {u}"
+        );
+        assert!(
+            u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "lowercase hex + dashes only: {u}"
+        );
+        assert!(
+            u.chars().all(|c| !c.is_ascii_uppercase()),
+            "upstream renders uids lowercase: {u}"
+        );
+    }
+
+    /// The version nibble is 8 and the variant bits are `10xx` (RFC 9562).
+    #[test]
+    fn carries_version_8_and_the_rfc_variant() {
+        let u = mint_uid("v1/v1/Pod/default/p", Revision(1));
+        let version = u.split('-').nth(2).unwrap().as_bytes()[0] as char;
+        assert_eq!(version, '8', "version-8 = custom/derived, honest for a hash: {u}");
+        let variant = u.split('-').nth(3).unwrap().as_bytes()[0] as char;
+        assert!(
+            matches!(variant, '8' | '9' | 'a' | 'b'),
+            "variant must be 10xx: {u}"
+        );
+    }
+
+    /// Determinism — the whole reason this is not `new_v4()`.
+    #[test]
+    fn is_deterministic() {
+        assert_eq!(
+            mint_uid("v1/v1/ConfigMap/ns/a", Revision(7)),
+            mint_uid("v1/v1/ConfigMap/ns/a", Revision(7)),
+            "the same (key, revision) MUST mint the same uid — the store is attested"
+        );
+    }
+
+    /// Distinct inputs mint distinct uids, on BOTH axes.
+    #[test]
+    fn distinguishes_key_and_revision() {
+        let base = mint_uid("v1/v1/ConfigMap/ns/a", Revision(7));
+        assert_ne!(base, mint_uid("v1/v1/ConfigMap/ns/b", Revision(7)), "name must matter");
+        assert_ne!(base, mint_uid("v1/v1/ConfigMap/ns2/a", Revision(7)), "namespace must matter");
+        assert_ne!(base, mint_uid("v1/v1/Secret/ns/a", Revision(7)), "kind must matter");
+        assert_ne!(base, mint_uid("v1/v1/ConfigMap/ns/a", Revision(8)), "revision must matter");
+    }
+
+    /// A recreated object (same name, later revision) gets a DIFFERENT uid —
+    /// upstream's rule, and what lets a stale ownerReference be detected.
+    #[test]
+    fn recreation_mints_a_new_identity() {
+        assert_ne!(
+            mint_uid("v1/v1/Pod/ns/p", Revision(10)),
+            mint_uid("v1/v1/Pod/ns/p", Revision(99)),
+            "delete+recreate is a NEW object; a reused uid would make a stale \
+             ownerReference silently adopt the replacement"
+        );
+    }
+
+    /// The old format's actual defect, pinned so it cannot come back.
+    #[test]
+    fn is_not_the_old_prefixed_format() {
+        let u = mint_uid("v1/v1/ConfigMap/conformance-probe/x", Revision(640));
+        assert!(!u.starts_with("uid-"), "the `uid-` prefix was never a UUID: {u}");
+        assert!(!u.contains("v1-v1"), "the doubled core-group render must be gone: {u}");
+        assert!(!u.contains("ConfigMap"), "a uid must not leak the kind: {u}");
     }
 }
