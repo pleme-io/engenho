@@ -19,8 +19,45 @@ use std::path::PathBuf;
 use prost_reflect::prost::Message;
 
 fn main() {
+    // ── Locating the vendored protos across TWO build layouts ─────────
+    // Under real cargo, CARGO_MANIFEST_DIR is THIS crate's directory and
+    // `vendor/proto` sits directly beneath it.
+    //
+    // Under substrate's lockfile-builder it is the WORKSPACE ROOT. That
+    // is deliberate, not a bug: every member is built with
+    // `src = workspaceSrc` so an `include_str!("../../x")` reaching a
+    // workspace-root file still resolves, and `libPath`/`build_script`
+    // are prefixed with the member path to compensate
+    // (substrate/lib/build/rust/lockfile-builder.nix:281).
+    // CARGO_MANIFEST_DIR is NOT among the prefixed values, so joining a
+    // path onto it resolves one level too high.
+    //
+    // The failure that causes is actively misleading: protox reports
+    // "file '...' is not in any include path" — which reads as a missing
+    // vendored file — when the files are present and merely one
+    // directory down. So try both layouts and, on failure, name every
+    // candidate rather than let protox describe it.
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let proto_root = manifest_dir.join("vendor/proto");
+    let candidates = [
+        manifest_dir.join("vendor/proto"),
+        manifest_dir.join("engenho-kube-proto/vendor/proto"),
+    ];
+    let proto_root = candidates
+        .iter()
+        .find(|p| p.join("k8s.io").is_dir())
+        .unwrap_or_else(|| {
+            let tried = candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            panic!(
+                "engenho-kube-proto: vendored k8s protos not found.\n\
+                 CARGO_MANIFEST_DIR = {}\n  tried:\n  {tried}",
+                manifest_dir.display()
+            )
+        })
+        .clone();
 
     // The eight vendored files, referenced by their import path relative
     // to the include root. protox resolves the `import "..."` graph from
