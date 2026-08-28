@@ -830,3 +830,92 @@ async fn fake_backend_boots_without_any_container_runtime() {
         .expect("a fake-backend node boots with no container runtime present");
     assert!(rt.local_addr().port() > 0, "apiserver bound");
 }
+
+/// **A create into a namespace that does not exist is rejected 404.**
+///
+/// Measured 2026-08-28: a ConfigMap POSTed into `ghost-namespace` — a
+/// namespace that did not exist — returned **201**. The object was stored,
+/// listable, and permanently orphaned: nothing would ever collect it, because
+/// namespace deletion is what collects a namespace's contents and there was no
+/// namespace to delete.
+///
+/// Upstream's NamespaceLifecycle admission plugin rejects this, naming the
+/// NAMESPACE rather than the object — what kubectl renders as
+/// `Error from server (NotFound): namespaces "ghost" not found`.
+#[tokio::test]
+async fn create_into_a_nonexistent_namespace_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = Arc::new(FakeBackend::new());
+    let backend_dyn: Arc<dyn ContainerRuntime> = backend.clone();
+
+    let rt = Runtime::start_with_backend(durable_config(tmp.path()), backend_dyn)
+        .await
+        .expect("Runtime boots");
+    let addr = rt.local_addr();
+    let client = admin_client(tmp.path());
+
+    let resp = client
+        .post(format!(
+            "http://{addr}/api/v1/namespaces/ghost-namespace/configmaps"
+        ))
+        .json(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "orphan" },
+            "data": { "a": "1" },
+        }))
+        .send()
+        .await
+        .expect("POST into a ghost namespace");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the live daemon returned 201 for this and stored an orphan"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("ghost-namespace"),
+        "the error must name the NAMESPACE, not the object: {body:#}"
+    );
+    assert!(
+        msg.contains("namespaces"),
+        "kubectl renders this as `namespaces \"x\" not found`: {body:#}"
+    );
+
+    // And the object was NOT stored — a rejected create must leave nothing.
+    let listed = client
+        .get(format!(
+            "http://{addr}/api/v1/namespaces/ghost-namespace/configmaps"
+        ))
+        .send()
+        .await
+        .expect("list ghost namespace")
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.get("items").and_then(|i| i.as_array()).map(Vec::len),
+        Some(0),
+        "a rejected create must commit nothing: {listed:#}"
+    );
+
+    // A create into a SEEDED namespace still works — the guard is not a wall.
+    let ok = client
+        .post(format!("http://{addr}/api/v1/namespaces/default/configmaps"))
+        .json(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "legit" },
+            "data": { "a": "1" },
+        }))
+        .send()
+        .await
+        .expect("POST into default");
+    assert_eq!(
+        ok.status(),
+        reqwest::StatusCode::CREATED,
+        "the seeded `default` namespace accepts creates"
+    );
+}

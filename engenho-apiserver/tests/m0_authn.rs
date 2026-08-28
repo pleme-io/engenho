@@ -293,6 +293,30 @@ async fn boot_store() -> Arc<StoreMesh> {
     );
     store.initialize_singleton().await.unwrap();
     assert!(store.wait_for_leadership(Duration::from_secs(3)).await);
+    // Seed `default`, because the assembled (with_admission) handler set now
+    // enforces NamespaceLifecycle: a create into a namespace that does not
+    // exist is rejected 404, exactly as upstream does. The real Runtime seeds
+    // the four system namespaces at boot; a hand-built store must do the same
+    // or it is testing a cluster that could not exist.
+    store
+        .propose(engenho_store::command::ResourceCommand::Put {
+            key: engenho_store::ResourceKey::cluster_scoped(
+                "",
+                "v1",
+                "Namespace",
+                "default".to_string(),
+            ),
+            value: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "default" },
+                "status": { "phase": "Active" }
+            }),
+            expected: None,
+            reason: engenho_store::command::Reason::Operator,
+        })
+        .await
+        .unwrap();
     store
 }
 

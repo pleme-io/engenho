@@ -461,6 +461,16 @@ pub struct StoreBackedHandler {
     /// unaffected by the new field. Controller writes (`Reason::Controller`)
     /// do NOT flow through a handler, so they never hit admission.
     admission: Option<Arc<AdmissionChain>>,
+    /// Whether the NamespaceLifecycle admission rule is enforced — reject a
+    /// create into a namespace that does not exist.
+    ///
+    /// OFF by default and enabled by the assembled Runtime, mirroring
+    /// upstream where NamespaceLifecycle is an admission PLUGIN rather than
+    /// an unconditional apiserver behaviour. A bare handler under unit test
+    /// has no seeded namespaces and is exercising handler mechanics, not
+    /// cluster lifecycle; making this unconditional would have made ~59 such
+    /// tests assert cluster bootstrap as a side effect of testing pagination.
+    namespace_lifecycle: bool,
     /// Optional in-process Pod-log reader (the kubelet adapter). `None` for
     /// every kind except Pod (and for Pod when no kubelet is wired — tests /
     /// apiserver-only). When `Some`, the Pod handler's `logs` override
@@ -497,6 +507,7 @@ impl StoreBackedHandler {
             // none at this brick.
             subresources: &[],
             admission: None,
+            namespace_lifecycle: false,
             log_reader: None,
         }
     }
@@ -544,6 +555,16 @@ impl StoreBackedHandler {
     #[must_use]
     pub fn with_admission(mut self, admission: Arc<AdmissionChain>) -> Self {
         self.admission = Some(admission);
+        self
+    }
+
+    /// Enforce NamespaceLifecycle — a create into a non-existent namespace is
+    /// rejected 404 rather than silently storing a permanently-orphaned
+    /// object. Enabled by the assembled Runtime, where the system namespaces
+    /// are seeded at boot.
+    #[must_use]
+    pub fn with_namespace_lifecycle(mut self) -> Self {
+        self.namespace_lifecycle = true;
         self
     }
 
@@ -1100,6 +1121,28 @@ impl ResourceHandler for StoreBackedHandler {
                 ]
                 .concat(),
             ));
+        }
+        // ── NamespaceLifecycle admission. ──────────────────────────────
+        // Measured 2026-08-28: a ConfigMap POSTed into `ghost-namespace`, a
+        // namespace that did not exist, returned 201. The object was stored,
+        // listable, and permanently orphaned — nothing would ever collect it,
+        // because namespace deletion is what collects a namespace's contents
+        // and there was no namespace to delete.
+        //
+        // Upstream's NamespaceLifecycle plugin rejects this with 404
+        // NotFound naming the NAMESPACE (not the object), which is what
+        // kubectl renders as `Error from server (NotFound): namespaces "x"
+        // not found`.
+        //
+        // Scoped to namespaced kinds, and `Namespace` itself is necessarily
+        // exempt — it is cluster-scoped, so it never reaches this branch.
+        if self.namespace_lifecycle && let Some(ns) = namespace {
+            let ns_key = ResourceKey::cluster_scoped("", "v1", "Namespace", ns.to_string());
+            if self.store.get(&ns_key).await.is_none() {
+                return Err(ApiError::NotFound(
+                    ["namespaces \"", ns, "\" not found"].concat(),
+                ));
+            }
         }
         let key = self.key(namespace, &name)?;
         // Admission runs at the API boundary BEFORE any store proposal.
@@ -1710,7 +1753,15 @@ pub fn handlers_from_catalog_with_admission(
         .map(|d| {
             Arc::new(
                 StoreBackedHandler::from_descriptor(store.clone(), d)
-                    .with_admission(admission.clone()),
+                    .with_admission(admission.clone())
+                    // NamespaceLifecycle rides with the admission chain
+                    // because upstream models it as an admission PLUGIN, and
+                    // this is the assembled-cluster path — the one where the
+                    // Runtime has seeded the system namespaces at boot. The
+                    // plain `handlers_from_catalog` stays lenient for bare
+                    // handlers under unit test, which have no seeded
+                    // namespaces and are exercising handler mechanics.
+                    .with_namespace_lifecycle(),
             ) as Arc<dyn ResourceHandler>
         })
         .collect()
