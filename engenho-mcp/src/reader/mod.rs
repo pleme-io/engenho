@@ -8,12 +8,13 @@
 use async_trait::async_trait;
 
 use crate::views::{
-    ClusterConfigView, ClusterStatus, KubeAuthDescriptor, PodListView, SnapshotMetaView,
+    ClusterConfig, ClusterStatus, KubeAuthDescriptor, PodListView, SnapshotMetaView,
 };
 
 pub mod kikai;
 #[cfg(test)]
 pub mod mock;
+pub mod node;
 
 /// Operator-facing filter spec for `list_resource`. Every field is
 /// optional — empty `ListSpec::default()` is equivalent to "no
@@ -85,7 +86,7 @@ pub trait ClusterReader: Send + Sync {
     async fn cluster_status(&self, cluster: &str) -> Result<ClusterStatus, ReaderError>;
 
     /// Non-secret slice of the deployed cluster config.
-    async fn cluster_config(&self, cluster: &str) -> Result<ClusterConfigView, ReaderError>;
+    async fn cluster_config(&self, cluster: &str) -> Result<ClusterConfig, ReaderError>;
 
     /// Path + auth method, never the secret material itself.
     async fn kubeconfig_descriptor(&self, cluster: &str)
@@ -194,7 +195,7 @@ mod tests {
             async fn cluster_status(&self, _: &str) -> Result<ClusterStatus, ReaderError> {
                 unimplemented!()
             }
-            async fn cluster_config(&self, _: &str) -> Result<ClusterConfigView, ReaderError> {
+            async fn cluster_config(&self, _: &str) -> Result<ClusterConfig, ReaderError> {
                 unimplemented!()
             }
             async fn kubeconfig_descriptor(

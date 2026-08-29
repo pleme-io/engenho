@@ -32,16 +32,26 @@ use engenho_types::generated_v1_34::core_v1::{
 };
 use engenho_types::generated_v1_34::rbac_v1::{Role, RoleBinding};
 
+use crate::reader::node::{self, NodeCluster};
 use crate::reader::{ClusterReader, ReaderError};
 use crate::resource_kind::ResourceKind;
 use crate::views::{
-    ArgocdView, AuthMethod, ClusterConfigView, ClusterStatus, ContainerSummary, FluxcdView,
-    GitopsBackendView, KubeAuthDescriptor, PodListView, PodSummary, SnapshotMetaView,
-    StatusOutcome, StatusRow,
+    ArgocdView, AuthMethod, ClusterConfig, ClusterConfigView, ClusterStatus, ContainerSummary,
+    FluxcdView, GitopsBackendView, KubeAuthDescriptor, NodeConfigView, PodListView, PodSummary,
+    SnapshotMetaView, StatusOutcome, StatusRow,
 };
 
 pub struct KikaiClusterReader {
     home: PathBuf,
+    /// This node's own baremetal engenho cluster, if it has one.
+    ///
+    /// Resolved ONCE at construction, not per call: the name is read out of
+    /// a kubeconfig, and a roster that changed shape between two calls in
+    /// one session would make `legal` unreproducible — the operator retries
+    /// with a name the previous refusal told them was valid and is refused
+    /// again. A node that bootstraps mid-session is a restart, which is the
+    /// same contract every other on-disk source here already has.
+    node: Option<NodeCluster>,
 }
 
 impl KikaiClusterReader {
@@ -50,7 +60,11 @@ impl KikaiClusterReader {
     /// path layout in isolation.
     #[must_use]
     pub fn new(home: PathBuf) -> Self {
-        Self { home }
+        // A node with no engenho cluster is an ordinary state (VM-only
+        // workstation, pre-bootstrap machine), never an error: it must not
+        // turn every unrelated VM-cluster call into a failure.
+        let node = node::discover(&home).ok();
+        Self { home, node }
     }
 
     /// Resolve `$HOME` from the environment; errors if unset.
@@ -86,7 +100,10 @@ impl KikaiClusterReader {
                 what: path.display().to_string(),
                 source,
             })?;
-        let known: Vec<String> = all.keys().cloned().collect();
+        // The refusal's `legal` set must name every cluster this reader can
+        // serve — VM and node — or it tells the operator a live cluster does
+        // not exist. That was the 2026-08-29 defect exactly.
+        let known: Vec<String> = self.known_clusters();
         all.into_iter()
             .find(|(k, _)| k == cluster)
             .map(|(_, v)| v)
@@ -95,11 +112,130 @@ impl KikaiClusterReader {
                 known,
             })
     }
+
+    /// Is `cluster` this node's baremetal cluster?
+    fn as_node(&self, cluster: &str) -> Option<&NodeCluster> {
+        self.node.as_ref().filter(|n| n.name == cluster)
+    }
+
+    /// Every cluster this reader can serve, VM and node alike.
+    ///
+    /// ★ This is the set a refusal reports as `legal`, and it is why the
+    /// node cluster had to reach it: the refusal the operator hit on
+    /// 2026-08-29 said `legal: ["engenho-local"]` while the cluster they
+    /// asked for was running. A refusal that omits a live name is not a
+    /// smaller answer, it is a wrong one — it ends the conversation by
+    /// telling the caller the thing they can see does not exist.
+    fn known_clusters(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .load_all_entries()
+            .map(|all| all.keys().cloned().collect())
+            .unwrap_or_default();
+        if let Some(n) = &self.node {
+            names.push(n.name.clone());
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Read the whole registry. Absent `clusters.yaml` is EMPTY, not fatal:
+    /// a darwin node that only ever ran baremetal engenho has no kikai
+    /// registry at all, and on such a node every call would otherwise fail
+    /// with an I/O error naming a file the operator never had reason to
+    /// create.
+    fn load_all_entries(&self) -> Result<BTreeMap<String, ClusterYamlEntry>, ReaderError> {
+        let path = self.clusters_yaml_path();
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(source) => {
+                return Err(ReaderError::Io {
+                    what: path.display().to_string(),
+                    source,
+                });
+            }
+        };
+        serde_yaml::from_str(&contents).map_err(|source| ReaderError::Parse {
+            what: path.display().to_string(),
+            source,
+        })
+    }
+
+    /// Baremetal status rows. Deliberately NOT the VM rows: a node cluster
+    /// has no `vm.pid` and no vmstate snapshot, and reporting `VM: fail`
+    /// for a machine that never had one is the exact misreport this split
+    /// exists to end — it reads as an outage when it is a category error.
+    fn node_status(&self, n: &NodeCluster) -> ClusterStatus {
+        let store = self.node_store_path();
+        let store_present = store.exists();
+        let kubeconfig_present = n.kubeconfig.exists();
+        ClusterStatus {
+            cluster: n.name.clone(),
+            rows: vec![
+                StatusRow {
+                    name: "Control plane".into(),
+                    outcome: StatusOutcome::Ok,
+                    detail: ["native host process, API at ", &n.server].concat(),
+                },
+                StatusRow {
+                    name: "Store".into(),
+                    outcome: if store_present {
+                        StatusOutcome::Ok
+                    } else {
+                        StatusOutcome::Fail
+                    },
+                    detail: if store_present {
+                        ["journalled segment store at ", &store.display().to_string()].concat()
+                    } else {
+                        ["no store at ", &store.display().to_string()].concat()
+                    },
+                },
+                StatusRow {
+                    name: "API".into(),
+                    outcome: if kubeconfig_present {
+                        StatusOutcome::Ok
+                    } else {
+                        StatusOutcome::Fail
+                    },
+                    detail: [
+                        "kubeconfig ",
+                        if kubeconfig_present {
+                            "at "
+                        } else {
+                            "absent at "
+                        },
+                        &n.kubeconfig.display().to_string(),
+                    ]
+                    .concat(),
+                },
+                StatusRow {
+                    name: "VM".into(),
+                    outcome: StatusOutcome::NotApplicable,
+                    detail: "baremetal cluster — the control plane is a host process, not a VM"
+                        .into(),
+                },
+                StatusRow {
+                    name: "Snapshot".into(),
+                    outcome: StatusOutcome::NotApplicable,
+                    detail: "no vmstate to snapshot; durability is the store's journal".into(),
+                },
+            ],
+        }
+    }
+
+    /// engenho's answer to etcd — a journalled, partitioned segment store.
+    fn node_store_path(&self) -> PathBuf {
+        self.home.join(".local/share/engenho/store")
+    }
 }
 
 #[async_trait]
 impl ClusterReader for KikaiClusterReader {
     async fn cluster_status(&self, cluster: &str) -> Result<ClusterStatus, ReaderError> {
+        if let Some(n) = self.as_node(cluster) {
+            return Ok(self.node_status(n));
+        }
         // Verify the cluster exists in the registry first.
         let _ = self.load_cluster_entry(cluster)?;
 
@@ -116,17 +252,35 @@ impl ClusterReader for KikaiClusterReader {
         })
     }
 
-    async fn cluster_config(&self, cluster: &str) -> Result<ClusterConfigView, ReaderError> {
+    async fn cluster_config(&self, cluster: &str) -> Result<ClusterConfig, ReaderError> {
+        if let Some(n) = self.as_node(cluster) {
+            let store = self.node_store_path();
+            return Ok(ClusterConfig::Node(NodeConfigView {
+                cluster: n.name.clone(),
+                server: n.server.clone(),
+                kubeconfig_path: n.kubeconfig.display().to_string(),
+                store_present: store.exists(),
+                store_path: store.display().to_string(),
+            }));
+        }
         let entry = self.load_cluster_entry(cluster)?;
-        Ok(entry.into_view(cluster))
+        Ok(ClusterConfig::Vm(entry.into_view(cluster)))
     }
 
     async fn kubeconfig_descriptor(
         &self,
         cluster: &str,
     ) -> Result<KubeAuthDescriptor, ReaderError> {
-        let _ = self.load_cluster_entry(cluster)?;
-        let path = self.kubeconfig_path(cluster);
+        // The node cluster's kubeconfig lives at a STABLE path; rebuilding
+        // it as `configs/<name>` is what made the live cluster report
+        // "API: fail — kubeconfig absent" while it was serving.
+        let path = match self.as_node(cluster) {
+            Some(n) => n.kubeconfig.clone(),
+            None => {
+                let _ = self.load_cluster_entry(cluster)?;
+                self.kubeconfig_path(cluster)
+            }
+        };
         let exists = path.exists();
         let auth_method = if !exists {
             AuthMethod::Unknown
@@ -142,6 +296,12 @@ impl ClusterReader for KikaiClusterReader {
     }
 
     async fn snapshot_meta(&self, cluster: &str) -> Result<Option<SnapshotMetaView>, ReaderError> {
+        // `None` is the honest answer for a baremetal cluster: there is no
+        // vmstate to snapshot. Not an error — the caller asked a coherent
+        // question whose answer happens to be "there is none".
+        if self.as_node(cluster).is_some() {
+            return Ok(None);
+        }
         let _ = self.load_cluster_entry(cluster)?;
         read_snapshot_meta(cluster, &self.data_dir(cluster))
     }
@@ -345,8 +505,13 @@ impl KikaiClusterReader {
     /// typed errors when kubeconfig is missing or unparseable.
     /// Shared by every list_* method on this reader.
     fn build_kube_client(&self, cluster: &str) -> Result<ReqwestKubeClient, ReaderError> {
-        let _ = self.load_cluster_entry(cluster)?;
-        let kc_path = self.kubeconfig_path(cluster);
+        let kc_path = match self.as_node(cluster) {
+            Some(n) => n.kubeconfig.clone(),
+            None => {
+                let _ = self.load_cluster_entry(cluster)?;
+                self.kubeconfig_path(cluster)
+            }
+        };
         if !kc_path.exists() {
             return Err(ReaderError::InvalidState(format!(
                 "kubeconfig missing at {} — cluster API not yet bootstrapped",
@@ -859,7 +1024,9 @@ demo:
     #[tokio::test]
     async fn known_cluster_parses_typed_view() {
         let (_t, reader) = setup_home_with_cluster(&sample_yaml());
-        let view = reader.cluster_config("demo").await.unwrap();
+        let ClusterConfig::Vm(view) = reader.cluster_config("demo").await.unwrap() else {
+            panic!("a kikai registry cluster must resolve as the Vm kind");
+        };
         assert_eq!(view.cluster, "demo");
         assert_eq!(view.cpus, 4);
         assert_eq!(view.memory_mib, 8192);
