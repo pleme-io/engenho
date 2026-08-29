@@ -996,3 +996,94 @@ async fn kubernetes_service_exists_and_holds_the_first_vip() {
          — this is exactly what the live daemon did"
     );
 }
+
+/// **A Table request gets a Table** — server-side printing, over real HTTP.
+///
+/// Measured 2026-08-28: `Accept: application/json;as=Table;v=1;g=meta.k8s.io`
+/// returned a plain `NodeList`, and Table conversion did not exist anywhere in
+/// the workspace. kubectl and k9s both default to this for list views and let
+/// the SERVER pick the columns — it is what makes `kubectl get` render the same
+/// columns against any cluster, and why k9s could not draw a useful row.
+///
+/// Columns here are upstream's DEFAULT pair (NAME/AGE), which upstream itself
+/// falls back to for a kind with no registered printer. Per-kind columns
+/// (Pod READY/STATUS/RESTARTS) live in upstream Go source and must arrive as a
+/// generated table, never hand-transcribed — see `table.rs`.
+#[tokio::test]
+async fn accept_as_table_returns_a_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = Arc::new(FakeBackend::new());
+    let backend_dyn: Arc<dyn ContainerRuntime> = backend.clone();
+
+    let rt = Runtime::start_with_backend(durable_config(tmp.path()), backend_dyn)
+        .await
+        .expect("Runtime boots");
+    let addr = rt.local_addr();
+    let client = admin_client(tmp.path());
+
+    // The exact header kubectl sends: Table first, plain JSON as fallback.
+    const TABLE_ACCEPT: &str = "application/json;as=Table;v=1;g=meta.k8s.io,application/json";
+
+    let body: serde_json::Value = client
+        .get(format!("http://{addr}/api/v1/namespaces"))
+        .header(reqwest::header::ACCEPT, TABLE_ACCEPT)
+        .send()
+        .await
+        .expect("GET namespaces as Table")
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        body.get("kind").and_then(|k| k.as_str()),
+        Some("Table"),
+        "a Table request must get a Table, not a List: {body:#}"
+    );
+    assert_eq!(
+        body.get("apiVersion").and_then(|v| v.as_str()),
+        Some("meta.k8s.io/v1")
+    );
+
+    let cols = body
+        .get("columnDefinitions")
+        .and_then(|c| c.as_array())
+        .expect("columnDefinitions present — without them a client cannot draw a header");
+    assert!(!cols.is_empty());
+    assert_eq!(cols[0].get("name").and_then(|n| n.as_str()), Some("Name"));
+
+    // The four seeded namespaces become four rows, each with cells.
+    let rows = body
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .expect("rows present");
+    assert!(
+        rows.len() >= 4,
+        "the four seeded namespaces must each be a row; got {}",
+        rows.len()
+    );
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.get("cells")?.get(0)?.as_str())
+        .collect();
+    assert!(
+        names.contains(&"default") && names.contains(&"kube-system"),
+        "row cells carry the object NAME: {names:?}"
+    );
+
+    // A plain JSON request still gets a List — the negotiation is real, not a
+    // global switch.
+    let plain: serde_json::Value = client
+        .get(format!("http://{addr}/api/v1/namespaces"))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .expect("GET namespaces as JSON")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        plain.get("kind").and_then(|k| k.as_str()),
+        Some("NamespaceList"),
+        "a plain Accept must still get a List: {plain:#}"
+    );
+}

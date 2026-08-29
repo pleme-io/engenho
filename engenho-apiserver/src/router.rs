@@ -709,6 +709,11 @@ fn serve_openapi_v3_document(group: &str, version: &str) -> Result<Response, Api
 enum ResponseCodec {
     Json,
     Protobuf,
+    /// `Accept: application/json;as=Table;v=1;g=meta.k8s.io` — server-side
+    /// printing. kubectl and k9s BOTH default to this for list views and let
+    /// the server choose the columns; without it they receive a plain List and
+    /// cannot draw a table at all.
+    Table(crate::table::IncludeObject),
 }
 
 impl ResponseCodec {
@@ -719,7 +724,15 @@ impl ResponseCodec {
             .get(ACCEPT)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if response_wants_protobuf(accept) {
+        // Table is checked BEFORE protobuf because kubectl sends both in one
+        // Accept header (`...;as=Table;...,application/json`) and the Table
+        // range is the specific request; falling through to protobuf/JSON
+        // would silently ignore it.
+        if crate::table::accept_wants_table(accept) {
+            // `includeObject` is a query parameter, not part of Accept. The
+            // upstream default (Metadata) is what kubectl and k9s rely on.
+            ResponseCodec::Table(crate::table::IncludeObject::default())
+        } else if response_wants_protobuf(accept) {
             ResponseCodec::Protobuf
         } else {
             ResponseCodec::Json
@@ -820,6 +833,20 @@ fn decode_patch(
 /// protobuf → the typed `engenho-kube-proto` encoder (magic +
 /// `runtime.Unknown` + per-kind `DynamicMessage`) with
 /// `Content-Type: application/vnd.kubernetes.protobuf`.
+/// Render a LIST envelope through the negotiated codec.
+///
+/// Split from [`render_object`] only because a list's Table conversion carries
+/// the LIST's metadata (resourceVersion, continue) rather than an object's —
+/// a paging client that lost the continue token would silently stop at the
+/// first page.
+fn render_list(
+    codec: ResponseCodec,
+    gvk: &Gvk,
+    value: serde_json::Value,
+) -> Result<Response, ApiError> {
+    render_object(codec, gvk, StatusCode::OK, value)
+}
+
 fn render_object(
     codec: ResponseCodec,
     gvk: &Gvk,
@@ -828,6 +855,10 @@ fn render_object(
 ) -> Result<Response, ApiError> {
     match codec {
         ResponseCodec::Json => Ok((status, Json(value)).into_response()),
+        ResponseCodec::Table(include) => {
+            let table = crate::table::to_table(&value, include);
+            Ok((status, Json(table)).into_response())
+        }
         ResponseCodec::Protobuf => {
             // The read-back Value carries apiVersion+kind from
             // inject_type_meta; the codec re-derives the per-kind
@@ -998,6 +1029,7 @@ async fn do_list_or_watch(
     h: Arc<dyn ResourceHandler>,
     namespace: Option<String>,
     p: ListWatchParams,
+    codec: ResponseCodec,
 ) -> Result<Response, ApiError> {
     let sel = p.selectors()?;
     if p.watch {
@@ -1012,10 +1044,10 @@ async fn do_list_or_watch(
             let (items, rv, cont, remaining) = h
                 .list_page(namespace.as_deref(), &sel, limit, continue_token)
                 .await?;
-            Ok(Json(h.list_response(items, rv, cont, remaining)).into_response())
+            render_list(codec, &handler_gvk(&h), h.list_response(items, rv, cont, remaining))
         } else {
             let (items, rv) = h.list_at(namespace.as_deref(), &sel).await?;
-            Ok(Json(h.list_response(items, rv, None, None)).into_response())
+            render_list(codec, &handler_gvk(&h), h.list_response(items, rv, None, None))
         }
     }
 }
@@ -1367,7 +1399,10 @@ async fn resource_get_or_list(
         // `p.watch`). `lookup` already returns an owned `Arc` (the
         // ArcSwap-snapshot clone) — exactly what the watch unfold stream
         // needs, no extra `.clone()`.
-        None => do_list_or_watch(h, coords.namespace, p).await,
+        None => {
+            let codec = ResponseCodec::from_headers(&headers);
+            do_list_or_watch(h, coords.namespace, p, codec).await
+        }
         // Instance GET → the shared `do_get` body. Bind the owned `Arc`,
         // pass it by reference (`do_get` takes `&Arc`).
         Some(name) => {
