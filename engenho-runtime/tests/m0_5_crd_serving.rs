@@ -368,3 +368,128 @@ async fn crd_lifecycle_register_crud_discovery_unregister() {
 
     rt.shutdown().await.unwrap();
 }
+
+/// **A CR that violates its CRD's declared schema is rejected 422.**
+///
+/// Measured 2026-08-28: a CRD declaring `spec.size: {type: integer}` accepted a
+/// CR carrying `spec.size: "NOT-AN-INT"` and returned **201**. `crd.rs` was
+/// explicit that this was pending — `CrdEntry::schema` is documented "the
+/// opaque openAPIV3Schema for this version (validation DEFERRED)" — so the
+/// schema was captured all along and simply never reached the handler.
+///
+/// A CRD's whole promise is that its schema is enforced. An unvalidated CR is
+/// worse than an unschema'd one: every controller downstream was written
+/// against the declared types and will panic, mis-branch, or silently coerce on
+/// data the apiserver swore could not exist.
+///
+/// NOTE the scope, so a green run is not over-read: `schema_validation` checks
+/// TYPES (plus `required`), not full JSON Schema — no `enum`, `pattern`,
+/// bounds, or CEL. See that module's header.
+#[tokio::test]
+async fn a_cr_violating_its_declared_schema_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = Runtime::start(crd_test_config(tmp.path()))
+        .await
+        .expect("runtime boots");
+    let addr = rt.local_addr();
+    let client = admin_client(tmp.path());
+    let base = format!("http://{addr}");
+
+    // A CRD with a TYPED spec — unlike `crd_body()`, which marks spec
+    // preserve-unknown-fields and so declares nothing to enforce.
+    let typed_crd = serde_json::json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": { "name": "gadgets.example.com" },
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {
+                "plural": "gadgets", "singular": "gadget",
+                "kind": "Gadget", "listKind": "GadgetList"
+            },
+            "versions": [{
+                "name": "v1", "served": true, "storage": true,
+                "schema": { "openAPIV3Schema": {
+                    "type": "object",
+                    "properties": {
+                        "spec": {
+                            "type": "object",
+                            "properties": { "size": { "type": "integer" } }
+                        }
+                    }
+                }}
+            }]
+        }
+    });
+
+    let resp = client
+        .post(format!(
+            "{base}/apis/apiextensions.k8s.io/v1/customresourcedefinitions"
+        ))
+        .json(&typed_crd)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "CRD POST 201");
+
+    // Wait for the CrdController to register the dynamic handler.
+    let ready = poll_until(Duration::from_secs(10), Duration::from_millis(50), || async {
+        let r = client
+            .get(format!("{base}/apis/example.com/v1/namespaces/default/gadgets"))
+            .send()
+            .await
+            .ok()?;
+        (r.status() == reqwest::StatusCode::OK).then_some(())
+    })
+    .await;
+    assert!(ready.is_some(), "the Gadget handler must register");
+
+    // ── the defect: a string where the schema declares an integer ──────
+    let bad = client
+        .post(format!("{base}/apis/example.com/v1/namespaces/default/gadgets"))
+        .json(&serde_json::json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Gadget",
+            "metadata": { "name": "bad" },
+            "spec": { "size": "NOT-AN-INT" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bad.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a CR violating its own declared schema must be rejected; the live \
+         daemon returned 201 and stored it"
+    );
+    let body: serde_json::Value = bad.json().await.unwrap();
+    assert_eq!(
+        body.get("reason").and_then(|r| r.as_str()),
+        Some("Invalid"),
+        "client-go's IsInvalid keys on this: {body:#}"
+    );
+    let msg = body.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("spec.size"),
+        "the error must name the offending FIELD or the author cannot act: {msg}"
+    );
+
+    // ── and a well-typed CR still works: the guard is not a wall ───────
+    let good = client
+        .post(format!("{base}/apis/example.com/v1/namespaces/default/gadgets"))
+        .json(&serde_json::json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Gadget",
+            "metadata": { "name": "good" },
+            "spec": { "size": 42 }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        good.status(),
+        reqwest::StatusCode::CREATED,
+        "a schema-conforming CR is still accepted"
+    );
+}

@@ -282,6 +282,13 @@ pub struct CrdHandlerSpec {
     pub namespaced: bool,
     /// `true` ⇒ register the `/status` subresource for this version.
     pub serves_status: bool,
+    /// This version's `openAPIV3Schema` — the INNER schema, already unwrapped
+    /// from [`CrdEntry::schema`]'s `{ "openAPIV3Schema": … }` envelope, so the
+    /// consumer validates against a real schema rather than against a
+    /// one-key wrapper that declares no `type` and silently matches
+    /// everything. That exact off-by-one-level made the first cut of this
+    /// enforcement a no-op.
+    pub schema: Value,
 }
 
 impl From<&CrdEntry> for CrdHandlerSpec {
@@ -296,6 +303,13 @@ impl From<&CrdEntry> for CrdHandlerSpec {
             categories: e.categories.clone(),
             namespaced: e.scope.is_namespaced(),
             serves_status: e.serves_status,
+            // Unwrap the envelope HERE, where the shape is known, rather than
+            // making every consumer remember to.
+            schema: e
+                .schema
+                .get("openAPIV3Schema")
+                .cloned()
+                .unwrap_or(Value::Null),
         }
     }
 }
