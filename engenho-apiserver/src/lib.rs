@@ -30,6 +30,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod schema_validation;
 pub mod table;
 pub mod authn;
 pub mod authz;

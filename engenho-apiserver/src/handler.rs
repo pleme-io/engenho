@@ -471,6 +471,12 @@ pub struct StoreBackedHandler {
     /// cluster lifecycle; making this unconditional would have made ~59 such
     /// tests assert cluster bootstrap as a side effect of testing pagination.
     namespace_lifecycle: bool,
+    /// This kind's `openAPIV3Schema`, for a CRD-served kind. `None` for a
+    /// cataloged kind, whose shape is already enforced by its generated Rust
+    /// type. A CRD's whole promise is that its schema is enforced, so leaving
+    /// this unset for a custom resource means accepting data every downstream
+    /// controller was written to assume impossible.
+    crd_schema: Option<Arc<serde_json::Value>>,
     /// Optional in-process Pod-log reader (the kubelet adapter). `None` for
     /// every kind except Pod (and for Pod when no kubelet is wired — tests /
     /// apiserver-only). When `Some`, the Pod handler's `logs` override
@@ -508,6 +514,7 @@ impl StoreBackedHandler {
             subresources: &[],
             admission: None,
             namespace_lifecycle: false,
+            crd_schema: None,
             log_reader: None,
         }
     }
@@ -565,6 +572,19 @@ impl StoreBackedHandler {
     #[must_use]
     pub fn with_namespace_lifecycle(mut self) -> Self {
         self.namespace_lifecycle = true;
+        self
+    }
+
+    /// Enforce a CRD's `openAPIV3Schema` on create. See
+    /// [`crate::schema_validation`] for exactly which keywords are checked —
+    /// it is type-checking, not full JSON Schema.
+    #[must_use]
+    pub fn with_crd_schema(mut self, schema: serde_json::Value) -> Self {
+        // An empty or non-object schema carries no constraints; storing it
+        // would cost a clone per create for nothing.
+        if schema.is_object() {
+            self.crd_schema = Some(Arc::new(schema));
+        }
         self
     }
 
@@ -1141,6 +1161,26 @@ impl ResourceHandler for StoreBackedHandler {
             if self.store.get(&ns_key).await.is_none() {
                 return Err(ApiError::NotFound(
                     ["namespaces \"", ns, "\" not found"].concat(),
+                ));
+            }
+        }
+        // ── CRD structural-schema validation. ──────────────────────────
+        // Measured 2026-08-28: a CRD declaring `spec.size: {type: integer}`
+        // accepted a CR with `spec.size: "NOT-AN-INT"` and returned 201. The
+        // schema was captured all along (crd.rs called it "validation
+        // DEFERRED") but never reached the handler. An unvalidated CR is worse
+        // than an unschema'd one: every controller downstream was written
+        // against the declared types.
+        if let Some(schema) = &self.crd_schema {
+            let violations = crate::schema_validation::validate(schema, &body);
+            if !violations.is_empty() {
+                let detail = violations
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(ApiError::Invalid(
+                    [&self.kind, " \"", name.as_str(), "\" is invalid: ", &detail].concat(),
                 ));
             }
         }
@@ -1878,7 +1918,14 @@ impl DynamicHandlerSink for RouterHandlerSink {
                 // never opted into.
                 &[]
             })
-            .with_admission(self.admission.clone()),
+            .with_admission(self.admission.clone())
+            // The CRD's own schema, ENFORCED. Threaded from CrdEntry through
+            // CrdHandlerSpec so the handler can reject a CR that violates the
+            // types its author declared.
+            .with_crd_schema(spec.schema.clone())
+            // A dynamically-registered CR lives in a namespace like anything
+            // else, so the same NamespaceLifecycle rule applies.
+            .with_namespace_lifecycle(),
         );
         self.router.register(handler);
     }
