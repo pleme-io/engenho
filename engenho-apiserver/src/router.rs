@@ -719,11 +719,34 @@ enum ResponseCodec {
 impl ResponseCodec {
     /// Negotiate from the request headers' `Accept`. Defaults to JSON
     /// when `Accept` is absent or does not list protobuf.
-    fn from_headers(headers: &HeaderMap) -> Self {
+    /// Negotiate from the request's `Accept`.
+    ///
+    /// # Errors
+    /// [`ApiError::NotAcceptable`] (HTTP 406) when `Accept` is present and
+    /// names NO type this server can produce. Measured 2026-08-28:
+    /// `Accept: text/html` returned **200 with a JSON body** — the server
+    /// ignored the header entirely and sent something the client had
+    /// explicitly said it could not read.
+    fn from_headers(headers: &HeaderMap) -> Result<Self, ApiError> {
         let accept = headers
             .get(ACCEPT)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+        // An absent or empty Accept means "anything" — default to JSON, never
+        // 406. Only an Accept that is PRESENT and names nothing servable is a
+        // failed negotiation.
+        if !accept.trim().is_empty() && !accept_is_servable(accept) {
+            return Err(ApiError::NotAcceptable(
+                [
+                    "only the following media types are acceptable: application/json, \
+                     application/yaml, ",
+                    CONTENT_TYPE_PROTOBUF,
+                    "; got ",
+                    accept,
+                ]
+                .concat(),
+            ));
+        }
         // Table is checked BEFORE protobuf because kubectl sends both in one
         // Accept header (`...;as=Table;...,application/json`) and the Table
         // range is the specific request; falling through to protobuf/JSON
@@ -731,13 +754,29 @@ impl ResponseCodec {
         if crate::table::accept_wants_table(accept) {
             // `includeObject` is a query parameter, not part of Accept. The
             // upstream default (Metadata) is what kubectl and k9s rely on.
-            ResponseCodec::Table(crate::table::IncludeObject::default())
+            Ok(ResponseCodec::Table(crate::table::IncludeObject::default()))
         } else if response_wants_protobuf(accept) {
-            ResponseCodec::Protobuf
+            Ok(ResponseCodec::Protobuf)
         } else {
-            ResponseCodec::Json
+            Ok(ResponseCodec::Json)
         }
     }
+}
+
+/// Whether ANY media range in `accept` names something this server produces.
+///
+/// Per-range, because `Accept` is a list and one servable range is enough.
+/// `*/*` and `application/*` are wildcards every real client sends, and
+/// rejecting them would break kubectl before it made a single call.
+fn accept_is_servable(accept: &str) -> bool {
+    accept.split(',').any(|range| {
+        let media = range.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        media == "*/*"
+            || media == "application/*"
+            || media == "application/json"
+            || media == "application/yaml"
+            || media == CONTENT_TYPE_PROTOBUF
+    })
 }
 
 /// The GVK a handler speaks, as the K8s wire `(apiVersion, kind)` —
@@ -897,7 +936,7 @@ async fn do_create(
 ) -> Result<Response, ApiError> {
     let body = decode_write_body(headers, raw)?;
     let v = h.create(ns, body, user_info, dry_run).await?;
-    let codec = ResponseCodec::from_headers(headers);
+    let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &handler_gvk(h), StatusCode::CREATED, v)
 }
 
@@ -912,7 +951,7 @@ async fn do_replace(
 ) -> Result<Response, ApiError> {
     let body = decode_write_body(headers, raw)?;
     let v = h.replace(ns, name, body, user_info, dry_run).await?;
-    let codec = ResponseCodec::from_headers(headers);
+    let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &handler_gvk(h), StatusCode::OK, v)
 }
 
@@ -955,7 +994,7 @@ async fn do_patch(
     // surfaces the status via the response — here we keep 200 for parity with
     // the existing patch path (kubectl apply --server-side accepts both, and
     // the read-back object carries the committed state either way).
-    let codec = ResponseCodec::from_headers(headers);
+    let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &gvk, StatusCode::OK, v)
 }
 
@@ -979,7 +1018,7 @@ async fn do_delete(
     let obj = h
         .delete_with_precondition(ns, name, expected, user_info, dry_run)
         .await?;
-    let codec = ResponseCodec::from_headers(headers);
+    let codec = ResponseCodec::from_headers(headers)?;
     // PROTOBUF CAVEAT: the deleted-object branch encodes cleanly (its GVK
     // — Deployment, ConfigMap, … — is in the proto pool). The Status-Success
     // fallback only arises when no object existed; `Status` lives in
@@ -1283,7 +1322,7 @@ async fn do_put_status(
 ) -> Result<Response, ApiError> {
     let body = decode_write_body(headers, raw)?;
     let v = h.put_status(ns, name, body).await?;
-    let codec = ResponseCodec::from_headers(headers);
+    let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &handler_gvk(h), StatusCode::OK, v)
 }
 
@@ -1297,7 +1336,7 @@ async fn do_patch_status(
     let gvk = handler_gvk(h);
     let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
     let v = h.patch_status(ns, name, patch, patch_type).await?;
-    let codec = ResponseCodec::from_headers(headers);
+    let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &gvk, StatusCode::OK, v)
 }
 
@@ -1384,7 +1423,7 @@ async fn resource_get_or_list(
         // A subresource always targets an instance — `name` is present
         // (resolve_subresource enforces it).
         let name = coords.name.as_deref().expect("subresource requires a name");
-        let codec = ResponseCodec::from_headers(&headers);
+        let codec = ResponseCodec::from_headers(&headers)?;
         return match sub {
             Subresource::Status => {
                 do_get_status(&h, coords.namespace.as_deref(), name, codec).await
@@ -1400,7 +1439,7 @@ async fn resource_get_or_list(
         // ArcSwap-snapshot clone) — exactly what the watch unfold stream
         // needs, no extra `.clone()`.
         None => {
-            let codec = ResponseCodec::from_headers(&headers);
+            let codec = ResponseCodec::from_headers(&headers)?;
             do_list_or_watch(h, coords.namespace, p, codec).await
         }
         // Instance GET → the shared `do_get` body. Bind the owned `Arc`,
@@ -1410,7 +1449,7 @@ async fn resource_get_or_list(
                 &h,
                 coords.namespace.as_deref(),
                 name,
-                ResponseCodec::from_headers(&headers),
+                ResponseCodec::from_headers(&headers)?,
             )
             .await
         }

@@ -31,6 +31,12 @@ pub enum ApiError {
     /// look like a transient protocol error and be retried forever.
     #[error("{0}")]
     Invalid(String),
+    /// The request's `Accept` named no media type this server can produce —
+    /// the K8s 406 Not Acceptable equivalent. Distinct from
+    /// [`Self::UnsupportedMediaType`] (415), which is about the REQUEST body's
+    /// Content-Type; this is about the RESPONSE the client will accept.
+    #[error("{0}")]
+    NotAcceptable(String),
     /// Authentication failed on a typed-bad credential — the K8s 401
     /// Unauthorized equivalent. Carries the human-readable reason rendered
     /// into the `Status` body (reason "Unauthorized", code 401). This brick
@@ -95,6 +101,7 @@ pub enum ErrorKind {
     ResourceVersionConflict,
     BadRequest,
     Invalid,
+    NotAcceptable,
     Unauthorized,
     UnsupportedMediaType,
     Forbidden,
@@ -114,6 +121,7 @@ impl ApiError {
             Self::ResourceVersionConflict(_) => ErrorKind::ResourceVersionConflict,
             Self::BadRequest(_) => ErrorKind::BadRequest,
             Self::Invalid(_) => ErrorKind::Invalid,
+            Self::NotAcceptable(_) => ErrorKind::NotAcceptable,
             Self::Unauthorized(_) => ErrorKind::Unauthorized,
             Self::UnsupportedMediaType(_) => ErrorKind::UnsupportedMediaType,
             Self::Forbidden(_) => ErrorKind::Forbidden,
@@ -133,6 +141,7 @@ impl ApiError {
             }
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::NotAcceptable(_) => StatusCode::NOT_ACCEPTABLE,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Forbidden(_) | Self::AuthzForbidden(_) => StatusCode::FORBIDDEN,
@@ -337,6 +346,7 @@ impl IntoResponse for ApiError {
             ApiError::ResourceVersionConflict(_) | ApiError::ApplyConflict(_) => "Conflict",
             ApiError::BadRequest(_) => "BadRequest",
             ApiError::Invalid(_) => "Invalid",
+            ApiError::NotAcceptable(_) => "NotAcceptable",
             ApiError::Unauthorized(_) => "Unauthorized",
             ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
             ApiError::Forbidden(_) | ApiError::AuthzForbidden(_) => "Forbidden",

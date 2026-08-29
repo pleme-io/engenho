@@ -1087,3 +1087,73 @@ async fn accept_as_table_returns_a_table() {
         "a plain Accept must still get a List: {plain:#}"
     );
 }
+
+/// **An `Accept` naming nothing servable gets 406, not a JSON body.**
+///
+/// Measured 2026-08-28: `Accept: text/html` returned **200 with JSON** — the
+/// server ignored the header entirely and sent something the client had
+/// explicitly said it could not read.
+#[tokio::test]
+async fn unservable_accept_is_406() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = Arc::new(FakeBackend::new());
+    let backend_dyn: Arc<dyn ContainerRuntime> = backend.clone();
+
+    let rt = Runtime::start_with_backend(durable_config(tmp.path()), backend_dyn)
+        .await
+        .expect("Runtime boots");
+    let addr = rt.local_addr();
+    let client = admin_client(tmp.path());
+
+    for bad in ["text/html", "application/x-total-nonsense", "image/png"] {
+        let resp = client
+            .get(format!("http://{addr}/api/v1/namespaces"))
+            .header(reqwest::header::ACCEPT, bad)
+            .send()
+            .await
+            .expect("GET with an unservable Accept");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_ACCEPTABLE,
+            "Accept {bad:?} must 406; the live daemon returned 200 with a JSON body"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("reason").and_then(|r| r.as_str()),
+            Some("NotAcceptable"),
+            "a proper metav1.Status: {body:#}"
+        );
+    }
+
+    // Everything a real client actually sends must still work. Wildcards are
+    // the important ones — rejecting `*/*` would break kubectl before it made
+    // a single call.
+    for ok in [
+        "*/*",
+        "application/*",
+        "application/json",
+        "application/json, */*",
+        "application/vnd.kubernetes.protobuf,application/json",
+        "application/json;as=Table;v=1;g=meta.k8s.io,application/json",
+    ] {
+        let resp = client
+            .get(format!("http://{addr}/api/v1/namespaces"))
+            .header(reqwest::header::ACCEPT, ok)
+            .send()
+            .await
+            .expect("GET with a servable Accept");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "Accept {ok:?} is servable and must NOT 406"
+        );
+    }
+
+    // And an ABSENT Accept means "anything" — never a 406.
+    let resp = client
+        .get(format!("http://{addr}/api/v1/namespaces"))
+        .send()
+        .await
+        .expect("GET with no Accept");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "absent Accept is not a failed negotiation");
+}
