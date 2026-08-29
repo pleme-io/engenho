@@ -1164,6 +1164,23 @@ impl ResourceHandler for StoreBackedHandler {
                 ));
             }
         }
+        // ── API DEFAULTING (upstream's `scheme.Default(obj)`). ─────────
+        // Upstream's pipeline is `decode → DEFAULT → validate → admit →
+        // persist`, and engenho had every stage but this one. Order is
+        // load-bearing and this position is the reason: BEFORE validation,
+        // so a validator judges the object that will actually be stored
+        // rather than rejecting every client that merely omitted a field;
+        // and BEFORE admission, so a mutating webhook can see and override
+        // a default, which it can only do if the default is already there.
+        //
+        // Measured on cid 2026-08-29: `default/final-check` read back with
+        // NO `restartPolicy` while the kubelet restarted it 160 times — the
+        // runtime already behaved as `Always` while the stored object
+        // declined to say so. Nothing crashed and nothing logged, which is
+        // exactly the class defaulting exists to close.
+        let mut body = body;
+        crate::defaulting::apply(&self.group, &self.version, &self.kind, &mut body);
+
         // ── CRD structural-schema validation. ──────────────────────────
         // Measured 2026-08-28: a CRD declaring `spec.size: {type: integer}`
         // accepted a CR with `spec.size: "NOT-AN-INT"` and returned 201. The
