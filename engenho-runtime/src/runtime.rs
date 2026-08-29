@@ -451,13 +451,41 @@ fn build_pod_log_handler(
     Some(Arc::new(handler))
 }
 
+/// Render a small signed int without `format!()` (★★ TYPED EMISSION).
+fn itoa_i32(n: i32) -> String {
+    let mut out = String::new();
+    let mut v = i64::from(n);
+    if v < 0 {
+        out.push('-');
+        v = -v;
+    }
+    let mut digits = Vec::new();
+    if v == 0 {
+        digits.push(b'0');
+    }
+    while v > 0 {
+        digits.push(b'0' + u8::try_from(v % 10).unwrap_or(0));
+        v /= 10;
+    }
+    digits.reverse();
+    out.push_str(&String::from_utf8(digits).unwrap_or_default());
+    out
+}
+
 /// Verify at BOOT that a configured container runtime is actually usable.
 ///
-/// The `Fake` backend needs nothing. For `Podman` this spawns the resolved
-/// binary with `--version` and requires it to launch — a cheap, read-only
-/// probe that distinguishes "the binary is missing from my PATH" from "podman
-/// is present but the machine is down" (the latter starts fine and fails later
-/// with a real podman error, which is legible).
+/// The `Fake` backend needs nothing. For `Podman` this runs `podman info`,
+/// which requires a working CONNECTION to the runtime — not merely a binary on
+/// disk.
+///
+/// `--version` was the first cut and it was too weak, proven by running it:
+/// with a redirected `XDG_CONFIG_HOME` the binary answered `--version` happily
+/// while every container start failed with `unable to connect to Podman
+/// socket`. A preflight that green-lights an unusable runtime is worse than
+/// none, because it moves the failure back to where it was — one warn per
+/// reconcile tick, forever. `info` is the cheapest call that actually proves
+/// the socket answers, and it is exactly the case a launchd daemon hits: it
+/// has neither the operator's PATH nor their podman machine connection.
 ///
 /// Deliberately at boot, once, fatal. The failure this replaces emitted one
 /// WARN per reconcile tick forever while the API showed pods with no status at
@@ -472,15 +500,27 @@ fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
         .clone()
         .unwrap_or_else(|| "podman".to_string());
     match std::process::Command::new(&binary)
-        .arg("--version")
+        .arg("info")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
     {
-        Ok(_) => {
+        // `status()` is Ok whenever the process RAN — including when it ran
+        // and reported a dead connection. The exit code is the part that
+        // carries the verdict, and ignoring it is how the weak `--version`
+        // check passed on a runtime that could not start a single container.
+        Ok(st) if st.success() => {
             info!(backend = "podman", %binary, "container runtime resolved");
             Ok(())
         }
+        Ok(st) => Err(RuntimeError::ContainerRuntimeUnavailable {
+            backend: "podman".to_string(),
+            binary,
+            source: std::io::Error::other(match st.code() {
+                Some(c) => ["`podman info` exited ", itoa_i32(c).as_str()].concat(),
+                None => "`podman info` was terminated by a signal".to_string(),
+            }),
+        }),
         Err(source) => Err(RuntimeError::ContainerRuntimeUnavailable {
             backend: "podman".to_string(),
             binary,
