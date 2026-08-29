@@ -70,6 +70,51 @@ pub struct ClusterConfigView {
     pub gitops: GitopsBackendView,
 }
 
+/// A cluster's KIND — how it is realised, which decides what can honestly
+/// be said about it.
+///
+/// ★ WHY THIS ENUM EXISTS. `ClusterConfigView` below requires `vm_mode`,
+/// `cpus`, `mac_address`, `vm_ip` and `ssh_port` — all non-optional, all
+/// VM facts. A baremetal engenho cluster has none of them, so before this
+/// enum a node cluster was literally UNREPRESENTABLE in the MCP's own view
+/// type: the reader could only ever offer VM clusters, which is why the
+/// operator's live `engenho-cid-f3c36831` was unreachable while
+/// `engenho-local` — a VM that does not run — was the only legal name.
+///
+/// The fix is a kind-typed union rather than making the VM fields optional.
+/// Optional fields would let a node cluster answer `cpus: null` and a VM
+/// cluster answer `store_path: null`, so every consumer would carry the
+/// same "which kind is this really" branch, un-typed, forever.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClusterConfig {
+    /// A kikai-managed VM cluster — the original shape, unchanged.
+    Vm(ClusterConfigView),
+    /// A per-node baremetal control plane running natively on the host.
+    Node(NodeConfigView),
+}
+
+/// Non-secret config of a baremetal, per-node engenho control plane.
+///
+/// Deliberately NOT a subset of `ClusterConfigView`: the questions worth
+/// asking are different. There is no VM to size, no MAC to assign and no
+/// SSH port to reach — there is a process, a store and an endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NodeConfigView {
+    /// `engenho-<node>-<blake3-8>` — read from the kubeconfig, never spelled.
+    pub cluster: String,
+    /// The API endpoint the kubeconfig's sole context points at.
+    pub server: String,
+    /// The stable per-node kubeconfig path (`~/.kube/configs/engenho`).
+    /// Stable BECAUSE the cluster name is not — see `reader::node`.
+    pub kubeconfig_path: String,
+    /// Where the control plane persists state. engenho's answer to etcd:
+    /// a journalled, partitioned segment store, not an etcd wire endpoint.
+    pub store_path: String,
+    /// Whether that store directory is present on disk.
+    pub store_present: bool,
+}
+
 /// Typed projection of kikai's `GitopsBackend` — same tagged-union
 /// shape but without any auth material.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]

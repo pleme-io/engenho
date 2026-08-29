@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::reader::{ClusterReader, ReaderError};
-use crate::views::{ClusterConfigView, ClusterStatus, KubeAuthDescriptor, SnapshotMetaView};
+use crate::views::{
+    ClusterConfig, ClusterConfigView, ClusterStatus, KubeAuthDescriptor, SnapshotMetaView,
+};
 
 #[derive(Default)]
 pub struct MockClusterReader {
@@ -46,11 +48,11 @@ impl ClusterReader for MockClusterReader {
             })
     }
 
-    async fn cluster_config(&self, cluster: &str) -> Result<ClusterConfigView, ReaderError> {
+    async fn cluster_config(&self, cluster: &str) -> Result<ClusterConfig, ReaderError> {
         let state = self.state.lock().unwrap();
         state
             .get(cluster)
-            .map(|s| s.config.clone())
+            .map(|s| ClusterConfig::Vm(s.config.clone()))
             .ok_or_else(|| ReaderError::UnknownCluster {
                 requested: cluster.to_string(),
                 known: state.keys().cloned().collect(),
