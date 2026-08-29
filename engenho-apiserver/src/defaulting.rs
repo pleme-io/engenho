@@ -197,7 +197,7 @@ mod tests {
     fn image_pull_policy_follows_the_tag_not_the_colon() {
         let cases = [
             ("busybox:latest", "Always"),
-            ("busybox", "Always"),               // untagged ⇒ latest
+            ("busybox", "Always"), // untagged ⇒ latest
             ("busybox:1.36", "IfNotPresent"),
             ("docker.io/library/busybox:1.36", "IfNotPresent"),
             // The trap: a registry PORT is not a tag. Read as one, every
@@ -222,8 +222,14 @@ mod tests {
             "initContainers":[{"name":"i","image":"busybox:1.36"}],
             "containers":[{"name":"c","image":"busybox:1.36"}]
         }));
-        assert_eq!(b["spec"]["initContainers"][0]["imagePullPolicy"], "IfNotPresent");
-        assert_eq!(b["spec"]["initContainers"][0]["terminationMessagePolicy"], "File");
+        assert_eq!(
+            b["spec"]["initContainers"][0]["imagePullPolicy"],
+            "IfNotPresent"
+        );
+        assert_eq!(
+            b["spec"]["initContainers"][0]["terminationMessagePolicy"],
+            "File"
+        );
     }
 
     #[test]
@@ -249,6 +255,9 @@ mod tests {
     fn a_pod_with_no_spec_does_not_panic() {
         let mut b = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"p"}});
         apply("", "v1", "Pod", &mut b);
-        assert!(b.get("spec").is_none(), "no spec is left absent, not invented");
+        assert!(
+            b.get("spec").is_none(),
+            "no spec is left absent, not invented"
+        );
     }
 }
