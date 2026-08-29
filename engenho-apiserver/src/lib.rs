@@ -35,6 +35,7 @@ pub mod table;
 pub mod authn;
 pub mod authz;
 pub mod coords;
+pub mod defaulting;
 pub mod discovery;
 pub mod error;
 pub mod handler;
