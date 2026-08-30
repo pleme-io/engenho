@@ -39,6 +39,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod backend;
+pub mod backoff;
 pub mod config_bridge;
 pub mod error;
 pub mod kubelet;
