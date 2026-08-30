@@ -1704,6 +1704,7 @@ name = "engenho-runtime"
 version = "0.53.43"
 dependencies = [
  "async-trait",
+ "axum 0.7.9",
  "cofre-fs",
  "engenho-apiserver",
  "engenho-config",
