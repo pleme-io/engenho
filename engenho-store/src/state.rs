@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use engenho_types::patch::PatchType;
 
-use crate::command::{ApplyMeta, ResourceCommand, ResourceOp};
+use crate::command::{ApplyMeta, ResourceCommand, ResourceOp, TxnCompare, TxnOp};
 use crate::pagination::ListPage;
 use crate::patch_apply::{self, Gvk, OpenApiPatchEnv, PatchBody, PatchError, PatchSchemaEnv};
 use crate::resource::{ResourceKey, ResourceValue};
@@ -88,6 +88,14 @@ pub struct ApplyOutcome {
     /// [`ApplyOutcome`] keeps its derives (the `PatchError` is rendered to a
     /// stable message at the rejection site).
     pub patch_error: Option<String>,
+    /// Additional committed changes beyond `change`, for a command that
+    /// mutates MORE THAN ONE key — today only [`ResourceCommand::Txn`].
+    ///
+    /// Every entry shares `change`'s revision: etcd stamps one transaction
+    /// with one `mod_revision`, and splitting them would be observable on
+    /// the wire. Empty for every single-key command, so no existing caller
+    /// changes behaviour.
+    pub extra_changes: Vec<Change>,
 }
 
 impl ApplyOutcome {
@@ -97,6 +105,7 @@ impl ApplyOutcome {
     pub fn no_change(op: ResourceOp) -> Self {
         Self {
             op,
+            extra_changes: Vec::new(),
             change: None,
             patch_error: None,
         }
@@ -109,6 +118,7 @@ impl ApplyOutcome {
             op,
             change: Some(change),
             patch_error: None,
+            extra_changes: Vec::new(),
         }
     }
 
@@ -120,6 +130,7 @@ impl ApplyOutcome {
             op: ResourceOp::PatchRejected,
             change: None,
             patch_error: Some(error),
+            extra_changes: Vec::new(),
         }
     }
 
@@ -137,6 +148,7 @@ impl ApplyOutcome {
             op: ResourceOp::ApplyConflict,
             change: None,
             patch_error: Some(causes_json),
+            extra_changes: Vec::new(),
         }
     }
 }
@@ -330,6 +342,12 @@ impl ResourceCatalog {
                 deletion_timestamp,
                 ..
             } => self.apply_delete(key, *expected, deletion_timestamp.as_deref(), rev),
+            ResourceCommand::Txn {
+                compares,
+                success,
+                failure,
+                ..
+            } => self.apply_txn(compares, success, failure, rev),
         };
         self.last_applied_term = term;
         self.last_applied_index = index;
@@ -339,6 +357,13 @@ impl ResourceCatalog {
             debug_assert_eq!(change.revision, rev);
             self.current_revision = rev;
             self.push_history(change.clone());
+            // A transaction commits EVERY key it touched at the SAME
+            // revision — see `ResourceCommand::Txn`. Empty for every
+            // single-key command, so this is a no-op on the hot path.
+            for extra in &outcome.extra_changes {
+                debug_assert_eq!(extra.revision, rev);
+                self.push_history(extra.clone());
+            }
         }
         outcome
     }
@@ -353,6 +378,73 @@ impl ResourceCatalog {
                 // the NEW front. Anything <= evicted.revision is gone.
                 self.compacted_revision = evicted.revision;
             }
+        }
+    }
+
+    /// Apply an atomic multi-key transaction — etcd `Txn` semantics.
+    ///
+    /// ★ ALL-OR-NOTHING IS ENFORCED BY EVALUATING FIRST. Every compare is
+    /// evaluated against the live catalog BEFORE any mutation, so a branch
+    /// is chosen from a single consistent view. Within the chosen branch
+    /// each op is unconditional — the compares were the condition — which
+    /// is exactly etcd's model and is why an op here carries no `expected`.
+    ///
+    /// ★ ONE TRANSACTION, ONE REVISION. Every op commits at `rev`, so all
+    /// touched keys share a `mod_revision`. The first real change becomes
+    /// `ApplyOutcome.change` and the rest `extra_changes`; the caller
+    /// pushes them all to history at the same revision.
+    ///
+    /// ★ AN EMPTY BRANCH IS A NoOp, not a silent success-with-no-revision:
+    /// `change: None` means the outer `apply` leaves `current_revision`
+    /// untouched and fans nothing, which is the same "no mutation ⇒ no
+    /// revision" law every other path obeys.
+    fn apply_txn(
+        &mut self,
+        compares: &[TxnCompare],
+        success: &[TxnOp],
+        failure: &[TxnOp],
+        rev: Revision,
+    ) -> ApplyOutcome {
+        // An empty compare list is vacuously true — etcd's unconditional Txn.
+        let taken = compares.iter().all(|c| self.eval_compare(c));
+        let branch = if taken { success } else { failure };
+
+        let mut changes: Vec<Change> = Vec::new();
+        for op in branch {
+            let outcome = match op {
+                TxnOp::Put { key, value } => self.apply_put(key, value, None, rev),
+                TxnOp::Delete {
+                    key,
+                    deletion_timestamp,
+                } => self.apply_delete(key, None, deletion_timestamp.as_deref(), rev),
+            };
+            if let Some(c) = outcome.change {
+                changes.push(c);
+            }
+        }
+
+        // The op reported is the branch's shape, not any one key's: a
+        // transaction is one outcome. `Replaced` reads correctly for a
+        // multi-key mutation and keeps the enum closed.
+        let mut iter = changes.into_iter();
+        match iter.next() {
+            None => ApplyOutcome::no_change(ResourceOp::NoOp),
+            Some(first) => {
+                let mut out = ApplyOutcome::with_change(ResourceOp::Replaced, first);
+                out.extra_changes = iter.collect();
+                out
+            }
+        }
+    }
+
+    /// Evaluate ONE transaction predicate against the live catalog.
+    fn eval_compare(&self, cmp: &TxnCompare) -> bool {
+        match cmp {
+            TxnCompare::ModRevisionEq { key, revision } => self
+                .resources
+                .get(key)
+                .is_some_and(|(_, m)| m.mod_revision == *revision),
+            TxnCompare::NotExists { key } => !self.resources.contains_key(key),
         }
     }
 
@@ -1351,7 +1443,10 @@ mod tests {
             uid_1.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
             "uid is lowercase hex + dashes: {uid_1}"
         );
-        assert!(!uid_1.starts_with("uid-"), "the non-UUID prefix must not return");
+        assert!(
+            !uid_1.starts_with("uid-"),
+            "the non-UUID prefix must not return"
+        );
         put(&mut cat, &k, serde_json::json!({"spec": {"x": true}}), 2);
         let uid_2 = cat
             .get(&k)
@@ -2150,7 +2245,10 @@ mod uid_tests {
     fn carries_version_8_and_the_rfc_variant() {
         let u = mint_uid("v1/v1/Pod/default/p", Revision(1));
         let version = u.split('-').nth(2).unwrap().as_bytes()[0] as char;
-        assert_eq!(version, '8', "version-8 = custom/derived, honest for a hash: {u}");
+        assert_eq!(
+            version, '8',
+            "version-8 = custom/derived, honest for a hash: {u}"
+        );
         let variant = u.split('-').nth(3).unwrap().as_bytes()[0] as char;
         assert!(
             matches!(variant, '8' | '9' | 'a' | 'b'),
@@ -2172,10 +2270,26 @@ mod uid_tests {
     #[test]
     fn distinguishes_key_and_revision() {
         let base = mint_uid("v1/v1/ConfigMap/ns/a", Revision(7));
-        assert_ne!(base, mint_uid("v1/v1/ConfigMap/ns/b", Revision(7)), "name must matter");
-        assert_ne!(base, mint_uid("v1/v1/ConfigMap/ns2/a", Revision(7)), "namespace must matter");
-        assert_ne!(base, mint_uid("v1/v1/Secret/ns/a", Revision(7)), "kind must matter");
-        assert_ne!(base, mint_uid("v1/v1/ConfigMap/ns/a", Revision(8)), "revision must matter");
+        assert_ne!(
+            base,
+            mint_uid("v1/v1/ConfigMap/ns/b", Revision(7)),
+            "name must matter"
+        );
+        assert_ne!(
+            base,
+            mint_uid("v1/v1/ConfigMap/ns2/a", Revision(7)),
+            "namespace must matter"
+        );
+        assert_ne!(
+            base,
+            mint_uid("v1/v1/Secret/ns/a", Revision(7)),
+            "kind must matter"
+        );
+        assert_ne!(
+            base,
+            mint_uid("v1/v1/ConfigMap/ns/a", Revision(8)),
+            "revision must matter"
+        );
     }
 
     /// A recreated object (same name, later revision) gets a DIFFERENT uid —
@@ -2194,8 +2308,17 @@ mod uid_tests {
     #[test]
     fn is_not_the_old_prefixed_format() {
         let u = mint_uid("v1/v1/ConfigMap/conformance-probe/x", Revision(640));
-        assert!(!u.starts_with("uid-"), "the `uid-` prefix was never a UUID: {u}");
-        assert!(!u.contains("v1-v1"), "the doubled core-group render must be gone: {u}");
-        assert!(!u.contains("ConfigMap"), "a uid must not leak the kind: {u}");
+        assert!(
+            !u.starts_with("uid-"),
+            "the `uid-` prefix was never a UUID: {u}"
+        );
+        assert!(
+            !u.contains("v1-v1"),
+            "the doubled core-group render must be gone: {u}"
+        );
+        assert!(
+            !u.contains("ConfigMap"),
+            "a uid must not leak the kind: {u}"
+        );
     }
 }
