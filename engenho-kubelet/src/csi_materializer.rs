@@ -592,3 +592,120 @@ impl engenho_controllers::csi_provisioner::CsiProvisioner for DriverCsiProvision
             .map_err(|e| e.to_string())
     }
 }
+
+// =====================================================================
+// THE REGISTRATION PRODUCER
+// =====================================================================
+
+/// Scans the kubelet's `plugins_registry` directory each tick and keeps
+/// [`DriverTable`] in sync with what is actually there.
+///
+/// ★ A DIRECTORY SCAN RATHER THAN A WATCH, DELIBERATELY. Registration is a
+/// startup event measured in seconds, not a hot path, and an `inotify` /
+/// `FSEvents` watcher would add a second platform-specific code path for a
+/// problem that does not need one. Named here so the absence reads as a
+/// decision rather than an omission.
+///
+/// ★ IT ALSO DEREGISTERS. A driver whose registration socket has vanished
+/// is removed from the table, so a PV naming it fails with a typed
+/// `CsiUnavailable` instead of hanging on a dead socket — and so the
+/// annotation an operator reads matches what is actually dialable.
+pub struct CsiRegistrarController {
+    registry: engenho_csi::registry::PluginRegistry,
+    drivers: DriverTable,
+}
+
+impl CsiRegistrarController {
+    /// New registrar over `<kubelet-root>/plugins_registry`.
+    #[must_use]
+    pub fn new(root: impl AsRef<std::path::Path>, drivers: DriverTable) -> Self {
+        Self {
+            registry: engenho_csi::registry::PluginRegistry::under_kubelet_root(root),
+            drivers,
+        }
+    }
+
+    /// The directory being scanned.
+    #[must_use]
+    pub fn dir(&self) -> &std::path::Path {
+        self.registry.dir()
+    }
+}
+
+#[async_trait]
+impl engenho_controllers::Controller for CsiRegistrarController {
+    fn name(&self) -> &'static str {
+        "csi-registrar"
+    }
+
+    async fn tick(
+        &self,
+    ) -> Result<
+        engenho_controllers::controller::ReconcileOutcome,
+        engenho_controllers::error::ControllerError,
+    > {
+        let mut report = engenho_controllers::controller::ReconcileReport::default();
+
+        // A missing directory is an empty scan, not an error: a node with
+        // no CSI driver deployed is completely normal.
+        let (found, failed) = match self.registry.scan().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "CSI plugin registry scan failed");
+                return Ok(engenho_controllers::controller::ReconcileOutcome::from(
+                    report,
+                ));
+            }
+        };
+        report.objects_examined = found.len() + failed.len();
+
+        for (socket, err) in &failed {
+            // One broken plugin must not hide three working ones, and a
+            // silently-skipped driver is how a storage outage becomes
+            // unexplainable.
+            tracing::warn!(socket = %socket.display(), error = %err, "CSI plugin registration failed");
+            report.objects_skipped += 1;
+        }
+
+        let known = self.drivers.names().await;
+        for (name, plugin) in &found {
+            if known.contains(name) {
+                continue;
+            }
+            let Ok(client) = engenho_csi::client::CsiClient::dial(&plugin.endpoint).await else {
+                report.objects_skipped += 1;
+                continue;
+            };
+            tracing::info!(
+                driver = %name,
+                endpoint = %plugin.endpoint,
+                stage_unstage = plugin.info.stage_unstage,
+                "CSI driver registered"
+            );
+            self.drivers
+                .insert(
+                    name.clone(),
+                    RegisteredDriver {
+                        client,
+                        stage_unstage: plugin.info.stage_unstage,
+                        node_id: plugin.info.node_id.clone(),
+                    },
+                )
+                .await;
+            report.objects_changed += 1;
+        }
+
+        // Deregister what is gone, or a PV naming it hangs on a dead socket.
+        for name in known {
+            if !found.contains_key(&name) {
+                tracing::info!(driver = %name, "CSI driver deregistered: its socket is gone");
+                self.drivers.remove(&name).await;
+                report.objects_changed += 1;
+            }
+        }
+
+        Ok(engenho_controllers::controller::ReconcileOutcome::from(
+            report,
+        ))
+    }
+}

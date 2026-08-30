@@ -1,7 +1,9 @@
 # CNI + CSI — the plugin-contract programme
 
-**Status: PLAN. Nothing here is implemented.** Measured against engenho HEAD,
-2026-08-30.
+**Status: IMPLEMENTED, 2026-08-30 — with one honest limit, stated in
+"What is NOT done" at the end.** The measurements below were taken before
+the work; they are kept as the starting position because they explain why
+each piece is shaped the way it is.
 
 ## Why these two, and why now
 
@@ -273,3 +275,70 @@ Two additions specific to this programme:
 - **`engenho-diff` `Expect::Divergent` entries** for the darwin `Planned` and
   `Computed` states, so the day they start passing on a Linux node is itself a
   signal rather than a silent change.
+
+
+---
+
+# What landed
+
+| piece | where | state |
+|---|---|---|
+| NetworkPolicy producer + `PolicyDatapath` | `engenho-controllers/src/network_policy_controller.rs` | wired, 18 tests |
+| CSI protos (v1.9.0 + k8s v1.34.0 registration) | `engenho-csi/vendor/proto/` | vendored, provenance recorded |
+| CSI client + registration handshake | `engenho-csi/src/{client,registry}.rs` | 17 tests against a real gRPC driver |
+| CSI node path (stage/publish/unpublish) | `engenho-kubelet/src/csi_materializer.rs` | wired into the kubelet, 9 tests |
+| CSI dynamic provisioning | `engenho-controllers/src/csi_provisioner.rs` + the PV binder | wired, 13 tests |
+| CSI registrar | `CsiRegistrarController` | wired as a runtime driver |
+| CNI config + result + exec | `engenho-cni/` | 30 tests, 7 forking a real plugin binary |
+| CNI status publication | `engenho-controllers/src/cni_status.rs` | wired as a runtime driver |
+
+Every one of these has a producer wired in the same commit that introduced
+it. That was the explicit goal: the programme opened by naming two
+instances of "type + backend + no producer" and it would have been absurd
+to close them by adding two more.
+
+## Three decisions worth re-reading before changing any of it
+
+**`VolumeRuntime` was NOT the seam, and the reason is a rule not a
+preference.** It looked like the obvious home — its own header names
+`CsiVolumeBackend (R13b — gRPC to CSI plugins)` as future work. Measured:
+its inputs are provisioning-shaped and its output is mounting-shaped, while
+CSI splits those across two services on two machines. That is the org
+rule's *same goal, different shapes* case, where one type fits neither side
+and looks well-motivated anyway. Two seams landed instead, and
+`volume.rs`'s header now records the decision. The declaration stays (★★
+MODULARIZE, DON'T DELETE).
+
+**The darwin arm is typed, not faked** — `CniInstall::{Planned, Invoked}`
+and `PolicyDatapath::{Computed, Installed}`, both copying
+`DatapathInstall`'s precedent. A pod gets an address either way and
+`kubectl get pod -o wide` shows it either way; the annotation is the only
+thing that distinguishes them.
+
+**Tests go through the real thing.** The CSI tests talk to a generated
+`tonic` server on a real `UnixStream`; the CNI tests fork a real plugin
+binary. A CSI client tested against a hand-written double proves only that
+our encoder agrees with our decoder, and a CNI test that calls a Rust
+function exercises none of the env marshalling, stdin write, exit code or
+error-document convention that ARE the contract.
+
+# What is NOT done
+
+**The CNI pod-attach path.** `engenho-cni` can read `net.d`, plan a chain,
+exec a plugin, thread `prevResult` and parse the result — and the kubelet
+does not yet call `ADD` at pod start, because on darwin there is no netns
+to pass and the call would refuse every time. What ships is the contract
+plus an honest published verdict; wiring the attach is a Linux task whose
+payoff test is on rio. `pending-cni: pod-attach (needs a Linux node)`
+
+**Neither payoff test has run.** The plan named `csi-driver-host-path` and
+`containernetworking/plugins` as the external oracles. Everything here is
+tested against engenho's own reference driver and reference plugin, which
+are real processes speaking the real wire — but they are still ours. Until
+a third-party driver registers and a third-party plugin assigns an address,
+the claim is "the contract is implemented", not "the contract is proven".
+
+**`ControllerPublishVolume` (attach/detach) is reachable but unwired.** The
+client method exists and is tested; no controller calls it, because
+attaching is only meaningful for a driver whose volumes move between nodes
+and engenho is single-node today. Named rather than silently absent.

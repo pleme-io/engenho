@@ -1467,6 +1467,24 @@ fn write_kubeconfig_file(path: &std::path::Path, contents: &str) -> Result<(), R
 /// `Controller for Arc<C>` blanket impl) between its WatchDriver AND the
 /// apiserver's Pod `/log` reader, so the driver's ticks + the log queries see
 /// the SAME local bookkeeping.
+/// Where CNI network configuration lives. Upstream's path, and not
+/// configurable today on purpose: every CNI installer writes here, and a
+/// configurable directory that nobody sets is a knob whose only effect is
+/// to let one operator point engenho at an empty dir by accident.
+const CNI_CONFIG_DIR: &str = "/etc/cni/net.d";
+
+/// Whether this build can execute CNI plugins.
+///
+/// ★ A COMPILE-TIME CONSTANT, NOT A RUNTIME PROBE. There is no network
+/// namespace on darwin, so `CNI_NETNS` cannot be satisfied and no
+/// conformant plugin can run — that is a property of the target, and
+/// deciding it at runtime would mean a darwin build carries a code path
+/// that can never be correct on it.
+#[cfg(target_os = "linux")]
+const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall::Invoked;
+#[cfg(not(target_os = "linux"))]
+const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall::Planned;
+
 fn spawn_drivers(
     config: &EngenhoConfig,
     store: &Arc<StoreMesh>,
@@ -1492,6 +1510,13 @@ fn spawn_drivers(
     };
 
     let enable = &config.controllers.enable;
+
+    // ★ ONE CSI driver table, shared by three consumers: the registrar
+    // fills it, the PV binder provisions through it, and the kubelet's
+    // materializer publishes through it. Two tables would let a driver be
+    // provisionable but not mountable — a PVC that binds and then never
+    // mounts, with nothing anywhere explaining the difference.
+    let csi_drivers = engenho_kubelet::DriverTable::new();
 
     if enable.deployment {
         let c = DeploymentController::new(store.clone(), ns.clone());
@@ -1635,7 +1660,17 @@ fn spawn_drivers(
             .join("local-path")
             .to_string_lossy()
             .into_owned();
-        let c = PvBinderController::new(store.clone(), ns.clone(), local_path_root);
+        // Declared here so both the binder below and the kubelet further
+        // down share it. `DriverTable` is an Arc inside, so a clone is the
+        // same table.
+        // The CSI plane: ONE driver table shared by the registrar (which
+        // fills it), the provisioner (CreateVolume) and the materializer
+        // (NodePublishVolume). Two tables would let a driver be
+        // provisionable but not mountable, or the reverse.
+        let c =
+            PvBinderController::new(store.clone(), ns.clone(), local_path_root).with_csi(Arc::new(
+                engenho_kubelet::DriverCsiProvisioner::new(csi_drivers.clone()),
+            ));
         handles.push(
             WatchDriver::new(
                 c,
@@ -1724,6 +1759,45 @@ fn spawn_drivers(
         handles.push(WatchDriver::new(c, store.clone(), driver_config(&["NetworkPolicy"])).spawn());
     }
 
+    // CSI registration: scan `<kubelet-root>/plugins_registry` and keep the
+    // driver table in sync. Without this the whole CSI plane is inert — a
+    // driver deploys, creates its sockets, and nothing ever dials them.
+    {
+        let c = engenho_kubelet::CsiRegistrarController::new(
+            &config.runtime.data_dir,
+            csi_drivers.clone(),
+        );
+        handles.push(
+            WatchDriver::new(
+                c,
+                store.clone(),
+                WatchDriverConfig {
+                    // Registration is a filesystem event, not a store one,
+                    // so this rides the FALLBACK tick alone rather than
+                    // waking on writes it can never be caused by.
+                    filter: KindFilter::Kinds(vec!["CSINode".to_string()]),
+                    debounce,
+                    fallback_interval: fallback,
+                },
+            )
+            .spawn(),
+        );
+    }
+
+    // CNI status: publish which network config this node actually resolved
+    // and whether its plugin chain is executed or merely planned. On darwin
+    // the answer is `Planned` — the pod address comes from podman, not from
+    // IPAM — and nothing else in the cluster distinguishes the two.
+    {
+        let c = engenho_controllers::cni_status::CniStatusController::new(
+            store.clone(),
+            config.runtime.node_name.clone(),
+            std::path::PathBuf::from(CNI_CONFIG_DIR),
+            CNI_INSTALL,
+        );
+        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Node"])).spawn());
+    }
+
     // Kubelet: bound Pod → container via the backend. Watches Pods. Built
     // ONCE as an Arc<Kubelet> so the SAME instance is shared between its
     // WatchDriver (via the `Controller for Arc<C>` blanket impl) and the
@@ -1733,13 +1807,23 @@ fn spawn_drivers(
     // keeps its NullEventSink and the cluster cannot explain itself: that is
     // precisely the state in which a pod reached 149 restarts and `kubectl
     // describe` had nothing to say about it.
+    // The CSI node path is layered ON the podman materializer rather than
+    // replacing it: configMap / secret / emptyDir keep the behaviour that
+    // took several passes to get right, and CSI is two additional methods.
+    let csi_materializer: Arc<dyn engenho_kubelet::VolumeMaterializer> =
+        Arc::new(engenho_kubelet::CsiVolumeMaterializer::new(
+            Arc::new(engenho_kubelet::PodmanVolumeMaterializer::new()),
+            csi_drivers.clone(),
+            config.runtime.data_dir.clone(),
+        ));
     let kubelet = Arc::new(
         Kubelet::new(
             store.clone(),
             backend.clone(),
             config.runtime.node_name.clone(),
         )
-        .with_event_sink(events),
+        .with_event_sink(events)
+        .with_volume_materializer(csi_materializer),
     );
     handles.push(WatchDriver::new(kubelet.clone(), store.clone(), driver_config(&["Pod"])).spawn());
 
@@ -1874,7 +1958,7 @@ mod tests {
         // converging that kind), so the arithmetic here is the tripwire.
         // Moving it is correct ONLY alongside an intentional change to the
         // driver set — which is what added served_capability.
-        assert_eq!(rt.drivers.len(), 17);
+        assert_eq!(rt.drivers.len(), 19);
         rt.shutdown().await.unwrap();
     }
 
@@ -1971,7 +2055,7 @@ mod tests {
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(rt.drivers.len(), 16);
+        assert_eq!(rt.drivers.len(), 18);
         rt.shutdown().await.unwrap();
     }
 }

@@ -24,6 +24,7 @@ default = []
 with-cofre = ["dep:cofre-fs"]
 
 [dependencies]
+engenho-cni   = { path = "../engenho-cni" }
 engenho-config      = { workspace = true }
 # Typed RBAC kinds (rbac_v1) — the bootstrap seeds are built as typed
 # ClusterRole/ClusterRoleBinding values, then serialized + Put into the store.
