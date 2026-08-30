@@ -13,6 +13,9 @@ keywords.workspace = true
 description = "engenho-kubelet — the missing piece between 'Pod object in the store' and 'container running on host'. Per-node controller that watches Pods bound to its node + materializes containers via a pluggable ContainerRuntime backend (PodmanBackend / CriBackend / RunwasiBackend / FakeBackend for tests)."
 
 [dependencies]
+tonic         = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
+tonic-prost   = "0.14"
+prost         = "0.14"
 axum   = { workspace = true }
 async-trait        = { workspace = true }
 serde              = { workspace = true }
@@ -32,6 +35,10 @@ engenho-store       = { workspace = true }
 engenho-controllers = { workspace = true }
 engenho-config      = { workspace = true }
 engenho-substrate   = { workspace = true }
+
+[build-dependencies]
+protox            = "0.9"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
