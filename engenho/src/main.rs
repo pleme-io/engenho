@@ -19,6 +19,18 @@
 //!   kubeconfig for the persisted cluster CA to stdout. Use this to
 //!   re-emit a kubeconfig after the daemon is up, or to point kubectl at
 //!   a non-loopback address.
+//! * `engenho --help` / `-h` / `help` — print the usage summary.
+//! * `engenho --version` / `-V` / `version` — print the version.
+//!
+//! ## Why `--help` is a subcommand and not a flag
+//!
+//! The bare no-arg form boots the daemon, so argv[1] is the ONLY
+//! dispatch position and `--help` classifies there like any other verb.
+//! Before this existed, `engenho --help` fell through to the unknown-verb
+//! arm and printed an `anyhow` error plus a stack backtrace — i.e. the
+//! first two commands anyone runs against a fresh install both looked
+//! like a crash. Keep both spellings: `--help` is what a stranger types,
+//! `help` is what someone used to subcommand-style CLIs types.
 
 use std::path::PathBuf;
 
@@ -27,6 +39,16 @@ use engenho_config::{ConfigTier, EngenhoConfig, TieredConfig, render_provenance}
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_runtime::Runtime;
 use tracing_subscriber::EnvFilter;
+
+/// The verb list, written ONCE.
+///
+/// `help_text` renders it and the unknown-verb error joins it, so the
+/// usage summary and the error can never disagree about what engenho
+/// accepts. `subcommand_list_matches_parse` asserts every name here is
+/// actually dispatched by [`Command::parse`], which closes the other
+/// direction: a verb added to the match arms without a row here fails
+/// the suite rather than becoming silently undiscoverable.
+const SUBCOMMAND_NAMES: [&str; 4] = ["daemon", "kubeconfig", "config-show", "config-diff"];
 
 /// The parsed top-level command. Splitting the argv classification out of
 /// `main` keeps it unit-testable without booting the daemon or touching
@@ -46,6 +68,10 @@ enum Command {
     ConfigShow(Option<String>),
     /// `config-diff <from> <to>` — unified diff between two resolved tiers.
     ConfigDiff(String, String),
+    /// `--help` / `-h` / `help` — print usage to stdout and exit 0.
+    Help,
+    /// `--version` / `-V` / `version` — print the version to stdout and exit 0.
+    Version,
 }
 
 impl Command {
@@ -56,10 +82,14 @@ impl Command {
     /// * `kubeconfig …` → [`Command::Kubeconfig`] with the remaining args
     /// * `config-show [tier]` → [`Command::ConfigShow`]
     /// * `config-diff <from> <to>` → [`Command::ConfigDiff`]
+    /// * `--help` / `-h` / `help` → [`Command::Help`]
+    /// * `--version` / `-V` / `version` → [`Command::Version`]
     /// * anything else → an error naming the supported verbs
     fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
         match args.next().as_deref() {
             None | Some("daemon") => Ok(Command::Daemon),
+            Some("--help" | "-h" | "help") => Ok(Command::Help),
+            Some("--version" | "-V" | "version") => Ok(Command::Version),
             Some("kubeconfig") => Ok(Command::Kubeconfig(args.collect())),
             Some("config-show") => Ok(Command::ConfigShow(args.next())),
             Some("config-diff") => match (args.next(), args.next()) {
@@ -69,7 +99,8 @@ impl Command {
                 )),
             },
             Some(other) => Err(anyhow::anyhow!(
-                "unknown subcommand {other:?} (supported: daemon [or no args] to boot the daemon, kubeconfig, config-show [tier], config-diff <from> <to>)"
+                "unknown subcommand {other:?} (supported: {}) — run `engenho --help` for usage",
+                SUBCOMMAND_NAMES.join(", ")
             )),
         }
     }
@@ -86,6 +117,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Kubeconfig(flags) => run_kubeconfig(flags.into_iter()),
         Command::ConfigShow(tier) => run_config_show(tier),
         Command::ConfigDiff(from, to) => run_config_diff(&from, &to),
+        Command::Help => {
+            print!("{}", help_text());
+            Ok(())
+        }
+        Command::Version => {
+            println!("engenho {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
 }
 
@@ -266,6 +305,49 @@ fn run_config_diff(from: &str, to: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The usage summary printed by `engenho --help`.
+///
+/// Kept as a pure function returning a `String` so a test can assert on
+/// its content without capturing stdout. The trailing example is
+/// deliberate: a stranger's next question after "what is this" is "how do
+/// I see it work", and the answer should be one copyable line rather than
+/// a link.
+fn help_text() -> String {
+    format!(
+        "\
+engenho {version} — a Rust-native Kubernetes runtime.
+
+Runs the control plane as a single binary: API server, scheduler, controllers
+and kubelet in one process. Real kubectl drives it.
+
+USAGE:
+    engenho [SUBCOMMAND]
+
+SUBCOMMANDS:
+    daemon                    Boot the runtime. This is the default when no
+                              subcommand is given, so bare `engenho` runs it.
+    kubeconfig [FLAGS]        Print a kubeconfig for the persisted cluster CA.
+                              Flags: --data-dir <dir>, --server <url>
+    config-show [TIER]        Print the resolved config and each leaf's
+                              provenance. TIER overrides $ENGENHO_TIER.
+    config-diff <FROM> <TO>   Unified diff between two resolved config tiers.
+                              Tiers: bare | discovered | default | <yaml-path>
+
+OPTIONS:
+    -h, --help                Print this message.
+    -V, --version             Print the version.
+
+GETTING STARTED:
+    engenho &                                    # boot the runtime
+    engenho kubeconfig > /tmp/engenho.kubeconfig # write a kubeconfig
+    KUBECONFIG=/tmp/engenho.kubeconfig kubectl get --raw /api
+
+Docs: https://github.com/pleme-io/engenho
+",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::Command;
@@ -278,6 +360,96 @@ mod tests {
     #[test]
     fn bare_no_args_is_daemon() {
         assert_eq!(parse(&[]).unwrap(), Command::Daemon);
+    }
+
+    /// Every spelling of help classifies as [`Command::Help`].
+    ///
+    /// REGRESSION: `--help` and `--version` used to fall through to the
+    /// unknown-subcommand arm, so both printed an `anyhow` error and a
+    /// stack backtrace. They are the first two things anyone runs against
+    /// an unfamiliar binary, and both looked like a crash.
+    #[test]
+    fn every_help_spelling_is_help() {
+        for argv in [&["--help"], &["-h"], &["help"]] {
+            assert_eq!(parse(argv).unwrap(), Command::Help, "argv {argv:?}");
+        }
+    }
+
+    /// Every spelling of version classifies as [`Command::Version`].
+    #[test]
+    fn every_version_spelling_is_version() {
+        for argv in [&["--version"], &["-V"], &["version"]] {
+            assert_eq!(parse(argv).unwrap(), Command::Version, "argv {argv:?}");
+        }
+    }
+
+    /// Neither help nor version may be mistaken for the daemon — booting a
+    /// control plane because someone asked for usage is the worst possible
+    /// reading of that argv.
+    #[test]
+    fn help_and_version_never_boot_the_daemon() {
+        for argv in [&["--help"], &["-h"], &["help"], &["--version"], &["-V"], &["version"]] {
+            assert_ne!(parse(argv).unwrap(), Command::Daemon, "argv {argv:?}");
+        }
+    }
+
+    /// The help text names every verb `Command::parse` accepts.
+    ///
+    /// This is the anti-drift row: adding a subcommand without listing it
+    /// here fails, so the usage summary cannot silently fall behind the
+    /// dispatch table the way the README fell behind the code.
+    #[test]
+    fn help_text_names_every_subcommand() {
+        let help = super::help_text();
+        for verb in super::SUBCOMMAND_NAMES {
+            assert!(help.contains(verb), "help text omits the {verb:?} subcommand");
+        }
+        for flag in ["--help", "--version"] {
+            assert!(help.contains(flag), "help text omits {flag:?}");
+        }
+    }
+
+    /// The help text carries the version and a runnable first command.
+    #[test]
+    fn help_text_is_actionable() {
+        let help = super::help_text();
+        assert!(help.contains(env!("CARGO_PKG_VERSION")), "help omits the version");
+        assert!(help.contains("kubectl"), "help gives no working next step");
+    }
+
+    /// An unknown verb names the supported verbs AND points at `--help`.
+    #[test]
+    fn unknown_subcommand_points_at_help() {
+        let err = parse(&["frobnicate"]).unwrap_err().to_string();
+        assert!(err.contains("--help"), "unknown-verb error does not mention --help: {err}");
+    }
+
+    /// THE ANTI-DRIFT ROW. Every verb in `SUBCOMMAND_NAMES` is really
+    /// dispatched, and the error message really lists all of them.
+    ///
+    /// Adding a match arm without a const row, or a const row without an
+    /// arm, fails here — which is what keeps `--help` and the error from
+    /// falling behind the dispatch table the way the README fell behind
+    /// the code.
+    #[test]
+    fn subcommand_list_matches_parse() {
+        let err = parse(&["frobnicate"]).unwrap_err().to_string();
+        for verb in super::SUBCOMMAND_NAMES {
+            // The verb must be RECOGNISED, not necessarily complete:
+            // `config-diff` alone is a legitimate arity error. What may
+            // never happen is an advertised verb reported as unknown.
+            if let Err(e) = parse(&[verb]) {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("unknown subcommand"),
+                    "{verb:?} is advertised but Command::parse rejects it as unknown: {msg}"
+                );
+            }
+            assert!(
+                err.contains(verb),
+                "unknown-verb error omits the advertised verb {verb:?}: {err}"
+            );
+        }
     }
 
     /// `engenho daemon` is an explicit alias that resolves to the SAME
