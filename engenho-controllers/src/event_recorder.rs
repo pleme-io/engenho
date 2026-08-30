@@ -320,6 +320,57 @@ impl EventSink for NullEventSink {
     async fn record(&self, _event: EventRecord) {}
 }
 
+/// The sink that writes events into the store, so `kubectl describe` and
+/// `kubectl get events` can see them.
+///
+/// ★ THIS IS THE PRODUCER THE VOCABULARY WAS MISSING. `Reason`, `Severity`,
+/// `EventRecord` and `EventSink` all shipped and were fully tested against
+/// `CollectingEventSink`, and no event ever reached a cluster — which is
+/// why diagnosing a pod stuck at 149 restarts had to bypass the cluster
+/// entirely and read the container runtime directly. A cluster that cannot
+/// explain itself makes every operator an engenho developer.
+///
+/// ★ A FAILED WRITE IS DROPPED, NOT PROPAGATED, and that is the design
+/// stated in this module's header rather than an oversight here: upstream's
+/// recorder is deliberately lossy under pressure. A dropped event costs
+/// visibility; a failed reconcile costs the workload.
+pub struct StoreEventSink<S: EventStore> {
+    store: std::sync::Arc<S>,
+}
+
+impl<S: EventStore> StoreEventSink<S> {
+    #[must_use]
+    pub fn new(store: std::sync::Arc<S>) -> Self {
+        Self { store }
+    }
+}
+
+/// The one store capability an event sink needs.
+///
+/// A narrow trait rather than a dependency on the concrete mesh: this crate
+/// already sits below the assembly layer, and a sink that could do anything
+/// to the store is a sink that will eventually be asked to.
+#[async_trait::async_trait]
+pub trait EventStore: Send + Sync + 'static {
+    /// Write one event object. Errors are the sink's to swallow.
+    async fn put_event(&self, key: ResourceKey, value: ResourceValue) -> Result<(), String>;
+}
+
+#[async_trait::async_trait]
+impl<S: EventStore> EventSink for StoreEventSink<S> {
+    async fn record(&self, event: EventRecord) {
+        if let Err(e) = self.store.put_event(event.key(), event.to_value()).await {
+            // Logged, never returned: see above.
+            tracing::debug!(
+                reason = event.reason.as_str(),
+                object = %event.involved.name,
+                error = %e,
+                "event write dropped"
+            );
+        }
+    }
+}
+
 /// A sink that collects into memory, for tests.
 #[derive(Default)]
 pub struct CollectingEventSink {
