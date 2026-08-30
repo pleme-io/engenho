@@ -307,6 +307,45 @@ impl Runtime {
         //     IS this process's kubelet, so the read is in-process. `register`
         //     keys on (group, version, plural) so it overwrites the Pod entry
         //     atomically (same swap mechanism the CRD sink uses).
+        // 7a. Bind the KUBELET's own HTTP surface (:10250).
+        //
+        //     ★ THIS IS WHAT MAKES THE SURFACE EXIST. `KubeletApi` and its
+        //     router shipped with a trait, a route table and a test double,
+        //     and nothing ever bound them — so the port was a type, not a
+        //     port. Logs worked only because the kubelet happens to share a
+        //     process with the apiserver; the moment there is a second node,
+        //     `kubectl logs` against a pod on it has no path at all.
+        //
+        //     A bind failure is logged and NOT fatal: the apiserver is
+        //     already serving, and killing a working control plane because
+        //     one auxiliary port is taken trades a partial outage for a
+        //     total one. The log line names the address so the cause is not
+        //     a mystery.
+        let kubelet_api: Arc<dyn engenho_kubelet::server::KubeletApi> = Arc::new(WeakKubeletApi {
+            kubelet: Arc::downgrade(&kubelet),
+        });
+        let kubelet_addr = config.runtime.kubelet_listen_addr.clone();
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(&kubelet_addr).await {
+                Ok(listener) => {
+                    let bound = listener
+                        .local_addr()
+                        .map_or_else(|_| kubelet_addr.clone(), |a| a.to_string());
+                    info!(addr = %bound, "kubelet HTTP surface bound");
+                    let app = engenho_kubelet::server::KubeletServer::new(kubelet_api).routes();
+                    if let Err(e) = axum::serve(listener, app).await {
+                        warn!(error = %e, "kubelet HTTP surface stopped");
+                    }
+                }
+                Err(e) => warn!(
+                    addr = %kubelet_addr,
+                    error = %e,
+                    "kubelet HTTP surface could not bind; container logs and exec \
+                     are unreachable from off-process (the apiserver is unaffected)"
+                ),
+            }
+        });
+
         let log_reader: Arc<dyn engenho_apiserver::PodLogReader> =
             Arc::new(KubeletLogReader { kubelet });
         if let Some(pod_handler) = build_pod_log_handler(&store, &admission, log_reader) {
@@ -395,6 +434,83 @@ impl Runtime {
 /// reader with no apiserver change.
 struct KubeletLogReader {
     kubelet: Arc<Kubelet>,
+}
+
+/// The kubelet HTTP surface's view of the kubelet, held WEAKLY.
+///
+/// ★ WHY WEAK AND NOT `Arc`. The :10250 listener outlives a `Runtime` that
+/// is being torn down — `axum::serve` owns its router, the router owns this
+/// state, and a strong `Arc<Kubelet>` there keeps the `StoreMesh` alive
+/// forever. Measured: it turned four graceful-shutdown tests into
+/// `StoreStillShared { strong_count: 2 }`, which is not a test artifact —
+/// it is a real leak of the whole store behind a port nobody is using.
+///
+/// A dropped kubelet then answers with a REASON rather than a hang or a
+/// panic: the surface is gone because the node is shutting down, and that
+/// is exactly what a client should be told.
+struct WeakKubeletApi {
+    kubelet: std::sync::Weak<Kubelet>,
+}
+
+impl WeakKubeletApi {
+    fn get(&self) -> Result<Arc<Kubelet>, String> {
+        self.kubelet
+            .upgrade()
+            .ok_or_else(|| "kubelet is shutting down on this node".to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl engenho_kubelet::server::KubeletApi for WeakKubeletApi {
+    async fn container_logs(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        opts: &LogOptions,
+    ) -> Result<String, String> {
+        engenho_kubelet::server::KubeletApi::container_logs(
+            self.get()?.as_ref(),
+            namespace,
+            pod,
+            container,
+            opts,
+        )
+        .await
+    }
+
+    async fn pods(&self) -> serde_json::Value {
+        match self.get() {
+            Ok(k) => engenho_kubelet::server::KubeletApi::pods(k.as_ref()).await,
+            // An empty list, not an error: `/pods` has no error shape, and a
+            // shutting-down kubelet genuinely manages nothing.
+            Err(_) => serde_json::json!({ "kind": "PodList", "apiVersion": "v1", "items": [] }),
+        }
+    }
+
+    async fn running_pods(&self) -> serde_json::Value {
+        match self.get() {
+            Ok(k) => engenho_kubelet::server::KubeletApi::running_pods(k.as_ref()).await,
+            Err(_) => serde_json::json!({ "kind": "PodList", "apiVersion": "v1", "items": [] }),
+        }
+    }
+
+    async fn exec(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        argv: &[String],
+    ) -> Result<engenho_kubelet::backend::ExecOutcome, String> {
+        engenho_kubelet::server::KubeletApi::exec(
+            self.get()?.as_ref(),
+            namespace,
+            pod,
+            container,
+            argv,
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]

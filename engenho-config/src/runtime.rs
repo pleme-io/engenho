@@ -86,6 +86,19 @@ pub struct RuntimeConfig {
     /// written), which is what tests use to stay out of `$HOME`.
     pub kubeconfig_publish_path: String,
     /// Which container runtime the kubelet drives.
+    /// Where the KUBELET's own HTTP surface binds (`/containerLogs`,
+    /// `/pods`, `/exec`, `/healthz`) — upstream's :10250.
+    ///
+    /// ★ THE DEFAULT IS LOOPBACK, NOT `0.0.0.0`, and that is a decision.
+    /// This surface serves container logs and runs commands inside
+    /// containers, and it has NO authentication of its own — upstream gates
+    /// :10250 behind webhook authn/authz, which engenho does not have yet.
+    /// Binding every interface by default would publish unauthenticated
+    /// exec on the node. Loopback keeps it usable for the apiserver on the
+    /// same host (the single-binary layout today) and reachable from
+    /// elsewhere only by an explicit operator decision. Widen it when the
+    /// authn gate exists, not before.
+    pub kubelet_listen_addr: String,
     pub kubelet_backend: KubeletBackendKind,
     /// Optional explicit podman binary path (ignored unless
     /// `kubelet_backend == Podman`). `None` = default `podman` on PATH.
@@ -107,6 +120,7 @@ impl TieredConfig for RuntimeConfig {
             durable: false,
             node_name: String::new(),
             kubeconfig_publish_path: String::new(),
+            kubelet_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             leadership_timeout_seconds: 0,
@@ -153,6 +167,7 @@ impl TieredConfig for RuntimeConfig {
             // `$HOME` is resolved at write time, not here, so the default
             // stays a pure value.
             kubeconfig_publish_path: "~/.kube/configs/engenho".into(),
+            kubelet_listen_addr: "127.0.0.1:10250".into(),
             kubelet_backend: KubeletBackendKind::Podman,
             podman_binary: None,
             leadership_timeout_seconds: 10,
@@ -185,6 +200,11 @@ impl TieredConfig for RuntimeConfig {
                 base.kubeconfig_publish_path.clone()
             } else {
                 self.kubeconfig_publish_path
+            },
+            kubelet_listen_addr: if self.kubelet_listen_addr.is_empty() {
+                base.kubelet_listen_addr.clone()
+            } else {
+                self.kubelet_listen_addr
             },
             kubelet_backend: self.kubelet_backend,
             podman_binary: self.podman_binary.or_else(|| base.podman_binary.clone()),
@@ -322,6 +342,7 @@ mod tests {
             // Empty ⇒ `extend` must fill it from the base, which is
             // precisely what this test asserts for every other field.
             kubeconfig_publish_path: String::new(),
+            kubelet_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             leadership_timeout_seconds: 0,

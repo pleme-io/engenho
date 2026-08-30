@@ -2948,3 +2948,129 @@ mod tests {
         assert!(aliases.contains(&"web.default.svc.cluster.local".to_string()));
     }
 }
+
+// =====================================================================
+// THE HTTP SURFACE'S PRODUCER
+// =====================================================================
+
+/// The real kubelet behind [`crate::server::KubeletServer`].
+///
+/// ★ THIS IMPL IS THE POINT. `KubeletApi` shipped with a trait, a router
+/// and a FakeApi in its own test module, and NO production implementor —
+/// so :10250 existed as a type and not as a port. That shape (a type, a
+/// backend, and no producer) has now been the root of four separate gaps
+/// in this codebase; it defeats grep, because every symbol it names is
+/// present and every test is green.
+#[async_trait::async_trait]
+impl crate::server::KubeletApi for Kubelet {
+    async fn container_logs(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        opts: &crate::backend::LogOptions,
+    ) -> Result<String, String> {
+        let id = self
+            .container_id_of(namespace, pod, container)
+            .await
+            .ok_or_else(|| Self::no_such_container(namespace, pod, container))?;
+        self.backend
+            .logs(&id, opts)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn pods(&self) -> Value {
+        self.pod_list(false).await
+    }
+
+    async fn running_pods(&self) -> Value {
+        self.pod_list(true).await
+    }
+
+    async fn exec(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        argv: &[String],
+    ) -> Result<crate::backend::ExecOutcome, String> {
+        let id = self
+            .container_id_of(namespace, pod, container)
+            .await
+            .ok_or_else(|| Self::no_such_container(namespace, pod, container))?;
+        self.backend
+            .exec(&id, argv)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl Kubelet {
+    /// The message for a container this kubelet is not running.
+    ///
+    /// Names all three parts: on a multi-node cluster the overwhelmingly
+    /// common cause is asking the WRONG kubelet, and a bare "not found"
+    /// sends the operator to look for a deleted pod instead.
+    fn no_such_container(namespace: &str, pod: &str, container: &str) -> String {
+        format!("no container {container:?} of pod {namespace}/{pod} is running on this node")
+    }
+
+    /// Resolve (namespace, pod, container) → the backend container id.
+    ///
+    /// Looks in app containers first, then init containers: an init
+    /// container's logs are exactly what an operator wants while a pod is
+    /// stuck Pending, and that is the moment the app container has no id.
+    async fn container_id_of(&self, namespace: &str, pod: &str, container: &str) -> Option<String> {
+        let key = ResourceKey::namespaced("", "v1", "Pod", namespace, pod);
+        let local = self.local.lock().await;
+        let entry = local.get(&key)?;
+        entry
+            .containers
+            .get(container)
+            .or_else(|| entry.init_containers.get(container))
+            .map(|r| r.container_id.clone())
+    }
+
+    /// The `v1.PodList` this kubelet is managing.
+    ///
+    /// `running_only` filters to pods with at least one running container —
+    /// upstream's `/runningpods/` — which is a DIFFERENT question from
+    /// `/pods` and is why both endpoints exist.
+    ///
+    /// The pod bodies come from the store rather than being reconstructed
+    /// here: a second renderer of a Pod is a second thing to drift.
+    async fn pod_list(&self, running_only: bool) -> Value {
+        let keys: Vec<ResourceKey> = {
+            let local = self.local.lock().await;
+            local
+                .iter()
+                .filter(|(_, p)| {
+                    !running_only || p.containers.values().any(|c| !c.container_id.is_empty())
+                })
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+
+        let mut items = Vec::new();
+        for key in keys {
+            if let Some(v) = self.store.get(&key).await {
+                if running_only {
+                    let running = v
+                        .get("status")
+                        .and_then(|s| s.get("containerStatuses"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|cs| {
+                            cs.iter()
+                                .any(|c| c.get("state").and_then(|st| st.get("running")).is_some())
+                        });
+                    if !running {
+                        continue;
+                    }
+                }
+                items.push(v);
+            }
+        }
+        json!({ "kind": "PodList", "apiVersion": "v1", "items": items })
+    }
+}

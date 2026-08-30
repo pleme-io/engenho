@@ -32,6 +32,7 @@ engenho-store       = { workspace = true }
 engenho-apiserver   = { workspace = true }
 engenho-controllers = { workspace = true }
 engenho-scheduler   = { workspace = true }
+axum               = { workspace = true }
 engenho-kubelet     = { workspace = true }
 engenho-kube-client = { workspace = true }
 # ErrorKind trait + impl_error_kind! macro — stable .kind() tags.
