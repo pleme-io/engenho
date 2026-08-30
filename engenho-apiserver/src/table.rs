@@ -179,10 +179,7 @@ pub fn to_table(value: &Value, include: IncludeObject) -> Table {
         // A single object: one row. Its own metadata would be the OBJECT's,
         // which is not list metadata, so send an empty block rather than
         // something a client would misread as a continue token.
-        None => (
-            vec![row_for(value, include)],
-            serde_json::json!({}),
-        ),
+        None => (vec![row_for(value, include)], serde_json::json!({})),
     };
     Table {
         kind: "Table",
@@ -229,7 +226,9 @@ mod tests {
         assert!(accept_wants_table(
             "application/json;as=Table;v=1;g=meta.k8s.io,application/json"
         ));
-        assert!(accept_wants_table("application/json;as=Table;v=1;g=meta.k8s.io"));
+        assert!(accept_wants_table(
+            "application/json;as=Table;v=1;g=meta.k8s.io"
+        ));
         assert!(!accept_wants_table("application/json"));
         assert!(!accept_wants_table(""));
         // `as=Table` without the meta.k8s.io group is not a Table request.
@@ -282,7 +281,10 @@ mod tests {
     fn include_object_metadata_embeds_partial_object_metadata() {
         let t = to_table(&list(), IncludeObject::Metadata);
         let o = t.rows[0].object.as_ref().expect("metadata embedded");
-        assert_eq!(o.get("kind"), Some(&serde_json::json!("PartialObjectMetadata")));
+        assert_eq!(
+            o.get("kind"),
+            Some(&serde_json::json!("PartialObjectMetadata"))
+        );
         assert!(o.get("metadata").is_some());
     }
 

@@ -109,7 +109,11 @@ fn walk(schema: &Value, value: &Value, path: &str, out: &mut Vec<SchemaViolation
     }
     // `x-kubernetes-int-or-string` is upstream's escape hatch for fields like
     // `targetPort`; both types are legal by construction.
-    if obj.get("x-kubernetes-int-or-string").and_then(Value::as_bool) == Some(true) {
+    if obj
+        .get("x-kubernetes-int-or-string")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
         return;
     }
 
@@ -123,7 +127,11 @@ fn walk(schema: &Value, value: &Value, path: &str, out: &mut Vec<SchemaViolation
         && !type_matches(t, value)
     {
         out.push(SchemaViolation {
-            path: if path.is_empty() { "<root>".into() } else { path.into() },
+            path: if path.is_empty() {
+                "<root>".into()
+            } else {
+                path.into()
+            },
             expected: t.to_string(),
             found: type_name(value).to_string(),
         });
@@ -203,7 +211,11 @@ fn itoa(mut n: usize) -> String {
 
 impl core::fmt::Display for SchemaViolation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}: expected {}, found {}", self.path, self.expected, self.found)
+        write!(
+            f,
+            "{}: expected {}, found {}",
+            self.path, self.expected, self.found
+        )
     }
 }
 
@@ -251,7 +263,10 @@ mod tests {
     #[test]
     fn integer_number_asymmetry_is_respected() {
         let num = json!({ "type": "number" });
-        assert!(validate(&num, &json!(3)).is_empty(), "an integer IS a number");
+        assert!(
+            validate(&num, &json!(3)).is_empty(),
+            "an integer IS a number"
+        );
         assert!(validate(&num, &json!(3.5)).is_empty());
 
         let int = json!({ "type": "integer" });

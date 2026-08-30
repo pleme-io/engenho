@@ -392,6 +392,10 @@ fn build_routes(state: RouterState) -> Router {
         .route("/readyz", get(health::readyz))
         .route("/livez", get(health::livez))
         .route("/healthz", get(health::healthz))
+        // Prometheus. RBAC already classified this as a non-resource URL
+        // before anything served it — authz could authorize a path that
+        // did not exist.
+        .route("/metrics", get(crate::metrics::metrics))
         .with_state(state)
 }
 
@@ -770,7 +774,12 @@ impl ResponseCodec {
 /// rejecting them would break kubectl before it made a single call.
 fn accept_is_servable(accept: &str) -> bool {
     accept.split(',').any(|range| {
-        let media = range.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let media = range
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         media == "*/*"
             || media == "application/*"
             || media == "application/json"
@@ -1083,10 +1092,18 @@ async fn do_list_or_watch(
             let (items, rv, cont, remaining) = h
                 .list_page(namespace.as_deref(), &sel, limit, continue_token)
                 .await?;
-            render_list(codec, &handler_gvk(&h), h.list_response(items, rv, cont, remaining))
+            render_list(
+                codec,
+                &handler_gvk(&h),
+                h.list_response(items, rv, cont, remaining),
+            )
         } else {
             let (items, rv) = h.list_at(namespace.as_deref(), &sel).await?;
-            render_list(codec, &handler_gvk(&h), h.list_response(items, rv, None, None))
+            render_list(
+                codec,
+                &handler_gvk(&h),
+                h.list_response(items, rv, None, None),
+            )
         }
     }
 }
