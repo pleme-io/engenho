@@ -33,6 +33,7 @@ pub mod admission_webhook;
 pub mod attestation;
 pub mod build_backend_roceiro;
 pub mod cluster_ip;
+pub mod cni_status;
 pub mod controller;
 pub mod crd;
 pub mod crd_conversion;

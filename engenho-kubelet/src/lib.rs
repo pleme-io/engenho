@@ -60,7 +60,8 @@ pub use backend::{
 };
 pub use config_bridge::make_container_runtime;
 pub use csi_materializer::{
-    CsiVolumeMaterializer, DriverCsiProvisioner, DriverTable, RegisteredDriver,
+    CsiRegistrarController, CsiVolumeMaterializer, DriverCsiProvisioner, DriverTable,
+    RegisteredDriver,
 };
 pub use error::KubeletError;
 pub use kubelet::{Kubelet, TestClock};
