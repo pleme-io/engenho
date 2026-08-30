@@ -133,7 +133,9 @@ what answers it is ours.
 | `/healthz` `/readyz` `/livez` `/version` | probes, HA | **SHIPPED** |
 | OpenAPI v3 | generators, modern clients | **SHIPPED** |
 | OpenAPI v2 | older clients, codegen | **ABSENT** |
-| etcd v3 gRPC (Range/Put/Txn/Watch/Lease) | `etcdctl`, backup/DR, Velero, `--etcd-servers` | **PARTIAL** — wire types generated from upstream protos, `/registry` bijection oracle-verified, KV semantics + store prerequisites (multi-key `Txn`, point-in-time reads, explicit `Compact`) landed. **No listener on :2379 yet** |
+| etcd v3 gRPC — reads | `etcdctl get`, backup/DR inspection | **SHIPPED (read path)** — `KV.Range` served over tonic: point reads, prefix scans, intervals, `limit`/`more`/`count`, `keys_only`. Wire types generated from upstream protos; `/registry` bijection verified against a real apiserver's 699-key keyspace |
+| etcd v3 gRPC — writes | `--etcd-servers` (a real kube-apiserver) | **REFUSED BY DESIGN** — `Put`/`Txn`/`DeleteRange`/`Compact` return a typed `Unimplemented` naming the reason: writes go through engenho's apiserver, which owns admission, defaulting and validation. Serving them raw would let a client store an object no apiserver would have admitted. The store prerequisites (multi-key `Txn`, point-in-time reads, explicit `Compact`) are landed and tested, so opening the write path is a policy decision, not missing machinery |
+| etcd v3 gRPC — `Watch` / `Lease` / `Maintenance` | Velero, `etcdctl watch`, `snapshot save` | **ABSENT** — service traits generated, not implemented |
 | kubelet API :10250 | `kubectl exec/logs/cp/port-forward`, metrics-server | **ABSENT** — no listener. This is why pod logs read empty |
 | Event recording | every "why did this fail" question | **PARTIAL** — typed recorder + upstream reason vocabulary landed; emission sites (kubelet/scheduler/controllers) pending |
 | `/metrics` (Prometheus) | monitoring, HPA | **SHIPPED** — Prometheus text exposition, served at `/metrics` |
@@ -151,7 +153,7 @@ contracts; only the first is realised.**
 | Surface | Format | Source of truth | Status |
 |---|---|---|---|
 | Kubernetes REST API | HTTPS :6443; JSON / protobuf; v1.34 schema | upstream `kubernetes/api/openapi-spec/v3/` | **SHIPPED** |
-| etcd v3 gRPC | Range/Put/Txn/Watch/Lease over UDS | upstream `etcd-io/etcd@v3.5/api/etcdserverpb/` | **ABSENT** |
+| etcd v3 gRPC | Range/Put/Txn/Watch/Lease over UDS | upstream `etcd-io/etcd@v3.5/api/etcdserverpb/` | **PARTIAL** — `KV.Range` served; writes refused by design; Watch/Lease/Maintenance absent |
 | CRI v1 | gRPC client to containerd / youki | upstream `kubernetes/cri-api/v1` | **ABSENT** (podman driven directly) |
 | CNI v1 | stdin JSON + ADD/DEL/CHECK/VERSION | `containernetworking/cni` spec | **ABSENT** |
 | Gateway API | v1.1 GA — GatewayClass/Gateway/HTTPRoute (M3+) | sigs.k8s.io/gateway-api | **ABSENT** |
