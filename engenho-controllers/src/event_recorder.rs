@@ -83,6 +83,13 @@ pub enum Reason {
     SuccessfulDelete,
     /// A PersistentVolumeClaim was bound.
     ProvisioningSucceeded,
+    // ── networking ──
+    /// A NetworkPolicy was accepted and its rules computed, but no packet
+    /// filter was installed — so the traffic it claims to restrict is
+    /// unrestricted. The one case where silence would be a SECURITY claim
+    /// rather than a missing feature, which is why it is a `Warning` and
+    /// why it is surfaced where `kubectl describe` shows it.
+    NetworkPolicyNotEnforced,
 }
 
 impl Reason {
@@ -103,6 +110,7 @@ impl Reason {
             Self::SuccessfulCreate => "SuccessfulCreate",
             Self::SuccessfulDelete => "SuccessfulDelete",
             Self::ProvisioningSucceeded => "ProvisioningSucceeded",
+            Self::NetworkPolicyNotEnforced => "NetworkPolicyNotEnforced",
         }
     }
 
@@ -114,9 +122,11 @@ impl Reason {
     #[must_use]
     pub fn severity(self) -> Severity {
         match self {
-            Self::Failed | Self::Unhealthy | Self::BackOff | Self::FailedScheduling => {
-                Severity::Warning
-            }
+            Self::Failed
+            | Self::Unhealthy
+            | Self::BackOff
+            | Self::FailedScheduling
+            | Self::NetworkPolicyNotEnforced => Severity::Warning,
             _ => Severity::Normal,
         }
     }
