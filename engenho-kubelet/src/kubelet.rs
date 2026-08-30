@@ -250,6 +250,10 @@ pub struct Kubelet {
     /// The `now()` source (defaults to [`Instant::now`]; overridable for
     /// deterministic probe-cadence tests via [`Kubelet::with_clock`]).
     clock: Clock,
+    /// Where lifecycle events go. Defaults to the null sink so emission is
+    /// safe to add to a code path before the plumbing exists — the
+    /// alternative being an `Option` check at every call site.
+    events: Arc<dyn engenho_controllers::event_recorder::EventSink>,
     node_name: String,
     /// Bookkeeping for every Pod we started, keyed by its typed
     /// [`ResourceKey`]. Persists for the kubelet's process lifetime; on
@@ -272,6 +276,7 @@ impl Kubelet {
             net_prober: Arc::new(TokioNetProber::new()),
             volume_materializer: Arc::new(PodmanVolumeMaterializer::new()),
             clock: Arc::new(Instant::now),
+            events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
             node_name: node_name.into(),
             local: Mutex::new(BTreeMap::new()),
         }
@@ -303,6 +308,41 @@ impl Kubelet {
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Builder: override the event sink (defaults to the null sink).
+    #[must_use]
+    pub fn with_event_sink(
+        mut self,
+        events: Arc<dyn engenho_controllers::event_recorder::EventSink>,
+    ) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Emit one Pod lifecycle event.
+    ///
+    /// The timestamp is wall-clock rather than this kubelet's injected
+    /// `Instant` clock: an `Instant` has no calendar meaning, and an event a
+    /// human reads needs a time they can compare against their own logs.
+    /// That is why the test clock does not reach here — deliberately.
+    async fn emit(
+        &self,
+        key: &ResourceKey,
+        reason: engenho_controllers::event_recorder::Reason,
+        message: impl Into<String>,
+    ) {
+        engenho_controllers::event_recorder::record_pod_event(
+            self.events.as_ref(),
+            key.namespace.as_deref().unwrap_or("default"),
+            &key.name,
+            None,
+            reason,
+            message,
+            "kubelet",
+            &engenho_types::time::now_rfc3339_utc(),
+        )
+        .await;
     }
 
     /// The current instant per this kubelet's clock.
@@ -1390,6 +1430,12 @@ impl Kubelet {
                         },
                     );
                     started_any = true;
+                    self.emit(
+                        key,
+                        engenho_controllers::event_recorder::Reason::Started,
+                        format!("Started container {cname}"),
+                    )
+                    .await;
                 }
                 Err(e) => {
                     warn!(
@@ -1760,6 +1806,15 @@ impl Kubelet {
                                     ready: false,
                                 });
                                 report.objects_changed += 1;
+                                self.emit(
+                                    key,
+                                    engenho_controllers::event_recorder::Reason::Unhealthy,
+                                    format!(
+                                        "Container {cname} failed its liveness/startup probe and was restarted (restart #{})",
+                                        record.restart_count + 1
+                                    ),
+                                )
+                                .await;
                                 debug!(
                                     pod = %key.label(),
                                     container = %cname,
@@ -1853,6 +1908,19 @@ impl Kubelet {
                             remaining_secs = remaining.as_secs(),
                             "container held in CrashLoopBackOff"
                         );
+                        // ★ THE EVENT THAT WAS MISSING. A pod at 149
+                        // restarts said nothing; this is the line that
+                        // would have explained it without reading podman.
+                        self.emit(
+                            key,
+                            engenho_controllers::event_recorder::Reason::BackOff,
+                            format!(
+                                "Back-off restarting failed container {cname} ({}s remaining, {} prior restarts)",
+                                remaining.as_secs(),
+                                record.restart_count
+                            ),
+                        )
+                        .await;
                         observations.push(ContainerObservation::backing_off(
                             cname,
                             &record.container_id,
@@ -1885,6 +1953,15 @@ impl Kubelet {
                                     record.restart_count + 1,
                                 ));
                                 report.objects_changed += 1;
+                                self.emit(
+                                    key,
+                                    engenho_controllers::event_recorder::Reason::Started,
+                                    format!(
+                                        "Restarted container {cname} (exit {exit}, restart #{})",
+                                        record.restart_count + 1
+                                    ),
+                                )
+                                .await;
                                 debug!(
                                     pod = %key.label(),
                                     container = %cname,

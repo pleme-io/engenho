@@ -432,6 +432,35 @@ impl Runtime {
 /// knows the `PodLogReader` trait; the runtime (above both) supplies the
 /// concrete kubelet behind it. A multi-node future swaps this for a node-proxy
 /// reader with no apiserver change.
+/// The store, seen through the one capability an event sink needs.
+struct MeshEventStore {
+    store: Arc<engenho_store::StoreMesh>,
+}
+
+#[async_trait::async_trait]
+impl engenho_controllers::event_recorder::EventStore for MeshEventStore {
+    async fn put_event(
+        &self,
+        key: engenho_store::ResourceKey,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        self.store
+            .propose(engenho_store::command::ResourceCommand::Put {
+                key,
+                value,
+                // No precondition: an event is a fresh object with a
+                // timestamped name, and a CAS here would turn two events in
+                // the same second into a conflict the sink must swallow —
+                // losing the SECOND one, which is usually the interesting one.
+                expected: None,
+                reason: engenho_store::command::Reason::Controller,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 struct KubeletLogReader {
     kubelet: Arc<Kubelet>,
 }
@@ -1648,11 +1677,24 @@ fn spawn_drivers(
     // ONCE as an Arc<Kubelet> so the SAME instance is shared between its
     // WatchDriver (via the `Controller for Arc<C>` blanket impl) and the
     // apiserver's Pod `/log` reader — both see one local bookkeeping map.
-    let kubelet = Arc::new(Kubelet::new(
-        store.clone(),
-        backend.clone(),
-        config.runtime.node_name.clone(),
-    ));
+    // The event sink is wired HERE, at assembly, because this is the only
+    // layer that has both the kubelet and the store. Without it the kubelet
+    // keeps its NullEventSink and the cluster cannot explain itself: that is
+    // precisely the state in which a pod reached 149 restarts and `kubectl
+    // describe` had nothing to say about it.
+    let events: Arc<dyn engenho_controllers::event_recorder::EventSink> = Arc::new(
+        engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
+            store: store.clone(),
+        })),
+    );
+    let kubelet = Arc::new(
+        Kubelet::new(
+            store.clone(),
+            backend.clone(),
+            config.runtime.node_name.clone(),
+        )
+        .with_event_sink(events),
+    );
     handles.push(WatchDriver::new(kubelet.clone(), store.clone(), driver_config(&["Pod"])).spawn());
 
     (handles, kubelet)
