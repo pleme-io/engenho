@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "a82b85c9934356deef55698a158e7302721291fa30e0d94bcab6b687e00b3bcd",
+  "cargo_lock_sha256": "fe0903997c0ebf6a70368b77fe139a5dd4dd8808d368ea3c7cdb8fef38600d2f",
   "manifest_sha256": {
     "Cargo.toml": "d8a5729462e0361f51b0e0422cfc8e1dd41af7f032eb5439c1a395e55e575e78",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
@@ -9,7 +9,7 @@
     "engenho-config/Cargo.toml": "b96a79e9008ee6a636df2a80815df844ce2081fac132eeddd6e4d60e87055b88",
     "engenho-controllers/Cargo.toml": "d7e6db6f9b70d927029a5f5436736b8d139de75867c5379362f23245960b0462",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
-    "engenho-etcd/Cargo.toml": "c9a2e228e51e13818b201a475bba2ad358b89fca4a67843384d94f4da296182a",
+    "engenho-etcd/Cargo.toml": "3d04c235ef9b9decb845adc207c3dc000b7cf7578b53833751714f7c636824f2",
     "engenho-fonte-cli/Cargo.toml": "650eb2c143e2d16dd0f02a56a9f73035f83652349b83daf33f9caa582c8ca8a7",
     "engenho-fonte/Cargo.toml": "a074bc92449afc5b002c35965f1c0e8f86754064d7bf7e6d86cb7c496c5bfd1e",
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
@@ -4709,7 +4709,28 @@
         "features": []
       },
       "engenho-etcd-0.53.30": {
-        "runtime_dependencies": [],
+        "runtime_dependencies": [
+          {
+            "name": "engenho_types",
+            "package_key": "engenho-types-0.53.30",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
         "build_dependencies": [],
         "features": []
       },
