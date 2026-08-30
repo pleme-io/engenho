@@ -321,6 +321,88 @@ is a working non-container domain — reconciled, watched, RBAC'd, served
 through the same apiserver — and it is cheap enough to be the next thing
 built after the determinism audit.
 
+## III.6 The top of the stack — and the link that is not wired
+
+The operator's completion:
+
+> *And then we build products on this that are ever-present, global,
+> dynamic, and fully expressed in the tatara-lisp ecosystem — whether it is
+> all the way to Rust, to YAML, to bluelang.*
+
+### Why this is not the usual "one language for infrastructure"
+
+That idea has a graveyard: Pulumi, CDK, Ballerina, Dhall, CUE, Nickel. They
+fail the same way every time, and the failure is structural rather than a
+matter of taste — **each is an authoring layer over a runtime it does not
+own.** Pulumi lowers into Terraform's model; CDK into CloudFormation's. The
+moment the substrate does something the model did not anticipate, the
+abstraction leaks, an escape hatch appears, and the escape hatch becomes the
+language people actually write.
+
+**engenho changes who owns the bottom.** If the substrate is ours, then
+tatara-lisp is not transpiling into a foreign system — it is lowering into
+one whose types it already shares. That is the difference between a
+transpiler and a compiler with its own backend, and it is the only reason
+to believe this attempt differs from the previous ones.
+
+And §III.5 measured the second precondition: the core is domain-agnostic.
+`Pod` appears in `engenho-store`, `engenho-apiserver`'s handler and the
+controller framework **only inside `#[cfg(test)]`**. So "all of computing"
+is not a category error — the same machinery could reconcile domains with
+no containers in them.
+
+### The pieces all exist. They are not a chain.
+
+The lowering the operator names — tatara-lisp → Rust, YAML, blue — exists
+as three separate lowerings that happen to share an author:
+
+| rung | status |
+|---|---|
+| tatara-lisp → Rust types | `#[derive(TataraDomain)]`, shipped and used across the fleet |
+| tatara-lisp → YAML config | shikumi's tiered config, shipped |
+| tatara-lisp → scripting | `blue` is implemented, 13 crates |
+| **tatara-lisp → the engenho runtime** | **NOT CONNECTED** |
+
+`engenho-fonte` already carries the authoring surface —
+`(defsistema "rio-cluster" :apps […] :infra […] :promises […] :topology …)`
+as a `TataraDomain`. Measured 2026-08-30: **nothing outside `engenho-fonte`
+and its own CLI consumes it, and `engenho-runtime/src/runtime.rs` contains
+zero mentions of `fonte`.**
+
+That is the same defect class as the nine instances above, at the strategic
+layer: the authoring surface exists, the runtime exists, and the arrow
+between them was never drawn. It is the single load-bearing gap in the
+whole thesis — every other rung is shipped.
+
+### The risk in the word "fully"
+
+Every system of this kind dies at the 5% that does not fit its model. The
+answer is never to grow the model until it covers everything; that produces
+a language whose surface nobody can hold. The answer is that the escape
+hatch must be **typed rather than a string** — which is already fleet
+doctrine (★★ TYPED EMISSION, `format!()` banned at emission boundaries),
+and which is exactly what stops the escape hatch from becoming the real
+language.
+
+Stated plainly so it is not discovered later: *fully expressed* should be
+read as *fully expressed or explicitly refused*, never as *the model covers
+everything*.
+
+### "Ever-present, global, dynamic" is not new invention
+
+Those three words already have fleet primitives, and none of them is
+engenho's to build:
+
+- **dynamic** → breathability (bands, derived bounds, propose/realise)
+- **global** → vining (rooted growth onto solid ground), utsuroi (one
+  lifecycle spine under every ephemeral thing)
+- **ever-present** → formigueiro (continuous fleet convergence), the
+  reconciler-liveness doctrine
+
+What they have lacked is a substrate they can run *on* rather than *beside*.
+That is what engenho supplies, and it is why the ordering matters: the
+primitives are ready and the hook point is what was missing.
+
 ## IV. What to do about it
 
 In dependency order, and none of it is speculative:
@@ -338,12 +420,16 @@ In dependency order, and none of it is speculative:
    fault-injecting, replayable from a seed. `madsim`
    ([madsim-rs](https://github.com/madsim-rs/madsim)) is the Rust framework
    for it and is worth evaluating before writing one.
-4. **Prove the substrate is domain-agnostic** with one non-container domain
+4. **Wire `engenho-fonte` into the runtime.** `(defsistema …)` exists and
+   reaches nothing; `runtime.rs` has zero mentions of it. This is the
+   load-bearing gap of §III.6 and the one rung of the tatara-lisp chain
+   that is missing — every other rung ships today.
+5. **Prove the substrate is domain-agnostic** with one non-container domain
    through the unchanged store + apiserver + controller framework. This is
    the falsifiable test of §III.5 and it gates the whole tatara-lisp thesis:
    until it passes, "many faces" is a design intention rather than a
    measured property.
-5. **Then embedding, as a stated product surface.** It is already true that
+6. **Then embedding, as a stated product surface.** It is already true that
    `engenho-runtime` is a library; what is missing is the documented,
    tested, minimal embedding — which contracts are optional, what a
    consumer must supply, what it gets.
