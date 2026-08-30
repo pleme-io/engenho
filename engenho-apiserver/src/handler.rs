@@ -1156,7 +1156,9 @@ impl ResourceHandler for StoreBackedHandler {
         //
         // Scoped to namespaced kinds, and `Namespace` itself is necessarily
         // exempt — it is cluster-scoped, so it never reaches this branch.
-        if self.namespace_lifecycle && let Some(ns) = namespace {
+        if self.namespace_lifecycle
+            && let Some(ns) = namespace
+        {
             let ns_key = ResourceKey::cluster_scoped("", "v1", "Namespace", ns.to_string());
             if self.store.get(&ns_key).await.is_none() {
                 return Err(ApiError::NotFound(

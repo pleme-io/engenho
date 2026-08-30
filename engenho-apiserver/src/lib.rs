@@ -30,8 +30,6 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-pub mod schema_validation;
-pub mod table;
 pub mod authn;
 pub mod authz;
 pub mod coords;
@@ -40,13 +38,16 @@ pub mod discovery;
 pub mod error;
 pub mod handler;
 pub mod health;
+pub mod metrics;
 pub mod openapi;
 pub mod params;
 pub mod pki;
 pub mod pod_logs;
 pub mod router;
 pub mod scale;
+pub mod schema_validation;
 pub mod server;
+pub mod table;
 pub mod webhook_admission;
 
 pub use authn::{
