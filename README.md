@@ -102,7 +102,7 @@ the `M0.0` line this replaces.
 |---|---|
 | built-in API resources | **52 of 57** upstream built-ins (91%) across 19 groups |
 | absent built-ins | `bindings`, `componentstatuses`, `selfsubjectreviews`, `validatingadmissionpolicies`, `validatingadmissionpolicybindings`, and — found 2026-08-29 by parsing a real apiserver's whole keyspace — `networking.k8s.io` **IPAddress** and **ServiceCIDR**. The "52 of 57" figure above counts against a hand-written upstream list that omitted those two, so the catalog gap is WIDER than 5 |
-| API machinery | server-side apply (+`managedFields`), WATCH, label selectors, resourceVersion, API defaulting — all working |
+| API machinery | server-side apply (+`managedFields`), WATCH, label selectors, resourceVersion, API **defaulting** and **validation** (core kinds), field selectors incl. `spec.nodeName`/`status.phase` — all working |
 | controller chain | Deployment → ReplicaSet → Pod reconciles end to end |
 | endpoints serving | `/healthz` `/readyz` `/livez` `/version` (`v1.34.0`) `/api` `/apis` `/openapi/v3` |
 | crates | 24 workspace members; `engenho-datastore`, `-cni`, `-kubeproxy`, `-dns`, `-localpath`, `-ca`, `-caixa`, `-mesh`, `-gateway`, `-attest`, `-cli` are TARGET names above and do **not** exist yet |
