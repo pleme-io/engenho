@@ -108,22 +108,99 @@ impl Authenticator for X509Authenticator {
 //   * a bearer that is NOT SA-shaped → None (falls through to the admin/anon
 //     stages, so the placeholder ANONYMOUS_TOKEN keeps authenticating as
 //     anonymous). NEVER a silent admin / silent SA identity.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ServiceAccountTokenAuthenticator;
+#[derive(Debug, Default, Clone)]
+pub struct ServiceAccountTokenAuthenticator {
+    /// The verifying half of the cluster's SA signing keypair, plus the
+    /// issuer and audience a token must claim.
+    ///
+    /// `None` keeps the pre-existing typed-deferred behaviour: an SA-shaped
+    /// bearer is a typed 401 rather than a silent anonymous. That is the
+    /// honest state for a server with no key, and it is NEVER a fallback
+    /// that authenticates — refusing to validate must not become refusing
+    /// to reject.
+    key: Option<SaVerifier>,
+}
+
+/// What the authenticator needs to check an SA token.
+#[derive(Clone)]
+pub struct SaVerifier {
+    /// Public half of the cluster's SA signing key.
+    pub verifying: ed25519_dalek::VerifyingKey,
+    /// The `iss` a token must carry.
+    pub issuer: String,
+    /// The audience this API server accepts.
+    pub audience: String,
+}
+
+impl std::fmt::Debug for SaVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaVerifier")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServiceAccountTokenAuthenticator {
+    /// An authenticator that can actually VALIDATE tokens.
+    #[must_use]
+    pub fn with_key(
+        verifying: ed25519_dalek::VerifyingKey,
+        issuer: String,
+        audience: String,
+    ) -> Self {
+        Self {
+            key: Some(SaVerifier {
+                verifying,
+                issuer,
+                audience,
+            }),
+        }
+    }
+}
 
 impl Authenticator for ServiceAccountTokenAuthenticator {
     fn authenticate(&self, creds: &RequestCreds) -> Result<Option<UserInfo>, AuthnError> {
         let Some(bearer) = &creds.bearer else {
             return Ok(None);
         };
-        if is_service_account_token(bearer) {
-            // Recognized as an SA token but unvalidatable this brick → typed
-            // 401, NEVER a silent anonymous-as-that-SA or a silent admin.
-            Err(AuthnError::ServiceAccountUnsupported)
-        } else {
+        if !is_service_account_token(bearer) {
             // Not SA-shaped (opaque token / placeholder) → fall through.
-            Ok(None)
+            return Ok(None);
         }
+        let Some(v) = &self.key else {
+            // SA-shaped but this server holds no key → typed 401, NEVER a
+            // silent anonymous-as-that-SA or a silent admin.
+            return Err(AuthnError::ServiceAccountUnsupported);
+        };
+
+        // A structurally-SA bearer that FAILS validation is a typed 401, not
+        // a fall-through. Falling through would hand a forged or expired
+        // token the anonymous identity and answer 200 for whatever anonymous
+        // may do — the silent-downgrade this stage exists to prevent.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let claims = crate::sa_token::verify(&v.verifying, bearer, &v.issuer, &v.audience, now)
+            .map_err(|_| AuthnError::ServiceAccountUnsupported)?;
+
+        let (namespace, name) = claims
+            .kubernetes
+            .as_ref()
+            .map(|k| (k.namespace.clone(), k.serviceaccount.name.clone()))
+            .ok_or(AuthnError::ServiceAccountUnsupported)?;
+
+        Ok(Some(UserInfo {
+            username: crate::sa_token::subject_for(&namespace, &name),
+            uid: claims
+                .kubernetes
+                .as_ref()
+                .map(|k| k.serviceaccount.uid.clone())
+                .unwrap_or_default(),
+            groups: crate::sa_token::groups_for(&namespace),
+            extra: std::collections::BTreeMap::new(),
+        }))
     }
 }
 
@@ -185,7 +262,28 @@ impl ChainAuthenticator {
         Self {
             stages: vec![
                 Box::new(X509Authenticator),
-                Box::new(ServiceAccountTokenAuthenticator),
+                Box::new(ServiceAccountTokenAuthenticator::default()),
+                Box::new(BootstrapAdminTokenAuthenticator::new(admin_token)),
+                Box::new(AnonymousAuthenticator),
+            ],
+        }
+    }
+
+    /// The canonical chain WITH a live SA verifier, so in-cluster clients
+    /// authenticate as their ServiceAccount instead of taking a typed 401.
+    #[must_use]
+    pub fn bootstrap_with_sa(
+        admin_token: Option<String>,
+        verifying: ed25519_dalek::VerifyingKey,
+        issuer: String,
+        audience: String,
+    ) -> Self {
+        Self {
+            stages: vec![
+                Box::new(X509Authenticator),
+                Box::new(ServiceAccountTokenAuthenticator::with_key(
+                    verifying, issuer, audience,
+                )),
                 Box::new(BootstrapAdminTokenAuthenticator::new(admin_token)),
                 Box::new(AnonymousAuthenticator),
             ],
@@ -262,6 +360,205 @@ fn decode_jwt_payload(payload: &str) -> Option<serde_json::Map<String, serde_jso
         .ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     value.as_object().cloned()
+}
+
+#[cfg(test)]
+mod sa_verification_tests {
+    use super::{Authenticator, RequestCreds, ServiceAccountTokenAuthenticator};
+    use crate::sa_token::{issue, load_or_generate_sa_key};
+
+    const ISS: &str = "https://kubernetes.default.svc";
+    const AUD: &str = "https://kubernetes.default.svc";
+
+    /// Wall-clock seconds. `authenticate` reads the real clock (no seam
+    /// yet), so a token must be issued against the same clock or it is
+    /// expired before it is ever checked.
+    fn now_secs() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs(),
+        )
+        .expect("fits i64")
+    }
+
+    fn creds(bearer: &str) -> RequestCreds {
+        RequestCreds {
+            bearer: Some(bearer.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// A VALID token authenticates as its ServiceAccount, with upstream's
+    /// `system:serviceaccount:<ns>:<name>` username and group set.
+    #[test]
+    fn a_valid_token_authenticates_as_its_service_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = load_or_generate_sa_key(dir.path()).expect("key");
+        let tok = issue(
+            &kp.signing,
+            ISS,
+            "pangea-system",
+            "pangea-operator",
+            "uid-7",
+            &[AUD.to_string()],
+            None,
+            now_secs(),
+            3600,
+        )
+        .expect("issue");
+
+        let a = ServiceAccountTokenAuthenticator::with_key(
+            kp.verifying,
+            ISS.to_string(),
+            AUD.to_string(),
+        );
+        let user = a
+            .authenticate(&creds(&tok))
+            .expect("a valid token is not an error")
+            .expect("a valid token authenticates");
+        assert_eq!(
+            user.username,
+            "system:serviceaccount:pangea-system:pangea-operator"
+        );
+        assert_eq!(user.uid, "uid-7");
+        assert!(
+            user.groups.iter().any(|g| g == "system:serviceaccounts"),
+            "{:?}",
+            user.groups
+        );
+    }
+
+    /// ★ THE ONE THAT MATTERS. A forged or expired token is a typed 401 —
+    /// NEVER a fall-through to anonymous.
+    ///
+    /// Falling through would hand a bad token the anonymous identity and
+    /// answer 200 for whatever anonymous may do. That silent downgrade is
+    /// the entire reason this stage exists, and it is the failure a
+    /// "return Ok(None) on error" would quietly introduce.
+    #[test]
+    fn a_forged_or_expired_token_is_rejected_never_downgraded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = load_or_generate_sa_key(dir.path()).expect("key");
+        let other = load_or_generate_sa_key(tempfile::tempdir().expect("tempdir2").path())
+            .expect("second key");
+
+        let a = ServiceAccountTokenAuthenticator::with_key(
+            kp.verifying,
+            ISS.to_string(),
+            AUD.to_string(),
+        );
+
+        // Signed by a DIFFERENT cluster's key.
+        let forged = issue(
+            &other.signing,
+            ISS,
+            "kube-system",
+            "admin",
+            "uid-x",
+            &[AUD.to_string()],
+            None,
+            now_secs(),
+            3600,
+        )
+        .expect("issue");
+        assert!(
+            a.authenticate(&creds(&forged)).is_err(),
+            "a token signed by another key must be REJECTED, not downgraded"
+        );
+
+        // Correctly signed but for the wrong audience.
+        let wrong_aud = issue(
+            &kp.signing,
+            ISS,
+            "kube-system",
+            "admin",
+            "uid-y",
+            &["some-other-audience".to_string()],
+            None,
+            now_secs(),
+            3600,
+        )
+        .expect("issue");
+        assert!(
+            a.authenticate(&creds(&wrong_aud)).is_err(),
+            "an audience mismatch must be rejected"
+        );
+    }
+
+    /// An EXPIRED token is rejected. Mandatory expiry is the whole point of
+    /// a bound token — a token that outlives its pod is a credential nobody
+    /// can revoke.
+    #[test]
+    fn an_expired_token_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = load_or_generate_sa_key(dir.path()).expect("key");
+        // Issued two hours ago with a one-hour life.
+        let tok = issue(
+            &kp.signing,
+            ISS,
+            "ns",
+            "sa",
+            "uid",
+            &[AUD.to_string()],
+            None,
+            now_secs() - 7200,
+            3600,
+        )
+        .expect("issue");
+        let a = ServiceAccountTokenAuthenticator::with_key(
+            kp.verifying,
+            ISS.to_string(),
+            AUD.to_string(),
+        );
+        assert!(
+            a.authenticate(&creds(&tok)).is_err(),
+            "an expired token must be rejected, never downgraded to anonymous"
+        );
+    }
+
+    /// With NO key the stage keeps its typed-deferred behaviour: an SA-shaped
+    /// bearer is a 401, never a silent anonymous. Refusing to VALIDATE must
+    /// not become refusing to REJECT.
+    #[test]
+    fn without_a_key_an_sa_bearer_is_still_refused() {
+        let a = ServiceAccountTokenAuthenticator::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = load_or_generate_sa_key(dir.path()).expect("key");
+        let tok = issue(
+            &kp.signing,
+            ISS,
+            "ns",
+            "sa",
+            "uid",
+            &[AUD.to_string()],
+            None,
+            now_secs(),
+            3600,
+        )
+        .expect("issue");
+        assert!(a.authenticate(&creds(&tok)).is_err());
+    }
+
+    /// A non-SA bearer still falls THROUGH, so the admin and anonymous
+    /// stages behind this one keep working.
+    #[test]
+    fn a_non_sa_bearer_falls_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = load_or_generate_sa_key(dir.path()).expect("key");
+        let a = ServiceAccountTokenAuthenticator::with_key(
+            kp.verifying,
+            ISS.to_string(),
+            AUD.to_string(),
+        );
+        assert_eq!(
+            a.authenticate(&creds("an-opaque-admin-token"))
+                .expect("not an error"),
+            None,
+            "a non-SA bearer must fall through to the later stages"
+        );
+    }
 }
 
 #[cfg(test)]
