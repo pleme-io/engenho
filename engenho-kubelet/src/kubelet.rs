@@ -492,6 +492,132 @@ impl Kubelet {
     /// prefix so they never collide with a same-named app container's
     /// `<ns>_<pod>_<cname>`. The RETURNED logical name is always the raw
     /// `spec.<key>[i].name` (the bookkeeping key + status name).
+    /// Resolve one `spec.containers[].env[]` entry to a `(name, value)` pair.
+    ///
+    /// ## The defect this replaces
+    ///
+    /// The previous extractor was a `filter_map` requiring a literal
+    /// `value` key:
+    ///
+    /// ```ignore
+    /// let v = e.get("value")?.as_str()?.to_string();
+    /// ```
+    ///
+    /// Any entry carrying `valueFrom` has no `value` key, so `?` yielded
+    /// `None` and the variable **vanished** — no error, no Pending reason,
+    /// no log line. The container started, looked healthy, and was simply
+    /// missing the variable. Measured casualties in the reference pangea
+    /// render were the downward-API `POD_NAME` / `POD_NAMESPACE` /
+    /// `NODE_NAME`, and `leader.rs` resolves pod identity from `POD_NAME`,
+    /// so leader election degraded **silently**.
+    ///
+    /// ## What this does instead
+    ///
+    /// * a literal `value` is used as-is;
+    /// * a bare `{name}` with neither `value` nor `valueFrom` is the empty
+    ///   string, which is upstream's semantics, not a guess;
+    /// * `valueFrom.fieldRef` is RESOLVED — every supported path is
+    ///   answerable from the pod object already in hand, needing no store
+    ///   access;
+    /// * every other `valueFrom` source is a typed `InvalidPod` naming the
+    ///   variable AND the source kind.
+    ///
+    /// That last arm is the point. `secretKeyRef` and `configMapKeyRef`
+    /// need store access the kubelet does not have here, so they are not
+    /// supported yet — but an unsupported source now **fails loudly at
+    /// admission** instead of producing a container that runs without its
+    /// credentials. A pod that cannot get its environment must not reach
+    /// Running, because "started successfully, silently misconfigured" is
+    /// the single hardest state to debug from outside.
+    fn resolve_env_entry(
+        namespace: &str,
+        pod_name: &str,
+        pod: &Value,
+        entry: &Value,
+    ) -> Result<(String, String), KubeletError> {
+        let invalid = |reason: String| KubeletError::InvalidPod {
+            pod: format!("{namespace}/{pod_name}"),
+            reason,
+        };
+
+        let key = entry
+            .get("name")
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| invalid("env entry has no name".to_string()))?
+            .to_string();
+
+        // A literal value wins, exactly as upstream.
+        if let Some(v) = entry.get("value") {
+            let v = v
+                .as_str()
+                .ok_or_else(|| invalid(format!("env {key}: value is not a string")))?;
+            return Ok((key, v.to_string()));
+        }
+
+        let Some(from) = entry.get("valueFrom") else {
+            // `{name: FOO}` with neither value nor valueFrom is the empty
+            // string upstream, not an error and not an omission.
+            return Ok((key, String::new()));
+        };
+
+        if let Some(field_ref) = from.get("fieldRef") {
+            let path = field_ref
+                .get("fieldPath")
+                .and_then(|p| p.as_str())
+                .ok_or_else(|| invalid(format!("env {key}: fieldRef has no fieldPath")))?;
+
+            let resolved = match path {
+                "metadata.name" => Some(pod_name.to_string()),
+                "metadata.namespace" => Some(namespace.to_string()),
+                "metadata.uid" => pod
+                    .pointer("/metadata/uid")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                "spec.nodeName" => pod
+                    .pointer("/spec/nodeName")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                "spec.serviceAccountName" => pod
+                    .pointer("/spec/serviceAccountName")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                "status.podIP" => pod
+                    .pointer("/status/podIP")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                "status.hostIP" => pod
+                    .pointer("/status/hostIP")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                other => {
+                    return Err(invalid(format!(
+                        "env {key}: unsupported fieldRef path {other:?} \
+                         (supported: metadata.name, metadata.namespace, metadata.uid, \
+                         spec.nodeName, spec.serviceAccountName, status.podIP, status.hostIP)"
+                    )));
+                }
+            };
+
+            // A KNOWN path whose value is not yet populated (status.podIP
+            // before the sandbox exists) resolves to empty rather than
+            // failing — upstream does the same, and refusing here would
+            // make a legal pod permanently unadmittable on a timing detail.
+            return Ok((key, resolved.unwrap_or_default()));
+        }
+
+        // Everything else is a source we cannot serve yet. Name the source
+        // rather than emitting a generic message: the operator's next
+        // question is always "which one".
+        let source = ["secretKeyRef", "configMapKeyRef", "resourceFieldRef"]
+            .into_iter()
+            .find(|k| from.get(*k).is_some())
+            .unwrap_or("unknown source");
+        Err(invalid(format!(
+            "env {key}: valueFrom.{source} is not supported yet — refusing rather than \
+             starting the container without it"
+        )))
+    }
+
     fn extract_container_specs(
         namespace: &str,
         name: &str,
@@ -546,19 +672,17 @@ impl Kubelet {
                     reason: format!("spec.{spec_key}[{i}].image missing"),
                 })?
                 .to_string();
-            let env = c
-                .get("env")
-                .and_then(|e| e.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| {
-                            let n = e.get("name")?.as_str()?.to_string();
-                            let v = e.get("value")?.as_str()?.to_string();
-                            Some((n, v))
-                        })
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default();
+            let env = match c.get("env").and_then(|e| e.as_array()) {
+                Some(arr) => {
+                    let mut map = BTreeMap::new();
+                    for entry in arr {
+                        let (k, v) = Self::resolve_env_entry(namespace, name, pod, entry)?;
+                        map.insert(k, v);
+                    }
+                    map
+                }
+                None => BTreeMap::new(),
+            };
             // command = entrypoint override; args = appended arguments
             // (K8s semantics). The container's run argv is command ++ args.
             let str_array = |key: &str| -> Vec<String> {
@@ -2668,6 +2792,125 @@ impl Kubelet {
             report.objects_changed += 1;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod env_resolution_tests {
+    use super::Kubelet;
+    use serde_json::json;
+
+    fn pod() -> serde_json::Value {
+        json!({
+            "metadata": { "name": "pangea-operator-abc", "namespace": "pangea-system",
+                          "uid": "11111111-2222-3333-4444-555555555555" },
+            "spec": { "nodeName": "cid", "serviceAccountName": "pangea-operator" },
+            "status": { "podIP": "10.42.0.7", "hostIP": "192.168.1.10" }
+        })
+    }
+
+    fn resolve(entry: serde_json::Value) -> Result<(String, String), super::KubeletError> {
+        Kubelet::resolve_env_entry("pangea-system", "pangea-operator-abc", &pod(), &entry)
+    }
+
+    /// THE REGRESSION. Every one of these used to VANISH — the extractor
+    /// required a literal `value` key, so `valueFrom` entries were dropped
+    /// with no error and no Pending reason. `leader.rs` reads POD_NAME, so
+    /// leader election degraded silently on a healthy-looking pod.
+    #[test]
+    fn downward_api_entries_no_longer_vanish() {
+        for (path, expected) in [
+            ("metadata.name", "pangea-operator-abc"),
+            ("metadata.namespace", "pangea-system"),
+            ("metadata.uid", "11111111-2222-3333-4444-555555555555"),
+            ("spec.nodeName", "cid"),
+            ("spec.serviceAccountName", "pangea-operator"),
+            ("status.podIP", "10.42.0.7"),
+            ("status.hostIP", "192.168.1.10"),
+        ] {
+            let (k, v) = resolve(json!({
+                "name": "VAR", "valueFrom": { "fieldRef": { "fieldPath": path } }
+            }))
+            .unwrap_or_else(|e| panic!("{path} must resolve, got {e}"));
+            assert_eq!(k, "VAR");
+            assert_eq!(v, expected, "wrong value for {path}");
+        }
+    }
+
+    /// A literal value still wins and is unchanged.
+    #[test]
+    fn a_literal_value_is_passed_through() {
+        assert_eq!(
+            resolve(json!({ "name": "LOG_LEVEL", "value": "debug" })).unwrap(),
+            ("LOG_LEVEL".to_string(), "debug".to_string())
+        );
+    }
+
+    /// Upstream treats `{name: FOO}` with no value as the empty string.
+    /// This is semantics, not a fallback — do not "fix" it into an error.
+    #[test]
+    fn a_bare_name_is_the_empty_string_not_an_omission() {
+        assert_eq!(
+            resolve(json!({ "name": "EMPTY" })).unwrap(),
+            ("EMPTY".to_string(), String::new())
+        );
+    }
+
+    /// An unsupported SOURCE must fail loudly and name itself. Starting a
+    /// container without its credentials is the failure mode this whole
+    /// function exists to prevent.
+    #[test]
+    fn an_unsupported_source_refuses_and_names_itself() {
+        for source in ["secretKeyRef", "configMapKeyRef", "resourceFieldRef"] {
+            let err = resolve(json!({
+                "name": "PGPASSWORD",
+                "valueFrom": { source: { "name": "pangea-database-app", "key": "password" } }
+            }))
+            .expect_err("an unresolvable source must not be silently dropped");
+            let msg = err.to_string();
+            assert!(msg.contains(source), "error must name the source: {msg}");
+            assert!(
+                msg.contains("PGPASSWORD"),
+                "error must name the variable: {msg}"
+            );
+        }
+    }
+
+    /// An unknown fieldRef path fails and lists what IS supported, rather
+    /// than resolving to empty — which would be indistinguishable from a
+    /// legitimately-empty value.
+    #[test]
+    fn an_unknown_fieldref_path_refuses_and_lists_the_supported_set() {
+        let err = resolve(json!({
+            "name": "WAT", "valueFrom": { "fieldRef": { "fieldPath": "spec.hostNetwork" } }
+        }))
+        .expect_err("an unknown fieldPath must not resolve to empty");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("spec.hostNetwork"),
+            "must name the bad path: {msg}"
+        );
+        assert!(
+            msg.contains("metadata.name"),
+            "must list the supported set: {msg}"
+        );
+    }
+
+    /// A KNOWN path that is not yet populated resolves to empty rather
+    /// than failing. status.podIP is absent before the sandbox exists, and
+    /// refusing there would make a legal pod permanently unadmittable on a
+    /// timing detail.
+    #[test]
+    fn a_known_but_unpopulated_path_resolves_empty() {
+        let bare = json!({ "metadata": { "name": "p", "namespace": "n" } });
+        let (_, v) = Kubelet::resolve_env_entry(
+            "n",
+            "p",
+            &bare,
+            &json!({ "name": "POD_IP", "valueFrom": { "fieldRef": { "fieldPath": "status.podIP" } } }),
+        )
+        .expect("a known-but-unset path is not an error");
+        assert_eq!(v, "");
     }
 }
 
