@@ -1496,6 +1496,7 @@ dependencies = [
  "bytes",
  "engenho-store",
  "engenho-types",
+ "futures-core",
  "prost",
  "prost-build",
  "protox",
