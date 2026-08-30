@@ -44,6 +44,7 @@ pub mod config_bridge;
 pub mod error;
 pub mod kubelet;
 pub mod lifecycle;
+pub mod node_lease;
 pub mod pod_volume;
 pub mod probe;
 pub mod volume;
