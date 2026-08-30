@@ -1489,6 +1489,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-etcd"
+version = "0.53.28"
+
+[[package]]
 name = "engenho-fonte"
 version = "0.53.28"
 dependencies = [

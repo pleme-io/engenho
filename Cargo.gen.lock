@@ -1,14 +1,15 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "4b5bd3b2e9d72f8d43f4aaa4cd7717453e43a0cc2d5d294008406a0149fdec67",
+  "cargo_lock_sha256": "f1be87281398d671156e13b5294e14ad7d9f8a438e127e5c3f9cb792b040b1fb",
   "manifest_sha256": {
-    "Cargo.toml": "a24e4afdd31899543f642ef82f3ac4df53350fb94d1068f92738a8f08d5ebd68",
+    "Cargo.toml": "cccd09fa46e5e0bad6e1295d16f6042571a69054eb3b38a6e9472f6d73ebfb3e",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-config/Cargo.toml": "b96a79e9008ee6a636df2a80815df844ce2081fac132eeddd6e4d60e87055b88",
     "engenho-controllers/Cargo.toml": "d7e6db6f9b70d927029a5f5436736b8d139de75867c5379362f23245960b0462",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
+    "engenho-etcd/Cargo.toml": "c9a2e228e51e13818b201a475bba2ad358b89fca4a67843384d94f4da296182a",
     "engenho-fonte-cli/Cargo.toml": "650eb2c143e2d16dd0f02a56a9f73035f83652349b83daf33f9caa582c8ca8a7",
     "engenho-fonte/Cargo.toml": "a074bc92449afc5b002c35965f1c0e8f86754064d7bf7e6d86cb7c496c5bfd1e",
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
@@ -4704,6 +4705,11 @@
             "tree": "target"
           }
         ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "engenho-etcd-0.53.28": {
+        "runtime_dependencies": [],
         "build_dependencies": [],
         "features": []
       },
@@ -37251,6 +37257,13 @@
       "edition": "2024",
       "lib_target": {
         "name": "engenho_diff",
+        "path": "src/lib.rs"
+      }
+    },
+    "engenho-etcd-0.53.28": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_etcd",
         "path": "src/lib.rs"
       }
     },
