@@ -25,6 +25,7 @@ members = [
   "engenho-fonte-cli",
   "engenho-machines",
   "engenho-diff",
+  "engenho-cni",
   "engenho-csi",
   "engenho-etcd",
 ]

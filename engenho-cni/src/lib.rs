@@ -34,6 +34,6 @@ pub mod config;
 pub mod exec;
 pub mod result;
 
-pub use config::{ConfigError, NetworkConfigList, PluginConfig, load_conflist_dir};
+pub use config::{ConfigError, LoadedNetD, NetworkConfigList, PluginConfig, load_conflist_dir};
 pub use exec::{CniCommand, CniEnv, CniInstall, CniInvocation, CniPlugin, ExecError, PlannedCni};
 pub use result::{CniResult, Interface, IpConfig, Route};

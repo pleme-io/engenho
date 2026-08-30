@@ -1439,6 +1439,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-cni"
+version = "0.53.47"
+dependencies = [
+ "async-trait",
+ "engenho-substrate",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "engenho-config"
 version = "0.53.47"
 dependencies = [

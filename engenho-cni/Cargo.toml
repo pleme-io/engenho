@@ -1,0 +1,32 @@
+[package]
+name = "engenho-cni"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+homepage.workspace     = true
+readme.workspace       = true
+categories.workspace   = true
+keywords.workspace     = true
+description = "Container Network Interface runtime for engenho. CNI is a file + exec + JSON contract, not an RPC one; engenho implements the runtime half so containernetworking/plugins, Calico and Cilium work against it unmodified. The parsing and result halves are platform-independent; the invocation is Linux-only and the difference is a typed CniInstall, never faked."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+async-trait = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+tokio       = { workspace = true, features = ["process", "io-util"] }
+engenho-substrate = { path = "../engenho-substrate" }
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+
+[lints]
+workspace = true
