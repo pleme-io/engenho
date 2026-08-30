@@ -45,6 +45,7 @@ pub mod params;
 pub mod pki;
 pub mod pod_logs;
 pub mod router;
+pub mod sa_token;
 pub mod scale;
 pub mod schema_validation;
 pub mod server;
