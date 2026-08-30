@@ -45,6 +45,11 @@ use engenho_types::generated_v1_34::RESOURCE_CATALOG;
 const MWC_GROUP: &str = "admissionregistration.k8s.io";
 const MWC_VERSION: &str = "v1";
 const MWC_KIND: &str = "MutatingWebhookConfiguration";
+/// `ValidatingWebhookConfiguration` — same group/version, different kind.
+/// It has always been in the catalog and therefore storable; nothing read
+/// it, so a cluster could hold a policy configuration that was never
+/// consulted and reported no error.
+const VWC_KIND: &str = "ValidatingWebhookConfiguration";
 
 /// Store-backed [`WebhookConfigSource`]: lists every live
 /// `MutatingWebhookConfiguration` (cluster-scoped) from the mesh on each
@@ -68,6 +73,15 @@ impl WebhookConfigSource for StoreWebhookConfigSource {
     async fn mutating_configs(&self) -> Vec<Value> {
         self.store
             .list(MWC_GROUP, MWC_VERSION, MWC_KIND, None)
+            .await
+            .into_iter()
+            .map(|(_k, v)| v)
+            .collect()
+    }
+
+    async fn validating_configs(&self) -> Vec<Value> {
+        self.store
+            .list(MWC_GROUP, MWC_VERSION, VWC_KIND, None)
             .await
             .into_iter()
             .map(|(_k, v)| v)
