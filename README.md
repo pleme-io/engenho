@@ -101,7 +101,7 @@ the `M0.0` line this replaces.
 | Surface | Measured |
 |---|---|
 | built-in API resources | **52 of 57** upstream built-ins (91%) across 19 groups |
-| absent built-ins | `bindings`, `componentstatuses`, `selfsubjectreviews`, `validatingadmissionpolicies`, `validatingadmissionpolicybindings` |
+| absent built-ins | `bindings`, `componentstatuses`, `selfsubjectreviews`, `validatingadmissionpolicies`, `validatingadmissionpolicybindings`, and — found 2026-08-29 by parsing a real apiserver's whole keyspace — `networking.k8s.io` **IPAddress** and **ServiceCIDR**. The "52 of 57" figure above counts against a hand-written upstream list that omitted those two, so the catalog gap is WIDER than 5 |
 | API machinery | server-side apply (+`managedFields`), WATCH, label selectors, resourceVersion, API defaulting — all working |
 | controller chain | Deployment → ReplicaSet → Pod reconciles end to end |
 | endpoints serving | `/healthz` `/readyz` `/livez` `/version` (`v1.34.0`) `/api` `/apis` `/openapi/v3` |
@@ -133,10 +133,10 @@ what answers it is ours.
 | `/healthz` `/readyz` `/livez` `/version` | probes, HA | **SHIPPED** |
 | OpenAPI v3 | generators, modern clients | **SHIPPED** |
 | OpenAPI v2 | older clients, codegen | **ABSENT** |
-| etcd v3 gRPC (Range/Put/Txn/Watch/Lease) | `etcdctl`, backup/DR, Velero, `--etcd-servers` | **ABSENT** — no `etcdserverpb` vendored, no crate. Highest leverage: revisioned-MVCC semantics already exist, so this is a façade, not new behaviour |
+| etcd v3 gRPC (Range/Put/Txn/Watch/Lease) | `etcdctl`, backup/DR, Velero, `--etcd-servers` | **PARTIAL** — wire types generated from upstream protos, `/registry` bijection oracle-verified, KV semantics + store prerequisites (multi-key `Txn`, point-in-time reads, explicit `Compact`) landed. **No listener on :2379 yet** |
 | kubelet API :10250 | `kubectl exec/logs/cp/port-forward`, metrics-server | **ABSENT** — no listener. This is why pod logs read empty |
-| Event recording | every "why did this fail" question | **ABSENT** — the cluster cannot explain itself; triage has to go to the runtime directly |
-| `/metrics` (Prometheus) | monitoring, HPA | **ABSENT** |
+| Event recording | every "why did this fail" question | **PARTIAL** — typed recorder + upstream reason vocabulary landed; emission sites (kubelet/scheduler/controllers) pending |
+| `/metrics` (Prometheus) | monitoring, HPA | **SHIPPED** — Prometheus text exposition, served at `/metrics` |
 | CRI (`runtime.v1`) | runtime substitutability | **ABSENT** — drives podman directly |
 | CNI / CSI | network + storage plugins | **ABSENT** — nothing wired |
 
