@@ -785,12 +785,75 @@ async fn boot_store(config: &EngenhoConfig) -> Result<Arc<StoreMesh>, RuntimeErr
 /// declares a request would stay Pending forever. We report the host's
 /// actual logical-CPU count + total memory so the single-node cluster
 /// advertises real capacity.
+/// Kubernetes' `kubernetes.io/arch` label speaks Go's `GOARCH`, not Rust's
+/// `std::env::consts::ARCH`.
+///
+/// The two disagree on exactly the values that matter here: Rust says
+/// `aarch64` and `x86_64` where Kubernetes says `arm64` and `amd64`. This
+/// is the difference between a label that works and a label that looks
+/// right and matches nothing — the reference pangea Postgres carries
+/// `nodeSelector: {kubernetes.io/arch: arm64}`, and against an `aarch64`
+/// label the scheduler's exact-match predicate leaves it
+/// `NodeSelectorMismatch` **forever**, with a correct-looking label
+/// visible in `kubectl get node -o yaml`.
+///
+/// Unknown architectures pass through verbatim rather than guessing: a
+/// wrong-but-plausible label is worse than an unfamiliar one, because it
+/// matches a selector that meant something else.
+#[must_use]
+fn kube_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        "arm" => "arm",
+        "powerpc64" => "ppc64le",
+        "s390x" => "s390x",
+        other => other,
+    }
+}
+
+/// The `kubernetes.io/os` label, in Go's `GOOS` vocabulary.
+///
+/// Rust says `macos`; Kubernetes says `darwin`. Same failure mode as
+/// [`kube_arch`].
+#[must_use]
+fn kube_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+/// The well-known labels upstream's kubelet self-applies at registration.
+///
+/// Without these, `metadata.labels` is ABSENT — not sparse — and
+/// `matches_node_selector` is an exact-match AND over that map, so EVERY
+/// `nodeSelector` key fails and every pod carrying one stays Pending
+/// permanently. Measured on the live node 2026-08-30: `labels: None`.
+///
+/// The `beta.kubernetes.io/*` pair is deprecated upstream and still
+/// emitted, because charts in the wild continue to select on it and a
+/// missing label is a silent non-match rather than an error.
+#[must_use]
+fn well_known_node_labels(node_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kubernetes.io/hostname": node_name,
+        "kubernetes.io/os": kube_os(),
+        "kubernetes.io/arch": kube_arch(),
+        "beta.kubernetes.io/os": kube_os(),
+        "beta.kubernetes.io/arch": kube_arch(),
+    })
+}
+
 async fn register_node(store: &StoreMesh, node_name: &str) -> Result<(), RuntimeError> {
     let (cpu, memory) = host_capacity();
     let mut value = serde_json::json!({
         "kind": "Node",
         "apiVersion": "v1",
-        "metadata": { "name": node_name },
+        "metadata": {
+            "name": node_name,
+            "labels": well_known_node_labels(node_name),
+        },
         "spec": { "unschedulable": false },
         "status": {
             "capacity": { "cpu": cpu, "memory": memory },
@@ -1923,6 +1986,79 @@ fn make_service_router(resolved: ResolvedDatapath) -> Arc<dyn ServiceRouter> {
 // `start_inner` (typed error for unimplemented strategies) and handed to
 // `spawn_drivers`. `Scheduler::new<S: SchedulingStrategy + 'static>`
 // accepts the box (Box<dyn Trait> implements Trait via the blanket impl).
+
+#[cfg(test)]
+mod node_label_tests {
+    use super::{kube_arch, kube_os, well_known_node_labels};
+
+    /// The labels speak Go's vocabulary, not Rust's.
+    ///
+    /// This is the whole point of the mapping: the reference pangea
+    /// Postgres selects `kubernetes.io/arch: arm64`, and Rust's
+    /// `std::env::consts::ARCH` is `aarch64` on the same machine. Emitting
+    /// the Rust spelling yields a label that reads correctly in
+    /// `kubectl get node -o yaml` and matches no selector anyone writes.
+    #[test]
+    fn labels_use_go_vocabulary_not_rust() {
+        assert_ne!(
+            kube_arch(),
+            "aarch64",
+            "kubernetes.io/arch must never be the Rust spelling"
+        );
+        assert_ne!(
+            kube_os(),
+            "macos",
+            "kubernetes.io/os must never be the Rust spelling"
+        );
+        assert!(
+            matches!(kube_arch(), "arm64" | "amd64" | "arm" | "ppc64le" | "s390x"),
+            "unexpected GOARCH rendering: {}",
+            kube_arch()
+        );
+        assert!(
+            matches!(kube_os(), "linux" | "darwin" | "windows"),
+            "unexpected GOOS rendering: {}",
+            kube_os()
+        );
+    }
+
+    /// Every well-known key upstream's kubelet self-applies is present and
+    /// non-empty. An ABSENT labels map is what made every nodeSelector fail
+    /// permanently; a present-but-partial one fails the same way, quietly.
+    #[test]
+    fn every_well_known_label_is_present_and_non_empty() {
+        let labels = well_known_node_labels("cid");
+        let obj = labels.as_object().expect("labels must be an object");
+        for key in [
+            "kubernetes.io/hostname",
+            "kubernetes.io/os",
+            "kubernetes.io/arch",
+            "beta.kubernetes.io/os",
+            "beta.kubernetes.io/arch",
+        ] {
+            let v = obj
+                .get(key)
+                .unwrap_or_else(|| panic!("missing well-known label {key}"))
+                .as_str()
+                .unwrap_or_else(|| panic!("{key} must be a string"));
+            assert!(!v.is_empty(), "{key} is empty, which matches nothing");
+        }
+        assert_eq!(obj["kubernetes.io/hostname"], "cid");
+    }
+
+    /// The deprecated beta aliases must agree with their replacements —
+    /// charts in the wild still select on them, and a disagreement would
+    /// make the same node match one selector and not its equivalent.
+    #[test]
+    fn beta_aliases_agree_with_their_replacements() {
+        let labels = well_known_node_labels("cid");
+        assert_eq!(labels["beta.kubernetes.io/os"], labels["kubernetes.io/os"]);
+        assert_eq!(
+            labels["beta.kubernetes.io/arch"],
+            labels["kubernetes.io/arch"]
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
