@@ -132,11 +132,53 @@ fn field_override(owner_key: &str, wire_field: &str) -> Option<&'static str> {
         .map(|(_, _, t)| *t)
 }
 
-/// Field-name shapes the kind struct handles structurally rather than as
+/// Field-name shapes a TOP-LEVEL KIND handles structurally rather than as
 /// data fields: `apiVersion`/`kind` are TypeMeta (carried separately by the
 /// wire envelope, not stored), and `metadata` is the provided `ObjectMeta`.
+///
+/// ★ ONLY TRUE FOR A TOP-LEVEL KIND. On a nested struct these are ordinary
+/// data: `RoleRef.kind` is `"Role"` or `"ClusterRole"`, `Subject.kind` is
+/// `"User"`/`"Group"`/`"ServiceAccount"`, and `ObjectReference` carries BOTH
+/// `apiVersion` and `kind` as real fields. Stripping them there silently
+/// deletes load-bearing data — which is why `emit_fields` now takes
+/// [`EnvelopePolicy`] instead of deciding for itself.
+///
+/// A purely structural test does not work: "has apiVersion AND kind" would
+/// correctly classify `RoleRef` and then wrongly strip `ObjectReference`.
+/// The caller knows whether it is emitting a kind; the callee cannot.
 fn is_envelope_field(name: &str) -> bool {
     matches!(name, "apiVersion" | "kind")
+}
+
+/// Emit fields for a TOP-LEVEL KIND (TypeMeta stripped).
+///
+/// Kept as the name every existing kind-emitter call site already uses, so
+/// the policy is opt-in at the two places that actually needed it rather
+/// than a mechanical edit across the file.
+#[must_use]
+pub fn emit_fields(
+    owner_key: &str,
+    properties: &BTreeMap<String, serde_json::Value>,
+    required: &[String],
+    refs: &mut BTreeSet<String>,
+) -> String {
+    emit_fields_with(
+        owner_key,
+        properties,
+        required,
+        refs,
+        EnvelopePolicy::StripTypeMeta,
+    )
+}
+
+/// Whether `apiVersion`/`kind` are envelope (a top-level kind) or data (a
+/// nested struct).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopePolicy {
+    /// Top-level kind: strip TypeMeta, it is carried by the wire envelope.
+    StripTypeMeta,
+    /// Nested struct: `apiVersion`/`kind` are ordinary data fields.
+    KeepAllFields,
 }
 
 /// Rust keywords that can be raw identifiers (`r#type`). K8s hits `type`,
@@ -186,10 +228,25 @@ pub fn snake_case(camel: &str) -> String {
             // `pod_ip`, `clusterIP` → `cluster_ip`, `IPAddress` → `ip_address`.
             let prev_lower_or_digit =
                 i > 0 && (chars[i - 1].is_ascii_lowercase() || chars[i - 1].is_ascii_digit());
+            // ...EXCEPT when the "following lowercase" is a lone trailing
+            // `s`, which pluralises the acronym rather than starting a word.
+            // `nonResourceURLs` is one word plus a plural, not `...UR` + `Ls`.
+            //
+            // This bug produced `non_resource_ur_ls`, and rather than being
+            // fixed it was worked around by hand-writing
+            // `generated_v1_34/rbac_v1/policy.rs` INSIDE a directory headed
+            // GENERATED — DO NOT EDIT. That single workaround made the
+            // --check determinism gate permanently red, which hid 40 files
+            // of formatting drift and two more hand-authored files behind
+            // it, and made a routine regeneration delete code the apiserver
+            // needs to compile. One mangled identifier, three files of
+            // debt, one dead gate.
+            let plural_s_at_end = i + 1 == chars.len() - 1 && chars[i + 1] == 's';
             let acronym_end = i > 0
                 && chars[i - 1].is_ascii_uppercase()
                 && i + 1 < chars.len()
-                && chars[i + 1].is_ascii_lowercase();
+                && chars[i + 1].is_ascii_lowercase()
+                && !plural_s_at_end;
             if prev_lower_or_digit || acronym_end {
                 out.push('_');
             }
@@ -226,15 +283,16 @@ fn rustdoc(desc: &str, indent: &str) -> String {
 /// `properties` + `required`, collecting referenced schema KEYS into `refs`.
 /// `metadata` → the provided `ObjectMeta`; `apiVersion`/`kind` are skipped.
 #[must_use]
-pub fn emit_fields(
+pub fn emit_fields_with(
     owner_key: &str,
     properties: &BTreeMap<String, serde_json::Value>,
     required: &[String],
     refs: &mut BTreeSet<String>,
+    envelope: EnvelopePolicy,
 ) -> String {
     let mut out = String::new();
     for (name, schema) in properties {
-        if is_envelope_field(name) {
+        if envelope == EnvelopePolicy::StripTypeMeta && is_envelope_field(name) {
             continue;
         }
         let (field, rename_to) = field_ident(name);
@@ -304,7 +362,16 @@ pub fn emit_struct(name: &str, owner_key: &str, shape: &SchemaView) -> (String, 
         return (body.to_string(), BTreeSet::new());
     }
     let mut refs = BTreeSet::new();
-    let fields = emit_fields(owner_key, &shape.properties, &shape.required, &mut refs);
+    // A sub-struct is NOT a kind: `RoleRef.kind` and `Subject.kind` are
+    // data, and stripping them is what made hand-written replacements
+    // necessary in the generated directory.
+    let fields = emit_fields_with(
+        owner_key,
+        &shape.properties,
+        &shape.required,
+        &mut refs,
+        EnvelopePolicy::KeepAllFields,
+    );
     let doc = rustdoc(&shape.description, "");
     let doc = if doc.is_empty() {
         format!("/// `{name}` — generated typed struct.")
@@ -392,6 +459,49 @@ pub struct SchemaView {
     pub description: String,
     pub properties: BTreeMap<String, serde_json::Value>,
     pub required: Vec<String>,
+}
+
+#[cfg(test)]
+mod snake_case_acronym_tests {
+    use super::snake_case;
+
+    /// An acronym followed by a PLURAL `s` is one word, not two.
+    ///
+    /// REGRESSION: `nonResourceURLs` produced `non_resource_ur_ls`. The
+    /// wire name was right (`#[serde(rename)]` carries it), so the defect
+    /// was invisible on the wire and fatal in Rust — `authz` writes
+    /// `non_resource_urls` and could not compile against the generated
+    /// type. It was worked around with a hand-written file inside the
+    /// generated directory instead of being fixed here.
+    #[test]
+    fn an_acronym_plus_plural_s_is_one_word() {
+        assert_eq!(snake_case("nonResourceURLs"), "non_resource_urls");
+        assert_eq!(snake_case("externalIPs"), "external_ips");
+        assert_eq!(snake_case("clusterIPs"), "cluster_ips");
+        assert_eq!(
+            snake_case("serverAddressByClientCIDRs"),
+            "server_address_by_client_cidrs"
+        );
+    }
+
+    /// The original acronym rule must still hold — an acronym followed by a
+    /// real WORD still splits.
+    #[test]
+    fn an_acronym_plus_a_word_still_splits() {
+        assert_eq!(snake_case("IPAddress"), "ip_address");
+        assert_eq!(snake_case("TLSConfig"), "tls_config");
+        assert_eq!(snake_case("HTTPSPort"), "https_port");
+    }
+
+    /// And the ordinary cases are unchanged.
+    #[test]
+    fn ordinary_camel_case_is_unchanged() {
+        assert_eq!(snake_case("podIP"), "pod_ip");
+        assert_eq!(snake_case("nodeName"), "node_name");
+        assert_eq!(snake_case("apiGroups"), "api_groups");
+        assert_eq!(snake_case("resourceNames"), "resource_names");
+        assert_eq!(snake_case("verbs"), "verbs");
+    }
 }
 
 #[cfg(test)]

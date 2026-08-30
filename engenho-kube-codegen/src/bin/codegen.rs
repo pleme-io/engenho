@@ -18,7 +18,7 @@ use clap::Parser;
 
 use engenho_kube_codegen::{
     KIND_CATALOG, KindEntry, OpenApiDoc, SchemaView, emit_catalog, emit_kind_typed, emit_module,
-    emit_shared_module, shared_substructs,
+    emit_shared_module, format_source, shared_substructs,
 };
 
 #[derive(Parser, Debug)]
@@ -135,6 +135,7 @@ fn main() -> Result<()> {
             .collect();
         let shared = shared_substructs(&kind_keys, &kind_names, &schemas);
         let shared_src = emit_shared_module(&shared, KIND_CATALOG);
+        let shared_src = format_source(&shared_src)?;
         let shared_target = args.output.join("types.rs");
         if args.check {
             let existing = std::fs::read_to_string(&shared_target).unwrap_or_default();
@@ -163,6 +164,7 @@ fn main() -> Result<()> {
                 anyhow::anyhow!("kind {:?} not in merged schemas", entry.openapi_key)
             })?;
             let rust = emit_kind_typed(entry, view, &schemas);
+            let rust = format_source(&rust)?;
             let target = module_dir.join(format!("{}.rs", entry.kind.to_lowercase()));
             if args.check {
                 let existing = std::fs::read_to_string(&target).unwrap_or_default();
@@ -178,6 +180,7 @@ fn main() -> Result<()> {
 
         // Emit module-level mod.rs.
         let mod_rs = emit_module(module, entries);
+        let mod_rs = format_source(&mod_rs)?;
         let mod_target = module_dir.join("mod.rs");
         if args.check {
             let existing = std::fs::read_to_string(&mod_target).unwrap_or_default();
@@ -197,6 +200,7 @@ fn main() -> Result<()> {
     // discovery from ONE source. Plural = entry.resource verbatim.
     {
         let catalog_src = emit_catalog(KIND_CATALOG);
+        let catalog_src = format_source(&catalog_src)?;
         let catalog_target = args.output.join("catalog.rs");
         if args.check {
             let existing = std::fs::read_to_string(&catalog_target).unwrap_or_default();

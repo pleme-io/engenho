@@ -18,6 +18,12 @@ serde_json  = { workspace = true }
 serde_yaml  = { workspace = true }
 anyhow      = "1.0"
 clap        = { version = "4.5", features = ["derive"] }
+# Pure-Rust formatting of the emitted source. Deliberately NOT a `rustfmt`
+# subprocess: the output must be byte-identical on every machine for the
+# --check determinism contract to mean anything, and a subprocess would make
+# it depend on whichever rustfmt happens to be on PATH.
+prettyplease = "0.2"
+syn          = { version = "2.0", features = ["full", "parsing"] }
 
 [[bin]]
 name = "engenho-kube-codegen"
