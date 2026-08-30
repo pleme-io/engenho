@@ -30,6 +30,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod audit;
 pub mod authn;
 pub mod authz;
 pub mod coords;
