@@ -585,6 +585,59 @@ impl ContainerRuntime for FakeBackend {
 // PodmanBackend — shells out to `podman` for local Mac/Linux
 // =================================================================
 
+/// Inject the Kubernetes service-discovery environment every container
+/// gets from upstream's kubelet.
+///
+/// `kube-rs`, client-go and every other in-cluster client find the API
+/// server by reading `KUBERNETES_SERVICE_HOST` and
+/// `KUBERNETES_SERVICE_PORT`. Nothing in engenho set them, so
+/// `Client::try_default()` fell through in-cluster detection to a
+/// kubeconfig lookup and died. Measured 2026-08-30 with the real
+/// pangea-operator, which started, logged its version, and exited 1:
+///
+/// ```text
+/// Error: Kube(InferConfig(InferConfigError {
+///     in_cluster: ReadEnvironmentVariable(NotPresent),
+///     kubeconfig: ReadConfig(NotFound, "/app/.kube/config") }))
+/// ```
+///
+/// The legacy Docker-link-style variables are emitted too. They are
+/// deprecated and still read by older clients, and their absence is a
+/// silent misconfiguration rather than an error.
+///
+/// A user-declared value WINS: upstream injects the service block
+/// first and lets the pod's own `env` override it, which is how an
+/// operator points a workload at a different API server.
+///
+/// NOT SUFFICIENT ON ITS OWN. `Config::incluster()` also needs the
+/// projected ServiceAccount token and CA at
+/// `/var/run/secrets/kubernetes.io/serviceaccount/`, which is the
+/// separate SA-token brick. This closes the half that is cheap and
+/// leaves the half that is not.
+pub fn inject_kubernetes_service_env(env: &mut BTreeMap<String, String>, host: &str, port: u16) {
+    let port_s = port.to_string();
+    let tcp = format!("tcp://{host}:{port}");
+    for (k, v) in [
+        ("KUBERNETES_SERVICE_HOST", host.to_string()),
+        ("KUBERNETES_SERVICE_PORT", port_s.clone()),
+        ("KUBERNETES_SERVICE_PORT_HTTPS", port_s.clone()),
+        ("KUBERNETES_PORT", tcp.clone()),
+        (&format!("KUBERNETES_PORT_{port}_TCP"), tcp),
+        (
+            &format!("KUBERNETES_PORT_{port}_TCP_PROTO"),
+            "tcp".to_string(),
+        ),
+        (&format!("KUBERNETES_PORT_{port}_TCP_PORT"), port_s),
+        (
+            &format!("KUBERNETES_PORT_{port}_TCP_ADDR"),
+            host.to_string(),
+        ),
+    ] {
+        // A pod that declares the variable itself keeps its value.
+        env.entry(k.to_string()).or_insert(v);
+    }
+}
+
 /// `--pull` policy passed to `podman run`. Typed so the backend has ONE
 /// extensible knob for image-pull behavior instead of a hard-coded flag.
 ///
@@ -760,6 +813,16 @@ pub struct PodmanBackend {
     pub binary: String,
     /// `--pull` policy for `podman run` (default [`PullPolicy::Never`]).
     pub pull_policy: PullPolicy,
+    /// The API server's `(host, port)`, injected into EVERY container as the
+    /// `KUBERNETES_SERVICE_*` block.
+    ///
+    /// A node-level fact, like `network` and `pull_policy`, which is why it
+    /// lives here rather than being stamped per pod. It was first written at
+    /// ONE of the kubelet's three `backend.start` call sites and therefore
+    /// missed the restart path — a crash-looping pod came back without the
+    /// variables it crashed for lacking. Injecting at the single point every
+    /// start converges on is the fix, not three stamps.
+    pub kubernetes_service: Option<(String, u16)>,
     /// Optional explicit `REGISTRY_AUTH_FILE` value. `None` (the default)
     /// inherits the spawned process env — production reads the operator's
     /// ambient `REGISTRY_AUTH_FILE`. `Some(path)` forces it explicitly so
@@ -776,6 +839,7 @@ impl Default for PodmanBackend {
         Self {
             binary: "podman".to_string(),
             pull_policy: PullPolicy::Never,
+            kubernetes_service: None,
             registry_auth_file: None,
             network: PodmanNetwork::default(),
         }
@@ -799,6 +863,13 @@ impl PodmanBackend {
             binary: binary.into(),
             ..Self::default()
         }
+    }
+
+    /// Builder: set the API-server coordinates injected into every container.
+    #[must_use]
+    pub fn with_kubernetes_service(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.kubernetes_service = Some((host.into(), port));
+        self
     }
 
     /// Builder: set the `--pull` policy.
@@ -904,8 +975,19 @@ impl PodmanBackend {
             argv.push("-v".to_string());
             argv.push(spec_str);
         }
+        // The API-server coordinates every in-cluster client reads, merged
+        // into a COPY so the pod's own declarations still win and the stored
+        // spec is never mutated by rendering it.
+        let env = match &self.kubernetes_service {
+            Some((host, port)) => {
+                let mut merged = spec.env.clone();
+                inject_kubernetes_service_env(&mut merged, host, *port);
+                merged
+            }
+            None => spec.env.clone(),
+        };
         // BTreeMap iteration is sorted → deterministic env ordering.
-        for (k, v) in &spec.env {
+        for (k, v) in &env {
             argv.push("-e".to_string());
             argv.push(format!("{k}={v}"));
         }
@@ -2370,5 +2452,93 @@ mod tests {
             s.pod_ip.is_none(),
             "empty per-network IP must yield pod_ip None"
         );
+    }
+}
+
+#[cfg(test)]
+mod kubernetes_service_env_tests {
+    use super::inject_kubernetes_service_env;
+    use std::collections::BTreeMap;
+
+    /// Every in-cluster client finds the API server through these. Nothing
+    /// set them, so the real pangea-operator started, logged its version and
+    /// exited 1 on `InferConfigError { in_cluster: NotPresent }`.
+    #[test]
+    fn the_service_coordinates_are_injected() {
+        let mut env = BTreeMap::new();
+        inject_kubernetes_service_env(&mut env, "10.96.0.1", 443);
+        assert_eq!(
+            env.get("KUBERNETES_SERVICE_HOST").map(String::as_str),
+            Some("10.96.0.1")
+        );
+        assert_eq!(
+            env.get("KUBERNETES_SERVICE_PORT").map(String::as_str),
+            Some("443")
+        );
+        assert_eq!(
+            env.get("KUBERNETES_SERVICE_PORT_HTTPS").map(String::as_str),
+            Some("443")
+        );
+    }
+
+    /// The deprecated Docker-link variables are emitted too — older clients
+    /// still read them, and their absence is a silent misconfiguration.
+    #[test]
+    fn the_legacy_link_variables_are_emitted() {
+        let mut env = BTreeMap::new();
+        inject_kubernetes_service_env(&mut env, "10.96.0.1", 443);
+        assert_eq!(
+            env.get("KUBERNETES_PORT").map(String::as_str),
+            Some("tcp://10.96.0.1:443")
+        );
+        assert_eq!(
+            env.get("KUBERNETES_PORT_443_TCP").map(String::as_str),
+            Some("tcp://10.96.0.1:443")
+        );
+        assert_eq!(
+            env.get("KUBERNETES_PORT_443_TCP_PROTO").map(String::as_str),
+            Some("tcp")
+        );
+        assert_eq!(
+            env.get("KUBERNETES_PORT_443_TCP_PORT").map(String::as_str),
+            Some("443")
+        );
+        assert_eq!(
+            env.get("KUBERNETES_PORT_443_TCP_ADDR").map(String::as_str),
+            Some("10.96.0.1")
+        );
+    }
+
+    /// A pod that declares the variable itself KEEPS its own value —
+    /// upstream injects first and lets the pod override, which is how an
+    /// operator points a workload at a different API server.
+    #[test]
+    fn a_pod_declared_value_is_never_overwritten() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "KUBERNETES_SERVICE_HOST".to_string(),
+            "my-proxy".to_string(),
+        );
+        inject_kubernetes_service_env(&mut env, "10.96.0.1", 443);
+        assert_eq!(
+            env.get("KUBERNETES_SERVICE_HOST").map(String::as_str),
+            Some("my-proxy"),
+            "injection must not clobber a pod's own declaration"
+        );
+        // ...while everything it did NOT declare is still injected.
+        assert_eq!(
+            env.get("KUBERNETES_SERVICE_PORT").map(String::as_str),
+            Some("443")
+        );
+    }
+
+    /// The port is carried into the variable NAMES, not just the values, so
+    /// a non-443 API server produces the right legacy keys.
+    #[test]
+    fn a_non_default_port_reaches_the_variable_names() {
+        let mut env = BTreeMap::new();
+        inject_kubernetes_service_env(&mut env, "10.0.0.5", 6443);
+        assert!(env.contains_key("KUBERNETES_PORT_6443_TCP"));
+        assert!(!env.contains_key("KUBERNETES_PORT_443_TCP"));
     }
 }

@@ -22,11 +22,34 @@ pub fn make_container_runtime(
     kind: KubeletBackendKind,
     podman_binary: Option<&str>,
 ) -> Arc<dyn ContainerRuntime> {
+    make_container_runtime_with_apiserver(kind, podman_binary, None)
+}
+
+/// As [`make_container_runtime`], plus the API-server `(host, port)` injected
+/// into every container as the `KUBERNETES_SERVICE_*` block.
+///
+/// Separate constructor rather than a changed signature: every existing
+/// caller keeps working and gets `None`, which is the pre-existing behaviour.
+/// A `None` here means an in-cluster client sees no service env and reports
+/// "no kubeconfig" — correct-but-useless, and exactly what the real
+/// pangea-operator hit.
+#[must_use]
+pub fn make_container_runtime_with_apiserver(
+    kind: KubeletBackendKind,
+    podman_binary: Option<&str>,
+    apiserver: Option<(String, u16)>,
+) -> Arc<dyn ContainerRuntime> {
     match kind {
-        KubeletBackendKind::Podman => match podman_binary {
-            Some(path) => Arc::new(PodmanBackend::with_binary(path)),
-            None => Arc::new(PodmanBackend::new()),
-        },
+        KubeletBackendKind::Podman => {
+            let b = match podman_binary {
+                Some(path) => PodmanBackend::with_binary(path),
+                None => PodmanBackend::new(),
+            };
+            Arc::new(match apiserver {
+                Some((h, p)) => b.with_kubernetes_service(h, p),
+                None => b,
+            })
+        }
         KubeletBackendKind::Fake => Arc::new(FakeBackend::new()),
     }
 }
