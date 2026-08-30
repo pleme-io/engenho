@@ -96,11 +96,44 @@ engenho_substrate::impl_error_kind! {
     }
 }
 
+/// Whether a backend actually INSTALLS the policy datapath, or only
+/// computes it.
+///
+/// ★ THE SAME SPLIT `DatapathInstall` MAKES FOR kube-proxy, AND FOR THE
+/// SAME REASON. A NetworkPolicy that is parsed, selected and tracked but
+/// never installed in a kernel allows every packet it claims to deny. That
+/// is not a partial implementation, it is the opposite of the stated
+/// semantics — and it is the one failure shape where silence is a security
+/// claim rather than a missing feature. Making the distinction a value on
+/// the trait means a caller cannot hold an enforcer without being able to
+/// ask which of the two it got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyDatapath {
+    /// Rules are computed, selected and observable, but NO packet filter
+    /// is installed anywhere. The fail-safe state on a topology that
+    /// cannot host the filter (engenho on darwin, pods inside a podman
+    /// VM). Traffic is UNRESTRICTED; the policy is a plan, not a control.
+    Computed,
+    /// The backend installed the filter (iptables / eBPF / a Cilium CRD a
+    /// running cilium-operator loads). Traffic is actually restricted.
+    Installed,
+}
+
 /// Pluggable network-policy backend trait.
 #[async_trait]
 pub trait NetworkPolicyEnforcer: Send + Sync {
     /// Backend identifier for telemetry.
     fn name(&self) -> &'static str;
+
+    /// Whether this backend installs the datapath or only computes it.
+    ///
+    /// Defaults to [`PolicyDatapath::Installed`] — the kernel backends —
+    /// so a NEW backend that forgets to override is claimed to enforce and
+    /// will be caught by the honesty test, rather than defaulting to the
+    /// permissive answer that nobody notices.
+    fn datapath(&self) -> PolicyDatapath {
+        PolicyDatapath::Installed
+    }
 
     /// Install / refresh a rule. Idempotent.
     ///
@@ -168,6 +201,12 @@ impl FakeNetworkPolicyEnforcer {
 impl NetworkPolicyEnforcer for FakeNetworkPolicyEnforcer {
     fn name(&self) -> &'static str {
         "fake"
+    }
+
+    /// A test double installs nothing, and neither does the darwin
+    /// topology it stands in for.
+    fn datapath(&self) -> PolicyDatapath {
+        PolicyDatapath::Computed
     }
 
     async fn upsert(&self, rule: &NetworkPolicyRule) -> Result<(), NetworkPolicyError> {
@@ -438,5 +477,83 @@ mod tests {
     fn backend_names_are_stable() {
         assert_eq!(FakeNetworkPolicyEnforcer::new().name(), "fake");
         assert_eq!(CiliumNetworkPolicyAdapter::new("/tmp").name(), "cilium");
+    }
+}
+
+// =================================================================
+// ComputedNetworkPolicyEnforcer — the honest PRODUCTION backend for a
+// topology that cannot host a packet filter.
+// =================================================================
+
+/// The production backend on a host with no filter to install into
+/// (engenho on darwin, pods inside a podman VM).
+///
+/// ★ WHY THIS EXISTS SEPARATELY FROM `FakeNetworkPolicyEnforcer` WHEN THE
+/// BEHAVIOUR IS IDENTICAL. It is not duplicated — the tracking is
+/// DELEGATED to the same implementation. What differs is the only two
+/// things that matter at a boundary: the `name()` that appears in an
+/// operator-facing event and in logs, and the fact that wiring a struct
+/// called `Fake…` into a production runtime is how a test double quietly
+/// becomes the shipped answer. A backend an operator sees named `fake` in
+/// a warning is a bug report; one named `computed` is the truth.
+#[derive(Default, Clone)]
+pub struct ComputedNetworkPolicyEnforcer {
+    inner: FakeNetworkPolicyEnforcer,
+}
+
+impl ComputedNetworkPolicyEnforcer {
+    /// Fresh backend.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl NetworkPolicyEnforcer for ComputedNetworkPolicyEnforcer {
+    fn name(&self) -> &'static str {
+        "computed"
+    }
+
+    /// Computed, always. This backend has no path to `Installed`, so the
+    /// permissive answer cannot be reached by a configuration mistake.
+    fn datapath(&self) -> PolicyDatapath {
+        PolicyDatapath::Computed
+    }
+
+    async fn upsert(&self, rule: &NetworkPolicyRule) -> Result<(), NetworkPolicyError> {
+        self.inner.upsert(rule).await
+    }
+
+    async fn remove(&self, policy_id: &str) -> Result<(), NetworkPolicyError> {
+        self.inner.remove(policy_id).await
+    }
+
+    async fn list(&self) -> Result<Vec<NetworkPolicyRule>, NetworkPolicyError> {
+        self.inner.list().await
+    }
+}
+
+#[cfg(test)]
+mod computed_backend_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_production_computed_backend_tracks_but_never_claims_enforcement() {
+        let e = ComputedNetworkPolicyEnforcer::new();
+        assert_eq!(e.datapath(), PolicyDatapath::Computed);
+        // The operator-facing name must not be the word "fake": that is the
+        // whole reason this type is not the test double.
+        assert_eq!(e.name(), "computed");
+        e.upsert(&NetworkPolicyRule {
+            policy_id: "ns/p#ingress:0".into(),
+            pod_selector: BTreeMap::new(),
+            direction: Direction::Ingress,
+            allowed_peers: vec![],
+            allowed_ports: vec![],
+        })
+        .await
+        .unwrap();
+        assert_eq!(e.list().await.unwrap().len(), 1, "rules are still tracked");
     }
 }

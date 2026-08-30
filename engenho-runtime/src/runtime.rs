@@ -1692,6 +1692,38 @@ fn spawn_drivers(
         );
     }
 
+    // The event sink, built once and shared by every producer below. It
+    // lives here rather than inside the kubelet block because the
+    // NetworkPolicy controller needs it too, and two sinks over one store
+    // would be two independent lossy buffers for one cluster's events.
+    let events: Arc<dyn engenho_controllers::event_recorder::EventSink> = Arc::new(
+        engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
+            store: store.clone(),
+        })),
+    );
+
+    // NetworkPolicy: translate every policy into enforcer rules AND record
+    // whether they are actually enforced. Wired HERE, at assembly, for the
+    // same reason the event sink is: this is the only layer holding both
+    // the store and the enforcer. Without it a default-deny policy applies
+    // cleanly and restricts nothing, with no object anywhere saying so —
+    // the one gap in this codebase where silence is a SECURITY claim.
+    //
+    // The backend is `ComputedNetworkPolicyEnforcer` because engenho runs
+    // on darwin with pods in a podman VM: there is no kernel here to
+    // install a filter into. It is a deliberate, named, operator-visible
+    // state, not a stub — see `PolicyDatapath`.
+    {
+        let enforcer =
+            Arc::new(engenho_controllers::network_policy::ComputedNetworkPolicyEnforcer::new());
+        let c = engenho_controllers::network_policy_controller::NetworkPolicyController::new(
+            store.clone(),
+            enforcer,
+        )
+        .with_event_sink(events.clone());
+        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["NetworkPolicy"])).spawn());
+    }
+
     // Kubelet: bound Pod → container via the backend. Watches Pods. Built
     // ONCE as an Arc<Kubelet> so the SAME instance is shared between its
     // WatchDriver (via the `Controller for Arc<C>` blanket impl) and the
@@ -1701,11 +1733,6 @@ fn spawn_drivers(
     // keeps its NullEventSink and the cluster cannot explain itself: that is
     // precisely the state in which a pod reached 149 restarts and `kubectl
     // describe` had nothing to say about it.
-    let events: Arc<dyn engenho_controllers::event_recorder::EventSink> = Arc::new(
-        engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
-            store: store.clone(),
-        })),
-    );
     let kubelet = Arc::new(
         Kubelet::new(
             store.clone(),
@@ -1847,7 +1874,7 @@ mod tests {
         // converging that kind), so the arithmetic here is the tripwire.
         // Moving it is correct ONLY alongside an intentional change to the
         // driver set — which is what added served_capability.
-        assert_eq!(rt.drivers.len(), 16);
+        assert_eq!(rt.drivers.len(), 17);
         rt.shutdown().await.unwrap();
     }
 
@@ -1944,7 +1971,7 @@ mod tests {
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(rt.drivers.len(), 15);
+        assert_eq!(rt.drivers.len(), 16);
         rt.shutdown().await.unwrap();
     }
 }
