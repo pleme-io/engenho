@@ -1627,9 +1627,11 @@ version = "0.53.55"
 dependencies = [
  "anyhow",
  "clap",
+ "prettyplease",
  "serde",
  "serde_json",
  "serde_yaml",
+ "syn 2.0.117",
 ]
 
 [[package]]
