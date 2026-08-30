@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "5aa1a239831ab726dd2455ff7b537be56e4565e311b64d767bc575b5e34f64c7",
+  "cargo_lock_sha256": "c06720a3b5f1f1b4afc51265aca922c163ebc3f095723827d4429daf4ffe95f1",
   "manifest_sha256": {
     "Cargo.toml": "395d519348f6dbbf8c0f51c570254d695967e6cff8cff83739f5aa78acc56adc",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
@@ -9,7 +9,7 @@
     "engenho-config/Cargo.toml": "b96a79e9008ee6a636df2a80815df844ce2081fac132eeddd6e4d60e87055b88",
     "engenho-controllers/Cargo.toml": "d7e6db6f9b70d927029a5f5436736b8d139de75867c5379362f23245960b0462",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
-    "engenho-etcd/Cargo.toml": "3d04c235ef9b9decb845adc207c3dc000b7cf7578b53833751714f7c636824f2",
+    "engenho-etcd/Cargo.toml": "98621f87c4fe809cc7c5b811a4befb0eb54eff750f7de681737cca1654286325",
     "engenho-fonte-cli/Cargo.toml": "650eb2c143e2d16dd0f02a56a9f73035f83652349b83daf33f9caa582c8ca8a7",
     "engenho-fonte/Cargo.toml": "a074bc92449afc5b002c35965f1c0e8f86754064d7bf7e6d86cb7c496c5bfd1e",
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
@@ -4711,8 +4711,38 @@
       "engenho-etcd-0.53.31": {
         "runtime_dependencies": [
           {
+            "name": "bytes",
+            "package_key": "bytes-1.11.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_store",
+            "package_key": "engenho-store-0.53.31",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "engenho_types",
             "package_key": "engenho-types-0.53.31",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "prost",
+            "package_key": "prost-0.14.4",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4731,7 +4761,28 @@
             "tree": "target"
           }
         ],
-        "build_dependencies": [],
+        "build_dependencies": [
+          {
+            "name": "prost_build",
+            "package_key": "prost-build-0.14.4",
+            "kind": "build",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          },
+          {
+            "name": "protox",
+            "package_key": "protox-0.9.1",
+            "kind": "build",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          }
+        ],
         "features": []
       },
       "engenho-fonte-0.53.31": {
@@ -7021,6 +7072,11 @@
         "features": []
       },
       "find-msvc-tools-0.1.9": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
+      "fixedbitset-0.5.7": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": []
@@ -16149,6 +16205,11 @@
           "os-poll"
         ]
       },
+      "multimap-0.10.1": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
       "munge-0.4.7": {
         "runtime_dependencies": [
           {
@@ -17367,6 +17428,47 @@
           "std"
         ]
       },
+      "petgraph-0.8.3": {
+        "runtime_dependencies": [
+          {
+            "name": "fixedbitset",
+            "package_key": "fixedbitset-0.5.7",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "hashbrown",
+            "package_key": "hashbrown-0.15.5",
+            "kind": "normal",
+            "features": [
+              "default-hasher",
+              "inline-more"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "indexmap",
+            "package_key": "indexmap-2.14.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "std"
+        ]
+      },
       "pgvector-0.4.2": {
         "runtime_dependencies": [
           {
@@ -17630,6 +17732,34 @@
           "simd",
           "std"
         ]
+      },
+      "prettyplease-0.2.37": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.117",
+            "kind": "normal",
+            "features": [
+              "full"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
       },
       "proc-macro-crate-3.5.0": {
         "runtime_dependencies": [
@@ -17979,6 +18109,134 @@
           "default",
           "derive",
           "std"
+        ]
+      },
+      "prost-build-0.14.4": {
+        "runtime_dependencies": [
+          {
+            "name": "heck",
+            "package_key": "heck-0.5.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "itertools",
+            "package_key": "itertools-0.14.0",
+            "kind": "normal",
+            "features": [
+              "use_alloc"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "log",
+            "package_key": "log-0.4.30",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "multimap",
+            "package_key": "multimap-0.10.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "petgraph",
+            "package_key": "petgraph-0.8.3",
+            "kind": "normal",
+            "features": [
+              "std"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "prettyplease",
+            "package_key": "prettyplease-0.2.37",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "prost",
+            "package_key": "prost-0.14.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "prost_types",
+            "package_key": "prost-types-0.14.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "regex",
+            "package_key": "regex-1.12.3",
+            "kind": "normal",
+            "features": [
+              "std",
+              "unicode-bool"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.117",
+            "kind": "normal",
+            "features": [
+              "full"
+            ],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tempfile",
+            "package_key": "tempfile-3.27.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "default",
+          "format"
         ]
       },
       "prost-derive-0.14.4": {
@@ -37283,6 +37541,7 @@
     },
     "engenho-etcd-0.53.31": {
       "edition": "2024",
+      "build_script": "build.rs",
       "lib_target": {
         "name": "engenho_etcd",
         "path": "src/lib.rs"
@@ -37450,6 +37709,9 @@
     },
     "find-msvc-tools-0.1.9": {
       "edition": "2018"
+    },
+    "fixedbitset-0.5.7": {
+      "edition": "2021"
     },
     "fjall-2.11.2": {
       "edition": "2021"
@@ -38050,6 +38312,9 @@
     "mio-1.2.1": {
       "edition": "2021"
     },
+    "multimap-0.10.1": {
+      "edition": "2015"
+    },
     "munge-0.4.7": {
       "edition": "2021"
     },
@@ -38209,6 +38474,9 @@
     "percent-encoding-2.3.2": {
       "edition": "2018"
     },
+    "petgraph-0.8.3": {
+      "edition": "2021"
+    },
     "pgvector-0.4.2": {
       "edition": "2021"
     },
@@ -38251,6 +38519,11 @@
     "ppv-lite86-0.2.21": {
       "edition": "2021"
     },
+    "prettyplease-0.2.37": {
+      "edition": "2021",
+      "build_script": "build.rs",
+      "links": "prettyplease02"
+    },
     "proc-macro-crate-3.5.0": {
       "edition": "2021"
     },
@@ -38276,6 +38549,9 @@
       "edition": "2021"
     },
     "prost-0.14.4": {
+      "edition": "2021"
+    },
+    "prost-build-0.14.4": {
       "edition": "2021"
     },
     "prost-derive-0.14.4": {
