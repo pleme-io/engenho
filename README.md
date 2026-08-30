@@ -136,7 +136,7 @@ what answers it is ours.
 | etcd v3 gRPC — reads | `etcdctl get`, backup/DR inspection | **SHIPPED (read path)** — `KV.Range` served over tonic: point reads, prefix scans, intervals, `limit`/`more`/`count`, `keys_only`. Wire types generated from upstream protos; `/registry` bijection verified against a real apiserver's 699-key keyspace |
 | etcd v3 gRPC — writes | `--etcd-servers` (a real kube-apiserver) | **REFUSED BY DESIGN** — `Put`/`Txn`/`DeleteRange`/`Compact` return a typed `Unimplemented` naming the reason: writes go through engenho's apiserver, which owns admission, defaulting and validation. Serving them raw would let a client store an object no apiserver would have admitted. The store prerequisites (multi-key `Txn`, point-in-time reads, explicit `Compact`) are landed and tested, so opening the write path is a policy decision, not missing machinery |
 | etcd v3 gRPC — `Maintenance` | `etcdctl endpoint status/health` | **SHIPPED** — `Status`/`Alarm`/`Defragment` served. `Snapshot` REFUSED: `etcdctl snapshot save` writes whatever it receives and reports success, so streaming non-restorable bytes hands an operator a backup that fails only during a disaster |
-| etcd v3 gRPC — `Watch` | `etcdctl watch`, cache-building clients | **PARTIAL** — response shapes (created ack, events, compaction-cancel carrying `compact_revision`) built and tested; the streaming RPC REFUSES, because a watch that delivers history then goes quiet diverges a client's cache silently and forever |
+| etcd v3 gRPC — `Watch` | `etcdctl watch`, cache-building clients | **SHIPPED** — multiplexed bidi streaming: many watches per gRPC stream, server-assigned ids, subscribe-before-replay, live event fan-out, cancel ack, progress requests, and a compaction cancel carrying `compact_revision`. A store that cannot subscribe gets the watch REFUSED, never history-then-silence |
 | etcd v3 gRPC — `Lease` | lease-holding clients | **ABSENT** — traits generated, not implemented |
 | kubelet API :10250 — logs/pods | `kubectl logs`, node inspection | **SHIPPED (routes)** — `/containerLogs/{ns}/{pod}/{container}`, `/pods`, `/runningpods/`, `/healthz` on upstream's exact paths and camelCase query spelling. Not yet bound to a listening socket by the runtime |
 | kubelet API :10250 — exec/attach/portForward | `kubectl exec/cp/port-forward` | **REFUSED (501, reasoned)** — needs SPDY or WebSocket stream multiplexing; a half-implemented stream protocol hangs a client rather than failing it |
@@ -146,6 +146,9 @@ what answers it is ours.
 | CRI (`runtime.v1`) | runtime substitutability | **ABSENT** — drives podman directly |
 | CNI / CSI | network + storage plugins | **ABSENT** — nothing wired |
 | Validating admission webhooks | policy engines (Kyverno, Gatekeeper) | **SHIPPED** — run after mutation, may not mutate |
+| ServiceAccount tokens | every in-cluster client | **SHIPPED** — bound tokens with mandatory expiry, audience checked, signature verified before any claim is read |
+| CRD conversion | multi-version CRDs | **SHIPPED** — `None` strategy relabels; a webhook strategy fails the read rather than falling back |
+| Audit logging | compliance, incident response | **SHIPPED** — upstream's four levels; secrets capped at `Metadata` by a first-match rule |
 | API validation (core kinds) | every client, every controller below it | **SHIPPED** — Pod + Service |
 | Scheduler placement rules | HA guarantees an operator writes | **SHIPPED** — cordon, `nodeSelector`, `nodeName`, taints/tolerations, pod affinity/anti-affinity, topology spread. **Preemption absent** |
 | DNS SRV | port-discovering clients (StatefulSet peers, etcd, Kafka) | **SHIPPED** — derived from a Service's named ports |

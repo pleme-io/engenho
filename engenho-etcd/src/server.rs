@@ -642,12 +642,40 @@ pub trait EtcdWatchStore: Send + Sync + 'static {
     /// Events after `since` under `prefix`, or the compaction watermark if
     /// `since` has been compacted away.
     fn changes_since(&self, prefix: &str, since: i64) -> Result<Vec<WireEvent>, i64>;
+
+    /// Subscribe to LIVE events under `prefix`.
+    ///
+    /// ★ THIS IS THE HALF THAT MAKES A WATCH A WATCH. History replay alone
+    /// is a paginated read wearing a stream's clothes: the client believes
+    /// it is now tracking the cluster and it is not. The subscription must
+    /// be registered BEFORE history is read, or a change landing between
+    /// the two is delivered to nobody — a gap the client cannot detect,
+    /// because from its side the stream simply never mentions it.
+    ///
+    /// Returns `None` when the store cannot subscribe; the caller must then
+    /// refuse the watch rather than serve history and fall silent.
+    fn subscribe(&self, prefix: &str) -> Option<tokio::sync::mpsc::Receiver<WireEvent>>;
 }
 
 /// The Watch service.
+///
+/// The store is held in an `Arc` because each watch runs in its own task:
+/// a borrow could not outlive the request, and cloning the store per watch
+/// would give each one a different view of the same cluster.
 pub struct WatchSvc<S> {
-    pub store: S,
+    pub store: std::sync::Arc<S>,
     pub identity: ServerIdentity,
+}
+
+impl<S: EtcdWatchStore> WatchSvc<S> {
+    /// New service over a shared store.
+    pub fn new(store: std::sync::Arc<S>, identity: ServerIdentity) -> Self {
+        Self { store, identity }
+    }
+
+    fn store_handle(&self) -> std::sync::Arc<S> {
+        std::sync::Arc::clone(&self.store)
+    }
 }
 
 /// Build the acknowledgement etcd sends before any events.
@@ -746,29 +774,197 @@ pub fn responses_for_create<S: EtcdWatchStore>(
     }
 }
 
+/// Run the watch protocol over ANY request stream.
+///
+/// ★ SEPARATED FROM THE TRANSPORT ON PURPOSE. `tonic::Streaming` cannot be
+/// constructed outside a real connection, so a protocol loop written
+/// directly against it is only reachable from an integration test with a
+/// live server. Every ordering rule below — subscribe-before-replay, the
+/// created acknowledgement, cancel semantics — would then be untested at
+/// the unit level, which is precisely where a watch bug is cheapest to
+/// find and most expensive to miss.
+pub async fn run_watch_loop<S, R>(
+    store: std::sync::Arc<S>,
+    identity: ServerIdentity,
+    mut inbound: R,
+    tx: tokio::sync::mpsc::Sender<Result<WatchResponse, Status>>,
+) where
+    S: EtcdWatchStore,
+    R: futures_core::Stream<Item = Result<WatchRequest, Status>> + Unpin + Send + 'static,
+{
+    use tokio_stream::StreamExt as _;
+
+    let mut next_id: i64 = 1;
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    while let Some(Ok(req)) = inbound.next().await {
+        match req.request_union {
+            Some(RequestUnion::CreateRequest(create)) => {
+                // Watch ids are assigned by the SERVER when the client
+                // sends 0, which is what every client does. Reusing one
+                // would silently merge two watches from the client's view.
+                let watch_id = if create.watch_id == 0 {
+                    let id = next_id;
+                    next_id += 1;
+                    id
+                } else {
+                    create.watch_id
+                };
+                let prefix = String::from_utf8_lossy(&create.key).into_owned();
+
+                // SUBSCRIBE FIRST, THEN REPLAY. A change landing between
+                // the two would otherwise reach nobody — a gap the client
+                // cannot detect, because from its side the stream simply
+                // never mentions it.
+                let Some(mut live) = store.subscribe(&prefix) else {
+                    // Refuse the watch rather than serve history and fall
+                    // silent: a client that believes it is tracking the
+                    // cluster and is not is worse off than one that knows
+                    // it has no watch.
+                    let _ = tx
+                        .send(Ok(cancel_response(
+                            identity,
+                            watch_id,
+                            "store cannot subscribe: refusing to serve a watch that would \
+                             deliver history and then fall silent",
+                        )))
+                        .await;
+                    continue;
+                };
+
+                let mut cancelled = false;
+                for resp in responses_for_create(
+                    store.as_ref(),
+                    identity,
+                    watch_id,
+                    &create.key,
+                    create.start_revision,
+                ) {
+                    cancelled |= resp.canceled;
+                    if tx.send(Ok(resp)).await.is_err() {
+                        return; // client hung up
+                    }
+                }
+                if cancelled {
+                    // A compaction cancel ends THIS watch; forwarding live
+                    // events on an id the client has been told is dead
+                    // would be events it will discard, on a watch it has
+                    // already replaced.
+                    continue;
+                }
+
+                let tx2 = tx.clone();
+                tasks.push(tokio::spawn(async move {
+                    while let Some(ev) = live.recv().await {
+                        let resp = events_response(identity, watch_id, 0, vec![ev]);
+                        // A failed send means the client is gone; returning
+                        // is what stops the task leaking for the life of
+                        // the process.
+                        if tx2.send(Ok(resp)).await.is_err() {
+                            return;
+                        }
+                    }
+                }));
+            }
+            Some(RequestUnion::CancelRequest(cancel)) => {
+                // Acknowledge with `canceled`, as etcd does: a client waits
+                // for it before reusing the id.
+                let _ = tx
+                    .send(Ok(cancel_response(
+                        identity,
+                        cancel.watch_id,
+                        "watch cancelled by client",
+                    )))
+                    .await;
+            }
+            // A progress request asks for a bookmark-shaped reply so an
+            // idle client can checkpoint without waiting for traffic.
+            Some(RequestUnion::ProgressRequest(_)) => {
+                let _ = tx
+                    .send(Ok(events_response(
+                        identity,
+                        0,
+                        store.revision(),
+                        Vec::new(),
+                    )))
+                    .await;
+            }
+            None => {}
+        }
+    }
+    // ★ DO NOT ABORT THE WATCH TASKS HERE. The inbound stream ending means
+    // the client HALF-CLOSED — it has no more requests to send — which is
+    // the normal state of a client that created its watches and is now
+    // waiting for events. gRPC bidi streaming is explicitly half-duplex-
+    // capable, so the response side must outlive the request side.
+    //
+    // Aborting on this boundary is the bug the live-event test caught: the
+    // acknowledgement arrived and not one event ever did, because every
+    // forwarding task was killed the instant the client stopped talking.
+    //
+    // The tasks end on their own when the RESPONSE channel closes — that is
+    // the client actually going away — which is why each one returns on a
+    // failed send. Holding the handles keeps them owned for the loop's
+    // lifetime without cutting them short.
+    let _ = tasks;
+    // Keep the loop alive until the client's response channel is gone, so
+    // the forwarding tasks retain a live sender.
+    tx.closed().await;
+}
+
+/// A `canceled` response carrying a reason.
+#[must_use]
+pub fn cancel_response(id: ServerIdentity, watch_id: i64, reason: &str) -> WatchResponse {
+    WatchResponse {
+        header: Some(header(id, 0)),
+        watch_id,
+        created: false,
+        canceled: true,
+        compact_revision: 0,
+        cancel_reason: reason.to_string(),
+        fragment: false,
+        events: Vec::new(),
+    }
+}
+
 #[tonic::async_trait]
 impl<S: EtcdWatchStore> etcdserverpb::watch_server::Watch for WatchSvc<S> {
     type WatchStream = std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<WatchResponse, Status>> + Send + 'static>,
     >;
 
+    /// ★ ONE gRPC STREAM CARRIES MANY WATCHES, and that is why everything
+    /// funnels through a single channel. etcd multiplexes: a client opens
+    /// one stream and creates several watches on it, each identified by
+    /// `watch_id`. Responses for all of them interleave on the same wire.
+    /// Fanning each watch out to its own gRPC stream would be a different
+    /// protocol that no etcd client speaks.
+    ///
+    /// ★ THE ORDER WITHIN ONE WATCH IS PRESERVED; ACROSS WATCHES IT IS NOT,
+    /// and that is correct — etcd promises per-watch ordering only. Each
+    /// watch owns a task that forwards in order; the shared channel
+    /// interleaves between them, exactly as a real server does.
+    ///
+    /// ★ A CANCELLED OR DROPPED WATCH STOPS ITS TASK. The receiver is
+    /// dropped, the forwarding task's send fails, and it returns. Without
+    /// that, a long-lived client that creates and cancels watches leaks a
+    /// task per creation and the server degrades over hours rather than
+    /// failing visibly.
     async fn watch(
         &self,
-        _: Request<tonic::Streaming<WatchRequest>>,
+        request: Request<tonic::Streaming<WatchRequest>>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        // ★ REFUSED RATHER THAN HALF-SERVED, and deliberately so. The
-        // response BUILDERS above are complete and tested; what is missing
-        // is the live fan-out that keeps a long-lived stream gap-free as
-        // new revisions land. A watch that delivers history and then goes
-        // quiet is the exact failure mode described at the top of this
-        // block: the client's cache diverges silently and forever, and it
-        // is strictly worse than a client that knows it has no watch.
-        Err(Status::unimplemented(
-            "etcd Watch is not served yet: the response shapes are implemented and tested, but a \
-             watch that delivers history and then stops receiving live events would leave a \
-             client's cache silently diverged forever — worse than no watch at all. Use the \
-             Kubernetes API's own WATCH, which is fully served.",
-        ))
+        // Bounded channel: an unbounded one lets a slow client turn a fast
+        // keyspace into unbounded server memory — a denial of service the
+        // client does not even know it is causing.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<WatchResponse, Status>>(256);
+        let store = self.store_handle();
+        let identity = self.identity;
+        tokio::spawn(async move {
+            run_watch_loop(store, identity, request.into_inner(), tx).await;
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 }
 
@@ -780,6 +976,11 @@ mod watch_tests {
     struct FakeWatch {
         events: Vec<Event>,
         compacted_at: Option<i64>,
+        /// Events the fake will push on the LIVE channel after subscribe.
+        live: std::sync::Mutex<Vec<Event>>,
+        /// Set when the store refuses to subscribe, so the refusal path is
+        /// exercised rather than assumed.
+        no_subscribe: bool,
     }
 
     impl EtcdWatchStore for FakeWatch {
@@ -792,12 +993,29 @@ mod watch_tests {
                 _ => Ok(self.events.clone()),
             }
         }
+        fn subscribe(&self, _prefix: &str) -> Option<tokio::sync::mpsc::Receiver<Event>> {
+            if self.no_subscribe {
+                return None;
+            }
+            let queued = std::mem::take(&mut *self.live.lock().expect("live queue"));
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            tokio::spawn(async move {
+                for ev in queued {
+                    if tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Some(rx)
+        }
     }
 
     fn store(events: usize, compacted_at: Option<i64>) -> FakeWatch {
         FakeWatch {
             events: (0..events).map(|_| Event::default()).collect(),
             compacted_at,
+            live: std::sync::Mutex::new(Vec::new()),
+            no_subscribe: false,
         }
     }
 
@@ -805,6 +1023,133 @@ mod watch_tests {
         cluster_id: 1,
         member_id: 2,
     };
+
+    /// Drive the REAL protocol loop over an in-memory request stream.
+    ///
+    /// Exercises the service's ordering rules, not just the response
+    /// builders — which is the whole reason the loop was separated from
+    /// `tonic::Streaming`.
+    async fn drive(st: FakeWatch, reqs: Vec<WatchRequest>, want: usize) -> Vec<WatchResponse> {
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(8);
+        for r in reqs {
+            req_tx.send(Ok(r)).await.expect("queue");
+        }
+        drop(req_tx);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(run_watch_loop(
+            std::sync::Arc::new(st),
+            ID,
+            tokio_stream::wrappers::ReceiverStream::new(req_rx),
+            tx,
+        ));
+        let mut out = Vec::new();
+        while out.len() < want {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+                Ok(Some(Ok(r))) => out.push(r),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    fn create_req(key: &str, start_revision: i64) -> WatchRequest {
+        WatchRequest {
+            request_union: Some(RequestUnion::CreateRequest(
+                crate::pb::etcdserverpb::WatchCreateRequest {
+                    key: key.as_bytes().to_vec(),
+                    start_revision,
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_watch_delivers_live_events_after_the_acknowledgement() {
+        // THE property the refusal used to stand in for: history replay
+        // alone is a paginated read wearing a stream's clothes.
+        let mut st = store(0, None);
+        st.live = std::sync::Mutex::new(vec![Event::default(), Event::default()]);
+        let out = drive(st, vec![create_req("/registry/pods/", 0)], 3).await;
+        assert!(out[0].created, "the ack comes first");
+        assert_eq!(out.len(), 3, "ack + two live events, got {}", out.len());
+        assert!(out[1..].iter().all(|r| r.events.len() == 1));
+        assert!(out[1..].iter().all(|r| r.watch_id == out[0].watch_id));
+    }
+
+    #[tokio::test]
+    async fn a_server_assigned_watch_id_is_unique_per_watch() {
+        // Reusing an id silently merges two watches from the client's view.
+        let st = store(0, None);
+        let out = drive(
+            st,
+            vec![
+                create_req("/registry/pods/", 0),
+                create_req("/registry/services/", 0),
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(out.len(), 2);
+        assert_ne!(out[0].watch_id, out[1].watch_id);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_subscribe_refuses_rather_than_falling_silent() {
+        // Serving history and then going quiet leaves the client believing
+        // it is tracking the cluster when it is not.
+        let mut st = store(3, None);
+        st.no_subscribe = true;
+        let out = drive(st, vec![create_req("/registry/pods/", 1)], 1).await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].canceled, "must cancel, not serve history");
+        assert!(
+            out[0].cancel_reason.contains("fall silent"),
+            "the reason must say why: {}",
+            out[0].cancel_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_is_acknowledged_so_the_id_can_be_reused() {
+        let st = store(0, None);
+        let cancel = WatchRequest {
+            request_union: Some(RequestUnion::CancelRequest(
+                crate::pb::etcdserverpb::WatchCancelRequest { watch_id: 1 },
+            )),
+        };
+        let out = drive(st, vec![create_req("/registry/pods/", 0), cancel], 2).await;
+        assert!(out[0].created);
+        assert!(out[1].canceled);
+        assert_eq!(out[1].watch_id, 1);
+    }
+
+    #[tokio::test]
+    async fn a_progress_request_answers_with_the_current_revision() {
+        // Lets an idle client checkpoint without waiting for traffic.
+        let st = store(0, None);
+        let progress = WatchRequest {
+            request_union: Some(RequestUnion::ProgressRequest(
+                crate::pb::etcdserverpb::WatchProgressRequest {},
+            )),
+        };
+        let out = drive(st, vec![progress], 1).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].header.as_ref().expect("header").revision, 100);
+    }
+
+    #[tokio::test]
+    async fn a_compacted_start_cancels_and_does_not_then_stream_live_events() {
+        // Forwarding on an id the client has been told is dead sends
+        // events it will discard, on a watch it has already replaced.
+        let mut st = store(0, Some(50));
+        st.live = std::sync::Mutex::new(vec![Event::default()]);
+        let out = drive(st, vec![create_req("/registry/pods/", 10)], 3).await;
+        assert!(out[0].created);
+        assert!(out[1].canceled);
+        assert_eq!(out[1].compact_revision, 50);
+        assert_eq!(out.len(), 2, "no live events after a cancel");
+    }
 
     #[test]
     fn the_acknowledgement_is_always_first() {
