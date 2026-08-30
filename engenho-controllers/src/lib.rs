@@ -35,6 +35,7 @@ pub mod build_backend_roceiro;
 pub mod cluster_ip;
 pub mod controller;
 pub mod crd;
+pub mod crd_conversion;
 pub mod crd_validator;
 pub mod create_stamp;
 pub mod cron;
