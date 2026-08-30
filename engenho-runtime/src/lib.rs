@@ -58,8 +58,11 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod etcd_facade;
+
 mod error;
 mod runtime;
 
 pub use error::RuntimeError;
+pub use etcd_facade::MeshEtcdStore;
 pub use runtime::Runtime;

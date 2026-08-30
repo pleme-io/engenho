@@ -99,6 +99,29 @@ pub struct RuntimeConfig {
     /// elsewhere only by an explicit operator decision. Widen it when the
     /// authn gate exists, not before.
     pub kubelet_listen_addr: String,
+
+    /// Where the etcd v3 FAÇADE binds — upstream's :2379.
+    ///
+    /// ★ WHAT THIS BUYS, since engenho runs no etcd and its own apiserver
+    /// never speaks it. Nothing in the ecosystem asks "do you have etcd?";
+    /// it asks to `Range` a keyspace, to `snapshot save`, to be pointed at
+    /// `--etcd-servers`. Those verbs are the contract every backup tool,
+    /// runbook and dashboard drives. Serving them makes engenho
+    /// substitutable for k3s to that whole class of software — and it is
+    /// the door through which upstream's REAL kube-apiserver can one day be
+    /// pointed at engenho-store, turning every Kubernetes conformance suite
+    /// into a test of our storage layer against the genuine article.
+    ///
+    /// ★ LOOPBACK BY DEFAULT, for the same reason as :10250 above: the
+    /// façade has no authentication of its own. Upstream etcd gates :2379
+    /// behind mutual TLS; engenho does not yet. It is READ-ONLY today,
+    /// which bounds the exposure to disclosure rather than mutation — but
+    /// the whole cluster state, Secrets included, is a disclosure worth
+    /// keeping on the loopback interface until the TLS gate exists.
+    ///
+    /// Empty string DISABLES the listener, which is what tests use.
+    pub etcd_listen_addr: String,
+
     pub kubelet_backend: KubeletBackendKind,
     /// Optional explicit podman binary path (ignored unless
     /// `kubelet_backend == Podman`). `None` = default `podman` on PATH.
@@ -121,6 +144,7 @@ impl TieredConfig for RuntimeConfig {
             node_name: String::new(),
             kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: String::new(),
+            etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             leadership_timeout_seconds: 0,
@@ -168,6 +192,7 @@ impl TieredConfig for RuntimeConfig {
             // stays a pure value.
             kubeconfig_publish_path: "~/.kube/configs/engenho".into(),
             kubelet_listen_addr: "127.0.0.1:10250".into(),
+            etcd_listen_addr: "127.0.0.1:2379".into(),
             kubelet_backend: KubeletBackendKind::Podman,
             podman_binary: None,
             leadership_timeout_seconds: 10,
@@ -205,6 +230,11 @@ impl TieredConfig for RuntimeConfig {
                 base.kubelet_listen_addr.clone()
             } else {
                 self.kubelet_listen_addr
+            },
+            etcd_listen_addr: if self.etcd_listen_addr.is_empty() {
+                base.etcd_listen_addr.clone()
+            } else {
+                self.etcd_listen_addr
             },
             kubelet_backend: self.kubelet_backend,
             podman_binary: self.podman_binary.or_else(|| base.podman_binary.clone()),
@@ -343,6 +373,7 @@ mod tests {
             // precisely what this test asserts for every other field.
             kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: String::new(),
+            etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             leadership_timeout_seconds: 0,

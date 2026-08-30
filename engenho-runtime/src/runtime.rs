@@ -346,6 +346,76 @@ impl Runtime {
             }
         });
 
+        // The etcd v3 façade on :2379. Same failure posture as :10250: a
+        // bind failure is a WARNING, not a boot failure — refusing to start
+        // the cluster because one auxiliary port is taken trades a partial
+        // outage for a total one.
+        //
+        // ★ THIS IS WHAT MAKES engenho DRIVABLE BY SOFTWARE THAT HAS NEVER
+        // HEARD OF IT. `etcdctl get /registry/ --prefix --keys-only`,
+        // `snapshot save`, every backup tool and every runbook that was
+        // written against etcd. engenho runs no etcd and its apiserver
+        // never speaks it — the INTERFACE is the obligation, not the
+        // technology.
+        //
+        // READ-ONLY: Kv serves Range; Put/DeleteRange/Txn are absent rather
+        // than silently dropping writes. See `etcd_facade`'s header.
+        if !config.runtime.etcd_listen_addr.is_empty() {
+            // `MeshEtcdStore` is `Clone` and holds an `Arc<StoreMesh>`
+            // inside, so every clone is the SAME store — the three services
+            // must not end up with different views of one cluster.
+            let etcd_store = crate::etcd_facade::MeshEtcdStore::new(&store);
+            let etcd_addr = config.runtime.etcd_listen_addr.clone();
+            let identity = engenho_etcd::server::ServerIdentity::default();
+            tokio::spawn(async move {
+                match tokio::net::TcpListener::bind(&etcd_addr).await {
+                    Ok(listener) => {
+                        let bound = listener
+                            .local_addr()
+                            .map_or_else(|_| etcd_addr.clone(), |a| a.to_string());
+                        info!(addr = %bound, "etcd v3 facade bound (read-only)");
+                        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                        let kv = engenho_etcd::server::ReadOnlyKv {
+                            store: etcd_store.clone(),
+                            identity,
+                        };
+                        let maintenance = engenho_etcd::server::MaintenanceSvc {
+                            store: etcd_store.clone(),
+                            identity,
+                        };
+                        let watch =
+                            engenho_etcd::server::WatchSvc::new(Arc::new(etcd_store), identity);
+                        if let Err(e) = tonic::transport::Server::builder()
+                            .add_service(
+                                engenho_etcd::pb::etcdserverpb::kv_server::KvServer::new(kv),
+                            )
+                            .add_service(
+                                engenho_etcd::pb::etcdserverpb::watch_server::WatchServer::new(
+                                    watch,
+                                ),
+                            )
+                            .add_service(
+                                engenho_etcd::pb::etcdserverpb::maintenance_server::MaintenanceServer::new(
+                                    maintenance,
+                                ),
+                            )
+                            .serve_with_incoming(incoming)
+                            .await
+                        {
+                            warn!(error = %e, "etcd v3 facade stopped");
+                        }
+                    }
+                    Err(e) => warn!(
+                        addr = %etcd_addr,
+                        error = %e,
+                        "etcd v3 facade could not bind; etcdctl, snapshot tooling and \
+                         any --etcd-servers consumer are unreachable (the apiserver is \
+                         unaffected)"
+                    ),
+                }
+            });
+        }
+
         let log_reader: Arc<dyn engenho_apiserver::PodLogReader> =
             Arc::new(KubeletLogReader { kubelet });
         if let Some(pod_handler) = build_pod_log_handler(&store, &admission, log_reader) {

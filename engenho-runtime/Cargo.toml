@@ -24,7 +24,10 @@ default = []
 with-cofre = ["dep:cofre-fs"]
 
 [dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["router", "server", "codegen", "transport"] }
 engenho-cni   = { path = "../engenho-cni" }
+engenho-etcd  = { path = "../engenho-etcd" }
 engenho-config      = { workspace = true }
 # Typed RBAC kinds (rbac_v1) — the bootstrap seeds are built as typed
 # ClusterRole/ClusterRoleBinding values, then serialized + Put into the store.
@@ -58,6 +61,7 @@ getrandom           = "0.3"
 cofre-fs            = { version = "0.1.0", optional = true }
 
 [dev-dependencies]
+engenho-etcd = { path = "../engenho-etcd" }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 shikumi = "0.1.0"

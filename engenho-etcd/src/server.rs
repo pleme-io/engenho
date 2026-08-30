@@ -85,12 +85,20 @@ pub struct ReadOnlyKv<S> {
 /// What the KV service needs from a store, kept as a trait so the service
 /// is testable without a Raft cluster — the house's `InMemoryStore`
 /// pattern applied at the façade boundary.
+///
+/// ★ ASYNC BECAUSE THE STORE IS. The production implementation reads a
+/// Raft-backed `StoreMesh`, every method of which is `async`. A synchronous
+/// trait over it would force one of two bad answers: block inside the
+/// runtime, or serve a cached snapshot — and a snapshot means `etcdctl get`
+/// returns the cluster as it was at the last refresh, which is exactly the
+/// silently-wrong answer this crate's header exists to forbid.
 #[allow(clippy::module_name_repetitions)]
+#[tonic::async_trait]
 pub trait EtcdReadStore: Send + Sync + 'static {
     /// The store's current global revision.
-    fn revision(&self) -> i64;
+    async fn revision(&self) -> i64;
     /// Every key/value under `prefix`, already rendered onto the wire.
-    fn range(&self, prefix: &str) -> Vec<crate::pb::mvccpb::KeyValue>;
+    async fn range(&self, prefix: &str) -> Vec<crate::pb::mvccpb::KeyValue>;
 }
 
 #[tonic::async_trait]
@@ -111,7 +119,7 @@ impl<S: EtcdReadStore> etcdserverpb::kv_server::Kv for ReadOnlyKv<S> {
             crate::kv::RangeShape::Interval { start, .. } => start.clone(),
         };
 
-        let mut kvs = self.store.range(&prefix);
+        let mut kvs = self.store.range(&prefix).await;
         if let crate::kv::RangeShape::Point(k) = &shape {
             kvs.retain(|kv| kv.key == k.as_bytes());
         }
@@ -127,7 +135,7 @@ impl<S: EtcdReadStore> etcdserverpb::kv_server::Kv for ReadOnlyKv<S> {
         // paginating reads it to size the remaining work, and reporting the
         // page length instead would make every page look like the last.
         Ok(Response::new(RangeResponse {
-            header: Some(header(self.identity, self.store.revision())),
+            header: Some(header(self.identity, self.store.revision().await)),
             kvs: if req.keys_only {
                 kvs.into_iter()
                     .map(|mut kv| {
@@ -215,11 +223,12 @@ mod tests {
         }
     }
 
+    #[tonic::async_trait]
     impl EtcdReadStore for FakeStore {
-        fn revision(&self) -> i64 {
+        async fn revision(&self) -> i64 {
             42
         }
-        fn range(&self, prefix: &str) -> Vec<crate::pb::mvccpb::KeyValue> {
+        async fn range(&self, prefix: &str) -> Vec<crate::pb::mvccpb::KeyValue> {
             self.kvs
                 .iter()
                 .filter(|kv| kv.key.starts_with(prefix.as_bytes()))
@@ -390,16 +399,17 @@ use crate::pb::etcdserverpb::{
 };
 
 /// What Maintenance needs to answer about the running store.
+#[tonic::async_trait]
 pub trait EtcdStatusStore: Send + Sync + 'static {
-    fn revision(&self) -> i64;
+    async fn revision(&self) -> i64;
     /// Raft applied index, surfaced as both `raft_index` and
     /// `raft_applied_index` — engenho applies what it commits.
-    fn applied_index(&self) -> u64;
+    async fn applied_index(&self) -> u64;
     /// On-disk size in bytes if the backend can report one cheaply.
     ///
     /// `None` becomes 0, which etcd clients read as unknown. A guess here
     /// would drive real capacity alerts off a number nobody measured.
-    fn db_size(&self) -> Option<i64>;
+    async fn db_size(&self) -> Option<i64>;
 }
 
 /// The Maintenance service.
@@ -411,20 +421,20 @@ pub struct MaintenanceSvc<S> {
 #[tonic::async_trait]
 impl<S: EtcdStatusStore> etcdserverpb::maintenance_server::Maintenance for MaintenanceSvc<S> {
     async fn status(&self, _: Request<StatusRequest>) -> Result<Response<StatusResponse>, Status> {
-        let rev = self.store.revision();
+        let rev = self.store.revision().await;
         Ok(Response::new(StatusResponse {
             header: Some(header(self.identity, rev)),
             // The etcd API version engenho's wire types were generated
             // from. Clients gate feature use on this, so it must name the
             // protocol actually served, not engenho's own version.
             version: "3.5.0".to_string(),
-            db_size: self.store.db_size().unwrap_or(0),
+            db_size: self.store.db_size().await.unwrap_or(0),
             leader: self.identity.member_id,
-            raft_index: self.store.applied_index(),
+            raft_index: self.store.applied_index().await,
             raft_term: 1,
-            raft_applied_index: self.store.applied_index(),
+            raft_applied_index: self.store.applied_index().await,
             errors: Vec::new(),
-            db_size_in_use: self.store.db_size().unwrap_or(0),
+            db_size_in_use: self.store.db_size().await.unwrap_or(0),
             is_learner: false,
         }))
     }
@@ -435,7 +445,7 @@ impl<S: EtcdStatusStore> etcdserverpb::maintenance_server::Maintenance for Maint
         // does not have). Returning Unimplemented here would make
         // `etcdctl endpoint health` fail on a healthy server.
         Ok(Response::new(AlarmResponse {
-            header: Some(header(self.identity, self.store.revision())),
+            header: Some(header(self.identity, self.store.revision().await)),
             alarms: Vec::new(),
         }))
     }
@@ -448,7 +458,7 @@ impl<S: EtcdStatusStore> etcdserverpb::maintenance_server::Maintenance for Maint
         // defragment. Succeeding is correct — the caller asked for a
         // post-condition that already holds.
         Ok(Response::new(DefragmentResponse {
-            header: Some(header(self.identity, self.store.revision())),
+            header: Some(header(self.identity, self.store.revision().await)),
         }))
     }
 
@@ -513,14 +523,15 @@ mod maintenance_tests {
     use crate::pb::etcdserverpb::maintenance_server::Maintenance as _;
 
     struct FakeStatus;
+    #[tonic::async_trait]
     impl EtcdStatusStore for FakeStatus {
-        fn revision(&self) -> i64 {
+        async fn revision(&self) -> i64 {
             77
         }
-        fn applied_index(&self) -> u64 {
+        async fn applied_index(&self) -> u64 {
             123
         }
-        fn db_size(&self) -> Option<i64> {
+        async fn db_size(&self) -> Option<i64> {
             None
         }
     }
@@ -637,11 +648,12 @@ pub type WireEvent = crate::pb::mvccpb::Event;
 /// `Result` whose error carries the compaction watermark, so the "gap" case
 /// is a value the service must handle rather than an empty vector it could
 /// forward by accident.
+#[tonic::async_trait]
 pub trait EtcdWatchStore: Send + Sync + 'static {
-    fn revision(&self) -> i64;
+    async fn revision(&self) -> i64;
     /// Events after `since` under `prefix`, or the compaction watermark if
     /// `since` has been compacted away.
-    fn changes_since(&self, prefix: &str, since: i64) -> Result<Vec<WireEvent>, i64>;
+    async fn changes_since(&self, prefix: &str, since: i64) -> Result<Vec<WireEvent>, i64>;
 
     /// Subscribe to LIVE events under `prefix`.
     ///
@@ -654,7 +666,7 @@ pub trait EtcdWatchStore: Send + Sync + 'static {
     ///
     /// Returns `None` when the store cannot subscribe; the caller must then
     /// refuse the watch rather than serve history and fall silent.
-    fn subscribe(&self, prefix: &str) -> Option<tokio::sync::mpsc::Receiver<WireEvent>>;
+    async fn subscribe(&self, prefix: &str) -> Option<tokio::sync::mpsc::Receiver<WireEvent>>;
 }
 
 /// The Watch service.
@@ -739,14 +751,14 @@ pub fn events_response(
 /// compaction cancels rather than truncating — is testable without a
 /// stream.
 #[must_use]
-pub fn responses_for_create<S: EtcdWatchStore>(
+pub async fn responses_for_create<S: EtcdWatchStore>(
     store: &S,
     id: ServerIdentity,
     watch_id: i64,
     key: &[u8],
     start_revision: i64,
 ) -> Vec<WatchResponse> {
-    let rev = store.revision();
+    let rev = store.revision().await;
     // The acknowledgement ALWAYS goes first. A client that never receives
     // it waits forever on a watch it believes is still pending.
     let mut out = vec![created_response(id, watch_id, rev)];
@@ -758,7 +770,7 @@ pub fn responses_for_create<S: EtcdWatchStore>(
     }
 
     let prefix = String::from_utf8_lossy(key).into_owned();
-    match store.changes_since(&prefix, start_revision - 1) {
+    match store.changes_since(&prefix, start_revision - 1).await {
         Ok(events) if events.is_empty() => out,
         Ok(events) => {
             out.push(events_response(id, watch_id, rev, events));
@@ -815,7 +827,7 @@ pub async fn run_watch_loop<S, R>(
                 // the two would otherwise reach nobody — a gap the client
                 // cannot detect, because from its side the stream simply
                 // never mentions it.
-                let Some(mut live) = store.subscribe(&prefix) else {
+                let Some(mut live) = store.subscribe(&prefix).await else {
                     // Refuse the watch rather than serve history and fall
                     // silent: a client that believes it is tracking the
                     // cluster and is not is worse off than one that knows
@@ -838,7 +850,9 @@ pub async fn run_watch_loop<S, R>(
                     watch_id,
                     &create.key,
                     create.start_revision,
-                ) {
+                )
+                .await
+                {
                     cancelled |= resp.canceled;
                     if tx.send(Ok(resp)).await.is_err() {
                         return; // client hung up
@@ -883,7 +897,7 @@ pub async fn run_watch_loop<S, R>(
                     .send(Ok(events_response(
                         identity,
                         0,
-                        store.revision(),
+                        store.revision().await,
                         Vec::new(),
                     )))
                     .await;
@@ -983,17 +997,18 @@ mod watch_tests {
         no_subscribe: bool,
     }
 
+    #[tonic::async_trait]
     impl EtcdWatchStore for FakeWatch {
-        fn revision(&self) -> i64 {
+        async fn revision(&self) -> i64 {
             100
         }
-        fn changes_since(&self, _prefix: &str, since: i64) -> Result<Vec<Event>, i64> {
+        async fn changes_since(&self, _prefix: &str, since: i64) -> Result<Vec<Event>, i64> {
             match self.compacted_at {
                 Some(c) if since < c => Err(c),
                 _ => Ok(self.events.clone()),
             }
         }
-        fn subscribe(&self, _prefix: &str) -> Option<tokio::sync::mpsc::Receiver<Event>> {
+        async fn subscribe(&self, _prefix: &str) -> Option<tokio::sync::mpsc::Receiver<Event>> {
             if self.no_subscribe {
                 return None;
             }
@@ -1151,40 +1166,40 @@ mod watch_tests {
         assert_eq!(out.len(), 2, "no live events after a cancel");
     }
 
-    #[test]
-    fn the_acknowledgement_is_always_first() {
+    #[tokio::test]
+    async fn the_acknowledgement_is_always_first() {
         // A client that never receives `created` waits forever on a watch
         // it believes is still pending.
-        let out = responses_for_create(&store(3, None), ID, 7, b"/registry/pods/", 5);
+        let out = responses_for_create(&store(3, None), ID, 7, b"/registry/pods/", 5).await;
         assert!(out[0].created, "the first response must acknowledge");
         assert_eq!(out[0].watch_id, 7);
         assert!(out[0].events.is_empty(), "the ack carries no events");
     }
 
-    #[test]
-    fn start_revision_zero_means_from_now_not_from_the_beginning() {
+    #[tokio::test]
+    async fn start_revision_zero_means_from_now_not_from_the_beginning() {
         // Treating 0 as "all history" would flood a client that asked for
         // a live tail — and on a large cluster, hang it.
-        let out = responses_for_create(&store(9, None), ID, 1, b"/registry/", 0);
+        let out = responses_for_create(&store(9, None), ID, 1, b"/registry/", 0).await;
         assert_eq!(out.len(), 1, "acknowledgement only");
         assert!(out[0].created);
     }
 
-    #[test]
-    fn history_follows_the_acknowledgement() {
-        let out = responses_for_create(&store(2, None), ID, 1, b"/registry/pods/", 5);
+    #[tokio::test]
+    async fn history_follows_the_acknowledgement() {
+        let out = responses_for_create(&store(2, None), ID, 1, b"/registry/pods/", 5).await;
         assert_eq!(out.len(), 2);
         assert!(out[0].created);
         assert_eq!(out[1].events.len(), 2);
         assert!(!out[1].canceled);
     }
 
-    #[test]
-    fn a_compacted_start_cancels_with_the_watermark_never_returns_short() {
+    #[tokio::test]
+    async fn a_compacted_start_cancels_with_the_watermark_never_returns_short() {
         // THE property. Forwarding an empty vector here is the silent
         // divergence the service exists to prevent: the client would
         // believe it had caught up.
-        let out = responses_for_create(&store(0, Some(50)), ID, 3, b"/registry/pods/", 10);
+        let out = responses_for_create(&store(0, Some(50)), ID, 3, b"/registry/pods/", 10).await;
         assert_eq!(out.len(), 2);
         assert!(out[0].created);
         let c = &out[1];
