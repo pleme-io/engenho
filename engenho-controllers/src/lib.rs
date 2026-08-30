@@ -46,6 +46,7 @@ pub mod drv_build;
 pub mod endpoints;
 pub mod error;
 pub mod event_driven;
+pub mod event_recorder;
 pub mod gc;
 pub mod hpa;
 pub mod ingress;
