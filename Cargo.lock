@@ -1609,6 +1609,7 @@ version = "0.53.33"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.7.9",
  "base64",
  "engenho-config",
  "engenho-controllers",
@@ -1621,6 +1622,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
 ]
 
