@@ -158,12 +158,35 @@ pub fn plan(
         plugins.reverse();
     }
 
-    let cni_args = sandbox
-        .args
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(";");
+    // ★ `IgnoreUnknown=true` IS MANDATORY, AND ITS ABSENCE IS TOTAL
+    // INCOMPATIBILITY WITH THE PLUGIN ECOSYSTEM. Measured on rio against
+    // `containernetworking/plugins` 1.8.0:
+    //
+    //   host-local: ARGS: unknown args
+    //     ["K8S_POD_NAME=pod1" "K8S_POD_NAMESPACE=ns"]
+    //
+    // Upstream's `types.LoadArgs` (pkg/types/args.go:118) REJECTS any
+    // CNI_ARGS key a plugin does not declare, unless the special
+    // `IgnoreUnknown` key is set. So a runtime faces a contradiction: the
+    // Kubernetes args are exactly what Calico and Cilium key their per-pod
+    // policy on, and passing them is what every conformant plugin without
+    // those fields refuses.
+    //
+    // The convention that resolves it — and what libcni and containerd
+    // both do — is to add `IgnoreUnknown=true`. Without it engenho can
+    // drive NO upstream plugin while passing the args those plugins need.
+    //
+    // Not discoverable from our own reference plugin, which parses args
+    // leniently: this took a foreign implementation to find.
+    let mut arg_pairs: Vec<String> = vec!["IgnoreUnknown=true".to_string()];
+    arg_pairs.extend(sandbox.args.iter().map(|(k, v)| format!("{k}={v}")));
+    let cni_args = if sandbox.args.is_empty() {
+        // Nothing plugin-specific to ignore, so nothing to say. An
+        // IgnoreUnknown with no unknowns is noise in every plugin's log.
+        String::new()
+    } else {
+        arg_pairs.join(";")
+    };
     let path = search_path
         .iter()
         .map(|p| p.display().to_string())
@@ -554,6 +577,25 @@ mod tests {
         assert!(args.contains("K8S_POD_NAMESPACE=ns"), "{args}");
         assert!(args.contains("K8S_POD_NAME=pod1"), "{args}");
         assert!(args.contains(';'), "semicolon-separated: {args}");
+        // ★ Without this, upstream's host-local REFUSES the ADD outright:
+        // `ARGS: unknown args ["K8S_POD_NAME=pod1" ...]`. Measured on rio
+        // against containernetworking/plugins 1.8.0 — engenho could drive
+        // no upstream plugin at all while passing the args those plugins
+        // need for per-pod policy.
+        assert!(
+            args.contains("IgnoreUnknown=true"),
+            "no upstream plugin will accept these args without it: {args}"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_with_no_args_sends_no_cni_args_at_all() {
+        // An `IgnoreUnknown` with no unknowns is noise in every plugin's
+        // log, and an empty CNI_ARGS is what upstream runtimes send.
+        let mut s = sandbox();
+        s.args.clear();
+        let p = plan(&conf(), &s, CniCommand::Add, &path());
+        assert!(!p.invocations[0].env.contains_key("CNI_ARGS"));
     }
 
     #[test]

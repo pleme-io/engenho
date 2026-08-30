@@ -13,12 +13,14 @@
 #![warn(missing_docs)]
 
 pub mod client;
+pub mod localpath;
 pub mod registry;
 
 #[cfg(any(test, feature = "test-driver"))]
 pub mod testdriver;
 
 pub use client::{CsiClient, CsiError, DriverInfo, socket_path};
+pub use localpath::{DRIVER_NAME, LocalPathDriver, VolumeRecord};
 pub use registry::{DiscoveredPlugin, PluginRegistry, RegistrationError};
 
 /// Generated `csi.v1` types + clients.

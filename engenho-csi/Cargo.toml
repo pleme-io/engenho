@@ -19,12 +19,12 @@ path = "src/lib.rs"
 # A real in-process CSI driver (a generated tonic server on a real unix
 # socket) for tests — this crate's own and any downstream crate's. Off by
 # default so it never ships in a production build.
-test-driver = ["dep:tempfile", "tonic/router", "tonic/server"]
+test-driver = ["dep:tempfile"]
 
 [dependencies]
 prost        = "0.14"
 prost-types  = "0.14"
-tonic        = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
+tonic        = { version = "0.14", default-features = false, features = ["codegen", "transport", "router", "server"] }
 tonic-prost  = "0.14"
 tokio        = { workspace = true }
 tokio-stream = "0.1"
@@ -36,6 +36,7 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
 engenho-substrate = { path = "../engenho-substrate" }
 tempfile     = { version = "3", optional = true }
 
