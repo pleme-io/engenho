@@ -123,6 +123,18 @@ struct ContainerRecord {
     /// Per-container probe specs + runtime counters (liveness/readiness/
     /// startup). Default = all-None = no probes = behavior-preserving.
     probes: ContainerProbeState,
+    /// When this container was (re)started. Feeds `uptime_before_exit`, which
+    /// is what lets a container that stayed up long enough earn a clean slate
+    /// instead of inheriting an old crash's penalty.
+    started_at: Option<Instant>,
+    /// When the kubelet FIRST observed this container terminated. `None`
+    /// while it is running.
+    ///
+    /// ★ FIRST observation, not most recent: the backoff clock must run from
+    /// the exit, and re-stamping it every tick would reset the wait on every
+    /// poll — a hold that never elapses, which is a hang wearing a
+    /// CrashLoopBackOff label.
+    terminated_at: Option<Instant>,
 }
 
 /// What the kubelet remembers about a Pod it started on this node.
@@ -1373,6 +1385,8 @@ impl Kubelet {
                                 .get(&cname)
                                 .cloned()
                                 .unwrap_or_default(),
+                            started_at: Some(now),
+                            terminated_at: None,
                         },
                     );
                     started_any = true;
@@ -1620,6 +1634,8 @@ impl Kubelet {
             if let Some(rec) = local.get_mut(key).and_then(|p| p.containers.get_mut(cname)) {
                 rec.container_id.clone_from(&new_status.container_id);
                 rec.restart_count = new_count;
+                rec.started_at = Some(now);
+                rec.terminated_at = None;
                 // Fresh startup window + zeroed probe counters on restart.
                 rec.probes.reset(now);
             }
@@ -1793,6 +1809,59 @@ impl Kubelet {
                     // restartable-terminated container to Running). Uses the
                     // shared restart_container helper (same stop→remove→start→
                     // record-update + probe-reset as the liveness path).
+                    // ── CRASHLOOP BACKOFF. Without this the kubelet
+                    // restarts a failing container on EVERY tick, which is
+                    // the hot loop that produced a pod at 149 restarts with
+                    // nothing in the cluster able to explain it.
+                    //
+                    // The stamp is taken here, on the FIRST tick that sees
+                    // the exit, so the delay is measured from the exit and
+                    // not from whenever the operator happened to look.
+                    let backoff = if restart_policy.should_restart(s.exit_code) {
+                        let (since_exit, uptime) = {
+                            let mut local = self.local.lock().await;
+                            let rec = local.get_mut(key).and_then(|p| p.containers.get_mut(cname));
+                            match rec {
+                                Some(r) => {
+                                    let exited = *r.terminated_at.get_or_insert(now);
+                                    let uptime = r.started_at.map_or(Duration::ZERO, |st| {
+                                        exited.saturating_duration_since(st)
+                                    });
+                                    (now.saturating_duration_since(exited), uptime)
+                                }
+                                None => (Duration::ZERO, Duration::ZERO),
+                            }
+                        };
+                        crate::backoff::decide(record.restart_count, since_exit, uptime)
+                    } else {
+                        // Not restartable at all — the terminal-latch branch
+                        // below owns it. `Restart` here is never acted on.
+                        crate::backoff::BackoffDecision::Restart
+                    };
+
+                    if let crate::backoff::BackoffDecision::Wait { remaining } = backoff {
+                        // Ask to be re-ticked when the hold expires rather
+                        // than relying on the next periodic sweep: a 5-minute
+                        // cap with a 30-second sweep would restart up to
+                        // 4m30s late, and the lateness grows with the delay.
+                        let soon = soonest_requeue.get_or_insert(remaining);
+                        *soon = (*soon).min(remaining);
+                        debug!(
+                            pod = %key.label(),
+                            container = %cname,
+                            restart_count = record.restart_count,
+                            remaining_secs = remaining.as_secs(),
+                            "container held in CrashLoopBackOff"
+                        );
+                        observations.push(ContainerObservation::backing_off(
+                            cname,
+                            &record.container_id,
+                            backoff.waiting_reason().unwrap_or("CrashLoopBackOff"),
+                            record.restart_count,
+                        ));
+                        continue;
+                    }
+
                     if restart_policy.should_restart(s.exit_code) {
                         match self
                             .restart_container(
@@ -1994,6 +2063,11 @@ impl Kubelet {
                 // Init containers never carry probes (K8s does not run
                 // liveness/readiness/startup on init containers).
                 probes: ContainerProbeState::default(),
+                // Init containers are not subject to CrashLoopBackOff here:
+                // the init sequence has its own ordering, and stamping a
+                // start it does not read would be a field nobody consults.
+                started_at: None,
+                terminated_at: None,
             },
         );
         Ok(status)

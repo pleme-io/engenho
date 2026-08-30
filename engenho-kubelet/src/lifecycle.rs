@@ -213,6 +213,32 @@ impl ContainerObservation {
         }
     }
 
+    /// A `Waiting` observation for a container that HAS run before and is
+    /// being held off — `CrashLoopBackOff` and its kin.
+    ///
+    /// ★ THE `container_id` IS WHAT MAKES THIS NOT `Pending`. Upstream keeps
+    /// a crash-looping pod in phase `Running` with the container `Waiting`;
+    /// only a container that has never started makes a pod `Pending`. The
+    /// fold reads the id to tell those apart, so passing one here is not
+    /// bookkeeping — it is the phase decision.
+    #[must_use]
+    pub fn backing_off(
+        name: impl Into<String>,
+        container_id: impl Into<String>,
+        reason: &'static str,
+        restart_count: u32,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            state: ContainerState::Waiting {
+                reason: reason.to_string(),
+            },
+            container_id: Some(container_id.into()),
+            restart_count,
+            ready: false,
+        }
+    }
+
     /// A `Waiting{ContainerCreating}` observation for a not-yet-started
     /// container.
     #[must_use]
@@ -254,8 +280,13 @@ pub struct ContainerStatusOut {
 ///
 ///   * **Empty** (no containers) → `Pending` (degenerate; a pod with no
 ///     containers is rejected upstream, but the fold is total).
-///   * **Any container `Waiting`** (not yet started) → `Pending`. The pod is
-///     not `Running` until *every* container is up at least once.
+///   * **Any container `Waiting` AND never started** (no `container_id`) →
+///     `Pending`. The pod is not `Running` until every container is up at
+///     least once. A container that IS waiting but HAS a `container_id` has
+///     run before — a `CrashLoopBackOff` hold — and upstream keeps that pod
+///     `Running`, so it does not force `Pending` here. Reporting `Pending`
+///     for a crash-looping pod would make it indistinguishable from one
+///     still pulling its image, which is the opposite diagnosis.
 ///   * **All containers `Running`** → `Running`.
 ///   * **Mixed running + terminated** under a restarting policy
 ///     (`Always`, or `OnFailure` with a restartable exit) → `Running`: the
@@ -303,12 +334,24 @@ pub fn reconcile_pod_phase(
         return (PodPhase::Pending, statuses);
     }
 
-    let any_waiting = observations
+    let any_never_started = observations
         .iter()
-        .any(|o| matches!(o.state, ContainerState::Waiting { .. }));
-    if any_waiting {
+        .any(|o| matches!(o.state, ContainerState::Waiting { .. }) && o.container_id.is_none());
+    if any_never_started {
         // Not every container is up yet → Pending. Never a fake Running.
         return (PodPhase::Pending, statuses);
+    }
+
+    // A container held in backoff has a container_id and is not Running, so
+    // it falls through the all_running check below to the restartable logic
+    // — where it has no exit code and so is not "restartable this instant".
+    // Handled explicitly: a pod whose only non-Running container is backing
+    // off is in a restart cycle, which is Running.
+    let any_backing_off = observations
+        .iter()
+        .any(|o| matches!(o.state, ContainerState::Waiting { .. }) && o.container_id.is_some());
+    if any_backing_off && restart_policy != RestartPolicy::Never {
+        return (PodPhase::Running, statuses);
     }
 
     let all_running = observations.iter().all(|o| o.state.is_running());
