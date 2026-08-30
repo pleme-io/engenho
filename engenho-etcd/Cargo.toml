@@ -16,6 +16,8 @@ description = "etcd v3 wire façade for engenho. engenho does not run etcd and d
 path = "src/lib.rs"
 
 [dependencies]
+engenho-types = { path = "../engenho-types" }
+thiserror     = { workspace = true }
 
 [dev-dependencies]
 
