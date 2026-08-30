@@ -418,17 +418,81 @@ impl LabelRequirement {
 }
 
 /// One typed field-selector requirement. K8s field selectors are equality-
-/// based only (`=`/`==`/`!=`); the SUPPORTED keys are `metadata.name` +
-/// `metadata.namespace` (the two every kind honors). An unsupported field key
-/// (`status.phase`, `spec.nodeName`, …) needs per-kind field-selector
-/// registration engenho does not yet have — such a requirement matches nothing
-/// (the object is filtered out), a divergence recorded in the diff harness.
+/// based only (`=`/`==`/`!=`).
+///
+/// ★ THE SUPPORTED SET IS AN ALLOWLIST, AND IT MATTERS WHICH FIELDS ARE ON
+/// IT. `metadata.name`/`metadata.namespace` alone are not enough for a
+/// working cluster: a kubelet lists its OWN pods with
+/// `spec.nodeName=<node>`, and controllers and operators filter on
+/// `status.phase`. Without those two, every such client silently receives
+/// an empty list.
+///
+/// ★ AN UNSUPPORTED KEY FILTERS TO NOTHING, WHICH IS THE DANGEROUS
+/// DIRECTION and is a KNOWN DIVERGENCE from upstream, which returns 400
+/// for a field it has not registered. `--field-selector status.phase!=Running`
+/// against an unsupported field yields an EMPTY list that reads exactly
+/// like "no pods are failing" — a false all-clear. It is left as a
+/// divergence rather than silently widened because matching-everything
+/// would be equally wrong in the opposite direction; closing it properly
+/// needs per-kind field registration, which needs the kind at parse time.
+/// Recorded in the diff harness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldRequirement {
     /// `k=v` / `k==v`.
     Equals(String, String),
     /// `k!=v`.
     NotEquals(String, String),
+}
+
+/// Field-selector keys engenho honours, mirroring what upstream registers.
+///
+/// Deliberately a short explicit list rather than "any dotted path": an
+/// open resolver would make a typo (`status.phse`) silently match nothing,
+/// which is the same false all-clear this type's doc warns about, only
+/// harder to notice because it looks like a supported field.
+pub const SUPPORTED_FIELD_SELECTORS: &[&str] = &[
+    // Honoured by every kind.
+    "metadata.name",
+    "metadata.namespace",
+    // Pod — the two a working cluster cannot do without. A kubelet lists
+    // its own pods by nodeName; controllers and operators filter on phase.
+    "spec.nodeName",
+    "status.phase",
+    "spec.restartPolicy",
+    "spec.schedulerName",
+    "spec.serviceAccountName",
+    "status.podIP",
+    "status.nominatedNodeName",
+    // Node.
+    "spec.unschedulable",
+    // Secret — `kubectl get secrets --field-selector type=...`.
+    "type",
+    // Event — how kubectl describe finds an object's events.
+    "involvedObject.kind",
+    "involvedObject.name",
+    "involvedObject.namespace",
+    "involvedObject.uid",
+    "reason",
+];
+
+/// Resolve a dotted path to a string, coercing the scalar kinds a field
+/// selector can legally compare against.
+///
+/// Booleans are stringified because `spec.unschedulable=true` arrives as
+/// the STRING "true" on the wire while the object holds a JSON bool —
+/// comparing them without coercion would never match, which is precisely
+/// how a supported field can still behave as if unsupported.
+fn resolve_path<'a>(obj: &'a serde_json::Value, path: &str) -> Option<std::borrow::Cow<'a, str>> {
+    let mut cur = obj;
+    for seg in path.split('.') {
+        cur = cur.get(seg)?;
+    }
+    match cur {
+        serde_json::Value::String(s) => Some(std::borrow::Cow::Borrowed(s.as_str())),
+        serde_json::Value::Bool(b) => Some(std::borrow::Cow::Owned(b.to_string())),
+        serde_json::Value::Number(n) => Some(std::borrow::Cow::Owned(n.to_string())),
+        _ => None,
+    }
 }
 
 impl FieldRequirement {
@@ -442,16 +506,16 @@ impl FieldRequirement {
     /// for an unsupported field key (filter the object out — the safe
     /// default until per-kind field-selector registration lands).
     fn satisfied_by(&self, obj: &serde_json::Value) -> bool {
-        let metadata = obj.get("metadata");
-        let have = match self.key() {
-            "metadata.name" => metadata
-                .and_then(|m| m.get("name"))
-                .and_then(serde_json::Value::as_str),
-            "metadata.namespace" => metadata
-                .and_then(|m| m.get("namespace"))
-                .and_then(serde_json::Value::as_str),
-            _ => return false, // unsupported field key → no match
-        };
+        let key = self.key();
+        if !SUPPORTED_FIELD_SELECTORS.contains(&key) {
+            return false; // unsupported field key → no match (see the type doc)
+        }
+        // Every supported key is a dotted path into the object, so one
+        // resolver serves them all — a per-field `match` arm would drift
+        // from the allowlist the moment a field is added to one and not
+        // the other.
+        let have = resolve_path(obj, key);
+        let have = have.as_deref();
         match self {
             Self::Equals(_, v) => have == Some(v.as_str()),
             Self::NotEquals(_, v) => have != Some(v.as_str()),
@@ -845,6 +909,103 @@ fn bad_selector(what: &str, clause: &str, why: &str) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+
+    // ── field selectors (Phase 5.8) ───────────────────────────────────
+
+    fn pod_on(node: &str, phase: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": { "name": "p", "namespace": "default" },
+            "spec": { "nodeName": node, "schedulerName": "default-scheduler" },
+            "status": { "phase": phase, "podIP": "10.0.0.1" }
+        })
+    }
+
+    fn req(sel: &str) -> Vec<super::FieldRequirement> {
+        super::parse_field_selector(Some(sel)).expect("parses")
+    }
+
+    fn matches(sel: &str, obj: &serde_json::Value) -> bool {
+        req(sel).iter().all(|r| r.satisfied_by(obj))
+    }
+
+    #[test]
+    fn a_kubelet_can_list_its_own_pods_by_node_name() {
+        // Without this every kubelet silently receives an empty list.
+        let p = pod_on("cid", "Running");
+        assert!(matches("spec.nodeName=cid", &p));
+        assert!(!matches("spec.nodeName=other", &p));
+        assert!(matches("spec.nodeName!=other", &p));
+    }
+
+    #[test]
+    fn controllers_can_filter_on_status_phase() {
+        let running = pod_on("cid", "Running");
+        let failed = pod_on("cid", "Failed");
+        assert!(matches("status.phase=Running", &running));
+        assert!(!matches("status.phase=Running", &failed));
+        // The negated form is what an operator uses to find broken pods.
+        assert!(matches("status.phase!=Running", &failed));
+        assert!(!matches("status.phase!=Running", &running));
+    }
+
+    #[test]
+    fn requirements_are_anded() {
+        let p = pod_on("cid", "Running");
+        assert!(matches("spec.nodeName=cid,status.phase=Running", &p));
+        assert!(!matches("spec.nodeName=cid,status.phase=Failed", &p));
+    }
+
+    #[test]
+    fn a_non_string_scalar_is_coerced_before_comparison() {
+        // `spec.unschedulable=true` arrives as the STRING "true" while the
+        // object holds a JSON bool. Without coercion a SUPPORTED field
+        // behaves exactly as if it were unsupported.
+        let node = serde_json::json!({
+            "metadata": { "name": "cid" },
+            "spec": { "unschedulable": true }
+        });
+        assert!(matches("spec.unschedulable=true", &node));
+        assert!(!matches("spec.unschedulable=false", &node));
+    }
+
+    #[test]
+    fn an_unsupported_key_matches_nothing_and_that_is_the_known_divergence() {
+        // Upstream returns 400 here. engenho filters to empty, which reads
+        // as a false all-clear — pinned so the behaviour is deliberate and
+        // visible rather than discovered.
+        let p = pod_on("cid", "Running");
+        assert!(!matches("status.phse=Running", &p), "typo must not match");
+        assert!(
+            !matches("spec.madeUpField!=x", &p),
+            "even the negated form matches nothing — the divergence is \
+             symmetric, which is why widening it would be equally wrong"
+        );
+    }
+
+    #[test]
+    fn the_allowlist_and_the_resolver_cannot_drift() {
+        // Every advertised key must actually resolve on an object that has
+        // it — an entry in the list with no working path would advertise a
+        // field that silently matches nothing.
+        for key in super::SUPPORTED_FIELD_SELECTORS {
+            assert!(
+                !key.is_empty() && !key.starts_with('.') && !key.ends_with('.'),
+                "malformed allowlist entry: {key}"
+            );
+        }
+        let p = pod_on("cid", "Running");
+        for key in [
+            "metadata.name",
+            "metadata.namespace",
+            "spec.nodeName",
+            "status.phase",
+        ] {
+            assert!(
+                matches(&format!("{key}!=__definitely_not__"), &p),
+                "{key} must resolve on a pod"
+            );
+        }
+    }
     use super::*;
 
     fn params_with_rv(rv: Option<&str>) -> ListWatchParams {
