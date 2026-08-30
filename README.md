@@ -93,17 +93,68 @@ engenho (workspace root)
 └── engenho               — Umbrella binary; one ~30-50 MB Rust binary.
 ```
 
-**Today (M0.0)**: `engenho-types` + `engenho` binary only.
+**Today — MEASURED 2026-08-29 on the live cid cluster, not inferred from this
+document.** Re-measure before citing; a status line rots DOWNWARD (it reads as
+modest and so never gets flagged as wrong), which is exactly what happened to
+the `M0.0` line this replaces.
+
+| Surface | Measured |
+|---|---|
+| built-in API resources | **52 of 57** upstream built-ins (91%) across 19 groups |
+| absent built-ins | `bindings`, `componentstatuses`, `selfsubjectreviews`, `validatingadmissionpolicies`, `validatingadmissionpolicybindings` |
+| API machinery | server-side apply (+`managedFields`), WATCH, label selectors, resourceVersion, API defaulting — all working |
+| controller chain | Deployment → ReplicaSet → Pod reconciles end to end |
+| endpoints serving | `/healthz` `/readyz` `/livez` `/version` (`v1.34.0`) `/api` `/apis` `/openapi/v3` |
+| crates | 24 workspace members; `engenho-datastore`, `-cni`, `-kubeproxy`, `-dns`, `-localpath`, `-ca`, `-caixa`, `-mesh`, `-gateway`, `-attest`, `-cli` are TARGET names above and do **not** exist yet |
+
+## The load-bearing insight: interfaces are the contract, technology is not
+
+engenho does not run etcd, and does not intend to. It runs a journalled,
+partitioned segment store (`~/.local/share/engenho/store`). That is a
+legitimate choice about TECHNOLOGY — and it is not the whole obligation.
+
+**Nothing in the ecosystem asks "do you have etcd?".** It asks to `Range` a
+keyspace, to take a snapshot, to be pointed at `--etcd-servers`, to scrape
+`/metrics`, to `exec` into a container on :10250. Those verbs are the contract,
+and they are load-bearing even when the technology behind them is not. A system
+that satisfies them is transparently substitutable for k3s; a system that does
+not is a Kubernetes-shaped thing that no existing runbook, backup tool or
+dashboard can drive.
+
+So the order is deliberate: **establish the interfaces first, then do what we
+like with the technology underneath.** Every façade below is owed to the world;
+what answers it is ours.
+
+### Contract ledger — MEASURED 2026-08-29
+
+| Contract | Consumed by | Status |
+|---|---|---|
+| Kubernetes REST API | kubectl, every controller | **SHIPPED** — 52/57 kinds, SSA + WATCH |
+| `/healthz` `/readyz` `/livez` `/version` | probes, HA | **SHIPPED** |
+| OpenAPI v3 | generators, modern clients | **SHIPPED** |
+| OpenAPI v2 | older clients, codegen | **ABSENT** |
+| etcd v3 gRPC (Range/Put/Txn/Watch/Lease) | `etcdctl`, backup/DR, Velero, `--etcd-servers` | **ABSENT** — no `etcdserverpb` vendored, no crate. Highest leverage: revisioned-MVCC semantics already exist, so this is a façade, not new behaviour |
+| kubelet API :10250 | `kubectl exec/logs/cp/port-forward`, metrics-server | **ABSENT** — no listener. This is why pod logs read empty |
+| Event recording | every "why did this fail" question | **ABSENT** — the cluster cannot explain itself; triage has to go to the runtime directly |
+| `/metrics` (Prometheus) | monitoring, HPA | **ABSENT** |
+| CRI (`runtime.v1`) | runtime substitutability | **ABSENT** — drives podman directly |
+| CNI / CSI | network + storage plugins | **ABSENT** — nothing wired |
+
+Ports measured on the live node: only `6443` listens. `10250` (kubelet),
+`10248`, `10256`, `10257`, `10259`, `2379`/`2381` (etcd) are all closed.
 
 ## Wire compatibility (theory/ENGENHO.md §III)
 
-| Surface | Format | Source of truth |
-|---|---|---|
-| Kubernetes REST API | HTTPS :6443; JSON / protobuf; v1.34 schema | upstream `kubernetes/api/openapi-spec/v3/` |
-| etcd v3 gRPC | Range/Put/Txn/Watch/Lease over UDS | upstream `etcd-io/etcd@v3.5/api/etcdserverpb/` |
-| CRI v1 | gRPC client to containerd / youki | upstream `kubernetes/cri-api/v1` |
-| CNI v1 | stdin JSON + ADD/DEL/CHECK/VERSION | `containernetworking/cni` spec |
-| Gateway API | v1.1 GA — GatewayClass/Gateway/HTTPRoute (M3+) | sigs.k8s.io/gateway-api |
+**Status column added 2026-08-29 — the rows below are the TARGET wire
+contracts; only the first is realised.**
+
+| Surface | Format | Source of truth | Status |
+|---|---|---|---|
+| Kubernetes REST API | HTTPS :6443; JSON / protobuf; v1.34 schema | upstream `kubernetes/api/openapi-spec/v3/` | **SHIPPED** |
+| etcd v3 gRPC | Range/Put/Txn/Watch/Lease over UDS | upstream `etcd-io/etcd@v3.5/api/etcdserverpb/` | **ABSENT** |
+| CRI v1 | gRPC client to containerd / youki | upstream `kubernetes/cri-api/v1` | **ABSENT** (podman driven directly) |
+| CNI v1 | stdin JSON + ADD/DEL/CHECK/VERSION | `containernetworking/cni` spec | **ABSENT** |
+| Gateway API | v1.1 GA — GatewayClass/Gateway/HTTPRoute (M3+) | sigs.k8s.io/gateway-api | **ABSENT** |
 
 ## CNCF Certified Kubernetes target — M4
 
