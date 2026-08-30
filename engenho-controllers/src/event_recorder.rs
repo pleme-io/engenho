@@ -284,3 +284,178 @@ mod tests {
         assert_eq!(k.kind, "Event");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// THE SINK — the seam between "an event happened" and "it is in the store".
+//
+// ★ WHY A TRAIT AND NOT A DIRECT STORE WRITE. Events are emitted from the
+// kubelet, the scheduler and a dozen controllers, none of which should
+// take a store dependency just to say what they observed. More
+// importantly, event recording MUST NOT be able to fail a reconcile: if
+// writing an event errored upward, a full event store would stop the
+// cluster from working. The sink's contract is therefore infallible from
+// the caller's view — it records or it drops, and it never propagates.
+//
+// ★ DROPPING IS A REAL POLICY, NOT AN OVERSIGHT. Upstream's recorder is
+// lossy under pressure for exactly this reason. A dropped event costs
+// visibility; a failed reconcile costs the workload.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Where recorded events go.
+#[async_trait::async_trait]
+pub trait EventSink: Send + Sync + 'static {
+    /// Record one event. Never returns an error: see the block above.
+    async fn record(&self, event: EventRecord);
+}
+
+/// A sink that discards everything.
+///
+/// The honest default for a component with no store wired, and what makes
+/// event emission safe to add to a code path before the plumbing exists —
+/// the alternative being an `Option<Sink>` check at every call site.
+pub struct NullEventSink;
+
+#[async_trait::async_trait]
+impl EventSink for NullEventSink {
+    async fn record(&self, _event: EventRecord) {}
+}
+
+/// A sink that collects into memory, for tests.
+#[derive(Default)]
+pub struct CollectingEventSink {
+    events: std::sync::Mutex<Vec<EventRecord>>,
+}
+
+impl CollectingEventSink {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every event recorded so far, in order.
+    #[must_use]
+    pub fn drain(&self) -> Vec<EventRecord> {
+        std::mem::take(&mut *self.events.lock().expect("event sink poisoned"))
+    }
+
+    /// The reasons recorded so far — the assertion most tests actually want.
+    #[must_use]
+    pub fn reasons(&self) -> Vec<Reason> {
+        self.events
+            .lock()
+            .expect("event sink poisoned")
+            .iter()
+            .map(|e| e.reason)
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for CollectingEventSink {
+    async fn record(&self, event: EventRecord) {
+        self.events.lock().expect("event sink poisoned").push(event);
+    }
+}
+
+/// Helper: record an event about a pod.
+///
+/// Exists so a call site names only what it observed — the object, the
+/// reason, the message — and cannot get the involvedObject shape wrong.
+pub async fn record_pod_event(
+    sink: &dyn EventSink,
+    namespace: &str,
+    pod: &str,
+    uid: Option<&str>,
+    reason: Reason,
+    message: impl Into<String>,
+    component: &str,
+    timestamp: &str,
+) {
+    sink.record(EventRecord {
+        involved: InvolvedObject {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some(namespace.to_string()),
+            name: pod.to_string(),
+            uid: uid.map(ToString::to_string),
+        },
+        reason,
+        message: message.into(),
+        component: component.to_string(),
+        timestamp: timestamp.to_string(),
+    })
+    .await;
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_collecting_sink_preserves_order() {
+        let sink = CollectingEventSink::new();
+        for r in [Reason::Pulled, Reason::Created, Reason::Started] {
+            record_pod_event(
+                &sink,
+                "default",
+                "nginx",
+                Some("u"),
+                r,
+                "m",
+                "kubelet",
+                "2026-08-29T21:00:00Z",
+            )
+            .await;
+        }
+        // Order matters: kubectl describe renders events chronologically,
+        // and a reordered lifecycle reads as a different failure.
+        assert_eq!(
+            sink.reasons(),
+            vec![Reason::Pulled, Reason::Created, Reason::Started]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_null_sink_makes_emission_safe_before_the_plumbing_exists() {
+        // The alternative is an Option<Sink> check at every call site,
+        // which is where a forgotten branch silently stops recording.
+        let sink = NullEventSink;
+        record_pod_event(
+            &sink,
+            "default",
+            "nginx",
+            None,
+            Reason::Failed,
+            "m",
+            "kubelet",
+            "2026-08-29T21:00:00Z",
+        )
+        .await;
+        // Nothing to assert but the absence of a panic — which IS the
+        // contract: recording must never be able to fail a reconcile.
+    }
+
+    #[tokio::test]
+    async fn the_helper_cannot_get_the_involved_object_shape_wrong() {
+        let sink = CollectingEventSink::new();
+        record_pod_event(
+            &sink,
+            "kube-system",
+            "coredns",
+            Some("abc"),
+            Reason::Unhealthy,
+            "probe failed",
+            "kubelet",
+            "2026-08-29T21:00:00Z",
+        )
+        .await;
+        let e = &sink.drain()[0];
+        assert_eq!(e.involved.kind, "Pod");
+        assert_eq!(e.involved.api_version, "v1");
+        assert_eq!(e.involved.namespace.as_deref(), Some("kube-system"));
+        assert_eq!(e.involved.name, "coredns");
+        assert_eq!(e.involved.uid.as_deref(), Some("abc"));
+        // And the severity still derives from the reason, not the caller.
+        assert_eq!(e.reason.severity(), Severity::Warning);
+    }
+}
