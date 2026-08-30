@@ -1183,6 +1183,36 @@ impl ResourceHandler for StoreBackedHandler {
         let mut body = body;
         crate::defaulting::apply(&self.group, &self.version, &self.kind, &mut body);
 
+        // ── API VALIDATION (upstream's `validation.ValidateX`). ────────
+        // AFTER defaulting, and the order is what makes the enum checks
+        // legal: `restartPolicy` is optional on the wire, so a validator
+        // running first would have to accept absent-or-valid and every rule
+        // would carry an "or missing" arm that hides real typos. Because
+        // defaulting has already filled it, validation can demand a legal
+        // value outright.
+        //
+        // BEFORE admission, so a webhook sees an object that is already
+        // known well-formed rather than having to re-check it.
+        //
+        // Before this stage a built-in could be stored with a
+        // `restartPolicy` of "Sometimes" or a containerPort of 99999 and be
+        // rejected by nothing — surfacing later as a confusing runtime
+        // error on a node instead of a 422 to whoever typed it.
+        {
+            let violations =
+                crate::validation::validate(&self.group, &self.version, &self.kind, &body);
+            if !violations.is_empty() {
+                let detail = violations
+                    .iter()
+                    .map(|v| [v.field.as_str(), ": ", v.message.as_str()].concat())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(ApiError::Invalid(
+                    [&self.kind, " \"", name.as_str(), "\" is invalid: ", &detail].concat(),
+                ));
+            }
+        }
+
         // ── CRD structural-schema validation. ──────────────────────────
         // Measured 2026-08-28: a CRD declaring `spec.size: {type: integer}`
         // accepted a CR with `spec.size: "NOT-AN-INT"` and returned 201. The

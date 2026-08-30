@@ -123,7 +123,7 @@ async fn list_pods_returns_pod_list() {
     for name in ["a", "b", "c"] {
         let body = serde_json::json!({
             "metadata": { "name": name },
-            "spec": {}
+            "spec": { "containers": [ { "name": "c", "image": "busybox:1.36" } ] }
         });
         client
             .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
@@ -157,7 +157,15 @@ async fn patch_pod_merges_into_existing() {
 
     let body = serde_json::json!({
         "metadata": { "name": "p" },
-        "spec": { "replicas": 1, "image": "v1" }
+        // `replicas`/`image` are not PodSpec fields — they are merge
+        // probes, kept because this test is about PATCH semantics. The
+        // container list is what makes the object VALID; without it the
+        // create is a 422 and the patch then 404s.
+        "spec": {
+            "containers": [ { "name": "c", "image": "busybox:1.36" } ],
+            "replicas": 1,
+            "image": "v1"
+        }
     });
     client
         .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
@@ -189,7 +197,7 @@ async fn delete_pod_removes_it_from_store() {
     let addr = server.local_addr();
     let client = reqwest::Client::new();
 
-    let body = serde_json::json!({"metadata": {"name": "delete-me"}, "spec": {}});
+    let body = serde_json::json!({"metadata": {"name": "delete-me"}, "spec": { "containers": [ { "name": "c", "image": "busybox:1.36" } ] }});
     client
         .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
         .json(&body)
@@ -237,7 +245,7 @@ async fn delete_pod_returns_object_json() {
     let addr = server.local_addr();
     let client = reqwest::Client::new();
 
-    let body = serde_json::json!({"metadata": {"name": "byebye"}, "spec": {}});
+    let body = serde_json::json!({"metadata": {"name": "byebye"}, "spec": { "containers": [ { "name": "c", "image": "busybox:1.36" } ] }});
     client
         .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
         .json(&body)
@@ -378,7 +386,7 @@ async fn delete_with_stale_resource_version_conflicts() {
     let addr = server.local_addr();
     let client = reqwest::Client::new();
 
-    let body = serde_json::json!({"metadata": {"name": "cas"}, "spec": {}});
+    let body = serde_json::json!({"metadata": {"name": "cas"}, "spec": { "containers": [ { "name": "c", "image": "busybox:1.36" } ] }});
     let created = client
         .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
         .json(&body)
@@ -420,7 +428,7 @@ async fn create_conflict_when_pod_already_exists() {
     let addr = server.local_addr();
     let client = reqwest::Client::new();
 
-    let body = serde_json::json!({"metadata": {"name": "p"}, "spec": {}});
+    let body = serde_json::json!({"metadata": {"name": "p"}, "spec": { "containers": [ { "name": "c", "image": "busybox:1.36" } ] }});
     let first = client
         .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
         .json(&body)
