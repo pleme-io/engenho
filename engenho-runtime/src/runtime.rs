@@ -24,7 +24,9 @@ use engenho_controllers::{
 };
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_kubelet::config_bridge::KubeletBackendKind;
-use engenho_kubelet::{ContainerRuntime, Kubelet, LogOptions, make_container_runtime};
+use engenho_kubelet::{
+    ContainerRuntime, Kubelet, LogOptions, make_container_runtime_with_apiserver,
+};
 use engenho_scheduler::{Scheduler, make_scheduling_strategy};
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
@@ -745,12 +747,35 @@ fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
 }
 
 /// Construct the container backend from the operator's config choice.
+/// The `kubernetes` Service's address, as `seed_kubernetes_service` creates it.
+///
+/// The IP is the ClusterIP allocator's FIRST assignment (see that function's
+/// doc) and the port is upstream's conventional 443, which fronts the
+/// apiserver's real listen port as the target. Stated here as a constant
+/// because `build_backend` runs before the store exists, so the seeded object
+/// cannot be read at that point.
+///
+/// Verified live 2026-08-30: `kubectl get svc kubernetes -n default` returns
+/// `10.96.0.1:443` on a freshly booted engenho. If the allocator's base ever
+/// changes, this must change with it — the two are a pair, and the failure
+/// mode is silent (a container gets coordinates that route nowhere).
+const DEFAULT_KUBERNETES_SERVICE_IP: &str = "10.96.0.1";
+
 fn build_backend(config: &EngenhoConfig) -> Arc<dyn ContainerRuntime> {
     let kind = match config.runtime.kubelet_backend {
         CfgBackendKind::Podman => KubeletBackendKind::Podman,
         CfgBackendKind::Fake => KubeletBackendKind::Fake,
     };
-    make_container_runtime(kind, config.runtime.podman_binary.as_deref())
+    // The `kubernetes` Service engenho itself creates in `default`. A
+    // node-level constant, so it is set once here rather than resolved per
+    // pod — and it must reach the backend, because the kubelet has THREE
+    // `backend.start` call sites and stamping any one of them misses the
+    // restart path.
+    make_container_runtime_with_apiserver(
+        kind,
+        config.runtime.podman_binary.as_deref(),
+        Some((DEFAULT_KUBERNETES_SERVICE_IP.to_string(), 443)),
+    )
 }
 
 /// Bring up the store spine — durable or ephemeral per config.

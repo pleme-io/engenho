@@ -58,7 +58,7 @@ pub use backend::{
     ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeNetProber, HttpProbeTarget,
     LogOptions, NetProber, PodmanBackend, ProbeIoError, PullPolicy, TcpProbeTarget, TokioNetProber,
 };
-pub use config_bridge::make_container_runtime;
+pub use config_bridge::{make_container_runtime, make_container_runtime_with_apiserver};
 pub use csi_materializer::{
     CsiRegistrarController, CsiVolumeMaterializer, DriverCsiProvisioner, DriverTable,
     RegisteredDriver,
