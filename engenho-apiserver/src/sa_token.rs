@@ -395,3 +395,158 @@ mod tests {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// KEY PERSISTENCE
+// ─────────────────────────────────────────────────────────────────────
+
+/// The ServiceAccount signing keypair, persisted beside the cluster PKI.
+///
+/// It MUST survive a restart. A fresh key on every boot invalidates every
+/// token already handed to a running pod, and the pod does not re-read its
+/// token file — so the whole cluster would silently lose its identity on a
+/// restart with nothing logging why.
+#[derive(Clone)]
+pub struct SaKeypair {
+    /// Signs tokens. Held by whatever issues them.
+    pub signing: SigningKey,
+    /// Verifies tokens. Held by the authenticator.
+    pub verifying: VerifyingKey,
+}
+
+impl std::fmt::Debug for SaKeypair {
+    /// Never render the key material. A `{:?}` of a struct holding this in a
+    /// log line would publish the cluster's identity.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SaKeypair(<redacted>)")
+    }
+}
+
+/// Load the SA signing keypair from `<data_dir>/pki/sa.key`, generating and
+/// persisting one on first boot.
+///
+/// Mirrors [`crate::pki::load_or_generate_ca`] deliberately, including the
+/// directory, so an operator finds every piece of cluster identity in one
+/// place. The file holds the 32 raw seed bytes.
+///
+/// # Errors
+///
+/// Any filesystem failure, or a key file that is not exactly 32 bytes —
+/// which is a truncated or foreign file, and is refused rather than padded
+/// into a valid-but-wrong key.
+pub fn load_or_generate_sa_key(data_dir: &std::path::Path) -> std::io::Result<SaKeypair> {
+    let pki_dir = data_dir.join("pki");
+    let key_path = pki_dir.join("sa.key");
+
+    let seed: [u8; 32] = if key_path.exists() {
+        let bytes = std::fs::read(&key_path)?;
+        <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: expected a 32-byte ed25519 seed, found {} bytes — \
+                     refusing to derive a key from a truncated or foreign file",
+                    key_path.display(),
+                    bytes.len()
+                ),
+            )
+        })?
+    } else {
+        std::fs::create_dir_all(&pki_dir)?;
+        // Random, not `blake3::derive_key` like the PKI. See the dependency
+        // comment in Cargo.toml: the CA's determinism buys a byte-identical
+        // kubeconfig and costs nothing, while a derivable SA signing key
+        // would let anyone with the source mint a token for any
+        // ServiceAccount.
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed).map_err(|e| {
+            std::io::Error::other(format!("no OS entropy for the SA signing key: {e}"))
+        })?;
+        std::fs::write(&key_path, seed)?;
+        // 0600: the private half of the cluster's identity. Anyone who can
+        // read it can mint a token for any ServiceAccount, including
+        // system:masters-bound ones.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        seed
+    };
+
+    let signing = SigningKey::from_bytes(&seed);
+    let verifying = signing.verifying_key();
+    Ok(SaKeypair { signing, verifying })
+}
+
+#[cfg(test)]
+mod keypair_tests {
+    use super::{issue, load_or_generate_sa_key, verify};
+
+    /// The key SURVIVES a restart. A fresh key each boot would invalidate
+    /// every token already in a running pod, silently.
+    #[test]
+    fn the_key_is_stable_across_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = load_or_generate_sa_key(dir.path()).expect("first load generates");
+        let b = load_or_generate_sa_key(dir.path()).expect("second load reuses");
+        assert_eq!(
+            a.signing.to_bytes(),
+            b.signing.to_bytes(),
+            "a restart must not mint a new identity"
+        );
+
+        // And a token minted before the reload still verifies after it.
+        let tok = issue(
+            &a.signing,
+            "https://kubernetes.default.svc",
+            "pangea-system",
+            "pangea-operator",
+            "uid-1",
+            &["api".to_string()],
+            None,
+            1_000,
+            3600,
+        )
+        .expect("issue");
+        verify(
+            &b.verifying,
+            &tok,
+            "https://kubernetes.default.svc",
+            "api",
+            1_100,
+        )
+        .expect("a token from before the restart must still verify");
+    }
+
+    /// A truncated or foreign key file is REFUSED, never padded into a
+    /// valid-but-wrong key that would silently reject every live token.
+    #[test]
+    fn a_wrong_sized_key_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("pki")).expect("mkdir");
+        std::fs::write(dir.path().join("pki/sa.key"), b"too short").expect("write");
+        let err = load_or_generate_sa_key(dir.path()).expect_err("must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("32-byte"), "{err}");
+    }
+
+    /// The key material never appears in a Debug rendering.
+    #[test]
+    fn debug_never_leaks_the_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = load_or_generate_sa_key(dir.path()).expect("load");
+        let rendered = format!("{kp:?}");
+        assert_eq!(rendered, "SaKeypair(<redacted>)");
+        let hex: String = kp
+            .signing
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(
+            !rendered.contains(&hex[..8]),
+            "key material must not render"
+        );
+    }
+}
