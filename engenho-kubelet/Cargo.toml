@@ -13,6 +13,7 @@ keywords.workspace = true
 description = "engenho-kubelet — the missing piece between 'Pod object in the store' and 'container running on host'. Per-node controller that watches Pods bound to its node + materializes containers via a pluggable ContainerRuntime backend (PodmanBackend / CriBackend / RunwasiBackend / FakeBackend for tests)."
 
 [dependencies]
+axum   = { workspace = true }
 async-trait        = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
@@ -33,4 +34,5 @@ engenho-config      = { workspace = true }
 engenho-substrate   = { workspace = true }
 
 [dev-dependencies]
+tower = { workspace = true, features = ["util"] }
 proptest = "1"
