@@ -78,6 +78,83 @@ pub fn srv_fqdn(
     )
 }
 
+/// Derive the SRV records a Service's ports imply.
+///
+/// ★ WHY THIS WAS THE GAP. `SrvRecord`, `srv_fqdn` and the backend's
+/// `upsert_srv` all existed; nothing ever CALLED them from a Service, so
+/// the only SRV records in the system were the ones tests wrote by hand.
+/// A type plus a backend method plus no producer is indistinguishable from
+/// a working feature until someone tries to resolve a name.
+///
+/// ★ WHY SRV MATTERS AND A-RECORDS ARE NOT ENOUGH. An A record answers
+/// "where is this service"; SRV answers "on WHICH PORT". Every client that
+/// discovers a port rather than hardcoding it — StatefulSet peers finding
+/// each other, Kafka and etcd clients, anything using
+/// `_port._proto.service` — reads SRV. Without it those clients fall back
+/// to a default port that is usually wrong, and the failure looks like a
+/// connection refused rather than a DNS problem.
+///
+/// ★ AN UNNAMED PORT PRODUCES NO SRV RECORD, deliberately. Upstream keys
+/// the name on the port's `name`, and a port without one has no
+/// `_name._proto` to be addressed by. Synthesising a name (`_0._tcp`)
+/// would publish a record nothing queries and that no upstream client
+/// would ever construct.
+///
+/// `target` is the service's own FQDN: for a headless service the client
+/// then resolves that to the pod set, which is exactly upstream's
+/// indirection.
+#[must_use]
+pub fn srv_records_for_service(
+    service: &serde_json::Value,
+    domain: &str,
+    ttl: u32,
+) -> Vec<SrvRecord> {
+    let Some(meta) = service.get("metadata") else {
+        return Vec::new();
+    };
+    let (Some(name), Some(namespace)) = (
+        meta.get("name").and_then(serde_json::Value::as_str),
+        meta.get("namespace").and_then(serde_json::Value::as_str),
+    ) else {
+        return Vec::new();
+    };
+    let Some(ports) = service
+        .get("spec")
+        .and_then(|s| s.get("ports"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let target = format!("{name}.{namespace}.svc.{domain}");
+    ports
+        .iter()
+        .filter_map(|p| {
+            // No name ⇒ no addressable SRV. See the note above.
+            let port_name = p.get("name").and_then(serde_json::Value::as_str)?;
+            if port_name.is_empty() {
+                return None;
+            }
+            let port = u16::try_from(p.get("port").and_then(serde_json::Value::as_i64)?).ok()?;
+            // Protocol defaults to TCP, matching the API's own default —
+            // a Service port that omits it is a TCP port, and treating it
+            // as unknown would drop the record.
+            let protocol = p
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("TCP");
+            Some(SrvRecord {
+                fqdn: srv_fqdn(port_name, protocol, name, namespace, domain),
+                priority: 0,
+                weight: 100,
+                port,
+                target: target.clone(),
+                ttl,
+            })
+        })
+        .collect()
+}
+
 /// Backend errors.
 #[derive(Debug, Clone, Error)]
 pub enum DnsError {
@@ -362,6 +439,95 @@ impl Controller for DnsController {
 
 #[cfg(test)]
 mod tests {
+
+    // ── SRV derivation (Phase 5.6) ────────────────────────────────────
+
+    fn svc(ports: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": { "name": "podinfo", "namespace": "default" },
+            "spec": { "ports": ports }
+        })
+    }
+
+    #[test]
+    fn srv_records_are_derived_from_a_services_named_ports() {
+        // The gap this closes: the type and backend existed, nothing
+        // produced one from a Service.
+        let recs = super::srv_records_for_service(
+            &svc(serde_json::json!([
+                { "name": "http", "port": 80, "protocol": "TCP" },
+                { "name": "metrics", "port": 9090 }
+            ])),
+            "cluster.local",
+            30,
+        );
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].fqdn, "_http._tcp.podinfo.default.svc.cluster.local");
+        assert_eq!(recs[0].port, 80);
+        // Protocol defaults to TCP, matching the API's own default — a
+        // port that omits it is a TCP port, and treating it as unknown
+        // would drop the record entirely.
+        assert_eq!(
+            recs[1].fqdn,
+            "_metrics._tcp.podinfo.default.svc.cluster.local"
+        );
+        assert_eq!(recs[1].port, 9090);
+    }
+
+    #[test]
+    fn the_target_is_the_services_own_fqdn() {
+        // A client resolves the target to the pod set; that indirection is
+        // upstream's, and pointing straight at a pod would break the
+        // moment the pod is replaced.
+        let recs = super::srv_records_for_service(
+            &svc(serde_json::json!([{ "name": "http", "port": 80 }])),
+            "cluster.local",
+            30,
+        );
+        assert_eq!(recs[0].target, "podinfo.default.svc.cluster.local");
+    }
+
+    #[test]
+    fn an_unnamed_port_produces_no_srv_record() {
+        // Upstream keys the name on the port's `name`. Synthesising one
+        // would publish a record nothing queries and no client constructs.
+        let recs = super::srv_records_for_service(
+            &svc(serde_json::json!([
+                { "port": 80 },
+                { "name": "", "port": 81 },
+                { "name": "ok", "port": 82 }
+            ])),
+            "cluster.local",
+            30,
+        );
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].port, 82);
+    }
+
+    #[test]
+    fn udp_ports_get_the_udp_protocol_label() {
+        let recs = super::srv_records_for_service(
+            &svc(serde_json::json!([{ "name": "dns", "port": 53, "protocol": "UDP" }])),
+            "cluster.local",
+            30,
+        );
+        assert_eq!(recs[0].fqdn, "_dns._udp.podinfo.default.svc.cluster.local");
+    }
+
+    #[test]
+    fn a_service_without_ports_or_metadata_yields_nothing_rather_than_panicking() {
+        assert!(
+            super::srv_records_for_service(&serde_json::json!({}), "cluster.local", 30).is_empty()
+        );
+        assert!(
+            super::srv_records_for_service(
+                &serde_json::json!({ "metadata": { "name": "s", "namespace": "d" } }),
+                "cluster.local",
+                30
+            )
+            .is_empty()
+        );
+    }
     use super::*;
 
     #[test]
