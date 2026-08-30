@@ -37,3 +37,26 @@
 //! nobody reads this crate as finished: **there is no listener on :2379.**
 
 pub mod keyspace;
+pub mod kv;
+
+/// The etcd v3 wire types, generated from the vendored upstream protos.
+///
+/// `mvccpb` carries `KeyValue` and `Event`; `etcdserverpb` carries every
+/// request/response. Generated at build time by protox + prost — no
+/// `protoc` on the build host, the same route `engenho-kube-proto` takes.
+pub mod pb {
+    /// `mvccpb` — `KeyValue`, `Event`.
+    pub mod mvccpb {
+        include!(concat!(env!("OUT_DIR"), "/mvccpb.rs"));
+    }
+    /// `authpb` — role/user messages. Present because `etcdserverpb`
+    /// imports it; engenho's authn lives at the apiserver, so the `Auth`
+    /// RPCs are permission-denied stubs (theory/ENGENHO.md III.2).
+    pub mod authpb {
+        include!(concat!(env!("OUT_DIR"), "/authpb.rs"));
+    }
+    /// `etcdserverpb` — the KV / Watch / Lease / Maintenance messages.
+    pub mod etcdserverpb {
+        include!(concat!(env!("OUT_DIR"), "/etcdserverpb.rs"));
+    }
+}
