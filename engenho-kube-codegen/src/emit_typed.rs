@@ -40,6 +40,90 @@ const FIELD_OVERRIDES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Kubernetes types that marshal as a SCALAR, not as an object.
+///
+/// Their OpenAPI schemas carry no `properties` — the wire form is defined by
+/// hand-written Go `MarshalJSON`/`UnmarshalJSON`, which the schema cannot
+/// express. A generic emitter therefore produces `pub struct Quantity {}`,
+/// which is syntactically fine and **rejects every real value**:
+///
+/// ```text
+/// invalid type: string "1Gi", expected struct Quantity
+/// ```
+///
+/// Measured 2026-08-30 against the reference pangea deployment: an
+/// `emptyDir` with `sizeLimit: 1Gi` failed to parse, so the Postgres pod
+/// stayed Pending forever. All five of these were empty structs, and each
+/// one silently breaks a whole family of manifests — every resource
+/// request/limit (`Quantity`), every `targetPort: http` or
+/// `maxUnavailable: 25%` (`IntOrString`), every nested timestamp (`Time`,
+/// `MicroTime`), every webhook payload and CRD default (`RawExtension`).
+///
+/// The override is by SCHEMA KEY, not by bare name, so a same-named type in
+/// another group cannot be caught by accident.
+const SCALAR_TYPE_OVERRIDES: &[(&str, &str)] = &[
+    (
+        "io.k8s.apimachinery.pkg.api.resource.Quantity",
+        "/// `Quantity` — a fixed-point number on the wire as a STRING (`\"1Gi\"`,\n\
+         /// `\"100m\"`, `\"1.5\"`). Kept as the literal wire text rather than\n\
+         /// parsed: comparing quantities needs suffix-aware arithmetic, and a\n\
+         /// lossy round-trip through f64 would change bytes we must echo back\n\
+         /// verbatim in a GET.\n\
+         #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]\n\
+         #[serde(transparent)]\n\
+         pub struct Quantity(pub String);\n",
+    ),
+    (
+        "io.k8s.apimachinery.pkg.util.intstr.IntOrString",
+        "/// `IntOrString` — an int OR a string on the wire. `targetPort: 8080`\n\
+         /// and `targetPort: http` are both legal, as are `maxUnavailable: 1`\n\
+         /// and `maxUnavailable: \"25%\"`.\n\
+         #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]\n\
+         #[serde(untagged)]\n\
+         pub enum IntOrString {\n\
+         \x20   Int(i64),\n\
+         \x20   Str(String),\n\
+         }\n\
+         \n\
+         impl Default for IntOrString {\n\
+         \x20   fn default() -> Self {\n\
+         \x20       Self::Int(0)\n\
+         \x20   }\n\
+         }\n",
+    ),
+    (
+        "io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+        "/// `Time` — RFC3339 on the wire, as a string.\n\
+         #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]\n\
+         #[serde(transparent)]\n\
+         pub struct Time(pub String);\n",
+    ),
+    (
+        "io.k8s.apimachinery.pkg.apis.meta.v1.MicroTime",
+        "/// `MicroTime` — RFC3339 with microseconds, on the wire as a string.\n\
+         #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]\n\
+         #[serde(transparent)]\n\
+         pub struct MicroTime(pub String);\n",
+    ),
+    (
+        "io.k8s.apimachinery.pkg.runtime.RawExtension",
+        "/// `RawExtension` — arbitrary JSON held verbatim. Used for webhook\n\
+         /// payloads and CRD defaults, where the shape is not knowable here.\n\
+         #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]\n\
+         #[serde(transparent)]\n\
+         pub struct RawExtension(pub serde_json::Value);\n",
+    ),
+];
+
+/// The hand-written body for a scalar-marshalled type, if `owner_key` names one.
+#[must_use]
+pub fn scalar_type_override(owner_key: &str) -> Option<&'static str> {
+    SCALAR_TYPE_OVERRIDES
+        .iter()
+        .find(|(k, _)| *k == owner_key)
+        .map(|(_, body)| *body)
+}
+
 /// Look up a field-type override for `(owner_key, wire_field)`.
 fn field_override(owner_key: &str, wire_field: &str) -> Option<&'static str> {
     FIELD_OVERRIDES
@@ -213,6 +297,12 @@ pub fn emit_fields(
 /// the set of referenced schema keys (for transitive emission).
 #[must_use]
 pub fn emit_struct(name: &str, owner_key: &str, shape: &SchemaView) -> (String, BTreeSet<String>) {
+    // A scalar-marshalled Kubernetes type is emitted verbatim: its schema
+    // has no properties, so the generic path below would produce an empty
+    // struct that rejects every real value. See SCALAR_TYPE_OVERRIDES.
+    if let Some(body) = scalar_type_override(owner_key) {
+        return (body.to_string(), BTreeSet::new());
+    }
     let mut refs = BTreeSet::new();
     let fields = emit_fields(owner_key, &shape.properties, &shape.required, &mut refs);
     let doc = rustdoc(&shape.description, "");
@@ -302,6 +392,86 @@ pub struct SchemaView {
     pub description: String,
     pub properties: BTreeMap<String, serde_json::Value>,
     pub required: Vec<String>,
+}
+
+#[cfg(test)]
+mod scalar_override_tests {
+    use super::{SCALAR_TYPE_OVERRIDES, SchemaView, emit_struct, scalar_type_override};
+
+    /// Every Kubernetes type that marshals as a scalar is overridden.
+    ///
+    /// Their schemas have no `properties`, so the generic emitter produces
+    /// `pub struct X {}` — which compiles and rejects every real value with
+    /// `invalid type: string "1Gi", expected struct Quantity`.
+    #[test]
+    fn all_five_scalar_types_are_overridden() {
+        for key in [
+            "io.k8s.apimachinery.pkg.api.resource.Quantity",
+            "io.k8s.apimachinery.pkg.util.intstr.IntOrString",
+            "io.k8s.apimachinery.pkg.apis.meta.v1.Time",
+            "io.k8s.apimachinery.pkg.apis.meta.v1.MicroTime",
+            "io.k8s.apimachinery.pkg.runtime.RawExtension",
+        ] {
+            assert!(
+                scalar_type_override(key).is_some(),
+                "{key} must be overridden or it emits an empty struct"
+            );
+        }
+    }
+
+    /// The emitted bodies carry the right wire representation, and NONE of
+    /// them is an empty struct.
+    #[test]
+    fn no_override_emits_an_empty_struct() {
+        for (key, body) in SCALAR_TYPE_OVERRIDES {
+            assert!(
+                !body.contains("{}"),
+                "{key} still emits an empty struct: {body}"
+            );
+            assert!(
+                body.contains("(pub ") || body.contains("pub enum"),
+                "{key} must be a newtype or an enum: {body}"
+            );
+        }
+    }
+
+    /// Quantity keeps the literal wire text. Parsing to a number would be a
+    /// lossy round-trip, and a GET must echo the submitted bytes back.
+    #[test]
+    fn quantity_is_a_transparent_string_newtype() {
+        let body = scalar_type_override("io.k8s.apimachinery.pkg.api.resource.Quantity").unwrap();
+        assert!(body.contains("pub struct Quantity(pub String);"));
+        assert!(body.contains("#[serde(transparent)]"));
+    }
+
+    /// IntOrString must accept BOTH forms — `targetPort: 8080` and
+    /// `targetPort: http` are each legal in the same field.
+    #[test]
+    fn int_or_string_is_an_untagged_enum_over_both_forms() {
+        let body = scalar_type_override("io.k8s.apimachinery.pkg.util.intstr.IntOrString").unwrap();
+        assert!(body.contains("#[serde(untagged)]"));
+        assert!(body.contains("Int(i64)"));
+        assert!(body.contains("Str(String)"));
+    }
+
+    /// The override fires from emit_struct, and takes precedence over the
+    /// generic property-driven path.
+    #[test]
+    fn emit_struct_routes_through_the_override() {
+        let empty = SchemaView::default();
+        let (src, refs) = emit_struct(
+            "Quantity",
+            "io.k8s.apimachinery.pkg.api.resource.Quantity",
+            &empty,
+        );
+        assert!(src.contains("pub struct Quantity(pub String);"), "{src}");
+        assert!(refs.is_empty(), "an override references no other schema");
+
+        // A normal type with no properties is still an empty struct — the
+        // override is keyed, not a blanket rule.
+        let (plain, _) = emit_struct("SomeThing", "io.k8s.api.core.v1.SomeThing", &empty);
+        assert!(plain.contains("pub struct SomeThing {"), "{plain}");
+    }
 }
 
 #[cfg(test)]
