@@ -672,6 +672,14 @@ impl Kubelet {
                     reason: format!("spec.{spec_key}[{i}].image missing"),
                 })?
                 .to_string();
+            // Read the container's OWN imagePullPolicy. Nothing in the tree
+            // read this field before, so every container inherited the
+            // backend-wide `Never` and any uncached image failed as
+            // "image not known".
+            let pull_policy = crate::backend::PullPolicy::resolve(
+                c.get("imagePullPolicy").and_then(|p| p.as_str()),
+                &image,
+            );
             let env = match c.get("env").and_then(|e| e.as_array()) {
                 Some(arr) => {
                     let mut map = BTreeMap::new();
@@ -712,6 +720,7 @@ impl Kubelet {
                     image,
                     env,
                     command,
+                    pull_policy: Some(pull_policy),
                     // Service-name DNS aliases are computed once per pod in
                     // `start_bound_pod` and assigned onto each spec there.
                     network_aliases: Vec::new(),
