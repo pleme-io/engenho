@@ -145,6 +145,36 @@ pub enum ResourceCommand {
         #[serde(default = "default_deletion_timestamp")]
         deletion_timestamp: Option<String>,
     },
+
+    /// An ATOMIC multi-key transaction — etcd's `Txn`.
+    ///
+    /// ★ WHY THIS EXISTS AND WHY IT MUST BE ONE COMMAND. Every other
+    /// variant here touches exactly one key, which is all engenho's own
+    /// apiserver ever needed. etcd's contract is different: a `Txn`
+    /// evaluates a compare-list and then applies a WHOLE branch, and the
+    /// result must be all-or-nothing. Expressing that as N separate
+    /// commands would let a replica apply half a branch and would give each
+    /// key its own revision — both observable, both wrong.
+    ///
+    /// ★ ONE TRANSACTION IS ONE REVISION. etcd stamps every key a `Txn`
+    /// mutates with the SAME `mod_revision`. That falls out of the design
+    /// here because [`crate::state::ResourceCatalog::apply`] reserves one
+    /// revision per command; the branch's ops all commit at it.
+    ///
+    /// ★ THE COMPARES ARE PART OF THE REPLICATED COMMAND, for the same
+    /// reason `expected` is on `Put`: a leader-only evaluation would let
+    /// replicas take different branches and diverge.
+    Txn {
+        /// Predicates, ALL of which must hold to take `success`. An empty
+        /// list is vacuously true and takes `success` — etcd's behaviour
+        /// for an unconditional transaction.
+        compares: Vec<TxnCompare>,
+        /// Applied when every compare holds.
+        success: Vec<TxnOp>,
+        /// Applied otherwise. Usually empty (etcd's `Txn` without an else).
+        failure: Vec<TxnOp>,
+        reason: Reason,
+    },
 }
 
 impl ResourceCommand {
@@ -480,4 +510,45 @@ mod tests {
             other => panic!("expected Delete, got {other:?}"),
         }
     }
+}
+
+/// One predicate in a [`ResourceCommand::Txn`].
+///
+/// Deliberately NOT etcd's full compare grammar. etcd can compare on
+/// `VERSION`, `CREATE`, `MOD` and `VALUE`; kube-apiserver only ever emits
+/// `MOD` (and existence, expressed as `MOD == 0`). Modelling the two forms
+/// that are actually used keeps the unused ones UNREPRESENTABLE rather than
+/// stubbed — a stubbed compare that silently returns `true` would take the
+/// wrong branch and corrupt state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cmp", rename_all = "snake_case")]
+pub enum TxnCompare {
+    /// The key's live `mod_revision` equals `revision`.
+    ModRevisionEq {
+        key: ResourceKey,
+        revision: Revision,
+    },
+    /// The key does not exist. etcd spells this `MOD(key) == 0`, and it is
+    /// the compare kube-apiserver uses for every create.
+    NotExists { key: ResourceKey },
+}
+
+/// One operation inside a transaction branch.
+///
+/// A branch cannot contain a nested `Txn`: etcd allows it, kube-apiserver
+/// never emits it, and permitting it would make the revision-per-command
+/// invariant recursive for no consumer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum TxnOp {
+    Put {
+        key: ResourceKey,
+        value: ResourceValue,
+    },
+    Delete {
+        key: ResourceKey,
+        /// Frozen at the boundary, exactly as [`ResourceCommand::Delete`]
+        /// requires — the clock is not a replicated input.
+        deletion_timestamp: Option<String>,
+    },
 }
