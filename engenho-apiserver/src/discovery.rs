@@ -415,6 +415,78 @@ pub struct APIGroupDiscoveryList {
 /// The media type upstream negotiates aggregated discovery with.
 pub const AGGREGATED_DISCOVERY_ACCEPT: &str = "apidiscovery.k8s.io";
 
+/// The `Content-Type` upstream stamps ON THE RESPONSE, byte for byte.
+///
+/// This is not cosmetic and it is not a courtesy to the client. client-go
+/// branches on the **response** content type, never on what it asked for
+/// (`discovery/aggregated_discovery.go`, `downloadAPIs`). A plain
+/// `application/json` fails its v2 match and sends it down the legacy
+/// branch, where it unmarshals this `items`-shaped document into a
+/// `groups`-shaped `APIGroupList`, finds the `groups` key absent, and
+/// concludes the server has **zero API groups** — on a 200, with no error
+/// anywhere.
+///
+/// The blast radius is total and it does not look like a discovery bug:
+/// `kubectl get deployments` reports *"the server doesn't have a resource
+/// type"*, `kubectl api-resources` prints core/v1 alone, and kustomize,
+/// helm and flux are all unusable, while `kubectl get --raw /apis` shows
+/// every group present and correct. Serve the right header or serve
+/// nothing — a correct body under the wrong content type is worse than a
+/// 406, because a 406 is legible.
+pub const AGGREGATED_DISCOVERY_CONTENT_TYPE: &str =
+    "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
+
+/// Does this `Accept` genuinely include aggregated discovery **v2** — as
+/// opposed to only the older `v2beta1`?
+///
+/// The naive check is a trap: `"v=v2beta1".contains("v=v2")` is **true**,
+/// so a substring match would answer a v2beta1-only client with a document
+/// stamped v2. We only ever emit v2 (`APIGroupDiscoveryList::api_version`
+/// is fixed), so claiming it to a client that did not ask for it is the
+/// same class of defect as the content-type bug itself — a correct body
+/// under a label the reader cannot use.
+///
+/// A v2beta1-only client therefore falls back to the legacy
+/// `APIGroupList`, which every client since 1.0 understands. Real kubectl
+/// is unaffected: it sends v2 **and** v2beta1 **and** plain JSON, in that
+/// preference order.
+#[must_use]
+pub fn accepts_aggregated_v2(accept: Option<&str>) -> bool {
+    let Some(a) = accept else { return false };
+    if !a.contains(AGGREGATED_DISCOVERY_ACCEPT) {
+        return false;
+    }
+    // `v=v2` must be the WHOLE version token: the next byte, if any, has
+    // to be a parameter or media-range separator rather than more version.
+    a.match_indices("v=v2").any(|(i, m)| {
+        match a.as_bytes().get(i + m.len()) {
+            // End of header, or a parameter/media-range boundary: the
+            // version token really was `v2`.
+            None => true,
+            Some(b) => matches!(b, b';' | b',' | b' '),
+        }
+    })
+}
+
+/// Render an aggregated-discovery document under the content type that
+/// makes a client parse it as one.
+///
+/// Every aggregated response goes through here. `Json(..)` alone stamps
+/// `application/json`, which is the defect above, so constructing the
+/// response by hand at a call site is the thing this function exists to
+/// prevent.
+#[must_use]
+pub fn aggregated_response(doc: APIGroupDiscoveryList) -> axum::response::Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            AGGREGATED_DISCOVERY_CONTENT_TYPE,
+        )],
+        Json(doc),
+    )
+        .into_response()
+}
+
 /// Does this `Accept` header ask for aggregated discovery?
 ///
 /// Matched on the GROUP parameter rather than the whole string: clients
@@ -521,13 +593,31 @@ pub fn build_aggregated(state: &RouterState, core: bool) -> APIGroupDiscoveryLis
 
 // ── axum route handlers ────────────────────────────────────────────────
 
-/// `GET /api` → the core `APIVersions` (we serve exactly `v1`).
-pub async fn api_versions() -> impl IntoResponse {
+/// `GET /api` → the core `APIVersions`, or the aggregated document when
+/// the client negotiates for it.
+///
+/// Upstream serves aggregated discovery on BOTH `/api` and `/apis`, and
+/// `build_aggregated`'s `core` parameter existed for exactly this — but
+/// until now nothing in production ever passed `true`, so the core arm was
+/// reachable only from a unit test. A client asking `/api` for aggregated
+/// discovery got an `APIVersions` document instead: the right shape for a
+/// question it did not ask.
+pub async fn api_versions(
+    State(state): State<RouterState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok());
+    if accepts_aggregated_v2(accept) {
+        return aggregated_response(build_aggregated(&state, true));
+    }
     Json(APIVersions {
         kind: "APIVersions",
         versions: vec!["v1".to_string()],
         server_address_by_client_cidrs: Vec::new(),
     })
+    .into_response()
 }
 
 /// `GET /api/v1` → the core `APIResourceList`.
@@ -545,8 +635,8 @@ pub async fn api_groups(
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok());
-    if wants_aggregated(accept) {
-        return Json(build_aggregated(&state, false)).into_response();
+    if accepts_aggregated_v2(accept) {
+        return aggregated_response(build_aggregated(&state, false));
     }
     Json(build_api_groups(&state)).into_response()
 }
@@ -603,6 +693,107 @@ mod aggregated_tests {
         assert!(
             !wants_aggregated(None),
             "an absent Accept is not a request for it"
+        );
+    }
+
+    /// THE REGRESSION. The aggregated response must carry upstream's exact
+    /// content type, because client-go branches on the RESPONSE header.
+    ///
+    /// Every pre-existing test here asserted `wants_aggregated` on the
+    /// REQUEST side, and the document envelope on the BODY side. Both were
+    /// correct and the feature was still entirely broken, because nothing
+    /// asserted the one byte-string in between. That gap is why
+    /// `kubectl get deployments` answered "the server doesn't have a
+    /// resource type" against a server serving all 18 groups.
+    #[test]
+    fn the_aggregated_response_carries_upstreams_content_type() {
+        use axum::http::header::CONTENT_TYPE;
+
+        let resp = aggregated_response(build_aggregated(&RouterState::new(Vec::new()), false));
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("aggregated response must set a content type")
+            .to_str()
+            .expect("content type must be ASCII");
+
+        assert_eq!(
+            ct, AGGREGATED_DISCOVERY_CONTENT_TYPE,
+            "content type must match upstream byte for byte"
+        );
+        // Spelled out, so a future edit that drops a parameter fails on the
+        // parameter rather than on an opaque string comparison.
+        for part in [
+            "application/json",
+            "g=apidiscovery.k8s.io",
+            "v=v2",
+            "as=APIGroupDiscoveryList",
+        ] {
+            assert!(ct.contains(part), "content type omits {part:?}: {ct}");
+        }
+        assert_ne!(
+            ct, "application/json",
+            "a bare application/json is the defect this test exists for"
+        );
+    }
+
+    /// `v=v2beta1` CONTAINS `v=v2`, so a substring check would claim v2 to
+    /// a client that never asked for it. We only ever emit v2, so a
+    /// v2beta1-only client must fall back to the legacy `APIGroupList`.
+    #[test]
+    fn v2beta1_alone_is_not_a_request_for_v2() {
+        assert!(
+            !accepts_aggregated_v2(Some(
+                "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList"
+            )),
+            "v2beta1 alone must not be served a v2-stamped document"
+        );
+        // But `wants_aggregated` — the loose predicate — still matches it,
+        // which is precisely why the handlers use the precise one.
+        assert!(wants_aggregated(Some(
+            "application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList"
+        )));
+    }
+
+    /// Real kubectl asks for v2, v2beta1 and plain JSON together, and must
+    /// get aggregated discovery. Parameter order varies between clients.
+    #[test]
+    fn real_client_accept_headers_negotiate_v2() {
+        for accept in [
+            "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList",
+            "application/json;as=APIGroupDiscoveryList;v=v2;g=apidiscovery.k8s.io",
+            "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,application/json",
+            // kubectl's real header: v2 preferred, v2beta1 next, json last.
+            "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList,application/json",
+        ] {
+            assert!(
+                accepts_aggregated_v2(Some(accept)),
+                "must negotiate: {accept}"
+            );
+        }
+        for accept in [
+            "application/json",
+            "*/*",
+            "application/vnd.kubernetes.protobuf",
+        ] {
+            assert!(!accepts_aggregated_v2(Some(accept)), "must not: {accept}");
+        }
+        assert!(!accepts_aggregated_v2(None));
+    }
+
+    /// The core arm had NO production caller — `build_aggregated(_, true)`
+    /// was reachable only from a test, so `/api` never served aggregated
+    /// discovery at all. Upstream serves it on both paths.
+    #[test]
+    fn the_core_arm_is_reachable_and_distinct() {
+        let state = RouterState::new(Vec::new());
+        let core = aggregated_response(build_aggregated(&state, true));
+        assert_eq!(
+            core.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            AGGREGATED_DISCOVERY_CONTENT_TYPE,
+            "/api's aggregated response needs the same content type as /apis'"
         );
     }
 
