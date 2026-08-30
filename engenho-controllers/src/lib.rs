@@ -54,6 +54,7 @@ pub mod job;
 pub mod meta;
 pub mod namespace;
 pub mod network_policy;
+pub mod node_port;
 pub mod owned_children;
 pub mod owner;
 pub mod pdb;
