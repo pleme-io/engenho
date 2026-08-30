@@ -124,6 +124,104 @@ const DEFAULT_COLUMNS: &[ColumnDefinition] = &[
     },
 ];
 
+/// A printer column declared by a CRD's `additionalPrinterColumns`.
+///
+/// ★ WHY THIS IS THE RIGHT SOURCE and hand-written per-kind arms are not.
+/// Upstream's built-in column sets live in Go source that engenho vendors
+/// no schema for, so they can only be TRANSCRIBED — and a transcribed
+/// table is a hand-list that drifts from upstream silently, showing a
+/// plausible-but-wrong column set. A CRD's columns are different: the
+/// author DECLARED them in the CRD, engenho already stores that CRD, so
+/// they are DERIVED. No drift is possible because there is one source.
+///
+/// This covers the kinds operators most often stare at — Flux
+/// Kustomizations, Cilium policies, Pangea resources — every one of which
+/// ships printer columns that were being discarded.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedColumn {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub format: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub priority: i32,
+}
+
+/// Extract the printer columns a CRD version declares.
+///
+/// Returns `None` when the CRD declares none, so the caller falls back to
+/// the default pair rather than rendering an empty header row.
+#[must_use]
+pub fn crd_printer_columns(version: &Value) -> Option<Vec<(OwnedColumn, String)>> {
+    let cols = version.get("additionalPrinterColumns")?.as_array()?;
+    if cols.is_empty() {
+        return None;
+    }
+    let out: Vec<(OwnedColumn, String)> = cols
+        .iter()
+        .filter_map(|c| {
+            // `jsonPath` is required by the CRD schema; a column without
+            // one cannot be rendered and is dropped rather than emitted
+            // with a null cell, which would misalign every following
+            // column in the row.
+            let path = c.get("jsonPath")?.as_str()?.to_string();
+            Some((
+                OwnedColumn {
+                    name: c.get("name")?.as_str()?.to_string(),
+                    type_: c
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("string")
+                        .to_string(),
+                    format: c
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    description: c
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    priority: c
+                        .get("priority")
+                        .and_then(Value::as_i64)
+                        .and_then(|p| i32::try_from(p).ok())
+                        .unwrap_or(0),
+                },
+                path,
+            ))
+        })
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// Resolve one `jsonPath` cell value against an object.
+///
+/// ★ A DELIBERATELY NARROW SUBSET. CRD printer columns use simple dotted
+/// paths (`.status.phase`, `.spec.replicas`) in practice; the full JSONPath
+/// grammar includes filters and wildcards that would need a real evaluator.
+/// Anything outside the subset yields `null` — an EMPTY CELL, which renders
+/// as `<none>` exactly as upstream does for an unresolvable path, rather
+/// than dropping the column and misaligning the row.
+#[must_use]
+pub fn resolve_json_path(obj: &Value, path: &str) -> Value {
+    let mut cur = obj;
+    for seg in path.trim_start_matches('.').split('.') {
+        if seg.is_empty() {
+            continue;
+        }
+        match cur.get(seg) {
+            Some(next) => cur = next,
+            None => return Value::Null,
+        }
+    }
+    cur.clone()
+}
+
 /// Build the `PartialObjectMetadata` upstream embeds for
 /// `includeObject=Metadata` — the object's `metadata` and nothing else, which
 /// is the whole point of asking for a Table rather than a List.
@@ -207,6 +305,82 @@ pub fn accept_wants_table(accept: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    // ── CRD additionalPrinterColumns (Phase 5.7) ──────────────────────
+
+    fn crd_version_with_columns() -> serde_json::Value {
+        serde_json::json!({
+            "name": "v1",
+            "additionalPrinterColumns": [
+                { "name": "Ready", "type": "string", "jsonPath": ".status.conditions[0].status" },
+                { "name": "Phase", "type": "string", "jsonPath": ".status.phase",
+                  "description": "current phase" },
+                { "name": "Replicas", "type": "integer", "jsonPath": ".spec.replicas",
+                  "priority": 1 }
+            ]
+        })
+    }
+
+    #[test]
+    fn a_crds_declared_columns_are_derived_not_transcribed() {
+        // These are the kinds operators stare at — Flux, Cilium, Pangea —
+        // and their columns were being discarded entirely.
+        let cols = super::crd_printer_columns(&crd_version_with_columns()).expect("declared");
+        let names: Vec<&str> = cols.iter().map(|(c, _)| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Ready", "Phase", "Replicas"]);
+        assert_eq!(cols[1].0.description, "current phase");
+        assert_eq!(cols[2].0.priority, 1, "priority is honoured, not flattened");
+        assert_eq!(cols[2].0.type_, "integer");
+    }
+
+    #[test]
+    fn a_crd_with_no_columns_falls_back_rather_than_rendering_an_empty_header() {
+        assert!(super::crd_printer_columns(&serde_json::json!({ "name": "v1" })).is_none());
+        assert!(
+            super::crd_printer_columns(&serde_json::json!({ "additionalPrinterColumns": [] }))
+                .is_none(),
+            "an empty array must fall back, not produce a headerless table"
+        );
+    }
+
+    #[test]
+    fn a_column_without_a_json_path_is_dropped_not_emitted_null() {
+        // Emitting it with a null cell would misalign every FOLLOWING
+        // column in the row, which is worse than omitting one.
+        let v = serde_json::json!({
+            "additionalPrinterColumns": [
+                { "name": "Broken", "type": "string" },
+                { "name": "Fine", "type": "string", "jsonPath": ".status.phase" }
+            ]
+        });
+        let cols = super::crd_printer_columns(&v).expect("one survives");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].0.name, "Fine");
+    }
+
+    #[test]
+    fn dotted_json_paths_resolve_and_a_missing_one_is_an_empty_cell() {
+        let obj = serde_json::json!({
+            "spec": { "replicas": 3 },
+            "status": { "phase": "Ready" }
+        });
+        assert_eq!(super::resolve_json_path(&obj, ".status.phase"), "Ready");
+        assert_eq!(super::resolve_json_path(&obj, ".spec.replicas"), 3);
+        // Leading dot optional — CRDs write it both ways.
+        assert_eq!(super::resolve_json_path(&obj, "status.phase"), "Ready");
+        // Unresolvable renders as <none> upstream, so null is right; the
+        // column must NOT be dropped at render time or the row misaligns.
+        assert_eq!(
+            super::resolve_json_path(&obj, ".status.nope"),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            super::resolve_json_path(&obj, ".status.conditions[0].status"),
+            serde_json::Value::Null,
+            "the filter/index grammar is outside the subset and yields an \
+             empty cell rather than a wrong one"
+        );
+    }
     use super::*;
 
     fn list() -> Value {
