@@ -267,6 +267,24 @@ pub enum WebhookError {
 pub trait WebhookConfigSource: Send + Sync {
     /// Every live `MutatingWebhookConfiguration` object, as stored JSON.
     async fn mutating_configs(&self) -> Vec<Value>;
+
+    /// Every live `ValidatingWebhookConfiguration` object, as stored JSON.
+    ///
+    /// ★ WHY A SEPARATE ARM AND NOT A REUSE OF THE MUTATING ONE. The two
+    /// kinds are stored separately, called at different points in the
+    /// pipeline, and mean different things: a mutating webhook may REWRITE
+    /// the object, a validating one may only accept or reject it. Serving
+    /// validating configs from the mutating list would let a policy webhook
+    /// silently rewrite objects, which is precisely the privilege the split
+    /// exists to withhold.
+    ///
+    /// Defaulted to empty so every existing implementor keeps compiling and
+    /// behaves exactly as before — an implementor that has not yet been
+    /// taught about validating webhooks reports none, rather than
+    /// accidentally reporting the mutating ones.
+    async fn validating_configs(&self) -> Vec<Value> {
+        Vec::new()
+    }
 }
 
 /// The HTTP(S) call-out seam. Production POSTs the `AdmissionReview` request
@@ -774,6 +792,53 @@ impl MutatingWebhookPlugin {
             }
         }
 
+        // ── VALIDATING PASS ───────────────────────────────────────────
+        //
+        // ★ AFTER every mutation, and that ORDER is the whole point. A
+        // validating webhook exists to judge the object the cluster will
+        // actually store; running it first would let a later mutating
+        // webhook rewrite the object into something the policy would have
+        // rejected — which is exactly the hole a policy engine is deployed
+        // to close.
+        //
+        // ★ A VALIDATING WEBHOOK MAY NOT MUTATE. Any patch in its response
+        // is IGNORED rather than applied. Upstream ignores it too, and
+        // honouring it would hand a policy webhook a privilege the object
+        // kind it was registered under explicitly withholds.
+        let validating = self.source.validating_configs().await;
+        for config in &validating {
+            for webhook in parse_mutating_config(config) {
+                if !rules_match(&webhook, &key.group, &key.version, &resource, operation) {
+                    continue;
+                }
+                if !self.selectors_match(&webhook, request, &object) {
+                    continue;
+                }
+                uid_counter += 1;
+                let uid = format!("{}-{}", request.key.label(), uid_counter);
+                let mut req_for_review = request.clone();
+                req_for_review.value = Some(object.clone());
+                let review_req = build_admission_review(&req_for_review, &resource, &uid);
+
+                match self.call_one(&webhook, &review_req).await {
+                    Ok(resp) => {
+                        if !resp.allowed {
+                            let reason = resp
+                                .message
+                                .unwrap_or_else(|| "request denied by webhook".to_string());
+                            return AdmissionDecision::Deny(format!("{}: {reason}", webhook.name));
+                        }
+                        // resp.patch deliberately unread — see above.
+                    }
+                    Err(e) => {
+                        if let Some(d) = Self::govern_failure(&webhook, &e.to_string()) {
+                            return d;
+                        }
+                    }
+                }
+            }
+        }
+
         if mutated {
             AdmissionDecision::Mutate(object)
         } else {
@@ -942,10 +1007,11 @@ impl AdmissionWebhook for MutatingWebhookPlugin {
 //  Mock seams for tests.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A [`WebhookConfigSource`] holding a static list of config objects.
+/// A [`WebhookConfigSource`] holding static lists of config objects.
 #[derive(Clone, Default)]
 pub struct StaticConfigSource {
     configs: Arc<Vec<Value>>,
+    validating: Arc<Vec<Value>>,
 }
 
 impl StaticConfigSource {
@@ -954,6 +1020,20 @@ impl StaticConfigSource {
     pub fn new(configs: Vec<Value>) -> Self {
         Self {
             configs: Arc::new(configs),
+            validating: Arc::new(Vec::new()),
+        }
+    }
+
+    /// New source carrying `ValidatingWebhookConfiguration` objects too.
+    ///
+    /// Separate constructor rather than a second argument on `new` so every
+    /// existing caller keeps its meaning: a test that registered mutating
+    /// configs must not silently acquire validating ones.
+    #[must_use]
+    pub fn with_validating(mutating: Vec<Value>, validating: Vec<Value>) -> Self {
+        Self {
+            configs: Arc::new(mutating),
+            validating: Arc::new(validating),
         }
     }
 }
@@ -962,6 +1042,10 @@ impl StaticConfigSource {
 impl WebhookConfigSource for StaticConfigSource {
     async fn mutating_configs(&self) -> Vec<Value> {
         (*self.configs).clone()
+    }
+
+    async fn validating_configs(&self) -> Vec<Value> {
+        (*self.validating).clone()
     }
 }
 
@@ -1147,6 +1231,31 @@ mod tests {
 
     /// A config whose webhook injects a sidecar container via a JSONPatch and
     /// matches Pod CREATE.
+    /// A ValidatingWebhookConfiguration over the same rule shape.
+    ///
+    /// Same webhook body as the mutating one on purpose: the tests below
+    /// must show that the DIFFERENCE in behaviour comes from WHICH LIST the
+    /// config was read from, not from anything in the object.
+    fn validating_config(endpoint: &str, name: &str) -> Value {
+        json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": { "name": name },
+            "webhooks": [{
+                "name": "policy.tatara-mesh.io",
+                "clientConfig": { "url": endpoint },
+                "rules": [{
+                    "operations": ["CREATE"],
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["pods"]
+                }],
+                "failurePolicy": "Fail",
+                "timeoutSeconds": 5
+            }]
+        })
+    }
+
     fn sidecar_inject_config(endpoint: &str) -> Value {
         json!({
             "apiVersion": "admissionregistration.k8s.io/v1",
@@ -1359,6 +1468,113 @@ mod tests {
             caller.calls().await.len(),
             0,
             "no HTTP call for an unresolved service ref"
+        );
+    }
+
+    // ── validating webhooks (Phase 5.9) ───────────────────────────────
+
+    #[tokio::test]
+    async fn a_validating_webhook_can_deny() {
+        // ValidatingWebhookConfiguration has always been in the catalog and
+        // therefore storable. Nothing read it, so a cluster could hold a
+        // policy configuration that was never consulted and reported no
+        // error — a policy engine that silently does nothing.
+        let ep = "https://policy.example/validate";
+        let source = Arc::new(StaticConfigSource::with_validating(
+            vec![],
+            vec![validating_config(ep, "policy")],
+        ));
+        let caller = Arc::new(MockWebhookCaller::new());
+        caller
+            .set_response(
+                ep,
+                MockWebhookCaller::deny_review("u", "no privileged pods"),
+            )
+            .await;
+        let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer());
+
+        match plugin.review(&pod_request()).await.unwrap() {
+            AdmissionDecision::Deny(reason) => {
+                assert!(reason.contains("no privileged pods"), "got: {reason}");
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+        assert_eq!(caller.calls().await.len(), 1, "the webhook must be called");
+    }
+
+    #[tokio::test]
+    async fn a_validating_webhook_may_not_mutate() {
+        // The identical config body that MUTATES when registered as a
+        // MutatingWebhookConfiguration must NOT mutate when registered as a
+        // validating one. Honouring its patch would hand a policy webhook a
+        // privilege the kind it registered under explicitly withholds.
+        let ep = "https://policy.example/validate";
+        let source = Arc::new(StaticConfigSource::with_validating(
+            vec![],
+            vec![validating_config(ep, "policy")],
+        ));
+        let caller = Arc::new(MockWebhookCaller::new());
+        caller
+            .set_response(
+                ep,
+                MockWebhookCaller::json_patch_review("u", &sidecar_ops()),
+            )
+            .await;
+        let plugin = MutatingWebhookPlugin::new(source, caller, pluralizer());
+
+        match plugin.review(&pod_request()).await.unwrap() {
+            AdmissionDecision::Allow => {}
+            other => panic!("a validating webhook's patch must be ignored, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_runs_after_mutation_so_it_judges_what_will_be_stored() {
+        // THE ordering property. Running validation first would let a later
+        // mutating webhook rewrite the object into something the policy
+        // would have rejected — exactly the hole a policy engine closes.
+        let mutate_ep = "https://inject.example/mutate";
+        let validate_ep = "https://policy.example/validate";
+        let source = Arc::new(StaticConfigSource::with_validating(
+            vec![sidecar_inject_config(mutate_ep)],
+            vec![validating_config(validate_ep, "policy")],
+        ));
+        let caller = Arc::new(MockWebhookCaller::new());
+        caller
+            .set_response(
+                mutate_ep,
+                MockWebhookCaller::json_patch_review("u", &sidecar_ops()),
+            )
+            .await;
+        caller
+            .set_response(validate_ep, MockWebhookCaller::allow_review("u"))
+            .await;
+        let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer());
+
+        // The mutation still lands.
+        match plugin.review(&pod_request()).await.unwrap() {
+            AdmissionDecision::Mutate(_) => {}
+            other => panic!("expected Mutate, got {other:?}"),
+        }
+        // And the validating webhook was called SECOND.
+        let calls = caller.calls().await;
+        assert_eq!(calls.len(), 2, "both webhooks must run");
+        assert!(
+            calls[0].0.contains("inject") && calls[1].0.contains("policy"),
+            "validation must run after mutation, got {:?}",
+            calls.iter().map(|c| c.0.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_reports_no_validating_configs_behaves_exactly_as_before() {
+        // The defaulted trait method must not accidentally serve the
+        // MUTATING list — that would let a policy webhook rewrite objects.
+        let ep = "https://inject.example/mutate";
+        let source = Arc::new(StaticConfigSource::new(vec![sidecar_inject_config(ep)]));
+        assert!(
+            source.validating_configs().await.is_empty(),
+            "mutating configs must never surface as validating ones"
         );
     }
 
