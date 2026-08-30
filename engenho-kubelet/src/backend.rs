@@ -30,6 +30,16 @@ pub struct ContainerSpec {
     pub env: BTreeMap<String, String>,
     /// Command to run inside the container; empty = image default.
     pub command: Vec<String>,
+    /// This container's effective image-pull policy, resolved from its
+    /// `imagePullPolicy` and image reference by [`PullPolicy::resolve`].
+    ///
+    /// Per-container because Kubernetes is: two containers in one pod may
+    /// legitimately differ. Before this existed nothing read
+    /// `imagePullPolicy` anywhere in the tree, so every container used the
+    /// backend-wide `Never` default and any image not already in local
+    /// storage failed with podman's "image not known" — a registry-shaped
+    /// error for what was actually a policy that forbade the pull.
+    pub pull_policy: Option<PullPolicy>,
     /// Per-pod DNS aliases (`--network-alias`) the kubelet computed from
     /// the Services whose selector matches this Pod's labels (M0.3
     /// cluster-DNS brick). Each alias is a Service-name form — `<svc>`,
@@ -594,21 +604,59 @@ pub enum PullPolicy {
     /// Pull only when the image is absent from local storage. Maps to
     /// `--pull missing` (podman's "pull if not in store" mode).
     Missing,
-    /// Alias for [`PullPolicy::Missing`] phrased the K8s way; pulls only
-    /// when the image isn't already present locally. Maps to
-    /// `--pull newer` so a stale cached layer is refreshed when the
-    /// registry advertises a newer one.
+    /// Kubernetes' `IfNotPresent`: use the local copy when present and do
+    /// NOT contact the registry otherwise. Maps to `--pull missing`.
+    ///
+    /// CORRECTED 2026-08-30 — this mapped to `--pull newer`, which is a
+    /// registry round-trip on every start to see whether a newer layer
+    /// exists. That is close to `Always` and is the opposite of what the
+    /// K8s name promises; the old doc comment said so itself ("so a stale
+    /// cached layer is refreshed"). A policy named after an upstream
+    /// concept must mean the upstream thing.
     IfNotPresent,
+    /// Kubernetes' `Always`: contact the registry every start. Maps to
+    /// `--pull always`.
+    Always,
 }
 
 impl PullPolicy {
+    /// Resolve a container's effective policy from its `imagePullPolicy`
+    /// and its image reference, exactly as upstream does.
+    ///
+    /// Upstream's defaulting rule is not "IfNotPresent": an image with the
+    /// `:latest` tag, or with no tag at all, defaults to `Always`, and
+    /// everything else to `IfNotPresent`. Getting this wrong is invisible
+    /// until a `:latest` deployment silently keeps running a stale image.
+    ///
+    /// An unrecognised spelling falls back to the default rule rather than
+    /// to `Never`. `Never` would turn a typo into "image not known" — a
+    /// message that blames the registry for a manifest mistake.
+    #[must_use]
+    pub fn resolve(declared: Option<&str>, image: &str) -> Self {
+        match declared {
+            Some("Always") => PullPolicy::Always,
+            Some("Never") => PullPolicy::Never,
+            Some("IfNotPresent") => PullPolicy::IfNotPresent,
+            _ => {
+                // Tag-bearing only if the last path segment has a colon —
+                // a registry port (`host:5000/img`) is not a tag.
+                let last = image.rsplit('/').next().unwrap_or(image);
+                match last.split_once(':') {
+                    Some((_, tag)) if tag != "latest" => PullPolicy::IfNotPresent,
+                    _ => PullPolicy::Always,
+                }
+            }
+        }
+    }
+
     /// The `--pull` argument value this policy maps to.
     #[must_use]
     pub fn flag_value(self) -> &'static str {
         match self {
             PullPolicy::Never => "never",
             PullPolicy::Missing => "missing",
-            PullPolicy::IfNotPresent => "newer",
+            PullPolicy::IfNotPresent => "missing",
+            PullPolicy::Always => "always",
         }
     }
 }
@@ -820,7 +868,16 @@ impl PodmanBackend {
             }
         }
         argv.push("--pull".to_string());
-        argv.push(self.pull_policy.flag_value().to_string());
+        // The CONTAINER's own policy wins — that is Kubernetes' rule, and
+        // two containers in one pod may legitimately differ. `None` means
+        // the spec came from a non-pod path and falls back to the
+        // backend-wide setting, which keeps every existing caller intact.
+        argv.push(
+            spec.pull_policy
+                .unwrap_or(self.pull_policy)
+                .flag_value()
+                .to_string(),
+        );
         argv.push("--name".to_string());
         argv.push(spec.name.clone());
         // (M0.7 kubelet-volumes) Already-resolved volume mounts → `-v` pairs,
@@ -1641,7 +1698,61 @@ mod tests {
     fn pull_policy_flag_values() {
         assert_eq!(PullPolicy::Never.flag_value(), "never");
         assert_eq!(PullPolicy::Missing.flag_value(), "missing");
-        assert_eq!(PullPolicy::IfNotPresent.flag_value(), "newer");
+        // CORRECTED 2026-08-30: was "newer", which is a registry
+        // round-trip on every start — nearly `Always`, and the opposite of
+        // what the Kubernetes name promises.
+        assert_eq!(PullPolicy::IfNotPresent.flag_value(), "missing");
+        assert_eq!(PullPolicy::Always.flag_value(), "always");
+    }
+
+    /// Upstream's defaulting rule, which is NOT "IfNotPresent": an image
+    /// tagged `:latest`, or carrying no tag at all, defaults to `Always`.
+    #[test]
+    fn resolve_follows_upstreams_defaulting_rule() {
+        use PullPolicy::{Always, IfNotPresent, Never};
+        // Explicit declarations win outright.
+        assert_eq!(PullPolicy::resolve(Some("Always"), "img:1.0"), Always);
+        assert_eq!(PullPolicy::resolve(Some("Never"), "img:latest"), Never);
+        assert_eq!(
+            PullPolicy::resolve(Some("IfNotPresent"), "img:latest"),
+            IfNotPresent
+        );
+        // Absent → tag decides.
+        assert_eq!(PullPolicy::resolve(None, "alpine:3.20"), IfNotPresent);
+        assert_eq!(PullPolicy::resolve(None, "alpine:latest"), Always);
+        assert_eq!(PullPolicy::resolve(None, "alpine"), Always);
+        // A registry PORT is not a tag — `host:5000/img` is untagged.
+        assert_eq!(PullPolicy::resolve(None, "reg.local:5000/img"), Always);
+        assert_eq!(
+            PullPolicy::resolve(None, "reg.local:5000/img:2.1"),
+            IfNotPresent
+        );
+        // An unrecognised spelling falls back to the rule, never to Never:
+        // Never would turn a typo into "image not known", blaming the
+        // registry for a manifest mistake.
+        assert_eq!(
+            PullPolicy::resolve(Some("ifnotpresent"), "img:1.0"),
+            IfNotPresent
+        );
+        assert_eq!(PullPolicy::resolve(Some("garbage"), "img:latest"), Always);
+    }
+
+    /// A container's own policy overrides the backend-wide default, which
+    /// is Kubernetes' rule: two containers in one pod may differ.
+    #[test]
+    fn a_containers_own_policy_overrides_the_backend_default() {
+        let backend = PodmanBackend::new().with_pull_policy(PullPolicy::Never);
+        let mut s = spec("c", "img", &[], &[]);
+        s.pull_policy = Some(PullPolicy::Always);
+        let argv = backend.run_argv(&s);
+        let i = argv.iter().position(|a| a == "--pull").unwrap();
+        assert_eq!(argv[i + 1], "always", "the container's policy must win");
+
+        // And None still defers to the backend.
+        let s2 = spec("c", "img", &[], &[]);
+        let argv2 = backend.run_argv(&s2);
+        let j = argv2.iter().position(|a| a == "--pull").unwrap();
+        assert_eq!(argv2[j + 1], "never");
     }
 
     #[test]
@@ -1684,6 +1795,9 @@ mod tests {
             image: image.into(),
             env: BTreeMap::new(),
             command: command.iter().map(|c| (*c).to_string()).collect(),
+            // None = defer to the backend-wide policy, which is what these
+            // argv tests are asserting on.
+            pull_policy: None,
             network_aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
             mounts: Vec::new(),
         }
@@ -1807,7 +1921,7 @@ mod tests {
         let argv = backend.run_argv(&s);
         // The --pull flag value reflects the configured policy.
         let pull_idx = argv.iter().position(|a| a == "--pull").unwrap();
-        assert_eq!(argv[pull_idx + 1], "newer");
+        assert_eq!(argv[pull_idx + 1], "missing");
     }
 
     // ── M0.3 shared-network membership ──────────────────────────────────
