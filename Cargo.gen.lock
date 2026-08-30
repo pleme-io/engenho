@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "d93aa1c4545451801e1a6f1c545673ae78f10921b5ecfbdb53e99fc65af25c6d",
+  "cargo_lock_sha256": "d2e8eacf622f4df2b80e7a5155bc7e5bb7ac94e871a0449cb1463447bc20493a",
   "manifest_sha256": {
     "Cargo.toml": "dc548a677c7ae9a898dc3bbb4f70159c2200bc3bfc04a0982ff622109b1cf1e0",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
@@ -9,7 +9,7 @@
     "engenho-config/Cargo.toml": "b96a79e9008ee6a636df2a80815df844ce2081fac132eeddd6e4d60e87055b88",
     "engenho-controllers/Cargo.toml": "d7e6db6f9b70d927029a5f5436736b8d139de75867c5379362f23245960b0462",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
-    "engenho-etcd/Cargo.toml": "0827cccc0af5268b323021dbf0bff557f34d6f579955d22365cacc9ee46f950c",
+    "engenho-etcd/Cargo.toml": "317b6fd67d6f09f733ea06e938cc987bda0908861ab91c22ae1716a723445ef0",
     "engenho-fonte-cli/Cargo.toml": "650eb2c143e2d16dd0f02a56a9f73035f83652349b83daf33f9caa582c8ca8a7",
     "engenho-fonte/Cargo.toml": "a074bc92449afc5b002c35965f1c0e8f86754064d7bf7e6d86cb7c496c5bfd1e",
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
@@ -5029,6 +5029,16 @@
           {
             "name": "engenho_types",
             "package_key": "engenho-types-0.53.38",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "futures_core",
+            "package_key": "futures-core-0.3.32",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
