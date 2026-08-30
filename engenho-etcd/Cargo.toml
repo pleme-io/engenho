@@ -16,8 +16,15 @@ description = "etcd v3 wire façade for engenho. engenho does not run etcd and d
 path = "src/lib.rs"
 
 [dependencies]
+prost         = "0.14"
+bytes         = "1"
 engenho-types = { path = "../engenho-types" }
+engenho-store = { path = "../engenho-store" }
 thiserror     = { workspace = true }
+
+[build-dependencies]
+protox       = "0.9"
+prost-build  = "0.14"
 
 [dev-dependencies]
 
