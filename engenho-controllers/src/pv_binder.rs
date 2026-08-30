@@ -59,6 +59,7 @@ use std::str::FromStr;
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::csi_provisioner::{CsiCreateRequest, CsiProvisioner, NoCsiProvisioner, parse_quantity};
 use crate::error::ControllerError;
 
 /// The local-path provisioner identifier. A StorageClass whose
@@ -107,6 +108,11 @@ pub struct PvBinderController {
     local_path_root: String,
     /// The filesystem seam (mockable).
     env: Arc<dyn ProvisionerEnv>,
+    /// The CSI provisioning seam. Defaults to [`NoCsiProvisioner`], under
+    /// which every CSI StorageClass stays Pending exactly as it did before
+    /// this branch existed — so wiring it is opt-in and its absence is not
+    /// a behaviour change.
+    csi: Arc<dyn CsiProvisioner>,
 }
 
 impl PvBinderController {
@@ -123,6 +129,7 @@ impl PvBinderController {
             namespace,
             local_path_root: local_path_root.into(),
             env: Arc::new(HostProvisionerEnv),
+            csi: Arc::new(NoCsiProvisioner),
         }
     }
 
@@ -140,7 +147,15 @@ impl PvBinderController {
             namespace,
             local_path_root: local_path_root.into(),
             env,
+            csi: Arc::new(NoCsiProvisioner),
         }
+    }
+
+    /// Builder: wire the CSI provisioning seam.
+    #[must_use]
+    pub fn with_csi(mut self, csi: Arc<dyn CsiProvisioner>) -> Self {
+        self.csi = csi;
+        self
     }
 
     /// A PVC's `status.phase`, defaulting to `"Pending"` when unset (a freshly
@@ -397,6 +412,136 @@ impl PvBinderController {
         (pv_name, host_path, pv)
     }
 
+    /// Provision one PVC through a registered CSI driver, then bind it.
+    ///
+    /// ★ THE ORDER IS CREATE-THEN-WRITE, AND IT MATTERS. The driver call
+    /// happens first; only on success is a PV written. The reverse — write
+    /// the PV, then create — leaves a PV referencing a volume handle that
+    /// does not exist if the driver call fails, and a pod that mounts it
+    /// gets a mount error rather than a Pending claim.
+    ///
+    /// The idempotency key is the PV NAME, derived from the claim, so a
+    /// retry after a transient failure returns the SAME volume instead of
+    /// provisioning a second disk nobody will ever delete.
+    async fn provision_csi(
+        &self,
+        pvc: &Value,
+        pvc_ns: &str,
+        pvc_name: &str,
+        sc: &Value,
+        provisioner: &str,
+    ) -> Result<(), String> {
+        let pv_name = format!("pvc-{pvc_ns}-{pvc_name}");
+        let requested = pvc
+            .get("spec")
+            .and_then(|s| s.get("resources"))
+            .and_then(|r| r.get("requests"))
+            .and_then(|r| r.get("storage"))
+            .and_then(Value::as_str)
+            .and_then(parse_quantity)
+            .unwrap_or(0);
+
+        let mut parameters = std::collections::BTreeMap::new();
+        if let Some(params) = sc.get("parameters").and_then(Value::as_object) {
+            for (k, v) in params {
+                if let Some(v) = v.as_str() {
+                    parameters.insert(k.clone(), v.to_string());
+                }
+            }
+        }
+
+        let access_modes = pvc
+            .get("spec")
+            .and_then(|s| s.get("accessModes"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let multi_node = access_modes
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|m| m == "ReadWriteMany" || m == "ReadOnlyMany");
+
+        let created = self
+            .csi
+            .create_volume(&CsiCreateRequest {
+                driver: provisioner.to_string(),
+                name: pv_name.clone(),
+                capacity_bytes: requested,
+                parameters,
+                multi_node,
+            })
+            .await?;
+
+        let sc_name = sc
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let reclaim = sc
+            .get("reclaimPolicy")
+            .and_then(Value::as_str)
+            .unwrap_or("Delete");
+        let claim_ref = json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "namespace": pvc_ns,
+            "name": pvc_name,
+            "uid": pvc.get("metadata").and_then(|m| m.get("uid")).cloned().unwrap_or(Value::Null),
+        });
+        let attributes: serde_json::Map<String, Value> = created
+            .volume_attributes
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v)))
+            .collect();
+
+        let pv = json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {
+                "name": pv_name,
+                "annotations": { "pv.kubernetes.io/provisioned-by": provisioner }
+            },
+            "spec": {
+                // The DRIVER's capacity, which may exceed the request: a
+                // driver rounds up to its allocation unit, and recording the
+                // request instead would make a later binding check compare
+                // against a size that does not exist.
+                "capacity": { "storage": format!("{}", created.capacity_bytes) },
+                "accessModes": if access_modes.is_empty() {
+                    json!(["ReadWriteOnce"])
+                } else {
+                    json!(access_modes)
+                },
+                "persistentVolumeReclaimPolicy": reclaim,
+                "storageClassName": sc_name,
+                "csi": {
+                    "driver": provisioner,
+                    "volumeHandle": created.volume_handle,
+                    "volumeAttributes": Value::Object(attributes),
+                },
+                "claimRef": claim_ref
+            },
+            "status": { "phase": "Bound" }
+        });
+
+        let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
+        self.put(pv_key, pv)
+            .await
+            .map_err(|e| format!("writing PV {pv_name}: {e}"))?;
+
+        let mut bound_pvc = pvc.clone();
+        if let Some(spec) = bound_pvc.get_mut("spec").and_then(Value::as_object_mut) {
+            spec.insert("volumeName".into(), json!(pv_name));
+        }
+        set_phase(&mut bound_pvc, "Bound");
+        let pvc_key = ResourceKey::namespaced("", "v1", "PersistentVolumeClaim", pvc_ns, pvc_name);
+        self.put(pvc_key, bound_pvc)
+            .await
+            .map_err(|e| format!("binding PVC {pvc_ns}/{pvc_name}: {e}"))?;
+
+        Ok(())
+    }
+
     /// Write a Put for a resource value (Controller reason).
     async fn put(&self, key: ResourceKey, value: Value) -> Result<(), ControllerError> {
         self.store
@@ -520,9 +665,44 @@ impl Controller for PvBinderController {
                 continue;
             };
             if !sc_is_local_path(sc) {
-                // The class isn't local-path-backed (e.g. a CSI class we don't
-                // serve) → stay Pending; an external provisioner would handle it.
-                report.objects_skipped += 1;
+                // 2b. CSI DYNAMIC PROVISION. The class names some other
+                // provisioner; if a registered CSI driver answers to that
+                // name, engenho provisions through it.
+                let provisioner = sc
+                    .get("provisioner")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                // Asked BEFORE creating: an absent driver must leave the PVC
+                // Pending ("waiting for your driver"), not fail a provision
+                // ("your storage is broken"). Also what keeps a cluster with
+                // an external provisioner working unchanged.
+                if provisioner.is_empty() || !self.csi.can_provision(&provisioner).await {
+                    report.objects_skipped += 1;
+                    continue;
+                }
+                if Self::is_wait_for_first_consumer(Some(sc)) {
+                    report.objects_skipped += 1;
+                    continue;
+                }
+                match self
+                    .provision_csi(pvc, pvc_ns, pvc_name, sc, &provisioner)
+                    .await
+                {
+                    Ok(()) => report.objects_changed += 1,
+                    Err(e) => {
+                        // Retried next tick. Never a fake Bound: a PVC bound
+                        // to a volume that was never created is worse than
+                        // one that is honestly still Pending.
+                        tracing::warn!(
+                            pvc = %format!("{pvc_ns}/{pvc_name}"),
+                            provisioner = %provisioner,
+                            error = %e,
+                            "CSI provisioning failed; the claim stays Pending"
+                        );
+                        report.objects_skipped += 1;
+                    }
+                }
                 continue;
             }
             if Self::is_wait_for_first_consumer(Some(sc)) {
