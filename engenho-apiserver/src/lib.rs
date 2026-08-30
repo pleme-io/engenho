@@ -48,6 +48,7 @@ pub mod scale;
 pub mod schema_validation;
 pub mod server;
 pub mod table;
+pub mod validation;
 pub mod webhook_admission;
 
 pub use authn::{

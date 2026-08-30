@@ -54,7 +54,7 @@ async fn boot_store_and_server() -> (Arc<StoreMesh>, ApiServer) {
 }
 
 fn pod_body(name: &str) -> serde_json::Value {
-    serde_json::json!({ "metadata": { "name": name }, "spec": {} })
+    serde_json::json!({ "metadata": { "name": name }, "spec": { "containers": [ { "name": "c", "image": "busybox:1.36" } ] } })
 }
 
 fn rv_of(obj: &serde_json::Value) -> String {
@@ -502,7 +502,7 @@ async fn pagination_with_label_selector_over_fetches_and_pages_matches_only() {
         let app = if i % 2 == 0 { "web" } else { "api" };
         let body = serde_json::json!({
             "metadata": { "name": format!("s{i:02}"), "labels": { "app": app } },
-            "spec": {}
+            "spec": { "containers": [ { "name": "c", "image": "busybox:1.36" } ] }
         });
         post_pod(&client, addr, "default", &body).await;
     }

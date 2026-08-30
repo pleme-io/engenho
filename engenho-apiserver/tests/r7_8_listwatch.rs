@@ -65,11 +65,11 @@ async fn boot_store_and_server() -> (Arc<StoreMesh>, ApiServer) {
 }
 
 fn pod_body(name: &str) -> serde_json::Value {
-    serde_json::json!({ "metadata": { "name": name }, "spec": {} })
+    serde_json::json!({ "metadata": { "name": name }, "spec": { "containers": [ { "name": "c", "image": "busybox:1.36" } ] } })
 }
 
 fn pod_body_labeled(name: &str, key: &str, val: &str) -> serde_json::Value {
-    serde_json::json!({ "metadata": { "name": name, "labels": { key: val } }, "spec": {} })
+    serde_json::json!({ "metadata": { "name": name, "labels": { key: val } }, "spec": { "containers": [ { "name": "c", "image": "busybox:1.36" } ] } })
 }
 
 async fn post_pod(
