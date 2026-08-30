@@ -400,6 +400,64 @@ engenho_substrate::impl_error_kind! {
 ///   * [`ensure_empty_dir`](VolumeMaterializer::ensure_empty_dir) —
 ///     idempotently create a per-pod-volume named volume, return the
 ///     [`MountSource::NamedVolume`]. Shared across the pod's containers.
+/// The standard path upstream mounts a pod's ServiceAccount credentials at.
+///
+/// `kube-rs`, client-go and every other in-cluster client look here and
+/// nowhere else. `Config::incluster()` reads `namespace` first, then `token`,
+/// then `ca.crt` — which is why an engenho pod with the service env set but
+/// no files reports `ReadDefaultNamespace(NotFound)` rather than a token
+/// error.
+pub const SA_MOUNT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+
+/// Supplies the files for a pod's projected ServiceAccount volume.
+///
+/// A SEAM, not a concrete type, because issuing a token needs the cluster's
+/// ed25519 signing key which lives in `engenho-apiserver` — and
+/// `engenho-kubelet` does not depend on it, deliberately. The runtime holds
+/// both and implements this; tests inject a fake.
+///
+/// Returning `None` means this pod gets NO ServiceAccount projection, the
+/// honest state for a runtime with no signing key. It must never mean
+/// "project an empty token": a zero-byte token file is WORSE than an absent
+/// one, because the client stops looking for a kubeconfig and then fails
+/// authentication instead of falling back.
+#[async_trait]
+pub trait ServiceAccountProjector: Send + Sync {
+    /// The files to place at [`SA_MOUNT_PATH`] — upstream projects exactly
+    /// `token`, `ca.crt` and `namespace`.
+    ///
+    /// # Errors
+    ///
+    /// Any failure to mint a token. Surfaces as the pod-Pending reason, never
+    /// a silent skip — a pod that cannot get its identity must not reach
+    /// Running and then fail every API call it makes.
+    async fn project(
+        &self,
+        namespace: &str,
+        service_account: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<BTreeMap<String, Vec<u8>>>, String>;
+}
+
+/// A projector that supplies nothing — the honest default for a kubelet with
+/// no signing key wired.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoServiceAccountProjection;
+
+#[async_trait]
+impl ServiceAccountProjector for NoServiceAccountProjection {
+    async fn project(
+        &self,
+        _namespace: &str,
+        _service_account: &str,
+        _pod_name: &str,
+        _pod_uid: &str,
+    ) -> Result<Option<BTreeMap<String, Vec<u8>>>, String> {
+        Ok(None)
+    }
+}
+
 #[async_trait]
 pub trait VolumeMaterializer: Send + Sync {
     /// Stable identifier (telemetry).
