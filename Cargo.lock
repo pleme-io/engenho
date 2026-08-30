@@ -1476,6 +1476,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-csi"
+version = "0.53.47"
+dependencies = [
+ "async-trait",
+ "engenho-csi",
+ "engenho-substrate",
+ "http",
+ "hyper-util",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protox",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "engenho-diff"
 version = "0.53.47"
 dependencies = [
