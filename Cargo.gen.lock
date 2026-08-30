@@ -1,11 +1,12 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "cd96bacd3b048915a31896447bdf4666703aa8a96f7621036ec08d2607ce87c9",
+  "cargo_lock_sha256": "a90df9e0bdb8bb52791fab9b44cbb94c15327c2026b995c3a93226132935938c",
   "manifest_sha256": {
-    "Cargo.toml": "6e80b1f39070d57f9ebcd7cccb4fdb2db5658f862759c66a8f5db15652f93740",
+    "Cargo.toml": "2d5ed6cf1b8446bc3873256ea9b46559798d41fc874bb8e5c88e888b46fd9328",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
+    "engenho-cni/Cargo.toml": "18a964f983410b945d3e150fe0f2a33635fe63aaadb02f9425a20eac53f39908",
     "engenho-config/Cargo.toml": "b96a79e9008ee6a636df2a80815df844ce2081fac132eeddd6e4d60e87055b88",
     "engenho-controllers/Cargo.toml": "d7e6db6f9b70d927029a5f5436736b8d139de75867c5379362f23245960b0462",
     "engenho-csi/Cargo.toml": "6aa334c629d8c00370473e47b87b38ead169c319a75cc3019a9590e854b86366",
@@ -4650,6 +4651,88 @@
           {
             "name": "serde_yaml",
             "package_key": "serde_yaml-0.9.34+deprecated",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "engenho-cni-0.53.47": {
+        "runtime_dependencies": [
+          {
+            "name": "async_trait",
+            "package_key": "async-trait-0.1.89",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          },
+          {
+            "name": "engenho_substrate",
+            "package_key": "engenho-substrate-0.53.47",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio",
+            "package_key": "tokio-1.52.3",
+            "kind": "normal",
+            "features": [
+              "full",
+              "io-util",
+              "process"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing",
+            "package_key": "tracing-0.1.44",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -38970,6 +39053,19 @@
         {
           "name": "engenho-cluster-config-render",
           "path": "src/main.rs"
+        }
+      ]
+    },
+    "engenho-cni-0.53.47": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_cni",
+        "path": "src/lib.rs"
+      },
+      "binaries": [
+        {
+          "name": "cni-reference-plugin",
+          "path": "src/bin/cni-reference-plugin.rs"
         }
       ]
     },
