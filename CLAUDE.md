@@ -230,6 +230,48 @@ manufactures exactly the permanently-red gate this split removes.
 | `ObjectMeta` serialization | byte-deterministic across runs | proptest in `tests/determinism_proptest.rs` (256 cases × 3 properties = 768 random cases per run) |
 | `nix build .#default` | byte-identical from same git rev | substrate flake's check |
 
+### ★ Reading the codegen gate — two traps that cost a day
+
+**`cargo ... 2>&1 | grep -E "^error"` matches NOTHING, even on a failed
+build.** Cargo emits ANSI colour, so the line is
+`\x1b[1m\x1b[38;5;9merror[E0432]...` and does not *start* with `error`.
+The empty output reads as success while a stale binary sits in `target/`.
+Measured 2026-08-30: three "no errors" reports from builds that had failed,
+the worst of which sent a live test against a binary 6 minutes older than
+the source and produced a diagnosis of a bug that did not exist.
+
+```
+cargo build 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^error" -A5
+```
+
+**A fast build is the tell** — `Finished in 0.34s` after editing a large file
+means nothing recompiled. Check `ls -lT target/debug/engenho` against the
+source mtime before trusting any live test.
+
+**`--check` prints DRIFT to stderr, and `$?` after a pipe is the pipe's
+status, not the program's.** `... --check 2>/dev/null | head` reported clean
+while 46 files were drifting. Redirect stderr to a file and read the exit
+code directly.
+
+### ★ A permanently-red gate is an incident, not a quirk
+
+`--check` was unpassable from `16d0fd5` (a workspace `cargo fmt` that swept
+this generated directory) until 2026-08-30. It reported 46 drifting files of
+which **40 were whitespace**. Behind them hid three hand-authored files
+inside `generated_v1_34/` — `rbac_v1/policy.rs`,
+`apps_v1/{deployment,replicaset}_spec.rs` — which a regen DELETES, and which
+is how a routine regeneration broke `engenho-apiserver`.
+
+They existed to work around two generator bugs that were never fixed:
+`snake_case` mangling `nonResourceURLs` → `non_resource_ur_ls` (the WIRE name
+was right, so it was invisible in JSON and fatal in Rust), and TypeMeta being
+stripped from nested structs where `kind` is real data (`RoleRef`, `Subject`).
+
+Emission now runs through `prettyplease` — a Cargo-pinned library, **never a
+`rustfmt` subprocess**, since `--check` compares bytes and must not depend on
+whatever is on PATH. If you find `--check` red, fix the noise before reading
+the signal.
+
 ## Anti-patterns
 
 - **Hand-authoring K8s resource types.** The non-negotiable rule above.
