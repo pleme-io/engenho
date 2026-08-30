@@ -1491,6 +1491,10 @@ dependencies = [
 [[package]]
 name = "engenho-etcd"
 version = "0.53.30"
+dependencies = [
+ "engenho-types",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "engenho-fonte"
