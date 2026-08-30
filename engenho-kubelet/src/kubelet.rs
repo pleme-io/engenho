@@ -247,6 +247,10 @@ pub struct Kubelet {
     /// volumes brick — the trait IS the testability contract, so volume
     /// resolution is unit-testable WITHOUT real podman.
     volume_materializer: Arc<dyn VolumeMaterializer>,
+    /// Supplies a pod's ServiceAccount credentials. Defaults to
+    /// [`NoServiceAccountProjection`] so a kubelet with no signing key
+    /// projects nothing rather than an empty token.
+    sa_projector: Arc<dyn crate::pod_volume::ServiceAccountProjector>,
     /// The `now()` source (defaults to [`Instant::now`]; overridable for
     /// deterministic probe-cadence tests via [`Kubelet::with_clock`]).
     clock: Clock,
@@ -287,6 +291,7 @@ impl Kubelet {
             volume_materializer: Arc::new(PodmanVolumeMaterializer::new()),
             clock: Arc::new(Instant::now),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
+            sa_projector: Arc::new(crate::pod_volume::NoServiceAccountProjection),
             last_lease_renewal: Mutex::new(None),
             node_name: node_name.into(),
             local: Mutex::new(BTreeMap::new()),
@@ -328,6 +333,16 @@ impl Kubelet {
         events: Arc<dyn engenho_controllers::event_recorder::EventSink>,
     ) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Builder: supply the pod ServiceAccount projector.
+    #[must_use]
+    pub fn with_sa_projector(
+        mut self,
+        projector: Arc<dyn crate::pod_volume::ServiceAccountProjector>,
+    ) -> Self {
+        self.sa_projector = projector;
         self
     }
 
@@ -1546,6 +1561,60 @@ impl Kubelet {
         // future tick. A no-volume pod returns an empty map (no store reads,
         // no materialization) → every spec keeps `mounts: vec![]` → identical
         // behavior to before this brick.
+        // Project the pod's ServiceAccount credentials ONCE for the pod, the
+        // way upstream's admission injects a `kube-api-access-*` volume into
+        // every pod that has a service account. Without these three files an
+        // in-cluster client finds the service env, tries
+        // `Config::incluster()`, and dies on a missing `namespace` file.
+        //
+        // A projection FAILURE is not swallowed: a pod that cannot get its
+        // identity must not reach Running and then fail every API call it
+        // makes. It stays Pending with the reason visible.
+        let sa_name = value
+            .pointer("/spec/serviceAccountName")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        let pod_uid = value
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let sa_mount = match self
+            .sa_projector
+            .project(namespace, sa_name, &key.name, pod_uid)
+            .await
+        {
+            Ok(Some(files)) => {
+                let src = self
+                    .volume_materializer
+                    .materialize_files(namespace, &key.name, "kube-api-access", &files)
+                    .await
+                    .map_err(|e| {
+                        ControllerError::Internal(format!(
+                            "materialize ServiceAccount projection: {e}"
+                        ))
+                    })?;
+                Some(crate::pod_volume::ResolvedMount {
+                    source: src,
+                    mount_path: crate::pod_volume::SA_MOUNT_PATH.to_string(),
+                    // Read-only, as upstream projects it. A writable
+                    // credential directory lets a compromised container
+                    // rewrite its own identity.
+                    read_only: true,
+                    sub_path: None,
+                })
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(
+                    pod = %key.label(),
+                    error = %e,
+                    "ServiceAccount projection failed; pod stays Pending"
+                );
+                report.objects_skipped += 1;
+                return Ok(());
+            }
+        };
+
         let cnames: Vec<String> = specs.iter().map(|(c, _)| c.clone()).collect();
         let Some(resolved) = self
             .resolve_or_pending(key, value, namespace, &cnames, report, soonest_requeue)
@@ -1582,7 +1651,18 @@ impl Kubelet {
             // → identical argv to before this brick.
             if let Some(cjson) = Self::container_json(value, &cname) {
                 match container_mounts(cjson, &resolved) {
-                    Ok(mounts) => spec.mounts = mounts,
+                    Ok(mut mounts) => {
+                        // Append the projected ServiceAccount credentials.
+                        // Upstream's admission injects a `kube-api-access-*`
+                        // projected volume into every pod with a service
+                        // account; engenho materializes the same three files
+                        // directly, reaching the same place by the route a
+                        // single-binary runtime has available.
+                        if let Some(m) = &sa_mount {
+                            mounts.push(m.clone());
+                        }
+                        spec.mounts = mounts;
+                    }
                     Err(e) => {
                         warn!(
                             pod = %key.label(),

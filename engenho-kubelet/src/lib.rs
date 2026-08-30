@@ -69,7 +69,8 @@ pub use lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
 };
 pub use pod_volume::{
-    FakeVolumeMaterializer, MountSource, PodVolumeSource, PodmanVolumeMaterializer, ResolvedMount,
+    FakeVolumeMaterializer, MountSource, NoServiceAccountProjection, PodVolumeSource,
+    PodmanVolumeMaterializer, ResolvedMount, SA_MOUNT_PATH, ServiceAccountProjector,
     VolumeMaterializer, VolumeResolveError, resolve_pod_volumes,
 };
 pub use probe::{

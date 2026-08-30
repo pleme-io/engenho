@@ -761,6 +761,77 @@ fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
 /// mode is silent (a container gets coordinates that route nowhere).
 const DEFAULT_KUBERNETES_SERVICE_IP: &str = "10.96.0.1";
 
+/// The `iss` and `aud` engenho stamps on ServiceAccount tokens.
+///
+/// Upstream's in-cluster default. Kept as one constant because the issuer a
+/// token CLAIMS and the audience the apiserver ACCEPTS must agree — split
+/// into two literals they drift, and the failure is a 401 that looks like a
+/// key problem.
+const SA_ISSUER: &str = "https://kubernetes.default.svc";
+
+/// Mints a pod's ServiceAccount credentials from the cluster's signing key.
+///
+/// Lives here because it is the only layer holding BOTH the apiserver's
+/// signing key and the kubelet — `engenho-kubelet` deliberately does not
+/// depend on `engenho-apiserver`, so the kubelet takes this as a trait.
+///
+/// Upstream mints tokens through the TokenRequest API, so a remote kubelet
+/// asks the apiserver rather than holding the key. In a single-binary
+/// runtime the two are the same process, which makes issuing directly the
+/// honest shape — and the thing that must change first when engenho grows a
+/// second node.
+struct RuntimeSaProjector {
+    signing: ed25519_dalek::SigningKey,
+    issuer: String,
+    audience: String,
+    ca_cert_pem: String,
+    lifetime_secs: i64,
+}
+
+#[async_trait::async_trait]
+impl engenho_kubelet::ServiceAccountProjector for RuntimeSaProjector {
+    async fn project(
+        &self,
+        namespace: &str,
+        service_account: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        let now = i64::try_from(now).map_err(|e| e.to_string())?;
+
+        let token = engenho_apiserver::sa_token::issue(
+            &self.signing,
+            &self.issuer,
+            namespace,
+            service_account,
+            // The SA object's uid is not resolved here; the pod's identity is
+            // what a reader needs to trace a request back to a workload.
+            pod_uid,
+            &[self.audience.clone()],
+            Some(engenho_apiserver::sa_token::NamedUid {
+                name: pod_name.to_string(),
+                uid: pod_uid.to_string(),
+            }),
+            now,
+            self.lifetime_secs,
+        )
+        .map_err(|e| format!("mint ServiceAccount token: {e}"))?;
+
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("token".to_string(), token.into_bytes());
+        files.insert("ca.crt".to_string(), self.ca_cert_pem.clone().into_bytes());
+        // `Config::incluster()` reads THIS first. Its absence is what made a
+        // pod with correct service env still report
+        // `ReadDefaultNamespace(NotFound)`.
+        files.insert("namespace".to_string(), namespace.as_bytes().to_vec());
+        Ok(Some(files))
+    }
+}
+
 fn build_backend(config: &EngenhoConfig) -> Arc<dyn ContainerRuntime> {
     let kind = match config.runtime.kubelet_backend {
         CfgBackendKind::Podman => KubeletBackendKind::Podman,
@@ -1974,6 +2045,39 @@ fn spawn_drivers(
             csi_drivers.clone(),
             config.runtime.data_dir.clone(),
         ));
+    // The pod ServiceAccount projection. Built here because this is the only
+    // layer holding both the signing key and the kubelet.
+    //
+    // A missing key or CA yields the NO-PROJECTION default rather than an
+    // empty token: a zero-byte token file is worse than an absent one,
+    // because the client stops looking for a kubeconfig and then fails
+    // authentication instead of falling back.
+    // Both loaders are idempotent (`load_or_generate_*`), so reading them
+    // here rather than threading them through costs one file read and keeps
+    // the identity plumbing in the layer that uses it.
+    let sa_key = engenho_apiserver::sa_token::load_or_generate_sa_key(&config.runtime.data_dir)
+        .map_err(|e| warn!(error = %e, "no SA signing key; pods get no ServiceAccount projection"))
+        .ok();
+    let ca_pem_for_sa = engenho_apiserver::load_or_generate_ca(&config.runtime.data_dir)
+        .map(|ca| ca.cert_pem().to_string())
+        .map_err(|e| warn!(error = %e, "no cluster CA; pods get no ServiceAccount projection"))
+        .ok();
+    let sa_projector: Arc<dyn engenho_kubelet::ServiceAccountProjector> =
+        match (sa_key.as_ref(), ca_pem_for_sa.as_ref()) {
+            (Some(kp), Some(ca)) => Arc::new(RuntimeSaProjector {
+                signing: kp.signing.clone(),
+                issuer: SA_ISSUER.to_string(),
+                audience: SA_ISSUER.to_string(),
+                ca_cert_pem: ca.clone(),
+                // One hour, matching upstream's default bound-token lifetime.
+                // A pod does not re-read its token file, so this is currently
+                // a ceiling on pod lifetime for API-calling workloads — the
+                // refresh loop is the follow-up this does not ship.
+                lifetime_secs: 3600,
+            }),
+            _ => Arc::new(engenho_kubelet::NoServiceAccountProjection),
+        };
+
     let kubelet = Arc::new(
         Kubelet::new(
             store.clone(),
@@ -1981,6 +2085,7 @@ fn spawn_drivers(
             config.runtime.node_name.clone(),
         )
         .with_event_sink(events)
+        .with_sa_projector(sa_projector)
         .with_volume_materializer(csi_materializer),
     );
     handles.push(WatchDriver::new(kubelet.clone(), store.clone(), driver_config(&["Pod"])).spawn());

@@ -34,6 +34,9 @@ engenho-config      = { workspace = true }
 engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }
 engenho-apiserver   = { workspace = true }
+# The ServiceAccount signing key's type, for RuntimeSaProjector — this layer
+# is the only one holding both the apiserver's key and the kubelet.
+ed25519-dalek       = { workspace = true }
 engenho-controllers = { workspace = true }
 engenho-scheduler   = { workspace = true }
 axum               = { workspace = true }

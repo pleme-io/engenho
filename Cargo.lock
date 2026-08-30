@@ -1753,6 +1753,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "cofre-fs",
+ "ed25519-dalek",
  "engenho-apiserver",
  "engenho-cni",
  "engenho-config",
