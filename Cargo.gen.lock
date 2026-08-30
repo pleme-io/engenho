@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "9fabfd9a80ec05633856ced0da7af3bd0b8f2607ee7c7036fae4e0e29e78970b",
+  "cargo_lock_sha256": "7ec7b3f4eaf68b929819c71cd4b1b333dfac17ae3bb0427f9b27d199d8b3da22",
   "manifest_sha256": {
     "Cargo.toml": "28ba175c42a345e9f549b9d376322516c8c2f143fd00f154db64ad3952f9647e",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
@@ -15,7 +15,7 @@
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "b46b05226d557291f9c293ce8d483ffadc4d72e7ad4ab8c50a36c15337fd206e",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
-    "engenho-kubelet/Cargo.toml": "add7ad574a6eec58479f28631f9387c8db2ef1f4a5bef7bc06437d1ee8324991",
+    "engenho-kubelet/Cargo.toml": "0898ba87777dae67d5d7f42f5de577530bb4607c4b4cd529ec4ce881ad6c339a",
     "engenho-machines/Cargo.toml": "7722f5b1de0b7af3d290f6b36bdea89e36ab888853f23a6432792ddd9640c442",
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
@@ -1015,6 +1015,16 @@
             "tree": "target"
           },
           {
+            "name": "base64",
+            "package_key": "base64-0.22.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "bytes",
             "package_key": "bytes-1.11.1",
             "kind": "normal",
@@ -1203,6 +1213,16 @@
             "tree": "target"
           },
           {
+            "name": "sha1",
+            "package_key": "sha1-0.10.6",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "sync_wrapper",
             "package_key": "sync_wrapper-1.0.2",
             "kind": "normal",
@@ -1219,6 +1239,16 @@
             "features": [
               "time"
             ],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio_tungstenite",
+            "package_key": "tokio-tungstenite-0.24.0",
+            "kind": "normal",
+            "features": [],
             "uses_default_features": true,
             "optional": true,
             "target": null,
@@ -1278,7 +1308,8 @@
           "query",
           "tokio",
           "tower-log",
-          "tracing"
+          "tracing",
+          "ws"
         ]
       },
       "axum-0.8.9": {
@@ -5746,7 +5777,9 @@
             "name": "axum",
             "package_key": "axum-0.7.9",
             "kind": "normal",
-            "features": [],
+            "features": [
+              "ws"
+            ],
             "uses_default_features": true,
             "optional": false,
             "target": null,
@@ -28377,6 +28410,62 @@
           "tokio-util"
         ]
       },
+      "tokio-tungstenite-0.24.0": {
+        "runtime_dependencies": [
+          {
+            "name": "futures_util",
+            "package_key": "futures-util-0.3.32",
+            "kind": "normal",
+            "features": [
+              "sink",
+              "std"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "log",
+            "package_key": "log-0.4.30",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio",
+            "package_key": "tokio-1.52.3",
+            "kind": "normal",
+            "features": [
+              "io-util"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tungstenite",
+            "package_key": "tungstenite-0.24.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "connect",
+          "default",
+          "handshake",
+          "stream"
+        ]
+      },
       "tokio-util-0.7.18": {
         "runtime_dependencies": [
           {
@@ -29839,6 +29928,118 @@
         "build_dependencies": [],
         "features": []
       },
+      "tungstenite-0.24.0": {
+        "runtime_dependencies": [
+          {
+            "name": "byteorder",
+            "package_key": "byteorder-1.5.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "bytes",
+            "package_key": "bytes-1.11.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "data_encoding",
+            "package_key": "data-encoding-2.11.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "http",
+            "package_key": "http-1.4.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "httparse",
+            "package_key": "httparse-1.10.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "log",
+            "package_key": "log-0.4.30",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rand",
+            "package_key": "rand-0.8.6",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "sha1",
+            "package_key": "sha1-0.10.6",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-1.0.69",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "utf8",
+            "package_key": "utf-8-0.7.6",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "data-encoding",
+          "handshake",
+          "http",
+          "httparse",
+          "sha1"
+        ]
+      },
       "typenum-1.20.0": {
         "runtime_dependencies": [],
         "build_dependencies": [],
@@ -30165,6 +30366,11 @@
           "default",
           "std"
         ]
+      },
+      "utf-8-0.7.6": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
       },
       "utf8-width-0.1.8": {
         "runtime_dependencies": [],
@@ -40216,6 +40422,9 @@
     "tokio-stream-0.1.18": {
       "edition": "2021"
     },
+    "tokio-tungstenite-0.24.0": {
+      "edition": "2018"
+    },
     "tokio-util-0.7.18": {
       "edition": "2021"
     },
@@ -40292,6 +40501,9 @@
     "tryhard-0.5.2": {
       "edition": "2018"
     },
+    "tungstenite-0.24.0": {
+      "edition": "2018"
+    },
     "typenum-1.20.0": {
       "edition": "2018"
     },
@@ -40353,6 +40565,13 @@
     },
     "url-2.5.8": {
       "edition": "2018"
+    },
+    "utf-8-0.7.6": {
+      "edition": "2015",
+      "lib_target": {
+        "name": "utf8",
+        "path": "src/lib.rs"
+      }
     },
     "utf8-width-0.1.8": {
       "edition": "2021"
