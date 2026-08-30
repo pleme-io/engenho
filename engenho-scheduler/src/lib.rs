@@ -40,6 +40,7 @@
 pub mod config_bridge;
 pub mod error;
 pub mod fit;
+pub mod predicates;
 pub mod scheduler;
 pub mod strategy;
 
