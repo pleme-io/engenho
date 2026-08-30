@@ -1,0 +1,23 @@
+[package]
+name = "engenho-etcd"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+homepage.workspace     = true
+readme.workspace       = true
+categories.workspace   = true
+keywords.workspace     = true
+description = "etcd v3 wire façade for engenho. engenho does not run etcd and does not intend to — but the etcd INTERFACE is load-bearing even where the technology is not: etcdctl, backup/DR, Velero and every --etcd-servers consumer address a keyspace, not a database. This crate owns the /registry keyspace mapping and the vendored etcdserverpb wire definitions, so engenho's own journalled store can answer for etcd."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true
