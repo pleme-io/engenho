@@ -407,3 +407,188 @@ async fn a_broken_plugin_does_not_hide_a_working_one() {
     good.stop().await;
     bad.stop().await;
 }
+
+/// A registration service for engenho's own driver, at module scope
+/// because a nested item inside a test reads as if it were scoped to a
+/// statement when it is not.
+#[derive(Clone)]
+struct Reg(String);
+#[tonic::async_trait]
+impl engenho_csi::reg::registration_server::Registration for Reg {
+    async fn get_info(
+        &self,
+        _r: tonic::Request<engenho_csi::reg::InfoRequest>,
+    ) -> Result<tonic::Response<engenho_csi::reg::PluginInfo>, tonic::Status> {
+        Ok(tonic::Response::new(engenho_csi::reg::PluginInfo {
+            r#type: engenho_csi::registry::CSI_PLUGIN_TYPE.into(),
+            name: engenho_csi::localpath::DRIVER_NAME.into(),
+            endpoint: self.0.clone(),
+            supported_versions: vec![engenho_csi::registry::SUPPORTED_CSI_VERSION.to_string()],
+        }))
+    }
+    async fn notify_registration_status(
+        &self,
+        _r: tonic::Request<engenho_csi::reg::RegistrationStatus>,
+    ) -> Result<tonic::Response<engenho_csi::reg::RegistrationStatusResponse>, tonic::Status> {
+        Ok(tonic::Response::new(
+            engenho_csi::reg::RegistrationStatusResponse {},
+        ))
+    }
+}
+
+/// N1 — engenho's OWN driver, registered and driven by engenho's OWN
+/// registry, end to end.
+///
+/// ★ THIS IS THE NATURALIZE PROOF, AND ITS LIMIT IS STATED. Both halves are
+/// ours, so this cannot falsify either — that job belongs to
+/// `m2_3_foreign_driver_differential`, which drives the same client against
+/// `csi-driver-host-path`. What THIS asserts is that the naturalized driver
+/// is conformant enough to complete the real four-step registration
+/// handshake and a real provision→publish→delete cycle, which is the thing
+/// a claim of "engenho ships a CSI driver" actually rests on.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end story; splitting it hides the sequence
+async fn engenhos_own_driver_registers_and_serves_a_volume() {
+    use engenho_csi::localpath::{DRIVER_NAME, LocalPathDriver};
+    use engenho_csi::registry::PluginRegistry;
+
+    let root = tempfile::tempdir().unwrap();
+    let sockets = tempfile::tempdir().unwrap();
+    let endpoint = sockets.path().join("csi.sock");
+    let registration = sockets.path().join("driver-reg.sock");
+
+    // Serve the driver plus its own registration, the way the binary does.
+    let driver = LocalPathDriver::new(root.path(), "test-node");
+    let reg_endpoint = endpoint.display().to_string();
+    let d = driver.clone();
+    let driver_listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+    let reg_listener = tokio::net::UnixListener::bind(&registration).unwrap();
+
+    let servers = tokio::spawn(async move {
+        let a = tonic::transport::Server::builder()
+            .add_service(pb::identity_server::IdentityServer::new(d.clone()))
+            .add_service(pb::controller_server::ControllerServer::new(d.clone()))
+            .add_service(pb::node_server::NodeServer::new(d))
+            .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
+                driver_listener,
+            ));
+        let b = tonic::transport::Server::builder()
+            .add_service(
+                engenho_csi::reg::registration_server::RegistrationServer::new(Reg(reg_endpoint)),
+            )
+            .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(
+                reg_listener,
+            ));
+        let _ = tokio::join!(a, b);
+    });
+    for _ in 0..200 {
+        if tokio::net::UnixStream::connect(&endpoint).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // engenho's own registry performs the real handshake against it.
+    let plugin = PluginRegistry::new(sockets.path())
+        .register_one(&registration)
+        .await
+        .expect("engenho registers engenho's driver");
+    assert_eq!(plugin.info.name, DRIVER_NAME);
+    assert!(plugin.info.has_controller_service);
+    // No staging: the volume is already a directory on this node, so
+    // declaring STAGE_UNSTAGE would make every runtime issue a call with
+    // nothing to do.
+    assert!(!plugin.info.stage_unstage, "{:?}", plugin.info);
+    assert_eq!(plugin.info.node_id, "test-node");
+
+    // And the full volume lifecycle through engenho's own client.
+    let client = CsiClient::dial(&plugin.endpoint).await.unwrap();
+    let volume = client
+        .create_volume(pb::CreateVolumeRequest {
+            name: "pvc-ns-claim".into(),
+            capacity_range: Some(pb::CapacityRange {
+                required_bytes: 4096,
+                limit_bytes: 0,
+            }),
+            volume_capabilities: vec![cap_value()],
+            ..Default::default()
+        })
+        .await
+        .expect("provision");
+    assert_eq!(
+        volume.volume_id, "pvc-pvc-ns-claim",
+        "derived from the name"
+    );
+
+    // Idempotent: a retry returns the same volume rather than a second dir.
+    let again = client
+        .create_volume(pb::CreateVolumeRequest {
+            name: "pvc-ns-claim".into(),
+            capacity_range: Some(pb::CapacityRange {
+                required_bytes: 4096,
+                limit_bytes: 0,
+            }),
+            volume_capabilities: vec![cap_value()],
+            ..Default::default()
+        })
+        .await
+        .expect("retry");
+    assert_eq!(again.volume_id, volume.volume_id);
+
+    // ★ AND A LARGER RE-REQUEST IS REFUSED. Silently returning the smaller
+    // volume would give a workload less storage than it asked for with no
+    // error anywhere.
+    let conflict = client
+        .create_volume(pb::CreateVolumeRequest {
+            name: "pvc-ns-claim".into(),
+            capacity_range: Some(pb::CapacityRange {
+                required_bytes: 1 << 30,
+                limit_bytes: 0,
+            }),
+            volume_capabilities: vec![cap_value()],
+            ..Default::default()
+        })
+        .await;
+    assert!(
+        conflict.is_err(),
+        "a bigger request must not silently shrink"
+    );
+
+    let target = root.path().join("pods/p1/vol");
+    client
+        .node_publish(pb::NodePublishVolumeRequest {
+            volume_id: volume.volume_id.clone(),
+            target_path: target.display().to_string(),
+            volume_capability: Some(cap_value()),
+            ..Default::default()
+        })
+        .await
+        .expect("publish");
+    assert!(target.exists(), "the volume is visible at the target");
+
+    // Data written through the target lands in the volume's own directory.
+    std::fs::write(target.join("hello"), b"engenho").unwrap();
+    let record = driver.record(&volume.volume_id).expect("a record survives");
+    assert_eq!(
+        std::fs::read_to_string(record.data_path.join("hello")).unwrap(),
+        "engenho"
+    );
+
+    client
+        .node_unpublish(pb::NodeUnpublishVolumeRequest {
+            volume_id: volume.volume_id.clone(),
+            target_path: target.display().to_string(),
+        })
+        .await
+        .expect("unpublish");
+    client
+        .delete_volume(pb::DeleteVolumeRequest {
+            volume_id: volume.volume_id,
+            ..Default::default()
+        })
+        .await
+        .expect("delete");
+    assert!(driver.volumes().is_empty(), "the volume is gone");
+
+    servers.abort();
+}

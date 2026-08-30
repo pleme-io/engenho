@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "35389a9048294524bddae7a522e48e829f7335e9ec6ce8ec03f84ab28ae6ab63",
+  "cargo_lock_sha256": "605e7e1d232a2184a0a2488a3514a9e4ee0270e9f89dd1b2b902cfbf12ce520a",
   "manifest_sha256": {
     "Cargo.toml": "7c8b0ee27fc0600defc65e0e4c31fa7e4a0f9d1b2860335da0e66c418c55ee5c",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
@@ -9,7 +9,7 @@
     "engenho-cni/Cargo.toml": "18a964f983410b945d3e150fe0f2a33635fe63aaadb02f9425a20eac53f39908",
     "engenho-config/Cargo.toml": "b96a79e9008ee6a636df2a80815df844ce2081fac132eeddd6e4d60e87055b88",
     "engenho-controllers/Cargo.toml": "6e33573c7d9d4e64b9e4ef83236b6542861862afa1b15ba47c8e1565bfd058b7",
-    "engenho-csi/Cargo.toml": "6aa334c629d8c00370473e47b87b38ead169c319a75cc3019a9590e854b86366",
+    "engenho-csi/Cargo.toml": "1e80780c1c952308203895db7e3cac22d1f7e6465cacb9d698060412e56d4c97",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
     "engenho-etcd/Cargo.toml": "317b6fd67d6f09f733ea06e938cc987bda0908861ab91c22ae1716a723445ef0",
     "engenho-fonte-cli/Cargo.toml": "650eb2c143e2d16dd0f02a56a9f73035f83652349b83daf33f9caa582c8ca8a7",
@@ -5138,6 +5138,8 @@
             "kind": "normal",
             "features": [
               "codegen",
+              "router",
+              "server",
               "transport"
             ],
             "uses_default_features": false,
@@ -5170,6 +5172,18 @@
             "package_key": "tracing-0.1.44",
             "kind": "normal",
             "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing_subscriber",
+            "package_key": "tracing-subscriber-0.3.23",
+            "kind": "normal",
+            "features": [
+              "env-filter"
+            ],
             "uses_default_features": true,
             "optional": false,
             "target": null,
@@ -39150,7 +39164,13 @@
       "lib_target": {
         "name": "engenho_csi",
         "path": "src/lib.rs"
-      }
+      },
+      "binaries": [
+        {
+          "name": "engenho-csi-localpath",
+          "path": "src/bin/engenho-csi-localpath.rs"
+        }
+      ]
     },
     "engenho-diff-0.53.51": {
       "edition": "2024",
