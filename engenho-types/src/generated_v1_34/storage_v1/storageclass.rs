@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// StorageClass describes the parameters for a class of storage for which PersistentVolumes can be dynamically provisioned.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StorageClass {
@@ -63,7 +59,6 @@ pub struct StorageClass {
     )]
     pub volume_binding_mode: Option<String>,
 }
-
 impl KubeResource for StorageClass {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "storage.k8s.io",
@@ -76,7 +71,6 @@ impl KubeResource for StorageClass {
         resource: "storageclasses",
     };
     const SCOPE: Scope = Scope::Cluster;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -91,7 +85,6 @@ impl KubeResource for StorageClass {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

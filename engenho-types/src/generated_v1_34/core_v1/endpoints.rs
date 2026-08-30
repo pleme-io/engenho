@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// Endpoints is a collection of endpoints that implement the actual service. Example:
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Endpoints {
@@ -25,7 +21,6 @@ pub struct Endpoints {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subsets: Vec<EndpointSubset>,
 }
-
 impl KubeResource for Endpoints {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -38,7 +33,6 @@ impl KubeResource for Endpoints {
         resource: "endpoints",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -53,7 +47,6 @@ impl KubeResource for Endpoints {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

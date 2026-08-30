@@ -5,20 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-// The CANONICAL RBAC primitive (carries the `kind` discriminator the codegen
-// `types::PolicyRule` drops). The explicit import shadows the glob above.
-// `AggregationRule` still comes from the `types::*` glob.
-use super::policy::PolicyRule;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// ClusterRole is a cluster level, logical grouping of PolicyRules that can be referenced as a unit by a RoleBinding or ClusterRoleBinding.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClusterRole {
@@ -36,7 +28,6 @@ pub struct ClusterRole {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<PolicyRule>,
 }
-
 impl KubeResource for ClusterRole {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "rbac.authorization.k8s.io",
@@ -49,7 +40,6 @@ impl KubeResource for ClusterRole {
         resource: "clusterroles",
     };
     const SCOPE: Scope = Scope::Cluster;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -64,7 +54,6 @@ impl KubeResource for ClusterRole {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

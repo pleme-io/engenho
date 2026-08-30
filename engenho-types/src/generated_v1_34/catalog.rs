@@ -11,9 +11,7 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 use crate::kind::{GroupVersionKind, GroupVersionResource, Scope};
-
 /// A K8s subresource a kind serves under `<plural>/<name>/<sub>`.
 ///
 /// Typed — NOT a string — so a bad combination is unrepresentable: the
@@ -34,7 +32,6 @@ pub enum Subresource {
     /// (single-node: in-process) which reads `backend.logs`.
     Log,
 }
-
 /// One runtime row describing a routable/discoverable Kubernetes kind.
 ///
 /// `plural` is the curated URL segment (`KindEntry.resource`) — irregular
@@ -82,26 +79,22 @@ pub struct ResourceDescriptor {
     /// is ever special-cased by name. `&[]` for kinds with no subresource.
     pub subresources: &'static [Subresource],
 }
-
 impl ResourceDescriptor {
     /// `true` iff this kind serves the `/status` subresource.
     #[must_use]
     pub fn has_status(&self) -> bool {
         self.subresources.contains(&Subresource::Status)
     }
-
     /// `true` iff this kind serves the autoscaling/v1 `/scale` subresource.
     #[must_use]
     pub fn has_scale(&self) -> bool {
         self.subresources.contains(&Subresource::Scale)
     }
-
     /// `true` iff this kind serves the `/log` subresource (Pod only).
     #[must_use]
     pub fn has_log(&self) -> bool {
         self.subresources.contains(&Subresource::Log)
     }
-
     /// The Group/Version/Kind triple for this descriptor.
     #[must_use]
     pub const fn to_gvk(&self) -> GroupVersionKind {
@@ -111,7 +104,6 @@ impl ResourceDescriptor {
             kind: self.kind,
         }
     }
-
     /// The Group/Version/Resource triple for this descriptor.
     #[must_use]
     pub const fn to_gvr(&self) -> GroupVersionResource {
@@ -121,7 +113,6 @@ impl ResourceDescriptor {
             resource: self.plural,
         }
     }
-
     /// The runtime [`Scope`] for this descriptor.
     #[must_use]
     pub const fn scope(&self) -> Scope {
@@ -132,7 +123,6 @@ impl ResourceDescriptor {
         }
     }
 }
-
 /// Every routable/discoverable kind, in `KIND_CATALOG` order.
 pub const RESOURCE_CATALOG: &[ResourceDescriptor] = &[
     ResourceDescriptor {

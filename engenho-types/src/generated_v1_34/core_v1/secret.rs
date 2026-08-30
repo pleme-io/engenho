@@ -5,15 +5,11 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// Secret holds secret data of a certain type. The total bytes of the values in the Data field must be less than MaxSecretSize bytes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Secret {
@@ -37,7 +33,6 @@ pub struct Secret {
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<crate::curated_enums::SecretType>,
 }
-
 impl KubeResource for Secret {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -50,7 +45,6 @@ impl KubeResource for Secret {
         resource: "secrets",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -65,7 +59,6 @@ impl KubeResource for Secret {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

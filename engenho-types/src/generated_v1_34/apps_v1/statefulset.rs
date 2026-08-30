@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// StatefulSet represents a set of pods with consistent identities. Identities are defined as:
 /// - Network: A single stable DNS and hostname.
 /// - Storage: As many VolumeClaims as requested.
@@ -30,7 +26,6 @@ pub struct StatefulSet {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<StatefulSetStatus>,
 }
-
 impl KubeResource for StatefulSet {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "apps",
@@ -43,7 +38,6 @@ impl KubeResource for StatefulSet {
         resource: "statefulsets",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -58,7 +52,6 @@ impl KubeResource for StatefulSet {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

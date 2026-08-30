@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// ResourceQuota sets aggregate quota restrictions enforced per namespace
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceQuota {
@@ -28,7 +24,6 @@ pub struct ResourceQuota {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ResourceQuotaStatus>,
 }
-
 impl KubeResource for ResourceQuota {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -41,7 +36,6 @@ impl KubeResource for ResourceQuota {
         resource: "resourcequotas",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -56,7 +50,6 @@ impl KubeResource for ResourceQuota {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

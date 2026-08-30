@@ -1,5 +1,4 @@
 //! GENERATED — `core_v1` typed kinds. Source: engenho-kube-codegen.
-
 mod configmap;
 mod endpoints;
 mod event;
@@ -15,7 +14,7 @@ mod resourcequota;
 mod secret;
 mod service;
 mod serviceaccount;
-
+pub use crate::generated_v1_34::types::*;
 pub use configmap::ConfigMap;
 pub use endpoints::Endpoints;
 pub use event::Event;
@@ -31,5 +30,3 @@ pub use resourcequota::ResourceQuota;
 pub use secret::Secret;
 pub use service::Service;
 pub use serviceaccount::ServiceAccount;
-
-pub use crate::generated_v1_34::types::*;

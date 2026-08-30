@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// CSIStorageCapacity stores the result of one CSI GetCapacity call. For a given StorageClass, this describes the available capacity in a particular topology segment.  This can be used when considering where to instantiate new PersistentVolumes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CSIStorageCapacity {
@@ -42,7 +38,6 @@ pub struct CSIStorageCapacity {
     #[serde(default, rename = "storageClassName")]
     pub storage_class_name: String,
 }
-
 impl KubeResource for CSIStorageCapacity {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "storage.k8s.io",
@@ -55,7 +50,6 @@ impl KubeResource for CSIStorageCapacity {
         resource: "csistoragecapacities",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -70,7 +64,6 @@ impl KubeResource for CSIStorageCapacity {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

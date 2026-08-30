@@ -5,15 +5,11 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// PriorityClass defines mapping from a priority class name to the priority integer value. The value can be any valid integer.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PriorityClass {
@@ -41,7 +37,6 @@ pub struct PriorityClass {
     #[serde(default)]
     pub value: i32,
 }
-
 impl KubeResource for PriorityClass {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "scheduling.k8s.io",
@@ -54,7 +49,6 @@ impl KubeResource for PriorityClass {
         resource: "priorityclasses",
     };
     const SCOPE: Scope = Scope::Cluster;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -69,7 +63,6 @@ impl KubeResource for PriorityClass {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

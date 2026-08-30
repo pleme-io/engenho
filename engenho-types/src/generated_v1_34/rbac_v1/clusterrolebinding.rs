@@ -5,18 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
+use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-// The CANONICAL RBAC primitives (carry the `kind` discriminator the codegen
-// `types::{RoleRef,Subject}` drop).
-use super::policy::{RoleRef, Subject};
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// ClusterRoleBinding references a ClusterRole, but not contain it.  It can reference a ClusterRole in the global namespace, and adds who information via Subject.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClusterRoleBinding {
@@ -30,7 +24,6 @@ pub struct ClusterRoleBinding {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<Subject>,
 }
-
 impl KubeResource for ClusterRoleBinding {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "rbac.authorization.k8s.io",
@@ -43,7 +36,6 @@ impl KubeResource for ClusterRoleBinding {
         resource: "clusterrolebindings",
     };
     const SCOPE: Scope = Scope::Cluster;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -58,7 +50,6 @@ impl KubeResource for ClusterRoleBinding {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

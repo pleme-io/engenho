@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// Event is a report of an event somewhere in the cluster.  Events have a limited retention time and triggers and messages may evolve with time.  Event consumers should not rely on the timing of an event with a given Reason reflecting a consistent underlying trigger, or the continued existence of events with that Reason.  Events should be treated as informative, best-effort, supplemental data.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -80,7 +76,6 @@ pub struct Event {
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
 }
-
 impl KubeResource for Event {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -93,7 +88,6 @@ impl KubeResource for Event {
         resource: "events",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -108,7 +102,6 @@ impl KubeResource for Event {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// Service is a named abstraction of software service (for example, mysql) consisting of local port (for example 3306) that the proxy listens on, and the selector that determines which pods will answer requests sent through the proxy.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Service {
@@ -28,7 +24,6 @@ pub struct Service {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ServiceStatus>,
 }
-
 impl KubeResource for Service {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -41,7 +36,6 @@ impl KubeResource for Service {
         resource: "services",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -56,7 +50,6 @@ impl KubeResource for Service {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

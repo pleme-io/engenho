@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// Job represents the configuration of a single job.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Job {
@@ -28,7 +24,6 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<JobStatus>,
 }
-
 impl KubeResource for Job {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "batch",
@@ -41,7 +36,6 @@ impl KubeResource for Job {
         resource: "jobs",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -56,7 +50,6 @@ impl KubeResource for Job {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }
