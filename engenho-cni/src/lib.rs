@@ -32,8 +32,10 @@
 
 pub mod config;
 pub mod exec;
+pub mod ipam;
 pub mod result;
 
 pub use config::{ConfigError, LoadedNetD, NetworkConfigList, PluginConfig, load_conflist_dir};
 pub use exec::{CniCommand, CniEnv, CniInstall, CniInvocation, CniPlugin, ExecError, PlannedCni};
+pub use ipam::{Cidr, IpamError, LeaseStore};
 pub use result::{CniResult, Interface, IpConfig, Route};

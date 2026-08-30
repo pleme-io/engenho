@@ -44,7 +44,12 @@ pub struct IpConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gateway: String,
     /// Index into `interfaces` this address belongs to.
-    #[serde(default)]
+    ///
+    /// OMITTED when absent rather than serialized as `null`: an IPAM plugin
+    /// creates no interface, upstream's plugins leave the field out
+    /// entirely, and a strict consumer reading `null` where it expects an
+    /// integer is a difference we would have introduced for nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<usize>,
 }
 
@@ -93,6 +98,14 @@ pub struct Dns {
     pub search: Vec<String>,
 }
 
+impl Dns {
+    /// Whether this carries nothing, so it can be omitted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nameservers.is_empty() && self.search.is_empty()
+    }
+}
+
 /// A CNI `ADD` result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -100,17 +113,18 @@ pub struct CniResult {
     /// The spec version the plugin answered in.
     #[serde(default)]
     pub cni_version: String,
-    /// Interfaces created. Empty for a chained plugin that adds none.
-    #[serde(default)]
+    /// Interfaces created. Empty for a chained plugin that adds none, and
+    /// omitted in that case — see `IpConfig::interface`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<Interface>,
     /// Addresses assigned.
     #[serde(default)]
     pub ips: Vec<IpConfig>,
     /// Routes installed.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<Route>,
     /// DNS settings.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Dns::is_empty")]
     pub dns: Dns,
 }
 

@@ -39123,6 +39123,10 @@
         {
           "name": "cni-reference-plugin",
           "path": "src/bin/cni-reference-plugin.rs"
+        },
+        {
+          "name": "engenho-ipam",
+          "path": "src/bin/engenho-ipam.rs"
         }
       ]
     },
