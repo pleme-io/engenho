@@ -315,6 +315,20 @@ pub enum VolumeResolveError {
         /// The referenced claim name (in the pod's namespace).
         claim: String,
     },
+    /// A `persistentVolumeClaim` is bound to a CSI PV, but this kubelet has
+    /// no CSI plane wired (or the named driver never registered). Pending
+    /// reason `"CsiUnavailable"` — distinct from `PvcSourceUnsupported`,
+    /// which means engenho cannot serve the source class AT ALL. This one
+    /// says the class is supported and THIS node cannot serve it, which is
+    /// a completely different thing for an operator to act on.
+    #[error("PVC volume {vol} needs CSI driver {driver}, which is not available on this node")]
+    CsiUnavailable {
+        /// The offending volume's name.
+        vol: String,
+        /// The driver the PV names.
+        driver: String,
+    },
+
     /// A `persistentVolumeClaim` is `Bound` but its PV carries a source class
     /// the kubelet can't mount node-locally (CSI / NFS / cloud disk / …; only
     /// `hostPath` + `local` are served). Pending reason
@@ -350,6 +364,7 @@ impl VolumeResolveError {
             VolumeResolveError::Unsupported { reason, .. } => reason,
             VolumeResolveError::PvcNotBound { .. } => "PvcNotBound",
             VolumeResolveError::PvcSourceUnsupported { .. } => "PvcSourceUnsupported",
+            VolumeResolveError::CsiUnavailable { .. } => "CsiUnavailable",
             VolumeResolveError::Materialize(_) => "VolumeMaterializeError",
         }
     }
@@ -365,6 +380,7 @@ engenho_substrate::impl_error_kind! {
         { Unsupported { .. } } => "unsupported",
         { PvcNotBound { .. } } => "pvc_not_bound",
         { PvcSourceUnsupported { .. } } => "pvc_source_unsupported",
+        { CsiUnavailable { .. } } => "csi_unavailable",
         (Materialize(_)) => "materialize",
     }
 }
@@ -418,6 +434,54 @@ pub trait VolumeMaterializer: Send + Sync {
         pod: &str,
         volume: &str,
     ) -> Result<MountSource, VolumeResolveError>;
+
+    /// Ask a CSI driver to publish `req`'s volume for pod
+    /// `<namespace>/<pod>`, returning the [`MountSource`] to bind-mount.
+    ///
+    /// ★ THE DEFAULT REFUSES BY NAME rather than returning a plausible
+    /// path. A materializer with no CSI wiring genuinely cannot mount a CSI
+    /// volume, and the failure modes of the alternatives are both bad: an
+    /// empty dir would present as a silently-empty volume (data loss that
+    /// looks like an application bug), and a panic would take the kubelet
+    /// down for one misconfigured pod. A typed Pending keeps the pod
+    /// waiting with a reason an operator can read.
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeResolveError::CsiUnavailable`] when this materializer has no
+    /// CSI plane; whatever the driver returned otherwise.
+    async fn publish_csi(
+        &self,
+        _namespace: &str,
+        _pod: &str,
+        volume: &str,
+        req: &CsiPublishRequest,
+    ) -> Result<MountSource, VolumeResolveError> {
+        Err(VolumeResolveError::CsiUnavailable {
+            vol: volume.to_string(),
+            driver: req.driver.clone(),
+        })
+    }
+
+    /// The pod-delete counterpart of
+    /// [`publish_csi`](VolumeMaterializer::publish_csi).
+    ///
+    /// An already-unpublished volume is SUCCESS: teardown runs on a path
+    /// that may already have partially completed, and an error here would
+    /// wedge pod deletion behind a volume that is already gone.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver returned. The default is a no-op success,
+    /// because a materializer that never published has nothing to undo.
+    async fn unpublish_csi(
+        &self,
+        _namespace: &str,
+        _pod: &str,
+        _volume: &str,
+    ) -> Result<(), VolumeResolveError> {
+        Ok(())
+    }
 
     /// Idempotently remove the named volume backing the emptyDir `volume` of
     /// pod `<namespace>/<pod>` — the pod-delete counterpart of
@@ -587,7 +651,16 @@ where
             PodVolumeSource::Pvc {
                 claim_name,
                 read_only,
-            } => resolve_pvc_volume(&vol.name, &claim_name, read_only, &fetch)?,
+            } => match resolve_pvc_volume(&vol.name, &claim_name, read_only, &fetch)? {
+                PvcBacking::HostDir(source) => source,
+                // The side effect lives HERE, alongside the other
+                // materializations, not inside the pure resolver.
+                PvcBacking::Csi(req) => {
+                    materializer
+                        .publish_csi(namespace, pod_name, &vol.name, &req)
+                        .await?
+                }
+            },
             PodVolumeSource::HostPath => {
                 return Err(VolumeResolveError::Unsupported {
                     vol: vol.name.clone(),
@@ -702,6 +775,46 @@ fn secret_files(
     Ok(files)
 }
 
+/// What the kubelet must ask a CSI driver for, to make one PV visible on
+/// this node.
+///
+/// ★ EVERY FIELD HERE IS LOAD-BEARING AND COMES OFF THE PV, NOT A DEFAULT.
+/// `volume_handle` is the driver's own id for the volume and is what
+/// `NodePublishVolume` keys on — inventing it, or reusing the PV name,
+/// publishes the wrong volume or nothing at all. `volume_attributes` is the
+/// opaque bag `CreateVolume` returned and the driver expects back verbatim;
+/// dropping it is how a mount succeeds against the wrong backend path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CsiPublishRequest {
+    /// `spec.csi.driver` — which registered driver to call.
+    pub driver: String,
+    /// `spec.csi.volumeHandle` — the driver's id for this volume.
+    pub volume_handle: String,
+    /// `spec.csi.fsType`, when the PV names one.
+    pub fs_type: Option<String>,
+    /// `spec.csi.volumeAttributes`, passed back to the driver verbatim.
+    pub volume_attributes: BTreeMap<String, String>,
+    /// Read-only, from EITHER `spec.csi.readOnly` or the pod's
+    /// `persistentVolumeClaim.readOnly`. Either one alone forces it: a
+    /// volume declared read-only by the PV must not become writable
+    /// because the pod forgot to say so.
+    pub read_only: bool,
+}
+
+/// How a bound PV is backed on this node.
+///
+/// Introduced so `resolve_pvc_volume` stays PURE: deciding that a PV is CSI
+/// is a computation, and CALLING the driver is a side effect. Collapsing
+/// them would put a gRPC call inside the one function every volume test
+/// exercises without a driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PvcBacking {
+    /// A node-local `hostPath`/`local` directory: bind-mount it directly.
+    HostDir(MountSource),
+    /// A CSI volume: the driver must publish it before it can be mounted.
+    Csi(CsiPublishRequest),
+}
+
 /// Resolve a `persistentVolumeClaim` volume to its bound PV's node-local
 /// source dir, producing a [`MountSource::PvcHostDir`].
 ///
@@ -726,14 +839,16 @@ fn secret_files(
 ///   * [`VolumeResolveError::PvcNotBound`] — the bound PV named by the PVC is
 ///     itself absent from the store (binder hasn't created/written it yet).
 ///   * [`VolumeResolveError::PvcSourceUnsupported`] — the bound PV carries a
-///     source class the kubelet can't mount node-locally (CSI / NFS / cloud
-///     disk); only `hostPath` + `local` are served. Never a fake mount.
+///     source class engenho serves through no plane at all (NFS, a cloud
+///     disk), or a `csi` source missing its driver/handle. Never a fake
+///     mount. A well-formed `csi` source is NOT this error any more: it
+///     returns [`PvcBacking::Csi`] for the caller to publish.
 fn resolve_pvc_volume<F>(
     vol_name: &str,
     claim_name: &str,
     pvc_read_only: bool,
     fetch: &F,
-) -> Result<MountSource, VolumeResolveError>
+) -> Result<PvcBacking, VolumeResolveError>
 where
     F: Fn(&str, &str) -> Option<Value>,
 {
@@ -776,18 +891,68 @@ where
         .and_then(|l| l.get("path"))
         .and_then(Value::as_str);
 
-    let path =
-        host_path
-            .or(local_path)
-            .ok_or_else(|| VolumeResolveError::PvcSourceUnsupported {
+    if let Some(path) = host_path.or(local_path) {
+        return Ok(PvcBacking::HostDir(MountSource::PvcHostDir {
+            path: PathBuf::from(path),
+            read_only: pvc_read_only,
+        }));
+    }
+
+    // A `csi` source is not "unsupported" any more — it is the whole point
+    // of the CSI contract. The driver publishes it; the kubelet bind-mounts
+    // whatever path comes back.
+    if let Some(csi) = spec.and_then(|s| s.get("csi")) {
+        let driver = csi
+            .get("driver")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty());
+        let handle = csi
+            .get("volumeHandle")
+            .and_then(Value::as_str)
+            .filter(|h| !h.is_empty());
+        // A csi source missing either field is MALFORMED, not unsupported.
+        // Publishing with an empty handle would ask the driver for "the
+        // volume named nothing", and drivers differ on whether that is an
+        // error or a silently-wrong mount.
+        let (Some(driver), Some(volume_handle)) = (driver, handle) else {
+            return Err(VolumeResolveError::PvcSourceUnsupported {
                 vol: vol_name.to_string(),
                 claim: claim_name.to_string(),
                 pv: pv_name.to_string(),
-            })?;
+            });
+        };
+        let mut volume_attributes = BTreeMap::new();
+        if let Some(attrs) = csi.get("volumeAttributes").and_then(Value::as_object) {
+            for (k, v) in attrs {
+                if let Some(v) = v.as_str() {
+                    volume_attributes.insert(k.clone(), v.to_string());
+                }
+            }
+        }
+        return Ok(PvcBacking::Csi(CsiPublishRequest {
+            driver: driver.to_string(),
+            volume_handle: volume_handle.to_string(),
+            fs_type: csi
+                .get("fsType")
+                .and_then(Value::as_str)
+                .filter(|f| !f.is_empty())
+                .map(ToString::to_string),
+            volume_attributes,
+            // EITHER source of read-only forces it. A PV the cluster
+            // declared read-only must not become writable because the pod
+            // did not repeat the claim.
+            read_only: pvc_read_only
+                || csi
+                    .get("readOnly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+        }));
+    }
 
-    Ok(MountSource::PvcHostDir {
-        path: PathBuf::from(path),
-        read_only: pvc_read_only,
+    Err(VolumeResolveError::PvcSourceUnsupported {
+        vol: vol_name.to_string(),
+        claim: claim_name.to_string(),
+        pv: pv_name.to_string(),
     })
 }
 
@@ -1561,7 +1726,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pvc_bound_to_unsupported_source_pv_stays_pending() {
+    async fn a_csi_pv_now_says_csi_unavailable_not_source_unsupported() {
+        // BEHAVIOUR CHANGE, deliberate. Before the CSI contract landed a
+        // CSI-backed PV was `PvcSourceUnsupported` — "engenho cannot serve
+        // this source class". That is no longer true: the class IS served,
+        // and what is missing is a CSI plane on THIS node. The two are
+        // completely different things for an operator to act on, which is
+        // why they are different reasons rather than one shared string.
         let pod = json!({
             "spec": { "volumes": [
                 { "name": "data", "persistentVolumeClaim": { "claimName": "c" } }
@@ -1570,7 +1741,6 @@ mod tests {
         let pvc = json!({
             "spec": { "volumeName": "pv-csi" }, "status": { "phase": "Bound" }
         });
-        // CSI-backed PV — no hostPath/local source the kubelet can mount.
         let pv = json!({
             "spec": { "csi": { "driver": "ebs.csi.aws.com", "volumeHandle": "vol-123" } }
         });
@@ -1582,11 +1752,60 @@ mod tests {
         let err = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
             .await
             .unwrap_err();
+        assert_eq!(err.pending_reason(), "CsiUnavailable");
+        // And it names the driver, so an operator knows WHICH one to deploy.
+        assert!(err.to_string().contains("ebs.csi.aws.com"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_unservable_source_class_still_says_so() {
+        // The `PvcSourceUnsupported` path must not have been lost: an NFS
+        // PV is a source class engenho serves through no plane at all.
+        let pod = json!({
+            "spec": { "volumes": [
+                { "name": "data", "persistentVolumeClaim": { "claimName": "c" } }
+            ] }
+        });
+        let pvc = json!({
+            "spec": { "volumeName": "pv-nfs" }, "status": { "phase": "Bound" }
+        });
+        let pv = json!({
+            "spec": { "nfs": { "server": "10.0.0.1", "path": "/exports/x" } }
+        });
+        let mat = FakeVolumeMaterializer::new();
+        let fetch = pvc_fetch(vec![
+            ("PersistentVolumeClaim", "c", pvc),
+            ("PersistentVolume", "pv-nfs", pv),
+        ]);
+        let err = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
+            .await
+            .unwrap_err();
         assert_eq!(err.pending_reason(), "PvcSourceUnsupported");
-        assert!(matches!(
-            err,
-            VolumeResolveError::PvcSourceUnsupported { .. }
-        ));
+    }
+
+    #[tokio::test]
+    async fn a_csi_pv_missing_its_handle_is_malformed_not_publishable() {
+        // Publishing with an empty handle asks the driver for "the volume
+        // named nothing"; drivers differ on whether that errors or mounts
+        // something wrong, and neither is acceptable.
+        let pod = json!({
+            "spec": { "volumes": [
+                { "name": "data", "persistentVolumeClaim": { "claimName": "c" } }
+            ] }
+        });
+        let pvc = json!({
+            "spec": { "volumeName": "pv-csi" }, "status": { "phase": "Bound" }
+        });
+        let pv = json!({ "spec": { "csi": { "driver": "ebs.csi.aws.com" } } });
+        let mat = FakeVolumeMaterializer::new();
+        let fetch = pvc_fetch(vec![
+            ("PersistentVolumeClaim", "c", pvc),
+            ("PersistentVolume", "pv-csi", pv),
+        ]);
+        let err = resolve_pod_volumes(&pod, "default", "p1", fetch, &mat)
+            .await
+            .unwrap_err();
+        assert_eq!(err.pending_reason(), "PvcSourceUnsupported");
     }
 
     #[tokio::test]

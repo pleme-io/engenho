@@ -42,6 +42,7 @@ pub mod backend;
 pub mod backoff;
 pub mod config_bridge;
 pub mod cri;
+pub mod csi_materializer;
 pub mod error;
 pub mod exec_channel;
 pub mod exec_session;
@@ -58,6 +59,7 @@ pub use backend::{
     LogOptions, NetProber, PodmanBackend, ProbeIoError, PullPolicy, TcpProbeTarget, TokioNetProber,
 };
 pub use config_bridge::make_container_runtime;
+pub use csi_materializer::{CsiVolumeMaterializer, DriverTable, RegisteredDriver};
 pub use error::KubeletError;
 pub use kubelet::{Kubelet, TestClock};
 pub use lifecycle::{

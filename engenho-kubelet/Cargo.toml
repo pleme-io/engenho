@@ -13,6 +13,7 @@ keywords.workspace = true
 description = "engenho-kubelet — the missing piece between 'Pod object in the store' and 'container running on host'. Per-node controller that watches Pods bound to its node + materializes containers via a pluggable ContainerRuntime backend (PodmanBackend / CriBackend / RunwasiBackend / FakeBackend for tests)."
 
 [dependencies]
+engenho-csi   = { path = "../engenho-csi" }
 tonic         = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
 tonic-prost   = "0.14"
 prost         = "0.14"
@@ -41,6 +42,8 @@ protox            = "0.9"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+tempfile = "3"
+engenho-csi = { path = "../engenho-csi", features = ["test-driver"] }
 tower = { workspace = true, features = ["util"] }
 proptest = "1"
 # A REAL client for the one test that opens an actual socket. The pure
