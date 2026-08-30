@@ -388,7 +388,14 @@ mod tests {
     /// reading of that argv.
     #[test]
     fn help_and_version_never_boot_the_daemon() {
-        for argv in [&["--help"], &["-h"], &["help"], &["--version"], &["-V"], &["version"]] {
+        for argv in [
+            &["--help"],
+            &["-h"],
+            &["help"],
+            &["--version"],
+            &["-V"],
+            &["version"],
+        ] {
             assert_ne!(parse(argv).unwrap(), Command::Daemon, "argv {argv:?}");
         }
     }
@@ -402,7 +409,10 @@ mod tests {
     fn help_text_names_every_subcommand() {
         let help = super::help_text();
         for verb in super::SUBCOMMAND_NAMES {
-            assert!(help.contains(verb), "help text omits the {verb:?} subcommand");
+            assert!(
+                help.contains(verb),
+                "help text omits the {verb:?} subcommand"
+            );
         }
         for flag in ["--help", "--version"] {
             assert!(help.contains(flag), "help text omits {flag:?}");
@@ -413,7 +423,10 @@ mod tests {
     #[test]
     fn help_text_is_actionable() {
         let help = super::help_text();
-        assert!(help.contains(env!("CARGO_PKG_VERSION")), "help omits the version");
+        assert!(
+            help.contains(env!("CARGO_PKG_VERSION")),
+            "help omits the version"
+        );
         assert!(help.contains("kubectl"), "help gives no working next step");
     }
 
@@ -421,7 +434,10 @@ mod tests {
     #[test]
     fn unknown_subcommand_points_at_help() {
         let err = parse(&["frobnicate"]).unwrap_err().to_string();
-        assert!(err.contains("--help"), "unknown-verb error does not mention --help: {err}");
+        assert!(
+            err.contains("--help"),
+            "unknown-verb error does not mention --help: {err}"
+        );
     }
 
     /// THE ANTI-DRIFT ROW. Every verb in `SUBCOMMAND_NAMES` is really
