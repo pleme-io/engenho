@@ -254,6 +254,16 @@ pub struct Kubelet {
     /// safe to add to a code path before the plumbing exists — the
     /// alternative being an `Option` check at every call site.
     events: Arc<dyn engenho_controllers::event_recorder::EventSink>,
+    /// When this kubelet last wrote its node lease.
+    ///
+    /// ★ THE CADENCE IS LOAD-BEARING, not a nicety. A heartbeat written on
+    /// every tick makes every idle reconcile a STORE WRITE, which advances
+    /// the revision forever and defeats the idempotent-skip defense the
+    /// rest of this controller is built around — caught by
+    /// `deployment_status_converges_then_reconcile_is_bounded`, which is
+    /// exactly the hot-loop tripwire it exists to be. Upstream renews on
+    /// `RENEW_INTERVAL`, not per sync loop, for the same reason.
+    last_lease_renewal: Mutex<Option<Instant>>,
     node_name: String,
     /// Bookkeeping for every Pod we started, keyed by its typed
     /// [`ResourceKey`]. Persists for the kubelet's process lifetime; on
@@ -277,6 +287,7 @@ impl Kubelet {
             volume_materializer: Arc::new(PodmanVolumeMaterializer::new()),
             clock: Arc::new(Instant::now),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
+            last_lease_renewal: Mutex::new(None),
             node_name: node_name.into(),
             local: Mutex::new(BTreeMap::new()),
         }
@@ -343,6 +354,61 @@ impl Kubelet {
             &engenho_types::time::now_rfc3339_utc(),
         )
         .await;
+    }
+
+    /// Write this node's heartbeat into `kube-node-lease`.
+    ///
+    /// ★ THIS IS THE PRODUCER `node_lease` WAS MISSING. The module defined
+    /// the key, the object shape, the renew interval, the grace period and
+    /// the readiness derivation — and nothing ever wrote a lease, so the
+    /// derivation had no input and every node's readiness stayed whatever
+    /// it was first set to. A `Ready` condition that cannot become
+    /// `Unknown` is not a health signal, it is a constant.
+    ///
+    /// `transitions` is left at 0: it counts LEADER transitions, which is
+    /// meaningful for a lock-style Lease and not for a heartbeat one. A
+    /// number incremented for its own sake is worse than a stable zero.
+    async fn renew_node_lease(&self) {
+        // Due yet? First call always is; after that, only every
+        // RENEW_INTERVAL. Read against this kubelet's injected clock so the
+        // cadence is testable without sleeping.
+        {
+            let now = self.now();
+            let mut last = self.last_lease_renewal.lock().await;
+            if let Some(prev) = *last {
+                if now.saturating_duration_since(prev) < crate::node_lease::RENEW_INTERVAL {
+                    return;
+                }
+            }
+            *last = Some(now);
+        }
+
+        let key = crate::node_lease::lease_key(&self.node_name);
+        let value = crate::node_lease::lease_value(
+            &self.node_name,
+            &engenho_types::time::now_rfc3339_utc(),
+            0,
+        );
+        if let Err(e) = self
+            .store
+            .propose(engenho_store::command::ResourceCommand::Put {
+                key,
+                value,
+                // No precondition: a heartbeat is last-writer-wins by
+                // definition. A CAS would make a lost race look like a dead
+                // node, which is the exact misreading this lease exists to
+                // prevent.
+                expected: None,
+                reason: engenho_store::command::Reason::Controller,
+            })
+            .await
+        {
+            warn!(
+                node = %self.node_name,
+                error = %e,
+                "node lease renewal failed; the node may be reported NotReady"
+            );
+        }
     }
 
     /// The current instant per this kubelet's clock.
@@ -870,6 +936,17 @@ impl Controller for Kubelet {
     }
 
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+        // ── NODE LEASE. Renewed FIRST, before any pod work, and this
+        // ordering is the point: the lease says "this kubelet is alive",
+        // and a kubelet that renews only after a slow reconcile reports
+        // itself unhealthy precisely when it is busiest. Upstream renews on
+        // its own cadence for the same reason.
+        //
+        // Renewal failure is logged, never fatal — a kubelet that stops
+        // managing containers because it could not write a heartbeat has
+        // turned an observability problem into an outage.
+        self.renew_node_lease().await;
+
         let pods = self.store.list("", "v1", "Pod", None).await;
         let mut report = ReconcileReport::default();
 
