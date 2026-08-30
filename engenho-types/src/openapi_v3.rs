@@ -425,7 +425,10 @@ mod verb_tests {
     #[test]
     fn core_group_derives_verbs() {
         let v = verbs_for("", "v1", "configmaps").expect("core/v1 is vendored");
-        assert!(v.contains(&Verb::DeleteCollection), "configmaps support deletecollection");
+        assert!(
+            v.contains(&Verb::DeleteCollection),
+            "configmaps support deletecollection"
+        );
     }
 
     /// **Ignorance is not an empty set.** An unvendored group returns `None`,

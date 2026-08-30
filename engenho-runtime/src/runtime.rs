@@ -32,10 +32,10 @@ use engenho_store::{
     default_config,
 };
 use engenho_types::generated_v1_34::core_v1::Namespace;
-use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
 use engenho_types::generated_v1_34::rbac_v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
 };
+use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -706,21 +706,21 @@ async fn seed_kubernetes_service(
     if config.networking.service_cidr.is_empty() {
         return Ok(());
     }
-    let mut allocator =
-        match engenho_controllers::cluster_ip::ClusterIpAllocator::new(&config.networking.service_cidr)
-        {
-            Ok(a) => a,
-            Err(e) => {
-                // A malformed CIDR is the allocator's problem to report at its
-                // own boundary, not a reason to refuse to boot the whole node.
-                warn!(
-                    cidr = %config.networking.service_cidr,
-                    error = %e,
-                    "service_cidr unparseable; skipping the kubernetes Service seed"
-                );
-                return Ok(());
-            }
-        };
+    let mut allocator = match engenho_controllers::cluster_ip::ClusterIpAllocator::new(
+        &config.networking.service_cidr,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            // A malformed CIDR is the allocator's problem to report at its
+            // own boundary, not a reason to refuse to boot the whole node.
+            warn!(
+                cidr = %config.networking.service_cidr,
+                error = %e,
+                "service_cidr unparseable; skipping the kubernetes Service seed"
+            );
+            return Ok(());
+        }
+    };
     let Ok(vip) = allocator.allocate() else {
         warn!("service CIDR has no assignable address; skipping the kubernetes Service seed");
         return Ok(());
@@ -784,10 +784,9 @@ fn system_namespace(name: &str) -> Namespace {
         name: name.to_string(),
         ..Default::default()
     };
-    metadata.labels.insert(
-        "kubernetes.io/metadata.name".to_string(),
-        name.to_string(),
-    );
+    metadata
+        .labels
+        .insert("kubernetes.io/metadata.name".to_string(), name.to_string());
     Namespace {
         metadata,
         spec: Some(NamespaceSpec {

@@ -210,9 +210,9 @@ pub fn adjudicate(expect: &Expect, verdict: &Verdict) -> Outcome {
         (Expect::KnownDiverge { class, .. }, Verdict::Divergent(_)) => {
             Outcome::Tracked { class: *class }
         }
-        (Expect::KnownDiverge { note, .. }, Verdict::Parity(_)) => Outcome::Graduated {
-            stale_note: note,
-        },
+        (Expect::KnownDiverge { note, .. }, Verdict::Parity(_)) => {
+            Outcome::Graduated { stale_note: note }
+        }
     }
 }
 
@@ -271,7 +271,6 @@ impl MatrixReport {
     pub fn is_green(&self) -> bool {
         self.rows > 0 && self.failures.is_empty()
     }
-
 }
 
 /// One line carrying the denominator, suitable for a gate's output. Always
@@ -360,7 +359,10 @@ mod tests {
         for e in [Expect::Match, known()] {
             let out = adjudicate(&e, &Verdict::ReferenceUnreachable);
             assert_eq!(out, Outcome::OracleLost);
-            assert!(!out.passes(), "an unreachable oracle is never a silent skip");
+            assert!(
+                !out.passes(),
+                "an unreachable oracle is never a silent skip"
+            );
         }
     }
 
@@ -389,7 +391,10 @@ mod tests {
         ]);
         assert!(r.is_green());
         assert_eq!((r.rows, r.held, r.tracked), (2, 1, 1));
-        assert!(r.to_string().contains("2 rows"), "denominator must be visible");
+        assert!(
+            r.to_string().contains("2 rows"),
+            "denominator must be visible"
+        );
     }
 
     #[test]

@@ -630,7 +630,10 @@ async fn boot_seeds_the_four_system_namespaces() {
     let default_ns = items
         .iter()
         .find(|n| {
-            n.get("metadata").and_then(|m| m.get("name")).and_then(|v| v.as_str()) == Some("default")
+            n.get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|v| v.as_str())
+                == Some("default")
         })
         .expect("default namespace present");
 
@@ -734,7 +737,10 @@ async fn invalid_object_names_are_rejected_with_422() {
             Some("Invalid"),
             "reason must be Invalid (not BadRequest) for {bad:?}: {body:#}"
         );
-        assert_eq!(body.get("code").and_then(serde_json::Value::as_u64), Some(422));
+        assert_eq!(
+            body.get("code").and_then(serde_json::Value::as_u64),
+            Some(422)
+        );
     }
 
     // A VALID name still works — the guard must not have become a wall.
@@ -903,7 +909,9 @@ async fn create_into_a_nonexistent_namespace_is_rejected() {
 
     // A create into a SEEDED namespace still works — the guard is not a wall.
     let ok = client
-        .post(format!("http://{addr}/api/v1/namespaces/default/configmaps"))
+        .post(format!(
+            "http://{addr}/api/v1/namespaces/default/configmaps"
+        ))
         .json(&serde_json::json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
@@ -1155,5 +1163,9 @@ async fn unservable_accept_is_406() {
         .send()
         .await
         .expect("GET with no Accept");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "absent Accept is not a failed negotiation");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "absent Accept is not a failed negotiation"
+    );
 }
