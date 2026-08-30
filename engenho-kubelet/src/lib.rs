@@ -41,6 +41,7 @@
 pub mod backend;
 pub mod backoff;
 pub mod config_bridge;
+pub mod cri;
 pub mod error;
 pub mod exec_channel;
 pub mod kubelet;
