@@ -38,6 +38,7 @@
 
 pub mod keyspace;
 pub mod kv;
+pub mod server;
 
 /// The etcd v3 wire types, generated from the vendored upstream protos.
 ///

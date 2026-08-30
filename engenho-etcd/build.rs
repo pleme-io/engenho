@@ -35,8 +35,14 @@ fn main() {
     let descriptors = protox::compile(&files, [&root]).expect("vendored etcd protos must compile");
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    prost_build::Config::new()
+    // tonic-build wraps prost codegen and additionally emits the SERVICE
+    // traits — `KvServer`, `WatchServer`, `MaintenanceServer`. Servers only:
+    // engenho answers etcd requests, it never issues them, so generating
+    // clients would ship dead code.
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(false)
         .out_dir(&out)
         .compile_fds(descriptors)
-        .expect("prost codegen for the etcd protos");
+        .expect("tonic + prost codegen for the etcd protos");
 }

@@ -17,6 +17,11 @@ path = "src/lib.rs"
 
 [dependencies]
 prost         = "0.14"
+tonic         = { version = "0.14", default-features = false, features = ["router", "server", "codegen", "transport"] }
+tonic-prost   = "0.14"
+tokio          = { workspace = true }
+tokio-stream   = "0.1"
+async-stream   = "0.3"
 bytes         = "1"
 engenho-types = { path = "../engenho-types" }
 engenho-store = { path = "../engenho-store" }
@@ -25,8 +30,10 @@ thiserror     = { workspace = true }
 [build-dependencies]
 protox       = "0.9"
 prost-build  = "0.14"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
