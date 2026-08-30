@@ -1753,6 +1753,7 @@ dependencies = [
  "engenho-cni",
  "engenho-config",
  "engenho-controllers",
+ "engenho-etcd",
  "engenho-kube-client",
  "engenho-kubelet",
  "engenho-scheduler",
@@ -1766,6 +1767,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "tracing",
 ]
 

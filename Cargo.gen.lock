@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "7c3458b8c6c8870bce76e6caf5f262d16e40b17c8e0320a617e6ee6ef497585d",
+  "cargo_lock_sha256": "ba7807a97d590484782373668f4adb5f12c999ce5bff49692b0de57f6b4ddf95",
   "manifest_sha256": {
     "Cargo.toml": "2eec79d4fa2938b1edd6ea76494277d6788cb0060c1c1a5b434a34296df8109c",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
@@ -21,7 +21,7 @@
     "engenho-machines/Cargo.toml": "7722f5b1de0b7af3d290f6b36bdea89e36ab888853f23a6432792ddd9640c442",
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "64809e6c36b095668395108481ee3029000066f855ed6c795b01f221d9b8ddd5",
+    "engenho-runtime/Cargo.toml": "3ba17512aeb3ce955117f9865c695902f0a295ad86f48b21ad27d9e55cbdba64",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-store/Cargo.toml": "90fc000b817605e80df052790c359fb79e171a49f68eb39a34c79122f776ead3",
     "engenho-substrate-props/Cargo.toml": "6f95b92f74fa8ac52030f06626f6af99c00c7939722497de0e91f8074fc0c52a",
@@ -6773,6 +6773,16 @@
             "tree": "target"
           },
           {
+            "name": "engenho_etcd",
+            "package_key": "engenho-etcd-0.53.49",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "engenho_kube_client",
             "package_key": "engenho-kube-client-0.53.49",
             "kind": "normal",
@@ -6870,6 +6880,33 @@
               "full"
             ],
             "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio_stream",
+            "package_key": "tokio-stream-0.1.18",
+            "kind": "normal",
+            "features": [
+              "net"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tonic",
+            "package_key": "tonic-0.14.6",
+            "kind": "normal",
+            "features": [
+              "codegen",
+              "router",
+              "server",
+              "transport"
+            ],
+            "uses_default_features": false,
             "optional": false,
             "target": null,
             "tree": "target"
