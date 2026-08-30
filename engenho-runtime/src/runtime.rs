@@ -1673,6 +1673,25 @@ fn spawn_drivers(
         handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Pod", "Node"])).spawn());
     }
 
+    // Served-capability honesty: stamps truthful status conditions on the
+    // kinds engenho advertises in discovery but does not implement
+    // (APIService, FlowSchema, PriorityLevelConfiguration). Without this
+    // the module is a well-tested vocabulary nobody emits, and an
+    // aggregated APIService registers successfully while every request to
+    // its group silently goes nowhere.
+    {
+        let c =
+            engenho_controllers::served_capability::ServedCapabilityController::new(store.clone());
+        handles.push(
+            WatchDriver::new(
+                c,
+                store.clone(),
+                driver_config(&["APIService", "FlowSchema", "PriorityLevelConfiguration"]),
+            )
+            .spawn(),
+        );
+    }
+
     // Kubelet: bound Pod → container via the backend. Watches Pods. Built
     // ONCE as an Arc<Kubelet> so the SAME instance is shared between its
     // WatchDriver (via the `Controller for Arc<C>` blanket impl) and the
@@ -1820,8 +1839,15 @@ mod tests {
         );
         // Drivers: 12 reconcilers (deployment, replicaset, statefulset,
         // daemonset, job, cronjob, endpoints, pdb, service_routing, gc,
-        // namespace, pv_binder, crd) + scheduler + kubelet = 15.
-        assert_eq!(rt.drivers.len(), 15);
+        // namespace, pv_binder, crd) + served_capability + scheduler +
+        // kubelet = 16.
+        //
+        // This count is deliberately pinned: a driver that stops being
+        // spawned is invisible at runtime (the cluster simply stops
+        // converging that kind), so the arithmetic here is the tripwire.
+        // Moving it is correct ONLY alongside an intentional change to the
+        // driver set — which is what added served_capability.
+        assert_eq!(rt.drivers.len(), 16);
         rt.shutdown().await.unwrap();
     }
 
@@ -1914,11 +1940,11 @@ mod tests {
     #[tokio::test]
     async fn disabling_service_routing_drops_one_driver() {
         // Gating works: turning off enable.service_routing removes exactly
-        // one spawned driver (15 → 14).
+        // one spawned driver (16 → 15).
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(rt.drivers.len(), 14);
+        assert_eq!(rt.drivers.len(), 15);
         rt.shutdown().await.unwrap();
     }
 }
