@@ -59,7 +59,9 @@ pub use backend::{
     LogOptions, NetProber, PodmanBackend, ProbeIoError, PullPolicy, TcpProbeTarget, TokioNetProber,
 };
 pub use config_bridge::make_container_runtime;
-pub use csi_materializer::{CsiVolumeMaterializer, DriverTable, RegisteredDriver};
+pub use csi_materializer::{
+    CsiVolumeMaterializer, DriverCsiProvisioner, DriverTable, RegisteredDriver,
+};
 pub use error::KubeletError;
 pub use kubelet::{Kubelet, TestClock};
 pub use lifecycle::{

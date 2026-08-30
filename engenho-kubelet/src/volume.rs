@@ -1,5 +1,39 @@
 //! R13 — Volume runtime (CSI-style storage plugin).
 //!
+//! ★★ SUPERSEDED, 2026-08-30, AND DELIBERATELY STILL DECLARED.
+//!
+//! This trait was the intended home for CSI ("`CsiVolumeBackend` (R13b —
+//! gRPC to CSI plugins)", below). When CSI was actually built it went
+//! elsewhere, and the reason is worth recording rather than leaving the
+//! next reader to re-derive it.
+//!
+//! `mount(&VolumeSpec) -> MountedVolume` has provisioning-shaped INPUTS
+//! (storage class, size, access mode, parameters — very nearly a
+//! `CreateVolumeRequest`) and mounting-shaped OUTPUTS (`mount_path`, a host
+//! directory). CSI splits those across two different services on two
+//! different machines: `Controller.CreateVolume` returns a volume ID and no
+//! path, because at provision time no node has mounted anything and there
+//! IS no path; `Node.NodePublishVolume` produces the path and knows nothing
+//! about storage classes.
+//!
+//! Forcing both through one call would give every caller a `mount_path`
+//! that is empty exactly when it matters — the org rule's "same goal,
+//! different shapes" case, where one type fits neither side and looks
+//! well-motivated anyway. So the work landed as two seams that each match
+//! one half:
+//!
+//!   * provisioning → `engenho_controllers::csi_provisioner::CsiProvisioner`
+//!     (implemented by `crate::csi_materializer::DriverCsiProvisioner`)
+//!   * the node path → `crate::pod_volume::VolumeMaterializer::publish_csi`
+//!     (implemented by `crate::csi_materializer::CsiVolumeMaterializer`)
+//!
+//! Per ★★ MODULARIZE, DON'T DELETE the declaration stays: it is a coherent
+//! local-storage abstraction, it has two working backends and tests, and a
+//! future non-CSI storage plane may well want exactly this shape. What it
+//! does NOT have is a production consumer — and now that is a recorded
+//! decision rather than the eighth silent instance of "type + backend + no
+//! producer".
+//!
 //! Same shape as [`crate::backend::ContainerRuntime`] — a typed
 //! trait the kubelet calls to materialize storage on the host;
 //! pluggable backends for tests + production.

@@ -39,6 +39,7 @@ pub mod crd_conversion;
 pub mod crd_validator;
 pub mod create_stamp;
 pub mod cron;
+pub mod csi_provisioner;
 pub mod daemonset;
 pub mod deployment;
 pub mod dns;

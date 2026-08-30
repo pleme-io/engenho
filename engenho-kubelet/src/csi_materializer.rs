@@ -474,3 +474,121 @@ mod path_tests {
         assert!(m.unpublish_csi("ns", "pod1", "data").await.is_ok());
     }
 }
+
+// =====================================================================
+// THE PROVISIONING PRODUCER
+// =====================================================================
+
+/// [`engenho_controllers::csi_provisioner::CsiProvisioner`] backed by the
+/// node's registered drivers.
+///
+/// Lives HERE rather than in `engenho-controllers` because that crate must
+/// not depend on `engenho-csi` — `engenho-kubelet` already depends on
+/// `engenho-controllers`, so the arrow cannot be reversed. The controller
+/// declares the verbs; this supplies the transport.
+#[derive(Clone, Debug)]
+pub struct DriverCsiProvisioner {
+    drivers: DriverTable,
+}
+
+impl DriverCsiProvisioner {
+    /// New provisioner over `drivers`.
+    #[must_use]
+    pub fn new(drivers: DriverTable) -> Self {
+        Self { drivers }
+    }
+}
+
+#[async_trait]
+impl engenho_controllers::csi_provisioner::CsiProvisioner for DriverCsiProvisioner {
+    async fn can_provision(&self, driver: &str) -> bool {
+        self.drivers.get(driver).await.is_some()
+    }
+
+    async fn create_volume(
+        &self,
+        req: &engenho_controllers::csi_provisioner::CsiCreateRequest,
+    ) -> Result<engenho_controllers::csi_provisioner::CsiCreatedVolume, String> {
+        let driver = self
+            .drivers
+            .get(&req.driver)
+            .await
+            .ok_or_else(|| format!("CSI driver {} is not registered", req.driver))?;
+
+        // The access mode the driver is told about is the CLAIM's, because
+        // it changes how the driver locks the volume. Defaulting everything
+        // to SingleNodeWriter would make a ReadWriteMany PVC silently
+        // single-writer, which presents as one pod's writes vanishing.
+        let mode = if req.multi_node {
+            pb::volume_capability::access_mode::Mode::MultiNodeMultiWriter
+        } else {
+            pb::volume_capability::access_mode::Mode::SingleNodeWriter
+        };
+
+        let volume = driver
+            .client
+            .create_volume(pb::CreateVolumeRequest {
+                name: req.name.clone(),
+                capacity_range: if req.capacity_bytes > 0 {
+                    Some(pb::CapacityRange {
+                        required_bytes: req.capacity_bytes,
+                        limit_bytes: 0,
+                    })
+                } else {
+                    // No size asked for: send NO capacity range rather than
+                    // a zero one. A `required_bytes: 0` is a request for a
+                    // zero-byte volume, which drivers variously reject or
+                    // honour; omitting the field lets the driver pick its
+                    // own default, which is what upstream does.
+                    None
+                },
+                volume_capabilities: vec![pb::VolumeCapability {
+                    access_type: Some(pb::volume_capability::AccessType::Mount(
+                        pb::volume_capability::MountVolume::default(),
+                    )),
+                    access_mode: Some(pb::volume_capability::AccessMode { mode: mode as i32 }),
+                }],
+                parameters: req
+                    .parameters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                secrets: HashMap::new(),
+                volume_content_source: None,
+                accessibility_requirements: None,
+                mutable_parameters: HashMap::new(),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(engenho_controllers::csi_provisioner::CsiCreatedVolume {
+            volume_handle: volume.volume_id,
+            // The driver's answer, not the request: a driver rounds up to
+            // its allocation unit, and a zero here (a driver that declines
+            // to report) falls back to what was asked for rather than
+            // recording a zero-capacity PV.
+            capacity_bytes: if volume.capacity_bytes > 0 {
+                volume.capacity_bytes
+            } else {
+                req.capacity_bytes
+            },
+            volume_attributes: volume.volume_context.into_iter().collect(),
+        })
+    }
+
+    async fn delete_volume(&self, driver: &str, volume_handle: &str) -> Result<(), String> {
+        let driver = self
+            .drivers
+            .get(driver)
+            .await
+            .ok_or_else(|| format!("CSI driver {driver} is not registered"))?;
+        driver
+            .client
+            .delete_volume(pb::DeleteVolumeRequest {
+                volume_id: volume_handle.to_string(),
+                secrets: HashMap::new(),
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
