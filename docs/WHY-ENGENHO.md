@@ -209,6 +209,118 @@ the *workload domain* is as replaceable as the *API face*.
 
 ---
 
+## III.5 The sharper frame: convergence is FORCED, and that is the opening
+
+The operator's framing, which is stronger than §I's and supersedes it:
+
+> *Progressive standardization across time will force integration markets,
+> and integration markets will force normalization — so it is the DESTINY of
+> orchestrators to reach a point of similarity diminishing returns. That
+> presents the opportunity: hook in, augment, control.*
+
+§I observed convergence. This explains it, and the difference matters
+because an accident might reverse while a forcing function will not.
+
+### The mechanism, and its name
+
+The loop: a standard interface appears → vendors build to it → an
+integration market forms → the market exerts pressure BACK on every
+implementation, because an orchestrator that does not speak CSI has no
+storage vendors → speaking CSI constrains your object model → the
+implementations normalize toward each other.
+
+This is the **narrow waist**, the shape that made IP, POSIX, SQL and LLVM
+IR what they are. A modular interface commoditizes the layer beneath it and
+pushes value elsewhere. Once ~150 CSI drivers exist, no orchestrator can
+afford not to speak CSI — and having spoken it, it has agreed to a
+significant part of its own design.
+
+**The consequence for strategy: building "a better orchestrator" is a
+low-value move, because the forcing function drags every entrant to the
+same place.** The high-value move is to stand BELOW the waist, where the
+market has guaranteed your integration surface stays valid.
+
+Today measured how thin the waist actually is: four contracts, each small,
+implemented once on the runtime side, working against the whole vendor
+ecosystem. That thinness is not a coincidence — it is what a waist is.
+
+### engenho as a hook point, not a clone
+
+The operator's completion of the thought:
+
+> *engenho is a hook point across the development matrix where we can
+> onboard but at the same time control and evolve safely — for others and
+> for ourselves — for the common workloads which will be Kubernetes soon
+> across the world, to being ours.*
+
+This reframes what compatibility is FOR. Compatibility is normally
+defensive: *we can run your things*. Here it is a **migration surface**:
+you enter through the standard interface, and the implementation underneath
+is ours and free to evolve.
+
+**★ That is `mata-pau`, applied to the orchestrator layer** — the fleet
+doctrine for replacing a system you cannot stop. The incumbent keeps
+running; units migrate one at a time; each migration is gated on an
+**oracle**, one output both systems produce, compared directly. *No oracle
+⇒ no plan.* The differentials built today ARE those oracles, which is why
+they are not optional decoration: they are the mechanism that makes the
+substitution safe rather than merely attempted.
+
+The strangler fig grows in the host's shape until the host is gone and the
+fig stands where it stood. engenho grows in Kubernetes' shape — its API,
+its CSI, its CNI, its etcd — while the substance underneath becomes ours.
+
+### Three things a hook point must be, and the honest scoreboard
+
+| requirement | engenho, measured 2026-08-30 |
+|---|---|
+| **where the workload already is** | 18 API groups + core v1, real `kubectl`, real `etcdctl` |
+| **thin enough to reimplement** | 4 contracts; the etcd façade is ~1,200 lines |
+| **provable at the seam** | 3 differentials; 2 found real defects on first contact |
+| **able to EVOLVE past the standard** | the §III case: determinism, simulation, embedding |
+
+The fourth is the one that separates a hook point from a clone. Matching
+only makes you a compatible implementation with worse support. The value
+is in what the substrate permits that the incumbent architecturally cannot
+— and §III argues that is deterministic simulation, because Kubernetes'
+process topology (etcd + apiserver + N controllers) forecloses it and
+engenho's does not.
+
+### The risk to name: waists ossify, and you inherit their model
+
+Kubernetes' API is not a good API. It is an accident with enormous
+momentum — namespaces, labels, `resourceVersion` semantics, the
+`metadata`/`spec`/`status` shape. Standing below the waist means inheriting
+all of it, forever, if the waist is your MODEL.
+
+The escape is that the waist must be a **rendering target**, not the model.
+The "many faces" design asserts this; today made it measurable. Grepping
+the production paths of `engenho-store` and `engenho-apiserver` for
+container concepts finds **only test fixtures** — `state.rs`,
+`command.rs` and `handler.rs` mention `Pod` exclusively inside `#[cfg(test)]`,
+and `engenho-controllers/src/controller.rs` (the framework itself) has zero
+mentions. Nothing in the store, the apiserver core or the controller
+framework knows what a container is. `engenho-kubelet` is one renderer of
+one kind.
+
+### The falsifiable test of the whole thesis
+
+The claim "engenho is a hook point onto all of computing, expressible in
+tatara-lisp" reduces to one measurable question:
+
+> **Can the store + apiserver + controller framework reconcile a domain
+> that has nothing to do with containers, with no changes to those crates?**
+
+If yes, Kubernetes is genuinely one face of a general declarative substrate
+and `(defentidade …)`-style authoring can drive any of them. If it requires
+changes, the container model has leaked into the core and the "many faces"
+claim is aspiration rather than architecture.
+
+The grep above says it should be yes. **A grep is not a proof.** The proof
+is a working non-container domain — reconciled, watched, RBAC'd, served
+through the same apiserver — and it is cheap enough to be the next thing
+built after the determinism audit.
+
 ## IV. What to do about it
 
 In dependency order, and none of it is speculative:
@@ -226,7 +338,12 @@ In dependency order, and none of it is speculative:
    fault-injecting, replayable from a seed. `madsim`
    ([madsim-rs](https://github.com/madsim-rs/madsim)) is the Rust framework
    for it and is worth evaluating before writing one.
-4. **Then embedding, as a stated product surface.** It is already true that
+4. **Prove the substrate is domain-agnostic** with one non-container domain
+   through the unchanged store + apiserver + controller framework. This is
+   the falsifiable test of §III.5 and it gates the whole tatara-lisp thesis:
+   until it passes, "many faces" is a design intention rather than a
+   measured property.
+5. **Then embedding, as a stated product surface.** It is already true that
    `engenho-runtime` is a library; what is missing is the documented,
    tested, minimal embedding — which contracts are optional, what a
    consumer must supply, what it gets.
