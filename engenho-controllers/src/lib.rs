@@ -66,6 +66,7 @@ pub mod replicaset;
 pub mod roceiro;
 pub mod runtime;
 pub mod selector;
+pub mod served_capability;
 pub mod service_router;
 pub mod statefulset;
 pub mod status;
