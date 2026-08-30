@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// PodTemplate describes a template for creating copies of a predefined pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodTemplate {
@@ -25,7 +21,6 @@ pub struct PodTemplate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<PodTemplateSpec>,
 }
-
 impl KubeResource for PodTemplate {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -38,7 +33,6 @@ impl KubeResource for PodTemplate {
         resource: "podtemplates",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -53,7 +47,6 @@ impl KubeResource for PodTemplate {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

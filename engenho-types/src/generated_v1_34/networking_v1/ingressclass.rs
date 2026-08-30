@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// IngressClass represents the class of the Ingress, referenced by the Ingress Spec. The `ingressclass.kubernetes.io/is-default-class` annotation can be used to indicate that an IngressClass should be considered default. When a single IngressClass resource has this annotation set to true, new Ingress resources without a class specified will be assigned this default class.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressClass {
@@ -25,7 +21,6 @@ pub struct IngressClass {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<IngressClassSpec>,
 }
-
 impl KubeResource for IngressClass {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "networking.k8s.io",
@@ -38,7 +33,6 @@ impl KubeResource for IngressClass {
         resource: "ingressclasses",
     };
     const SCOPE: Scope = Scope::Cluster;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -53,7 +47,6 @@ impl KubeResource for IngressClass {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

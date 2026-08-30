@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// RuntimeClass defines a class of container runtime supported in the cluster. The RuntimeClass is used to determine which container runtime is used to run all containers in a pod. RuntimeClasses are manually defined by a user or cluster provisioner, and referenced in the PodSpec. The Kubelet is responsible for resolving the RuntimeClassName reference before running the pod.  For more details, see https://kubernetes.io/docs/concepts/containers/runtime-class/
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeClass {
@@ -32,7 +28,6 @@ pub struct RuntimeClass {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduling: Option<Scheduling>,
 }
-
 impl KubeResource for RuntimeClass {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "node.k8s.io",
@@ -45,7 +40,6 @@ impl KubeResource for RuntimeClass {
         resource: "runtimeclasses",
     };
     const SCOPE: Scope = Scope::Cluster;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -60,7 +54,6 @@ impl KubeResource for RuntimeClass {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

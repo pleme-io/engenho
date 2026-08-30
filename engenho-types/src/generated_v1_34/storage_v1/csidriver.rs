@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// CSIDriver captures information about a Container Storage Interface (CSI) volume driver deployed on the cluster. Kubernetes attach detach controller uses this object to determine whether attach is required. Kubelet uses this object to determine whether pod information needs to be passed on mount. CSIDriver objects are non-namespaced.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CSIDriver {
@@ -25,7 +21,6 @@ pub struct CSIDriver {
     #[serde(default)]
     pub spec: CSIDriverSpec,
 }
-
 impl KubeResource for CSIDriver {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "storage.k8s.io",
@@ -38,7 +33,6 @@ impl KubeResource for CSIDriver {
         resource: "csidrivers",
     };
     const SCOPE: Scope = Scope::Cluster;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -53,7 +47,6 @@ impl KubeResource for CSIDriver {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

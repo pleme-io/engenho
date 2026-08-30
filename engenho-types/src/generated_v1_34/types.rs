@@ -2,12 +2,9 @@
 //!
 //! Shared sub-structs referenced by the generated kinds — emitted once,
 //! globally deduplicated, so every kind references one canonical type.
-
 #![allow(clippy::module_name_repetitions)]
-
 use crate::generated_v1_34::core_v1::PersistentVolumeClaim;
 use serde::{Deserialize, Serialize};
-
 /// Represents a Persistent Disk resource in AWS.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AWSElasticBlockStoreVolumeSource {
@@ -24,7 +21,6 @@ pub struct AWSElasticBlockStoreVolumeSource {
     #[serde(default, rename = "volumeID")]
     pub volume_id: String,
 }
-
 /// Affinity is a group of affinity scheduling rules.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Affinity {
@@ -50,7 +46,6 @@ pub struct Affinity {
     )]
     pub pod_anti_affinity: Option<PodAntiAffinity>,
 }
-
 /// AggregationRule describes how to locate ClusterRoles to aggregate into the ClusterRole
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AggregationRule {
@@ -62,7 +57,6 @@ pub struct AggregationRule {
     )]
     pub cluster_role_selectors: Vec<LabelSelector>,
 }
-
 /// AppArmorProfile defines a pod or container's AppArmor settings.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppArmorProfile {
@@ -80,7 +74,6 @@ pub struct AppArmorProfile {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// AttachedVolume describes a volume attached to a node
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AttachedVolume {
@@ -91,7 +84,6 @@ pub struct AttachedVolume {
     #[serde(default)]
     pub name: String,
 }
-
 /// AzureDisk represents an Azure Data Disk mount on the host and bind mount to the pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AzureDiskVolumeSource {
@@ -111,11 +103,13 @@ pub struct AzureDiskVolumeSource {
     /// fsType is Filesystem type to mount. Must be a filesystem type supported by the host operating system. Ex. "ext4", "xfs", "ntfs". Implicitly inferred to be "ext4" if unspecified.
     #[serde(default, rename = "fsType", skip_serializing_if = "Option::is_none")]
     pub fs_type: Option<String>,
+    /// kind expected values are Shared: multiple blob disks per storage account  Dedicated: single blob disk per storage account  Managed: azure managed data disk (only in managed availability set). defaults to shared
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// readOnly Defaults to false (read/write). ReadOnly here will force the ReadOnly setting in VolumeMounts.
     #[serde(default, rename = "readOnly", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
 }
-
 /// AzureFile represents an Azure File Service mount on the host and bind mount to the pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AzureFilePersistentVolumeSource {
@@ -136,7 +130,6 @@ pub struct AzureFilePersistentVolumeSource {
     #[serde(default, rename = "shareName")]
     pub share_name: String,
 }
-
 /// AzureFile represents an Azure File Service mount on the host and bind mount to the pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AzureFileVolumeSource {
@@ -150,7 +143,6 @@ pub struct AzureFileVolumeSource {
     #[serde(default, rename = "shareName")]
     pub share_name: String,
 }
-
 /// CSIDriverSpec is the specification of a CSIDriver.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CSIDriverSpec {
@@ -224,7 +216,6 @@ pub struct CSIDriverSpec {
     )]
     pub volume_lifecycle_modes: Vec<String>,
 }
-
 /// CSINodeDriver holds information about the specification of one CSI driver installed on a node
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CSINodeDriver {
@@ -245,7 +236,6 @@ pub struct CSINodeDriver {
     )]
     pub topology_keys: Vec<String>,
 }
-
 /// CSINodeSpec holds information about the specification of all CSI drivers installed on a node
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CSINodeSpec {
@@ -253,7 +243,6 @@ pub struct CSINodeSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drivers: Vec<CSINodeDriver>,
 }
-
 /// Represents storage that is managed by an external CSI volume driver
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CSIPersistentVolumeSource {
@@ -312,7 +301,6 @@ pub struct CSIPersistentVolumeSource {
     #[serde(default, rename = "volumeHandle")]
     pub volume_handle: String,
 }
-
 /// Represents a source location of a volume to mount, managed by an external CSI driver
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CSIVolumeSource {
@@ -340,7 +328,6 @@ pub struct CSIVolumeSource {
     )]
     pub volume_attributes: std::collections::BTreeMap<String, String>,
 }
-
 /// Adds and removes POSIX capabilities from running containers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
@@ -351,7 +338,6 @@ pub struct Capabilities {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drop: Vec<String>,
 }
-
 /// Represents a Ceph Filesystem mount that lasts the lifetime of a pod Cephfs volumes do not support ownership management or SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CephFSPersistentVolumeSource {
@@ -378,7 +364,6 @@ pub struct CephFSPersistentVolumeSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
-
 /// Represents a Ceph Filesystem mount that lasts the lifetime of a pod Cephfs volumes do not support ownership management or SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CephFSVolumeSource {
@@ -405,7 +390,6 @@ pub struct CephFSVolumeSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
-
 /// Represents a cinder volume resource in Openstack. A Cinder volume must exist before mounting to a container. The volume must also be in the same region as the kubelet. Cinder volumes support ownership management and SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CinderPersistentVolumeSource {
@@ -422,7 +406,6 @@ pub struct CinderPersistentVolumeSource {
     #[serde(default, rename = "volumeID")]
     pub volume_id: String,
 }
-
 /// Represents a cinder volume resource in Openstack. A Cinder volume must exist before mounting to a container. The volume must also be in the same region as the kubelet. Cinder volumes support ownership management and SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CinderVolumeSource {
@@ -439,7 +422,6 @@ pub struct CinderVolumeSource {
     #[serde(default, rename = "volumeID")]
     pub volume_id: String,
 }
-
 /// ClientIPConfig represents the configurations of Client IP based session affinity.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClientIPConfig {
@@ -451,7 +433,6 @@ pub struct ClientIPConfig {
     )]
     pub timeout_seconds: Option<i32>,
 }
-
 /// ClusterTrustBundleProjection describes how to select a set of ClusterTrustBundle objects and project their contents into the pod filesystem.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClusterTrustBundleProjection {
@@ -479,7 +460,6 @@ pub struct ClusterTrustBundleProjection {
     )]
     pub signer_name: Option<String>,
 }
-
 /// Condition contains details for one aspect of the current state of this API Resource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Condition {
@@ -506,7 +486,6 @@ pub struct Condition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// ConfigMapEnvSource selects a ConfigMap to populate the environment variables with.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigMapEnvSource {
@@ -517,7 +496,6 @@ pub struct ConfigMapEnvSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
 }
-
 /// Selects a key from a ConfigMap.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigMapKeySelector {
@@ -531,7 +509,6 @@ pub struct ConfigMapKeySelector {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
 }
-
 /// ConfigMapNodeConfigSource contains the information to reference a ConfigMap as a config source for the Node. This API is deprecated since 1.22: https://git.k8s.io/enhancements/keps/sig-node/281-dynamic-kubelet-configuration
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigMapNodeConfigSource {
@@ -555,7 +532,6 @@ pub struct ConfigMapNodeConfigSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
 }
-
 /// Adapts a ConfigMap into a projected volume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigMapProjection {
@@ -569,7 +545,6 @@ pub struct ConfigMapProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
 }
-
 /// Adapts a ConfigMap into a volume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigMapVolumeSource {
@@ -590,7 +565,6 @@ pub struct ConfigMapVolumeSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
 }
-
 /// A single application container that you want to run within a pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Container {
@@ -722,7 +696,6 @@ pub struct Container {
     )]
     pub working_dir: Option<String>,
 }
-
 /// ContainerExtendedResourceRequest has the mapping of container name, extended resource name to the device request name.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerExtendedResourceRequest {
@@ -736,7 +709,6 @@ pub struct ContainerExtendedResourceRequest {
     #[serde(default, rename = "resourceName")]
     pub resource_name: String,
 }
-
 /// Describe a container image
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerImage {
@@ -747,7 +719,6 @@ pub struct ContainerImage {
     #[serde(default, rename = "sizeBytes", skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<i64>,
 }
-
 /// ContainerPort represents a network port in a single container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerPort {
@@ -767,7 +738,6 @@ pub struct ContainerPort {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
 }
-
 /// ContainerResizePolicy represents resource resize policy for the container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerResizePolicy {
@@ -778,7 +748,6 @@ pub struct ContainerResizePolicy {
     #[serde(default, rename = "restartPolicy")]
     pub restart_policy: String,
 }
-
 /// ContainerResourceMetricSource indicates how to scale on a resource metric known to Kubernetes, as specified in requests and limits, describing each pod in the current scale target (e.g. CPU or memory).  The values will be averaged together before being compared to the target.  Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.  Only one "target" type should be set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerResourceMetricSource {
@@ -792,7 +761,6 @@ pub struct ContainerResourceMetricSource {
     #[serde(default)]
     pub target: MetricTarget,
 }
-
 /// ContainerResourceMetricStatus indicates the current value of a resource metric known to Kubernetes, as specified in requests and limits, describing a single container in each pod in the current scale target (e.g. CPU or memory).  Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerResourceMetricStatus {
@@ -806,7 +774,6 @@ pub struct ContainerResourceMetricStatus {
     #[serde(default)]
     pub name: String,
 }
-
 /// ContainerRestartRule describes how a container exit is handled.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerRestartRule {
@@ -817,7 +784,6 @@ pub struct ContainerRestartRule {
     #[serde(default, rename = "exitCodes", skip_serializing_if = "Option::is_none")]
     pub exit_codes: Option<ContainerRestartRuleOnExitCodes>,
 }
-
 /// ContainerRestartRuleOnExitCodes describes the condition for handling an exited container based on its exit codes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerRestartRuleOnExitCodes {
@@ -831,7 +797,6 @@ pub struct ContainerRestartRuleOnExitCodes {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<i32>,
 }
-
 /// ContainerState holds a possible state of container. Only one of its members may be specified. If none of them is specified, the default one is ContainerStateWaiting.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerState {
@@ -845,7 +810,6 @@ pub struct ContainerState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<ContainerStateWaiting>,
 }
-
 /// ContainerStateRunning is a running state of a container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerStateRunning {
@@ -853,7 +817,6 @@ pub struct ContainerStateRunning {
     #[serde(default, rename = "startedAt", skip_serializing_if = "Option::is_none")]
     pub started_at: Option<Time>,
 }
-
 /// ContainerStateTerminated is a terminated state of a container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerStateTerminated {
@@ -887,7 +850,6 @@ pub struct ContainerStateTerminated {
     #[serde(default, rename = "startedAt", skip_serializing_if = "Option::is_none")]
     pub started_at: Option<Time>,
 }
-
 /// ContainerStateWaiting is a waiting state of a container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerStateWaiting {
@@ -898,7 +860,6 @@ pub struct ContainerStateWaiting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
-
 /// ContainerStatus contains details for the current status of this container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerStatus {
@@ -968,7 +929,6 @@ pub struct ContainerStatus {
     )]
     pub volume_mounts: Vec<VolumeMountStatus>,
 }
-
 /// ContainerUser represents user identity information
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerUser {
@@ -976,7 +936,6 @@ pub struct ContainerUser {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux: Option<LinuxContainerUser>,
 }
-
 /// CronJobSpec describes how the job execution will look like and when it will actually run.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CronJobSpec {
@@ -1021,7 +980,6 @@ pub struct CronJobSpec {
     #[serde(default, rename = "timeZone", skip_serializing_if = "Option::is_none")]
     pub time_zone: Option<String>,
 }
-
 /// CronJobStatus represents the current state of a cron job.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CronJobStatus {
@@ -1043,15 +1001,23 @@ pub struct CronJobStatus {
     )]
     pub last_successful_time: Option<Time>,
 }
-
 /// CrossVersionObjectReference contains enough information to let you identify the referred resource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CrossVersionObjectReference {
+    /// apiVersion is the API version of the referent
+    #[serde(
+        default,
+        rename = "apiVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_version: Option<String>,
+    /// kind is the kind of the referent; More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+    #[serde(default)]
+    pub kind: String,
     /// name is the name of the referent; More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
     #[serde(default)]
     pub name: String,
 }
-
 /// DaemonEndpoint contains information about a single Daemon endpoint.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DaemonEndpoint {
@@ -1059,7 +1025,6 @@ pub struct DaemonEndpoint {
     #[serde(default, rename = "Port")]
     pub port: i32,
 }
-
 /// DaemonSetCondition describes the state of a DaemonSet at a certain point.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DaemonSetCondition {
@@ -1083,7 +1048,6 @@ pub struct DaemonSetCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// DaemonSetSpec is the specification of a daemon set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DaemonSetSpec {
@@ -1115,7 +1079,6 @@ pub struct DaemonSetSpec {
     )]
     pub update_strategy: Option<DaemonSetUpdateStrategy>,
 }
-
 /// DaemonSetStatus represents the current status of a daemon set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DaemonSetStatus {
@@ -1170,7 +1133,6 @@ pub struct DaemonSetStatus {
     )]
     pub updated_number_scheduled: Option<i32>,
 }
-
 /// DaemonSetUpdateStrategy is a struct used to control the update strategy for a DaemonSet.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DaemonSetUpdateStrategy {
@@ -1185,7 +1147,6 @@ pub struct DaemonSetUpdateStrategy {
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
 }
-
 /// DeploymentCondition describes the state of a deployment at a certain point.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeploymentCondition {
@@ -1216,7 +1177,6 @@ pub struct DeploymentCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// DeploymentSpec is the specification of the desired behavior of the Deployment.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeploymentSpec {
@@ -1257,7 +1217,6 @@ pub struct DeploymentSpec {
     #[serde(default)]
     pub template: PodTemplateSpec,
 }
-
 /// DeploymentStatus is the most recently observed status of the Deployment.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeploymentStatus {
@@ -1317,7 +1276,6 @@ pub struct DeploymentStatus {
     )]
     pub updated_replicas: Option<i32>,
 }
-
 /// DeploymentStrategy describes how to replace existing pods with new ones.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeploymentStrategy {
@@ -1332,7 +1290,6 @@ pub struct DeploymentStrategy {
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
 }
-
 /// Represents downward API info for projecting into a projected volume. Note that this is identical to a downwardAPI volume source without the default mode.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DownwardAPIProjection {
@@ -1340,7 +1297,6 @@ pub struct DownwardAPIProjection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<DownwardAPIVolumeFile>,
 }
-
 /// DownwardAPIVolumeFile represents information to create the file containing the pod field
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DownwardAPIVolumeFile {
@@ -1361,7 +1317,6 @@ pub struct DownwardAPIVolumeFile {
     )]
     pub resource_field_ref: Option<ResourceFieldSelector>,
 }
-
 /// DownwardAPIVolumeSource represents a volume containing downward API info. Downward API volumes support ownership management and SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DownwardAPIVolumeSource {
@@ -1376,7 +1331,6 @@ pub struct DownwardAPIVolumeSource {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<DownwardAPIVolumeFile>,
 }
-
 /// Represents an empty directory for a pod. Empty directory volumes support ownership management and SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EmptyDirVolumeSource {
@@ -1387,7 +1341,6 @@ pub struct EmptyDirVolumeSource {
     #[serde(default, rename = "sizeLimit", skip_serializing_if = "Option::is_none")]
     pub size_limit: Option<Quantity>,
 }
-
 /// EndpointAddress is a tuple that describes single IP address. Deprecated: This API is deprecated in v1.33+.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EndpointAddress {
@@ -1404,7 +1357,6 @@ pub struct EndpointAddress {
     #[serde(default, rename = "targetRef", skip_serializing_if = "Option::is_none")]
     pub target_ref: Option<ObjectReference>,
 }
-
 /// EndpointPort is a tuple that describes a single port. Deprecated: This API is deprecated in v1.33+.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EndpointPort {
@@ -1425,7 +1377,6 @@ pub struct EndpointPort {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
 }
-
 /// EndpointSubset is a group of addresses with a common set of ports. The expanded set of endpoints is the Cartesian product of Addresses x Ports. For example, given:
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EndpointSubset {
@@ -1443,7 +1394,6 @@ pub struct EndpointSubset {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<EndpointPort>,
 }
-
 /// EnvFromSource represents the source of a set of ConfigMaps or Secrets
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EnvFromSource {
@@ -1461,7 +1411,6 @@ pub struct EnvFromSource {
     #[serde(default, rename = "secretRef", skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<SecretEnvSource>,
 }
-
 /// EnvVar represents an environment variable present in a Container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EnvVar {
@@ -1475,7 +1424,6 @@ pub struct EnvVar {
     #[serde(default, rename = "valueFrom", skip_serializing_if = "Option::is_none")]
     pub value_from: Option<EnvVarSource>,
 }
-
 /// EnvVarSource represents a source for the value of an EnvVar.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EnvVarSource {
@@ -1511,7 +1459,6 @@ pub struct EnvVarSource {
     )]
     pub secret_key_ref: Option<SecretKeySelector>,
 }
-
 /// An EphemeralContainer is a temporary container that you may add to an existing Pod for user-initiated activities such as debugging. Ephemeral containers have no resource or scheduling guarantees, and they will not be restarted when they exit or when a Pod is removed or restarted. The kubelet may evict a Pod if an ephemeral container causes the Pod to exceed its resource allocation.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EphemeralContainer {
@@ -1650,7 +1597,6 @@ pub struct EphemeralContainer {
     )]
     pub working_dir: Option<String>,
 }
-
 /// Represents an ephemeral volume that is handled by a normal storage driver.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EphemeralVolumeSource {
@@ -1662,7 +1608,6 @@ pub struct EphemeralVolumeSource {
     )]
     pub volume_claim_template: Option<PersistentVolumeClaimTemplate>,
 }
-
 /// EventSeries contain information on series of events, i.e. thing that was/is happening continuously for some time.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EventSeries {
@@ -1677,7 +1622,6 @@ pub struct EventSeries {
     )]
     pub last_observed_time: Option<MicroTime>,
 }
-
 /// EventSource contains information for an event.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EventSource {
@@ -1688,7 +1632,6 @@ pub struct EventSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
 }
-
 /// ExecAction describes a "run in container" action.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExecAction {
@@ -1696,7 +1639,6 @@ pub struct ExecAction {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
 }
-
 /// ExternalMetricSource indicates how to scale on a metric not associated with any Kubernetes object (for example length of queue in cloud messaging service, or QPS from loadbalancer running outside of cluster).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExternalMetricSource {
@@ -1707,7 +1649,6 @@ pub struct ExternalMetricSource {
     #[serde(default)]
     pub target: MetricTarget,
 }
-
 /// ExternalMetricStatus indicates the current value of a global metric not associated with any Kubernetes object.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExternalMetricStatus {
@@ -1718,7 +1659,6 @@ pub struct ExternalMetricStatus {
     #[serde(default)]
     pub metric: MetricIdentifier,
 }
-
 /// Represents a Fibre Channel volume. Fibre Channel volumes can only be mounted as read/write once. Fibre Channel volumes support ownership management and SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FCVolumeSource {
@@ -1733,12 +1673,11 @@ pub struct FCVolumeSource {
     pub read_only: Option<bool>,
     /// targetWWNs is Optional: FC target worldwide names (WWNs)
     #[serde(default, rename = "targetWWNs", skip_serializing_if = "Vec::is_empty")]
-    pub target_ww_ns: Vec<String>,
+    pub target_wwns: Vec<String>,
     /// wwids Optional: FC volume world wide identifiers (wwids) Either wwids or combination of targetWWNs and lun must be set, but not both simultaneously.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wwids: Vec<String>,
 }
-
 /// FileKeySelector selects a key of the env file.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileKeySelector {
@@ -1755,7 +1694,6 @@ pub struct FileKeySelector {
     #[serde(default, rename = "volumeName")]
     pub volume_name: String,
 }
-
 /// FlexPersistentVolumeSource represents a generic persistent volume resource that is provisioned/attached using an exec based plugin.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FlexPersistentVolumeSource {
@@ -1775,7 +1713,6 @@ pub struct FlexPersistentVolumeSource {
     #[serde(default, rename = "secretRef", skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<SecretReference>,
 }
-
 /// FlexVolume represents a generic volume resource that is provisioned/attached using an exec based plugin.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FlexVolumeSource {
@@ -1795,7 +1732,6 @@ pub struct FlexVolumeSource {
     #[serde(default, rename = "secretRef", skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<LocalObjectReference>,
 }
-
 /// Represents a Flocker volume mounted by the Flocker agent. One and only one of datasetName and datasetUUID should be set. Flocker volumes do not support ownership management or SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FlockerVolumeSource {
@@ -1814,7 +1750,6 @@ pub struct FlockerVolumeSource {
     )]
     pub dataset_uuid: Option<String>,
 }
-
 /// Represents a Persistent Disk resource in Google Compute Engine.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GCEPersistentDiskVolumeSource {
@@ -1831,7 +1766,6 @@ pub struct GCEPersistentDiskVolumeSource {
     #[serde(default, rename = "readOnly", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
 }
-
 /// GRPCAction specifies an action involving a GRPC service.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GRPCAction {
@@ -1842,7 +1776,6 @@ pub struct GRPCAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
 }
-
 /// Represents a volume that is populated with the contents of a git repository. Git repo volumes do not support ownership management. Git repo volumes support SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GitRepoVolumeSource {
@@ -1856,7 +1789,6 @@ pub struct GitRepoVolumeSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
 }
-
 /// Represents a Glusterfs mount that lasts the lifetime of a pod. Glusterfs volumes do not support ownership management or SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GlusterfsPersistentVolumeSource {
@@ -1877,7 +1809,6 @@ pub struct GlusterfsPersistentVolumeSource {
     #[serde(default, rename = "readOnly", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
 }
-
 /// Represents a Glusterfs mount that lasts the lifetime of a pod. Glusterfs volumes do not support ownership management or SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GlusterfsVolumeSource {
@@ -1891,7 +1822,6 @@ pub struct GlusterfsVolumeSource {
     #[serde(default, rename = "readOnly", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
 }
-
 /// HPAScalingPolicy is a single policy which must hold true for a specified past interval.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HPAScalingPolicy {
@@ -1905,7 +1835,6 @@ pub struct HPAScalingPolicy {
     #[serde(default)]
     pub value: i32,
 }
-
 /// HPAScalingRules configures the scaling behavior for one direction via scaling Policy Rules and a configurable metric tolerance.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HPAScalingRules {
@@ -1930,7 +1859,6 @@ pub struct HPAScalingRules {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tolerance: Option<Quantity>,
 }
-
 /// HTTPGetAction describes an action based on HTTP Get requests.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HTTPGetAction {
@@ -1950,7 +1878,6 @@ pub struct HTTPGetAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
 }
-
 /// HTTPHeader describes a custom header to be used in HTTP probes
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HTTPHeader {
@@ -1961,7 +1888,6 @@ pub struct HTTPHeader {
     #[serde(default)]
     pub value: String,
 }
-
 /// HTTPIngressPath associates a path with a backend. Incoming urls matching the path are forwarded to the backend.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HTTPIngressPath {
@@ -1985,7 +1911,6 @@ pub struct HTTPIngressPath {
     #[serde(default, rename = "pathType")]
     pub path_type: String,
 }
-
 /// HTTPIngressRuleValue is a list of http selectors pointing to backends. In the example: http://<host>/<path>?<searchpart> -> backend where where parts of the url correspond to RFC 3986, this resource will be used to match against everything after the last '/' and before the first '?' or '#'.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HTTPIngressRuleValue {
@@ -1993,7 +1918,6 @@ pub struct HTTPIngressRuleValue {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<HTTPIngressPath>,
 }
-
 /// HorizontalPodAutoscalerBehavior configures the scaling behavior of the target in both Up and Down directions (scaleUp and scaleDown fields respectively).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HorizontalPodAutoscalerBehavior {
@@ -2007,7 +1931,6 @@ pub struct HorizontalPodAutoscalerBehavior {
     #[serde(default, rename = "scaleUp", skip_serializing_if = "Option::is_none")]
     pub scale_up: Option<HPAScalingRules>,
 }
-
 /// HorizontalPodAutoscalerCondition describes the state of a HorizontalPodAutoscaler at a certain point.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HorizontalPodAutoscalerCondition {
@@ -2031,7 +1954,6 @@ pub struct HorizontalPodAutoscalerCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// HorizontalPodAutoscalerSpec describes the desired functionality of the HorizontalPodAutoscaler.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HorizontalPodAutoscalerSpec {
@@ -2055,7 +1977,6 @@ pub struct HorizontalPodAutoscalerSpec {
     #[serde(default, rename = "scaleTargetRef")]
     pub scale_target_ref: CrossVersionObjectReference,
 }
-
 /// HorizontalPodAutoscalerStatus describes the current status of a horizontal pod autoscaler.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HorizontalPodAutoscalerStatus {
@@ -2094,7 +2015,6 @@ pub struct HorizontalPodAutoscalerStatus {
     )]
     pub observed_generation: Option<i64>,
 }
-
 /// HostAlias holds the mapping between IP and hostnames that will be injected as an entry in the pod's hosts file.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostAlias {
@@ -2105,7 +2025,6 @@ pub struct HostAlias {
     #[serde(default)]
     pub ip: String,
 }
-
 /// HostIP represents a single IP address allocated to the host.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostIP {
@@ -2113,7 +2032,6 @@ pub struct HostIP {
     #[serde(default)]
     pub ip: String,
 }
-
 /// Represents a host path mapped into a pod. Host path volumes do not support ownership management or SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostPathVolumeSource {
@@ -2124,7 +2042,6 @@ pub struct HostPathVolumeSource {
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
 }
-
 /// IPBlock describes a particular CIDR (Ex. "192.168.1.0/24","2001:db8::/64") that is allowed to the pods matched by a NetworkPolicySpec's podSelector. The except entry describes CIDRs that should not be included within this rule.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IPBlock {
@@ -2135,7 +2052,6 @@ pub struct IPBlock {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub except: Vec<String>,
 }
-
 /// ISCSIPersistentVolumeSource represents an ISCSI disk. ISCSI volumes can only be mounted as read/write once. ISCSI volumes support ownership management and SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ISCSIPersistentVolumeSource {
@@ -2189,7 +2105,6 @@ pub struct ISCSIPersistentVolumeSource {
     #[serde(default, rename = "targetPortal")]
     pub target_portal: String,
 }
-
 /// Represents an ISCSI disk. ISCSI volumes can only be mounted as read/write once. ISCSI volumes support ownership management and SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ISCSIVolumeSource {
@@ -2243,7 +2158,6 @@ pub struct ISCSIVolumeSource {
     #[serde(default, rename = "targetPortal")]
     pub target_portal: String,
 }
-
 /// ImageVolumeSource represents a image volume resource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImageVolumeSource {
@@ -2258,7 +2172,6 @@ pub struct ImageVolumeSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
 }
-
 /// IngressBackend describes all endpoints for a given service and port.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressBackend {
@@ -2269,13 +2182,15 @@ pub struct IngressBackend {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<IngressServiceBackend>,
 }
-
 /// IngressClassParametersReference identifies an API object. This can be used to specify a cluster or namespace-scoped resource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressClassParametersReference {
     /// apiGroup is the group for the resource being referenced. If APIGroup is not specified, the specified Kind must be in the core API group. For any other third-party types, APIGroup is required.
     #[serde(default, rename = "apiGroup", skip_serializing_if = "Option::is_none")]
     pub api_group: Option<String>,
+    /// kind is the type of resource being referenced.
+    #[serde(default)]
+    pub kind: String,
     /// name is the name of resource being referenced.
     #[serde(default)]
     pub name: String,
@@ -2286,7 +2201,6 @@ pub struct IngressClassParametersReference {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
 }
-
 /// IngressClassSpec provides information about the class of an Ingress.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressClassSpec {
@@ -2297,7 +2211,6 @@ pub struct IngressClassSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<IngressClassParametersReference>,
 }
-
 /// IngressLoadBalancerIngress represents the status of a load-balancer ingress point.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressLoadBalancerIngress {
@@ -2311,7 +2224,6 @@ pub struct IngressLoadBalancerIngress {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<IngressPortStatus>,
 }
-
 /// IngressLoadBalancerStatus represents the status of a load-balancer.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressLoadBalancerStatus {
@@ -2319,7 +2231,6 @@ pub struct IngressLoadBalancerStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<IngressLoadBalancerIngress>,
 }
-
 /// IngressPortStatus represents the error condition of a service port
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressPortStatus {
@@ -2336,7 +2247,6 @@ pub struct IngressPortStatus {
     #[serde(default)]
     pub protocol: String,
 }
-
 /// IngressRule represents the rules mapping the paths under a specified host to the related backend services. Incoming requests are first evaluated for a host match, then routed to the backend associated with the matching IngressRuleValue.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressRule {
@@ -2351,7 +2261,6 @@ pub struct IngressRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HTTPIngressRuleValue>,
 }
-
 /// IngressServiceBackend references a Kubernetes Service as a Backend.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressServiceBackend {
@@ -2362,7 +2271,6 @@ pub struct IngressServiceBackend {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<ServiceBackendPort>,
 }
-
 /// IngressSpec describes the Ingress the user wishes to exist.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressSpec {
@@ -2387,7 +2295,6 @@ pub struct IngressSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tls: Vec<IngressTLS>,
 }
-
 /// IngressStatus describe the current state of the Ingress.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressStatus {
@@ -2399,7 +2306,6 @@ pub struct IngressStatus {
     )]
     pub load_balancer: Option<IngressLoadBalancerStatus>,
 }
-
 /// IngressTLS describes the transport layer security associated with an ingress.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressTLS {
@@ -2414,11 +2320,20 @@ pub struct IngressTLS {
     )]
     pub secret_name: Option<String>,
 }
-
-/// IntOrString is a type that can hold an int32 or a string.  When used in JSON or YAML marshalling and unmarshalling, it produces or consumes the inner type.  This allows you to have, for example, a JSON field that can accept a name or number.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct IntOrString {}
-
+/// `IntOrString` — an int OR a string on the wire. `targetPort: 8080`
+/// and `targetPort: http` are both legal, as are `maxUnavailable: 1`
+/// and `maxUnavailable: "25%"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IntOrString {
+    Int(i64),
+    Str(String),
+}
+impl Default for IntOrString {
+    fn default() -> Self {
+        Self::Int(0)
+    }
+}
 /// JobCondition describes current state of a job.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct JobCondition {
@@ -2449,7 +2364,6 @@ pub struct JobCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// JobSpec describes how the job execution will look like.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct JobSpec {
@@ -2545,7 +2459,6 @@ pub struct JobSpec {
     )]
     pub ttl_seconds_after_finished: Option<i32>,
 }
-
 /// JobStatus represents the current state of a Job.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct JobStatus {
@@ -2599,7 +2512,6 @@ pub struct JobStatus {
     )]
     pub uncounted_terminated_pods: Option<UncountedTerminatedPods>,
 }
-
 /// JobTemplateSpec describes the data a Job should have when created from a template
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct JobTemplateSpec {
@@ -2610,7 +2522,6 @@ pub struct JobTemplateSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<JobSpec>,
 }
-
 /// Maps a string key to a path within a volume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct KeyToPath {
@@ -2624,7 +2535,6 @@ pub struct KeyToPath {
     #[serde(default)]
     pub path: String,
 }
-
 /// A label selector is a label query over a set of resources. The result of matchLabels and matchExpressions are ANDed. An empty label selector matches all objects. A null label selector matches no objects.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LabelSelector {
@@ -2643,7 +2553,6 @@ pub struct LabelSelector {
     )]
     pub match_labels: std::collections::BTreeMap<String, String>,
 }
-
 /// A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LabelSelectorRequirement {
@@ -2657,7 +2566,6 @@ pub struct LabelSelectorRequirement {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
 }
-
 /// LeaseSpec is a specification of a Lease.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LeaseSpec {
@@ -2703,7 +2611,6 @@ pub struct LeaseSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
 }
-
 /// Lifecycle describes actions that the management system should take in response to container lifecycle events. For the PostStart and PreStop lifecycle handlers, management of the container blocks until the action is complete, unless the container process fails, in which case the handler is aborted.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Lifecycle {
@@ -2721,7 +2628,6 @@ pub struct Lifecycle {
     )]
     pub stop_signal: Option<String>,
 }
-
 /// LifecycleHandler defines a specific action that should be taken in a lifecycle hook. One and only one of the fields, except TCPSocket must be specified.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LifecycleHandler {
@@ -2738,7 +2644,6 @@ pub struct LifecycleHandler {
     #[serde(default, rename = "tcpSocket", skip_serializing_if = "Option::is_none")]
     pub tcp_socket: Option<TCPSocketAction>,
 }
-
 /// LimitRangeItem defines a min/max usage limit for any resource that matches on kind.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LimitRangeItem {
@@ -2769,7 +2674,6 @@ pub struct LimitRangeItem {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// LimitRangeSpec defines a min/max usage limit for resources that match on kind.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LimitRangeSpec {
@@ -2777,7 +2681,6 @@ pub struct LimitRangeSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limits: Vec<LimitRangeItem>,
 }
-
 /// LinuxContainerUser represents user identity information in Linux containers
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LinuxContainerUser {
@@ -2795,7 +2698,6 @@ pub struct LinuxContainerUser {
     #[serde(default)]
     pub uid: i64,
 }
-
 /// LoadBalancerIngress represents the status of a load-balancer ingress point: traffic intended for the service should be sent to an ingress point.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LoadBalancerIngress {
@@ -2812,7 +2714,6 @@ pub struct LoadBalancerIngress {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortStatus>,
 }
-
 /// LoadBalancerStatus represents the status of a load-balancer.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LoadBalancerStatus {
@@ -2820,7 +2721,6 @@ pub struct LoadBalancerStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<LoadBalancerIngress>,
 }
-
 /// LocalObjectReference contains enough information to let you locate the referenced object inside the same namespace.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LocalObjectReference {
@@ -2828,7 +2728,6 @@ pub struct LocalObjectReference {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
-
 /// Local represents directly-attached storage with node affinity
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LocalVolumeSource {
@@ -2839,7 +2738,6 @@ pub struct LocalVolumeSource {
     #[serde(default)]
     pub path: String,
 }
-
 /// MetricIdentifier defines the name and optionally selector for a metric
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricIdentifier {
@@ -2850,7 +2748,6 @@ pub struct MetricIdentifier {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<LabelSelector>,
 }
-
 /// MetricSpec specifies how to scale based on a single metric (only `type` and one other matching field should be set at once).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricSpec {
@@ -2877,7 +2774,6 @@ pub struct MetricSpec {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// MetricStatus describes the last-read state of a single metric.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricStatus {
@@ -2904,7 +2800,6 @@ pub struct MetricStatus {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// MetricTarget defines the target value, average value, or average utilization of a specific metric
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricTarget {
@@ -2929,7 +2824,6 @@ pub struct MetricTarget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<Quantity>,
 }
-
 /// MetricValueStatus holds the current value for a metric
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricValueStatus {
@@ -2951,11 +2845,10 @@ pub struct MetricValueStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<Quantity>,
 }
-
-/// MicroTime is version of Time with microsecond level precision.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct MicroTime {}
-
+/// `MicroTime` — RFC3339 with microseconds, on the wire as a string.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MicroTime(pub String);
 /// ModifyVolumeStatus represents the status object of ControllerModifyVolume operation
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModifyVolumeStatus {
@@ -2979,7 +2872,6 @@ pub struct ModifyVolumeStatus {
     )]
     pub target_volume_attributes_class_name: Option<String>,
 }
-
 /// Represents an NFS mount that lasts the lifetime of a pod. NFS volumes do not support ownership management or SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NFSVolumeSource {
@@ -2993,7 +2885,6 @@ pub struct NFSVolumeSource {
     #[serde(default)]
     pub server: String,
 }
-
 /// NamespaceCondition contains details about state of namespace.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceCondition {
@@ -3017,7 +2908,6 @@ pub struct NamespaceCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// NamespaceSpec describes the attributes on a Namespace.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceSpec {
@@ -3025,7 +2915,6 @@ pub struct NamespaceSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finalizers: Vec<String>,
 }
-
 /// NamespaceStatus is information about the current status of a Namespace.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NamespaceStatus {
@@ -3036,7 +2925,6 @@ pub struct NamespaceStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
 }
-
 /// NetworkPolicyEgressRule describes a particular set of traffic that is allowed out of pods matched by a NetworkPolicySpec's podSelector. The traffic must match both ports and to. This type is beta-level in 1.8
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NetworkPolicyEgressRule {
@@ -3047,7 +2935,6 @@ pub struct NetworkPolicyEgressRule {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<NetworkPolicyPeer>,
 }
-
 /// NetworkPolicyIngressRule describes a particular set of traffic that is allowed to the pods matched by a NetworkPolicySpec's podSelector. The traffic must match both ports and from.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NetworkPolicyIngressRule {
@@ -3058,7 +2945,6 @@ pub struct NetworkPolicyIngressRule {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<NetworkPolicyPort>,
 }
-
 /// NetworkPolicyPeer describes a peer to allow traffic to/from. Only certain combinations of fields are allowed
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NetworkPolicyPeer {
@@ -3080,7 +2966,6 @@ pub struct NetworkPolicyPeer {
     )]
     pub pod_selector: Option<LabelSelector>,
 }
-
 /// NetworkPolicyPort describes a port to allow traffic on
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NetworkPolicyPort {
@@ -3094,7 +2979,6 @@ pub struct NetworkPolicyPort {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
 }
-
 /// NetworkPolicySpec provides the specification of a NetworkPolicy
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NetworkPolicySpec {
@@ -3115,7 +2999,6 @@ pub struct NetworkPolicySpec {
     #[serde(default, rename = "policyTypes", skip_serializing_if = "Vec::is_empty")]
     pub policy_types: Vec<String>,
 }
-
 /// NodeAddress contains information for the node's address.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeAddress {
@@ -3126,7 +3009,6 @@ pub struct NodeAddress {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// Node affinity is a group of node affinity scheduling rules.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeAffinity {
@@ -3145,7 +3027,6 @@ pub struct NodeAffinity {
     )]
     pub required_during_scheduling_ignored_during_execution: Option<NodeSelector>,
 }
-
 /// NodeCondition contains condition information for a node.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeCondition {
@@ -3176,7 +3057,6 @@ pub struct NodeCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// NodeConfigSource specifies a source of node configuration. Exactly one subfield (excluding metadata) must be non-nil. This API is deprecated since 1.22
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfigSource {
@@ -3184,7 +3064,6 @@ pub struct NodeConfigSource {
     #[serde(default, rename = "configMap", skip_serializing_if = "Option::is_none")]
     pub config_map: Option<ConfigMapNodeConfigSource>,
 }
-
 /// NodeConfigStatus describes the status of the config assigned by Node.Spec.ConfigSource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfigStatus {
@@ -3205,7 +3084,6 @@ pub struct NodeConfigStatus {
     )]
     pub last_known_good: Option<NodeConfigSource>,
 }
-
 /// NodeDaemonEndpoints lists ports opened by daemons running on the Node.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeDaemonEndpoints {
@@ -3217,7 +3095,6 @@ pub struct NodeDaemonEndpoints {
     )]
     pub kubelet_endpoint: Option<DaemonEndpoint>,
 }
-
 /// NodeFeatures describes the set of features implemented by the CRI implementation. The features contained in the NodeFeatures should depend only on the cri implementation independent of runtime handlers.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeFeatures {
@@ -3229,7 +3106,6 @@ pub struct NodeFeatures {
     )]
     pub supplemental_groups_policy: Option<bool>,
 }
-
 /// NodeRuntimeHandler is a set of runtime handler information.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeRuntimeHandler {
@@ -3240,7 +3116,6 @@ pub struct NodeRuntimeHandler {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
-
 /// NodeRuntimeHandlerFeatures is a set of features implemented by the runtime handler.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeRuntimeHandlerFeatures {
@@ -3259,7 +3134,6 @@ pub struct NodeRuntimeHandlerFeatures {
     )]
     pub user_namespaces: Option<bool>,
 }
-
 /// A node selector represents the union of the results of one or more label queries over a set of nodes; that is, it represents the OR of the selectors represented by the node selector terms.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSelector {
@@ -3271,7 +3145,6 @@ pub struct NodeSelector {
     )]
     pub node_selector_terms: Vec<NodeSelectorTerm>,
 }
-
 /// A node selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSelectorRequirement {
@@ -3285,7 +3158,6 @@ pub struct NodeSelectorRequirement {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
 }
-
 /// A null or empty node selector term matches no objects. The requirements of them are ANDed. The TopologySelectorTerm type implements a subset of the NodeSelectorTerm.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSelectorTerm {
@@ -3300,7 +3172,6 @@ pub struct NodeSelectorTerm {
     #[serde(default, rename = "matchFields", skip_serializing_if = "Vec::is_empty")]
     pub match_fields: Vec<NodeSelectorRequirement>,
 }
-
 /// NodeSpec describes the attributes that a node is created with.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSpec {
@@ -3323,7 +3194,7 @@ pub struct NodeSpec {
     pub pod_cidr: Option<String>,
     /// podCIDRs represents the IP ranges assigned to the node for usage by Pods on that node. If this field is specified, the 0th entry must match the podCIDR field. It may contain at most 1 value for each of IPv4 and IPv6.
     #[serde(default, rename = "podCIDRs", skip_serializing_if = "Vec::is_empty")]
-    pub pod_cid_rs: Vec<String>,
+    pub pod_cidrs: Vec<String>,
     /// ID of the node assigned by the cloud provider in the format: <ProviderName>://<ProviderSpecificNodeID>
     #[serde(
         default,
@@ -3338,7 +3209,6 @@ pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unschedulable: Option<bool>,
 }
-
 /// NodeStatus is information about the current status of a node.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeStatus {
@@ -3398,7 +3268,6 @@ pub struct NodeStatus {
     )]
     pub volumes_in_use: Vec<String>,
 }
-
 /// NodeSwapStatus represents swap memory information.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSwapStatus {
@@ -3406,7 +3275,6 @@ pub struct NodeSwapStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<i64>,
 }
-
 /// NodeSystemInfo is a set of ids/uuids to uniquely identify the node.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeSystemInfo {
@@ -3444,15 +3312,20 @@ pub struct NodeSystemInfo {
     #[serde(default, rename = "systemUUID")]
     pub system_uuid: String,
 }
-
 /// ObjectFieldSelector selects an APIVersioned field of an object.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObjectFieldSelector {
+    /// Version of the schema the FieldPath is written in terms of, defaults to "v1".
+    #[serde(
+        default,
+        rename = "apiVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_version: Option<String>,
     /// Path of the field to select in the specified API version.
     #[serde(default, rename = "fieldPath")]
     pub field_path: String,
 }
-
 /// ObjectMetricSource indicates how to scale on a metric describing a kubernetes object (for example, hits-per-second on an Ingress object).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObjectMetricSource {
@@ -3466,7 +3339,6 @@ pub struct ObjectMetricSource {
     #[serde(default)]
     pub target: MetricTarget,
 }
-
 /// ObjectMetricStatus indicates the current value of a metric describing a kubernetes object (for example, hits-per-second on an Ingress object).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObjectMetricStatus {
@@ -3480,13 +3352,22 @@ pub struct ObjectMetricStatus {
     #[serde(default)]
     pub metric: MetricIdentifier,
 }
-
 /// ObjectReference contains enough information to let you inspect or modify the referred object.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObjectReference {
+    /// API version of the referent.
+    #[serde(
+        default,
+        rename = "apiVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_version: Option<String>,
     /// If referring to a piece of an object instead of an entire object, this string should contain a valid JSON/Go field access statement, such as desiredState.manifest.containers[2]. For example, if the object reference is to a container within a pod, this would take on a value like: "spec.containers{name}" (where "name" refers to the name of the container that triggered the event) or if no container name is specified "spec.containers[2]" (container with index 2 in this pod). This syntax is chosen only to have some well-defined way of referencing a part of an object.
     #[serde(default, rename = "fieldPath", skip_serializing_if = "Option::is_none")]
     pub field_path: Option<String>,
+    /// Kind of the referent. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// Name of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -3504,7 +3385,6 @@ pub struct ObjectReference {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
 }
-
 /// Overhead structure represents the resource overhead associated with running a pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Overhead {
@@ -3516,7 +3396,6 @@ pub struct Overhead {
     )]
     pub pod_fixed: std::collections::BTreeMap<String, Quantity>,
 }
-
 /// PersistentVolumeClaimCondition contains details about state of pvc
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistentVolumeClaimCondition {
@@ -3547,7 +3426,6 @@ pub struct PersistentVolumeClaimCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// PersistentVolumeClaimSpec describes the common attributes of storage devices and allows a Source for provider-specific attributes
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistentVolumeClaimSpec {
@@ -3610,7 +3488,6 @@ pub struct PersistentVolumeClaimSpec {
     )]
     pub volume_name: Option<String>,
 }
-
 /// PersistentVolumeClaimStatus is the current status of a persistent volume claim.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistentVolumeClaimStatus {
@@ -3663,7 +3540,6 @@ pub struct PersistentVolumeClaimStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
 }
-
 /// PersistentVolumeClaimTemplate is used to produce PersistentVolumeClaim objects as part of an EphemeralVolumeSource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistentVolumeClaimTemplate {
@@ -3674,7 +3550,6 @@ pub struct PersistentVolumeClaimTemplate {
     #[serde(default)]
     pub spec: PersistentVolumeClaimSpec,
 }
-
 /// PersistentVolumeClaimVolumeSource references the user's PVC in the same namespace. This volume finds the bound PV and mounts that volume for the pod. A PersistentVolumeClaimVolumeSource is, essentially, a wrapper around another type of volume that is owned by someone else (the system).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistentVolumeClaimVolumeSource {
@@ -3685,7 +3560,6 @@ pub struct PersistentVolumeClaimVolumeSource {
     #[serde(default, rename = "readOnly", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
 }
-
 /// PersistentVolumeSpec is the specification of a persistent volume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistentVolumeSpec {
@@ -3831,7 +3705,6 @@ pub struct PersistentVolumeSpec {
     )]
     pub vsphere_volume: Option<VsphereVirtualDiskVolumeSource>,
 }
-
 /// PersistentVolumeStatus is the current status of a persistent volume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistentVolumeStatus {
@@ -3852,7 +3725,6 @@ pub struct PersistentVolumeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
-
 /// Represents a Photon Controller persistent disk resource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PhotonPersistentDiskVolumeSource {
@@ -3863,7 +3735,6 @@ pub struct PhotonPersistentDiskVolumeSource {
     #[serde(default, rename = "pdID")]
     pub pd_id: String,
 }
-
 /// Pod affinity is a group of inter pod affinity scheduling rules.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodAffinity {
@@ -3882,7 +3753,6 @@ pub struct PodAffinity {
     )]
     pub required_during_scheduling_ignored_during_execution: Vec<PodAffinityTerm>,
 }
-
 /// Defines a set of pods (namely those matching the labelSelector relative to the given namespace(s)) that this pod should be co-located (affinity) or not co-located (anti-affinity) with, where co-located is defined as running on a node whose value of the label with key <topologyKey> matches that of any node on which a pod of the set of pods is running
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodAffinityTerm {
@@ -3921,7 +3791,6 @@ pub struct PodAffinityTerm {
     #[serde(default, rename = "topologyKey")]
     pub topology_key: String,
 }
-
 /// Pod anti affinity is a group of inter pod anti affinity scheduling rules.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodAntiAffinity {
@@ -3940,7 +3809,6 @@ pub struct PodAntiAffinity {
     )]
     pub required_during_scheduling_ignored_during_execution: Vec<PodAffinityTerm>,
 }
-
 /// PodCertificateProjection provides a private key and X.509 certificate in the pod filesystem.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodCertificateProjection {
@@ -3975,7 +3843,6 @@ pub struct PodCertificateProjection {
     #[serde(default, rename = "signerName")]
     pub signer_name: String,
 }
-
 /// PodCondition contains details for the current condition of this pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodCondition {
@@ -4013,7 +3880,6 @@ pub struct PodCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// PodDNSConfig defines the DNS parameters of a pod in addition to those generated from DNSPolicy.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodDNSConfig {
@@ -4027,7 +3893,6 @@ pub struct PodDNSConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub searches: Vec<String>,
 }
-
 /// PodDNSConfigOption defines DNS resolver options of a pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodDNSConfigOption {
@@ -4038,7 +3903,6 @@ pub struct PodDNSConfigOption {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
 }
-
 /// PodDisruptionBudgetSpec is a description of a PodDisruptionBudget.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodDisruptionBudgetSpec {
@@ -4067,7 +3931,6 @@ pub struct PodDisruptionBudgetSpec {
     )]
     pub unhealthy_pod_eviction_policy: Option<String>,
 }
-
 /// PodDisruptionBudgetStatus represents information about the status of a PodDisruptionBudget. Status may trail the actual state of a system.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodDisruptionBudgetStatus {
@@ -4109,7 +3972,6 @@ pub struct PodDisruptionBudgetStatus {
     )]
     pub observed_generation: Option<i64>,
 }
-
 /// PodExtendedResourceClaimStatus is stored in the PodStatus for the extended resource requests backed by DRA. It stores the generated name for the corresponding special ResourceClaim created by the scheduler.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodExtendedResourceClaimStatus {
@@ -4124,7 +3986,6 @@ pub struct PodExtendedResourceClaimStatus {
     #[serde(default, rename = "resourceClaimName")]
     pub resource_claim_name: String,
 }
-
 /// PodFailurePolicy describes how failed pods influence the backoffLimit.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodFailurePolicy {
@@ -4132,7 +3993,6 @@ pub struct PodFailurePolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<PodFailurePolicyRule>,
 }
-
 /// PodFailurePolicyOnExitCodesRequirement describes the requirement for handling a failed pod based on its container exit codes. In particular, it lookups the .state.terminated.exitCode for each app container and init container status, represented by the .status.containerStatuses and .status.initContainerStatuses fields in the Pod status, respectively. Containers completed with success (exit code 0) are excluded from the requirement check.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodFailurePolicyOnExitCodesRequirement {
@@ -4150,7 +4010,6 @@ pub struct PodFailurePolicyOnExitCodesRequirement {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<i32>,
 }
-
 /// PodFailurePolicyOnPodConditionsPattern describes a pattern for matching an actual pod condition type.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodFailurePolicyOnPodConditionsPattern {
@@ -4161,7 +4020,6 @@ pub struct PodFailurePolicyOnPodConditionsPattern {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// PodFailurePolicyRule describes how a pod failure is handled when the requirements are met. One of onExitCodes and onPodConditions, but not both, can be used in each rule.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodFailurePolicyRule {
@@ -4183,7 +4041,6 @@ pub struct PodFailurePolicyRule {
     )]
     pub on_pod_conditions: Vec<PodFailurePolicyOnPodConditionsPattern>,
 }
-
 /// PodIP represents a single IP address allocated to the pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodIP {
@@ -4191,7 +4048,6 @@ pub struct PodIP {
     #[serde(default)]
     pub ip: String,
 }
-
 /// PodOS defines the OS parameters of a pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodOS {
@@ -4199,7 +4055,6 @@ pub struct PodOS {
     #[serde(default)]
     pub name: String,
 }
-
 /// PodReadinessGate contains the reference to a pod condition
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodReadinessGate {
@@ -4207,7 +4062,6 @@ pub struct PodReadinessGate {
     #[serde(default, rename = "conditionType")]
     pub condition_type: String,
 }
-
 /// PodResourceClaim references exactly one ResourceClaim, either directly or by naming a ResourceClaimTemplate which is then turned into a ResourceClaim for the pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodResourceClaim {
@@ -4229,7 +4083,6 @@ pub struct PodResourceClaim {
     )]
     pub resource_claim_template_name: Option<String>,
 }
-
 /// PodResourceClaimStatus is stored in the PodStatus for each PodResourceClaim which references a ResourceClaimTemplate. It stores the generated name for the corresponding ResourceClaim.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodResourceClaimStatus {
@@ -4244,7 +4097,6 @@ pub struct PodResourceClaimStatus {
     )]
     pub resource_claim_name: Option<String>,
 }
-
 /// PodSchedulingGate is associated to a Pod to guard its scheduling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodSchedulingGate {
@@ -4252,7 +4104,6 @@ pub struct PodSchedulingGate {
     #[serde(default)]
     pub name: String,
 }
-
 /// PodSecurityContext holds pod-level security attributes and common container settings. Some fields are also present in container.securityContext.  Field values of container.securityContext take precedence over field values of PodSecurityContext.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodSecurityContext {
@@ -4336,7 +4187,6 @@ pub struct PodSecurityContext {
     )]
     pub windows_options: Option<WindowsSecurityContextOptions>,
 }
-
 /// PodSpec is a description of a pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodSpec {
@@ -4560,7 +4410,6 @@ pub struct PodSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<Volume>,
 }
-
 /// PodStatus represents information about the status of a pod. Status may trail the actual state of a system, especially if the node that hosts the pod cannot contact the control plane.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodStatus {
@@ -4593,7 +4442,7 @@ pub struct PodStatus {
     pub host_ip: Option<String>,
     /// hostIPs holds the IP addresses allocated to the host. If this field is specified, the first entry must match the hostIP field. This list is empty if the pod has not started yet. A pod can be assigned to a node that has a problem in kubelet which in turns means that HostIPs will not be updated even if there is a node is assigned to this pod.
     #[serde(default, rename = "hostIPs", skip_serializing_if = "Vec::is_empty")]
-    pub host_i_ps: Vec<HostIP>,
+    pub host_ips: Vec<HostIP>,
     /// Statuses of init containers in this pod. The most recent successful non-restartable init container will have ready = true, the most recently started container will have startTime set. Each init container in the pod should have at most one status in this list, and all statuses should be for containers in the pod. However this is not enforced. If a status for a non-existent container is present in the list, or the list has duplicate names, the behavior of various Kubernetes components is not defined and those statuses might be ignored. More info: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-and-container-status
     #[serde(
         default,
@@ -4626,7 +4475,7 @@ pub struct PodStatus {
     pub pod_ip: Option<String>,
     /// podIPs holds the IP addresses allocated to the pod. If this field is specified, the 0th entry must match the podIP field. Pods may be allocated at most 1 value for each of IPv4 and IPv6. This list is empty if no IPs have been allocated yet.
     #[serde(default, rename = "podIPs", skip_serializing_if = "Vec::is_empty")]
-    pub pod_i_ps: Vec<PodIP>,
+    pub pod_ips: Vec<PodIP>,
     /// The Quality of Service (QOS) classification assigned to the pod based on resource requirements See PodQOSClass type for available QOS classes More info: https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/#quality-of-service-classes
     #[serde(default, rename = "qosClass", skip_serializing_if = "Option::is_none")]
     pub qos_class: Option<String>,
@@ -4647,7 +4496,6 @@ pub struct PodStatus {
     #[serde(default, rename = "startTime", skip_serializing_if = "Option::is_none")]
     pub start_time: Option<Time>,
 }
-
 /// PodTemplateSpec describes the data a pod should have when created from a template
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodTemplateSpec {
@@ -4658,7 +4506,6 @@ pub struct PodTemplateSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<PodSpec>,
 }
-
 /// PodsMetricSource indicates how to scale on a metric describing each pod in the current scale target (for example, transactions-processed-per-second). The values will be averaged together before being compared to the target value.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodsMetricSource {
@@ -4669,7 +4516,6 @@ pub struct PodsMetricSource {
     #[serde(default)]
     pub target: MetricTarget,
 }
-
 /// PodsMetricStatus indicates the current value of a metric describing each pod in the current scale target (for example, transactions-processed-per-second).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PodsMetricStatus {
@@ -4680,7 +4526,6 @@ pub struct PodsMetricStatus {
     #[serde(default)]
     pub metric: MetricIdentifier,
 }
-
 /// PolicyRule holds information that describes a policy rule, but does not contain information about who the rule applies to or which namespace the rule applies to.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PolicyRule {
@@ -4693,7 +4538,7 @@ pub struct PolicyRule {
         rename = "nonResourceURLs",
         skip_serializing_if = "Vec::is_empty"
     )]
-    pub non_resource_ur_ls: Vec<String>,
+    pub non_resource_urls: Vec<String>,
     /// ResourceNames is an optional white list of names that the rule applies to.  An empty set means that everything is allowed.
     #[serde(
         default,
@@ -4708,7 +4553,6 @@ pub struct PolicyRule {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verbs: Vec<String>,
 }
-
 /// PortStatus represents the error condition of a service port
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PortStatus {
@@ -4725,7 +4569,6 @@ pub struct PortStatus {
     #[serde(default)]
     pub protocol: String,
 }
-
 /// PortworxVolumeSource represents a Portworx volume resource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PortworxVolumeSource {
@@ -4739,7 +4582,6 @@ pub struct PortworxVolumeSource {
     #[serde(default, rename = "volumeID")]
     pub volume_id: String,
 }
-
 /// An empty preferred scheduling term matches all objects with implicit weight 0 (i.e. it's a no-op). A null preferred scheduling term matches no objects (i.e. is also a no-op).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PreferredSchedulingTerm {
@@ -4750,7 +4592,6 @@ pub struct PreferredSchedulingTerm {
     #[serde(default)]
     pub weight: i32,
 }
-
 /// Probe describes a health check to be performed against a container to determine whether it is alive or ready to receive traffic.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Probe {
@@ -4809,7 +4650,6 @@ pub struct Probe {
     )]
     pub timeout_seconds: Option<i32>,
 }
-
 /// Represents a projected volume source
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProjectedVolumeSource {
@@ -4824,11 +4664,14 @@ pub struct ProjectedVolumeSource {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<VolumeProjection>,
 }
-
-/// Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Quantity {}
-
+/// `Quantity` — a fixed-point number on the wire as a STRING (`"1Gi"`,
+/// `"100m"`, `"1.5"`). Kept as the literal wire text rather than
+/// parsed: comparing quantities needs suffix-aware arithmetic, and a
+/// lossy round-trip through f64 would change bytes we must echo back
+/// verbatim in a GET.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Quantity(pub String);
 /// Represents a Quobyte mount that lasts the lifetime of a pod. Quobyte volumes do not support ownership management or SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct QuobyteVolumeSource {
@@ -4851,7 +4694,6 @@ pub struct QuobyteVolumeSource {
     #[serde(default)]
     pub volume: String,
 }
-
 /// Represents a Rados Block Device mount that lasts the lifetime of a pod. RBD volumes support ownership management and SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RBDPersistentVolumeSource {
@@ -4880,7 +4722,6 @@ pub struct RBDPersistentVolumeSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
-
 /// Represents a Rados Block Device mount that lasts the lifetime of a pod. RBD volumes support ownership management and SELinux relabeling.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RBDVolumeSource {
@@ -4909,11 +4750,11 @@ pub struct RBDVolumeSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
-
-/// RawExtension is used to hold extensions in external versions.
+/// `RawExtension` — arbitrary JSON held verbatim. Used for webhook
+/// payloads and CRD defaults, where the shape is not knowable here.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct RawExtension {}
-
+#[serde(transparent)]
+pub struct RawExtension(pub serde_json::Value);
 /// ReplicaSetCondition describes the state of a replica set at a certain point.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReplicaSetCondition {
@@ -4937,7 +4778,6 @@ pub struct ReplicaSetCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// ReplicaSetSpec is the specification of a ReplicaSet.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReplicaSetSpec {
@@ -4958,7 +4798,6 @@ pub struct ReplicaSetSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<PodTemplateSpec>,
 }
-
 /// ReplicaSetStatus represents the current status of a ReplicaSet.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReplicaSetStatus {
@@ -5004,7 +4843,6 @@ pub struct ReplicaSetStatus {
     )]
     pub terminating_replicas: Option<i32>,
 }
-
 /// ReplicationControllerCondition describes the state of a replication controller at a certain point.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReplicationControllerCondition {
@@ -5028,7 +4866,6 @@ pub struct ReplicationControllerCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// ReplicationControllerSpec is the specification of a replication controller.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReplicationControllerSpec {
@@ -5049,7 +4886,6 @@ pub struct ReplicationControllerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<PodTemplateSpec>,
 }
-
 /// ReplicationControllerStatus represents the current status of a replication controller.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReplicationControllerStatus {
@@ -5088,7 +4924,6 @@ pub struct ReplicationControllerStatus {
     #[serde(default)]
     pub replicas: i32,
 }
-
 /// ResourceClaim references one entry in PodSpec.ResourceClaims.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceClaim {
@@ -5099,7 +4934,6 @@ pub struct ResourceClaim {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
 }
-
 /// ResourceFieldSelector represents container resources (cpu, memory) and their output format
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceFieldSelector {
@@ -5117,7 +4951,6 @@ pub struct ResourceFieldSelector {
     #[serde(default)]
     pub resource: String,
 }
-
 /// ResourceHealth represents the health of a resource. It has the latest device health information. This is a part of KEP https://kep.k8s.io/4680.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceHealth {
@@ -5134,7 +4967,6 @@ pub struct ResourceHealth {
     #[serde(default, rename = "resourceID")]
     pub resource_id: String,
 }
-
 /// ResourceMetricSource indicates how to scale on a resource metric known to Kubernetes, as specified in requests and limits, describing each pod in the current scale target (e.g. CPU or memory).  The values will be averaged together before being compared to the target.  Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.  Only one "target" type should be set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceMetricSource {
@@ -5145,7 +4977,6 @@ pub struct ResourceMetricSource {
     #[serde(default)]
     pub target: MetricTarget,
 }
-
 /// ResourceMetricStatus indicates the current value of a resource metric known to Kubernetes, as specified in requests and limits, describing each pod in the current scale target (e.g. CPU or memory).  Such metrics are built in to Kubernetes, and have special scaling options on top of those available to normal per-pod metrics using the "pods" source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceMetricStatus {
@@ -5156,7 +4987,6 @@ pub struct ResourceMetricStatus {
     #[serde(default)]
     pub name: String,
 }
-
 /// ResourceQuotaSpec defines the desired hard limits to enforce for Quota.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceQuotaSpec {
@@ -5174,7 +5004,6 @@ pub struct ResourceQuotaSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
 }
-
 /// ResourceQuotaStatus defines the enforced hard limits and observed use.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceQuotaStatus {
@@ -5185,7 +5014,6 @@ pub struct ResourceQuotaStatus {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub used: std::collections::BTreeMap<String, Quantity>,
 }
-
 /// ResourceRequirements describes the compute resource requirements.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceRequirements {
@@ -5199,7 +5027,6 @@ pub struct ResourceRequirements {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub requests: std::collections::BTreeMap<String, Quantity>,
 }
-
 /// ResourceStatus represents the status of a single resource allocated to a Pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceStatus {
@@ -5210,18 +5037,19 @@ pub struct ResourceStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ResourceHealth>,
 }
-
 /// RoleRef contains information that points to the role being used
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RoleRef {
     /// APIGroup is the group for the resource being referenced
     #[serde(default, rename = "apiGroup")]
     pub api_group: String,
+    /// Kind is the type of resource being referenced
+    #[serde(default)]
+    pub kind: String,
     /// Name is the name of resource being referenced
     #[serde(default)]
     pub name: String,
 }
-
 /// Spec to control the desired behavior of daemon set rolling update.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RollingUpdateDaemonSet {
@@ -5236,7 +5064,6 @@ pub struct RollingUpdateDaemonSet {
     )]
     pub max_unavailable: Option<IntOrString>,
 }
-
 /// Spec to control the desired behavior of rolling update.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RollingUpdateDeployment {
@@ -5251,7 +5078,6 @@ pub struct RollingUpdateDeployment {
     )]
     pub max_unavailable: Option<IntOrString>,
 }
-
 /// RollingUpdateStatefulSetStrategy is used to communicate parameter for RollingUpdateStatefulSetStrategyType.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RollingUpdateStatefulSetStrategy {
@@ -5266,7 +5092,6 @@ pub struct RollingUpdateStatefulSetStrategy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<i32>,
 }
-
 /// SELinuxOptions are the labels to be applied to the container
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SELinuxOptions {
@@ -5283,7 +5108,6 @@ pub struct SELinuxOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
 }
-
 /// ScaleIOPersistentVolumeSource represents a persistent ScaleIO volume
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScaleIOPersistentVolumeSource {
@@ -5338,7 +5162,6 @@ pub struct ScaleIOPersistentVolumeSource {
     )]
     pub volume_name: Option<String>,
 }
-
 /// ScaleIOVolumeSource represents a persistent ScaleIO volume
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScaleIOVolumeSource {
@@ -5393,7 +5216,6 @@ pub struct ScaleIOVolumeSource {
     )]
     pub volume_name: Option<String>,
 }
-
 /// Scheduling specifies the scheduling constraints for nodes supporting a RuntimeClass.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Scheduling {
@@ -5408,7 +5230,6 @@ pub struct Scheduling {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tolerations: Vec<Toleration>,
 }
-
 /// A scope selector represents the AND of the selectors represented by the scoped-resource selector requirements.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScopeSelector {
@@ -5420,7 +5241,6 @@ pub struct ScopeSelector {
     )]
     pub match_expressions: Vec<ScopedResourceSelectorRequirement>,
 }
-
 /// A scoped-resource selector requirement is a selector that contains values, a scope name, and an operator that relates the scope name and values.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScopedResourceSelectorRequirement {
@@ -5434,7 +5254,6 @@ pub struct ScopedResourceSelectorRequirement {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
 }
-
 /// SeccompProfile defines a pod/container's seccomp profile settings. Only one profile source may be set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SeccompProfile {
@@ -5449,7 +5268,6 @@ pub struct SeccompProfile {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// SecretEnvSource selects a Secret to populate the environment variables with.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SecretEnvSource {
@@ -5460,7 +5278,6 @@ pub struct SecretEnvSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
 }
-
 /// SecretKeySelector selects a key of a Secret.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SecretKeySelector {
@@ -5474,7 +5291,6 @@ pub struct SecretKeySelector {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
 }
-
 /// Adapts a secret into a projected volume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SecretProjection {
@@ -5488,7 +5304,6 @@ pub struct SecretProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
 }
-
 /// SecretReference represents a Secret Reference. It has enough information to retrieve secret in any namespace
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SecretReference {
@@ -5499,7 +5314,6 @@ pub struct SecretReference {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
 }
-
 /// Adapts a Secret into a volume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SecretVolumeSource {
@@ -5524,7 +5338,6 @@ pub struct SecretVolumeSource {
     )]
     pub secret_name: Option<String>,
 }
-
 /// SecurityContext holds security configuration that will be applied to a container. Some fields are present in both SecurityContext and PodSecurityContext.  When both are set, the values in SecurityContext take precedence.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SecurityContext {
@@ -5597,7 +5410,6 @@ pub struct SecurityContext {
     )]
     pub windows_options: Option<WindowsSecurityContextOptions>,
 }
-
 /// ServiceAccountTokenProjection represents a projected service account token volume. This projection can be used to insert a service account token into the pods runtime filesystem for use against APIs (Kubernetes API Server or otherwise).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServiceAccountTokenProjection {
@@ -5615,7 +5427,6 @@ pub struct ServiceAccountTokenProjection {
     #[serde(default)]
     pub path: String,
 }
-
 /// ServiceBackendPort is the service port being referenced.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServiceBackendPort {
@@ -5626,7 +5437,6 @@ pub struct ServiceBackendPort {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number: Option<i32>,
 }
-
 /// ServicePort contains information on service's port.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServicePort {
@@ -5657,7 +5467,6 @@ pub struct ServicePort {
     )]
     pub target_port: Option<IntOrString>,
 }
-
 /// ServiceSpec describes the attributes that a user creates on a service.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServiceSpec {
@@ -5673,10 +5482,10 @@ pub struct ServiceSpec {
     pub cluster_ip: Option<String>,
     /// ClusterIPs is a list of IP addresses assigned to this service, and are usually assigned randomly.  If an address is specified manually, is in-range (as per system configuration), and is not in use, it will be allocated to the service; otherwise creation of the service will fail. This field may not be changed through updates unless the type field is also being changed to ExternalName (which requires this field to be empty) or the type field is being changed from ExternalName (in which case this field may optionally be specified, as describe above).  Valid values are "None", empty string (""), or a valid IP address.  Setting this to "None" makes a "headless service" (no virtual IP), which is useful when direct endpoint connections are preferred and proxying is not required.  Only applies to types ClusterIP, NodePort, and LoadBalancer. If this field is specified when creating a Service of type ExternalName, creation will fail. This field will be wiped when updating a Service to type ExternalName.  If this field is not specified, it will be initialized from the clusterIP field.  If this field is specified, clients must ensure that clusterIPs[0] and clusterIP have the same value.
     #[serde(default, rename = "clusterIPs", skip_serializing_if = "Vec::is_empty")]
-    pub cluster_i_ps: Vec<String>,
+    pub cluster_ips: Vec<String>,
     /// externalIPs is a list of IP addresses for which nodes in the cluster will also accept traffic for this service.  These IPs are not managed by Kubernetes.  The user is responsible for ensuring that traffic arrives at a node with this IP.  A common example is external load-balancers that are not part of the Kubernetes system.
     #[serde(default, rename = "externalIPs", skip_serializing_if = "Vec::is_empty")]
-    pub external_i_ps: Vec<String>,
+    pub external_ips: Vec<String>,
     /// externalName is the external reference that discovery mechanisms will return as an alias for this service (e.g. a DNS CNAME record). No proxying will be involved.  Must be a lowercase RFC-1123 hostname (https://tools.ietf.org/html/rfc1123) and requires `type` to be "ExternalName".
     #[serde(
         default,
@@ -5774,7 +5583,6 @@ pub struct ServiceSpec {
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
 }
-
 /// ServiceStatus represents the current status of a service.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServiceStatus {
@@ -5789,7 +5597,6 @@ pub struct ServiceStatus {
     )]
     pub load_balancer: Option<LoadBalancerStatus>,
 }
-
 /// SessionAffinityConfig represents the configurations of session affinity.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionAffinityConfig {
@@ -5797,7 +5604,6 @@ pub struct SessionAffinityConfig {
     #[serde(default, rename = "clientIP", skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<ClientIPConfig>,
 }
-
 /// SleepAction describes a "sleep" action.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SleepAction {
@@ -5805,7 +5611,6 @@ pub struct SleepAction {
     #[serde(default)]
     pub seconds: i64,
 }
-
 /// StatefulSetCondition describes the state of a statefulset at a certain point.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatefulSetCondition {
@@ -5829,7 +5634,6 @@ pub struct StatefulSetCondition {
     #[serde(default, rename = "type")]
     pub r#type: String,
 }
-
 /// StatefulSetOrdinals describes the policy used for replica ordinal assignment in this StatefulSet.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatefulSetOrdinals {
@@ -5840,7 +5644,6 @@ pub struct StatefulSetOrdinals {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<i32>,
 }
-
 /// StatefulSetPersistentVolumeClaimRetentionPolicy describes the policy used for PVCs created from the StatefulSet VolumeClaimTemplates.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatefulSetPersistentVolumeClaimRetentionPolicy {
@@ -5859,7 +5662,6 @@ pub struct StatefulSetPersistentVolumeClaimRetentionPolicy {
     )]
     pub when_scaled: Option<String>,
 }
-
 /// A StatefulSetSpec is the specification of a StatefulSet.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatefulSetSpec {
@@ -5926,7 +5728,6 @@ pub struct StatefulSetSpec {
     )]
     pub volume_claim_templates: Vec<PersistentVolumeClaim>,
 }
-
 /// StatefulSetStatus represents the current state of a StatefulSet.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatefulSetStatus {
@@ -5993,7 +5794,6 @@ pub struct StatefulSetStatus {
     )]
     pub updated_replicas: Option<i32>,
 }
-
 /// StatefulSetUpdateStrategy indicates the strategy that the StatefulSet controller will use to perform updates. It includes any additional parameters necessary to perform the update for the indicated strategy.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatefulSetUpdateStrategy {
@@ -6008,7 +5808,6 @@ pub struct StatefulSetUpdateStrategy {
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
 }
-
 /// Represents a StorageOS persistent volume resource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StorageOSPersistentVolumeSource {
@@ -6036,7 +5835,6 @@ pub struct StorageOSPersistentVolumeSource {
     )]
     pub volume_namespace: Option<String>,
 }
-
 /// Represents a StorageOS persistent volume resource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StorageOSVolumeSource {
@@ -6064,13 +5862,15 @@ pub struct StorageOSVolumeSource {
     )]
     pub volume_namespace: Option<String>,
 }
-
 /// Subject contains a reference to the object or user identities a role binding applies to.  This can either hold a direct API object reference, or a value for non-objects such as user and group names.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Subject {
     /// APIGroup holds the API group of the referenced subject. Defaults to "" for ServiceAccount subjects. Defaults to "rbac.authorization.k8s.io" for User and Group subjects.
     #[serde(default, rename = "apiGroup", skip_serializing_if = "Option::is_none")]
     pub api_group: Option<String>,
+    /// Kind of object being referenced. Values defined by this API group are "User", "Group", and "ServiceAccount". If the Authorizer does not recognized the kind value, the Authorizer should report an error.
+    #[serde(default)]
+    pub kind: String,
     /// Name of the object being referenced.
     #[serde(default)]
     pub name: String,
@@ -6078,7 +5878,6 @@ pub struct Subject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
 }
-
 /// SuccessPolicy describes when a Job can be declared as succeeded based on the success of some indexes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SuccessPolicy {
@@ -6086,7 +5885,6 @@ pub struct SuccessPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<SuccessPolicyRule>,
 }
-
 /// SuccessPolicyRule describes rule for declaring a Job as succeeded. Each rule must have at least one of the "succeededIndexes" or "succeededCount" specified.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SuccessPolicyRule {
@@ -6105,7 +5903,6 @@ pub struct SuccessPolicyRule {
     )]
     pub succeeded_indexes: Option<String>,
 }
-
 /// Sysctl defines a kernel parameter to be set
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Sysctl {
@@ -6116,7 +5913,6 @@ pub struct Sysctl {
     #[serde(default)]
     pub value: String,
 }
-
 /// TCPSocketAction describes an action based on opening a socket
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TCPSocketAction {
@@ -6127,7 +5923,6 @@ pub struct TCPSocketAction {
     #[serde(default)]
     pub port: IntOrString,
 }
-
 /// The node this Taint is attached to has the "effect" on any pod that does not tolerate the Taint.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Taint {
@@ -6144,11 +5939,10 @@ pub struct Taint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
 }
-
-/// Time is a wrapper around time.Time which supports correct marshaling to YAML and JSON.  Wrappers are provided for many of the factory methods that the time package offers.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Time {}
-
+/// `Time` — RFC3339 on the wire, as a string.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Time(pub String);
 /// TokenRequest contains parameters of a service account token.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenRequest {
@@ -6163,7 +5957,6 @@ pub struct TokenRequest {
     )]
     pub expiration_seconds: Option<i64>,
 }
-
 /// The pod this Toleration is attached to tolerates any taint that matches the triple <key,value,effect> using the matching operator <operator>.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Toleration {
@@ -6187,7 +5980,6 @@ pub struct Toleration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
 }
-
 /// A topology selector requirement is a selector that matches given label. This is an alpha feature and may change in the future.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TopologySelectorLabelRequirement {
@@ -6198,7 +5990,6 @@ pub struct TopologySelectorLabelRequirement {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
 }
-
 /// A topology selector term represents the result of label queries. A null or empty topology selector term matches no objects. The requirements of them are ANDed. It provides a subset of functionality as NodeSelectorTerm. This is an alpha feature and may change in the future.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TopologySelectorTerm {
@@ -6210,7 +6001,6 @@ pub struct TopologySelectorTerm {
     )]
     pub match_label_expressions: Vec<TopologySelectorLabelRequirement>,
 }
-
 /// TopologySpreadConstraint specifies how to spread matching pods among the given topology.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TopologySpreadConstraint {
@@ -6262,24 +6052,28 @@ pub struct TopologySpreadConstraint {
     #[serde(default, rename = "whenUnsatisfiable")]
     pub when_unsatisfiable: String,
 }
-
 /// TypedLocalObjectReference contains enough information to let you locate the typed referenced object inside the same namespace.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TypedLocalObjectReference {
     /// APIGroup is the group for the resource being referenced. If APIGroup is not specified, the specified Kind must be in the core API group. For any other third-party types, APIGroup is required.
     #[serde(default, rename = "apiGroup", skip_serializing_if = "Option::is_none")]
     pub api_group: Option<String>,
+    /// Kind is the type of resource being referenced
+    #[serde(default)]
+    pub kind: String,
     /// Name is the name of resource being referenced
     #[serde(default)]
     pub name: String,
 }
-
 /// TypedObjectReference contains enough information to let you locate the typed referenced object
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TypedObjectReference {
     /// APIGroup is the group for the resource being referenced. If APIGroup is not specified, the specified Kind must be in the core API group. For any other third-party types, APIGroup is required.
     #[serde(default, rename = "apiGroup", skip_serializing_if = "Option::is_none")]
     pub api_group: Option<String>,
+    /// Kind is the type of resource being referenced
+    #[serde(default)]
+    pub kind: String,
     /// Name is the name of resource being referenced
     #[serde(default)]
     pub name: String,
@@ -6287,7 +6081,6 @@ pub struct TypedObjectReference {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
 }
-
 /// UncountedTerminatedPods holds UIDs of Pods that have terminated but haven't been accounted in Job status counters.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UncountedTerminatedPods {
@@ -6298,7 +6091,6 @@ pub struct UncountedTerminatedPods {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub succeeded: Vec<String>,
 }
-
 /// Volume represents a named volume in a pod that may be accessed by any container in the pod.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Volume {
@@ -6428,7 +6220,6 @@ pub struct Volume {
     )]
     pub vsphere_volume: Option<VsphereVirtualDiskVolumeSource>,
 }
-
 /// VolumeAttachmentSource represents a volume that should be attached. Right now only PersistentVolumes can be attached via external attacher, in the future we may allow also inline volumes in pods. Exactly one member can be set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeAttachmentSource {
@@ -6447,7 +6238,6 @@ pub struct VolumeAttachmentSource {
     )]
     pub persistent_volume_name: Option<String>,
 }
-
 /// VolumeAttachmentSpec is the specification of a VolumeAttachment request.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeAttachmentSpec {
@@ -6461,7 +6251,6 @@ pub struct VolumeAttachmentSpec {
     #[serde(default)]
     pub source: VolumeAttachmentSource,
 }
-
 /// VolumeAttachmentStatus is the status of a VolumeAttachment request.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeAttachmentStatus {
@@ -6490,7 +6279,6 @@ pub struct VolumeAttachmentStatus {
     )]
     pub detach_error: Option<VolumeError>,
 }
-
 /// volumeDevice describes a mapping of a raw block device within a container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeDevice {
@@ -6501,7 +6289,6 @@ pub struct VolumeDevice {
     #[serde(default)]
     pub name: String,
 }
-
 /// VolumeError captures an error encountered during a volume operation.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeError {
@@ -6515,7 +6302,6 @@ pub struct VolumeError {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<Time>,
 }
-
 /// VolumeMount describes a mounting of a Volume within a container.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeMount {
@@ -6553,7 +6339,6 @@ pub struct VolumeMount {
     )]
     pub sub_path_expr: Option<String>,
 }
-
 /// VolumeMountStatus shows status of volume mounts.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeMountStatus {
@@ -6574,7 +6359,6 @@ pub struct VolumeMountStatus {
     )]
     pub recursive_read_only: Option<String>,
 }
-
 /// VolumeNodeAffinity defines constraints that limit what nodes this volume can be accessed from.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeNodeAffinity {
@@ -6582,7 +6366,6 @@ pub struct VolumeNodeAffinity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<NodeSelector>,
 }
-
 /// VolumeNodeResources is a set of resource limits for scheduling of volumes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeNodeResources {
@@ -6590,7 +6373,6 @@ pub struct VolumeNodeResources {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<i32>,
 }
-
 /// Projection that may be projected along with other supported volume types. Exactly one of these fields must be set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeProjection {
@@ -6629,7 +6411,6 @@ pub struct VolumeProjection {
     )]
     pub service_account_token: Option<ServiceAccountTokenProjection>,
 }
-
 /// VolumeResourceRequirements describes the storage resource requirements for a volume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeResourceRequirements {
@@ -6640,7 +6421,6 @@ pub struct VolumeResourceRequirements {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub requests: std::collections::BTreeMap<String, Quantity>,
 }
-
 /// Represents a vSphere volume resource.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VsphereVirtualDiskVolumeSource {
@@ -6665,7 +6445,6 @@ pub struct VsphereVirtualDiskVolumeSource {
     #[serde(default, rename = "volumePath")]
     pub volume_path: String,
 }
-
 /// The weights of all of the matched WeightedPodAffinityTerm fields are added per-node to find the most preferred node(s)
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WeightedPodAffinityTerm {
@@ -6676,7 +6455,6 @@ pub struct WeightedPodAffinityTerm {
     #[serde(default)]
     pub weight: i32,
 }
-
 /// WindowsSecurityContextOptions contain Windows-specific options and credentials.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowsSecurityContextOptions {
@@ -6709,7 +6487,6 @@ pub struct WindowsSecurityContextOptions {
     )]
     pub run_as_user_name: Option<String>,
 }
-
 fn is_empty_meta(m: &crate::meta::ObjectMeta) -> bool {
     m == &crate::meta::ObjectMeta::default()
 }

@@ -5,18 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
+use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-// The CANONICAL RBAC primitive (carries the `kind` discriminator the codegen
-// `types::PolicyRule` drops).
-use super::policy::PolicyRule;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// Role is a namespaced, logical grouping of PolicyRules that can be referenced as a unit by a RoleBinding.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Role {
@@ -27,7 +21,6 @@ pub struct Role {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<PolicyRule>,
 }
-
 impl KubeResource for Role {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "rbac.authorization.k8s.io",
@@ -40,7 +33,6 @@ impl KubeResource for Role {
         resource: "roles",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -55,7 +47,6 @@ impl KubeResource for Role {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

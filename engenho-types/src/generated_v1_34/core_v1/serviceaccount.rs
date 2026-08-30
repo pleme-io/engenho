@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// ServiceAccount binds together: * a name, understood by users, and perhaps by peripheral systems, for an identity * a principal that can be authenticated and authorized * a set of secrets
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServiceAccount {
@@ -39,7 +35,6 @@ pub struct ServiceAccount {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<ObjectReference>,
 }
-
 impl KubeResource for ServiceAccount {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -52,7 +47,6 @@ impl KubeResource for ServiceAccount {
         resource: "serviceaccounts",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -67,7 +61,6 @@ impl KubeResource for ServiceAccount {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

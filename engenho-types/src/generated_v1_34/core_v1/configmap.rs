@@ -5,15 +5,11 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// ConfigMap holds configuration data for pods to consume.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConfigMap {
@@ -34,7 +30,6 @@ pub struct ConfigMap {
     #[serde(default, skip_serializing_if = "is_empty_meta")]
     pub metadata: crate::meta::ObjectMeta,
 }
-
 impl KubeResource for ConfigMap {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -47,7 +42,6 @@ impl KubeResource for ConfigMap {
         resource: "configmaps",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -62,7 +56,6 @@ impl KubeResource for ConfigMap {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

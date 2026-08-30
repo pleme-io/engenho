@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// PersistentVolumeClaim is a user's request for and claim to a persistent volume
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PersistentVolumeClaim {
@@ -28,7 +24,6 @@ pub struct PersistentVolumeClaim {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<PersistentVolumeClaimStatus>,
 }
-
 impl KubeResource for PersistentVolumeClaim {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -41,7 +36,6 @@ impl KubeResource for PersistentVolumeClaim {
         resource: "persistentvolumeclaims",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -56,7 +50,6 @@ impl KubeResource for PersistentVolumeClaim {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

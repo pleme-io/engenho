@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// Pod is a collection of containers that can run on a host. This resource is created by clients and scheduled onto hosts.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pod {
@@ -28,7 +24,6 @@ pub struct Pod {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<PodStatus>,
 }
-
 impl KubeResource for Pod {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "",
@@ -41,7 +36,6 @@ impl KubeResource for Pod {
         resource: "pods",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -56,7 +50,6 @@ impl KubeResource for Pod {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

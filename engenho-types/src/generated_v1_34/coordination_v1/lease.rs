@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// Lease defines a lease concept.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Lease {
@@ -25,7 +21,6 @@ pub struct Lease {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<LeaseSpec>,
 }
-
 impl KubeResource for Lease {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "coordination.k8s.io",
@@ -38,7 +33,6 @@ impl KubeResource for Lease {
         resource: "leases",
     };
     const SCOPE: Scope = Scope::Namespaced;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -53,7 +47,6 @@ impl KubeResource for Lease {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }

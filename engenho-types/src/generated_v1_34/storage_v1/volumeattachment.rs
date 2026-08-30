@@ -5,16 +5,12 @@
 //!     --output engenho-types/src/generated_v1_34`.
 //!
 //! Edit src/catalog.rs to add or remove kinds.
-
 #![allow(clippy::module_name_repetitions)]
-
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-
 use crate::generated_v1_34::types::*;
 use crate::kind::{GroupVersionKind, GroupVersionResource, KubeResource, Scope};
 use crate::meta::ObjectMeta;
-
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 /// VolumeAttachment captures the intent to attach or detach the specified volume to/from the specified node.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VolumeAttachment {
@@ -28,7 +24,6 @@ pub struct VolumeAttachment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<VolumeAttachmentStatus>,
 }
-
 impl KubeResource for VolumeAttachment {
     const GVK: GroupVersionKind = GroupVersionKind {
         group: "storage.k8s.io",
@@ -41,7 +36,6 @@ impl KubeResource for VolumeAttachment {
         resource: "volumeattachments",
     };
     const SCOPE: Scope = Scope::Cluster;
-
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(self.metadata.name.as_str())
     }
@@ -56,7 +50,6 @@ impl KubeResource for VolumeAttachment {
         }
     }
 }
-
 fn is_empty_meta(m: &ObjectMeta) -> bool {
     m == &ObjectMeta::default()
 }
