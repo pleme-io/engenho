@@ -1654,6 +1654,30 @@ impl Kubelet {
                         error = %e,
                         "container start failed; pod remains pending"
                     );
+                    // Tell the CLUSTER, not just the log.
+                    //
+                    // `Reason::Failed` sat in the closed vocabulary with no
+                    // emitting site, under a doc comment promising that
+                    // "only reasons engenho can actually emit today are
+                    // listed" — so a container that could not start was
+                    // visible ONLY to whoever could read the daemon's
+                    // stdout. Measured 2026-08-30: a pod wedged at
+                    // ContainerCreating for two minutes showed `kubectl get
+                    // events` empty, `status.containerStatuses[].state.
+                    // waiting` with no message, and the real cause
+                    // ("image not known") in the log alone. An operator has
+                    // no way in to that.
+                    //
+                    // The error text goes in the message verbatim. A
+                    // generic "failed to start" would preserve the silence
+                    // that made this worth fixing: the reason a container
+                    // did not start IS the diagnostic.
+                    self.emit(
+                        key,
+                        engenho_controllers::event_recorder::Reason::Failed,
+                        format!("Failed to start container {cname}: {e}"),
+                    )
+                    .await;
                     report.objects_skipped += 1;
                 }
             }
