@@ -434,20 +434,28 @@ async fn a_cr_violating_its_declared_schema_is_rejected() {
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "CRD POST 201");
 
     // Wait for the CrdController to register the dynamic handler.
-    let ready = poll_until(Duration::from_secs(10), Duration::from_millis(50), || async {
-        let r = client
-            .get(format!("{base}/apis/example.com/v1/namespaces/default/gadgets"))
-            .send()
-            .await
-            .ok()?;
-        (r.status() == reqwest::StatusCode::OK).then_some(())
-    })
+    let ready = poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || async {
+            let r = client
+                .get(format!(
+                    "{base}/apis/example.com/v1/namespaces/default/gadgets"
+                ))
+                .send()
+                .await
+                .ok()?;
+            (r.status() == reqwest::StatusCode::OK).then_some(())
+        },
+    )
     .await;
     assert!(ready.is_some(), "the Gadget handler must register");
 
     // ── the defect: a string where the schema declares an integer ──────
     let bad = client
-        .post(format!("{base}/apis/example.com/v1/namespaces/default/gadgets"))
+        .post(format!(
+            "{base}/apis/example.com/v1/namespaces/default/gadgets"
+        ))
         .json(&serde_json::json!({
             "apiVersion": "example.com/v1",
             "kind": "Gadget",
@@ -477,7 +485,9 @@ async fn a_cr_violating_its_declared_schema_is_rejected() {
 
     // ── and a well-typed CR still works: the guard is not a wall ───────
     let good = client
-        .post(format!("{base}/apis/example.com/v1/namespaces/default/gadgets"))
+        .post(format!(
+            "{base}/apis/example.com/v1/namespaces/default/gadgets"
+        ))
         .json(&serde_json::json!({
             "apiVersion": "example.com/v1",
             "kind": "Gadget",

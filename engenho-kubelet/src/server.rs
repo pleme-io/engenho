@@ -19,21 +19,27 @@
 //!
 //! ★ WHAT IS AND IS NOT SERVED, stated plainly rather than discovered.
 //! `/containerLogs`, `/pods`, `/runningpods` and `/healthz` are served.
-//! `/exec`, `/attach` and `/portforward` are NOT: they require SPDY or
-//! WebSocket stream multiplexing, which is a genuinely separate body of
-//! work, and half-implementing a stream protocol produces hangs rather
-//! than errors. They return a typed 501 naming the reason.
+//! `/exec` is served over the `v5.channel.k8s.io` WebSocket subprotocol
+//! for NON-interactive commands — `kubectl exec <pod> -- <cmd>` — which is
+//! the overwhelming majority of real exec traffic. `-i` and `-t` are
+//! REFUSED with a reason rather than accepted and served with batch
+//! semantics; see [`crate::exec_session`] for why a refusal beats a hang.
+//! `/attach` and `/portForward` remain a typed 501: both are inherently
+//! interactive and there is nothing honest to serve them with yet.
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use serde::Deserialize;
 
-use crate::backend::LogOptions;
+use crate::backend::{ExecOutcome, LogOptions};
+use crate::exec_channel::SUBPROTOCOL_V5;
+use crate::exec_session::{ExecQuery, ExecRefusal, backend_failure_frame, plan, session_frames};
 
 /// What the HTTP surface needs from the running kubelet.
 ///
@@ -56,6 +62,22 @@ pub trait KubeletApi: Send + Sync + 'static {
 
     /// Only the pods with at least one running container.
     async fn running_pods(&self) -> serde_json::Value;
+
+    /// Run `argv` inside one container of one pod.
+    ///
+    /// Mirrors [`crate::backend::ContainerRuntime::exec`]'s split
+    /// deliberately: `Ok` with a non-zero `exit_code` is a command that RAN
+    /// and failed, `Err` is a command that could not be run at all. The
+    /// exec stream renders those as two different objects, and collapsing
+    /// them here would make "no such container" indistinguishable from
+    /// "your program returned 1".
+    async fn exec(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        argv: &[String],
+    ) -> Result<ExecOutcome, String>;
 }
 
 /// Query parameters `kubectl logs` sends.
@@ -126,7 +148,7 @@ impl KubeletServer {
             // Upstream's own segment shapes: exec/attach take
             // {namespace}/{pod}/{container}, portForward takes
             // {namespace}/{pod}.
-            .route("/exec/:namespace/:pod/:container", get(stream_unsupported))
+            .route("/exec/:namespace/:pod/:container", get(exec))
             .route(
                 "/attach/:namespace/:pod/:container",
                 get(stream_unsupported),
@@ -159,6 +181,84 @@ async fn pods(State(s): State<KubeletServer>) -> impl IntoResponse {
 
 async fn running_pods(State(s): State<KubeletServer>) -> impl IntoResponse {
     axum::Json(s.api.running_pods().await)
+}
+
+/// `kubectl exec` — upgrade to v5 channel framing and run the command.
+async fn exec(
+    State(s): State<KubeletServer>,
+    Path((namespace, pod, container)): Path<(String, String, String)>,
+    RawQuery(raw): RawQuery,
+    headers: axum::http::HeaderMap,
+    // ★ OPTIONAL ON PURPOSE. As a bare extractor, `WebSocketUpgrade`
+    // rejects any non-upgrade request BEFORE this handler runs — which
+    // makes every refusal below unreachable and answers a plain `curl` to
+    // this path with a generic 400 that names nothing. Optional keeps the
+    // typed reason as the thing a client actually receives.
+    ws: Option<WebSocketUpgrade>,
+) -> axum::response::Response {
+    let offered = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let query = ExecQuery::parse(raw.as_deref().unwrap_or(""));
+
+    // ★ REFUSE BEFORE UPGRADING. A refusal after the upgrade is a socket
+    // that opens and immediately closes, which kubectl reports as a
+    // connection error with no reason attached. Answering with a plain
+    // HTTP status keeps the explanation attached to the request.
+    let plan = match plan(&query, offered) {
+        Ok(p) => p,
+        Err(e) => {
+            let code = match e {
+                ExecRefusal::NoCommand => StatusCode::BAD_REQUEST,
+                ExecRefusal::StdinUnsupported
+                | ExecRefusal::TtyUnsupported
+                | ExecRefusal::SubprotocolUnsupported => StatusCode::NOT_IMPLEMENTED,
+            };
+            return (code, e.to_string()).into_response();
+        }
+    };
+
+    let Some(ws) = ws else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("exec requires a WebSocket upgrade offering {SUBPROTOCOL_V5}"),
+        )
+            .into_response();
+    };
+
+    // ★ THE PATH'S CONTAINER WINS over any `?container=`. On the kubelet's
+    // own surface the path IS the contract — the apiserver resolves which
+    // container and puts it there. The query field exists because the
+    // apiserver-side subresource reuses this parser, where it is the only
+    // place the name appears.
+    let _ = &plan.container;
+    ws.protocols([SUBPROTOCOL_V5])
+        .on_upgrade(move |socket| async move {
+            run_exec(socket, s, namespace, pod, container, plan).await;
+        })
+}
+
+async fn run_exec(
+    mut socket: WebSocket,
+    s: KubeletServer,
+    namespace: String,
+    pod: String,
+    container: String,
+    plan: crate::exec_session::ExecPlan,
+) {
+    let frames = match s.api.exec(&namespace, &pod, &container, &plan.argv).await {
+        Ok(outcome) => session_frames(&plan, &outcome),
+        Err(reason) => vec![backend_failure_frame(&reason)],
+    };
+    for frame in frames {
+        if socket.send(Message::Binary(frame)).await.is_err() {
+            // The client hung up mid-stream. Nothing to report to and
+            // nothing to clean up: the command already ran to completion.
+            return;
+        }
+    }
+    let _ = socket.close().await;
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -203,6 +303,23 @@ mod tests {
         async fn pods(&self) -> serde_json::Value {
             serde_json::json!({ "kind": "PodList", "items": [{ "metadata": { "name": "a" } }] })
         }
+        async fn exec(
+            &self,
+            _ns: &str,
+            _pod: &str,
+            _container: &str,
+            argv: &[String],
+        ) -> Result<crate::backend::ExecOutcome, String> {
+            if argv.first().map(String::as_str) == Some("missing") {
+                return Err("no such container".into());
+            }
+            Ok(crate::backend::ExecOutcome {
+                exit_code: 0,
+                stdout: argv.join(" "),
+                stderr: String::new(),
+            })
+        }
+
         async fn running_pods(&self) -> serde_json::Value {
             serde_json::json!({ "kind": "PodList", "items": [] })
         }
@@ -210,6 +327,29 @@ mod tests {
 
     fn app() -> Router {
         KubeletServer::new(Arc::new(FakeApi)).routes()
+    }
+
+    /// A GET carrying the v5 subprotocol offer but NO upgrade — enough to
+    /// reach every refusal, which is the point of them being reachable.
+    async fn get_v5(uri: &str) -> (StatusCode, String) {
+        let res = app()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(
+                        "sec-websocket-protocol",
+                        crate::exec_channel::SUBPROTOCOL_V5,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("routes");
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     async fn get_body(uri: &str) -> (StatusCode, String) {
@@ -284,15 +424,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_is_501_with_a_reason_not_a_404() {
+    async fn exec_refuses_interactive_before_upgrading() {
+        // The load-bearing shape: a plain HTTP status carrying the reason,
+        // NOT an upgrade that opens and immediately closes.
+        let (status, body) = get_v5("/exec/default/p/c?command=sh&stdin=true&tty=true").await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("stdin"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn exec_without_a_command_is_a_400_not_a_501() {
+        // A missing parameter is the client's error; a missing capability
+        // is ours. Reporting both the same way sends an operator to file a
+        // bug about their own typo.
+        let (status, _) = get_v5("/exec/default/p/c?command=").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_plain_get_to_exec_says_it_needs_an_upgrade() {
+        // Without `Option<WebSocketUpgrade>` this is axum's own generic
+        // rejection, naming nothing, and every refusal above is
+        // unreachable. This test is what pins that choice.
+        let (status, body) = get_v5("/exec/default/p/c?command=ls").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("WebSocket upgrade"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_client_without_v5_is_refused_by_capability_not_by_axum() {
+        let (status, body) = get_body("/exec/default/p/c?command=ls").await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("v5.channel.k8s.io"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn attach_and_port_forward_are_still_501_with_a_reason() {
         // A 404 reads as "wrong kubelet" and sends an operator to debug
         // their URL instead of learning the capability is absent.
-        let (status, body) = get_body("/exec/default/nginx/app").await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("multiplexing"), "got: {body}");
         for p in ["/attach/default/nginx/app", "/portForward/default/nginx"] {
-            let (s, _) = get_body(p).await;
+            let (s, body) = get_body(p).await;
             assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "{p}");
+            assert!(body.contains("multiplexing"), "{p}: {body}");
         }
     }
 }

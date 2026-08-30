@@ -44,6 +44,7 @@ pub mod config_bridge;
 pub mod cri;
 pub mod error;
 pub mod exec_channel;
+pub mod exec_session;
 pub mod kubelet;
 pub mod lifecycle;
 pub mod node_lease;

@@ -16,7 +16,7 @@ description = "engenho-kubelet — the missing piece between 'Pod object in the 
 tonic         = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
 tonic-prost   = "0.14"
 prost         = "0.14"
-axum   = { workspace = true }
+axum   = { workspace = true, features = ["ws"] }
 async-trait        = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
@@ -43,3 +43,11 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 proptest = "1"
+# A REAL client for the one test that opens an actual socket. The pure
+# pump tests cannot see a wiring bug — a handler that never upgrades, a
+# subprotocol never echoed back, a frame sent as text instead of binary —
+# and every one of those presents to a user as a hang, not an error.
+# Both are already in the lock as axum's own ws dependencies, so this
+# costs no new third-party code.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
