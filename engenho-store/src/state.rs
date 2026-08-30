@@ -68,6 +68,33 @@ pub fn check_precondition(expected: Option<Revision>, live: Option<VersionMeta>)
 /// `compacted_revision`.
 pub const DEFAULT_HISTORY_CAPACITY: usize = 8192;
 
+/// How faithful a historical read's [`VersionMeta`] is.
+///
+/// The VALUE at a past revision is always exact — it is reconstructed by
+/// undoing each retained change's `prior`. The METADATA is not always, and
+/// the difference is worth a TYPE rather than a doc note: a client that
+/// uses `mod_revision` for optimistic concurrency would corrupt state if
+/// handed a plausible-looking guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaFidelity {
+    /// The change at or before the requested revision is still retained, so
+    /// every field is the exact value the store held at that revision.
+    Exact,
+    /// The key was not modified anywhere in the retained window at or before
+    /// the requested revision, so its true `mod_revision` lies at or below
+    /// `compacted_revision` and cannot be recovered. The reported value is
+    /// that FLOOR, not a guess — the real one is `<=` it.
+    ModRevisionFloor,
+}
+
+/// One key's state as of a past revision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoricalEntry {
+    pub value: ResourceValue,
+    pub meta: VersionMeta,
+    pub fidelity: MetaFidelity,
+}
+
 /// What [`ResourceCatalog::apply`] returns: the resource operation
 /// the apiserver / client gets back, plus the typed [`Change`] the
 /// mutation committed (or `None` for a no-op).
@@ -966,6 +993,145 @@ impl ResourceCatalog {
                 version_meta,
             },
         )
+    }
+
+    /// Discard history at or below `target`, advancing the compaction
+    /// watermark — etcd's `Compact`.
+    ///
+    /// ★ WHY AN EXPLICIT OPERATION AND NOT JUST THE RING. Compaction here
+    /// has always been implicit: the bounded history ring evicts its oldest
+    /// entry once it overflows `history_capacity`. That is a CAPACITY
+    /// policy, and etcd's `Compact` is an OPERATOR one — "I have taken a
+    /// backup, reclaim everything older". A façade cannot synthesize it
+    /// from the ring, because the caller names a revision the ring knows
+    /// nothing about.
+    ///
+    /// ★ COMPACTION RECLAIMS HISTORY, NEVER DATA. The live map keeps
+    /// exactly one version per key, so nothing a client can still read is
+    /// ever removed — only the ability to WATCH FROM or (once historical
+    /// reads land) read AT a revision below the watermark. This is why the
+    /// return is the new watermark rather than a byte count: there is no
+    /// space to report.
+    ///
+    /// ★ THE WATERMARK ONLY EVER MOVES FORWARD. A `Compact` to a revision
+    /// below the current watermark is a no-op returning the existing
+    /// watermark, not an error and not a rewind — etcd's own behaviour, and
+    /// rewinding would promise history that has already been dropped.
+    /// A target above `current_revision` is clamped to it: you cannot
+    /// compact away revisions that do not exist yet.
+    pub fn compact(&mut self, target: Revision) -> Revision {
+        let target = Revision(target.get().min(self.current_revision.get()));
+        if target.get() <= self.compacted_revision.get() {
+            return self.compacted_revision;
+        }
+        while self
+            .history
+            .front()
+            .is_some_and(|c| c.revision.get() <= target.get())
+        {
+            self.history.pop_front();
+        }
+        self.compacted_revision = target;
+        self.compacted_revision
+    }
+
+    /// Reconstruct the whole keyspace as of `rev` — etcd's
+    /// `Range{revision: N}`.
+    ///
+    /// ★ NO SECOND INDEX. The obvious implementation is a per-key version
+    /// history, and it was the deferred design. It is unnecessary: every
+    /// retained [`Change`] already carries `prior`, the pre-image, so the
+    /// past is reachable by REWINDING the live map — undo each change newer
+    /// than `rev`, newest first. That reuses storage already paid for, and
+    /// it makes the reachable window exactly the retained window, which is
+    /// the honest boundary rather than an arbitrary one.
+    ///
+    /// ★ COST IS PROPORTIONAL TO RECENCY, which matches the consumer.
+    /// kube-apiserver reads at a past revision to initialise a watch cache
+    /// and to keep a paginated list self-consistent — both a few revisions
+    /// back, not thousands. A read far in the past is `O(changes since)`,
+    /// and one past the watermark is refused outright.
+    ///
+    /// ★ VALUES ARE EXACT; METADATA CARRIES ITS OWN FIDELITY. See
+    /// [`MetaFidelity`] — a guessed `mod_revision` handed to a client doing
+    /// optimistic concurrency is worse than a declared floor.
+    pub fn state_at(
+        &self,
+        rev: Revision,
+    ) -> Result<BTreeMap<ResourceKey, HistoricalEntry>, CompactedTooOld> {
+        if rev < self.compacted_revision {
+            return Err(CompactedTooOld {
+                requested: rev,
+                compacted: self.compacted_revision,
+            });
+        }
+
+        // Start from the present and walk backwards.
+        let mut state: BTreeMap<ResourceKey, HistoricalEntry> = self
+            .resources
+            .iter()
+            .map(|(k, (v, m))| {
+                (
+                    k.clone(),
+                    HistoricalEntry {
+                        value: v.clone(),
+                        meta: *m,
+                        fidelity: MetaFidelity::Exact,
+                    },
+                )
+            })
+            .collect();
+
+        // Undo every change strictly newer than `rev`, newest first. After
+        // undoing change C, the entry holds C's PRE-image; its metadata is
+        // whatever an older retained change to the same key says, which the
+        // second pass below supplies.
+        for c in self.history.iter().rev().filter(|c| c.revision > rev) {
+            match &c.prior {
+                Some(prior) => {
+                    let e = state.entry(c.key.clone()).or_insert(HistoricalEntry {
+                        value: prior.clone(),
+                        meta: c.version_meta,
+                        fidelity: MetaFidelity::ModRevisionFloor,
+                    });
+                    e.value = prior.clone();
+                    // create_revision is stable across modifications, so it
+                    // survives the undo; mod_revision/version do not and are
+                    // corrected below.
+                    e.meta = VersionMeta {
+                        create_revision: c.version_meta.create_revision,
+                        mod_revision: self.compacted_revision,
+                        version: 1,
+                    };
+                    e.fidelity = MetaFidelity::ModRevisionFloor;
+                }
+                // No pre-image ⇒ the key was CREATED by this change, so it
+                // did not exist at `rev`.
+                None => {
+                    state.remove(&c.key);
+                }
+            }
+        }
+
+        // Second pass: for every key still present, the newest retained
+        // change at or before `rev` gives its exact metadata.
+        for c in self.history.iter().filter(|c| c.revision <= rev) {
+            if let Some(e) = state.get_mut(&c.key) {
+                e.meta = c.version_meta;
+                e.fidelity = MetaFidelity::Exact;
+            }
+        }
+
+        Ok(state)
+    }
+
+    /// One key's state as of `rev`. See [`Self::state_at`].
+    pub fn get_at(
+        &self,
+        key: &ResourceKey,
+        rev: Revision,
+    ) -> Result<Option<HistoricalEntry>, CompactedTooOld> {
+        Ok(self.state_at(rev)?.remove(key))
     }
 
     /// Read a single resource by key (value only).
