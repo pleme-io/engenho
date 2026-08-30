@@ -1,21 +1,45 @@
 # engenho
 
-> Pangea declares the supercontinent's shape; magma realizes it on cloud
-> substrate; engenho is the engine that runs the land (terreno) — the
-> typed, attested, Rust-native Kubernetes runtime.
+**A Kubernetes control plane written from scratch in Rust, in one binary.**
 
-One single-binary Kubernetes distribution, wire-compatible with kubectl /
-CRI / CNI / etcd-v3. Resource catalog mechanically generated from
-upstream OpenAPI v3 via `kube-forge` (Pillar 12 — generation over
-composition). Caixa M2/M3 slots reconciled natively without Helm
-intermediation. Secrets flow through cofre (no plaintext k8s Secrets).
-Compliance via tameshi + sekiban + kensa at admission. Pods can be OCI
-containers OR tatara tlisp programs via `runwasi`.
+API server, scheduler, controllers and kubelet run in a single process.
+Real `kubectl` drives it — not a mock, not a shim. It serves 18 API
+groups with server-side apply, watch, RBAC and admission, and real
+`etcdctl` reads its store over etcd's own gRPC wire protocol.
 
-**Status:** Draft v1, pre-implementation (M0.0 in flight). The
-destination doc —
-[`pleme-io/theory/ENGENHO.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO.md)
-— is canonical; read it before touching anything load-bearing.
+It is **not** a Kubernetes distribution and it is not certified. It runs
+a lot and refuses a lot, and the difference is written down rather than
+discovered: the [contract ledger](#contract-ledger--measured-2026-08-30)
+below states, per interface, whether it is **SHIPPED**, **PARTIAL**,
+**REFUSED** (deliberately, with the reason) or **ABSENT**. Read that
+before the prose.
+
+**Why it exists.** Nothing in the ecosystem asks *"do you have etcd?"*.
+It asks to `Range` a keyspace, to `exec` on :10250, to scrape `/metrics`.
+Those verbs are the contract; what answers them is an implementation
+detail. engenho satisfies the interfaces and then does what it likes
+underneath — which is the point, and is explained in full under
+[the load-bearing insight](#the-load-bearing-insight-interfaces-are-the-contract-technology-is-not).
+
+```
+git clone https://github.com/pleme-io/engenho && cd engenho
+cargo run --bin engenho -- --help
+```
+
+**Status: working, incomplete, and honest about which is which.** CRI,
+`/stats/summary` and etcd `Lease` are ABSENT. `kubectl exec` returns a
+reasoned 501. ServiceAccount-token authentication has an implementation
+with no caller. The ledger names all of it.
+
+> Internal framing, for pleme-io readers: Pangea declares the
+> supercontinent's shape; magma realizes it on cloud substrate; engenho
+> is the engine that runs the land (terreno). Resource catalog generated
+> from upstream OpenAPI v3 via `kube-forge` (Pillar 12). Caixa M2/M3
+> slots reconciled natively without Helm. Secrets flow through cofre.
+> Pods can be OCI containers OR tatara tlisp programs via `runwasi`. The
+> destination doc —
+> [`pleme-io/theory/ENGENHO.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO.md)
+> — is canonical; read it before touching anything load-bearing.
 
 **Repo docs:**
 - [`CLAUDE.md`](./CLAUDE.md) — agent-facing repo guide (architecture, build, anti-patterns)
@@ -125,7 +149,7 @@ So the order is deliberate: **establish the interfaces first, then do what we
 like with the technology underneath.** Every façade below is owed to the world;
 what answers it is ours.
 
-### Contract ledger — MEASURED 2026-08-29
+### Contract ledger — MEASURED 2026-08-30
 
 | Contract | Consumed by | Status |
 |---|---|---|
@@ -144,9 +168,9 @@ what answers it is ours.
 | Event recording | every "why did this fail" question | **PARTIAL** — typed recorder + upstream reason vocabulary landed; emission sites (kubelet/scheduler/controllers) pending |
 | `/metrics` (Prometheus) | monitoring, HPA | **SHIPPED** — Prometheus text exposition, served at `/metrics` |
 | CRI (`runtime.v1`) | runtime substitutability | **ABSENT** — drives podman directly |
-| CNI / CSI | network + storage plugins | **ABSENT** — nothing wired |
+| CNI / CSI | network + storage plugins | **PARTIAL** — `engenho-cni` and `engenho-csi` implement both plugin contracts (CNI file+exec+JSON with chain ordering and `prevResult` threading; CSI Identity/Controller/Node over gRPC with the two-socket registration handshake), each differentially tested against a foreign reference plugin. Both differentials found real defects. The kubelet reaches CSI through a materializer with refusing defaults; the CNI side computes but does not install on darwin. Corrected 2026-08-30 — this row read ABSENT |
 | Validating admission webhooks | policy engines (Kyverno, Gatekeeper) | **SHIPPED** — run after mutation, may not mutate |
-| ServiceAccount tokens | every in-cluster client | **SHIPPED** — bound tokens with mandatory expiry, audience checked, signature verified before any claim is read |
+| ServiceAccount tokens | every in-cluster client | **ABSENT (implementation exists, nothing calls it)** — `sa_token.rs` is 397 lines of ed25519 issue/verify with 11 passing tests and **zero non-test callers**; `authn.rs` still answers any SA-shaped bearer with `ServiceAccountUnsupported` → 401, there is no `serviceaccounts/token` subresource, and nothing projects a token into a pod. Corrected 2026-08-30 — this row read SHIPPED, which counted the code existing as the contract being met |
 | CRD conversion | multi-version CRDs | **SHIPPED** — `None` strategy relabels; a webhook strategy fails the read rather than falling back |
 | Audit logging | compliance, incident response | **SHIPPED** — upstream's four levels; secrets capped at `Metadata` by a first-match rule |
 | API validation (core kinds) | every client, every controller below it | **SHIPPED** — Pod + Service |
