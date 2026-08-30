@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "350e2c0bab158ae24bde5e3f47cfb3ef6f4a8c85227b2c29953eb4026ad05bd6",
+  "cargo_lock_sha256": "5e2b575d383d2720f0047a7cb114d59d9d15a7bd1615205741a46fca5cd3b9e6",
   "manifest_sha256": {
     "Cargo.toml": "ae588dcbe36ad5ec8e5eba6d36de7e9d3e2e152bafbf18d04b768bb1ca7c0dbd",
     "engenho-apiserver/Cargo.toml": "99e9d3c93d1a3f355bd435b9b5c511e21e29ecc8fa1bba5c93aa194056d9eec6",
@@ -15,7 +15,7 @@
     "engenho-fonte-cli/Cargo.toml": "650eb2c143e2d16dd0f02a56a9f73035f83652349b83daf33f9caa582c8ca8a7",
     "engenho-fonte/Cargo.toml": "a074bc92449afc5b002c35965f1c0e8f86754064d7bf7e6d86cb7c496c5bfd1e",
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
-    "engenho-kube-codegen/Cargo.toml": "b46b05226d557291f9c293ce8d483ffadc4d72e7ad4ab8c50a36c15337fd206e",
+    "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
     "engenho-kubelet/Cargo.toml": "627102d6c30b00de213be7439fe61284412c707dbf0a1ec267167d0f127fda7d",
     "engenho-machines/Cargo.toml": "7722f5b1de0b7af3d290f6b36bdea89e36ab888853f23a6432792ddd9640c442",
@@ -5929,6 +5929,16 @@
             "tree": "target"
           },
           {
+            "name": "prettyplease",
+            "package_key": "prettyplease-0.2.37",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "serde",
             "package_key": "serde-1.0.228",
             "kind": "normal",
@@ -5955,6 +5965,19 @@
             "package_key": "serde_yaml-0.9.34+deprecated",
             "kind": "normal",
             "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.117",
+            "kind": "normal",
+            "features": [
+              "full",
+              "parsing"
+            ],
             "uses_default_features": true,
             "optional": false,
             "target": null,
