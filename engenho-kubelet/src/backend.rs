@@ -638,6 +638,32 @@ pub fn inject_kubernetes_service_env(env: &mut BTreeMap<String, String>, host: &
     }
 }
 
+/// Does this `podman run` stderr mean the container NAME is taken?
+///
+/// ★ THE NEEDLE MUST MATCH WHAT PODMAN ACTUALLY PRINTS. This guard read
+/// `.contains("already in use")` for its whole life, and podman says:
+///
+/// ```text
+/// Error: name "ns_pod_container" is in use: container already exists
+/// ```
+///
+/// which contains `is in use` and `already exists` and **never the literal
+/// `already in use`**. So the reclaim path below it — correct, commented,
+/// and exactly right — was unreachable, and a leftover container from a
+/// crashed daemon wedged its pod FOREVER: the kubelet retried every 30s and
+/// the name never came free. Measured 2026-08-30 against a real pangea
+/// deployment.
+///
+/// Both spellings are accepted because the wording has changed across podman
+/// releases and a missed match costs a permanently stuck pod, while a false
+/// match costs one wasted `rm` of a name this kubelet already owns.
+#[must_use]
+fn is_name_conflict(stderr: &str) -> bool {
+    stderr.contains("is in use")
+        || stderr.contains("already in use")
+        || stderr.contains("container already exists")
+}
+
 /// `--pull` policy passed to `podman run`. Typed so the backend has ONE
 /// extensible knob for image-pull behavior instead of a hard-coded flag.
 ///
@@ -1236,8 +1262,7 @@ impl ContainerRuntime for PodmanBackend {
             .output()
             .await
             .map_err(|e| KubeletError::Backend(format!("podman run spawn: {e}")))?;
-        if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("already in use")
-        {
+        if !out.status.success() && is_name_conflict(&String::from_utf8_lossy(&out.stderr)) {
             // Idempotent start: a name conflict means a leftover container from
             // a crashed/killed prior daemon still holds this pod's deterministic
             // name (`<namespace>_<pod>_<container>`). Because the kubelet is
@@ -2540,5 +2565,51 @@ mod kubernetes_service_env_tests {
         inject_kubernetes_service_env(&mut env, "10.0.0.5", 6443);
         assert!(env.contains_key("KUBERNETES_PORT_6443_TCP"));
         assert!(!env.contains_key("KUBERNETES_PORT_443_TCP"));
+    }
+}
+
+#[cfg(test)]
+mod name_conflict_tests {
+    use super::is_name_conflict;
+
+    /// The REAL podman message, pasted verbatim from a live failure. The
+    /// previous needle (`"already in use"`) does not appear in it, which is
+    /// why the reclaim path never ran.
+    #[test]
+    fn the_real_podman_message_is_recognised() {
+        let real = r#"Error: name "pangea-system_pangea-operator-5bd094d3e6-0_pangea-operator" is in use: container already exists"#;
+        assert!(
+            is_name_conflict(real),
+            "must match what podman actually prints"
+        );
+        assert!(
+            !real.contains("already in use"),
+            "the OLD needle must not appear — that is the whole defect"
+        );
+    }
+
+    /// Older and alternative wordings still match; the cost of a false match
+    /// is one wasted `rm`, the cost of a miss is a permanently stuck pod.
+    #[test]
+    fn alternative_wordings_match() {
+        for msg in [
+            r#"Error: name "x" is already in use by container abc"#,
+            "container already exists",
+        ] {
+            assert!(is_name_conflict(msg), "{msg}");
+        }
+    }
+
+    /// An UNRELATED failure must NOT trigger a destructive reclaim — a
+    /// pull failure or an OOM must surface, not silently `rm` a container.
+    #[test]
+    fn unrelated_failures_do_not_trigger_a_reclaim() {
+        for msg in [
+            "Error: short-name resolution enforced but cannot prompt without a TTY",
+            r#"Error: unable to copy from source docker://ghcr.io/x:1: manifest unknown"#,
+            "Error: OCI runtime error: crun: cannot set memory limit",
+        ] {
+            assert!(!is_name_conflict(msg), "must NOT reclaim on: {msg}");
+        }
     }
 }
