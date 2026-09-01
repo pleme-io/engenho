@@ -50,7 +50,7 @@
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};

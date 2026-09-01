@@ -120,6 +120,20 @@ in
         Empty string disables publishing. `~/` is expanded by engenho at write
         time, not here, so a rendered config stays valid for any user.
       '';
+
+      podKubeconfigPublishPath = optional types.str ''
+        Where a POD-FACING kubeconfig is published (empty = none).
+
+        Same credentials as `kubeconfigPublishPath`, different server address:
+        the one containers can reach. In-cluster config does not work on this
+        runtime yet — engenho projects a valid ServiceAccount token and its own
+        authenticator returns `service account token authentication is not yet
+        supported` (401, measured 2026-09-01) — so a workload that needs the
+        API needs a kubeconfig, and engenho is the only thing holding both the
+        admin cert and the routable address.
+
+        Opt-in because the file embeds admin credentials.
+      '';
       kubeletBackend = optional (types.enum [ "podman" "fake" ]) ''
         Container runtime the kubelet drives.
 
@@ -261,6 +275,7 @@ in
         durable = cfg.runtime.durable;
         node_name = cfg.runtime.nodeName;
         kubeconfig_publish_path = cfg.runtime.kubeconfigPublishPath;
+      pod_kubeconfig_publish_path = cfg.runtime.podKubeconfigPublishPath;
         kubelet_backend = cfg.runtime.kubeletBackend;
         # DERIVED, never a second hand-list: an explicit `podmanBinary` wins,
         # else the package's own bin path. So "kubelet drives podman, with no

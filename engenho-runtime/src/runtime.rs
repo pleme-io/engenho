@@ -1602,6 +1602,54 @@ fn write_boot_kubeconfig(
     // serving; refusing to boot because `$HOME` is read-only (or absent, as
     // under launchd) would trade a working cluster for a missing
     // convenience. It is logged at WARN so the reason is visible.
+    // ── ★ AND A POD-FACING ONE, IF ASKED FOR ──────────────────────────
+    // Same credentials, DIFFERENT server address: the one pods can reach.
+    // Derived from `apiserver_reachability` rather than written again, so the
+    // address a workload dials cannot disagree with the address engenho tells
+    // it to dial.
+    //
+    // This exists because in-cluster config does not work here: engenho
+    // projects a valid ServiceAccount token and its own authenticator returns
+    // `service account token authentication is not yet supported` (401). Until
+    // that lands, a workload needing the API needs a kubeconfig, and engenho
+    // is the only thing that holds both the admin cert and the right address.
+    if let Some(pod_publish) = resolve_publish_path(&config.runtime.pod_kubeconfig_publish_path) {
+        match apiserver_reachability(config).injectable() {
+            Some((host, port)) => {
+                let pod_server = format!("https://{host}:{port}");
+                let pod_yaml = match admin {
+                    Some(admin) => emit_kubeconfig_with_admin(
+                        &config.cluster.name,
+                        &pod_server,
+                        ca_pem.as_bytes(),
+                        admin.cert_pem.as_bytes(),
+                        admin.key_pem.as_bytes(),
+                    ),
+                    None => emit_kubeconfig(&config.cluster.name, &pod_server, ca_pem.as_bytes()),
+                }
+                .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
+                match write_kubeconfig_file(&pod_publish, &pod_yaml) {
+                    Ok(()) => info!(
+                        path = %pod_publish.display(), server = %pod_server,
+                        "pod-facing kubeconfig published"
+                    ),
+                    Err(e) => tracing::warn!(
+                        path = %pod_publish.display(), error = %e,
+                        "pod-facing kubeconfig publish failed — the daemon is serving"
+                    ),
+                }
+            }
+            // No reachable address is known, so there is no honest server URL
+            // to write. Writing one anyway would hand a workload a kubeconfig
+            // that cannot connect, which is the failure this whole path exists
+            // to remove.
+            None => tracing::warn!(
+                "pod-facing kubeconfig requested but no pod-reachable apiserver \
+                 address is known; writing nothing rather than an unusable file"
+            ),
+        }
+    }
+
     if let Some(publish) = resolve_publish_path(&config.runtime.kubeconfig_publish_path) {
         match write_kubeconfig_file(&publish, &yaml) {
             Ok(()) => {
