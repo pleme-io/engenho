@@ -85,6 +85,27 @@ pub struct RuntimeConfig {
     /// Empty string disables the publish (the `data_dir` copy is always
     /// written), which is what tests use to stay out of `$HOME`.
     pub kubeconfig_publish_path: String,
+    /// Where a POD-FACING kubeconfig is published, or empty for none.
+    ///
+    /// ── ★ WHY A SECOND KUBECONFIG EXISTS ──────────────────────────────
+    /// `kubeconfig_publish_path`'s file points at LOOPBACK, which is right
+    /// for the operator's kubectl and useless from inside a pod: on darwin
+    /// the apiserver binds the host while containers live in a VM.
+    ///
+    /// In-cluster config is not the answer today. engenho projects a real
+    /// ServiceAccount token, and its own authenticator rejects it —
+    /// `service account token authentication is not yet supported`, HTTP
+    /// 401 (measured 2026-09-01). So a workload that needs the API needs a
+    /// kubeconfig, and the only thing that can mint one with the right
+    /// server address and a valid client cert is engenho itself.
+    ///
+    /// This file therefore exists so a consumer can create a Secret from it
+    /// rather than hand-assembling one from the admin cert — which is what
+    /// the pangea stack was doing, with the address pasted in by hand.
+    ///
+    /// Empty by default: it embeds admin credentials, and a file that
+    /// appears without being asked for is one nobody decided to create.
+    pub pod_kubeconfig_publish_path: String,
     /// Which container runtime the kubelet drives.
     /// Where the KUBELET's own HTTP surface binds (`/containerLogs`,
     /// `/pods`, `/exec`, `/healthz`) — upstream's :10250.
@@ -143,6 +164,7 @@ impl TieredConfig for RuntimeConfig {
             durable: false,
             node_name: String::new(),
             kubeconfig_publish_path: String::new(),
+            pod_kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: String::new(),
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
@@ -191,6 +213,8 @@ impl TieredConfig for RuntimeConfig {
             // `$HOME` is resolved at write time, not here, so the default
             // stays a pure value.
             kubeconfig_publish_path: "~/.kube/configs/engenho".into(),
+            // Empty: publishing admin credentials is opt-in.
+            pod_kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: "127.0.0.1:10250".into(),
             etcd_listen_addr: "127.0.0.1:2379".into(),
             kubelet_backend: KubeletBackendKind::Podman,
@@ -225,6 +249,11 @@ impl TieredConfig for RuntimeConfig {
                 base.kubeconfig_publish_path.clone()
             } else {
                 self.kubeconfig_publish_path
+            },
+            pod_kubeconfig_publish_path: if self.pod_kubeconfig_publish_path.is_empty() {
+                base.pod_kubeconfig_publish_path.clone()
+            } else {
+                self.pod_kubeconfig_publish_path.clone()
             },
             kubelet_listen_addr: if self.kubelet_listen_addr.is_empty() {
                 base.kubelet_listen_addr.clone()
@@ -306,6 +335,34 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+
+    /// The pod-facing kubeconfig is OPT-IN: it embeds admin credentials, so a
+    /// file appearing without being asked for is one nobody decided to create.
+    #[test]
+    fn the_pod_kubeconfig_is_not_published_unless_asked() {
+        let prescribed = RuntimeConfig::prescribed_default();
+        assert_eq!(
+            prescribed.pod_kubeconfig_publish_path, "",
+            "prescribed defaults must not publish admin credentials"
+        );
+        assert_eq!(
+            prescribed.kubeconfig_publish_path, "~/.kube/configs/engenho",
+            "the loopback publish IS a default — it is what makes kubectl work"
+        );
+    }
+
+    /// An operator's value must survive the progressive fold, or the option is
+    /// declared and inert.
+    #[test]
+    fn an_operator_pod_kubeconfig_path_wins_the_fold() {
+        let mut file = RuntimeConfig::bare();
+        file.pod_kubeconfig_publish_path = "~/.kube/configs/engenho-pod".into();
+        let folded = file.extend(&RuntimeConfig::prescribed_default());
+        assert_eq!(
+            folded.pod_kubeconfig_publish_path, "~/.kube/configs/engenho-pod",
+            "the file tier must beat the empty prescribed default"
+        );
+    }
     use super::*;
     use crate::discovery::{HostnameLayer, NODE_NAME_FALLBACK};
 
@@ -372,6 +429,7 @@ mod tests {
             // Empty ⇒ `extend` must fill it from the base, which is
             // precisely what this test asserts for every other field.
             kubeconfig_publish_path: String::new(),
+            pod_kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: String::new(),
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
