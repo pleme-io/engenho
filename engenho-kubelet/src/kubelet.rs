@@ -127,6 +127,29 @@ struct ContainerRecord {
     /// is what lets a container that stayed up long enough earn a clean slate
     /// instead of inheriting an old crash's penalty.
     started_at: Option<Instant>,
+    /// The resolved volume mounts this container was STARTED with.
+    ///
+    /// ── ★ WHY THE RECORD REMEMBERS THEM ──────────────────────────────
+    /// Mounts are resolved on the create path only: it holds the
+    /// `volName → MountSource` map and the projected ServiceAccount, and
+    /// stamps them onto the spec. The restart path rebuilds its specs from
+    /// `pod_to_container_specs`, a pure function of the Pod value, which
+    /// emits `mounts: vec![]` because resolution needs `&self` and an
+    /// await. So a restart re-ran `podman run` with NO `-v` flags at all
+    /// and the replacement container came up with every volume missing.
+    ///
+    /// This is the same defect the `kubernetes_service` field records one
+    /// field over — an input written at ONE of the three `backend.start`
+    /// call sites, missing from the restart path. Measured 2026-08-31: a
+    /// controller lost its projected ServiceAccount token on its first
+    /// restart and then CrashLooped on `Config::incluster()`, which reads
+    /// as an auth bug and is really a lost mount.
+    ///
+    /// Remembering is correct rather than re-resolving: mounts are
+    /// materialized once at pod-start (see `ContainerSpec::mounts`), the
+    /// backing directories outlive the container, and re-projecting here
+    /// would change that documented semantic.
+    mounts: Vec<crate::pod_volume::ResolvedMount>,
     /// When the kubelet FIRST observed this container terminated. `None`
     /// while it is running.
     ///
@@ -1717,6 +1740,9 @@ impl Kubelet {
                                 .unwrap_or_default(),
                             started_at: Some(now),
                             terminated_at: None,
+                            // Remember what this container was started with,
+                            // so a restart can be given the same mounts.
+                            mounts: spec.mounts.clone(),
                         },
                     );
                     started_any = true;
@@ -1981,6 +2007,27 @@ impl Kubelet {
         let services = self.store.list("", "v1", "Service", Some(namespace)).await;
         restart_spec.network_aliases =
             Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
+        // ── ★ RESTORE THE MOUNTS THE CONTAINER STARTED WITH ──────────────
+        // `spec` here came from `pod_to_container_specs`, a pure function of
+        // the Pod value, so its `mounts` is ALWAYS empty — resolution lives on
+        // the create path, which alone holds the volume map and the projected
+        // ServiceAccount. Without this the replacement container is started
+        // with no `-v` flags and comes up missing every volume, including
+        // `/var/run/secrets/kubernetes.io/serviceaccount`. Measured
+        // 2026-08-31: a controller restarted once and then CrashLooped on
+        // `Config::incluster()` for the rest of the pod's life.
+        //
+        // Same shape as the `kubernetes_service` note on `PodmanBackend`: an
+        // input stamped at one of three `backend.start` call sites, missed by
+        // the restart path.
+        restart_spec.mounts = {
+            let local = self.local.lock().await;
+            local
+                .get(key)
+                .and_then(|p| p.containers.get(cname))
+                .map(|rec| rec.mounts.clone())
+                .unwrap_or_default()
+        };
         // Free the deterministic name first: stop THEN remove the old container
         // (best-effort — an exited container is already stopped). Only then can
         // the replacement reuse `--name`.
@@ -1992,6 +2039,9 @@ impl Kubelet {
         {
             let mut local = self.local.lock().await;
             if let Some(rec) = local.get_mut(key).and_then(|p| p.containers.get_mut(cname)) {
+                // The replacement was started with these; keep them so the
+                // NEXT restart is given them too.
+                rec.mounts.clone_from(&restart_spec.mounts);
                 rec.container_id.clone_from(&new_status.container_id);
                 rec.restart_count = new_count;
                 rec.started_at = Some(now);
@@ -2459,6 +2509,7 @@ impl Kubelet {
                 // start it does not read would be a field nobody consults.
                 started_at: None,
                 terminated_at: None,
+                mounts: spec.mounts.clone(),
             },
         );
         Ok(status)
