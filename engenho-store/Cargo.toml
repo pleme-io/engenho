@@ -29,6 +29,11 @@ openraft           = { workspace = true }
 fjall              = { workspace = true }
 blake3             = "1"
 
+[target.'cfg(unix)'.dependencies]
+# flock(2) for the data-dir lock. Unix-only on purpose: the lock is a real
+# guarantee there, and `data_dir_lock` refuses rather than fakes it elsewhere.
+libc               = "0.2"
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
