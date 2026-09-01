@@ -1262,6 +1262,10 @@ impl ContainerRuntime for PodmanBackend {
             .output()
             .await
             .map_err(|e| KubeletError::Backend(format!("podman run spawn: {e}")))?;
+        // What the remove said, kept for the retry-failure message below. podman
+        // EXITS 0 while refusing to remove a container whose record is missing
+        // from the store, so the exit code cannot be the signal — only the text.
+        let mut rm_report = String::new();
         if !out.status.success() && is_name_conflict(&String::from_utf8_lossy(&out.stderr)) {
             // Idempotent start: a name conflict means a leftover container from
             // a crashed/killed prior daemon still holds this pod's deterministic
@@ -1272,11 +1276,28 @@ impl ContainerRuntime for PodmanBackend {
             // (`rm -f` accepts a name or id) and retry the run exactly ONCE; a
             // second conflict is a genuine error surfaced below. This makes pod
             // start survive daemon restarts without manual `podman rm`.
-            let _ = self
+            let rm_out = self
                 .command(&Self::rm_argv(&spec.name))
                 .output()
                 .await
                 .map_err(|e| KubeletError::Backend(format!("podman rm (stale name) spawn: {e}")))?;
+            // ★ The remove's own complaint used to be DISCARDED, and that cost a
+            // real debugging session (2026-09-01). A leftover container sat in
+            // `Created` with its store record missing, so `podman rm` printed
+            // `getting container from store "<id>": container not known`, changed
+            // nothing, AND EXITED 0. The retry then hit the same conflict and the
+            // operator saw a bare `podman run failed (status 125)` with no hint
+            // that a remove had been attempted, let alone why it did nothing.
+            //
+            // Measured cause: the REMOTE podman client (mac talking to the
+            // machine VM over the socket) cannot reclaim that container, while
+            // `podman machine ssh podman rm -f <name>` — the LOCAL client inside
+            // the VM — removes it instantly. engenho's backend is the remote
+            // client, so this is not reachable from here; the only useful thing
+            // this code can do is say exactly what podman said.
+            if !rm_out.stderr.is_empty() || !rm_out.status.success() {
+                rm_report = String::from_utf8_lossy(&rm_out.stderr).trim().to_string();
+            }
             out = self
                 .command(&argv)
                 .output()
@@ -1289,12 +1310,25 @@ impl ContainerRuntime for PodmanBackend {
             // failure (e.g. a live container we don't own) — surface the
             // specific class so the kubelet/test sees it rather than an opaque
             // failure.
-            if stderr.contains("already in use") {
-                return Err(KubeletError::Backend(format!(
+            //
+            // ★ THIS CALLS `is_name_conflict` NOW. It was `stderr.contains("already
+            // in use")` — a second, drifted copy of that predicate which does NOT
+            // match what podman actually emits (`name "..." is in use: container
+            // already exists`). So the specific diagnostic never fired: every
+            // surviving conflict fell through to the generic `podman run failed`
+            // below, which is precisely the message that made a reclaim failure
+            // look like a plain start failure. One predicate, one place.
+            if is_name_conflict(&stderr) {
+                let mut msg = format!(
                     "podman run name conflict for {:?}: a container with this name already exists \
                      and could not be reclaimed by remove+retry; stderr: {stderr}",
                     spec.name
-                )));
+                );
+                if !rm_report.is_empty() {
+                    msg.push_str(" | podman rm said: ");
+                    msg.push_str(&rm_report);
+                }
+                return Err(KubeletError::Backend(msg));
             }
             return Err(KubeletError::Backend(format!(
                 "podman run failed (status {:?}): {stderr}",
@@ -2275,6 +2309,56 @@ mod tests {
     #[test]
     fn stop_argv_maps_id() {
         assert_eq!(PodmanBackend::stop_argv("abc123"), vec!["stop", "abc123"]);
+    }
+
+    #[test]
+    /// ★ podman's VERBATIM wording, captured from podman 5.7.0 on 2026-09-01.
+    ///
+    /// This exists because a paraphrase shipped and was wrong. A second copy of
+    /// this predicate was written inline as `stderr.contains("already in use")`,
+    /// which does not match the string below — so a name conflict that survived
+    /// remove+retry was reported as a generic `podman run failed (status 125)`
+    /// and the reclaim attempt was invisible. Our reading of a foreign tool's
+    /// message is not evidence; the tool's actual bytes are.
+    ///
+    /// Keep the literal. If podman rewords it, this test is where that is meant
+    /// to be discovered.
+    #[test]
+    fn the_name_conflict_classifier_matches_what_podman_actually_prints() {
+        let measured = "Error: name \"pangea-system_pangea-pangea-operator-d759413ffb-0_pangea-operator\" \
+                        is in use: container already exists";
+        assert!(
+            is_name_conflict(measured),
+            "podman 5.7.0's real conflict message must classify as a name conflict"
+        );
+        // ★ AND HERE IS THE EXACT REASON THE DRIFTED COPY FAILED, pinned so it
+        // cannot be reintroduced by someone "simplifying" the classifier.
+        //
+        // The real message says `... is in use: container already exists`. It
+        // contains "is in use" and "container already exists" — but NOT
+        // "already in use", which is what the inline paraphrase tested. Two
+        // near-identical English phrases, one of which podman never emits.
+        assert!(
+            !measured.contains("already in use"),
+            "the paraphrase that shipped must stay falsified: podman writes \
+             'is in use' and 'already exists', never 'already in use'"
+        );
+        // Note for anyone red-running this: the predicate's clauses OVERLAP on
+        // the real message (two of three match), so breaking a single clause
+        // does NOT turn this red. Falsify it by breaking all three.
+
+        // The other two forms this predicate has seen, kept so narrowing it is
+        // caught rather than silently accepted.
+        assert!(is_name_conflict("Error: container already exists"));
+        assert!(is_name_conflict("that name is already in use"));
+        // And it must not fire on unrelated failures, or a real error gets
+        // reported as a reclaimable conflict and retried forever.
+        assert!(!is_name_conflict(
+            "Error: short-name resolution enforced but cannot prompt without a TTY"
+        ));
+        assert!(!is_name_conflict(
+            "Error: getting container from store \"cea832b7\": container not known"
+        ));
     }
 
     #[test]
