@@ -832,20 +832,142 @@ impl engenho_kubelet::ServiceAccountProjector for RuntimeSaProjector {
     }
 }
 
+/// Where a POD can actually reach this engenho's apiserver.
+///
+/// ── ★ AN UNREACHABLE ADDRESS IS WORSE THAN NO ADDRESS ─────────────────────
+/// `KUBERNETES_SERVICE_HOST` is not advice; it is the coordinate every
+/// in-cluster client library commits to. kube-rs' `Config::infer()` tries
+/// in-cluster FIRST and only falls back to a kubeconfig when in-cluster
+/// CONSTRUCTION fails. Construction needs the env vars and the projected
+/// token — both of which engenho supplies — so injecting an address that
+/// routes nowhere makes construction SUCCEED and removes the fallback. The
+/// client then fails at every request instead of quietly using a kubeconfig.
+///
+/// That is the same reasoning `ServiceAccountProjector` already records for
+/// tokens: a zero-byte token is worse than an absent one, because the client
+/// stops looking for a kubeconfig. The address half had not learned it.
+///
+/// Measured 2026-09-01 on a darwin workstation: engenho injected the
+/// `kubernetes` Service ClusterIP (10.96.0.1:443), pods authenticated with a
+/// valid token, and every call failed to connect — surfacing as
+/// `Leader election acquire attempt failed … client error (Connect)` in an
+/// operator that had already started, reached its database and reported
+/// healthy. The cause was three layers away from the symptom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApiserverReachability {
+    /// A service datapath (kube-proxy rules, or an equivalent) actually
+    /// serves the cluster Service VIP, so the conventional coordinates work.
+    ServiceVip {
+        /// The `kubernetes` Service ClusterIP.
+        ip: String,
+        /// Its port (upstream's conventional 443).
+        port: u16,
+    },
+    /// No service datapath, but the container runtime gives pods a route to
+    /// the host the apiserver is bound on. Inject THAT instead — different
+    /// coordinates, same apiserver, and it works.
+    HostGateway {
+        /// A name resolvable from inside a container.
+        host: String,
+        /// engenho's REAL listen port, not 443 — nothing rewrites it here.
+        port: u16,
+    },
+    /// Neither is known to work. Inject nothing, so `Config::infer()` fails
+    /// construction and falls back to a kubeconfig. Absent beats wrong.
+    Unknown,
+}
+
+impl ApiserverReachability {
+    /// The `(host, port)` to inject, or `None` to inject nothing at all.
+    fn injectable(&self) -> Option<(String, u16)> {
+        match self {
+            Self::ServiceVip { ip, port } => Some((ip.clone(), *port)),
+            Self::HostGateway { host, port } => Some((host.clone(), *port)),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// The hostname podman resolves, inside every container, to the host running
+/// the machine. Documented podman behaviour, and the only route from a pod to
+/// a loopback-bound apiserver when the containers live in a VM.
+const PODMAN_HOST_GATEWAY: &str = "host.containers.internal";
+
+/// Decide what pods should be told, from what is actually true.
+///
+/// The service VIP is claimed ONLY when a datapath installs it. engenho
+/// computes kube-proxy rules on darwin without installing them (see
+/// `DatapathInstall::{Computed,Installed}`), so on that platform the VIP is a
+/// bookkeeping entry and the host gateway is the truth.
+fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
+    // The port engenho really listens on. `listen_addr` is `host:port`; a
+    // shape we cannot parse is a reason to inject nothing, never to guess.
+    let Some(port) = config
+        .runtime
+        .listen_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+    else {
+        return ApiserverReachability::Unknown;
+    };
+
+    match config.runtime.kubelet_backend {
+        // Pods run in podman. On darwin they are inside a VM and cannot reach
+        // a host-loopback apiserver by any cluster address, and even on Linux
+        // engenho installs no kube-proxy datapath for the VIP — so the
+        // gateway is correct on both, and the VIP is correct on neither.
+        CfgBackendKind::Podman => ApiserverReachability::HostGateway {
+            host: PODMAN_HOST_GATEWAY.to_string(),
+            port,
+        },
+        // Nothing is dialled under the fake backend, so there is nothing to
+        // be reachable. Injecting the conventional VIP keeps the env shape
+        // that tests assert on.
+        CfgBackendKind::Fake => ApiserverReachability::ServiceVip {
+            ip: DEFAULT_KUBERNETES_SERVICE_IP.to_string(),
+            port: 443,
+        },
+    }
+}
+
 fn build_backend(config: &EngenhoConfig) -> Arc<dyn ContainerRuntime> {
     let kind = match config.runtime.kubelet_backend {
         CfgBackendKind::Podman => KubeletBackendKind::Podman,
         CfgBackendKind::Fake => KubeletBackendKind::Fake,
     };
-    // The `kubernetes` Service engenho itself creates in `default`. A
-    // node-level constant, so it is set once here rather than resolved per
-    // pod — and it must reach the backend, because the kubelet has THREE
-    // `backend.start` call sites and stamping any one of them misses the
-    // restart path.
+    // A node-level fact, set once here rather than resolved per pod — and it
+    // must reach the backend, because the kubelet has THREE `backend.start`
+    // call sites and stamping any one of them misses the restart path.
+    //
+    // What is injected is a REACHABILITY CLAIM, not a constant: see
+    // `ApiserverReachability`. `None` means "tell pods nothing", which is a
+    // working outcome (kubeconfig fallback), not a degraded one.
+    let reachability = apiserver_reachability(config);
+    match &reachability {
+        ApiserverReachability::ServiceVip { ip, port } => {
+            info!(%ip, %port, "apiserver advertised to pods via the service VIP");
+        }
+        ApiserverReachability::HostGateway { host, port } => {
+            info!(
+                %host, %port,
+                "apiserver advertised to pods via the container host gateway \
+                 (no service datapath installs the cluster VIP)"
+            );
+        }
+        ApiserverReachability::Unknown => {
+            warn!(
+                listen_addr = %config.runtime.listen_addr,
+                "cannot determine an apiserver address pods can reach; \
+                 injecting no KUBERNETES_SERVICE_* env so in-cluster config \
+                 fails construction and clients fall back to a kubeconfig"
+            );
+        }
+    }
     make_container_runtime_with_apiserver(
         kind,
         config.runtime.podman_binary.as_deref(),
-        Some((DEFAULT_KUBERNETES_SERVICE_IP.to_string(), 443)),
+        reachability.injectable(),
     )
 }
 
@@ -2192,6 +2314,64 @@ mod node_label_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// ★ The invariant this exists for: pods are never told an address that
+    /// routes nowhere. Under podman they get the host gateway, because no
+    /// service datapath installs the cluster VIP.
+    #[test]
+    fn podman_pods_are_told_the_host_gateway_not_the_unrouted_service_vip() {
+        let mut cfg = EngenhoConfig::default();
+        cfg.runtime.kubelet_backend = CfgBackendKind::Podman;
+        cfg.runtime.listen_addr = "127.0.0.1:6443".to_string();
+
+        let r = super::apiserver_reachability(&cfg);
+        assert_eq!(
+            r,
+            super::ApiserverReachability::HostGateway {
+                host: super::PODMAN_HOST_GATEWAY.to_string(),
+                port: 6443,
+            },
+            "the ClusterIP has no datapath under podman; advertising it makes \
+             in-cluster construction SUCCEED and removes the kubeconfig \
+             fallback, so every request fails instead"
+        );
+
+        let (host, port) = r.injectable().expect("podman must advertise something");
+        assert_ne!(
+            host,
+            super::DEFAULT_KUBERNETES_SERVICE_IP,
+            "injecting the unrouted VIP is the defect"
+        );
+        assert_eq!(port, 6443, "the REAL listen port, not 443 — nothing rewrites it");
+    }
+
+    /// An unparseable listen address means we do not know a reachable
+    /// coordinate. Inject NOTHING: absent env fails in-cluster CONSTRUCTION,
+    /// which is what makes a client fall back to a kubeconfig.
+    #[test]
+    fn an_unknown_address_injects_nothing_so_the_kubeconfig_fallback_survives() {
+        let mut cfg = EngenhoConfig::default();
+        cfg.runtime.kubelet_backend = CfgBackendKind::Podman;
+        cfg.runtime.listen_addr = "not-a-socket-address".to_string();
+
+        let r = super::apiserver_reachability(&cfg);
+        assert_eq!(r, super::ApiserverReachability::Unknown);
+        assert!(
+            r.injectable().is_none(),
+            "a guessed address is worse than none: it removes the fallback"
+        );
+    }
+
+    /// The port is read from config, never assumed — a non-default listen
+    /// port must reach the pod, or in-cluster clients dial the wrong one.
+    #[test]
+    fn the_advertised_port_follows_the_configured_listen_port() {
+        let mut cfg = EngenhoConfig::default();
+        cfg.runtime.kubelet_backend = CfgBackendKind::Podman;
+        cfg.runtime.listen_addr = "127.0.0.1:16443".to_string();
+        let (_, port) = super::apiserver_reachability(&cfg).injectable().unwrap();
+        assert_eq!(port, 16443);
+    }
 
     /// Empty disables publishing — the escape hatch tests and headless
     /// contexts use to stay out of `$HOME`.
