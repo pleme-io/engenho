@@ -50,7 +50,7 @@
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
@@ -108,6 +108,18 @@ pub struct FjallStore {
 
 /// The on-disk handles + the in-RAM working copy.
 struct FjallInner {
+    /// Exclusive claim on the data directory, held for as long as this store
+    /// is open.
+    ///
+    /// ── ★ DO NOT DROP THIS EARLY, AND DO NOT `_`-PREFIX IT ─────────────
+    /// Its Drop releases the directory. fjall does not lock its own
+    /// directory (2.11.2 depends on no locking crate and has no
+    /// already-open error), so while this is held is exactly the window in
+    /// which a second opener is refused. A store was destroyed on
+    /// 2026-09-01 by two processes opening one directory: it went
+    /// `Poisoned`, then `Storage(Unrecoverable)`, and never opened again.
+    /// See `crate::data_dir_lock`.
+    _dir_lock: crate::data_dir_lock::DataDirLock,
     keyspace: fjall::Keyspace,
     log: fjall::PartitionHandle,
     meta: fjall::PartitionHandle,
@@ -217,6 +229,20 @@ impl FjallStore {
     /// can't be opened or a persisted value can't be deserialized.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
+        // ── ★ TAKE THE DIRECTORY BEFORE READING A BYTE OF IT ──────────────
+        // fjall will happily open a directory a live process is already
+        // writing, and the result is an unrecoverable store rather than an
+        // error (measured 2026-09-01). The apiserver's port bind used to be
+        // the de-facto single-instance guard, but it happens AFTER the store
+        // is opened and seeded — far too late. Lock first, so a second opener
+        // fails with a typed conflict instead of corrupting the first.
+        //
+        // The lock is `<path>.lock` — derived from the store's OWN path, so its
+        // identity is the store's identity. Locking the parent directory
+        // instead makes every store under a shared parent contend for one
+        // lock, which is a false conflict (caught by this crate's own tests).
+        let dir_lock = crate::data_dir_lock::DataDirLock::acquire(&path)
+            .map_err(|e| StoreError::Fatal(e.to_string()))?;
         let keyspace = fjall::Config::new(&path)
             .open()
             .map_err(|e| StoreError::Fatal(format!("fjall open {}: {e}", path.display())))?;
@@ -249,6 +275,7 @@ impl FjallStore {
         state.snapshot_index = meta_get_json(&meta, META_SNAPSHOT_INDEX)?.unwrap_or(0);
 
         let inner = Arc::new(FjallInner {
+            _dir_lock: dir_lock,
             keyspace,
             log,
             meta,

@@ -1807,6 +1807,7 @@ dependencies = [
  "engenho-types",
  "fjall",
  "futures",
+ "libc",
  "openraft",
  "proptest",
  "serde",

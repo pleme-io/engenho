@@ -56,6 +56,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 pub mod command;
+pub mod data_dir_lock;
 pub mod drv_committal;
 pub mod fjall_store;
 pub mod mesh;
