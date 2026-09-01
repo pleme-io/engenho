@@ -486,13 +486,44 @@ pub fn parse_client_cert(leaf_der: &[u8]) -> Result<Option<VerifiedClientCert>, 
     }))
 }
 
+/// The container-host gateway name pods dial the apiserver on when no service
+/// datapath serves the cluster VIP.
+///
+/// Must stay equal to `engenho_runtime`'s `PODMAN_HOST_GATEWAY`. It is
+/// duplicated rather than shared because engenho-apiserver deliberately does
+/// not depend on engenho-runtime; a test pins the equality.
+pub const CONTAINER_HOST_GATEWAY_SAN: &str = "host.containers.internal";
+
 /// Build the server cert SAN list. DNS SANs are deduped-by-construction
 /// (we never push the node name twice even if it's `localhost`).
 fn build_sans(san: &ServerSanInputs<'_>) -> Result<Vec<SanType>, PkiError> {
     let mut sans: Vec<SanType> = Vec::new();
 
-    // Standard DNS SANs every K8s apiserver carries.
-    let mut dns_names: Vec<&str> = vec!["localhost", "kubernetes", "kubernetes.default"];
+    // Standard DNS SANs every K8s apiserver carries, plus the container
+    // host gateway.
+    //
+    // ── ★ THE ADVERTISED ADDRESS AND THE SAN LIST ARE A PAIR ──────────────
+    // `host.containers.internal` is what the runtime TELLS pods to dial (see
+    // `ApiserverReachability::HostGateway` in engenho-runtime): on darwin the
+    // apiserver binds host loopback while pods live in a VM, so the cluster
+    // Service VIP has no datapath and the gateway name is the only route.
+    //
+    // Advertising a name that is NOT in this list is a slower version of the
+    // same bug it was meant to fix. Measured 2026-09-01: after the runtime
+    // began advertising the gateway, in-cluster clients still failed with
+    // `client error (Connect)` — the name now ROUTED, and TLS verification
+    // against the projected CA rejected it, because the serving cert did not
+    // name it. Two layers, one symptom, and the second is invisible from the
+    // first.
+    //
+    // A test asserts the pair, so changing one side alone fails the build
+    // rather than the cluster.
+    let mut dns_names: Vec<&str> = vec![
+        "localhost",
+        "kubernetes",
+        "kubernetes.default",
+        CONTAINER_HOST_GATEWAY_SAN,
+    ];
     // The node name is a DNS SAN so `server: https://<node>:port` works;
     // skip it if it duplicates one already present (e.g. node "localhost").
     if !san.node_name.is_empty() && !dns_names.contains(&san.node_name) {
@@ -583,6 +614,38 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<(), PkiError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// ★ The advertised address must be authenticable. The runtime tells pods
+    /// to dial the container host gateway; if the serving cert does not name
+    /// it, TLS verification against the projected CA fails and every
+    /// in-cluster call dies with a connect error that looks like a network
+    /// fault. Measured 2026-09-01 — the routing fix alone was not enough.
+    #[test]
+    fn the_serving_cert_names_the_container_host_gateway_pods_are_told_to_dial() {
+        let san = ServerSanInputs { node_name: "ryn", listen_ip: None };
+        let sans = super::build_sans(&san).expect("build_sans");
+        assert!(
+            sans.iter().any(|s| matches!(
+                s,
+                SanType::DnsName(n) if n.as_str() == super::CONTAINER_HOST_GATEWAY_SAN
+            )),
+            "serving cert must carry a SAN for {}, the name pods are told to \
+             dial; without it in-cluster TLS fails against a routable address",
+            super::CONTAINER_HOST_GATEWAY_SAN
+        );
+    }
+
+    /// The two sides of the pair are separate constants in separate crates
+    /// (engenho-apiserver does not depend on engenho-runtime). Pin the value
+    /// so they cannot drift silently.
+    #[test]
+    fn the_gateway_san_matches_the_runtime_constant_value() {
+        assert_eq!(
+            super::CONTAINER_HOST_GATEWAY_SAN, "host.containers.internal",
+            "engenho_runtime::PODMAN_HOST_GATEWAY carries the same literal; \
+             changing one alone breaks in-cluster auth"
+        );
+    }
     use super::*;
 
     fn ca_in_tempdir() -> (tempfile::TempDir, ClusterCa) {
