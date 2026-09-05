@@ -37,19 +37,58 @@ use crate::pki::VerifiedClientCert;
 /// silent wrong identity.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthnError {
-    /// A bearer token is structurally a ServiceAccount JWT (carries SA-shaped
-    /// `sub` / `iss` claims) but engenho cannot validate it yet — SA-token
-    /// validation (issuer keypair + JWKS + TokenRequest API) is tied to the
-    /// kubelet projection brick. The middleware renders a typed 401
-    /// Unauthorized; it does NOT silently authenticate the request as that SA
-    /// nor as anonymous.
-    #[error("service account token authentication is not yet supported")]
+    /// A bearer token is structurally a `ServiceAccount` JWT, but THIS SERVER
+    /// holds no `ServiceAccount` signing key, so it cannot check the signature.
+    ///
+    /// The honest state for a server with no key. It is a refusal, never a
+    /// fall-through: without the key the request is rejected rather than
+    /// admitted as anonymous or as the claimed SA.
+    #[error(
+        "this apiserver holds no ServiceAccount signing key, so it cannot verify \
+         ServiceAccount tokens"
+    )]
     ServiceAccountUnsupported,
+
+    /// A `ServiceAccount` token was CHECKED and REJECTED, with the reason.
+    ///
+    /// ── ★ WHY THIS IS SEPARATE FROM THE VARIANT ABOVE ────────────────────
+    /// It used to not be. Every validation failure — a forged signature, an
+    /// expired token, the wrong issuer, the wrong audience — was mapped onto
+    /// `ServiceAccountUnsupported`, whose message read "service account token
+    /// authentication is not yet supported". `sa_token::TokenError` goes to
+    /// deliberate trouble to keep those five apart, stating in its own doc that
+    /// "collapsing them makes an audit log useless for telling an attack from
+    /// clock skew" — and this layer collapsed them one call later.
+    ///
+    /// The cost was not abstract. `Err(e) => ApiError::Unauthorized(e.to_string())`
+    /// puts this text in the 401 body, so an operator whose token had merely
+    /// EXPIRED was told the feature did not exist. That sends them to look for a
+    /// missing capability instead of at their clock, their issuer, or an
+    /// attacker — and it makes a forged-signature event indistinguishable from a
+    /// routine expiry in the audit log, which is precisely the distinction the
+    /// log exists to record.
+    #[error("service account token rejected: {0}")]
+    ServiceAccountRejected(#[from] crate::sa_token::TokenError),
+
+    /// A `ServiceAccount` token verified, but carries no `kubernetes.io` claim
+    /// block naming its namespace and `ServiceAccount`.
+    ///
+    /// Distinct from a rejection: the signature was GOOD, so this is a
+    /// well-formed credential from a trusted issuer that does not say who it is
+    /// for — a token-minting bug on our side, not a bad credential on theirs,
+    /// and the two want different investigations.
+    #[error(
+        "service account token verified but carries no kubernetes.io claims naming its \
+         namespace and service account"
+    )]
+    ServiceAccountClaimsMissing,
 }
 
 engenho_substrate::impl_error_kind! {
     AuthnError {
         ServiceAccountUnsupported => "service_account_unsupported",
+        (ServiceAccountRejected(_)) => "service_account_rejected",
+        ServiceAccountClaimsMissing => "service_account_claims_missing",
     }
 }
 
@@ -182,14 +221,17 @@ impl Authenticator for ServiceAccountTokenAuthenticator {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0);
-        let claims = crate::sa_token::verify(&v.verifying, bearer, &v.issuer, &v.audience, now)
-            .map_err(|_| AuthnError::ServiceAccountUnsupported)?;
+        // The reason travels. `?` on a `TokenError` becomes
+        // `ServiceAccountRejected(reason)` via `#[from]`, so the 401 body names
+        // whether the token expired, was forged, or was minted for a different
+        // audience — see that variant's doc for why discarding this was costly.
+        let claims = crate::sa_token::verify(&v.verifying, bearer, &v.issuer, &v.audience, now)?;
 
         let (namespace, name) = claims
             .kubernetes
             .as_ref()
             .map(|k| (k.namespace.clone(), k.serviceaccount.name.clone()))
-            .ok_or(AuthnError::ServiceAccountUnsupported)?;
+            .ok_or(AuthnError::ServiceAccountClaimsMissing)?;
 
         Ok(Some(UserInfo {
             username: crate::sa_token::subject_for(&namespace, &name),
@@ -364,7 +406,7 @@ fn decode_jwt_payload(payload: &str) -> Option<serde_json::Map<String, serde_jso
 
 #[cfg(test)]
 mod sa_verification_tests {
-    use super::{Authenticator, RequestCreds, ServiceAccountTokenAuthenticator};
+    use super::{Authenticator, AuthnError, RequestCreds, ServiceAccountTokenAuthenticator};
     use crate::sa_token::{issue, load_or_generate_sa_key};
 
     const ISS: &str = "https://kubernetes.default.svc";
@@ -557,6 +599,191 @@ mod sa_verification_tests {
                 .expect("not an error"),
             None,
             "a non-SA bearer must fall through to the later stages"
+        );
+    }
+
+    // ── The rejection REASON survives to the client ──────────────────────
+    //
+    // These pin the split of `ServiceAccountUnsupported` into three variants.
+    // Every one of these cases used to answer "service account token
+    // authentication is not yet supported", which sent an operator looking for
+    // a missing feature instead of at the actual fault — and made a forged
+    // signature indistinguishable from a routine expiry in the audit log.
+
+    #[test]
+    fn an_expired_token_says_expired_not_unsupported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = load_or_generate_sa_key(dir.path()).expect("key");
+        let auth = ServiceAccountTokenAuthenticator::with_key(
+            kp.verifying,
+            ISS.to_string(),
+            AUD.to_string(),
+        );
+        // Issued two hours ago with a one-hour life.
+        let token = issue(
+            &kp.signing,
+            ISS,
+            "default",
+            "sa",
+            "uid",
+            &[AUD.to_string()],
+            None,
+            now_secs() - 7200,
+            3600,
+        )
+        .expect("mint");
+
+        let err = auth
+            .authenticate(&RequestCreds {
+                client_cert: None,
+                bearer: Some(token),
+            })
+            .expect_err("an expired token must be refused");
+
+        assert!(
+            matches!(
+                err,
+                AuthnError::ServiceAccountRejected(crate::sa_token::TokenError::Expired { .. })
+            ),
+            "expiry must reach the caller as an expiry; got {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("expired"),
+            "the 401 body is this string — it must name the expiry: {rendered}"
+        );
+        assert!(
+            !rendered.contains("not yet supported"),
+            "an expired token must NOT report a missing feature: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_token_signed_by_a_stranger_says_signature_not_unsupported() {
+        let ours = tempfile::tempdir().expect("tempdir");
+        let theirs = tempfile::tempdir().expect("tempdir");
+        let our_key = load_or_generate_sa_key(ours.path()).expect("key");
+        let their_key = load_or_generate_sa_key(theirs.path()).expect("key");
+
+        // Distinct data dirs must yield distinct keys, or the forgery case is
+        // untestable and — far worse — any cluster could mint tokens for any
+        // other. Assert it rather than assume it.
+        assert_ne!(
+            our_key.verifying.to_bytes(),
+            their_key.verifying.to_bytes(),
+            "two clusters must not share a ServiceAccount signing key"
+        );
+
+        let auth = ServiceAccountTokenAuthenticator::with_key(
+            our_key.verifying,
+            ISS.to_string(),
+            AUD.to_string(),
+        );
+        let forged = issue(
+            &their_key.signing,
+            ISS,
+            "default",
+            "sa",
+            "uid",
+            &[AUD.to_string()],
+            None,
+            now_secs(),
+            3600,
+        )
+        .expect("mint");
+
+        let err = auth
+            .authenticate(&RequestCreds {
+                client_cert: None,
+                bearer: Some(forged),
+            })
+            .expect_err("a token from another key must be refused");
+
+        assert!(
+            matches!(
+                err,
+                AuthnError::ServiceAccountRejected(crate::sa_token::TokenError::BadSignature)
+            ),
+            "a foreign signature is a SECURITY EVENT and must be recorded as one, \
+             not as a capability gap; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_token_for_another_audience_says_audience() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = load_or_generate_sa_key(dir.path()).expect("key");
+        let auth = ServiceAccountTokenAuthenticator::with_key(
+            kp.verifying,
+            ISS.to_string(),
+            AUD.to_string(),
+        );
+        // The reason bound tokens carry `aud` at all: a token minted for a
+        // webhook must not authenticate against the apiserver.
+        let token = issue(
+            &kp.signing,
+            ISS,
+            "default",
+            "sa",
+            "uid",
+            &["https://some-webhook.example".to_string()],
+            None,
+            now_secs(),
+            3600,
+        )
+        .expect("mint");
+
+        let err = auth
+            .authenticate(&RequestCreds {
+                client_cert: None,
+                bearer: Some(token),
+            })
+            .expect_err("a foreign-audience token must be refused");
+
+        assert!(
+            matches!(
+                err,
+                AuthnError::ServiceAccountRejected(
+                    crate::sa_token::TokenError::WrongAudience { .. }
+                )
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_keyless_server_reports_unsupported() {
+        // The one case where "unsupported" is the truth. Keeping it distinct is
+        // what makes the message trustworthy again: an operator who sees it now
+        // knows the server genuinely has no key, rather than having to wonder
+        // whether their token was simply stale.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = load_or_generate_sa_key(dir.path()).expect("key");
+        let token = issue(
+            &kp.signing,
+            ISS,
+            "default",
+            "sa",
+            "uid",
+            &[AUD.to_string()],
+            None,
+            now_secs(),
+            3600,
+        )
+        .expect("mint");
+
+        let keyless = ServiceAccountTokenAuthenticator::default();
+        let err = keyless
+            .authenticate(&RequestCreds {
+                client_cert: None,
+                bearer: Some(token),
+            })
+            .expect_err("no key means refuse");
+
+        assert_eq!(err, AuthnError::ServiceAccountUnsupported);
+        assert!(
+            err.to_string().contains("no ServiceAccount signing key"),
+            "the message must say what is actually missing: {err}"
         );
     }
 }

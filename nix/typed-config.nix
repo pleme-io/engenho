@@ -134,6 +134,45 @@ in
 
         Opt-in because the file embeds admin credentials.
       '';
+      advertiseAddress = optional types.str ''
+        The address REMOTE clients dial to reach this apiserver — a hostname or
+        IP, optionally with `:port`. Empty means node-local.
+
+        ★ Setting this does TWO things that must never be done separately: it
+        becomes the `server:` of `remoteKubeconfigPublishPath`, AND its host
+        half is added to the serving certificate's SANs.
+
+        engenho already paid for the split version of this once. After the
+        runtime began advertising `host.containers.internal` to pods,
+        in-cluster clients still failed: the name now ROUTED, and TLS
+        verification rejected it because the serving cert did not NAME it —
+        two layers, one symptom, the second invisible from the first. Here
+        there is one field and two readers, so a kubeconfig naming an address
+        the certificate does not is unconstructible rather than merely tested
+        for.
+
+        The port is optional and defaults to the one in `listenAddr`. A
+        different one is expected and fine — a reverse proxy, a tailnet
+        forward, a NAT — and only the HOST reaches the certificate, because a
+        certificate names hosts, not ports.
+      '';
+
+      remoteKubeconfigPublishPath = optional types.str ''
+        Where to publish a kubeconfig whose `server:` is `advertiseAddress`
+        (empty = none).
+
+        The third audience, and the one that had no path.
+        `kubeconfigPublishPath` writes a LOOPBACK url — correct on the node,
+        useless from any other — and `podKubeconfigPublishPath` writes the
+        address CONTAINERS reach. Neither serves an operator on a different
+        machine, so distributing access meant copying a kubeconfig and
+        hand-editing its `server:` line, which is exactly the edit that
+        silently disagrees with the serving certificate.
+
+        Opt-in because, like the pod-facing file, it embeds admin client-key
+        material.
+      '';
+
       kubeletBackend = optional (types.enum [ "podman" "fake" ]) ''
         Container runtime the kubelet drives.
 
@@ -304,6 +343,8 @@ in
         node_name = cfg.runtime.nodeName;
         kubeconfig_publish_path = cfg.runtime.kubeconfigPublishPath;
       pod_kubeconfig_publish_path = cfg.runtime.podKubeconfigPublishPath;
+      advertise_address = cfg.runtime.advertiseAddress;
+      remote_kubeconfig_publish_path = cfg.runtime.remoteKubeconfigPublishPath;
         kubelet_backend = cfg.runtime.kubeletBackend;
         # DERIVED, never a second hand-list: an explicit `podmanBinary` wins,
         # else the package's own bin path. So "kubelet drives podman, with no

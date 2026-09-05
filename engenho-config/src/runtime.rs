@@ -106,6 +106,39 @@ pub struct RuntimeConfig {
     /// Empty by default: it embeds admin credentials, and a file that
     /// appears without being asked for is one nobody decided to create.
     pub pod_kubeconfig_publish_path: String,
+    /// The address REMOTE clients dial to reach this apiserver — a hostname or
+    /// IP, optionally with `:port`.
+    ///
+    /// ── ★ THE ADDRESS AND THE CERTIFICATE ARE ONE FACT ────────────────────
+    /// Setting this does two things that must never be done separately: it is
+    /// the `server:` of the remote kubeconfig, AND it is added to the serving
+    /// certificate's SANs. engenho already learned this once — after the
+    /// runtime began advertising `host.containers.internal` to pods, in-cluster
+    /// clients still failed, because the name now ROUTED but the certificate did
+    /// not NAME it. Two layers, one symptom, and the second invisible from the
+    /// first. A test pins that pair; this field makes the same pair
+    /// unconstructible for the remote case, rather than pinned after the fact.
+    ///
+    /// Empty means this apiserver is node-local: no remote kubeconfig is
+    /// published and no extra SAN is derived.
+    ///
+    /// The port is optional and defaults to the one in `listen_addr`. Giving a
+    /// different one is legitimate and expected — a reverse proxy, a tailnet
+    /// forward, a NAT — and only the HOST reaches the certificate, since a
+    /// certificate names hosts, not ports.
+    pub advertise_address: String,
+    /// Where to publish a kubeconfig whose `server:` is [`Self::advertise_address`].
+    ///
+    /// The third audience, and the one that had no path. `kubeconfig_publish_path`
+    /// writes a LOOPBACK url — correct on the node, useless anywhere else — and
+    /// `pod_kubeconfig_publish_path` writes the address CONTAINERS reach. Neither
+    /// serves the operator on another machine, so distributing access meant
+    /// hand-editing a copied kubeconfig's `server:` line, which is the shape that
+    /// silently disagrees with the certificate.
+    ///
+    /// Empty by default: like the pod-facing file it embeds admin credentials,
+    /// and a file carrying those should never appear unasked.
+    pub remote_kubeconfig_publish_path: String,
     /// Which container runtime the kubelet drives.
     /// Where the KUBELET's own HTTP surface binds (`/containerLogs`,
     /// `/pods`, `/exec`, `/healthz`) — upstream's :10250.
@@ -165,6 +198,8 @@ impl TieredConfig for RuntimeConfig {
             node_name: String::new(),
             kubeconfig_publish_path: String::new(),
             pod_kubeconfig_publish_path: String::new(),
+            advertise_address: String::new(),
+            remote_kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: String::new(),
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
@@ -215,6 +250,8 @@ impl TieredConfig for RuntimeConfig {
             kubeconfig_publish_path: "~/.kube/configs/engenho".into(),
             // Empty: publishing admin credentials is opt-in.
             pod_kubeconfig_publish_path: String::new(),
+            advertise_address: String::new(),
+            remote_kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: "127.0.0.1:10250".into(),
             etcd_listen_addr: "127.0.0.1:2379".into(),
             kubelet_backend: KubeletBackendKind::Podman,
@@ -254,6 +291,16 @@ impl TieredConfig for RuntimeConfig {
                 base.pod_kubeconfig_publish_path.clone()
             } else {
                 self.pod_kubeconfig_publish_path.clone()
+            },
+            advertise_address: if self.advertise_address.is_empty() {
+                base.advertise_address.clone()
+            } else {
+                self.advertise_address.clone()
+            },
+            remote_kubeconfig_publish_path: if self.remote_kubeconfig_publish_path.is_empty() {
+                base.remote_kubeconfig_publish_path.clone()
+            } else {
+                self.remote_kubeconfig_publish_path.clone()
             },
             kubelet_listen_addr: if self.kubelet_listen_addr.is_empty() {
                 base.kubelet_listen_addr.clone()
@@ -430,6 +477,8 @@ mod tests {
             // precisely what this test asserts for every other field.
             kubeconfig_publish_path: String::new(),
             pod_kubeconfig_publish_path: String::new(),
+            advertise_address: String::new(),
+            remote_kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: String::new(),
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
