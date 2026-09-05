@@ -145,7 +145,10 @@ impl DataDirLock {
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(|source| LockError::Unusable { path: path.clone(), source })?;
+            .map_err(|source| LockError::Unusable {
+                path: path.clone(),
+                source,
+            })?;
 
         if !try_lock_exclusive(&file) {
             // Read the holder's PID for the message. Best-effort: the holder
@@ -232,7 +235,11 @@ mod tests {
         let first = DataDirLock::acquire(tmp.path()).expect("first");
         drop(first);
         let again = DataDirLock::acquire(tmp.path());
-        assert!(again.is_ok(), "a released lock must be re-acquirable: {:?}", again.err());
+        assert!(
+            again.is_ok(),
+            "a released lock must be re-acquirable: {:?}",
+            again.err()
+        );
     }
 
     /// The lock is `<store_path>.lock`: a sibling of the keyspace directory,
