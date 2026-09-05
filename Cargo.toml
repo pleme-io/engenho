@@ -84,7 +84,9 @@ axum                   = "0.7"
 # request's lookup); register/unregister is a rare clone-insert-swap via
 # rcu (read-copy-update, lost-write-safe under racing CrdController ticks).
 arc-swap               = "1"
-hyper                  = "1"
+hyper                  = { version = "1", features = ["client", "http1"] }
+hyper-util             = { version = "0.1", features = ["tokio"] }
+http-body-util         = "0.1"
 tower                  = "0.5"
 reqwest                = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 utoipa                 = { version = "5", features = ["axum_extras"] }

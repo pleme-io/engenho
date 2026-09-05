@@ -943,7 +943,10 @@ fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
         // a host-loopback apiserver by any cluster address, and even on Linux
         // engenho installs no kube-proxy datapath for the VIP — so the
         // gateway is correct on both, and the VIP is correct on neither.
-        CfgBackendKind::Podman => ApiserverReachability::HostGateway {
+        // Both podman backends drive the same container store, so pods reach
+        // the apiserver by the same route regardless of how the kubelet talks
+        // to podman. The seam that changed is client-side only.
+        CfgBackendKind::PodmanApi | CfgBackendKind::Podman => ApiserverReachability::HostGateway {
             host: PODMAN_HOST_GATEWAY.to_string(),
             port,
         },
@@ -959,6 +962,7 @@ fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
 
 fn build_backend(config: &EngenhoConfig) -> Arc<dyn ContainerRuntime> {
     let kind = match config.runtime.kubelet_backend {
+        CfgBackendKind::PodmanApi => KubeletBackendKind::PodmanApi,
         CfgBackendKind::Podman => KubeletBackendKind::Podman,
         CfgBackendKind::Fake => KubeletBackendKind::Fake,
     };

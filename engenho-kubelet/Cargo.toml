@@ -26,6 +26,12 @@ tokio              = { workspace = true }
 tracing            = { workspace = true }
 anyhow             = { workspace = true }
 reqwest            = { workspace = true }
+# The naturalized podman seam: HTTP/1.1 over a unix socket, pure Rust.
+# No connector crate — `handshake` takes any async stream, so a
+# `UnixStream` needs only TokioIo to adapt it.
+hyper              = { workspace = true }
+hyper-util         = { workspace = true }
+http-body-util     = { workspace = true }
 # Secret volume values are base64-encoded per K8s; decode them before
 # writing the materialized files. Same 0.22 line the apiserver + kube-client
 # already pin (single closure).
