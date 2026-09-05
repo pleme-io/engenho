@@ -176,6 +176,34 @@ in
         enabled = optional types.bool "Serve the apiserver over TLS.";
         autoGenerate = optional types.bool
           "Generate and persist a cluster CA at boot when absent.";
+        extraSans = optional (types.listOf types.str) ''
+          Additional Subject Alternative Names for the serving certificate, as
+          plain host strings — no scheme, no port.
+
+          engenho derives the SANs it can KNOW: `localhost`, `kubernetes`,
+          `kubernetes.default`, the container host gateway, this node's name,
+          and the concrete listen IP. That set answers for the NODE. It cannot
+          answer for the names the cluster is REACHED BY — a tailnet address, a
+          LAN alias, a `*.quero.cloud` record, a VIP in front of several
+          apiservers — because those are facts about the deployment, and this is
+          where the deployment states them.
+
+          Two properties worth knowing before leaving it unset. Binding
+          `0.0.0.0` yields NO listen-IP SAN at all (an unspecified address is not
+          a valid SAN), so on a node reached by address rather than by name this
+          list is the only thing naming it. And the PKI is generated once and
+          reloaded thereafter, so adding a name later means deleting
+          `<dataDir>/pki/` — the cheap moment to get this right is the first
+          boot.
+
+          Anything parsing as an IP address becomes an IP SAN; everything else
+          becomes a DNS SAN, the rule `kubeadm`'s `certSANs` uses. Entries that
+          duplicate a derived SAN collapse rather than erroring, so listing a
+          name without first checking whether it is automatic is safe. A
+          malformed entry — a URL, a `host:port`, embedded whitespace — fails the
+          daemon at start with the offending value named, rather than producing a
+          certificate that serves happily and verifies for nobody.
+        '';
       };
     };
 
@@ -305,6 +333,7 @@ in
         tls = {
           enabled = cfg.runtime.tls.enabled;
           auto_generate = cfg.runtime.tls.autoGenerate;
+          extra_sans = cfg.runtime.tls.extraSans;
         };
       };
       scheduler = {

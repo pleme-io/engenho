@@ -14,10 +14,18 @@
 //!   * **The apiserver server cert.** Issued FROM the CA on EVERY boot
 //!     (cheap; it need not persist, only the CA must). `CN=engenho-apiserver`,
 //!     EKU `serverAuth`, with SANs covering `localhost` / `kubernetes` /
-//!     `kubernetes.default` / the node name / `127.0.0.1` / the configured
-//!     listen IP. kubectl validates the presented server cert against the
-//!     SAN list, so a missing `127.0.0.1` SAN = handshake failure for a
-//!     loopback kubeconfig.
+//!     `kubernetes.default` / the container host gateway / the node name /
+//!     `127.0.0.1` / the configured listen IP, PLUS whatever
+//!     `runtime.tls.extra_sans` declares. kubectl validates the presented
+//!     server cert against the SAN list, so a missing `127.0.0.1` SAN =
+//!     handshake failure for a loopback kubeconfig.
+//!
+//!     The derived half answers for the NODE; the declared half answers for
+//!     the names the cluster is REACHED BY — a tailnet address, a LAN alias,
+//!     a VIP — which are facts about the deployment rather than the process.
+//!     Note that binding `0.0.0.0` contributes NO listen-IP SAN (an
+//!     unspecified address is not a valid SAN), so on a node reached by
+//!     address the declared list is the only thing naming it.
 //!
 //! NO SHELL — pure rcgen, no `openssl` subprocess. Errors are typed
 //! [`PkiError`]; nothing here panics or returns a placeholder Ok.
@@ -209,6 +217,112 @@ pub struct ServerSanInputs<'a> {
     pub node_name: &'a str,
     /// The concrete listen IP, if `listen_addr` resolved to one.
     pub listen_ip: Option<IpAddr>,
+    /// Operator-declared additional SANs, in config order.
+    ///
+    /// The derived set — loopback, `kubernetes`, the container host gateway,
+    /// the node name, the listen IP — answers only for the node itself. It
+    /// cannot answer for the names a cluster is reached BY: a tailnet name, a
+    /// LAN alias, a `*.quero.cloud` record, a load-balancer VIP. Those are
+    /// facts about the deployment, so the deployment declares them.
+    ///
+    /// Already typed by the time they arrive: [`SanEntry`] has done the
+    /// IP-versus-DNS decision, so this list cannot carry a string that turns
+    /// out not to be a SAN at issuance time.
+    pub extra_sans: &'a [SanEntry],
+}
+
+/// One operator-declared Subject Alternative Name, after classification.
+///
+/// A SAN is either an IP address or a DNS name and the encodings are not
+/// interchangeable: a certificate carrying `10.0.0.1` as a *DNS* SAN verifies
+/// against nothing, because a client connecting to that address checks the IP
+/// list. Rather than ask an operator to say which kind each entry is — a second
+/// field to get wrong, and one whose right answer is always derivable — the
+/// string is parsed: anything that parses as an IP address is an IP SAN, and
+/// everything else is a DNS name. This matches how `kubeadm`'s `certSANs`
+/// behaves, so an operator's existing intuition transfers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SanEntry {
+    /// A DNS name, e.g. `plo.tail1234.ts.net`.
+    Dns(String),
+    /// An IP address, e.g. `100.64.0.1`.
+    Ip(IpAddr),
+}
+
+impl std::fmt::Display for SanEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dns(name) => f.write_str(name),
+            Self::Ip(ip) => write!(f, "{ip}"),
+        }
+    }
+}
+
+impl std::str::FromStr for SanEntry {
+    type Err = SanParseError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(SanParseError::Empty);
+        }
+        // The three mistakes worth naming rather than encoding verbatim into a
+        // certificate nobody will think to inspect. Each produces a cert that
+        // builds, serves, and silently fails to verify for the address the
+        // operator believed they had covered.
+        if value.contains("://") {
+            return Err(SanParseError::HasScheme {
+                value: value.to_string(),
+            });
+        }
+        if value.chars().any(char::is_whitespace) {
+            return Err(SanParseError::HasWhitespace {
+                value: value.to_string(),
+            });
+        }
+        if let Ok(ip) = value.parse::<IpAddr>() {
+            return Ok(Self::Ip(ip));
+        }
+        // A bare `host:port` is the other common paste. An IPv6 literal has
+        // colons legitimately, but it would have parsed as an IP above, so any
+        // colon still here is a port.
+        if value.contains(':') {
+            return Err(SanParseError::HasPort {
+                value: value.to_string(),
+            });
+        }
+        Ok(Self::Dns(value.to_string()))
+    }
+}
+
+/// Why a declared SAN string is not a SAN.
+///
+/// Separate from [`PkiError`] because these are rejected when configuration is
+/// read, long before any certificate is issued — the point of the split is that
+/// a typo in a config file never reaches cert issuance.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SanParseError {
+    /// The entry was empty or whitespace only.
+    #[error("a SAN entry is empty")]
+    Empty,
+    /// A URL was given where a name was wanted.
+    #[error("SAN {value:?} looks like a URL — give the host alone, with no scheme")]
+    HasScheme {
+        /// The offending entry.
+        value: String,
+    },
+    /// The entry contains whitespace.
+    #[error("SAN {value:?} contains whitespace")]
+    HasWhitespace {
+        /// The offending entry.
+        value: String,
+    },
+    /// A `host:port` was given where a host was wanted.
+    #[error("SAN {value:?} carries a port — a certificate names hosts, not ports")]
+    HasPort {
+        /// The offending entry.
+        value: String,
+    },
 }
 
 /// Generate-or-load the cluster CA rooted at `data_dir/pki/`.
@@ -529,6 +643,17 @@ fn build_sans(san: &ServerSanInputs<'_>) -> Result<Vec<SanType>, PkiError> {
     if !san.node_name.is_empty() && !dns_names.contains(&san.node_name) {
         dns_names.push(san.node_name);
     }
+    // Operator-declared DNS SANs, deduped against the derived ones. Declaring a
+    // name the runtime already derives is not an error — it is the natural thing
+    // to write when you do not know which names are automatic — so it collapses
+    // rather than producing a certificate with the same name listed twice.
+    for entry in san.extra_sans {
+        if let SanEntry::Dns(name) = entry
+            && !dns_names.contains(&name.as_str())
+        {
+            dns_names.push(name.as_str());
+        }
+    }
     for name in dns_names {
         let ia5 = name.try_into().map_err(|source| PkiError::San {
             value: name.to_string(),
@@ -541,11 +666,24 @@ fn build_sans(san: &ServerSanInputs<'_>) -> Result<Vec<SanType>, PkiError> {
     // kubeconfig). The concrete listen IP is added when it isn't loopback
     // (avoids a duplicate) and isn't unspecified (filtered by the caller).
     let loopback: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-    sans.push(SanType::IpAddress(loopback));
-    if let Some(ip) = san.listen_ip {
-        if ip != loopback {
-            sans.push(SanType::IpAddress(ip));
+    let mut ips: Vec<IpAddr> = vec![loopback];
+    if let Some(ip) = san.listen_ip
+        && !ips.contains(&ip)
+    {
+        ips.push(ip);
+    }
+    // Declared IP SANs, deduped the same way. A tailnet address or a VIP the
+    // apiserver does not itself bind belongs here: the cert must name every
+    // address a client dials, not only the one the socket sits on.
+    for entry in san.extra_sans {
+        if let SanEntry::Ip(ip) = entry
+            && !ips.contains(ip)
+        {
+            ips.push(*ip);
         }
+    }
+    for ip in ips {
+        sans.push(SanType::IpAddress(ip));
     }
 
     Ok(sans)
@@ -622,7 +760,11 @@ mod tests {
     /// fault. Measured 2026-09-01 — the routing fix alone was not enough.
     #[test]
     fn the_serving_cert_names_the_container_host_gateway_pods_are_told_to_dial() {
-        let san = ServerSanInputs { node_name: "ryn", listen_ip: None };
+        let san = ServerSanInputs {
+            node_name: "ryn",
+            listen_ip: None,
+            extra_sans: &[],
+        };
         let sans = super::build_sans(&san).expect("build_sans");
         assert!(
             sans.iter().any(|s| matches!(
@@ -641,7 +783,8 @@ mod tests {
     #[test]
     fn the_gateway_san_matches_the_runtime_constant_value() {
         assert_eq!(
-            super::CONTAINER_HOST_GATEWAY_SAN, "host.containers.internal",
+            super::CONTAINER_HOST_GATEWAY_SAN,
+            "host.containers.internal",
             "engenho_runtime::PODMAN_HOST_GATEWAY carries the same literal; \
              changing one alone breaks in-cluster auth"
         );
@@ -692,6 +835,7 @@ mod tests {
         let san = ServerSanInputs {
             node_name: "engenho-local",
             listen_ip: None,
+            extra_sans: &[],
         };
         let s1 = issue_server_material(&ca1, &san).unwrap();
         let s2 = issue_server_material(&ca2, &san).unwrap();
@@ -800,6 +944,7 @@ mod tests {
             &ServerSanInputs {
                 node_name: "engenho-node",
                 listen_ip: Some(listen_ip),
+                extra_sans: &[],
             },
         )
         .unwrap();
@@ -851,6 +996,7 @@ mod tests {
             &ServerSanInputs {
                 node_name: "n",
                 listen_ip: None,
+                extra_sans: &[],
             },
         )
         .unwrap();
@@ -992,5 +1138,166 @@ mod tests {
 
     fn is_ip(s: &SanType, ip: IpAddr) -> bool {
         matches!(s, SanType::IpAddress(got) if *got == ip)
+    }
+
+    // ── Operator-declared SANs ────────────────────────────────────────────
+    //
+    // The derived set answers for the NODE. These prove it can be made to
+    // answer for the names the cluster is REACHED BY, which is a fact about
+    // the deployment that the runtime cannot know.
+
+    #[test]
+    fn a_declared_dns_name_reaches_the_certificate() {
+        let extra = vec![SanEntry::Dns("plo.natal.quero.cloud".to_string())];
+        let san = ServerSanInputs {
+            node_name: "plo",
+            listen_ip: None,
+            extra_sans: &extra,
+        };
+        let sans = super::build_sans(&san).expect("build_sans");
+        assert!(
+            sans.iter().any(|s| matches!(
+                s,
+                SanType::DnsName(n) if n.as_str() == "plo.natal.quero.cloud"
+            )),
+            "a declared DNS SAN must appear in the serving cert; without it a \
+             client dialing that name gets a verification failure that reads \
+             like a bad kubeconfig"
+        );
+    }
+
+    #[test]
+    fn a_declared_ip_reaches_the_certificate_even_when_nothing_binds_it() {
+        // The case the field exists for: a tailnet address the apiserver does
+        // NOT bind (it binds 0.0.0.0, which is not a usable SAN) but which
+        // every remote client dials.
+        let tailnet: IpAddr = "100.64.0.7".parse().unwrap();
+        let extra = vec![SanEntry::Ip(tailnet)];
+        let san = ServerSanInputs {
+            node_name: "plo",
+            listen_ip: None,
+            extra_sans: &extra,
+        };
+        let sans = super::build_sans(&san).expect("build_sans");
+        assert!(
+            sans.iter()
+                .any(|s| matches!(s, SanType::IpAddress(ip) if *ip == tailnet)),
+            "a declared IP SAN must appear even though listen_ip is None — \
+             binding 0.0.0.0 yields no listen_ip, and that is exactly when a \
+             declared address is the only thing naming the reachable one"
+        );
+    }
+
+    #[test]
+    fn declaring_a_name_the_runtime_already_derives_does_not_duplicate_it() {
+        // An operator listing every name they can think of is the expected
+        // usage; they should not have to first learn which are automatic.
+        let extra = vec![
+            SanEntry::Dns("localhost".to_string()),
+            SanEntry::Dns("plo".to_string()),
+            SanEntry::Ip("127.0.0.1".parse().unwrap()),
+        ];
+        let san = ServerSanInputs {
+            node_name: "plo",
+            listen_ip: None,
+            extra_sans: &extra,
+        };
+        let sans = super::build_sans(&san).expect("build_sans");
+        let count = |want: &str| {
+            sans.iter()
+                .filter(|s| match s {
+                    SanType::DnsName(n) => n.as_str() == want,
+                    SanType::IpAddress(ip) => ip.to_string() == want,
+                    _ => false,
+                })
+                .count()
+        };
+        assert_eq!(count("localhost"), 1, "localhost duplicated");
+        assert_eq!(count("plo"), 1, "the node name duplicated");
+        assert_eq!(count("127.0.0.1"), 1, "loopback duplicated");
+    }
+
+    #[test]
+    fn an_empty_declaration_leaves_the_derived_set_exactly_as_it_was() {
+        // The regression guard for every existing deployment: adding this
+        // field must not perturb a cert issued without it.
+        let with = ServerSanInputs {
+            node_name: "plo",
+            listen_ip: None,
+            extra_sans: &[],
+        };
+        let sans = super::build_sans(&with).expect("build_sans");
+        let dns: Vec<String> = sans
+            .iter()
+            .filter_map(|s| match s {
+                SanType::DnsName(n) => Some(n.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dns,
+            vec![
+                "localhost".to_string(),
+                "kubernetes".to_string(),
+                "kubernetes.default".to_string(),
+                super::CONTAINER_HOST_GATEWAY_SAN.to_string(),
+                "plo".to_string(),
+            ],
+            "the derived DNS SAN set and its ORDER must be unchanged by the \
+             introduction of extra_sans"
+        );
+    }
+
+    // ── Classification, and the four mistakes it refuses ──────────────────
+
+    #[test]
+    fn an_address_is_classified_as_an_ip_and_a_name_as_dns() {
+        // The whole reason the operator does not declare which kind an entry
+        // is: the answer is always derivable, and a wrong answer produces a
+        // cert that verifies for nothing.
+        assert_eq!(
+            "100.64.0.7".parse::<SanEntry>().unwrap(),
+            SanEntry::Ip("100.64.0.7".parse().unwrap())
+        );
+        assert_eq!(
+            "::1".parse::<SanEntry>().unwrap(),
+            SanEntry::Ip("::1".parse().unwrap()),
+            "an IPv6 literal is an IP SAN, not a DNS name with colons in it"
+        );
+        assert_eq!(
+            "plo.tail1234.ts.net".parse::<SanEntry>().unwrap(),
+            SanEntry::Dns("plo.tail1234.ts.net".to_string())
+        );
+    }
+
+    #[test]
+    fn the_four_pastes_that_would_silently_produce_a_useless_cert_are_refused() {
+        // Each of these is a plausible thing to copy out of a kubeconfig or a
+        // browser bar, and each would be encoded verbatim as a DNS SAN that
+        // matches no connection anyone ever makes.
+        assert_eq!("".parse::<SanEntry>(), Err(SanParseError::Empty));
+        assert_eq!("   ".parse::<SanEntry>(), Err(SanParseError::Empty));
+        assert!(matches!(
+            "https://plo:6443".parse::<SanEntry>(),
+            Err(SanParseError::HasScheme { .. })
+        ));
+        assert!(matches!(
+            "plo:6443".parse::<SanEntry>(),
+            Err(SanParseError::HasPort { .. })
+        ));
+        assert!(matches!(
+            "plo natal".parse::<SanEntry>(),
+            Err(SanParseError::HasWhitespace { .. })
+        ));
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_rather_than_refused() {
+        // YAML list items pick up spaces; that is a formatting artifact, not
+        // an operator error, and refusing it would be hostile.
+        assert_eq!(
+            "  plo.quero.cloud  ".parse::<SanEntry>().unwrap(),
+            SanEntry::Dns("plo.quero.cloud".to_string())
+        );
     }
 }

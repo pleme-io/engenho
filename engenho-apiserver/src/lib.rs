@@ -78,9 +78,9 @@ pub use params::{
     status_410_line, to_k8s_watch_line,
 };
 pub use pki::{
-    ClientMaterial, ClusterCa, PkiError, ServerSanInputs, TlsMaterial, VerifiedClientCert,
-    client_verifier, issue_admin_client_material, issue_server_material, load_or_generate_ca,
-    parse_client_cert,
+    ClientMaterial, ClusterCa, PkiError, SanEntry, SanParseError, ServerSanInputs, TlsMaterial,
+    VerifiedClientCert, client_verifier, issue_admin_client_material, issue_server_material,
+    load_or_generate_ca, parse_client_cert,
 };
 pub use pod_logs::{LogQuery, PodLogReader};
 pub use router::{RouterState, build};

@@ -56,6 +56,7 @@ async fn boot_authn_server(
         &ServerSanInputs {
             node_name: "engenho-node",
             listen_ip: None,
+            extra_sans: &[],
         },
     )
     .unwrap()

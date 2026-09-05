@@ -47,6 +47,7 @@ async fn boot_tls_server() -> (String, String, ApiServer, tempfile::TempDir) {
         &ServerSanInputs {
             node_name: "engenho-node",
             listen_ip: None,
+            extra_sans: &[],
         },
     )
     .unwrap();
