@@ -161,6 +161,17 @@ impl Runtime {
         let tls: Option<TlsMaterial> = if config.runtime.tls.enabled {
             let ca = load_or_generate_ca(&config.runtime.data_dir)
                 .map_err(|e| RuntimeError::Server(e.into()))?;
+            // ── ★ A PUBLIC CA MAY NOT SERVE A REACHABLE ADDRESS ──────────
+            // See `RuntimeError::PublicCaOnReachableAddress`. The danger is not
+            // the CA by itself and not the address by itself; it is the pair,
+            // so the pair is what is refused. A pre-seed cluster stays usable on
+            // loopback and cannot be exposed by accident.
+            if ca.is_publicly_derivable() && !is_loopback_only(listen_addr) {
+                return Err(RuntimeError::PublicCaOnReachableAddress {
+                    listen_addr: config.runtime.listen_addr.clone(),
+                    pki_dir: config.runtime.data_dir.join("pki").display().to_string(),
+                });
+            }
             ca_cert_pem = Some(ca.cert_pem().to_string());
             let listen_ip = san_listen_ip(listen_addr);
             // Classify the operator's declared SANs before anything binds, so a
@@ -1710,6 +1721,17 @@ fn advertised_server_url(config: &EngenhoConfig, bound: SocketAddr) -> Option<St
     }
 }
 
+/// Whether this bind address can only be reached from the host itself.
+///
+/// `0.0.0.0` and `::` are UNSPECIFIED, not loopback: they bind every interface,
+/// which is the most reachable address there is. Treating them as "no specific
+/// address, therefore safe" is the inversion this function exists to prevent —
+/// and it is an easy one to write, because `is_loopback()` returns false for
+/// them and a careless guard reads that as "not remote".
+fn is_loopback_only(addr: SocketAddr) -> bool {
+    addr.ip().is_loopback()
+}
+
 /// Classify every operator-declared SAN string, failing on the first bad one.
 ///
 /// Fails rather than skipping. A skipped SAN produces exactly the certificate
@@ -3135,5 +3157,43 @@ mod advertised_address {
             advertised_server_url(&config_with("[fd00::1]:6443", &[]), bound()).as_deref(),
             Some("https://[fd00::1]:6443")
         );
+    }
+}
+
+/// The pairing that decides whether a public CA is harmless or fatal.
+#[cfg(test)]
+mod public_ca_guard {
+    use super::is_loopback_only;
+
+    #[test]
+    fn loopback_is_the_only_safe_address() {
+        for addr in ["127.0.0.1:6443", "127.0.0.53:6443", "[::1]:6443"] {
+            assert!(
+                is_loopback_only(addr.parse().unwrap()),
+                "{addr} is loopback and a pre-seed cluster stays usable on it"
+            );
+        }
+    }
+
+    #[test]
+    fn unspecified_addresses_are_the_most_reachable_not_the_least() {
+        // ★ The inversion this guard exists to prevent. `0.0.0.0` binds EVERY
+        // interface, so it is maximally reachable — but `is_loopback()` returns
+        // false for it and a careless guard reads that as "no specific address,
+        // therefore nothing can reach it". Getting this backwards would let the
+        // one case that most needs refusing sail through.
+        for addr in ["0.0.0.0:6443", "[::]:6443"] {
+            assert!(
+                !is_loopback_only(addr.parse().unwrap()),
+                "{addr} binds every interface and must NOT count as loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn routable_addresses_are_not_loopback() {
+        for addr in ["100.91.10.110:6443", "192.168.50.3:6443", "[fd00::1]:6443"] {
+            assert!(!is_loopback_only(addr.parse().unwrap()), "{addr}");
+        }
     }
 }

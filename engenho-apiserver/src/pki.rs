@@ -83,6 +83,14 @@ pub enum PkiError {
     /// the PKCS#8 encode step. Should never happen for a valid 32-byte seed.
     #[error("deterministic key derivation error: {0}")]
     DeterministicKey(#[from] ed25519_dalek::pkcs8::Error),
+
+    /// The OS declined to supply randomness for a new cluster seed.
+    ///
+    /// Fatal on purpose. The alternative — falling back to a fixed value — is
+    /// precisely the defect the seed exists to remove, and it would reintroduce
+    /// it silently on exactly the machines where entropy is scarce.
+    #[error("could not obtain entropy for the cluster PKI seed: {0}")]
+    Entropy(String),
 }
 
 engenho_substrate::impl_error_kind! {
@@ -90,6 +98,7 @@ engenho_substrate::impl_error_kind! {
         { Io { .. } } => "io",
         (Crypto(_)) => "crypto",
         { San { .. } } => "san",
+        (Entropy(_)) => "entropy",
         (ClientVerifier(_)) => "client_verifier",
         (DeterministicKey(_)) => "deterministic_key",
     }
@@ -101,20 +110,120 @@ const CTX_CA: &str = "engenho cluster-ca v1";
 const CTX_SERVER: &str = "engenho apiserver-cert v1";
 const CTX_CLIENT: &str = "engenho admin-client-cert v1";
 
-/// The base key material every role-seed is derived from. For a LOCAL
-/// single-node engenho this is a fixed constant, so a fresh cluster's CA /
-/// kubeconfig is byte-identical (the operator's "a new engenho can't result in
-/// a different kubectl configuration"). An EXPOSED cluster MUST mix in a
-/// per-cluster secret here (a cofre value) so the admin key isn't derivable
-/// from public knowledge — tracked as a follow-up.
-const PKI_BASE: &[u8] = b"engenho deterministic cluster identity v1";
+/// Filename of the per-cluster PKI seed inside `data_dir/pki/`.
+const CLUSTER_SEED_FILE: &str = "cluster-seed";
 
-/// A deterministic ed25519 [`KeyPair`] for a PKI role. The seed is
-/// `BLAKE3::derive_key(ctx, PKI_BASE)`, so the same role always yields the same
-/// key — hence a byte-identical CA / server / client cert (and kubeconfig)
-/// across fresh boots, replacing rcgen's random `KeyPair::generate`.
-fn deterministic_keypair(ctx: &str) -> Result<KeyPair, PkiError> {
-    let seed = blake3::derive_key(ctx, PKI_BASE);
+/// The seed every engenho cluster used to derive its keys from.
+///
+/// ── ★ KEPT SOLELY TO DETECT ITS OWN VICTIMS ────────────────────────────────
+/// This literal shipped in a PUBLIC repository, and every role key was
+/// `blake3::derive_key(ctx, LEGACY_PKI_BASE)`. Any cluster whose `pki/` was
+/// created before the per-cluster seed therefore holds a CA private key — and
+/// an `O=system:masters` admin client key — that anyone can reproduce from
+/// source.
+///
+/// Replacing the derivation does NOT rescue those clusters: their `ca.key` is
+/// already on disk and is still loaded on every boot, so the compromise
+/// survives the fix. The only remedy is regenerating the PKI, which an operator
+/// has to be TOLD about, because nothing else about such a cluster looks wrong.
+///
+/// So the constant stays, used for exactly one thing: recognising a CA that was
+/// born public. See [`ClusterCa::is_publicly_derivable`]. Never derive from it.
+const LEGACY_PKI_BASE: &[u8] = b"engenho deterministic cluster identity v1";
+
+/// Bytes of entropy in a cluster seed. 32 matches the ed25519 seed width, so
+/// the derivation neither stretches nor truncates it.
+const CLUSTER_SEED_LEN: usize = 32;
+
+/// This cluster's secret PKI root — random, generated once, persisted 0600.
+///
+/// ── ★ WHY THIS IS RANDOM AND NOT A CONSTANT ────────────────────────────────
+/// It used to be a constant: `PKI_BASE = b"engenho deterministic cluster
+/// identity v1"`, a literal in a PUBLIC repository, from which every role key
+/// was derived by `blake3::derive_key(ctx, PKI_BASE)`.
+///
+/// That made the CA private key and the `CN=engenho-admin, O=system:masters`
+/// ADMIN CLIENT key byte-identical on every engenho cluster in existence, and
+/// reproducible by anyone who can read the source. Any party able to reach the
+/// apiserver port could mint a client certificate for the Kubernetes super-user
+/// group and be admitted, because the CA that signs it is public knowledge.
+///
+/// It was harmless only because of where engenho ran: bound to `127.0.0.1` on a
+/// workstation, nothing but a local process could reach it. The property is
+/// invisible in that posture and total the instant the listener moves — a
+/// tailnet address, a LAN interface, a port-forward — and it fails OPEN, with
+/// no error, no log and no failed handshake to notice. The old comment named
+/// exactly this ("an EXPOSED cluster MUST mix in a per-cluster secret… tracked
+/// as a follow-up"); this is that follow-up, landed before the listener moved
+/// rather than after.
+///
+/// What determinism was actually buying is preserved. The operator's property —
+/// "a new engenho can't result in a different kubectl configuration" — is about
+/// stability across RESTARTS, and that already comes from persistence: the CA is
+/// written to `data_dir/pki/` and reloaded, and the seed is persisted beside it,
+/// so every certificate is byte-identical boot after boot. Only the *cross
+/// machine* coincidence is gone, and that coincidence was the vulnerability: two
+/// unrelated clusters sharing an admin key is not a feature.
+///
+/// # Errors
+///
+/// [`PkiError::Io`] if the directory cannot be created, or the seed cannot be
+/// read or written; [`PkiError::Entropy`] if the OS declines to supply
+/// randomness. Never falls back to a fixed value — a predictable seed is the
+/// defect this exists to remove, so failing to get entropy must fail loudly.
+fn load_or_generate_cluster_seed(data_dir: &Path) -> Result<[u8; CLUSTER_SEED_LEN], PkiError> {
+    let pki_dir = data_dir.join("pki");
+    let seed_path = pki_dir.join(CLUSTER_SEED_FILE);
+
+    if seed_path.exists() {
+        let bytes = std::fs::read(&seed_path).map_err(|source| PkiError::Io {
+            path: seed_path.clone(),
+            source,
+        })?;
+        // A short or truncated seed is refused rather than padded. Padding
+        // would silently reduce the entropy this whole mechanism exists to
+        // supply, and would do it on a path nobody looks at again.
+        return <[u8; CLUSTER_SEED_LEN]>::try_from(bytes.as_slice()).map_err(|_| PkiError::Io {
+            path: seed_path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "cluster seed must be exactly {CLUSTER_SEED_LEN} bytes, found {}",
+                    bytes.len()
+                ),
+            ),
+        });
+    }
+
+    let mut seed = [0u8; CLUSTER_SEED_LEN];
+    getrandom::getrandom(&mut seed).map_err(|e| PkiError::Entropy(e.to_string()))?;
+
+    create_dir_all_mode(&pki_dir, 0o700)?;
+    write_bytes_mode(&seed_path, &seed, 0o600)?;
+    Ok(seed)
+}
+
+/// The key a pre-seed engenho would have derived for `ctx`.
+///
+/// Detection only — see [`LEGACY_PKI_BASE`]. Nothing in the issuing path calls
+/// this, and nothing should: its whole purpose is to recognise a key that must
+/// be replaced.
+fn legacy_public_keypair(ctx: &str) -> Result<KeyPair, PkiError> {
+    let seed = blake3::derive_key(ctx, LEGACY_PKI_BASE);
+    let signing = SigningKey::from_bytes(&seed);
+    let der = signing.to_pkcs8_der()?;
+    let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(der.as_bytes().to_vec());
+    Ok(KeyPair::try_from(&pkcs8)?)
+}
+
+/// An ed25519 [`KeyPair`] for a PKI role, derived from THIS cluster's seed.
+///
+/// Deterministic given the seed, which is what makes every certificate stable
+/// across restarts; unpredictable across clusters, because the seed is random
+/// and secret. Both halves matter: the first is the operator convenience, the
+/// second is the reason the admin key is not public knowledge.
+fn cluster_keypair(ctx: &str, cluster_seed: &[u8; CLUSTER_SEED_LEN]) -> Result<KeyPair, PkiError> {
+    let seed = blake3::derive_key(ctx, cluster_seed);
     let signing = SigningKey::from_bytes(&seed);
     let der = signing.to_pkcs8_der()?;
     let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(der.as_bytes().to_vec());
@@ -141,6 +250,14 @@ pub struct ClusterCa {
     /// The persisted CA certificate PEM — the bytes that go into a
     /// kubeconfig's `certificate-authority-data`.
     ca_cert_pem: String,
+    /// This cluster's secret PKI seed.
+    ///
+    /// Carried BY the CA rather than passed alongside it, so issuing server or
+    /// admin material for a cluster requires holding that cluster's secret —
+    /// there is no signature that takes a CA and derives a key from somewhere
+    /// else. That is what makes the old failure mode (every cluster sharing one
+    /// publicly-derivable admin key) unconstructible rather than merely fixed.
+    cluster_seed: [u8; CLUSTER_SEED_LEN],
 }
 
 impl ClusterCa {
@@ -148,6 +265,30 @@ impl ClusterCa {
     #[must_use]
     pub fn cert_pem(&self) -> &str {
         &self.ca_cert_pem
+    }
+
+    /// Whether this CA's private key is reproducible from public source.
+    ///
+    /// True for any cluster whose `pki/` predates the per-cluster seed: its
+    /// `ca.key` was derived from [`LEGACY_PKI_BASE`], a literal in a public
+    /// repository, so anyone can reconstruct it and mint an
+    /// `O=system:masters` client certificate this cluster will accept.
+    ///
+    /// Loading such a CA is not itself an error — on a loopback-only apiserver
+    /// nothing can reach it, and refusing to start would break working local
+    /// clusters for a risk they do not carry. It becomes fatal only when the
+    /// listener is reachable, which is the check the runtime performs. The
+    /// remedy is to delete `<data_dir>/pki/` and let it regenerate.
+    #[must_use]
+    pub fn is_publicly_derivable(&self) -> bool {
+        let Ok(legacy) = legacy_public_keypair(CTX_CA) else {
+            // If the legacy key cannot be derived we cannot prove this CA is
+            // public — and must not claim it is private either. Report false
+            // and let the caller's other guards stand; the alternative is
+            // failing every cluster on an unrelated crypto error.
+            return false;
+        };
+        self.key.serialize_pem() == legacy.serialize_pem()
     }
 
     /// Reconstruct an issuer [`rcgen::Certificate`] from the CA params +
@@ -342,15 +483,23 @@ pub fn load_or_generate_ca(data_dir: &Path) -> Result<ClusterCa, PkiError> {
     let ca_cert_path = pki_dir.join("ca.crt");
     let ca_key_path = pki_dir.join("ca.key");
 
+    // One seed per cluster, read (or minted) before either branch, because both
+    // need it: a loaded CA still issues server and admin leaves from it.
+    let cluster_seed = load_or_generate_cluster_seed(data_dir)?;
+
     if ca_cert_path.exists() && ca_key_path.exists() {
-        load_ca(&ca_cert_path, &ca_key_path)
+        load_ca(&ca_cert_path, &ca_key_path, cluster_seed)
     } else {
-        generate_and_persist_ca(&pki_dir, &ca_cert_path, &ca_key_path)
+        generate_and_persist_ca(&pki_dir, &ca_cert_path, &ca_key_path, cluster_seed)
     }
 }
 
 /// Load an existing CA from its persisted `ca.crt` + `ca.key` PEM.
-fn load_ca(ca_cert_path: &Path, ca_key_path: &Path) -> Result<ClusterCa, PkiError> {
+fn load_ca(
+    ca_cert_path: &Path,
+    ca_key_path: &Path,
+    cluster_seed: [u8; CLUSTER_SEED_LEN],
+) -> Result<ClusterCa, PkiError> {
     let ca_cert_pem = read_to_string(ca_cert_path)?;
     let ca_key_pem = read_to_string(ca_key_path)?;
     let key = KeyPair::from_pem(&ca_key_pem)?;
@@ -359,6 +508,7 @@ fn load_ca(ca_cert_path: &Path, ca_key_path: &Path) -> Result<ClusterCa, PkiErro
         params,
         key,
         ca_cert_pem,
+        cluster_seed,
     })
 }
 
@@ -367,6 +517,7 @@ fn generate_and_persist_ca(
     pki_dir: &Path,
     ca_cert_path: &Path,
     ca_key_path: &Path,
+    cluster_seed: [u8; CLUSTER_SEED_LEN],
 ) -> Result<ClusterCa, PkiError> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -380,7 +531,7 @@ fn generate_and_persist_ca(
     // after the key + validity, so the CA cert is fully deterministic.
     params.serial_number = Some(SerialNumber::from(1u64));
 
-    let key = deterministic_keypair(CTX_CA)?;
+    let key = cluster_keypair(CTX_CA, &cluster_seed)?;
     let cert = params.clone().self_signed(&key)?;
     let ca_cert_pem = cert.pem();
     let ca_key_pem = key.serialize_pem();
@@ -394,6 +545,7 @@ fn generate_and_persist_ca(
         params,
         key,
         ca_cert_pem,
+        cluster_seed,
     })
 }
 
@@ -426,7 +578,7 @@ pub fn issue_server_material(
     params.subject_alt_names = build_sans(san)?;
     params.serial_number = Some(SerialNumber::from(2u64));
 
-    let leaf_key = deterministic_keypair(CTX_SERVER)?;
+    let leaf_key = cluster_keypair(CTX_SERVER, &ca.cluster_seed)?;
     let issuer = ca.issuer()?;
     let leaf_cert = params.signed_by(&leaf_key, &issuer, &ca.key)?;
 
@@ -495,7 +647,7 @@ pub fn issue_admin_client_material(ca: &ClusterCa) -> Result<ClientMaterial, Pki
     // No SANs: a client cert is identified by its Subject, not a SAN.
     params.serial_number = Some(SerialNumber::from(3u64));
 
-    let leaf_key = deterministic_keypair(CTX_CLIENT)?;
+    let leaf_key = cluster_keypair(CTX_CLIENT, &ca.cluster_seed)?;
     let issuer = ca.issuer()?;
     let leaf_cert = params.signed_by(&leaf_key, &issuer, &ca.key)?;
 
@@ -724,6 +876,20 @@ fn create_dir_all_mode(dir: &Path, mode: u32) -> Result<(), PkiError> {
     set_mode(dir, mode)
 }
 
+/// Write raw secret bytes at `mode`.
+///
+/// A sibling of [`write_pem`] rather than a reuse of it: the cluster seed is
+/// RAW ENTROPY, not text, and routing it through a `&str` API would invite a
+/// future caller to hexify or trim it. The bytes on disk are exactly the bytes
+/// derived from.
+fn write_bytes_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), PkiError> {
+    std::fs::write(path, bytes).map_err(|source| PkiError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    set_mode(path, mode)
+}
+
 fn write_pem(path: &Path, pem: &str, mode: u32) -> Result<(), PkiError> {
     std::fs::write(path, pem.as_bytes()).map_err(|source| PkiError::Io {
         path: path.to_path_buf(),
@@ -819,51 +985,155 @@ mod tests {
     }
 
     #[test]
-    fn pki_is_deterministic_across_fresh_clusters() {
-        // Two brand-new clusters (separate data dirs) must produce a
-        // BYTE-IDENTICAL CA + server cert + admin client cert — so a fresh
-        // engenho yields the same kubeconfig ("a new engenho can't result in
-        // a different kubectl configuration").
+    fn two_clusters_do_not_share_a_certificate_authority() {
+        // ★ THIS TEST WAS INVERTED, AND THE OLD VERSION ENCODED A
+        // VULNERABILITY AS A REQUIREMENT.
+        //
+        // It read `pki_is_deterministic_across_fresh_clusters` and asserted
+        // that two brand-new clusters in SEPARATE data dirs produce a
+        // BYTE-IDENTICAL CA, server cert and admin client cert. That was true,
+        // and it was the bug: every key descended from `LEGACY_PKI_BASE`, a
+        // literal in a public repository, so the CA private key and the
+        // `O=system:masters` admin key were the same everywhere and
+        // reconstructible by anyone from source.
+        //
+        // The property the operator actually wanted — "a new engenho can't
+        // result in a different kubectl configuration" — is about stability
+        // across RESTARTS, and it is asserted below by its own test. Sharing an
+        // identity across unrelated machines was never the goal; it was a side
+        // effect of how the stability was implemented.
         let (_d1, ca1) = ca_in_tempdir();
         let (_d2, ca2) = ca_in_tempdir();
-        assert_eq!(
+
+        assert_ne!(
             ca1.cert_pem(),
             ca2.cert_pem(),
-            "CA cert must be deterministic"
-        );
-
-        let san = ServerSanInputs {
-            node_name: "engenho-local",
-            listen_ip: None,
-            extra_sans: &[],
-        };
-        let s1 = issue_server_material(&ca1, &san).unwrap();
-        let s2 = issue_server_material(&ca2, &san).unwrap();
-        assert_eq!(
-            s1.cert_chain_pem, s2.cert_chain_pem,
-            "server cert must be deterministic"
+            "two clusters must not share a CA — a shared CA means either can \
+             mint credentials the other accepts"
         );
 
         let c1 = issue_admin_client_material(&ca1).unwrap();
         let c2 = issue_admin_client_material(&ca2).unwrap();
+        assert_ne!(
+            c1.key_pem, c2.key_pem,
+            "two clusters must not share an O=system:masters admin key"
+        );
+    }
+
+    #[test]
+    fn a_cluster_keeps_its_identity_across_restarts() {
+        // The property that determinism was FOR, preserved: reloading the same
+        // data dir yields byte-identical material, so a distributed kubeconfig
+        // keeps working and nobody re-copies a file after a restart.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = load_or_generate_ca(dir.path()).expect("first boot");
+        let second = load_or_generate_ca(dir.path()).expect("second boot");
+
         assert_eq!(
-            c1.cert_pem, c2.cert_pem,
-            "admin client cert must be deterministic"
+            first.cert_pem(),
+            second.cert_pem(),
+            "a restart must not change the CA"
         );
         assert_eq!(
-            c1.key_pem, c2.key_pem,
-            "admin client key must be deterministic"
+            issue_admin_client_material(&first).unwrap().key_pem,
+            issue_admin_client_material(&second).unwrap().key_pem,
+            "a restart must not invalidate the operator's kubeconfig"
+        );
+    }
+
+    #[test]
+    fn the_seed_is_persisted_owner_only_and_reused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _ = load_or_generate_ca(dir.path()).expect("boot");
+        let seed_path = dir.path().join("pki").join(super::CLUSTER_SEED_FILE);
+
+        let bytes = std::fs::read(&seed_path).expect("seed persisted");
+        assert_eq!(
+            bytes.len(),
+            super::CLUSTER_SEED_LEN,
+            "seed must be full width"
+        );
+        let mode = std::fs::metadata(&seed_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the seed IS the cluster's private identity and must be owner-only"
         );
 
-        // Same role → same key; distinct roles → distinct keys.
+        // Reload must reuse it rather than mint a second one.
+        let _ = load_or_generate_ca(dir.path()).expect("reboot");
         assert_eq!(
-            deterministic_keypair(CTX_CA).unwrap().serialize_pem(),
-            deterministic_keypair(CTX_CA).unwrap().serialize_pem(),
+            std::fs::read(&seed_path).expect("still there"),
+            bytes,
+            "a reboot must not re-mint the seed"
+        );
+    }
+
+    #[test]
+    fn roles_stay_independent_within_one_cluster() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = super::load_or_generate_cluster_seed(dir.path()).expect("seed");
+        assert_eq!(
+            super::cluster_keypair(CTX_CA, &seed)
+                .unwrap()
+                .serialize_pem(),
+            super::cluster_keypair(CTX_CA, &seed)
+                .unwrap()
+                .serialize_pem(),
+            "same role + same seed must be stable"
         );
         assert_ne!(
-            deterministic_keypair(CTX_CA).unwrap().serialize_pem(),
-            deterministic_keypair(CTX_SERVER).unwrap().serialize_pem(),
-            "CA and server keys must be independent",
+            super::cluster_keypair(CTX_CA, &seed)
+                .unwrap()
+                .serialize_pem(),
+            super::cluster_keypair(CTX_SERVER, &seed)
+                .unwrap()
+                .serialize_pem(),
+            "CA and server keys must be independent"
+        );
+    }
+
+    #[test]
+    fn a_legacy_public_ca_is_recognised_as_public() {
+        // The detector must actually fire on the thing it exists to catch:
+        // a CA generated the old way, which is what every pre-seed data dir on
+        // disk still holds. Reconstructed here exactly as a pre-seed engenho
+        // would have written it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pki = dir.path().join("pki");
+        std::fs::create_dir_all(&pki).unwrap();
+
+        let legacy_key = super::legacy_public_keypair(CTX_CA).expect("legacy key");
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "engenho-ca");
+        set_validity(&mut params, CA_VALIDITY_DAYS);
+        params.serial_number = Some(SerialNumber::from(1u64));
+        let cert = params.self_signed(&legacy_key).unwrap();
+        std::fs::write(pki.join("ca.crt"), cert.pem()).unwrap();
+        std::fs::write(pki.join("ca.key"), legacy_key.serialize_pem()).unwrap();
+
+        let loaded = load_or_generate_ca(dir.path()).expect("loads");
+        assert!(
+            loaded.is_publicly_derivable(),
+            "a CA built from the legacy public constant MUST be recognised — \
+             this is the only signal an existing cluster gets that its admin \
+             key is public knowledge"
+        );
+    }
+
+    #[test]
+    fn a_freshly_seeded_ca_is_not_flagged_as_public() {
+        // The other half: no false positive, or the guard becomes noise an
+        // operator learns to ignore.
+        let (_d, ca) = ca_in_tempdir();
+        assert!(
+            !ca.is_publicly_derivable(),
+            "a per-cluster-seeded CA must not be reported as public"
         );
     }
 
@@ -904,16 +1174,31 @@ mod tests {
     }
 
     #[test]
-    fn fresh_tempdir_generates_the_same_ca() {
-        // Determinism (changed 2026-06): independent data_dirs now mint a
-        // BYTE-IDENTICAL CA — a fresh engenho yields the same kubeconfig. (Was
-        // `assert_ne!` under the old random `KeyPair::generate` keygen.)
+    fn fresh_tempdirs_generate_DIFFERENT_cas() {
+        // ★ THIS GUARD ALREADY EXISTED, CORRECTLY, AND WAS FLIPPED TO
+        // ACCOMMODATE THE REGRESSION IT WOULD HAVE CAUGHT.
+        //
+        // It was `assert_ne!` while keys came from a random
+        // `KeyPair::generate`. When deterministic derivation from a public
+        // constant landed (2026-06) this test went red — correctly, because two
+        // unrelated clusters had just started sharing a CA private key and an
+        // O=system:masters admin key. It was changed to `assert_eq!` and its
+        // comment rewritten to describe the new behaviour as the intent.
+        //
+        // Nothing was hidden and nobody was careless: the change genuinely did
+        // deliver the property it was aimed at (a stable kubeconfig), the test
+        // genuinely did disagree, and re-pointing it looked like keeping the
+        // suite honest. The lesson is narrower and worth keeping — a test that
+        // turns red on a deliberate change is evidence about the change, and
+        // rewriting its assertion answers it rather than considers it. Ask what
+        // the old assertion was PROTECTING before editing it; here it was
+        // protecting the isolation of one cluster's super-user credentials.
         let (_d1, ca1) = ca_in_tempdir();
         let (_d2, ca2) = ca_in_tempdir();
-        assert_eq!(
+        assert_ne!(
             ca1.cert_pem(),
             ca2.cert_pem(),
-            "deterministic PKI: independent data_dirs mint the SAME CA"
+            "independent clusters must mint independent CAs"
         );
     }
 
