@@ -168,7 +168,7 @@ impl Runtime {
             // rather than a certificate that serves happily and verifies for
             // nobody. See `RuntimeError::ExtraSan` for why this is checked here
             // and not lazily at handshake time.
-            let extra_sans = parse_extra_sans(&config.runtime.tls.extra_sans)?;
+            let extra_sans = server_sans(&config)?;
             let material = issue_server_material(
                 &ca,
                 &ServerSanInputs {
@@ -233,7 +233,15 @@ impl Runtime {
         // carrying the configured bootstrap admin bearer token. Installed into
         // the RouterState so the authn middleware resolves the admin bearer +
         // admin client cert to the admin identity; everything else is unchanged.
-        let authenticator = Arc::new(ChainAuthenticator::bootstrap(admin_token));
+        //
+        // The SA stage's key is loaded here — see `build_authenticator`, which
+        // holds the reasoning and is unit-tested, because THE BUG THIS FIXES WAS
+        // A WIRING BUG: every piece of ServiceAccount authentication already
+        // existed and worked, and the runtime called the keyless constructor.
+        // A capability that is only reachable through the call site nobody
+        // audits is indistinguishable from an absent one.
+        let authenticator: Arc<ChainAuthenticator> =
+            Arc::new(build_authenticator(&config.runtime.data_dir, admin_token));
 
         // Build the RouterState HERE (not inside ApiServer::start) so the
         // SAME table is shared with the CrdController's DynamicHandlerSink.
@@ -1559,6 +1567,149 @@ fn san_listen_ip(addr: SocketAddr) -> Option<std::net::IpAddr> {
     if ip.is_unspecified() { None } else { Some(ip) }
 }
 
+/// Build the apiserver's authenticator chain, WITH `ServiceAccount` verification
+/// whenever the cluster's SA signing key can be read.
+///
+/// ── ★ WHY THIS IS A NAMED FUNCTION AND NOT FOUR INLINE LINES ────────────────
+/// The defect it closes was not a missing feature. `sa_token::verify`, the
+/// `SaVerifier` and `ChainAuthenticator::bootstrap_with_sa` were all written,
+/// tested and correct; the runtime called `bootstrap()` instead, which installs
+/// the KEYLESS `ServiceAccountTokenAuthenticator::default()`. So a server fully
+/// able to validate a `ServiceAccount` token answered every in-cluster client with
+/// `401 service account token authentication is not yet supported`.
+///
+/// The real cost was downstream. In-cluster config could never work, so every
+/// workload needing the API had to mount a kubeconfig carrying ADMIN client-key
+/// material — cluster-admin credentials distributed to ordinary pods because the
+/// pod's own identity was refused. Measured 2026-09-01 while bringing up the
+/// pangea-operator stack, where it presented as a crashloop rather than as an
+/// authentication gap.
+///
+/// Pulling it out of the boot sequence makes the wiring itself assertable, which
+/// is the property that was missing: a capability reachable only through a call
+/// site nobody audits is indistinguishable from one that was never built.
+///
+/// The key is read with the same idempotent `load_or_generate_sa_key` the pod
+/// projector uses, so the token minted for a pod and the key checking it are the
+/// same keypair by construction rather than by coordination. Issuer and audience
+/// both come from `SA_ISSUER` for the same reason: split into two literals they
+/// drift, and the failure is a 401 that looks like a key problem.
+///
+/// A key that cannot be read falls back to the KEYLESS chain, never a permissive
+/// one — refusing to validate must not become refusing to reject.
+fn build_authenticator(
+    data_dir: &std::path::Path,
+    admin_token: Option<String>,
+) -> ChainAuthenticator {
+    match engenho_apiserver::sa_token::load_or_generate_sa_key(data_dir) {
+        Ok(kp) => {
+            info!("ServiceAccount token authentication enabled");
+            ChainAuthenticator::bootstrap_with_sa(
+                admin_token,
+                kp.verifying,
+                SA_ISSUER.to_string(),
+                SA_ISSUER.to_string(),
+            )
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "no ServiceAccount signing key; in-cluster clients will take a typed 401 and \
+                 must fall back to a kubeconfig"
+            );
+            ChainAuthenticator::bootstrap(admin_token)
+        }
+    }
+}
+
+/// Every SAN the serving certificate must carry beyond the derived set: the
+/// operator's declared list, plus the advertised address.
+///
+/// ── ★ THE ADVERTISED ADDRESS IS A SAN BY CONSTRUCTION ──────────────────────
+/// `advertise_address` is the `server:` of the remote kubeconfig. A kubeconfig
+/// naming an address the certificate does not is a file that cannot work, and
+/// the failure surfaces only at whoever tries to use it, as a verification error
+/// that reads like THEIR misconfiguration.
+///
+/// engenho has already paid for this once, in the other direction. After the
+/// runtime began advertising `host.containers.internal` to pods, in-cluster
+/// clients still failed with a connect error: the name now routed, and TLS
+/// verification rejected it because the serving cert did not name it. Two
+/// layers, one symptom, the second invisible from the first (see
+/// `build_sans`'s note). That was fixed by adding the name to the derived list
+/// and pinning the pair with a test.
+///
+/// Here the pair is not pinned after the fact — it cannot come apart, because
+/// there is one field and both consumers read it. Advertising an address IS
+/// naming it in the certificate.
+///
+/// Only the HOST is taken: a certificate names hosts, not ports, and the
+/// advertised port is legitimately different from the bound one (a reverse
+/// proxy, a tailnet forward, a NAT).
+fn server_sans(config: &EngenhoConfig) -> Result<Vec<SanEntry>, RuntimeError> {
+    let mut sans = parse_extra_sans(&config.runtime.tls.extra_sans)?;
+    if let Some(host) = advertised_host(&config.runtime.advertise_address) {
+        let entry = host
+            .parse::<SanEntry>()
+            .map_err(|source| RuntimeError::ExtraSan { source })?;
+        if !sans.contains(&entry) {
+            sans.push(entry);
+        }
+    }
+    Ok(sans)
+}
+
+/// The host half of `advertise_address`, or `None` when nothing is advertised.
+///
+/// Accepts `host`, `host:port`, `[v6]:port` and a bare IPv6 literal. The port is
+/// dropped: it is meaningful for the kubeconfig's URL and meaningless in a
+/// certificate.
+fn advertised_host(advertise: &str) -> Option<&str> {
+    let value = advertise.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // A bracketed IPv6 literal, with or without a port.
+    if let Some(rest) = value.strip_prefix('[') {
+        return rest.split(']').next().filter(|h| !h.is_empty());
+    }
+    // A bare IPv6 literal has several colons and no port; anything with exactly
+    // one colon is host:port.
+    if value.matches(':').count() == 1 {
+        return value.split(':').next().filter(|h| !h.is_empty());
+    }
+    Some(value)
+}
+
+/// The `server:` URL remote clients are handed, or `None` when this apiserver is
+/// node-local.
+///
+/// The port defaults to the bound one, so an operator who only needs to name a
+/// host does not have to restate a port that is already declared — and cannot
+/// restate it wrongly.
+fn advertised_server_url(config: &EngenhoConfig, bound: SocketAddr) -> Option<String> {
+    let value = config.runtime.advertise_address.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let has_port = if value.starts_with('[') {
+        value.rsplit(']').next().is_some_and(|t| t.starts_with(':'))
+    } else {
+        value.matches(':').count() == 1
+    };
+    if has_port {
+        Some(format!("https://{value}"))
+    } else {
+        // Bracket a bare IPv6 literal so the URL is well-formed.
+        let host = if value.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{value}]")
+        } else {
+            value.to_string()
+        };
+        Some(format!("https://{host}:{}", bound.port()))
+    }
+}
+
 /// Classify every operator-declared SAN string, failing on the first bad one.
 ///
 /// Fails rather than skipping. A skipped SAN produces exactly the certificate
@@ -1667,6 +1818,56 @@ fn write_boot_kubeconfig(
                 "pod-facing kubeconfig requested but no pod-reachable apiserver \
                  address is known; writing nothing rather than an unusable file"
             ),
+        }
+    }
+
+    // ── ★ AND A REMOTE ONE, FOR OPERATORS ON ANOTHER MACHINE ──────────
+    // The third audience. The `data_dir` copy and `kubeconfig_publish_path`
+    // both carry a LOOPBACK server url — correct on this node, useless from any
+    // other — and the pod-facing copy carries the address CONTAINERS reach.
+    // Nobody served the operator sitting at a different workstation, so
+    // distributing access meant copying a kubeconfig and hand-editing its
+    // `server:` line, which is exactly the edit that silently disagrees with
+    // the serving certificate.
+    //
+    // The address is not re-derived here: it is `advertise_address`, the same
+    // field `server_sans` turns into a certificate SAN. One field, both
+    // consumers — so a kubeconfig naming an address the cert does not is
+    // unconstructible rather than merely tested for.
+    if let Some(remote_publish) =
+        resolve_publish_path(&config.runtime.remote_kubeconfig_publish_path)
+    {
+        if let Some(remote_server) = advertised_server_url(config, bound_addr) {
+            let remote_yaml = match admin {
+                Some(admin) => emit_kubeconfig_with_admin(
+                    &config.cluster.name,
+                    &remote_server,
+                    ca_pem.as_bytes(),
+                    admin.cert_pem.as_bytes(),
+                    admin.key_pem.as_bytes(),
+                ),
+                None => emit_kubeconfig(&config.cluster.name, &remote_server, ca_pem.as_bytes()),
+            }
+            .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
+            match write_kubeconfig_file(&remote_publish, &remote_yaml) {
+                Ok(()) => info!(
+                    path = %remote_publish.display(), server = %remote_server,
+                    "remote kubeconfig published"
+                ),
+                Err(e) => tracing::warn!(
+                    path = %remote_publish.display(), error = %e,
+                    "remote kubeconfig publish failed — the daemon is serving"
+                ),
+            }
+        } else {
+            // Asked for a remote kubeconfig without saying what address is
+            // remote. Writing a loopback url under that name would be worse
+            // than writing nothing: it produces a file that looks like remote
+            // access and silently is not.
+            tracing::warn!(
+                "remote_kubeconfig_publish_path is set but advertise_address is empty; \
+                 writing nothing rather than a file with a loopback server url"
+            );
         }
     }
 
@@ -2644,5 +2845,295 @@ mod tests {
         let rt = Runtime::start(cfg).await.unwrap();
         assert_eq!(rt.drivers.len(), 18);
         rt.shutdown().await.unwrap();
+    }
+}
+
+/// The wiring the runtime actually performs, asserted directly.
+///
+/// ★ These exist because the defect was invisible to every other test. The
+/// authenticator, the verifier, the token format and the chain constructor all
+/// had passing tests; what was untested was WHICH constructor the boot sequence
+/// reached for. Unit tests of a capability say nothing about whether the
+/// capability is connected, and the disconnected version failed in a way that
+/// read as a deliberate limitation ("not yet supported") rather than as a bug.
+#[cfg(test)]
+mod authenticator_wiring {
+    use super::{SA_ISSUER, build_authenticator};
+    use engenho_apiserver::RequestCreds;
+
+    fn now_secs() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after the epoch")
+                .as_secs(),
+        )
+        .expect("seconds fit in i64")
+    }
+
+    /// Mint a token exactly as `RuntimeSaProjector` does, then present it to
+    /// the chain `build_authenticator` produces. Both halves read the same
+    /// idempotent key file, which is the property under test: the pod's token
+    /// and the server's verifier are one keypair by construction.
+    #[test]
+    fn a_pod_token_authenticates_as_its_service_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = engenho_apiserver::sa_token::load_or_generate_sa_key(dir.path())
+            .expect("key generates on first read");
+
+        // Validation reads the real clock, so the token must be minted against
+        // it. Pinning a fixed epoch here mints a token that is already years
+        // expired — which is how this test first failed, reporting
+        // `ServiceAccountUnsupported` for what was actually an expiry. That
+        // confusion is exactly what the split AuthnError variants now prevent.
+        let now = now_secs();
+        let token = engenho_apiserver::sa_token::issue(
+            &kp.signing,
+            SA_ISSUER,
+            "pangea-system",
+            "pangea-operator",
+            "sa-uid-1",
+            &[SA_ISSUER.to_string()],
+            None,
+            now,
+            3600,
+        )
+        .expect("mint");
+
+        let chain = build_authenticator(dir.path(), None);
+        let user = chain
+            .authenticate(&RequestCreds {
+                client_cert: None,
+                bearer: Some(token),
+            })
+            .expect("a validly-minted token must not be a typed error");
+
+        assert_eq!(
+            user.username, "system:serviceaccount:pangea-system:pangea-operator",
+            "the workload must authenticate AS ITSELF — this being wrong is what \
+             forced every pod to mount an admin kubeconfig instead"
+        );
+        assert!(
+            user.groups.iter().any(|g| g == "system:serviceaccounts"),
+            "SA group membership carries the RBAC bindings; got {:?}",
+            user.groups
+        );
+    }
+
+    /// The regression guard proper. `bootstrap()` and `bootstrap_with_sa()`
+    /// differ ONLY in whether the SA stage holds a key, and the difference is
+    /// invisible until a token is presented — which is precisely why the wrong
+    /// one shipped. Assert the observable difference, not the constructor name.
+    #[test]
+    fn the_runtime_chain_differs_observably_from_the_keyless_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kp = engenho_apiserver::sa_token::load_or_generate_sa_key(dir.path()).expect("key");
+        let token = engenho_apiserver::sa_token::issue(
+            &kp.signing,
+            SA_ISSUER,
+            "default",
+            "probe",
+            "uid",
+            &[SA_ISSUER.to_string()],
+            None,
+            now_secs(),
+            3600,
+        )
+        .expect("mint");
+        let creds = RequestCreds {
+            client_cert: None,
+            bearer: Some(token),
+        };
+
+        let keyless = engenho_apiserver::ChainAuthenticator::bootstrap(None);
+        assert!(
+            keyless.authenticate(&creds).is_err(),
+            "the keyless chain must still REJECT — the fallback path has to stay \
+             a refusal, never a silent anonymous"
+        );
+
+        assert!(
+            build_authenticator(dir.path(), None)
+                .authenticate(&creds)
+                .is_ok(),
+            "the chain the runtime builds must ACCEPT the same token the keyless \
+             one refuses; if these ever agree, the key stopped being wired"
+        );
+    }
+
+    /// An unreadable key must degrade to refusal, not to permission.
+    #[test]
+    fn an_unreadable_key_falls_back_to_rejecting_not_to_admitting() {
+        // A path that cannot hold a key file: a regular file where the loader
+        // wants a directory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = dir.path().join("occupied");
+        std::fs::write(&not_a_dir, b"not a directory").expect("write");
+
+        let real = tempfile::tempdir().expect("tempdir");
+        let kp = engenho_apiserver::sa_token::load_or_generate_sa_key(real.path()).expect("key");
+        let token = engenho_apiserver::sa_token::issue(
+            &kp.signing,
+            SA_ISSUER,
+            "default",
+            "probe",
+            "uid",
+            &[SA_ISSUER.to_string()],
+            None,
+            now_secs(),
+            3600,
+        )
+        .expect("mint");
+
+        let chain = build_authenticator(&not_a_dir, None);
+        assert!(
+            chain
+                .authenticate(&RequestCreds {
+                    client_cert: None,
+                    bearer: Some(token)
+                })
+                .is_err(),
+            "with no usable key an SA bearer must be a typed 401 — losing the key \
+             must never widen access"
+        );
+    }
+}
+
+/// The advertised address, the remote kubeconfig, and the serving certificate.
+///
+/// ★ The property under test is that these cannot disagree. engenho has already
+/// paid once for the version of this bug where a name ROUTED but was not NAMED
+/// by the cert (the container host gateway, 2026-09-01) — two layers, one
+/// symptom, the second invisible from the first. That was fixed by adding the
+/// name and pinning the pair. Here there is one field and two readers, so the
+/// pair is structural; these tests exist to keep it that way.
+#[cfg(test)]
+mod advertised_address {
+    use super::{SanEntry, advertised_host, advertised_server_url, server_sans};
+    use engenho_config::EngenhoConfig;
+    use shikumi::TieredConfig;
+
+    fn config_with(advertise: &str, extra: &[&str]) -> EngenhoConfig {
+        let mut c = EngenhoConfig::prescribed_default();
+        c.runtime.advertise_address = advertise.to_string();
+        c.runtime.tls.extra_sans = extra.iter().map(|s| (*s).to_string()).collect();
+        c
+    }
+
+    fn bound() -> std::net::SocketAddr {
+        "0.0.0.0:6443".parse().expect("addr")
+    }
+
+    #[test]
+    fn advertising_a_name_puts_it_in_the_certificate() {
+        let sans = server_sans(&config_with("plo.natal.quero.cloud", &[])).expect("sans");
+        assert!(
+            sans.contains(&SanEntry::Dns("plo.natal.quero.cloud".to_string())),
+            "the advertised host MUST be a SAN — a kubeconfig naming an address \
+             the cert does not is a file that cannot work, and it fails at the \
+             client, not here; got {sans:?}"
+        );
+    }
+
+    #[test]
+    fn advertising_an_address_puts_it_in_the_certificate_as_an_ip() {
+        let sans = server_sans(&config_with("100.64.0.7:6443", &[])).expect("sans");
+        assert!(
+            sans.contains(&SanEntry::Ip("100.64.0.7".parse().unwrap())),
+            "got {sans:?}"
+        );
+    }
+
+    #[test]
+    fn the_port_reaches_the_url_and_never_the_certificate() {
+        // A certificate names hosts; a URL needs the port. Conflating them
+        // yields either a cert with a port in a DNS SAN (matches nothing) or a
+        // URL missing its port (dials 443).
+        let cfg = config_with("plo.quero.cloud:16443", &[]);
+        let sans = server_sans(&cfg).expect("sans");
+        assert!(
+            sans.contains(&SanEntry::Dns("plo.quero.cloud".to_string())),
+            "the SAN must be the bare host; got {sans:?}"
+        );
+        assert!(
+            !sans.iter().any(|s| s.to_string().contains(":16443")),
+            "no SAN may carry a port; got {sans:?}"
+        );
+        assert_eq!(
+            advertised_server_url(&cfg, bound()).as_deref(),
+            Some("https://plo.quero.cloud:16443"),
+            "the URL must keep the advertised port — a proxy or forward makes it \
+             legitimately different from the bound one"
+        );
+    }
+
+    #[test]
+    fn an_advertised_host_without_a_port_inherits_the_bound_one() {
+        // So an operator naming only a host cannot restate the port wrongly.
+        assert_eq!(
+            advertised_server_url(&config_with("plo", &[]), bound()).as_deref(),
+            Some("https://plo:6443")
+        );
+    }
+
+    #[test]
+    fn advertising_nothing_yields_no_url_and_no_extra_san() {
+        let cfg = config_with("", &[]);
+        assert_eq!(advertised_server_url(&cfg, bound()), None);
+        assert!(
+            server_sans(&cfg).expect("sans").is_empty(),
+            "a node-local apiserver must gain no SANs from this path"
+        );
+    }
+
+    #[test]
+    fn declaring_the_advertised_name_explicitly_does_not_duplicate_it() {
+        // Listing it in extra_sans as well is the natural thing to do before
+        // learning it is automatic, and must not produce a doubled SAN.
+        let sans =
+            server_sans(&config_with("plo.quero.cloud", &["plo.quero.cloud"])).expect("sans");
+        assert_eq!(
+            sans.iter()
+                .filter(|s| **s == SanEntry::Dns("plo.quero.cloud".to_string()))
+                .count(),
+            1,
+            "got {sans:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_advertised_address_fails_at_start_rather_than_at_a_client() {
+        // Same reasoning as extra_sans: this must not become a cert that serves
+        // and verifies for nobody.
+        assert!(
+            server_sans(&config_with("https://plo:6443", &[])).is_err(),
+            "a URL is not an address and must be refused, not encoded"
+        );
+    }
+
+    #[test]
+    fn ipv6_is_bracketed_in_the_url_and_bare_in_the_certificate() {
+        let cfg = config_with("fd00::1", &[]);
+        assert_eq!(advertised_host("fd00::1"), Some("fd00::1"));
+        assert_eq!(
+            advertised_server_url(&cfg, bound()).as_deref(),
+            Some("https://[fd00::1]:6443"),
+            "an unbracketed IPv6 host makes a URL that will not parse"
+        );
+        assert!(
+            server_sans(&cfg)
+                .expect("sans")
+                .contains(&SanEntry::Ip("fd00::1".parse().unwrap())),
+            "the SAN is the bare address, unbracketed"
+        );
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_with_a_port_splits_correctly() {
+        assert_eq!(advertised_host("[fd00::1]:6443"), Some("fd00::1"));
+        assert_eq!(
+            advertised_server_url(&config_with("[fd00::1]:6443", &[]), bound()).as_deref(),
+            Some("https://[fd00::1]:6443")
+        );
     }
 }
