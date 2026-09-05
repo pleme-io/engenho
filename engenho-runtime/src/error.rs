@@ -38,6 +38,24 @@ pub enum RuntimeError {
         source: std::net::AddrParseError,
     },
 
+    /// An entry in `runtime.tls.extra_sans` is not a usable SAN.
+    ///
+    /// Refused BEFORE the apiserver binds, deliberately. A SAN is only ever
+    /// consulted by a remote client during a TLS handshake, so a malformed one
+    /// costs nothing locally and the node comes up looking entirely healthy —
+    /// the failure lands on whoever tries to connect, as a verification error
+    /// that reads like their kubeconfig is wrong. Worse, the certificate is
+    /// persisted on first boot and reloaded thereafter, so the mistake outlives
+    /// the fix until the PKI directory is removed. Failing the unit at start,
+    /// naming the value, is the loud version of a fault that is otherwise
+    /// silent and sticky.
+    #[error("invalid runtime.tls.extra_sans entry: {source}")]
+    ExtraSan {
+        /// The classification failure.
+        #[source]
+        source: engenho_apiserver::SanParseError,
+    },
+
     /// At shutdown, the Runtime could not become the sole owner of the
     /// store `Arc` (a driver task or apiserver handler still holds a
     /// clone). `terminate` consumes `StoreMesh` and requires the only
@@ -97,6 +115,7 @@ engenho_substrate::impl_error_kind! {
         (Server(_)) => "server",
         { LeadershipTimeout { .. } } => "leadership_timeout",
         { ListenAddr { .. } } => "listen_addr",
+        { ExtraSan { .. } } => "extra_san",
         { StoreStillShared { .. } } => "store_still_shared",
         { ContainerRuntimeUnavailable { .. } } => "container_runtime_unavailable",
         (Kubeconfig(_)) => "kubeconfig",

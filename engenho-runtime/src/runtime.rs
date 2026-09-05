@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use engenho_apiserver::{
     ApiServer, ChainAuthenticator, ClientMaterial, RbacAuthorizer, RouterHandlerSink, RouterState,
-    ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
+    SanEntry, ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
     handlers_from_catalog_with_admission, issue_admin_client_material, issue_server_material,
     load_or_generate_ca,
 };
@@ -163,11 +163,18 @@ impl Runtime {
                 .map_err(|e| RuntimeError::Server(e.into()))?;
             ca_cert_pem = Some(ca.cert_pem().to_string());
             let listen_ip = san_listen_ip(listen_addr);
+            // Classify the operator's declared SANs before anything binds, so a
+            // typo is a failed unit with the offending value in the message
+            // rather than a certificate that serves happily and verifies for
+            // nobody. See `RuntimeError::ExtraSan` for why this is checked here
+            // and not lazily at handshake time.
+            let extra_sans = parse_extra_sans(&config.runtime.tls.extra_sans)?;
             let material = issue_server_material(
                 &ca,
                 &ServerSanInputs {
                     node_name: &config.runtime.node_name,
                     listen_ip,
+                    extra_sans: &extra_sans,
                 },
             )
             .map_err(|e| RuntimeError::Server(e.into()))?;
@@ -1552,6 +1559,19 @@ fn san_listen_ip(addr: SocketAddr) -> Option<std::net::IpAddr> {
     if ip.is_unspecified() { None } else { Some(ip) }
 }
 
+/// Classify every operator-declared SAN string, failing on the first bad one.
+///
+/// Fails rather than skipping. A skipped SAN produces exactly the certificate
+/// the operator was trying to avoid, and produces it silently — the whole point
+/// of the field is that the cert names something the runtime cannot derive, so
+/// dropping the entry defeats it while looking like success.
+fn parse_extra_sans(raw: &[String]) -> Result<Vec<SanEntry>, RuntimeError> {
+    raw.iter()
+        .map(|s| s.parse::<SanEntry>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| RuntimeError::ExtraSan { source })
+}
+
 /// Write `data_dir/kubeconfig` (mode 0600) so an operator can immediately
 /// `kubectl --kubeconfig <data_dir>/kubeconfig get nodes`. server_url is
 /// `https://127.0.0.1:<bound_port>` (loopback SAN + the real bound port);
@@ -2390,7 +2410,10 @@ mod tests {
             super::DEFAULT_KUBERNETES_SERVICE_IP,
             "injecting the unrouted VIP is the defect"
         );
-        assert_eq!(port, 6443, "the REAL listen port, not 443 — nothing rewrites it");
+        assert_eq!(
+            port, 6443,
+            "the REAL listen port, not 443 — nothing rewrites it"
+        );
     }
 
     /// An unparseable listen address means we do not know a reachable

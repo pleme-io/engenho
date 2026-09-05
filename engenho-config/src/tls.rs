@@ -49,6 +49,33 @@ pub struct TlsConfig {
     /// Explicit server key path. `None` → `data_dir/pki/apiserver.key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_path: Option<PathBuf>,
+    /// Additional Subject Alternative Names for the serving certificate.
+    ///
+    /// ── ★ WHY THIS IS CONFIGURATION AND NOT DERIVED ──────────────────────
+    /// The runtime derives the SANs it can KNOW: loopback, `kubernetes`, the
+    /// container host gateway, this node's name, and the concrete listen IP.
+    /// That set answers for the node. It cannot answer for the names the
+    /// cluster is REACHED BY, because those are facts about the deployment
+    /// rather than about the process — a tailnet name, a LAN alias, a
+    /// `*.quero.cloud` record, a VIP in front of several apiservers. Deriving
+    /// them would mean guessing, and a guessed SAN is worse than an absent
+    /// one: the cert still builds and still serves.
+    ///
+    /// The failure this closes is quiet. A serving cert missing the name a
+    /// client dials does not fail at boot, does not log, and does not degrade
+    /// anything on the node; it fails at the CLIENT, once, as a certificate
+    /// verification error that reads like a misconfigured kubeconfig. Adding
+    /// the name later requires deleting the persisted PKI, because the CA and
+    /// leaf are generated once and reloaded thereafter.
+    ///
+    /// Entries are plain host strings — `100.64.0.1`, `plo.tail1234.ts.net`,
+    /// `engenho.plo.natal.quero.cloud`. No scheme, no port: anything that
+    /// parses as an IP address becomes an IP SAN and everything else becomes a
+    /// DNS SAN, the same rule `kubeadm`'s `certSANs` uses. Entries that
+    /// duplicate a derived SAN collapse rather than erroring, so an operator
+    /// may safely list a name without first checking whether it is automatic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_sans: Vec<String>,
 }
 
 impl TieredConfig for TlsConfig {
@@ -62,6 +89,9 @@ impl TieredConfig for TlsConfig {
             ca_key_path: None,
             cert_path: None,
             key_path: None,
+            // No opinion about how this cluster is reached — the bare tier
+            // has no deployment to have an opinion about.
+            extra_sans: Vec::new(),
         }
     }
 
@@ -75,6 +105,10 @@ impl TieredConfig for TlsConfig {
             ca_key_path: None,
             cert_path: None,
             key_path: None,
+            // Still none: the derived SANs cover a single-node local cluster
+            // completely, which is what the prescribed tier is for. A name
+            // beyond that is a deployment fact and arrives from the file tier.
+            extra_sans: Vec::new(),
         }
     }
 
@@ -89,6 +123,16 @@ impl TieredConfig for TlsConfig {
             ca_key_path: self.ca_key_path.or_else(|| base.ca_key_path.clone()),
             cert_path: self.cert_path.or_else(|| base.cert_path.clone()),
             key_path: self.key_path.or_else(|| base.key_path.clone()),
+            // REPLACE, not append. An overlay that names SANs is stating the
+            // full set it wants, exactly as a `values.yaml` list overrides
+            // rather than extends. Appending would make a lower tier's entry
+            // impossible to remove — you could add a SAN but never retract
+            // one, which is the wrong shape for a security-relevant list.
+            extra_sans: if self.extra_sans.is_empty() {
+                base.extra_sans.clone()
+            } else {
+                self.extra_sans
+            },
         }
     }
 }
@@ -157,6 +201,7 @@ mod tests {
             ca_key_path: Some("/pki/ca.key".into()),
             cert_path: Some("/pki/srv.crt".into()),
             key_path: Some("/pki/srv.key".into()),
+            extra_sans: Vec::new(),
         };
         t.validate().unwrap();
     }
@@ -178,6 +223,7 @@ mod tests {
             ca_key_path: None,
             cert_path: None,
             key_path: None,
+            extra_sans: Vec::new(),
         };
         let base = TlsConfig {
             enabled: true,
@@ -186,11 +232,51 @@ mod tests {
             ca_key_path: Some("/b/ca.key".into()),
             cert_path: Some("/b/srv.crt".into()),
             key_path: Some("/b/srv.key".into()),
+            extra_sans: vec!["base.example".to_string()],
         };
         let merged = overlay.extend(&base);
         // overlay's ca_cert_path wins; the rest fall back to base.
         assert_eq!(merged.ca_cert_path, Some("/o/ca.crt".into()));
         assert_eq!(merged.ca_key_path, Some("/b/ca.key".into()));
         assert!(!merged.auto_generate, "overlay's bool wins");
+        assert_eq!(
+            merged.extra_sans,
+            vec!["base.example".to_string()],
+            "an overlay silent about SANs inherits the base's — otherwise \
+             every tier above the one declaring them would erase them"
+        );
+    }
+
+    #[test]
+    fn an_overlay_that_names_sans_replaces_rather_than_appends() {
+        // The decision worth pinning. Appending would mean a SAN, once
+        // declared at any tier, could never be RETRACTED — you could widen
+        // the certificate but never narrow it, which is the wrong direction
+        // for a list that decides who a server will answer as.
+        let base = TlsConfig {
+            extra_sans: vec!["old.example".to_string(), "stale.example".to_string()],
+            ..TlsConfig::prescribed_default()
+        };
+        let overlay = TlsConfig {
+            extra_sans: vec!["new.example".to_string()],
+            ..TlsConfig::prescribed_default()
+        };
+        let merged = overlay.extend(&base);
+        assert_eq!(
+            merged.extra_sans,
+            vec!["new.example".to_string()],
+            "the overlay states the full set it wants; a retracted name must \
+             actually disappear"
+        );
+    }
+
+    #[test]
+    fn a_config_written_before_this_field_existed_still_parses() {
+        // `deny_unknown_fields` makes the reverse direction strict, so the
+        // compatibility that matters is this one: every engenho.yaml already
+        // deployed omits `extra_sans` entirely.
+        let yaml = "enabled: true\nauto_generate: true\n";
+        let parsed: TlsConfig = serde_yaml::from_str(yaml).expect("legacy config must parse");
+        assert!(parsed.extra_sans.is_empty());
     }
 }
