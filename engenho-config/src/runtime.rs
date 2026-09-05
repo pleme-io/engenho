@@ -34,7 +34,33 @@ use crate::tls::TlsConfig;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KubeletBackendKind {
-    /// Real podman shell-out (production for local Mac/Linux).
+    /// podman over its libpod REST API on the unix socket — **the default**.
+    ///
+    /// No subprocess: typed JSON requests, status codes instead of parsed
+    /// error prose, and a versioned contract instead of a command line. This
+    /// is the naturalized seam, and it is the default because the alternative
+    /// below is a NO SHELL violation that happened to be the only option.
+    ///
+    /// Requires `podman.socket` to be served — `systemctl enable --now
+    /// podman.socket` (or the `--user` form for rootless). engenho reports the
+    /// socket it chose at startup so an operator can see WHICH container store
+    /// is being driven.
+    ///
+    /// Does not yet implement `exec` or `logs`: libpod streams both as
+    /// multiplexed frames, and both refuse with a typed error naming
+    /// `kubeletBackend = "podman"` as the fallback rather than returning a
+    /// fabricated success or an empty string.
+    PodmanApi,
+    /// Real podman SHELL-OUT — argv, subprocess, stdout parsing.
+    ///
+    /// Retained, not deleted (★★ MODULARIZE, DON'T DELETE): it is the only
+    /// backend that currently serves `exec` and `logs`, so a node running
+    /// exec-based probes or serving `kubectl logs` still needs it.
+    ///
+    /// Its failure modes are the reason it is no longer the default. A CLI
+    /// error is prose with no schema; `podman rm` can exit 0 while removing
+    /// nothing (measured 2026-09-01, invisible from the exit code); and a
+    /// renamed flag in a podman release is a silent behaviour change.
     Podman,
     /// In-memory deterministic fake (tests + dev environments).
     Fake,
@@ -176,9 +202,18 @@ pub struct RuntimeConfig {
     /// Empty string DISABLES the listener, which is what tests use.
     pub etcd_listen_addr: String,
 
+    /// Which container backend the kubelet drives.
+    ///
+    /// Defaults to [`KubeletBackendKind::PodmanApi`] — podman over its libpod
+    /// socket, no subprocess. See that enum for why the shell-out backend is
+    /// retained but no longer the default.
     pub kubelet_backend: KubeletBackendKind,
-    /// Optional explicit podman binary path (ignored unless
-    /// `kubelet_backend == Podman`). `None` = default `podman` on PATH.
+    /// Optional explicit podman binary path.
+    ///
+    /// Used by the shell-out backend, and by the `PodmanApi` backend ONLY on
+    /// its fallback path (when no podman socket is available). `None` = resolve
+    /// `podman` from `$PATH`, which is the case that fails silently under a
+    /// launchd agent — prefer setting it from a package.
     pub podman_binary: Option<String>,
     /// How long to wait for raft leadership before the Runtime gives
     /// up at boot. Must be > 0.
@@ -254,7 +289,10 @@ impl TieredConfig for RuntimeConfig {
             remote_kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: "127.0.0.1:10250".into(),
             etcd_listen_addr: "127.0.0.1:2379".into(),
-            kubelet_backend: KubeletBackendKind::Podman,
+            // ★ The API backend, not the shell-out one. A default that
+            // violates the fleet's NO SHELL law is a default that has to be
+            // overridden on every node to be correct.
+            kubelet_backend: KubeletBackendKind::PodmanApi,
             podman_binary: None,
             leadership_timeout_seconds: 10,
             tls: TlsConfig::prescribed_default(),
@@ -377,6 +415,61 @@ impl RuntimeConfig {
             .ca_key_path
             .clone()
             .unwrap_or_else(|| self.data_dir.join("pki").join("ca.key"))
+    }
+}
+
+#[cfg(test)]
+mod backend_kind_wire {
+    use super::KubeletBackendKind;
+    use shikumi::TieredConfig;
+
+    /// The Nix enum and the serde name must agree, or a declared value produces
+    /// a config engenho refuses to parse.
+    ///
+    /// These strings live in two repositories — `nix/typed-config.nix`'s
+    /// `types.enum [ "podman_api" "podman" "fake" ]` and this enum's
+    /// `rename_all = "snake_case"`. Nothing but this test connects them, and the
+    /// failure is at DAEMON START on the node, long after the nix build went
+    /// green.
+    #[test]
+    fn the_wire_names_are_exactly_what_the_nix_enum_offers() {
+        let cases = [
+            (KubeletBackendKind::PodmanApi, "\"podman_api\""),
+            (KubeletBackendKind::Podman, "\"podman\""),
+            (KubeletBackendKind::Fake, "\"fake\""),
+        ];
+        for (kind, want) in cases {
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                want,
+                "nix/typed-config.nix offers {want} for {kind:?}"
+            );
+        }
+    }
+
+    /// The naturalized backend is what a node gets without asking.
+    ///
+    /// A default that violates the fleet's NO SHELL law is a default that must
+    /// be overridden on every node to be correct, which is not a default.
+    #[test]
+    fn the_prescribed_default_is_the_api_backend_not_the_shell_out_one() {
+        assert_eq!(
+            super::RuntimeConfig::prescribed_default().kubelet_backend,
+            KubeletBackendKind::PodmanApi
+        );
+    }
+
+    /// The shell-out backend is still SELECTABLE.
+    ///
+    /// ★★ MODULARIZE, DON'T DELETE — it is the only backend serving `exec` and
+    /// `logs`, so removing it would take exec-based probes and `kubectl logs`
+    /// with it. Retirement here is a changed default, not a deletion.
+    #[test]
+    fn the_shell_out_backend_remains_reachable() {
+        assert_eq!(
+            serde_json::from_str::<KubeletBackendKind>("\"podman\"").unwrap(),
+            KubeletBackendKind::Podman
+        );
     }
 }
 

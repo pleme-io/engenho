@@ -173,13 +173,29 @@ in
         material.
       '';
 
-      kubeletBackend = optional (types.enum [ "podman" "fake" ]) ''
+      kubeletBackend = optional (types.enum [ "podman_api" "podman" "fake" ]) ''
         Container runtime the kubelet drives.
 
-        `fake` runs NOTHING — it is the mock backend, correct for a
+        `podman_api` (the DEFAULT) speaks podman's libpod REST API over its unix
+        socket — no subprocess, typed JSON, status codes instead of parsed error
+        prose, and a versioned contract instead of a command line. Requires
+        `podman.socket` to be served (`systemctl enable --now podman.socket`, or
+        the `--user` form for rootless); engenho logs which socket it chose so
+        an operator can see WHICH container store is being driven.
+
+        `podman` is the original SHELL-OUT backend: argv, subprocess, stdout
+        parsing. It is retained rather than removed because it is the only
+        backend that currently serves `exec` and `logs` — libpod streams both as
+        multiplexed frames and the API backend refuses them with a typed error
+        rather than a fabricated success. Choose it on a node that runs
+        exec-based probes or serves `kubectl logs`.
+
+        `fake` runs NOTHING — the mock backend, correct for a
         control-plane-only node and wrong anywhere pods must actually run.
-        On macOS `podman` is itself a Linux VM, so neither option yet gives
-        real pods on baremetal.
+
+        ★ Both podman arms drive the SAME container store; the difference is
+        entirely client-side. Switching between them does not migrate, restart
+        or orphan anything.
       '';
       podmanPackage = mkOption {
         type = types.nullOr types.package;

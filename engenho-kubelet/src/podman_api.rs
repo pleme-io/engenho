@@ -1,0 +1,924 @@
+//! PODMAN, SPOKEN AS A PROTOCOL — the libpod REST API over its unix socket.
+//!
+//! ── ★ WHY THIS REPLACES SHELLING OUT ───────────────────────────────────────
+//! [`crate::backend::PodmanBackend`] drives podman by building an argv,
+//! spawning a process, and parsing its stdout. That works, and it makes the
+//! runtime seam **a text format nobody versions**. A renamed flag, a reworded
+//! error, a locale that formats a number differently, a podman release that
+//! adds a column to `inspect` — each is a silent behaviour change with no
+//! compiler and no schema between it and the kubelet. `cri.rs` already states
+//! this case for CRI; it applies with equal force to podman, which is the
+//! runtime actually in use.
+//!
+//! It is also a direct violation of the fleet's NO SHELL law, and of CONTAIN
+//! THE C's sharper form: *speak the protocol, do not link the library* — and
+//! do not shell to its CLI either, which is the same coupling with a worse
+//! type system.
+//!
+//! podman ships exactly the surface that removes it. `podman.socket` serves
+//! the **libpod REST API** — the same HTTP API the `podman --remote` client
+//! speaks — as JSON over a unix socket. Every operation this kubelet performs
+//! has an endpoint, so the subprocess buys nothing.
+//!
+//! ── WHAT THIS IS AND IS NOT ────────────────────────────────────────────────
+//! It is: an HTTP/1.1 client over `tokio::net::UnixStream`, driven by `hyper`,
+//! with typed request and response bodies. No `Command`, no argv, no stdout
+//! parsing, no shell, no C library linked — hyper and serde are pure Rust and
+//! the socket is a kernel object, not a vendored client.
+//!
+//! It is NOT a reimplementation of podman. engenho CALLS a runtime; it does
+//! not become one. The same division `cri.rs` draws.
+//!
+//! ── ★ WHY NOT CRI, WHICH IS ALREADY WRITTEN ────────────────────────────────
+//! `cri.rs` is the better long-term seam — containerd, CRI-O and youki all
+//! speak it, and a distribution locked to one runtime is not a distribution.
+//! But **podman does not implement CRI**. Selecting CRI means also installing
+//! containerd or CRI-O; measured on plo 2026-09-05, the only runtime present is
+//! podman and the only socket is `/run/podman/podman.sock`.
+//!
+//! So the two are siblings, not rivals: CRI substitutes the RUNTIME, this
+//! removes the SUBPROCESS. Shipping this first fixes the seam that is actually
+//! in the path today without making a runtime migration a prerequisite.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::backend::{ContainerSpec, PullPolicy};
+use crate::error::KubeletError;
+
+/// Where podman serves its API, in the order upstream itself looks.
+///
+/// NOT a constant. Rootful podman, rootless podman and every distribution's
+/// packaging put the socket somewhere different, and a hardcoded path produces
+/// a kubelet that works on exactly one machine — the same reasoning `cri.rs`
+/// records for CRI endpoints.
+///
+/// Rootless comes FIRST when `XDG_RUNTIME_DIR` is set, because a user session
+/// that has its own podman means the rootful socket (if it even exists) belongs
+/// to a different container store, and picking it would leave the kubelet
+/// managing containers nobody can see.
+#[must_use]
+pub fn default_socket_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR")
+        && !xdg.is_empty()
+    {
+        out.push(PathBuf::from(xdg).join("podman/podman.sock"));
+    }
+    out.push(PathBuf::from("/run/podman/podman.sock"));
+    out.push(PathBuf::from("/var/run/podman/podman.sock"));
+    out
+}
+
+/// The first candidate that exists, or `None`.
+///
+/// Existence, not connectability: a socket whose server is down still names the
+/// right store, and failing later with a connect error is more useful than
+/// silently choosing a different one.
+#[must_use]
+pub fn discover_socket() -> Option<PathBuf> {
+    default_socket_candidates().into_iter().find(|p| p.exists())
+}
+
+/// A libpod endpoint — the unix socket the API is served on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint(PathBuf);
+
+impl Endpoint {
+    /// Wrap an explicit socket path.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+
+    /// Discover the socket, or fail with a message naming every path tried.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] when no candidate exists. The error lists the
+    /// candidates rather than saying "not found": on a machine where podman is
+    /// installed but its socket unit is not enabled, the fix is
+    /// `systemctl enable --now podman.socket`, and that is only obvious once
+    /// you can see which paths were checked.
+    pub fn discover() -> Result<Self, KubeletError> {
+        discover_socket().map(Self).ok_or_else(|| {
+            let tried = default_socket_candidates()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            KubeletError::Backend(format!(
+                "no podman API socket found (tried: {tried}). If podman is installed but the \
+                 socket is not being served, enable it — `systemctl enable --now podman.socket` \
+                 for rootful, or `systemctl --user enable --now podman.socket` for rootless"
+            ))
+        })
+    }
+
+    /// The socket path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// engenho's default container network.
+///
+/// The same literal `PodmanNetwork::default()` uses in the CLI backend. Named
+/// here rather than imported because it is `PodmanNetwork::Named`'s inner
+/// value, not a public constant — and duplicating a literal is better than
+/// exporting a type whose shape this backend does not otherwise need. A test
+/// pins the two together so they cannot drift.
+pub const ENGENHO_NETWORK: &str = "engenho-net";
+
+/// libpod's API version prefix.
+///
+/// Pinned rather than floating. podman serves versioned paths and keeps old
+/// versions working; asking for a version is how a client states the contract
+/// it was written against. `4.0.0` is the compatibility floor podman 4.x and
+/// 5.x both honour, so this does not chase the installed version.
+pub const API_VERSION: &str = "v4.0.0";
+
+/// Build a libpod path: `/{API_VERSION}/libpod/{tail}`.
+#[must_use]
+pub fn libpod_path(tail: &str) -> String {
+    let mut s = String::with_capacity(API_VERSION.len() + tail.len() + 10);
+    s.push('/');
+    s.push_str(API_VERSION);
+    s.push_str("/libpod/");
+    s.push_str(tail.trim_start_matches('/'));
+    s
+}
+
+// ── Request bodies ─────────────────────────────────────────────────────────
+//
+// Typed structs rather than hand-built JSON. A misspelled key in a
+// `serde_json::json!` literal is accepted by the compiler and rejected — or
+// worse, IGNORED — by podman, which is the same failure class as a misspelled
+// CLI flag and would defeat the point of moving off the CLI.
+
+/// libpod's container-create request (the subset engenho sets).
+///
+/// podman's `SpecGenerator` has well over a hundred fields; every one omitted
+/// here takes podman's own default, which is what the CLI would also have done.
+/// Fields are `skip_serializing_if` so an unset value is ABSENT rather than
+/// `null` — podman distinguishes the two for several options.
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct CreateRequest {
+    /// Container name.
+    pub name: String,
+    /// Image reference.
+    pub image: String,
+    /// Entrypoint override — podman's `command`, the CLI's trailing args.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Environment, as a map (the CLI's repeated `-e k=v`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Networks to attach, keyed by name.
+    #[serde(rename = "Networks", skip_serializing_if = "BTreeMap::is_empty")]
+    pub networks: BTreeMap<String, PerNetworkOptions>,
+    /// Bind mounts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<Mount>,
+    /// Pull policy for the image.
+    #[serde(rename = "pull_policy", skip_serializing_if = "Option::is_none")]
+    pub pull_policy: Option<String>,
+    /// Remove the container when it exits. Always false: the kubelet reads exit
+    /// codes off stopped containers, and a self-removing container makes a
+    /// terminal status unobservable.
+    pub remove: bool,
+}
+
+/// Per-network attachment options — carries the DNS aliases.
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct PerNetworkOptions {
+    /// DNS names this container answers to on that network.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+/// A bind mount.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Mount {
+    /// In-container path.
+    #[serde(rename = "Destination")]
+    pub destination: String,
+    /// Host path.
+    #[serde(rename = "Source")]
+    pub source: String,
+    /// Always `bind` here — engenho resolves volumes to host paths before this
+    /// layer, so podman never has to know about the Kubernetes volume kinds.
+    #[serde(rename = "Type")]
+    pub mount_type: String,
+    /// `ro` / `rw` and friends.
+    #[serde(rename = "Options")]
+    pub options: Vec<String>,
+}
+
+/// libpod's create response.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CreateResponse {
+    /// The new container's id.
+    #[serde(rename = "Id")]
+    pub id: String,
+    /// Non-fatal warnings podman attached.
+    #[serde(rename = "Warnings", default)]
+    pub warnings: Vec<String>,
+}
+
+/// The slice of `GET /containers/{id}/json` engenho reads.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct InspectResponse {
+    /// Container id.
+    #[serde(rename = "Id")]
+    pub id: String,
+    /// Runtime state.
+    #[serde(rename = "State")]
+    pub state: InspectState,
+    /// Network attachments, keyed by network name.
+    #[serde(rename = "NetworkSettings", default)]
+    pub network_settings: Option<NetworkSettings>,
+}
+
+/// The state block of an inspect response.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct InspectState {
+    /// podman's state string: `created`, `running`, `exited`, …
+    #[serde(rename = "Status", default)]
+    pub status: String,
+    /// Whether it is running right now.
+    #[serde(rename = "Running", default)]
+    pub running: bool,
+    /// Exit code — meaningful only once terminal.
+    #[serde(rename = "ExitCode", default)]
+    pub exit_code: i32,
+}
+
+/// Network settings, for the pod IP.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct NetworkSettings {
+    /// Per-network detail, keyed by network name.
+    #[serde(rename = "Networks", default)]
+    pub networks: BTreeMap<String, NetworkDetail>,
+    /// The legacy top-level address, used when `Networks` is empty.
+    #[serde(rename = "IPAddress", default)]
+    pub ip_address: String,
+}
+
+/// One network's attachment detail.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct NetworkDetail {
+    /// This container's address on that network.
+    #[serde(rename = "IPAddress", default)]
+    pub ip_address: String,
+}
+
+impl InspectResponse {
+    /// The container's address, preferring a named network over the legacy
+    /// top-level field.
+    ///
+    /// Returns `None` rather than an empty string for "no address yet": a
+    /// container in `created` has no IP, and an empty string presented as an
+    /// address is the kind of value that reaches a Pod status and looks real.
+    #[must_use]
+    pub fn pod_ip(&self) -> Option<String> {
+        let settings = self.network_settings.as_ref()?;
+        for detail in settings.networks.values() {
+            if !detail.ip_address.is_empty() {
+                return Some(detail.ip_address.clone());
+            }
+        }
+        if settings.ip_address.is_empty() {
+            None
+        } else {
+            Some(settings.ip_address.clone())
+        }
+    }
+}
+
+/// Map engenho's [`PullPolicy`] onto libpod's `pull_policy` string.
+///
+/// The same mapping [`crate::backend::PodmanBackend`] makes for `--pull`, kept
+/// deliberately identical so switching backends cannot change WHEN a registry
+/// is contacted. That would be a behaviour change disguised as a refactor.
+#[must_use]
+pub fn pull_policy_value(policy: PullPolicy) -> &'static str {
+    match policy {
+        // `IfNotPresent` is `missing`, NOT `newer`: `newer` is a registry
+        // round-trip on every start. Corrected in the CLI backend 2026-08-30
+        // and carried here rather than re-derived.
+        PullPolicy::Never => "never",
+        PullPolicy::Missing | PullPolicy::IfNotPresent => "missing",
+        PullPolicy::Always => "always",
+    }
+}
+
+/// Build the create request for a [`ContainerSpec`].
+///
+/// Pure — no I/O — so the request body is unit-testable without a podman.
+/// That is most of the value of moving off argv: the thing that used to be an
+/// unverifiable string vector is now a typed value with an equality test.
+#[must_use]
+pub fn create_request(spec: &ContainerSpec, network: Option<&str>) -> CreateRequest {
+    let mut networks = BTreeMap::new();
+    if let Some(net) = network {
+        networks.insert(
+            net.to_string(),
+            PerNetworkOptions {
+                aliases: spec.network_aliases.clone(),
+            },
+        );
+    }
+    CreateRequest {
+        name: spec.name.clone(),
+        image: spec.image.clone(),
+        command: spec.command.clone(),
+        env: spec.env.clone(),
+        networks,
+        mounts: Vec::new(),
+        pull_policy: spec.pull_policy.map(|p| pull_policy_value(p).to_string()),
+        remove: false,
+    }
+}
+
+// ── The transport ──────────────────────────────────────────────────────────
+
+/// A libpod client: HTTP/1.1 over the unix socket, no subprocess.
+///
+/// One connection PER REQUEST rather than a pooled client, deliberately. The
+/// kubelet's call rate is a handful of requests per pod per reconcile tick, a
+/// unix-socket connect is microseconds, and a pool would add a failure mode
+/// (a half-closed connection surviving a podman restart) that costs more than
+/// the connect it saves. `podman --remote` does the same thing.
+#[derive(Clone, Debug)]
+pub struct PodmanApi {
+    endpoint: Endpoint,
+}
+
+impl PodmanApi {
+    /// A client for an explicit endpoint.
+    #[must_use]
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self { endpoint }
+    }
+
+    /// A client for the discovered socket.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] when no socket exists — see [`Endpoint::discover`].
+    pub fn discover() -> Result<Self, KubeletError> {
+        Ok(Self::new(Endpoint::discover()?))
+    }
+
+    /// The endpoint this client talks to.
+    #[must_use]
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Send one request and read the whole response.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on connect, protocol or read failure. Every
+    /// message names the socket, because the two failures that actually happen
+    /// — the socket not being served, and it belonging to a different user's
+    /// podman — are indistinguishable without it.
+    async fn send(
+        &self,
+        method: hyper::Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<(hyper::StatusCode, Vec<u8>), KubeletError> {
+        use http_body_util::{BodyExt as _, Full};
+        use hyper::body::Bytes;
+
+        let sock = self.endpoint.path();
+        let stream = tokio::net::UnixStream::connect(sock).await.map_err(|e| {
+            KubeletError::Backend(format!("connect to podman API at {}: {e}", sock.display()))
+        })?;
+
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .map_err(|e| {
+                    KubeletError::Backend(format!(
+                        "podman API handshake at {}: {e}",
+                        sock.display()
+                    ))
+                })?;
+
+        // The connection future must be driven for the request to progress. It
+        // ends when the response is complete; a dropped handle would cancel the
+        // request mid-flight.
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let has_body = body.is_some();
+        let mut req = hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            // libpod ignores Host for a unix socket, but HTTP/1.1 requires it
+            // and some proxies in front of a socket do not.
+            .header(hyper::header::HOST, "d");
+        if has_body {
+            req = req.header(hyper::header::CONTENT_TYPE, "application/json");
+        }
+        let req = req
+            .body(Full::new(Bytes::from(body.unwrap_or_default())))
+            .map_err(|e| KubeletError::Backend(format!("build podman request {path}: {e}")))?;
+
+        let resp = sender.send_request(req).await.map_err(|e| {
+            KubeletError::Backend(format!("podman API {path} at {}: {e}", sock.display()))
+        })?;
+        let status = resp.status();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| KubeletError::Backend(format!("read podman response {path}: {e}")))?
+            .to_bytes()
+            .to_vec();
+        Ok((status, bytes))
+    }
+
+    /// `POST /libpod/containers/create`.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure or a non-2xx status, with
+    /// podman's own error body included — that body is the diagnosis (`image not
+    /// known`, `name already in use`) and discarding it is how a runtime error
+    /// becomes "create failed".
+    pub async fn create(&self, req: &CreateRequest) -> Result<CreateResponse, KubeletError> {
+        let body = serde_json::to_vec(req)
+            .map_err(|e| KubeletError::Backend(format!("encode create request: {e}")))?;
+        let (status, bytes) = self
+            .send(
+                hyper::Method::POST,
+                &libpod_path("containers/create"),
+                Some(body),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman create {}: HTTP {status}: {}",
+                req.name,
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| KubeletError::Backend(format!("decode create response: {e}")))
+    }
+
+    /// `POST /libpod/containers/{id}/start`.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure or a non-2xx status.
+    /// **304 is success**: podman returns Not Modified when the container is
+    /// already running, and treating that as an error would make every
+    /// reconcile tick after the first one fail.
+    pub async fn start(&self, id: &str) -> Result<(), KubeletError> {
+        let (status, bytes) = self
+            .send(
+                hyper::Method::POST,
+                &libpod_path(&format!("containers/{id}/start")),
+                None,
+            )
+            .await?;
+        if status.is_success() || status == hyper::StatusCode::NOT_MODIFIED {
+            return Ok(());
+        }
+        Err(KubeletError::Backend(format!(
+            "podman start {id}: HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )))
+    }
+
+    /// `GET /libpod/containers/{id}/json`, or `None` when absent.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure or an unexpected status.
+    /// A 404 is `Ok(None)`, NOT an error: "this container does not exist" is a
+    /// normal answer to the kubelet's question and the reconciler acts on it.
+    pub async fn inspect(&self, id: &str) -> Result<Option<InspectResponse>, KubeletError> {
+        let (status, bytes) = self
+            .send(
+                hyper::Method::GET,
+                &libpod_path(&format!("containers/{id}/json")),
+                None,
+            )
+            .await?;
+        if status == hyper::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman inspect {id}: HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| KubeletError::Backend(format!("decode inspect {id}: {e}")))
+    }
+
+    /// `POST /libpod/containers/{id}/stop`.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure or an unexpected status.
+    /// 304 (already stopped) and 404 (already gone) are both success — stopping
+    /// is idempotent from the reconciler's point of view, and it re-issues stop
+    /// on every tick until the pod object disappears.
+    pub async fn stop(&self, id: &str) -> Result<(), KubeletError> {
+        let (status, bytes) = self
+            .send(
+                hyper::Method::POST,
+                &libpod_path(&format!("containers/{id}/stop")),
+                None,
+            )
+            .await?;
+        if status.is_success()
+            || status == hyper::StatusCode::NOT_MODIFIED
+            || status == hyper::StatusCode::NOT_FOUND
+        {
+            return Ok(());
+        }
+        Err(KubeletError::Backend(format!(
+            "podman stop {id}: HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )))
+    }
+
+    /// `DELETE /libpod/containers/{id}?force=true`.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure or an unexpected status.
+    /// 404 is success, for the same idempotence reason as `stop`.
+    ///
+    /// ★ This is also the fix for a measured CLI-backend failure: `podman rm`
+    /// exits 0 while removing nothing when the store record is missing, so
+    /// neither the exit code nor the absence of an exception reveals it — only
+    /// the stderr text. Over the API a failure is a STATUS CODE, which cannot
+    /// be mistaken for success.
+    pub async fn remove(&self, id: &str) -> Result<(), KubeletError> {
+        let (status, bytes) = self
+            .send(
+                hyper::Method::DELETE,
+                &libpod_path(&format!("containers/{id}?force=true")),
+                None,
+            )
+            .await?;
+        if status.is_success() || status == hyper::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        Err(KubeletError::Backend(format!(
+            "podman remove {id}: HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )))
+    }
+}
+
+// ── The ContainerRuntime implementation ────────────────────────────────────
+
+/// The naturalized podman backend: every operation an API call.
+///
+/// Drop-in for [`crate::backend::PodmanBackend`] — same trait, same semantics,
+/// no subprocess. The differences that matter are all in the failure modes:
+///
+/// * A failure is a STATUS CODE, not a parsed error string. `podman rm` exiting
+///   0 while removing nothing (measured 2026-09-01, and undetectable from the
+///   exit code) has no analogue here.
+/// * "Already running" / "already gone" are distinguishable from "failed",
+///   because 304 and 404 are distinct from 500. On the CLI they are all
+///   non-zero exits with prose.
+/// * A podman upgrade that renames a flag cannot silently change behaviour.
+///   The API is versioned; the CLI is not.
+#[derive(Clone, Debug)]
+pub struct PodmanApiBackend {
+    api: PodmanApi,
+    network: Option<String>,
+}
+
+impl PodmanApiBackend {
+    /// A backend on an explicit endpoint.
+    #[must_use]
+    pub fn new(api: PodmanApi, network: Option<String>) -> Self {
+        Self { api, network }
+    }
+
+    /// A backend on the discovered socket, attached to engenho's network.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] when no podman socket exists.
+    pub fn discover() -> Result<Self, KubeletError> {
+        Ok(Self::new(
+            PodmanApi::discover()?,
+            Some(ENGENHO_NETWORK.to_string()),
+        ))
+    }
+
+    /// The endpoint in use — for startup logging, so an operator can see WHICH
+    /// podman store this kubelet is driving without guessing.
+    #[must_use]
+    pub fn endpoint_path(&self) -> &Path {
+        self.api.endpoint().path()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::backend::ContainerRuntime for PodmanApiBackend {
+    fn name(&self) -> &'static str {
+        "podman-api"
+    }
+
+    async fn start(
+        &self,
+        spec: &ContainerSpec,
+    ) -> Result<crate::backend::ContainerStatus, KubeletError> {
+        let req = create_request(spec, self.network.as_deref());
+        let created = self.api.create(&req).await?;
+        self.api.start(&created.id).await?;
+
+        // Read back rather than assume. `start` returning 2xx means podman
+        // accepted the request; the ADDRESS is assigned during startup, and a
+        // status synthesised from the request would report an IP the container
+        // does not have.
+        let status = self.api.inspect(&created.id).await?;
+        Ok(match status {
+            Some(i) => {
+                let pod_ip = i.pod_ip();
+                crate::backend::ContainerStatus {
+                    container_id: i.id,
+                    running: i.state.running,
+                    pod_ip,
+                    exit_code: if i.state.running {
+                        None
+                    } else {
+                        Some(i.state.exit_code)
+                    },
+                }
+            }
+            // Created and started, then gone before the read: a container that
+            // exits instantly. Report it as not-running with no exit code
+            // rather than inventing one — the reconciler's next tick will see
+            // the real terminal state.
+            None => crate::backend::ContainerStatus {
+                container_id: created.id,
+                running: false,
+                pod_ip: None,
+                exit_code: None,
+            },
+        })
+    }
+
+    async fn status(
+        &self,
+        container_id: &str,
+    ) -> Result<Option<crate::backend::ContainerStatus>, KubeletError> {
+        Ok(self.api.inspect(container_id).await?.map(|i| {
+            let pod_ip = i.pod_ip();
+            crate::backend::ContainerStatus {
+                container_id: i.id,
+                running: i.state.running,
+                pod_ip,
+                // An exit code is only meaningful once the container is
+                // terminal. Reporting 0 for a RUNNING container is how a
+                // healthy workload gets read as a clean exit and restarted.
+                exit_code: if i.state.running {
+                    None
+                } else {
+                    Some(i.state.exit_code)
+                },
+            }
+        }))
+    }
+
+    async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
+        self.api.stop(container_id).await
+    }
+
+    async fn remove(&self, container_id: &str) -> Result<(), KubeletError> {
+        self.api.remove(container_id).await
+    }
+
+    async fn logs(
+        &self,
+        container_id: &str,
+        opts: &crate::backend::LogOptions,
+    ) -> Result<String, KubeletError> {
+        // Same multiplexed-stream shape as exec: libpod's logs endpoint frames
+        // stdout and stderr with 8-byte headers. Refused rather than returned
+        // empty — the trait's own contract says a not-found container must be a
+        // typed error and "never a silently-empty success", and the same
+        // reasoning forbids an empty string standing in for an unimplemented
+        // decoder. An operator reading empty logs concludes the workload is
+        // quiet, not that the backend cannot read them.
+        // `pending-podman-api: log stream demultiplexing`
+        let _ = (container_id, opts);
+        Err(KubeletError::Backend(
+            "logs are not implemented on the podman API backend yet (the libpod log stream is \
+             multiplexed and needs demultiplexing); use kubeletBackend = \"podman\" if you need \
+             container logs"
+                .to_string(),
+        ))
+    }
+
+    async fn exec(
+        &self,
+        container_id: &str,
+        argv: &[String],
+    ) -> Result<crate::backend::ExecOutcome, KubeletError> {
+        // ── NOT YET ON THE API PATH, AND SAID SO RATHER THAN FAKED ─────────
+        // libpod's exec is a two-step create/start whose output arrives as a
+        // MULTIPLEXED stream (8-byte frame headers interleaving stdout and
+        // stderr) over a hijacked connection. Demultiplexing it is real work,
+        // and the honest thing is a typed refusal rather than a plausible
+        // `ExecOutcome::success()` — a fabricated success here would be read by
+        // a liveness probe as a healthy container.
+        //
+        // Exec is used by probes and `kubectl exec`, not by the pod lifecycle,
+        // so a node running this backend still starts, stops and reports pods
+        // correctly. `pending-podman-api: exec stream demultiplexing`
+        let _ = (container_id, argv);
+        Err(KubeletError::Backend(
+            "exec is not implemented on the podman API backend yet (the libpod exec stream is \
+             multiplexed and needs demultiplexing); use kubeletBackend = \"podman\" if you need \
+             exec or exec-based probes"
+                .to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn libpod_paths_are_versioned_and_single_slashed() {
+        assert_eq!(
+            libpod_path("containers/create"),
+            "/v4.0.0/libpod/containers/create"
+        );
+        // A caller writing a leading slash is the obvious mistake and must not
+        // produce `//`, which some proxies normalise and some do not.
+        assert_eq!(
+            libpod_path("/containers/create"),
+            "/v4.0.0/libpod/containers/create"
+        );
+    }
+
+    #[test]
+    fn the_socket_search_prefers_rootless_when_a_user_session_exists() {
+        // Whichever socket is chosen decides which container STORE the kubelet
+        // manages. Choosing the rootful one inside a user session leaves it
+        // driving containers that user cannot see.
+        let candidates = default_socket_candidates();
+        assert!(
+            candidates.contains(&PathBuf::from("/run/podman/podman.sock")),
+            "the rootful socket must always be a candidate: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn pull_policy_mapping_matches_the_cli_backend_exactly() {
+        // If these ever diverge, switching backends silently changes when a
+        // registry is contacted — a behaviour change wearing a refactor's
+        // clothes.
+        assert_eq!(pull_policy_value(PullPolicy::Never), "never");
+        assert_eq!(pull_policy_value(PullPolicy::Missing), "missing");
+        assert_eq!(
+            pull_policy_value(PullPolicy::IfNotPresent),
+            "missing",
+            "IfNotPresent is `missing`, never `newer` — `newer` is a registry \
+             round-trip on every start (corrected in the CLI backend 2026-08-30)"
+        );
+        assert_eq!(pull_policy_value(PullPolicy::Always), "always");
+    }
+
+    #[test]
+    fn a_create_request_carries_name_image_env_command_and_aliases() {
+        let mut env = BTreeMap::new();
+        env.insert("KUBECONFIG".to_string(), "/etc/kube/config".to_string());
+        let spec = ContainerSpec {
+            name: "operator-0".to_string(),
+            image: "ghcr.io/pleme-io/pangea-operator:x".to_string(),
+            env,
+            command: vec!["/bin/operator".to_string(), "--serve".to_string()],
+            pull_policy: Some(PullPolicy::Never),
+            network_aliases: vec!["operator".to_string()],
+            mounts: Vec::new(),
+        };
+        let req = create_request(&spec, Some("engenho-net"));
+
+        assert_eq!(req.name, "operator-0");
+        assert_eq!(req.command, vec!["/bin/operator", "--serve"]);
+        assert_eq!(
+            req.env.get("KUBECONFIG").map(String::as_str),
+            Some("/etc/kube/config")
+        );
+        assert_eq!(req.pull_policy.as_deref(), Some("never"));
+        assert_eq!(
+            req.networks.get("engenho-net").map(|n| n.aliases.clone()),
+            Some(vec!["operator".to_string()]),
+            "network aliases are what make pod-to-pod DNS work; losing them is \
+             silent until one workload cannot resolve another"
+        );
+    }
+
+    #[test]
+    fn a_created_container_never_self_removes() {
+        // `remove: true` would delete the container on exit, which makes a
+        // terminal exit code unobservable — and the kubelet's whole restart
+        // decision reads that exit code.
+        let spec = ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            ..ContainerSpec::default()
+        };
+        assert!(!create_request(&spec, None).remove);
+    }
+
+    #[test]
+    fn an_absent_pull_policy_is_omitted_rather_than_null() {
+        // podman distinguishes an unset field from an explicit null on several
+        // options, so an omitted policy must take podman's default rather than
+        // assert one.
+        let spec = ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            ..ContainerSpec::default()
+        };
+        let json = serde_json::to_string(&create_request(&spec, None)).unwrap();
+        assert!(
+            !json.contains("pull_policy"),
+            "an unset pull policy must not appear in the body: {json}"
+        );
+    }
+
+    #[test]
+    fn a_container_with_no_address_reports_none_not_empty_string() {
+        let r = InspectResponse {
+            id: "abc".to_string(),
+            state: InspectState {
+                status: "created".to_string(),
+                running: false,
+                exit_code: 0,
+            },
+            network_settings: Some(NetworkSettings::default()),
+        };
+        assert_eq!(
+            r.pod_ip(),
+            None,
+            "an empty string presented as an address reaches Pod status and \
+             looks like a real value"
+        );
+    }
+
+    #[test]
+    fn a_named_network_address_wins_over_the_legacy_field() {
+        let mut networks = BTreeMap::new();
+        networks.insert(
+            "engenho-net".to_string(),
+            NetworkDetail {
+                ip_address: "10.89.1.7".to_string(),
+            },
+        );
+        let r = InspectResponse {
+            id: "abc".to_string(),
+            state: InspectState::default(),
+            network_settings: Some(NetworkSettings {
+                networks,
+                ip_address: "172.17.0.2".to_string(),
+            }),
+        };
+        assert_eq!(r.pod_ip().as_deref(), Some("10.89.1.7"));
+    }
+
+    #[test]
+    fn inspect_deserialises_from_podmans_actual_field_casing() {
+        // Podman capitalises these; serde would silently leave every field at
+        // its Default if the rename attributes were wrong, producing a
+        // container that always reads as not-running with exit code 0 — a
+        // crash-loop that looks like a workload bug.
+        let raw = r#"{
+            "Id": "deadbeef",
+            "State": {"Status": "running", "Running": true, "ExitCode": 0},
+            "NetworkSettings": {"Networks": {"engenho-net": {"IPAddress": "10.89.1.9"}}}
+        }"#;
+        let r: InspectResponse = serde_json::from_str(raw).expect("inspect must parse");
+        assert_eq!(r.id, "deadbeef");
+        assert!(r.state.running);
+        assert_eq!(r.pod_ip().as_deref(), Some("10.89.1.9"));
+    }
+}

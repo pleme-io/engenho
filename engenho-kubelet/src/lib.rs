@@ -50,6 +50,7 @@ pub mod kubelet;
 pub mod lifecycle;
 pub mod node_lease;
 pub mod pod_volume;
+pub mod podman_api;
 pub mod probe;
 pub mod server;
 pub mod volume;
