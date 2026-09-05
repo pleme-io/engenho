@@ -38,6 +38,40 @@ pub enum RuntimeError {
         source: std::net::AddrParseError,
     },
 
+    /// The cluster's CA is reproducible from public source AND the apiserver
+    /// was asked to listen somewhere other than loopback.
+    ///
+    /// ── ★ WHY THIS REFUSES TO START ────────────────────────────────────────
+    /// Before the per-cluster PKI seed, every engenho derived its CA and its
+    /// `O=system:masters` admin client key from a constant in a PUBLIC
+    /// repository. Anyone who can read the source can reconstruct that CA and
+    /// mint a super-user certificate such a cluster will accept.
+    ///
+    /// Bound to `127.0.0.1` that is inert: nothing off-host can reach it, and
+    /// refusing to start would break every working local cluster over a risk
+    /// they do not carry. Bound to a tailnet address, a LAN interface or
+    /// `0.0.0.0`, it is an unauthenticated path to cluster-admin — and one that
+    /// fails OPEN, with a successful handshake, a valid certificate and no log
+    /// line anywhere to notice.
+    ///
+    /// So the pairing is the check: a public CA is tolerated exactly as long as
+    /// it is unreachable. Refusing here makes "expose a cluster whose admin key
+    /// is public knowledge" a startup failure rather than a silent posture.
+    #[error(
+        "refusing to serve {listen_addr} with a CA whose private key is derivable from public \
+         source. This cluster's PKI predates the per-cluster seed, so its CA and its \
+         system:masters admin certificate are identical on every engenho ever built and can be \
+         reconstructed by anyone. Loopback-only is safe; this address is not. Remove \
+         {pki_dir} and restart to mint a private cluster identity (every kubeconfig for this \
+         cluster must then be re-fetched)"
+    )]
+    PublicCaOnReachableAddress {
+        /// The address that would have been served.
+        listen_addr: String,
+        /// The directory to delete to regenerate the PKI.
+        pki_dir: String,
+    },
+
     /// An entry in `runtime.tls.extra_sans` is not a usable SAN.
     ///
     /// Refused BEFORE the apiserver binds, deliberately. A SAN is only ever
@@ -116,6 +150,7 @@ engenho_substrate::impl_error_kind! {
         { LeadershipTimeout { .. } } => "leadership_timeout",
         { ListenAddr { .. } } => "listen_addr",
         { ExtraSan { .. } } => "extra_san",
+        { PublicCaOnReachableAddress { .. } } => "public_ca_on_reachable_address",
         { StoreStillShared { .. } } => "store_still_shared",
         { ContainerRuntimeUnavailable { .. } } => "container_runtime_unavailable",
         (Kubeconfig(_)) => "kubeconfig",
