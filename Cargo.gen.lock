@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "d737a4434e9ce912b69b068787b8981769cca75163104acc80608973dabb9d39",
+  "cargo_lock_sha256": "18ad4e39c214117a1982aa5ada736a2c1a9fbdd5a75055390f42c0cf8f2fa451",
   "manifest_sha256": {
-    "Cargo.toml": "79ddb299f50a5b9924fdfdca60fd9bed808e2c25e0fe477a83e7a325f569fcd5",
+    "Cargo.toml": "8002e32a989006c20f76aa466dbd7b9aca51d1b6c932506c1d9fc2dbc4a2c9e5",
     "engenho-apiserver/Cargo.toml": "dd8ed22200247d6e30cbd121f61cf79de3c9bc3f83946ddd4519d6626b03ac33",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
@@ -17,7 +17,7 @@
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
-    "engenho-kubelet/Cargo.toml": "627102d6c30b00de213be7439fe61284412c707dbf0a1ec267167d0f127fda7d",
+    "engenho-kubelet/Cargo.toml": "dea84119b26f794b755c0e073c5eea390b149b3c68314c7c3ada1648efaae051",
     "engenho-machines/Cargo.toml": "7722f5b1de0b7af3d290f6b36bdea89e36ab888853f23a6432792ddd9640c442",
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
@@ -6197,6 +6197,41 @@
             "package_key": "engenho-types-0.53.67",
             "kind": "normal",
             "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "http_body_util",
+            "package_key": "http-body-util-0.1.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "hyper",
+            "package_key": "hyper-1.10.0",
+            "kind": "normal",
+            "features": [
+              "client",
+              "http1"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "hyper_util",
+            "package_key": "hyper-util-0.1.20",
+            "kind": "normal",
+            "features": [
+              "tokio"
+            ],
             "uses_default_features": true,
             "optional": false,
             "target": null,
