@@ -46,16 +46,19 @@ pub enum KubeletBackendKind {
     /// socket it chose at startup so an operator can see WHICH container store
     /// is being driven.
     ///
-    /// Does not yet implement `exec` or `logs`: libpod streams both as
-    /// multiplexed frames, and both refuse with a typed error naming
-    /// `kubeletBackend = "podman"` as the fallback rather than returning a
-    /// fabricated success or an empty string.
+    /// Implements the FULL trait including `exec` and `logs` — libpod frames
+    /// both Docker-style (kind byte, big-endian length) and the backend
+    /// demultiplexes them. Verified against podman's actual bytes on the wire,
+    /// not against a reading of the spec.
     PodmanApi,
     /// Real podman SHELL-OUT — argv, subprocess, stdout parsing.
     ///
-    /// Retained, not deleted (★★ MODULARIZE, DON'T DELETE): it is the only
-    /// backend that currently serves `exec` and `logs`, so a node running
-    /// exec-based probes or serving `kubectl logs` still needs it.
+    /// Retained, not deleted (★★ MODULARIZE, DON'T DELETE). It is no longer
+    /// needed for any capability — the API backend now serves the whole trait —
+    /// so it is kept as the fallback when no podman socket is being served, and
+    /// as the differential oracle: the two backends must place the same bytes
+    /// at the same container path, and a divergence between them is a bug in
+    /// one of the two.
     ///
     /// Its failure modes are the reason it is no longer the default. A CLI
     /// error is prose with no schema; `podman rm` can exit 0 while removing
@@ -461,7 +464,7 @@ mod backend_kind_wire {
 
     /// The shell-out backend is still SELECTABLE.
     ///
-    /// ★★ MODULARIZE, DON'T DELETE — it is the only backend serving `exec` and
+    /// ★★ MODULARIZE, DON'T DELETE — retained as fallback and oracle, formerly the only backend serving `exec` and
     /// `logs`, so removing it would take exec-based probes and `kubectl logs`
     /// with it. Retirement here is a changed default, not a deletion.
     #[test]
