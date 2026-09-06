@@ -1116,6 +1116,17 @@ struct WatchStreamState {
     namespace: Option<String>,
     selectors: Selectors,
     allow_bookmarks: bool,
+    /// Server-side deadline from `?timeoutSeconds=N`. `None` = stream
+    /// until the client goes away.
+    ///
+    /// K8s closes a watch CLEANLY at this point so the client re-LISTs and
+    /// re-WATCHes. Without it the field was parsed and honoured by nobody,
+    /// so a long-running client fell back on its own read timeout: measured
+    /// against a live engenho on 2026-09-06, pangea-operator logged ~28
+    /// `hyper::Error(Body, Kind(TimedOut))` per hour across all 12 of its
+    /// controllers, each followed by a re-LIST. Reconciliation still
+    /// happened, so the failure was invisible except as log noise.
+    deadline: Option<tokio::time::Instant>,
 }
 
 /// Build the streaming chunked-transfer WATCH response.
@@ -1176,11 +1187,24 @@ async fn watch_response(
         namespace,
         selectors: sel,
         allow_bookmarks: p.allow_watch_bookmarks,
+        deadline: p.timeout()?.map(|d| tokio::time::Instant::now() + d),
     };
 
     let live = futures::stream::unfold(init, |mut st| async move {
         loop {
-            match st.stream.next().await {
+            // Honour `?timeoutSeconds=N`: at the deadline the server ENDS the
+            // stream cleanly (`None`), which is a normal close on the wire, not
+            // an error. The client re-LISTs and re-WATCHes — the K8s contract.
+            // Racing here rather than wrapping the whole stream keeps the
+            // in-band 410 paths below reachable right up to the deadline.
+            let next = match st.deadline {
+                Some(at) => match tokio::time::timeout_at(at, st.stream.next()).await {
+                    Ok(item) => item,
+                    Err(_) => return None,
+                },
+                None => st.stream.next().await,
+            };
+            match next {
                 Some(Ok(WatchSignal::Event(ev))) => {
                     // Filter to this handler's GVK + requested namespace,
                     // then by selectors. A change to another kind / ns /
