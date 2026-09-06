@@ -184,11 +184,11 @@ in
         an operator can see WHICH container store is being driven.
 
         `podman` is the original SHELL-OUT backend: argv, subprocess, stdout
-        parsing. It is retained rather than removed because it is the only
-        backend that currently serves `exec` and `logs` — libpod streams both as
-        multiplexed frames and the API backend refuses them with a typed error
-        rather than a fabricated success. Choose it on a node that runs
-        exec-based probes or serves `kubectl logs`.
+        parsing. It no longer serves any capability the API backend lacks — as of
+        2026-09-06 `podman_api` implements the full trait including `exec` and
+        `logs`. It is retained (★★ MODULARIZE, DON'T DELETE) as the fallback when
+        no podman socket is served, and as a differential oracle: both backends
+        must place the same bytes at the same container path.
 
         `fake` runs NOTHING — the mock backend, correct for a
         control-plane-only node and wrong anywhere pods must actually run.
