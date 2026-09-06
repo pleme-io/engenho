@@ -134,6 +134,37 @@ impl ListWatchParams {
         }
     }
 
+    /// `timeoutSeconds` as a typed duration. Absent / empty / `"0"` =>
+    /// `None`, meaning "no server-side deadline, stream until the client
+    /// goes away" — which is also K8s's meaning for an absent value.
+    ///
+    /// K8s treats this as the interval after which the server CLOSES the
+    /// watch cleanly, so the client re-LISTs and re-WATCHes. Honouring it
+    /// is what keeps a long-running client from having to rely on its own
+    /// read timeout: before this accessor existed the field was parsed and
+    /// read by nobody, so `?timeoutSeconds=N` was silently discarded and a
+    /// kube-rs controller churned on `hyper::Error(Body, Kind(TimedOut))`
+    /// instead (~28/hour, measured against a live engenho 2026-09-06).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::BadRequest`] when the value is present but not a
+    /// non-negative integer — a typed 400 rather than a serde reject, the
+    /// same shape as [`Self::limit`].
+    pub fn timeout(&self) -> Result<Option<std::time::Duration>, ApiError> {
+        match self.timeout_seconds.as_deref() {
+            None | Some("") | Some("0") => Ok(None),
+            Some(s) => s
+                .parse::<u64>()
+                .map(|n| Some(std::time::Duration::from_secs(n)))
+                .map_err(|_| {
+                    ApiError::BadRequest(format!(
+                        "invalid timeoutSeconds: {s:?} (must be a non-negative integer)"
+                    ))
+                }),
+        }
+    }
+
     /// Decode + integrity-verify the `continue` token. Absent / empty =>
     /// `None` (first page). A present-but-invalid/expired/corrupt token
     /// => [`ApiError::Gone`] (HTTP 410 / Expired), the K8s contract for a

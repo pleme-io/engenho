@@ -766,3 +766,96 @@ async fn handler_list_at_returns_items_and_current_revision() {
         .await
         .unwrap();
 }
+
+// =================================================================
+// timeoutSeconds — the server closes the watch, the client does not
+// =================================================================
+
+/// `?timeoutSeconds=N` ends the stream CLEANLY at the deadline.
+///
+/// Before this was honoured, `timeout_seconds` was parsed into
+/// `ListWatchParams` and read by nobody, so the watch stayed open forever
+/// and a long-running client fell back on its own read timeout instead.
+/// Measured against a live engenho on 2026-09-06: pangea-operator logged
+/// ~28 `hyper::Error(Body, Kind(TimedOut))` per hour, across all 12 of its
+/// controllers, each followed by a re-LIST. Reconciliation still happened,
+/// so nothing failed loudly — it was a poll wearing a watch's clothes.
+///
+/// The assertion is deliberately "the stream ENDS", not "an error arrives":
+/// K8s closes the watch cleanly and the client re-LISTs. An error here
+/// would be a different, worse contract.
+#[tokio::test]
+async fn watch_timeout_seconds_ends_the_stream_cleanly() {
+    let (_mesh, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let mut w = open_watch(
+        &client,
+        addr,
+        "/api/v1/namespaces/default/pods?watch=true&resourceVersion=0&timeoutSeconds=1",
+    )
+    .await;
+
+    // Drain until EOF. Any bookmark/event before the deadline is fine; the
+    // contract under test is that the stream TERMINATES, and within a bound
+    // that a never-closing stream could not satisfy.
+    let ended = tokio::time::timeout(Duration::from_secs(8), async {
+        while w.next_line().await.is_some() {}
+    })
+    .await;
+
+    assert!(
+        ended.is_ok(),
+        "watch with timeoutSeconds=1 must end; it was still open after 8s"
+    );
+}
+
+/// Negative control for the test above — WITHOUT `timeoutSeconds` the same
+/// watch is still open well past that deadline.
+///
+/// Without this, the test above passes for the wrong reason on any build
+/// where watches happen to close early (a dropped store, a panicking task),
+/// which would make it a vacuous guard rather than a test of the parameter.
+#[tokio::test]
+async fn watch_without_timeout_seconds_stays_open() {
+    let (_mesh, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    let mut w = open_watch(
+        &client,
+        addr,
+        "/api/v1/namespaces/default/pods?watch=true&resourceVersion=0",
+    )
+    .await;
+
+    // Read RAW chunks, not `next_line()`: that helper panics on a 3s
+    // silence ("watch chunk arrived before timeout"), and an idle watch is
+    // legitimately silent — so using it here would fail this control for
+    // the wrong reason instead of testing what it claims to.
+    //
+    // "Still open" = every chunk read either times out (silence, fine) or
+    // yields bytes. Only `Ok(None)` — a real EOF — means the server closed
+    // the stream, which is the thing that must NOT happen without the
+    // parameter.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let mut closed_early = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), w.resp.chunk()).await {
+            Err(_) => {}                       // silence: still open
+            Ok(Ok(Some(_))) => {}              // data: still open
+            Ok(Ok(None)) => {
+                closed_early = true;           // EOF: the server closed it
+                break;
+            }
+            Ok(Err(e)) => panic!("watch chunk read failed: {e}"),
+        }
+    }
+
+    assert!(
+        !closed_early,
+        "watch without timeoutSeconds must stay open; it ended on its own, \
+         which would make the timeoutSeconds test vacuous"
+    );
+}

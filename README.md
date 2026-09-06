@@ -170,13 +170,21 @@ DEGRADED, not broken. It is a poll wearing a watch's clothes.
 
 Two contributing causes, both verified:
 
-1. **`?timeoutSeconds=N` is parsed and never read.** `ListWatchParams`
-   (`engenho-apiserver/src/params.rs:70`) carries the field; nothing outside
-   that file ever reads it. A client asking the server to close the watch after
-   N seconds is silently ignored, so the watch is never closed server-side and
-   the client's own read timeout fires instead. This one is a plain conformance
-   gap: the parameter is accepted, well-formed, and consumed by nobody, so no
-   error is available to raise.
+1. **`?timeoutSeconds=N` was parsed and never read — FIXED.** `ListWatchParams`
+   carried the field while nothing outside `params.rs` ever read it, so a client
+   asking the server to close the watch after N seconds was silently ignored and
+   its own read timeout fired instead. A plain conformance gap: accepted,
+   well-formed, consumed by nobody, so no error was available to raise.
+
+   Now honoured — `ListWatchParams::timeout()` is a typed accessor in the same
+   shape as `limit()`/`continue_token()`, and the watch `unfold` races each poll
+   against a deadline, ENDING the stream cleanly at it (a normal close, not an
+   error, so the client re-LISTs per the K8s contract). Covered by
+   `watch_timeout_seconds_ends_the_stream_cleanly` plus a negative control that
+   asserts a watch WITHOUT the parameter stays open — without which the first
+   test would pass on any build where watches happen to close early. Red-run
+   receipt: forcing `deadline: None` fails the positive test and leaves the
+   control green.
 
 2. **Same-revision bookmarks are suppressed by design.**
    `WatcherRegistry::tick_bookmarks` skips when
@@ -187,8 +195,8 @@ Two contributing causes, both verified:
    against the declared 5s cadence (`handler.rs:27`). Upstream Kubernetes uses
    bookmarks as a periodic heartbeat precisely so an idle watch is not silent.
 
-The first is a bug and can simply be implemented. The second is a contract
-decision, not a defect to flip unilaterally — the tests
+The first is fixed. The second is a contract decision, not a defect to flip
+unilaterally — the tests
 (`bookmark_tick_delivers_then_advances`, `bookmark_gated_by_cadence`, and
 `r7_6_resumable_watch.rs:415`) pin the current behaviour on purpose. If the
 heartbeat reading wins, those tests change with it.
