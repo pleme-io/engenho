@@ -186,6 +186,33 @@ Two contributing causes, both verified:
    receipt: forcing `deadline: None` fails the positive test and leaves the
    control green.
 
+★★ **MEASURED AFTER SHIPPING (1): honouring `timeoutSeconds` alone made the
+observable WORSE, and it must not be deployed until gap 3 below is closed.**
+Deployed to plo and measured over a 12-minute window: **20 `WatchFailed` against
+a ~5.6 baseline** — roughly 4x. The fix works; the error merely CHANGED identity:
+
+    before: hyper::Error(Body, Kind(TimedOut))          — the client gave up
+    after:  hyper::Error(Body, Kind(UnexpectedEof))     — "peer closed
+            connection without sending TLS close_notify"
+
+3. **The server does not close a watch GRACEFULLY at the TLS layer.** Nothing in
+   this repo handles `close_notify` — `rg close_notify` across the tree returns
+   nothing. Before gap 1 was fixed, watches never ended, so the end-of-response
+   path was never exercised and this was invisible. Now that watches end on
+   schedule, every close trips rustls' truncation check, and they end MORE often
+   than the client used to time out — hence 4x.
+
+   Reconciliation is unaffected either way (6 reconciles in the same window,
+   against 1 before), so the node is arguably more responsive and definitely
+   noisier. That is not a good enough trade to leave deployed, so the plo
+   deployment was reverted to the pre-fix engenho while the fix stays on `main`.
+
+   The lesson generalises past TLS: **fixing the first defect in a chain can
+   expose the second and make the metric worse before it gets better.** The fix
+   was correct and tested (13/13, with a red-run receipt) and still regressed the
+   thing it targeted, because the test asserted the stream ENDS — which it does —
+   and could not see how the socket beneath it ended.
+
 2. **Same-revision bookmarks are suppressed by design.**
    `WatcherRegistry::tick_bookmarks` skips when
    `last_bookmarked_rev == Some(current)` (`engenho-store/src/watch_backend.rs:534`),
