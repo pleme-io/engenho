@@ -200,7 +200,13 @@ pub struct PerNetworkOptions {
     pub aliases: Vec<String>,
 }
 
-/// A bind mount.
+/// One mount, in libpod's `Mounts` shape.
+///
+/// `Type` is `bind` for a host path and `volume` for a named podman volume —
+/// the same distinction the CLI backend makes between `-v /host/path:/dst` and
+/// `-v volname:/dst`, where podman infers the kind from whether the source
+/// looks like a path. Over the API there is no inference: the kind is a field,
+/// which is one fewer thing to get wrong.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Mount {
     /// In-container path.
@@ -316,6 +322,34 @@ pub fn pull_policy_value(policy: PullPolicy) -> &'static str {
     }
 }
 
+/// Translate one resolved mount into libpod's shape.
+///
+/// Mirrors [`crate::backend::PodmanBackend`]'s argv rendering exactly —
+/// `HostDir` and `PvcHostDir` are bind mounts of a host path, `NamedVolume` is
+/// a podman volume — because the two backends must place the same bytes at the
+/// same container path. A mount that differs between backends is a workload
+/// that behaves differently depending on how the kubelet was configured, which
+/// is the worst kind of difference: invisible until something reads a file.
+fn to_libpod_mount(m: &crate::pod_volume::ResolvedMount) -> Mount {
+    use crate::pod_volume::MountSource;
+    let (source, mount_type) = match &m.source {
+        MountSource::HostDir(p) => (p.display().to_string(), "bind"),
+        MountSource::PvcHostDir { path, .. } => (path.display().to_string(), "bind"),
+        MountSource::NamedVolume(n) => (n.clone(), "volume"),
+    };
+    // `ro` / `rw` are the same option strings the CLI appends after the second
+    // colon. Emitting `rw` explicitly rather than omitting it keeps the
+    // request self-describing — an absent option reads as "unspecified", and a
+    // reader should not have to know podman's default to know what was asked.
+    let options = vec![if m.read_only { "ro" } else { "rw" }.to_string()];
+    Mount {
+        destination: m.mount_path.clone(),
+        source,
+        mount_type: mount_type.to_string(),
+        options,
+    }
+}
+
 /// Build the create request for a [`ContainerSpec`].
 ///
 /// Pure — no I/O — so the request body is unit-testable without a podman.
@@ -338,7 +372,7 @@ pub fn create_request(spec: &ContainerSpec, network: Option<&str>) -> CreateRequ
         command: spec.command.clone(),
         env: spec.env.clone(),
         networks,
-        mounts: Vec::new(),
+        mounts: spec.mounts.iter().map(to_libpod_mount).collect(),
         pull_policy: spec.pull_policy.map(|p| pull_policy_value(p).to_string()),
         remove: false,
     }
@@ -834,6 +868,106 @@ mod tests {
             "network aliases are what make pod-to-pod DNS work; losing them is \
              silent until one workload cannot resolve another"
         );
+    }
+
+    // ── Mounts ────────────────────────────────────────────────────────────
+    //
+    // ★ These exist because the first version of this backend set
+    // `mounts: Vec::new()` unconditionally while ContainerSpec carried them,
+    // so EVERY volume — ConfigMap, Secret, emptyDir, PVC — was silently
+    // dropped. The container started, so nothing failed; the workload simply
+    // could not read a file it was promised. That is the exact shape this
+    // whole module was written to eliminate, reintroduced by the module
+    // itself, and no test caught it because none asserted on mounts at all.
+
+    #[test]
+    fn a_host_dir_mount_reaches_the_request_as_a_bind() {
+        let spec = ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            mounts: vec![crate::pod_volume::ResolvedMount {
+                source: crate::pod_volume::MountSource::HostDir("/host/cm".into()),
+                mount_path: "/etc/config".to_string(),
+                read_only: true,
+                sub_path: None,
+            }],
+            ..ContainerSpec::default()
+        };
+        let req = create_request(&spec, None);
+        assert_eq!(req.mounts.len(), 1, "the mount must not be dropped");
+        let m = &req.mounts[0];
+        assert_eq!(m.destination, "/etc/config");
+        assert_eq!(m.source, "/host/cm");
+        assert_eq!(m.mount_type, "bind");
+        assert!(
+            m.options.contains(&"ro".to_string()),
+            "a ConfigMap/Secret mount is read-only in Kubernetes semantics; got {:?}",
+            m.options
+        );
+    }
+
+    #[test]
+    fn a_named_volume_is_a_volume_not_a_bind() {
+        // podman infers bind-vs-volume from whether the CLI source looks like a
+        // path. Over the API it is an explicit field, so it must be set — a
+        // named volume sent as `bind` would create a host directory named after
+        // the volume instead of using the volume.
+        let spec = ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            mounts: vec![crate::pod_volume::ResolvedMount {
+                source: crate::pod_volume::MountSource::NamedVolume("scratch".to_string()),
+                mount_path: "/scratch".to_string(),
+                read_only: false,
+                sub_path: None,
+            }],
+            ..ContainerSpec::default()
+        };
+        let m = &create_request(&spec, None).mounts[0];
+        assert_eq!(m.mount_type, "volume");
+        assert_eq!(m.source, "scratch");
+        assert!(m.options.contains(&"rw".to_string()));
+    }
+
+    #[test]
+    fn a_pvc_host_dir_is_a_bind_of_its_path() {
+        let spec = ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            mounts: vec![crate::pod_volume::ResolvedMount {
+                source: crate::pod_volume::MountSource::PvcHostDir {
+                    path: "/mnt/pv-7".into(),
+                    read_only: false,
+                },
+                mount_path: "/data".to_string(),
+                read_only: false,
+                sub_path: None,
+            }],
+            ..ContainerSpec::default()
+        };
+        let m = &create_request(&spec, None).mounts[0];
+        assert_eq!(m.mount_type, "bind");
+        assert_eq!(m.source, "/mnt/pv-7");
+    }
+
+    #[test]
+    fn every_mount_survives_translation() {
+        // The count assertion is the one that would have caught the original
+        // defect. A per-field assertion on mounts[0] passes happily while
+        // mounts 1..n are dropped.
+        let mk = |n: u8| crate::pod_volume::ResolvedMount {
+            source: crate::pod_volume::MountSource::HostDir(format!("/h/{n}").into()),
+            mount_path: format!("/c/{n}"),
+            read_only: false,
+            sub_path: None,
+        };
+        let spec = ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            mounts: vec![mk(1), mk(2), mk(3)],
+            ..ContainerSpec::default()
+        };
+        assert_eq!(create_request(&spec, None).mounts.len(), 3);
     }
 
     #[test]
