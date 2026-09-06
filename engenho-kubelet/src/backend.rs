@@ -20,6 +20,141 @@ use crate::probe::HttpScheme;
 
 /// Spec describing what the kubelet wants the backend to run.
 /// Distilled from `engenho_types::core_v1::Pod.spec.containers[0]`.
+/// What confinement a container runs under.
+///
+/// ── ★ UNCONFINED BY OMISSION IS THE DEFECT THIS TYPE EXISTS TO KILL ────────
+/// Until 2026-09-06 `ContainerSpec` carried NO security fields at all and
+/// `pod_to_container_specs` never read `container.securityContext`. So a Pod
+/// declaring `runAsNonRoot: true`, `capabilities.drop: [ALL]` or
+/// `readOnlyRootFilesystem: true` got NONE of it — the manifest stated a
+/// posture, the runtime applied podman's defaults, and nothing anywhere said
+/// the two disagreed. Exactly the shape of the dropped-mounts defect, one layer
+/// more dangerous.
+///
+/// Every field here is NON-`Option` on purpose. An `Option<bool>` for
+/// `privileged` has three states — true, false, and *nobody decided* — and the
+/// third silently becomes whatever the runtime happens to do. With a plain
+/// `bool` and a `Default` that encodes KUBERNETES' defaults rather than
+/// podman's, "unconfined because nobody said" has no representation: a spec
+/// always carries a disposition, and the only question is whose.
+///
+/// Tier: **parse-time-rejected**, not truly-unrepresentable. The type forces a
+/// disposition to EXIST; it cannot force it to be the RIGHT one, and it does
+/// not stop a caller writing `privileged: true`. The ceiling is C2 — whether
+/// the runtime actually honours what we send is an observation about the world,
+/// discharged by the differential against the CLI backend.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confinement {
+    /// Full host privileges. Kubernetes defaults this to false and so do we.
+    pub privileged: bool,
+    /// Mount the container's root filesystem read-only.
+    pub read_only_root_fs: bool,
+    /// Set `no_new_privs`, so `execve` cannot gain privileges via setuid.
+    ///
+    /// The POLARITY IS INVERTED relative to Kubernetes, deliberately.
+    /// `allowPrivilegeEscalation: false` means "set no_new_privs", and carrying
+    /// the negative through two layers is how a double negative eventually gets
+    /// read backwards. Converted once, at the boundary, in
+    /// [`Self::from_security_context`].
+    pub no_new_privileges: bool,
+    /// Capabilities to drop. `["ALL"]` is the hardened posture.
+    pub cap_drop: Vec<String>,
+    /// Capabilities to add back after the drops.
+    pub cap_add: Vec<String>,
+    /// uid to run as, when the Pod says so.
+    pub run_as_user: Option<i64>,
+    /// gid to run as, when the Pod says so.
+    pub run_as_group: Option<i64>,
+}
+
+impl Default for Confinement {
+    /// KUBERNETES' defaults, not podman's.
+    ///
+    /// The distinction is the point: a container whose Pod said nothing must
+    /// behave as Kubernetes specifies, not as whichever runtime happens to be
+    /// underneath. `privileged: false` and `read_only_root_fs: false` are
+    /// upstream's documented defaults; `no_new_privileges: false` matches
+    /// `allowPrivilegeEscalation` defaulting to true.
+    fn default() -> Self {
+        Self {
+            privileged: false,
+            read_only_root_fs: false,
+            no_new_privileges: false,
+            cap_drop: Vec::new(),
+            cap_add: Vec::new(),
+            run_as_user: None,
+            run_as_group: None,
+        }
+    }
+}
+
+impl Confinement {
+    /// Read a Kubernetes `SecurityContext` into a disposition.
+    ///
+    /// `None` yields [`Self::default`] — the Kubernetes defaults — rather than
+    /// "whatever the runtime does", which is the whole point of the type.
+    #[must_use]
+    pub fn from_security_context(
+        sc: Option<&engenho_types::generated_v1_34::types::SecurityContext>,
+    ) -> Self {
+        let Some(sc) = sc else {
+            return Self::default();
+        };
+        let caps = sc.capabilities.as_ref();
+        Self {
+            privileged: sc.privileged.unwrap_or(false),
+            read_only_root_fs: sc.read_only_root_filesystem.unwrap_or(false),
+            // ★ The inversion, done ONCE. `allowPrivilegeEscalation` defaults to
+            // true in Kubernetes, so an absent field must NOT set no_new_privs.
+            no_new_privileges: !sc.allow_privilege_escalation.unwrap_or(true),
+            cap_drop: caps.map(|c| c.drop.clone()).unwrap_or_default(),
+            cap_add: caps.map(|c| c.add.clone()).unwrap_or_default(),
+            run_as_user: sc.run_as_user,
+            run_as_group: sc.run_as_group,
+        }
+    }
+
+    /// Read a container's `securityContext` out of the Pod JSON.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::InvalidPod`] when the subtree is present but cannot be
+    /// parsed. That is deliberate and is the whole discipline of this type: a
+    /// securityContext we cannot understand must NOT quietly become "no
+    /// confinement". The Pod asked for something; if we cannot tell what, the
+    /// only honest answers are to refuse or to apply the strictest reading, and
+    /// refusing is the one that reaches a human.
+    pub fn from_pod_json(
+        sc: Option<&serde_json::Value>,
+        pod: &str,
+        container: &str,
+    ) -> Result<Self, KubeletError> {
+        let Some(sc) = sc else {
+            return Ok(Self::default());
+        };
+        if sc.is_null() {
+            return Ok(Self::default());
+        }
+        let parsed: engenho_types::generated_v1_34::types::SecurityContext =
+            serde_json::from_value(sc.clone()).map_err(|e| KubeletError::InvalidPod {
+                pod: pod.to_string(),
+                reason: format!(
+                    "container {container}: securityContext is present but unparseable ({e});                      refusing rather than running it unconfined"
+                ),
+            })?;
+        Ok(Self::from_security_context(Some(&parsed)))
+    }
+
+    /// Whether this disposition asks for anything beyond the defaults.
+    ///
+    /// Used only to keep a rendered request minimal; it must never gate whether
+    /// confinement is APPLIED, because "looks default" is not "is absent".
+    #[must_use]
+    pub fn is_kubernetes_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerSpec {
     /// Logical container name (namespace/podname/container).
@@ -89,6 +224,12 @@ pub struct ContainerSpec {
     /// recreated — mirroring K8s' eventual re-projection is a named
     /// typed-deferred follow-up, not a silent miss.
     pub mounts: Vec<crate::pod_volume::ResolvedMount>,
+    /// What confinement this container runs under.
+    ///
+    /// NOT `Option`. See [`Confinement`] — an absent disposition is how a Pod's
+    /// declared securityContext gets silently replaced by the runtime's
+    /// defaults, which is the defect this field exists to make unrepresentable.
+    pub confinement: Confinement,
 }
 
 /// Status the backend reports back.
@@ -1000,6 +1141,43 @@ impl PodmanBackend {
             };
             argv.push("-v".to_string());
             argv.push(spec_str);
+        }
+        // ── Confinement, rendered to argv ─────────────────────────────────
+        // The two backends MUST apply the same disposition. A container that is
+        // read-only under the API backend and writable under the CLI one is a
+        // workload whose security posture depends on how the kubelet was
+        // configured — and a differential test between them is only meaningful
+        // if both actually render it.
+        {
+            let c = &spec.confinement;
+            if c.privileged {
+                argv.push("--privileged".to_string());
+            }
+            if c.read_only_root_fs {
+                argv.push("--read-only".to_string());
+            }
+            if c.no_new_privileges {
+                argv.push("--security-opt".to_string());
+                argv.push("no-new-privileges".to_string());
+            }
+            for cap in &c.cap_drop {
+                argv.push("--cap-drop".to_string());
+                argv.push(cap.clone());
+            }
+            for cap in &c.cap_add {
+                argv.push("--cap-add".to_string());
+                argv.push(cap.clone());
+            }
+            // Same uid:gid rule as the API backend, and the same refusal: a gid
+            // with no uid cannot be expressed, and inventing uid 0 would run
+            // the container as root.
+            if let Some(u) = c.run_as_user {
+                argv.push("--user".to_string());
+                argv.push(match c.run_as_group {
+                    Some(g) => format!("{u}:{g}"),
+                    None => u.to_string(),
+                });
+            }
         }
         // The API-server coordinates every in-cluster client reads, merged
         // into a COPY so the pod's own declarations still win and the stored
@@ -1941,6 +2119,9 @@ mod tests {
             pull_policy: None,
             network_aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
             mounts: Vec::new(),
+            // The Kubernetes defaults: these argv tests assert the shape of an
+            // UNADORNED container, and a default disposition must not change it.
+            confinement: Confinement::default(),
         }
     }
 

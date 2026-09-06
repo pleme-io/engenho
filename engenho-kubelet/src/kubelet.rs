@@ -768,6 +768,15 @@ impl Kubelet {
                     // a no-volume pod produces `mounts: vec![]` → identical
                     // argv to before the kubelet-volumes brick.
                     mounts: Vec::new(),
+                    // ★ READ, not defaulted. Until 2026-09-06 this field did
+                    // not exist and `securityContext` was never consulted, so a
+                    // Pod asking for runAsNonRoot / cap-drop-ALL /
+                    // readOnlyRootFilesystem got none of it and nothing said so.
+                    confinement: crate::backend::Confinement::from_pod_json(
+                        c.get("securityContext"),
+                        &format!("{namespace}/{name}"),
+                        &cname,
+                    )?,
                 },
             ));
         }

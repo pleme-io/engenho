@@ -190,6 +190,27 @@ pub struct CreateRequest {
     /// codes off stopped containers, and a self-removing container makes a
     /// terminal status unobservable.
     pub remove: bool,
+    /// Full host privileges.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub privileged: bool,
+    /// Read-only root filesystem.
+    #[serde(
+        rename = "read_only_filesystem",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub read_only_filesystem: bool,
+    /// Set `no_new_privs` on the container process.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_new_privileges: bool,
+    /// Capabilities to add.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+    /// Capabilities to drop.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    /// `uid` or `uid:gid` to run as.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// Per-network attachment options — carries the DNS aliases.
@@ -357,6 +378,7 @@ fn to_libpod_mount(m: &crate::pod_volume::ResolvedMount) -> Mount {
 /// unverifiable string vector is now a typed value with an equality test.
 #[must_use]
 pub fn create_request(spec: &ContainerSpec, network: Option<&str>) -> CreateRequest {
+    let c = &spec.confinement;
     let mut networks = BTreeMap::new();
     if let Some(net) = network {
         networks.insert(
@@ -375,6 +397,26 @@ pub fn create_request(spec: &ContainerSpec, network: Option<&str>) -> CreateRequ
         mounts: spec.mounts.iter().map(to_libpod_mount).collect(),
         pull_policy: spec.pull_policy.map(|p| pull_policy_value(p).to_string()),
         remove: false,
+        // ── ★ CONFINEMENT IS RENDERED, NOT MERELY CARRIED ─────────────────
+        // A disposition read from the Pod and then not sent is the dropped-
+        // mounts defect with worse consequences: the manifest says
+        // `readOnlyRootFilesystem: true`, the type faithfully records it, and
+        // the container still gets a writable root.
+        privileged: c.privileged,
+        read_only_filesystem: c.read_only_root_fs,
+        no_new_privileges: c.no_new_privileges,
+        cap_add: c.cap_add.clone(),
+        cap_drop: c.cap_drop.clone(),
+        // podman takes `uid:gid` as one string. Built here rather than in
+        // Confinement so the typed side keeps two numbers and only the WIRE
+        // sees the concatenation.
+        user: match (c.run_as_user, c.run_as_group) {
+            (Some(u), Some(g)) => Some(format!("{u}:{g}")),
+            (Some(u), None) => Some(u.to_string()),
+            // A gid with no uid is not expressible as podman's `user` string,
+            // and inventing uid 0 to carry it would silently run as root.
+            (None, _) => None,
+        },
     }
 }
 
@@ -1094,6 +1136,7 @@ mod tests {
             pull_policy: Some(PullPolicy::Never),
             network_aliases: vec!["operator".to_string()],
             mounts: Vec::new(),
+            confinement: crate::backend::Confinement::default(),
         };
         let req = create_request(&spec, Some("engenho-net"));
 
@@ -1217,6 +1260,103 @@ mod tests {
         let d = demux(&s).unwrap();
         assert_eq!(d.stdout, b"real");
         assert!(d.stderr.is_empty());
+    }
+
+    // ── Confinement ───────────────────────────────────────────────────────
+    //
+    // ★ These exist because `securityContext` was read NOWHERE before
+    // 2026-09-06. A Pod could declare runAsNonRoot, cap-drop-ALL and
+    // readOnlyRootFilesystem and receive none of them, silently — the same
+    // shape as the dropped mounts, one layer more dangerous.
+
+    fn hardened() -> ContainerSpec {
+        ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            confinement: crate::backend::Confinement {
+                privileged: false,
+                read_only_root_fs: true,
+                no_new_privileges: true,
+                cap_drop: vec!["ALL".to_string()],
+                cap_add: vec!["NET_BIND_SERVICE".to_string()],
+                run_as_user: Some(65534),
+                run_as_group: Some(65534),
+            },
+            ..ContainerSpec::default()
+        }
+    }
+
+    #[test]
+    fn a_hardened_pod_reaches_the_wire_hardened() {
+        let r = create_request(&hardened(), None);
+        assert!(
+            r.read_only_filesystem,
+            "readOnlyRootFilesystem was declared"
+        );
+        assert!(
+            r.no_new_privileges,
+            "allowPrivilegeEscalation:false was declared"
+        );
+        assert_eq!(r.cap_drop, vec!["ALL".to_string()]);
+        assert_eq!(r.cap_add, vec!["NET_BIND_SERVICE".to_string()]);
+        assert_eq!(r.user.as_deref(), Some("65534:65534"));
+        assert!(!r.privileged);
+    }
+
+    #[test]
+    fn the_kubernetes_default_adds_nothing_to_the_wire() {
+        // A Pod that said nothing must produce the same request as before this
+        // field existed — otherwise every existing workload changes behaviour.
+        let spec = ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            ..ContainerSpec::default()
+        };
+        let json = serde_json::to_string(&create_request(&spec, None)).unwrap();
+        for absent in [
+            "privileged",
+            "read_only_filesystem",
+            "no_new_privileges",
+            "cap_add",
+            "cap_drop",
+            "user",
+        ] {
+            assert!(
+                !json.contains(absent),
+                "a default disposition must not appear on the wire: {absent} in {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gid_without_a_uid_is_omitted_rather_than_run_as_root() {
+        // podman's `user` is one string. Carrying a lone gid would mean
+        // inventing a uid, and the obvious invention is 0 — which would run the
+        // container AS ROOT while the Pod was asking to be constrained.
+        let spec = ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            confinement: crate::backend::Confinement {
+                run_as_group: Some(1000),
+                ..crate::backend::Confinement::default()
+            },
+            ..ContainerSpec::default()
+        };
+        assert_eq!(create_request(&spec, None).user, None);
+    }
+
+    #[test]
+    fn a_uid_alone_is_carried_without_a_colon() {
+        let spec = ContainerSpec {
+            name: "c".to_string(),
+            image: "img".to_string(),
+            confinement: crate::backend::Confinement {
+                run_as_user: Some(1000),
+                ..crate::backend::Confinement::default()
+            },
+            ..ContainerSpec::default()
+        };
+        assert_eq!(create_request(&spec, None).user.as_deref(), Some("1000"));
     }
 
     // ── Mounts ────────────────────────────────────────────────────────────
