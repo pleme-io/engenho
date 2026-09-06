@@ -378,6 +378,105 @@ pub fn create_request(spec: &ContainerSpec, network: Option<&str>) -> CreateRequ
     }
 }
 
+// ── The multiplexed stream ─────────────────────────────────────────────────
+
+/// Which stream a frame's payload belongs to.
+///
+/// The wire values are Docker's and libpod speaks the same framing, so these
+/// are fixed by the protocol rather than chosen here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    /// 0 — stdin echoed back (only in attach; never in logs or exec output).
+    Stdin,
+    /// 1 — stdout.
+    Stdout,
+    /// 2 — stderr.
+    Stderr,
+}
+
+impl StreamKind {
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::Stdin),
+            1 => Some(Self::Stdout),
+            2 => Some(Self::Stderr),
+            _ => None,
+        }
+    }
+}
+
+/// stdout and stderr, separated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Demuxed {
+    /// Everything that arrived on stdout, in order.
+    pub stdout: Vec<u8>,
+    /// Everything that arrived on stderr, in order.
+    pub stderr: Vec<u8>,
+}
+
+/// Split a libpod/Docker multiplexed stream into stdout and stderr.
+///
+/// ── THE FRAME ──────────────────────────────────────────────────────────────
+/// ```text
+///  0        1        2        3        4                                8
+///  +--------+--------+--------+--------+--------------------------------+
+///  |  kind  |          zero padding    |     payload length (BE u32)    |
+///  +--------+--------+--------+--------+--------------------------------+
+///  |                      payload, `length` bytes                       |
+///  +--------------------------------------------------------------------+
+/// ```
+///
+/// ── ★ WHY THIS IS A SEPARATE PURE FUNCTION ─────────────────────────────────
+/// It is the only part of exec/logs with any logic in it, and every way it can
+/// be wrong is SILENT. A misread length yields plausible-looking output that is
+/// subtly truncated or interleaved; a header mistaken for payload puts control
+/// bytes in the middle of a log line. None of that errors, and none of it is
+/// visible in an integration test that only asserts the output "contains" a
+/// word. So it is pure, and it is tested against bytes rather than against a
+/// running podman.
+///
+/// # Errors
+///
+/// [`KubeletError::Backend`] on a truncated frame or an unknown stream kind.
+/// A short frame is REFUSED rather than returned as a partial read: silently
+/// returning what arrived is how a caller concludes a command produced no
+/// output when in fact the stream was cut.
+pub fn demux(mut buf: &[u8]) -> Result<Demuxed, KubeletError> {
+    let mut out = Demuxed::default();
+    while !buf.is_empty() {
+        if buf.len() < 8 {
+            return Err(KubeletError::Backend(format!(
+                "truncated podman stream: {} trailing byte(s), need an 8-byte frame header",
+                buf.len()
+            )));
+        }
+        let kind = StreamKind::from_byte(buf[0]).ok_or_else(|| {
+            KubeletError::Backend(format!(
+                "unknown podman stream kind {} — the stream is not framed (a TTY-allocated \
+                 container emits a RAW stream with no headers; ask for it without a TTY)",
+                buf[0]
+            ))
+        })?;
+        let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let body = &buf[8..];
+        if body.len() < len {
+            return Err(KubeletError::Backend(format!(
+                "truncated podman frame: header declares {len} bytes, {} available",
+                body.len()
+            )));
+        }
+        match kind {
+            StreamKind::Stdout => out.stdout.extend_from_slice(&body[..len]),
+            StreamKind::Stderr => out.stderr.extend_from_slice(&body[..len]),
+            // stdin echo carries nothing a kubelet wants; dropping it is not a
+            // loss, and it never appears in logs or exec output anyway.
+            StreamKind::Stdin => {}
+        }
+        buf = &body[len..];
+    }
+    Ok(out)
+}
+
 // ── The transport ──────────────────────────────────────────────────────────
 
 /// A libpod client: HTTP/1.1 over the unix socket, no subprocess.
@@ -592,6 +691,158 @@ impl PodmanApi {
         )))
     }
 
+    /// `POST /libpod/containers/{id}/exec` — create an exec session.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure or a non-2xx status.
+    async fn exec_create(&self, id: &str, argv: &[String]) -> Result<String, KubeletError> {
+        // `Tty: false` is load-bearing, not a default: a TTY-allocated exec
+        // returns a RAW stream with no frame headers, which `demux` would
+        // correctly refuse. Asking for no TTY is what makes the output
+        // separable into stdout and stderr at all.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "AttachStdin": false,
+            "Tty": false,
+            "Cmd": argv,
+        }))
+        .map_err(|e| KubeletError::Backend(format!("encode exec create: {e}")))?;
+        let (status, bytes) = self
+            .send(
+                hyper::Method::POST,
+                &libpod_path(&format!("containers/{id}/exec")),
+                Some(body),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman exec create {id}: HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        #[derive(Deserialize)]
+        struct ExecCreated {
+            #[serde(rename = "Id")]
+            id: String,
+        }
+        serde_json::from_slice::<ExecCreated>(&bytes)
+            .map(|c| c.id)
+            .map_err(|e| KubeletError::Backend(format!("decode exec create: {e}")))
+    }
+
+    /// `POST /libpod/exec/{exec_id}/start` — run it and collect the output.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure, a non-2xx status, or an
+    /// unframed stream.
+    async fn exec_start(&self, exec_id: &str) -> Result<Demuxed, KubeletError> {
+        // `Detach: false` so the response body IS the output stream. The whole
+        // body is buffered, which is correct for the kubelet's uses (probes and
+        // short commands) and would be wrong for an interactive session — noted
+        // rather than discovered.
+        let body = serde_json::to_vec(&serde_json::json!({ "Detach": false, "Tty": false }))
+            .map_err(|e| KubeletError::Backend(format!("encode exec start: {e}")))?;
+        let (status, bytes) = self
+            .send(
+                hyper::Method::POST,
+                &libpod_path(&format!("exec/{exec_id}/start")),
+                Some(body),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman exec start {exec_id}: HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        demux(&bytes)
+    }
+
+    /// `GET /libpod/exec/{exec_id}/json` — the exit code, after the run.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure, a non-2xx status, or an
+    /// exec that reports itself still running.
+    async fn exec_exit_code(&self, exec_id: &str) -> Result<i32, KubeletError> {
+        let (status, bytes) = self
+            .send(
+                hyper::Method::GET,
+                &libpod_path(&format!("exec/{exec_id}/json")),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman exec inspect {exec_id}: HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        #[derive(Deserialize)]
+        struct ExecInspect {
+            #[serde(rename = "ExitCode")]
+            exit_code: Option<i32>,
+            #[serde(rename = "Running", default)]
+            running: bool,
+        }
+        let i: ExecInspect = serde_json::from_slice(&bytes)
+            .map_err(|e| KubeletError::Backend(format!("decode exec inspect: {e}")))?;
+        // ★ A still-running exec has NO exit code, and defaulting it to 0 would
+        // report success for a command that has not finished — which a liveness
+        // probe reads as healthy. Refuse instead.
+        if i.running {
+            return Err(KubeletError::Backend(format!(
+                "podman exec {exec_id} is still running after its output stream closed; \
+                 refusing to report an exit code it does not have"
+            )));
+        }
+        i.exit_code.ok_or_else(|| {
+            KubeletError::Backend(format!(
+                "podman exec {exec_id} finished with no exit code — cannot distinguish \
+                 success from failure"
+            ))
+        })
+    }
+
+    /// `GET /libpod/containers/{id}/logs` — the container's output.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure, a non-2xx status, or an
+    /// unframed stream. A 404 is an ERROR, not empty output — the trait's own
+    /// contract says a missing container must be typed, "never a silently-empty
+    /// success".
+    pub async fn logs(
+        &self,
+        id: &str,
+        opts: &crate::backend::LogOptions,
+    ) -> Result<Demuxed, KubeletError> {
+        let mut q = String::from("stdout=true&stderr=true");
+        if let Some(n) = opts.tail {
+            q.push_str(&format!("&tail={n}"));
+        }
+        if opts.timestamps {
+            q.push_str("&timestamps=true");
+        }
+        let (status, bytes) = self
+            .send(
+                hyper::Method::GET,
+                &libpod_path(&format!("containers/{id}/logs?{q}")),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman logs {id}: HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        demux(&bytes)
+    }
+
     /// `DELETE /libpod/containers/{id}?force=true`.
     ///
     /// # Errors
@@ -751,21 +1002,16 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         container_id: &str,
         opts: &crate::backend::LogOptions,
     ) -> Result<String, KubeletError> {
-        // Same multiplexed-stream shape as exec: libpod's logs endpoint frames
-        // stdout and stderr with 8-byte headers. Refused rather than returned
-        // empty — the trait's own contract says a not-found container must be a
-        // typed error and "never a silently-empty success", and the same
-        // reasoning forbids an empty string standing in for an unimplemented
-        // decoder. An operator reading empty logs concludes the workload is
-        // quiet, not that the backend cannot read them.
-        // `pending-podman-api: log stream demultiplexing`
-        let _ = (container_id, opts);
-        Err(KubeletError::Backend(
-            "logs are not implemented on the podman API backend yet (the libpod log stream is \
-             multiplexed and needs demultiplexing); use kubeletBackend = \"podman\" if you need \
-             container logs"
-                .to_string(),
-        ))
+        // Interleave stdout and stderr the way `kubectl logs` presents them:
+        // one text blob, stdout first. The two are collected separately because
+        // the WIRE separates them; joining is a presentation choice made here
+        // rather than a distinction lost on the way in.
+        let out = self.api.logs(container_id, opts).await?;
+        let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !out.stderr.is_empty() {
+            s.push_str(&String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(s)
     }
 
     async fn exec(
@@ -773,24 +1019,20 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         container_id: &str,
         argv: &[String],
     ) -> Result<crate::backend::ExecOutcome, KubeletError> {
-        // ── NOT YET ON THE API PATH, AND SAID SO RATHER THAN FAKED ─────────
-        // libpod's exec is a two-step create/start whose output arrives as a
-        // MULTIPLEXED stream (8-byte frame headers interleaving stdout and
-        // stderr) over a hijacked connection. Demultiplexing it is real work,
-        // and the honest thing is a typed refusal rather than a plausible
-        // `ExecOutcome::success()` — a fabricated success here would be read by
-        // a liveness probe as a healthy container.
-        //
-        // Exec is used by probes and `kubectl exec`, not by the pod lifecycle,
-        // so a node running this backend still starts, stops and reports pods
-        // correctly. `pending-podman-api: exec stream demultiplexing`
-        let _ = (container_id, argv);
-        Err(KubeletError::Backend(
-            "exec is not implemented on the podman API backend yet (the libpod exec stream is \
-             multiplexed and needs demultiplexing); use kubeletBackend = \"podman\" if you need \
-             exec or exec-based probes"
-                .to_string(),
-        ))
+        // Three calls, and the third is the one that matters. libpod's exec is
+        // create -> start -> inspect: the START response carries the OUTPUT but
+        // no status, so an implementation that stops there has to invent an exit
+        // code. Inventing 0 is how a failing liveness probe reads as healthy,
+        // which is the whole reason this backend refused to implement exec at
+        // all rather than fake it.
+        let exec_id = self.api.exec_create(container_id, argv).await?;
+        let streams = self.api.exec_start(&exec_id).await?;
+        let exit_code = self.api.exec_exit_code(&exec_id).await?;
+        Ok(crate::backend::ExecOutcome {
+            exit_code,
+            stdout: String::from_utf8_lossy(&streams.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&streams.stderr).into_owned(),
+        })
     }
 }
 
@@ -868,6 +1110,113 @@ mod tests {
             "network aliases are what make pod-to-pod DNS work; losing them is \
              silent until one workload cannot resolve another"
         );
+    }
+
+    // ── The multiplexed stream ────────────────────────────────────────────
+    //
+    // ★ Every way this can be wrong is SILENT. A misread length yields output
+    // that is plausibly-shaped and subtly truncated; a header mistaken for
+    // payload puts control bytes mid-line. An integration test asserting the
+    // output "contains" a word passes through all of it. So these test BYTES.
+
+    fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![kind, 0, 0, 0];
+        v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn stdout_and_stderr_are_separated_not_concatenated() {
+        let mut s = frame(1, b"out-a");
+        s.extend(frame(2, b"err-a"));
+        s.extend(frame(1, b"out-b"));
+        let d = demux(&s).expect("well-formed stream");
+        assert_eq!(d.stdout, b"out-aout-b");
+        assert_eq!(d.stderr, b"err-a");
+    }
+
+    #[test]
+    fn frames_keep_their_order_within_a_stream() {
+        // Interleaving must not reorder either side. A HashMap-shaped
+        // implementation passes the previous test and fails this one.
+        let mut s = Vec::new();
+        for i in 0..8u8 {
+            s.extend(frame(1, &[b'0' + i]));
+            s.extend(frame(2, &[b'a' + i]));
+        }
+        let d = demux(&s).unwrap();
+        assert_eq!(d.stdout, b"01234567");
+        assert_eq!(d.stderr, b"abcdefgh");
+    }
+
+    #[test]
+    fn a_length_is_big_endian_not_little() {
+        // 256 bytes is the discriminating length: BE encodes [0,0,1,0] and LE
+        // [0,1,0,0], so a byte-order mistake reads 1 byte instead of 256 and
+        // then desynchronises the whole stream. A 1-byte payload cannot tell
+        // the two apart, which is why this uses 256.
+        let payload = vec![b'x'; 256];
+        let d = demux(&frame(1, &payload)).expect("256-byte frame");
+        assert_eq!(d.stdout.len(), 256);
+    }
+
+    #[test]
+    fn an_empty_stream_is_empty_output_not_an_error() {
+        let d = demux(&[]).expect("no output is a valid outcome");
+        assert!(d.stdout.is_empty() && d.stderr.is_empty());
+    }
+
+    #[test]
+    fn a_zero_length_frame_is_valid_and_consumes_its_header() {
+        // podman emits these. Treating a 0-length frame as end-of-stream would
+        // silently drop everything after it.
+        let mut s = frame(1, b"");
+        s.extend(frame(1, b"after"));
+        assert_eq!(demux(&s).unwrap().stdout, b"after");
+    }
+
+    #[test]
+    fn a_truncated_payload_is_refused_not_returned_partial() {
+        // Returning what arrived is how a caller concludes a command produced
+        // no output when the stream was actually cut.
+        let mut s = frame(1, b"twelve chars");
+        s.truncate(s.len() - 4);
+        let e = demux(&s).expect_err("a short frame must be refused");
+        assert!(
+            e.to_string().contains("truncated"),
+            "the error must say the stream was cut: {e}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_partial_header_is_refused() {
+        let mut s = frame(1, b"ok");
+        s.extend_from_slice(&[1, 0, 0]);
+        assert!(demux(&s).is_err(), "3 trailing bytes cannot be a frame");
+    }
+
+    #[test]
+    fn a_raw_tty_stream_is_refused_with_the_reason() {
+        // A TTY-allocated container emits an UNFRAMED stream. Parsing it as
+        // frames yields garbage lengths and arbitrary output; the error has to
+        // name the cause, because "invalid stream" sends the reader to the
+        // wrong place entirely.
+        let e = demux(b"hello from a tty").expect_err("raw stream must be refused");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("TTY"),
+            "the error must name the TTY cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn stdin_echo_is_dropped_without_disturbing_the_others() {
+        let mut s = frame(0, b"echoed input");
+        s.extend(frame(1, b"real"));
+        let d = demux(&s).unwrap();
+        assert_eq!(d.stdout, b"real");
+        assert!(d.stderr.is_empty());
     }
 
     // ── Mounts ────────────────────────────────────────────────────────────
