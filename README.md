@@ -153,87 +153,73 @@ what answers it is ours.
 
 | Contract | Consumed by | Status |
 |---|---|---|
-| Kubernetes REST API | kubectl, every controller | **SHIPPED** — 52/57 kinds, SSA + WATCH. ★ WATCH has two measured gaps against a long-running client — see *Watch: two gaps* below |
+| Kubernetes REST API | kubectl, every controller | **SHIPPED** — 52/57 kinds, SSA + WATCH. ★ one verified WATCH gap (`timeoutSeconds`, now fixed) + an open long-uptime degradation — see *Watch* below |
 | `/healthz` `/readyz` `/livez` `/version` | probes, HA | **SHIPPED** |
 
 
-### ★ Watch: two gaps, measured against a live client (2026-09-06)
+### ★ Watch: one verified gap, and a mis-attribution worth reading (2026-09-06)
 
-`kubectl --watch` works, which is why this reads as green. A long-running
-controller client does not fare as well. Measured on a live single-node engenho
-with `pangea-operator` (kube-rs 0.99) attached: **~28 `WatchFailed` errors per
-hour, across every one of its 12 controllers**, each one a
-`hyper::Error(Body, Kind(TimedOut))` followed by a re-LIST.
+**The gap, verified from source and still true:** `?timeoutSeconds=N` was parsed
+into `ListWatchParams` and read nowhere — unlike `limit` and `continue`, it had
+no typed accessor. A client asking the server to close the watch after N seconds
+was silently ignored. Now honoured (`ListWatchParams::timeout()` plus a
+per-poll deadline in the watch `unfold` that ENDS the stream cleanly), covered by
+`watch_timeout_seconds_ends_the_stream_cleanly` and a negative control, with a
+red-run receipt: forcing `deadline: None` fails the positive test and leaves the
+control green.
 
-Reconciliation still happens — the watcher restarts and re-lists — so this is
-DEGRADED, not broken. It is a poll wearing a watch's clothes.
+**★ The mis-attribution, recorded because the reasoning error is more useful than
+the fix.** That gap was found while diagnosing a real symptom: `pangea-operator`
+logging ~28 `WatchFailed` per hour across all 12 of its controllers. The two were
+connected by a story that sounded airtight — the server never closes the watch,
+so the client's own read timeout fires — and the story was WRONG.
 
-Two contributing causes, both verified:
+What the per-minute timeline actually showed, once plotted instead of summed:
 
-1. **`?timeoutSeconds=N` was parsed and never read — FIXED.** `ListWatchParams`
-   carried the field while nothing outside `params.rs` ever read it, so a client
-   asking the server to close the watch after N seconds was silently ignored and
-   its own read timeout fired instead. A plain conformance gap: accepted,
-   well-formed, consumed by nobody, so no error was available to raise.
+    07:23   4      steady churn: exactly 4 every 5 minutes
+    07:28   4
+    07:33   4
+    07:35  20      <- engenho restarting (the fix deploying)
+    07:36..07:52   ZERO, for 17 minutes
+    07:53  16      <- engenho restarting (the revert deploying)
+    07:54   4
+    07:55..08:06   ZERO, for 16 minutes — on PRE-FIX engenho
 
-   Now honoured — `ListWatchParams::timeout()` is a typed accessor in the same
-   shape as `limit()`/`continue_token()`, and the watch `unfold` races each poll
-   against a deadline, ENDING the stream cleanly at it (a normal close, not an
-   error, so the client re-LISTs per the K8s contract). Covered by
-   `watch_timeout_seconds_ends_the_stream_cleanly` plus a negative control that
-   asserts a watch WITHOUT the parameter stays open — without which the first
-   test would pass on any build where watches happen to close early. Red-run
-   receipt: forcing `deadline: None` fails the positive test and leaves the
-   control green.
+The decisive control: after reverting to pre-fix engenho — binary identity
+confirmed by the absence of the fix's marker string, not by the flake pin — the
+churn did **not** return in 16 minutes, where the pre-fix rate predicts ~13.
 
-★★ **MEASURED AFTER SHIPPING (1): honouring `timeoutSeconds` alone made the
-observable WORSE, and it must not be deployed until gap 3 below is closed.**
-Deployed to plo and measured over a 12-minute window: **20 `WatchFailed` against
-a ~5.6 baseline** — roughly 4x. The fix works; the error merely CHANGED identity:
+**So the cure was the RESTART, not the fix.** The churn is a degraded state that
+a long-running engenho accumulates, and its cause is UNKNOWN. It is not
+`timeoutSeconds`.
 
-    before: hyper::Error(Body, Kind(TimedOut))          — the client gave up
-    after:  hyper::Error(Body, Kind(UnexpectedEof))     — "peer closed
-            connection without sending TLS close_notify"
+Three errors compounded, each worth naming:
 
-3. **The server does not close a watch GRACEFULLY at the TLS layer.** Nothing in
-   this repo handles `close_notify` — `rg close_notify` across the tree returns
-   nothing. Before gap 1 was fixed, watches never ended, so the end-of-response
-   path was never exercised and this was invisible. Now that watches end on
-   schedule, every close trips rustls' truncation check, and they end MORE often
-   than the client used to time out — hence 4x.
+1. **A restart artifact read as steady state.** Both measurement windows
+   contained a deploy. The tell was in the number — 20 and 16 are both about the
+   controller count, i.e. one failed watch per controller at reconnect — and
+   summing hid it. Plotting per-minute made it obvious instantly.
+2. **A verified fact carrying an unverified claim.** "`timeoutSeconds` is parsed
+   and never read" is true and checkable in the source. "…and that is why the
+   watches churn" is a different claim needing different evidence, and it
+   inherited the first one's confidence.
+3. **A confident retraction that was also wrong.** On the contaminated numbers
+   this file previously said the fix made things 4x worse and must not be
+   deployed. That was as unfounded as the original claim, in the opposite
+   direction — a correction is not automatically more reliable than what it
+   corrects.
 
-   Reconciliation is unaffected either way (6 reconciles in the same window,
-   against 1 before), so the node is arguably more responsive and definitely
-   noisier. That is not a good enough trade to leave deployed, so the plo
-   deployment was reverted to the pre-fix engenho while the fix stays on `main`.
+**Consequently unresolved, stated so nobody inherits a false answer:** whether
+`close_notify` is genuinely missing. `UnexpectedEof` — *"peer closed connection
+without sending TLS close_notify"* — was observed only inside restart spikes, and
+a restarting server closes connections uncleanly whether or not the watch path
+does. `rg close_notify` returns nothing across the tree, so the gap is plausible;
+it is not demonstrated.
 
-   The lesson generalises past TLS: **fixing the first defect in a chain can
-   expose the second and make the metric worse before it gets better.** The fix
-   was correct and tested (13/13, with a red-run receipt) and still regressed the
-   thing it targeted, because the test asserted the stream ENDS — which it does —
-   and could not see how the socket beneath it ended.
-
-2. **Same-revision bookmarks are suppressed by design.**
-   `WatcherRegistry::tick_bookmarks` skips when
-   `last_bookmarked_rev == Some(current)` (`engenho-store/src/watch_backend.rs:534`),
-   which is deliberate and test-pinned. The consequence is that on a QUIESCENT
-   store — where the revision never advances — a watch emits exactly ONE
-   bookmark and is then silent forever. Measured: **1 bookmark in a 60s window**
-   against the declared 5s cadence (`handler.rs:27`). Upstream Kubernetes uses
-   bookmarks as a periodic heartbeat precisely so an idle watch is not silent.
-
-The first is fixed. The second is a contract decision, not a defect to flip
-unilaterally — the tests
-(`bookmark_tick_delivers_then_advances`, `bookmark_gated_by_cadence`, and
-`r7_6_resumable_watch.rs:415`) pin the current behaviour on purpose. If the
-heartbeat reading wins, those tests change with it.
-
-Reproduce, on any engenho with at least one CR:
-
-    rv=$(kubectl get --raw "/apis/<group>/<v>/<plural>" | jq -r .metadata.resourceVersion)
-    timeout 62 kubectl get --raw \
-      "/apis/<group>/<v>/<plural>?watch=true&allowWatchBookmarks=true&resourceVersion=$rv" \
-      | grep -c BOOKMARK
+**The open question is the useful one:** what does a long-running engenho
+accumulate that makes ~12 watches fail every 5 minutes, and that a restart
+clears? Reproduce by leaving a controller attached for hours, then plot
+`WatchFailed` per minute — do not sum across a restart.
 
 | OpenAPI v3 | generators, modern clients | **SHIPPED** |
 | OpenAPI v2 | older clients, codegen | **ABSENT** |
