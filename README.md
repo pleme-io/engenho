@@ -153,8 +153,53 @@ what answers it is ours.
 
 | Contract | Consumed by | Status |
 |---|---|---|
-| Kubernetes REST API | kubectl, every controller | **SHIPPED** — 52/57 kinds, SSA + WATCH |
+| Kubernetes REST API | kubectl, every controller | **SHIPPED** — 52/57 kinds, SSA + WATCH. ★ WATCH has two measured gaps against a long-running client — see *Watch: two gaps* below |
 | `/healthz` `/readyz` `/livez` `/version` | probes, HA | **SHIPPED** |
+
+
+### ★ Watch: two gaps, measured against a live client (2026-09-06)
+
+`kubectl --watch` works, which is why this reads as green. A long-running
+controller client does not fare as well. Measured on a live single-node engenho
+with `pangea-operator` (kube-rs 0.99) attached: **~28 `WatchFailed` errors per
+hour, across every one of its 12 controllers**, each one a
+`hyper::Error(Body, Kind(TimedOut))` followed by a re-LIST.
+
+Reconciliation still happens — the watcher restarts and re-lists — so this is
+DEGRADED, not broken. It is a poll wearing a watch's clothes.
+
+Two contributing causes, both verified:
+
+1. **`?timeoutSeconds=N` is parsed and never read.** `ListWatchParams`
+   (`engenho-apiserver/src/params.rs:70`) carries the field; nothing outside
+   that file ever reads it. A client asking the server to close the watch after
+   N seconds is silently ignored, so the watch is never closed server-side and
+   the client's own read timeout fires instead. This one is a plain conformance
+   gap: the parameter is accepted, well-formed, and consumed by nobody, so no
+   error is available to raise.
+
+2. **Same-revision bookmarks are suppressed by design.**
+   `WatcherRegistry::tick_bookmarks` skips when
+   `last_bookmarked_rev == Some(current)` (`engenho-store/src/watch_backend.rs:534`),
+   which is deliberate and test-pinned. The consequence is that on a QUIESCENT
+   store — where the revision never advances — a watch emits exactly ONE
+   bookmark and is then silent forever. Measured: **1 bookmark in a 60s window**
+   against the declared 5s cadence (`handler.rs:27`). Upstream Kubernetes uses
+   bookmarks as a periodic heartbeat precisely so an idle watch is not silent.
+
+The first is a bug and can simply be implemented. The second is a contract
+decision, not a defect to flip unilaterally — the tests
+(`bookmark_tick_delivers_then_advances`, `bookmark_gated_by_cadence`, and
+`r7_6_resumable_watch.rs:415`) pin the current behaviour on purpose. If the
+heartbeat reading wins, those tests change with it.
+
+Reproduce, on any engenho with at least one CR:
+
+    rv=$(kubectl get --raw "/apis/<group>/<v>/<plural>" | jq -r .metadata.resourceVersion)
+    timeout 62 kubectl get --raw \
+      "/apis/<group>/<v>/<plural>?watch=true&allowWatchBookmarks=true&resourceVersion=$rv" \
+      | grep -c BOOKMARK
+
 | OpenAPI v3 | generators, modern clients | **SHIPPED** |
 | OpenAPI v2 | older clients, codegen | **ABSENT** |
 | etcd v3 gRPC — reads | `etcdctl get`, backup/DR inspection | **SHIPPED (read path)** — `KV.Range` served over tonic: point reads, prefix scans, intervals, `limit`/`more`/`count`, `keys_only`. Wire types generated from upstream protos; `/registry` bijection verified against a real apiserver's 699-key keyspace |
