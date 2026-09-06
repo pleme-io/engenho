@@ -2458,7 +2458,30 @@ fn spawn_drivers(
     // took several passes to get right, and CSI is two additional methods.
     let csi_materializer: Arc<dyn engenho_kubelet::VolumeMaterializer> =
         Arc::new(engenho_kubelet::CsiVolumeMaterializer::new(
-            Arc::new(engenho_kubelet::PodmanVolumeMaterializer::new()),
+            // ── Root the podman materializer at the DECLARED data dir ────────
+            // `PodmanVolumeMaterializer::new()` defaults its data root to
+            // `$HOME/.local/share/engenho/volumes`, and falls back to a
+            // RELATIVE path when `$HOME` is unset. A systemd service has no
+            // `$HOME`, so this daemon hit the fallback and every secret /
+            // configMap mount resolved against the process cwd:
+            //
+            //   materialize: write ./.local/share/engenho/volumes/<ns>_<pod>/…
+            //   rename …tmp → …: No such file or directory (os error 2)
+            //
+            // Measured on a live single-node engenho 2026-09-06: a pod mounting
+            // a Secret stayed Pending with VolumeMaterializeError, while the
+            // same code passes its tests — a test process inherits a `$HOME`.
+            //
+            // The `$HOME` default itself is not wrong where it came from: the
+            // macOS applehv podman machine shares the user's home and NOT
+            // `/tmp`, so bind sources must live under it (see the type's own
+            // header). That is a darwin constraint, and this is the Linux
+            // daemon, which already has a declared data dir one line below —
+            // the same one the CSI layer is being handed.
+            Arc::new(
+                engenho_kubelet::PodmanVolumeMaterializer::new()
+                    .with_data_root(config.runtime.data_dir.join("volumes")),
+            ),
             csi_drivers.clone(),
             config.runtime.data_dir.clone(),
         ));

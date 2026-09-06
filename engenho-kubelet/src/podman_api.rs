@@ -141,6 +141,16 @@ pub const ENGENHO_NETWORK: &str = "engenho-net";
 /// 5.x both honour, so this does not chase the installed version.
 pub const API_VERSION: &str = "v4.0.0";
 
+/// Body of `POST /libpod/networks/create`.
+///
+/// A typed struct rather than an inline `json!` so the wire shape is declared
+/// once and a field rename is a compile error, matching every other request
+/// type in this module.
+#[derive(Debug, serde::Serialize)]
+struct NetworkCreateRequest {
+    name: String,
+}
+
 /// Build a libpod path: `/{API_VERSION}/libpod/{tail}`.
 #[must_use]
 pub fn libpod_path(tail: &str) -> String {
@@ -622,6 +632,49 @@ impl PodmanApi {
         Ok((status, bytes))
     }
 
+    /// `POST /libpod/networks/create` — idempotent.
+    ///
+    /// engenho attaches every container it creates to [`ENGENHO_NETWORK`], but
+    /// until now NOTHING in production ever created it: `ensure_network` existed
+    /// on the CLI backend and in the M0.3 integration test, which makes its own
+    /// network before it runs. So the tests passed while a real single-node
+    /// deployment could not start ANY pod, failing with
+    ///
+    ///   podman create …: HTTP 500: unable to find network with name or ID
+    ///   engenho-net: network not found
+    ///
+    /// Measured on a live single-node engenho 2026-09-06: every pod stuck
+    /// Pending on exactly that, with `podman network ls` showing no such
+    /// network. This is the gap the podman-API backend inherited when it
+    /// replaced the CLI one — it carried the network REFERENCE across and left
+    /// the network CREATION behind.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure or a non-2xx status.
+    /// **409 Conflict is success**: podman returns it when the network already
+    /// exists, which is the steady state on every tick after the first.
+    pub async fn ensure_network(&self, name: &str) -> Result<(), KubeletError> {
+        let body = serde_json::to_vec(&NetworkCreateRequest {
+            name: name.to_string(),
+        })
+        .map_err(|e| KubeletError::Backend(format!("encode network create: {e}")))?;
+        let (status, bytes) = self
+            .send(
+                hyper::Method::POST,
+                &libpod_path("networks/create"),
+                Some(body),
+            )
+            .await?;
+        if status.is_success() || status == hyper::StatusCode::CONFLICT {
+            return Ok(());
+        }
+        Err(KubeletError::Backend(format!(
+            "podman network create {name}: HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )))
+    }
+
     /// `POST /libpod/containers/create`.
     ///
     /// # Errors
@@ -973,6 +1026,16 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         &self,
         spec: &ContainerSpec,
     ) -> Result<crate::backend::ContainerStatus, KubeletError> {
+        // Ensure the network BEFORE the create that depends on it. Idempotent
+        // (409 = already exists), so the cost after the first pod is one round
+        // trip on a unix socket. Doing it here rather than at construction
+        // keeps `discover()` infallible-by-IO and means a network deleted out
+        // from under a running kubelet is repaired on the next start instead of
+        // wedging until restart.
+        if let Some(net) = self.network.as_deref() {
+            self.api.ensure_network(net).await?;
+        }
+
         let req = create_request(spec, self.network.as_deref());
         let created = self.api.create(&req).await?;
         self.api.start(&created.id).await?;
