@@ -112,7 +112,7 @@ pub use discovery::{HostnameLayer, NODE_NAME_FALLBACK};
 pub use error::ConfigError;
 pub use networking::{DatapathMode, NetworkingConfig, ResolvedDatapath, parse_ipv4_cidr};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
-pub use runtime::{KubeletBackendKind, RuntimeConfig};
+pub use runtime::{KubeconfigVisibility, KubeletBackendKind, RuntimeConfig};
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
 pub use teia::TeiaConfig;
 pub use tls::TlsConfig;

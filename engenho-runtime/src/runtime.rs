@@ -11,7 +11,8 @@ use engenho_apiserver::{
     load_or_generate_ca,
 };
 use engenho_config::{
-    ConfigError, EngenhoConfig, KubeletBackendKind as CfgBackendKind, ResolvedDatapath,
+    ConfigError, EngenhoConfig, KubeconfigVisibility, KubeletBackendKind as CfgBackendKind,
+    ResolvedDatapath,
 };
 use engenho_controllers::{
     CrdController, CronJobController, DaemonSetController, DeploymentController,
@@ -1784,7 +1785,10 @@ fn write_boot_kubeconfig(
     }
     .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
     let path = config.runtime.data_dir.join("kubeconfig");
-    write_kubeconfig_file(&path, &yaml)?;
+    // The `data_dir` copy is engenho's own bookkeeping and nothing else reads
+    // it, so it stays owner-only regardless of the publish intent — widening
+    // it would grant access nobody asked for.
+    write_kubeconfig_file(&path, &yaml, KubeconfigVisibility::Private)?;
     info!(path = %path.display(), server = %server_url, admin = admin.is_some(), "kubeconfig written");
 
     // ── ★ ALSO PUBLISH WHERE ORDINARY TOOLING ACTUALLY LOOKS ──────────
@@ -1825,7 +1829,11 @@ fn write_boot_kubeconfig(
                     None => emit_kubeconfig(&config.cluster.name, &pod_server, ca_pem.as_bytes()),
                 }
                 .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
-                match write_kubeconfig_file(&pod_publish, &pod_yaml) {
+                match write_kubeconfig_file(
+                    &pod_publish,
+                    &pod_yaml,
+                    config.runtime.kubeconfig_publish_visibility,
+                ) {
                     Ok(()) => info!(
                         path = %pod_publish.display(), server = %pod_server,
                         "pod-facing kubeconfig published"
@@ -1875,7 +1883,11 @@ fn write_boot_kubeconfig(
                 None => emit_kubeconfig(&config.cluster.name, &remote_server, ca_pem.as_bytes()),
             }
             .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
-            match write_kubeconfig_file(&remote_publish, &remote_yaml) {
+            match write_kubeconfig_file(
+                &remote_publish,
+                &remote_yaml,
+                config.runtime.kubeconfig_publish_visibility,
+            ) {
                 Ok(()) => info!(
                     path = %remote_publish.display(), server = %remote_server,
                     "remote kubeconfig published"
@@ -1898,7 +1910,11 @@ fn write_boot_kubeconfig(
     }
 
     if let Some(publish) = resolve_publish_path(&config.runtime.kubeconfig_publish_path) {
-        match write_kubeconfig_file(&publish, &yaml) {
+        match write_kubeconfig_file(
+            &publish,
+            &yaml,
+            config.runtime.kubeconfig_publish_visibility,
+        ) {
             Ok(()) => {
                 info!(path = %publish.display(), "kubeconfig published for kubectl/k9s/flux");
             }
@@ -2093,14 +2109,27 @@ fn loopback_server_url(bound_addr: SocketAddr) -> String {
 /// owner-only). Creates the parent dir if missing (it normally exists — the
 /// durable store already opened `data_dir/store`); the parent is `data_dir`
 /// itself, which holds non-secret state too, so its mode is left alone.
-fn write_kubeconfig_file(path: &std::path::Path, contents: &str) -> Result<(), RuntimeError> {
+fn write_kubeconfig_file(
+    path: &std::path::Path,
+    contents: &str,
+    visibility: KubeconfigVisibility,
+) -> Result<(), RuntimeError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| RuntimeError::KubeconfigIo {
             path: parent.to_path_buf(),
             source,
         })?;
     }
-    write_at_mode(path, contents, 0o600)
+    // ── ★ ENGENHO IS THE LAST WRITER, SO THE MODE MUST BE DECIDED HERE ──
+    // Measured on plo 2026-09-07: a systemd oneshot existed to widen the
+    // published kubeconfig to 0640, reported success, the operator was in the
+    // owning group — and the file was still 0600 with ctime/mtime identical to
+    // this write. Nothing outside can win against a writer that runs on every
+    // boot; see `KubeconfigVisibility` for why no ordering fixes it.
+    //
+    // The write is in-place (`std::fs::write` truncates rather than unlinking),
+    // so the file's GROUP survives and the declarative layer owns that once.
+    write_at_mode(path, contents, visibility.mode())
 }
 
 /// Build + spawn every driver gated on `controllers.enable.*`. The

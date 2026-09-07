@@ -114,6 +114,38 @@ pub struct RuntimeConfig {
     /// Empty string disables the publish (the `data_dir` copy is always
     /// written), which is what tests use to stay out of `$HOME`.
     pub kubeconfig_publish_path: String,
+    /// WHO may read the published kubeconfigs.
+    ///
+    /// ── ★ WHY THIS LIVES IN ENGENHO AND NOT IN A CHMOD AFTERWARDS ─────
+    /// engenho is the LAST WRITER of these files. Measured on plo
+    /// 2026-09-07: a systemd oneshot existed specifically to widen the
+    /// published kubeconfig to 0640, it reported `ExecMainStatus=0`, the
+    /// operator was in the owning group — and the file was still 0600, with
+    /// ctime and mtime bit-identical to engenho's own last write. The unit
+    /// was ordered `After=engenho-daemon.service`, which orders on unit
+    /// START, not on kubeconfig PUBLISH, so its wait loop
+    /// (`[ -s <path> ] && break`) was satisfied by the file left over from
+    /// the PREVIOUS boot and the chmod landed before engenho rewrote it.
+    ///
+    /// That guard was vacuous — its condition was already true the instant
+    /// it ran. No ordering fixes it, because the daemon republishes on every
+    /// start: anything that adjusts the mode from outside is racing a writer
+    /// that runs again. The only place the race has no subject is here.
+    ///
+    /// ── ★ WHY AN INTENT AND NOT A MODE INTEGER ────────────────────────
+    /// These files embed a CA and an admin client certificate. A `u32` mode
+    /// lets an operator write `0o777` on that, and a YAML config has no
+    /// natural octal literal either — so the knob would be both dangerous
+    /// and awkward. The question an operator actually has is "may other
+    /// local users read this?", and these two arms are the whole answer.
+    /// World-readable has no representation.
+    ///
+    /// The GROUP is not set here. engenho's publish is an in-place
+    /// truncating write (`std::fs::write` then `set_permissions`), so it
+    /// preserves the file's existing owner and group — which means the
+    /// declarative layer can own the group once (nix: `systemd.tmpfiles`)
+    /// and engenho will never clobber it. Only the mode needed to move.
+    pub kubeconfig_publish_visibility: KubeconfigVisibility,
     /// Where a POD-FACING kubeconfig is published, or empty for none.
     ///
     /// ── ★ WHY A SECOND KUBECONFIG EXISTS ──────────────────────────────
@@ -122,7 +154,7 @@ pub struct RuntimeConfig {
     /// the apiserver binds the host while containers live in a VM.
     ///
     /// In-cluster config is not the answer today. engenho projects a real
-    /// ServiceAccount token, and its own authenticator rejects it —
+    /// `ServiceAccount` token, and its own authenticator rejects it —
     /// `service account token authentication is not yet supported`, HTTP
     /// 401 (measured 2026-09-01). So a workload that needs the API needs a
     /// kubeconfig, and the only thing that can mint one with the right
@@ -235,6 +267,8 @@ impl TieredConfig for RuntimeConfig {
             durable: false,
             node_name: String::new(),
             kubeconfig_publish_path: String::new(),
+            // The safe arm at every tier. Widening is an explicit act.
+            kubeconfig_publish_visibility: KubeconfigVisibility::Private,
             pod_kubeconfig_publish_path: String::new(),
             advertise_address: String::new(),
             remote_kubeconfig_publish_path: String::new(),
@@ -286,6 +320,11 @@ impl TieredConfig for RuntimeConfig {
             // `$HOME` is resolved at write time, not here, so the default
             // stays a pure value.
             kubeconfig_publish_path: "~/.kube/configs/engenho".into(),
+            // Private is right for the PRESCRIBED shape: it publishes into
+            // `$HOME`, where the process that writes the file and the human
+            // who reads it are the same user. `Group` is for the system-daemon
+            // shape, where they are not — and that is a per-node decision.
+            kubeconfig_publish_visibility: KubeconfigVisibility::Private,
             // Empty: publishing admin credentials is opt-in.
             pod_kubeconfig_publish_path: String::new(),
             advertise_address: String::new(),
@@ -354,6 +393,12 @@ impl TieredConfig for RuntimeConfig {
                 self.etcd_listen_addr
             },
             kubelet_backend: self.kubelet_backend,
+            // No "unset" sentinel on an enum whose safe arm is also a
+            // meaningful value, so the overlay's value wins — same rule as
+            // `durable` and `kubelet_backend` above. A node asking for
+            // `Group` is being explicit; there is no way to ask for
+            // "whatever the base said" and no reason to want one.
+            kubeconfig_publish_visibility: self.kubeconfig_publish_visibility,
             podman_binary: self.podman_binary.or_else(|| base.podman_binary.clone()),
             leadership_timeout_seconds: if self.leadership_timeout_seconds == 0 {
                 base.leadership_timeout_seconds
@@ -572,6 +617,12 @@ mod tests {
             // Empty ⇒ `extend` must fill it from the base, which is
             // precisely what this test asserts for every other field.
             kubeconfig_publish_path: String::new(),
+            // `Group` here on purpose: it is NOT the default, so asserting it
+            // survives the merge proves the overlay wins for a field with no
+            // "unset" sentinel — the same rule as `durable` and
+            // `kubelet_backend`. A `Private` value would be indistinguishable
+            // from the base's and the assertion would prove nothing.
+            kubeconfig_publish_visibility: KubeconfigVisibility::Group,
             pod_kubeconfig_publish_path: String::new(),
             advertise_address: String::new(),
             remote_kubeconfig_publish_path: String::new(),
@@ -592,6 +643,18 @@ mod tests {
         assert_eq!(
             merged.leadership_timeout_seconds,
             base.leadership_timeout_seconds
+        );
+        // No "unset" sentinel ⇒ the overlay's value wins outright. Anchored
+        // against the base being DIFFERENT, so the assertion cannot pass by
+        // coincidence.
+        assert_eq!(
+            base.kubeconfig_publish_visibility,
+            KubeconfigVisibility::Private
+        );
+        assert_eq!(
+            merged.kubeconfig_publish_visibility,
+            KubeconfigVisibility::Group,
+            "a node asking for Group must not have it merged away"
         );
     }
 
@@ -624,5 +687,102 @@ mod tests {
         assert_eq!(cfg.ca_cert_path(), PathBuf::from("/custom/ca.crt"));
         // ca_key still derives (only ca_cert was overridden).
         assert_eq!(cfg.ca_key_path(), PathBuf::from("/srv/engenho/pki/ca.key"));
+    }
+}
+
+/// Who may read a published kubeconfig.
+///
+/// Deliberately two arms and no third. These files carry a CA plus an admin
+/// client certificate, so "world" is not a state anyone should be able to ask
+/// for — it is absent rather than discouraged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KubeconfigVisibility {
+    /// Owner only — `0600`. The default, and correct for a node where the
+    /// only consumer is the same user that runs engenho.
+    #[default]
+    Private,
+    /// Owner and group — `0640`. For a SYSTEM daemon whose kubeconfig an
+    /// operator account must read: engenho runs as root, the operator does
+    /// not, and a copy into `$HOME` would go stale on the next republish.
+    ///
+    /// Pair it with a group the operator is in. engenho does not set the
+    /// group (see `kubeconfig_publish_visibility`) — it preserves whatever
+    /// the file already has, so the declarative layer owns that once.
+    Group,
+}
+
+impl KubeconfigVisibility {
+    /// The unix mode this intent renders to.
+    #[must_use]
+    pub const fn mode(self) -> u32 {
+        match self {
+            Self::Private => 0o600,
+            Self::Group => 0o640,
+        }
+    }
+}
+
+// ── KubeconfigVisibility ──────────────────────────────────────────────────
+// Its own module rather than appended to the file's existing one: the first
+// attempt inserted these at the file's LAST closing brace, which belonged to
+// the `impl` block above rather than to a test module, and `#[test]` on a
+// non-function is a hard error. A separate module has no ambiguous insertion
+// point.
+#[cfg(test)]
+mod visibility_tests {
+    use super::KubeconfigVisibility;
+
+    // The mode mapping IS the contract — everything else about this type is
+    // documentation. These pin it so a later edit cannot quietly widen a
+    // file that carries a CA and an admin client certificate.
+
+    #[test]
+    fn visibility_renders_the_intended_modes() {
+        assert_eq!(KubeconfigVisibility::Private.mode(), 0o600);
+        assert_eq!(KubeconfigVisibility::Group.mode(), 0o640);
+    }
+
+    #[test]
+    fn no_arm_is_world_readable_or_writable() {
+        // The reason this is an intent rather than a `u32`: world access must
+        // be unrepresentable, not merely discouraged. Iterating both arms
+        // means a THIRD arm added later fails here unless it is also safe.
+        for v in [KubeconfigVisibility::Private, KubeconfigVisibility::Group] {
+            let m = v.mode();
+            assert_eq!(m & 0o007, 0, "{v:?} grants world bits: {m:o}");
+            assert_eq!(m & 0o020, 0, "{v:?} grants group WRITE: {m:o}");
+        }
+    }
+
+    #[test]
+    fn the_default_is_the_private_arm() {
+        // A default that widened access would make every unconfigured node
+        // publish an admin credential to its whole group.
+        assert_eq!(
+            KubeconfigVisibility::default(),
+            KubeconfigVisibility::Private
+        );
+    }
+
+    #[test]
+    fn visibility_round_trips_through_serde_as_snake_case() {
+        // nix renders this config to YAML, so the wire spelling is load-bearing:
+        // a rename would silently fall back to the default rather than error.
+        let y = serde_yaml::to_string(&KubeconfigVisibility::Group).expect("serializes");
+        assert!(
+            y.contains("group"),
+            "expected snake_case `group`, got {y:?}"
+        );
+        let back: KubeconfigVisibility = serde_yaml::from_str("private").expect("parses");
+        assert_eq!(back, KubeconfigVisibility::Private);
+    }
+
+    #[test]
+    fn an_unknown_visibility_is_refused_not_defaulted() {
+        // A typo must not be indistinguishable from silence — the same rule
+        // engenho's `Dialect` records about not copying `spec.executor`.
+        assert!(serde_yaml::from_str::<KubeconfigVisibility>("groups").is_err());
+        assert!(serde_yaml::from_str::<KubeconfigVisibility>("Group").is_err());
     }
 }
