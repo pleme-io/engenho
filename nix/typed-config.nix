@@ -121,6 +121,36 @@ in
         time, not here, so a rendered config stays valid for any user.
       '';
 
+      kubeconfigPublishVisibility = optional
+        (types.enum [ "private" "group" ])
+        ''
+          WHO may read the published kubeconfigs. `private` = 0600 (owner only,
+          the default); `group` = 0640 (owner + the file's existing group).
+
+          ── ★ WHY THE MODE IS ENGENHO'S AND NOT A FOLLOW-UP CHMOD ─────────
+          engenho is the LAST WRITER of these files. Measured on plo
+          2026-09-07: a systemd oneshot existed to widen the published
+          kubeconfig to 0640, reported success, the operator WAS in the owning
+          group — and the file was still 0600, with ctime and mtime identical
+          to engenho's own write. The unit was ordered
+          `After=engenho-daemon.service`, which orders on unit START rather
+          than on kubeconfig PUBLISH, so its wait loop was satisfied by the
+          file left from the previous boot and the chmod landed before engenho
+          rewrote it. No ordering fixes that, because the daemon republishes on
+          every start.
+
+          ── ★ THE GROUP IS NOT SET HERE ───────────────────────────────────
+          engenho's publish is an in-place truncating write, so it PRESERVES
+          the file's owner and group. Own the group once declaratively
+          (`systemd.tmpfiles`) and engenho will never clobber it — only the
+          mode ever needed to move. That is also why plo's live file was
+          already `root:engenho-readers` while still being unreadable.
+
+          An enum rather than a mode integer because these files carry a CA and
+          an admin client certificate: world access is absent rather than
+          discouraged.
+        '';
+
       podKubeconfigPublishPath = optional types.str ''
         Where a POD-FACING kubeconfig is published (empty = none).
 
@@ -358,6 +388,7 @@ in
         durable = cfg.runtime.durable;
         node_name = cfg.runtime.nodeName;
         kubeconfig_publish_path = cfg.runtime.kubeconfigPublishPath;
+      kubeconfig_publish_visibility = cfg.runtime.kubeconfigPublishVisibility;
       pod_kubeconfig_publish_path = cfg.runtime.podKubeconfigPublishPath;
       advertise_address = cfg.runtime.advertiseAddress;
       remote_kubeconfig_publish_path = cfg.runtime.remoteKubeconfigPublishPath;
