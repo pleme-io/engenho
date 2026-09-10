@@ -489,8 +489,9 @@ impl Kubelet {
         namespace: &str,
         name: &str,
         pod: &Value,
+        sources: &BTreeMap<(String, String), Value>,
     ) -> Result<Vec<(String, ContainerSpec)>, KubeletError> {
-        Self::extract_container_specs(namespace, name, pod, "containers", false)
+        Self::extract_container_specs(namespace, name, pod, "containers", false, sources)
     }
 
     /// Extract a [`ContainerSpec`] for EVERY `spec.initContainers[i]`, in
@@ -516,8 +517,9 @@ impl Kubelet {
         namespace: &str,
         name: &str,
         pod: &Value,
+        sources: &BTreeMap<(String, String), Value>,
     ) -> Result<Vec<(String, ContainerSpec)>, KubeletError> {
-        Self::extract_container_specs(namespace, name, pod, "initContainers", true)
+        Self::extract_container_specs(namespace, name, pod, "initContainers", true, sources)
     }
 
     /// Shared container-extraction core, parameterized by the `spec` key
@@ -572,6 +574,7 @@ impl Kubelet {
         pod_name: &str,
         pod: &Value,
         entry: &Value,
+        sources: &BTreeMap<(String, String), Value>,
     ) -> Result<(String, String), KubeletError> {
         let invalid = |reason: String| KubeletError::InvalidPod {
             pod: format!("{namespace}/{pod_name}"),
@@ -643,10 +646,81 @@ impl Kubelet {
             return Ok((key, resolved.unwrap_or_default()));
         }
 
-        // Everything else is a source we cannot serve yet. Name the source
-        // rather than emitting a generic message: the operator's next
-        // question is always "which one".
-        let source = ["secretKeyRef", "configMapKeyRef", "resourceFieldRef"]
+        // Secret / ConfigMap lookups — the source object was pre-fetched by
+        // the caller into `sources`; here it's purely a keyed read + decoding.
+        for (kind, kubekind) in [
+            ("secretKeyRef", "Secret"),
+            ("configMapKeyRef", "ConfigMap"),
+        ] {
+            let Some(krf) = from.get(kind) else {
+                continue;
+            };
+            let ref_name = krf
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| invalid(format!("env {key}: valueFrom.{kind}.name missing")))?;
+            let ref_key = krf
+                .get("key")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| invalid(format!("env {key}: valueFrom.{kind}.key missing")))?;
+            let optional = krf
+                .get("optional")
+                .and_then(|o| o.as_bool())
+                .unwrap_or(false);
+
+            let Some(obj) = sources.get(&(kubekind.to_string(), ref_name.to_string())) else {
+                if optional {
+                    return Ok((key, String::new()));
+                }
+                return Err(invalid(format!(
+                    "env {key}: {kubekind} {namespace}/{ref_name} not found"
+                )));
+            };
+
+            let val = if kubekind == "Secret" {
+                let enc = obj
+                    .pointer(&format!("/data/{ref_key}"))
+                    .and_then(|v| v.as_str());
+                let Some(enc) = enc else {
+                    if optional {
+                        return Ok((key, String::new()));
+                    }
+                    return Err(invalid(format!(
+                        "env {key}: Secret {namespace}/{ref_name} has no key {ref_key}"
+                    )));
+                };
+                use base64::Engine as _;
+                match base64::engine::general_purpose::STANDARD.decode(enc) {
+                    Ok(bytes) => String::from_utf8(bytes).map_err(|e| {
+                        invalid(format!(
+                            "env {key}: Secret {namespace}/{ref_name}/{ref_key} not utf-8: {e}"
+                        ))
+                    })?,
+                    Err(e) => {
+                        return Err(invalid(format!(
+                            "env {key}: Secret {namespace}/{ref_name}/{ref_key} not base64: {e}"
+                        )));
+                    }
+                }
+            } else {
+                let Some(s) = obj
+                    .pointer(&format!("/data/{ref_key}"))
+                    .and_then(|v| v.as_str())
+                else {
+                    if optional {
+                        return Ok((key, String::new()));
+                    }
+                    return Err(invalid(format!(
+                        "env {key}: ConfigMap {namespace}/{ref_name} has no key {ref_key}"
+                    )));
+                };
+                s.to_string()
+            };
+            return Ok((key, val));
+        }
+
+        // resourceFieldRef and any unknown source class remain unsupported.
+        let source = ["resourceFieldRef"]
             .into_iter()
             .find(|k| from.get(*k).is_some())
             .unwrap_or("unknown source");
@@ -662,6 +736,7 @@ impl Kubelet {
         pod: &Value,
         spec_key: &str,
         optional: bool,
+        sources: &BTreeMap<(String, String), Value>,
     ) -> Result<Vec<(String, ContainerSpec)>, KubeletError> {
         let containers = match pod
             .get("spec")
@@ -722,7 +797,8 @@ impl Kubelet {
                 Some(arr) => {
                     let mut map = BTreeMap::new();
                     for entry in arr {
-                        let (k, v) = Self::resolve_env_entry(namespace, name, pod, entry)?;
+                        let (k, v) =
+                            Self::resolve_env_entry(namespace, name, pod, entry, sources)?;
                         map.insert(k, v);
                     }
                     map
@@ -1283,6 +1359,62 @@ impl Kubelet {
         Ok(())
     }
 
+    /// Pre-fetch every `Secret` / `ConfigMap` referenced by `env[].valueFrom`
+    /// (across both `spec.containers` and `spec.initContainers`) into a
+    /// `(kind, name) → Value` lookup, so [`Self::resolve_env_entry`] can stay
+    /// pure. Same pattern as [`Self::resolve_pod_volume_mounts`].
+    ///
+    /// A missing source object stays out of the map: the pure resolver treats
+    /// `optional: true` refs as empty and non-optional refs as a typed
+    /// [`KubeletError::InvalidPod`], so the pod stays Pending until the
+    /// object appears (and the store watch will requeue on that create).
+    async fn resolve_pod_env_sources(
+        &self,
+        namespace: &str,
+        pod: &Value,
+    ) -> BTreeMap<(String, String), Value> {
+        let mut refs: BTreeMap<(String, String), ()> = BTreeMap::new();
+        for spec_key in ["containers", "initContainers"] {
+            let Some(cs) = pod
+                .get("spec")
+                .and_then(|s| s.get(spec_key))
+                .and_then(|c| c.as_array())
+            else {
+                continue;
+            };
+            for c in cs {
+                let Some(env) = c.get("env").and_then(|e| e.as_array()) else {
+                    continue;
+                };
+                for e in env {
+                    let Some(vf) = e.get("valueFrom") else {
+                        continue;
+                    };
+                    for (field, kind) in [
+                        ("secretKeyRef", "Secret"),
+                        ("configMapKeyRef", "ConfigMap"),
+                    ] {
+                        if let Some(name) = vf
+                            .get(field)
+                            .and_then(|r| r.get("name"))
+                            .and_then(|n| n.as_str())
+                        {
+                            refs.insert((kind.to_string(), name.to_string()), ());
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: BTreeMap<(String, String), Value> = BTreeMap::new();
+        for (kind, name) in refs.into_keys() {
+            let key = ResourceKey::namespaced("", "v1", &kind, namespace, &name);
+            if let Some(val) = self.store.get(&key).await {
+                out.insert((kind, name), val);
+            }
+        }
+        out
+    }
+
     /// Resolve the Pod's `spec.volumes[]` into a `volName → MountSource` map
     /// (the M0.7 kubelet-volumes brick), reusing the SAME in-process store
     /// read the kubelet already does for Services.
@@ -1493,6 +1625,10 @@ impl Kubelet {
     ) -> Result<(), ControllerError> {
         let namespace = key.namespace.as_deref().unwrap_or("default");
 
+        // Pre-fetch env valueFrom sources (Secret/ConfigMap) once for the
+        // pod, keeping the spec extraction pure.
+        let env_sources = self.resolve_pod_env_sources(namespace, value).await;
+
         // INIT CONTAINERS: if the pod declares any init containers and they
         // haven't all Succeeded yet, the kubelet runs the init sequence FIRST —
         // one init container at a time, in order — and does NOT start any app
@@ -1502,7 +1638,12 @@ impl Kubelet {
         // NO init containers returns an empty Vec here, so this whole block is
         // skipped and the app-start path runs BYTE-IDENTICALLY to before the
         // init-container brick (the behavior-preserving guarantee).
-        let init_specs = match Self::pod_to_init_container_specs(namespace, &key.name, value) {
+        let init_specs = match Self::pod_to_init_container_specs(
+            namespace,
+            &key.name,
+            value,
+            &env_sources,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 warn!(
@@ -1530,7 +1671,12 @@ impl Kubelet {
             }
         }
 
-        let specs = match Self::pod_to_container_specs(namespace, &key.name, value) {
+        let specs = match Self::pod_to_container_specs(
+            namespace,
+            &key.name,
+            value,
+            &env_sources,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 warn!(
@@ -2082,6 +2228,7 @@ impl Kubelet {
     ) -> Result<(), ControllerError> {
         let restart_policy = Self::pod_restart_policy(value);
         let namespace = key.namespace.as_deref().unwrap_or("default");
+        let env_sources = self.resolve_pod_env_sources(namespace, value).await;
 
         // INIT CONTAINERS: if the pod has init containers and they haven't all
         // Succeeded yet (`!init_complete`), route to the init reconcile —
@@ -2090,7 +2237,12 @@ impl Kubelet {
         // init containers (or one already init_complete) falls through to the
         // app reconcile below, which itself renders initContainerStatuses +
         // Initialized=True alongside the app status once init_complete.
-        let init_specs = match Self::pod_to_init_container_specs(namespace, &key.name, value) {
+        let init_specs = match Self::pod_to_init_container_specs(
+            namespace,
+            &key.name,
+            value,
+            &env_sources,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 warn!(pod = %key.label(), error = %e, "invalid init manifest during reconcile");
@@ -2108,7 +2260,12 @@ impl Kubelet {
         // Re-derive the expected container set from the manifest so a
         // not-yet-started container shows up as Waiting (the pod is Pending
         // until every container has started at least once).
-        let specs = match Self::pod_to_container_specs(namespace, &key.name, value) {
+        let specs = match Self::pod_to_container_specs(
+            namespace,
+            &key.name,
+            value,
+            &env_sources,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 warn!(pod = %key.label(), error = %e, "invalid manifest during reconcile");
@@ -2975,6 +3132,7 @@ impl Kubelet {
 mod env_resolution_tests {
     use super::Kubelet;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn pod() -> serde_json::Value {
         json!({
@@ -2986,7 +3144,14 @@ mod env_resolution_tests {
     }
 
     fn resolve(entry: serde_json::Value) -> Result<(String, String), super::KubeletError> {
-        Kubelet::resolve_env_entry("pangea-system", "pangea-operator-abc", &pod(), &entry)
+        let sources: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
+        Kubelet::resolve_env_entry(
+            "pangea-system",
+            "pangea-operator-abc",
+            &pod(),
+            &entry,
+            &sources,
+        )
     }
 
     /// THE REGRESSION. Every one of these used to VANISH — the extractor
@@ -3034,22 +3199,102 @@ mod env_resolution_tests {
 
     /// An unsupported SOURCE must fail loudly and name itself. Starting a
     /// container without its credentials is the failure mode this whole
-    /// function exists to prevent.
+    /// function exists to prevent. `resourceFieldRef` remains unsupported;
+    /// `secretKeyRef` / `configMapKeyRef` now resolve when pre-fetched.
     #[test]
     fn an_unsupported_source_refuses_and_names_itself() {
-        for source in ["secretKeyRef", "configMapKeyRef", "resourceFieldRef"] {
-            let err = resolve(json!({
+        let err = resolve(json!({
+            "name": "CPU_LIMIT",
+            "valueFrom": { "resourceFieldRef": { "resource": "limits.cpu" } }
+        }))
+        .expect_err("an unresolvable source must not be silently dropped");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resourceFieldRef"),
+            "error must name the source: {msg}"
+        );
+        assert!(
+            msg.contains("CPU_LIMIT"),
+            "error must name the variable: {msg}"
+        );
+    }
+
+    /// A `secretKeyRef` resolves when the caller pre-fetched the Secret.
+    /// The Secret's `data` values are base64; the kubelet decodes into utf-8.
+    #[test]
+    fn a_secret_key_ref_resolves_when_prefetched() {
+        use base64::Engine as _;
+        let enc = base64::engine::general_purpose::STANDARD.encode("hunter2");
+        let mut sources: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
+        sources.insert(
+            ("Secret".to_string(), "pg-app".to_string()),
+            json!({ "data": { "password": enc } }),
+        );
+        let (k, v) = Kubelet::resolve_env_entry(
+            "pangea-system",
+            "pangea-operator-abc",
+            &pod(),
+            &json!({
                 "name": "PGPASSWORD",
-                "valueFrom": { source: { "name": "pangea-database-app", "key": "password" } }
-            }))
-            .expect_err("an unresolvable source must not be silently dropped");
-            let msg = err.to_string();
-            assert!(msg.contains(source), "error must name the source: {msg}");
-            assert!(
-                msg.contains("PGPASSWORD"),
-                "error must name the variable: {msg}"
-            );
-        }
+                "valueFrom": { "secretKeyRef": { "name": "pg-app", "key": "password" } }
+            }),
+            &sources,
+        )
+        .unwrap();
+        assert_eq!(k, "PGPASSWORD");
+        assert_eq!(v, "hunter2");
+    }
+
+    /// A `configMapKeyRef` resolves plaintext from `data`.
+    #[test]
+    fn a_config_map_key_ref_resolves_when_prefetched() {
+        let mut sources: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
+        sources.insert(
+            ("ConfigMap".to_string(), "app-cfg".to_string()),
+            json!({ "data": { "level": "debug" } }),
+        );
+        let (k, v) = Kubelet::resolve_env_entry(
+            "pangea-system",
+            "pangea-operator-abc",
+            &pod(),
+            &json!({
+                "name": "LOG_LEVEL",
+                "valueFrom": { "configMapKeyRef": { "name": "app-cfg", "key": "level" } }
+            }),
+            &sources,
+        )
+        .unwrap();
+        assert_eq!(k, "LOG_LEVEL");
+        assert_eq!(v, "debug");
+    }
+
+    /// A missing non-optional Secret is a typed InvalidPod naming the object.
+    #[test]
+    fn a_missing_secret_is_a_typed_invalid_pod() {
+        let err = resolve(json!({
+            "name": "PGPASSWORD",
+            "valueFrom": { "secretKeyRef": { "name": "pg-app", "key": "password" } }
+        }))
+        .expect_err("a missing non-optional Secret must fail loudly");
+        let msg = err.to_string();
+        assert!(msg.contains("Secret"), "error must name the kind: {msg}");
+        assert!(msg.contains("pg-app"), "error must name the object: {msg}");
+    }
+
+    /// An optional missing Secret resolves to empty — upstream semantics.
+    #[test]
+    fn an_optional_missing_secret_resolves_empty() {
+        let (k, v) = resolve(json!({
+            "name": "PGPASSWORD",
+            "valueFrom": { "secretKeyRef": {
+                "name": "pg-app",
+                "key": "password",
+                "optional": true
+            } }
+        }))
+        .expect("an optional missing Secret is not an error");
+        assert_eq!(k, "PGPASSWORD");
+        assert_eq!(v, "");
     }
 
     /// An unknown fieldRef path fails and lists what IS supported, rather
@@ -3079,11 +3324,13 @@ mod env_resolution_tests {
     #[test]
     fn a_known_but_unpopulated_path_resolves_empty() {
         let bare = json!({ "metadata": { "name": "p", "namespace": "n" } });
+        let sources: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
         let (_, v) = Kubelet::resolve_env_entry(
             "n",
             "p",
             &bare,
             &json!({ "name": "POD_IP", "valueFrom": { "fieldRef": { "fieldPath": "status.podIP" } } }),
+            &sources,
         )
         .expect("a known-but-unset path is not an error");
         assert_eq!(v, "");
@@ -3107,7 +3354,7 @@ mod tests {
                 }]
             }
         });
-        let specs = Kubelet::pod_to_container_specs("default", "p1", &pod).unwrap();
+        let specs = Kubelet::pod_to_container_specs("default", "p1", &pod, &BTreeMap::new()).unwrap();
         assert_eq!(specs.len(), 1);
         let (cname, spec) = &specs[0];
         assert_eq!(cname, "main");
@@ -3130,7 +3377,7 @@ mod tests {
                 }]
             }
         });
-        let specs = Kubelet::pod_to_container_specs("ns", "x", &pod).unwrap();
+        let specs = Kubelet::pod_to_container_specs("ns", "x", &pod, &BTreeMap::new()).unwrap();
         // command ++ args.
         assert_eq!(specs[0].1.command, vec!["sh", "-c", "echo hi; sleep 3600"]);
     }
@@ -3145,7 +3392,7 @@ mod tests {
                 ]
             }
         });
-        let specs = Kubelet::pod_to_container_specs("default", "p", &pod).unwrap();
+        let specs = Kubelet::pod_to_container_specs("default", "p", &pod, &BTreeMap::new()).unwrap();
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].0, "web");
         assert_eq!(specs[0].1.name, "default_p_web");
@@ -3157,20 +3404,20 @@ mod tests {
     #[test]
     fn pod_to_container_specs_rejects_missing_image() {
         let pod = json!({"spec": {"containers": [{"name": "c"}]}});
-        let err = Kubelet::pod_to_container_specs("ns", "p", &pod).unwrap_err();
+        let err = Kubelet::pod_to_container_specs("ns", "p", &pod, &BTreeMap::new()).unwrap_err();
         assert_eq!(err.kind(), "invalid_pod");
     }
 
     #[test]
     fn pod_to_container_specs_rejects_empty_containers() {
         let pod = json!({"spec": {"containers": []}});
-        assert!(Kubelet::pod_to_container_specs("n", "p", &pod).is_err());
+        assert!(Kubelet::pod_to_container_specs("n", "p", &pod, &BTreeMap::new()).is_err());
     }
 
     #[test]
     fn pod_to_container_specs_rejects_no_spec() {
         let pod = json!({"metadata": {"name": "p"}});
-        assert!(Kubelet::pod_to_container_specs("n", "p", &pod).is_err());
+        assert!(Kubelet::pod_to_container_specs("n", "p", &pod, &BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -3207,7 +3454,7 @@ mod tests {
     fn pod_to_container_specs_names_default_main_then_index() {
         // Unnamed first container → "main"; unnamed second → "container-1".
         let pod = json!({"spec": {"containers": [{"image": "a"}, {"image": "b"}]}});
-        let specs = Kubelet::pod_to_container_specs("ns", "p", &pod).unwrap();
+        let specs = Kubelet::pod_to_container_specs("ns", "p", &pod, &BTreeMap::new()).unwrap();
         assert_eq!(specs[0].0, "main");
         assert_eq!(specs[1].0, "container-1");
     }
