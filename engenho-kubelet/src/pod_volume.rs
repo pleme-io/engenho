@@ -1214,7 +1214,42 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
                 )));
             }
         }
-        Ok(MountSource::NamedVolume(vol_name))
+        // Resolve the named volume to its on-disk mountpoint and emit a
+        // HostDir bind mount rather than a NamedVolume. Measured 2026-09-10:
+        // libpod's container-create API, given `Type: volume, Source: <name>`
+        // and no `Name` field, records `Type: bind, Source: <name>` in the
+        // container's Mounts, and crun then fails to start the container with
+        // `mount <name>: No such device` — because there is no host device at
+        // a path called <name>. `podman run -v <name>:<dest>` (CLI) resolves
+        // to the same Mountpoint below and mounts as a bind, which works.
+        // Emitting a HostDir of the Mountpoint here reuses the bind path and
+        // sidesteps the API mismatch entirely.
+        let out = tokio::process::Command::new(&self.binary)
+            .args([
+                "volume",
+                "inspect",
+                &vol_name,
+                "--format",
+                "{{.Mountpoint}}",
+            ])
+            .output()
+            .await
+            .map_err(|e| {
+                VolumeResolveError::Materialize(format!("podman volume inspect spawn: {e}"))
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(VolumeResolveError::Materialize(format!(
+                "podman volume inspect {vol_name}: {stderr}"
+            )));
+        }
+        let mountpoint = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if mountpoint.is_empty() {
+            return Err(VolumeResolveError::Materialize(format!(
+                "podman volume inspect {vol_name}: empty Mountpoint"
+            )));
+        }
+        Ok(MountSource::HostDir(PathBuf::from(mountpoint)))
     }
 
     async fn remove_empty_dir(
