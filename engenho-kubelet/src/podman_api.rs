@@ -221,6 +221,14 @@ pub struct CreateRequest {
     /// `uid` or `uid:gid` to run as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Extra `/etc/hosts` entries, `"hostname:ip"` shape. The special value
+    /// `"host-gateway"` in place of the IP is resolved by podman to the
+    /// container-host gateway address on Linux native — the equivalent of the
+    /// hostname podman VM adds automatically on macOS. Used to make
+    /// `host.containers.internal` resolvable inside pods on Linux, where
+    /// (unlike podman-machine) podman does NOT add it automatically.
+    #[serde(rename = "hostadd", skip_serializing_if = "Vec::is_empty")]
+    pub host_add: Vec<String>,
 }
 
 /// Per-network attachment options — carries the DNS aliases.
@@ -427,6 +435,7 @@ pub fn create_request(spec: &ContainerSpec, network: Option<&str>) -> CreateRequ
             // and inventing uid 0 to carry it would silently run as root.
             (None, _) => None,
         },
+        host_add: spec.host_add.clone(),
     }
 }
 
@@ -1060,6 +1069,22 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
             Some((host, port)) => {
                 let mut merged = spec.clone();
                 crate::backend::inject_kubernetes_service_env(&mut merged.env, host, *port);
+                // On Linux native podman, `host.containers.internal` is NOT
+                // in the container's /etc/hosts automatically (unlike
+                // podman-machine on macOS). Add it explicitly so a pod whose
+                // KUBERNETES_SERVICE_HOST is that name can actually resolve
+                // it. `host-gateway` is podman's own sentinel — it resolves
+                // to the container-host gateway address at create time.
+                if host == "host.containers.internal"
+                    && !merged
+                        .host_add
+                        .iter()
+                        .any(|h| h.starts_with("host.containers.internal:"))
+                {
+                    merged
+                        .host_add
+                        .push("host.containers.internal:host-gateway".to_string());
+                }
                 create_request(&merged, self.network.as_deref())
             }
             None => create_request(spec, self.network.as_deref()),
