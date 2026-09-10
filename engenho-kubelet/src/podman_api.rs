@@ -377,6 +377,26 @@ fn to_libpod_mount(m: &crate::pod_volume::ResolvedMount) -> Mount {
         MountSource::PvcHostDir { path, .. } => (path.display().to_string(), "bind"),
         MountSource::NamedVolume(n) => (n.clone(), "volume"),
     };
+    // subPath: bind the *specific file or subdirectory* inside the resolved
+    // source, not the whole volume. Without this, a `volumeMount.subPath:
+    // config.yaml` with a file-shaped `mountPath: /etc/hanabi/config.yaml`
+    // still bind-mounts the whole configMap directory over the file path — the
+    // container then sees a directory where it expected a file and reads
+    // `Is a directory (os error 21)`. Kubernetes semantics: the subPath is a
+    // *relative* path inside the volume, so any leading `/` is dropped before
+    // it is joined to the source. Only meaningful for `bind` mounts; named
+    // volumes don't expose a host path to join against, so the field is left
+    // recorded-but-ignored there.
+    let source = if let Some(sub) = m.sub_path.as_deref() {
+        let clean = sub.trim_start_matches('/');
+        if !clean.is_empty() && mount_type == "bind" {
+            format!("{}/{}", source.trim_end_matches('/'), clean)
+        } else {
+            source
+        }
+    } else {
+        source
+    };
     // `ro` / `rw` are the same option strings the CLI appends after the second
     // colon. Emitting `rw` explicitly rather than omitting it keeps the
     // request self-describing — an absent option reads as "unspecified", and a
