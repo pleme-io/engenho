@@ -987,13 +987,18 @@ impl PodmanApi {
 pub struct PodmanApiBackend {
     api: PodmanApi,
     network: Option<String>,
+    kubernetes_service: Option<(String, u16)>,
 }
 
 impl PodmanApiBackend {
     /// A backend on an explicit endpoint.
     #[must_use]
     pub fn new(api: PodmanApi, network: Option<String>) -> Self {
-        Self { api, network }
+        Self {
+            api,
+            network,
+            kubernetes_service: None,
+        }
     }
 
     /// A backend on the discovered socket, attached to engenho's network.
@@ -1006,6 +1011,15 @@ impl PodmanApiBackend {
             PodmanApi::discover()?,
             Some(ENGENHO_NETWORK.to_string()),
         ))
+    }
+
+    /// Builder: set the API-server coordinates injected into every container as
+    /// `KUBERNETES_SERVICE_HOST` / `KUBERNETES_SERVICE_PORT` / `KUBERNETES_PORT`
+    /// / `KUBERNETES_PORT_443_TCP*`. Mirrors [`PodmanBackend::with_kubernetes_service`].
+    #[must_use]
+    pub fn with_kubernetes_service(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.kubernetes_service = Some((host.into(), port));
+        self
     }
 
     /// The endpoint in use — for startup logging, so an operator can see WHICH
@@ -1036,7 +1050,20 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
             self.api.ensure_network(net).await?;
         }
 
-        let req = create_request(spec, self.network.as_deref());
+        // Inject KUBERNETES_SERVICE_HOST/PORT/... into every container the API
+        // backend starts. Mirrors [`PodmanBackend`]'s single-point injection on
+        // its argv render path. Absent injection leaves in-cluster clients
+        // (kube-rs's `Config::infer()`, Go's `rest.InClusterConfig()`) unable
+        // to locate the apiserver and the container exits with
+        // "failed to infer config" the moment it starts.
+        let req = match &self.kubernetes_service {
+            Some((host, port)) => {
+                let mut merged = spec.clone();
+                crate::backend::inject_kubernetes_service_env(&mut merged.env, host, *port);
+                create_request(&merged, self.network.as_deref())
+            }
+            None => create_request(spec, self.network.as_deref()),
+        };
         let created = self.api.create(&req).await?;
         self.api.start(&created.id).await?;
 
