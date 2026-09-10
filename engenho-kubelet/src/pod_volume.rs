@@ -65,6 +65,12 @@ pub enum MountSource {
     /// An absolute host-filesystem directory (or file) to bind-mount.
     /// configMap / secret sources — default read-only (K8s semantics).
     HostDir(PathBuf),
+    /// An absolute host-filesystem directory bind-mounted from a podman
+    /// named volume's Mountpoint. emptyDir sourced via the volume-inspect
+    /// path (see `ensure_empty_dir`) — default read-write. Semantically
+    /// distinct from `HostDir` (configMap/secret) so the RO default doesn't
+    /// spill onto workload emptyDir mounts.
+    EmptyDirHostDir(PathBuf),
     /// A named podman volume (created via `podman volume create`).
     /// emptyDir sources — default read-write, shared across the pod.
     NamedVolume(String),
@@ -1043,11 +1049,13 @@ pub fn container_mounts(
             });
         };
         // configMap/secret are HostDir + default read-only; emptyDir is a
-        // NamedVolume + default read-write; a bound-PVC (PvcHostDir) defaults
-        // read-write but the PVC-source `readOnly` flag forces read-only. An
-        // explicit volumeMount.readOnly:true forces read-only in every case.
+        // NamedVolume OR EmptyDirHostDir + default read-write; a bound-PVC
+        // (PvcHostDir) defaults read-write but the PVC-source `readOnly` flag
+        // forces read-only. An explicit volumeMount.readOnly:true forces
+        // read-only in every case.
         let (source_ro, source_default_ro) = match source {
             MountSource::HostDir(_) => (false, true),
+            MountSource::EmptyDirHostDir(_) => (false, false),
             MountSource::NamedVolume(_) => (false, false),
             MountSource::PvcHostDir { read_only, .. } => (*read_only, false),
         };
@@ -1249,7 +1257,7 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
                 "podman volume inspect {vol_name}: empty Mountpoint"
             )));
         }
-        Ok(MountSource::HostDir(PathBuf::from(mountpoint)))
+        Ok(MountSource::EmptyDirHostDir(PathBuf::from(mountpoint)))
     }
 
     async fn remove_empty_dir(

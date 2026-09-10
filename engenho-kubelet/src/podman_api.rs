@@ -373,6 +373,7 @@ fn to_libpod_mount(m: &crate::pod_volume::ResolvedMount) -> Mount {
     use crate::pod_volume::MountSource;
     let (source, mount_type) = match &m.source {
         MountSource::HostDir(p) => (p.display().to_string(), "bind"),
+        MountSource::EmptyDirHostDir(p) => (p.display().to_string(), "bind"),
         MountSource::PvcHostDir { path, .. } => (path.display().to_string(), "bind"),
         MountSource::NamedVolume(n) => (n.clone(), "volume"),
     };

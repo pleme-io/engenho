@@ -1725,15 +1725,22 @@ impl Kubelet {
                     let entry = local.entry(key.clone()).or_default();
                     // Record this pod's emptyDir volume names ONCE so
                     // delete-cleanup can reap the backing podman named volumes.
-                    // emptyDir sources resolve to MountSource::NamedVolume;
-                    // configMap/secret (HostDir files) are NOT recorded — they
-                    // aren't podman named volumes. Idempotent: only set on the
-                    // first container start (when the list is still empty).
+                    // emptyDir sources resolve to MountSource::NamedVolume
+                    // (legacy) OR MountSource::EmptyDirHostDir (current, since
+                    // a563f42 resolved the named volume to its host mountpoint
+                    // to sidestep a libpod-API/crun mismatch). configMap/secret
+                    // (HostDir files) are NOT recorded — they aren't podman
+                    // named volumes. Idempotent: only set on the first
+                    // container start (when the list is still empty).
                     if entry.empty_dir_volumes.is_empty() {
                         entry.empty_dir_volumes = resolved
                             .iter()
                             .filter(|(_, src)| {
-                                matches!(src, crate::pod_volume::MountSource::NamedVolume(_))
+                                matches!(
+                                    src,
+                                    crate::pod_volume::MountSource::NamedVolume(_)
+                                        | crate::pod_volume::MountSource::EmptyDirHostDir(_)
+                                )
                             })
                             .map(|(name, _)| name.clone())
                             .collect();
