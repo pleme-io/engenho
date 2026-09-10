@@ -1373,9 +1373,23 @@ async fn do_patch_status(
     name: &str,
     headers: &HeaderMap,
     raw: &[u8],
+    apply_params: &crate::params::ApplyParams,
 ) -> Result<Response, ApiError> {
     let gvk = handler_gvk(h);
     let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
+    // A server-side-apply patch on `/status` DEMOTES to a merge patch here.
+    // Full subresource managedFields tracking is a separate brick; refusing
+    // apply-typed status writes would block every kube-rs / controller-runtime
+    // operator that follows the recommended `patch_status(Apply, fieldManager)`
+    // recipe — a semantic-preserving demotion is safer than a hard 400. The
+    // fieldManager identity is still validated (a missing one is a real 400
+    // exactly as upstream), it just isn't recorded on the subresource yet.
+    let patch_type = if patch_type == engenho_types::patch::PatchType::Apply {
+        crate::params::ApplyOptions::from_params(apply_params)?;
+        engenho_types::patch::PatchType::Merge
+    } else {
+        patch_type
+    };
     let v = h.patch_status(ns, name, patch, patch_type).await?;
     let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &gvk, StatusCode::OK, v)
@@ -1612,7 +1626,15 @@ async fn resource_patch(
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
     match resolve_subresource(&coords, &h)? {
         Some(Subresource::Status) => {
-            do_patch_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+            do_patch_status(
+                &h,
+                coords.namespace.as_deref(),
+                name,
+                &headers,
+                &raw,
+                &apply_params,
+            )
+            .await
         }
         Some(Subresource::Scale) => {
             do_patch_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
