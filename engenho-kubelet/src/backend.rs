@@ -1136,6 +1136,7 @@ impl PodmanBackend {
         for m in &spec.mounts {
             let src = match &m.source {
                 crate::pod_volume::MountSource::HostDir(p) => p.display().to_string(),
+                crate::pod_volume::MountSource::EmptyDirHostDir(p) => p.display().to_string(),
                 crate::pod_volume::MountSource::NamedVolume(n) => n.clone(),
                 crate::pod_volume::MountSource::PvcHostDir { path, .. } => {
                     path.display().to_string()
