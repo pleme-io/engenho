@@ -347,6 +347,49 @@ impl Resources {
     }
 }
 
+/// Which Pod this container belongs to, as separate typed fields.
+///
+/// ── ★ THE JOIN IS LOSSY AND THE CODE SAYS SO ──────────────────────────────
+/// [`ContainerSpec::name`] is `format!("{ns}_{pod}_{cname}")`, and
+/// `kubelet.rs`'s own note forbids reversing it: an `_` in any part cannot be
+/// split back, so two different Pods can produce the same backend name and a
+/// parser cannot tell which it holds. That is fine while the only consumer is
+/// podman, which just needs *a* unique string — and it is the blocker the
+/// moment anything needs the Pod's IDENTITY rather than a handle.
+///
+/// CRI needs exactly that: `RunPodSandbox` takes a `PodSandboxMetadata` of
+/// name + uid + namespace + attempt, and the runtime is required to key on it.
+/// So the identity is carried as DATA rather than recovered by parsing — the
+/// kubelet has all of it at construction and was already throwing it away.
+///
+/// Empty strings mean "constructed outside the Pod path" (a test, a direct
+/// backend call). A backend that requires identity must check rather than
+/// assume, which is why these are plain fields and not a newtype that would
+/// imply validity nobody enforces.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodIdentity {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// `metadata.uid` — the field that actually distinguishes two Pods with
+    /// the same name across a delete/recreate, and the one CRI keys on.
+    pub uid: String,
+    /// This container's own `name`, unfused from the pod's.
+    pub container_name: String,
+    /// Whether this is an init container (`spec.initContainers[]`).
+    pub init: bool,
+}
+
+impl PodIdentity {
+    /// Whether this carries a usable Pod identity. `false` for the default,
+    /// which is what a non-Pod construction path produces.
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        !self.namespace.is_empty() && !self.name.is_empty() && !self.container_name.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerSpec {
     /// Logical container name (namespace/podname/container).
@@ -429,6 +472,9 @@ pub struct ContainerSpec {
     /// podman does NOT synthesize that hostname automatically (unlike
     /// podman-machine on macOS).
     pub host_add: Vec<String>,
+    /// Which Pod this container belongs to, carried as typed fields because
+    /// [`Self::name`]'s join cannot be reversed. See [`PodIdentity`].
+    pub pod: PodIdentity,
     /// What the Pod asked the kernel to enforce for this container.
     ///
     /// Default (all [`ResourceBound::Unset`]) ⇒ behaviour-preserving: a Pod
@@ -2373,6 +2419,10 @@ mod tests {
             // same argv it did before the field existed, which is exactly what
             // these tests pin.
             resources: Resources::default(),
+            // No Pod identity: these argv tests construct a spec directly, not
+            // through the Pod path, and a backend that needs identity must
+            // check `is_present()` rather than assume it.
+            pod: PodIdentity::default(),
         }
     }
 

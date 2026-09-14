@@ -15,6 +15,9 @@ description = "engenho-kubelet — the missing piece between 'Pod object in the 
 [dependencies]
 engenho-csi   = { path = "../engenho-csi" }
 tonic         = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
+# A CRI endpoint is a unix socket and tonic dials a URI, so the channel needs
+# a custom connector. Same shape engenho-csi already uses (client.rs:112).
+tower         = { workspace = true, features = ["util"] }
 tonic-prost   = "0.14"
 prost         = "0.14"
 axum   = { workspace = true, features = ["ws"] }
@@ -50,7 +53,6 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tempfile = "3"
 engenho-csi = { path = "../engenho-csi", features = ["test-driver"] }
-tower = { workspace = true, features = ["util"] }
 proptest = "1"
 # A REAL client for the one test that opens an actual socket. The pure
 # pump tests cannot see a wiring bug — a handler that never upgrades, a

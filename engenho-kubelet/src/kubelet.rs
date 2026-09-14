@@ -860,6 +860,22 @@ impl Kubelet {
                     // requests`. The scheduler did arithmetic about a bound the
                     // node declined to enforce.
                     resources: crate::backend::Resources::from_container_json(c),
+                    // ★ The identity, carried rather than fused. The four
+                    // components are all in scope right here and were being
+                    // thrown away into `backend_name`'s lossy join — which the
+                    // note at the top of this file forbids reversing, and which
+                    // is exactly what a CRI `PodSandboxMetadata` needs.
+                    pod: crate::backend::PodIdentity {
+                        namespace: namespace.to_string(),
+                        name: name.to_string(),
+                        uid: pod
+                            .pointer("/metadata/uid")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        container_name: cname.clone(),
+                        init: optional,
+                    },
                 },
             ));
         }
@@ -3332,6 +3348,50 @@ mod env_resolution_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pod_identity_survives_the_pod_path_unfused() {
+        // A present-but-empty identity would be WORSE than none: a consumer
+        // would read `is_present()` as a contract and get a sandbox keyed on
+        // "". So assert the values, not the field.
+        //
+        // The names are chosen to contain the separator on purpose. Joined,
+        // "my_ns_my_pod_my_container" cannot be split back — which pod is it,
+        // `my/ns_my/pod_my/container` or `my/ns_my_pod/my/container`? The point
+        // of carrying identity is that nobody has to answer that.
+        let pod = json!({
+            "metadata": {"uid": "0e1f-CAFE"},
+            "spec": {"containers": [{"name": "my_container", "image": "i"}]}
+        });
+        let specs =
+            Kubelet::pod_to_container_specs("my_ns", "my_pod", &pod, &BTreeMap::new()).unwrap();
+        let (_, spec) = &specs[0];
+        assert_eq!(spec.name, "my_ns_my_pod_my_container", "the lossy join");
+        assert_eq!(spec.name.split('_').count(), 6, "6 pieces, 3 fields");
+        assert!(spec.pod.is_present());
+        assert_eq!(spec.pod.namespace, "my_ns");
+        assert_eq!(spec.pod.name, "my_pod");
+        assert_eq!(spec.pod.uid, "0e1f-CAFE");
+        assert_eq!(spec.pod.container_name, "my_container");
+        assert!(!spec.pod.init);
+    }
+
+    #[test]
+    fn an_init_container_is_marked_as_one() {
+        let pod = json!({
+            "metadata": {"uid": "u1"},
+            "spec": {
+                "initContainers": [{"name": "setup", "image": "i"}],
+                "containers": [{"name": "app", "image": "i"}]
+            }
+        });
+        let init =
+            Kubelet::pod_to_init_container_specs("ns", "p", &pod, &BTreeMap::new()).unwrap();
+        assert!(init[0].1.pod.init, "init containers must be distinguishable");
+        assert_eq!(init[0].1.pod.container_name, "setup");
+        let app = Kubelet::pod_to_container_specs("ns", "p", &pod, &BTreeMap::new()).unwrap();
+        assert!(!app[0].1.pod.init);
+    }
 
     #[test]
     fn pod_to_container_specs_extracts_image_and_env() {

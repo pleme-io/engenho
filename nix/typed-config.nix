@@ -205,7 +205,7 @@ in
         material.
       '';
 
-      kubeletBackend = optional (types.enum [ "podman_api" "podman" "fake" ]) ''
+      kubeletBackend = optional (types.enum [ "podman_api" "podman" "cri" "fake" ]) ''
         Container runtime the kubelet drives.
 
         `podman_api` (the DEFAULT) speaks podman's libpod REST API over its unix

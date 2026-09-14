@@ -1024,6 +1024,17 @@ fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
             host: PODMAN_HOST_GATEWAY.to_string(),
             port,
         },
+        // ★ CRI: HONESTLY UNKNOWN, NOT GUESSED. A pod under containerd/CRI-O
+        // is on a CNI-managed network, not podman's bridge, so
+        // `PODMAN_HOST_GATEWAY` is simply the wrong host — and engenho does
+        // not yet attach pods to any network under CRI (`run_chain` has no
+        // production caller), so there is no address to name. `Unknown`
+        // injects nothing and warns, which leaves in-cluster config failing to
+        // CONSTRUCT and the client falling back to a kubeconfig. That is the
+        // rule this function already states for an unparseable port: a guessed
+        // address is worse than none, because it removes the fallback and turns
+        // a clear failure into a connection timeout.
+        CfgBackendKind::Cri => ApiserverReachability::Unknown,
         // Nothing is dialled under the fake backend, so there is nothing to
         // be reachable. Injecting the conventional VIP keeps the env shape
         // that tests assert on.
@@ -1036,6 +1047,7 @@ fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
 
 fn build_backend(config: &EngenhoConfig) -> Arc<dyn ContainerRuntime> {
     let kind = match config.runtime.kubelet_backend {
+        CfgBackendKind::Cri => KubeletBackendKind::Cri,
         CfgBackendKind::PodmanApi => KubeletBackendKind::PodmanApi,
         CfgBackendKind::Podman => KubeletBackendKind::Podman,
         CfgBackendKind::Fake => KubeletBackendKind::Fake,

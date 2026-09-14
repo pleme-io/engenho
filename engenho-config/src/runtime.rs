@@ -34,6 +34,18 @@ use crate::tls::TlsConfig;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KubeletBackendKind {
+    /// A CRI runtime over gRPC — containerd, CRI-O, youki.
+    ///
+    /// ★ WHAT UPSTREAM'S KUBELET SPEAKS, AND THE ONLY BACKEND THAT MAKES THE
+    /// RUNTIME SUBSTITUTABLE. containerd, CRI-O and youki all implement CRI;
+    /// none of them speaks podman's libpod API, so a kubelet that can only
+    /// drive podman is locked to one runtime.
+    ///
+    /// Not the default: `logs` is a typed refusal until the CRI log-format
+    /// parser lands (CRI has no read-log RPC — the runtime writes a FILE the
+    /// kubelet must parse), so this backend is selected deliberately rather
+    /// than inherited. See `runtime.cri_endpoint` for where it dials.
+    Cri,
     /// podman over its libpod REST API on the unix socket — **the default**.
     ///
     /// No subprocess: typed JSON requests, status codes instead of parsed
@@ -498,6 +510,7 @@ mod backend_kind_wire {
     #[test]
     fn the_wire_names_are_exactly_what_the_nix_enum_offers() {
         let cases = [
+            (KubeletBackendKind::Cri, "\"cri\""),
             (KubeletBackendKind::PodmanApi, "\"podman_api\""),
             (KubeletBackendKind::Podman, "\"podman\""),
             (KubeletBackendKind::Fake, "\"fake\""),

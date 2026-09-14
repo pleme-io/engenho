@@ -42,6 +42,7 @@ pub mod backend;
 pub mod backoff;
 pub mod config_bridge;
 pub mod cri;
+pub mod cri_backend;
 pub mod csi_materializer;
 pub mod error;
 pub mod exec_channel;
