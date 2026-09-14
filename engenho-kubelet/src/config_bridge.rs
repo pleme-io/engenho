@@ -10,6 +10,10 @@ use crate::backend::{ContainerRuntime, FakeBackend, PodmanBackend};
 /// avoid a forward declaration in engenho-config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KubeletBackendKind {
+    /// A CRI runtime over gRPC (containerd / CRI-O / youki) — what upstream's
+    /// kubelet speaks, and the only backend that makes the runtime
+    /// substitutable.
+    Cri,
     /// podman over its libpod REST API — no subprocess. The default.
     PodmanApi,
     /// Real podman shell-out. Retained because it is the only backend that
@@ -92,6 +96,40 @@ pub fn make_container_runtime_with_apiserver(
                 Some((h, p)) => b.with_kubernetes_service(h, p),
                 None => b,
             })
+        }
+        KubeletBackendKind::Cri => {
+            // ── A MISSING SOCKET FALLS BACK, LOUDLY — same rule as PodmanApi.
+            // An operator who selected `cri` on a node whose containerd has not
+            // come up yet gets a working kubelet and a WARN naming the paths
+            // tried, rather than a node that refuses to start. The difference
+            // from PodmanApi's fallback is that this one says which runtime it
+            // ended up on, because silently running podman when the operator
+            // asked for CRI is the kind of substitution that gets discovered
+            // three debugging hours later.
+            match crate::cri_backend::CriBackend::discover(None) {
+                Some(b) => {
+                    tracing::info!(
+                        endpoint = b.endpoint_path(),
+                        "kubelet driving a CRI runtime over gRPC"
+                    );
+                    Arc::new(match apiserver {
+                        Some((h, p)) => b.with_kubernetes_service(h, p),
+                        None => b,
+                    })
+                }
+                None => {
+                    tracing::warn!(
+                        tried = ?crate::cri::DEFAULT_ENDPOINTS,
+                        "no CRI socket found — falling back to podman for this boot; \
+                         the kubelet is NOT on the runtime that was selected"
+                    );
+                    let b = PodmanBackend::new();
+                    Arc::new(match apiserver {
+                        Some((h, p)) => b.with_kubernetes_service(h, p),
+                        None => b,
+                    })
+                }
+            }
         }
         KubeletBackendKind::Fake => Arc::new(FakeBackend::new()),
     }

@@ -1404,6 +1404,7 @@ mod tests {
             host_add: Vec::new(),
             confinement: crate::backend::Confinement::default(),
             resources: crate::backend::Resources::default(),
+            pod: crate::backend::PodIdentity::default(),
         };
         let req = create_request(&spec, Some("engenho-net"));
 
