@@ -79,3 +79,21 @@ files:
     description: "apimachinery api/resource — Quantity"
     blake3: "bef5a679bb500224560465bd24a4589ad3926b7e04a887582c0183eacfcea12b"
     bytes: 3949
+  - path: k8s.io/api/coordination/v1/generated.proto
+    group: coordination.k8s.io
+    version: v1
+    description: "coordination v1 — Lease (leader election, protobuf-only in client-go)"
+    blake3: "e0fa3e552cf51494a128349a2bf8bb9f516f98d7ce1eba8f86f95f3a7f08ef5c"
+    bytes: 3807
+  - path: k8s.io/api/authentication/v1/generated.proto
+    group: authentication.k8s.io
+    version: v1
+    description: "authentication v1 — TokenRequest (kubectl create token POSTs protobuf)"
+    blake3: "5ed52d96a8cd0248bf3a2282d40def96a7ca9c4472a07be02d020567f90c89b6"
+    bytes: 8118
+  - path: k8s.io/api/authorization/v1/generated.proto
+    group: authorization.k8s.io
+    version: v1
+    description: "authorization v1 — SubjectAccessReview family (kubectl auth can-i)"
+    blake3: "8e1f71c58a2c94e9ecc67e30ec663050c7b5c62bd58c9439fa57e09512da386b"
+    bytes: 11656

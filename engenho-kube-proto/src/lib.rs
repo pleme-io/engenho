@@ -167,6 +167,16 @@ fn package_for_api_version(api_version: &str) -> Option<&'static str> {
         // application/vnd.kubernetes.protobuf, so the SA-token mint endpoint
         // cannot decode its own request body without this row.
         "authentication.k8s.io/v1" => Some("k8s.io.api.authentication.v1"),
+        // Lease — LEADER ELECTION is protobuf-only in practice. client-go's
+        // leaderelection package creates and renews a Lease as
+        // application/vnd.kubernetes.protobuf, so without this row every
+        // controller-runtime manager fails at
+        // `Error initially creating lease lock` and NEVER BECOMES LEADER.
+        // Measured on rio 2026-09-15: all four FluxCD controllers ran happily
+        // while reconciling nothing, every GitRepository/Kustomization sat
+        // with an empty status, and the pods reported Running the whole time —
+        // a workload that holds no lease looks perfectly healthy from outside.
+        "coordination.k8s.io/v1" => Some("k8s.io.api.coordination.v1"),
         _ => None,
     }
 }

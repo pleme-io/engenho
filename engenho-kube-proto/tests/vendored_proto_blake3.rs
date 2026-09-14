@@ -106,3 +106,65 @@ fn all_vendored_proto_have_valid_blake3_format() {
         );
     }
 }
+
+/// THE REVERSE DIRECTION — every on-disk proto must be IN the manifest.
+///
+/// ★ Added 2026-09-15 after the gap bit. Every check above iterates
+/// `manifest.files` and asserts the file on disk matches. None of them ask the
+/// opposite question, so a proto added to `vendor/proto/` and compiled into
+/// the descriptor set — i.e. one whose contents engenho actively decodes —
+/// was covered by NOTHING. It could change, or be replaced wholesale, and the
+/// whole suite stayed green.
+///
+/// Found while vendoring `coordination/v1` (the Lease descriptor leader
+/// election needs): the new file compiled, the codec used it, and all five
+/// checks passed without it being listed anywhere. A guard that only walks its
+/// own list reports the coverage of that list, never of the directory — and
+/// reads as if it covered both.
+#[test]
+fn every_on_disk_proto_is_declared_in_the_manifest() {
+    fn collect(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect(&p, out);
+            } else if p.extension().is_some_and(|x| x == "proto") {
+                out.push(p);
+            }
+        }
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(VENDOR_DIR);
+    let mut found = Vec::new();
+    collect(&root, &mut found);
+    assert!(
+        !found.is_empty(),
+        "discovered ZERO .proto files under {} — the check would pass \
+         vacuously, which is the failure it exists to prevent",
+        root.display()
+    );
+
+    let manifest = load_manifest();
+    let declared: std::collections::BTreeSet<String> =
+        manifest.files.iter().map(|f| f.path.clone()).collect();
+
+    let mut undeclared: Vec<String> = found
+        .iter()
+        .filter_map(|p| {
+            p.strip_prefix(&root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+        })
+        .filter(|rel| !declared.contains(rel))
+        .collect();
+    undeclared.sort();
+
+    assert!(
+        undeclared.is_empty(),
+        "{} vendored proto(s) are compiled into the descriptor set but declared \
+         in NO manifest entry, so nothing pins their contents: {:?}",
+        undeclared.len(),
+        undeclared
+    );
+}

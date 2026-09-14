@@ -68,6 +68,10 @@ fn main() {
         "k8s.io/api/rbac/v1/generated.proto",
         "k8s.io/api/authorization/v1/generated.proto",
         "k8s.io/api/authentication/v1/generated.proto",
+        // Lease — client-go's leaderelection package creates and renews it as
+        // application/vnd.kubernetes.protobuf, so every controller-runtime
+        // manager needs this descriptor before it can become leader.
+        "k8s.io/api/coordination/v1/generated.proto",
         "k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto",
         "k8s.io/apimachinery/pkg/runtime/generated.proto",
         "k8s.io/apimachinery/pkg/runtime/schema/generated.proto",
