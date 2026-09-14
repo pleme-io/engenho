@@ -77,6 +77,7 @@ pub mod store_ledger;
 pub mod store_resolver;
 pub mod tiered_build;
 pub mod tiered_reconciler;
+pub mod volume_snapshot;
 pub mod watch_driver;
 
 pub use admission::{
