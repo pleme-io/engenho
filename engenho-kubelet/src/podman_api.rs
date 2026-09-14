@@ -848,13 +848,36 @@ impl PodmanApi {
                 None,
             )
             .await?;
-        if status.is_success() {
-            return Ok(());
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman pull {image}: HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
         }
-        Err(KubeletError::Backend(format!(
-            "podman pull {image}: HTTP {status}: {}",
-            String::from_utf8_lossy(&bytes)
-        )))
+
+        // ★ A FAILED PULL RETURNS HTTP 200. Verified against podman 5.7.0 on
+        // rio: pulling a nonexistent reference answers `200 OK` and reports
+        // the failure only inside the streamed NDJSON body, as a final
+        // `{"error":"...403 Forbidden"}` object. Trusting the status here
+        // would call a failed pull a success, and the damage lands one step
+        // later as `create: image not known` — which blames the create and
+        // hides the real cause (auth, a typo'd tag, a dead registry). That is
+        // the silent-wrong-answer shape, so the BODY is the verdict.
+        let body = String::from_utf8_lossy(&bytes);
+        if let Some(line) = body
+            .lines()
+            .rev()
+            .find(|l| l.contains("\"error\"") && !l.contains("\"error\":\"\""))
+        {
+            let detail = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or_else(|| line.trim().to_string());
+            return Err(KubeletError::Backend(format!(
+                "podman pull {image}: {detail}"
+            )));
+        }
+        Ok(())
     }
 
     /// `POST /libpod/containers/create`.
@@ -1460,6 +1483,44 @@ mod tests {
         assert!(
             candidates.contains(&PathBuf::from("/run/podman/podman.sock")),
             "the rootful socket must always be a candidate: {candidates:?}"
+        );
+    }
+
+    #[test]
+    /// The pull-error detector, exercised against podman's REAL response
+    /// shape. Captured from podman 5.7.0 on rio: a pull of a nonexistent
+    /// reference returns **HTTP 200** and reports the failure only as a final
+    /// NDJSON `{"error":...}` object. A status-only check would call that a
+    /// success and the damage would surface later as `create: image not
+    /// known`, blaming the create and hiding the 403.
+    #[test]
+    fn a_failed_pull_is_detected_in_the_body_not_the_status() {
+        let failed = concat!(
+            r#"{"stream":"Trying to pull ghcr.io/pleme-io/definitely-not-real:v0...\n"}"#,
+            "\n",
+            r#"{"error":"unable to copy from source docker://ghcr.io/pleme-io/definitely-not-real:v0: initializing source: Requesting bearer token: received unexpected HTTP status: 403 Forbidden"}"#,
+        );
+        let detected = failed
+            .lines()
+            .rev()
+            .find(|l| l.contains("\"error\"") && !l.contains("\"error\":\"\""));
+        assert!(
+            detected.is_some(),
+            "a 200-with-error body must be read as a FAILURE"
+        );
+
+        // A successful pull ends with an images/id object and no error.
+        let ok = concat!(
+            r#"{"stream":"Writing manifest to image destination\n"}"#,
+            "\n",
+            r#"{"images":["e2ac70e7319a"],"id":"e2ac70e7319a"}"#,
+        );
+        assert!(
+            ok.lines()
+                .rev()
+                .find(|l| l.contains("\"error\"") && !l.contains("\"error\":\"\""))
+                .is_none(),
+            "a successful pull must not be misread as a failure"
         );
     }
 
