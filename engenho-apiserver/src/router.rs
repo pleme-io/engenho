@@ -101,6 +101,19 @@ pub struct RouterState {
     /// [`crate::authz::RbacAuthorizer`] over the store via
     /// [`Self::with_authorizer`].
     pub authorizer: Arc<dyn crate::authz::Authorizer>,
+    /// The ServiceAccount token MINTER, for `POST serviceaccounts/<n>/token`.
+    ///
+    /// `None` ⇒ the `/token` subresource answers a typed error rather than a
+    /// token. That is the honest state for a server with no signing key, and
+    /// it is deliberately NOT a fallback that mints an unsigned or
+    /// fixed-string token — refusing to issue must never degrade into issuing
+    /// something that does not authenticate.
+    ///
+    /// The verifying mirror of this lives in
+    /// [`crate::authn::ServiceAccountTokenAuthenticator`]; the runtime builds
+    /// both from ONE `SaKeypair`, so a mintable token is always a verifiable
+    /// one.
+    pub token_issuer: Option<Arc<crate::sa_token::SaIssuer>>,
 }
 
 impl RouterState {
@@ -120,7 +133,20 @@ impl RouterState {
             // behavior so every existing caller/test is unchanged. The runtime
             // installs the real RBAC authorizer via `with_authorizer`.
             authorizer: Arc::new(crate::authz::AllowAllAuthorizer),
+            // No signing key by default: `/token` answers a typed error until
+            // the runtime installs the cluster's keypair. NEVER a stub token.
+            token_issuer: None,
         }
+    }
+
+    /// Install the ServiceAccount token minter. Builder style mirroring
+    /// [`Self::with_authenticator`]; the runtime calls this with the SAME
+    /// `SaKeypair` it hands the authenticator, so the server cannot mint a
+    /// token it would then refuse.
+    #[must_use]
+    pub fn with_token_issuer(mut self, issuer: Arc<crate::sa_token::SaIssuer>) -> Self {
+        self.token_issuer = Some(issuer);
+        self
     }
 
     /// Install the typed authenticator chain (carrying the configured
@@ -1327,6 +1353,7 @@ fn resolve_subresource(
         "status" if h.subresources().contains(&Subresource::Status) => Subresource::Status,
         "scale" if h.subresources().contains(&Subresource::Scale) => Subresource::Scale,
         "log" if h.subresources().contains(&Subresource::Log) => Subresource::Log,
+        "token" if h.subresources().contains(&Subresource::Token) => Subresource::Token,
         other => {
             return Err(ApiError::NotFound(format!(
                 "the server could not find the requested resource: {} does not serve subresource {:?}",
@@ -1335,6 +1362,177 @@ fn resolve_subresource(
         }
     };
     Ok(Some(parsed))
+}
+
+/// Default token lifetime when a `TokenRequest` names none — one hour, the
+/// same default kube-apiserver applies.
+const TOKEN_LIFETIME_DEFAULT_SECS: i64 = 3600;
+/// Floor on a requested lifetime. Upstream refuses anything under 10 minutes;
+/// a token that expires faster than a kubelet can rotate it is a crashloop
+/// dressed as a credential.
+const TOKEN_LIFETIME_MIN_SECS: i64 = 600;
+/// Ceiling on a requested lifetime. A caller asking for more is CLAMPED, not
+/// refused — and `status.expirationTimestamp` echoes the lifetime actually
+/// minted, so a clamped caller can SEE it was clamped rather than believing it
+/// holds a token good for a year.
+const TOKEN_LIFETIME_MAX_SECS: i64 = 86_400;
+
+/// Clamp a requested token lifetime into the servable band.
+///
+/// CLAMPS rather than refuses, and the caller is told: `status.expirationTimestamp`
+/// is rendered from the clamped value, so a client asking for a year can SEE it
+/// holds a day. Refusing instead would break `kubectl create token
+/// --duration=...` for values upstream itself accepts.
+fn clamp_token_lifetime(requested: i64) -> i64 {
+    requested.clamp(TOKEN_LIFETIME_MIN_SECS, TOKEN_LIFETIME_MAX_SECS)
+}
+
+/// `POST serviceaccounts/<name>/token` — mint a bound ServiceAccount JWT.
+///
+/// The one create-shaped subresource. Nothing is persisted: the response IS
+/// the product, and the token exists only in it.
+///
+/// ── ★ WHY THIS CLOSES A REAL HOLE, NOT A MISSING FEATURE ───────────────────
+/// The verifying half shipped long ago — `sa_token::verify`, `SaVerifier`, and
+/// the runtime's `bootstrap_with_sa` over `pki/sa.key` are all live. Only the
+/// ISSUING half was absent, and the consequence was not "SA tokens don't
+/// work": it was that a pod had no identity of its own, so every workload
+/// needing the API had to mount a kubeconfig carrying ADMIN client-key
+/// material. Cluster-admin was distributed to ordinary pods because the
+/// cheapest correct credential could not be minted.
+///
+/// It also made RBAC decorative. The authorizer, the Roles and the bindings
+/// all worked; nothing could ever present a non-admin identity to be judged.
+async fn do_token_request(
+    state: &RouterState,
+    h: &Arc<dyn ResourceHandler>,
+    coords: &crate::coords::ResourceCoords,
+    headers: &HeaderMap,
+    raw: &Bytes,
+) -> Result<Response, ApiError> {
+    let Some(name) = coords.name.as_deref() else {
+        return Err(ApiError::BadRequest(
+            "the token subresource requires a ServiceAccount name".into(),
+        ));
+    };
+    let Some(namespace) = coords.namespace.as_deref() else {
+        return Err(ApiError::BadRequest(
+            "the token subresource is namespaced; no namespace in the request path".into(),
+        ));
+    };
+    // Refusing to issue must never degrade into issuing something that does
+    // not authenticate, so a keyless server says so instead of minting.
+    let Some(issuer) = state.token_issuer.as_ref() else {
+        return Err(ApiError::Internal(
+            "ServiceAccount token issuance is not configured: this apiserver holds no SA \
+             signing key, so `/token` cannot mint. (The cluster's key lives at \
+             <data_dir>/pki/sa.key and is installed via RouterState::with_token_issuer.)"
+                .into(),
+        ));
+    };
+
+    // The ServiceAccount must EXIST and its uid goes into the claim — a token
+    // naming a deleted SA would verify happily while authorizing an identity
+    // nobody can revoke. `get` yields the typed 404 when it is absent.
+    let sa = h.get(Some(namespace), name).await?;
+    let uid = sa
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    // An empty body is a legal TokenRequest (every spec field is optional).
+    // Decoded through the SHARED write-body decoder, not `serde_json` direct:
+    // kubectl negotiates protobuf for core/v1 writes, so a hand-rolled JSON
+    // parse here rejects the very client this endpoint exists for — measured,
+    // `kubectl create token` failed "expected value at line 1 column 1".
+    let req: serde_json::Value = if raw.is_empty() {
+        serde_json::json!({})
+    } else {
+        decode_write_body(headers, raw)?
+    };
+    let spec = req.get("spec");
+
+    let audiences: Vec<String> = spec
+        .and_then(|s| s.get("audiences"))
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .filter(|v: &Vec<String>| !v.is_empty())
+        .unwrap_or_else(|| vec![issuer.default_audience.clone()]);
+
+    let requested = spec
+        .and_then(|s| s.get("expirationSeconds"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(TOKEN_LIFETIME_DEFAULT_SECS);
+    let lifetime = clamp_token_lifetime(requested);
+
+    // Bind to a Pod when asked. Only Pod is honoured: binding to a kind whose
+    // lifetime we do not track would be a promise the runtime cannot keep.
+    let bound = spec
+        .and_then(|s| s.get("boundObjectRef"))
+        .filter(|b| b.get("kind").and_then(serde_json::Value::as_str) == Some("Pod"))
+        .map(|b| crate::sa_token::NamedUid {
+            name: b
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            uid: b
+                .get("uid")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+
+    // ONE clock read. `exp` and `status.expirationTimestamp` are both derived
+    // from it, so the token and the advertised expiry cannot disagree.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ApiError::Internal(["clock before UNIX epoch: ", &e.to_string()].concat()))?
+        .as_secs();
+    let now = i64::try_from(now)
+        .map_err(|_| ApiError::Internal("clock past the representable range".into()))?;
+
+    let token = crate::sa_token::issue(
+        &issuer.signing,
+        &issuer.issuer,
+        namespace,
+        name,
+        &uid,
+        &audiences,
+        bound,
+        now,
+        lifetime,
+    )
+    .map_err(|e| ApiError::Internal(["minting the token failed: ", &e.to_string()].concat()))?;
+
+    let expiry = engenho_types::time::epoch_to_rfc3339_utc(now + lifetime).ok_or_else(|| {
+        ApiError::Internal("the computed token expiry is not a representable instant".into())
+    })?;
+
+    let body = serde_json::json!({
+        "kind": "TokenRequest",
+        "apiVersion": "authentication.k8s.io/v1",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "creationTimestamp": engenho_types::time::now_rfc3339_utc(),
+        },
+        "spec": {
+            "audiences": audiences,
+            "expirationSeconds": lifetime,
+        },
+        "status": {
+            "token": token,
+            "expirationTimestamp": expiry,
+        },
+    });
+    Ok((StatusCode::CREATED, Json(body)).into_response())
 }
 
 // ── shared subresource do_* bodies (status/scale; both URL families) ────
@@ -1472,6 +1670,14 @@ async fn resource_get_or_list(
             Subresource::Scale => do_get_scale(&h, coords.namespace.as_deref(), name).await,
             // `/log` — read-only; the typed LogQuery is already decoded above.
             Subresource::Log => do_get_log(&h, coords.namespace.as_deref(), name, &log_query).await,
+            // `/token` is WRITE-ONLY (POST/create). A GET cannot return the
+            // last token because none is stored — the mint is the only copy
+            // that ever exists. Typed BadRequest naming the verb, never an
+            // empty 200 that reads as "this SA has no token".
+            Subresource::Token => Err(ApiError::BadRequest(
+                "the token subresource supports create (POST) only; there is no stored token to                  GET — a minted token is returned once, in the POST response, and never                  persisted"
+                    .into(),
+            )),
         };
     }
     match &coords.name {
@@ -1521,10 +1727,20 @@ async fn resource_create(
     raw: Bytes,
 ) -> Result<Response, ApiError> {
     let dry_run = DryRun::parse(write.dry_run.as_deref())?;
-    // POST on a subresource is not a K8s CREATE shape — no subresource
-    // supports create (status/scale are get/patch/update only). Typed
-    // BadRequest, never a stub Ok.
+    // POST on a subresource is not a K8s CREATE shape — status/scale/log are
+    // get/patch/update shapes. `/token` is the ONE exception: it is defined as
+    // a POST that mints rather than persists, so it is dispatched here rather
+    // than being refused with the others. The check stays catalog-driven — a
+    // kind that does not declare `Subresource::Token` still falls through to
+    // the typed BadRequest below.
     if let Some(sub) = &coords.subresource {
+        let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+        if matches!(
+            resolve_subresource(&coords, &h),
+            Ok(Some(Subresource::Token))
+        ) {
+            return do_token_request(&state, &h, &coords, &headers, &raw).await;
+        }
         return Err(ApiError::BadRequest(format!(
             "the {sub:?} subresource does not support create (POST)"
         )));
@@ -1570,6 +1786,11 @@ async fn resource_put(
         Some(Subresource::Scale) => {
             do_put_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
         }
+        // `/token` is create-only; PUT has no meaning on a thing that is
+        // minted rather than stored.
+        Some(Subresource::Token) => Err(ApiError::BadRequest(
+            "the token subresource supports create (POST) only".into(),
+        )),
         // `/log` is READ-ONLY (GET only) — PUT is a typed BadRequest, never a
         // silent accept.
         Some(Subresource::Log) => Err(ApiError::BadRequest(
@@ -1617,6 +1838,11 @@ async fn resource_patch(
         Some(Subresource::Scale) => {
             do_patch_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
         }
+        // `/token` is create-only; PATCH has no meaning on a thing that is
+        // minted rather than stored.
+        Some(Subresource::Token) => Err(ApiError::BadRequest(
+            "the token subresource supports create (POST) only".into(),
+        )),
         // `/log` is READ-ONLY (GET only) — PATCH is a typed BadRequest.
         Some(Subresource::Log) => Err(ApiError::BadRequest(
             "the log subresource is read-only (GET only)".into(),
@@ -2078,5 +2304,87 @@ mod tests {
         // And the group shows up in /apis (build_api_groups).
         let groups = crate::discovery::build_api_groups(&state);
         assert!(groups.groups.iter().any(|g| g.name == "example.com"));
+    }
+}
+
+#[cfg(test)]
+mod token_subresource {
+    use super::{
+        TOKEN_LIFETIME_DEFAULT_SECS, TOKEN_LIFETIME_MAX_SECS, TOKEN_LIFETIME_MIN_SECS,
+        clamp_token_lifetime,
+    };
+    use engenho_types::generated_v1_34::{RESOURCE_CATALOG, Subresource};
+
+    #[test]
+    fn a_default_request_is_inside_the_band_untouched() {
+        // If the default ever drifted outside the band the clamp would
+        // silently rewrite EVERY token's lifetime, which no caller would see.
+        assert_eq!(
+            clamp_token_lifetime(TOKEN_LIFETIME_DEFAULT_SECS),
+            TOKEN_LIFETIME_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn an_absurd_request_is_clamped_not_honoured() {
+        // A year. Honouring it would mint a credential that outlives the
+        // cluster; the caller reads the real expiry off status.
+        assert_eq!(clamp_token_lifetime(31_536_000), TOKEN_LIFETIME_MAX_SECS);
+    }
+
+    #[test]
+    fn a_too_short_request_is_raised_to_the_floor() {
+        // A token that expires faster than a kubelet can rotate it is a
+        // crashloop dressed as a credential.
+        assert_eq!(clamp_token_lifetime(1), TOKEN_LIFETIME_MIN_SECS);
+        assert_eq!(clamp_token_lifetime(0), TOKEN_LIFETIME_MIN_SECS);
+    }
+
+    #[test]
+    fn a_negative_request_cannot_mint_an_already_expired_token() {
+        // `exp = now + lifetime`, so a negative lifetime would mint a token
+        // that is expired at issue — refused by the verifier the instant it is
+        // used, presenting as an auth bug rather than a bad request.
+        assert!(clamp_token_lifetime(-3600) >= TOKEN_LIFETIME_MIN_SECS);
+    }
+
+    /// ★ NEGATIVE CONTROL for the band itself. Without this, both bounds could
+    /// be set to the same number and every clamp test above would still pass
+    /// while the endpoint served exactly one lifetime.
+    #[test]
+    fn the_band_is_actually_a_band() {
+        assert!(
+            TOKEN_LIFETIME_MIN_SECS < TOKEN_LIFETIME_MAX_SECS,
+            "a collapsed band serves one lifetime and silently ignores every request"
+        );
+        assert!(TOKEN_LIFETIME_DEFAULT_SECS >= TOKEN_LIFETIME_MIN_SECS);
+        assert!(TOKEN_LIFETIME_DEFAULT_SECS <= TOKEN_LIFETIME_MAX_SECS);
+    }
+
+    /// The catalog is the single authority for whether a kind serves `/token`;
+    /// the router never matches a kind by name. If this row is lost, the mint
+    /// endpoint 404s with no other symptom.
+    #[test]
+    fn serviceaccount_declares_the_token_subresource() {
+        let sa = RESOURCE_CATALOG
+            .iter()
+            .find(|d| d.kind == "ServiceAccount" && d.group.is_empty())
+            .expect("ServiceAccount is cataloged");
+        assert!(
+            sa.subresources.contains(&Subresource::Token),
+            "without this row `kubectl create token` is a 404 and every pod is identity-less"
+        );
+    }
+
+    /// ★ NEGATIVE CONTROL for the row above: `/token` must NOT be blanket-added
+    /// to every kind. A Pod serving `/token` would advertise a mint endpoint
+    /// the router cannot satisfy.
+    #[test]
+    fn pods_do_not_serve_the_token_subresource() {
+        let pod = RESOURCE_CATALOG
+            .iter()
+            .find(|d| d.kind == "Pod" && d.group.is_empty())
+            .expect("Pod is cataloged");
+        assert!(!pod.subresources.contains(&Subresource::Token));
     }
 }

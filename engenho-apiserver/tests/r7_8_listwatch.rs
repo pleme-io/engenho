@@ -843,10 +843,10 @@ async fn watch_without_timeout_seconds_stays_open() {
     let mut closed_early = false;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), w.resp.chunk()).await {
-            Err(_) => {}                       // silence: still open
-            Ok(Ok(Some(_))) => {}              // data: still open
+            Err(_) => {}          // silence: still open
+            Ok(Ok(Some(_))) => {} // data: still open
             Ok(Ok(None)) => {
-                closed_early = true;           // EOF: the server closed it
+                closed_early = true; // EOF: the server closed it
                 break;
             }
             Ok(Err(e)) => panic!("watch chunk read failed: {e}"),

@@ -422,6 +422,35 @@ impl std::fmt::Debug for SaKeypair {
     }
 }
 
+/// Everything the `/token` subresource needs to mint: the signing half plus
+/// the `iss` and default `aud` a minted token must carry.
+///
+/// Deliberately the MIRROR of [`crate::authn::SaVerifier`] — same issuer, same
+/// audience, opposite half of the keypair. They are constructed from one
+/// [`SaKeypair`] at boot so the server cannot mint tokens its own
+/// authenticator would reject, which is the failure this pairing exists to
+/// make unrepresentable.
+#[derive(Clone)]
+pub struct SaIssuer {
+    /// Signs minted tokens.
+    pub signing: SigningKey,
+    /// The `iss` every minted token carries.
+    pub issuer: String,
+    /// The `aud` used when a `TokenRequest` names none.
+    pub default_audience: String,
+}
+
+impl std::fmt::Debug for SaIssuer {
+    /// Never render the signing key. A `{:?}` in a log line would publish the
+    /// ability to mint a token for ANY ServiceAccount in the cluster.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaIssuer")
+            .field("issuer", &self.issuer)
+            .field("default_audience", &self.default_audience)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Load the SA signing keypair from `<data_dir>/pki/sa.key`, generating and
 /// persisting one on first boot.
 ///

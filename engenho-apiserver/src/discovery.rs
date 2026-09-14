@@ -226,6 +226,23 @@ fn subresource_row(h: &dyn ResourceHandler, sub: Subresource) -> APIResource {
             group: None,
             version: None,
         },
+        // `/token` is CREATE-ONLY — a minted token is never stored, so there
+        // is nothing to get/patch/update. Kind is `TokenRequest` in the
+        // `authentication.k8s.io/v1` group (NOT the parent ServiceAccount's
+        // GV): a client posts a TokenRequest and reads a TokenRequest back,
+        // and advertising the parent's kind here would tell kubectl to send
+        // the wrong body.
+        Subresource::Token => APIResource {
+            name: format!("{}/token", h.plural()),
+            singular_name: String::new(),
+            namespaced: h.namespaced(),
+            kind: "TokenRequest".to_string(),
+            verbs: vec!["create".to_string()],
+            short_names: Vec::new(),
+            categories: Vec::new(),
+            group: Some("authentication.k8s.io".to_string()),
+            version: Some("v1".to_string()),
+        },
     }
 }
 

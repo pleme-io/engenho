@@ -59,7 +59,7 @@ fn main() {
         })
         .clone();
 
-    // The eight vendored files, referenced by their import path relative
+    // The vendored files, referenced by their import path relative
     // to the include root. protox resolves the `import "..."` graph from
     // the same include root, so every transitive import is satisfied.
     let files = [
@@ -67,6 +67,7 @@ fn main() {
         "k8s.io/api/apps/v1/generated.proto",
         "k8s.io/api/rbac/v1/generated.proto",
         "k8s.io/api/authorization/v1/generated.proto",
+        "k8s.io/api/authentication/v1/generated.proto",
         "k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto",
         "k8s.io/apimachinery/pkg/runtime/generated.proto",
         "k8s.io/apimachinery/pkg/runtime/schema/generated.proto",
