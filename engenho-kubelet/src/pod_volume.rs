@@ -457,6 +457,25 @@ pub trait ServiceAccountProjector: Send + Sync {
         pod_name: &str,
         pod_uid: &str,
     ) -> Result<Option<BTreeMap<String, Vec<u8>>>, String>;
+
+    /// How long a token this projector mints stays valid, when it mints one.
+    ///
+    /// ── ★ WHY THE PROJECTOR OWNS THIS AND THE KUBELET DERIVES FROM IT ─────
+    /// The kubelet must rewrite the projected token before it expires, so the
+    /// refresh cadence is a FUNCTION of the lifetime. Written as a second
+    /// constant in the kubelet the two are free to drift, and the drift is
+    /// silent in the worst direction: shorten the lifetime (or lengthen the
+    /// cadence) and every long-lived pod starts taking 401s an hour after it
+    /// started, with nothing in the kubelet's own state looking wrong. This
+    /// is the repo's type-strict-modeling rule applied to a cadence — one
+    /// typed source, every consumer a derived projection of it.
+    ///
+    /// `None` means nothing is projected, so nothing needs refreshing. It
+    /// must never mean "refresh never" for a projector that DOES mint: that
+    /// is precisely the expired-token state this method exists to prevent.
+    fn token_lifetime(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// A projector that supplies nothing — the honest default for a kubelet with
