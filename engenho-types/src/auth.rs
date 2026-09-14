@@ -47,7 +47,22 @@ pub struct UserInfo {
 }
 
 /// The group every authenticated principal carries (upstream convention).
-const GROUP_AUTHENTICATED: &str = "system:authenticated";
+///
+/// ★ PUBLIC because "every authenticated principal" has to mean every one, and
+/// while this was private it did not. The ServiceAccount authenticator builds
+/// its own group list in `engenho-apiserver::sa_token::groups_for` and could
+/// not reference this constant, so it enumerated the groups its author thought
+/// of and omitted this one. The result: every in-cluster client authenticated
+/// successfully and then took **403 on `/api` and `/apis`**, because the
+/// default `system:discovery` ClusterRoleBinding is keyed on this group.
+/// Admin and client-cert identities were unaffected, so `kubectl` worked and
+/// only the controllers failed — measured on rio 2026-09-15 as FluxCD's
+/// source-controller and notification-controller crash-looping on
+/// `failed to get server groups`.
+///
+/// One constant, every consumer: a second hand-written copy of this string is
+/// how the same omission comes back.
+pub const GROUP_AUTHENTICATED: &str = "system:authenticated";
 /// The group an unauthenticated (anonymous) request carries.
 const GROUP_UNAUTHENTICATED: &str = "system:unauthenticated";
 /// The super-user group the bootstrap admin identity carries.

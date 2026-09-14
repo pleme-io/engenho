@@ -111,9 +111,34 @@ pub fn subject_for(namespace: &str, name: &str) -> String {
 /// group, and a great many default RoleBindings key on the latter. Emitting
 /// only the first would silently strip permissions the cluster grants by
 /// convention.
+/// ── ★ `system:authenticated` IS NOT OPTIONAL, AND ITS ABSENCE 403s DISCOVERY ─
+///
+/// Upstream puts EVERY successfully authenticated identity — service accounts
+/// included — into `system:authenticated`, and the default `system:discovery`
+/// ClusterRoleBinding is keyed on exactly that group. Omitting it left every
+/// SA authenticated but outside the one group the discovery grant names, so
+/// `GET /api` and `GET /apis` answered **403** for every in-cluster client
+/// while answering 200 for the admin kubeconfig — which is why `kubectl
+/// api-resources` passed and the controllers did not.
+///
+/// Measured on rio 2026-09-15: FluxCD's source-controller and
+/// notification-controller crash-looped on
+///   `failed to determine if *v1.Bucket is namespaced:
+///    failed to get restmapping: failed to get server groups: unknown`
+/// — client-go's rendering of that 403 — while the ClusterRole, the
+/// ClusterRoleBinding and every discovery surface were individually correct.
+/// The role existed, the binding existed, the subject group simply never
+/// reached the request.
+///
+/// This is the same mistake the paragraph above warns about, made one level
+/// up: enumerating the groups a reader thinks of and missing the one the
+/// cluster grants by convention.
 #[must_use]
 pub fn groups_for(namespace: &str) -> Vec<String> {
     vec![
+        // The SAME constant the admin and client-cert identities use, not a
+        // second copy of the string — a duplicate is how this omission returns.
+        engenho_types::auth::GROUP_AUTHENTICATED.to_string(),
         "system:serviceaccounts".to_string(),
         format!("system:serviceaccounts:{namespace}"),
     ]
@@ -223,6 +248,32 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE GATE. A ServiceAccount must land in `system:authenticated`, because
+    /// the default `system:discovery` ClusterRoleBinding is keyed on that group
+    /// and nothing else grants `/api` + `/apis` to an in-cluster client.
+    ///
+    /// Without it every SA authenticated fine and then took 403 on discovery,
+    /// while admin and client-cert identities were unaffected — so `kubectl`
+    /// worked and only the controllers failed. Measured on rio 2026-09-15:
+    /// FluxCD's source-controller and notification-controller crash-looped on
+    /// `failed to get server groups`, with the ClusterRole, the binding, and
+    /// every discovery surface each individually correct.
+    #[test]
+    fn a_service_account_is_in_system_authenticated() {
+        let g = groups_for("flux-system");
+        assert!(
+            g.contains(&engenho_types::auth::GROUP_AUTHENTICATED.to_string()),
+            "an SA outside system:authenticated takes 403 on /api and /apis, \
+             which surfaces as 'failed to get server groups' three layers away: {g:?}"
+        );
+        // The namespace-scoped groups upstream also grants, still present.
+        assert!(g.contains(&"system:serviceaccounts".to_string()), "{g:?}");
+        assert!(
+            g.contains(&"system:serviceaccounts:flux-system".to_string()),
+            "{g:?}"
+        );
+    }
 
     fn key() -> SigningKey {
         // Deterministic so tests are reproducible; never a pattern for
