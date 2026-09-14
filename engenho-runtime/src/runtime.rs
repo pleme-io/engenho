@@ -930,6 +930,14 @@ impl engenho_kubelet::ServiceAccountProjector for RuntimeSaProjector {
         files.insert("namespace".to_string(), namespace.as_bytes().to_vec());
         Ok(Some(files))
     }
+
+    /// Derived from the SAME `lifetime_secs` the token is minted with, so the
+    /// kubelet's refresh cadence cannot drift from the expiry it is racing.
+    fn token_lifetime(&self) -> Option<std::time::Duration> {
+        u64::try_from(self.lifetime_secs)
+            .ok()
+            .map(std::time::Duration::from_secs)
+    }
 }
 
 /// Where a POD can actually reach this engenho's apiserver.
@@ -2974,9 +2982,14 @@ fn spawn_drivers(
                 audience: SA_ISSUER.to_string(),
                 ca_cert_pem: ca.clone(),
                 // One hour, matching upstream's default bound-token lifetime.
-                // A pod does not re-read its token file, so this is currently
-                // a ceiling on pod lifetime for API-calling workloads — the
-                // refresh loop is the follow-up this does not ship.
+                //
+                // This was a CEILING ON POD LIFETIME for every API-calling
+                // workload until the kubelet learned to rewrite the projected
+                // token (`Kubelet::refresh_service_account_projections`). It no
+                // longer is: the kubelet re-mints on a cadence DERIVED from
+                // this number via `ServiceAccountProjector::token_lifetime`,
+                // so changing it here moves the refresh with it and the two
+                // cannot drift apart.
                 lifetime_secs: 3600,
             }),
             _ => Arc::new(engenho_kubelet::NoServiceAccountProjection),

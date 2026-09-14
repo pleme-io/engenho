@@ -78,7 +78,7 @@ pub use csi_materializer::{
     RegisteredDriver,
 };
 pub use error::KubeletError;
-pub use kubelet::{Kubelet, TestClock};
+pub use kubelet::{Kubelet, SaRefreshReport, TestClock};
 pub use lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
 };

@@ -170,6 +170,25 @@ struct ContainerRecord {
 /// bookkeeping is a map keyed by CONTAINER NAME (`spec.containers[i].name`)
 /// → its [`ContainerRecord`]. The deterministic backend name per container is
 /// `<ns>_<pod>_<containerName>`.
+/// What one projected-token refresh pass looked at and rewrote.
+///
+/// Carries its own denominator (`examined`) on purpose: a pass that refreshed
+/// 0 of 0 pods and a pass that refreshed 0 of 12 are completely different
+/// events, and a bare "refreshed" count renders them identically. A discovery
+/// regression shows up here as `examined: 0`, not as a quiet success.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SaRefreshReport {
+    /// Started pods carrying a namespace that this pass considered.
+    pub examined: usize,
+    /// Tokens successfully re-minted AND rewritten.
+    pub refreshed: usize,
+    /// Pods whose token could not be re-minted or could not be written.
+    pub failed: usize,
+    /// The cadence gate declined to run this tick. Distinct from
+    /// `examined: 0`, which means the pass RAN and found nothing.
+    pub skipped_not_due: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct LocalPod {
     /// Per-container records keyed by the container's logical name. These are
@@ -291,6 +310,11 @@ pub struct Kubelet {
     /// exactly the hot-loop tripwire it exists to be. Upstream renews on
     /// `RENEW_INTERVAL`, not per sync loop, for the same reason.
     last_lease_renewal: Mutex<Option<Instant>>,
+    /// When this kubelet last rewrote its pods' projected ServiceAccount
+    /// tokens. Same cadence discipline as `last_lease_renewal` and for the
+    /// same reason — re-minting on every tick would make every idle reconcile
+    /// a filesystem write.
+    last_sa_refresh: Mutex<Option<Instant>>,
     node_name: String,
     /// Bookkeeping for every Pod we started, keyed by its typed
     /// [`ResourceKey`]. Persists for the kubelet's process lifetime; on
@@ -316,6 +340,7 @@ impl Kubelet {
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
             sa_projector: Arc::new(crate::pod_volume::NoServiceAccountProjection),
             last_lease_renewal: Mutex::new(None),
+            last_sa_refresh: Mutex::new(None),
             node_name: node_name.into(),
             local: Mutex::new(BTreeMap::new()),
         }
@@ -392,6 +417,143 @@ impl Kubelet {
             &engenho_types::time::now_rfc3339_utc(),
         )
         .await;
+    }
+
+    /// How often to rewrite a projected token, DERIVED from its lifetime.
+    ///
+    /// A third of the lifetime, so a pod gets three chances to be rewritten
+    /// before its credential expires and two consecutive failures are still
+    /// survivable. A fraction rather than a constant is the whole point: the
+    /// lifetime is owned by whoever mints (the runtime), and any absolute
+    /// number here would be a second declaration of the same fact, free to
+    /// drift the moment the lifetime changes.
+    ///
+    /// Floored, because a pathologically short lifetime must degrade into a
+    /// busy kubelet rather than a hot loop that rewrites files continuously.
+    /// A floor above the lifetime means the token expires — that is a
+    /// misconfiguration and the floor makes it survivable, not correct.
+    fn sa_refresh_interval(lifetime: std::time::Duration) -> std::time::Duration {
+        (lifetime / 3).max(std::time::Duration::from_secs(10))
+    }
+
+    /// Rewrite every started pod's projected ServiceAccount token before it
+    /// expires.
+    ///
+    /// ── ★ WHAT ITS ABSENCE BROKE, AND WHY IT LOOKED LIKE SOMETHING ELSE ───
+    /// The projection ran exactly ONCE, on the path that starts a pod's
+    /// containers. Tokens are bound and therefore carry an `exp`, so every
+    /// API-calling workload worked perfectly and then began failing at a
+    /// fixed age — one hour by default. Nothing in the kubelet's own state
+    /// looked wrong at that moment: the pod was Running, its containers were
+    /// healthy, the signing key was fine, and the apiserver was correctly
+    /// rejecting a genuinely expired credential. The symptom (an operator
+    /// that works after a restart and dies an hour later) points at the
+    /// workload, which is the most expensive place for it to point.
+    ///
+    /// ── ★ WHY REWRITING IN PLACE IS SOUND, AND NOT A RESTART ─────────────
+    /// `materialize_files` derives a STABLE directory from
+    /// `(namespace, pod, volume)` and that directory is bind-mounted into the
+    /// container, so a rewrite on the host is visible inside the container
+    /// immediately — no restart, no remount, no container churn. And it
+    /// writes through `write_atomic`, so a client reading the token
+    /// concurrently gets either the old token or the new one and never a
+    /// truncated one. A torn token would surface as a signature failure,
+    /// i.e. as a key-rotation incident that never happened.
+    ///
+    /// ── ★ SCOPED TO PODS WE STARTED, DELIBERATELY ────────────────────────
+    /// A bound pod with no local entry has not reached the start path, and
+    /// that path projects afresh every time it runs — so a pod still waiting
+    /// on an image gets a fresh token when it finally starts, and refreshing
+    /// it here would write files nothing has mounted.
+    ///
+    /// Failure is logged, never fatal, and never stops pod work: a pod whose
+    /// refresh failed keeps the token it has until that token expires, which
+    /// is strictly better than a kubelet that stopped reconciling.
+    async fn refresh_service_account_projections(
+        &self,
+        bound: &BTreeMap<ResourceKey, Value>,
+    ) -> SaRefreshReport {
+        let mut report = SaRefreshReport::default();
+
+        // No lifetime ⇒ this projector mints nothing ⇒ there is nothing to
+        // keep alive. The honest no-op, not a silent skip.
+        let Some(lifetime) = self.sa_projector.token_lifetime() else {
+            return report;
+        };
+        let interval = Self::sa_refresh_interval(lifetime);
+
+        // Due yet? Read against the injected clock so the cadence is testable
+        // without sleeping — the same discipline `renew_node_lease` uses.
+        {
+            let now = self.now();
+            let mut last = self.last_sa_refresh.lock().await;
+            if let Some(prev) = *last {
+                if now.saturating_duration_since(prev) < interval {
+                    report.skipped_not_due = true;
+                    return report;
+                }
+            }
+            *last = Some(now);
+        }
+
+        let started: BTreeSet<ResourceKey> = self.local.lock().await.keys().cloned().collect();
+
+        for (key, pod) in bound {
+            if !started.contains(key) {
+                continue;
+            }
+            let Some(namespace) = key.namespace.as_deref() else {
+                continue;
+            };
+            report.examined += 1;
+
+            let sa_name = pod
+                .pointer("/spec/serviceAccountName")
+                .and_then(Value::as_str)
+                .unwrap_or("default");
+            let pod_uid = pod
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            match self
+                .sa_projector
+                .project(namespace, sa_name, &key.name, pod_uid)
+                .await
+            {
+                Ok(Some(files)) => {
+                    match self
+                        .volume_materializer
+                        .materialize_files(namespace, &key.name, "kube-api-access", &files)
+                        .await
+                    {
+                        Ok(_) => report.refreshed += 1,
+                        Err(e) => {
+                            report.failed += 1;
+                            warn!(
+                                pod = %key.label(),
+                                error = %e,
+                                "ServiceAccount token refresh could not be written; the pod \
+                                 keeps its current token until that token expires"
+                            );
+                        }
+                    }
+                }
+                // Nothing to project for this pod — not a failure.
+                Ok(None) => {}
+                Err(e) => {
+                    report.failed += 1;
+                    warn!(
+                        pod = %key.label(),
+                        error = %e,
+                        "ServiceAccount token refresh could not be minted; the pod keeps its \
+                         current token until that token expires"
+                    );
+                }
+            }
+        }
+
+        report
     }
 
     /// Write this node's heartbeat into `kube-node-lease`.
@@ -1491,6 +1653,21 @@ impl Controller for Kubelet {
                     report.objects_skipped += 1;
                 }
             }
+        }
+
+        // ── PROJECTED-TOKEN REFRESH. After cleanup so a pod on its way out
+        // is not re-minted, and before the start/status work so a long-lived
+        // pod's credential is renewed on the same tick that keeps it running.
+        // Its own cadence gate, like the lease above; failures are logged
+        // there and never reach this outcome.
+        let sa = self.refresh_service_account_projections(&bound).await;
+        if sa.refreshed > 0 || sa.failed > 0 {
+            debug!(
+                examined = sa.examined,
+                refreshed = sa.refreshed,
+                failed = sa.failed,
+                "kubelet refreshed projected ServiceAccount tokens"
+            );
         }
 
         // ── (B)+(C) Start + running-status reconciliation over bound set ──
