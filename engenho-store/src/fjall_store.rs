@@ -312,6 +312,33 @@ impl FjallStore {
         self.inner.state.lock().await.catalog.clone()
     }
 
+    /// List + revision from ONE locked look, cloning only the MATCHED items.
+    ///
+    /// The durable sibling of [`crate::store::InMemoryStore::list_at_revision`];
+    /// that method's header carries the measurement and the reasoning. Short
+    /// version: cloning the whole [`ResourceCatalog`] to serve a LIST also
+    /// clones its 8192-entry watch-replay ring, making every read cost scale
+    /// with cluster age instead of object count.
+    pub async fn list_at_revision(
+        &self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> (
+        Vec<(crate::resource::ResourceKey, crate::resource::ResourceValue)>,
+        crate::revision::Revision,
+    ) {
+        let guard = self.inner.state.lock().await;
+        let items = guard
+            .catalog
+            .list(group, version, kind, namespace)
+            .into_iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        (items, guard.catalog.revision())
+    }
+
     /// Direct catalog read by typed key (skips Raft — the local
     /// replica has the data once apply has caught up).
     pub async fn get_resource(

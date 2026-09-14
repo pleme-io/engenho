@@ -63,6 +63,22 @@ impl StoreBackend {
         }
     }
 
+    /// List + revision without cloning the catalog's watch-replay ring — see
+    /// [`crate::store::InMemoryStore::list_at_revision`] for the measurement
+    /// that motivated it.
+    async fn list_at_revision(
+        &self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> (Vec<(ResourceKey, ResourceValue)>, crate::revision::Revision) {
+        match self {
+            Self::Memory(s) => s.list_at_revision(group, version, kind, namespace).await,
+            Self::Fjall(s) => s.list_at_revision(group, version, kind, namespace).await,
+        }
+    }
+
     async fn current_catalog(&self) -> ResourceCatalog {
         match self {
             Self::Memory(s) => s.current_catalog().await,
@@ -360,13 +376,18 @@ impl StoreMesh {
         kind: &str,
         namespace: Option<&str>,
     ) -> (Vec<(ResourceKey, ResourceValue)>, crate::revision::Revision) {
-        let cat = self.store.current_catalog().await;
-        let items = cat
-            .list(group, version, kind, namespace)
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        (items, cat.revision())
+        // ★ NOT `current_catalog()`. That clones the whole ResourceCatalog —
+        // including its 8192-entry watch-replay history ring — so serving a
+        // LIST cost time proportional to the cluster's AGE rather than to the
+        // number of objects listed. Measured 2026-09-14: 4.4ms → 31.8ms as the
+        // ring filled while ONE object existed, plateauing exactly at the cap;
+        // on rio, whose ring held ~100KB Helm release Secrets, the same clone
+        // pushed a single write to 12s fresh and 60s+ after hours and wedged
+        // Flux for five days. Atomicity is unchanged and in fact tightened:
+        // items and revision now come from one guard, not from a clone.
+        self.store
+            .list_at_revision(group, version, kind, namespace)
+            .await
     }
 
     /// One page of resources matching (group, version, kind), optionally
