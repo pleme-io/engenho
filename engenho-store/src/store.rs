@@ -122,6 +122,20 @@ impl InMemoryStore {
         self.inner.lock().await.catalog.clone()
     }
 
+    /// The current MVCC revision, read under the lock WITHOUT cloning.
+    ///
+    /// ── ★ WHY A SCALAR NEEDS ITS OWN METHOD ──────────────────────────────
+    /// `current_catalog().revision()` reads one `u64` by deep-cloning the
+    /// entire [`ResourceCatalog`] first — every resource AND the 8192-entry
+    /// watch-replay ring, whose entries each carry a full post-image and a
+    /// full pre-image. Measured on rio: that made establishing a single watch
+    /// cost hundreds of megabytes of memcpy, and since a watch is established
+    /// under the same lock `apply` needs, it stalled writes for tens of
+    /// seconds while burning ~2 cores. Flux opens dozens of watches.
+    pub async fn current_revision(&self) -> crate::revision::Revision {
+        self.inner.lock().await.catalog.revision()
+    }
+
     /// List + revision from ONE locked look at the catalog, cloning only the
     /// MATCHED items.
     ///

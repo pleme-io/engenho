@@ -174,7 +174,10 @@ impl MeshEtcdStore {
         let Some(store) = self.live() else {
             return 0;
         };
-        i64::try_from(store.current_catalog().await.current_revision.0).unwrap_or(i64::MAX)
+        // ★ Scalar read — must NOT go through `current_catalog()`, which
+        // deep-clones every resource plus the 8192-entry watch-replay ring to
+        // hand back one integer. See `MeshStore::current_revision`.
+        i64::try_from(store.current_revision().await.0).unwrap_or(i64::MAX)
     }
 }
 

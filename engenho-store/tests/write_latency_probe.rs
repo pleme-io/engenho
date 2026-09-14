@@ -179,6 +179,65 @@ async fn a_list_does_not_slow_down_as_the_history_ring_fills() {
     );
 }
 
+/// THE SECOND GATE: establishing a watch must not get slower as the ring fills.
+///
+/// The first gate covers LIST. This covers the path that actually took rio
+/// down a second time, AFTER the LIST fix shipped: the apiserver resolved a
+/// "watch from now" by calling `current_catalog().revision()` — reading one
+/// `u64` by deep-cloning every resource plus the 8192-entry replay ring, whose
+/// entries hold a full post-image AND pre-image each. Watches register under
+/// the same lock `apply` needs, so each one stalled every concurrent WRITE.
+///
+/// Measured on rio with FluxCD (dozens of watches) reconciling: writes went
+/// from ~40ms back to 27-51s, daemon at ~2 cores. `MostRecent` is the common
+/// case — every "watch from now" took that branch.
+#[tokio::test]
+async fn reading_the_current_revision_does_not_scale_with_history_depth() {
+    let dir = std::env::temp_dir().join(format!("engenho-rev-gate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let router = InProcessRouter::new();
+    let cfg = default_config("rev-gate").unwrap();
+    let store = Arc::new(
+        StoreMesh::start_durable(1, "in-process://1".into(), router, cfg, &dir)
+            .await
+            .unwrap(),
+    );
+    store.initialize_singleton().await.unwrap();
+    assert!(store.wait_for_leadership(Duration::from_secs(10)).await);
+
+    let body = "A".repeat(4096);
+    let key = ResourceKey::namespaced("", "v1", "Secret", "default", "churn");
+    for _ in 0..3000 {
+        store
+            .propose(ResourceCommand::Put {
+                key: key.clone(),
+                value: secret("churn", &body),
+                expected: None,
+                reason: Reason::Operator,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut best = Duration::from_secs(60);
+    for _ in 0..5 {
+        let t = Instant::now();
+        let _rev = store.current_revision().await;
+        best = best.min(t.elapsed());
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        best < Duration::from_millis(2),
+        "reading the current revision took {best:?} with a full history ring — \
+         it is cloning the catalog to read one integer, which stalls every \
+         concurrent write because watches register under the apply lock"
+    );
+}
+
 #[tokio::test]
 #[ignore = "diagnostic probe; run explicitly with --ignored --nocapture"]
 async fn latency_grows_with_history_depth_not_object_count() {

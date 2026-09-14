@@ -312,6 +312,17 @@ impl FjallStore {
         self.inner.state.lock().await.catalog.clone()
     }
 
+    /// The current MVCC revision, read under the lock WITHOUT cloning.
+    ///
+    /// Durable sibling of [`crate::store::InMemoryStore::current_revision`];
+    /// that method's header carries the measurement. Short version: reading
+    /// this scalar via `current_catalog()` deep-clones the whole catalog and
+    /// its 8192-entry replay ring, which is what made establishing a watch
+    /// stall every concurrent write.
+    pub async fn current_revision(&self) -> crate::revision::Revision {
+        self.inner.state.lock().await.catalog.revision()
+    }
+
     /// List + revision from ONE locked look, cloning only the MATCHED items.
     ///
     /// The durable sibling of [`crate::store::InMemoryStore::list_at_revision`];
