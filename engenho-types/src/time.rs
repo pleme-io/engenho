@@ -167,3 +167,20 @@ mod epoch_render {
         assert!(now.ends_with('Z') && epoch.ends_with('Z'));
     }
 }
+
+/// How long ago an RFC3339 timestamp was, relative to now.
+///
+/// `None` when the string does not parse, or when it is in the FUTURE.
+///
+/// ── ★ A FUTURE TIMESTAMP IS `None`, NOT `ZERO` ────────────────────────────
+/// Clamping it to zero would report a node with a badly-skewed clock as
+/// perfectly fresh, forever — the most convincing possible lie, since a
+/// heartbeat "0s old" is exactly what a healthy node looks like. `None` means
+/// "cannot say", which the readiness derivation renders as `Unknown`, and the
+/// fleet has already been bitten once by a wrong clock breaking every TLS
+/// operation on a node that otherwise read healthy.
+#[must_use]
+pub fn age_since_rfc3339(stamp: &str) -> Option<std::time::Duration> {
+    let then = DateTime::parse_from_rfc3339(stamp).ok()?.with_timezone(&Utc);
+    (Utc::now() - then).to_std().ok()
+}
