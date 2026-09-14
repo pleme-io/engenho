@@ -475,6 +475,10 @@ pub struct ContainerSpec {
     /// Which Pod this container belongs to, carried as typed fields because
     /// [`Self::name`]'s join cannot be reversed. See [`PodIdentity`].
     pub pod: PodIdentity,
+    /// For an init container, whether it is a regular one or a native sidecar
+    /// (`initContainers[i].restartPolicy: Always`, KEP-753). Always
+    /// [`crate::lifecycle::InitKind::Regular`] for an app container.
+    pub init_kind: crate::lifecycle::InitKind,
     /// What the Pod asked the kernel to enforce for this container.
     ///
     /// Default (all [`ResourceBound::Unset`]) ⇒ behaviour-preserving: a Pod
@@ -2443,6 +2447,7 @@ mod tests {
             // through the Pod path, and a backend that needs identity must
             // check `is_present()` rather than assume it.
             pod: PodIdentity::default(),
+            init_kind: crate::lifecycle::InitKind::Regular,
         }
     }
 

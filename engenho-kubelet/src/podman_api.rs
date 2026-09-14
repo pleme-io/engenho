@@ -1460,6 +1460,7 @@ mod tests {
             confinement: crate::backend::Confinement::default(),
             resources: crate::backend::Resources::default(),
             pod: crate::backend::PodIdentity::default(),
+            init_kind: crate::lifecycle::InitKind::Regular,
         };
         let req = create_request(&spec, Some("engenho-net"));
 

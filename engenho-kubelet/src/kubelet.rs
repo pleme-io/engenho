@@ -982,6 +982,32 @@ impl Kubelet {
                     // thrown away into `backend_name`'s lossy join — which the
                     // note at the top of this file forbids reversing, and which
                     // is exactly what a CRI `PodSandboxMetadata` needs.
+                    // ★ Read for INIT containers only. A present
+                    // `restartPolicy` on an APP container is rejected — upstream
+                    // forbids it, and accepting it would silently imply a
+                    // semantic engenho does not implement.
+                    init_kind: {
+                        let raw = c.get("restartPolicy").and_then(Value::as_str);
+                        if optional {
+                            crate::lifecycle::InitKind::from_spec_str(raw).map_err(|e| {
+                                KubeletError::InvalidPod {
+                                    pod: format!("{namespace}/{name}"),
+                                    reason: format!("initContainers[{cname}]: {e}"),
+                                }
+                            })?
+                        } else {
+                            if raw.is_some() {
+                                return Err(KubeletError::InvalidPod {
+                                    pod: format!("{namespace}/{name}"),
+                                    reason: format!(
+                                        "containers[{cname}]: restartPolicy is not \
+                                         permitted on an app container"
+                                    ),
+                                });
+                            }
+                            crate::lifecycle::InitKind::Regular
+                        }
+                    },
                     pod: crate::backend::PodIdentity {
                         namespace: namespace.to_string(),
                         name: name.to_string(),
@@ -1542,15 +1568,35 @@ impl Kubelet {
         key: &ResourceKey,
         lp: &LocalPod,
     ) -> Result<(), KubeletError> {
-        // Reap the INIT containers too (a pod deleted mid-init, or after a
-        // completed init sequence, still has its init containers recorded — an
-        // exited init container retains its podman name until removed). stop is
-        // a no-op on an already-exited container; remove frees the
-        // `<ns>_<pod>_init-<cname>` name. Idempotent (already-gone is success).
-        for record in lp.init_containers.values() {
+        // ── ★ APP CONTAINERS FIRST, INIT/SIDECARS SECOND ─────────────────
+        // This order was REVERSED until 2026-09-14, and with native sidecars
+        // that is a live defect rather than a cosmetic one: a sidecar is a
+        // proxy or an agent the app container is actively talking to, so
+        // stopping it first tears the proxy out from under in-flight traffic.
+        // It surfaces as connection-refused noise in the app's final log lines
+        // and reads as an application bug.
+        //
+        // Upstream's rule (KEP-753 R8): stop the regular app containers, and
+        // only once they are gone stop the sidecars.
+        for record in lp.containers.values() {
             self.cleanup_container(&record.container_id).await?;
         }
-        for record in lp.containers.values() {
+        // Then the init containers. A pod deleted mid-init, or after a
+        // completed init sequence, still has them recorded — an exited init
+        // container retains its podman name until removed. stop is a no-op on
+        // an already-exited container; remove frees the
+        // `<ns>_<pod>_init-<cname>` name. Idempotent (already-gone is success).
+        //
+        // ★ `pending-sidecar-reverse-order`: upstream stops sidecars in REVERSE
+        // `spec.initContainers` order, and that is not expressible here —
+        // `LocalPod::init_containers` is a `BTreeMap<String, _>`, i.e.
+        // ALPHABETICAL, so "reverse the iteration" would yield
+        // reverse-alphabetical, which is a different sequence that happens to
+        // look right whenever containers are declared alphabetically. Fixing it
+        // means making the map ordered, which is a wider change than this one;
+        // recorded rather than approximated, because an ordering that is wrong
+        // in a way tests can pass is worse than one that is openly absent.
+        for record in lp.init_containers.values() {
             self.cleanup_container(&record.container_id).await?;
         }
         // emptyDir is pod-lifetime scratch → reap its backing podman named
@@ -2534,6 +2580,10 @@ impl Kubelet {
                                     container_id: Some(new_status.container_id.clone()),
                                     restart_count: record.restart_count + 1,
                                     ready: false,
+                                    // App container: the init-kind field is
+                                    // meaningless here and stays Regular.
+                                    kind: crate::lifecycle::InitKind::Regular,
+                                    ever_started: true,
                                 });
                                 report.objects_changed += 1;
                                 self.emit(
@@ -2565,6 +2615,8 @@ impl Kubelet {
                                     container_id: Some(record.container_id.clone()),
                                     restart_count: record.restart_count,
                                     ready: outcome.ready,
+                                    kind: crate::lifecycle::InitKind::Regular,
+                                    ever_started: true,
                                 });
                                 report.objects_skipped += 1;
                             }
@@ -2579,6 +2631,8 @@ impl Kubelet {
                             container_id: Some(record.container_id.clone()),
                             restart_count: record.restart_count,
                             ready: outcome.ready,
+                            kind: crate::lifecycle::InitKind::Regular,
+                            ever_started: true,
                         });
                     }
                 }
@@ -2960,25 +3014,41 @@ impl Kubelet {
             .cloned()
             .unwrap_or_default();
         let mut observations: Vec<ContainerObservation> = Vec::with_capacity(init_specs.len());
-        for (cname, _spec) in init_specs {
+        for (cname, spec) in init_specs {
+            // Every observation carries the kind so the fold can tell a
+            // sidecar from a regular init container — without it the fold is
+            // correct code reading uniformly-Regular input, i.e. the old
+            // behaviour with extra steps.
+            let mark = |o: ContainerObservation| {
+                let o = if spec.init_kind.is_sidecar() {
+                    o.as_sidecar()
+                } else {
+                    o
+                };
+                // A RECORD existing means this container has been started
+                // before, which `state` alone cannot say.
+                o.with_ever_started(lp.init_containers.contains_key(cname))
+            };
             match lp.init_containers.get(cname) {
-                None => observations.push(ContainerObservation::waiting(cname)),
+                None => observations.push(mark(ContainerObservation::waiting(cname))),
                 Some(record) => match self.backend.status(&record.container_id).await {
-                    Ok(Some(s)) if s.running => observations.push(ContainerObservation::running(
-                        cname,
-                        &record.container_id,
-                        record.restart_count,
+                    Ok(Some(s)) if s.running => observations.push(mark(
+                        ContainerObservation::running(
+                            cname,
+                            &record.container_id,
+                            record.restart_count,
+                        ),
                     )),
-                    Ok(Some(s)) => observations.push(ContainerObservation::terminated(
+                    Ok(Some(s)) => observations.push(mark(ContainerObservation::terminated(
                         cname,
                         &record.container_id,
                         s.exit_code.unwrap_or(0),
                         record.restart_count,
-                    )),
+                    ))),
                     Ok(None) => {
                         // Backend lost this init container out-of-band → treat
                         // as Waiting so it re-starts on the AwaitInit path.
-                        observations.push(ContainerObservation::waiting(cname));
+                        observations.push(mark(ContainerObservation::waiting(cname)));
                     }
                     Err(e) => {
                         warn!(
@@ -2988,7 +3058,7 @@ impl Kubelet {
                             "init container status poll failed; treating as Waiting"
                         );
                         report.objects_skipped += 1;
-                        observations.push(ContainerObservation::waiting(cname));
+                        observations.push(mark(ContainerObservation::waiting(cname)));
                     }
                 },
             }
@@ -3038,16 +3108,39 @@ impl Kubelet {
                 );
                 self.write_pod_status(key, value, &desired, report).await
             }
-            crate::lifecycle::InitAction::AwaitInit { index } => {
-                // init[index] is the active one. Ensure it's started (start it
-                // if not recorded) or restarted (if it Terminated with a
-                // restartable exit under the policy).
-                let (cname, base_spec) = &init_specs[index];
-                let pod_ip = self
-                    .advance_active_init(
-                        key, value, index, cname, base_spec, &aliases, &resolved, &lp, report,
-                    )
-                    .await?;
+            crate::lifecycle::InitAction::AwaitInit { start, blocked_on } => {
+                // ── ★ `start` IS A SET NOW, NOT ONE INDEX ────────────────────
+                // Before native sidecars, `AwaitInit { index }` meant both
+                // "ensure index is started" and "start nothing after it" —
+                // with sidecars those separate. `start` carries every index
+                // that must be running this tick (the sidecars cleared so far,
+                // plus whichever container the sequence is gated on), and
+                // `blocked_on` says whether anything still blocks at all.
+                let mut pod_ip = None;
+                for index in start {
+                    let (cname, base_spec) = &init_specs[index];
+                    let ip = self
+                        .advance_active_init(
+                            key, value, index, cname, base_spec, &aliases, &resolved, &lp, report,
+                        )
+                        .await?;
+                    pod_ip = pod_ip.or(ip);
+                }
+                // `blocked_on: None` means every REGULAR init container has
+                // succeeded and only sidecars were (re)started — the pod is
+                // initialized and app containers may run. Re-enter the
+                // reconcile rather than writing Pending over a pod that is
+                // ready to proceed, which would be the forever-Pending hang
+                // wearing a different hat.
+                if blocked_on.is_none() {
+                    self.local
+                        .lock()
+                        .await
+                        .entry(key.clone())
+                        .or_default()
+                        .init_complete = true;
+                    return Ok(());
+                }
 
                 // Re-read the (possibly just-updated) init records so the
                 // rendered initContainerStatuses reflect the freshly-started /
