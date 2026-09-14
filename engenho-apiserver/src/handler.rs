@@ -1136,11 +1136,20 @@ impl ResourceHandler for StoreBackedHandler {
         allow_bookmarks: bool,
     ) -> Result<WatchStream, ApiError> {
         // Resolve the resume revision. MostRecent ("0"/absent) means
-        // "from now, no replay" → read the current revision under one
-        // catalog clone and start there.
+        // "from now, no replay" → read the current revision and start there.
+        //
+        // ★ `current_revision()`, NOT `current_catalog().revision()`. The
+        // latter reads this one `u64` by deep-cloning the entire catalog —
+        // every resource plus the 8192-entry watch-replay ring, whose entries
+        // each hold a full post-image AND a full pre-image. Because a watch is
+        // registered under the same lock `apply` needs, that clone stalled
+        // every concurrent WRITE. Measured on rio while FluxCD (dozens of
+        // watches) was reconciling: writes went from ~40ms to 27-51s with the
+        // daemon burning ~2 cores in memcpy. MostRecent is the COMMON case —
+        // every "watch from now" takes this branch.
         let from_rev = match from {
             ResumePoint::At(rev) => rev,
-            ResumePoint::MostRecent => self.store.current_catalog().await.revision(),
+            ResumePoint::MostRecent => self.store.current_revision().await,
         };
         let opts = WatchOpts {
             from: from_rev,

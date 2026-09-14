@@ -63,6 +63,14 @@ impl StoreBackend {
         }
     }
 
+    /// The current MVCC revision, WITHOUT cloning the catalog.
+    async fn current_revision(&self) -> crate::revision::Revision {
+        match self {
+            Self::Memory(s) => s.current_revision().await,
+            Self::Fjall(s) => s.current_revision().await,
+        }
+    }
+
     /// List + revision without cloning the catalog's watch-replay ring — see
     /// [`crate::store::InMemoryStore::list_at_revision`] for the measurement
     /// that motivated it.
@@ -446,6 +454,18 @@ impl StoreMesh {
     /// Read-only snapshot of the whole catalog.
     pub async fn current_catalog(&self) -> ResourceCatalog {
         self.store.current_catalog().await
+    }
+
+    /// The current MVCC revision, read WITHOUT cloning the catalog.
+    ///
+    /// ★ Reach for this instead of `current_catalog().revision()`. That reads
+    /// one `u64` by deep-cloning every resource plus the 8192-entry
+    /// watch-replay ring (two full resource bodies per entry). Measured on
+    /// rio: it made each watch establishment cost hundreds of MB of memcpy
+    /// under the same lock `apply` needs, stalling writes for tens of seconds
+    /// at ~2 cores of CPU while FluxCD held dozens of watches.
+    pub async fn current_revision(&self) -> crate::revision::Revision {
+        self.store.current_revision().await
     }
 
     /// Open a RESUMABLE, gap-free watch from `opts.from`. The
