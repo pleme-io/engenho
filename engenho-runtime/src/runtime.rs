@@ -2432,16 +2432,42 @@ fn write_kubeconfig_file(
 /// to let one operator point engenho at an empty dir by accident.
 const CNI_CONFIG_DIR: &str = "/etc/cni/net.d";
 
-/// Whether this build can execute CNI plugins.
+/// Whether this node's pods are attached by a CNI plugin chain.
 ///
-/// ★ A COMPILE-TIME CONSTANT, NOT A RUNTIME PROBE. There is no network
-/// namespace on darwin, so `CNI_NETNS` cannot be satisfied and no
-/// conformant plugin can run — that is a property of the target, and
-/// deciding it at runtime would mean a darwin build carries a code path
-/// that can never be correct on it.
-#[cfg(target_os = "linux")]
-const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall::Invoked;
-#[cfg(not(target_os = "linux"))]
+/// ── ★ CORRECTED 2026-09-14: THIS SAID `Invoked` ON LINUX AND IT WAS FALSE ──
+/// `CniInstall::Invoked` is defined as *"the plugin chain ran; the pod IP is
+/// the chain's result"*, and `Planned` as *"NO plugin was executed — the pod IP
+/// came from the container runtime instead"*. The second is what actually
+/// happens on every engenho node: `engenho_cni::exec::run_chain` has **zero
+/// non-test callers** (measured across the whole tree), so no chain has ever
+/// run and every pod IP comes from podman.
+///
+/// Measured on rio the same day, which is what makes this a correction rather
+/// than a tidy-up. Its Node object carried:
+///
+/// ```text
+/// engenho.io/cni-install  Invoked
+/// engenho.io/cni-network  cbr0
+/// engenho.io/cni-config   /etc/cni/net.d/10-flannel.conflist
+/// ```
+///
+/// All three are wrong together, and the third explains the second: that
+/// flannel conflist belongs to **k3s**, which shares `/etc/cni/net.d` with us —
+/// exactly the first-lexical-wins hazard `cni_status.rs`'s own header warns
+/// about. engenho attaches pods to podman's `engenho-net`, never to `cbr0`.
+///
+/// The annotation exists so an operator debugging an unreachable pod knows
+/// *before* they "start reading plugin logs that do not exist" (that file's
+/// words). Publishing `Invoked` sent them to flannel's logs for a pod that
+/// never touched flannel — the annotation defeating its own stated purpose.
+///
+/// The original reasoning was sound about the wrong question: darwin genuinely
+/// *cannot* run a plugin, so a target-conditional constant is right for
+/// CAPABILITY. But this constant is read as a claim about what HAPPENED, and
+/// "this build could execute plugins" is not "this build did". It stays
+/// `Planned` on every target until `run_chain` has a production caller, and the
+/// commit that gives it one flips this line — with the Linux arm restored,
+/// since the darwin arm was never in question.
 const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall::Planned;
 
 fn spawn_drivers(
