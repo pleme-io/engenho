@@ -1272,6 +1272,7 @@ mod tests {
             pull_policy: Some(PullPolicy::Never),
             network_aliases: vec!["operator".to_string()],
             mounts: Vec::new(),
+            host_add: Vec::new(),
             confinement: crate::backend::Confinement::default(),
         };
         let req = create_request(&spec, Some("engenho-net"));
