@@ -2127,6 +2127,10 @@ mod tests {
             pull_policy: None,
             network_aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
             mounts: Vec::new(),
+            // No extra /etc/hosts entries: these argv tests assert the shape of
+            // an UNADORNED container, so host_add stays empty for the same
+            // reason confinement stays default.
+            host_add: Vec::new(),
             // The Kubernetes defaults: these argv tests assert the shape of an
             // UNADORNED container, and a default disposition must not change it.
             confinement: Confinement::default(),
