@@ -716,6 +716,48 @@ fn itoa_i32(n: i32) -> String {
     out
 }
 
+/// Longest stderr excerpt carried into a preflight error, in bytes.
+const STDERR_TAIL_MAX: usize = 400;
+
+/// The last meaningful line of a failed subprocess's stderr, ready to append.
+///
+/// Returns `": <line>"`, or empty when there is nothing to say, so a caller
+/// never branches on it.
+///
+/// The LAST non-empty line is the right one for the tools this fronts: podman
+/// prints a human preamble first (`OS: …`, `provider: …`) and the actual
+/// `Error:` last, so taking the head would reliably select the noise.
+///
+/// Bounded on purpose. An error message is read by a human in a log, and
+/// pasting a runtime's unbounded chatter is how the one useful line gets
+/// scrolled away — the same failure-to-communicate this whole preflight exists
+/// to fix, arrived at from the opposite direction.
+fn stderr_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let Some(line) = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .next_back()
+    else {
+        return String::new();
+    };
+    let mut out = String::from(": ");
+    if line.len() > STDERR_TAIL_MAX {
+        // Walk back to a char boundary — slicing UTF-8 at an arbitrary byte
+        // index panics, and a runtime's error text is not guaranteed ASCII.
+        let mut end = STDERR_TAIL_MAX;
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&line[..end]);
+        out.push('…');
+    } else {
+        out.push_str(line);
+    }
+    out
+}
+
 /// Verify at BOOT that a configured container runtime is actually usable.
 ///
 /// The `Fake` backend needs nothing. For `Podman` this runs `podman info`,
@@ -743,27 +785,41 @@ fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
         .podman_binary
         .clone()
         .unwrap_or_else(|| "podman".to_string());
-    match std::process::Command::new(&binary)
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        // `status()` is Ok whenever the process RAN — including when it ran
-        // and reported a dead connection. The exit code is the part that
-        // carries the verdict, and ignoring it is how the weak `--version`
-        // check passed on a runtime that could not start a single container.
-        Ok(st) if st.success() => {
+    // `output()` rather than `status()` — it captures stderr, which is the
+    // only part of a failed run that says WHY. See the error arm below.
+    match std::process::Command::new(&binary).arg("info").output() {
+        // Ok whenever the process RAN — including when it ran and reported a
+        // dead connection. The exit code is the part that carries the verdict,
+        // and ignoring it is how the weak `--version` check passed on a
+        // runtime that could not start a single container.
+        Ok(out) if out.status.success() => {
             info!(backend = "podman", %binary, "container runtime resolved");
             Ok(())
         }
-        Ok(st) => Err(RuntimeError::ContainerRuntimeUnavailable {
+        // ★ The backend's stderr is CARRIED, not dropped. An exit code names
+        // THAT it failed; only stderr names WHY, and the gap between those two
+        // is paid by whoever is holding the broken node.
+        //
+        // Measured 2026-09-13 on ryn: two malformed lines in the operator's
+        // `~/.ssh/known_hosts` (a key with no host pattern, from an append
+        // whose host variable was empty) made podman's Go `knownhosts` parser
+        // refuse the machine connection — so every pod on the node was
+        // unrunnable. OpenSSH's own client skips such lines with a warning, so
+        // `ssh` kept working and nothing else pointed at the file.
+        //
+        // `podman info` exited 125 and said exactly which file and line:
+        //   `knownhosts: /Users/…/.ssh/known_hosts:9: missing key type pattern`
+        // This preflight discarded that sentence and reported the number
+        // alone, turning a one-line read into a hunt through the ssh stack.
+        Ok(out) => Err(RuntimeError::ContainerRuntimeUnavailable {
             backend: "podman".to_string(),
             binary,
-            source: std::io::Error::other(match st.code() {
-                Some(c) => ["`podman info` exited ", itoa_i32(c).as_str()].concat(),
-                None => "`podman info` was terminated by a signal".to_string(),
-            }),
+            source: std::io::Error::other(
+                match out.status.code() {
+                    Some(c) => ["`podman info` exited ", itoa_i32(c).as_str()].concat(),
+                    None => "`podman info` was terminated by a signal".to_string(),
+                } + stderr_tail(&out.stderr).as_str(),
+            ),
         }),
         Err(source) => Err(RuntimeError::ContainerRuntimeUnavailable {
             backend: "podman".to_string(),
@@ -3251,5 +3307,67 @@ mod public_ca_guard {
         for addr in ["100.91.10.110:6443", "192.168.50.3:6443", "[fd00::1]:6443"] {
             assert!(!is_loopback_only(addr.parse().unwrap()), "{addr}");
         }
+    }
+}
+
+#[cfg(test)]
+mod preflight_stderr_tail {
+    use super::{STDERR_TAIL_MAX, stderr_tail};
+
+    /// The shape that cost real time on ryn, 2026-09-13: podman prints a human
+    /// preamble and puts the actual cause LAST. Taking the head would select
+    /// the noise and report an unusable node as merely "exited 125".
+    #[test]
+    fn selects_the_cause_not_the_preamble() {
+        let stderr = b"OS: darwin/arm64\nprovider: applehv\nversion: 5.7.0\n\n\
+Cannot connect to Podman. Please verify your connection\n\
+Error: unable to connect to Podman socket: knownhosts: /Users/x/.ssh/known_hosts:9: knownhosts: missing key type pattern\n";
+        let tail = stderr_tail(stderr);
+        assert!(
+            tail.contains("known_hosts:9"),
+            "the file AND line are the whole diagnosis; got {tail:?}"
+        );
+        assert!(
+            !tail.contains("provider: applehv"),
+            "preamble must not be selected; got {tail:?}"
+        );
+        assert!(tail.starts_with(": "), "must append cleanly; got {tail:?}");
+    }
+
+    /// ★ NEGATIVE CONTROL. Without this the function could return a constant
+    /// non-empty string and every other assertion here would still pass.
+    #[test]
+    fn silent_stderr_yields_nothing_to_append() {
+        assert_eq!(stderr_tail(b""), "");
+        assert_eq!(stderr_tail(b"\n   \n\t\n"), "", "whitespace is not a cause");
+    }
+
+    /// Bounded, because an unbounded paste scrolls the useful line away — the
+    /// same failure this preflight exists to fix, from the other direction.
+    #[test]
+    fn a_chatty_runtime_cannot_flood_the_error() {
+        let noisy = "x".repeat(5_000);
+        let tail = stderr_tail(noisy.as_bytes());
+        assert!(
+            tail.len() <= STDERR_TAIL_MAX + 8,
+            "unbounded tail: {} bytes",
+            tail.len()
+        );
+        assert!(tail.ends_with('…'), "truncation must be visible to the reader");
+    }
+
+    /// Slicing UTF-8 at an arbitrary byte index panics. A runtime's error text
+    /// is not guaranteed ASCII, so the truncation walks to a char boundary.
+    #[test]
+    fn truncating_multibyte_text_does_not_panic() {
+        let wide = "é".repeat(STDERR_TAIL_MAX);
+        let tail = stderr_tail(wide.as_bytes());
+        assert!(tail.ends_with('…'));
+    }
+
+    /// Invalid UTF-8 from a subprocess is data, not a reason to report nothing.
+    #[test]
+    fn invalid_utf8_still_reports_something() {
+        assert!(!stderr_tail(&[b'E', b'r', b'r', 0xFF, 0xFE]).is_empty());
     }
 }
