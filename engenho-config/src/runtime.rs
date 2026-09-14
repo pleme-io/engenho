@@ -153,12 +153,28 @@ pub struct RuntimeConfig {
     /// for the operator's kubectl and useless from inside a pod: on darwin
     /// the apiserver binds the host while containers live in a VM.
     ///
-    /// In-cluster config is not the answer today. engenho projects a real
-    /// `ServiceAccount` token, and its own authenticator rejects it —
-    /// `service account token authentication is not yet supported`, HTTP
-    /// 401 (measured 2026-09-01). So a workload that needs the API needs a
-    /// kubeconfig, and the only thing that can mint one with the right
-    /// server address and a valid client cert is engenho itself.
+    /// ★ CORRECTED 2026-09-13 — the SA-token half of this reasoning is no
+    /// longer true, and the conclusion survives anyway for a different
+    /// reason.
+    ///
+    /// This used to read: "In-cluster config is not the answer today. engenho
+    /// projects a real `ServiceAccount` token, and its own authenticator
+    /// rejects it — `service account token authentication is not yet
+    /// supported`, HTTP 401 (measured 2026-09-01)." That was accurate when
+    /// written and is now false: the authenticator has since been wired to the
+    /// cluster's `pki/sa.key`, and `POST serviceaccounts/<n>/token` mints a
+    /// token it accepts. Measured — a minted token takes a 403 (authenticated,
+    /// RBAC declined) and a 200 once bound, never a 401.
+    ///
+    /// What still holds is the ADDRESS, which is the durable half:
+    /// `kubeconfig_publish_path`'s file points at LOOPBACK, and on darwin the
+    /// apiserver binds the host while containers live in a VM. A pod therefore
+    /// still needs a kubeconfig naming a reachable address — but now for
+    /// routing, not because its own identity is refused.
+    ///
+    /// The correction matters because the old sentence justified handing pods
+    /// ADMIN client-key material: if a pod's own identity cannot work, the
+    /// admin kubeconfig looks unavoidable. It is not, any more.
     ///
     /// This file therefore exists so a consumer can create a Secret from it
     /// rather than hand-assembling one from the admin cert — which is what
