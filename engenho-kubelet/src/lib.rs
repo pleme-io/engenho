@@ -49,7 +49,19 @@ pub mod exec_channel;
 pub mod exec_session;
 pub mod kubelet;
 pub mod lifecycle;
-pub mod node_lease;
+/// Node lease + readiness derivation.
+///
+/// ── ★ MOVED TO `engenho-controllers` 2026-09-14, RE-EXPORTED HERE ─────────
+/// It lived in this crate because the kubelet was its only consumer. The
+/// apiserver now DERIVES a Node's `Ready` condition from the lease at READ
+/// time, and `engenho-apiserver` does not — and should not — depend on
+/// `engenho-kubelet`. Both depend on `engenho-controllers`, so the derivation
+/// moved there rather than being copied, which would have left two definitions
+/// of `GRACE_PERIOD` free to disagree about when a node is stale.
+///
+/// Re-exported so every existing `engenho_kubelet::node_lease::…` path still
+/// resolves (★★ MODULARIZE, DON'T DELETE).
+pub use engenho_controllers::node_lease;
 pub mod pod_volume;
 pub mod podman_api;
 pub mod probe;
