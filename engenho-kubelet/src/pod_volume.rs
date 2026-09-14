@@ -65,6 +65,12 @@ pub enum MountSource {
     /// An absolute host-filesystem directory (or file) to bind-mount.
     /// configMap / secret sources — default read-only (K8s semantics).
     HostDir(PathBuf),
+    /// An absolute host-filesystem directory bind-mounted from a podman
+    /// named volume's Mountpoint. emptyDir sourced via the volume-inspect
+    /// path (see `ensure_empty_dir`) — default read-write. Semantically
+    /// distinct from `HostDir` (configMap/secret) so the RO default doesn't
+    /// spill onto workload emptyDir mounts.
+    EmptyDirHostDir(PathBuf),
     /// A named podman volume (created via `podman volume create`).
     /// emptyDir sources — default read-write, shared across the pod.
     NamedVolume(String),
@@ -1043,11 +1049,13 @@ pub fn container_mounts(
             });
         };
         // configMap/secret are HostDir + default read-only; emptyDir is a
-        // NamedVolume + default read-write; a bound-PVC (PvcHostDir) defaults
-        // read-write but the PVC-source `readOnly` flag forces read-only. An
-        // explicit volumeMount.readOnly:true forces read-only in every case.
+        // NamedVolume OR EmptyDirHostDir + default read-write; a bound-PVC
+        // (PvcHostDir) defaults read-write but the PVC-source `readOnly` flag
+        // forces read-only. An explicit volumeMount.readOnly:true forces
+        // read-only in every case.
         let (source_ro, source_default_ro) = match source {
             MountSource::HostDir(_) => (false, true),
+            MountSource::EmptyDirHostDir(_) => (false, false),
             MountSource::NamedVolume(_) => (false, false),
             MountSource::PvcHostDir { read_only, .. } => (*read_only, false),
         };
@@ -1214,7 +1222,42 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
                 )));
             }
         }
-        Ok(MountSource::NamedVolume(vol_name))
+        // Resolve the named volume to its on-disk mountpoint and emit a
+        // HostDir bind mount rather than a NamedVolume. Measured 2026-09-10:
+        // libpod's container-create API, given `Type: volume, Source: <name>`
+        // and no `Name` field, records `Type: bind, Source: <name>` in the
+        // container's Mounts, and crun then fails to start the container with
+        // `mount <name>: No such device` — because there is no host device at
+        // a path called <name>. `podman run -v <name>:<dest>` (CLI) resolves
+        // to the same Mountpoint below and mounts as a bind, which works.
+        // Emitting a HostDir of the Mountpoint here reuses the bind path and
+        // sidesteps the API mismatch entirely.
+        let out = tokio::process::Command::new(&self.binary)
+            .args([
+                "volume",
+                "inspect",
+                &vol_name,
+                "--format",
+                "{{.Mountpoint}}",
+            ])
+            .output()
+            .await
+            .map_err(|e| {
+                VolumeResolveError::Materialize(format!("podman volume inspect spawn: {e}"))
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(VolumeResolveError::Materialize(format!(
+                "podman volume inspect {vol_name}: {stderr}"
+            )));
+        }
+        let mountpoint = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if mountpoint.is_empty() {
+            return Err(VolumeResolveError::Materialize(format!(
+                "podman volume inspect {vol_name}: empty Mountpoint"
+            )));
+        }
+        Ok(MountSource::EmptyDirHostDir(PathBuf::from(mountpoint)))
     }
 
     async fn remove_empty_dir(

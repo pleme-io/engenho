@@ -70,6 +70,8 @@ in
     runtime = {
       listenAddr = optional types.str
         "apiserver bind address. `127.0.0.1:6443` keeps it node-local.";
+      kubeletListenAddr = optional types.str
+        "kubelet HTTP surface bind address (default `127.0.0.1:10250`). Override when another kubelet on the same host — notably k3s, which binds `0.0.0.0:10250` — would collide.";
       # ── NOT `optional`: an unprivileged agent CANNOT use the default ──
       # engenho's own prescribed default is `/var/lib/engenho`, which is
       # right for a system daemon and impossible for a per-user launchd
@@ -384,6 +386,7 @@ in
       cluster = { inherit (cfg.cluster) name region; };
       runtime = {
         listen_addr = cfg.runtime.listenAddr;
+        kubelet_listen_addr = cfg.runtime.kubeletListenAddr;
         data_dir = cfg.runtime.dataDir;
         durable = cfg.runtime.durable;
         node_name = cfg.runtime.nodeName;
