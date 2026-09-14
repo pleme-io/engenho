@@ -31,6 +31,7 @@
 //! construct one (★★ UNREPRESENTABILITY). [`JsonPath`] is a typed value,
 //! rendered only through `Display` (★★ TYPED EMISSION).
 
+pub mod butai;
 pub mod cotejo;
 pub mod junkyo;
 pub mod normalize;

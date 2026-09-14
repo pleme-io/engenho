@@ -189,7 +189,13 @@ fn status_divergence(op: &Operation, eng: u16, k3s: u16) -> Vec<Divergence> {
 /// Recursive object differ. `k3s` is the oracle: a key on k3s that engenho
 /// lacks is a `MissingDefault`; a key engenho adds that k3s lacks is an
 /// `ExtraField`; a shared key with differing values is a `FieldDiff`.
-fn diff_object(eng: &Value, k3s: &Value, sev: Severity) -> Vec<Divergence> {
+/// Diff two already-normalized JSON objects.
+///
+/// Public because the OCI-runtime differential ([`crate::butai`]) compares
+/// `state` documents with exactly these semantics and must not grow a second
+/// recursive JSON differ that can disagree with this one about what counts as
+/// a difference.
+pub fn diff_object(eng: &Value, k3s: &Value, sev: Severity) -> Vec<Divergence> {
     let mut out = Vec::new();
     walk(JsonPath::root(), eng, k3s, sev, &mut out);
     out
