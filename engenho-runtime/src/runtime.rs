@@ -2087,11 +2087,17 @@ fn write_boot_kubeconfig(
     // address a workload dials cannot disagree with the address engenho tells
     // it to dial.
     //
-    // This exists because in-cluster config does not work here: engenho
-    // projects a valid ServiceAccount token and its own authenticator returns
-    // `service account token authentication is not yet supported` (401). Until
-    // that lands, a workload needing the API needs a kubeconfig, and engenho
-    // is the only thing that holds both the admin cert and the right address.
+    // ★ CORRECTED 2026-09-13. This used to say in-cluster config "does not
+    // work here" because the authenticator returned `service account token
+    // authentication is not yet supported` (401). That is no longer true —
+    // the authenticator is wired to `pki/sa.key` and `/token` mints tokens it
+    // accepts (a minted token measures 403 unbound, 200 once bound).
+    //
+    // The file still exists, for the ADDRESS rather than the identity:
+    // the operator-facing kubeconfig names LOOPBACK, and on darwin the
+    // apiserver binds the host while containers live in a VM. A pod needs a
+    // reachable address; it no longer needs borrowed admin credentials to be
+    // ALLOWED, so prefer a ServiceAccount for new workloads.
     if let Some(pod_publish) = resolve_publish_path(&config.runtime.pod_kubeconfig_publish_path) {
         match apiserver_reachability(config).injectable() {
             Some((host, port)) => {
