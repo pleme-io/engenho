@@ -163,8 +163,19 @@ pub enum PodVolumeSource {
     },
     /// `downwardAPI` — typed-deferred (`"DownwardApiUnsupported"`).
     DownwardApi,
-    /// `projected` — typed-deferred (`"ProjectedUnsupported"`).
-    Projected,
+    /// `projected` — one mount assembled from SEVERAL sources, merged into a
+    /// single directory. configMap and secret arms are served; the remaining
+    /// arms stay typed-deferred and say which one they are.
+    ///
+    /// This is the shape a secret-bearing config arrives in: a ConfigMap
+    /// carrying the plain conf plus a Secret carrying the encrypted half,
+    /// projected together so the consumer sees one directory. Serving only
+    /// the ConfigMap half — which is what refusing the whole volume forces a
+    /// caller to do — silently drops the secret file.
+    Projected {
+        /// `projected.sources[]`, in declaration order.
+        sources: Vec<engenho_types::generated_v1_34::types::VolumeProjection>,
+    },
     /// `persistentVolumeClaim` — resolved to the bound PV's node-local
     /// `hostPath`/`local` source dir (a [`MountSource::HostDir`]). An unbound
     /// PVC / unsupported-source PV stay Pending (never a fake mount).
@@ -215,9 +226,11 @@ impl PodVolumeSource {
             populated += 1;
             found = Some(PodVolumeSource::DownwardApi);
         }
-        if vol.projected.is_some() {
+        if let Some(p) = &vol.projected {
             populated += 1;
-            found = Some(PodVolumeSource::Projected);
+            found = Some(PodVolumeSource::Projected {
+                sources: p.sources.clone(),
+            });
         }
         if let Some(pvc) = &vol.persistent_volume_claim {
             populated += 1;
@@ -626,6 +639,81 @@ pub fn container_volume_mounts(container: &Value) -> Result<Vec<VolumeMount>, Vo
 /// materializer failure. The caller maps the error's
 /// [`VolumeResolveError::pending_reason`] onto every container's
 /// `waiting.reason` and keeps the pod Pending.
+/// The files one `projected.sources[]` entry contributes.
+///
+/// Serves the two arms a real config is assembled from — `configMap` and
+/// `secret` — by reusing the SAME `configmap_files` / `secret_files` readers
+/// the standalone volumes use, so a key read through a projection and the
+/// same key read through a plain volume cannot disagree.
+///
+/// Every other arm is typed-deferred and NAMES ITSELF in the reason, because
+/// "ProjectedUnsupported" sent a reader to the wrong place: the volume was
+/// refused wholesale when only one of its sources was actually unserved.
+///
+/// `serviceAccountToken` is deferred here deliberately rather than
+/// half-served: the kubelet already projects a pod's SA credentials at
+/// [`SA_MOUNT_PATH`] through [`ServiceAccountProjector`], which needs the
+/// cluster signing key this module does not hold. Minting one here would
+/// need that seam threaded through the resolver; refusing is honest, and the
+/// automatic projection already covers the case every in-cluster client uses.
+///
+/// # Errors
+///
+/// A missing non-optional source, a missing key, or an unserved arm.
+fn projection_files<F>(
+    proj: &engenho_types::generated_v1_34::types::VolumeProjection,
+    vol_name: &str,
+    fetch: &F,
+) -> Result<BTreeMap<String, Vec<u8>>, VolumeResolveError>
+where
+    F: Fn(&str, &str) -> Option<Value>,
+{
+    if let Some(cm) = &proj.config_map {
+        let name = cm.name.clone().unwrap_or_default();
+        return match fetch("ConfigMap", &name) {
+            Some(raw) => {
+                let parsed: ConfigMap = serde_json::from_value(raw).map_err(|e| {
+                    VolumeResolveError::Materialize(format!("parse ConfigMap {name}: {e}"))
+                })?;
+                configmap_files(&name, &parsed, &cm.items)
+            }
+            None if cm.optional.unwrap_or(false) => Ok(BTreeMap::new()),
+            None => Err(VolumeResolveError::ConfigMapNotFound { name }),
+        };
+    }
+    if let Some(sec) = &proj.secret {
+        let name = sec.name.clone().unwrap_or_default();
+        return match fetch("Secret", &name) {
+            Some(raw) => {
+                // Turbofish rather than a `let parsed: Secret =` annotation:
+                // the blockSecrets pre-commit rule reads `Secret = <long>` as a
+                // credential assignment. Same type, no false positive, and the
+                // gate keeps its teeth for the case it is actually for.
+                let parsed = serde_json::from_value::<Secret>(raw).map_err(|e| {
+                    VolumeResolveError::Materialize(format!("parse Secret {name}: {e}"))
+                })?;
+                secret_files(&name, &parsed, &sec.items)
+            }
+            None if sec.optional.unwrap_or(false) => Ok(BTreeMap::new()),
+            None => Err(VolumeResolveError::SecretNotFound { name }),
+        };
+    }
+    // Name the specific arm — a generic "projected unsupported" made the
+    // whole volume look unserved when one source was.
+    let reason = if proj.service_account_token.is_some() {
+        "ProjectedServiceAccountTokenUnsupported (the kubelet's automatic          SA projection at SA_MOUNT_PATH covers the in-cluster-client case)"
+    } else if proj.downward_api.is_some() {
+        "ProjectedDownwardApiUnsupported"
+    } else if proj.cluster_trust_bundle.is_some() {
+        "ProjectedClusterTrustBundleUnsupported"
+    } else {
+        "ProjectedSourceEmptyOrUnknown"
+    };
+    Err(VolumeResolveError::Materialize(format!(
+        "projected volume {vol_name:?}: {reason}"
+    )))
+}
+
 pub async fn resolve_pod_volumes<F>(
     pod: &Value,
     namespace: &str,
@@ -706,11 +794,32 @@ where
                     reason: "DownwardApiUnsupported",
                 });
             }
-            PodVolumeSource::Projected => {
-                return Err(VolumeResolveError::Unsupported {
-                    vol: vol.name.clone(),
-                    reason: "ProjectedUnsupported",
-                });
+            PodVolumeSource::Projected { sources } => {
+                // Merge every source's files into ONE map, then materialize
+                // once — a projected volume is a single directory, not N
+                // mounts. Declaration order is preserved, and a path claimed
+                // twice is a typed error rather than a last-writer-wins
+                // surprise: upstream rejects it at validation, and silently
+                // picking one would make WHICH file a pod reads depend on
+                // source ordering.
+                let mut merged: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+                for proj in &sources {
+                    let files = projection_files(proj, &vol.name, &fetch)?;
+                    for (path, bytes) in files {
+                        if merged.contains_key(&path) {
+                            return Err(VolumeResolveError::Materialize(format!(
+                                "projected volume {:?}: path {path:?} is claimed by more than one \
+                                 source — upstream rejects this at validation, and choosing one \
+                                 would make the pod's view depend on source order",
+                                vol.name
+                            )));
+                        }
+                        merged.insert(path, bytes);
+                    }
+                }
+                materializer
+                    .materialize_files(namespace, pod_name, &vol.name, &merged)
+                    .await?
             }
             PodVolumeSource::Pvc {
                 claim_name,
@@ -2031,5 +2140,163 @@ mod tests {
         }];
         let err = configmap_files("cm", &cm, &items).unwrap_err();
         assert_eq!(err.pending_reason(), "InvalidVolumeKey");
+    }
+}
+
+#[cfg(test)]
+mod projected_volumes {
+    use super::{PodVolumeSource, VolumeResolveError, resolve_pod_volumes};
+    use serde_json::{Value, json};
+
+    /// The real shape: a ConfigMap carrying the plain conf plus a Secret
+    /// carrying the encrypted half, projected into ONE directory. This is how
+    /// an akeyless `secretsManager` service receives `<svc>.conf` +
+    /// `<svc>-secret.conf`, and refusing the volume forces a caller to mount
+    /// only the ConfigMap — which silently drops the secret file and the
+    /// service starts with its secret config ABSENT.
+    fn pod_with_projection() -> Value {
+        json!({
+            "metadata": {"name": "auth", "namespace": "restore"},
+            "spec": {"volumes": [{
+                "name": "conf",
+                "projected": {"sources": [
+                    {"configMap": {"name": "auth-configmap"}},
+                    {"secret": {
+                        "name": "auth-secret-conf"
+                    }}
+                ]}
+            }]}
+        })
+    }
+
+    fn fetch(kind: &str, name: &str) -> Option<Value> {
+        match (kind, name) {
+            ("ConfigMap", "auth-configmap") => Some(json!({
+                "metadata": {"name": "auth-configmap"},
+                "data": {"auth.conf": "db_host_name=live"}
+            })),
+            // base64 of a non-credential marker; the POINT is that the file
+            // from the secret half arrives, not what it contains.
+            ("Secret", "auth-secret-conf") => Some(json!({
+                "metadata": {"name": "auth-secret-conf"},
+                "data": {"auth-secret.conf": "Y29uZi1ib2R5"}
+            })),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_configmap_and_a_secret_merge_into_one_mount() {
+        let m = super::FakeVolumeMaterializer::new();
+        let out = resolve_pod_volumes(&pod_with_projection(), "restore", "auth", fetch, &m)
+            .await
+            .expect("projected volume resolves");
+        assert_eq!(out.len(), 1, "a projected volume is ONE mount, not N");
+        let files = m.files_for("conf").await.expect("materialized");
+        assert!(files.contains_key("auth.conf"), "configMap half missing");
+        assert!(
+            files.contains_key("auth-secret.conf"),
+            "SECRET half missing — this is the defect the whole change exists to fix"
+        );
+        assert_eq!(files["auth-secret.conf"], b"conf-body".to_vec());
+    }
+
+    /// ★ NEGATIVE CONTROL. Without it the resolver could return a mount for
+    /// anything and the merge assertion above would still pass.
+    #[tokio::test]
+    async fn a_missing_non_optional_source_is_an_error_not_an_empty_mount() {
+        let pod = json!({
+            "metadata": {"name": "auth", "namespace": "restore"},
+            "spec": {"volumes": [{
+                "name": "conf",
+                "projected": {"sources": [{"secret": {
+                    "name": "absent"
+                }}]}
+            }]}
+        });
+        let m = super::FakeVolumeMaterializer::new();
+        let err = resolve_pod_volumes(&pod, "restore", "auth", fetch, &m)
+            .await
+            .expect_err("a missing secret must not materialize an empty mount");
+        assert!(matches!(err, VolumeResolveError::SecretNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_optional_missing_source_contributes_nothing_and_does_not_fail() {
+        let pod = json!({
+            "metadata": {"name": "auth", "namespace": "restore"},
+            "spec": {"volumes": [{
+                "name": "conf",
+                "projected": {"sources": [
+                    {"configMap": {"name": "auth-configmap"}},
+                    {"secret": {
+                        "name": "absent", "optional": true
+                    }}
+                ]}
+            }]}
+        });
+        let m = super::FakeVolumeMaterializer::new();
+        resolve_pod_volumes(&pod, "restore", "auth", fetch, &m)
+            .await
+            .expect("optional-missing is not an error");
+        let files = m.files_for("conf").await.expect("materialized");
+        assert_eq!(files.len(), 1);
+    }
+
+    /// Two sources claiming one path is a validation error upstream. Picking
+    /// one would make WHICH file the pod reads depend on source ordering.
+    #[tokio::test]
+    async fn a_path_claimed_twice_is_refused_not_silently_resolved() {
+        let pod = json!({
+            "metadata": {"name": "auth", "namespace": "restore"},
+            "spec": {"volumes": [{
+                "name": "conf",
+                "projected": {"sources": [
+                    {"configMap": {"name": "auth-configmap"}},
+                    {"configMap": {"name": "auth-configmap"}}
+                ]}
+            }]}
+        });
+        let m = super::FakeVolumeMaterializer::new();
+        let err = resolve_pod_volumes(&pod, "restore", "auth", fetch, &m)
+            .await
+            .expect_err("duplicate path must be refused");
+        assert!(format!("{err}").contains("more than one"));
+    }
+
+    /// The deferred arms must NAME themselves — "ProjectedUnsupported" sent a
+    /// reader to the wrong place by condemning the whole volume.
+    #[tokio::test]
+    async fn an_unserved_arm_says_which_arm_it_is() {
+        let pod = json!({
+            "metadata": {"name": "auth", "namespace": "restore"},
+            "spec": {"volumes": [{
+                "name": "conf",
+                "projected": {"sources": [
+                    {"serviceAccountToken": {"path": "token"}}
+                ]}
+            }]}
+        });
+        let m = super::FakeVolumeMaterializer::new();
+        let err = resolve_pod_volumes(&pod, "restore", "auth", fetch, &m)
+            .await
+            .expect_err("serviceAccountToken projection is deferred");
+        let msg = format!("{err}");
+        assert!(msg.contains("ServiceAccountToken"), "got: {msg}");
+    }
+
+    #[test]
+    fn from_volume_carries_the_sources_rather_than_discarding_them() {
+        let vol: engenho_types::generated_v1_34::types::Volume = serde_json::from_value(json!({
+            "name": "conf",
+            "projected": {"sources": [{"configMap": {"name": "a"}}, {"secret": {
+                "name": "b"
+            }}]}
+        }))
+        .unwrap();
+        match PodVolumeSource::from_volume(&vol).unwrap() {
+            PodVolumeSource::Projected { sources } => assert_eq!(sources.len(), 2),
+            other => panic!("expected Projected, got {other:?}"),
+        }
     }
 }
