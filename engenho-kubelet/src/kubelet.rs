@@ -449,6 +449,123 @@ impl Kubelet {
         }
     }
 
+    /// Derive this node's `Ready` condition from its Lease and publish it.
+    ///
+    /// ── ★ THE CONSUMER `node_lease` WAS MISSING ───────────────────────────
+    /// `readiness()` and `ready_condition()` were written, documented and
+    /// tested, and had **zero non-test callers**. The producer above writes a
+    /// heartbeat every 10s and nothing ever read it, so the Node's condition
+    /// stayed the literal `{"type":"Ready","status":"True"}` that
+    /// `register_node` stamps once at boot — for the life of the process, on
+    /// every node. The scheduler CONSUMES that value
+    /// (`engenho-scheduler/src/strategy.rs`'s `is_schedulable`), so it was a
+    /// constant standing in for a health signal, not an unused field.
+    ///
+    /// ── ★ WHY IT DERIVES FROM THE LEASE AS READ BACK, NOT FROM `now()` ────
+    /// Judging our own liveness from our own clock is circular: this code only
+    /// runs when the kubelet is alive, so it could only ever conclude "alive".
+    /// Reading the Lease back out of the store makes one real failure
+    /// observable — **the store being unreachable**. If `propose` above failed,
+    /// or the mesh is partitioned, the lease we read is stale (or absent) and
+    /// the condition honestly degrades, even though this process is running.
+    ///
+    /// ── ★ WHAT IT STILL CANNOT DO, NAMED RATHER THAN IMPLIED ──────────────
+    /// A node whose engenho process is DEAD writes neither the lease nor the
+    /// condition, so its last-published value stands. Detecting that requires a
+    /// different actor reading the lease — upstream's node-lifecycle-controller,
+    /// which is a separate process precisely because a dead kubelet cannot
+    /// report its own death. `pending-node-lifecycle-controller`: on a
+    /// multi-node engenho (`engenho-revoada` carries the membership layer)
+    /// peers can judge each other's leases; single-node cannot, and no amount
+    /// of code here changes that.
+    async fn publish_node_readiness(&self) {
+        let lease_key = crate::node_lease::lease_key(&self.node_name);
+        // Age of the heartbeat AS THE STORE HAS IT.
+        let since_renew = match self.store.get(&lease_key).await {
+            Some(lease) => lease
+                .get("spec")
+                .and_then(|s| s.get("renewTime"))
+                .and_then(|t| t.as_str())
+                .and_then(engenho_types::time::age_since_rfc3339),
+            // No lease in the store at all — never written, or lost.
+            None => None,
+        };
+        let state = crate::node_lease::readiness(since_renew);
+
+        let node_key = ResourceKey::cluster_scoped("", "v1", "Node", &self.node_name);
+        let Some(node) = self.store.get(&node_key).await else {
+            // No Node object yet: registration has not landed. Not an error —
+            // the next tick will find it.
+            return;
+        };
+        let previous = crate::node_lease::find_ready_condition(&node);
+        let condition = crate::node_lease::ready_condition(
+            state,
+            &engenho_types::time::now_rfc3339_utc(),
+            previous,
+        );
+
+        // Skip the write when nothing an operator would act on has changed.
+        // `lastHeartbeatTime` moves every tick by design, so comparing whole
+        // conditions would write on every single tick forever — which is how
+        // the store journal grows without bound while the cluster is idle.
+        let unchanged = previous.is_some_and(|p| {
+            p.get("status") == condition.get("status")
+                && p.get("reason") == condition.get("reason")
+        });
+        if unchanged {
+            return;
+        }
+
+        // Merge BY TYPE. Replacing `status.conditions` wholesale would drop
+        // every condition this kubelet does not own — the same array-replacement
+        // defect the Pod status path has.
+        let mut conditions: Vec<serde_json::Value> = node
+            .get("status")
+            .and_then(|s| s.get("conditions"))
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.get("type").and_then(|t| t.as_str()) != Some("Ready"))
+            .collect();
+        conditions.push(condition);
+
+        let mut desired = node.clone();
+        if let Some(obj) = desired.as_object_mut() {
+            let status = obj
+                .entry("status")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(status_obj) = status.as_object_mut() {
+                status_obj.insert("conditions".to_string(), serde_json::json!(conditions));
+            }
+        }
+
+        if let Err(e) = self
+            .store
+            .propose(engenho_store::command::ResourceCommand::Put {
+                key: node_key,
+                value: desired,
+                expected: None,
+                reason: engenho_store::command::Reason::Controller,
+            })
+            .await
+        {
+            warn!(
+                node = %self.node_name,
+                error = %e,
+                "could not publish the node Ready condition"
+            );
+        } else {
+            info!(
+                node = %self.node_name,
+                status = state.condition_status(),
+                reason = state.reason(),
+                "node Ready condition published"
+            );
+        }
+    }
+
     /// The current instant per this kubelet's clock.
     fn now(&self) -> Instant {
         (self.clock)()
@@ -1225,6 +1342,12 @@ impl Controller for Kubelet {
         // managing containers because it could not write a heartbeat has
         // turned an observability problem into an outage.
         self.renew_node_lease().await;
+        // Read that heartbeat back and turn it into the Node's Ready
+        // condition. Deliberately AFTER the renew and on EVERY tick, not on
+        // the renew's 10s cadence: the interesting case is the one where the
+        // renew above FAILED, and a consumer that only runs when the producer
+        // succeeded can never observe that.
+        self.publish_node_readiness().await;
 
         let pods = self.store.list("", "v1", "Pod", None).await;
         let mut report = ReconcileReport::default();

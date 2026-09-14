@@ -207,24 +207,95 @@ async fn l1_l2_l3_the_kubelet_writes_a_lease_that_drives_readiness() {
         "a heartbeat carries a time: {lease}"
     );
 
-    // L3 — the derivation this write finally feeds, and the reason the
-    // write had to exist: with no lease ever written, EVERY node sat on the
-    // `None` arm forever, so the other two arms were unreachable code.
+    // L3 — the derivation this write feeds.
     //
-    // Three states, not two. `Unknown` is never-heartbeat (mid-registration)
-    // and `NotReady` is heartbeat-then-stopped (failed) — collapsing them
-    // makes a booting node look like a dying one, and every autoscaler
-    // treats those differently.
+    // Three states, not two. `Unknown` is never-heartbeat (mid-registration),
+    // `Stale` is heartbeat-then-stopped — collapsing them makes a booting node
+    // look like a dying one, and every autoscaler treats those differently.
+    // Both render "Unknown" on the wire (upstream has no third status) and stay
+    // distinct in the REASON, which is the field that carries the difference.
     assert_eq!(readiness(Some(StdDuration::ZERO)), NodeReadiness::Ready);
     assert_eq!(
         readiness(Some(GRACE_PERIOD + StdDuration::from_secs(1))),
-        NodeReadiness::NotReady,
-        "a stale heartbeat is a FAILED node, not an unregistered one"
+        NodeReadiness::Stale,
+        "a stale heartbeat is a node that stopped reporting, not an unregistered one"
     );
     assert_eq!(
         readiness(None),
         NodeReadiness::Unknown,
         "never heartbeat is the mid-registration state"
+    );
+
+    // ── ★ L4 — THE NODE OBJECT ITSELF. ────────────────────────────────────
+    // Everything above L3 is a PURE FUNCTION CALL. Until 2026-09-14 this test
+    // stopped there, called itself "the derivation this write finally feeds",
+    // and never once read a Node — so it passed identically against a kubelet
+    // that published nothing and a Node carrying the hardcoded
+    // `{"type":"Ready","status":"True"}` literal that `register_node` stamps at
+    // boot. A test that cannot tell those two apart is measuring the test.
+    //
+    // The consumer now exists, so assert on what it wrote. Seed the Node the
+    // way `register_node` does — INCLUDING the boot-time literal condition —
+    // and also a second condition this kubelet does not own, so the merge is
+    // exercised rather than assumed.
+    let node_key = engenho_store::ResourceKey::cluster_scoped("", "v1", "Node", "node-A");
+    store
+        .propose(engenho_store::command::ResourceCommand::Put {
+            key: node_key.clone(),
+            value: serde_json::json!({
+                "kind": "Node",
+                "apiVersion": "v1",
+                "metadata": { "name": "node-A" },
+                "status": { "conditions": [
+                    // The literal this whole brick replaces: no reason, no
+                    // timestamps, never updated.
+                    { "type": "Ready", "status": "True" },
+                    // Owned by somebody else. It must survive.
+                    { "type": "MemoryPressure", "status": "False" }
+                ]}
+            }),
+            expected: None,
+            reason: engenho_store::command::Reason::Operator,
+        })
+        .await
+        .expect("seed the node");
+    kubelet.tick().await.unwrap();
+
+    let node = store
+        .get(&node_key)
+        .await
+        .expect("the node object exists");
+    assert!(
+        engenho_kubelet::node_lease::find_ready_condition(&node)
+            .and_then(|c| c.get("reason"))
+            .is_some(),
+        "the boot-time literal must be SUPERSEDED, not left in place: {node}"
+    );
+    assert!(
+        node["status"]["conditions"]
+            .as_array()
+            .is_some_and(|cs| cs
+                .iter()
+                .any(|c| c["type"] == "MemoryPressure")),
+        "merging by type must preserve a condition this kubelet does not own: {node}"
+    );
+    let ready = engenho_kubelet::node_lease::find_ready_condition(&node)
+        .expect("the kubelet published a Ready condition");
+    assert_eq!(ready["status"], "True", "fresh lease ⇒ Ready: {node}");
+    assert_eq!(
+        ready["reason"], "KubeletReady",
+        "the reason must be the kubelet's own, not the lifecycle controller's: {node}"
+    );
+    // The two stamps are DIFFERENT FIELDS with different jobs, and the
+    // published condition must carry both — the boot-time literal carries
+    // neither, which is the cheapest way to tell them apart.
+    assert!(
+        ready.get("lastHeartbeatTime").and_then(|t| t.as_str()).is_some(),
+        "a published condition records that we looked: {node}"
+    );
+    assert!(
+        ready.get("lastTransitionTime").and_then(|t| t.as_str()).is_some(),
+        "and when the state last changed: {node}"
     );
 
     drop(kubelet);

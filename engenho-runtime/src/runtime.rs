@@ -1807,21 +1807,94 @@ fn seed_serialize_err(kind: &str, e: &serde_json::Error) -> engenho_apiserver::S
     )))
 }
 
+/// Parse `MemTotal` out of `/proc/meminfo`, in bytes.
+///
+/// Pure so it is testable without a `/proc`. The line is
+/// `MemTotal:       32793532 kB` — the unit is ALWAYS kB on Linux (the
+/// kernel hardcodes it in `fs/proc/meminfo.c`), but it is parsed rather
+/// than assumed, because silently reading kB as bytes understates the
+/// node by 1024× and the resulting number still looks plausible.
+#[must_use]
+fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let mut it = line.split_whitespace().skip(1);
+    let value: u64 = it.next()?.parse().ok()?;
+    match it.next() {
+        Some("kB" | "KB") => Some(value * 1024),
+        Some("mB" | "MB") => Some(value * 1024 * 1024),
+        // No unit at all means bytes, per proc(5). An unrecognised unit is
+        // refused rather than guessed — see the doc above.
+        None => Some(value),
+        Some(_) => None,
+    }
+}
+
+/// Total host memory in bytes, or `None` when this target cannot say.
+fn host_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .as_deref()
+            .and_then(parse_mem_total_bytes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // darwin would need `sysctlbyname`, i.e. libc — and engenho's
+        // production target is `x86_64-unknown-linux-musl`, which links no
+        // libc at all. Adding a C dependency to serve a dev-only host is
+        // exactly the trade ★★ CONTAIN THE C says not to make. The caller
+        // falls back and SAYS SO.
+        None
+    }
+}
+
 /// Host capacity advertised on the self-registered Node: `(cpu, memory)`
 /// as K8s quantity strings.
 ///
-/// CPU is the host's logical-core count (`std::thread::available_parallelism`,
-/// falling back to 1). Memory is a conservative fixed default (`8Gi`,
-/// the documented engenho-local VM size) — a real total-memory probe is
-/// a follow-up (would add a sysinfo dep); the value only needs to be a
-/// truthful lower bound for the resource-fit predicate to admit normal
-/// workloads. Both are integer/SI quantities the scheduler parses back
-/// through the typed `Quantity` surface.
+/// ── ★ THE MEMORY VALUE WAS A HARDCODED `"8Gi"` STRING UNTIL 2026-09-14 ─────
+/// Not a probe that fell back — a literal, on every node, forever. The old
+/// comment defended it as "a truthful lower bound", and that defence fails in
+/// both directions: on a node with less than 8Gi it is an OVER-claim that lets
+/// the scheduler pack a node into swap, and on rio it was a 3.6× UNDER-claim
+/// (advertised `8Gi`, host has 29Gi) that silently capped what the node would
+/// accept. Measured on the live node: `status.allocatable = {"cpu":"32",
+/// "memory":"8Gi"}`.
+///
+/// It compounds: `engenho-scheduler`'s `fit.rs` packs by
+/// `allocatable − Σ requests`, so the scheduler was doing exact arithmetic
+/// against a fabricated denominator — and, until the same day, against limits
+/// the node then did not enforce either.
+///
+/// The probe needs no new dependency. `/proc/meminfo` is a FILE; the old note
+/// that this "would add a sysinfo dep" was reaching for a crate to read text.
+///
+/// `capacity` and `allocatable` are still reported EQUAL by the caller, which
+/// is not upstream's model — upstream subtracts a system reservation. That is
+/// named as `pending-node-allocatable-reservation` rather than approximated,
+/// because a made-up reservation is the same class of defect as the made-up
+/// total this replaces.
 fn host_capacity() -> (String, String) {
     let cpus = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
-    (cpus.to_string(), "8Gi".to_string())
+    let memory = match host_memory_bytes() {
+        Some(bytes) => {
+            // Plain bytes, not a rounded `Gi`: rounding down discards real
+            // capacity and rounding up over-claims, and the scheduler parses
+            // this back through the typed `Quantity` surface either way.
+            bytes.to_string()
+        }
+        None => {
+            warn!(
+                "cannot read total host memory on this target; advertising the \
+                 8Gi fallback — the scheduler will pack this node against a \
+                 value that is not measured"
+            );
+            "8Gi".to_string()
+        }
+    };
+    (cpus.to_string(), memory)
 }
 
 /// The listen IP to add as a server-cert SAN, or `None` when it isn't a
@@ -3123,6 +3196,62 @@ mod tests {
 
     use super::*;
     use engenho_config::KubeletBackendKind as CfgKind;
+
+    // ── host capacity ────────────────────────────────────────────────────
+
+    #[test]
+    fn mem_total_is_parsed_in_kb_not_bytes() {
+        // rio's real /proc/meminfo shape. The unit is the whole trap: reading
+        // 32793532 as BYTES gives 31MiB, which is a plausible-looking number
+        // that would make the node refuse nearly every pod.
+        let meminfo = "MemTotal:       32793532 kB\nMemFree:         1234 kB\n";
+        assert_eq!(
+            super::parse_mem_total_bytes(meminfo),
+            Some(32_793_532 * 1024)
+        );
+        // ~31.3 GiB, i.e. the 29G `free -g` reports once the kernel's own
+        // reservations are taken out.
+        let gib = super::parse_mem_total_bytes(meminfo).unwrap() / (1024 * 1024 * 1024);
+        assert_eq!(gib, 31);
+    }
+
+    #[test]
+    fn an_unrecognised_unit_is_refused_not_guessed() {
+        // Guessing here understates or overstates the node by 1024x and the
+        // result still looks like a real number. `None` makes the caller fall
+        // back loudly instead.
+        assert_eq!(super::parse_mem_total_bytes("MemTotal: 100 furlongs\n"), None);
+        // No unit means bytes, per proc(5).
+        assert_eq!(super::parse_mem_total_bytes("MemTotal: 4096\n"), Some(4096));
+    }
+
+    #[test]
+    fn a_meminfo_without_memtotal_yields_none() {
+        assert_eq!(super::parse_mem_total_bytes("MemFree: 1 kB\n"), None);
+        assert_eq!(super::parse_mem_total_bytes(""), None);
+        // Not a prefix match on some other key that happens to contain it.
+        assert_eq!(super::parse_mem_total_bytes("SwapTotal: 8 kB\n"), None);
+    }
+
+    #[test]
+    fn host_capacity_no_longer_reports_the_8gi_literal_on_linux() {
+        let (cpu, mem) = super::host_capacity();
+        assert!(cpu.parse::<u64>().is_ok(), "cpu must be an integer: {cpu}");
+        if cfg!(target_os = "linux") {
+            // The defect this replaces: the string "8Gi", on every node,
+            // regardless of the host. On Linux the probe must have answered.
+            assert_ne!(mem, "8Gi", "memory must be measured on linux, not defaulted");
+            assert!(
+                mem.parse::<u64>().is_ok(),
+                "measured memory is plain bytes: {mem}"
+            );
+        } else {
+            // Honest fallback on a target that cannot say — and it is the
+            // documented literal, not a silent zero.
+            assert_eq!(mem, "8Gi");
+        }
+    }
+
     use shikumi::TieredConfig;
 
     fn ephemeral_test_config() -> EngenhoConfig {

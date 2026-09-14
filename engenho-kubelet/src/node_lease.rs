@@ -34,11 +34,11 @@ use serde_json::json;
 /// How often a node renews its lease. Upstream's default.
 pub const RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How stale a lease may get before the node is judged `NotReady`.
+/// How stale a lease may get before the node is judged [`NodeReadiness::Stale`].
 ///
 /// Upstream's default is 40s — four missed renewals. Deliberately several
 /// intervals, not one: a single missed renewal is a hiccup, and flapping a
-/// node to `NotReady` on one slow tick would evict workloads for nothing.
+/// node stale on one slow tick would evict workloads for nothing.
 pub const GRACE_PERIOD: Duration = Duration::from_secs(40);
 
 /// The namespace node leases live in.
@@ -77,11 +77,37 @@ pub fn lease_key(node: &str) -> ResourceKey {
 pub enum NodeReadiness {
     /// Renewed within the grace period.
     Ready,
-    /// The heartbeat is older than the grace period.
-    NotReady,
+    /// The heartbeat is older than the grace period, so this node's health
+    /// is no longer KNOWN.
+    ///
+    /// ── ★ RENAMED FROM `NotReady` AND ITS WIRE VALUE CORRECTED 2026-09-14 ──
+    /// It rendered `status: "False"` while carrying `reason:
+    /// "NodeStatusUnknown"` and `message: "Kubelet stopped posting node
+    /// status"` — upstream's **Unknown** pair, verbatim. The struct disagreed
+    /// with itself, and the wire value was the half that was wrong.
+    ///
+    /// Upstream distinguishes two different facts and engenho can only observe
+    /// one of them:
+    ///   * `Ready=False` is what a LIVE kubelet posts about ITSELF when it
+    ///     knows it is unhealthy (reason `KubeletNotReady`) — the runtime is
+    ///     down, the network plugin is not ready. It means "I am here and I am
+    ///     broken."
+    ///   * `Ready=Unknown` is what the node-lifecycle-controller posts when the
+    ///     heartbeat has simply STOPPED. It means "nobody is answering."
+    ///
+    /// A stale lease is the second. engenho has no health probe on the
+    /// container runtime at all (`ContainerRuntime` has no `health()` — its
+    /// `status` asks about one container), so it cannot honestly produce the
+    /// first, and claiming `False` asserts knowledge it does not have.
+    ///
+    /// The distinction is not cosmetic: upstream's taint manager applies
+    /// `node.kubernetes.io/unreachable` for Unknown and
+    /// `node.kubernetes.io/not-ready` for False, and workloads tolerate them
+    /// differently.
+    Stale,
     /// No lease has ever been observed.
     ///
-    /// Distinct from `NotReady` on purpose: a node that has never
+    /// Distinct from [`Self::Stale`] on purpose: a node that has never
     /// heartbeat is mid-registration, while one that HAS and then stopped
     /// has failed. Collapsing them would make a booting node look like a
     /// dying one, and every autoscaler treats those differently.
@@ -94,7 +120,10 @@ impl NodeReadiness {
     pub fn condition_status(self) -> &'static str {
         match self {
             Self::Ready => "True",
-            Self::NotReady => "False",
+            // "Unknown", NOT "False" — see the variant's doc. A stale
+            // heartbeat means nobody is answering, which is not the same
+            // claim as "I am here and broken".
+            Self::Stale => "Unknown",
             // Upstream's third value. Not "False": a node whose state
             // cannot be determined is not the same as one known to be bad.
             Self::Unknown => "Unknown",
@@ -106,7 +135,7 @@ impl NodeReadiness {
     pub fn reason(self) -> &'static str {
         match self {
             Self::Ready => "KubeletReady",
-            Self::NotReady => "NodeStatusUnknown",
+            Self::Stale => "NodeStatusUnknown",
             Self::Unknown => "NodeStatusNeverUpdated",
         }
     }
@@ -120,25 +149,72 @@ pub fn readiness(since_renew: Option<Duration>) -> NodeReadiness {
     match since_renew {
         None => NodeReadiness::Unknown,
         Some(age) if age <= GRACE_PERIOD => NodeReadiness::Ready,
-        Some(_) => NodeReadiness::NotReady,
+        Some(_) => NodeReadiness::Stale,
     }
 }
 
 /// The `Ready` condition to publish on `Node.status`.
+///
+/// `previous` is the condition currently on the Node, when there is one.
+///
+/// ── ★ THE TWO TIMESTAMPS ARE NOT THE SAME TIMESTAMP ───────────────────────
+/// This function used to stamp both with `now` unconditionally, which makes
+/// `lastTransitionTime` a synonym for `lastHeartbeatTime` and destroys the only
+/// question either field exists to answer: **how long has the node been in this
+/// state?** With both moving every tick, a node that went unreachable an hour
+/// ago reports a transition time of *now*, forever.
+///
+/// That is load-bearing rather than cosmetic. Upstream's pod-eviction path is
+/// driven by how long `Ready` has been non-`True` (`--pod-eviction-timeout`
+/// against `lastTransitionTime`), so a transition time that always reads
+/// "just now" is a timer that never fires. It is also what `kubectl describe
+/// node` prints, so an operator reading it is told every outage is fresh.
+///
+/// Hence:
+///   * `lastHeartbeatTime` — **always** `now`. It records that we looked.
+///   * `lastTransitionTime` — `now` ONLY when the status string differs from
+///     `previous`; otherwise the previous value is carried forward verbatim.
+///
+/// A `previous` with no readable `lastTransitionTime` (a hand-written Node, or
+/// the boot-time literal this replaces) falls back to `now`, which is the
+/// honest answer: we genuinely do not know when it transitioned.
 #[must_use]
-pub fn ready_condition(state: NodeReadiness, now: &str) -> ResourceValue {
+pub fn ready_condition(
+    state: NodeReadiness,
+    now: &str,
+    previous: Option<&ResourceValue>,
+) -> ResourceValue {
+    let status = state.condition_status();
+    let last_transition = previous
+        .filter(|p| p.get("status").and_then(|s| s.as_str()) == Some(status))
+        .and_then(|p| p.get("lastTransitionTime"))
+        .and_then(|t| t.as_str())
+        .unwrap_or(now);
     json!({
         "type": "Ready",
-        "status": state.condition_status(),
+        "status": status,
         "reason": state.reason(),
         "message": match state {
             NodeReadiness::Ready => "kubelet is posting ready status",
-            NodeReadiness::NotReady => "Kubelet stopped posting node status",
+            NodeReadiness::Stale => "Kubelet stopped posting node status",
             NodeReadiness::Unknown => "Kubelet never posted node status",
         },
         "lastHeartbeatTime": now,
-        "lastTransitionTime": now,
+        "lastTransitionTime": last_transition,
     })
+}
+
+/// Find the `Ready` condition in a Node's `status.conditions`, if present.
+///
+/// By `type`, never by index: the array's order is not a contract, and
+/// `conditions[0]` happens to be Ready only until something else writes one.
+#[must_use]
+pub fn find_ready_condition(node: &ResourceValue) -> Option<&ResourceValue> {
+    node.get("status")?
+        .get("conditions")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready"))
 }
 
 #[cfg(test)]
@@ -153,15 +229,12 @@ mod tests {
         // forever and the scheduler kept placing pods on it.
         assert_eq!(readiness(Some(S(0))), NodeReadiness::Ready);
         assert_eq!(readiness(Some(GRACE_PERIOD)), NodeReadiness::Ready);
-        assert_eq!(
-            readiness(Some(GRACE_PERIOD + S(1))),
-            NodeReadiness::NotReady
-        );
+        assert_eq!(readiness(Some(GRACE_PERIOD + S(1))), NodeReadiness::Stale);
     }
 
     #[test]
     fn the_grace_period_is_several_intervals_not_one() {
-        // A single missed renewal is a hiccup. Flapping to NotReady on one
+        // A single missed renewal is a hiccup. Flapping to Stale on one
         // slow tick would evict workloads for nothing.
         assert!(
             GRACE_PERIOD >= RENEW_INTERVAL * 3,
@@ -176,20 +249,63 @@ mod tests {
         // treats those differently.
         assert_eq!(readiness(None), NodeReadiness::Unknown);
         assert_eq!(NodeReadiness::Unknown.condition_status(), "Unknown");
-        assert_eq!(NodeReadiness::NotReady.condition_status(), "False");
+        // ★ Both render "Unknown" on the wire, and that is CORRECT — upstream
+        // has no third status for "we used to hear from it". They stay
+        // distinct in the REASON, which is the field that carries the
+        // difference an autoscaler acts on.
+        assert_eq!(NodeReadiness::Stale.condition_status(), "Unknown");
         assert_ne!(
             NodeReadiness::Unknown.reason(),
-            NodeReadiness::NotReady.reason()
+            NodeReadiness::Stale.reason()
         );
     }
 
     #[test]
     fn the_condition_carries_what_kubectl_describe_node_prints() {
-        let c = ready_condition(NodeReadiness::Ready, "2026-08-29T21:00:00Z");
+        let c = ready_condition(NodeReadiness::Ready, "2026-08-29T21:00:00Z", None);
         assert_eq!(c["type"], "Ready");
         assert_eq!(c["status"], "True");
         assert_eq!(c["reason"], "KubeletReady");
         assert_eq!(c["lastHeartbeatTime"], "2026-08-29T21:00:00Z");
+        // With no previous condition there is nothing to carry, so the
+        // transition is honestly "now".
+        assert_eq!(c["lastTransitionTime"], "2026-08-29T21:00:00Z");
+    }
+
+    #[test]
+    fn last_transition_time_only_moves_when_the_status_does() {
+        // THE bug this signature exists to make impossible: both stamps set to
+        // `now` every tick makes "how long has this node been down" always
+        // read zero, which is the input upstream's eviction timer runs on.
+        let first = ready_condition(NodeReadiness::Ready, "2026-01-01T00:00:00Z", None);
+        // Same status, later heartbeat -> transition carried forward.
+        let later = ready_condition(NodeReadiness::Ready, "2026-01-01T01:00:00Z", Some(&first));
+        assert_eq!(later["lastHeartbeatTime"], "2026-01-01T01:00:00Z");
+        assert_eq!(
+            later["lastTransitionTime"], "2026-01-01T00:00:00Z",
+            "a steady node has not transitioned; its transition time must not move"
+        );
+        // Status CHANGES -> transition is now.
+        let flipped = ready_condition(NodeReadiness::Stale, "2026-01-01T02:00:00Z", Some(&later));
+        assert_eq!(flipped["status"], "Unknown");
+        assert_eq!(flipped["lastTransitionTime"], "2026-01-01T02:00:00Z");
+        // And back again, from the flipped one.
+        let back = ready_condition(NodeReadiness::Ready, "2026-01-01T03:00:00Z", Some(&flipped));
+        assert_eq!(back["lastTransitionTime"], "2026-01-01T03:00:00Z");
+    }
+
+    #[test]
+    fn the_ready_condition_is_found_by_type_not_by_index() {
+        // conditions[] order is not a contract; Ready is conditions[0] only
+        // until something else writes one.
+        let node = json!({"status": {"conditions": [
+            {"type": "MemoryPressure", "status": "False"},
+            {"type": "Ready", "status": "True", "lastTransitionTime": "T"}
+        ]}});
+        let found = find_ready_condition(&node).expect("Ready is present");
+        assert_eq!(found["lastTransitionTime"], "T");
+        assert!(find_ready_condition(&json!({"status": {"conditions": []}})).is_none());
+        assert!(find_ready_condition(&json!({})).is_none());
     }
 
     #[test]
