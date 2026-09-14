@@ -245,7 +245,10 @@ fn every_subresources_slice_is_a_subset_of_known_subresources() {
             assert!(
                 matches!(
                     s,
-                    Subresource::Status | Subresource::Scale | Subresource::Log | Subresource::Token
+                    Subresource::Status
+                        | Subresource::Scale
+                        | Subresource::Log
+                        | Subresource::Token
                 ),
                 "{}: subresource must be Status, Scale, Log, or Token",
                 d.kind

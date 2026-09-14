@@ -93,6 +93,77 @@ impl StatefulSetController {
         Some((pod_name, pod))
     }
 
+    /// Materialize `spec.volumeClaimTemplates` into real per-pod PVCs.
+    ///
+    /// ── ★ WHY THIS EXISTS ──────────────────────────────────────────────
+    /// The naming contract and the pod-side wiring shipped at M0; only the
+    /// CLAIM was missing, so a StatefulSet with storage produced a pod
+    /// referencing `{template}-{sts}-{ordinal}` that nothing ever created.
+    /// The pod then waits on a volume forever, which presents as a slow
+    /// scheduler rather than as a missing subsystem.
+    ///
+    /// Measured 2026-09-14 on ryn: a MySQL StatefulSet reached `mysql-0`
+    /// with `persistentVolumeClaim.claimName: data-mysql-0` and
+    /// `kubectl get pvc` returned nothing at all.
+    ///
+    /// Each claim is the template's own `spec` verbatim — accessModes,
+    /// resources, storageClassName, and `dataSource` — so a claim whose
+    /// template names a VolumeSnapshot restores from it through the same
+    /// binder path an explicit PVC uses. That is what lets a restore vector
+    /// be expressed as `VolumeSnapshot -> StatefulSet` with no hand-written
+    /// PVC in between.
+    ///
+    /// Returns `(name, object)` pairs; empty when the set declares no
+    /// templates, so a storage-less StatefulSet is untouched.
+    fn build_pvcs(
+        sts: &Value,
+        sts_name: &str,
+        ordinal: usize,
+        namespace: &str,
+    ) -> Vec<(String, Value)> {
+        let Some(vcts) = sts
+            .get("spec")
+            .and_then(|s| s.get("volumeClaimTemplates"))
+            .and_then(|v| v.as_array())
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for vct in vcts {
+            let Some(tpl_name) = vct
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(Value::as_str)
+            else {
+                // A template with no name has no derivable claim name. Skip
+                // it rather than invent one: a guessed name would not match
+                // what `wire_pvc_volumes` put on the pod.
+                continue;
+            };
+            let claim_name = format!("{tpl_name}-{sts_name}-{ordinal}");
+            // The template's spec verbatim — including dataSource, which is
+            // the restore-from-snapshot path.
+            let spec = vct.get("spec").cloned().unwrap_or_else(|| json!({}));
+            out.push((
+                claim_name.clone(),
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "metadata": {
+                        "name": claim_name,
+                        "namespace": namespace,
+                        // The upstream label, so a claim is traceable to its
+                        // set without an ownerReference (see the retention
+                        // note at the call site).
+                        "labels": { "app.kubernetes.io/managed-by": "engenho-statefulset" },
+                    },
+                    "spec": spec,
+                }),
+            ));
+        }
+        out
+    }
+
     /// For each `spec.volumeClaimTemplates[i].metadata.name`, append a
     /// `spec.volumes` entry on the pod referencing the deterministic
     /// per-pod claim `{template}-{sts}-{ordinal}` (the K8s naming
@@ -225,6 +296,49 @@ impl OwnedChildrenReconciler for StatefulSetController {
             .collect();
 
         let mut commands = Vec::new();
+
+        // ── PVCs: CREATE-IF-ABSENT, before any pod ───────────────────────
+        // Ordering is load-bearing in both directions.
+        //
+        // Before the pod, because the pod's volumes already name
+        // `{template}-{sts}-{ordinal}` — a pod created ahead of its claim sits
+        // in ContainerCreating until a later tick.
+        //
+        // And create-IF-ABSENT rather than Put, because an unconditional Put
+        // is a WRITE FIGHT with the binder: the binder stamps
+        // `status.phase: Bound` + `spec.volumeName`, this controller rewrites
+        // the claim from the template, and the pair loop forever. Measured
+        // 2026-09-14 on ryn — `pv-binder examined=2 changed=1` every tick with
+        // the phase flapping Bound/unset between reads. Kubernetes never
+        // rewrites an existing claim from its template either; the template is
+        // a creation-time shape, not a desired state.
+        let existing_pvcs: std::collections::BTreeSet<String> = self
+            .store
+            .list("", "v1", "PersistentVolumeClaim", Some(&pod_ns))
+            .await
+            .into_iter()
+            .map(|(k, _)| k.name)
+            .collect();
+        for ordinal in 0..desired {
+            for (pvc_name, pvc) in Self::build_pvcs(sts_value, sts_name, ordinal, &pod_ns) {
+                if existing_pvcs.contains(&pvc_name) {
+                    continue;
+                }
+                debug!(sts = sts_name, pvc = %pvc_name, "creating claim from volumeClaimTemplate");
+                commands.push(ResourceCommand::Put {
+                    key: ResourceKey::namespaced(
+                        "",
+                        "v1",
+                        "PersistentVolumeClaim",
+                        &pod_ns,
+                        &pvc_name,
+                    ),
+                    value: pvc,
+                    expected: None,
+                    reason: Reason::Controller,
+                });
+            }
+        }
 
         // Create missing ordinals 0..desired.
         for ordinal in 0..desired {
@@ -599,5 +713,108 @@ mod tests {
         }
         let rev_b = store.current_catalog().await.revision();
         assert_eq!(rev_a, rev_b, "converged StatefulSet must not thrash");
+    }
+}
+
+#[cfg(test)]
+mod volume_claim_templates {
+    use super::StatefulSetController;
+    use serde_json::json;
+
+    fn sts_with(vcts: serde_json::Value) -> serde_json::Value {
+        json!({
+            "metadata": {"name": "mysql", "namespace": "pitr"},
+            "spec": {"replicas": 1, "volumeClaimTemplates": vcts},
+        })
+    }
+
+    /// The K8s naming contract. `wire_pvc_volumes` already puts this exact
+    /// string on the pod, so a claim named anything else is a volume the pod
+    /// can never bind — the pod waits in ContainerCreating forever.
+    #[test]
+    fn claim_name_follows_the_kubernetes_contract() {
+        let sts = sts_with(json!([{"metadata": {"name": "data"}, "spec": {}}]));
+        let pvcs = StatefulSetController::build_pvcs(&sts, "mysql", 0, "pitr");
+        assert_eq!(pvcs.len(), 1);
+        assert_eq!(pvcs[0].0, "data-mysql-0");
+    }
+
+    #[test]
+    fn each_ordinal_gets_its_own_claim() {
+        let sts = sts_with(json!([{"metadata": {"name": "data"}, "spec": {}}]));
+        let a = StatefulSetController::build_pvcs(&sts, "mysql", 0, "pitr");
+        let b = StatefulSetController::build_pvcs(&sts, "mysql", 1, "pitr");
+        assert_ne!(a[0].0, b[0].0, "two ordinals sharing a claim is data loss");
+    }
+
+    /// ★ THE RESTORE PATH. A volumeClaimTemplate naming a VolumeSnapshot is
+    /// how `VolumeSnapshot -> StatefulSet` is expressed with no hand-written
+    /// PVC in between — which is the shape a PITR restore vector needs. If the
+    /// template's spec were rebuilt field-by-field instead of carried
+    /// verbatim, dataSource would be silently dropped and the restored set
+    /// would come up EMPTY while reporting healthy.
+    #[test]
+    fn the_templates_spec_is_carried_verbatim_including_datasource() {
+        let sts = sts_with(json!([{
+            "metadata": {"name": "data"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "engenho-local-path",
+                "resources": {"requests": {"storage": "2Gi"}},
+                "dataSource": {
+                    "apiGroup": "snapshot.storage.k8s.io",
+                    "kind": "VolumeSnapshot",
+                    "name": "db-snap"
+                }
+            }
+        }]));
+        let pvcs = StatefulSetController::build_pvcs(&sts, "mysql", 0, "pitr");
+        let spec = &pvcs[0].1["spec"];
+        assert_eq!(spec["dataSource"]["name"], "db-snap");
+        assert_eq!(spec["dataSource"]["kind"], "VolumeSnapshot");
+        assert_eq!(spec["storageClassName"], "engenho-local-path");
+        assert_eq!(spec["resources"]["requests"]["storage"], "2Gi");
+    }
+
+    /// ★ NEGATIVE CONTROL. Without this, `build_pvcs` could return a claim
+    /// unconditionally and every assertion above would still pass while every
+    /// storage-less StatefulSet acquired a phantom volume.
+    #[test]
+    fn a_statefulset_without_templates_gets_no_claims() {
+        let no_key = json!({"metadata": {"name": "x"}, "spec": {"replicas": 1}});
+        assert!(StatefulSetController::build_pvcs(&no_key, "x", 0, "ns").is_empty());
+        let empty = sts_with(json!([]));
+        assert!(StatefulSetController::build_pvcs(&empty, "mysql", 0, "pitr").is_empty());
+    }
+
+    /// A nameless template has no derivable claim name. Skipped rather than
+    /// invented: a guessed name would not match what the pod was wired to.
+    #[test]
+    fn a_nameless_template_is_skipped_not_guessed() {
+        let sts = sts_with(json!([{"spec": {}}, {"metadata": {"name": "ok"}, "spec": {}}]));
+        let pvcs = StatefulSetController::build_pvcs(&sts, "mysql", 0, "pitr");
+        assert_eq!(pvcs.len(), 1);
+        assert_eq!(pvcs[0].0, "ok-mysql-0");
+    }
+
+    /// ★ RETENTION. Kubernetes keeps a StatefulSet's PVCs when the set is
+    /// deleted — the data outlives the workload. An ownerReference would
+    /// garbage-collect them, which on a PITR restore target would delete the
+    /// very data the drill exists to prove recoverable.
+    #[test]
+    fn claims_carry_no_owner_reference() {
+        let sts = sts_with(json!([{"metadata": {"name": "data"}, "spec": {}}]));
+        let pvcs = StatefulSetController::build_pvcs(&sts, "mysql", 0, "pitr");
+        assert!(
+            pvcs[0].1["metadata"].get("ownerReferences").is_none(),
+            "an ownerReference here deletes restored data on teardown"
+        );
+    }
+
+    #[test]
+    fn claims_land_in_the_statefulsets_namespace() {
+        let sts = sts_with(json!([{"metadata": {"name": "data"}, "spec": {}}]));
+        let pvcs = StatefulSetController::build_pvcs(&sts, "mysql", 0, "pitr");
+        assert_eq!(pvcs[0].1["metadata"]["namespace"], "pitr");
     }
 }
