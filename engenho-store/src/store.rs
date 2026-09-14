@@ -122,6 +122,47 @@ impl InMemoryStore {
         self.inner.lock().await.catalog.clone()
     }
 
+    /// List + revision from ONE locked look at the catalog, cloning only the
+    /// MATCHED items.
+    ///
+    /// ── ★ WHY THIS EXISTS RATHER THAN `current_catalog().list(…)` ─────────
+    /// `ResourceCatalog` derives `Clone` and carries `history: VecDeque<Change>`
+    /// — the watch-replay ring, 8192 entries, each holding a full resource body.
+    /// Cloning the catalog to serve a LIST therefore copies the entire ring, so
+    /// the cost of every read scales with the cluster's AGE and write volume
+    /// rather than with the number of objects it holds.
+    ///
+    /// Measured 2026-09-14: rewriting ONE object, a LIST went 4.4ms → 31.8ms as
+    /// the ring filled, then plateaued exactly at the 8192 cap. On rio, where
+    /// the ring holds ~100KB Helm release Secrets, the same clone reached
+    /// hundreds of megabytes per request: a single Secret write took 12s on a
+    /// fresh daemon and 60s+ on one up for hours, against ~50 live objects.
+    /// Helm times out at 30s, so Flux could not converge and wedged for 5 days.
+    /// A daemon restart "fixed" it only by emptying the ring.
+    ///
+    /// The atomicity `list_at_revision` promises is preserved and in fact
+    /// tightened: items and revision now come from ONE guard rather than from a
+    /// clone taken under one.
+    pub async fn list_at_revision(
+        &self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> (
+        Vec<(crate::resource::ResourceKey, crate::resource::ResourceValue)>,
+        crate::revision::Revision,
+    ) {
+        let guard = self.inner.lock().await;
+        let items = guard
+            .catalog
+            .list(group, version, kind, namespace)
+            .into_iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        (items, guard.catalog.revision())
+    }
+
     /// Direct read — used by RaftStore consumers without going
     /// through Raft (read-after-write callers use `applied_index`).
     pub async fn get_resource(
