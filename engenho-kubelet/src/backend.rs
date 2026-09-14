@@ -1743,6 +1743,26 @@ impl ContainerRuntime for PodmanBackend {
             // (`rm -f` accepts a name or id) and retry the run exactly ONCE; a
             // second conflict is a genuine error surfaced below. This makes pod
             // start survive daemon restarts without manual `podman rm`.
+            //
+            // ── ★ DIVERGENCE FROM `PodmanApiBackend`, AND THIS SIDE IS THE
+            // WEAKER ONE. `pending-adopt-parity`.
+            //
+            // The premise above — "no live container is tracked under that
+            // name" — is FALSE, measured on rio 2026-09-14. After a daemon
+            // restart lost the in-memory `LocalPod` map, a container was found
+            // `Up 2 hours`, serving, and untracked by the kubelet that started
+            // it. This branch would have `rm -f`'d it: a healthy container
+            // killed and its pod IP changed, for a name collision the kubelet
+            // caused itself.
+            //
+            // `PodmanApiBackend::start` now ADOPTS a running container and only
+            // removes a stopped one. That is the correct disposition and this
+            // path should acquire it — an inspect-before-remove, gated on
+            // `State.Running` — rather than the two backends disagreeing about
+            // whether a restart kills live workloads. Not done in the same
+            // change because this retry path carries two hard-won corrections
+            // (the stderr-wording match above, and the discarded-rm-output
+            // lesson below) and is worth touching with its own test pass.
             let rm_out = self
                 .command(&Self::rm_argv(&spec.name))
                 .output()
