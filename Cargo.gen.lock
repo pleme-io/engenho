@@ -17,7 +17,7 @@
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
-    "engenho-kubelet/Cargo.toml": "dea84119b26f794b755c0e073c5eea390b149b3c68314c7c3ada1648efaae051",
+    "engenho-kubelet/Cargo.toml": "61f3b57b809bf3b6a8680f57d32637a7a4e414337f2cda04f2c1db2500f02fae",
     "engenho-machines/Cargo.toml": "7722f5b1de0b7af3d290f6b36bdea89e36ab888853f23a6432792ddd9640c442",
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
@@ -6322,6 +6322,18 @@
             "package_key": "tonic-prost-0.14.6",
             "kind": "normal",
             "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tower",
+            "package_key": "tower-0.5.3",
+            "kind": "normal",
+            "features": [
+              "util"
+            ],
             "uses_default_features": true,
             "optional": false,
             "target": null,
