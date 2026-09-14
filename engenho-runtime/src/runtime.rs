@@ -139,6 +139,9 @@ impl Runtime {
         //    moments of a cluster's life should provision like any other, not
         //    hang until something happens to seed a class later.
         seed_default_storage_class(&store).await?;
+        //    Then the snapshot CRDs, so the VolumeSnapshot controller spawned
+        //    below is watching kinds this cluster actually serves.
+        seed_snapshot_crds(&store).await?;
 
         // 5. Bind the apiserver, backed by the same store.
         let listen_addr: SocketAddr =
@@ -1344,6 +1347,103 @@ async fn seed_default_storage_class(store: &StoreMesh) -> Result<(), RuntimeErro
     Ok(())
 }
 
+/// Seed the `snapshot.storage.k8s.io/v1` CRDs that
+/// [`engenho_controllers::volume_snapshot`] serves.
+///
+/// ── ★ WHY THESE ARE CRDs AND NOT BUILT-IN KINDS ────────────────────────────
+/// They are CRDs upstream too. `VolumeSnapshot` is not part of Kubernetes
+/// proper: the external-snapshotter project ships these three definitions and
+/// a controller, and each CSI driver implements the actual copy. Declaring
+/// them here as CRDs is therefore the FAITHFUL shape, not a shortcut — a
+/// client that installs the upstream definitions sees the same group, version
+/// and names.
+///
+/// Seeded rather than left to the operator because the pairing is what makes
+/// the feature real: engenho ships the controller, so shipping the API it
+/// reconciles is part of the same promise. A controller watching a kind the
+/// cluster does not serve is the "declared but unreachable" failure this whole
+/// change set exists to remove.
+///
+/// The schema is deliberately permissive (`x-kubernetes-preserve-unknown-fields`)
+/// — validation is the CRD layer's DEFERRED concern here, and a partial schema
+/// that silently PRUNES an unknown field is worse than none: a pruned
+/// `spec.source` would make a snapshot request vanish with no error.
+async fn seed_snapshot_crds(store: &StoreMesh) -> Result<(), RuntimeError> {
+    // (kind, plural, singular, namespaced)
+    let kinds = [
+        ("VolumeSnapshot", "volumesnapshots", "volumesnapshot", true),
+        (
+            "VolumeSnapshotContent",
+            "volumesnapshotcontents",
+            "volumesnapshotcontent",
+            false,
+        ),
+        (
+            "VolumeSnapshotClass",
+            "volumesnapshotclasses",
+            "volumesnapshotclass",
+            false,
+        ),
+    ];
+    for (kind, plural, singular, namespaced) in kinds {
+        let name = [
+            plural,
+            ".",
+            engenho_controllers::volume_snapshot::SNAPSHOT_GROUP,
+        ]
+        .concat();
+        let list_kind = [kind, "List"].concat();
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": name },
+            "spec": {
+                "group": engenho_controllers::volume_snapshot::SNAPSHOT_GROUP,
+                "scope": if namespaced { "Namespaced" } else { "Cluster" },
+                "names": {
+                    "kind": kind,
+                    "listKind": list_kind,
+                    "plural": plural,
+                    "singular": singular,
+                },
+                "versions": [{
+                    "name": engenho_controllers::volume_snapshot::SNAPSHOT_VERSION,
+                    "served": true,
+                    "storage": true,
+                    "subresources": { "status": {} },
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "x-kubernetes-preserve-unknown-fields": true
+                        }
+                    }
+                }]
+            }
+        });
+        let mut value = crd;
+        stamp_creation_timestamp_value(&mut value);
+        store
+            .propose(ResourceCommand::Put {
+                key: ResourceKey::cluster_scoped(
+                    "apiextensions.k8s.io",
+                    "v1",
+                    "CustomResourceDefinition",
+                    name,
+                ),
+                value,
+                expected: None,
+                reason: Reason::Operator,
+            })
+            .await?;
+    }
+    info!(
+        group = engenho_controllers::volume_snapshot::SNAPSHOT_GROUP,
+        count = kinds.len(),
+        "seeded the VolumeSnapshot CRDs"
+    );
+    Ok(())
+}
+
 /// The `kubernetes` Service in `default` — the in-cluster address of the
 /// apiserver itself, and the object that RESERVES the first address of the
 /// service CIDR.
@@ -2532,6 +2632,35 @@ fn spawn_drivers(
             )
             .spawn(),
         );
+
+        // VolumeSnapshot: the snapshot half of the same local-path
+        // provisioner. Gated with the binder because it is meaningless
+        // without it — it snapshots the directories the binder provisions,
+        // and enabling one without the other yields a controller that can
+        // only ever decline.
+        let snapshot_root = config
+            .runtime
+            .data_dir
+            .join("snapshots")
+            .to_string_lossy()
+            .into_owned();
+        let snap = engenho_controllers::volume_snapshot::VolumeSnapshotController::new(
+            store.clone(),
+            snapshot_root,
+            Arc::new(engenho_controllers::volume_snapshot::HostSnapshotEnv),
+        );
+        handles.push(
+            WatchDriver::new(
+                snap,
+                store.clone(),
+                driver_config(&[
+                    "VolumeSnapshot",
+                    "PersistentVolumeClaim",
+                    "PersistentVolume",
+                ]),
+            )
+            .spawn(),
+        );
     }
 
     // CRD: CustomResourceDefinition → dynamic CR-handler registration. The
@@ -2992,17 +3121,18 @@ mod tests {
             node.get("spec").unwrap().get("unschedulable").unwrap(),
             false
         );
-        // Drivers: 12 reconcilers (deployment, replicaset, statefulset,
+        // Drivers: the reconciler set (deployment, replicaset, statefulset,
         // daemonset, job, cronjob, endpoints, pdb, service_routing, gc,
-        // namespace, pv_binder, crd) + served_capability + scheduler +
-        // kubelet = 16.
+        // namespace, pv_binder, volume_snapshot, crd) + served_capability +
+        // scheduler + kubelet.
         //
         // This count is deliberately pinned: a driver that stops being
         // spawned is invisible at runtime (the cluster simply stops
         // converging that kind), so the arithmetic here is the tripwire.
         // Moving it is correct ONLY alongside an intentional change to the
-        // driver set — which is what added served_capability.
-        assert_eq!(rt.drivers.len(), 19);
+        // driver set — which is what added served_capability, and now
+        // volume_snapshot (19 → 20).
+        assert_eq!(rt.drivers.len(), 20);
         rt.shutdown().await.unwrap();
     }
 
@@ -3095,11 +3225,11 @@ mod tests {
     #[tokio::test]
     async fn disabling_service_routing_drops_one_driver() {
         // Gating works: turning off enable.service_routing removes exactly
-        // one spawned driver (16 → 15).
+        // one spawned driver (20 → 19).
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(rt.drivers.len(), 18);
+        assert_eq!(rt.drivers.len(), 19);
         rt.shutdown().await.unwrap();
     }
 }

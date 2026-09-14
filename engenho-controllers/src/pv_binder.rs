@@ -87,6 +87,20 @@ pub trait ProvisionerEnv: Send + Sync {
     /// [`ControllerError`] so provisioning fails loudly (the PVC stays Pending),
     /// never a silent fake-Bound.
     fn ensure_dir(&self, path: &str) -> Result<(), String>;
+
+    /// Hydrate a freshly-provisioned backing dir FROM a snapshot directory.
+    ///
+    /// Added to this trait rather than to a second env so restore stays the
+    /// same seam as provision: a PV whose data came from a snapshot is still
+    /// just a local-path PV, and splitting the two would let a cluster
+    /// provision without being able to restore.
+    ///
+    /// # Errors
+    ///
+    /// A human-readable message. A failed restore must leave the claim
+    /// Pending — an EMPTY volume presented as a restored one is the silent
+    /// wrong answer this whole controller refuses to give.
+    fn restore_tree(&self, src: &str, dst: &str) -> Result<(), String>;
 }
 
 /// Production [`ProvisionerEnv`] — `std::fs::create_dir_all` rooted under the
@@ -96,6 +110,18 @@ pub struct HostProvisionerEnv;
 impl ProvisionerEnv for HostProvisionerEnv {
     fn ensure_dir(&self, path: &str) -> Result<(), String> {
         std::fs::create_dir_all(path).map_err(|e| format!("mkdir {path}: {e}"))
+    }
+
+    /// Delegates to the snapshot controller's copy, so provision-side restore
+    /// and snapshot-side capture are ONE implementation. Two copies of a
+    /// recursive directory copy would be free to disagree about symlinks,
+    /// permissions or partial failure — and only one of them would be tested.
+    fn restore_tree(&self, src: &str, dst: &str) -> Result<(), String> {
+        crate::volume_snapshot::SnapshotEnv::copy_tree(
+            &crate::volume_snapshot::HostSnapshotEnv,
+            src,
+            dst,
+        )
     }
 }
 
@@ -412,6 +438,64 @@ impl PvBinderController {
         (pv_name, host_path, pv)
     }
 
+    /// The VolumeSnapshot name a PVC restores from, if any.
+    ///
+    /// Reads `spec.dataSource` (and accepts `spec.dataSourceRef`, which
+    /// upstream added as the general form). The apiGroup is CHECKED: a
+    /// dataSource naming a PVC clone or some other kind is not a snapshot and
+    /// must not be silently treated as one.
+    fn snapshot_data_source(pvc: &Value) -> Option<String> {
+        let spec = pvc.get("spec")?;
+        let ds = spec
+            .get("dataSource")
+            .or_else(|| spec.get("dataSourceRef"))?;
+        if ds.get("kind").and_then(Value::as_str)? != "VolumeSnapshot" {
+            return None;
+        }
+        let group = ds.get("apiGroup").and_then(Value::as_str).unwrap_or("");
+        if group != crate::volume_snapshot::SNAPSHOT_GROUP {
+            return None;
+        }
+        ds.get("name").and_then(Value::as_str).map(str::to_string)
+    }
+
+    /// Resolve a VolumeSnapshot to the directory holding its data.
+    ///
+    /// Returns `None` unless the snapshot is READY and its bound content
+    /// carries a `snapshotHandle`. Every other outcome — missing snapshot,
+    /// not-yet-ready, missing content — is `None` on purpose, and the caller
+    /// leaves the claim Pending. A restore that silently produced an empty
+    /// volume would pass every liveness check while losing all the data,
+    /// which is the failure mode a drill is supposed to detect, not cause.
+    fn resolve_snapshot_path(
+        &self,
+        namespace: &str,
+        snapshot_name: &str,
+        snapshots: &[(ResourceKey, Value)],
+        contents: &[(ResourceKey, Value)],
+    ) -> Option<String> {
+        let (_, snap) = snapshots
+            .iter()
+            .find(|(k, _)| k.namespace.as_deref() == Some(namespace) && k.name == snapshot_name)?;
+        let status = snap.get("status")?;
+        if !status
+            .get("readyToUse")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let content_name = status
+            .get("boundVolumeSnapshotContentName")
+            .and_then(Value::as_str)?;
+        let (_, content) = contents.iter().find(|(k, _)| k.name == content_name)?;
+        content
+            .get("status")
+            .and_then(|s| s.get("snapshotHandle"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     /// Provision one PVC through a registered CSI driver, then bind it.
     ///
     /// ★ THE ORDER IS CREATE-THEN-WRITE, AND IT MATTERS. The driver call
@@ -601,6 +685,27 @@ impl Controller for PvBinderController {
             .store
             .list("storage.k8s.io", "v1", "StorageClass", None)
             .await;
+        // Snapshot kinds, for `spec.dataSource` restores. Listing them
+        // unconditionally costs one store read per tick and keeps the restore
+        // path from needing a second controller.
+        let snapshots = self
+            .store
+            .list(
+                crate::volume_snapshot::SNAPSHOT_GROUP,
+                crate::volume_snapshot::SNAPSHOT_VERSION,
+                "VolumeSnapshot",
+                None,
+            )
+            .await;
+        let snapshot_contents = self
+            .store
+            .list(
+                crate::volume_snapshot::SNAPSHOT_GROUP,
+                crate::volume_snapshot::SNAPSHOT_VERSION,
+                "VolumeSnapshotContent",
+                None,
+            )
+            .await;
 
         let mut report = ReconcileReport::default();
         report.objects_examined = pvcs.len();
@@ -720,6 +825,32 @@ impl Controller for PvBinderController {
             self.env
                 .ensure_dir(&host_path)
                 .map_err(|e| ControllerError::Internal(format!("provision local-path dir: {e}")))?;
+            // ── RESTORE-FROM-SNAPSHOT ────────────────────────────────────
+            // A PVC whose `spec.dataSource` names a VolumeSnapshot is a
+            // RESTORE, and this is the PITR drill's whole restore vector. The
+            // hydrate happens AFTER the dir exists and BEFORE the PV is
+            // visible, so a pod can never observe a half-filled volume.
+            //
+            // A named-but-unresolvable snapshot leaves the claim Pending
+            // rather than provisioning an empty volume: presenting an empty
+            // restore as a successful one is exactly the "clean receipt, no
+            // data underneath" failure a drill exists to catch.
+            if let Some(snap_name) = Self::snapshot_data_source(pvc) {
+                let Some(src) =
+                    self.resolve_snapshot_path(pvc_ns, &snap_name, &snapshots, &snapshot_contents)
+                else {
+                    report.objects_skipped += 1;
+                    report.note = Some(
+                        "PVC names a VolumeSnapshot dataSource that is not ready; left Pending                          rather than provisioned empty"
+                            .to_string(),
+                    );
+                    continue;
+                };
+                self.env.restore_tree(&src, &host_path).map_err(|e| {
+                    ControllerError::Internal(format!("restore from snapshot: {e}"))
+                })?;
+                debug!(pvc = %pvc_key.label(), snapshot = %snap_name, "restored PV data from snapshot");
+            }
             let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
             self.put(pv_key, dyn_pv).await?;
             // Bind the PVC to the freshly-provisioned PV.
@@ -740,6 +871,7 @@ impl Controller for PvBinderController {
 #[derive(Default)]
 pub struct FakeProvisionerEnv {
     ensured: std::sync::Mutex<Vec<String>>,
+    restored: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl FakeProvisionerEnv {
@@ -754,11 +886,29 @@ impl FakeProvisionerEnv {
     pub fn ensured_dirs(&self) -> Vec<String> {
         self.ensured.lock().unwrap().clone()
     }
+
+    /// The `(src, dst)` restores the mock was asked to perform, in call order.
+    #[must_use]
+    pub fn restored_trees(&self) -> Vec<(String, String)> {
+        self.restored.lock().unwrap().clone()
+    }
 }
 
 impl ProvisionerEnv for FakeProvisionerEnv {
     fn ensure_dir(&self, path: &str) -> Result<(), String> {
         self.ensured.lock().unwrap().push(path.to_string());
+        Ok(())
+    }
+
+    /// Records `(src, dst)` instead of copying, so a test can assert that a
+    /// restore was attempted FROM THE RIGHT SNAPSHOT — the pair is the whole
+    /// claim, and a mock that only recorded "a restore happened" could not
+    /// catch a restore from the wrong snapshot.
+    fn restore_tree(&self, src: &str, dst: &str) -> Result<(), String> {
+        self.restored
+            .lock()
+            .unwrap()
+            .push((src.to_string(), dst.to_string()));
         Ok(())
     }
 }
@@ -1162,5 +1312,80 @@ mod tests {
             }
         }
         assert_eq!(bound_count, 1, "exactly one PVC binds the single PV");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_restore_source {
+    use super::PvBinderController;
+    use serde_json::json;
+
+    fn pvc_with(ds: serde_json::Value) -> serde_json::Value {
+        json!({ "spec": { "dataSource": ds } })
+    }
+
+    #[test]
+    fn a_volume_snapshot_data_source_is_recognised() {
+        let pvc = pvc_with(json!({
+            "apiGroup": "snapshot.storage.k8s.io",
+            "kind": "VolumeSnapshot",
+            "name": "db-snap"
+        }));
+        assert_eq!(
+            PvBinderController::snapshot_data_source(&pvc).as_deref(),
+            Some("db-snap")
+        );
+    }
+
+    #[test]
+    fn data_source_ref_is_accepted_too() {
+        // Upstream added `dataSourceRef` as the general form; a cluster that
+        // only read `dataSource` would silently provision an EMPTY volume for
+        // a restore written the modern way.
+        let pvc = json!({ "spec": { "dataSourceRef": {
+            "apiGroup": "snapshot.storage.k8s.io",
+            "kind": "VolumeSnapshot",
+            "name": "db-snap"
+        }}});
+        assert_eq!(
+            PvBinderController::snapshot_data_source(&pvc).as_deref(),
+            Some("db-snap")
+        );
+    }
+
+    /// ★ NEGATIVE CONTROL — the group is CHECKED. A same-named kind in some
+    /// other group is not our snapshot, and treating it as one would restore
+    /// from a directory that has nothing to do with it.
+    #[test]
+    fn a_foreign_api_group_is_not_our_snapshot() {
+        let pvc = pvc_with(json!({
+            "apiGroup": "example.com",
+            "kind": "VolumeSnapshot",
+            "name": "db-snap"
+        }));
+        assert_eq!(PvBinderController::snapshot_data_source(&pvc), None);
+    }
+
+    /// ★ NEGATIVE CONTROL — a PVC CLONE (`kind: PersistentVolumeClaim`) is a
+    /// different feature. Silently treating it as a snapshot restore would
+    /// look up a snapshot that does not exist and leave the claim Pending
+    /// with a misleading note.
+    #[test]
+    fn a_pvc_clone_data_source_is_not_a_snapshot() {
+        let pvc = pvc_with(json!({
+            "apiGroup": "",
+            "kind": "PersistentVolumeClaim",
+            "name": "other"
+        }));
+        assert_eq!(PvBinderController::snapshot_data_source(&pvc), None);
+    }
+
+    #[test]
+    fn a_plain_pvc_has_no_data_source() {
+        assert_eq!(
+            PvBinderController::snapshot_data_source(&json!({"spec": {}})),
+            None
+        );
+        assert_eq!(PvBinderController::snapshot_data_source(&json!({})), None);
     }
 }

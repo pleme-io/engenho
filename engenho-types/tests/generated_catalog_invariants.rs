@@ -239,15 +239,15 @@ fn all_category_is_on_the_workload_kinds() {
 fn every_subresources_slice_is_a_subset_of_known_subresources() {
     // The typed enum makes a bad value unrepresentable, but pin that no row
     // somehow carries a duplicate or an unexpected combination — every slice
-    // is a subset of {Status, Scale, Log}.
+    // is a subset of {Status, Scale, Log, Token}.
     for d in RESOURCE_CATALOG {
         for s in d.subresources {
             assert!(
                 matches!(
                     s,
-                    Subresource::Status | Subresource::Scale | Subresource::Log
+                    Subresource::Status | Subresource::Scale | Subresource::Log | Subresource::Token
                 ),
-                "{}: subresource must be Status, Scale, or Log",
+                "{}: subresource must be Status, Scale, Log, or Token",
                 d.kind
             );
         }
