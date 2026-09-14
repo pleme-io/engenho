@@ -221,6 +221,14 @@ pub struct CreateRequest {
     /// `uid` or `uid:gid` to run as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Extra `/etc/hosts` entries, `"hostname:ip"` shape. The special value
+    /// `"host-gateway"` in place of the IP is resolved by podman to the
+    /// container-host gateway address on Linux native — the equivalent of the
+    /// hostname podman VM adds automatically on macOS. Used to make
+    /// `host.containers.internal` resolvable inside pods on Linux, where
+    /// (unlike podman-machine) podman does NOT add it automatically.
+    #[serde(rename = "hostadd", skip_serializing_if = "Vec::is_empty")]
+    pub host_add: Vec<String>,
 }
 
 /// Per-network attachment options — carries the DNS aliases.
@@ -365,8 +373,29 @@ fn to_libpod_mount(m: &crate::pod_volume::ResolvedMount) -> Mount {
     use crate::pod_volume::MountSource;
     let (source, mount_type) = match &m.source {
         MountSource::HostDir(p) => (p.display().to_string(), "bind"),
+        MountSource::EmptyDirHostDir(p) => (p.display().to_string(), "bind"),
         MountSource::PvcHostDir { path, .. } => (path.display().to_string(), "bind"),
         MountSource::NamedVolume(n) => (n.clone(), "volume"),
+    };
+    // subPath: bind the *specific file or subdirectory* inside the resolved
+    // source, not the whole volume. Without this, a `volumeMount.subPath:
+    // config.yaml` with a file-shaped `mountPath: /etc/hanabi/config.yaml`
+    // still bind-mounts the whole configMap directory over the file path — the
+    // container then sees a directory where it expected a file and reads
+    // `Is a directory (os error 21)`. Kubernetes semantics: the subPath is a
+    // *relative* path inside the volume, so any leading `/` is dropped before
+    // it is joined to the source. Only meaningful for `bind` mounts; named
+    // volumes don't expose a host path to join against, so the field is left
+    // recorded-but-ignored there.
+    let source = if let Some(sub) = m.sub_path.as_deref() {
+        let clean = sub.trim_start_matches('/');
+        if !clean.is_empty() && mount_type == "bind" {
+            format!("{}/{}", source.trim_end_matches('/'), clean)
+        } else {
+            source
+        }
+    } else {
+        source
     };
     // `ro` / `rw` are the same option strings the CLI appends after the second
     // colon. Emitting `rw` explicitly rather than omitting it keeps the
@@ -427,6 +456,7 @@ pub fn create_request(spec: &ContainerSpec, network: Option<&str>) -> CreateRequ
             // and inventing uid 0 to carry it would silently run as root.
             (None, _) => None,
         },
+        host_add: spec.host_add.clone(),
     }
 }
 
@@ -987,13 +1017,18 @@ impl PodmanApi {
 pub struct PodmanApiBackend {
     api: PodmanApi,
     network: Option<String>,
+    kubernetes_service: Option<(String, u16)>,
 }
 
 impl PodmanApiBackend {
     /// A backend on an explicit endpoint.
     #[must_use]
     pub fn new(api: PodmanApi, network: Option<String>) -> Self {
-        Self { api, network }
+        Self {
+            api,
+            network,
+            kubernetes_service: None,
+        }
     }
 
     /// A backend on the discovered socket, attached to engenho's network.
@@ -1006,6 +1041,15 @@ impl PodmanApiBackend {
             PodmanApi::discover()?,
             Some(ENGENHO_NETWORK.to_string()),
         ))
+    }
+
+    /// Builder: set the API-server coordinates injected into every container as
+    /// `KUBERNETES_SERVICE_HOST` / `KUBERNETES_SERVICE_PORT` / `KUBERNETES_PORT`
+    /// / `KUBERNETES_PORT_443_TCP*`. Mirrors [`PodmanBackend::with_kubernetes_service`].
+    #[must_use]
+    pub fn with_kubernetes_service(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.kubernetes_service = Some((host.into(), port));
+        self
     }
 
     /// The endpoint in use — for startup logging, so an operator can see WHICH
@@ -1036,7 +1080,36 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
             self.api.ensure_network(net).await?;
         }
 
-        let req = create_request(spec, self.network.as_deref());
+        // Inject KUBERNETES_SERVICE_HOST/PORT/... into every container the API
+        // backend starts. Mirrors [`PodmanBackend`]'s single-point injection on
+        // its argv render path. Absent injection leaves in-cluster clients
+        // (kube-rs's `Config::infer()`, Go's `rest.InClusterConfig()`) unable
+        // to locate the apiserver and the container exits with
+        // "failed to infer config" the moment it starts.
+        let req = match &self.kubernetes_service {
+            Some((host, port)) => {
+                let mut merged = spec.clone();
+                crate::backend::inject_kubernetes_service_env(&mut merged.env, host, *port);
+                // On Linux native podman, `host.containers.internal` is NOT
+                // in the container's /etc/hosts automatically (unlike
+                // podman-machine on macOS). Add it explicitly so a pod whose
+                // KUBERNETES_SERVICE_HOST is that name can actually resolve
+                // it. `host-gateway` is podman's own sentinel — it resolves
+                // to the container-host gateway address at create time.
+                if host == "host.containers.internal"
+                    && !merged
+                        .host_add
+                        .iter()
+                        .any(|h| h.starts_with("host.containers.internal:"))
+                {
+                    merged
+                        .host_add
+                        .push("host.containers.internal:host-gateway".to_string());
+                }
+                create_request(&merged, self.network.as_deref())
+            }
+            None => create_request(spec, self.network.as_deref()),
+        };
         let created = self.api.create(&req).await?;
         self.api.start(&created.id).await?;
 

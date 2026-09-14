@@ -230,6 +230,13 @@ pub struct ContainerSpec {
     /// declared securityContext gets silently replaced by the runtime's
     /// defaults, which is the defect this field exists to make unrepresentable.
     pub confinement: Confinement,
+    /// Extra `/etc/hosts` entries in `"hostname:ip"` shape (`"host-gateway"`
+    /// as the RHS resolves to the container-host gateway on Linux podman —
+    /// what `--add-host <name>:host-gateway` does on the CLI). Used by the
+    /// runtime to inject `host.containers.internal` on Linux native, where
+    /// podman does NOT synthesize that hostname automatically (unlike
+    /// podman-machine on macOS).
+    pub host_add: Vec<String>,
 }
 
 /// Status the backend reports back.
@@ -1129,6 +1136,7 @@ impl PodmanBackend {
         for m in &spec.mounts {
             let src = match &m.source {
                 crate::pod_volume::MountSource::HostDir(p) => p.display().to_string(),
+                crate::pod_volume::MountSource::EmptyDirHostDir(p) => p.display().to_string(),
                 crate::pod_volume::MountSource::NamedVolume(n) => n.clone(),
                 crate::pod_volume::MountSource::PvcHostDir { path, .. } => {
                     path.display().to_string()

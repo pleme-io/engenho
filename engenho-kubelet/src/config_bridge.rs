@@ -61,7 +61,10 @@ pub fn make_container_runtime_with_apiserver(
                         socket = %b.endpoint_path().display(),
                         "kubelet driving podman over its API socket (no subprocess)"
                     );
-                    Arc::new(b)
+                    Arc::new(match apiserver {
+                        Some((h, p)) => b.with_kubernetes_service(h, p),
+                        None => b,
+                    })
                 }
                 Err(e) => {
                     tracing::warn!(
