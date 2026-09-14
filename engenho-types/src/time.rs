@@ -50,6 +50,23 @@ pub fn now_rfc3339_utc() -> String {
     to_rfc3339_utc(Utc::now())
 }
 
+/// Render a Unix epoch second count to the Kubernetes-wire RFC3339 form.
+///
+/// Exists for the `TokenRequest` mint path, which computes an expiry in epoch
+/// seconds (because that is what a JWT `exp` claim IS) and must echo the same
+/// instant back as `status.expirationTimestamp`. Deriving both from ONE
+/// integer is what makes the token and the advertised expiry unable to
+/// disagree — rendering the timestamp from a second clock read would let them
+/// drift by the duration of the mint.
+///
+/// An out-of-range epoch yields `None` rather than a silently-wrong instant:
+/// chrono's conversion is fallible and papering over it with a default would
+/// advertise an expiry the token does not carry.
+#[must_use]
+pub fn epoch_to_rfc3339_utc(secs: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp(secs, 0).map(to_rfc3339_utc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +112,58 @@ mod tests {
         let t = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).single().unwrap()
             + chrono::Duration::nanoseconds(987_654_321);
         assert_eq!(to_rfc3339_utc(t), "2026-01-02T03:04:05Z");
+    }
+}
+
+#[cfg(test)]
+mod epoch_render {
+    use super::{epoch_to_rfc3339_utc, now_rfc3339_utc};
+
+    #[test]
+    fn renders_the_kubernetes_wire_shape() {
+        // Second precision, Zulu suffix — the metav1.Time shape, so a client
+        // parsing status.expirationTimestamp sees what it sees from upstream.
+        assert_eq!(
+            epoch_to_rfc3339_utc(1_700_000_000).as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+    }
+
+    #[test]
+    fn the_epoch_itself_is_representable() {
+        assert_eq!(
+            epoch_to_rfc3339_utc(0).as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
+    }
+
+    /// ★ The whole reason this returns `Option`. chrono's conversion is
+    /// fallible, and defaulting an out-of-range instant would advertise an
+    /// expiry the token does not carry — a lie the client cannot detect.
+    #[test]
+    fn an_unrepresentable_instant_is_none_not_a_default() {
+        assert_eq!(epoch_to_rfc3339_utc(i64::MAX), None);
+        assert_eq!(epoch_to_rfc3339_utc(i64::MIN), None);
+    }
+
+    /// ★ NEGATIVE CONTROL: without this the function could return a constant
+    /// and every assertion above that uses a fixed epoch would still pass.
+    #[test]
+    fn distinct_instants_render_distinctly() {
+        assert_ne!(
+            epoch_to_rfc3339_utc(1_700_000_000),
+            epoch_to_rfc3339_utc(1_700_000_001)
+        );
+    }
+
+    /// The two surfaces must agree on SHAPE — a mint reads `now_rfc3339_utc`
+    /// for creationTimestamp and `epoch_to_rfc3339_utc` for the expiry, and a
+    /// client parses both with one parser.
+    #[test]
+    fn both_render_surfaces_agree_on_shape() {
+        let now = now_rfc3339_utc();
+        let epoch = epoch_to_rfc3339_utc(1_700_000_000).expect("representable");
+        assert_eq!(now.len(), epoch.len(), "{now} vs {epoch}");
+        assert!(now.ends_with('Z') && epoch.ends_with('Z'));
     }
 }

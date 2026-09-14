@@ -33,6 +33,15 @@ pub enum Subresource {
     /// (GET; no put/patch/delete). Pod-only; the router dispatches it to the
     /// kubelet (single-node: in-process) which reads `backend.logs`.
     Log,
+    /// `/token` — POST a `TokenRequest`, receive a signed ServiceAccount JWT
+    /// (`kubectl create token`, and every in-cluster client's identity).
+    ///
+    /// The ONLY create-shaped subresource: status/scale/log are read or
+    /// update shapes, so the router's blanket "POST on a subresource is not a
+    /// CREATE" rule has exactly this exception. It is also the only one whose
+    /// response body is not the stored object — nothing is persisted, the
+    /// minted token is returned in `.status.token` and never stored.
+    Token,
 }
 
 /// One entry in the curated catalog: enough info to emit a typed
@@ -178,7 +187,13 @@ pub const KIND_CATALOG: &[KindEntry] = &[
         singular: "serviceaccount",
         categories: &[],
         opaque: false,
-        subresources: &[],
+        // `/token` is what makes RBAC mean anything on this runtime: without a
+        // mint endpoint a pod has no identity of its own, so every workload
+        // needing the API had to mount a kubeconfig carrying ADMIN client-key
+        // material. The verifying half was already wired (runtime.rs's
+        // `bootstrap_with_sa` over `pki/sa.key`); only the issuing half was
+        // missing, so this row is the whole gap on the catalog side.
+        subresources: &[Subresource::Token],
     },
     KindEntry {
         kind: "Node",

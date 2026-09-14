@@ -134,6 +134,11 @@ impl Runtime {
         //    can be created.
         seed_kubernetes_service(&store, &config).await?;
         seed_bootstrap_rbac(&store).await?;
+        //    Then the default StorageClass. It must precede the apiserver bind
+        //    for the same reason the others do: a PVC created in the first
+        //    moments of a cluster's life should provision like any other, not
+        //    hang until something happens to seed a class later.
+        seed_default_storage_class(&store).await?;
 
         // 5. Bind the apiserver, backed by the same store.
         let listen_addr: SocketAddr =
@@ -273,6 +278,15 @@ impl Runtime {
         ))
         .with_authenticator(authenticator)
         .with_authorizer(authorizer);
+        // The minting half, from the SAME key the authenticator verifies with.
+        // Without it RBAC is decorative: the authorizer, the Roles and the
+        // bindings all work, but nothing can present a non-admin identity to
+        // be judged, so every workload needing the API has to mount a
+        // kubeconfig carrying ADMIN client-key material.
+        let router_state = match build_token_issuer(&config.runtime.data_dir) {
+            Some(issuer) => router_state.with_token_issuer(issuer),
+            None => router_state,
+        };
         // The CRD handler sink: builds a StoreBackedHandler (admission-
         // dispatched, opaque-JSON) per served CRD version + registers it
         // into the SAME router_state. Shared (as Arc<dyn DynamicHandlerSink>)
@@ -1261,6 +1275,75 @@ async fn seed_system_namespaces(store: &StoreMesh) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// The name of the seeded default StorageClass.
+const DEFAULT_STORAGE_CLASS: &str = "engenho-local-path";
+
+/// Seed the cluster's default `StorageClass`, so a PVC that names no class is
+/// actually provisionable.
+///
+/// ── ★ WHY A CAPABILITY THAT EXISTS STILL DID NOTHING ───────────────────────
+/// `PvBinderController` has shipped a local-path dynamic provisioner for some
+/// time, and it was never reachable: it provisions only for a PVC whose
+/// effective StorageClass names a local-path provisioner OR carries the
+/// default-class annotation, and NO StorageClass was ever seeded. A cluster
+/// therefore had a working provisioner, an empty class list, and every PVC
+/// sitting `Pending` forever.
+///
+/// Measured 2026-09-13 on ryn: a 1Gi PVC with no class stayed unbound with
+/// `pv-binder examined=1 changed=0 skipped=1` — the controller looking at the
+/// claim each tick and correctly declining, because nothing told it which
+/// provisioner to use. That is indistinguishable, from the outside, from a
+/// runtime with no storage support at all.
+///
+/// Seeded like the bootstrap RBAC and the `kubernetes` Service: idempotent,
+/// at boot, before the apiserver binds. An operator who wants different
+/// storage edits or replaces the class; an operator who wants none removes the
+/// default annotation. Seeding a WORKING default is the difference between a
+/// runtime that stores things and one that merely serves the storage API.
+async fn seed_default_storage_class(store: &StoreMesh) -> Result<(), RuntimeError> {
+    use engenho_types::generated_v1_34::storage_v1::StorageClass;
+
+    let mut sc = StorageClass {
+        provisioner: engenho_controllers::pv_binder::ENGENHO_LOCAL_PATH_PROVISIONER.to_string(),
+        ..Default::default()
+    };
+    sc.metadata.name = DEFAULT_STORAGE_CLASS.to_string();
+    sc.metadata.annotations.insert(
+        "storageclass.kubernetes.io/is-default-class".to_string(),
+        "true".to_string(),
+    );
+    // `Delete` matches the provisioner's own lifecycle: the backing directory
+    // lives under the data dir, so a retained PV would leak a directory nobody
+    // is tracking. `Immediate` because it is the only mode the binder
+    // provisions in — advertising `WaitForFirstConsumer` here would promise
+    // behaviour it typed-defers.
+    sc.reclaim_policy = Some("Delete".to_string());
+    sc.volume_binding_mode = Some("Immediate".to_string());
+
+    let mut value = serde_json::to_value(&sc)
+        .map_err(|e| RuntimeError::Server(seed_serialize_err("StorageClass", &e)))?;
+    stamp_creation_timestamp_value(&mut value);
+    store
+        .propose(ResourceCommand::Put {
+            key: ResourceKey::cluster_scoped(
+                "storage.k8s.io",
+                "v1",
+                "StorageClass",
+                DEFAULT_STORAGE_CLASS.to_string(),
+            ),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await?;
+    info!(
+        class = DEFAULT_STORAGE_CLASS,
+        provisioner = engenho_controllers::pv_binder::ENGENHO_LOCAL_PATH_PROVISIONER,
+        "seeded the default StorageClass (PVCs with no class are now provisionable)"
+    );
+    Ok(())
+}
+
 /// The `kubernetes` Service in `default` — the in-cluster address of the
 /// apiserver itself, and the object that RESERVES the first address of the
 /// service CIDR.
@@ -1690,6 +1773,45 @@ fn build_authenticator(
                  must fall back to a kubeconfig"
             );
             ChainAuthenticator::bootstrap(admin_token)
+        }
+    }
+}
+
+/// Build the ServiceAccount token MINTER for `POST serviceaccounts/<n>/token`.
+///
+/// The exact mirror of [`build_authenticator`], and a named function for the
+/// same stated reason: the defect this whole area keeps producing is a WIRING
+/// bug, where every piece works and the boot sequence calls the inert
+/// constructor. Pulling it out makes the wiring assertable.
+///
+/// ── ★ WHY ISSUER AND AUDIENCE COME FROM THE SAME CONSTANT AS THE VERIFIER ──
+/// Both read `SA_ISSUER`, exactly as `build_authenticator` does. Split into
+/// two literals they are free to drift, and the failure mode is silent in the
+/// worst way: the server mints a token its OWN authenticator then rejects,
+/// which reads as a key problem and sends the reader to the PKI.
+///
+/// A key that cannot be read yields `None` — `/token` then answers a typed
+/// error rather than minting something unverifiable. Refusing to issue must
+/// never degrade into issuing.
+fn build_token_issuer(
+    data_dir: &std::path::Path,
+) -> Option<Arc<engenho_apiserver::sa_token::SaIssuer>> {
+    match engenho_apiserver::sa_token::load_or_generate_sa_key(data_dir) {
+        Ok(kp) => {
+            info!("ServiceAccount token issuance enabled (POST serviceaccounts/<name>/token)");
+            Some(Arc::new(engenho_apiserver::sa_token::SaIssuer {
+                signing: kp.signing,
+                issuer: SA_ISSUER.to_string(),
+                default_audience: SA_ISSUER.to_string(),
+            }))
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "no ServiceAccount signing key; `kubectl create token` and every in-cluster \
+                 identity will take a typed error"
+            );
+            None
         }
     }
 }
@@ -3353,7 +3475,10 @@ Error: unable to connect to Podman socket: knownhosts: /Users/x/.ssh/known_hosts
             "unbounded tail: {} bytes",
             tail.len()
         );
-        assert!(tail.ends_with('…'), "truncation must be visible to the reader");
+        assert!(
+            tail.ends_with('…'),
+            "truncation must be visible to the reader"
+        );
     }
 
     /// Slicing UTF-8 at an arbitrary byte index panics. A runtime's error text

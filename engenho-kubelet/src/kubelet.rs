@@ -648,10 +648,7 @@ impl Kubelet {
 
         // Secret / ConfigMap lookups — the source object was pre-fetched by
         // the caller into `sources`; here it's purely a keyed read + decoding.
-        for (kind, kubekind) in [
-            ("secretKeyRef", "Secret"),
-            ("configMapKeyRef", "ConfigMap"),
-        ] {
+        for (kind, kubekind) in [("secretKeyRef", "Secret"), ("configMapKeyRef", "ConfigMap")] {
             let Some(krf) = from.get(kind) else {
                 continue;
             };
@@ -797,8 +794,7 @@ impl Kubelet {
                 Some(arr) => {
                     let mut map = BTreeMap::new();
                     for entry in arr {
-                        let (k, v) =
-                            Self::resolve_env_entry(namespace, name, pod, entry, sources)?;
+                        let (k, v) = Self::resolve_env_entry(namespace, name, pod, entry, sources)?;
                         map.insert(k, v);
                     }
                     map
@@ -1390,10 +1386,9 @@ impl Kubelet {
                     let Some(vf) = e.get("valueFrom") else {
                         continue;
                     };
-                    for (field, kind) in [
-                        ("secretKeyRef", "Secret"),
-                        ("configMapKeyRef", "ConfigMap"),
-                    ] {
+                    for (field, kind) in
+                        [("secretKeyRef", "Secret"), ("configMapKeyRef", "ConfigMap")]
+                    {
                         if let Some(name) = vf
                             .get(field)
                             .and_then(|r| r.get("name"))
@@ -1638,23 +1633,19 @@ impl Kubelet {
         // NO init containers returns an empty Vec here, so this whole block is
         // skipped and the app-start path runs BYTE-IDENTICALLY to before the
         // init-container brick (the behavior-preserving guarantee).
-        let init_specs = match Self::pod_to_init_container_specs(
-            namespace,
-            &key.name,
-            value,
-            &env_sources,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    pod = %key.label(),
-                    error = %e,
-                    "skipping pod with invalid init-container manifest"
-                );
-                report.objects_skipped += 1;
-                return Ok(());
-            }
-        };
+        let init_specs =
+            match Self::pod_to_init_container_specs(namespace, &key.name, value, &env_sources) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        pod = %key.label(),
+                        error = %e,
+                        "skipping pod with invalid init-container manifest"
+                    );
+                    report.objects_skipped += 1;
+                    return Ok(());
+                }
+            };
         if !init_specs.is_empty() {
             let init_complete = self
                 .local
@@ -1671,12 +1662,7 @@ impl Kubelet {
             }
         }
 
-        let specs = match Self::pod_to_container_specs(
-            namespace,
-            &key.name,
-            value,
-            &env_sources,
-        ) {
+        let specs = match Self::pod_to_container_specs(namespace, &key.name, value, &env_sources) {
             Ok(s) => s,
             Err(e) => {
                 warn!(
@@ -2244,19 +2230,15 @@ impl Kubelet {
         // init containers (or one already init_complete) falls through to the
         // app reconcile below, which itself renders initContainerStatuses +
         // Initialized=True alongside the app status once init_complete.
-        let init_specs = match Self::pod_to_init_container_specs(
-            namespace,
-            &key.name,
-            value,
-            &env_sources,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(pod = %key.label(), error = %e, "invalid init manifest during reconcile");
-                report.objects_skipped += 1;
-                return Ok(());
-            }
-        };
+        let init_specs =
+            match Self::pod_to_init_container_specs(namespace, &key.name, value, &env_sources) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(pod = %key.label(), error = %e, "invalid init manifest during reconcile");
+                    report.objects_skipped += 1;
+                    return Ok(());
+                }
+            };
         let has_init = !init_specs.is_empty();
         if has_init && !lp.init_complete {
             return self
@@ -2267,12 +2249,7 @@ impl Kubelet {
         // Re-derive the expected container set from the manifest so a
         // not-yet-started container shows up as Waiting (the pod is Pending
         // until every container has started at least once).
-        let specs = match Self::pod_to_container_specs(
-            namespace,
-            &key.name,
-            value,
-            &env_sources,
-        ) {
+        let specs = match Self::pod_to_container_specs(namespace, &key.name, value, &env_sources) {
             Ok(s) => s,
             Err(e) => {
                 warn!(pod = %key.label(), error = %e, "invalid manifest during reconcile");
@@ -3361,7 +3338,8 @@ mod tests {
                 }]
             }
         });
-        let specs = Kubelet::pod_to_container_specs("default", "p1", &pod, &BTreeMap::new()).unwrap();
+        let specs =
+            Kubelet::pod_to_container_specs("default", "p1", &pod, &BTreeMap::new()).unwrap();
         assert_eq!(specs.len(), 1);
         let (cname, spec) = &specs[0];
         assert_eq!(cname, "main");
@@ -3399,7 +3377,8 @@ mod tests {
                 ]
             }
         });
-        let specs = Kubelet::pod_to_container_specs("default", "p", &pod, &BTreeMap::new()).unwrap();
+        let specs =
+            Kubelet::pod_to_container_specs("default", "p", &pod, &BTreeMap::new()).unwrap();
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].0, "web");
         assert_eq!(specs[0].1.name, "default_p_web");

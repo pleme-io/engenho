@@ -163,6 +163,10 @@ fn package_for_api_version(api_version: &str) -> Option<&'static str> {
         // The SubjectAccessReview family (kubectl `auth can-i` posts these as
         // application/vnd.kubernetes.protobuf).
         "authorization.k8s.io/v1" => Some("k8s.io.api.authorization.v1"),
+        // TokenRequest — `kubectl create token` POSTs it as
+        // application/vnd.kubernetes.protobuf, so the SA-token mint endpoint
+        // cannot decode its own request body without this row.
+        "authentication.k8s.io/v1" => Some("k8s.io.api.authentication.v1"),
         _ => None,
     }
 }

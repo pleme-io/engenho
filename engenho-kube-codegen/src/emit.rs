@@ -351,6 +351,15 @@ pub enum Subresource {
     /// (GET only). Pod-only; the router dispatches it to the kubelet
     /// (single-node: in-process) which reads `backend.logs`.
     Log,
+    /// `/token` — POST a `TokenRequest`, receive a signed ServiceAccount JWT
+    /// (`kubectl create token`, and every in-cluster client's identity).
+    ///
+    /// The ONLY create-shaped subresource: status/scale/log are read or
+    /// update shapes, so the router's blanket \"POST on a subresource is not
+    /// a CREATE\" rule has exactly this exception. It is also the only one
+    /// whose response body is not the stored object — nothing is persisted,
+    /// the minted token is returned in `.status.token` and never stored.
+    Token,
 }
 
 /// One runtime row describing a routable/discoverable Kubernetes kind.
@@ -528,6 +537,7 @@ fn render_subresources(items: &[Subresource]) -> String {
             Subresource::Status => "Subresource::Status",
             Subresource::Scale => "Subresource::Scale",
             Subresource::Log => "Subresource::Log",
+            Subresource::Token => "Subresource::Token",
         })
         .collect::<Vec<_>>()
         .join(", ");
