@@ -295,6 +295,78 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_lease_makes_a_stored_ready_true_read_as_unknown() {
+        // THE POINT. This is the rio failure exactly: the kubelet wedged, the
+        // Node kept its last-published `Ready=True`, and the apiserver served
+        // it for three days. Derivation means the stored value cannot lie,
+        // because it is not what gets served.
+        let mut node = json!({"status": {"conditions": [
+            {"type": "Ready", "status": "True", "reason": "KubeletReady",
+             "lastTransitionTime": "2026-01-01T00:00:00Z"}
+        ]}});
+        let stale = json!({"spec": {"renewTime": "2020-01-01T00:00:00Z"}});
+        project_ready_condition(&mut node, Some(&stale), "2026-09-14T12:00:00Z");
+        let ready = find_ready_condition(&node).expect("Ready");
+        assert_eq!(ready["status"], "Unknown", "a stale heartbeat cannot read Ready: {node}");
+        assert_eq!(ready["reason"], "NodeStatusUnknown");
+        // The status CHANGED, so the transition time moves to now.
+        assert_eq!(ready["lastTransitionTime"], "2026-09-14T12:00:00Z");
+    }
+
+    #[test]
+    fn no_lease_at_all_reads_as_unknown_never_as_ready() {
+        // A Node object with a stored Ready=True and NO lease — the shape
+        // `register_node` produces at boot before the first heartbeat.
+        let mut node = json!({"status": {"conditions": [
+            {"type": "Ready", "status": "True"}
+        ]}});
+        project_ready_condition(&mut node, None, "2026-09-14T12:00:00Z");
+        let ready = find_ready_condition(&node).expect("Ready");
+        assert_eq!(ready["status"], "Unknown");
+        assert_eq!(ready["reason"], "NodeStatusNeverUpdated", "{node}");
+    }
+
+    #[test]
+    fn a_fresh_lease_reads_ready_and_preserves_foreign_conditions() {
+        let mut node = json!({"status": {"conditions": [
+            {"type": "MemoryPressure", "status": "False"},
+            {"type": "Ready", "status": "Unknown",
+             "lastTransitionTime": "2026-01-01T00:00:00Z"}
+        ]}});
+        let fresh = json!({"spec": {"renewTime": engenho_types::time::now_rfc3339_utc()}});
+        project_ready_condition(&mut node, Some(&fresh), "2026-09-14T12:00:00Z");
+        let ready = find_ready_condition(&node).expect("Ready");
+        assert_eq!(ready["status"], "True");
+        // NEGATIVE CONTROL: the projection must REPLACE only Ready. A
+        // condition it does not own surviving is what separates this from a
+        // renderer that rebuilds the array.
+        assert!(
+            node["status"]["conditions"].as_array().unwrap()
+                .iter().any(|c| c["type"] == "MemoryPressure"),
+            "a foreign condition must survive the projection: {node}"
+        );
+        // And exactly one Ready, not one appended beside the old.
+        let n = node["status"]["conditions"].as_array().unwrap()
+            .iter().filter(|c| c["type"] == "Ready").count();
+        assert_eq!(n, 1, "{node}");
+    }
+
+    #[test]
+    fn an_unparseable_renew_time_reads_unknown_rather_than_fresh() {
+        // A future or malformed timestamp must not read as a 0-second-old
+        // heartbeat, which is exactly what a healthy node looks like. This is
+        // the most convincing possible lie.
+        let mut node = json!({});
+        let future = json!({"spec": {"renewTime": "2099-01-01T00:00:00Z"}});
+        project_ready_condition(&mut node, Some(&future), "2026-09-14T12:00:00Z");
+        assert_eq!(find_ready_condition(&node).unwrap()["status"], "Unknown");
+        let garbage = json!({"spec": {"renewTime": "not-a-time"}});
+        let mut node2 = json!({});
+        project_ready_condition(&mut node2, Some(&garbage), "2026-09-14T12:00:00Z");
+        assert_eq!(find_ready_condition(&node2).unwrap()["status"], "Unknown");
+    }
+
+    #[test]
     fn the_ready_condition_is_found_by_type_not_by_index() {
         // conditions[] order is not a contract; Ready is conditions[0] only
         // until something else writes one.
@@ -326,5 +398,79 @@ mod tests {
         assert_eq!(k.kind, "Lease");
         assert_eq!(k.namespace.as_deref(), Some("kube-node-lease"));
         assert_eq!(k.name, "cid");
+    }
+}
+
+// =================================================================
+// Read-time projection
+// =================================================================
+
+/// Project the `Ready` condition a Node's Lease implies onto that Node.
+///
+/// ── ★ WHY A DERIVATION AND NOT JUST A STORED FIELD ────────────────────────
+/// Upstream stores `Ready` as a fact because the writer (the
+/// node-lifecycle-controller) and the reader (scheduler, kubectl) live on
+/// different machines and communicate through etcd. That separation is also
+/// what lets a dead kubelet be *judged*: something else is still running.
+///
+/// engenho is one binary. Removing the distribution removes the observer, not
+/// the problem — so reproducing upstream's shape faithfully would reproduce a
+/// stored condition with nobody to correct it. A kubelet task that wedges
+/// (measured on rio: three days, 2,050 failed reconciles) leaves `Ready=True`
+/// standing while the apiserver happily serves it.
+///
+/// So the condition is DERIVED when a Node is read. There is no stored copy to
+/// go stale, which makes the bad state unrepresentable rather than reconciled
+/// — the `invariant-by-consistency-and-controller` third case: re-derive the
+/// value from live inputs instead of storing one that can drift.
+///
+/// The API contract is unchanged. A client GETting a Node sees a conformant
+/// `Ready` condition with status, reason, message and both timestamps. Only
+/// the mechanism differs, which is the naturalize posture: speak the API, own
+/// the implementation.
+///
+/// ── ★ WHAT THIS DOES NOT FIX, SO NOBODY READS IT AS MORE ──────────────────
+/// A derived value changes by the PASSAGE OF TIME, so no write happens, so no
+/// WATCH event fires. `kubectl get` is correct; `kubectl get --watch` stays
+/// silent until something writes. That is why the kubelet still publishes the
+/// condition on transition — the two halves are not alternatives:
+/// derivation makes the answer correct, the write makes it observable.
+///
+/// And if the WHOLE process is dead nothing serves reads either, so there is
+/// no one to lie to. This covers exactly the set where a reader outlives the
+/// writer — a wedged kubelet beside a live apiserver, or a peer serving a read
+/// of another node's object from the replicated store.
+///
+/// `lease` is that node's Lease, `None` when it has none. Conditions the
+/// kubelet does not own are preserved; only `Ready` is replaced.
+pub fn project_ready_condition(node: &mut ResourceValue, lease: Option<&ResourceValue>, now: &str) {
+    let since_renew = lease
+        .and_then(|l| l.get("spec"))
+        .and_then(|s| s.get("renewTime"))
+        .and_then(|t| t.as_str())
+        .and_then(engenho_types::time::age_since_rfc3339);
+    let state = readiness(since_renew);
+
+    // Carry `lastTransitionTime` from whatever is stored, so the derived value
+    // still answers "how long has it been like this" when the status agrees.
+    let previous = find_ready_condition(node).cloned();
+    let condition = ready_condition(state, now, previous.as_ref());
+
+    let mut conditions: Vec<ResourceValue> = node
+        .get("status")
+        .and_then(|s| s.get("conditions"))
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.get("type").and_then(|t| t.as_str()) != Some("Ready"))
+        .collect();
+    conditions.push(condition);
+
+    if let Some(obj) = node.as_object_mut() {
+        let status = obj.entry("status").or_insert_with(|| json!({}));
+        if let Some(status_obj) = status.as_object_mut() {
+            status_obj.insert("conditions".to_string(), json!(conditions));
+        }
     }
 }

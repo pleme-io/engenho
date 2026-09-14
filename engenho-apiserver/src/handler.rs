@@ -486,6 +486,46 @@ pub struct StoreBackedHandler {
 }
 
 impl StoreBackedHandler {
+    /// Whether this handler serves the core `v1 Node` kind.
+    fn serves_nodes(&self) -> bool {
+        self.group.is_empty() && self.version == "v1" && self.kind == "Node"
+    }
+
+    /// Replace a Node's `Ready` condition with the one its Lease implies.
+    ///
+    /// ── ★ DERIVED AT READ, NOT SERVED FROM STORAGE ────────────────────────
+    /// A stored `Ready` can only be corrected by something that is still
+    /// running. Upstream has one — the node-lifecycle-controller, on another
+    /// machine. engenho is one binary, so being embedded removes the observer
+    /// rather than the problem, and a kubelet task that wedges leaves
+    /// `Ready=True` standing while this apiserver serves it. Measured on rio:
+    /// three days, 2,050 failed reconciles, every pod Pending, node Ready.
+    ///
+    /// Deriving here means there is no stored copy to go stale. The full
+    /// reasoning, and what it deliberately does NOT fix (a derived value
+    /// changes by the passage of time, so no WATCH event fires — which is why
+    /// the kubelet still writes on transition), is on
+    /// [`engenho_controllers::node_lease::project_ready_condition`].
+    ///
+    /// No recursion: this reads a **Lease**, a different kind, straight from
+    /// the store rather than back through a handler.
+    async fn project_node_readiness(&self, value: &mut Value, name: &str) {
+        if !self.serves_nodes() || name.is_empty() {
+            return;
+        }
+        let lease = self
+            .store
+            .get(&engenho_controllers::node_lease::lease_key(name))
+            .await;
+        engenho_controllers::node_lease::project_ready_condition(
+            value,
+            lease.as_ref(),
+            &engenho_types::time::now_rfc3339_utc(),
+        );
+    }
+}
+
+impl StoreBackedHandler {
     #[must_use]
     pub fn new(
         store: Arc<StoreMesh>,
@@ -909,13 +949,15 @@ impl ResourceHandler for StoreBackedHandler {
 
     async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
-        let v = self
+        let mut v = self
             .store
             .get(&key)
             .await
             .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
+        self.project_node_readiness(&mut v, name).await;
         Ok(inject_type_meta(&v, self.api_version(), &self.kind))
     }
+
 
     async fn list(&self, namespace: Option<&str>) -> Result<Value, ApiError> {
         // Default (no selectors) LIST. The atomic-rv envelope is built
@@ -939,11 +981,24 @@ impl ResourceHandler for StoreBackedHandler {
             .store
             .list_at_revision(&self.group, &self.version, &self.kind, namespace)
             .await;
-        let items: Vec<Value> = entries
+        let mut items: Vec<Value> = entries
             .into_iter()
             .filter(|(_, v)| sel.matches(v))
             .map(|(_, v)| strip_type_meta(&v))
             .collect();
+        // Same derivation on the LIST path. Doing it only on GET would make
+        // `kubectl get node` and `kubectl get nodes` disagree about the same
+        // field, which is a worse failure than either answer alone.
+        if self.serves_nodes() {
+            for item in &mut items {
+                let name = item
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.project_node_readiness(item, &name).await;
+            }
+        }
         Ok((items, rv))
     }
 
