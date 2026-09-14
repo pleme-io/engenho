@@ -1199,6 +1199,61 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
             }
             None => create_request(spec, self.network.as_deref()),
         };
+        // ── ★ ADOPT-OR-REPLACE, BEFORE CREATE ─────────────────────────────
+        // `start` means "make a container matching this spec be running", and
+        // a blind create does not mean that: podman's container names are a
+        // unique namespace, so creating `{ns}_{pod}_{cname}` a second time is
+        // an HTTP 500 `"that name is already in use"`, forever.
+        //
+        // That is not hypothetical. Measured on rio 2026-09-14: the daemon
+        // restarted at 11:04:33, `LocalPod` (in-memory, the ONLY record of what
+        // this kubelet had started) was lost, and every subsequent tick tried
+        // to create names its own orphans already held — **2,050 failures in
+        // three hours, all seven pods stuck `Pending`, one of the colliding
+        // containers `Up 2 hours` and unrecognised by the kubelet that started
+        // it.** Some orphans were three days old. Unrecoverable without a
+        // manual `podman rm`, and invisible because `kubectl get pods` reads
+        // `Pending`, which looks like scheduling rather than breakage.
+        //
+        // The fix belongs HERE and not at the call sites: there are three
+        // (`kubelet.rs` 1878 / 2211 / 2673) and this file's own history records
+        // being bitten twice by an input stamped at one of them and missed by
+        // the restart path. Inside `start`, all three get it and a fourth site
+        // cannot forget it.
+        //
+        // Upstream's kubelet does the same thing at a different altitude —
+        // it lists the runtime's containers on sync and adopts or removes what
+        // it finds, rather than assuming its own memory is the truth.
+        if let Some(existing) = self.api.inspect(&spec.name).await? {
+            if existing.state.running {
+                // Already doing what was asked. Adopting is not merely the
+                // cheap path: recreating would stop a healthy container and
+                // change its IP for no reason the manifest asked for.
+                let pod_ip = existing.pod_ip();
+                tracing::info!(
+                    container = %spec.name,
+                    id = %existing.id,
+                    "adopting a container this kubelet did not start (restart recovery)"
+                );
+                return Ok(crate::backend::ContainerStatus {
+                    container_id: existing.id,
+                    running: true,
+                    pod_ip,
+                    exit_code: None,
+                });
+            }
+            // Present but not running: a dead predecessor holding the name.
+            // Remove it so the create below can succeed. This is the branch
+            // that was wedging rio.
+            tracing::info!(
+                container = %spec.name,
+                id = %existing.id,
+                exit_code = existing.state.exit_code,
+                "removing a stale container holding this name before recreate"
+            );
+            self.api.remove(&existing.id).await?;
+        }
+
         let created = self.api.create(&req).await?;
         self.api.start(&created.id).await?;
 
