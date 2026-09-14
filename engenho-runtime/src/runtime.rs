@@ -2480,6 +2480,17 @@ const CNI_CONFIG_DIR: &str = "/etc/cni/net.d";
 /// `Planned` on every target until `run_chain` has a production caller, and the
 /// commit that gives it one flips this line — with the Linux arm restored,
 /// since the darwin arm was never in question.
+///
+/// ★ AND THAT CALLER IS `butai`, NOT THE CRI BACKEND. Worth writing down
+/// because it is the obvious wrong guess: under CRI the kubelet does NOT
+/// invoke CNI. The vendored `runtime/v1/api.proto` mentions netns and CNI
+/// exactly zero times, there is no field for a kubelet to hand a network
+/// namespace down, and `StopPodSandbox`'s own contract is that it "reclaims
+/// network resources (e.g., IP addresses) allocated to the sandbox" — i.e.
+/// containerd/CRI-O allocated them. The same is true of podman, which owns its
+/// own bridge. So `run_chain` has no caller precisely because engenho has never
+/// been the runtime; it acquires one when engenho IS the runtime, in `butai`'s
+/// sandbox creation, and not before.
 const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall::Planned;
 
 fn spawn_drivers(
