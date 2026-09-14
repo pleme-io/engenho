@@ -161,6 +161,61 @@ impl ContainerState {
 /// One container's observed shape — the per-element input to
 /// [`reconcile_pod_phase`]. The kubelet builds this slice from its local
 /// bookkeeping + the backend's `status` poll.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InitKind {
+    /// A classic init container: runs to completion, and the next one does not
+    /// start until it exits 0.
+    #[default]
+    Regular,
+    /// A **native sidecar** — `initContainers[i].restartPolicy: Always`,
+    /// KEP-753, GA in Kubernetes 1.29.
+    ///
+    /// The kubelet starts it, does NOT wait for it to exit, proceeds to the
+    /// next init container once it has STARTED, keeps it running for the pod's
+    /// whole lifetime, and terminates it AFTER the app containers.
+    Sidecar,
+}
+
+impl InitKind {
+    /// Read `initContainers[i].restartPolicy`.
+    ///
+    /// ── ★ AN UNRECOGNISED VALUE IS AN ERROR, NEVER A DEFAULT ──────────────
+    /// `Always` is the only value the API permits on an init container.
+    /// Defaulting anything else to [`Self::Regular`] — the way
+    /// `RestartPolicy::from_spec_str` defaults a bad pod-level policy to
+    /// `Always` — would make `restartPolicy: always` (lowercase) silently
+    /// revert to blocking semantics, i.e. straight back to the forever-Pending
+    /// hang this whole feature exists to remove, now triggered by a typo and
+    /// with no error anywhere.
+    ///
+    /// # Errors
+    /// [`InitKindError`] naming the offending value.
+    pub fn from_spec_str(raw: Option<&str>) -> Result<Self, InitKindError> {
+        match raw {
+            None => Ok(Self::Regular),
+            Some("Always") => Ok(Self::Sidecar),
+            Some(other) => Err(InitKindError(other.to_string())),
+        }
+    }
+
+    /// Whether this is a sidecar.
+    #[must_use]
+    pub fn is_sidecar(self) -> bool {
+        matches!(self, Self::Sidecar)
+    }
+}
+
+/// An `initContainers[i].restartPolicy` value Kubernetes does not permit.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("initContainers[].restartPolicy must be absent or \"Always\", got {0:?}")]
+pub struct InitKindError(pub String);
+
+/// One container's observed shape — the per-element input to
+/// [`reconcile_pod_phase`]. The kubelet builds this slice from its local
+/// bookkeeping + the backend's `status` poll.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerObservation {
     /// The container's logical name (`spec.containers[i].name`).
@@ -177,6 +232,19 @@ pub struct ContainerObservation {
     /// `state.is_running()` (probes are deferred — see crate docs); carried
     /// explicitly so the readiness source is a typed field, not a re-derive.
     pub ready: bool,
+    /// Regular init container or native sidecar. Meaningless for an app
+    /// container, where it stays [`InitKind::Regular`].
+    pub kind: InitKind,
+    /// Whether this container has EVER been started.
+    ///
+    /// ── ★ NOT DERIVABLE FROM `state` ──────────────────────────────────────
+    /// `ContainerState::Running` answers "up right now", not "has been up". A
+    /// sidecar caught mid-restart reads as not-Running, and a sequencer that
+    /// re-derives startedness from the current state would let it re-block the
+    /// init sequence — a pod that was Running silently falling back to Pending
+    /// on a sidecar hiccup, which is the original hang with an intermittent
+    /// trigger. The kubelet LATCHES this on first successful start.
+    pub ever_started: bool,
 }
 
 impl ContainerObservation {
@@ -193,6 +261,9 @@ impl ContainerObservation {
             container_id: Some(container_id.into()),
             restart_count,
             ready: true,
+            kind: InitKind::Regular,
+            // It has an id, so it has started.
+            ever_started: true,
         }
     }
 
@@ -210,6 +281,8 @@ impl ContainerObservation {
             container_id: Some(container_id.into()),
             restart_count,
             ready: false,
+            kind: InitKind::Regular,
+            ever_started: true,
         }
     }
 
@@ -236,6 +309,8 @@ impl ContainerObservation {
             container_id: Some(container_id.into()),
             restart_count,
             ready: false,
+            kind: InitKind::Regular,
+            ever_started: true,
         }
     }
 
@@ -249,7 +324,30 @@ impl ContainerObservation {
             container_id: None,
             restart_count: 0,
             ready: false,
+            kind: InitKind::Regular,
+            // Never started — this is the state the sidecar fold reads to
+            // decide "start it", and the reason `ever_started` is latched by
+            // the kubelet rather than re-derived from `state` each tick.
+            ever_started: false,
         }
+    }
+
+    /// Mark this observation as a native sidecar.
+    ///
+    /// A builder rather than a parameter on all four constructors: every
+    /// existing call site means a regular container and stays byte-identical,
+    /// and only the init path — which is the only place that can know — opts in.
+    #[must_use]
+    pub fn as_sidecar(mut self) -> Self {
+        self.kind = InitKind::Sidecar;
+        self
+    }
+
+    /// Override the latched started flag (the kubelet knows; the state does not).
+    #[must_use]
+    pub fn with_ever_started(mut self, ever_started: bool) -> Self {
+        self.ever_started = ever_started;
+        self
     }
 }
 
@@ -410,8 +508,13 @@ pub enum InitAction {
     /// (if `Running` / restartable-`Terminated`). App containers must NOT start
     /// yet. This is the only arm that keeps the pod in `Pending`/initializing.
     AwaitInit {
-        /// 0-based index into `spec.initContainers`.
-        index: usize,
+        /// Every index the kubelet must ensure is running this tick: the
+        /// sidecars cleared so far, plus the one container the sequence is
+        /// gated on. Before sidecars this was always exactly one.
+        start: Vec<usize>,
+        /// The index the sequence is blocked on, or `None` when nothing blocks
+        /// and only sidecars are still coming up.
+        blocked_on: Option<usize>,
     },
     /// Init container `index` terminated non-restartably with `exit_code` (a
     /// non-zero exit under `restartPolicy: Never`) → the whole pod has **Failed**
@@ -462,14 +565,46 @@ pub fn next_init_action(
     restart_policy: RestartPolicy,
     init_observations: &[ContainerObservation],
 ) -> InitAction {
+    let mut start: Vec<usize> = Vec::new();
     for (index, o) in init_observations.iter().enumerate() {
+        if o.kind.is_sidecar() {
+            // ── ★ SIDECARS ARE STARTED, NEVER AWAITED (KEP-753 R2/R5) ─────
+            // The sequence proceeds once a sidecar has STARTED. It never waits
+            // for one to exit — a sidecar by definition does not — which is
+            // the whole reason a pod with one used to sit Pending forever.
+            if !o.ever_started {
+                start.push(index);
+                // Upstream additionally gates on the sidecar's startupProbe
+                // when it declares one. engenho runs no probes on init
+                // containers at all today, so that gate degrades to
+                // "proceed once started". Named rather than silently skipped:
+                // `pending-sidecar-startup-probe`. The consequence is real —
+                // a mesh proxy that has started but not programmed its
+                // listeners will blackhole the app's first connections.
+                continue;
+            }
+            if matches!(o.state, ContainerState::Terminated { .. }) {
+                // ★ RESTARTED UNCONDITIONALLY — the pod-level restartPolicy is
+                // NOT consulted. Upstream restarts a sidecar regardless of the
+                // pod policy, including `Never` and including a non-zero exit,
+                // and a sidecar exiting never fails the pod. Consulting
+                // `should_restart` here is the single most likely wrong port,
+                // because that call sits in the arm right below.
+                start.push(index);
+            }
+            continue;
+        }
         match &o.state {
             // Succeeded → move on to the next init container.
             ContainerState::Terminated { exit_code, .. } if *exit_code == 0 => continue,
             // Failed init container: restart per policy, else terminal failure.
             ContainerState::Terminated { exit_code, .. } => {
                 return if restart_policy.should_restart(Some(*exit_code)) {
-                    InitAction::AwaitInit { index }
+                    start.push(index);
+                    InitAction::AwaitInit {
+                        start,
+                        blocked_on: Some(index),
+                    }
                 } else {
                     InitAction::InitFailed {
                         index,
@@ -479,12 +614,27 @@ pub fn next_init_action(
             }
             // In flight or not yet started → this is the active init container.
             ContainerState::Running | ContainerState::Waiting { .. } => {
-                return InitAction::AwaitInit { index };
+                if matches!(o.state, ContainerState::Waiting { .. }) {
+                    start.push(index);
+                }
+                return InitAction::AwaitInit {
+                    start,
+                    blocked_on: Some(index),
+                };
             }
         }
     }
-    // Every init container Succeeded (or there were none).
-    InitAction::Complete
+    // Every REGULAR init container Succeeded (or there were none). If sidecars
+    // still need starting or restarting, say so — but do not block: they are
+    // started alongside the app containers, not before them.
+    if start.is_empty() {
+        InitAction::Complete
+    } else {
+        InitAction::AwaitInit {
+            start,
+            blocked_on: None,
+        }
+    }
 }
 
 /// PURE composition of init + app phase into the pod's reported
@@ -739,13 +889,113 @@ mod tests {
         assert!(next_init_action(RestartPolicy::Never, &[]).is_complete());
     }
 
+    // ── Native sidecars (KEP-753) ────────────────────────────────────────
+
+    #[test]
+    fn a_sidecar_does_not_block_the_init_sequence() {
+        // THE BUG. A sidecar never exits, and the old fold's only path to
+        // Complete was `Terminated{0}` for EVERY init container — so one
+        // sidecar pinned the pod Pending forever, with no event, no failing
+        // condition and no non-zero exit. The reconcile loop looked healthy
+        // and busy while making zero progress, indefinitely.
+        let obs = vec![
+            running("proxy", "id0").as_sidecar(),
+            terminated("setup", "id1", 0),
+        ];
+        assert_eq!(next_init_action(RestartPolicy::Always, &obs), InitAction::Complete);
+
+        // NEGATIVE CONTROL: the identical slice with a REGULAR container in
+        // position 0 must still block. Without this the test would pass on a
+        // fold that simply stopped blocking on everything.
+        let obs_regular = vec![running("proxy", "id0"), terminated("setup", "id1", 0)];
+        assert_eq!(
+            next_init_action(RestartPolicy::Always, &obs_regular),
+            InitAction::AwaitInit { start: vec![], blocked_on: Some(0) }
+        );
+    }
+
+    #[test]
+    fn a_sidecar_exit_never_fails_the_pod_even_under_restart_policy_never() {
+        // R5: a sidecar is restarted regardless of the pod-level policy —
+        // including Never, including a non-zero exit — and its exit never
+        // fails the pod. Consulting `should_restart` here is the single most
+        // likely wrong port, because that call sits in the arm right below.
+        let obs = vec![
+            terminated("proxy", "id0", 7).as_sidecar(),
+            terminated("setup", "id1", 0),
+        ];
+        assert_eq!(
+            next_init_action(RestartPolicy::Never, &obs),
+            InitAction::AwaitInit { start: vec![0], blocked_on: None },
+            "restart it, do not fail the pod, and do not block"
+        );
+
+        // NEGATIVE CONTROL: the same exit on a REGULAR init container under
+        // Never is terminal. This is the pair that proves `should_restart` is
+        // no longer consulted for sidecars — a naive port returns InitFailed
+        // for both.
+        let obs_regular = vec![terminated("setup", "id0", 7)];
+        assert_eq!(
+            next_init_action(RestartPolicy::Never, &obs_regular),
+            InitAction::InitFailed { index: 0, exit_code: 7 }
+        );
+    }
+
+    #[test]
+    fn an_unstarted_sidecar_is_started_without_blocking_what_follows() {
+        // R2: started, never awaited. The sequence proceeds past it.
+        let obs = vec![
+            waiting("proxy").as_sidecar(),
+            waiting("setup"),
+        ];
+        assert_eq!(
+            next_init_action(RestartPolicy::Always, &obs),
+            InitAction::AwaitInit { start: vec![0, 1], blocked_on: Some(1) },
+            "start the sidecar AND the regular one; block only on the regular"
+        );
+    }
+
+    #[test]
+    fn ever_started_is_latched_not_derived_from_the_current_state() {
+        // A sidecar caught mid-restart is not Running. If startedness were
+        // re-derived from `state`, it would re-block the sequence — a pod that
+        // was Running silently falling back to Pending on a hiccup, i.e. the
+        // original hang with an intermittent trigger.
+        let restarting = ContainerObservation::waiting("proxy")
+            .as_sidecar()
+            .with_ever_started(true);
+        let obs = vec![restarting, terminated("setup", "id1", 0)];
+        assert_eq!(
+            next_init_action(RestartPolicy::Always, &obs),
+            InitAction::Complete,
+            "a restarting sidecar must not re-block init"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_restart_policy_is_an_error_not_a_default() {
+        // `Always` is the only value the API permits on an init container.
+        // Defaulting anything else to Regular — the way RestartPolicy's own
+        // from_spec_str defaults a bad POD policy to Always — would make
+        // `restartPolicy: always` (lowercase) silently revert to blocking
+        // semantics: the forever-Pending hang, triggered by a typo, with no
+        // error anywhere.
+        assert_eq!(InitKind::from_spec_str(None), Ok(InitKind::Regular));
+        assert_eq!(InitKind::from_spec_str(Some("Always")), Ok(InitKind::Sidecar));
+        assert!(InitKind::from_spec_str(Some("always")).is_err());
+        assert!(InitKind::from_spec_str(Some("OnFailure")).is_err());
+        // The error names the offending value, so the log says what to fix.
+        let e = InitKind::from_spec_str(Some("always")).unwrap_err();
+        assert!(format!("{e}").contains("always"), "{e}");
+    }
+
     #[test]
     fn first_waiting_init_is_the_active_one() {
         // init[0] not yet started → AwaitInit{0}; later ones are irrelevant.
         let obs = vec![waiting("init-0"), waiting("init-1")];
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs),
-            InitAction::AwaitInit { index: 0 }
+            InitAction::AwaitInit { start: vec![0], blocked_on: Some(0) }
         );
     }
 
@@ -755,7 +1005,8 @@ mod tests {
         let obs = vec![running("init-0", "id0"), waiting("init-1")];
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs),
-            InitAction::AwaitInit { index: 0 }
+            // Running already: nothing to START, but still blocking.
+            InitAction::AwaitInit { start: vec![], blocked_on: Some(0) }
         );
     }
 
@@ -765,7 +1016,7 @@ mod tests {
         let obs = vec![terminated("init-0", "id0", 0), waiting("init-1")];
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs),
-            InitAction::AwaitInit { index: 1 }
+            InitAction::AwaitInit { start: vec![1], blocked_on: Some(1) }
         );
     }
 
@@ -800,7 +1051,7 @@ mod tests {
         let obs = vec![terminated("init-0", "id0", 7)];
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs),
-            InitAction::AwaitInit { index: 0 }
+            InitAction::AwaitInit { start: vec![0], blocked_on: Some(0) }
         );
     }
 
@@ -810,12 +1061,12 @@ mod tests {
         let nonzero = vec![terminated("init-0", "id0", 3)];
         assert_eq!(
             next_init_action(RestartPolicy::OnFailure, &nonzero),
-            InitAction::AwaitInit { index: 0 }
+            InitAction::AwaitInit { start: vec![0], blocked_on: Some(0) }
         );
         let zero = vec![terminated("init-0", "id0", 0), waiting("init-1")];
         assert_eq!(
             next_init_action(RestartPolicy::OnFailure, &zero),
-            InitAction::AwaitInit { index: 1 }
+            InitAction::AwaitInit { start: vec![1], blocked_on: Some(1) }
         );
     }
 
