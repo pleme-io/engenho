@@ -852,6 +852,10 @@ impl Kubelet {
         namespace: &str,
         pod_name: &str,
         pod: &Value,
+        // The container this env entry belongs to. Needed because
+        // `resourceFieldRef.containerName` is OPTIONAL and defaults to the
+        // enclosing container — without it, an omitted name has no referent.
+        container_name: &str,
         entry: &Value,
         sources: &BTreeMap<(String, String), Value>,
     ) -> Result<(String, String), KubeletError> {
@@ -995,15 +999,142 @@ impl Kubelet {
             return Ok((key, val));
         }
 
-        // resourceFieldRef and any unknown source class remain unsupported.
-        let source = ["resourceFieldRef"]
-            .into_iter()
-            .find(|k| from.get(*k).is_some())
-            .unwrap_or("unknown source");
+        // ── valueFrom.resourceFieldRef — the DOWNWARD API for resources ────
+        //
+        // ★ WHY THIS HAD TO EXIST BEFORE FLUX COULD RUN AT ALL. Flux's three
+        // controllers each set `GOMEMLIMIT` from `resourceFieldRef`
+        // (limits.memory). Refusing it is the right call — a Go runtime told
+        // the wrong memory limit misbehaves silently — but it meant every Flux
+        // pod was rejected at admission, and the kubelet retried each one
+        // EVERY TICK. Measured on rio 2026-09-15: 273 `invalid manifest` warns
+        // in 3 minutes, engenho pinned at ~126% CPU, node readiness flapping to
+        // Unknown, and a single Secret write taking 70s — all downstream of
+        // three pods that could never be admitted.
+        //
+        // Semantics follow upstream exactly:
+        //   * `containerName` omitted ⇒ THIS container (hence `container`).
+        //   * `divisor` defaults to 1; the value is the resource quantity
+        //     divided by it, rounded UP (upstream uses ceiling), rendered as a
+        //     bare integer.
+        //   * A `limits.*` reference with no limit set falls back to the
+        //     NODE's allocatable in upstream. We do not have that here, so we
+        //     refuse by name rather than substituting 0 — a Go runtime handed
+        //     `GOMEMLIMIT=0` would thrash immediately, which is precisely the
+        //     silent-misconfiguration this function exists to prevent.
+        if let Some(rref) = from.get("resourceFieldRef") {
+            let resource = rref
+                .get("resource")
+                .and_then(|r| r.as_str())
+                .ok_or_else(|| invalid(format!("env {key}: resourceFieldRef has no resource")))?;
+
+            // Which container's resources? Default is the enclosing one.
+            let target = rref
+                .get("containerName")
+                .and_then(|c| c.as_str())
+                .unwrap_or(container_name);
+            let cspec = Self::find_container_spec(pod, target).ok_or_else(|| {
+                invalid(format!(
+                    "env {key}: resourceFieldRef names container {target}, which this pod \
+                     does not declare"
+                ))
+            })?;
+
+            // "limits.memory" → ("limits", "memory")
+            let (bucket, field) = resource.split_once('.').ok_or_else(|| {
+                invalid(format!(
+                    "env {key}: resourceFieldRef resource {resource:?} is not \
+                     <limits|requests>.<resource>"
+                ))
+            })?;
+            if bucket != "limits" && bucket != "requests" {
+                return Err(invalid(format!(
+                    "env {key}: resourceFieldRef resource {resource:?} must start with \
+                     limits. or requests."
+                )));
+            }
+
+            // ★ THE UNIT IS WHAT MAKES THE DIVISOR DEFAULT CORRECT. Upstream
+            // reports cpu in CORES and memory in BYTES, with `divisor`
+            // defaulting to the quantity "1". Reading BOTH the resource and
+            // the divisor in the same canonical unit makes that fall out:
+            // "1" as MilliCores is 1000 (one core), "1" as Bytes is 1. So
+            // 500m cpu / default → ceil(500/1000) = 1 core, and 1Gi memory /
+            // default → 1073741824 bytes, both matching upstream without a
+            // special case per resource.
+            let unit = if field == "cpu" {
+                crate::backend::QuantityUnit::MilliCores
+            } else {
+                crate::backend::QuantityUnit::Bytes
+            };
+
+            let bucket_map = cspec.pointer(&format!("/resources/{bucket}"));
+            let amount = match crate::backend::ResourceBound::read(bucket_map, field, unit) {
+                crate::backend::ResourceBound::Set(n) => n,
+                crate::backend::ResourceBound::Unset => {
+                    return Err(invalid(format!(
+                        "env {key}: resourceFieldRef wants {resource} of container {target}, \
+                         but it declares none — refusing rather than substituting a value the \
+                         workload would act on"
+                    )));
+                }
+                crate::backend::ResourceBound::Unparseable(s) => {
+                    return Err(invalid(format!(
+                        "env {key}: {resource} of container {target} is {s:?}, which is not a \
+                         quantity this kubelet can parse"
+                    )));
+                }
+            };
+
+            let divisor_raw = rref
+                .get("divisor")
+                .and_then(|d| match d {
+                    Value::String(s) if !s.is_empty() => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "1".to_string());
+            let divisor = match crate::backend::ResourceBound::read(
+                Some(&serde_json::json!({ "d": divisor_raw })),
+                "d",
+                unit,
+            ) {
+                crate::backend::ResourceBound::Set(n) if n > 0 => n,
+                _ => {
+                    return Err(invalid(format!(
+                        "env {key}: resourceFieldRef divisor {divisor_raw:?} is not a positive \
+                         quantity"
+                    )));
+                }
+            };
+
+            // Upstream rounds UP, so a quantity smaller than the divisor
+            // reports 1 rather than 0 — a workload dividing by this must never
+            // see a zero it did not ask for.
+            let scaled = amount.div_euclid(divisor) + i64::from(amount.rem_euclid(divisor) != 0);
+            return Ok((key, scaled.to_string()));
+        }
+
+        // Any remaining unknown source class stays unsupported, loudly.
         Err(invalid(format!(
-            "env {key}: valueFrom.{source} is not supported yet — refusing rather than \
+            "env {key}: valueFrom.unknown source is not supported yet — refusing rather than \
              starting the container without it"
         )))
+    }
+
+    /// The container object named `want` within `pod`, searched across
+    /// `containers` and `initContainers` — `resourceFieldRef.containerName`
+    /// may legally name either.
+    fn find_container_spec<'p>(pod: &'p Value, want: &str) -> Option<&'p Value> {
+        for key in ["containers", "initContainers"] {
+            if let Some(arr) = pod.pointer(&format!("/spec/{key}")).and_then(|c| c.as_array()) {
+                for c in arr {
+                    if c.get("name").and_then(|n| n.as_str()) == Some(want) {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn extract_container_specs(
@@ -1073,7 +1204,8 @@ impl Kubelet {
                 Some(arr) => {
                     let mut map = BTreeMap::new();
                     for entry in arr {
-                        let (k, v) = Self::resolve_env_entry(namespace, name, pod, entry, sources)?;
+                        let (k, v) =
+                            Self::resolve_env_entry(namespace, name, pod, &cname, entry, sources)?;
                         map.insert(k, v);
                     }
                     map
@@ -3619,9 +3751,141 @@ mod env_resolution_tests {
             "pangea-system",
             "pangea-operator-abc",
             &pod(),
+            "main",
             &entry,
             &sources,
         )
+    }
+
+    /// A pod shaped like Flux's controllers: one container declaring both
+    /// limits, which is what `resourceFieldRef` reads.
+    fn pod_with_resources() -> serde_json::Value {
+        json!({
+            "metadata": { "name": "helm-controller-1", "namespace": "flux-system" },
+            "spec": { "containers": [ {
+                "name": "manager",
+                "image": "ghcr.io/fluxcd/helm-controller:v1.4.5",
+                "resources": {
+                    "limits": { "cpu": "1", "memory": "1Gi" },
+                    "requests": { "cpu": "500m", "memory": "64Mi" }
+                }
+            } ] }
+        })
+    }
+
+    fn resolve_in(
+        pod: &serde_json::Value,
+        container: &str,
+        entry: serde_json::Value,
+    ) -> Result<(String, String), super::KubeletError> {
+        let sources: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
+        Kubelet::resolve_env_entry("flux-system", "helm-controller-1", pod, container, &entry, &sources)
+    }
+
+    /// THE ONE FLUX NEEDS. Every Flux controller sets GOMEMLIMIT from
+    /// `limits.memory` via the downward API. Until this resolved, all three
+    /// were refused at admission and the kubelet retried them EVERY TICK —
+    /// measured on rio 2026-09-15: 273 `invalid manifest` warnings in three
+    /// minutes, engenho pinned near 126% CPU, node readiness flapping to
+    /// Unknown, and a single Secret write taking 70s. Three unadmittable pods
+    /// degraded the whole apiserver.
+    #[test]
+    fn gomemlimit_from_limits_memory_resolves_in_bytes() {
+        assert_eq!(
+            resolve_in(
+                &pod_with_resources(),
+                "manager",
+                json!({
+                    "name": "GOMEMLIMIT",
+                    "valueFrom": { "resourceFieldRef": {
+                        "containerName": "manager", "resource": "limits.memory"
+                    } }
+                })
+            )
+            .unwrap(),
+            ("GOMEMLIMIT".to_string(), "1073741824".to_string()),
+            "1Gi must render as BYTES — a Go runtime acts on this number"
+        );
+    }
+
+    /// `containerName` is OPTIONAL and defaults to the enclosing container.
+    /// Flux omits it, so an implementation that required it would still
+    /// refuse every Flux pod while looking correct against an explicit test.
+    #[test]
+    fn an_omitted_container_name_means_the_enclosing_container() {
+        assert_eq!(
+            resolve_in(
+                &pod_with_resources(),
+                "manager",
+                json!({
+                    "name": "GOMEMLIMIT",
+                    "valueFrom": { "resourceFieldRef": { "resource": "limits.memory" } }
+                })
+            )
+            .unwrap()
+            .1,
+            "1073741824"
+        );
+    }
+
+    /// Upstream reports cpu in CORES and rounds UP, so `500m` with the
+    /// default divisor is 1, not 0. A zero here would be acted on.
+    #[test]
+    fn cpu_is_reported_in_whole_cores_rounded_up() {
+        assert_eq!(
+            resolve_in(
+                &pod_with_resources(),
+                "manager",
+                json!({
+                    "name": "GOMAXPROCS",
+                    "valueFrom": { "resourceFieldRef": { "resource": "requests.cpu" } }
+                })
+            )
+            .unwrap()
+            .1,
+            "1",
+            "500m must round UP to 1 core, never down to 0"
+        );
+    }
+
+    /// An explicit divisor scales in the resource's own unit.
+    #[test]
+    fn a_divisor_scales_in_the_resources_unit() {
+        assert_eq!(
+            resolve_in(
+                &pod_with_resources(),
+                "manager",
+                json!({
+                    "name": "MEM_MI",
+                    "valueFrom": { "resourceFieldRef": {
+                        "resource": "limits.memory", "divisor": "1Mi"
+                    } }
+                })
+            )
+            .unwrap()
+            .1,
+            "1024"
+        );
+    }
+
+    /// A reference to a resource the container does not declare REFUSES.
+    /// Upstream falls back to the node's allocatable; we do not have that
+    /// here, and substituting 0 would hand a Go runtime a GOMEMLIMIT it would
+    /// thrash on. Refusing by name is the honest answer.
+    #[test]
+    fn an_undeclared_resource_refuses_rather_than_substituting() {
+        let err = resolve_in(
+            &pod_with_resources(),
+            "manager",
+            json!({
+                "name": "EPH",
+                "valueFrom": { "resourceFieldRef": {
+                    "resource": "limits.ephemeral-storage"
+                } }
+            }),
+        )
+        .expect_err("must not invent a value");
+        assert!(err.to_string().contains("declares none"), "{err}");
     }
 
     /// THE REGRESSION. Every one of these used to VANISH — the extractor
@@ -3669,19 +3933,25 @@ mod env_resolution_tests {
 
     /// An unsupported SOURCE must fail loudly and name itself. Starting a
     /// container without its credentials is the failure mode this whole
-    /// function exists to prevent. `resourceFieldRef` remains unsupported;
-    /// `secretKeyRef` / `configMapKeyRef` now resolve when pre-fetched.
+    /// function exists to prevent.
+    ///
+    /// ★ CHANGED 2026-09-15: this used to assert that `resourceFieldRef` was
+    /// unsupported. It is now IMPLEMENTED (Flux needs it for GOMEMLIMIT), so
+    /// asserting its refusal would pin the very gap that broke the cluster.
+    /// The invariant under test is unchanged — an unknown source still
+    /// refuses and still names the variable — only the example moved to a
+    /// source that genuinely remains unsupported.
     #[test]
     fn an_unsupported_source_refuses_and_names_itself() {
         let err = resolve(json!({
             "name": "CPU_LIMIT",
-            "valueFrom": { "resourceFieldRef": { "resource": "limits.cpu" } }
+            "valueFrom": { "someFutureRef": { "resource": "limits.cpu" } }
         }))
         .expect_err("an unresolvable source must not be silently dropped");
         let msg = err.to_string();
         assert!(
-            msg.contains("resourceFieldRef"),
-            "error must name the source: {msg}"
+            msg.contains("not supported yet"),
+            "error must say the source is unsupported: {msg}"
         );
         assert!(
             msg.contains("CPU_LIMIT"),
@@ -3704,6 +3974,7 @@ mod env_resolution_tests {
             "pangea-system",
             "pangea-operator-abc",
             &pod(),
+            "main",
             &json!({
                 "name": "PGPASSWORD",
                 "valueFrom": { "secretKeyRef": { "name": "pg-app", "key": "password" } }
@@ -3727,6 +3998,7 @@ mod env_resolution_tests {
             "pangea-system",
             "pangea-operator-abc",
             &pod(),
+            "main",
             &json!({
                 "name": "LOG_LEVEL",
                 "valueFrom": { "configMapKeyRef": { "name": "app-cfg", "key": "level" } }
@@ -3799,6 +4071,7 @@ mod env_resolution_tests {
             "n",
             "p",
             &bare,
+            "main",
             &json!({ "name": "POD_IP", "valueFrom": { "fieldRef": { "fieldPath": "status.podIP" } } }),
             &sources,
         )
