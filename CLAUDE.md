@@ -71,6 +71,46 @@ Same shape as Crossplane's ban on `format!()` of Go syntax
 and NixAST's ban on string-concat of Nix
 ([`pleme-io/theory/NIX-AST.md`](https://github.com/pleme-io/theory/blob/main/NIX-AST.md)).
 
+## One binary — the shape every change is measured against
+
+**engenho IS the Kubernetes system, it does not supervise one.** One
+statically-linked binary, no second daemon, no sidecar, no shell. When you
+add a capability the default is that it lives in this workspace, in Rust,
+in-process — reached by a trait call, not by a socket or a subprocess.
+
+Destination: [`pleme-io/theory/BUTAI.md`](https://github.com/pleme-io/theory/blob/main/BUTAI.md)
+§1. What is still outside the binary today:
+[`docs/PITR-READINESS.md`](./docs/PITR-READINESS.md) §4.
+
+**For a new capability, in order:**
+
+1. **A Rust module in this workspace** — the route the store, scheduler,
+   controllers, kubelet, CSI provisioner and snapshot controller all took.
+2. **A plugin CONTRACT the ecosystem ships binaries for** (CNI, CSI) —
+   implement the *seam* in-process and let someone else's binary plug into
+   it. The interface outlives the technology, so satisfying the seam buys
+   ~150 drivers without engenho implementing any of them.
+3. **A fact about the WORLD** — type it as a permanent front door, and say
+   in the code that it is one.
+
+**Embedding a CAPABILITY is not embedding someone else's IMPLEMENTATION.**
+The anti-patterns below forbid vendoring upstream Go; this section requires
+owning the capability in Rust. They are one rule seen twice — engenho
+implements what it runs. Re-deriving is embedding; copying is not.
+
+**The exception is a world-fact, never a convenience.** `engenho → CRI →
+containerd` stays reachable **by design, permanently** — not because butai
+cannot replace it, but because a cluster we do not own may already run it and
+because upstream publishes OCI images rather than Nix derivations. Per
+[`MIRAGEM`](https://github.com/pleme-io/theory/blob/main/MIRAGEM.md), a limit
+phrased in terms of *our own* abstractions is ours to dissolve; one phrased as
+a fact about *the world* gets typed. "We shell out to podman" is ours. "Docker
+Hub serves images" is not. Deleting the CRI backend to chase a purity number
+is the misreading of this section.
+
+A build-time tool is not a violation: `engenho-kube-codegen` and
+`engenho-cluster-config-render` never ship in the runtime path.
+
 ## Build
 
 ```bash
@@ -280,6 +320,12 @@ the signal.
 - **Bypassing cofre for secrets.** Kubelet must materialize secrets
   through cofre; no plaintext k8s `Secret` object in flight.
 - **Embedding upstream Go.** Engenho ships zero vendored Go (theory/ENGENHO.md §I).
+  This bans copying an implementation, not owning a capability — see
+  "One binary" above for the distinction.
+- **A second daemon, sidecar or `Command::new` for a capability** a Rust
+  trait impl could serve. The two shell-outs that remain are tracked, not
+  precedent: podman (theory/BUTAI.md M0–M8) and helm
+  (`engenho-fonte/src/caixa_helm_installer.rs`).
 - **Hand-rolled work-graph orchestration.** Use `shigoto::Dag` per
   pleme-io/theory/SHIGOTO.md.
 - **Shell scripts beyond 3-line glue.** Tatara-lisp via `tatara-script`
