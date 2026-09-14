@@ -1235,11 +1235,12 @@ impl Kubelet {
     /// status is byte-identical to before the init-container brick. The init
     /// path uses the with-init form directly.
     fn build_pod_status(
+        live: &Value,
         phase: engenho_types::curated_enums::PodPhase,
         statuses: &[ContainerStatusOut],
         pod_ip: Option<&str>,
     ) -> Value {
-        Self::build_pod_status_with_init(phase, &[], statuses, pod_ip, true, false)
+        Self::build_pod_status_with_init(live, phase, &[], statuses, pod_ip, true, false)
     }
 
     /// Build the desired Pod `status`, optionally carrying init-container state.
@@ -1259,6 +1260,7 @@ impl Kubelet {
     /// and the app containers are up they become `True`. Init containers do NOT
     /// contribute to `ContainersReady` (K8s excludes them).
     fn build_pod_status_with_init(
+        live: &Value,
         phase: engenho_types::curated_enums::PodPhase,
         init_statuses: &[ContainerStatusOut],
         statuses: &[ContainerStatusOut],
@@ -1285,26 +1287,73 @@ impl Kubelet {
         let status_str = |b: bool| if b { "True" } else { "False" };
         let container_statuses: Vec<Value> =
             statuses.iter().map(Self::render_container_status).collect();
-        // Deterministic order: ContainersReady then Ready (stable across writes
-        // → NoChange at steady state).
-        let mut conditions = vec![
-            json!({
-                "type": "ContainersReady",
-                "status": status_str(containers_ready),
-            }),
-            json!({
-                "type": "Ready",
-                "status": status_str(ready),
-            }),
-        ];
-        // Append the Initialized condition ONLY for a pod with init containers.
-        // A no-init pod omits it entirely (byte-identical pre-init render).
+        // ── ★ CONDITIONS ARE MERGED BY TYPE, NOT REPLACED ────────────────
+        // This array is shipped through an RFC 7396 JSON Merge Patch, whose
+        // defined semantics are "arrays replace whole". So rendering a fresh
+        // 2-3 element array DELETED every condition the kubelet does not
+        // author — and engenho's scheduler writes exactly one:
+        // `PodScheduled=False/Unschedulable`. The first kubelet status write
+        // silently removed it, turning "this pod could not be placed, here is
+        // why" into no condition at all.
+        //
+        // The fix is read-modify-write HERE rather than strategic-merge in the
+        // store, for a reason that is not stylistic: `write_status_cas`
+        // compares the rendered `desired` against the stored `live` for exact
+        // whole-JSON equality to decide `NoChange`. Under a store-side merge
+        // the STORE would decide the merged array, `desired` would never equal
+        // `live`, `NoChange` would never fire, and the kubelet would write on
+        // every tick — waking every Pod-subscribed controller forever. Computed
+        // FROM `live`, equality holds by construction.
+        //
+        // Upstream's own list, `kubetypes.PodConditionsByKubelet`.
+        const KUBELET_OWNED: [&str; 4] =
+            ["PodScheduled", "Initialized", "Ready", "ContainersReady"];
+        // (a) Everything we do NOT own, in its existing order — readiness
+        // gates, DisruptionTarget, anything a future controller adds.
+        let mut conditions: Vec<Value> = live
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .map(|cs| {
+                cs.iter()
+                    .filter(|c| {
+                        !c.get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| KUBELET_OWNED.contains(&t))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        // (b) Ours, in a fixed order so the render is stable across writes
+        // (stable render ⇒ NoChange at steady state ⇒ no watch storm).
+        conditions.push(json!({
+            "type": "ContainersReady",
+            "status": status_str(containers_ready),
+        }));
+        conditions.push(json!({
+            "type": "Ready",
+            "status": status_str(ready),
+        }));
+        // Initialized ONLY for a pod with init containers. A no-init pod omits
+        // it entirely (byte-identical pre-init render).
         if has_init {
             conditions.push(json!({
                 "type": "Initialized",
                 "status": status_str(initialized),
             }));
         }
+        // ★ PodScheduled=True, ALWAYS. The kubelet only reconciles pods whose
+        // `spec.nodeName` is this node, so by the time this renders, being
+        // scheduled is a tautology — which is exactly upstream's reasoning for
+        // the kubelet owning this condition. Before this, `PodScheduled=True`
+        // appeared NOWHERE in engenho: the scheduler writes the condition only
+        // on the failure path, so a successfully-placed pod simply never had
+        // one. Asserting it here is also what TRANSITIONS a stale
+        // `False/Unschedulable` rather than deleting it.
+        conditions.push(json!({
+            "type": "PodScheduled",
+            "status": "True",
+        }));
         let mut status = json!({
             "phase": phase_str,
             "conditions": conditions,
@@ -1320,7 +1369,23 @@ impl Kubelet {
         }
         if let Some(ip) = pod_ip {
             status["podIP"] = Value::String(ip.to_string());
+            // `podIPs` is the plural upstream added for dual-stack and it is
+            // what modern clients read; `podIP` is retained as the first entry.
+            // Derived from the same value so `podIP == podIPs[0]` holds by
+            // construction rather than by two writers agreeing.
+            status["podIPs"] = json!([{ "ip": ip }]);
         }
+        // ★ `startTime` is LATCHED, never minted per render. It records when
+        // the kubelet first accepted the pod; re-stamping it every tick would
+        // make "how long has this been running" always read zero — the same
+        // defect as the Node condition's lastTransitionTime. It also breaks
+        // `NoChange`: a value that differs on every render writes on every
+        // tick.
+        let start_time = live
+            .pointer("/status/startTime")
+            .and_then(Value::as_str)
+            .map_or_else(engenho_types::time::now_rfc3339_utc, str::to_string);
+        status["startTime"] = Value::String(start_time);
         status
     }
 }
@@ -1701,6 +1766,7 @@ impl Kubelet {
             })
             .collect();
         let desired = Self::build_pod_status(
+            value,
             engenho_types::curated_enums::PodPhase::Pending,
             &statuses,
             None,
@@ -2709,6 +2775,7 @@ impl Kubelet {
             // describe shows the completed init sequence.
             let init_statuses = self.init_statuses_terminated(key, &init_specs).await;
             Self::build_pod_status_with_init(
+                value,
                 phase,
                 &init_statuses,
                 &statuses,
@@ -2717,7 +2784,7 @@ impl Kubelet {
                 /* has_init */ true,
             )
         } else {
-            Self::build_pod_status(phase, &statuses, pod_ip.as_deref())
+            Self::build_pod_status(value, phase, &statuses, pod_ip.as_deref())
         };
         self.write_pod_status(key, value, &desired, report).await
     }
@@ -2961,6 +3028,7 @@ impl Kubelet {
                 );
                 let init_statuses = self.init_statuses_observed(&observations);
                 let desired = Self::build_pod_status_with_init(
+                    value,
                     engenho_types::curated_enums::PodPhase::Failed,
                     &init_statuses,
                     &[],
@@ -2986,6 +3054,7 @@ impl Kubelet {
                 // restarted container.
                 let init_statuses = self.init_statuses_current(key, init_specs).await;
                 let desired = Self::build_pod_status_with_init(
+                    value,
                     engenho_types::curated_enums::PodPhase::Pending,
                     &init_statuses,
                     &[],
@@ -3653,6 +3722,107 @@ mod tests {
         assert!(!Kubelet::pod_already_terminal(&json!({"spec": {}})));
     }
 
+    fn one_running_status() -> Vec<ContainerStatusOut> {
+        vec![ContainerStatusOut {
+            name: "c".into(),
+            ready: true,
+            state: ContainerState::Running,
+            container_id: Some("fake-1".into()),
+            restart_count: 0,
+        }]
+    }
+
+    fn type_of<'a>(status: &'a Value, ty: &str) -> Option<&'a Value> {
+        status["conditions"]
+            .as_array()?
+            .iter()
+            .find(|c| c["type"] == ty)
+    }
+
+    #[test]
+    fn a_condition_the_kubelet_does_not_own_survives_the_render() {
+        use engenho_types::curated_enums::PodPhase;
+        // THE BUG. The rendered array ships through an RFC 7396 merge patch,
+        // where arrays REPLACE. So a fresh 2-3 element render deleted every
+        // condition the kubelet does not author. engenho's scheduler writes
+        // exactly one — PodScheduled=False/Unschedulable — and the first
+        // kubelet status write removed it, turning "could not be placed, here
+        // is why" into no condition at all.
+        let live = json!({"status": {"conditions": [
+            {"type": "PodScheduled", "status": "False", "reason": "Unschedulable"},
+            {"type": "DisruptionTarget", "status": "True", "reason": "EvictionByEvictionAPI"}
+        ]}});
+        let status = Kubelet::build_pod_status(&live, PodPhase::Running, &one_running_status(), None);
+
+        // The foreign condition is preserved verbatim, reason included.
+        let foreign = type_of(&status, "DisruptionTarget").expect("preserved");
+        assert_eq!(foreign["reason"], "EvictionByEvictionAPI");
+
+        // NEGATIVE CONTROL: rendering against an EMPTY live pod must NOT
+        // produce it. Without this, the assertion above would also pass if the
+        // renderer simply invented a DisruptionTarget, and would pass on a
+        // renderer that ignored `live` entirely and got lucky.
+        let fresh = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &one_running_status(), None);
+        assert!(
+            type_of(&fresh, "DisruptionTarget").is_none(),
+            "the renderer must PRESERVE, never invent: {fresh}"
+        );
+    }
+
+    #[test]
+    fn a_stale_unschedulable_is_transitioned_not_deleted() {
+        use engenho_types::curated_enums::PodPhase;
+        // The kubelet only reconciles pods already bound to this node, so
+        // PodScheduled is a tautology by the time this renders — which is why
+        // the kubelet owns it upstream. Before this it appeared NOWHERE in
+        // engenho: the scheduler writes it only on the failure path, so a
+        // successfully-placed pod simply never had one.
+        let live = json!({"status": {"conditions": [
+            {"type": "PodScheduled", "status": "False", "reason": "Unschedulable"}
+        ]}});
+        let status = Kubelet::build_pod_status(&live, PodPhase::Running, &one_running_status(), None);
+        let sched = type_of(&status, "PodScheduled").expect("PodScheduled is owned and always emitted");
+        assert_eq!(sched["status"], "True", "transitioned, not deleted: {status}");
+        // Exactly one — the stale False was replaced, not appended beside.
+        let n = status["conditions"].as_array().unwrap()
+            .iter().filter(|c| c["type"] == "PodScheduled").count();
+        assert_eq!(n, 1, "no duplicate PodScheduled: {status}");
+    }
+
+    #[test]
+    fn start_time_is_latched_not_reminted_on_every_render() {
+        use engenho_types::curated_enums::PodPhase;
+        // Re-stamping per render makes "how long has this been running" always
+        // read zero, and — worse — makes `desired` differ on every tick, so
+        // write_status_cas never yields NoChange and the kubelet writes
+        // forever, waking every Pod-subscribed controller.
+        let live = json!({"status": {"startTime": "2026-01-01T00:00:00Z"}});
+        let a = Kubelet::build_pod_status(&live, PodPhase::Running, &one_running_status(), None);
+        assert_eq!(a["startTime"], "2026-01-01T00:00:00Z");
+        // Two renders of the same live pod are byte-identical — the property
+        // NoChange depends on.
+        let b = Kubelet::build_pod_status(&live, PodPhase::Running, &one_running_status(), None);
+        assert_eq!(a, b, "the render must be stable at steady state");
+        // NEGATIVE CONTROL: with no previous startTime one is minted, so the
+        // field is genuinely produced rather than merely echoed.
+        let fresh = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &one_running_status(), None);
+        assert!(fresh["startTime"].as_str().is_some_and(|t| !t.is_empty()));
+    }
+
+    #[test]
+    fn pod_ips_is_derived_from_pod_ip_not_written_twice() {
+        use engenho_types::curated_enums::PodPhase;
+        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &one_running_status(), Some("10.42.0.7"));
+        assert_eq!(status["podIP"], "10.42.0.7");
+        // Derived, so `podIP == podIPs[0]` holds by construction rather than
+        // by two writers agreeing.
+        assert_eq!(status["podIPs"][0]["ip"], "10.42.0.7");
+        // No IP ⇒ neither field, rather than an empty array a client must
+        // distinguish from "no address yet".
+        let none = Kubelet::build_pod_status(&json!({}), PodPhase::Pending, &one_running_status(), None);
+        assert!(none.get("podIPs").is_none(), "{none}");
+    }
+
     #[test]
     fn build_pod_status_running_carries_ready_and_pod_ip() {
         use engenho_types::curated_enums::PodPhase;
@@ -3663,7 +3833,7 @@ mod tests {
             container_id: Some("fake-1".into()),
             restart_count: 0,
         }];
-        let status = Kubelet::build_pod_status(PodPhase::Running, &statuses, Some("10.42.0.5"));
+        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &statuses, Some("10.42.0.5"));
         assert_eq!(status["phase"], "Running");
         assert_eq!(status["podIP"], "10.42.0.5");
         // Deterministic pair: ContainersReady then Ready, both True when Running
@@ -3689,7 +3859,7 @@ mod tests {
             container_id: Some("fake-2".into()),
             restart_count: 0,
         }];
-        let status = Kubelet::build_pod_status(PodPhase::Succeeded, &statuses, Some("10.42.0.9"));
+        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Succeeded, &statuses, Some("10.42.0.9"));
         assert_eq!(status["phase"], "Succeeded");
         // Both conditions False for a terminal pod.
         assert_eq!(status["conditions"][0]["type"], "ContainersReady");
@@ -3714,7 +3884,7 @@ mod tests {
             container_id: Some("fake-3".into()),
             restart_count: 0,
         }];
-        let status = Kubelet::build_pod_status(PodPhase::Failed, &statuses, None);
+        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Failed, &statuses, None);
         assert_eq!(status["phase"], "Failed");
         let term = &status["containerStatuses"][0]["state"]["terminated"];
         assert_eq!(term["exitCode"], 137);
@@ -3741,7 +3911,7 @@ mod tests {
                 restart_count: 2,
             },
         ];
-        let status = Kubelet::build_pod_status(PodPhase::Running, &statuses, Some("10.0.0.1"));
+        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &statuses, Some("10.0.0.1"));
         let arr = status["containerStatuses"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["name"], "web");
@@ -3769,7 +3939,7 @@ mod tests {
                 restart_count: 0,
             },
         ];
-        let status = Kubelet::build_pod_status(PodPhase::Pending, &statuses, None);
+        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Pending, &statuses, None);
         assert_eq!(status["phase"], "Pending");
         // Pod not Ready / ContainersReady while a container is Waiting.
         assert_eq!(status["conditions"][0]["type"], "ContainersReady");

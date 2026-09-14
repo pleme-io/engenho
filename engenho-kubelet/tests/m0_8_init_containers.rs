@@ -422,9 +422,19 @@ async fn no_init_pod_starts_app_immediately_initialized_true() {
         "no-init pod has NO initContainerStatuses field"
     );
     let conds = pod["status"]["conditions"].as_array().unwrap();
-    assert_eq!(conds.len(), 2, "no-init pod has exactly 2 conditions");
+    // ── ★ UPDATED 2026-09-14: THREE, not two. `PodScheduled` joined. ──────
+    // This asserted 2 because the kubelet emitted only the conditions it
+    // computes. It now also emits `PodScheduled=True`, which upstream's
+    // kubelet owns and engenho previously published NOWHERE — the scheduler
+    // writes the condition only on the FAILURE path, so a successfully-placed
+    // pod never had one at all. The kubelet only reconciles pods already bound
+    // to this node, so asserting it here is a tautology, which is exactly
+    // upstream's reasoning for the kubelet owning it.
+    assert_eq!(conds.len(), 3, "ContainersReady, Ready, PodScheduled: {conds:?}");
     assert_eq!(conds[0]["type"], "ContainersReady");
     assert_eq!(conds[1]["type"], "Ready");
+    assert_eq!(conds[2]["type"], "PodScheduled");
+    assert_eq!(conds[2]["status"], "True");
     assert!(
         condition_status(&pod, "Initialized").is_none(),
         "no-init pod has NO Initialized condition"
