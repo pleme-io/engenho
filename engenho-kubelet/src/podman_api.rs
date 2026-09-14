@@ -794,6 +794,69 @@ impl PodmanApi {
         )))
     }
 
+    /// Make sure `image` exists locally, pulling it if it does not.
+    ///
+    /// ── ★ WHY CREATE'S `pull_policy` IS NOT ENOUGH ────────────────────────
+    /// [`CreateRequest`] carries a `pull_policy` and we set it correctly
+    /// (`IfNotPresent` → `"missing"`), but `POST /libpod/containers/create`
+    /// does NOT fetch on its behalf — `podman run` pulls in a separate step
+    /// before it creates, and the REST create endpoint has no equivalent. So
+    /// a policy that looks right produced `HTTP 404 … "image not known"` for
+    /// every image not already in the local store.
+    ///
+    /// Measured on rio 2026-09-15: all four FluxCD controllers sat Pending in
+    /// ContainerCreating with exactly that error, while `podman pull` of the
+    /// very same reference succeeded by hand — so the images were reachable
+    /// and the registry was fine. This is the same shape the CRI backend
+    /// already solved with its `ensure_image` (ImageStatus → PullImage); the
+    /// libpod backend simply never grew one.
+    ///
+    /// `Never` is honoured: it must not reach out, so an absent image stays a
+    /// typed create failure rather than becoming a silent pull.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] if the pull is attempted and fails. An image
+    /// that is already present is a cheap no-op — existence is checked first,
+    /// so a steady-state reconcile does not re-pull on every tick.
+    pub async fn ensure_image(
+        &self,
+        image: &str,
+        policy: Option<PullPolicy>,
+    ) -> Result<(), KubeletError> {
+        if policy == Some(PullPolicy::Never) {
+            return Ok(());
+        }
+        let always = policy == Some(PullPolicy::Always);
+        if !always {
+            // `GET /libpod/images/{name}/exists` → 204 present, 404 absent.
+            let (status, _) = self
+                .send(
+                    hyper::Method::GET,
+                    &libpod_path(&format!("images/{image}/exists")),
+                    None,
+                )
+                .await?;
+            if status.is_success() || status == hyper::StatusCode::NO_CONTENT {
+                return Ok(());
+            }
+        }
+        let (status, bytes) = self
+            .send(
+                hyper::Method::POST,
+                &libpod_path(&format!("images/pull?reference={image}")),
+                None,
+            )
+            .await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(KubeletError::Backend(format!(
+            "podman pull {image}: HTTP {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )))
+    }
+
     /// `POST /libpod/containers/create`.
     ///
     /// # Errors
@@ -1168,6 +1231,18 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         if let Some(net) = self.network.as_deref() {
             self.api.ensure_network(net).await?;
         }
+
+        // Ensure the IMAGE before the create that needs it, for the same
+        // reason and in the same place as the network above. `create` carries
+        // a pull_policy but libpod's REST create does not act on it — see
+        // `PodmanApi::ensure_image`. Without this, every image not already in
+        // the local store produced `HTTP 404 … "image not known"` and the pod
+        // sat in ContainerCreating forever; measured on rio with all four
+        // FluxCD controllers, where `podman pull` of the identical reference
+        // succeeded by hand.
+        self.api
+            .ensure_image(&spec.image, spec.pull_policy)
+            .await?;
 
         // Inject KUBERNETES_SERVICE_HOST/PORT/... into every container the API
         // backend starts. Mirrors [`PodmanBackend`]'s single-point injection on
