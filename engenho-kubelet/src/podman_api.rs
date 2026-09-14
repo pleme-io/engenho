@@ -229,6 +229,90 @@ pub struct CreateRequest {
     /// (unlike podman-machine) podman does NOT add it automatically.
     #[serde(rename = "hostadd", skip_serializing_if = "Vec::is_empty")]
     pub host_add: Vec<String>,
+    /// What the kernel is asked to enforce. Absent when the Pod declared
+    /// nothing, so a no-resources Pod produces a byte-identical body to
+    /// before this field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<ResourceLimits>,
+}
+
+/// podman's `resource_limits` block — the subset Kubernetes actually lowers to.
+///
+/// Mirrors OCI's `linux.resources`, which is what podman forwards to the
+/// runtime and the runtime writes into cgroup v2. Measured working on rio
+/// 2026-09-14 via the H1 spike: a `cpu.quota`/`cpu.period`/`memory.limit` set
+/// this way is readable as `cpu.max` / `memory.max` from inside the container.
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// CPU shares/quota/period.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<CpuLimits>,
+    /// Memory ceiling and soft reservation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryLimits>,
+}
+
+/// CPU half of [`ResourceLimits`].
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct CpuLimits {
+    /// Relative weight under contention, from `resources.requests.cpu`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shares: Option<u64>,
+    /// Hard ceiling numerator, microseconds per `period`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<i64>,
+    /// Hard ceiling denominator, microseconds. Fixed at 100_000 — the value
+    /// upstream Kubernetes uses, so a quota computed here means the same
+    /// fraction of a core it would mean on any other kubelet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<u64>,
+}
+
+/// Memory half of [`ResourceLimits`].
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct MemoryLimits {
+    /// Hard ceiling in bytes, from `resources.limits.memory`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+    /// Soft reservation in bytes, from `resources.requests.memory`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<i64>,
+}
+
+/// The CFS period every Kubernetes kubelet uses. Not a tunable here: a
+/// different period would make the same `cpu.max` numerator mean a different
+/// fraction of a core than it does on every other cluster.
+pub const CFS_PERIOD_US: u64 = 100_000;
+
+impl ResourceLimits {
+    /// Lower a typed [`crate::backend::Resources`] onto podman's block.
+    ///
+    /// Returns `None` when nothing was declared, so the field serializes away
+    /// entirely rather than as an empty object.
+    #[must_use]
+    pub fn from_resources(r: &crate::backend::Resources) -> Option<Self> {
+        let quota = r.cpu_limit_milli.value().map(|milli| {
+            // milli-cores → microseconds of CPU per 100ms period.
+            // 1000 milli (one core) → 100_000us == the full period.
+            (i128::from(milli) * i128::from(CFS_PERIOD_US) / 1000) as i64
+        });
+        let shares = r.cpu_weight().map(|w| {
+            // podman's `shares` is the cgroup-v1 number; convert back from the
+            // v2 weight so the two backends cannot disagree by re-deriving.
+            (2 + ((i128::from(w) - 1) * 262_142) / 9999) as u64
+        });
+        let cpu = (quota.is_some() || shares.is_some()).then(|| CpuLimits {
+            shares,
+            quota,
+            period: quota.is_some().then_some(CFS_PERIOD_US),
+        });
+        let memory = {
+            let limit = r.memory_limit_bytes.value();
+            let reservation = r.memory_request_bytes.value();
+            (limit.is_some() || reservation.is_some()).then_some(MemoryLimits { limit, reservation })
+        };
+        (cpu.is_some() || memory.is_some()).then_some(Self { cpu, memory })
+    }
 }
 
 /// Per-network attachment options — carries the DNS aliases.
@@ -457,6 +541,11 @@ pub fn create_request(spec: &ContainerSpec, network: Option<&str>) -> CreateRequ
             (None, _) => None,
         },
         host_add: spec.host_add.clone(),
+        // ★ Same rule as confinement: a bound read from the Pod and then not
+        // SENT is worse than one never read, because the manifest, the typed
+        // spec and the scheduler all still read correct while the kernel
+        // enforces nothing.
+        resource_limits: ResourceLimits::from_resources(&spec.resources),
     }
 }
 
@@ -1261,6 +1350,46 @@ mod tests {
     }
 
     #[test]
+    fn resource_limits_lower_to_the_values_the_kernel_read_back() {
+        use crate::backend::Resources;
+        // Not invented numbers: the H1 spike on rio (2026-09-14) ran a
+        // container with cpu quota 50000 / period 100000 and memory limit
+        // 268435456, then read `cpu.max` and `memory.max` back from INSIDE it
+        // and got exactly those. Pinning them ties this lowering to a
+        // measurement on a real kernel rather than to a reading of a doc.
+        let c: serde_json::Value = serde_json::from_str(
+            r#"{"name":"c","image":"i","resources":{"limits":{"cpu":"500m","memory":"256Mi"}}}"#,
+        )
+        .unwrap();
+        let rl = ResourceLimits::from_resources(&Resources::from_container_json(&c))
+            .expect("declared bounds must lower to a block");
+        let cpu = rl.cpu.expect("cpu block");
+        assert_eq!(cpu.quota, Some(50_000));
+        assert_eq!(cpu.period, Some(CFS_PERIOD_US));
+        assert_eq!(CFS_PERIOD_US, 100_000);
+        assert_eq!(rl.memory.expect("memory block").limit, Some(268_435_456));
+    }
+
+    #[test]
+    fn a_pod_with_no_resources_serializes_no_resource_block() {
+        use crate::backend::Resources;
+        // Behaviour preservation asserted on the WIRE, not assumed:
+        // `resource_limits` must be ABSENT, not an empty object, or podman
+        // sees a request shape it did not see before this field existed.
+        assert_eq!(ResourceLimits::from_resources(&Resources::default()), None);
+        let spec = ContainerSpec {
+            name: "n".into(),
+            image: "i".into(),
+            ..Default::default()
+        };
+        let body = serde_json::to_string(&create_request(&spec, None)).unwrap();
+        assert!(
+            !body.contains("resource_limits"),
+            "unset resources must not reach the wire: {body}"
+        );
+    }
+
+    #[test]
     fn a_create_request_carries_name_image_env_command_and_aliases() {
         let mut env = BTreeMap::new();
         env.insert("KUBECONFIG".to_string(), "/etc/kube/config".to_string());
@@ -1274,6 +1403,7 @@ mod tests {
             mounts: Vec::new(),
             host_add: Vec::new(),
             confinement: crate::backend::Confinement::default(),
+            resources: crate::backend::Resources::default(),
         };
         let req = create_request(&spec, Some("engenho-net"));
 

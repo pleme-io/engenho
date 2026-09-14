@@ -852,6 +852,14 @@ impl Kubelet {
                     // Extra /etc/hosts entries; the backend fills in
                     // host.containers.internal on Linux native when needed.
                     host_add: Vec::new(),
+                    // ★ READ, not defaulted — the same class of miss as
+                    // `confinement` above, and measured on 2026-09-14: nothing
+                    // in the tree consulted `resources` at all, so every
+                    // container engenho has ever run was unlimited, while
+                    // engenho-scheduler packed nodes by `allocatable − Σ
+                    // requests`. The scheduler did arithmetic about a bound the
+                    // node declined to enforce.
+                    resources: crate::backend::Resources::from_container_json(c),
                 },
             ));
         }

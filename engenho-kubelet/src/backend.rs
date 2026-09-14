@@ -155,6 +155,198 @@ impl Confinement {
     }
 }
 
+// =================================================================
+// Resources — what the Pod asked the kernel to enforce
+// =================================================================
+
+/// One declared resource bound.
+///
+/// ── ★ `Option` CONFLATES THE TWO STATES THAT MATTER ───────────────────────
+/// `None` cannot distinguish *"the Pod declared no limit"* — a legitimate,
+/// common Kubernetes state — from *"the Pod declared `512Mi` and we could not
+/// parse it"*. Those demand opposite behaviour: the first runs unlimited
+/// correctly, the second must NOT, because running unlimited is precisely the
+/// silent failure where a manifest states a bound, the kernel enforces nothing,
+/// and no line anywhere says the two disagree. Same argument that made
+/// [`Confinement`] non-`Option`.
+///
+/// So the unparseable case is its OWN variant and carries the original text. A
+/// backend cannot reach [`Self::Set`]'s value without matching, and the match
+/// is non-exhaustive without handling [`Self::Unparseable`] — the compiler,
+/// not a convention, is what stops the drop.
+///
+/// Tier: **parse-time-rejected**. The type forces the case to be HANDLED; it
+/// cannot force the handling to be correct, and whether the kernel then applies
+/// what we sent is an observation about the world (C2), discharged by reading
+/// the cgroup back.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceBound {
+    /// The Pod declared nothing. Kubernetes' own default: unlimited.
+    #[default]
+    Unset,
+    /// A parsed bound, in this field's canonical unit (see [`Resources`]).
+    Set(i64),
+    /// Declared, and NOT parseable. Carries the original text so an error
+    /// names what the manifest actually said.
+    Unparseable(String),
+}
+
+impl ResourceBound {
+    /// Read one quantity out of a `requests`/`limits` map.
+    ///
+    /// Absent key → [`Self::Unset`]. Present but unparseable →
+    /// [`Self::Unparseable`], never `Unset`.
+    #[must_use]
+    pub fn read(map: Option<&serde_json::Value>, key: &str, unit: QuantityUnit) -> Self {
+        let Some(raw) = map.and_then(|m| m.get(key)) else {
+            return Self::Unset;
+        };
+        // A non-string (a bare JSON number) is legal in some manifests.
+        let text = match raw {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            other => return Self::Unparseable(other.to_string()),
+        };
+        match text.parse::<engenho_types::primitives::Quantity>() {
+            Ok(q) => match unit.extract(&q) {
+                Some(v) => Self::Set(v),
+                None => Self::Unparseable(text),
+            },
+            Err(_) => Self::Unparseable(text),
+        }
+    }
+
+    /// The parsed value, if any. `None` for BOTH `Unset` and `Unparseable` —
+    /// use only where the two genuinely behave alike (they rarely do).
+    #[must_use]
+    pub fn value(&self) -> Option<i64> {
+        match self {
+            Self::Set(v) => Some(*v),
+            Self::Unset | Self::Unparseable(_) => None,
+        }
+    }
+
+    /// The original text of a bound we could not parse.
+    #[must_use]
+    pub fn unparseable(&self) -> Option<&str> {
+        match self {
+            Self::Unparseable(s) => Some(s),
+            Self::Unset | Self::Set(_) => None,
+        }
+    }
+}
+
+/// Which canonical unit a [`ResourceBound`] is read in.
+///
+/// cpu is milli-cores because that is Kubernetes' own quantum (`100m`);
+/// memory is whole bytes because a milli-byte is meaningless and cgroup
+/// `memory.max` takes bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantityUnit {
+    /// Milli-cores: `"1"` → 1000, `"100m"` → 100.
+    MilliCores,
+    /// Whole bytes: `"1Gi"` → 1_073_741_824.
+    Bytes,
+}
+
+impl QuantityUnit {
+    fn extract(self, q: &engenho_types::primitives::Quantity) -> Option<i64> {
+        let raw = match self {
+            Self::MilliCores => q.milli_value()?,
+            Self::Bytes => q.integer_value()?,
+        };
+        // A negative bound is not a thing the kernel accepts, and i64 is what
+        // every downstream cgroup/argv surface takes.
+        if raw < 0 {
+            return None;
+        }
+        i64::try_from(raw).ok()
+    }
+}
+
+/// What the Pod asked the kernel to enforce for one container.
+///
+/// ── ★ NOTHING READ THIS UNTIL 2026-09-14 ──────────────────────────────────
+/// `ContainerSpec` carried no resources field at all, and no backend set a
+/// single cgroup value, so **every container engenho has ever run was
+/// unlimited** — while `engenho-scheduler`'s `fit.rs` packed nodes by
+/// `allocatable − Σ requests`, i.e. the scheduler did arithmetic about a bound
+/// the node then declined to enforce. A Pod could request 100m, burn 32 cores,
+/// and both the manifest and the scheduler would still read correct.
+///
+/// `requests` and `limits` are BOTH carried because they lower to different
+/// kernel knobs and conflating them is a real bug: a limit is a ceiling
+/// (`cpu.max`, `memory.max`), a request is a weight under contention
+/// (`cpu.weight`) and the scheduler's currency. Dropping requests would make
+/// every pod equally important under CPU pressure.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resources {
+    /// `resources.limits.cpu`, milli-cores. Lowers to `cpu.max`.
+    pub cpu_limit_milli: ResourceBound,
+    /// `resources.limits.memory`, bytes. Lowers to `memory.max`.
+    pub memory_limit_bytes: ResourceBound,
+    /// `resources.requests.cpu`, milli-cores. Lowers to `cpu.weight`.
+    pub cpu_request_milli: ResourceBound,
+    /// `resources.requests.memory`, bytes. Not a kernel ceiling — the
+    /// scheduler's currency, and the floor for a future `memory.low`.
+    pub memory_request_bytes: ResourceBound,
+}
+
+impl Resources {
+    /// Read `resources.{limits,requests}.{cpu,memory}` off one entry of
+    /// `spec.containers[]`.
+    #[must_use]
+    pub fn from_container_json(container: &serde_json::Value) -> Self {
+        let resources = container.get("resources");
+        let limits = resources.and_then(|r| r.get("limits"));
+        let requests = resources.and_then(|r| r.get("requests"));
+        Self {
+            cpu_limit_milli: ResourceBound::read(limits, "cpu", QuantityUnit::MilliCores),
+            memory_limit_bytes: ResourceBound::read(limits, "memory", QuantityUnit::Bytes),
+            cpu_request_milli: ResourceBound::read(requests, "cpu", QuantityUnit::MilliCores),
+            memory_request_bytes: ResourceBound::read(requests, "memory", QuantityUnit::Bytes),
+        }
+    }
+
+    /// Every bound the manifest declared and we could not parse, in a stable
+    /// order, as `(field, text)`. A backend refuses to start on a non-empty
+    /// result rather than running the container unbounded.
+    #[must_use]
+    pub fn unparseable(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("limits.cpu", &self.cpu_limit_milli),
+            ("limits.memory", &self.memory_limit_bytes),
+            ("requests.cpu", &self.cpu_request_milli),
+            ("requests.memory", &self.memory_request_bytes),
+        ]
+        .into_iter()
+        .filter_map(|(name, b)| b.unparseable().map(|t| (name, t)))
+        .collect()
+    }
+
+    /// Whether anything at all was declared. `false` ⇒ byte-identical
+    /// behaviour to before this type existed.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// `cpu.weight` for this container's cpu request, in cgroup v2's 1..=10000
+    /// range.
+    ///
+    /// Upstream computes cgroup v1 `cpu.shares = max(2, milli * 1024 / 1000)`
+    /// and the v2 conversion is `weight = 1 + ((shares - 2) * 9999) / 262142`.
+    /// Both are reproduced rather than approximated, because a weight that is
+    /// merely *plausible* silently redistributes CPU under contention.
+    #[must_use]
+    pub fn cpu_weight(&self) -> Option<u64> {
+        let milli = self.cpu_request_milli.value()?;
+        let shares = ((milli as i128) * 1024 / 1000).max(2);
+        let weight = 1 + ((shares - 2) * 9999) / 262_142;
+        Some(weight.clamp(1, 10_000) as u64)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerSpec {
     /// Logical container name (namespace/podname/container).
@@ -237,6 +429,13 @@ pub struct ContainerSpec {
     /// podman does NOT synthesize that hostname automatically (unlike
     /// podman-machine on macOS).
     pub host_add: Vec<String>,
+    /// What the Pod asked the kernel to enforce for this container.
+    ///
+    /// Default (all [`ResourceBound::Unset`]) ⇒ behaviour-preserving: a Pod
+    /// declaring no resources produces the same argv / create-body as before
+    /// this field existed. See [`Resources`] for why an unparseable bound is a
+    /// distinct state rather than an absent one.
+    pub resources: Resources,
 }
 
 /// Status the backend reports back.
@@ -1187,6 +1386,42 @@ impl PodmanBackend {
                 });
             }
         }
+        // ── Resources, rendered to argv ───────────────────────────────────
+        // Emitted AFTER confinement and BEFORE env, so the position is
+        // deterministic and unit-assertable. An all-`Unset` `Resources` (a Pod
+        // that declared nothing) pushes nothing → byte-identical argv to before
+        // this brick, which is what makes the existing run_argv tests still
+        // hold without edits.
+        //
+        // NOTE the asymmetry with `--cpus`: podman takes a FRACTIONAL core
+        // count, Kubernetes states milli-cores, and integer division would turn
+        // `500m` into `0` — i.e. a limit of zero cores, which podman rejects,
+        // rather than the half core the manifest asked for. Rendered through a
+        // decimal to keep the quantum.
+        {
+            let r = &spec.resources;
+            if let Some(milli) = r.cpu_limit_milli.value() {
+                argv.push("--cpus".to_string());
+                argv.push(format!("{}.{:03}", milli / 1000, milli % 1000));
+            }
+            if let Some(bytes) = r.memory_limit_bytes.value() {
+                argv.push("--memory".to_string());
+                argv.push(format!("{bytes}b"));
+            }
+            if let Some(weight) = r.cpu_weight() {
+                // podman speaks cgroup-v1 shares on the CLI and converts; the
+                // v2 weight is what the kernel finally stores, so convert back
+                // rather than re-deriving shares from milli a second time and
+                // risking the two paths disagreeing.
+                let shares = 2 + ((weight as i128 - 1) * 262_142) / 9999;
+                argv.push("--cpu-shares".to_string());
+                argv.push(shares.to_string());
+            }
+            if let Some(bytes) = r.memory_request_bytes.value() {
+                argv.push("--memory-reservation".to_string());
+                argv.push(format!("{bytes}b"));
+            }
+        }
         // The API-server coordinates every in-cluster client reads, merged
         // into a COPY so the pod's own declarations still win and the stored
         // spec is never mutated by rendering it.
@@ -2134,10 +2369,133 @@ mod tests {
             // The Kubernetes defaults: these argv tests assert the shape of an
             // UNADORNED container, and a default disposition must not change it.
             confinement: Confinement::default(),
+            // Likewise unset: a Pod that declared no resources must render the
+            // same argv it did before the field existed, which is exactly what
+            // these tests pin.
+            resources: Resources::default(),
         }
     }
 
+    // ── Resources ────────────────────────────────────────────────────────
+
+    fn res_json(limits: &str, requests: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(
+            r#"{{"name":"c","image":"i","resources":{{"limits":{limits},"requests":{requests}}}}}"#
+        ))
+        .unwrap()
+    }
+
     #[test]
+    fn an_unparseable_bound_is_its_own_state_not_unset() {
+        // THE invariant this type exists for. `Option` would collapse these two
+        // into `None`, and the container would then run UNLIMITED while the
+        // manifest said 512Quatloos — the silent failure, not a loud one.
+        let c = res_json(r#"{"memory":"512Quatloos"}"#, "{}");
+        let r = Resources::from_container_json(&c);
+        assert_eq!(
+            r.memory_limit_bytes,
+            ResourceBound::Unparseable("512Quatloos".into())
+        );
+        assert_ne!(r.memory_limit_bytes, ResourceBound::Unset);
+        assert_eq!(r.memory_limit_bytes.value(), None);
+        assert_eq!(r.unparseable(), vec![("limits.memory", "512Quatloos")]);
+        // And an absent key is genuinely Unset — the contrast that makes the
+        // distinction load-bearing rather than decorative.
+        assert_eq!(r.cpu_limit_milli, ResourceBound::Unset);
+        assert!(r.cpu_limit_milli.unparseable().is_none());
+    }
+
+    #[test]
+    fn quantities_read_in_their_canonical_units() {
+        let c = res_json(
+            r#"{"cpu":"500m","memory":"256Mi"}"#,
+            r#"{"cpu":"1","memory":"1Gi"}"#,
+        );
+        let r = Resources::from_container_json(&c);
+        assert_eq!(r.cpu_limit_milli, ResourceBound::Set(500));
+        // 256Mi — the exact byte count the H1 spike read back as memory.max.
+        assert_eq!(r.memory_limit_bytes, ResourceBound::Set(268_435_456));
+        assert_eq!(r.cpu_request_milli, ResourceBound::Set(1000));
+        assert_eq!(r.memory_request_bytes, ResourceBound::Set(1_073_741_824));
+        assert!(r.unparseable().is_empty());
+        assert!(!r.is_unset());
+    }
+
+    #[test]
+    fn a_pod_declaring_nothing_is_unset_and_renders_nothing() {
+        // The behaviour-preservation claim, asserted rather than assumed: this
+        // is why every pre-existing run_argv test still passes unedited.
+        let c: serde_json::Value = serde_json::from_str(r#"{"name":"c","image":"i"}"#).unwrap();
+        let r = Resources::from_container_json(&c);
+        assert!(r.is_unset());
+
+        let b = PodmanBackend::new();
+        let mut spec = ContainerSpec {
+            name: "n".into(),
+            image: "img".into(),
+            ..Default::default()
+        };
+        let before = b.run_argv(&spec);
+        spec.resources = r;
+        assert_eq!(b.run_argv(&spec), before, "unset resources must add no argv");
+        assert!(!before.iter().any(|a| a == "--cpus" || a == "--memory"));
+    }
+
+    #[test]
+    fn run_argv_emits_the_declared_bounds() {
+        let b = PodmanBackend::new();
+        let spec = ContainerSpec {
+            name: "n".into(),
+            image: "img".into(),
+            resources: Resources::from_container_json(&res_json(
+                r#"{"cpu":"500m","memory":"256Mi"}"#,
+                r#"{"cpu":"250m","memory":"64Mi"}"#,
+            )),
+            ..Default::default()
+        };
+        let argv = b.run_argv(&spec);
+        let at = |flag: &str| {
+            argv.iter()
+                .position(|a| a == flag)
+                .map(|i| argv[i + 1].clone())
+        };
+        // 500m must NOT integer-divide to 0 cores — podman rejects `--cpus 0`,
+        // and that is how a half-core limit becomes a startup failure.
+        assert_eq!(at("--cpus").as_deref(), Some("0.500"));
+        assert_eq!(at("--memory").as_deref(), Some("268435456b"));
+        assert_eq!(at("--memory-reservation").as_deref(), Some("67108864b"));
+        assert!(at("--cpu-shares").is_some());
+        // Position is deterministic: resources land after confinement, before env.
+        let cpus = argv.iter().position(|a| a == "--cpus").unwrap();
+        let image = argv.iter().position(|a| a == "img").unwrap();
+        assert!(cpus < image, "resources must precede the image argument");
+    }
+
+    #[test]
+    fn cpu_weight_reproduces_upstreams_conversion() {
+        // shares = max(2, milli*1024/1000); weight = 1 + (shares-2)*9999/262142.
+        // Reproduced, not approximated — a merely plausible weight silently
+        // redistributes CPU under contention, which nothing would report.
+        let r = Resources::from_container_json(&res_json("{}", r#"{"cpu":"1"}"#));
+        assert_eq!(r.cpu_request_milli, ResourceBound::Set(1000));
+        let shares = 1024i128;
+        let expect = (1 + ((shares - 2) * 9999) / 262_142) as u64;
+        assert_eq!(r.cpu_weight(), Some(expect));
+        // No request ⇒ no weight, rather than a default that would make every
+        // unweighted pod equally important.
+        let none = Resources::from_container_json(&res_json("{}", "{}"));
+        assert_eq!(none.cpu_weight(), None);
+    }
+
+    #[test]
+    fn a_negative_or_absurd_bound_is_refused_not_silently_clamped() {
+        let r = Resources::from_container_json(&res_json(r#"{"cpu":"-1"}"#, "{}"));
+        // Negative is not something the kernel accepts; it must surface as
+        // unparseable rather than reaching a backend as Set(-1000).
+        assert!(r.cpu_limit_milli.unparseable().is_some());
+        assert_eq!(r.cpu_limit_milli.value(), None);
+    }
+
     fn run_argv_full_mapping_in_order() {
         let backend = PodmanBackend::new();
         let s = spec(
