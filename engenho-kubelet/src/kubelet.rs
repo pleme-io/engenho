@@ -1527,6 +1527,91 @@ impl Kubelet {
     ///
     /// [`EndpointsController`]: engenho_controllers::EndpointsController
     #[must_use]
+    /// `/etc/hosts` entries mapping every Service's DNS names to its
+    /// **ClusterIP**, in podman's `"name:ip"` `--add-host` shape.
+    ///
+    /// ## Why this exists alongside `service_aliases_for_pod`
+    ///
+    /// The alias path registers a pod's OWN Service names with aardvark-dns,
+    /// so a name resolves to the backing **pod IP**. That is correct only
+    /// while `port == targetPort`. Measured on rio 2026-09-15: Flux's
+    /// source-controller Service is `port: 80` → `targetPort: http` (9090),
+    /// so a client resolving the name got `10.89.0.33` and connected to
+    /// **:80**, where nothing listens — the pod answered 200 on 9090 the
+    /// whole time. kustomize-controller could not fetch a single artifact.
+    ///
+    /// `/etc/hosts` is consulted BEFORE DNS, so mapping the same names to the
+    /// ClusterIP puts the request back on the Service VIP, where the iptables
+    /// datapath performs the port translation the Service declares. That is
+    /// what makes a `port != targetPort` Service work at all.
+    ///
+    /// Headless Services (no ClusterIP, or the literal `"None"`) are
+    /// deliberately SKIPPED — their contract is "resolve to the pod IPs",
+    /// which is exactly what the alias path already provides. Overriding them
+    /// here would break the one case the aliases get right.
+    ///
+    /// Resolution follows Kubernetes' search shape: a Service in the pod's own
+    /// namespace is reachable by all three forms, one in another namespace
+    /// only by its qualified forms.
+    ///
+    /// ## Start-time only — the same accepted limitation as the aliases
+    ///
+    /// `--add-host` is a `podman run` flag, so a Service created after a pod
+    /// starts is not visible to it until the pod is recreated. The named
+    /// destination is unchanged and is the real fix: the `engenho-dns`
+    /// authority (`engenho-controllers/src/dns.rs` already computes exactly
+    /// these `fqdn → clusterIP` records and is not yet served to pods).
+    fn service_cluster_ip_hosts(
+        namespace: &str,
+        services: &[(ResourceKey, Value)],
+        cluster_domain: &str,
+    ) -> Vec<String> {
+        let mut hosts: Vec<String> = Vec::new();
+        for (svc_key, svc_value) in services {
+            let Some(cluster_ip) = svc_value
+                .get("spec")
+                .and_then(|s| s.get("clusterIP"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            // "None" is how a headless Service spells "I have no VIP".
+            if cluster_ip.is_empty() || cluster_ip == "None" {
+                continue;
+            }
+            let Some(svc_name) = svc_value
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let svc_ns = svc_key.namespace.as_deref().unwrap_or("default");
+
+            // Qualified forms are reachable from any namespace.
+            hosts.push([svc_name, ".", svc_ns, ":", cluster_ip].concat());
+            hosts.push(
+                [
+                    svc_name,
+                    ".",
+                    svc_ns,
+                    ".svc.",
+                    cluster_domain,
+                    ":",
+                    cluster_ip,
+                ]
+                .concat(),
+            );
+            // The bare name resolves only within the Service's own namespace.
+            if svc_ns == namespace {
+                hosts.push([svc_name, ":", cluster_ip].concat());
+            }
+        }
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
+
     fn service_aliases_for_pod(
         pod: &Value,
         namespace: &str,
@@ -2365,6 +2450,13 @@ impl Kubelet {
         let services = self.store.list("", "v1", "Service", Some(namespace)).await;
         let aliases =
             Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
+        // ClusterIP `/etc/hosts` entries, listed across ALL namespaces: a pod
+        // resolves Services it CONSUMES, which are frequently not in its own
+        // namespace, whereas the aliases above are about Services that select
+        // THIS pod. Two different questions, so two different lists.
+        let all_services = self.store.list("", "v1", "Service", None).await;
+        let cluster_ip_hosts =
+            Self::service_cluster_ip_hosts(namespace, &all_services, DEFAULT_CLUSTER_DOMAIN);
 
         // (M0.7 kubelet-volumes) Resolve + materialize `spec.volumes[]` ONCE
         // for the pod (configMap/secret → host files; emptyDir → a shared
@@ -2462,6 +2554,7 @@ impl Kubelet {
                 continue;
             }
             spec.network_aliases = aliases.clone();
+            spec.host_add = cluster_ip_hosts.clone();
             // (M0.7 kubelet-volumes) Map this container's `volumeMounts[]`
             // against the resolved `volName → MountSource` map onto its
             // `spec.mounts`. A volumeMount naming an unknown volume is an
@@ -3278,10 +3371,15 @@ impl Kubelet {
         cname: &str,
         base: &ContainerSpec,
         aliases: &[String],
+        cluster_ip_hosts: &[String],
         resolved: &BTreeMap<String, MountSource>,
     ) -> Result<ContainerSpec, KubeletError> {
         let mut spec = base.clone();
         spec.network_aliases = aliases.to_vec();
+        // An init container resolves Service names too — a migration job that
+        // waits on its database is the common shape — so it gets the same
+        // ClusterIP map as the app containers.
+        spec.host_add = cluster_ip_hosts.to_vec();
         if let Some(cjson) = Self::container_json_in(value, "initContainers", cname) {
             spec.mounts =
                 container_mounts(cjson, resolved).map_err(|e| KubeletError::InvalidPod {
@@ -3390,6 +3488,13 @@ impl Kubelet {
         let services = self.store.list("", "v1", "Service", Some(namespace)).await;
         let aliases =
             Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
+        // ClusterIP `/etc/hosts` entries, listed across ALL namespaces: a pod
+        // resolves Services it CONSUMES, which are frequently not in its own
+        // namespace, whereas the aliases above are about Services that select
+        // THIS pod. Two different questions, so two different lists.
+        let all_services = self.store.list("", "v1", "Service", None).await;
+        let cluster_ip_hosts =
+            Self::service_cluster_ip_hosts(namespace, &all_services, DEFAULT_CLUSTER_DOMAIN);
         let cnames: Vec<String> = init_specs.iter().map(|(c, _)| c.clone()).collect();
         let Some(resolved) = self
             .resolve_or_pending(key, value, namespace, &cnames, report, soonest_requeue)
@@ -3514,7 +3619,16 @@ impl Kubelet {
                     let (cname, base_spec) = &init_specs[index];
                     let ip = self
                         .advance_active_init(
-                            key, value, index, cname, base_spec, &aliases, &resolved, &lp, report,
+                            key,
+                            value,
+                            index,
+                            cname,
+                            base_spec,
+                            &aliases,
+                            &cluster_ip_hosts,
+                            &resolved,
+                            &lp,
+                            report,
                         )
                         .await?;
                     pod_ip = pod_ip.or(ip);
@@ -3578,11 +3692,19 @@ impl Kubelet {
         cname: &str,
         base_spec: &ContainerSpec,
         aliases: &[String],
+        cluster_ip_hosts: &[String],
         resolved: &BTreeMap<String, MountSource>,
         lp: &LocalPod,
         report: &mut ReconcileReport,
     ) -> Result<Option<String>, ControllerError> {
-        let spec = match Self::build_init_spec(value, cname, base_spec, aliases, resolved) {
+        let spec = match Self::build_init_spec(
+            value,
+            cname,
+            base_spec,
+            aliases,
+            cluster_ip_hosts,
+            resolved,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 warn!(pod = %key.label(), container = %cname, error = %e,
@@ -4707,6 +4829,75 @@ mod tests {
             "spec": { "selector": selector },
         });
         (key, value)
+    }
+
+    /// The exact Service that stopped Flux: `port: 80` -> `targetPort: http`
+    /// (9090). The alias path resolves the name to the POD IP, so a client
+    /// using the service port connects to a port nothing listens on. The
+    /// ClusterIP entry puts it back on the VIP, where the datapath translates.
+    #[test]
+    fn a_service_maps_to_its_cluster_ip_not_its_pod() {
+        let services = vec![(
+            ResourceKey::namespaced("", "v1", "Service", "flux-system", "source-controller"),
+            serde_json::json!({
+                "metadata": {"name": "source-controller", "namespace": "flux-system"},
+                "spec": {"clusterIP": "10.97.0.5",
+                         "ports": [{"name":"http","port":80,"targetPort":"http"}]}
+            }),
+        )];
+        let hosts = Kubelet::service_cluster_ip_hosts("flux-system", &services, "cluster.local");
+        assert!(
+            hosts
+                .contains(&"source-controller.flux-system.svc.cluster.local:10.97.0.5".to_string()),
+            "got: {hosts:?}"
+        );
+        // Same-namespace pods reach it by the bare name too.
+        assert!(
+            hosts.contains(&"source-controller:10.97.0.5".to_string()),
+            "got: {hosts:?}"
+        );
+    }
+
+    /// A headless Service must NOT be overridden — its contract is "resolve to
+    /// the pod IPs", which is exactly what the alias path already provides.
+    /// Writing a hosts entry here would break the one case aliases get right.
+    #[test]
+    fn a_headless_service_is_left_to_the_alias_path() {
+        let services = vec![(
+            ResourceKey::namespaced("", "v1", "Service", "default", "headless"),
+            serde_json::json!({
+                "metadata": {"name": "headless", "namespace": "default"},
+                "spec": {"clusterIP": "None"}
+            }),
+        )];
+        assert!(
+            Kubelet::service_cluster_ip_hosts("default", &services, "cluster.local").is_empty()
+        );
+    }
+
+    /// A Service in ANOTHER namespace is reachable by its qualified forms and
+    /// NOT by the bare name — the bare form belongs to the pod's own namespace,
+    /// and claiming it cluster-wide would shadow a local Service of the same
+    /// name with a foreign address.
+    #[test]
+    fn a_foreign_namespace_service_does_not_claim_the_bare_name() {
+        let services = vec![(
+            ResourceKey::namespaced("", "v1", "Service", "other", "api"),
+            serde_json::json!({
+                "metadata": {"name": "api", "namespace": "other"},
+                "spec": {"clusterIP": "10.97.0.9"}
+            }),
+        )];
+        let hosts = Kubelet::service_cluster_ip_hosts("default", &services, "cluster.local");
+        assert!(
+            hosts.contains(&"api.other:10.97.0.9".to_string()),
+            "got: {hosts:?}"
+        );
+        assert!(hosts.contains(&"api.other.svc.cluster.local:10.97.0.9".to_string()));
+        assert!(
+            !hosts.contains(&"api:10.97.0.9".to_string()),
+            "a foreign Service must not claim the bare name: {hosts:?}"
+        );
     }
 
     #[test]
