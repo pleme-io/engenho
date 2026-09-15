@@ -19,7 +19,9 @@
 //!
 //! It does **not** implement: `format`, `pattern`, `enum`, numeric bounds
 //! (`minimum`/`maximum`), string/array length bounds, `oneOf`/`anyOf`/`allOf`,
-//! `x-kubernetes-validations` (CEL), defaulting, or pruning of unknown fields.
+//! `x-kubernetes-validations` (CEL), or pruning of unknown fields.
+//! **Defaulting IS implemented** — see [`apply_defaults`], added 2026-09-15
+//! after a missing default crashed a controller in a loop.
 //! Each is a real upstream behaviour and each is absent here. The honest
 //! framing is that a CR which passes this has *correctly-typed* fields, not a
 //! *valid* object.
@@ -90,6 +92,83 @@ pub fn validate(schema: &Value, value: &Value) -> Vec<SchemaViolation> {
     let mut out = Vec::new();
     walk(schema, value, "", &mut out);
     out
+}
+
+/// Apply the schema's `default` values to every absent field of `value`,
+/// in place.
+///
+/// **A missing default is not a cosmetic gap — it is a crash.** Kubernetes
+/// applies structural-schema defaults when an object is decoded, so every
+/// controller in the ecosystem is written as though a defaulted field is
+/// always present, and reads it without a nil check. Measured on rio
+/// 2026-09-15: `GitRepository.spec.timeout` carries `default: 60s` in Flux's
+/// CRD, engenho stored the object without it, and source-controller v1.8.5
+/// dereferenced the nil `*metav1.Duration` at
+/// `gitrepository_controller.go:1007` — panicking on every reconcile, forever,
+/// with the GitRepository stuck reporting "building artifact". No error
+/// pointed at the apiserver.
+///
+/// Runs BEFORE validation, as upstream does: a default must be able to satisfy
+/// a `required` field, which it cannot if validation has already rejected the
+/// object.
+///
+/// ## Two deliberate boundaries
+///
+/// **Only descends into fields that are PRESENT.** If `spec` itself is absent
+/// and carries no `default` of its own, its children are not defaulted —
+/// upstream behaves the same way, and inventing a `spec: {}` to hang defaults
+/// on would fabricate an object the author never wrote.
+///
+/// **`null` counts as absent.** Upstream prunes an explicit null on a
+/// non-nullable field and then defaults it; we do not implement pruning, so
+/// treating null as absent reaches the same end state for the case that
+/// matters and never leaves a nil where a controller expects a value.
+pub fn apply_defaults(schema: &Value, value: &mut Value) {
+    let Some(obj) = schema.as_object() else {
+        return;
+    };
+
+    // Same two escape hatches validation honours: a free-form subtree is the
+    // author asking us not to touch it, and int-or-string has no sub-schema
+    // to default from.
+    if obj
+        .get("x-kubernetes-preserve-unknown-fields")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || obj
+            .get("x-kubernetes-int-or-string")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        return;
+    }
+
+    if let Some(props) = obj.get("properties").and_then(Value::as_object)
+        && let Some(map) = value.as_object_mut()
+    {
+        for (k, sub_schema) in props {
+            let absent = map.get(k).is_none_or(Value::is_null);
+            if absent {
+                if let Some(d) = sub_schema.get("default") {
+                    map.insert(k.clone(), d.clone());
+                }
+                // Whether or not a default landed, an absent field has no
+                // children to descend into.
+                continue;
+            }
+            if let Some(sub_value) = map.get_mut(k) {
+                apply_defaults(sub_schema, sub_value);
+            }
+        }
+    }
+
+    if let Some(items) = obj.get("items")
+        && let Some(arr) = value.as_array_mut()
+    {
+        for element in arr.iter_mut() {
+            apply_defaults(items, element);
+        }
+    }
 }
 
 fn walk(schema: &Value, value: &Value, path: &str, out: &mut Vec<SchemaViolation>) {
@@ -353,5 +432,158 @@ mod tests {
         let v = json!({ "spec": { "size": "x" } });
         let s = validate(&widget_schema(), &v)[0].to_string();
         assert!(s.contains("spec.size") && s.contains("integer"), "got: {s}");
+    }
+}
+
+#[cfg(test)]
+mod defaulting {
+    use super::apply_defaults;
+    use serde_json::{Value, json};
+
+    /// The exact object that crash-looped source-controller on rio.
+    #[test]
+    fn a_gitrepository_gains_the_timeout_its_crd_promises() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "interval": {"type": "string"},
+                        "timeout": {"type": "string", "default": "60s"}
+                    }
+                }
+            }
+        });
+        let mut obj =
+            json!({"spec": {"url": "https://github.com/pleme-io/k8s", "interval": "1m0s"}});
+        apply_defaults(&schema, &mut obj);
+        assert_eq!(obj["spec"]["timeout"], json!("60s"));
+        // Defaulting must not disturb what the author DID write.
+        assert_eq!(obj["spec"]["interval"], json!("1m0s"));
+    }
+
+    /// Negative control: with no `default` in the schema there is nothing to
+    /// add, so a green result above cannot come from the walk inventing
+    /// fields.
+    #[test]
+    fn a_schema_without_defaults_adds_nothing() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"spec": {"type": "object", "properties": {"timeout": {"type": "string"}}}}
+        });
+        let mut obj = json!({"spec": {"url": "u"}});
+        let before = obj.clone();
+        apply_defaults(&schema, &mut obj);
+        assert_eq!(obj, before);
+    }
+
+    /// An author's explicit value always wins — a default that overwrote it
+    /// would silently discard configuration.
+    #[test]
+    fn an_explicit_value_is_never_overwritten() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"timeout": {"type": "string", "default": "60s"}}
+        });
+        let mut obj = json!({"timeout": "5m"});
+        apply_defaults(&schema, &mut obj);
+        assert_eq!(obj["timeout"], json!("5m"));
+    }
+
+    /// An explicit null is how a client spells "absent" through a merge
+    /// patch; leaving it null hands a controller the nil this whole change
+    /// exists to prevent.
+    #[test]
+    fn an_explicit_null_is_treated_as_absent() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"timeout": {"type": "string", "default": "60s"}}
+        });
+        let mut obj = json!({"timeout": Value::Null});
+        apply_defaults(&schema, &mut obj);
+        assert_eq!(obj["timeout"], json!("60s"));
+    }
+
+    /// An ABSENT parent stays absent. Upstream does not fabricate a `spec`
+    /// to hang defaults on, and neither may we — a spec the author never
+    /// wrote is not a default, it is an invention.
+    #[test]
+    fn an_absent_parent_object_is_not_fabricated() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "properties": {"timeout": {"type": "string", "default": "60s"}}
+                }
+            }
+        });
+        let mut obj = json!({"metadata": {"name": "x"}});
+        apply_defaults(&schema, &mut obj);
+        assert!(obj.get("spec").is_none(), "got: {obj}");
+    }
+
+    /// Array elements are objects too, and a default inside `items` is the
+    /// common shape for a container list.
+    #[test]
+    fn defaults_reach_inside_array_elements() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "containers": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "protocol": {"type": "string", "default": "TCP"}
+                        }
+                    }
+                }
+            }
+        });
+        let mut obj = json!({"containers": [{"name": "a"}, {"name": "b", "protocol": "UDP"}]});
+        apply_defaults(&schema, &mut obj);
+        assert_eq!(obj["containers"][0]["protocol"], json!("TCP"));
+        assert_eq!(obj["containers"][1]["protocol"], json!("UDP"));
+    }
+
+    /// A free-form subtree is the author asking the apiserver not to touch
+    /// it. Writing a default in there would corrupt data the schema
+    /// deliberately declines to describe.
+    #[test]
+    fn a_preserve_unknown_subtree_is_left_alone() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "values": {
+                    "x-kubernetes-preserve-unknown-fields": true,
+                    "properties": {"replicas": {"default": 1}}
+                }
+            }
+        });
+        let mut obj = json!({"values": {"anything": true}});
+        apply_defaults(&schema, &mut obj);
+        assert!(obj["values"].get("replicas").is_none(), "got: {obj}");
+    }
+
+    /// Defaulting must run BEFORE validation, or a defaulted field cannot
+    /// satisfy `required` — this pins the ordering the handler relies on.
+    #[test]
+    fn a_default_can_satisfy_a_required_field() {
+        let schema = json!({
+            "type": "object",
+            "required": ["timeout"],
+            "properties": {"timeout": {"type": "string", "default": "60s"}}
+        });
+        let mut obj = json!({});
+        assert!(
+            !super::validate(&schema, &obj).is_empty(),
+            "negative control: undefaulted, this object must be invalid"
+        );
+        apply_defaults(&schema, &mut obj);
+        assert!(super::validate(&schema, &obj).is_empty(), "got: {obj}");
     }
 }
