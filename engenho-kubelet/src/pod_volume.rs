@@ -2416,5 +2416,4 @@ mod projected_volumes {
             other => panic!("expected Projected, got {other:?}"),
         }
     }
-
 }
