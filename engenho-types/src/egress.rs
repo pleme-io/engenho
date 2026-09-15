@@ -359,6 +359,41 @@ impl IptablesScript {
         self
     }
 
+    /// The match+target of a Service-VIP jump, WITHOUT the leading
+    /// `-A <chain>` / `-D <chain>` / `-C <chain>` verb.
+    ///
+    /// Split out so the restore script and the `iptables` control calls that
+    /// check or delete the same rule are rendered from ONE source. They must
+    /// agree argument-for-argument — an `-D` whose spec differs from the `-A`
+    /// that created it silently deletes nothing and reports success, which is
+    /// how a duplicate-pruning loop becomes a no-op that looks like a fix.
+    #[must_use]
+    pub fn service_jump_spec(
+        cluster_ip: &str,
+        protocol: &str,
+        dport: u16,
+        chain_svc: &str,
+    ) -> Vec<String> {
+        vec![
+            "-d".to_string(),
+            {
+                let mut d = String::new();
+                let _ = write!(d, "{cluster_ip}/32");
+                d
+            },
+            "-p".to_string(),
+            protocol.to_string(),
+            "--dport".to_string(),
+            {
+                let mut p = String::new();
+                let _ = write!(p, "{dport}");
+                p
+            },
+            "-j".to_string(),
+            chain_svc.to_string(),
+        ]
+    }
+
     /// Append a `-A KUBE-SERVICES …` jump to a per-service chain.
     pub fn jump_to_service_chain(
         &mut self,
@@ -367,11 +402,8 @@ impl IptablesScript {
         dport: u16,
         chain_svc: &str,
     ) -> &mut Self {
-        let mut line = String::new();
-        let _ = write!(
-            line,
-            "-A KUBE-SERVICES -d {cluster_ip}/32 -p {protocol} --dport {dport} -j {chain_svc}"
-        );
+        let mut line = String::from("-A KUBE-SERVICES ");
+        line.push_str(&Self::service_jump_spec(cluster_ip, protocol, dport, chain_svc).join(" "));
         self.lines.push(IptablesLine::Rule(line));
         self
     }

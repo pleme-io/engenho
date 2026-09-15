@@ -277,6 +277,10 @@ impl ServiceRouter for FakeRouter {
 pub struct IptablesRouter {
     /// Binary path; default `iptables-restore`.
     binary: String,
+    /// The `iptables` control binary (check / create / delete a single
+    /// rule). `iptables-restore` cannot express "append only if absent",
+    /// which is the whole of [`ensure_root_chain`](IptablesRouter::ensure_root_chain).
+    control_binary: String,
     inner: Arc<Mutex<IptablesState>>,
 }
 
@@ -303,10 +307,31 @@ impl IptablesRouter {
     /// against `iptables-legacy-restore` or for shimming in CI.
     #[must_use]
     pub fn with_binary(binary: impl Into<String>) -> Self {
+        let binary = binary.into();
+        let control = Self::control_binary_for(&binary);
+        Self::with_binaries(binary, control)
+    }
+
+    /// New router with both binaries named explicitly.
+    #[must_use]
+    pub fn with_binaries(binary: impl Into<String>, control_binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            control_binary: control_binary.into(),
             inner: Arc::new(Mutex::new(IptablesState::default())),
         }
+    }
+
+    /// `iptables-restore` -> `iptables`, preserving any directory and any
+    /// variant prefix (`iptables-legacy-restore` -> `iptables-legacy`), so a
+    /// node pinned to the legacy backend does not get its rules checked
+    /// through the nft one. Pure — unit-assertable.
+    #[must_use]
+    pub fn control_binary_for(restore_binary: &str) -> String {
+        restore_binary
+            .strip_suffix("-restore")
+            .unwrap_or(restore_binary)
+            .to_string()
     }
 
     /// Render the iptables-restore script for one route. Pure —
@@ -342,6 +367,161 @@ impl IptablesRouter {
         }
         script.commit();
         script.to_string()
+    }
+
+    /// The chain every Service-VIP jump hangs off.
+    ///
+    /// **engenho must create this itself.** kube-proxy creates
+    /// `KUBE-SERVICES` and hooks it into nat/PREROUTING + nat/OUTPUT, and an
+    /// earlier version of this router simply appended into it — which works
+    /// only on a node where kube-proxy has run. That is exactly the node
+    /// engenho is built to replace, so the dependency was on the one thing
+    /// guaranteed absent. Measured on rio 2026-09-15: the host still carried
+    /// k3s's chains hours after k3s was stopped, so Service routing would
+    /// have appeared to work and then vanished at the next reboot, when
+    /// iptables comes up empty.
+    const ROOT_CHAIN: &'static str = "KUBE-SERVICES";
+
+    /// Comment stamped on the two hook rules so they are identifiable as
+    /// ours in `iptables -S` and matched exactly by the `-C` check.
+    const HOOK_COMMENT: &'static str = "engenho service portals";
+
+    /// The nat hooks a Service VIP must be reachable from: PREROUTING for
+    /// traffic arriving from a pod, OUTPUT for traffic originating on the
+    /// node itself. Missing OUTPUT is the classic half-fix — pods reach the
+    /// VIP and the host does not.
+    const HOOKS: [&'static str; 2] = ["PREROUTING", "OUTPUT"];
+
+    /// Run the control binary, returning (success, stderr).
+    async fn control(&self, args: &[String]) -> Result<(bool, String), RouterError> {
+        let out = tokio::process::Command::new(&self.control_binary)
+            .args(args)
+            .output()
+            .await
+            .map_err(|e| RouterError::Backend(format!("{} spawn: {e}", self.control_binary)))?;
+        Ok((
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        ))
+    }
+
+    /// argv for creating the root chain (pure, unit-assertable).
+    #[must_use]
+    pub fn root_chain_create_argv() -> Vec<String> {
+        vec![
+            "-t".into(),
+            "nat".into(),
+            "-N".into(),
+            Self::ROOT_CHAIN.into(),
+        ]
+    }
+
+    /// argv for checking (`-C`) or inserting (`-I <hook> 1`) the hook rule.
+    /// Inserted at position 1 rather than appended: a DNAT that runs after
+    /// someone else's blanket MASQUERADE or RETURN never runs at all.
+    #[must_use]
+    pub fn hook_argv(hook: &str, verb: &str) -> Vec<String> {
+        let mut v = vec![
+            "-t".to_string(),
+            "nat".to_string(),
+            verb.to_string(),
+            hook.to_string(),
+        ];
+        if verb == "-I" {
+            v.push("1".to_string());
+        }
+        v.extend([
+            "-m".to_string(),
+            "comment".to_string(),
+            "--comment".to_string(),
+            Self::HOOK_COMMENT.to_string(),
+            "-j".to_string(),
+            Self::ROOT_CHAIN.to_string(),
+        ]);
+        v
+    }
+
+    /// Create the root chain and its two hooks if they are not already
+    /// there. Idempotent by CHECKING, never by blind append — `iptables -A`
+    /// happily installs a second identical hook rule, and nothing complains.
+    async fn ensure_root_chain(&self) -> Result<(), RouterError> {
+        let (ok, stderr) = self.control(&Self::root_chain_create_argv()).await?;
+        if !ok && !stderr.contains("already exists") {
+            return Err(RouterError::Backend(format!(
+                "create {}: {stderr}",
+                Self::ROOT_CHAIN
+            )));
+        }
+        for hook in Self::HOOKS {
+            let (present, _) = self.control(&Self::hook_argv(hook, "-C")).await?;
+            if !present {
+                let (ok, stderr) = self.control(&Self::hook_argv(hook, "-I")).await?;
+                if !ok {
+                    return Err(RouterError::Backend(format!(
+                        "hook {hook} -> {}: {stderr}",
+                        Self::ROOT_CHAIN
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// argv deleting ONE jump for this route+port from the root chain.
+    /// Pure so the `-D` spec can be asserted equal to the `-A` the script
+    /// renders — they are the same bytes or the delete silently matches
+    /// nothing.
+    #[must_use]
+    pub fn jump_delete_argv(
+        cluster_ip: &str,
+        protocol: &str,
+        dport: u16,
+        chain_svc: &str,
+    ) -> Vec<String> {
+        use engenho_types::egress::IptablesScript;
+        let mut argv = vec![
+            "-t".to_string(),
+            "nat".to_string(),
+            "-D".to_string(),
+            Self::ROOT_CHAIN.to_string(),
+        ];
+        argv.extend(IptablesScript::service_jump_spec(
+            cluster_ip, protocol, dport, chain_svc,
+        ));
+        argv
+    }
+
+    /// Delete EVERY existing jump for this route from the root chain.
+    ///
+    /// The root chain is shared by all Services, so it can never be declared
+    /// (and therefore flushed) in a per-route restore script without wiping
+    /// the other Services' jumps. Measured on rio 2026-09-15: applying the
+    /// same script twice through `iptables-restore --noflush` left ONE rule
+    /// in a chain the script declares and TWO in a chain it does not — so
+    /// without this the node grows a duplicate jump per resync, forever.
+    ///
+    /// Loops until the delete fails, which both prevents a new duplicate and
+    /// heals a node that already accumulated them.
+    async fn prune_jumps(&self, route: &ServiceRoute) -> Result<(), RouterError> {
+        let chain_svc = chain_name("KUBE-SVC", &route.service_id);
+        for port in &route.ports {
+            let argv = Self::jump_delete_argv(
+                &route.cluster_ip,
+                &port.protocol.to_lowercase(),
+                port.service_port,
+                &chain_svc,
+            );
+            // Bounded: an unbounded loop here would wedge the reconciler
+            // (★★ reconciler liveness) if iptables ever reported success
+            // without deleting anything.
+            for _ in 0..MAX_DUPLICATE_JUMPS {
+                let (ok, _) = self.control(&argv).await?;
+                if !ok {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn run_restore(&self, script: &str) -> Result<(), RouterError> {
@@ -381,6 +561,12 @@ impl IptablesRouter {
     }
 }
 
+/// Upper bound on how many duplicate jumps `prune_jumps` will delete for one
+/// port before giving up. Generous against any plausible accumulation, finite
+/// so a backend that reported success without deleting cannot wedge the
+/// reconciler in an unbounded loop.
+const MAX_DUPLICATE_JUMPS: usize = 64;
+
 /// Hash a free-form id to a 12-char iptables-chain-safe suffix.
 fn chain_name(prefix: &str, key: &str) -> String {
     let hash = blake3::hash(key.as_bytes());
@@ -407,6 +593,11 @@ impl ServiceRouter for IptablesRouter {
         if route.service_id.is_empty() {
             return Err(RouterError::InvalidRoute("empty service_id".into()));
         }
+        // Order is load-bearing: the root chain must exist before the
+        // script appends into it, and the stale jumps must go before the
+        // script adds the fresh one.
+        self.ensure_root_chain().await?;
+        self.prune_jumps(route).await?;
         let script = Self::render_script(route);
         self.run_restore(&script).await?;
         let mut state = self.inner.lock().await;
@@ -977,6 +1168,85 @@ mod tests {
         assert!(script.contains("DNAT --to-destination 10.42.0.1:9898"));
         assert!(script.contains("DNAT --to-destination 10.42.0.2:9898"));
         assert!(script.contains("-m statistic --mode random"));
+    }
+
+    /// The delete must be byte-identical to the append, or pruning removes
+    /// nothing and reports success — a duplicate-cleanup that looks like a
+    /// fix while the duplicates keep accumulating. Derived from one source
+    /// (`service_jump_spec`); this proves the two consumers agree.
+    #[test]
+    fn the_prune_delete_matches_the_rule_the_script_appends() {
+        // The chain name is DERIVED, exactly as prune_jumps derives it — a
+        // literal here would test a rule the router never writes.
+        let chain_svc = chain_name("KUBE-SVC", "ns/svc");
+        let argv = IptablesRouter::jump_delete_argv("10.96.5.1", "tcp", 80, &chain_svc);
+        assert_eq!(argv[0..4], ["-t", "nat", "-D", "KUBE-SERVICES"]);
+        let rendered = argv[4..].join(" ");
+        let route = ServiceRoute {
+            service_id: "ns/svc".into(),
+            cluster_ip: "10.96.5.1".into(),
+            ports: vec![PortMap {
+                name: "http".into(),
+                service_port: 80,
+                target_port: 8080,
+                protocol: "TCP".into(),
+            }],
+            endpoints: ["10.244.0.5".to_string()].into_iter().collect(),
+        };
+        let script = IptablesRouter::render_script(&route);
+        let appended = script
+            .lines()
+            .find(|l| l.starts_with("-A KUBE-SERVICES "))
+            .expect("the script must append a jump");
+        assert_eq!(
+            appended.trim_start_matches("-A KUBE-SERVICES "),
+            rendered,
+            "the -D spec and the -A spec have drifted"
+        );
+    }
+
+    /// The root chain and its hooks are engenho's to create. A node that
+    /// never ran kube-proxy has neither, and appending into an absent chain
+    /// fails the whole restore.
+    #[test]
+    fn the_router_creates_its_own_root_chain_and_both_hooks() {
+        assert_eq!(
+            IptablesRouter::root_chain_create_argv(),
+            ["-t", "nat", "-N", "KUBE-SERVICES"]
+        );
+        let check = IptablesRouter::hook_argv("PREROUTING", "-C");
+        assert_eq!(check[0..4], ["-t", "nat", "-C", "PREROUTING"]);
+        assert!(check.contains(&"KUBE-SERVICES".to_string()));
+
+        // Inserted at position 1, never appended: a DNAT placed after a
+        // blanket MASQUERADE or RETURN never runs.
+        let insert = IptablesRouter::hook_argv("OUTPUT", "-I");
+        assert_eq!(insert[0..5], ["-t", "nat", "-I", "OUTPUT", "1"]);
+
+        // The check and the insert must describe the SAME rule apart from
+        // the verb and the position, or the check never matches and a hook
+        // is inserted on every single reconcile.
+        let check_out = IptablesRouter::hook_argv("OUTPUT", "-C");
+        assert_eq!(check_out[4..], insert[5..]);
+    }
+
+    /// A node pinned to the legacy backend must be checked through the
+    /// legacy binary; asking nft whether a legacy rule exists answers "no"
+    /// forever, and the hook is re-inserted every reconcile.
+    #[test]
+    fn the_control_binary_keeps_the_backend_variant() {
+        assert_eq!(
+            IptablesRouter::control_binary_for("iptables-restore"),
+            "iptables"
+        );
+        assert_eq!(
+            IptablesRouter::control_binary_for("iptables-legacy-restore"),
+            "iptables-legacy"
+        );
+        assert_eq!(
+            IptablesRouter::control_binary_for("/usr/sbin/iptables-nft-restore"),
+            "/usr/sbin/iptables-nft"
+        );
     }
 
     #[test]
