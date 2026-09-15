@@ -61,7 +61,7 @@ use crate::health;
 use crate::openapi::ApiDoc;
 use crate::params::{
     DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, event_line,
-    gvk_ns_matches, status_410_line, to_k8s_watch_line,
+    gvk_ns_matches, status_410_line,
 };
 
 /// The dispatch key for a registered handler: `(group, version, plural)`.
@@ -1130,7 +1130,7 @@ async fn do_list_or_watch(
 ) -> Result<Response, ApiError> {
     let sel = p.selectors()?;
     if p.watch {
-        watch_response(h, namespace, p, sel).await
+        watch_response(h, namespace, p, sel, codec).await
     } else {
         // Paged path when `limit` or `continue` is present; otherwise the
         // unbounded atomic-rv LIST envelope (back-compat: no continue /
@@ -1176,6 +1176,33 @@ struct WatchStreamState {
     /// controllers, each followed by a re-LIST. Reconciliation still
     /// happened, so the failure was invisible except as log noise.
     deadline: Option<tokio::time::Instant>,
+    /// Project every emitted object to its metadata (see `watch_response`).
+    partial: bool,
+}
+
+/// The object a watch line carries: the stored object, or just its metadata
+/// when the client negotiated PartialObjectMetadata.
+fn project_watch_object(object: &serde_json::Value, partial: bool) -> serde_json::Value {
+    if partial {
+        crate::table::to_partial_object_metadata(object)
+    } else {
+        object.clone()
+    }
+}
+
+/// The TypeMeta stamped on a watch line. A projected object is a
+/// `meta.k8s.io/v1 PartialObjectMetadata`, never the resource's own kind —
+/// stamping the resource kind onto a stripped object is exactly the
+/// mismatch the client refuses to decode.
+fn watch_gvk<'a>(gvk: WatchGvk<'a>, partial: bool) -> WatchGvk<'a> {
+    if partial {
+        WatchGvk {
+            api_version: "meta.k8s.io/v1",
+            kind: "PartialObjectMetadata",
+        }
+    } else {
+        gvk
+    }
 }
 
 /// Build the streaming chunked-transfer WATCH response.
@@ -1193,7 +1220,16 @@ async fn watch_response(
     namespace: Option<String>,
     p: ListWatchParams,
     sel: Selectors,
+    codec: ResponseCodec,
 ) -> Result<Response, ApiError> {
+    // A metadata-only client sends ONE Accept for its LIST and its WATCH, so
+    // a stream that ignores the `as=` parameter hands a full object to a
+    // decoder registered only for PartialObjectMetadata. That does not fail
+    // as a bad object: client-go reports `no kind "ConfigMap" is registered
+    // for version "v1" in scheme`, drops the watch and re-LISTs forever.
+    // Measured on rio 2026-09-15 — Flux's controllers logged it every ~25s
+    // while their LIST (already projected) succeeded.
+    let partial = matches!(codec, ResponseCodec::PartialMetadata);
     let mut from: ResumePoint = p.resume_point()?;
 
     // ── streaming lists (K8s 1.27 `sendInitialEvents`) ──
@@ -1214,7 +1250,11 @@ async fn watch_response(
         };
         prelude.reserve(items.len() + 1);
         for item in &items {
-            prelude.push(event_line(WatchEventKind::Added, item, gvk));
+            prelude.push(event_line(
+                WatchEventKind::Added,
+                &project_watch_object(item, partial),
+                watch_gvk(gvk, partial),
+            ));
         }
         // The terminator. Without this annotation a kube-rs `watcher` /
         // client-go reflector stays in its initializing state forever even
@@ -1237,6 +1277,7 @@ async fn watch_response(
         selectors: sel,
         allow_bookmarks: p.allow_watch_bookmarks,
         deadline: p.timeout()?.map(|d| tokio::time::Instant::now() + d),
+        partial,
     };
 
     let live = futures::stream::unfold(init, |mut st| async move {
@@ -1270,13 +1311,15 @@ async fn watch_response(
                         continue;
                     }
                     let api_version = st.handler.api_version();
-                    let line = to_k8s_watch_line(
-                        &ev,
+                    let gvk = watch_gvk(
                         WatchGvk {
                             api_version: &api_version,
                             kind: st.handler.kind(),
                         },
+                        st.partial,
                     );
+                    let line =
+                        event_line(ev.kind, &project_watch_object(&ev.object, st.partial), gvk);
                     return Some((Ok::<Bytes, Infallible>(line), st));
                 }
                 Some(Ok(WatchSignal::Bookmark(rev))) => {
@@ -1940,6 +1983,63 @@ async fn resource_delete(
 
 #[cfg(test)]
 mod tests {
+
+    /// A metadata-only WATCH must carry PartialObjectMetadata objects under
+    /// meta.k8s.io/v1. Serving the stored object instead is what made
+    /// client-go drop the stream with `no kind "ConfigMap" is registered`.
+    #[test]
+    fn watch_projects_objects_when_partial_metadata_was_negotiated() {
+        let stored = serde_json::json!({
+            "kind": "ConfigMap",
+            "apiVersion": "v1",
+            "metadata": {"name": "c", "namespace": "flux-system", "resourceVersion": "7"},
+            "data": {"k": "v"}
+        });
+        let projected = super::project_watch_object(&stored, true);
+        assert_eq!(projected.get("kind").unwrap(), "PartialObjectMetadata");
+        assert_eq!(projected.get("apiVersion").unwrap(), "meta.k8s.io/v1");
+        assert!(
+            projected.get("data").is_none(),
+            "the body must not survive the projection"
+        );
+        assert_eq!(
+            projected.pointer("/metadata/resourceVersion").unwrap(),
+            "7",
+            "the resourceVersion is what the client resumes from"
+        );
+
+        let gvk = super::watch_gvk(
+            crate::params::WatchGvk {
+                api_version: "v1",
+                kind: "ConfigMap",
+            },
+            true,
+        );
+        assert_eq!(gvk.kind, "PartialObjectMetadata");
+        assert_eq!(gvk.api_version, "meta.k8s.io/v1");
+    }
+
+    /// Negative control for the test above: an ordinary watcher keeps the
+    /// whole object and the resource's own TypeMeta.
+    #[test]
+    fn watch_leaves_objects_whole_when_partial_metadata_was_not_negotiated() {
+        let stored = serde_json::json!({
+            "kind": "ConfigMap",
+            "apiVersion": "v1",
+            "metadata": {"name": "c"},
+            "data": {"k": "v"}
+        });
+        assert_eq!(super::project_watch_object(&stored, false), stored);
+        let gvk = super::watch_gvk(
+            crate::params::WatchGvk {
+                api_version: "v1",
+                kind: "ConfigMap",
+            },
+            false,
+        );
+        assert_eq!(gvk.kind, "ConfigMap");
+        assert_eq!(gvk.api_version, "v1");
+    }
     use super::*;
 
     /// `lookup_core(p)` IS `lookup("", "v1", p)` — the fold the refactor
