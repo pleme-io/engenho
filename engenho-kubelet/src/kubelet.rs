@@ -672,8 +672,7 @@ impl Kubelet {
         // conditions would write on every single tick forever — which is how
         // the store journal grows without bound while the cluster is idle.
         let unchanged = previous.is_some_and(|p| {
-            p.get("status") == condition.get("status")
-                && p.get("reason") == condition.get("reason")
+            p.get("status") == condition.get("status") && p.get("reason") == condition.get("reason")
         });
         if unchanged {
             return;
@@ -695,9 +694,7 @@ impl Kubelet {
 
         let mut desired = node.clone();
         if let Some(obj) = desired.as_object_mut() {
-            let status = obj
-                .entry("status")
-                .or_insert_with(|| serde_json::json!({}));
+            let status = obj.entry("status").or_insert_with(|| serde_json::json!({}));
             if let Some(status_obj) = status.as_object_mut() {
                 status_obj.insert("conditions".to_string(), serde_json::json!(conditions));
             }
@@ -848,6 +845,71 @@ impl Kubelet {
     /// credentials. A pod that cannot get its environment must not reach
     /// Running, because "started successfully, silently misconfigured" is
     /// the single hardest state to debug from outside.
+    /// Expand `$(VAR)` references in an env value or an argv element, using
+    /// the variables already defined for this container.
+    ///
+    /// **Kubernetes does this and every workload assumes it.** A manifest
+    /// writes `value: "source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local."`
+    /// and expects a hostname; without expansion the container receives the
+    /// literal text and fails at whatever it hands the string to — far from
+    /// the kubelet, with nothing naming it. Measured on rio 2026-09-15: Flux's
+    /// kustomize-controller logged
+    /// `Get "http://source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local./…"`
+    /// and could not fetch a single artifact, so nothing was ever applied.
+    ///
+    /// Upstream's three rules, all load-bearing:
+    ///   * only variables defined EARLIER in the list are visible — the caller
+    ///     passes the map accumulated so far, so order is the semantics;
+    ///   * `$$` escapes to a single literal `$`;
+    ///   * an UNRESOLVABLE `$(VAR)` is left exactly as written, never blanked.
+    ///     Blanking would turn a typo into a silently-empty hostname, which is
+    ///     strictly harder to debug than the unexpanded text.
+    #[must_use]
+    fn expand_env_refs(raw: &str, defined: &BTreeMap<String, String>) -> String {
+        let bytes = raw.as_bytes();
+        let mut out = String::with_capacity(raw.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'$' {
+                // Push the whole UTF-8 character, not the byte: indexing by
+                // byte and emitting bytes would split a multi-byte codepoint.
+                let ch = raw[i..].chars().next().unwrap_or('$');
+                out.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+            match bytes.get(i + 1) {
+                Some(b'$') => {
+                    out.push('$');
+                    i += 2;
+                }
+                Some(b'(') => {
+                    if let Some(close) = raw[i + 2..].find(')') {
+                        let name = &raw[i + 2..i + 2 + close];
+                        if let Some(v) = defined.get(name) {
+                            out.push_str(v);
+                        } else {
+                            // Unresolvable: emit verbatim, including the
+                            // delimiters, so the operator sees what was asked
+                            // for rather than an empty string.
+                            out.push_str(&raw[i..i + 3 + close]);
+                        }
+                        i += 3 + close;
+                    } else {
+                        // No closing paren — not a reference at all.
+                        out.push('$');
+                        i += 1;
+                    }
+                }
+                _ => {
+                    out.push('$');
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
     fn resolve_env_entry(
         namespace: &str,
         pod_name: &str,
@@ -1126,7 +1188,10 @@ impl Kubelet {
     /// may legally name either.
     fn find_container_spec<'p>(pod: &'p Value, want: &str) -> Option<&'p Value> {
         for key in ["containers", "initContainers"] {
-            if let Some(arr) = pod.pointer(&format!("/spec/{key}")).and_then(|c| c.as_array()) {
+            if let Some(arr) = pod
+                .pointer(&format!("/spec/{key}"))
+                .and_then(|c| c.as_array())
+            {
                 for c in arr {
                     if c.get("name").and_then(|n| n.as_str()) == Some(want) {
                         return Some(c);
@@ -1206,6 +1271,17 @@ impl Kubelet {
                     for entry in arr {
                         let (k, v) =
                             Self::resolve_env_entry(namespace, name, pod, &cname, entry, sources)?;
+                        // `$(VAR)` expansion applies to a literal `value` only.
+                        // A `valueFrom` result is the value of another object
+                        // and upstream does NOT re-scan it — expanding there
+                        // would let a ConfigMap's contents reach into the
+                        // container's environment, which is a different and
+                        // much larger promise than the one Kubernetes makes.
+                        let v = if entry.get("value").is_some() {
+                            Self::expand_env_refs(&v, &map)
+                        } else {
+                            v
+                        };
                         map.insert(k, v);
                     }
                     map
@@ -1214,12 +1290,20 @@ impl Kubelet {
             };
             // command = entrypoint override; args = appended arguments
             // (K8s semantics). The container's run argv is command ++ args.
+            //
+            // `$(VAR)` is expanded here too, against the container's FULLY
+            // resolved environment — upstream applies the same substitution to
+            // argv as to env values, and a manifest that writes
+            // `--webhook-addr=$(POD_IP):9443` is relying on it. Unlike env,
+            // every variable is visible: argv is processed after the whole
+            // environment exists, so there is no ordering rule to honour.
             let str_array = |key: &str| -> Vec<String> {
                 c.get(key)
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
+                            .filter_map(|x| x.as_str())
+                            .map(|x| Self::expand_env_refs(x, &env))
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default()
@@ -3341,13 +3425,13 @@ impl Kubelet {
             match lp.init_containers.get(cname) {
                 None => observations.push(mark(ContainerObservation::waiting(cname))),
                 Some(record) => match self.backend.status(&record.container_id).await {
-                    Ok(Some(s)) if s.running => observations.push(mark(
-                        ContainerObservation::running(
+                    Ok(Some(s)) if s.running => {
+                        observations.push(mark(ContainerObservation::running(
                             cname,
                             &record.container_id,
                             record.restart_count,
-                        ),
-                    )),
+                        )))
+                    }
                     Ok(Some(s)) => observations.push(mark(ContainerObservation::terminated(
                         cname,
                         &record.container_id,
@@ -3745,6 +3829,88 @@ mod env_resolution_tests {
         })
     }
 
+    /// The exact value that stopped Flux: an unexpanded `$(RUNTIME_NAMESPACE)`
+    /// reached the container as literal text, so kustomize-controller asked
+    /// for a hostname containing `$(…)` and fetched nothing.
+    #[test]
+    fn a_dollar_paren_reference_expands_from_an_earlier_variable() {
+        let mut defined = BTreeMap::new();
+        defined.insert("RUNTIME_NAMESPACE".to_string(), "flux-system".to_string());
+        assert_eq!(
+            Kubelet::expand_env_refs(
+                "http://source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local.",
+                &defined
+            ),
+            "http://source-controller.flux-system.svc.cluster.local."
+        );
+    }
+
+    /// `$$` is the escape for a literal `$`. Without it, a password or a shell
+    /// snippet carrying `$$` would be silently rewritten.
+    #[test]
+    fn a_doubled_dollar_is_an_escape_not_a_reference() {
+        let defined = BTreeMap::new();
+        assert_eq!(
+            Kubelet::expand_env_refs("cost is $$5", &defined),
+            "cost is $5"
+        );
+        assert_eq!(
+            Kubelet::expand_env_refs("$$(NOT_A_REF)", &defined),
+            "$(NOT_A_REF)"
+        );
+    }
+
+    /// An unresolvable reference is left EXACTLY as written. Blanking it would
+    /// turn a typo into a silently-empty hostname, which is strictly harder to
+    /// debug than seeing the text that was asked for.
+    #[test]
+    fn an_unresolvable_reference_is_left_verbatim_never_blanked() {
+        let defined = BTreeMap::new();
+        assert_eq!(
+            Kubelet::expand_env_refs("host.$(MISSING).local", &defined),
+            "host.$(MISSING).local"
+        );
+    }
+
+    /// A bare `$` and an unclosed `$(` are not references and must survive.
+    #[test]
+    fn a_bare_dollar_is_not_a_reference() {
+        let defined = BTreeMap::new();
+        assert_eq!(Kubelet::expand_env_refs("100$", &defined), "100$");
+        assert_eq!(
+            Kubelet::expand_env_refs("$(unclosed", &defined),
+            "$(unclosed"
+        );
+        assert_eq!(Kubelet::expand_env_refs("a $ b", &defined), "a $ b");
+    }
+
+    /// Multi-byte text must survive byte-wise scanning — emitting bytes rather
+    /// than characters would split a codepoint and produce invalid UTF-8.
+    #[test]
+    fn multibyte_text_is_not_corrupted() {
+        let mut defined = BTreeMap::new();
+        defined.insert("NS".to_string(), "café".to_string());
+        assert_eq!(
+            Kubelet::expand_env_refs("日本語-$(NS)-日本語", &defined),
+            "日本語-café-日本語"
+        );
+    }
+
+    /// Several references in one value, and a reference whose value itself
+    /// contains `$(` — which must NOT be re-expanded (upstream substitutes
+    /// once, so a value carrying a reference is data, not a further lookup).
+    #[test]
+    fn expansion_is_single_pass() {
+        let mut defined = BTreeMap::new();
+        defined.insert("A".to_string(), "$(B)".to_string());
+        defined.insert("B".to_string(), "final".to_string());
+        assert_eq!(Kubelet::expand_env_refs("$(A)", &defined), "$(B)");
+        assert_eq!(
+            Kubelet::expand_env_refs("$(A)/$(B)", &defined),
+            "$(B)/final"
+        );
+    }
+
     fn resolve(entry: serde_json::Value) -> Result<(String, String), super::KubeletError> {
         let sources: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
         Kubelet::resolve_env_entry(
@@ -3779,7 +3945,14 @@ mod env_resolution_tests {
         entry: serde_json::Value,
     ) -> Result<(String, String), super::KubeletError> {
         let sources: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
-        Kubelet::resolve_env_entry("flux-system", "helm-controller-1", pod, container, &entry, &sources)
+        Kubelet::resolve_env_entry(
+            "flux-system",
+            "helm-controller-1",
+            pod,
+            container,
+            &entry,
+            &sources,
+        )
     }
 
     /// THE ONE FLUX NEEDS. Every Flux controller sets GOMEMLIMIT from
@@ -4120,9 +4293,11 @@ mod tests {
                 "containers": [{"name": "app", "image": "i"}]
             }
         });
-        let init =
-            Kubelet::pod_to_init_container_specs("ns", "p", &pod, &BTreeMap::new()).unwrap();
-        assert!(init[0].1.pod.init, "init containers must be distinguishable");
+        let init = Kubelet::pod_to_init_container_specs("ns", "p", &pod, &BTreeMap::new()).unwrap();
+        assert!(
+            init[0].1.pod.init,
+            "init containers must be distinguishable"
+        );
         assert_eq!(init[0].1.pod.container_name, "setup");
         let app = Kubelet::pod_to_container_specs("ns", "p", &pod, &BTreeMap::new()).unwrap();
         assert!(!app[0].1.pod.init);
@@ -4295,7 +4470,8 @@ mod tests {
             {"type": "PodScheduled", "status": "False", "reason": "Unschedulable"},
             {"type": "DisruptionTarget", "status": "True", "reason": "EvictionByEvictionAPI"}
         ]}});
-        let status = Kubelet::build_pod_status(&live, PodPhase::Running, &one_running_status(), None);
+        let status =
+            Kubelet::build_pod_status(&live, PodPhase::Running, &one_running_status(), None);
 
         // The foreign condition is preserved verbatim, reason included.
         let foreign = type_of(&status, "DisruptionTarget").expect("preserved");
@@ -4305,7 +4481,8 @@ mod tests {
         // produce it. Without this, the assertion above would also pass if the
         // renderer simply invented a DisruptionTarget, and would pass on a
         // renderer that ignored `live` entirely and got lucky.
-        let fresh = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &one_running_status(), None);
+        let fresh =
+            Kubelet::build_pod_status(&json!({}), PodPhase::Running, &one_running_status(), None);
         assert!(
             type_of(&fresh, "DisruptionTarget").is_none(),
             "the renderer must PRESERVE, never invent: {fresh}"
@@ -4323,12 +4500,21 @@ mod tests {
         let live = json!({"status": {"conditions": [
             {"type": "PodScheduled", "status": "False", "reason": "Unschedulable"}
         ]}});
-        let status = Kubelet::build_pod_status(&live, PodPhase::Running, &one_running_status(), None);
-        let sched = type_of(&status, "PodScheduled").expect("PodScheduled is owned and always emitted");
-        assert_eq!(sched["status"], "True", "transitioned, not deleted: {status}");
+        let status =
+            Kubelet::build_pod_status(&live, PodPhase::Running, &one_running_status(), None);
+        let sched =
+            type_of(&status, "PodScheduled").expect("PodScheduled is owned and always emitted");
+        assert_eq!(
+            sched["status"], "True",
+            "transitioned, not deleted: {status}"
+        );
         // Exactly one — the stale False was replaced, not appended beside.
-        let n = status["conditions"].as_array().unwrap()
-            .iter().filter(|c| c["type"] == "PodScheduled").count();
+        let n = status["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["type"] == "PodScheduled")
+            .count();
         assert_eq!(n, 1, "no duplicate PodScheduled: {status}");
     }
 
@@ -4348,21 +4534,28 @@ mod tests {
         assert_eq!(a, b, "the render must be stable at steady state");
         // NEGATIVE CONTROL: with no previous startTime one is minted, so the
         // field is genuinely produced rather than merely echoed.
-        let fresh = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &one_running_status(), None);
+        let fresh =
+            Kubelet::build_pod_status(&json!({}), PodPhase::Running, &one_running_status(), None);
         assert!(fresh["startTime"].as_str().is_some_and(|t| !t.is_empty()));
     }
 
     #[test]
     fn pod_ips_is_derived_from_pod_ip_not_written_twice() {
         use engenho_types::curated_enums::PodPhase;
-        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &one_running_status(), Some("10.42.0.7"));
+        let status = Kubelet::build_pod_status(
+            &json!({}),
+            PodPhase::Running,
+            &one_running_status(),
+            Some("10.42.0.7"),
+        );
         assert_eq!(status["podIP"], "10.42.0.7");
         // Derived, so `podIP == podIPs[0]` holds by construction rather than
         // by two writers agreeing.
         assert_eq!(status["podIPs"][0]["ip"], "10.42.0.7");
         // No IP ⇒ neither field, rather than an empty array a client must
         // distinguish from "no address yet".
-        let none = Kubelet::build_pod_status(&json!({}), PodPhase::Pending, &one_running_status(), None);
+        let none =
+            Kubelet::build_pod_status(&json!({}), PodPhase::Pending, &one_running_status(), None);
         assert!(none.get("podIPs").is_none(), "{none}");
     }
 
@@ -4376,7 +4569,8 @@ mod tests {
             container_id: Some("fake-1".into()),
             restart_count: 0,
         }];
-        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &statuses, Some("10.42.0.5"));
+        let status =
+            Kubelet::build_pod_status(&json!({}), PodPhase::Running, &statuses, Some("10.42.0.5"));
         assert_eq!(status["phase"], "Running");
         assert_eq!(status["podIP"], "10.42.0.5");
         // Deterministic pair: ContainersReady then Ready, both True when Running
@@ -4402,7 +4596,12 @@ mod tests {
             container_id: Some("fake-2".into()),
             restart_count: 0,
         }];
-        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Succeeded, &statuses, Some("10.42.0.9"));
+        let status = Kubelet::build_pod_status(
+            &json!({}),
+            PodPhase::Succeeded,
+            &statuses,
+            Some("10.42.0.9"),
+        );
         assert_eq!(status["phase"], "Succeeded");
         // Both conditions False for a terminal pod.
         assert_eq!(status["conditions"][0]["type"], "ContainersReady");
@@ -4454,7 +4653,8 @@ mod tests {
                 restart_count: 2,
             },
         ];
-        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Running, &statuses, Some("10.0.0.1"));
+        let status =
+            Kubelet::build_pod_status(&json!({}), PodPhase::Running, &statuses, Some("10.0.0.1"));
         let arr = status["containerStatuses"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["name"], "web");
