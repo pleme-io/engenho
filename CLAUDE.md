@@ -98,6 +98,35 @@ The anti-patterns below forbid vendoring upstream Go; this section requires
 owning the capability in Rust. They are one rule seen twice — engenho
 implements what it runs. Re-deriving is embedding; copying is not.
 
+### ★★ Replacing a component means inheriting its PROMISES, not just its API
+
+The API surface is the easy half and the half that gets tested. The hard
+half is every **default and side effect** a controller was written against
+without ever naming it — and those fail *inside somebody else's binary*,
+with engenho named nowhere.
+
+Four measured on rio 2026-09-15, the first day engenho ran a real
+controller fleet alone:
+
+| what engenho did | what the replaced component promised | how it surfaced |
+|---|---|---|
+| left CRD `default:` unapplied | the apiserver defaults on decode | source-controller nil-deref'd `spec.timeout` and panicked every reconcile, reporting "building artifact" forever |
+| created `emptyDir` `0755 root:root` (podman's default) | kubelet creates it `0777` so any `runAsUser` can write | the pod stayed **Running**, the kubelet reported **success**, and the container got EACCES |
+| appended to `KUBE-SERVICES` without creating it | kube-proxy owns that chain and its hooks | Service routing worked off the *dead* k3s rules still in the kernel, and would have vanished at the next reboot |
+| left `Secret.type` unset | the apiserver defaults it to `Opaque` | a consumer that branches on type takes its not-mine path and does nothing, silently |
+
+**The test to run before claiming a capability is embedded:** name what the
+thing you replaced did that nobody writes down — its defaults, the modes it
+sets, the state it installs in the kernel, the fields it fills on decode.
+Then ask whether engenho does it, on a node where the replaced component
+has **never run**. rio could not answer that question honestly until k3s
+was stood down, because its corpse was still providing two of the four.
+
+★ And the diagnostic tell: when a Kubernetes-ecosystem binary panics,
+hangs, or no-ops against engenho and its own logs blame nothing, suspect an
+unkept promise before suspecting the binary. Three of the four above were
+first read as "Flux is broken".
+
 **The exception is a world-fact, never a convenience.** `engenho → CRI →
 containerd` stays reachable **by design, permanently** — not because butai
 cannot replace it, but because a cluster we do not own may already run it and
