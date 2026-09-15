@@ -54,9 +54,51 @@ pub fn apply(group: &str, version: &str, kind: &str, body: &mut Value) {
     if !(group.is_empty() && version == "v1") {
         return;
     }
-    if kind == "Pod" {
-        if let Some(spec) = body.get_mut("spec").and_then(Value::as_object_mut) {
-            default_pod_spec(spec);
+    match kind {
+        "Pod" => {
+            if let Some(spec) = body.get_mut("spec").and_then(Value::as_object_mut) {
+                default_pod_spec(spec);
+            }
+        }
+        "Secret" => default_secret(body),
+        "Service" => {
+            if let Some(spec) = body.get_mut("spec").and_then(Value::as_object_mut) {
+                default_service_spec(spec);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `SetDefaults_Secret` — an absent `type` is `Opaque`.
+///
+/// Note this is on the OBJECT, not on a spec: Secret has no spec. Measured on
+/// rio 2026-09-15, `kubectl get secret flux-system -o json` came back with no
+/// `type` field at all, where every real cluster returns `Opaque`. Consumers
+/// branch on it — an ESO or cert-manager reading `""` takes the
+/// not-the-type-I-handle path and does nothing, silently.
+fn default_secret(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        fill_str(obj, "type", "Opaque");
+    }
+}
+
+/// `SetDefaults_Service` — the two fields upstream fills unconditionally.
+///
+/// Deliberately NOT defaulted here: `ipFamilies` / `ipFamilyPolicy` /
+/// `clusterIP`, because upstream derives those from cluster configuration and
+/// allocation rather than from a constant. A wrong constant would be worse
+/// than the absence — it diverges only for the clients that omit the field,
+/// which is precisely the population that cannot notice.
+fn default_service_spec(spec: &mut Map<String, Value>) {
+    fill_str(spec, "type", "ClusterIP");
+    fill_str(spec, "sessionAffinity", "None");
+    // Per-port protocol, upstream's `SetDefaults_ServicePort`.
+    if let Some(ports) = spec.get_mut("ports").and_then(Value::as_array_mut) {
+        for port in ports.iter_mut() {
+            if let Some(p) = port.as_object_mut() {
+                fill_str(p, "protocol", "TCP");
+            }
         }
     }
 }
@@ -259,5 +301,88 @@ mod tests {
             b.get("spec").is_none(),
             "no spec is left absent, not invented"
         );
+    }
+}
+
+#[cfg(test)]
+mod secret_and_service {
+    use super::apply;
+    use serde_json::json;
+
+    /// Measured on rio 2026-09-15: engenho returned this Secret with no
+    /// `type` at all. Every consumer that branches on the type takes its
+    /// not-mine path against `""` and does nothing, without erroring.
+    #[test]
+    fn a_secret_without_a_type_becomes_opaque() {
+        let mut b = json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "flux-system"},
+            "data": {"username": "Z2l0"}
+        });
+        apply("", "v1", "Secret", &mut b);
+        assert_eq!(b["type"], json!("Opaque"));
+    }
+
+    /// A typed Secret keeps its type — defaulting must never reclassify a
+    /// dockerconfigjson or an SA token as Opaque.
+    #[test]
+    fn a_typed_secret_is_left_alone() {
+        let mut b = json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "pull"},
+            "type": "kubernetes.io/dockerconfigjson"
+        });
+        apply("", "v1", "Secret", &mut b);
+        assert_eq!(b["type"], json!("kubernetes.io/dockerconfigjson"));
+    }
+
+    #[test]
+    fn a_service_gains_type_session_affinity_and_port_protocol() {
+        let mut b = json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "source-controller"},
+            "spec": {"ports": [{"name": "http", "port": 80}, {"name": "u", "port": 53, "protocol": "UDP"}]}
+        });
+        apply("", "v1", "Service", &mut b);
+        assert_eq!(b["spec"]["type"], json!("ClusterIP"));
+        assert_eq!(b["spec"]["sessionAffinity"], json!("None"));
+        assert_eq!(b["spec"]["ports"][0]["protocol"], json!("TCP"));
+        // An explicit protocol survives.
+        assert_eq!(b["spec"]["ports"][1]["protocol"], json!("UDP"));
+    }
+
+    /// A NodePort Service must not be silently demoted to ClusterIP.
+    #[test]
+    fn an_explicit_service_type_is_never_overwritten() {
+        let mut b = json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "x"},
+            "spec": {"type": "NodePort", "ports": [{"port": 80}]}
+        });
+        apply("", "v1", "Service", &mut b);
+        assert_eq!(b["spec"]["type"], json!("NodePort"));
+    }
+
+    /// Negative control for the group guard: a CUSTOM resource whose kind
+    /// happens to be "Secret" must not be defaulted as a core Secret.
+    #[test]
+    fn a_same_named_custom_resource_is_untouched() {
+        let before =
+            json!({"apiVersion": "example.com/v1", "kind": "Secret", "metadata": {"name": "x"}});
+        let mut after = before.clone();
+        apply("example.com", "v1", "Secret", &mut after);
+        assert_eq!(after, before);
+    }
+
+    /// The fields upstream derives from cluster state are deliberately NOT
+    /// defaulted — a constant here would diverge only for clients that omit
+    /// the field, which is exactly the population that cannot notice.
+    #[test]
+    fn allocation_derived_service_fields_are_left_absent() {
+        let mut b =
+            json!({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "x"}, "spec": {}});
+        apply("", "v1", "Service", &mut b);
+        assert!(b["spec"].get("clusterIP").is_none(), "got: {b}");
+        assert!(b["spec"].get("ipFamilyPolicy").is_none(), "got: {b}");
     }
 }
