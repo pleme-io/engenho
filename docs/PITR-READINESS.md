@@ -57,6 +57,61 @@ below is worth exactly its last LIVE measurement. Before citing a row as
 live, check whether a controller has actually completed the operation on a
 node, not whether the type exists.
 
+### ★★ THE OPEN BLOCKER — a write costs O(whole catalog) + fsync
+
+**Measured on rio 2026-09-15, on an IDLE box (load 2.0):**
+
+| operation | latency |
+|---|---|
+| GET one Lease (connection reused, TLS ruled out at 2 ms) | 0.40 – 0.65 s |
+| PUT one ConfigMap | **4.9 – 17.3 s**, and rising across consecutive samples |
+
+Upstream serves both in single-digit milliseconds. The consequence is not
+slowness, it is that **no controller can hold leadership**: Flux's managers
+renew a Lease on a ~10 s deadline, the PUT exceeds it, `leader election
+lost`, and controller-runtime exits by design. kustomize-controller and
+helm-controller crash-loop on exactly this. source-controller survives only
+because it happened to renew inside a fast window.
+
+**Root cause, in the code's own words** — `engenho-store/src/fjall_store.rs`
+in the `apply` loop:
+
+```rust
+// Overwrite the single catalog key (idempotent full write —
+// cheap for small clusters; batched-delta is a future
+// optimization, not pre-optimized here)
+let catalog_bytes = serde_json::to_vec(&state.catalog)?;
+self.inner.catalog.insert(CATALOG_KEY, catalog_bytes)?;
+```
+
+Every applied raft entry serializes the ENTIRE catalog and fsyncs it under
+one LSM key. Measured effect on rio: the `catalog` partition is **578 MB**
+(430 MB after a restart compacted some) for **42 live objects**, while the
+raft log beside it is 3.9 MB. It is accumulated versions of a single hot
+key, and compaction cannot keep ahead of it — which is why the latency
+*grows* rather than sitting at a constant cost.
+
+**"Cheap for small clusters" is the MIRAGEM shape**: a limit stated calmly,
+in terms of our own abstraction, that was true on the day it was written
+and is now the thing holding the platform back. It is ours to dissolve.
+
+**What the fix is NOT:** deleting the history ring from the blob. Checked —
+`state.rs`'s hand-written `Serialize` already excludes it deliberately.
+
+**What the fix is:** the delta write the comment defers. Store each
+resource under its own key in the `catalog` partition so a write touches
+one small key instead of rewriting the world. Four call sites
+(`CATALOG_KEY` at fjall_store.rs:89, 262, 781, 836) plus a one-time
+migration for existing stores.
+
+**The trap to avoid while doing it** — do not simply persist the catalog
+less often. `META_LAST_APPLIED` is written in the same breath, so skipping
+the catalog write while advancing `last_applied` makes a restart trust a
+stale catalog. Moving both together means replaying applied entries, which
+re-advances the MVCC revision counter and changes resourceVersions across a
+restart. The per-key write avoids that question entirely; the
+write-less-often shortcut walks straight into it.
+
 ---
 
 ## 2. What a drill needs, and where it stands
