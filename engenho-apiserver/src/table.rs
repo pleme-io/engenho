@@ -222,6 +222,49 @@ pub fn resolve_json_path(obj: &Value, path: &str) -> Value {
     cur.clone()
 }
 
+/// Project an object (or a List) into the `meta.k8s.io/v1` metadata-only
+/// shape a client requested via `Accept: …;as=PartialObjectMetadataList`.
+///
+/// **This is a CONVERSION, not a hint.** A client that asks for
+/// `PartialObjectMetadataList` installs a decoder for exactly that kind, so
+/// serving it the full List is not a generous superset — it is undecodable.
+/// Measured on rio 2026-09-15: engenho ignored the `as=` parameter, Flux's
+/// kustomize-controller received a normal list, and its metadata-only cache
+/// failed to start with `unable to decode returned object as
+/// PartialObjectMetadataList`, so the controller never reconciled anything.
+/// Nothing in that chain named the apiserver.
+///
+/// A List becomes a `PartialObjectMetadataList` (each item stripped to its
+/// metadata); a single object becomes a `PartialObjectMetadata`.
+#[must_use]
+pub fn to_partial_object_metadata(value: &Value) -> Value {
+    let is_list = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|k| k.ends_with("List"))
+        || value.get("items").is_some_and(Value::is_array);
+
+    if !is_list {
+        return partial_object_metadata(value);
+    }
+
+    let items: Vec<Value> = value
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().map(partial_object_metadata).collect())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "kind": "PartialObjectMetadataList",
+        "apiVersion": "meta.k8s.io/v1",
+        // The list-level metadata carries resourceVersion, which is what a
+        // reflector resumes its watch from. Dropping it would make every
+        // metadata-only informer re-list from scratch on each sync.
+        "metadata": value.get("metadata").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "items": items,
+    })
+}
+
 /// Build the `PartialObjectMetadata` upstream embeds for
 /// `includeObject=Metadata` — the object's `metadata` and nothing else, which
 /// is the whole point of asking for a Table rather than a List.
@@ -300,6 +343,21 @@ pub fn accept_wants_table(accept: &str) -> bool {
     accept.split(',').any(|range| {
         let lower = range.to_ascii_lowercase();
         lower.contains("as=table") && lower.contains("g=meta.k8s.io")
+    })
+}
+
+/// Whether any `Accept` range asks for the metadata-only projection.
+///
+/// Matches both `as=PartialObjectMetadataList` (a list) and
+/// `as=PartialObjectMetadata` (a single object); `to_partial_object_metadata`
+/// picks the shape from the payload rather than from the header, so one
+/// predicate covers both. Both are gated on `g=meta.k8s.io` exactly as the
+/// Table check is — `as=` without the group is not this conversion.
+#[must_use]
+pub fn accept_wants_partial_metadata(accept: &str) -> bool {
+    accept.split(',').any(|range| {
+        let lower = range.to_ascii_lowercase();
+        lower.contains("as=partialobjectmetadata") && lower.contains("g=meta.k8s.io")
     })
 }
 
@@ -502,5 +560,100 @@ mod tests {
             "an empty table still defines its columns, or the client cannot \
              render a header"
         );
+    }
+}
+
+#[cfg(test)]
+mod partial_metadata {
+    use super::{accept_wants_partial_metadata, to_partial_object_metadata};
+    use serde_json::json;
+
+    /// The exact Accept controller-runtime's METADATA cache sends, and the
+    /// one engenho ignored — answering with a protobuf-encoded full list, so
+    /// the client's JSON decoder met the `k8s\0` magic and reported
+    /// `invalid character 'k'`.
+    #[test]
+    fn the_metadata_client_accept_is_recognised() {
+        assert!(accept_wants_partial_metadata(
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json"
+        ));
+        assert!(accept_wants_partial_metadata(
+            "application/vnd.kubernetes.protobuf;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json"
+        ));
+        // Single-object form, used by a metadata GET.
+        assert!(accept_wants_partial_metadata(
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+        ));
+    }
+
+    /// Negative controls. `as=` without the meta.k8s.io group is a different
+    /// conversion, and an ordinary Accept must not be hijacked — otherwise
+    /// every normal list would silently lose its objects.
+    #[test]
+    fn an_ordinary_accept_is_not_hijacked() {
+        assert!(!accept_wants_partial_metadata("application/json"));
+        assert!(!accept_wants_partial_metadata(
+            "application/vnd.kubernetes.protobuf,application/json"
+        ));
+        assert!(!accept_wants_partial_metadata(
+            "application/json;as=Table;g=meta.k8s.io;v=v1"
+        ));
+        // `as=` naming the right kind but the WRONG group is not this.
+        assert!(!accept_wants_partial_metadata(
+            "application/json;as=PartialObjectMetadataList;g=example.com;v=v1"
+        ));
+    }
+
+    #[test]
+    fn a_list_becomes_a_partial_object_metadata_list() {
+        let list = json!({
+            "apiVersion": "v1",
+            "kind": "SecretList",
+            "metadata": {"resourceVersion": "172654"},
+            "items": [
+                {"apiVersion":"v1","kind":"Secret","metadata":{"name":"a","namespace":"flux-system"},"data":{"k":"dg=="}},
+                {"apiVersion":"v1","kind":"Secret","metadata":{"name":"b","namespace":"flux-system"},"data":{"k":"dg=="}}
+            ]
+        });
+        let out = to_partial_object_metadata(&list);
+        assert_eq!(out["kind"], json!("PartialObjectMetadataList"));
+        assert_eq!(out["apiVersion"], json!("meta.k8s.io/v1"));
+        // The list-level resourceVersion is what a reflector resumes from;
+        // dropping it makes every metadata informer re-list on each sync.
+        assert_eq!(out["metadata"]["resourceVersion"], json!("172654"));
+        assert_eq!(out["items"].as_array().unwrap().len(), 2);
+        assert_eq!(out["items"][0]["kind"], json!("PartialObjectMetadata"));
+        assert_eq!(out["items"][0]["metadata"]["name"], json!("a"));
+        // ★ The point of the projection: the body is GONE. A metadata-only
+        // cache exists so a controller never holds Secret payloads in memory.
+        assert!(out["items"][0].get("data").is_none(), "got: {out}");
+    }
+
+    #[test]
+    fn a_single_object_becomes_a_partial_object_metadata() {
+        let obj = json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "flux-system"},
+            "data": {"password": "aHVudGVyMg=="}
+        });
+        let out = to_partial_object_metadata(&obj);
+        assert_eq!(out["kind"], json!("PartialObjectMetadata"));
+        assert_eq!(out["metadata"]["name"], json!("flux-system"));
+        assert!(
+            out.get("data").is_none(),
+            "the payload must not survive: {out}"
+        );
+    }
+
+    /// An empty list is still a list — it must not collapse into a single
+    /// PartialObjectMetadata, which the client cannot decode into a list.
+    #[test]
+    fn an_empty_list_stays_a_list() {
+        let out = to_partial_object_metadata(&json!({
+            "apiVersion": "v1", "kind": "SecretList",
+            "metadata": {}, "items": []
+        }));
+        assert_eq!(out["kind"], json!("PartialObjectMetadataList"));
+        assert_eq!(out["items"].as_array().unwrap().len(), 0);
     }
 }
