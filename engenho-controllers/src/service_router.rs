@@ -841,11 +841,7 @@ impl ServiceRoutingController {
                             .unwrap_or("default")
                             .to_string();
                         let service_port = p.get("port").and_then(|n| n.as_u64())? as u16;
-                        let target_port = p
-                            .get("targetPort")
-                            .and_then(|n| n.as_u64())
-                            .map(|n| n as u16)
-                            .unwrap_or(service_port);
+                        let target_port = Self::target_port(p, &name, endpoints, service_port)?;
                         let protocol = p
                             .get("protocol")
                             .and_then(|n| n.as_str())
@@ -883,6 +879,42 @@ impl ServiceRoutingController {
             ports,
             endpoints: endpoints_set,
         })
+    }
+
+    /// The pod-side port a Service port DNATs to.
+    ///
+    /// The Endpoints controller has already resolved a NAMED `targetPort`
+    /// against the backing containers, so a port published there under the
+    /// same name is authoritative. Reading only a numeric `targetPort` here
+    /// silently treated `targetPort: "http"` as absent and DNATed to the
+    /// SERVICE port — measured on rio 2026-09-15, where Flux's
+    /// source-controller (`port: 80`, `targetPort: http` → 9090) refused every
+    /// ClusterIP connection while the Endpoints object correctly said 9090.
+    ///
+    /// A named port with no resolved Endpoints port yields `None`: no rule
+    /// beats a rule to a port nothing listens on.
+    fn target_port(
+        port: &serde_json::Value,
+        name: &str,
+        endpoints: Option<&serde_json::Value>,
+        service_port: u16,
+    ) -> Option<u16> {
+        let published = endpoints
+            .and_then(|e| e.get("subsets"))
+            .and_then(|s| s.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|subset| subset.get("ports").and_then(|p| p.as_array()))
+            .flatten()
+            .find(|ep| ep.get("name").and_then(|n| n.as_str()).unwrap_or("default") == name)
+            .and_then(|ep| ep.get("port").and_then(|n| n.as_u64()))
+            .and_then(|n| u16::try_from(n).ok());
+        match port.get("targetPort") {
+            None | Some(serde_json::Value::Null) => Some(published.unwrap_or(service_port)),
+            Some(serde_json::Value::Number(n)) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
+            Some(serde_json::Value::String(_)) => published,
+            Some(_) => None,
+        }
     }
 
     fn service_id(namespace: &str, name: &str) -> String {
@@ -1008,6 +1040,56 @@ mod tests {
         let r = ServiceRoutingController::build_route(&svc, None, "x/y").unwrap();
         assert_eq!(r.ports[0].service_port, 9090);
         assert_eq!(r.ports[0].target_port, 9090);
+    }
+
+    fn named_target_service() -> serde_json::Value {
+        json!({
+            "spec": {
+                "clusterIP": "10.97.0.5",
+                "ports": [{"name": "http", "port": 80, "targetPort": "http"}]
+            }
+        })
+    }
+
+    #[test]
+    fn build_route_named_target_port_dnats_to_the_resolved_endpoints_port() {
+        let eps = json!({"subsets": [{
+            "addresses": [{"ip": "10.89.0.65"}],
+            "ports": [{"name": "http", "port": 9090, "protocol": "TCP"}]
+        }]});
+        let r = ServiceRoutingController::build_route(
+            &named_target_service(),
+            Some(&eps),
+            "flux-system/source-controller",
+        )
+        .unwrap();
+        assert_eq!(r.ports[0].service_port, 80);
+        assert_eq!(r.ports[0].target_port, 9090);
+    }
+
+    #[test]
+    fn build_route_named_target_port_never_falls_back_to_the_service_port() {
+        // Negative control for the test above: with nothing resolved, the old
+        // code produced 80 — a rule to a port nothing listens on.
+        let eps = json!({"subsets": [{"addresses": [{"ip": "10.89.0.65"}]}]});
+        let r = ServiceRoutingController::build_route(&named_target_service(), Some(&eps), "x/y")
+            .unwrap();
+        assert!(
+            r.ports.is_empty(),
+            "unresolved named port must emit no rule, got {:?}",
+            r.ports.first().map(|p| p.target_port)
+        );
+        let r =
+            ServiceRoutingController::build_route(&named_target_service(), None, "x/y").unwrap();
+        assert!(r.ports.is_empty());
+    }
+
+    #[test]
+    fn build_route_numeric_target_port_wins_over_endpoints() {
+        let svc = json!({"spec": {"clusterIP": "10.0.0.1", "ports": [{"name": "http", "port": 80, "targetPort": 8080}]}});
+        let eps = json!({"subsets": [{"addresses": [{"ip": "10.0.0.9"}], "ports": [{"name": "http", "port": 1234}]}]});
+        let r = ServiceRoutingController::build_route(&svc, Some(&eps), "x/y").unwrap();
+        assert_eq!(r.ports[0].target_port, 8080);
     }
 
     #[test]
