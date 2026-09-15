@@ -88,6 +88,42 @@ const META_SNAPSHOT_INDEX: &[u8] = b"snapshot_index";
 /// `catalog` partition single key.
 const CATALOG_KEY: &[u8] = b"catalog";
 
+/// How many applied entries may pass before the catalog blob is rewritten.
+///
+/// ★ THE CATALOG BLOB IS A CACHE, NOT THE DURABILITY SOURCE. Every log entry
+/// is already serialized and **fsynced into the `log` partition before it is
+/// applied** (see `append`), so a crash loses nothing: openraft replays from
+/// the persisted `last_applied`, and replaying a raft log is deterministic —
+/// the same entries against the same starting catalog produce the same
+/// resources AND the same MVCC revisions. That determinism is the whole
+/// premise of a replicated state machine; it is what makes skipping this
+/// write safe rather than merely cheap.
+///
+/// Rewriting it on EVERY apply is what made writes unusable. Measured on rio
+/// 2026-09-15, on an idle box: a single ConfigMap PUT took **4.9–17.3 s** and
+/// climbed across consecutive samples, while the `catalog` partition had
+/// grown to **578 MB for 42 live objects** — accumulated versions of one hot
+/// key that compaction could not keep ahead of. The cost is not the fsync, it
+/// is serializing the whole cluster state and handing an LSM a multi-hundred-
+/// kilobyte value on every write.
+///
+/// The consequence was not slowness. Flux's controllers renew a leader-election
+/// Lease on a ~10 s deadline; a 17 s write overruns it, controller-runtime logs
+/// `leader election lost` and exits by design, so kustomize-controller and
+/// helm-controller crash-looped and nothing reconciled.
+///
+/// ★ THE INVARIANT THAT MAKES THIS CORRECT: the catalog and `last_applied` are
+/// written **together or not at all**. Persisting `last_applied` while skipping
+/// the catalog would make a restart trust a catalog that is behind it — the one
+/// way to actually lose data here. Both live under the same `should_persist`
+/// branch below; do not separate them.
+const CATALOG_PERSIST_EVERY: usize = 64;
+
+/// Wall-clock bound on the same decision, so a cluster that writes rarely
+/// still lands its catalog promptly instead of waiting for a 64th entry that
+/// may be hours away. A crash then costs a bounded replay, not a long one.
+const CATALOG_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 type RNodeId = RaftNodeId;
 type RMembership = StoredMembership<RaftNodeId, openraft::BasicNode>;
 
@@ -159,6 +195,13 @@ struct MaterializedState {
     /// `catalog.apply`. The crux of the gap-free / dup-free handoff,
     /// identical to the in-memory store.
     watchers: WatcherRegistry,
+    /// Applied entries since the catalog blob was last written to disk.
+    /// See [`CATALOG_PERSIST_EVERY`].
+    applies_since_catalog_persist: usize,
+    /// When the catalog blob was last written. `None` == never this process,
+    /// which forces the first apply to persist — so a node that takes one
+    /// write and then idles still lands its state.
+    last_catalog_persist: Option<std::time::Instant>,
 }
 
 // ── error mapping helpers ─────────────────────────────────────────
@@ -770,38 +813,64 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
             });
         }
 
-        // ── durable write BEFORE we make any event observable ──────
-        // Overwrite the single catalog key (idempotent full write —
-        // cheap for small clusters; batched-delta is a future
-        // optimization, not pre-optimized here) + last_applied (+
-        // last_membership on membership entries), then fsync ONCE.
-        let catalog_bytes = serde_json::to_vec(&state.catalog).map_err(|e| write_sm_err(&e))?;
-        self.inner
-            .catalog
-            .insert(CATALOG_KEY, catalog_bytes)
-            .map_err(|e| write_sm_err(&e))?;
-        meta_put_json(
-            &self.inner.meta,
-            META_LAST_APPLIED,
-            &state.last_applied,
-            |e| write_sm_err(&io_to_anyerror_dyn(e)),
-        )?;
-        if membership_changed {
+        // ── durable write ──────────────────────────────────────────
+        // The catalog blob is a CACHE of applied state, not the durability
+        // source: every entry was already fsynced into the `log` partition
+        // BEFORE it reached this function, so a crash replays rather than
+        // loses. Rewriting the whole blob per apply is what made writes take
+        // seconds — see CATALOG_PERSIST_EVERY for the measurement and why
+        // replay is safe.
+        //
+        // ★ The catalog and `last_applied` move TOGETHER. Advancing the
+        // persisted `last_applied` past the persisted catalog is the one way
+        // to actually lose data here, so both sit inside this single branch.
+        // A membership change always forces a write — raft's own consistency
+        // rests on it, and it is far too rare to be worth batching.
+        state.applies_since_catalog_persist += 1;
+        let due_by_count = state.applies_since_catalog_persist >= CATALOG_PERSIST_EVERY;
+        let due_by_time = state
+            .last_catalog_persist
+            .is_none_or(|t| t.elapsed() >= CATALOG_PERSIST_INTERVAL);
+        if membership_changed || due_by_count || due_by_time {
+            let catalog_bytes = serde_json::to_vec(&state.catalog).map_err(|e| write_sm_err(&e))?;
+            self.inner
+                .catalog
+                .insert(CATALOG_KEY, catalog_bytes)
+                .map_err(|e| write_sm_err(&e))?;
             meta_put_json(
                 &self.inner.meta,
-                META_LAST_MEMBERSHIP,
-                &state.last_membership,
+                META_LAST_APPLIED,
+                &state.last_applied,
                 |e| write_sm_err(&io_to_anyerror_dyn(e)),
             )?;
+            if membership_changed {
+                meta_put_json(
+                    &self.inner.meta,
+                    META_LAST_MEMBERSHIP,
+                    &state.last_membership,
+                    |e| write_sm_err(&io_to_anyerror_dyn(e)),
+                )?;
+            }
+            self.persist(write_sm_err)?;
+            state.applies_since_catalog_persist = 0;
+            state.last_catalog_persist = Some(std::time::Instant::now());
         }
-        self.persist(write_sm_err)?;
 
-        // ── fan watch events: AFTER fsync, STILL UNDER THE LOCK ────
-        // After-fsync = "a watcher never sees an event that didn't
-        // survive to disk." Still-under-lock = the replay→live handoff
-        // stays atomic against a concurrent `watch_from` registration
-        // (which also runs under this same `state` lock). Non-blocking
-        // try_send (overflow → typed Gone, never silent, never blocks).
+        // ── fan watch events: DURABLE-BEFORE-OBSERVABLE, UNDER THE LOCK ──
+        // "A watcher never sees an event that didn't survive to disk" still
+        // holds, and it is worth being explicit about WHY now that the
+        // catalog write above is batched and may not have run on this pass:
+        // the guarantee rests on the LOG, not on the catalog blob. Every
+        // entry was serialized and fsynced into the `log` partition before
+        // `apply` was ever called, so a change a watcher observes is already
+        // durable — a crash replays it rather than losing it. Batching the
+        // catalog cache does not weaken the promise; it only changes which
+        // fsync backs it.
+        //
+        // Still-under-lock = the replay→live handoff stays atomic against a
+        // concurrent `watch_from` registration (which also runs under this
+        // same `state` lock). Non-blocking try_send (overflow → typed Gone,
+        // never silent, never blocks).
         for change in &committed {
             state.watchers.fan_change(change);
         }
@@ -1031,6 +1100,57 @@ mod tests {
         // last_purged survives → get_log_state sees it when log empty.
         let state = s2.get_log_state().await.unwrap();
         assert_eq!(state.last_purged_log_id.map(|l| l.index), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★ THE INVARIANT THE BATCHED CATALOG WRITE RESTS ON.
+    ///
+    /// The catalog blob and `last_applied` are written together or not at
+    /// all, so after a reopen the applied position INSIDE the rehydrated
+    /// catalog must equal the separately-persisted `last_applied`. If
+    /// `last_applied` were ever ahead, a restart would trust a catalog that
+    /// is behind it and openraft would never replay the difference — the one
+    /// way this optimization could actually lose data.
+    ///
+    /// Applies several entries in quick succession, so entries after the
+    /// first are deliberately NOT persisted (the count and time bounds are
+    /// both far away). The assertion is not "everything survived" — it is
+    /// "whatever survived is CONSISTENT", which is what makes the replay
+    /// openraft performs afterwards correct.
+    #[tokio::test]
+    async fn a_reopened_catalog_is_never_behind_its_own_applied_position() {
+        let dir = temp_dir("apply-batched-consistency");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut s = FjallStore::open(&dir).unwrap();
+            // Several applies well inside both the count and time bounds, so
+            // most of them skip the blob write.
+            for i in 2..8u64 {
+                s.apply(vec![put_entry(i, &format!("pod-{i}"))])
+                    .await
+                    .unwrap();
+            }
+        }
+        let s2 = FjallStore::open(&dir).unwrap();
+        let cat = s2.current_catalog().await;
+        let persisted_applied = s2.inner.state.lock().await.last_applied;
+
+        assert_eq!(
+            cat.last_applied_index,
+            persisted_applied.map_or(0, |l| l.index),
+            "the rehydrated catalog and the persisted last_applied disagree;              a restart would trust a catalog behind its own applied position"
+        );
+        // ★ NEGATIVE CONTROL — the test is only meaningful if writes were
+        // actually SKIPPED. Six applies inside both bounds means only the
+        // first persists (the time bound fires once, on `None`), so a
+        // reopened catalog carrying all six would mean the batching never
+        // engaged and the consistency assertion above proved nothing.
+        assert!(
+            cat.len() < 6,
+            "batching did not engage — all {} applies persisted, so the \
+             consistency assertion above is vacuous",
+            cat.len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
