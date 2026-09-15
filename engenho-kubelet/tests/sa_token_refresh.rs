@@ -35,7 +35,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use engenho_controllers::Controller;
 use engenho_kubelet::pod_volume::ServiceAccountProjector;
-use engenho_kubelet::{FakeBackend, FakeVolumeMaterializer, Kubelet, TestClock, VolumeMaterializer};
+use engenho_kubelet::{
+    FakeBackend, FakeVolumeMaterializer, Kubelet, TestClock, VolumeMaterializer,
+};
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
@@ -261,8 +263,7 @@ async fn a_shorter_lifetime_refreshes_sooner() {
 
         let reminted = proj.calls() > after_start;
         assert_eq!(
-            reminted,
-            want_remint,
+            reminted, want_remint,
             "lifetime {lifetime:?} after {advance:?}: the refresh cadence must \
              follow the lifetime, not a fixed constant"
         );

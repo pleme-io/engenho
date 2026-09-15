@@ -309,7 +309,8 @@ impl ResourceLimits {
         let memory = {
             let limit = r.memory_limit_bytes.value();
             let reservation = r.memory_request_bytes.value();
-            (limit.is_some() || reservation.is_some()).then_some(MemoryLimits { limit, reservation })
+            (limit.is_some() || reservation.is_some())
+                .then_some(MemoryLimits { limit, reservation })
         };
         (cpu.is_some() || memory.is_some()).then_some(Self { cpu, memory })
     }
@@ -1263,9 +1264,7 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         // sat in ContainerCreating forever; measured on rio with all four
         // FluxCD controllers, where `podman pull` of the identical reference
         // succeeded by hand.
-        self.api
-            .ensure_image(&spec.image, spec.pull_policy)
-            .await?;
+        self.api.ensure_image(&spec.image, spec.pull_policy).await?;
 
         // Inject KUBERNETES_SERVICE_HOST/PORT/... into every container the API
         // backend starts. Mirrors [`PodmanBackend`]'s single-point injection on

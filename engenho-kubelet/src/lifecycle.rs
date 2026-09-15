@@ -161,9 +161,7 @@ impl ContainerState {
 /// One container's observed shape — the per-element input to
 /// [`reconcile_pod_phase`]. The kubelet builds this slice from its local
 /// bookkeeping + the backend's `status` poll.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InitKind {
     /// A classic init container: runs to completion, and the next one does not
@@ -902,7 +900,10 @@ mod tests {
             running("proxy", "id0").as_sidecar(),
             terminated("setup", "id1", 0),
         ];
-        assert_eq!(next_init_action(RestartPolicy::Always, &obs), InitAction::Complete);
+        assert_eq!(
+            next_init_action(RestartPolicy::Always, &obs),
+            InitAction::Complete
+        );
 
         // NEGATIVE CONTROL: the identical slice with a REGULAR container in
         // position 0 must still block. Without this the test would pass on a
@@ -910,7 +911,10 @@ mod tests {
         let obs_regular = vec![running("proxy", "id0"), terminated("setup", "id1", 0)];
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs_regular),
-            InitAction::AwaitInit { start: vec![], blocked_on: Some(0) }
+            InitAction::AwaitInit {
+                start: vec![],
+                blocked_on: Some(0)
+            }
         );
     }
 
@@ -926,7 +930,10 @@ mod tests {
         ];
         assert_eq!(
             next_init_action(RestartPolicy::Never, &obs),
-            InitAction::AwaitInit { start: vec![0], blocked_on: None },
+            InitAction::AwaitInit {
+                start: vec![0],
+                blocked_on: None
+            },
             "restart it, do not fail the pod, and do not block"
         );
 
@@ -937,20 +944,23 @@ mod tests {
         let obs_regular = vec![terminated("setup", "id0", 7)];
         assert_eq!(
             next_init_action(RestartPolicy::Never, &obs_regular),
-            InitAction::InitFailed { index: 0, exit_code: 7 }
+            InitAction::InitFailed {
+                index: 0,
+                exit_code: 7
+            }
         );
     }
 
     #[test]
     fn an_unstarted_sidecar_is_started_without_blocking_what_follows() {
         // R2: started, never awaited. The sequence proceeds past it.
-        let obs = vec![
-            waiting("proxy").as_sidecar(),
-            waiting("setup"),
-        ];
+        let obs = vec![waiting("proxy").as_sidecar(), waiting("setup")];
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs),
-            InitAction::AwaitInit { start: vec![0, 1], blocked_on: Some(1) },
+            InitAction::AwaitInit {
+                start: vec![0, 1],
+                blocked_on: Some(1)
+            },
             "start the sidecar AND the regular one; block only on the regular"
         );
     }
@@ -981,7 +991,10 @@ mod tests {
         // semantics: the forever-Pending hang, triggered by a typo, with no
         // error anywhere.
         assert_eq!(InitKind::from_spec_str(None), Ok(InitKind::Regular));
-        assert_eq!(InitKind::from_spec_str(Some("Always")), Ok(InitKind::Sidecar));
+        assert_eq!(
+            InitKind::from_spec_str(Some("Always")),
+            Ok(InitKind::Sidecar)
+        );
         assert!(InitKind::from_spec_str(Some("always")).is_err());
         assert!(InitKind::from_spec_str(Some("OnFailure")).is_err());
         // The error names the offending value, so the log says what to fix.
@@ -995,7 +1008,10 @@ mod tests {
         let obs = vec![waiting("init-0"), waiting("init-1")];
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs),
-            InitAction::AwaitInit { start: vec![0], blocked_on: Some(0) }
+            InitAction::AwaitInit {
+                start: vec![0],
+                blocked_on: Some(0)
+            }
         );
     }
 
@@ -1006,7 +1022,10 @@ mod tests {
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs),
             // Running already: nothing to START, but still blocking.
-            InitAction::AwaitInit { start: vec![], blocked_on: Some(0) }
+            InitAction::AwaitInit {
+                start: vec![],
+                blocked_on: Some(0)
+            }
         );
     }
 
@@ -1016,7 +1035,10 @@ mod tests {
         let obs = vec![terminated("init-0", "id0", 0), waiting("init-1")];
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs),
-            InitAction::AwaitInit { start: vec![1], blocked_on: Some(1) }
+            InitAction::AwaitInit {
+                start: vec![1],
+                blocked_on: Some(1)
+            }
         );
     }
 
@@ -1051,7 +1073,10 @@ mod tests {
         let obs = vec![terminated("init-0", "id0", 7)];
         assert_eq!(
             next_init_action(RestartPolicy::Always, &obs),
-            InitAction::AwaitInit { start: vec![0], blocked_on: Some(0) }
+            InitAction::AwaitInit {
+                start: vec![0],
+                blocked_on: Some(0)
+            }
         );
     }
 
@@ -1061,12 +1086,18 @@ mod tests {
         let nonzero = vec![terminated("init-0", "id0", 3)];
         assert_eq!(
             next_init_action(RestartPolicy::OnFailure, &nonzero),
-            InitAction::AwaitInit { start: vec![0], blocked_on: Some(0) }
+            InitAction::AwaitInit {
+                start: vec![0],
+                blocked_on: Some(0)
+            }
         );
         let zero = vec![terminated("init-0", "id0", 0), waiting("init-1")];
         assert_eq!(
             next_init_action(RestartPolicy::OnFailure, &zero),
-            InitAction::AwaitInit { start: vec![1], blocked_on: Some(1) }
+            InitAction::AwaitInit {
+                start: vec![1],
+                blocked_on: Some(1)
+            }
         );
     }
 

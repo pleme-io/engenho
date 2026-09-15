@@ -430,7 +430,11 @@ async fn no_init_pod_starts_app_immediately_initialized_true() {
     // pod never had one at all. The kubelet only reconciles pods already bound
     // to this node, so asserting it here is a tautology, which is exactly
     // upstream's reasoning for the kubelet owning it.
-    assert_eq!(conds.len(), 3, "ContainersReady, Ready, PodScheduled: {conds:?}");
+    assert_eq!(
+        conds.len(),
+        3,
+        "ContainersReady, Ready, PodScheduled: {conds:?}"
+    );
     assert_eq!(conds[0]["type"], "ContainersReady");
     assert_eq!(conds[1]["type"], "Ready");
     assert_eq!(conds[2]["type"], "PodScheduled");

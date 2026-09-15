@@ -261,10 +261,7 @@ async fn l1_l2_l3_the_kubelet_writes_a_lease_that_drives_readiness() {
         .expect("seed the node");
     kubelet.tick().await.unwrap();
 
-    let node = store
-        .get(&node_key)
-        .await
-        .expect("the node object exists");
+    let node = store.get(&node_key).await.expect("the node object exists");
     assert!(
         engenho_kubelet::node_lease::find_ready_condition(&node)
             .and_then(|c| c.get("reason"))
@@ -274,9 +271,7 @@ async fn l1_l2_l3_the_kubelet_writes_a_lease_that_drives_readiness() {
     assert!(
         node["status"]["conditions"]
             .as_array()
-            .is_some_and(|cs| cs
-                .iter()
-                .any(|c| c["type"] == "MemoryPressure")),
+            .is_some_and(|cs| cs.iter().any(|c| c["type"] == "MemoryPressure")),
         "merging by type must preserve a condition this kubelet does not own: {node}"
     );
     let ready = engenho_kubelet::node_lease::find_ready_condition(&node)
@@ -290,11 +285,17 @@ async fn l1_l2_l3_the_kubelet_writes_a_lease_that_drives_readiness() {
     // published condition must carry both — the boot-time literal carries
     // neither, which is the cheapest way to tell them apart.
     assert!(
-        ready.get("lastHeartbeatTime").and_then(|t| t.as_str()).is_some(),
+        ready
+            .get("lastHeartbeatTime")
+            .and_then(|t| t.as_str())
+            .is_some(),
         "a published condition records that we looked: {node}"
     );
     assert!(
-        ready.get("lastTransitionTime").and_then(|t| t.as_str()).is_some(),
+        ready
+            .get("lastTransitionTime")
+            .and_then(|t| t.as_str())
+            .is_some(),
         "and when the state last changed: {node}"
     );
 
