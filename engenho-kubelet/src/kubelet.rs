@@ -1561,6 +1561,36 @@ impl Kubelet {
     /// destination is unchanged and is the real fix: the `engenho-dns`
     /// authority (`engenho-controllers/src/dns.rs` already computes exactly
     /// these `fqdn → clusterIP` records and is not yet served to pods).
+    /// Everything a container needs to resolve Service names, computed in ONE
+    /// place: the aardvark aliases for the Services that select this pod, and
+    /// the ClusterIP `/etc/hosts` map for the Services it consumes.
+    ///
+    /// ★ Why this is a single function. The two halves used to be computed
+    /// separately at each start path, and there are THREE start paths — first
+    /// start, init containers, and restart-after-exit. The ClusterIP map was
+    /// wired into two of them. Measured on rio 2026-09-15: kustomize-controller
+    /// exited once while waiting on its leader lease, came back through the
+    /// RESTART path with an empty `host_add`, resolved source-controller to
+    /// its pod IP on :80 and got `connection refused` — while
+    /// notification-controller, started through the normal path, had the map
+    /// and worked. A partial guard that read as a complete one. Returning both
+    /// halves together means a path that sets one cannot forget the other.
+    async fn service_name_resolution(
+        &self,
+        value: &Value,
+        namespace: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let own_ns = self.store.list("", "v1", "Service", Some(namespace)).await;
+        let aliases =
+            Self::service_aliases_for_pod(value, namespace, &own_ns, DEFAULT_CLUSTER_DOMAIN);
+        // Listed across ALL namespaces: a pod resolves Services it CONSUMES,
+        // which are frequently not its own, whereas the aliases are about
+        // Services that SELECT this pod. Two questions, two lists.
+        let all = self.store.list("", "v1", "Service", None).await;
+        let hosts = Self::service_cluster_ip_hosts(namespace, &all, DEFAULT_CLUSTER_DOMAIN);
+        (aliases, hosts)
+    }
+
     fn service_cluster_ip_hosts(
         namespace: &str,
         services: &[(ResourceKey, Value)],
@@ -2447,16 +2477,7 @@ impl Kubelet {
         // to a running container. LIST Services in the pod's namespace + reuse
         // the EndpointsController selector predicate. aardvark-dns resolves
         // these names to the pod's IP.
-        let services = self.store.list("", "v1", "Service", Some(namespace)).await;
-        let aliases =
-            Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
-        // ClusterIP `/etc/hosts` entries, listed across ALL namespaces: a pod
-        // resolves Services it CONSUMES, which are frequently not in its own
-        // namespace, whereas the aliases above are about Services that select
-        // THIS pod. Two different questions, so two different lists.
-        let all_services = self.store.list("", "v1", "Service", None).await;
-        let cluster_ip_hosts =
-            Self::service_cluster_ip_hosts(namespace, &all_services, DEFAULT_CLUSTER_DOMAIN);
+        let (aliases, cluster_ip_hosts) = self.service_name_resolution(value, namespace).await;
 
         // (M0.7 kubelet-volumes) Resolve + materialize `spec.volumes[]` ONCE
         // for the pod (configMap/secret → host files; emptyDir → a shared
@@ -2900,9 +2921,11 @@ impl Kubelet {
         old_restart_count: u32,
     ) -> Result<crate::backend::ContainerStatus, KubeletError> {
         let mut restart_spec = spec.clone();
-        let services = self.store.list("", "v1", "Service", Some(namespace)).await;
-        restart_spec.network_aliases =
-            Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
+        // BOTH halves — this path used to set only the aliases, which is the
+        // defect `service_name_resolution` documents.
+        let (aliases, cluster_ip_hosts) = self.service_name_resolution(value, namespace).await;
+        restart_spec.network_aliases = aliases;
+        restart_spec.host_add = cluster_ip_hosts;
         // ── ★ RESTORE THE MOUNTS THE CONTAINER STARTED WITH ──────────────
         // `spec` here came from `pod_to_container_specs`, a pure function of
         // the Pod value, so its `mounts` is ALWAYS empty — resolution lives on
@@ -3485,16 +3508,7 @@ impl Kubelet {
         // volume-resolution error writes the pod Pending with the typed reason
         // + arms a requeue (the no-silent-wrong-answer path), exactly like the
         // app-start path.
-        let services = self.store.list("", "v1", "Service", Some(namespace)).await;
-        let aliases =
-            Self::service_aliases_for_pod(value, namespace, &services, DEFAULT_CLUSTER_DOMAIN);
-        // ClusterIP `/etc/hosts` entries, listed across ALL namespaces: a pod
-        // resolves Services it CONSUMES, which are frequently not in its own
-        // namespace, whereas the aliases above are about Services that select
-        // THIS pod. Two different questions, so two different lists.
-        let all_services = self.store.list("", "v1", "Service", None).await;
-        let cluster_ip_hosts =
-            Self::service_cluster_ip_hosts(namespace, &all_services, DEFAULT_CLUSTER_DOMAIN);
+        let (aliases, cluster_ip_hosts) = self.service_name_resolution(value, namespace).await;
         let cnames: Vec<String> = init_specs.iter().map(|(c, _)| c.clone()).collect();
         let Some(resolved) = self
             .resolve_or_pending(key, value, namespace, &cnames, report, soonest_requeue)
