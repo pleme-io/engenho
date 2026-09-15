@@ -102,15 +102,71 @@ impl EndpointsController {
             .unwrap_or(false)
     }
 
+    /// Resolve a Service's ports to the POD-SIDE ports an Endpoints object
+    /// must publish.
+    ///
+    /// **`subsets[].ports[].port` is the TARGET port, not the service port.**
+    /// Getting this wrong does not produce an error anywhere: the Endpoints
+    /// object is well-formed, the Service looks healthy, and the datapath
+    /// faithfully DNATs to a port nothing listens on. Measured on rio
+    /// 2026-09-15 — Flux's source-controller Service is
+    /// `port: 80, targetPort: "http"` and the container serves 9090.
+    /// engenho published `port: 80`, so every connection to the ClusterIP
+    /// was refused while the pod answered 200 on its real port, and
+    /// kustomize-controller could never fetch an artifact.
+    ///
+    /// Three cases, and the middle one is the one that bites:
+    ///   * `targetPort` absent      -> the service port (upstream's default)
+    ///   * `targetPort` a STRING    -> the containerPort with that NAME
+    ///   * `targetPort` an integer  -> itself
+    ///
+    /// A named port is resolved against the pods actually backing the
+    /// Service. If no backing container declares the name, the port is
+    /// dropped rather than guessed: publishing a wrong number produces a
+    /// silent blackhole, publishing nothing produces a Service with no port,
+    /// which is at least visible.
+    fn resolve_service_ports(svc: &Value, pods: &[&Value]) -> Vec<Value> {
+        svc.get("spec")
+            .and_then(|s| s.get("ports"))
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| {
+                        let protocol = p.get("protocol").cloned().unwrap_or_else(|| json!("TCP"));
+                        let name = p.get("name").cloned().unwrap_or(Value::Null);
+                        let resolved = match p.get("targetPort") {
+                            None | Some(Value::Null) => p.get("port").and_then(Value::as_i64),
+                            Some(Value::Number(n)) => n.as_i64(),
+                            Some(Value::String(named)) => Self::container_port_named(pods, named),
+                            Some(_) => None,
+                        }?;
+                        Some(json!({ "name": name, "port": resolved, "protocol": protocol }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `containerPort` declared under `name` by any container of any
+    /// backing pod. Upstream resolves per-pod; engenho publishes one subset,
+    /// so the first match wins — which is correct whenever the backing pods
+    /// share a template, and every Service selecting a single workload does.
+    fn container_port_named(pods: &[&Value], name: &str) -> Option<i64> {
+        pods.iter()
+            .filter_map(|pod| pod.get("spec")?.get("containers")?.as_array())
+            .flatten()
+            .filter_map(|c| c.get("ports")?.as_array())
+            .flatten()
+            .find(|port| port.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|port| port.get("containerPort").and_then(Value::as_i64))
+    }
+
     /// Build the Endpoints object body. `addresses` is a typed
     /// list of (ip, target_pod_name) pairs.
-    fn build_endpoints(svc: &Value, addresses: Vec<(String, String)>) -> Value {
+    fn build_endpoints(svc: &Value, addresses: Vec<(String, String)>, pods: &[&Value]) -> Value {
         let name = svc.name().unwrap_or("");
-        let ports = svc
-            .get("spec")
-            .and_then(|s| s.get("ports"))
-            .cloned()
-            .unwrap_or_else(|| json!([]));
+        // The pod-side ports, NOT the Service's spec.ports verbatim.
+        let ports = Value::Array(Self::resolve_service_ports(svc, pods));
 
         let subset_addresses: Vec<Value> = addresses
             .into_iter()
@@ -148,34 +204,16 @@ impl EndpointsController {
     /// today; dual-stack is a typed follow-up). Each endpoint is marked
     /// `conditions.ready = true` (the caller already filtered to ready,
     /// ip-bearing pods).
-    fn build_endpoint_slice(svc: &Value, addresses: &[(String, String)]) -> Value {
+    fn build_endpoint_slice(svc: &Value, addresses: &[(String, String)], pods: &[&Value]) -> Value {
         let name = svc.name().unwrap_or("");
         // EndpointSlice ports use the same `(name, port, protocol)` shape as
         // the Service ports — projected verbatim (the Service's targetPort is
         // the pod-side port the slice publishes; engenho's Endpoints carries
         // the Service ports today, mirrored here for one source of truth).
-        let ports = svc
-            .get("spec")
-            .and_then(|s| s.get("ports"))
-            .and_then(|p| p.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|p| {
-                        let port_name = p.get("name").cloned().unwrap_or(Value::Null);
-                        // The slice publishes the pod-side port (targetPort);
-                        // default to the service port when targetPort is unset
-                        // (mirrors the routing controller's resolution).
-                        let port = p
-                            .get("targetPort")
-                            .or_else(|| p.get("port"))
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        let protocol = p.get("protocol").cloned().unwrap_or_else(|| json!("TCP"));
-                        json!({ "name": port_name, "port": port, "protocol": protocol })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // The SAME resolution the Endpoints object uses — one source of truth,
+        // as the doc comment above promises. Projecting `targetPort` verbatim
+        // here would republish a NAMED port as the literal string "http".
+        let ports = Self::resolve_service_ports(svc, pods);
 
         let endpoints: Vec<Value> = addresses
             .iter()
@@ -272,6 +310,15 @@ impl Controller for EndpointsController {
             let ns = svc_key.namespace.as_deref();
             let all_pods = self.store.list("", "v1", "Pod", ns).await;
 
+            // The pods backing this Service, kept so a NAMED targetPort can be
+            // resolved against the containerPort that actually declares it.
+            let matched_pods: Vec<&Value> = all_pods
+                .iter()
+                .filter(|(_, pod)| matches_labels(pod, selector))
+                .filter(|(_, pod)| Self::pod_is_ready(pod))
+                .map(|(_, pod)| pod)
+                .collect();
+
             // Filter to ready, ip-bearing pods matching the selector.
             let mut addresses: Vec<(String, String)> = all_pods
                 .iter()
@@ -297,11 +344,11 @@ impl Controller for EndpointsController {
 
             // Build the EndpointSlice from the SAME resolved address set
             // (borrowed before `addresses` is moved into build_endpoints).
-            let slice_body = Self::build_endpoint_slice(svc_value, &addresses);
+            let slice_body = Self::build_endpoint_slice(svc_value, &addresses, &matched_pods);
 
             // Check if existing Endpoints already matches what we'd write.
             let existing = self.store.get(&endpoints_key).await;
-            let mut new_endpoints = Self::build_endpoints(svc_value, addresses);
+            let mut new_endpoints = Self::build_endpoints(svc_value, addresses, &matched_pods);
             set_owner_reference(&mut new_endpoints, owner_ref.clone());
 
             // Emit the EndpointSlice (parallel projection). Done before the
@@ -422,7 +469,7 @@ mod tests {
             ("10.0.0.1".into(), "p1".into()),
             ("10.0.0.2".into(), "p2".into()),
         ];
-        let ep = EndpointsController::build_endpoints(&svc, addrs);
+        let ep = EndpointsController::build_endpoints(&svc, addrs, &[]);
         assert_eq!(ep.get("kind").unwrap(), "Endpoints");
         let subsets = ep.get("subsets").unwrap().as_array().unwrap();
         assert_eq!(subsets.len(), 1);
@@ -458,7 +505,7 @@ mod tests {
         ];
         // Mirror the controller's `addresses.sort()` before build.
         addrs.sort();
-        let ep = EndpointsController::build_endpoints(&svc, addrs);
+        let ep = EndpointsController::build_endpoints(&svc, addrs, &[]);
         let subsets = ep.get("subsets").unwrap().as_array().unwrap();
         assert_eq!(subsets.len(), 1);
         let addresses = subsets[0].get("addresses").unwrap().as_array().unwrap();
@@ -474,9 +521,100 @@ mod tests {
             addresses[1].get("targetRef").unwrap().get("name").unwrap(),
             "pod-b"
         );
-        // Port copied from the Service.
+        // targetPort 80 == the service port here, so the published port is 80.
         let ports = subsets[0].get("ports").unwrap().as_array().unwrap();
         assert_eq!(ports[0].get("port").unwrap(), 80);
+    }
+
+    /// The exact Service that broke rio: `port: 80, targetPort: "http"`, a
+    /// container serving 9090. Publishing 80 gives a well-formed Endpoints,
+    /// a healthy-looking Service, and a datapath that DNATs to a port
+    /// nothing listens on.
+    #[test]
+    fn a_named_target_port_resolves_to_the_container_port() {
+        let svc = json!({
+            "metadata": {"name": "source-controller"},
+            "spec": {
+                "selector": {"app": "source-controller"},
+                "ports": [{"name": "http", "port": 80, "targetPort": "http", "protocol": "TCP"}]
+            }
+        });
+        let pod = json!({
+            "metadata": {"name": "source-controller-0"},
+            "spec": {"containers": [{"name": "manager", "ports": [{"name": "http", "containerPort": 9090}]}]}
+        });
+        let ports = EndpointsController::resolve_service_ports(&svc, &[&pod]);
+        assert_eq!(ports.len(), 1);
+        assert_eq!(
+            ports[0].get("port").unwrap(),
+            9090,
+            "the pod-side port, not the service port: {ports:?}"
+        );
+        assert_eq!(ports[0].get("name").unwrap(), "http");
+        assert_eq!(ports[0].get("protocol").unwrap(), "TCP");
+    }
+
+    /// Negative control: with NO pod declaring the name there is nothing to
+    /// resolve to, and the port is DROPPED rather than guessed. A wrong
+    /// number is a silent blackhole; an absent port is at least visible.
+    #[test]
+    fn an_unresolvable_named_port_is_dropped_not_guessed() {
+        let svc = json!({
+            "metadata": {"name": "svc"},
+            "spec": {"ports": [{"name": "http", "port": 80, "targetPort": "grpc"}]}
+        });
+        let pod = json!({
+            "metadata": {"name": "p"},
+            "spec": {"containers": [{"name": "c", "ports": [{"name": "http", "containerPort": 9090}]}]}
+        });
+        assert!(
+            EndpointsController::resolve_service_ports(&svc, &[&pod]).is_empty(),
+            "an unresolvable name must not fall back to the service port"
+        );
+    }
+
+    /// A numeric targetPort is itself, and an ABSENT one is the service port
+    /// — upstream's default. Without this the common case would regress
+    /// while the named case was being fixed.
+    #[test]
+    fn numeric_and_absent_target_ports_keep_their_upstream_meaning() {
+        let numeric = json!({"spec": {"ports": [{"port": 80, "targetPort": 9898}]}});
+        assert_eq!(
+            EndpointsController::resolve_service_ports(&numeric, &[])[0]
+                .get("port")
+                .unwrap(),
+            9898
+        );
+        let absent = json!({"spec": {"ports": [{"port": 5432}]}});
+        assert_eq!(
+            EndpointsController::resolve_service_ports(&absent, &[])[0]
+                .get("port")
+                .unwrap(),
+            5432
+        );
+    }
+
+    /// Both projections must agree. They are separate objects consumed by
+    /// different clients, and a datapath built from one while a consumer
+    /// reads the other is the drift this shares a resolver to prevent.
+    #[test]
+    fn the_endpoints_and_the_slice_publish_the_same_port() {
+        let svc = json!({
+            "metadata": {"name": "source-controller"},
+            "spec": {"selector": {"app": "x"},
+                     "ports": [{"name": "http", "port": 80, "targetPort": "http"}]}
+        });
+        let pod = json!({
+            "metadata": {"name": "p"},
+            "spec": {"containers": [{"name": "c", "ports": [{"name": "http", "containerPort": 9090}]}]}
+        });
+        let addrs = vec![("10.89.0.104".to_string(), "p".to_string())];
+        let ep = EndpointsController::build_endpoints(&svc, addrs.clone(), &[&pod]);
+        let slice = EndpointsController::build_endpoint_slice(&svc, &addrs, &[&pod]);
+        let ep_port = ep["subsets"][0]["ports"][0]["port"].clone();
+        let slice_port = slice["ports"][0]["port"].clone();
+        assert_eq!(ep_port, json!(9090));
+        assert_eq!(ep_port, slice_port, "Endpoints and EndpointSlice disagree");
     }
 
     #[test]
@@ -490,7 +628,7 @@ mod tests {
             ("10.0.0.1".to_string(), "p1".to_string()),
             ("10.0.0.2".to_string(), "p2".to_string()),
         ];
-        let slice = EndpointsController::build_endpoint_slice(&svc, &addrs);
+        let slice = EndpointsController::build_endpoint_slice(&svc, &addrs, &[]);
         assert_eq!(slice["kind"], "EndpointSlice");
         assert_eq!(slice["apiVersion"], "discovery.k8s.io/v1");
         assert_eq!(slice["addressType"], "IPv4");
@@ -515,7 +653,7 @@ mod tests {
     #[test]
     fn build_endpoint_slice_empty_when_no_addresses() {
         let svc = json!({"metadata": {"name": "x"}, "spec": {"ports": [{"port": 80}]}});
-        let slice = EndpointsController::build_endpoint_slice(&svc, &[]);
+        let slice = EndpointsController::build_endpoint_slice(&svc, &[], &[]);
         assert!(slice["endpoints"].as_array().unwrap().is_empty());
     }
 
