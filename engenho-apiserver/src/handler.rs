@@ -958,7 +958,6 @@ impl ResourceHandler for StoreBackedHandler {
         Ok(inject_type_meta(&v, self.api_version(), &self.kind))
     }
 
-
     async fn list(&self, namespace: Option<&str>) -> Result<Value, ApiError> {
         // Default (no selectors) LIST. The atomic-rv envelope is built
         // by the trait's `list_response`; this wraps `list_at` with an
@@ -1275,6 +1274,23 @@ impl ResourceHandler for StoreBackedHandler {
                     [&self.kind, " \"", name.as_str(), "\" is invalid: ", &detail].concat(),
                 ));
             }
+        }
+
+        // ── CRD structural-schema DEFAULTING, then validation. ─────────
+        // Defaulting runs first, exactly as upstream orders it: a default
+        // must be able to satisfy a `required` field, which it cannot once
+        // validation has already rejected the object.
+        //
+        // Measured on rio 2026-09-15 — the cost of not doing this is not a
+        // missing field, it is a crash loop in somebody else's binary.
+        // Flux's GitRepository CRD declares `spec.timeout` default `60s`;
+        // engenho stored the object without it; source-controller v1.8.5
+        // dereferenced the nil `*metav1.Duration` and panicked on every
+        // reconcile. The GitRepository sat reporting "building artifact" and
+        // nothing anywhere named the apiserver as the cause.
+        let mut body = body;
+        if let Some(schema) = &self.crd_schema {
+            crate::schema_validation::apply_defaults(schema, &mut body);
         }
 
         // ── CRD structural-schema validation. ──────────────────────────
