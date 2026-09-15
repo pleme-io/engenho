@@ -22,6 +22,41 @@ cluster that no longer exists.
 That is a much better position than it looks, because the two things that
 blocked it for months were both identity bugs, and both are now closed.
 
+### ★ Addendum, measured live on rio 2026-09-15 — the platform's readiness was
+### a CODE claim, and running it found nine more blockers
+
+§1 above was measured by reading code on a workstation. rio then became the
+first node to run the whole stack for real — engenho alone, k3s stood down —
+and the difference between "every primitive is implemented" and "a controller
+can complete one reconcile" turned out to be nine defects, each hidden behind
+the one before it. None was visible from the code alone; each needed the
+system running under a real controller.
+
+| # | defect | how it presented |
+|---|---|---|
+| 1 | LIST cloned the whole history ring | writes slowed as the ring filled, plateauing at 8192 |
+| 2 | the watch path cloned the catalog to read one `u64` | writes 60s → 6s once removed |
+| 3 | `valueFrom.resourceFieldRef` unsupported | 273 invalid-manifest warnings in 3 minutes |
+| 4 | the libpod backend never pulled an image | pods sat `Pending` with no error |
+| 5 | ServiceAccounts were not in `system:authenticated` | discovery 403 |
+| 6 | `coordination/v1 Lease` uncataloged for protobuf | no controller could ever become leader |
+| 7 | `emptyDir` created `0755 root:root` | a `runAsUser` pod could not write `/tmp`; the pod stayed *Running* and the kubelet reported success |
+| 8 | **CRD schema defaults were never applied** | source-controller dereferenced a nil `*metav1.Duration` and panicked every reconcile, reporting only "building artifact" |
+| 9 | the iptables router appended into `KUBE-SERVICES` without creating it | Service routing worked only on a node where kube-proxy had run — i.e. exactly not engenho's |
+
+**The generalizable lesson is #7 and #8 together.** Both are cases where
+engenho did something *reasonable in isolation* and wrong with respect to a
+promise the ecosystem depends on: podman's default directory mode, and a
+schema keyword treated as advisory. In both, the failure surfaced inside
+somebody else's binary, with the apiserver named nowhere. A Kubernetes
+runtime's compatibility surface is not its API shapes — it is every default
+and every side effect a controller was written against.
+
+**So amend §1's verdict:** the platform is ready *as code*, and each claim
+below is worth exactly its last LIVE measurement. Before citing a row as
+live, check whether a controller has actually completed the operation on a
+node, not whether the type exists.
+
 ---
 
 ## 2. What a drill needs, and where it stands
