@@ -1241,6 +1241,11 @@ fn default_data_root() -> PathBuf {
 }
 
 impl PodmanVolumeMaterializer {
+    /// The mode every `emptyDir` host directory is widened to. Upstream
+    /// kubelet's `pkg/volume/empty_dir/empty_dir.go` uses exactly this value;
+    /// see [`open_empty_dir_to_every_uid`](Self::open_empty_dir_to_every_uid).
+    const EMPTY_DIR_MODE: u32 = 0o777;
+
     /// New materializer with the host's `podman` from `$PATH` + the default
     /// `$HOME`-rooted data root.
     #[must_use]
@@ -1290,6 +1295,51 @@ impl PodmanVolumeMaterializer {
     #[must_use]
     pub fn empty_dir_volume_name(namespace: &str, pod: &str, volume: &str) -> String {
         format!("engenho-empty-{namespace}_{pod}_{volume}")
+    }
+
+    /// Widen an emptyDir's host directory to `0777`.
+    ///
+    /// **This is a world-fact about Kubernetes, not a preference.** Upstream
+    /// kubelet creates every `emptyDir` with perm `0777`
+    /// (`pkg/volume/empty_dir/empty_dir.go` — `perm os.FileMode = 0777`,
+    /// applied by both `MkdirAll` and an explicit `Chmod`), precisely so a
+    /// container running as an arbitrary non-root UID can write into it. A
+    /// pod does not get to ask for that: no field in `EmptyDirVolumeSource`
+    /// controls the mode, so every workload in the ecosystem is written
+    /// assuming it.
+    ///
+    /// `podman volume create` makes its `_data` dir `0755 root:root`, so
+    /// inheriting podman's default silently breaks any pod with a
+    /// `runAsUser` — and it breaks it at *runtime*, inside the container, as
+    /// an errno the kubelet never sees. Measured 2026-09-15 on rio: Flux's
+    /// source-controller (`runAsUser: 65534`) reported
+    /// `failed to create temporary working directory: mkdir /tmp/...:
+    /// permission denied` and the GitRepository never synced, while the pod
+    /// itself stayed `Running` and the kubelet reported success.
+    ///
+    /// Not a security regression relative to Kubernetes: the directory is a
+    /// per-pod-per-volume podman volume whose parent
+    /// (`/var/lib/containers/storage/volumes`) is `0700 root:root`, so `0777`
+    /// on the leaf is reachable only from inside the pod that owns it —
+    /// exactly kubelet's own posture.
+    fn open_empty_dir_to_every_uid(dir: &std::path::Path) -> Result<(), VolumeResolveError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(Self::EMPTY_DIR_MODE))
+                .map_err(|e| {
+                    VolumeResolveError::Materialize(format!(
+                        "chmod {:o} {}: {e}",
+                        Self::EMPTY_DIR_MODE,
+                        dir.display()
+                    ))
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+        }
+        Ok(())
     }
 }
 
@@ -1385,7 +1435,9 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
                 "podman volume inspect {vol_name}: empty Mountpoint"
             )));
         }
-        Ok(MountSource::EmptyDirHostDir(PathBuf::from(mountpoint)))
+        let dir = PathBuf::from(&mountpoint);
+        Self::open_empty_dir_to_every_uid(&dir)?;
+        Ok(MountSource::EmptyDirHostDir(dir))
     }
 
     async fn remove_empty_dir(
@@ -2160,6 +2212,52 @@ mod tests {
         let err = configmap_files("cm", &cm, &items).unwrap_err();
         assert_eq!(err.pending_reason(), "InvalidVolumeKey");
     }
+    /// An emptyDir a non-root container cannot write into is the defect this
+    /// pins: podman hands back `0755 root:root`, kubelet promises `0777`.
+    /// Red-run by setting the dir to 0755 first, so the assertion is about
+    /// the chmod actually happening and not about a dir that was already
+    /// permissive.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_dir_is_writable_by_a_container_running_as_any_uid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "engenho-emptydir-mode-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "negative control: the dir must start restrictive, or the gate is vacuous"
+        );
+
+        PodmanVolumeMaterializer::open_empty_dir_to_every_uid(&tmp).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+            0o777,
+            "kubelet creates every emptyDir 0777; a runAsUser pod cannot write otherwise"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A missing directory must be a typed error, never a silent success —
+    /// otherwise a broken volume reaches the container as a permission denial
+    /// at runtime, which is exactly the failure mode being closed.
+    #[cfg(unix)]
+    #[test]
+    fn widening_a_directory_that_is_not_there_is_a_typed_error() {
+        let absent = std::env::temp_dir().join("engenho-emptydir-absent-1d0a7f2c");
+        std::fs::remove_dir_all(&absent).ok();
+        let err = PodmanVolumeMaterializer::open_empty_dir_to_every_uid(&absent)
+            .expect_err("a missing emptyDir dir must not report success");
+        let msg = format!("{err}");
+        assert!(msg.contains("chmod"), "got: {msg}");
+    }
 }
 
 #[cfg(test)]
@@ -2318,4 +2416,5 @@ mod projected_volumes {
             other => panic!("expected Projected, got {other:?}"),
         }
     }
+
 }
