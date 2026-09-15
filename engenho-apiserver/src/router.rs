@@ -744,6 +744,11 @@ enum ResponseCodec {
     /// the server choose the columns; without it they receive a plain List and
     /// cannot draw a table at all.
     Table(crate::table::IncludeObject),
+    /// `Accept: …;as=PartialObjectMetadataList;g=meta.k8s.io;v=1` — the
+    /// metadata-only projection every controller-runtime METADATA cache asks
+    /// for. A client requesting it installs a decoder for exactly that kind,
+    /// so answering with the full List is undecodable, not a superset.
+    PartialMetadata,
 }
 
 impl ResponseCodec {
@@ -785,6 +790,20 @@ impl ResponseCodec {
             // `includeObject` is a query parameter, not part of Accept. The
             // upstream default (Metadata) is what kubectl and k9s rely on.
             Ok(ResponseCodec::Table(crate::table::IncludeObject::default()))
+        } else if crate::table::accept_wants_partial_metadata(accept) {
+            // BEFORE protobuf, for the same reason Table is: the metadata
+            // client sends ONE Accept naming both
+            // (`application/vnd.kubernetes.protobuf;as=PartialObjectMetadataList;…,application/json`),
+            // and the `as=` range is the specific request. Falling through to
+            // protobuf answered with a protobuf-encoded FULL list, which is
+            // where `invalid character 'k'` came from — the JSON decoder
+            // meeting the `k8s\0` protobuf magic.
+            //
+            // Served as JSON deliberately: the same Accept lists
+            // `application/json`, and client-go selects its decoder from the
+            // response Content-Type, so this is honest negotiation rather
+            // than ignoring the preference.
+            Ok(ResponseCodec::PartialMetadata)
         } else if response_wants_protobuf(accept) {
             Ok(ResponseCodec::Protobuf)
         } else {
@@ -932,6 +951,10 @@ fn render_object(
         ResponseCodec::Table(include) => {
             let table = crate::table::to_table(&value, include);
             Ok((status, Json(table)).into_response())
+        }
+        ResponseCodec::PartialMetadata => {
+            let projected = crate::table::to_partial_object_metadata(&value);
+            Ok((status, Json(projected)).into_response())
         }
         ResponseCodec::Protobuf => {
             // The read-back Value carries apiVersion+kind from
