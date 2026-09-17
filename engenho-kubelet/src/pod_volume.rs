@@ -1219,6 +1219,10 @@ pub struct PodmanVolumeMaterializer {
     /// Host data root under which per-pod-per-volume dirs are written.
     /// Defaults to `$HOME/.local/share/engenho/volumes`.
     data_root: PathBuf,
+    /// Cached answer to "is the podman service remote (a VM)?" — asked once
+    /// per materializer, because it decides [`Mountpoint`] classification and
+    /// cannot change under a running podman connection.
+    service_is_remote: tokio::sync::OnceCell<bool>,
 }
 
 impl Default for PodmanVolumeMaterializer {
@@ -1226,6 +1230,7 @@ impl Default for PodmanVolumeMaterializer {
         Self {
             binary: "podman".to_string(),
             data_root: default_data_root(),
+            service_is_remote: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -1238,6 +1243,115 @@ fn default_data_root() -> PathBuf {
         .join("share")
         .join("engenho")
         .join("volumes")
+}
+
+/// A filesystem path valid on **this host**.
+///
+/// The newtype exists only because [`GuestPath`] is not one, and until
+/// 2026-09-17 nothing in the type system said so. `HostPath` is the only one
+/// of the pair that implements [`AsRef`]`<`[`Path`](std::path::Path)`>`, so a
+/// host filesystem call cannot be handed a path that lives inside a VM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPath(PathBuf);
+
+impl HostPath {
+    /// Assert that `p` is valid on this host.
+    #[must_use]
+    pub fn new(p: impl Into<PathBuf>) -> Self {
+        Self(p.into())
+    }
+
+    /// Borrow as a plain path, for a host syscall.
+    #[must_use]
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for HostPath {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// A filesystem path valid **only inside the container runtime's VM**.
+///
+/// ★ MEASURED 2026-09-17, and this type is the fix for it. On macOS
+/// `podman volume inspect --format {{.Mountpoint}}` returns
+/// `/var/home/core/.local/share/containers/storage/volumes/<vol>/_data` — a
+/// path inside the podman machine. `ensure_empty_dir` turned that string into
+/// a plain `PathBuf` and called [`std::fs::set_permissions`] on it FROM THE
+/// HOST. Result: `ENOENT`, **29,489 times**, the pod stuck `Pending` on
+/// `VolumeMaterializeError`, and nothing anywhere naming the host/VM boundary
+/// as the cause. The chmod itself was correct and well-justified (upstream
+/// kubelet creates every emptyDir `0777`); what was missing was the type.
+///
+/// Deliberately NO `AsRef<Path>` impl: passing a guest path to a host
+/// filesystem call is a **compile error**, not a runtime surprise. Red-run
+/// 2026-09-17 against a deliberately-broken call —
+/// `open_empty_dir_to_every_uid(&GuestPath::new(..))` — gives
+/// `error[E0308]: mismatched types, expected &HostPath, found &GuestPath`
+/// (`cargo check` rc=101). E0308 and not E0277: the parameter is a concrete
+/// `&HostPath`, so it never reaches a trait bound. The tier is
+/// honest — this is parse-boundary construction, not truly unrepresentable:
+/// nothing stops someone writing `HostPath::new(guest_string)`, so the
+/// classification lives in exactly one place ([`Mountpoint::classify`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestPath(PathBuf);
+
+impl GuestPath {
+    /// Assert that `p` is valid inside the runtime's guest, not here.
+    #[must_use]
+    pub fn new(p: impl Into<PathBuf>) -> Self {
+        Self(p.into())
+    }
+
+    /// The path **as the guest sees it** — for handing back to the runtime,
+    /// never to a host syscall.
+    #[must_use]
+    pub fn as_guest_str(&self) -> std::borrow::Cow<'_, str> {
+        self.0.to_string_lossy()
+    }
+}
+
+/// Where a path the container runtime reported is actually valid.
+///
+/// One value decides it — whether the runtime's service is remote — so the
+/// decision is made once, here, instead of being re-guessed per call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mountpoint {
+    /// The runtime runs on this host; its paths are ours.
+    Host(HostPath),
+    /// The runtime runs in a VM; its paths exist only there.
+    Guest(GuestPath),
+}
+
+impl Mountpoint {
+    /// Classify a runtime-reported mountpoint.
+    ///
+    /// `service_is_remote` is the whole decision: a podman machine on macOS is
+    /// remote, a Linux podman is not.
+    #[must_use]
+    pub fn classify(raw: impl Into<PathBuf>, service_is_remote: bool) -> Self {
+        if service_is_remote {
+            Self::Guest(GuestPath::new(raw))
+        } else {
+            Self::Host(HostPath::new(raw))
+        }
+    }
+
+    /// The path to hand back to the **runtime** for a bind mount.
+    ///
+    /// Both arms are valid for that purpose, which is exactly why the bug was
+    /// invisible: the bind mount worked all along: podman resolves a guest
+    /// path inside its own VM. Only the host-side chmod was wrong.
+    #[must_use]
+    pub fn as_runtime_path(&self) -> PathBuf {
+        match self {
+            Self::Host(h) => h.0.clone(),
+            Self::Guest(g) => g.0.clone(),
+        }
+    }
 }
 
 impl PodmanVolumeMaterializer {
@@ -1275,6 +1389,75 @@ impl PodmanVolumeMaterializer {
         self.data_root
             .join(format!("{namespace}_{pod}"))
             .join(volume)
+    }
+
+    /// `podman machine ssh sudo chmod 0777 <guest path>` argv (pure,
+    /// unit-assertable).
+    ///
+    /// The chmod has to happen where the directory exists. On a podman machine
+    /// that is inside the VM, so it goes through the runtime rather than
+    /// through this process's own filesystem.
+    #[must_use]
+    pub fn guest_chmod_argv(dir: &GuestPath) -> Vec<String> {
+        vec![
+            "machine".to_string(),
+            "ssh".to_string(),
+            "sudo".to_string(),
+            "chmod".to_string(),
+            format!("{:o}", Self::EMPTY_DIR_MODE),
+            dir.as_guest_str().into_owned(),
+        ]
+    }
+
+    /// Is the podman service remote (i.e. a VM)? Asked once and cached.
+    ///
+    /// ★ Fails CLOSED. If podman cannot answer, this returns a typed error
+    /// rather than guessing `false`: guessing `false` is precisely the old
+    /// behaviour, and it produced 29,489 silent `ENOENT`s. An error names the
+    /// cause once; a wrong guess hides it forever.
+    async fn service_is_remote(&self) -> Result<bool, VolumeResolveError> {
+        self.service_is_remote
+            .get_or_try_init(|| async {
+                let out = tokio::process::Command::new(&self.binary)
+                    .args(["info", "--format", "{{.Host.ServiceIsRemote}}"])
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        VolumeResolveError::Materialize(format!("podman info spawn: {e}"))
+                    })?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    return Err(VolumeResolveError::Materialize(format!(
+                        "podman info (path locality undecidable, refusing to guess): {stderr}"
+                    )));
+                }
+                Ok(String::from_utf8_lossy(&out.stdout).trim() == "true")
+            })
+            .await
+            .copied()
+    }
+
+    /// Widen a guest-side emptyDir to `0777`, inside the guest.
+    async fn open_guest_empty_dir_to_every_uid(
+        &self,
+        dir: &GuestPath,
+    ) -> Result<(), VolumeResolveError> {
+        let out = tokio::process::Command::new(&self.binary)
+            .args(Self::guest_chmod_argv(dir))
+            .output()
+            .await
+            .map_err(|e| {
+                VolumeResolveError::Materialize(format!("podman machine ssh chmod spawn: {e}"))
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(VolumeResolveError::Materialize(format!(
+                "chmod {:o} {} (in guest): {stderr}",
+                Self::EMPTY_DIR_MODE,
+                dir.as_guest_str()
+            )));
+        }
+        Ok(())
     }
 
     /// `podman volume create <name>` argv (pure, unit-assertable).
@@ -1322,7 +1505,7 @@ impl PodmanVolumeMaterializer {
     /// (`/var/lib/containers/storage/volumes`) is `0700 root:root`, so `0777`
     /// on the leaf is reachable only from inside the pod that owns it —
     /// exactly kubelet's own posture.
-    fn open_empty_dir_to_every_uid(dir: &std::path::Path) -> Result<(), VolumeResolveError> {
+    fn open_empty_dir_to_every_uid(dir: &HostPath) -> Result<(), VolumeResolveError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1331,7 +1514,7 @@ impl PodmanVolumeMaterializer {
                     VolumeResolveError::Materialize(format!(
                         "chmod {:o} {}: {e}",
                         Self::EMPTY_DIR_MODE,
-                        dir.display()
+                        dir.as_path().display()
                     ))
                 })?;
         }
@@ -1435,9 +1618,16 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
                 "podman volume inspect {vol_name}: empty Mountpoint"
             )));
         }
-        let dir = PathBuf::from(&mountpoint);
-        Self::open_empty_dir_to_every_uid(&dir)?;
-        Ok(MountSource::EmptyDirHostDir(dir))
+        // Classify ONCE, here, by the only thing that decides it. Before this
+        // existed the string became a bare PathBuf and the host chmod below
+        // ran against a path inside the VM (29,489 ENOENTs, pod Pending).
+        let where_valid =
+            Mountpoint::classify(PathBuf::from(&mountpoint), self.service_is_remote().await?);
+        match &where_valid {
+            Mountpoint::Host(dir) => Self::open_empty_dir_to_every_uid(dir)?,
+            Mountpoint::Guest(dir) => self.open_guest_empty_dir_to_every_uid(dir).await?,
+        }
+        Ok(MountSource::EmptyDirHostDir(where_valid.as_runtime_path()))
     }
 
     async fn remove_empty_dir(
@@ -2235,7 +2425,7 @@ mod tests {
             "negative control: the dir must start restrictive, or the gate is vacuous"
         );
 
-        PodmanVolumeMaterializer::open_empty_dir_to_every_uid(&tmp).unwrap();
+        PodmanVolumeMaterializer::open_empty_dir_to_every_uid(&HostPath::new(&tmp)).unwrap();
 
         assert_eq!(
             std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
@@ -2243,6 +2433,54 @@ mod tests {
             "kubelet creates every emptyDir 0777; a runAsUser pod cannot write otherwise"
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The whole defect in one assertion: a mountpoint reported by a REMOTE
+    /// podman service is a guest path, and the host arm must not be selected
+    /// for it. Before `Mountpoint` existed this string became a bare `PathBuf`
+    /// and went straight to a host `chmod` — ENOENT, 29,489 times.
+    #[test]
+    fn a_remote_service_mountpoint_is_a_guest_path() {
+        let raw = "/var/home/core/.local/share/containers/storage/volumes/v/_data";
+
+        let remote = Mountpoint::classify(raw, true);
+        assert!(
+            matches!(remote, Mountpoint::Guest(_)),
+            "a remote podman service reports paths inside its VM; got {remote:?}"
+        );
+
+        // Negative control: the same string from a LOCAL service is a host
+        // path. Without this the test would pass if classify() always said
+        // Guest, which would break every Linux node.
+        let local = Mountpoint::classify(raw, false);
+        assert!(
+            matches!(local, Mountpoint::Host(_)),
+            "a local podman service reports host paths; got {local:?}"
+        );
+    }
+
+    /// Both arms still hand the runtime the same string — which is why the bug
+    /// was invisible. The bind mount always worked; only the host chmod did not.
+    #[test]
+    fn both_localities_give_the_runtime_the_same_path() {
+        let raw = "/var/lib/containers/storage/volumes/v/_data";
+        assert_eq!(
+            Mountpoint::classify(raw, true).as_runtime_path(),
+            Mountpoint::classify(raw, false).as_runtime_path(),
+            "the runtime resolves either one; the difference is only whether WE may touch it"
+        );
+    }
+
+    /// The guest chmod goes through the runtime, with the same mode the host
+    /// arm uses — not a hand-typed 777 that could drift from EMPTY_DIR_MODE.
+    #[test]
+    fn guest_chmod_argv_is_the_runtime_path_not_a_host_syscall() {
+        let argv = PodmanVolumeMaterializer::guest_chmod_argv(&GuestPath::new("/var/home/core/x"));
+        assert_eq!(
+            argv,
+            vec!["machine", "ssh", "sudo", "chmod", "777", "/var/home/core/x"],
+            "got: {argv:?}"
+        );
     }
 
     /// A missing directory must be a typed error, never a silent success —
@@ -2253,7 +2491,7 @@ mod tests {
     fn widening_a_directory_that_is_not_there_is_a_typed_error() {
         let absent = std::env::temp_dir().join("engenho-emptydir-absent-1d0a7f2c");
         std::fs::remove_dir_all(&absent).ok();
-        let err = PodmanVolumeMaterializer::open_empty_dir_to_every_uid(&absent)
+        let err = PodmanVolumeMaterializer::open_empty_dir_to_every_uid(&HostPath::new(&absent))
             .expect_err("a missing emptyDir dir must not report success");
         let msg = format!("{err}");
         assert!(msg.contains("chmod"), "got: {msg}");
