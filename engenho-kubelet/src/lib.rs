@@ -47,6 +47,7 @@ pub mod csi_materializer;
 pub mod error;
 pub mod exec_channel;
 pub mod exec_session;
+pub mod image_source;
 pub mod kubelet;
 pub mod lifecycle;
 /// Node lease + readiness derivation.
