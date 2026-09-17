@@ -321,7 +321,9 @@ impl CriBackend {
             (PullPolicy::Never, Some(img))
             | (PullPolicy::IfNotPresent, Some(img))
             | (PullPolicy::Missing, Some(img)) => Ok(img.id),
-            (PullPolicy::Always, _) | (PullPolicy::IfNotPresent, None) | (PullPolicy::Missing, None) => {
+            (PullPolicy::Always, _)
+            | (PullPolicy::IfNotPresent, None)
+            | (PullPolicy::Missing, None) => {
                 let resp = ic
                     .pull_image(v1::PullImageRequest {
                         image: Some(image_spec),
@@ -468,9 +470,9 @@ impl ContainerRuntime for CriBackend {
             .insert(created.container_id.clone(), key);
 
         // Read back rather than assume — the same rule podman_api follows.
-        self.status(&created.container_id)
-            .await?
-            .ok_or_else(|| KubeletError::Backend("container vanished between start and status".into()))
+        self.status(&created.container_id).await?.ok_or_else(|| {
+            KubeletError::Backend("container vanished between start and status".into())
+        })
     }
 
     async fn status(&self, container_id: &str) -> Result<Option<ContainerStatus>, KubeletError> {

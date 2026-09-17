@@ -2512,7 +2512,11 @@ mod tests {
         };
         let before = b.run_argv(&spec);
         spec.resources = r;
-        assert_eq!(b.run_argv(&spec), before, "unset resources must add no argv");
+        assert_eq!(
+            b.run_argv(&spec),
+            before,
+            "unset resources must add no argv"
+        );
         assert!(!before.iter().any(|a| a == "--cpus" || a == "--memory"));
     }
 
