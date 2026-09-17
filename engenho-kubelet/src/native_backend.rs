@@ -37,6 +37,122 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// What the native backend refused, and why.
+///
+/// ★ TYPED FIELDS, rendered ONCE in `Display` through `write!`.
+///
+/// The first version of this module built every message with a chain of
+/// `push_str` calls. That dodged the `format!()` ban while reproducing exactly
+/// what the ban exists to prevent: prose assembled at the call site, where a
+/// path or a reason can be dropped, reordered or silently mangled — and it was
+/// mangled, reaching the daemon log with 22-space gaps mid-sentence.
+///
+/// `KubeletError::Backend(String)` is what pushes callers into assembling
+/// strings. This type absorbs that: every call site constructs a VALUE with
+/// fields, and exactly one `Display` impl decides how it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeError {
+    /// An OCI reference, which this backend structurally cannot run.
+    OciImage { reference: String },
+    /// The image reference itself was malformed.
+    Image(crate::image_source::ImageSourceError),
+    /// No command, and a closure has no ENTRYPOINT to fall back to.
+    NoCommand,
+    /// The resolved program is outside the Nix store, so the closure would not
+    /// be what actually ran.
+    CommandEscapesStore { program: PathBuf },
+    /// A runtime-managed named volume, which has no host path.
+    NamedVolume { volume: String },
+    /// A volume whose host path and mountPath differ; a native process has no
+    /// mount namespace to reconcile them with.
+    UnmappableMount { host: PathBuf, mount_path: String },
+    /// A volume path that could not be created.
+    VolumePath { path: PathBuf, detail: String },
+    /// No such container is tracked.
+    NoSuchContainer { id: String },
+    /// The backend's own state lock was poisoned.
+    StatePoisoned,
+    /// The workload could not be spawned.
+    Spawn { program: PathBuf, detail: String },
+    /// A container's log could not be read.
+    Log { path: PathBuf, detail: String },
+    /// `exec` was called with no command.
+    ExecNoCommand,
+    /// A tracked program has no closure root to resolve an exec against.
+    NoClosureRoot { program: PathBuf },
+}
+
+impl std::fmt::Display for NativeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OciImage { reference } => write!(
+                f,
+                "cannot run OCI image {reference} — this backend has no Linux \
+                 runtime under it. Declare the image as a realised closure \
+                 (nix:/nix/store/...) or schedule the pod onto a node running \
+                 the podman or CRI backend."
+            ),
+            Self::Image(e) => write!(f, "{e}"),
+            Self::NoCommand => write!(
+                f,
+                "the container declares no command, and a closure has no \
+                 ENTRYPOINT to fall back to"
+            ),
+            Self::CommandEscapesStore { program } => write!(
+                f,
+                "the resolved command {} escapes the Nix store, so the closure \
+                 would not be what actually ran",
+                program.display()
+            ),
+            Self::NamedVolume { volume } => write!(
+                f,
+                "volume {volume:?} is a runtime-managed named volume, which \
+                 has no host path a native process could read. Declare a \
+                 hostPath volume instead."
+            ),
+            Self::UnmappableMount { host, mount_path } => write!(
+                f,
+                "cannot mount {} at {mount_path} — a native process has no \
+                 mount namespace, so a volume is only honourable when its host \
+                 path and its mountPath are the SAME path. Declare the volume \
+                 at the path the workload already expects.",
+                host.display()
+            ),
+            Self::VolumePath { path, detail } => {
+                write!(f, "cannot create volume path {}: {detail}", path.display())
+            }
+            Self::NoSuchContainer { id } => write!(f, "no such container {id}"),
+            Self::StatePoisoned => write!(f, "state lock poisoned"),
+            Self::Spawn { program, detail } => {
+                write!(f, "cannot spawn {}: {detail}", program.display())
+            }
+            Self::Log { path, detail } => {
+                write!(f, "cannot read log {}: {detail}", path.display())
+            }
+            Self::ExecNoCommand => write!(f, "exec requires a command"),
+            Self::NoClosureRoot { program } => write!(
+                f,
+                "container program {} has no closure root to resolve an exec \
+                 against",
+                program.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeError {}
+
+impl From<NativeError> for KubeletError {
+    /// The ONE place a native-backend failure becomes a string, and it goes
+    /// through `Display`.
+    fn from(e: NativeError) -> Self {
+        let mut rendered = String::from("native backend: ");
+        std::fmt::Write::write_fmt(&mut rendered, format_args!("{e}"))
+            .expect("writing to a String cannot fail");
+        Self::Backend(rendered)
+    }
+}
+
 /// How much isolation a native container actually gets.
 ///
 /// One variant today, and the caller must choose it explicitly. See the module
@@ -48,6 +164,24 @@ pub enum Isolation {
     /// Honest about what it is. Appropriate for a single-operator node where
     /// the alternative is a whole Linux VM; NOT a substitute for a sandbox.
     HostProcess,
+}
+
+/// A container's identity on this node: `<namespace>_<pod>_<container>`.
+///
+/// A type with a `Display` rather than three `push_str` calls, for the same
+/// reason [`NativeError`] is: the separator and the field ORDER are part of
+/// the format, and assembling them at the call site is how a second call site
+/// comes to disagree with the first.
+struct ContainerId<'a> {
+    namespace: &'a str,
+    pod: &'a str,
+    container: &'a str,
+}
+
+impl std::fmt::Display for ContainerId<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}_{}_{}", self.namespace, self.pod, self.container)
+    }
 }
 
 /// A container this backend started.
@@ -93,14 +227,12 @@ impl NativeBackend {
     /// The deterministic container id, matching the scheme the podman backend
     /// uses so a node's containers are identifiable across backends.
     fn container_id(spec: &ContainerSpec) -> String {
-        let p = &spec.pod;
-        let mut id = String::with_capacity(p.namespace.len() + p.name.len() + spec.name.len() + 2);
-        id.push_str(&p.namespace);
-        id.push('_');
-        id.push_str(&p.name);
-        id.push('_');
-        id.push_str(&spec.name);
-        id
+        ContainerId {
+            namespace: &spec.pod.namespace,
+            pod: &spec.pod.name,
+            container: &spec.name,
+        }
+        .to_string()
     }
 
     /// Resolve the program to execute inside `closure`.
@@ -110,13 +242,9 @@ impl NativeBackend {
     /// the closure's `bin/`. A command that resolves outside the closure is
     /// refused — the closure is the thing being promised, and executing
     /// something else silently would make that promise false.
-    fn resolve_program(closure: &Path, command: &[String]) -> Result<PathBuf, KubeletError> {
+    fn resolve_program(closure: &Path, command: &[String]) -> Result<PathBuf, NativeError> {
         let Some(first) = command.first() else {
-            return Err(KubeletError::Backend(
-                "native backend: the container declares no command, and a \
-                 closure has no ENTRYPOINT to fall back to"
-                    .to_string(),
-            ));
+            return Err(NativeError::NoCommand);
         };
         let candidate = if first.starts_with('/') {
             PathBuf::from(first)
@@ -124,11 +252,7 @@ impl NativeBackend {
             closure.join("bin").join(first)
         };
         if !candidate.starts_with("/nix/store/") {
-            return Err(KubeletError::Backend(
-                "native backend: the resolved command escapes the Nix store, \
-                 so the closure would not be what actually ran"
-                    .to_string(),
-            ));
+            return Err(NativeError::CommandEscapesStore { program: candidate });
         }
         Ok(candidate)
     }
@@ -146,42 +270,29 @@ impl NativeBackend {
     /// exists to run. A Postgres started with its data directory silently
     /// absent does not fail loudly — it can initdb into the wrong place, or
     /// come up empty, and report success either way.
-    fn verify_mounts(spec: &ContainerSpec) -> Result<(), KubeletError> {
+    fn verify_mounts(spec: &ContainerSpec) -> Result<(), NativeError> {
         for m in &spec.mounts {
             let host = match &m.source {
                 MountSource::HostDir(p) | MountSource::EmptyDirHostDir(p) => p.clone(),
                 MountSource::PvcHostDir { path, .. } => path.clone(),
                 MountSource::NamedVolume(name) => {
-                    let mut msg = String::from("native backend: volume \"");
-                    msg.push_str(name);
-                    msg.push_str(
-                        "\" is a runtime-managed named volume, which has no host                          path a native process could read. Declare a hostPath                          volume instead.",
-                    );
-                    return Err(KubeletError::Backend(msg));
+                    return Err(NativeError::NamedVolume {
+                        volume: name.clone(),
+                    });
                 }
             };
             if host != Path::new(&m.mount_path) {
-                let mut msg = String::from("native backend: cannot mount ");
-                msg.push_str(&host.to_string_lossy());
-                msg.push_str(" at ");
-                msg.push_str(&m.mount_path);
-                msg.push_str(
-                    " — a native process has no mount namespace, so a volume is only \
-                     honourable when its host path and its mountPath are the \
-                     SAME path. Declare the volume at the path the workload \
-                     already expects.",
-                );
-                return Err(KubeletError::Backend(msg));
+                return Err(NativeError::UnmappableMount {
+                    host,
+                    mount_path: m.mount_path.clone(),
+                });
             }
             // The path must exist before the workload looks for it. Creating it
             // here rather than assuming the kubelet did keeps the failure at
             // start, where it is attributable.
-            std::fs::create_dir_all(&host).map_err(|e| {
-                let mut msg = String::from("native backend: cannot create volume path ");
-                msg.push_str(&host.to_string_lossy());
-                msg.push_str(": ");
-                msg.push_str(&e.to_string());
-                KubeletError::Backend(msg)
+            std::fs::create_dir_all(&host).map_err(|e| NativeError::VolumePath {
+                path: host.clone(),
+                detail: e.to_string(),
             })?;
         }
         Ok(())
@@ -192,22 +303,10 @@ impl NativeBackend {
     /// The error NAMES the reason and the remedy. A backend that returned a
     /// generic failure here would look identical to a crashed workload, and the
     /// operator would debug the wrong thing.
-    fn closure_of(spec: &ContainerSpec) -> Result<PathBuf, KubeletError> {
-        let source =
-            ImageSource::parse(&spec.image).map_err(|e| KubeletError::Backend(e.to_string()))?;
-        match source {
+    fn closure_of(spec: &ContainerSpec) -> Result<PathBuf, NativeError> {
+        match ImageSource::parse(&spec.image).map_err(NativeError::Image)? {
             ImageSource::NixClosure(p) => Ok(p),
-            ImageSource::Oci(reference) => {
-                let mut msg = String::from("native backend: cannot run OCI image ");
-                msg.push_str(&reference);
-                msg.push_str(
-                    " — this backend has no Linux runtime under it. Declare \
-                     the image as a realised closure (nix:/nix/store/...) or \
-                     schedule the pod onto a node running the podman or CRI \
-                     backend.",
-                );
-                Err(KubeletError::Backend(msg))
-            }
+            ImageSource::Oci(reference) => Err(NativeError::OciImage { reference }),
         }
     }
 }
@@ -224,13 +323,19 @@ impl ContainerRuntime for NativeBackend {
         Self::verify_mounts(spec)?;
 
         let id = Self::container_id(spec);
-        std::fs::create_dir_all(&self.log_dir).map_err(|e| KubeletError::Backend(e.to_string()))?;
+        std::fs::create_dir_all(&self.log_dir).map_err(|e| NativeError::VolumePath {
+            path: self.log_dir.clone(),
+            detail: e.to_string(),
+        })?;
         let log_path = self.log_dir.join(&id);
-        let log =
-            std::fs::File::create(&log_path).map_err(|e| KubeletError::Backend(e.to_string()))?;
-        let log_err = log
-            .try_clone()
-            .map_err(|e| KubeletError::Backend(e.to_string()))?;
+        let log = std::fs::File::create(&log_path).map_err(|e| NativeError::Log {
+            path: log_path.clone(),
+            detail: e.to_string(),
+        })?;
+        let log_err = log.try_clone().map_err(|e| NativeError::Log {
+            path: log_path.clone(),
+            detail: e.to_string(),
+        })?;
 
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(spec.command.iter().skip(1));
@@ -245,14 +350,15 @@ impl ContainerRuntime for NativeBackend {
         cmd.stderr(std::process::Stdio::from(log_err));
         cmd.stdin(std::process::Stdio::null());
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| KubeletError::Backend(e.to_string()))?;
+        let child = cmd.spawn().map_err(|e| NativeError::Spawn {
+            program: program.clone(),
+            detail: e.to_string(),
+        })?;
         let pid = child.id();
 
         self.state
             .lock()
-            .map_err(|_| KubeletError::Backend("native backend state poisoned".to_string()))?
+            .map_err(|_| NativeError::StatePoisoned)?
             .insert(
                 id.clone(),
                 NativeContainer {
@@ -275,20 +381,17 @@ impl ContainerRuntime for NativeBackend {
     }
 
     async fn status(&self, container_id: &str) -> Result<Option<ContainerStatus>, KubeletError> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| KubeletError::Backend("native backend state poisoned".to_string()))?;
+        let mut guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
         let Some(c) = guard.get_mut(container_id) else {
             return Ok(None);
         };
         // try_wait REAPS an exited child and yields its real status. Asking the
         // kernel beats trusting a cached flag: a container that died a second
         // ago must not still read as running.
-        let exited = c
-            .child
-            .try_wait()
-            .map_err(|e| KubeletError::Backend(e.to_string()))?;
+        let exited = c.child.try_wait().map_err(|e| NativeError::Spawn {
+            program: c.program.clone(),
+            detail: e.to_string(),
+        })?;
         let exit_code = exited.and_then(|s| s.code());
         Ok(Some(ContainerStatus {
             container_id: container_id.to_string(),
@@ -299,10 +402,7 @@ impl ContainerRuntime for NativeBackend {
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| KubeletError::Backend("native backend state poisoned".to_string()))?;
+        let mut guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
         let Some(c) = guard.get_mut(container_id) else {
             // Not tracked. A typed no-op beats an error: stopping something
             // already gone is the normal end of a pod, not a failure.
@@ -318,31 +418,28 @@ impl ContainerRuntime for NativeBackend {
     }
 
     async fn remove(&self, container_id: &str) -> Result<(), KubeletError> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| KubeletError::Backend("native backend state poisoned".to_string()))?;
+        let mut guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
         guard.remove(container_id);
         Ok(())
     }
 
     async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError> {
         let path = {
-            let guard = self
-                .state
-                .lock()
-                .map_err(|_| KubeletError::Backend("native backend state poisoned".to_string()))?;
+            let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
             guard.get(container_id).map(|c| c.log_path.clone())
         };
         let Some(path) = path else {
             // A typed error, never a silently-empty success — the same rule the
             // trait states for podman.
-            let mut msg = String::from("native backend: no such container ");
-            msg.push_str(container_id);
-            return Err(KubeletError::Backend(msg));
+            return Err(NativeError::NoSuchContainer {
+                id: container_id.to_string(),
+            }
+            .into());
         };
-        let body =
-            std::fs::read_to_string(&path).map_err(|e| KubeletError::Backend(e.to_string()))?;
+        let body = std::fs::read_to_string(&path).map_err(|e| NativeError::Log {
+            path: path.clone(),
+            detail: e.to_string(),
+        })?;
         Ok(match opts.tail {
             Some(n) => {
                 let lines: Vec<&str> = body.lines().collect();
@@ -359,36 +456,37 @@ impl ContainerRuntime for NativeBackend {
 
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
         let program = {
-            let guard = self
-                .state
-                .lock()
-                .map_err(|_| KubeletError::Backend("native backend state poisoned".to_string()))?;
+            let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
             guard.get(container_id).map(|c| c.program.clone())
         };
         let Some(program) = program else {
-            let mut msg = String::from("native backend: no such container ");
-            msg.push_str(container_id);
-            return Err(KubeletError::Backend(msg));
+            return Err(NativeError::NoSuchContainer {
+                id: container_id.to_string(),
+            }
+            .into());
         };
         let Some(first) = argv.first() else {
-            return Err(KubeletError::Backend(
-                "native backend: exec requires a command".to_string(),
-            ));
+            return Err(NativeError::ExecNoCommand.into());
         };
         // Resolve against the same closure the container runs from, so an
         // exec-probe cannot accidentally test a binary from the host's PATH
         // instead of the one in the image.
-        let closure = program.parent().and_then(Path::parent).ok_or_else(|| {
-            KubeletError::Backend(
-                "native backend: container program has no closure root".to_string(),
-            )
-        })?;
+        let closure =
+            program
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| NativeError::NoClosureRoot {
+                    program: program.clone(),
+                })?;
         let target = Self::resolve_program(closure, std::slice::from_ref(first))?;
         let out = tokio::process::Command::new(&target)
             .args(argv.iter().skip(1))
             .output()
             .await
-            .map_err(|e| KubeletError::Backend(e.to_string()))?;
+            .map_err(|e| NativeError::Spawn {
+                program: target.clone(),
+                detail: e.to_string(),
+            })?;
         Ok(ExecOutcome {
             exit_code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
