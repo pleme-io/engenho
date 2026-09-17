@@ -32,6 +32,7 @@
 use crate::backend::{ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions};
 use crate::error::KubeletError;
 use crate::image_source::ImageSource;
+use crate::pod_volume::MountSource;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -132,6 +133,57 @@ impl NativeBackend {
         Ok(candidate)
     }
 
+    /// Check every mount can actually be honoured, and say precisely which
+    /// cannot.
+    ///
+    /// ★ A native process has NO MOUNT NAMESPACE. There is no remapping
+    /// available: whatever path the host has is the path the workload sees. So
+    /// a mount is satisfiable only when the source host path IS the declared
+    /// `mountPath`, and anything else is refused here rather than discovered
+    /// later as an empty directory.
+    ///
+    /// That distinction matters most for exactly the workload this backend
+    /// exists to run. A Postgres started with its data directory silently
+    /// absent does not fail loudly — it can initdb into the wrong place, or
+    /// come up empty, and report success either way.
+    fn verify_mounts(spec: &ContainerSpec) -> Result<(), KubeletError> {
+        for m in &spec.mounts {
+            let host = match &m.source {
+                MountSource::HostDir(p) | MountSource::EmptyDirHostDir(p) => p.clone(),
+                MountSource::PvcHostDir { path, .. } => path.clone(),
+                MountSource::NamedVolume(name) => {
+                    let mut msg = String::from("native backend: volume \"");
+                    msg.push_str(name);
+                    msg.push_str(
+                        "\" is a runtime-managed named volume, which has no host                          path a native process could read. Declare a hostPath                          volume instead.",
+                    );
+                    return Err(KubeletError::Backend(msg));
+                }
+            };
+            if host != Path::new(&m.mount_path) {
+                let mut msg = String::from("native backend: cannot mount ");
+                msg.push_str(&host.to_string_lossy());
+                msg.push_str(" at ");
+                msg.push_str(&m.mount_path);
+                msg.push_str(
+                    " — a native process has no mount namespace, so a volume is                      only honourable when its host path and its mountPath are                      the SAME path. Declare the volume at the path the workload                      already expects.",
+                );
+                return Err(KubeletError::Backend(msg));
+            }
+            // The path must exist before the workload looks for it. Creating it
+            // here rather than assuming the kubelet did keeps the failure at
+            // start, where it is attributable.
+            std::fs::create_dir_all(&host).map_err(|e| {
+                let mut msg = String::from("native backend: cannot create volume path ");
+                msg.push_str(&host.to_string_lossy());
+                msg.push_str(": ");
+                msg.push_str(&e.to_string());
+                KubeletError::Backend(msg)
+            })?;
+        }
+        Ok(())
+    }
+
     /// Reject an image this backend structurally cannot run.
     ///
     /// The error NAMES the reason and the remedy. A backend that returned a
@@ -166,6 +218,7 @@ impl ContainerRuntime for NativeBackend {
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
         let closure = Self::closure_of(spec)?;
         let program = Self::resolve_program(&closure, &spec.command)?;
+        Self::verify_mounts(spec)?;
 
         let id = Self::container_id(spec);
         std::fs::create_dir_all(&self.log_dir).map_err(|e| KubeletError::Backend(e.to_string()))?;
@@ -475,6 +528,60 @@ mod tests {
             NativeBackend::container_id(&spec("nix:/nix/store/a-b", &["x"])),
             "pangea-system_pangea-postgres-0_postgres"
         );
+    }
+
+    /// ★ A volume that cannot be honoured is refused AT START, naming both
+    /// paths. The alternative is the shape this backend exists to avoid: a
+    /// Postgres whose data directory is silently absent comes up, reports
+    /// success, and is wrong.
+    #[test]
+    fn a_volume_that_cannot_be_remapped_is_refused_naming_both_paths() {
+        let mut s = spec("nix:/nix/store/a-pkg", &["postgres"]);
+        s.mounts = vec![crate::pod_volume::ResolvedMount {
+            source: MountSource::HostDir("/Users/luis.d/pgdata".into()),
+            mount_path: "/var/lib/postgresql/data".to_string(),
+            read_only: false,
+            sub_path: None,
+        }];
+        let err = NativeBackend::verify_mounts(&s).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("/Users/luis.d/pgdata"), "{msg}");
+        assert!(msg.contains("/var/lib/postgresql/data"), "{msg}");
+        assert!(msg.contains("no mount namespace"), "{msg}");
+    }
+
+    /// The positive control: identical paths ARE honourable, so the check is
+    /// not simply refusing every volume.
+    #[test]
+    fn a_volume_whose_host_path_equals_its_mount_path_is_accepted() {
+        let dir = std::env::temp_dir().join("engenho-native-mount-ok");
+        let mut s = spec("nix:/nix/store/a-pkg", &["postgres"]);
+        s.mounts = vec![crate::pod_volume::ResolvedMount {
+            source: MountSource::HostDir(dir.clone()),
+            mount_path: dir.to_string_lossy().into_owned(),
+            read_only: false,
+            sub_path: None,
+        }];
+        NativeBackend::verify_mounts(&s).expect("identical paths must be honourable");
+        assert!(dir.exists(), "the volume path must be created before start");
+    }
+
+    /// A runtime-managed named volume has no host path at all, so it is a
+    /// different refusal with a different remedy.
+    #[test]
+    fn a_named_volume_is_refused_because_it_has_no_host_path() {
+        let mut s = spec("nix:/nix/store/a-pkg", &["postgres"]);
+        s.mounts = vec![crate::pod_volume::ResolvedMount {
+            source: MountSource::NamedVolume("pgdata".to_string()),
+            mount_path: "/var/lib/postgresql/data".to_string(),
+            read_only: false,
+            sub_path: None,
+        }];
+        let msg = NativeBackend::verify_mounts(&s)
+            .expect_err("must refuse")
+            .to_string();
+        assert!(msg.contains("named volume"), "{msg}");
+        assert!(msg.contains("hostPath"), "the remedy must be named: {msg}");
     }
 
     /// Logs for an unknown container are a typed error, never an empty string
