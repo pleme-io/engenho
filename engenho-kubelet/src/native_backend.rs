@@ -166,7 +166,10 @@ impl NativeBackend {
                 msg.push_str(" at ");
                 msg.push_str(&m.mount_path);
                 msg.push_str(
-                    " — a native process has no mount namespace, so a volume is                      only honourable when its host path and its mountPath are                      the SAME path. Declare the volume at the path the workload                      already expects.",
+                    " — a native process has no mount namespace, so a volume is only \
+                     honourable when its host path and its mountPath are the \
+                     SAME path. Declare the volume at the path the workload \
+                     already expects.",
                 );
                 return Err(KubeletError::Backend(msg));
             }
@@ -548,6 +551,15 @@ mod tests {
         assert!(msg.contains("/Users/luis.d/pgdata"), "{msg}");
         assert!(msg.contains("/var/lib/postgresql/data"), "{msg}");
         assert!(msg.contains("no mount namespace"), "{msg}");
+        // ★ A rendered run of spaces means a `\`-continued literal lost its
+        // continuations and fmt baked the source indentation into the string.
+        // It happened: this message reached the daemon log with 22-space gaps
+        // mid-sentence. The guard is cheap and the defect is invisible in
+        // review.
+        assert!(
+            !msg.contains("  "),
+            "the message must not carry source indentation: {msg}"
+        );
     }
 
     /// The positive control: identical paths ARE honourable, so the check is

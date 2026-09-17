@@ -39,7 +39,7 @@
 //! Pending reason rather than mis-serving.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -186,8 +186,10 @@ pub enum PodVolumeSource {
         /// `persistentVolumeClaim.readOnly` — forces the mount read-only.
         read_only: bool,
     },
-    /// `hostPath` — typed-deferred (`"HostPathUnsupported"`; host-fs risk).
-    HostPath,
+    /// `hostPath` — served ONLY for a path an explicit [`HostPathPolicy`]
+    /// permits. Denied by default (`"HostPathUnsupported"`), because a pod
+    /// that can name any host path can name `/`.
+    HostPath { path: String },
 }
 
 impl PodVolumeSource {
@@ -239,9 +241,14 @@ impl PodVolumeSource {
                 read_only: pvc.read_only.unwrap_or(false),
             });
         }
-        if vol.host_path.is_some() {
+        if let Some(hp) = vol.host_path.as_ref() {
             populated += 1;
-            found = Some(PodVolumeSource::HostPath);
+            // The path is CARRIED now. It used to be discarded here, which
+            // made the deferral permanent by construction: nothing downstream
+            // could have honoured a hostPath even once a policy existed.
+            found = Some(PodVolumeSource::HostPath {
+                path: hp.path.clone(),
+            });
         }
 
         if populated > 1 {
@@ -638,6 +645,127 @@ pub fn container_volume_mounts(container: &Value) -> Result<Vec<VolumeMount>, Vo
         .map_err(|e| VolumeResolveError::Materialize(format!("parse volumeMounts: {e}")))
 }
 
+#[cfg(test)]
+mod host_path_policy_tests {
+    use super::HostPathPolicy;
+    use std::path::Path;
+
+    /// Deny-all is the default, and it is what every existing caller gets.
+    #[test]
+    fn nothing_is_permitted_by_default() {
+        let p = HostPathPolicy::deny_all();
+        assert!(!p.permits(Path::new("/Users/x/data")));
+        assert!(!p.permits(Path::new("/")));
+        assert_eq!(p, HostPathPolicy::default());
+    }
+
+    /// The positive control: an allowed prefix really does permit, or every
+    /// refusal below proves nothing.
+    #[test]
+    fn a_path_under_an_allowed_prefix_is_permitted() {
+        let p = HostPathPolicy::allowing(["/Users/x/.local/share"]);
+        assert!(p.permits(Path::new("/Users/x/.local/share/pangea-pg")));
+        assert!(p.permits(Path::new("/Users/x/.local/share")));
+    }
+
+    /// ★ Component-wise, not string-wise. `/Users/x/.local/share-evil` shares
+    /// a STRING prefix with the allowed directory but is a different place.
+    #[test]
+    fn a_sibling_sharing_a_string_prefix_is_not_permitted() {
+        let p = HostPathPolicy::allowing(["/Users/x/.local/share"]);
+        assert!(
+            !p.permits(Path::new("/Users/x/.local/share-evil/data")),
+            "a plain string prefix check would accept this"
+        );
+    }
+
+    /// ★ `..` can start inside a prefix and end outside it.
+    #[test]
+    fn a_path_that_climbs_out_of_its_prefix_is_not_permitted() {
+        let p = HostPathPolicy::allowing(["/Users/x/.local/share"]);
+        assert!(!p.permits(Path::new("/Users/x/.local/share/../../../etc/shadow")));
+    }
+
+    /// A relative path resolves against a working directory nobody declared.
+    #[test]
+    fn a_relative_path_is_not_permitted() {
+        let p = HostPathPolicy::allowing(["/Users/x/.local/share"]);
+        assert!(!p.permits(Path::new("Users/x/.local/share/data")));
+    }
+
+    /// Allowing `/` permits everything, which is a policy someone may choose
+    /// — it must not silently be treated as deny-all.
+    #[test]
+    fn allowing_root_really_does_permit_everything() {
+        let p = HostPathPolicy::allowing(["/"]);
+        assert!(p.permits(Path::new("/etc/shadow")));
+    }
+}
+
+/// Which host paths a pod may mount directly.
+///
+/// ## Why this is a policy and not a boolean
+///
+/// A pod that can name any host path can name `/`, and a `hostPath` mount is
+/// the one volume source with no namespace, no quota and no owner — which is
+/// why this crate deferred the source entirely rather than serve it. The
+/// deferral was always meant to end with an allowlist; this is it.
+///
+/// [`deny_all`](Self::deny_all) is the default everywhere, so nothing that
+/// exists today changes behaviour: a node opts IN by naming prefixes.
+///
+/// Three things are required of a permitted path, and each closes a way the
+/// check could be true while the mount is wrong:
+///   * **absolute** — a relative path resolves against a working directory
+///     nobody declared;
+///   * **no `..` component** — `/allowed/../etc` starts inside a prefix and
+///     ends outside it;
+///   * **a COMPONENT-WISE prefix match** — plain string prefixing would let
+///     `/allowed-evil` pass for the prefix `/allowed`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostPathPolicy {
+    allowed: Vec<PathBuf>,
+}
+
+impl HostPathPolicy {
+    /// Permit nothing. The default, and today's behaviour.
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self {
+            allowed: Vec::new(),
+        }
+    }
+
+    /// Permit any path at or below one of `prefixes`.
+    #[must_use]
+    pub fn allowing<I, P>(prefixes: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        Self {
+            allowed: prefixes.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Is `path` mountable under this policy?
+    #[must_use]
+    pub fn permits(&self, path: &Path) -> bool {
+        if !path.is_absolute() {
+            return false;
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        // `starts_with` on Path is COMPONENT-WISE, which is the point: the
+        // string form would accept `/allowed-evil` for the prefix `/allowed`.
+        self.allowed.iter().any(|p| path.starts_with(p))
+    }
+}
+
 /// The PURE resolver / interpreter — fetch the referenced ConfigMaps/Secrets
 /// (via `fetch`), materialize each volume's source (via `materializer`), and
 /// return a `volName → MountSource` map.
@@ -739,6 +867,40 @@ pub async fn resolve_pod_volumes<F>(
     pod_name: &str,
     fetch: F,
     materializer: &dyn VolumeMaterializer,
+) -> Result<BTreeMap<String, MountSource>, VolumeResolveError>
+where
+    F: Fn(&str, &str) -> Option<Value>,
+{
+    // Deny-all, so every existing caller keeps exactly today's behaviour. A
+    // node that wants hostPath calls the `_with_policy` form and says which
+    // prefixes — opting IN, never inheriting.
+    resolve_pod_volumes_with_policy(
+        pod,
+        namespace,
+        pod_name,
+        fetch,
+        materializer,
+        &HostPathPolicy::deny_all(),
+    )
+    .await
+}
+
+/// As [`resolve_pod_volumes`], plus the [`HostPathPolicy`] that decides
+/// whether a `hostPath` volume resolves or keeps the pod Pending.
+///
+/// A separate constructor rather than a changed signature: the ~28 existing
+/// call sites keep working and keep denying, which is the behaviour they were
+/// written against.
+///
+/// # Errors
+/// As [`resolve_pod_volumes`].
+pub async fn resolve_pod_volumes_with_policy<F>(
+    pod: &Value,
+    namespace: &str,
+    pod_name: &str,
+    fetch: F,
+    materializer: &dyn VolumeMaterializer,
+    host_path_policy: &HostPathPolicy,
 ) -> Result<BTreeMap<String, MountSource>, VolumeResolveError>
 where
     F: Fn(&str, &str) -> Option<Value>,
@@ -853,11 +1015,17 @@ where
                         .await?
                 }
             },
-            PodVolumeSource::HostPath => {
-                return Err(VolumeResolveError::Unsupported {
-                    vol: vol.name.clone(),
-                    reason: "HostPathUnsupported",
-                });
+            PodVolumeSource::HostPath { path } => {
+                if host_path_policy.permits(Path::new(&path)) {
+                    MountSource::HostDir(PathBuf::from(path))
+                } else {
+                    // Denied, and Pending — never a fake mount, and never a
+                    // quiet substitution of some other directory.
+                    return Err(VolumeResolveError::Unsupported {
+                        vol: vol.name.clone(),
+                        reason: "HostPathUnsupported",
+                    });
+                }
             }
         };
         out.insert(vol.name.clone(), mount_source);
@@ -1841,10 +2009,14 @@ mod tests {
             "name": "v", "hostPath": { "path": "/etc" }
         }))
         .unwrap();
-        assert!(matches!(
+        // The PATH must survive parsing now. It used to be discarded, which
+        // made the deferral permanent by construction.
+        assert_eq!(
             PodVolumeSource::from_volume(&hp).unwrap(),
-            PodVolumeSource::HostPath
-        ));
+            PodVolumeSource::HostPath {
+                path: "/etc".to_string()
+            }
+        );
     }
 
     #[tokio::test]
