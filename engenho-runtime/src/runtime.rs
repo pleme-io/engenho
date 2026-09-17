@@ -794,8 +794,27 @@ fn stderr_tail(stderr: &[u8]) -> String {
 /// WARN per reconcile tick forever while the API showed pods with no status at
 /// all: a permanently-broken node was indistinguishable from a slow one.
 fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
-    if matches!(config.runtime.kubelet_backend, CfgBackendKind::Fake) {
-        return Ok(());
+    // Exhaustive on purpose. This used to be `if matches!(.., Fake)`, which
+    // meant every NEW backend silently inherited a podman probe — and a
+    // backend with no podman under it then failed to start with an error
+    // naming podman, on a node deliberately configured not to use it.
+    // Measured on ryn 2026-09-17: `kubelet_backend: native` in the config,
+    // `backend="podman"` in the log, and a daemon that refused to come up.
+    match config.runtime.kubelet_backend {
+        // Runs no containers at all.
+        CfgBackendKind::Fake => return Ok(()),
+        // No container runtime underneath: a host process out of a Nix
+        // closure. There is no podman to probe, and probing one would make a
+        // node that cannot reach podman unable to run the backend that does
+        // not need it.
+        CfgBackendKind::Native => return Ok(()),
+        // ★ A PRE-EXISTING DEFECT, named rather than silently changed: `Cri`
+        // dials its own endpoint (containerd/CRI-O), yet still falls through
+        // to the podman probe below. Left as-is here because rio and plo run
+        // this arm today and changing their startup check is not this
+        // change's business — but a CRI node with no podman installed cannot
+        // currently start.
+        CfgBackendKind::Cri | CfgBackendKind::PodmanApi | CfgBackendKind::Podman => {}
     }
     let binary = config
         .runtime
@@ -3120,6 +3139,37 @@ mod node_label_tests {
 
 #[cfg(test)]
 mod tests {
+    /// ★ A backend with no podman under it must NOT be podman-probed.
+    ///
+    /// Regression for a measured failure: ryn was configured
+    /// `kubelet_backend: native`, and the daemon refused to start with
+    /// `kubelet backend "podman" is configured but its binary ... could not
+    /// be resolved`. The preflight early-returned only for `Fake`, so every
+    /// new backend inherited a podman probe by default.
+    ///
+    /// Asserted against a config whose podman binary CANNOT work, so a
+    /// regression fails here rather than only on a machine without podman.
+    #[test]
+    fn the_native_backend_is_not_podman_probed() {
+        let mut config = super::EngenhoConfig::prescribed_default();
+        config.runtime.kubelet_backend = super::CfgBackendKind::Native;
+        config.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
+        super::preflight_backend(&config).expect("native must skip the podman probe entirely");
+    }
+
+    /// The positive control: a podman backend with an unusable binary MUST
+    /// still fail, or the test above passes because the probe never runs.
+    #[test]
+    fn a_podman_backend_with_an_unusable_binary_still_fails_preflight() {
+        let mut config = super::EngenhoConfig::prescribed_default();
+        config.runtime.kubelet_backend = super::CfgBackendKind::Podman;
+        config.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
+        assert!(
+            super::preflight_backend(&config).is_err(),
+            "the probe must still catch a broken podman, or skipping it for \
+             native proves nothing"
+        );
+    }
 
     /// ★ The invariant this exists for: pods are never told an address that
     /// routes nowhere. Under podman they get the host gateway, because no
