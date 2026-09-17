@@ -205,6 +205,22 @@ in
         material.
       '';
 
+      hostPathAllowlist = optional (types.listOf types.str) ''
+        Host path prefixes a pod may mount directly with a `hostPath` volume.
+
+        EMPTY BY DEFAULT, which denies every hostPath. engenho defers hostPath
+        because a pod that can name any host path can name `/`; a node opts IN
+        by naming prefixes and never inherits the permission.
+
+        Required by the `native` backend for any stateful workload: a native
+        process has no mount namespace, so a volume is only honourable when its
+        host path equals its mountPath, and `hostPath` is the only source that
+        expresses that.
+
+        Matching is COMPONENT-WISE, so `/Users/x/data` does not permit
+        `/Users/x/data-evil`, and a path containing `..` is refused.
+      '';
+
       kubeletBackend = optional (types.enum [ "podman_api" "podman" "cri" "fake" "native" ]) ''
         Container runtime the kubelet drives.
 
@@ -409,6 +425,7 @@ in
       advertise_address = cfg.runtime.advertiseAddress;
       remote_kubeconfig_publish_path = cfg.runtime.remoteKubeconfigPublishPath;
         kubelet_backend = cfg.runtime.kubeletBackend;
+        host_path_allowlist = cfg.runtime.hostPathAllowlist;
         # DERIVED, never a second hand-list: an explicit `podmanBinary` wins,
         # else the package's own bin path. So "kubelet drives podman, with no
         # resolvable podman" is not constructible by default — reaching it now

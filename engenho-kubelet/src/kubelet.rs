@@ -289,6 +289,9 @@ pub struct Kubelet {
     /// volumes brick — the trait IS the testability contract, so volume
     /// resolution is unit-testable WITHOUT real podman.
     volume_materializer: Arc<dyn VolumeMaterializer>,
+    /// Which host paths a pod may mount directly. Deny-all unless a node opts
+    /// in, so the default stays exactly what it was.
+    host_path_policy: crate::pod_volume::HostPathPolicy,
     /// Supplies a pod's ServiceAccount credentials. Defaults to
     /// [`NoServiceAccountProjection`] so a kubelet with no signing key
     /// projects nothing rather than an empty token.
@@ -336,6 +339,7 @@ impl Kubelet {
             backend,
             net_prober: Arc::new(TokioNetProber::new()),
             volume_materializer: Arc::new(PodmanVolumeMaterializer::new()),
+            host_path_policy: crate::pod_volume::HostPathPolicy::deny_all(),
             clock: Arc::new(Instant::now),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
             sa_projector: Arc::new(crate::pod_volume::NoServiceAccountProjection),
@@ -351,6 +355,17 @@ impl Kubelet {
     /// resolution is exercised without real podman / a real filesystem;
     /// production keeps the default [`PodmanVolumeMaterializer`].
     #[must_use]
+    /// Permit `hostPath` volumes under the given prefixes.
+    ///
+    /// Absent this, the kubelet denies every hostPath — the behaviour before
+    /// the policy existed. A node opts IN by naming prefixes; it never
+    /// inherits the permission.
+    #[must_use]
+    pub fn with_host_path_policy(mut self, policy: crate::pod_volume::HostPathPolicy) -> Self {
+        self.host_path_policy = policy;
+        self
+    }
+
     pub fn with_volume_materializer(mut self, m: Arc<dyn VolumeMaterializer>) -> Self {
         self.volume_materializer = m;
         self
@@ -2283,12 +2298,13 @@ impl Kubelet {
         let fetch = |kind: &str, name: &str| -> Option<Value> {
             fetched.get(&(kind.to_string(), name.to_string())).cloned()
         };
-        crate::pod_volume::resolve_pod_volumes(
+        crate::pod_volume::resolve_pod_volumes_with_policy(
             pod,
             namespace,
             pod_name,
             fetch,
             self.volume_materializer.as_ref(),
+            &self.host_path_policy,
         )
         .await
     }

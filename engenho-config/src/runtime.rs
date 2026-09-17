@@ -286,6 +286,19 @@ pub struct RuntimeConfig {
     /// `podman` from `$PATH`, which is the case that fails silently under a
     /// launchd agent — prefer setting it from a package.
     pub podman_binary: Option<String>,
+    /// Host path prefixes a pod may mount directly with a `hostPath` volume.
+    ///
+    /// EMPTY BY DEFAULT, which denies every hostPath — the behaviour before
+    /// this option existed. engenho defers hostPath because a pod that can
+    /// name any host path can name `/`; a node opts IN by naming prefixes and
+    /// never inherits the permission.
+    ///
+    /// Load-bearing for the `native` backend: a native process has no mount
+    /// namespace, so a volume is only honourable when its host path equals its
+    /// mountPath, and a hostPath is the only volume source that can express
+    /// that.
+    #[serde(default)]
+    pub host_path_allowlist: Vec<String>,
     /// How long to wait for raft leadership before the Runtime gives
     /// up at boot. Must be > 0.
     pub leadership_timeout_seconds: u32,
@@ -312,6 +325,7 @@ impl TieredConfig for RuntimeConfig {
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
+            host_path_allowlist: Vec::new(),
             leadership_timeout_seconds: 0,
             tls: TlsConfig::bare(),
         }
@@ -372,6 +386,7 @@ impl TieredConfig for RuntimeConfig {
             // overridden on every node to be correct.
             kubelet_backend: KubeletBackendKind::PodmanApi,
             podman_binary: None,
+            host_path_allowlist: Vec::new(),
             leadership_timeout_seconds: 10,
             tls: TlsConfig::prescribed_default(),
         }
@@ -436,6 +451,7 @@ impl TieredConfig for RuntimeConfig {
             // "whatever the base said" and no reason to want one.
             kubeconfig_publish_visibility: self.kubeconfig_publish_visibility,
             podman_binary: self.podman_binary.or_else(|| base.podman_binary.clone()),
+            host_path_allowlist: Vec::new(),
             leadership_timeout_seconds: if self.leadership_timeout_seconds == 0 {
                 base.leadership_timeout_seconds
             } else {
@@ -668,6 +684,7 @@ mod tests {
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
+            host_path_allowlist: Vec::new(),
             leadership_timeout_seconds: 0,
             tls: TlsConfig::bare(),
         };

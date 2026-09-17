@@ -3033,7 +3033,13 @@ fn spawn_drivers(
         )
         .with_event_sink(events)
         .with_sa_projector(sa_projector)
-        .with_volume_materializer(csi_materializer),
+        .with_volume_materializer(csi_materializer)
+        // Deny-all unless this node named prefixes. Load-bearing for the
+        // native backend, whose only honourable volume shape is a hostPath
+        // mounted at its own path.
+        .with_host_path_policy(engenho_kubelet::pod_volume::HostPathPolicy::allowing(
+            config.runtime.host_path_allowlist.clone(),
+        )),
     );
     handles.push(WatchDriver::new(kubelet.clone(), store.clone(), driver_config(&["Pod"])).spawn());
 
