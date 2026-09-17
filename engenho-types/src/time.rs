@@ -181,6 +181,8 @@ mod epoch_render {
 /// operation on a node that otherwise read healthy.
 #[must_use]
 pub fn age_since_rfc3339(stamp: &str) -> Option<std::time::Duration> {
-    let then = DateTime::parse_from_rfc3339(stamp).ok()?.with_timezone(&Utc);
+    let then = DateTime::parse_from_rfc3339(stamp)
+        .ok()?
+        .with_timezone(&Utc);
     (Utc::now() - then).to_std().ok()
 }

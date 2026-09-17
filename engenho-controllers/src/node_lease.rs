@@ -307,7 +307,10 @@ mod tests {
         let stale = json!({"spec": {"renewTime": "2020-01-01T00:00:00Z"}});
         project_ready_condition(&mut node, Some(&stale), "2026-09-14T12:00:00Z");
         let ready = find_ready_condition(&node).expect("Ready");
-        assert_eq!(ready["status"], "Unknown", "a stale heartbeat cannot read Ready: {node}");
+        assert_eq!(
+            ready["status"], "Unknown",
+            "a stale heartbeat cannot read Ready: {node}"
+        );
         assert_eq!(ready["reason"], "NodeStatusUnknown");
         // The status CHANGED, so the transition time moves to now.
         assert_eq!(ready["lastTransitionTime"], "2026-09-14T12:00:00Z");
@@ -341,13 +344,20 @@ mod tests {
         // condition it does not own surviving is what separates this from a
         // renderer that rebuilds the array.
         assert!(
-            node["status"]["conditions"].as_array().unwrap()
-                .iter().any(|c| c["type"] == "MemoryPressure"),
+            node["status"]["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["type"] == "MemoryPressure"),
             "a foreign condition must survive the projection: {node}"
         );
         // And exactly one Ready, not one appended beside the old.
-        let n = node["status"]["conditions"].as_array().unwrap()
-            .iter().filter(|c| c["type"] == "Ready").count();
+        let n = node["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["type"] == "Ready")
+            .count();
         assert_eq!(n, 1, "{node}");
     }
 

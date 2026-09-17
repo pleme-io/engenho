@@ -3233,7 +3233,10 @@ mod tests {
         // Guessing here understates or overstates the node by 1024x and the
         // result still looks like a real number. `None` makes the caller fall
         // back loudly instead.
-        assert_eq!(super::parse_mem_total_bytes("MemTotal: 100 furlongs\n"), None);
+        assert_eq!(
+            super::parse_mem_total_bytes("MemTotal: 100 furlongs\n"),
+            None
+        );
         // No unit means bytes, per proc(5).
         assert_eq!(super::parse_mem_total_bytes("MemTotal: 4096\n"), Some(4096));
     }
@@ -3253,7 +3256,10 @@ mod tests {
         if cfg!(target_os = "linux") {
             // The defect this replaces: the string "8Gi", on every node,
             // regardless of the host. On Linux the probe must have answered.
-            assert_ne!(mem, "8Gi", "memory must be measured on linux, not defaulted");
+            assert_ne!(
+                mem, "8Gi",
+                "memory must be measured on linux, not defaulted"
+            );
             assert!(
                 mem.parse::<u64>().is_ok(),
                 "measured memory is plain bytes: {mem}"

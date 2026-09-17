@@ -193,8 +193,16 @@ pub fn diff_runtime_op(
     if reference.stderr.is_empty() != under_test.stderr.is_empty() {
         out.push(Divergence::FieldDiff {
             path: JsonPath::parse(&format!("{}.stderr", op.as_str())),
-            engenho: serde_json::json!(if under_test.stderr.is_empty() { "empty" } else { "non-empty" }),
-            k3s: serde_json::json!(if reference.stderr.is_empty() { "empty" } else { "non-empty" }),
+            engenho: serde_json::json!(if under_test.stderr.is_empty() {
+                "empty"
+            } else {
+                "non-empty"
+            }),
+            k3s: serde_json::json!(if reference.stderr.is_empty() {
+                "empty"
+            } else {
+                "non-empty"
+            }),
             severity: Severity::Hard,
         });
     }

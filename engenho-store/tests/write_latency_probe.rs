@@ -83,10 +83,16 @@ async fn propose_latency_on_an_empty_durable_store() {
     let median = timings[timings.len() / 2];
     let max = *timings.last().unwrap();
 
-    println!("--- propose latency, empty durable store, n={} ---", timings.len());
+    println!(
+        "--- propose latency, empty durable store, n={} ---",
+        timings.len()
+    );
     println!("median : {median:?}");
     println!("max    : {max:?}");
-    println!("mean   : {:?}", total / u32::try_from(timings.len()).unwrap());
+    println!(
+        "mean   : {:?}",
+        total / u32::try_from(timings.len()).unwrap()
+    );
     println!("total  : {total:?}");
 
     // No assertion on an absolute number: this is a diagnostic, and a
