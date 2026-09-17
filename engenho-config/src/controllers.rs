@@ -14,24 +14,28 @@ pub struct ControllersConfig {
     pub enable: ControllerEnable,
     /// Namespace scope (empty = all).
     pub namespace: String,
-    /// WatchDriver fallback tick interval (seconds).
+    /// `WatchDriver` fallback tick interval (seconds).
     pub fallback_interval_seconds: u32,
-    /// WatchDriver event-coalescing window (milliseconds).
+    /// `WatchDriver` event-coalescing window (milliseconds).
     pub debounce_milliseconds: u32,
 }
 
 /// Per-controller enable flags.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one named bool PER CONTROLLER is the point: this is a toggle               surface an operator reads and sets by name, and packing it into               bitflags would trade a self-describing config schema for a lint"
+)]
 pub struct ControllerEnable {
-    /// ReplicaSet → Pod controller.
+    /// `ReplicaSet` → Pod controller.
     pub replicaset: bool,
-    /// Deployment → ReplicaSet controller.
+    /// Deployment → `ReplicaSet` controller.
     pub deployment: bool,
-    /// StatefulSet → ordered Pod controller.
+    /// `StatefulSet` → ordered Pod controller.
     #[serde(default = "default_true")]
     pub statefulset: bool,
-    /// DaemonSet → one node-pinned Pod per schedulable node.
+    /// `DaemonSet` → one node-pinned Pod per schedulable node.
     /// `#[serde(default)]` is REQUIRED (the struct is
     /// `deny_unknown_fields`) so pre-existing operator YAML written
     /// before this flag still deserializes (defaults on).
@@ -40,9 +44,9 @@ pub struct ControllerEnable {
     /// Job → Pod-to-completion controller.
     #[serde(default = "default_true")]
     pub job: bool,
-    /// CronJob → Job factory controller. Parses `spec.schedule` (5-field
+    /// `CronJob` → Job factory controller. Parses `spec.schedule` (5-field
     /// cron) and creates a `batch/v1` Job from the jobTemplate on schedule;
-    /// the JobController then runs that Job's Pods. `#[serde(default)]` is
+    /// the `JobController` then runs that Job's Pods. `#[serde(default)]` is
     /// REQUIRED (the struct is `deny_unknown_fields`) so pre-existing
     /// operator YAML written before this flag still deserializes (on).
     #[serde(default = "default_true")]
@@ -61,7 +65,7 @@ pub struct ControllerEnable {
     /// Owner-reference garbage collector.
     pub gc: bool,
     /// CRD → dynamic CR-handler registration controller. Watches
-    /// CustomResourceDefinition objects + registers a `StoreBackedHandler`
+    /// `CustomResourceDefinition` objects + registers a `StoreBackedHandler`
     /// per served version into the live apiserver router table.
     #[serde(default = "default_true")]
     pub crd: bool,
@@ -74,19 +78,19 @@ pub struct ControllerEnable {
     #[serde(default = "default_true")]
     pub namespace: bool,
     /// PV/PVC binder + local-path dynamic provisioner
-    /// (`PvBinderController`). Binds Pending PersistentVolumeClaims to
-    /// matching Available PersistentVolumes (capacity/accessModes/SC/
+    /// (`PvBinderController`). Binds Pending `PersistentVolumeClaims` to
+    /// matching Available `PersistentVolumes` (capacity/accessModes/SC/
     /// volumeName) and dynamically provisions a node-local hostPath PV via
-    /// the local-path provisioner / default StorageClass when no PV matches.
+    /// the local-path provisioner / default `StorageClass` when no PV matches.
     /// `#[serde(default)]` is REQUIRED (the struct is `deny_unknown_fields`)
     /// so pre-existing operator YAML written before this flag still
     /// deserializes (defaults on).
     #[serde(default = "default_true")]
     pub pv_binder: bool,
-    /// PodDisruptionBudget controller: computes `status.{currentHealthy,
+    /// `PodDisruptionBudget` controller: computes `status.{currentHealthy,
     /// desiredHealthy,expectedPods,disruptionsAllowed,observedGeneration}`
     /// from the pods its selector matches vs minAvailable/maxUnavailable.
-    /// `#[serde(default)]` REQUIRED (deny_unknown_fields) so pre-existing
+    /// `#[serde(default)]` REQUIRED (`deny_unknown_fields`) so pre-existing
     /// operator YAML still deserializes (defaults on).
     #[serde(default = "default_true")]
     pub pdb: bool,

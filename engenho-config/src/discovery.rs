@@ -1,4 +1,4 @@
-//! The engenho **discovered() tier** — environment auto-detect wired through
+//! The engenho **`discovered()` tier** — environment auto-detect wired through
 //! shikumi's declarative [`shikumi::DiscoveryLayer`] seam (never a hand-rolled
 //! struct literal / one-off probe fn).
 //!

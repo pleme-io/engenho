@@ -14,7 +14,7 @@ pub struct SchedulerConfig {
     /// Namespace to scope the scheduler to. Empty = all namespaces.
     pub namespace: String,
     /// Polling fallback tick interval in seconds. (Primary path
-    /// is WatchDriver; this fires when the watch stream goes
+    /// is `WatchDriver`; this fires when the watch stream goes
     /// silent.)
     pub tick_interval_seconds: u32,
 }

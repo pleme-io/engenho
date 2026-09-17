@@ -5,7 +5,7 @@ use shikumi::TieredConfig;
 
 use crate::error::ConfigError;
 
-/// NATS fabric config — mirrors engenho-teia::TeiaConfig.
+/// NATS fabric config — mirrors `engenho-teia::TeiaConfig`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TeiaConfig {

@@ -28,7 +28,7 @@ pub struct TopologyConfig {
 }
 
 /// Closed enum of pre-packed topology strategies. Mirrors the
-/// engenho-revoada::topology::TopologyStrategy concrete impls.
+/// `engenho-revoada::topology::TopologyStrategy` concrete impls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopologyStrategyKind {
@@ -77,7 +77,7 @@ impl RevoadaConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::InvalidField`] if min_nodes is 0
+    /// Returns [`ConfigError::InvalidField`] if `min_nodes` is 0
     /// for a strategy that needs voters.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if matches!(

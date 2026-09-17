@@ -1,4 +1,4 @@
-//! Per-resource ConsistencyTier defaults.
+//! Per-resource `ConsistencyTier` defaults.
 
 use serde::{Deserialize, Serialize};
 use shikumi::TieredConfig;
@@ -16,7 +16,7 @@ pub struct ConsistencyConfig {
     pub default_tier: ConsistencyTierKind,
 }
 
-/// Closed enum mirroring engenho_types::ConsistencyTier variants.
+/// Closed enum mirroring `engenho_types::ConsistencyTier` variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsistencyTierKind {
@@ -24,7 +24,7 @@ pub enum ConsistencyTierKind {
     Strong,
     /// Chitchat gossip — 1-3s convergence.
     EventualGossip,
-    /// NATS JetStream — replayable durable stream.
+    /// NATS `JetStream` — replayable durable stream.
     DurableStream,
     /// iroh / NATS Object — content-addressed.
     Content,

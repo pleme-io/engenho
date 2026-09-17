@@ -9,7 +9,7 @@ pub enum ConfigError {
     #[error("config parse error: {0}")]
     Parse(String),
 
-    /// Cross-section invariant violation (e.g. Quorum3M + min_nodes < 3).
+    /// Cross-section invariant violation (e.g. `Quorum3M` + `min_nodes` < 3).
     #[error("incoherent config: {0}")]
     Incoherent(String),
 

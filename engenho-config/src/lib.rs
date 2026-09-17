@@ -14,7 +14,7 @@
 //!   * [`TeiaConfig`] — NATS fabric (servers, cluster, leaf-nodes)
 //!   * [`SchedulerConfig`] — engenho-scheduler tunables
 //!   * [`ControllersConfig`] — engenho-controllers tunables + per-controller toggles
-//!   * [`ConsistencyConfig`] — per-resource ConsistencyTier defaults
+//!   * [`ConsistencyConfig`] — per-resource `ConsistencyTier` defaults
 //!
 //! Each sub-struct implements `shikumi::TieredConfig`:
 //!
@@ -71,7 +71,7 @@
 //!
 //! [`EngenhoConfig::validate`] runs cross-section coherence checks
 //! (e.g. Solo topology + 3-node consensus quorum is incoherent;
-//! Phalanx with min_nodes=0 makes no sense). Returns [`ConfigError`]
+//! Phalanx with `min_nodes=0` makes no sense). Returns [`ConfigError`]
 //! naming the violated invariant.
 
 #![warn(clippy::pedantic)]
@@ -131,9 +131,9 @@ pub struct EngenhoConfig {
     pub scheduler: SchedulerConfig,
     /// Controller suite tunables + per-controller toggles.
     pub controllers: ControllersConfig,
-    /// Per-resource ConsistencyTier defaults.
+    /// Per-resource `ConsistencyTier` defaults.
     pub consistency: ConsistencyConfig,
-    /// Cluster networking — the Service ClusterIP CIDR. `#[serde(default)]`
+    /// Cluster networking — the Service `ClusterIP` CIDR. `#[serde(default)]`
     /// is REQUIRED (the struct is `deny_unknown_fields`) so operator YAML
     /// written before this section existed still deserializes; the default
     /// is the upstream `10.96.0.0/12` range.
@@ -218,7 +218,7 @@ impl EngenhoConfig {
     ///
     /// Returns [`ConfigError`] naming the violated invariant:
     ///
-    ///   * Quorum requires ≥3 nodes but topology min_nodes < 3
+    ///   * Quorum requires ≥3 nodes but topology `min_nodes` < 3
     ///   * Scheduler tick interval is zero (would hot-loop)
     ///   * Controllers fallback interval is zero (same)
     ///   * Empty cluster name
@@ -267,17 +267,14 @@ impl EngenhoConfig {
     /// read or is malformed; [`ConfigError::Incoherent`] /
     /// [`ConfigError::InvalidField`] on a validation failure.
     pub fn discover() -> Result<Self, ConfigError> {
-        match Self::discover_path() {
-            Some(path) => {
-                let yaml = std::fs::read_to_string(&path)
-                    .map_err(|e| ConfigError::Parse(format!("reading {}: {e}", path.display())))?;
-                Self::from_yaml_with_defaults(&yaml)
-            }
-            None => {
-                let cfg = Self::prescribed_default();
-                cfg.validate()?;
-                Ok(cfg)
-            }
+        if let Some(path) = Self::discover_path() {
+            let yaml = std::fs::read_to_string(&path)
+                .map_err(|e| ConfigError::Parse(format!("reading {}: {e}", path.display())))?;
+            Self::from_yaml_with_defaults(&yaml)
+        } else {
+            let cfg = Self::prescribed_default();
+            cfg.validate()?;
+            Ok(cfg)
         }
     }
 
@@ -632,15 +629,12 @@ cluster:
         // So the branch is on the DETECTOR, not on one of its inputs.
         // Asserting `$HOSTNAME` here would now be asserting an
         // implementation detail that is no longer the whole mechanism.
-        match crate::discovery::detected_node_name() {
-            Some(host) => {
-                assert_eq!(r.value().runtime.node_name, host);
-                assert_eq!(p.tier(), ConfigTierKind::Discovered);
-            }
-            None => {
-                assert_eq!(r.value().runtime.node_name, NODE_NAME_FALLBACK);
-                assert_eq!(p.tier(), ConfigTierKind::Default);
-            }
+        if let Some(host) = crate::discovery::detected_node_name() {
+            assert_eq!(r.value().runtime.node_name, host);
+            assert_eq!(p.tier(), ConfigTierKind::Discovered);
+        } else {
+            assert_eq!(r.value().runtime.node_name, NODE_NAME_FALLBACK);
+            assert_eq!(p.tier(), ConfigTierKind::Default);
         }
     }
 
