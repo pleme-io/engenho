@@ -56,8 +56,15 @@ pub enum NativeError {
     OciImage { reference: String },
     /// The image reference itself was malformed.
     Image(crate::image_source::ImageSourceError),
-    /// No command, and a closure has no ENTRYPOINT to fall back to.
-    NoCommand,
+    /// No command, and the closure's `bin/` holds no executable to infer one
+    /// from.
+    NoEntrypoint { closure: PathBuf },
+    /// No command, and the closure's `bin/` holds SEVERAL executables, so
+    /// there is nothing to infer. Names them: the remedy is to pick one.
+    AmbiguousEntrypoint {
+        closure: PathBuf,
+        candidates: Vec<String>,
+    },
     /// The resolved program is outside the Nix store, so the closure would not
     /// be what actually ran.
     CommandEscapesStore { program: PathBuf },
@@ -93,10 +100,23 @@ impl std::fmt::Display for NativeError {
                  the podman or CRI backend."
             ),
             Self::Image(e) => write!(f, "{e}"),
-            Self::NoCommand => write!(
+            Self::NoEntrypoint { closure } => write!(
                 f,
-                "the container declares no command, and a closure has no \
-                 ENTRYPOINT to fall back to"
+                "the container declares no command and {}/bin holds no \
+                 executable, so there is no entrypoint to infer",
+                closure.display()
+            ),
+            Self::AmbiguousEntrypoint {
+                closure,
+                candidates,
+            } => write!(
+                f,
+                "the container declares no command and {}/bin holds {} \
+                 executables ({}), so the entrypoint is ambiguous. Declare \
+                 `command` naming the one to run.",
+                closure.display(),
+                candidates.len(),
+                candidates.join(", ")
             ),
             Self::CommandEscapesStore { program } => write!(
                 f,
@@ -244,7 +264,18 @@ impl NativeBackend {
     /// something else silently would make that promise false.
     fn resolve_program(closure: &Path, command: &[String]) -> Result<PathBuf, NativeError> {
         let Some(first) = command.first() else {
-            return Err(NativeError::NoCommand);
+            // ── ★ A CLOSURE WITH EXACTLY ONE EXECUTABLE IS UNAMBIGUOUS ─────
+            // An OCI image carries an ENTRYPOINT; a Nix closure does not. But
+            // when `bin/` holds exactly one executable there is nothing to
+            // choose, so inferring it is a DERIVATION, not a default: with
+            // zero or several the backend refuses and names what it found,
+            // rather than picking one.
+            //
+            // This is what lets a well-formed single-binary closure run from a
+            // pod spec that declares no command — the common shape for a
+            // pleme-io service, and the reason pangea-operator needs no chart
+            // change to run natively.
+            return Self::sole_executable(closure);
         };
         let candidate = if first.starts_with('/') {
             PathBuf::from(first)
@@ -255,6 +286,30 @@ impl NativeBackend {
             return Err(NativeError::CommandEscapesStore { program: candidate });
         }
         Ok(candidate)
+    }
+
+    /// The closure's single executable, or a typed refusal naming what it
+    /// found instead.
+    fn sole_executable(closure: &Path) -> Result<PathBuf, NativeError> {
+        let bin = closure.join("bin");
+        let mut names: Vec<String> = std::fs::read_dir(&bin)
+            .map_err(|_| NativeError::NoEntrypoint {
+                closure: closure.to_path_buf(),
+            })?
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        match names.len() {
+            1 => Ok(bin.join(&names[0])),
+            0 => Err(NativeError::NoEntrypoint {
+                closure: closure.to_path_buf(),
+            }),
+            _ => Err(NativeError::AmbiguousEntrypoint {
+                closure: closure.to_path_buf(),
+                candidates: names,
+            }),
+        }
     }
 
     /// Check every mount can actually be honoured, and say precisely which
@@ -590,12 +645,51 @@ mod tests {
         assert_eq!(p, Path::new("/nix/store/aaa-pkg/bin/postgres"));
     }
 
-    /// A closure has no ENTRYPOINT to fall back on, so an empty command is a
-    /// refusal rather than a guess.
+    /// ★ A closure whose `bin/` holds exactly ONE executable has an
+    /// unambiguous entrypoint, so a pod spec need not repeat it. This is what
+    /// lets a single-binary pleme-io service run from a chart that cannot
+    /// express `command`.
     #[test]
-    fn an_empty_command_is_refused_rather_than_guessed() {
-        let closure = Path::new("/nix/store/aaa-pkg");
-        assert!(NativeBackend::resolve_program(closure, &[]).is_err());
+    fn a_closure_with_one_executable_needs_no_command() {
+        let dir = std::env::temp_dir().join("engenho-entrypoint-one/bin");
+        let _ = std::fs::remove_dir_all(dir.parent().expect("parent"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("only-binary"), b"x").expect("write");
+        let closure = dir.parent().expect("closure");
+        assert_eq!(
+            NativeBackend::sole_executable(closure).expect("one binary is unambiguous"),
+            dir.join("only-binary")
+        );
+    }
+
+    /// Several executables is NOT a default-to-the-first: it is a refusal that
+    /// names them, because picking one would run something nobody declared.
+    #[test]
+    fn several_executables_are_refused_and_named() {
+        let dir = std::env::temp_dir().join("engenho-entrypoint-many/bin");
+        let _ = std::fs::remove_dir_all(dir.parent().expect("parent"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for n in ["initdb", "postgres", "psql"] {
+            std::fs::write(dir.join(n), b"x").expect("write");
+        }
+        let err = NativeBackend::sole_executable(dir.parent().expect("closure"))
+            .expect_err("ambiguous must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "{msg}");
+        for n in ["initdb", "postgres", "psql"] {
+            assert!(msg.contains(n), "the candidates must be named: {msg}");
+        }
+    }
+
+    /// An empty `bin/` infers nothing, and says so distinctly from ambiguous.
+    #[test]
+    fn a_closure_with_no_executable_has_no_entrypoint() {
+        let dir = std::env::temp_dir().join("engenho-entrypoint-none/bin");
+        let _ = std::fs::remove_dir_all(dir.parent().expect("parent"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let err = NativeBackend::sole_executable(dir.parent().expect("closure"))
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("no entrypoint to infer"), "{err}");
     }
 
     /// ★ The guard that keeps `stop` from becoming a broadcast. `kill(0, sig)`
