@@ -2502,6 +2502,23 @@ impl Kubelet {
         // A projection FAILURE is not swallowed: a pod that cannot get its
         // identity must not reach Running and then fail every API call it
         // makes. It stays Pending with the reason visible.
+        // ── ★ `automountServiceAccountToken: false` MEANS IT ─────────────
+        // Upstream defaults this to true and injects the projection; a pod
+        // that sets it false is saying it does not use the API and does not
+        // want a credential. engenho projected unconditionally, so the field
+        // was accepted by the apiserver and then ignored by the kubelet —
+        // exactly the "inheriting a promise nobody writes down" failure this
+        // repo's CLAUDE.md names.
+        //
+        // It is load-bearing beyond tidiness: the projection mounts at a FIXED
+        // path from a source directory under engenho's state dir, and a native
+        // (no-mount-namespace) backend cannot reconcile the two. A workload
+        // that correctly declines the token was still refused for it.
+        let automount = value
+            .pointer("/spec/automountServiceAccountToken")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
         let sa_name = value
             .pointer("/spec/serviceAccountName")
             .and_then(Value::as_str)
@@ -2510,40 +2527,46 @@ impl Kubelet {
             .pointer("/metadata/uid")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let sa_mount = match self
-            .sa_projector
-            .project(namespace, sa_name, &key.name, pod_uid)
-            .await
-        {
-            Ok(Some(files)) => {
-                let src = self
-                    .volume_materializer
-                    .materialize_files(namespace, &key.name, "kube-api-access", &files)
-                    .await
-                    .map_err(|e| {
-                        ControllerError::Internal(format!(
-                            "materialize ServiceAccount projection: {e}"
-                        ))
-                    })?;
-                Some(crate::pod_volume::ResolvedMount {
-                    source: src,
-                    mount_path: crate::pod_volume::SA_MOUNT_PATH.to_string(),
-                    // Read-only, as upstream projects it. A writable
-                    // credential directory lets a compromised container
-                    // rewrite its own identity.
-                    read_only: true,
-                    sub_path: None,
-                })
-            }
-            Ok(None) => None,
-            Err(e) => {
-                warn!(
-                    pod = %key.label(),
-                    error = %e,
-                    "ServiceAccount projection failed; pod stays Pending"
-                );
-                report.objects_skipped += 1;
-                return Ok(());
+        let sa_mount = if !automount {
+            // No projection, no materialization, no mount. The pod asked for
+            // no credential and gets none.
+            None
+        } else {
+            match self
+                .sa_projector
+                .project(namespace, sa_name, &key.name, pod_uid)
+                .await
+            {
+                Ok(Some(files)) => {
+                    let src = self
+                        .volume_materializer
+                        .materialize_files(namespace, &key.name, "kube-api-access", &files)
+                        .await
+                        .map_err(|e| {
+                            ControllerError::Internal(format!(
+                                "materialize ServiceAccount projection: {e}"
+                            ))
+                        })?;
+                    Some(crate::pod_volume::ResolvedMount {
+                        source: src,
+                        mount_path: crate::pod_volume::SA_MOUNT_PATH.to_string(),
+                        // Read-only, as upstream projects it. A writable
+                        // credential directory lets a compromised container
+                        // rewrite its own identity.
+                        read_only: true,
+                        sub_path: None,
+                    })
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(
+                        pod = %key.label(),
+                        error = %e,
+                        "ServiceAccount projection failed; pod stays Pending"
+                    );
+                    report.objects_skipped += 1;
+                    return Ok(());
+                }
             }
         };
 
