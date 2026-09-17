@@ -21,6 +21,33 @@ pub enum KubeletBackendKind {
     Podman,
     /// In-memory deterministic fake (tests + dev environments).
     Fake,
+    /// Native host processes out of Nix closures — NO runtime underneath.
+    ///
+    /// The only backend that does not end at a Linux runtime, and therefore
+    /// the only one that runs a workload on macOS without a VM. It runs
+    /// `nix:` closure images and REFUSES OCI references, so it is selected
+    /// deliberately, never inherited.
+    Native,
+}
+
+/// Where the native backend keeps container logs.
+///
+/// Under the user's state dir rather than /var/log: this backend runs as
+/// whatever principal the daemon has, and a path it cannot write would turn
+/// every container start into a failure at the log-file step.
+fn native_log_dir() -> std::path::PathBuf {
+    std::env::var_os("ENGENHO_NATIVE_LOG_DIR").map_or_else(
+        || {
+            let mut p = dirs_home();
+            p.push(".local/share/engenho/containers");
+            p
+        },
+        std::path::PathBuf::from,
+    )
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os("HOME").map_or_else(std::env::temp_dir, std::path::PathBuf::from)
 }
 
 /// Construct the runtime trait object from the operator's choice.
@@ -132,6 +159,13 @@ pub fn make_container_runtime_with_apiserver(
             }
         }
         KubeletBackendKind::Fake => Arc::new(FakeBackend::new()),
+        KubeletBackendKind::Native => Arc::new(crate::native_backend::NativeBackend::new(
+            // The honest tier, named at the construction site so it appears in
+            // review rather than only in a doc comment: this backend confines
+            // nothing yet. See native_backend's module docs.
+            crate::native_backend::Isolation::HostProcess,
+            native_log_dir(),
+        )),
     }
 }
 

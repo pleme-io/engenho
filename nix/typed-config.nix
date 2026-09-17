@@ -205,8 +205,21 @@ in
         material.
       '';
 
-      kubeletBackend = optional (types.enum [ "podman_api" "podman" "cri" "fake" ]) ''
+      kubeletBackend = optional (types.enum [ "podman_api" "podman" "cri" "fake" "native" ]) ''
         Container runtime the kubelet drives.
+
+        `native` runs each container as a NATIVE HOST PROCESS out of a realised
+        Nix closure, with no container runtime underneath it at all. It is the
+        only backend that runs a workload on darwin without a Linux VM -- the
+        other three all end at a Linux runtime, which on macOS means
+        podman-machine. It accepts `nix:/nix/store/...` images and REFUSES OCI
+        references rather than falling back, so a node set to `native` cannot
+        silently end up running its pods in a VM.
+
+        Tier-honest: it confines nothing yet. A container runs with the
+        daemon's own privileges -- no Seatbelt profile, no container principal,
+        no uid-scoped reaper. Choose it where the alternative is a whole Linux
+        VM, not where you need a sandbox.
 
         `podman_api` (the DEFAULT) speaks podman's libpod REST API over its unix
         socket — no subprocess, typed JSON, status codes instead of parsed error

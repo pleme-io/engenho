@@ -79,6 +79,14 @@ pub enum KubeletBackendKind {
     Podman,
     /// In-memory deterministic fake (tests + dev environments).
     Fake,
+    /// Native host processes out of Nix closures — no runtime underneath.
+    ///
+    /// The only backend that runs a workload without a Linux runtime, so the
+    /// only one that runs a pod on macOS outside a VM. Accepts `nix:` closure
+    /// images and refuses OCI references: a node set to this backend will not
+    /// silently fall back to a VM.
+    #[serde(rename = "native")]
+    Native,
 }
 
 /// Process-level assembly config.
@@ -503,7 +511,7 @@ mod backend_kind_wire {
     /// a config engenho refuses to parse.
     ///
     /// These strings live in two repositories — `nix/typed-config.nix`'s
-    /// `types.enum [ "podman_api" "podman" "fake" ]` and this enum's
+    /// `types.enum [ "podman_api" "podman" "cri" "fake" "native" ]` and this enum's
     /// `rename_all = "snake_case"`. Nothing but this test connects them, and the
     /// failure is at DAEMON START on the node, long after the nix build went
     /// green.
@@ -514,6 +522,7 @@ mod backend_kind_wire {
             (KubeletBackendKind::PodmanApi, "\"podman_api\""),
             (KubeletBackendKind::Podman, "\"podman\""),
             (KubeletBackendKind::Fake, "\"fake\""),
+            (KubeletBackendKind::Native, "\"native\""),
         ];
         for (kind, want) in cases {
             assert_eq!(

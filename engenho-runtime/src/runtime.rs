@@ -1032,6 +1032,16 @@ fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
             host: PODMAN_HOST_GATEWAY.to_string(),
             port,
         },
+        // ★ NATIVE: a pod IS a host process, so it shares the host's network
+        // and reaches the apiserver on LOOPBACK directly. This is the one
+        // backend where the address the kubelet listens on is literally the
+        // address a pod can use — there is no VM boundary to cross and no
+        // gateway name to translate. Stated as its own arm rather than folded
+        // in with podman's: the two are the same shape and a different fact.
+        CfgBackendKind::Native => ApiserverReachability::HostGateway {
+            host: "127.0.0.1".to_string(),
+            port,
+        },
         // ★ CRI: HONESTLY UNKNOWN, NOT GUESSED. A pod under containerd/CRI-O
         // is on a CNI-managed network, not podman's bridge, so
         // `PODMAN_HOST_GATEWAY` is simply the wrong host — and engenho does
@@ -1059,6 +1069,7 @@ fn build_backend(config: &EngenhoConfig) -> Arc<dyn ContainerRuntime> {
         CfgBackendKind::PodmanApi => KubeletBackendKind::PodmanApi,
         CfgBackendKind::Podman => KubeletBackendKind::Podman,
         CfgBackendKind::Fake => KubeletBackendKind::Fake,
+        CfgBackendKind::Native => KubeletBackendKind::Native,
     };
     // A node-level fact, set once here rather than resolved per pod — and it
     // must reach the backend, because the kubelet has THREE `backend.start`
