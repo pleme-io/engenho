@@ -100,8 +100,36 @@ impl ImageSource {
         if image.is_empty() {
             return Err(ImageSourceError::Empty);
         }
-        let Some(path) = image.strip_prefix(NIX_SCHEME) else {
+        let Some(raw) = image.strip_prefix(NIX_SCHEME) else {
             return Ok(Self::Oci(image.to_string()));
+        };
+        // ── ★ A CHART-APPENDED TAG IS IGNORED, BY SPEC ───────────────────
+        // Helm composes an image as `repository:tag` and has no way to emit a
+        // bare reference — pleme-lib's helper falls back to the chart
+        // AppVersion, then "latest", so `nix:/nix/store/…` arrives as
+        // `nix:/nix/store/…:latest`.
+        //
+        // A closure is already content-addressed: its hash IS the version, so
+        // a tag carries no information and there is nothing to resolve. `nix:`
+        // is our own scheme, so defining that it MAY carry a trailing
+        // OCI-style tag which is discarded is a spec decision, not a guess —
+        // and it lets every existing chart name a closure without being
+        // modified.
+        //
+        // Bounded deliberately: only a final `:` segment matching the OCI tag
+        // grammar (no `/`, no `:`) is stripped, so a path containing a colon
+        // is not silently truncated.
+        let path = match raw.rsplit_once(':') {
+            Some((head, tag))
+                if !tag.is_empty()
+                    && !tag.contains('/')
+                    && tag
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) =>
+            {
+                head
+            }
+            _ => raw,
         };
         if !path.starts_with(STORE_ROOT) {
             return Err(ImageSourceError::NotAStorePath {
@@ -172,6 +200,35 @@ mod tests {
              to start it"
         );
         assert!(src.closure().is_none());
+    }
+
+    /// ★ Helm cannot emit a bare image reference, so a closure arrives tagged.
+    /// The tag is discarded: a closure's hash IS its version.
+    #[test]
+    fn a_chart_appended_tag_is_discarded() {
+        for tagged in [
+            "nix:/nix/store/00pjg4wzlg32ihqpcfw7jcm5q99r55vk-postgresql-16.15:latest",
+            "nix:/nix/store/00pjg4wzlg32ihqpcfw7jcm5q99r55vk-postgresql-16.15:0.1.0",
+        ] {
+            let src = ImageSource::parse(tagged).expect("a tagged closure must parse");
+            assert_eq!(
+                src.closure().expect("closure"),
+                Path::new("/nix/store/00pjg4wzlg32ihqpcfw7jcm5q99r55vk-postgresql-16.15"),
+                "{tagged}"
+            );
+        }
+    }
+
+    /// The strip is bounded: a colon inside a PATH segment is not a tag, so a
+    /// path is never silently truncated at one.
+    #[test]
+    fn a_colon_inside_a_path_segment_is_not_stripped_as_a_tag() {
+        let src = ImageSource::parse("nix:/nix/store/aaa-pkg/weird:dir/inner").expect("must parse");
+        assert_eq!(
+            src.closure().expect("closure"),
+            Path::new("/nix/store/aaa-pkg/weird:dir/inner"),
+            "a `:` followed by a path segment is not a tag"
+        );
     }
 
     /// A path outside the store carries none of the guarantees a closure does,
