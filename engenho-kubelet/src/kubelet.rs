@@ -2514,10 +2514,38 @@ impl Kubelet {
         // path from a source directory under engenho's state dir, and a native
         // (no-mount-namespace) backend cannot reconcile the two. A workload
         // that correctly declines the token was still refused for it.
+        // Upstream precedence: the POD field wins when set; otherwise the
+        // ServiceAccount's own `automountServiceAccountToken` applies; only if
+        // BOTH are unset does it default to true. engenho read the pod field
+        // alone, so a chart that declines the token on the ServiceAccount --
+        // which is where pleme-lib declares it -- was ignored.
+        let sa_name_for_automount = value
+            .pointer("/spec/serviceAccountName")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
         let automount = value
             .pointer("/spec/automountServiceAccountToken")
             .and_then(Value::as_bool)
-            .unwrap_or(true);
+            .unwrap_or_else(|| true);
+        let automount = match value.pointer("/spec/automountServiceAccountToken") {
+            Some(_) => automount,
+            None => {
+                let sa_key = ResourceKey::namespaced(
+                    "",
+                    "v1",
+                    "ServiceAccount",
+                    namespace,
+                    sa_name_for_automount,
+                );
+                self.store
+                    .get(&sa_key)
+                    .await
+                    .as_ref()
+                    .and_then(|sa| sa.pointer("/automountServiceAccountToken"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            }
+        };
 
         let sa_name = value
             .pointer("/spec/serviceAccountName")
