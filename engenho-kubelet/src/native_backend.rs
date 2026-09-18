@@ -226,6 +226,32 @@ pub struct NativeBackend {
     state: Arc<Mutex<HashMap<String, NativeContainer>>>,
 }
 
+/// The address a native container answers on.
+///
+/// A native container is a host PROCESS: it shares the host's network
+/// namespace, so its listening ports ARE the host's ports. There is no
+/// per-pod IP — and this used to report `None` on that basis, with a comment
+/// arguing that "inventing one would be worse than reporting none."
+///
+/// ★ `None` is not the neutral answer. `probe.rs` reads it as
+/// `ProbeObservation::Failure` unconditionally (`let Some(ip) = pod_ip else
+/// { return Failure }`), so EVERY httpGet and tcpSocket probe against a
+/// native pod fails forever, whatever the workload is doing.
+///
+/// Measured on ryn 2026-09-18: pangea-operator's `startupProbe`
+/// (failureThreshold 30 x periodSeconds 5 = 150s) could never pass, so the
+/// kubelet killed a perfectly healthy operator every 2.5 minutes —
+/// `restartCount: 14`, `ready: false` — while `curl 127.0.0.1:8080/healthz`
+/// answered **HTTP 200 in 0.4ms** from the same host. The pod was reported
+/// unready precisely because nothing could ask it.
+///
+/// The loopback is not invented, it is MEASURED: it is the address the
+/// process is bound to and the one a probe reaches it on. Upstream has the
+/// same case and the same answer — a `hostNetwork: true` pod takes
+/// `status.podIP = status.hostIP`, and the prober dials that. A native
+/// container is a host-network container.
+const HOST_NETWORK_POD_IP: &str = "127.0.0.1";
+
 impl NativeBackend {
     /// Build a backend that writes container logs under `log_dir`.
     #[must_use]
@@ -427,10 +453,7 @@ impl ContainerRuntime for NativeBackend {
         Ok(ContainerStatus {
             container_id: id,
             running: pid.is_some(),
-            // A native process shares the host's network namespace: there is no
-            // per-pod IP to hand back, and inventing one would be worse than
-            // reporting none.
-            pod_ip: None,
+            pod_ip: Some(HOST_NETWORK_POD_IP.to_string()),
             exit_code: None,
         })
     }
@@ -451,7 +474,7 @@ impl ContainerRuntime for NativeBackend {
         Ok(Some(ContainerStatus {
             container_id: container_id.to_string(),
             running: exited.is_none(),
-            pod_ip: None,
+            pod_ip: Some(HOST_NETWORK_POD_IP.to_string()),
             exit_code,
         }))
     }
@@ -798,5 +821,19 @@ mod tests {
             .await
             .expect_err("must be a typed error");
         assert!(err.to_string().contains("no such container"));
+    }
+
+    /// Pins the address itself. The two construction sites are covered by
+    /// `tests/native_runs_a_real_closure.rs`, which starts a real closure and
+    /// reads the address back off both `start()` and `status()`. The RULE this
+    /// constant serves — a missing address is read as a FAILED probe, not as
+    /// "no opinion" — is pinned in `probe.rs::probe_address`.
+    #[test]
+    fn a_native_container_answers_on_the_loopback() {
+        assert_eq!(
+            HOST_NETWORK_POD_IP, "127.0.0.1",
+            "a host process is reachable at the host's loopback; reporting no \
+             address at all makes every network probe fail forever"
+        );
     }
 }

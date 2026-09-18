@@ -75,10 +75,25 @@ async fn a_nix_closure_runs_as_a_native_process_and_its_output_is_readable() {
         started.running,
         "a freshly spawned process must report running"
     );
-    assert!(
-        started.pod_ip.is_none(),
-        "a native process shares the host network; inventing a pod IP would be \
-         worse than reporting none"
+    // ★ CORRECTED 2026-09-18. This asserted `pod_ip.is_none()`, reasoning that
+    // "inventing a pod IP would be worse than reporting none". The incident
+    // said otherwise: `probe.rs` maps an http/tcp probe with no pod IP to
+    // `ProbeObservation::Failure` unconditionally, so `None` does not mean
+    // "no opinion" — it means EVERY network probe fails forever.
+    //
+    // Measured on ryn: pangea-operator's startupProbe (30 x 5s = 150s) could
+    // never pass, so the kubelet killed a healthy operator every 2.5 minutes
+    // (`restartCount: 14`, `ready: false`) while `curl 127.0.0.1:8080/healthz`
+    // answered HTTP 200 in 0.4ms from the same host.
+    //
+    // The loopback is not invented, it is MEASURED: it is where the process is
+    // bound and where a probe reaches it. Upstream agrees — a `hostNetwork`
+    // pod takes `status.podIP = status.hostIP` and the prober dials that.
+    assert_eq!(
+        started.pod_ip.as_deref(),
+        Some("127.0.0.1"),
+        "a host process is reachable at the host's loopback; reporting no \
+         address makes a healthy pod permanently unprobeable"
     );
 
     // Poll for exit rather than sleeping a guessed interval.

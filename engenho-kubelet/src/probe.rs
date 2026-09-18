@@ -1220,3 +1220,75 @@ mod proptests {
         }
     }
 }
+
+#[cfg(test)]
+mod probe_address {
+    use super::*;
+
+    // ── A missing address is not "no opinion" ──────────────────────────
+    //
+    // `run_handler` maps an http/tcp probe with no pod IP to `Failure`. That
+    // is the right local choice — there is nothing to dial — but it means a
+    // backend reporting no address makes a HEALTHY workload indistinguishable
+    // from a broken one, forever.
+    //
+    // Measured on ryn 2026-09-18: the native backend returned `pod_ip: None`
+    // on the stated reasoning that "inventing one would be worse than
+    // reporting none". pangea-operator's startupProbe (30 x 5s) could then
+    // never pass, so the kubelet killed a healthy operator every 150s —
+    // `restartCount: 14`, `ready: false` — while `curl 127.0.0.1:8080/healthz`
+    // answered HTTP 200 in 0.4ms from the same host.
+    //
+    // Both directions are pinned, against the SAME healthy prober, so the
+    // difference is the address and nothing else.
+
+    use crate::backend::{FakeBackend, FakeNetProber};
+
+    fn http_spec() -> ProbeSpec {
+        ProbeSpec {
+            kind: ProbeKind::Startup,
+            handler: ProbeHandler::HttpGet {
+                path: "/healthz".into(),
+                port: ProbePort(8080),
+                scheme: HttpScheme::Http,
+                host: None,
+                headers: Vec::new(),
+            },
+            timing: ProbeTiming {
+                initial_delay: Duration::ZERO,
+                period: Duration::from_secs(5),
+                timeout: Duration::from_secs(1),
+                success_threshold: 1,
+                failure_threshold: 30,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn an_http_probe_with_an_address_reaches_a_healthy_workload() {
+        let runtime = FakeBackend::new();
+        let net = FakeNetProber::new();
+        net.seed_http("127.0.0.1", 8080, "/healthz", [200]).await;
+
+        let obs = run_handler(&http_spec(), &runtime, &net, "cid", Some("127.0.0.1")).await;
+
+        assert_eq!(obs, ProbeObservation::Success);
+    }
+
+    #[tokio::test]
+    async fn the_same_healthy_workload_fails_when_it_reports_no_address() {
+        let runtime = FakeBackend::new();
+        let net = FakeNetProber::new();
+        // Identical seeding: the workload is healthy either way.
+        net.seed_http("127.0.0.1", 8080, "/healthz", [200]).await;
+
+        let obs = run_handler(&http_spec(), &runtime, &net, "cid", None).await;
+
+        assert_eq!(
+            obs,
+            ProbeObservation::Failure,
+            "a backend that reports no address makes a healthy pod unprobeable; \
+             this is why the native backend must report the loopback"
+        );
+    }
+}
