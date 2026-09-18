@@ -62,6 +62,7 @@ async fn driver_ticks_on_matching_event() {
             filter: KindFilter::kind("Pod"),
             debounce: Duration::from_millis(20),
             fallback_interval: Duration::from_secs(3600),
+            stuck_tick_after: Duration::from_secs(120),
         },
     );
     let handle = driver.spawn();
@@ -109,6 +110,7 @@ async fn driver_filter_skips_irrelevant_events() {
             filter: KindFilter::kind("Pod"), // only Pods
             debounce: Duration::from_millis(20),
             fallback_interval: Duration::from_secs(3600),
+            stuck_tick_after: Duration::from_secs(120),
         },
     );
     let handle = driver.spawn();
@@ -155,6 +157,7 @@ async fn driver_coalesces_burst_events_into_one_tick() {
             filter: KindFilter::All,
             debounce: Duration::from_millis(100),
             fallback_interval: Duration::from_secs(3600),
+            stuck_tick_after: Duration::from_secs(120),
         },
     );
     let handle = driver.spawn();
@@ -210,6 +213,7 @@ async fn driver_fallback_timer_ticks_with_no_events() {
             filter: KindFilter::All,
             debounce: Duration::from_millis(20),
             fallback_interval: Duration::from_millis(150),
+            stuck_tick_after: Duration::from_secs(120),
         },
     );
     let handle = driver.spawn();

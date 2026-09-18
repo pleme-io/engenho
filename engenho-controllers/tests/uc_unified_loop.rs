@@ -143,6 +143,7 @@ async fn requeue_result_arms_one_shot_re_tick_not_swallowed() {
             // requeue timer — never the blind fallback. If requeue were
             // swallowed, ticks would stay at 1.
             fallback_interval: Duration::from_secs(3600),
+            stuck_tick_after: Duration::from_secs(120),
         },
     );
     let handle = driver.spawn();

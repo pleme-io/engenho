@@ -2619,6 +2619,15 @@ fn spawn_drivers(
         if n.is_empty() { None } else { Some(n.clone()) }
     };
 
+    // How long a single reconcile may run before the driver starts saying,
+    // once per window, that it is BLOCKED. It is never cancelled — see
+    // `watch_driver::tick_observed`, which copies the kubelet's
+    // `syncLoopHealthCheck` posture: make a stalled loop LOUD rather than
+    // abort it half-done. Measured motivation: engenho's kubelet controller
+    // was retired for 12 hours on ryn (2026-09-18) and the only evidence was
+    // the ABSENCE of its tick line among three healthy controllers.
+    const STUCK_TICK_AFTER: Duration = Duration::from_secs(120);
+
     let debounce = Duration::from_millis(u64::from(config.controllers.debounce_milliseconds));
     let fallback = Duration::from_secs(u64::from(config.controllers.fallback_interval_seconds));
 
@@ -2626,6 +2635,7 @@ fn spawn_drivers(
         filter: KindFilter::Kinds(kinds.iter().map(|k| (*k).to_string()).collect()),
         debounce,
         fallback_interval: fallback,
+        stuck_tick_after: STUCK_TICK_AFTER,
     };
 
     let enable = &config.controllers.enable;
@@ -2747,6 +2757,7 @@ fn spawn_drivers(
                     filter: KindFilter::All,
                     debounce,
                     fallback_interval: fallback,
+                    stuck_tick_after: STUCK_TICK_AFTER,
                 },
             )
             .spawn(),
@@ -2926,6 +2937,7 @@ fn spawn_drivers(
                     filter: KindFilter::Kinds(vec!["CSINode".to_string()]),
                     debounce,
                     fallback_interval: fallback,
+                    stuck_tick_after: STUCK_TICK_AFTER,
                 },
             )
             .spawn(),
