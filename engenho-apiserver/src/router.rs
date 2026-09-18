@@ -937,7 +937,33 @@ fn render_list(
     gvk: &Gvk,
     value: serde_json::Value,
 ) -> Result<Response, ApiError> {
-    render_object(codec, gvk, StatusCode::OK, value)
+    // ── ★ A LIST IS ENCODED AS `<Kind>List`, NOT AS `<Kind>` ──────────────
+    // The protobuf codec derives its descriptor from this GVK. Passing the
+    // ITEM's kind made it deserialize a `SecretList` body against the
+    // `Secret` descriptor, and because the codec is deliberately lenient
+    // (`deny_unknown_fields(false)`, so a newer apiserver field never breaks
+    // an older client) every field of the list — `items` included — was
+    // silently DROPPED. The result was a well-formed 200 with the right
+    // Content-Type and an essentially empty body.
+    //
+    // Measured on ryn 2026-09-17, the same LIST two ways: JSON 1196 bytes,
+    // protobuf 30. Nothing errored. `helm list` came back empty and
+    // `helm upgrade` said "has no deployed releases" for a release it had
+    // just written correctly — Helm's Go client negotiates protobuf, so it
+    // read zero items and reported that as fact.
+    //
+    // JSON was unaffected because it renders the value as-is; only the
+    // typed codec needs the descriptor, which is why every kubectl check
+    // passed while every Go-client tool saw an empty cluster.
+    let list_gvk = Gvk {
+        api_version: gvk.api_version.clone(),
+        kind: {
+            let mut k = gvk.kind.clone();
+            k.push_str("List");
+            k
+        },
+    };
+    render_object(codec, &list_gvk, StatusCode::OK, value)
 }
 
 fn render_object(
