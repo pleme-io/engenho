@@ -350,26 +350,50 @@ const TIME_METADATA_FIELDS: [&str; 2] = ["creationTimestamp", "deletionTimestamp
 /// `CodecError::FromJson` downstream — never a silent wrong answer).
 fn normalize_metadata_times(value: &serde_json::Value) -> serde_json::Value {
     let mut out = value.clone();
-    let Some(metadata) = out
+    normalize_metadata_times_in_place(&mut out);
+    out
+}
+
+/// Normalize this object's own `metadata` times, then EVERY item's.
+///
+/// ★ A LIST carries one `metadata` of its own and N more inside `items`.
+/// Normalizing only the outer one left every item's `creationTimestamp` as an
+/// RFC3339 string, which prost-reflect rejects against the `Time` message:
+/// `invalid type: string "2026-09-18T00:56:18Z", expected a map`.
+///
+/// This was unreachable until lists were encoded as `<Kind>List` at all --
+/// before that the item descriptor silently dropped `items`, so no item's
+/// metadata was ever looked at. Fixing the outer defect is what exposed this
+/// one, which is the usual shape: a silent failure hides the next failure
+/// behind it.
+fn normalize_metadata_times_in_place(value: &mut serde_json::Value) {
+    if let Some(metadata) = value
         .as_object_mut()
         .and_then(|o| o.get_mut("metadata"))
         .and_then(|m| m.as_object_mut())
-    else {
-        return out;
-    };
-    for field in TIME_METADATA_FIELDS {
-        if let Some(serde_json::Value::String(s)) = metadata.get(field) {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-                let seconds = dt.timestamp();
-                let nanos = i64::from(dt.timestamp_subsec_nanos());
-                metadata.insert(
-                    field.to_string(),
-                    serde_json::json!({ "seconds": seconds, "nanos": nanos }),
-                );
+    {
+        for field in TIME_METADATA_FIELDS {
+            if let Some(serde_json::Value::String(s)) = metadata.get(field) {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                    let seconds = dt.timestamp();
+                    let nanos = i64::from(dt.timestamp_subsec_nanos());
+                    metadata.insert(
+                        field.to_string(),
+                        serde_json::json!({ "seconds": seconds, "nanos": nanos }),
+                    );
+                }
             }
         }
     }
-    out
+    if let Some(items) = value
+        .as_object_mut()
+        .and_then(|o| o.get_mut("items"))
+        .and_then(|i| i.as_array_mut())
+    {
+        for item in items.iter_mut() {
+            normalize_metadata_times_in_place(item);
+        }
+    }
 }
 
 /// Encode a read-back `serde_json::Value` (the object the handler

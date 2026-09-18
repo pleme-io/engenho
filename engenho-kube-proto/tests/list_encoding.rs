@@ -25,7 +25,14 @@ fn secret_list() -> serde_json::Value {
             {
                 "apiVersion": "v1",
                 "kind": "Secret",
-                "metadata": { "name": "sh.helm.release.v1.probe.v1", "namespace": "default" },
+                "metadata": {
+                    "name": "sh.helm.release.v1.probe.v1",
+                    "namespace": "default",
+                    // ★ An RFC3339 string, as every real object carries. The
+                    // codec must normalize it to the proto Time message for
+                    // EVERY item, not just the list's own metadata.
+                    "creationTimestamp": "2026-09-18T00:56:18Z"
+                },
                 "type": "helm.sh/release.v1",
                 "data": { "release": "SDRzSUFBQUFBQUFDLw==" }
             }
@@ -88,5 +95,33 @@ fn encoding_a_list_against_the_item_descriptor_does_not_preserve_items() {
         "this is the shape of the original defect: the ITEM descriptor \
          cannot carry a list, so anything it produces must not look like a \
          populated list"
+    );
+}
+
+/// ★ Every ITEM's `creationTimestamp` must be normalized, not just the list's.
+///
+/// metav1.Time is a protobuf MESSAGE that JSON-marshals as an RFC3339 STRING.
+/// Normalizing only the outer metadata left each item's timestamp a string and
+/// prost-reflect rejected it:
+/// `invalid type: string "2026-09-18T00:56:18Z", expected a map`.
+///
+/// This was unreachable until lists were encoded as `<Kind>List`: before that
+/// the item descriptor dropped `items` wholesale, so no item's metadata was
+/// ever examined. A silent failure was hiding this one behind it.
+#[test]
+fn item_timestamps_are_normalized_not_just_the_lists_own() {
+    let gvk = Gvk {
+        api_version: "v1".to_string(),
+        kind: "SecretList".to_string(),
+    };
+    let bytes = encode_response(&gvk, &secret_list())
+        .expect("an item carrying an RFC3339 timestamp must encode");
+    let back = decode_protobuf(&bytes).expect("and decode");
+    let ts = back
+        .pointer("/items/0/metadata/creationTimestamp")
+        .expect("the item keeps its timestamp");
+    assert!(
+        !ts.is_null(),
+        "the timestamp must survive the round trip: {back}"
     );
 }
