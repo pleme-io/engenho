@@ -30,7 +30,7 @@
 //! A Pod's container is started exactly ONCE across its lifetime —
 //! membership in `local` is the guard, never `phase == Running`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -299,6 +299,13 @@ pub struct Kubelet {
     /// The `now()` source (defaults to [`Instant::now`]; overridable for
     /// deterministic probe-cadence tests via [`Kubelet::with_clock`]).
     clock: Clock,
+    /// Consecutive FAILED start attempts per (pod label, container name), with
+    /// the instant of the last attempt. Feeds `backoff::decide_start`.
+    ///
+    /// A `ContainerRecord` only exists once a start SUCCEEDED, so it cannot
+    /// carry this: the whole point is a container that has never started. An
+    /// entry is cleared on success and when the pod goes away.
+    start_failures: Mutex<HashMap<(String, String), (u32, Instant)>>,
     /// Where lifecycle events go. Defaults to the null sink so emission is
     /// safe to add to a code path before the plumbing exists — the
     /// alternative being an `Option` check at every call site.
@@ -341,6 +348,7 @@ impl Kubelet {
             volume_materializer: Arc::new(PodmanVolumeMaterializer::new()),
             host_path_policy: crate::pod_volume::HostPathPolicy::deny_all(),
             clock: Arc::new(Instant::now),
+            start_failures: Mutex::new(HashMap::new()),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
             sa_projector: Arc::new(crate::pod_volume::NoServiceAccountProjection),
             last_lease_renewal: Mutex::new(None),
@@ -1981,6 +1989,13 @@ impl Controller for Kubelet {
             match self.cleanup_pod_containers(&key, &lp).await {
                 Ok(()) => {
                     self.local.lock().await.remove(&key);
+                    // The pod is gone; its start penalties go with it, or
+                    // the map grows for the process's lifetime.
+                    let gone = key.label();
+                    self.start_failures
+                        .lock()
+                        .await
+                        .retain(|(pod, _), _| pod != &gone);
                     report.objects_changed += 1;
                     debug!(
                         pod = %key.label(),
@@ -2684,8 +2699,43 @@ impl Kubelet {
                 mounts = spec.mounts.len(),
                 "kubelet starting container"
             );
+            // ── CrashLoopBackOff for a container that has NEVER started ──
+            //
+            // A start that cannot succeed must not be retried at the sync
+            // loop's speed. `pitr-lab/mysql-0` declares an OCI image the
+            // native backend cannot run at all, and this retried it twice a
+            // second, forever, writing a log line and a status patch each
+            // time. Same curve as a crash restart — `backoff::decide_start`
+            // is the never-started half of `backoff::decide`, not a second
+            // implementation of the same 10s-doubling-to-5min shape.
+            let backoff_key = (key.label(), cname.clone());
+            let now_for_start = (self.clock)();
+            let owed = {
+                let failures = self.start_failures.lock().await;
+                match failures.get(&backoff_key) {
+                    Some((count, last)) => crate::backoff::decide_start(
+                        *count,
+                        now_for_start.saturating_duration_since(*last),
+                    ),
+                    None => crate::backoff::BackoffDecision::Restart,
+                }
+            };
+            if let crate::backoff::BackoffDecision::Wait { remaining } = owed {
+                // Said out loud, at debug: a skipped attempt that logs nothing
+                // is indistinguishable from one that was never reached.
+                debug!(
+                    pod = %key.label(),
+                    container = %cname,
+                    remaining_s = remaining.as_secs(),
+                    "container start backing off; not retrying yet"
+                );
+                report.objects_skipped += 1;
+                continue;
+            }
+
             match self.backend.start(&spec).await {
                 Ok(status) => {
+                    self.start_failures.lock().await.remove(&backoff_key);
                     let mut local = self.local.lock().await;
                     let entry = local.entry(key.clone()).or_default();
                     // Record this pod's emptyDir volume names ONCE so
@@ -2738,10 +2788,21 @@ impl Kubelet {
                     .await;
                 }
                 Err(e) => {
+                    let attempts = {
+                        let mut failures = self.start_failures.lock().await;
+                        let entry = failures
+                            .entry(backoff_key.clone())
+                            .or_insert((0, now_for_start));
+                        entry.0 = entry.0.saturating_add(1);
+                        entry.1 = now_for_start;
+                        entry.0
+                    };
                     warn!(
                         pod = %key.label(),
                         container = %cname,
                         error = %e,
+                        consecutive_failures = attempts,
+                        next_attempt_in_s = crate::backoff::delay_for(attempts).as_secs(),
                         "container start failed; pod remains pending"
                     );
                     // Tell the CLUSTER, not just the log.

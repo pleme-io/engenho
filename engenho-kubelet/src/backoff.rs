@@ -113,6 +113,36 @@ pub fn decide(
     }
 }
 
+/// The same curve, for a container that has never started at all.
+///
+/// [`decide`] answers "this container RAN and exited"; its reset rule keys on
+/// uptime, which a container that never started does not have. A start that
+/// FAILS — an unpullable image, a backend that cannot run the image at all —
+/// is the other half of the same question and had no backoff whatsoever.
+///
+/// Measured on ryn 2026-09-18: `pitr-lab/mysql-0` declares
+/// `docker.io/library/mysql:8.0`, the native macOS backend cannot run an OCI
+/// image, and the kubelet retried that permanently-impossible start **twice a
+/// second**, each attempt writing a log line and a status patch. Backed off it
+/// is four attempts in the first minute and one every five minutes after.
+///
+/// `failures` is the count of CONSECUTIVE failed starts, so the first attempt
+/// is immediate (`delay_for(0) == ZERO`) and a success clears it. The cap is a
+/// ceiling on the wait, never a stop: a permanently broken container keeps
+/// being retried, because "gave up" must be a state an operator can see rather
+/// than infer from silence.
+#[must_use]
+pub fn decide_start(failures: u32, since_last_attempt: Duration) -> BackoffDecision {
+    let owed = delay_for(failures);
+    if since_last_attempt >= owed {
+        BackoffDecision::Restart
+    } else {
+        BackoffDecision::Wait {
+            remaining: owed - since_last_attempt,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +224,61 @@ mod tests {
         // 180s uptime is well under the 600s forgiveness threshold, so the
         // restart count keeps mattering — which is the point.
         assert!(matches!(d, BackoffDecision::Wait { .. }));
+    }
+
+    // ── decide_start: the never-started half of the same curve ─────────
+
+    #[test]
+    fn the_first_start_attempt_is_immediate() {
+        assert_eq!(decide_start(0, S(0)), BackoffDecision::Restart);
+    }
+
+    #[test]
+    fn a_failed_start_defers_the_next_attempt_on_the_upstream_curve() {
+        assert_eq!(
+            decide_start(1, S(0)),
+            BackoffDecision::Wait { remaining: S(10) }
+        );
+        assert_eq!(decide_start(1, S(10)), BackoffDecision::Restart);
+        assert_eq!(
+            decide_start(2, S(0)),
+            BackoffDecision::Wait { remaining: S(20) }
+        );
+        assert_eq!(
+            decide_start(3, S(0)),
+            BackoffDecision::Wait { remaining: S(40) }
+        );
+    }
+
+    /// The measured defect, as arithmetic: a start that can never succeed was
+    /// polled twice a second. Replay that cadence against the gate.
+    #[test]
+    fn a_permanently_failing_start_costs_a_handful_of_attempts_a_minute() {
+        let mut failures = 0u32;
+        let mut since = S(0);
+        let mut attempts = 0;
+        for _ in 0..120 {
+            // 120 polls = 60s at the observed 2/s
+            if decide_start(failures, since) == BackoffDecision::Restart {
+                attempts += 1;
+                failures += 1;
+                since = S(0);
+            }
+            since += Duration::from_millis(500);
+        }
+        assert!(
+            (2..=4).contains(&attempts),
+            "expected a handful of attempts in a minute, got {attempts}"
+        );
+    }
+
+    #[test]
+    fn a_start_penalty_caps_rather_than_growing_forever() {
+        assert_eq!(delay_for(u32::MAX), MAX_DELAY);
+        assert_eq!(
+            decide_start(u32::MAX, MAX_DELAY),
+            BackoffDecision::Restart,
+            "a capped penalty still expires; backoff never becomes give-up"
+        );
     }
 }
