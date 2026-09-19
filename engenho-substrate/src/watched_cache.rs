@@ -128,7 +128,9 @@ impl DerivationCacheBackend for WatchedCache {
 
     async fn put_nar(&self, blob: &NarBlob) -> Result<(), CacheError> {
         self.inner.put_nar(blob).await?;
-        let _ = self.sender.send(CacheEvent::NarUpserted(blob.hash.clone()));
+        let _ = self
+            .sender
+            .send(CacheEvent::NarUpserted(blob.hash().clone()));
         Ok(())
     }
 
@@ -176,7 +178,7 @@ mod tests {
         let blob = NarBlob::from_bytes(b"hello".to_vec());
         w.put_nar(&blob).await.unwrap();
         let event = rx.recv().await.unwrap();
-        assert_eq!(event, CacheEvent::NarUpserted(blob.hash));
+        assert_eq!(event, CacheEvent::NarUpserted(blob.hash().clone()));
     }
 
     #[tokio::test]

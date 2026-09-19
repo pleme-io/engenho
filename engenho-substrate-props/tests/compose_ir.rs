@@ -1,6 +1,6 @@
 //! Property: ComposeIr fingerprint determinism + per-IR divergence.
 
-use engenho_substrate::{ComposeIr, ComposeService};
+use engenho_substrate_incubator::{ComposeIr, ComposeService};
 use proptest::prelude::*;
 // compose_ir.rs uses unwrap_or(128) — keeps its own ProptestConfig.
 use std::collections::BTreeMap;

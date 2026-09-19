@@ -12,6 +12,10 @@
 //! `expose_secret()` — operators have to type those names, making
 //! every leak a code-review-visible deliberate act.
 //!
+//! Every credential-shaped literal in this file (bearer tokens, `ghp_`
+//! strings, passwords) is a SYNTHETIC-FIXTURE the redaction tests feed in;
+//! none is a real secret.
+//!
 //! ## Surface
 //!
 //!   - `Risca<T>` — wrapper that opaques `T` from all default

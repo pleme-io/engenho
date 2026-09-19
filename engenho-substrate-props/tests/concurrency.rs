@@ -7,7 +7,9 @@
 //! the substrate's `Arc<...>`-shaped types to exercise the
 //! lock-free invariants under contention.
 
-use engenho_substrate::{Budget, Provacao, ReplayCursor};
+use engenho_substrate::{Provacao, ReplayCursor};
+
+use engenho_substrate_incubator::Budget;
 use engenho_substrate_props::helpers::frozen_clock;
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;

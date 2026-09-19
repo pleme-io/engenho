@@ -1,12 +1,16 @@
 //! Property: ChainedVerifier first-failure-denies + last-success-returns.
 
 use engenho_substrate::{
-    ChainedVerifier, FakeVerifier, NarHash, Verificacao, Verifier, VerifyError,
+    ChainedVerifier, FakeVerifier, NarHash, Verificacao, VerificacaoKind, Verifier, VerifyError,
 };
 use engenho_substrate_props::helpers::sample_emitter as emitter;
 use engenho_substrate_props::{block_on, proptest_with_env};
 use proptest::prelude::*;
 use std::sync::Arc;
+
+fn passing() -> Arc<dyn Verifier> {
+    Arc::new(FakeVerifier::passing(VerificacaoKind::ALL))
+}
 
 fn sample_verificacao() -> Verificacao {
     Verificacao::HashEquality {
@@ -32,9 +36,7 @@ proptest_with_env! {
     #[test]
     fn all_pass_chain_returns_ok(n in 1usize..6, emitter_b in any::<u8>()) {
         block_on(async {
-            let verifiers: Vec<Arc<dyn Verifier>> = (0..n)
-                .map(|_| Arc::new(FakeVerifier::new()) as Arc<dyn Verifier>)
-                .collect();
+            let verifiers: Vec<Arc<dyn Verifier>> = (0..n).map(|_| passing()).collect();
             let chain = ChainedVerifier::default_named(verifiers);
             let res = chain
                 .verify(&sample_verificacao(), [0u8; 32], emitter(emitter_b), 0)
@@ -63,16 +65,16 @@ proptest_with_env! {
         block_on(async {
             let mut verifiers: Vec<Arc<dyn Verifier>> = Vec::new();
             for _ in 0..before_pass {
-                verifiers.push(Arc::new(FakeVerifier::new()));
+                verifiers.push(passing());
             }
             // The N+1-th verifier fails.
-            let failing = Arc::new(FakeVerifier::new());
+            let failing = Arc::new(FakeVerifier::passing(VerificacaoKind::ALL));
             failing
                 .fail_next(VerifyError::Failed("simulated".into()))
                 .await;
             verifiers.push(failing);
             // Append one more that would pass — proves it's never reached.
-            verifiers.push(Arc::new(FakeVerifier::new()));
+            verifiers.push(passing());
             let chain = ChainedVerifier::default_named(verifiers);
             let err = chain
                 .verify(&sample_verificacao(), [0u8; 32], emitter(emitter_b), 0)
@@ -80,6 +82,27 @@ proptest_with_env! {
                 .unwrap_err();
             // Wrapped as Failed("{name}: {inner}").
             assert!(matches!(err, VerifyError::Failed(_)));
+        });
+    }
+
+    /// ★ T5.6: one member that was never told how to answer (nothing
+    /// pinned) denies the chain wherever it sits, however many members
+    /// around it pass. No receipt is issued for a check that did not run.
+    #[test]
+    fn an_unpinned_member_anywhere_denies_the_chain(
+        before in 0usize..4,
+        after in 0usize..4,
+        emitter_b in any::<u8>(),
+    ) {
+        block_on(async {
+            let mut verifiers: Vec<Arc<dyn Verifier>> = (0..before).map(|_| passing()).collect();
+            verifiers.push(Arc::new(FakeVerifier::new()));
+            verifiers.extend((0..after).map(|_| passing()));
+            let chain = ChainedVerifier::default_named(verifiers);
+            let res = chain
+                .verify(&sample_verificacao(), [0u8; 32], emitter(emitter_b), 0)
+                .await;
+            assert!(matches!(res, Err(VerifyError::Failed(_))), "{res:?}");
         });
     }
 

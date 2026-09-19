@@ -58,7 +58,7 @@ impl std::fmt::Display for SearchId {
     }
 }
 
-crate::define_hash_newtype! {
+engenho_substrate::define_hash_newtype! {
     #[derive(Copy)]
     /// Typed trial identifier. BLAKE3 over canonical inputs — same
     /// inputs always produce the same EnsaioId.
@@ -87,7 +87,7 @@ impl EnsaioId {
     }
 }
 
-crate::define_hash_newtype! {
+engenho_substrate::define_hash_newtype! {
     #[derive(Copy)]
     /// Generation identifier — BLAKE3-chained.
     GeracaoId
@@ -404,7 +404,7 @@ pub enum FitnessError {
     InvalidGenotype(String),
 }
 
-crate::impl_error_kind! {
+engenho_substrate::impl_error_kind! {
     FitnessError {
         (Backend(_)) => "backend",
         (InvalidGenotype(_)) => "invalid_genotype",
@@ -457,7 +457,7 @@ pub enum PesquisaError {
     Diverged(u64),
 }
 
-crate::impl_error_kind! {
+engenho_substrate::impl_error_kind! {
     PesquisaError {
         (Fitness(_)) => "fitness",
         (Engine(_)) => "engine",
@@ -468,7 +468,7 @@ crate::impl_error_kind! {
 // Trait impl forwards to the composite hand-written method —
 // keeps the chain semantics + lets generic Fingerprint consumers
 // dispatch polymorphically.
-impl crate::fingerprint::Fingerprint for Linhagem {
+impl engenho_substrate::fingerprint::Fingerprint for Linhagem {
     fn fingerprint(&self) -> [u8; 32] {
         Self::fingerprint(self)
     }
@@ -609,7 +609,7 @@ where
     }
 }
 
-// hex_encode helper extracted to crate::hex per PRIME DIRECTIVE;
+// hex_encode helper extracted to engenho_substrate::hex per PRIME DIRECTIVE;
 // EnsaioId / GeracaoId now go through `define_hash_newtype!`.
 
 // =================================================================
@@ -625,11 +625,11 @@ where
 #[must_use]
 pub fn aptidao_to_receipt<F>(
     aptidao: &Aptidao<F>,
-    emitter: crate::receipt::NodeId,
+    emitter: engenho_substrate::receipt::NodeId,
     emitted_at: u64,
-) -> crate::receipt::MaterializationReceipt {
-    crate::receipt::MaterializationReceipt::new(
-        crate::receipt::ReceiptKind::Shape("pesquisa:aptidao".into()),
+) -> engenho_substrate::receipt::MaterializationReceipt {
+    engenho_substrate::receipt::MaterializationReceipt::new(
+        engenho_substrate::receipt::ReceiptKind::Shape("pesquisa:aptidao".into()),
         aptidao.ensaio.id.0,
         emitter,
         emitted_at,
@@ -1006,11 +1006,15 @@ mod tests {
     #[test]
     fn aptidao_to_receipt_carries_subject_and_evidence() {
         let aptidao = sample_aptidao(7, 0, 0.5);
-        let receipt = aptidao_to_receipt(&aptidao, crate::receipt::NodeId::from_bytes(b"n"), 42);
+        let receipt = aptidao_to_receipt(
+            &aptidao,
+            engenho_substrate::receipt::NodeId::from_bytes(b"n"),
+            42,
+        );
         assert_eq!(receipt.subject, aptidao.ensaio.id.0);
         assert_eq!(receipt.evidence_hash, aptidao.evidence_hash);
         match receipt.kind {
-            crate::receipt::ReceiptKind::Shape(tag) => {
+            engenho_substrate::receipt::ReceiptKind::Shape(tag) => {
                 assert_eq!(tag, "pesquisa:aptidao");
             }
             _ => panic!("expected Shape"),

@@ -113,7 +113,11 @@ impl Verifier for ChainedVerifier {
 mod tests {
     use super::*;
     use crate::derivation::NarHash;
-    use crate::verifier::FakeVerifier;
+    use crate::verifier::{FakeOutcome, FakeVerifier, VerificacaoKind};
+
+    fn passing() -> FakeVerifier {
+        FakeVerifier::passing([VerificacaoKind::HashEquality])
+    }
 
     fn sample_verificacao() -> Verificacao {
         Verificacao::HashEquality {
@@ -146,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_passing_verifier_returns_its_receipt() {
-        let v: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());
+        let v: Arc<dyn Verifier> = Arc::new(passing());
         let c = ChainedVerifier::default_named(vec![v]);
         let receipt = c
             .verify(
@@ -162,8 +166,8 @@ mod tests {
 
     #[tokio::test]
     async fn all_passing_verifiers_returns_last_receipt() {
-        let v1: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());
-        let v2: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());
+        let v1: Arc<dyn Verifier> = Arc::new(passing());
+        let v2: Arc<dyn Verifier> = Arc::new(passing());
         let c = ChainedVerifier::default_named(vec![v1, v2]);
         let receipt = c
             .verify(
@@ -180,9 +184,10 @@ mod tests {
 
     #[tokio::test]
     async fn first_failure_short_circuits() {
-        let v1 = Arc::new(FakeVerifier::new());
-        v1.set_policy("hash_equality", false).await;
-        let v2 = Arc::new(FakeVerifier::new());
+        let v1 = Arc::new(passing());
+        v1.pin(VerificacaoKind::HashEquality, FakeOutcome::Deny)
+            .await;
+        let v2 = Arc::new(passing());
         let c = ChainedVerifier::default_named(vec![
             v1.clone() as Arc<dyn Verifier>,
             v2.clone() as Arc<dyn Verifier>,
@@ -204,10 +209,11 @@ mod tests {
 
     #[tokio::test]
     async fn middle_failure_short_circuits_and_skips_rest() {
-        let v1 = Arc::new(FakeVerifier::new());
-        let v2 = Arc::new(FakeVerifier::new());
-        v2.set_policy("hash_equality", false).await;
-        let v3 = Arc::new(FakeVerifier::new());
+        let v1 = Arc::new(passing());
+        let v2 = Arc::new(passing());
+        v2.pin(VerificacaoKind::HashEquality, FakeOutcome::Deny)
+            .await;
+        let v3 = Arc::new(passing());
         let c = ChainedVerifier::default_named(vec![
             v1.clone() as Arc<dyn Verifier>,
             v2.clone() as Arc<dyn Verifier>,
@@ -230,8 +236,9 @@ mod tests {
 
     #[tokio::test]
     async fn failure_message_includes_offending_verifier_name() {
-        let v = Arc::new(FakeVerifier::new());
-        v.set_policy("hash_equality", false).await;
+        let v = Arc::new(passing());
+        v.pin(VerificacaoKind::HashEquality, FakeOutcome::Deny)
+            .await;
         let c = ChainedVerifier::default_named(vec![v as Arc<dyn Verifier>]);
         let err = c
             .verify(
@@ -243,6 +250,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("fake"));
+    }
+
+    /// ★ T5.6: a chain is AND over its members, so one member that never
+    /// ran the check (nothing pinned) denies the whole chain, even when every
+    /// other member passes.
+    #[tokio::test]
+    async fn a_member_with_nothing_pinned_denies_the_chain() {
+        let v1 = Arc::new(passing());
+        let unpinned = Arc::new(FakeVerifier::new());
+        let c = ChainedVerifier::default_named(vec![
+            v1.clone() as Arc<dyn Verifier>,
+            unpinned.clone() as Arc<dyn Verifier>,
+        ]);
+        let err = c
+            .verify(
+                &sample_verificacao(),
+                sample_subject(),
+                sample_emitter(),
+                100,
+            )
+            .await
+            .expect_err("an unrun check must not yield a chain receipt");
+        assert_eq!(err.kind(), "failed");
+        assert_eq!(unpinned.calls().await.len(), 1);
     }
 
     #[tokio::test]

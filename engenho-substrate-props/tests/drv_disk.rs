@@ -59,7 +59,7 @@ proptest_with_env! {
         block_on(async {
             let cache = DiskDerivationCache::new(&root);
             let blob = nar(payload_b);
-            let blob_hash = blob.hash.clone();
+            let blob_hash = blob.hash().clone();
             cache.put_nar(&blob).await.unwrap();
             let got = cache.get_nar(&blob_hash).await.unwrap();
             assert_eq!(got, Some(blob));

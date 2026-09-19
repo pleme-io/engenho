@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "1966c7a2af4c79bd3e15ed9f790a9632ef689ccb7ec76505f5a973630018ea62",
+  "cargo_lock_sha256": "db6734c223d8768326f03f2fcb37106e9d39304467f01adcb8d38596dc62a938",
   "manifest_sha256": {
     "Cargo.toml": "04cf79221801b8562c19d8a3bcbf45a55f2886ba7d654cd6a523bd856736a98c",
     "engenho-apiserver/Cargo.toml": "be7d04cd80fe124f3094eb3f147cbde15e2eabe2975858e18f9ed7ab6c190ab1",
@@ -24,8 +24,10 @@
     "engenho-runtime/Cargo.toml": "1bb074d1b048ced7b852c243698ed6dab8b4ea4d2b1eb1537067e10ab7579665",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-store/Cargo.toml": "8b378fa9e3e1223b200168b5ff6f7a03c6dcc42fd6fb670576aaf0a9af5a80f1",
-    "engenho-substrate-props/Cargo.toml": "6f95b92f74fa8ac52030f06626f6af99c00c7939722497de0e91f8074fc0c52a",
-    "engenho-substrate/Cargo.toml": "042f3a24f99aa6b97723db699cfdcfb4e5817acb068b85963912766c1c4a4718",
+    "engenho-substrate-core/Cargo.toml": "3bc0b7054258b721c4ac21dc36f7bf1b949352bb0d345171db6f812461d5bf8b",
+    "engenho-substrate-incubator/Cargo.toml": "97fc8cd31503b2fba136f5b55614ad07345cfbfa44cc59b9a7ddc378140be5d4",
+    "engenho-substrate-props/Cargo.toml": "d5a75c33f45b46eddd6d7d4a7166e002f10b0787e57dc35bbbdd1521e126bec6",
+    "engenho-substrate/Cargo.toml": "674f26e64fef7da9bd4004ed774c5e35d4d26780f9c337ad7ad1d4e85f288a27",
     "engenho-sui-typescape/Cargo.toml": "30fde1a3a1db010241fa2d2c10c14a4953dcbb9979d760cf0843622f3b694207",
     "engenho-teia/Cargo.toml": "5f49fb93d3d30e02eea21bec4cb5cbe8b972bd40d3db3b8c29ce3c3f5f79c6fb",
     "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
@@ -7322,6 +7324,157 @@
           {
             "name": "blake3",
             "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_substrate_core",
+            "package_key": "engenho-substrate-core-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "futures",
+            "package_key": "futures-0.3.32",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio",
+            "package_key": "tokio-1.52.3",
+            "kind": "normal",
+            "features": [
+              "full",
+              "macros",
+              "rt",
+              "sync"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "engenho-substrate-core-0.53.118": {
+        "runtime_dependencies": [
+          {
+            "name": "blake3",
+            "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "engenho-substrate-incubator-0.53.118": {
+        "runtime_dependencies": [
+          {
+            "name": "async_trait",
+            "package_key": "async-trait-0.1.89",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          },
+          {
+            "name": "blake3",
+            "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_substrate",
+            "package_key": "engenho-substrate-0.53.118",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -39090,6 +39243,20 @@
       "edition": "2024",
       "lib_target": {
         "name": "engenho_substrate",
+        "path": "src/lib.rs"
+      }
+    },
+    "engenho-substrate-core-0.53.118": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_substrate_core",
+        "path": "src/lib.rs"
+      }
+    },
+    "engenho-substrate-incubator-0.53.118": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_substrate_incubator",
         "path": "src/lib.rs"
       }
     },

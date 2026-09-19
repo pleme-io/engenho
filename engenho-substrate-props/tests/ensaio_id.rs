@@ -1,7 +1,7 @@
 //! Property: EnsaioId::derive is deterministic + diverges
 //! across every input field.
 
-use engenho_substrate::{EnsaioId, SearchId};
+use engenho_substrate_incubator::{EnsaioId, SearchId};
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 

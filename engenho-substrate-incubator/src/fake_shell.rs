@@ -10,7 +10,7 @@
 //! ## Authoring shape (no extra deps)
 //!
 //! ```ignore
-//! use engenho_substrate::fake_backend_shell;
+//! use engenho_substrate_incubator::fake_backend_shell;
 //!
 //! pub enum FakeFooEvent { Insert(String), Remove(String) }
 //!

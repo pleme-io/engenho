@@ -125,14 +125,14 @@ impl ComposeIr {
     /// Deterministic across nodes for the same IR — fits the
     /// receipt evidence_hash + cache key contract.
     ///
-    /// Generated via [`crate::Fingerprint`] / [`crate::impl_fingerprint!`].
+    /// Generated via [`engenho_substrate::Fingerprint`] / [`engenho_substrate::impl_fingerprint!`].
     #[must_use]
     pub fn fingerprint(&self) -> [u8; 32] {
-        <Self as crate::Fingerprint>::fingerprint(self)
+        <Self as engenho_substrate::Fingerprint>::fingerprint(self)
     }
 }
 
-crate::impl_fingerprint!(ComposeIr);
+engenho_substrate::impl_fingerprint!(ComposeIr);
 
 impl ComposeIr {
     /// Render the IR as a docker-compose v3-shape YAML string.
@@ -179,7 +179,7 @@ pub enum ComposeError {
     Io(String),
 }
 
-crate::impl_error_kind! {
+engenho_substrate::impl_error_kind! {
     ComposeError {
         (Backend(_)) => "backend",
         (InvalidIr(_)) => "invalid_ir",

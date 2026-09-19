@@ -1,9 +1,10 @@
 //! Property: Fingerprint trait — generic determinism + divergence.
 
 use engenho_substrate::{
-    Fingerprint, Linhagem, NodeId, Placement, Plantio, SearchId, Stage, StageId, WorkloadShape,
-    fingerprint_blake3,
+    Fingerprint, NodeId, Placement, Plantio, Stage, StageId, WorkloadShape, fingerprint_blake3,
 };
+
+use engenho_substrate_incubator::{Linhagem, SearchId};
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
@@ -78,7 +79,7 @@ proptest_with_env! {
     ) {
         let mut l = Linhagem::new(SearchId::new(search));
         for i in 0..gen_count {
-            l.extend(engenho_substrate::GeracaoId([i as u8; 32]));
+            l.extend(engenho_substrate_incubator::GeracaoId([i as u8; 32]));
         }
         let inherent = Linhagem::fingerprint(&l);
         let trait_dispatched = <Linhagem as Fingerprint>::fingerprint(&l);

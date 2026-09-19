@@ -25,6 +25,9 @@ proptest = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [dev-dependencies]
+# The fenced-off substrate modules (pesquisa, orcamento, compose_ir, ...)
+# keep their property tests here; only tests reach the incubator.
+engenho-substrate-incubator = { path = "../engenho-substrate-incubator" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

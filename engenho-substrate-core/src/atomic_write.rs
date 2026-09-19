@@ -225,7 +225,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
     /// ★ An UNPUBLISHED temp removes itself, so no error path leaks one.
     #[test]
     fn an_unpublished_temp_file_is_cleaned_up_on_drop() {

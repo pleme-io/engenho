@@ -6,10 +6,11 @@
 //! algebra of their interactions. These tests guard the algebra.
 
 use engenho_substrate::{
-    Budget, BudgetSnapshot, Clock, Instant, LineageGraph, MachineRunner, Mirante,
-    ObservationChannel, Policy, Provacao, ReplayCursor, Risca, SeloIssuer, StateMachine,
-    define_named, impl_error_kind, replay_into,
+    Clock, Instant, LineageGraph, MachineRunner, Mirante, ObservationChannel, Policy, Provacao,
+    ReplayCursor, Risca, SeloIssuer, StateMachine, define_named, impl_error_kind, replay_into,
 };
+
+use engenho_substrate_incubator::{Budget, BudgetSnapshot};
 use engenho_substrate_props::helpers::frozen_clock;
 use engenho_substrate_props::{block_on, proptest_with_env};
 use proptest::prelude::*;
@@ -109,7 +110,8 @@ proptest_with_env! {
         chaos_p in 0.0_f64..1.0,
         seed in any::<u64>(),
     ) {
-        use engenho_substrate::{Budget, Clock, Policy, Provacao, SeloIssuer};
+        use engenho_substrate::{Clock, Policy, Provacao, SeloIssuer};
+        use engenho_substrate_incubator::Budget;
         let injector = Provacao::<ReplayFault>::new("api", seed).with_policy(
             Policy::Probability {
                 fault: ReplayFault::Drop,
@@ -155,7 +157,8 @@ proptest_with_env! {
         cap in 100u64..1000,
         tokens in 1u64..50,
     ) {
-        use engenho_substrate::{Budget, SeloIssuer};
+        use engenho_substrate::SeloIssuer;
+        use engenho_substrate_incubator::Budget;
         let iss = SeloIssuer::new(secret);
         let selo = iss.issue(&subj, "read:foo", Instant::from_ms(1_000_000));
         let budget = Budget::new("rate-limited-api", cap, 0, frozen_clock(0));

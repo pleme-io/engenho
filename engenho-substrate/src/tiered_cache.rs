@@ -272,10 +272,10 @@ mod tests {
         let blob = NarBlob::from_bytes(b"nar-bytes".to_vec());
         l1.put_nar(&blob).await.unwrap();
         let c = TieredCache::new(vec![l0.clone(), l1.clone()]);
-        let got = c.get_nar(&blob.hash).await.unwrap();
+        let got = c.get_nar(blob.hash()).await.unwrap();
         assert_eq!(got, Some(blob.clone()));
         // Promotion: L0 should have it.
-        assert_eq!(l0.get_nar(&blob.hash).await.unwrap(), Some(blob));
+        assert_eq!(l0.get_nar(blob.hash()).await.unwrap(), Some(blob));
     }
 
     #[tokio::test]
@@ -392,7 +392,7 @@ mod tests {
         let blob = NarBlob::from_bytes(b"lazy-nar".to_vec());
         l1.put_nar(&blob).await.unwrap();
         let c = TieredCache::with_promotion(vec![l0.clone(), l1.clone()], PromotionPolicy::Lazy);
-        let got = c.get_nar(&blob.hash).await.unwrap();
+        let got = c.get_nar(blob.hash()).await.unwrap();
         assert_eq!(got, Some(blob));
         assert_eq!(l0.nar_count().await, 0);
     }

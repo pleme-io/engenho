@@ -1829,6 +1829,32 @@ version = "0.53.118"
 dependencies = [
  "async-trait",
  "blake3",
+ "engenho-substrate-core",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "engenho-substrate-core"
+version = "0.53.118"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "engenho-substrate-incubator"
+version = "0.53.118"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "engenho-substrate",
  "futures",
  "serde",
  "serde_json",
@@ -1842,6 +1868,7 @@ name = "engenho-substrate-props"
 version = "0.53.118"
 dependencies = [
  "engenho-substrate",
+ "engenho-substrate-incubator",
  "proptest",
  "serde",
  "serde_json",

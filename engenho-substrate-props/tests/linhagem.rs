@@ -1,6 +1,6 @@
 //! Property: Linhagem fingerprint determinism + chain divergence.
 
-use engenho_substrate::{GeracaoId, Linhagem, SearchId};
+use engenho_substrate_incubator::{GeracaoId, Linhagem, SearchId};
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 

@@ -1,6 +1,6 @@
 //! Property: FakeCommandRunner pin/run/record invariants.
 
-use engenho_substrate::{
+use engenho_substrate_incubator::{
     CommandError, CommandRequest, CommandResponse, CommandRunner, FakeCommandRunner,
 };
 use engenho_substrate_props::{block_on, proptest_with_env};

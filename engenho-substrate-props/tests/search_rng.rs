@@ -4,7 +4,7 @@
 //! deterministic given (seed, stream_tag) — this is the
 //! replay-verifiability anchor for every search.
 
-use engenho_substrate::SearchRng;
+use engenho_substrate_incubator::SearchRng;
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
