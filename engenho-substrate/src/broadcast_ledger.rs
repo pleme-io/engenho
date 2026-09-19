@@ -12,29 +12,30 @@
 //! let inner = MemoryLedger::new();
 //! let watched = BroadcastLedger::new(Arc::new(inner));
 //! let mut rx = watched.subscribe(64);
-//! watched.ingest(&stage_id, 3, &receipt).await?;
-//! // rx receives LedgerEvent::ReceiptIngested { stage_id, outcome }
+//! watched.ingest(&stage_id, threshold, &receipt).await?; // threshold: NonZeroUsize
+//! // rx receives LedgerEvent::ReceiptIngested { stage_id, verdict }
 //! ```
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::ledger::{LedgerError, LedgerKey, MaterializationLedger};
-use crate::quorum::QuorumOutcome;
+use crate::quorum::QuorumVerdict;
 use crate::receipt::MaterializationReceipt;
 use crate::roca::StageId;
 
 /// Typed ledger event broadcast to subscribers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LedgerEvent {
-    /// A receipt was ingested and the tracker's post-state is `outcome`.
+    /// A receipt was ingested and the tracker's post-state is `verdict`.
     ReceiptIngested {
         /// Stage the receipt belonged to.
         stage_id: StageId,
         /// What the tracker says now.
-        outcome: QuorumOutcome,
+        verdict: QuorumVerdict,
     },
     /// `forget_stage(stage_id)` was invoked.
     StageForgotten {
@@ -104,19 +105,19 @@ impl MaterializationLedger for BroadcastLedger {
     async fn ingest(
         &self,
         stage_id: &StageId,
-        threshold: usize,
+        threshold: NonZeroUsize,
         receipt: &MaterializationReceipt,
-    ) -> Result<QuorumOutcome, LedgerError> {
-        let outcome = self.inner.ingest(stage_id, threshold, receipt).await?;
+    ) -> Result<QuorumVerdict, LedgerError> {
+        let verdict = self.inner.ingest(stage_id, threshold, receipt).await?;
         // Best-effort broadcast — no subscribers is not an error.
         let _ = self.sender.send(LedgerEvent::ReceiptIngested {
             stage_id: stage_id.clone(),
-            outcome: outcome.clone(),
+            verdict,
         });
-        Ok(outcome)
+        Ok(verdict)
     }
 
-    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumOutcome>, LedgerError> {
+    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumVerdict>, LedgerError> {
         self.inner.outcome(key).await
     }
 
@@ -139,6 +140,10 @@ mod tests {
         MaterializationReceipt::for_drv([7u8; 32], NodeId::new([emitter; 32]), 100, [evidence; 32])
     }
 
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("test thresholds are non-zero")
+    }
+
     fn stage() -> StageId {
         StageId::new("x")
     }
@@ -151,12 +156,12 @@ mod tests {
     async fn ingest_emits_event() {
         let l = wrap_memory();
         let mut rx = l.subscribe();
-        l.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         let event = rx.recv().await.unwrap();
         match event {
             LedgerEvent::ReceiptIngested {
                 stage_id,
-                outcome: _,
+                verdict: _,
             } => {
                 assert_eq!(stage_id, stage());
             }
@@ -168,10 +173,10 @@ mod tests {
     async fn outcome_event_propagates_reached() {
         let l = wrap_memory();
         let mut rx = l.subscribe();
-        l.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         let event = rx.recv().await.unwrap();
-        if let LedgerEvent::ReceiptIngested { outcome, .. } = event {
-            assert!(matches!(outcome, QuorumOutcome::Reached { .. }));
+        if let LedgerEvent::ReceiptIngested { verdict, .. } = event {
+            assert!(verdict.is_reached());
         }
     }
 
@@ -179,12 +184,12 @@ mod tests {
     async fn outcome_event_propagates_dissent() {
         let l = wrap_memory();
         let mut rx = l.subscribe();
-        l.ingest(&stage(), 2, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(2), &rcpt(1, 5)).await.unwrap();
         let _ = rx.recv().await; // first Pending
-        l.ingest(&stage(), 2, &rcpt(2, 6)).await.unwrap(); // dissent
+        l.ingest(&stage(), nz(2), &rcpt(2, 6)).await.unwrap(); // dissent
         let event = rx.recv().await.unwrap();
-        if let LedgerEvent::ReceiptIngested { outcome, .. } = event {
-            assert!(matches!(outcome, QuorumOutcome::Dissent { .. }));
+        if let LedgerEvent::ReceiptIngested { verdict, .. } = event {
+            assert_eq!(verdict.state(), crate::quorum::QuorumState::Dissent);
         }
     }
 
@@ -200,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn outcome_read_does_not_emit_event() {
         let l = wrap_memory();
-        l.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         let mut rx = l.subscribe();
         let key = LedgerKey {
             stage_id: stage(),
@@ -218,7 +223,7 @@ mod tests {
         let mut rx1 = l.subscribe();
         let mut rx2 = l.subscribe();
         assert_eq!(l.subscriber_count(), 2);
-        l.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         let e1 = rx1.recv().await.unwrap();
         let e2 = rx2.recv().await.unwrap();
         assert_eq!(e1, e2);
@@ -227,14 +232,14 @@ mod tests {
     #[tokio::test]
     async fn writes_with_no_subscribers_dont_fail() {
         let l = wrap_memory();
-        l.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
     }
 
     #[tokio::test]
     async fn wrapped_ledger_writes_actually_persist() {
         let inner = Arc::new(MemoryLedger::new());
         let l = BroadcastLedger::new(inner.clone());
-        l.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         // Underlying ledger has the receipt.
         assert_eq!(inner.len().await, 1);
     }

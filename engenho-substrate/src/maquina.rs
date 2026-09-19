@@ -2,7 +2,7 @@
 //!
 //! Per the research brief — MEDIUM-leverage inventive primitive.
 //! The substrate has multiple ad-hoc state machines (Plantio
-//! stage state, Transient lifecycle, QuorumOutcome enum, search
+//! stage state, Transient lifecycle, QuorumState enum, search
 //! Ensaio status) hand-rolled with match statements + bare
 //! enums. máquina folds them into one typed surface.
 //!

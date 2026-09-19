@@ -53,8 +53,8 @@ const RETRACTED: &[Retracted] = &[
     Retracted {
         file: "src/topology.rs",
         retracted: "True if the assignment satisfies Raft majority",
-        corrected: "**Not a majority check yet.**",
-        until: "has_majority counting against the configured voter set",
+        corrected: "A majority check is not a safety property on its own.",
+        until: "a promotion path that calls has_majority and a durable vote for it to count",
     },
 ];
 

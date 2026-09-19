@@ -118,7 +118,7 @@ pub use pesquisa::{
 };
 pub use promotion::{PromotionContext, PromotionGate, PromotionPolicy};
 pub use provacao::{Policy, Provacao};
-pub use quorum::{QuorumOutcome, QuorumTracker};
+pub use quorum::{QuorumState, QuorumTracker, QuorumVerdict, Tally};
 pub use receipt::{MaterializationReceipt, NodeId, ReceiptKind};
 pub use relogio::{Clock, FrozenClock, HlcClock, Instant, LogicalClock, WallClock};
 pub use replay::{ReplayCursor, ReplayCursorSnapshot, replay_into, replay_until};

@@ -32,7 +32,16 @@
 use engenho_substrate::{
     Drv, DrvHash, FrozenClock, MaterializationReceipt, NarBlob, NodeId, ReceiptKind,
 };
+use proptest::strategy::Strategy;
+use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::Arc;
+
+/// Quorum thresholds drawn from `range`. A zero in the range is
+/// filtered out rather than clamped: a zero threshold has no value.
+pub fn threshold_in(range: Range<usize>) -> impl Strategy<Value = NonZeroUsize> {
+    range.prop_filter_map("a quorum threshold is non-zero", NonZeroUsize::new)
+}
 
 /// Sample synthetic `Drv` with `drv_hash = [b; 32]` and the default
 /// `x86_64-linux` system tag.

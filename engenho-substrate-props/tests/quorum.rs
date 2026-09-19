@@ -3,6 +3,7 @@
 //! always reports Dissent.
 
 use engenho_substrate::{MaterializationReceipt, NodeId, QuorumTracker, ReceiptKind};
+use engenho_substrate_props::helpers::threshold_in;
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 
@@ -19,11 +20,11 @@ proptest_with_env! {
     /// K distinct emitters with IDENTICAL evidence → Reached.
     #[test]
     fn k_distinct_same_evidence_reaches_quorum(
-        threshold in 1usize..16,
+        threshold in threshold_in(1..16),
         n_emitters in 1usize..16,
         evidence_byte in any::<u8>(),
     ) {
-        prop_assume!(n_emitters >= threshold);
+        prop_assume!(n_emitters >= threshold.get());
         let mut tracker = QuorumTracker::new(ReceiptKind::Drv, [7u8; 32], threshold);
         for emitter in 0..n_emitters {
             tracker.ingest(&receipt(emitter as u8, evidence_byte));
@@ -36,11 +37,11 @@ proptest_with_env! {
     /// Below-threshold ingestion stays Pending.
     #[test]
     fn below_threshold_stays_pending(
-        threshold in 2usize..16,
+        threshold in threshold_in(2..16),
         n_emitters in 0usize..16,
         evidence_byte in any::<u8>(),
     ) {
-        prop_assume!(n_emitters < threshold);
+        prop_assume!(n_emitters < threshold.get());
         let mut tracker = QuorumTracker::new(ReceiptKind::Drv, [7u8; 32], threshold);
         for emitter in 0..n_emitters {
             tracker.ingest(&receipt(emitter as u8, evidence_byte));
@@ -51,7 +52,7 @@ proptest_with_env! {
     /// Duplicate emitter doesn't increment count.
     #[test]
     fn duplicate_emitter_doesnt_double_count(
-        threshold in 2usize..16,
+        threshold in threshold_in(2..16),
         evidence_byte in any::<u8>(),
         n_repeats in 1usize..32,
     ) {
@@ -65,14 +66,14 @@ proptest_with_env! {
     /// K distinct emitters with MIXED evidence reaching quorum → Dissent.
     #[test]
     fn mixed_evidence_above_threshold_reports_dissent(
-        threshold in 2usize..8,
+        threshold in threshold_in(2..8),
         e1 in any::<u8>(),
         e2 in any::<u8>(),
     ) {
         prop_assume!(e1 != e2);
         let mut tracker = QuorumTracker::new(ReceiptKind::Drv, [7u8; 32], threshold);
         // Push threshold receipts; alternate evidence variant.
-        for emitter in 0..threshold {
+        for emitter in 0..threshold.get() {
             let ev = if emitter % 2 == 0 { e1 } else { e2 };
             tracker.ingest(&receipt(emitter as u8, ev));
         }
@@ -83,7 +84,7 @@ proptest_with_env! {
     /// Reset clears all confirmations.
     #[test]
     fn reset_clears_state(
-        threshold in 1usize..8,
+        threshold in threshold_in(1..8),
         n_emitters in 1usize..16,
         evidence_byte in any::<u8>(),
     ) {

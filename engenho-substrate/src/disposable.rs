@@ -31,6 +31,7 @@
 //! `Transient` then makes them scope-bound + receipt-attested for
 //! free.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -231,7 +232,7 @@ impl<D: Disposable> Transient<D> {
             subject,                             // evidence = subject (faithful nodes converge)
         );
         self.ledger
-            .ingest(&self.stage_id, 1, &receipt)
+            .ingest(&self.stage_id, NonZeroUsize::MIN, &receipt)
             .await
             .map_err(DisposableError::from)?;
         Ok(())

@@ -27,6 +27,7 @@
 //! // inner ledger's aggregate view.
 //! ```
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,7 +35,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
 
 use crate::ledger::{LedgerError, LedgerKey, MaterializationLedger};
-use crate::quorum::QuorumOutcome;
+use crate::quorum::QuorumVerdict;
 use crate::receipt::MaterializationReceipt;
 use crate::roca::StageId;
 
@@ -53,7 +54,7 @@ pub struct GossipDelivery {
     /// Stage the receipt belongs to.
     pub stage_id: StageId,
     /// Threshold the originating node was using for the tracker.
-    pub threshold: usize,
+    pub threshold: NonZeroUsize,
     /// The receipt itself.
     pub receipt: MaterializationReceipt,
 }
@@ -91,7 +92,7 @@ pub trait GossipBroadcaster: Send + Sync {
     async fn broadcast_receipt(
         &self,
         stage_id: &StageId,
-        threshold: usize,
+        threshold: NonZeroUsize,
         receipt: &MaterializationReceipt,
     ) -> Result<(), GossipError>;
 }
@@ -114,7 +115,7 @@ pub struct GossipBroadcast {
     /// Stage the receipt belongs to.
     pub stage_id: StageId,
     /// Threshold used by the broadcasting node.
-    pub threshold: usize,
+    pub threshold: NonZeroUsize,
     /// The receipt.
     pub receipt: MaterializationReceipt,
 }
@@ -190,7 +191,7 @@ impl GossipBroadcaster for FakeGossipTransport {
     async fn broadcast_receipt(
         &self,
         stage_id: &StageId,
-        threshold: usize,
+        threshold: NonZeroUsize,
         receipt: &MaterializationReceipt,
     ) -> Result<(), GossipError> {
         let mut state = self.inner.lock().await;
@@ -251,7 +252,7 @@ impl GossipLedger {
     pub async fn ingest_delivery(
         &self,
         delivery: &GossipDelivery,
-    ) -> Result<QuorumOutcome, LedgerError> {
+    ) -> Result<QuorumVerdict, LedgerError> {
         self.inner
             .ingest(&delivery.stage_id, delivery.threshold, &delivery.receipt)
             .await
@@ -267,11 +268,11 @@ impl MaterializationLedger for GossipLedger {
     async fn ingest(
         &self,
         stage_id: &StageId,
-        threshold: usize,
+        threshold: NonZeroUsize,
         receipt: &MaterializationReceipt,
-    ) -> Result<QuorumOutcome, LedgerError> {
+    ) -> Result<QuorumVerdict, LedgerError> {
         // 1. Apply locally.
-        let outcome = self.inner.ingest(stage_id, threshold, receipt).await?;
+        let verdict = self.inner.ingest(stage_id, threshold, receipt).await?;
         // 2. Broadcast cluster-wide. Backend errors don't taint
         //    the local commit; we surface them as a typed log
         //    elsewhere (operator's transport choice).
@@ -279,10 +280,10 @@ impl MaterializationLedger for GossipLedger {
             .transport
             .broadcast_receipt(stage_id, threshold, receipt)
             .await;
-        Ok(outcome)
+        Ok(verdict)
     }
 
-    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumOutcome>, LedgerError> {
+    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumVerdict>, LedgerError> {
         self.inner.outcome(key).await
     }
 
@@ -301,6 +302,10 @@ mod tests {
         MaterializationReceipt::for_drv([7u8; 32], NodeId::new([emitter; 32]), 100, [evidence; 32])
     }
 
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("test thresholds are non-zero")
+    }
+
     fn stage() -> StageId {
         StageId::new("x")
     }
@@ -317,18 +322,22 @@ mod tests {
     #[tokio::test]
     async fn fake_transport_records_broadcasts() {
         let t = FakeGossipTransport::new();
-        t.broadcast_receipt(&stage(), 3, &rcpt(1, 5)).await.unwrap();
+        t.broadcast_receipt(&stage(), nz(3), &rcpt(1, 5))
+            .await
+            .unwrap();
         let b = t.broadcasts().await;
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].stage_id, stage());
-        assert_eq!(b[0].threshold, 3);
+        assert_eq!(b[0].threshold, nz(3));
     }
 
     #[tokio::test]
     async fn fake_transport_subscribers_receive_broadcasts() {
         let t = FakeGossipTransport::new();
         let mut rx = t.subscribe_outbound();
-        t.broadcast_receipt(&stage(), 3, &rcpt(1, 5)).await.unwrap();
+        t.broadcast_receipt(&stage(), nz(3), &rcpt(1, 5))
+            .await
+            .unwrap();
         let received = rx.recv().await.unwrap();
         assert_eq!(received.receipt.emitter, NodeId::new([1u8; 32]));
     }
@@ -338,7 +347,7 @@ mod tests {
         let t = FakeGossipTransport::new();
         t.fail_next(GossipError::NotConnected).await;
         let err = t
-            .broadcast_receipt(&stage(), 1, &rcpt(1, 5))
+            .broadcast_receipt(&stage(), nz(1), &rcpt(1, 5))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "not_connected");
@@ -347,7 +356,9 @@ mod tests {
     #[tokio::test]
     async fn fake_transport_broadcasts_with_no_subscribers_dont_fail() {
         let t = FakeGossipTransport::new();
-        t.broadcast_receipt(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        t.broadcast_receipt(&stage(), nz(1), &rcpt(1, 5))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -367,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_writes_locally_and_broadcasts() {
         let (inner, transport, ledger) = assemble();
-        ledger.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        ledger.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         // Inner has it.
         assert_eq!(inner.len().await, 1);
         // Transport saw it.
@@ -379,9 +390,9 @@ mod tests {
     #[tokio::test]
     async fn ingest_outcome_propagated_from_inner() {
         let (_inner, _t, ledger) = assemble();
-        let outcome = ledger.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        let verdict = ledger.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         // Threshold=1 + one emitter → Reached immediately.
-        assert!(matches!(outcome, QuorumOutcome::Reached { .. }));
+        assert!(verdict.is_reached());
     }
 
     #[tokio::test]
@@ -389,7 +400,7 @@ mod tests {
         let (inner, transport, ledger) = assemble();
         transport.fail_next(GossipError::NotConnected).await;
         // Even though transport will fail, local commit succeeds.
-        ledger.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        ledger.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         assert_eq!(inner.len().await, 1);
     }
 
@@ -398,7 +409,7 @@ mod tests {
         let (inner, transport, ledger) = assemble();
         let delivery = GossipDelivery {
             stage_id: stage(),
-            threshold: 1,
+            threshold: nz(1),
             receipt: rcpt(7, 5),
         };
         ledger.ingest_delivery(&delivery).await.unwrap();
@@ -410,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn forget_stage_passes_through_to_inner() {
         let (inner, _t, ledger) = assemble();
-        ledger.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        ledger.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         assert_eq!(inner.len().await, 1);
         ledger.forget_stage(&stage()).await.unwrap();
         assert_eq!(inner.len().await, 0);
@@ -419,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn outcome_read_passes_through_to_inner() {
         let (_inner, _t, ledger) = assemble();
-        ledger.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
+        ledger.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         let key = LedgerKey {
             stage_id: stage(),
             kind: crate::receipt::ReceiptKind::Drv,

@@ -6,6 +6,7 @@ use engenho_substrate::{
 use engenho_substrate_props::helpers::sample_receipt as receipt;
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 proptest_with_env! {
@@ -21,7 +22,7 @@ proptest_with_env! {
             let mut rx = ledger.subscribe();
             for (i, s) in subjects.iter().enumerate() {
                 let r = receipt(*s, i as u8);
-                ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
+                ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
             }
             let mut count = 0;
             while let Ok(ev) = rx.try_recv() {
@@ -76,7 +77,7 @@ proptest_with_env! {
             let ledger = BroadcastLedger::new(inner);
             // No subscribe() call.
             let r = receipt(subject, 0);
-            let res = ledger.ingest(&StageId::new("s"), 1, &r).await;
+            let res = ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await;
             assert!(res.is_ok());
     });
     }
@@ -90,7 +91,7 @@ proptest_with_env! {
             let mut rx1 = ledger.subscribe();
             let mut rx2 = ledger.subscribe();
             let r = receipt(subject, 0);
-            ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
+            ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
             let ev1 = rx1.try_recv().unwrap();
             let ev2 = rx2.try_recv().unwrap();
             assert_eq!(ev1, ev2);
@@ -104,7 +105,7 @@ proptest_with_env! {
             let inner: Arc<dyn MaterializationLedger> = Arc::new(MemoryLedger::new());
             let ledger = BroadcastLedger::new(inner);
             let r = receipt(subject, node);
-            ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
+            ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
             // outcome() delegates to inner — same shape.
             let key = engenho_substrate::LedgerKey {
                 stage_id: StageId::new("s"),
