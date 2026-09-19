@@ -40,6 +40,7 @@ pub mod error;
 pub mod handler;
 pub mod health;
 pub mod metrics;
+pub mod object_body;
 pub mod openapi;
 pub mod params;
 pub mod pki;
@@ -80,6 +81,7 @@ pub use health::{ChildLiveness, DrainState, LivenessSource, VersionInfo};
 pub use metrics::{
     LastTick, MetricsSnapshot, MetricsSource, ObjectCount, ReconcileCount, ReconcileResult,
 };
+pub use object_body::{FieldPath, JsonKind, MetaShapeError, ObjectBody};
 pub use openapi::ApiDoc;
 pub use params::{
     ListWatchParams, ResumePoint, Selectors, body_precondition, bookmark_line, gvk_ns_matches,

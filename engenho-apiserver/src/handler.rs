@@ -18,6 +18,7 @@ use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor, Subresource};
 
 use crate::error::ApiError;
+use crate::object_body::ObjectBody;
 use crate::params::{DryRun, ResumePoint, Selectors, body_precondition};
 use crate::pod_logs::{LogQuery, PodLogReader};
 use crate::scale::{Scale, project_scale};
@@ -255,10 +256,15 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// from the request's `Extension<UserInfo>`); it travels into the
     /// admission chain's `AdmissionRequest.user_info` so a webhook sees WHO is
     /// creating.
+    ///
+    /// `body` is an [`ObjectBody`]: a POST body is the object that will be
+    /// stored, so it arrives already normalized (null `labels`,
+    /// `annotations`, `ownerReferences`, `finalizers` dropped; mis-shaped
+    /// metadata refused). There is no way to hand this method raw bytes.
     async fn create(
         &self,
         namespace: Option<&str>,
-        body: Value,
+        body: ObjectBody,
         user_info: &UserInfo,
         dry_run: DryRun,
     ) -> Result<Value, ApiError>;
@@ -272,12 +278,14 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// existence-required (404 otherwise), server-owned metadata
     /// (creationTimestamp/uid) preserved, CAS on `metadata.resourceVersion`
     /// when present (absent → unconditional). `user_info` is the
-    /// authenticated identity threaded into admission.
+    /// authenticated identity threaded into admission. `body` is an
+    /// [`ObjectBody`] for the same reason as in [`Self::create`]: a PUT body
+    /// is the object that will be stored.
     async fn replace(
         &self,
         _namespace: Option<&str>,
         _name: &str,
-        _body: Value,
+        _body: ObjectBody,
         _user_info: &UserInfo,
         _dry_run: DryRun,
     ) -> Result<Value, ApiError> {
@@ -300,6 +308,10 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// `fieldManager` + `force`. For EVERY other patch algorithm it is
     /// `None` and the path is byte-identical to before SSA landed.
     /// `user_info` is the authenticated identity threaded into admission.
+    ///
+    /// ★ `patch` stays a raw `Value`, never an [`ObjectBody`]: in a merge
+    /// patch `null` means "delete this field", so normalizing it away would
+    /// turn `kubectl label x-` into a no-op (plan edge 9).
     async fn patch(
         &self,
         namespace: Option<&str>,
@@ -668,6 +680,28 @@ impl StoreBackedHandler {
             AdmissionDecision::Mutate(v) => Ok(v),
             AdmissionDecision::Deny(reason) => Err(ApiError::Forbidden(reason)),
         }
+    }
+
+    /// Admit the body of a write that IS the stored object (create,
+    /// replace), and normalize what the chain hands back.
+    ///
+    /// A mutating webhook returns a whole new body, which can carry the very
+    /// nulls the border dropped. Upstream decodes a webhook-patched object
+    /// into its Go type again, so the same normalization runs here; a body
+    /// the webhook left mis-shaped is upstream's 500 (the webhook's fault,
+    /// not the client's), not a 400.
+    async fn admit_object_body(
+        &self,
+        key: &ResourceKey,
+        body: Value,
+        user_info: &UserInfo,
+    ) -> Result<Value, ApiError> {
+        let admitted = self
+            .admit_object(ObjectAction::Put, key, body, user_info)
+            .await?;
+        ObjectBody::normalize(&self.group, &self.kind, admitted)
+            .map(ObjectBody::into_value)
+            .map_err(|e| e.admission_error(&self.version, &self.kind))
     }
 
     /// Run the admission chain over a DELETE of `key`. A delete has no body,
@@ -1249,10 +1283,11 @@ impl ResourceHandler for StoreBackedHandler {
     async fn create(
         &self,
         namespace: Option<&str>,
-        body: Value,
+        body: ObjectBody,
         user_info: &UserInfo,
         dry_run: DryRun,
     ) -> Result<Value, ApiError> {
+        let body = body.into_value();
         let name = body
             .get("metadata")
             .and_then(|m| m.get("name"))
@@ -1396,11 +1431,10 @@ impl ResourceHandler for StoreBackedHandler {
         }
         let key = self.key(namespace, &name)?;
         // Admission runs at the API boundary BEFORE any store proposal.
-        // A Mutate replaces the body; a Deny short-circuits with 403. The
+        // A Mutate replaces the body (re-normalized, see
+        // `admit_object_body`); a Deny short-circuits with 403. The
         // authenticated identity travels into AdmissionRequest.user_info.
-        let mut body = self
-            .admit_object(ObjectAction::Put, &key, body, user_info)
-            .await?;
+        let mut body = self.admit_object_body(&key, body, user_info).await?;
         // ── creationTimestamp stamp (DETERMINISM boundary clock read). ──
         // Inject `metadata.creationTimestamp` (if absent) from ONE typed
         // RFC3339 render at the apiserver boundary — the frozen string
@@ -1482,7 +1516,7 @@ impl ResourceHandler for StoreBackedHandler {
         &self,
         namespace: Option<&str>,
         name: &str,
-        body: Value,
+        body: ObjectBody,
         user_info: &UserInfo,
         dry_run: DryRun,
     ) -> Result<Value, ApiError> {
@@ -1495,10 +1529,11 @@ impl ResourceHandler for StoreBackedHandler {
             .await
             .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
         // Admission (Put) at the API boundary BEFORE any store proposal. A
-        // Mutate replaces the body, a Deny short-circuits with 403. The
-        // authenticated identity travels into AdmissionRequest.user_info.
+        // Mutate replaces the body (re-normalized, see `admit_object_body`),
+        // a Deny short-circuits with 403. The authenticated identity travels
+        // into AdmissionRequest.user_info.
         let mut body = self
-            .admit_object(ObjectAction::Put, &key, body, user_info)
+            .admit_object_body(&key, body.into_value(), user_info)
             .await?;
         // A namespaced object's metadata.namespace ALWAYS reflects the ns it
         // lives in (same invariant the create path stamps).

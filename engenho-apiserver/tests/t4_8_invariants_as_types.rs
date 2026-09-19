@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use engenho_apiserver::params::DryRun;
 use engenho_apiserver::{
-    ApiError, ApiServer, ResourceHandler, StoreBackedHandler, handlers_from_catalog,
+    ApiError, ApiServer, ObjectBody, ResourceHandler, StoreBackedHandler, handlers_from_catalog,
 };
 use engenho_controllers::{
     AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionMode, FakeAdmissionWebhook,
@@ -52,6 +52,12 @@ fn pod(name: &str, from: &str) -> serde_json::Value {
         "metadata": { "name": name, "labels": { "from": from } },
         "spec": { "containers": [{ "name": "app", "image": "podinfo:6" }] }
     })
+}
+
+/// A Pod as a create/replace body: normalized at the border, as the router
+/// does for every POST and PUT.
+fn body(v: serde_json::Value) -> ObjectBody {
+    ObjectBody::normalize("", "Pod", v).expect("a well-shaped Pod body")
 }
 
 fn label_from(v: &serde_json::Value) -> Option<&str> {
@@ -124,7 +130,7 @@ async fn create_under_allow_writes_the_body_it_was_given() {
 
     h.create(
         Some("default"),
-        pod("p", "client"),
+        body(pod("p", "client")),
         &UserInfo::default(),
         DryRun::Off,
     )
@@ -147,7 +153,7 @@ async fn replace_under_mutate_writes_the_admitted_body() {
     let h = admitted_pod_handler(&store, &hook);
     h.create(
         Some("default"),
-        pod("p", "seed"),
+        body(pod("p", "seed")),
         &UserInfo::default(),
         DryRun::Off,
     )
@@ -163,7 +169,7 @@ async fn replace_under_mutate_writes_the_admitted_body() {
         .replace(
             Some("default"),
             "p",
-            pod("p", "client"),
+            body(pod("p", "client")),
             &UserInfo::default(),
             DryRun::Off,
         )
@@ -186,7 +192,7 @@ async fn patch_under_mutate_applies_the_admitted_patch() {
     let h = admitted_pod_handler(&store, &hook);
     h.create(
         Some("default"),
-        pod("p", "seed"),
+        body(pod("p", "seed")),
         &UserInfo::default(),
         DryRun::Off,
     )
@@ -232,7 +238,7 @@ async fn patch_under_deny_is_forbidden_and_changes_nothing() {
     let h = admitted_pod_handler(&store, &hook);
     h.create(
         Some("default"),
-        pod("p", "seed"),
+        body(pod("p", "seed")),
         &UserInfo::default(),
         DryRun::Off,
     )
@@ -273,7 +279,7 @@ async fn delete_under_deny_is_forbidden_and_the_object_survives() {
     let h = admitted_pod_handler(&store, &hook);
     h.create(
         Some("default"),
-        pod("p", "seed"),
+        body(pod("p", "seed")),
         &UserInfo::default(),
         DryRun::Off,
     )
@@ -313,7 +319,7 @@ async fn delete_under_mutate_is_admitted_and_removes_the_object() {
     let h = admitted_pod_handler(&store, &hook);
     h.create(
         Some("default"),
-        pod("p", "seed"),
+        body(pod("p", "seed")),
         &UserInfo::default(),
         DryRun::Off,
     )

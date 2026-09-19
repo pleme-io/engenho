@@ -36,7 +36,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use engenho_apiserver::params::DryRun;
-use engenho_apiserver::{ApiError, ResourceHandler, StoreBackedHandler};
+use engenho_apiserver::{ApiError, ObjectBody, ResourceHandler, StoreBackedHandler};
 use engenho_store::{
     ApplyResult, InProcessRouter, Reason, ResourceCommand, ResourceKey, ResourceOp, StoreMesh,
     default_config,
@@ -69,13 +69,18 @@ fn cm_key(name: &str) -> ResourceKey {
     ResourceKey::namespaced("", "v1", "ConfigMap", NS, name)
 }
 
-fn configmap(name: &str, finalizers: &[&str]) -> Value {
-    json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": { "name": name, "namespace": NS, "finalizers": finalizers },
-        "data": { "k": "v" }
-    })
+fn configmap(name: &str, finalizers: &[&str]) -> ObjectBody {
+    ObjectBody::normalize(
+        "",
+        "ConfigMap",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": name, "namespace": NS, "finalizers": finalizers },
+            "data": { "k": "v" }
+        }),
+    )
+    .expect("a well-shaped ConfigMap body")
 }
 
 fn deletion_timestamp(v: &Value) -> Option<&str> {
@@ -184,7 +189,7 @@ async fn an_object_created_with_a_finalizer_after_the_read_still_goes_terminatin
 
     let create = ResourceCommand::put(
         cm_key("late"),
-        configmap("late", &[FINALIZER]),
+        configmap("late", &[FINALIZER]).into_value(),
         Reason::Controller,
     );
     let (created, body) = delete_racing(&store, &h, "late", create, None).await;

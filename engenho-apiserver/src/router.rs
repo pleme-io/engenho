@@ -58,6 +58,7 @@ use crate::discovery;
 use crate::error::ApiError;
 use crate::handler::ResourceHandler;
 use crate::health;
+use crate::object_body::ObjectBody;
 use crate::openapi::ApiDoc;
 use crate::params::{
     DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, error_line,
@@ -966,6 +967,25 @@ fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Valu
     }
 }
 
+/// Decode the body of a write that IS the stored object — a POST (create)
+/// or a PUT on the main object (replace) — and normalize it at the border
+/// (see [`crate::object_body`]). A mis-shaped `metadata` is upstream's 400.
+///
+/// Only these two verbs come through here. A PATCH body goes through
+/// [`decode_patch`] and is never normalized: in a merge patch `null` means
+/// "delete this field" (plan edge 9). A `/status` or `/scale` PUT body is not
+/// the stored object either (only its status, or its replica count, is taken),
+/// so it stays on [`decode_write_body`].
+fn decode_object_body(
+    h: &Arc<dyn ResourceHandler>,
+    headers: &HeaderMap,
+    raw: &[u8],
+) -> Result<ObjectBody, ApiError> {
+    let body = decode_write_body(headers, raw)?;
+    ObjectBody::normalize(h.group(), h.kind(), body)
+        .map_err(|e| e.request_error(h.version(), h.kind()))
+}
+
 /// Decode a PATCH request body AND resolve the typed patch algorithm from the
 /// `Content-Type`. The media type is the load-bearing signal: it tells the
 /// store which of the four algorithms (merge / strategic / json-patch / apply)
@@ -1116,7 +1136,7 @@ async fn do_create(
     user_info: &UserInfo,
     dry_run: DryRun,
 ) -> Result<Response, ApiError> {
-    let body = decode_write_body(headers, raw)?;
+    let body = decode_object_body(h, headers, raw)?;
     let v = h.create(ns, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &handler_gvk(h), StatusCode::CREATED, v)
@@ -1131,7 +1151,7 @@ async fn do_replace(
     user_info: &UserInfo,
     dry_run: DryRun,
 ) -> Result<Response, ApiError> {
-    let body = decode_write_body(headers, raw)?;
+    let body = decode_object_body(h, headers, raw)?;
     let v = h.replace(ns, name, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &handler_gvk(h), StatusCode::OK, v)
@@ -2574,7 +2594,7 @@ mod tests {
         async fn create(
             &self,
             _ns: Option<&str>,
-            _body: serde_json::Value,
+            _body: crate::object_body::ObjectBody,
             _user_info: &engenho_types::auth::UserInfo,
             _dry_run: crate::params::DryRun,
         ) -> Result<serde_json::Value, ApiError> {
