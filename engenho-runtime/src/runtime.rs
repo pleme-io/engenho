@@ -778,7 +778,10 @@ fn stderr_tail(stderr: &[u8]) -> String {
 
 /// Verify at BOOT that a configured container runtime is actually usable.
 ///
-/// The `Fake` backend needs nothing. For `Podman` this runs `podman info`,
+/// A backend the kubelet refuses to construct
+/// ([`KubeletBackendKind::refusal`], T5.9) is refused here FIRST, with that
+/// refusal, before anything is probed. The `Fake` and `Native` backends need
+/// nothing. For `Podman` this runs `podman info`,
 /// which requires a working CONNECTION to the runtime — not merely a binary on
 /// disk.
 ///
@@ -795,6 +798,16 @@ fn stderr_tail(stderr: &[u8]) -> String {
 /// WARN per reconcile tick forever while the API showed pods with no status at
 /// all: a permanently-broken node was indistinguishable from a slow one.
 fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
+    // ★ THE REFUSAL COMES BEFORE ANY PROBE, for every backend. It is decided
+    // from the kind alone and consults nothing on the host, so a refused
+    // backend gets the same verdict on every node. Probing first let the HOST
+    // pick the error: a `cri` node without podman failed on `podman info`,
+    // naming a runtime it was configured not to use, and only a node that
+    // happened to have a working podman got as far as the refusal that says
+    // why (I38, node T5.9).
+    if let Some(refused) = kubelet_backend_kind(config.runtime.kubelet_backend).refusal() {
+        return Err(RuntimeError::BackendRefused(refused));
+    }
     // Exhaustive on purpose. This used to be `if matches!(.., Fake)`, which
     // meant every NEW backend silently inherited a podman probe — and a
     // backend with no podman under it then failed to start with an error
@@ -809,13 +822,17 @@ fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
         // node that cannot reach podman unable to run the backend that does
         // not need it.
         CfgBackendKind::Native => return Ok(()),
-        // ★ A PRE-EXISTING DEFECT, named rather than silently changed: `Cri`
-        // dials its own endpoint (containerd/CRI-O), yet still falls through
-        // to the podman probe below. Left as-is here because rio and plo run
-        // this arm today and changing their startup check is not this
-        // change's business — but a CRI node with no podman installed cannot
-        // currently start.
-        CfgBackendKind::Cri | CfgBackendKind::PodmanApi | CfgBackendKind::Podman => {}
+        // Reached only once the kubelet ADMITS CRI, which today is never: the
+        // refusal above returns while `cri_backend::UNSUPPORTED` is
+        // non-empty. CRI dials its own endpoint (containerd / CRI-O), so there
+        // is no podman under it to probe.
+        //
+        // pending-cri: an admitted CRI still falls back to podman when no CRI
+        // socket answers (`make_container_runtime_with_apiserver`), so the
+        // probe that matches what gets built is "a CRI socket, else podman".
+        // The `a_cri_node_*` tests fail the day CRI is admitted, and say so.
+        CfgBackendKind::Cri => return Ok(()),
+        CfgBackendKind::PodmanApi | CfgBackendKind::Podman => {}
     }
     let binary = config
         .runtime
@@ -866,7 +883,6 @@ fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
     }
 }
 
-/// Construct the container backend from the operator's config choice.
 /// The `kubernetes` Service's address, as `seed_kubernetes_service` creates it.
 ///
 /// The IP is the ClusterIP allocator's FIRST assignment (see that function's
@@ -1083,14 +1099,25 @@ fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
     }
 }
 
-fn build_backend(config: &EngenhoConfig) -> Result<Arc<dyn ContainerRuntime>, RuntimeError> {
-    let kind = match config.runtime.kubelet_backend {
+/// The kubelet's name for the configured backend.
+///
+/// One mapping, read by [`preflight_backend`] for the refusal and by
+/// [`build_backend`] for construction, so the kind that is checked is the kind
+/// that is built. pending-I39: the two enums have identical arms and are to
+/// collapse into one.
+const fn kubelet_backend_kind(kind: CfgBackendKind) -> KubeletBackendKind {
+    match kind {
         CfgBackendKind::Cri => KubeletBackendKind::Cri,
         CfgBackendKind::PodmanApi => KubeletBackendKind::PodmanApi,
         CfgBackendKind::Podman => KubeletBackendKind::Podman,
         CfgBackendKind::Fake => KubeletBackendKind::Fake,
         CfgBackendKind::Native => KubeletBackendKind::Native,
-    };
+    }
+}
+
+/// Construct the container backend from the operator's config choice.
+fn build_backend(config: &EngenhoConfig) -> Result<Arc<dyn ContainerRuntime>, RuntimeError> {
+    let kind = kubelet_backend_kind(config.runtime.kubelet_backend);
     // A node-level fact, set once here rather than resolved per pod — and it
     // must reach the backend, because the kubelet has THREE `backend.start`
     // call sites and stamping any one of them misses the restart path.
@@ -3185,11 +3212,44 @@ mod tests {
         let mut config = super::EngenhoConfig::prescribed_default();
         config.runtime.kubelet_backend = super::CfgBackendKind::Podman;
         config.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
+        let verdict = super::preflight_backend(&config);
         assert!(
-            super::preflight_backend(&config).is_err(),
+            matches!(
+                verdict,
+                Err(super::RuntimeError::ContainerRuntimeUnavailable { .. })
+            ),
             "the probe must still catch a broken podman, or skipping it for \
-             native proves nothing"
+             native proves nothing; and the refusal check before it must not \
+             swallow an admitted backend. Got {verdict:?}"
         );
+    }
+
+    /// ★ I38 / node T5.9: a `cri` node is refused with the kubelet's own
+    /// typed refusal, BEFORE any podman probe.
+    ///
+    /// Regression: preflight probed podman for `Cri`, so a CRI node with no
+    /// podman failed with `ContainerRuntimeUnavailable { backend: "podman" }`,
+    /// an error naming a runtime it was configured not to use, and only a
+    /// node with a working podman reached the refusal. Asserted against a
+    /// podman binary that CANNOT work, so the old order fails here on every
+    /// machine, not only on one without podman.
+    #[test]
+    fn a_cri_node_is_refused_before_any_podman_probe() {
+        let mut config = super::EngenhoConfig::prescribed_default();
+        config.runtime.kubelet_backend = super::CfgBackendKind::Cri;
+        config.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
+        let expected = super::KubeletBackendKind::Cri.refusal().expect(
+            "CRI is refused while cri_backend::UNSUPPORTED is non-empty. Once it is \
+             admitted this premise is gone: give preflight_backend's Cri arm the \
+             probe its pending-cri note names, then rewrite this test",
+        );
+        match super::preflight_backend(&config) {
+            Err(super::RuntimeError::BackendRefused(refused)) => assert_eq!(
+                refused, expected,
+                "the node must carry the kubelet's refusal verbatim"
+            ),
+            other => panic!("a cri node must fail with the typed refusal, got {other:?}"),
+        }
     }
 
     /// ★ The invariant this exists for: pods are never told an address that
