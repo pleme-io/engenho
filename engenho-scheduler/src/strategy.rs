@@ -14,6 +14,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::observed::ObservedNode;
+
 #[async_trait]
 pub trait SchedulingStrategy: Send + Sync {
     /// Stable identifier — telemetry + audit.
@@ -22,10 +24,11 @@ pub trait SchedulingStrategy: Send + Sync {
     /// Pick a node for `pod` from `candidates`. Return `None` if
     /// no candidate is suitable.
     ///
-    /// Both `pod` and `candidates` are full K8s JSON resources
-    /// (the substrate keeps them opaque; per-kind typed handlers
-    /// land at R7.5c).
-    async fn pick<'a>(&self, pod: &'a Value, candidates: &'a [Value]) -> Option<String>;
+    /// `pod` is the full K8s JSON resource. Each candidate is an
+    /// [`ObservedNode`]: its `Ready` condition was derived from its Lease
+    /// by the projection the apiserver serves, so a strategy cannot judge
+    /// readiness from a stored condition.
+    async fn pick<'a>(&self, pod: &'a Value, candidates: &'a [ObservedNode]) -> Option<String>;
 }
 
 /// Blanket impl so the boxed trait object that
@@ -41,7 +44,7 @@ impl SchedulingStrategy for Box<dyn SchedulingStrategy> {
         (**self).name()
     }
 
-    async fn pick<'a>(&self, pod: &'a Value, candidates: &'a [Value]) -> Option<String> {
+    async fn pick<'a>(&self, pod: &'a Value, candidates: &'a [ObservedNode]) -> Option<String> {
         (**self).pick(pod, candidates).await
     }
 }
@@ -49,9 +52,7 @@ impl SchedulingStrategy for Box<dyn SchedulingStrategy> {
 /// Round-robin across schedulable nodes. Cursor advances on every
 /// pick so consecutive pods spread evenly.
 ///
-/// Treats a node as unschedulable when:
-///   * `spec.unschedulable == true` (cordoned)
-///   * `status.conditions[Ready].status != "True"`
+/// Skips every candidate [`is_schedulable`] rejects.
 pub struct RoundRobinStrategy {
     cursor: Mutex<usize>,
 }
@@ -70,7 +71,7 @@ impl RoundRobinStrategy {
         Self::default()
     }
 
-    fn schedulable_nodes<'a>(candidates: &'a [Value]) -> Vec<&'a Value> {
+    fn schedulable_nodes(candidates: &[ObservedNode]) -> Vec<&ObservedNode> {
         candidates.iter().filter(|n| is_schedulable(n)).collect()
     }
 }
@@ -81,7 +82,7 @@ impl SchedulingStrategy for RoundRobinStrategy {
         "round_robin"
     }
 
-    async fn pick<'a>(&self, _pod: &'a Value, candidates: &'a [Value]) -> Option<String> {
+    async fn pick<'a>(&self, _pod: &'a Value, candidates: &'a [ObservedNode]) -> Option<String> {
         let schedulable = Self::schedulable_nodes(candidates);
         if schedulable.is_empty() {
             return None;
@@ -89,78 +90,67 @@ impl SchedulingStrategy for RoundRobinStrategy {
         let mut cursor = self.cursor.lock().unwrap();
         let chosen = &schedulable[*cursor % schedulable.len()];
         *cursor = cursor.wrapping_add(1);
-        chosen
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-            .map(String::from)
+        chosen.name().map(String::from)
     }
 }
 
-/// Returns `true` if the node is healthy + not cordoned.
-pub fn is_schedulable(node: &Value) -> bool {
-    let unsched = node
-        .get("spec")
-        .and_then(|s| s.get("unschedulable"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if unsched {
-        return false;
-    }
-    let conditions = node
-        .get("status")
-        .and_then(|s| s.get("conditions"))
-        .and_then(|c| c.as_array());
-    let Some(conditions) = conditions else {
-        // No status yet — assume schedulable (newly-registered node)
-        return true;
-    };
-    let ready = conditions
-        .iter()
-        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready"));
-    match ready {
-        Some(r) => r.get("status").and_then(|s| s.as_str()) == Some("True"),
-        // No Ready condition yet — assume schedulable
-        None => true,
-    }
+/// A node may take a pod: it is not cordoned, and its Lease-derived
+/// `Ready` status is `"True"`.
+///
+/// There is no "assume schedulable" arm. A node with no conditions, or no
+/// `Ready` condition, used to be treated as newly registered and therefore
+/// schedulable; readiness now comes from the Lease through
+/// [`ObservedNode::project`], so a node that has never heartbeat reads
+/// `Unknown` and a node whose heartbeat went stale reads `Unknown` even
+/// when storage still says `Ready=True`. Neither takes a pod.
+#[must_use]
+pub fn is_schedulable(node: &ObservedNode) -> bool {
+    !node.is_cordoned() && node.is_ready()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engenho_controllers::node_lease::lease_value;
     use serde_json::json;
 
-    fn ready_node(name: &str) -> Value {
+    const NOW: &str = "2026-09-19T12:00:00Z";
+
+    /// A lease renewed just now.
+    fn fresh(name: &str) -> Value {
+        lease_value(name, &engenho_types::time::now_rfc3339_utc(), 0)
+    }
+
+    /// A lease last renewed years ago: far past the grace period.
+    fn stale(name: &str) -> Value {
+        lease_value(name, "2020-01-01T00:00:00Z", 0)
+    }
+
+    fn node(name: &str, unschedulable: bool, stored_ready: &str) -> Value {
         json!({
             "kind": "Node",
             "apiVersion": "v1",
             "metadata": { "name": name },
-            "spec": { "unschedulable": false },
+            "spec": { "unschedulable": unschedulable },
             "status": {
-                "conditions": [{ "type": "Ready", "status": "True" }]
+                "conditions": [{ "type": "Ready", "status": stored_ready }]
             }
         })
     }
 
-    fn unready_node(name: &str) -> Value {
-        json!({
-            "kind": "Node",
-            "apiVersion": "v1",
-            "metadata": { "name": name },
-            "status": {
-                "conditions": [{ "type": "Ready", "status": "False" }]
-            }
-        })
+    /// Stored Ready=True and a fresh lease.
+    fn ready_node(name: &str) -> ObservedNode {
+        ObservedNode::project(node(name, false, "True"), Some(&fresh(name)), NOW)
     }
 
-    fn cordoned_node(name: &str) -> Value {
-        json!({
-            "kind": "Node",
-            "apiVersion": "v1",
-            "metadata": { "name": name },
-            "spec": { "unschedulable": true },
-            "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
-        })
+    /// Stored Ready=True, but the heartbeat stopped long ago.
+    fn stale_node(name: &str) -> ObservedNode {
+        ObservedNode::project(node(name, false, "True"), Some(&stale(name)), NOW)
+    }
+
+    /// Heartbeating, but cordoned.
+    fn cordoned_node(name: &str) -> ObservedNode {
+        ObservedNode::project(node(name, true, "True"), Some(&fresh(name)), NOW)
     }
 
     fn pending_pod() -> Value {
@@ -173,14 +163,50 @@ mod tests {
     #[test]
     fn is_schedulable_classifies_correctly() {
         assert!(is_schedulable(&ready_node("a")));
-        assert!(!is_schedulable(&unready_node("b")));
+        assert!(!is_schedulable(&stale_node("b")));
         assert!(!is_schedulable(&cordoned_node("c")));
     }
 
     #[test]
-    fn is_schedulable_assumes_true_when_no_status() {
-        let n = json!({"metadata": {"name": "x"}});
-        assert!(is_schedulable(&n));
+    fn a_stale_lease_is_not_schedulable_even_when_storage_says_ready() {
+        // The stored condition is the value a wedged kubelet leaves behind.
+        // The scheduler must agree with what the apiserver serves: Unknown.
+        let n = stale_node("wedged");
+        assert!(!is_schedulable(&n), "{:#}", n.value());
+    }
+
+    #[test]
+    fn a_node_with_no_conditions_and_no_lease_is_not_schedulable() {
+        // Was: "no status yet, assume schedulable". A node nobody has heard
+        // from is Unknown, not ready.
+        let n = ObservedNode::project(json!({ "metadata": { "name": "x" } }), None, NOW);
+        assert!(!is_schedulable(&n), "{:#}", n.value());
+    }
+
+    #[test]
+    fn a_node_with_no_ready_condition_and_no_lease_is_not_schedulable() {
+        // Was: "no Ready condition yet, assume schedulable".
+        let n = ObservedNode::project(
+            json!({
+                "metadata": { "name": "x" },
+                "status": { "conditions": [{ "type": "MemoryPressure", "status": "False" }] }
+            }),
+            None,
+            NOW,
+        );
+        assert!(!is_schedulable(&n), "{:#}", n.value());
+    }
+
+    #[test]
+    fn a_fresh_lease_makes_a_node_without_a_stored_ready_schedulable() {
+        // The positive control: readiness is DERIVED, so a registering node
+        // is schedulable as soon as it heartbeats.
+        let n = ObservedNode::project(
+            json!({ "metadata": { "name": "x" } }),
+            Some(&fresh("x")),
+            NOW,
+        );
+        assert!(is_schedulable(&n), "{:#}", n.value());
     }
 
     #[tokio::test]
@@ -188,8 +214,7 @@ mod tests {
         let strategy = RoundRobinStrategy::new();
         let nodes = vec![ready_node("a"), ready_node("b"), ready_node("c")];
         let pod = pending_pod();
-        // 3 picks → a, b, c (in BTreeMap-sorted order over input, but
-        // round-robin actually iterates in input order from the candidates list)
+        // Round-robin iterates the candidates in input order.
         let pick1 = strategy.pick(&pod, &nodes).await;
         let pick2 = strategy.pick(&pod, &nodes).await;
         let pick3 = strategy.pick(&pod, &nodes).await;
@@ -206,7 +231,7 @@ mod tests {
         let nodes = vec![
             cordoned_node("a"),
             ready_node("b"),
-            unready_node("c"),
+            stale_node("c"),
             ready_node("d"),
         ];
         let pod = pending_pod();
@@ -219,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn round_robin_returns_none_when_no_candidates() {
         let strategy = RoundRobinStrategy::new();
-        let nodes = vec![cordoned_node("a"), unready_node("b")];
+        let nodes = vec![cordoned_node("a"), stale_node("b")];
         let pod = pending_pod();
         assert!(strategy.pick(&pod, &nodes).await.is_none());
     }

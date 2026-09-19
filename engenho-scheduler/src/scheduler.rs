@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use engenho_controllers::node_lease::lease_key;
 use engenho_controllers::{Controller, ControllerError, ReconcileOutcome, ReconcileReport};
 use engenho_store::{
     StoreMesh,
@@ -15,6 +16,7 @@ use tracing::{debug, info, warn};
 use crate::error::SchedulerError;
 use crate::fit::pod_requests;
 use crate::ledger::{NodeLedger, node_name_of};
+use crate::observed::ObservedNode;
 use crate::strategy::SchedulingStrategy;
 
 /// The scheduler.
@@ -41,7 +43,8 @@ impl Scheduler {
 
     /// One reconcile tick.
     ///
-    /// 1. List all Pods (matching namespace filter) + all Nodes.
+    /// 1. List all Pods (matching namespace filter) + all Nodes, and
+    ///    derive each Node's `Ready` from its Lease ([`Self::observe`]).
     /// 2. Open a [`NodeLedger`]: each Node's allocatable minus the
     ///    effective requests of every pod bound there that still holds
     ///    capacity (the resource-fit **Filter** stage's accumulator).
@@ -73,13 +76,15 @@ impl Scheduler {
         report.pods_examined = pods.len();
         report.nodes_available = nodes.len();
 
-        let node_values: Vec<Value> = nodes.iter().map(|(_, v)| v.clone()).collect();
+        let node_values: Vec<Value> = nodes.into_iter().map(|(_, v)| v).collect();
 
         // Open the books over EVERY pod (cluster-wide, not just the
         // namespace-scoped pending set): a pod bound in another namespace
         // still occupies its node.
         let all_pods = self.store.list("", "v1", "Pod", None).await;
         let mut ledger = NodeLedger::seed(&node_values, all_pods.iter().map(|(_, v)| v));
+
+        let observed = self.observe(node_values).await;
 
         for (pod_key, pod_value) in &pods {
             if !is_pending(pod_value) {
@@ -90,9 +95,9 @@ impl Scheduler {
             // Resource-fit Filter: restrict candidates to nodes that fit
             // THIS pod's request given the ledger's current balances.
             let req = pod_requests(pod_value);
-            let fitting: Vec<Value> = node_values
+            let fitting: Vec<ObservedNode> = observed
                 .iter()
-                .filter(|n| node_name_of(n).is_some_and(|name| ledger.fits(name, &req)))
+                .filter(|n| n.name().is_some_and(|name| ledger.fits(name, &req)))
                 .cloned()
                 .collect();
 
@@ -151,6 +156,31 @@ impl Scheduler {
             );
         }
         Ok(report)
+    }
+
+    /// Derive each Node's `Ready` condition from its Lease.
+    ///
+    /// This is the apiserver's Node read path, run by the scheduler: the
+    /// Lease is read by [`lease_key`] straight from the store and handed to
+    /// the one projection
+    /// ([`engenho_controllers::node_lease::project_ready_condition`], through
+    /// [`ObservedNode::project`]). The scheduler therefore places pods by the
+    /// same `Ready` that `kubectl get node` shows, never by the condition
+    /// storage happens to hold.
+    ///
+    /// One `now` for the whole tick, so every node is judged at one instant.
+    /// A node with no name has no Lease to look up and reads `Unknown`.
+    async fn observe(&self, nodes: Vec<Value>) -> Vec<ObservedNode> {
+        let now = engenho_types::time::now_rfc3339_utc();
+        let mut observed = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let lease = match node_name_of(&node) {
+                Some(name) => self.store.get(&lease_key(name)).await,
+                None => None,
+            };
+            observed.push(ObservedNode::project(node, lease.as_ref(), &now));
+        }
+        observed
     }
 
     /// Write a typed `PodScheduled=False / reason=Unschedulable` status
@@ -247,9 +277,9 @@ pub struct TickReport {
     pub pods_examined: usize,
     pub nodes_available: usize,
     pub pending_pods: usize,
-    /// Pending pods left unbound because NO schedulable node existed at
-    /// all (every node cordoned / not-Ready). Distinct from
-    /// `unschedulable_no_fit`.
+    /// Pending pods left unbound because no node that fit them was
+    /// schedulable: each was cordoned, or its Lease-derived `Ready` was not
+    /// `True`. Distinct from `unschedulable_no_fit`.
     pub skipped_no_node: usize,
     /// Pending pods left unbound because no node had enough free
     /// cpu/memory to fit the pod's requests. Each such pod gets a typed

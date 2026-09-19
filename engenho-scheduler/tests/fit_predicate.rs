@@ -8,6 +8,8 @@
 //! Boot pattern copied from `r8_end_to_end.rs` (real openraft single-node
 //! + real ResourceCatalog + real RoundRobinStrategy).
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +35,11 @@ async fn boot_store() -> Arc<StoreMesh> {
 }
 
 /// Put a Ready, schedulable node with the given cpu/memory allocatable.
+///
+/// "Ready" means a fresh Lease: the scheduler derives `Ready` from the
+/// heartbeat, not from the stored condition.
 async fn put_sized_node(store: &StoreMesh, name: &str, cpu: &str, memory: &str) {
+    common::put_fresh_lease(store, name).await;
     store
         .propose(ResourceCommand::Put {
             key: ResourceKey::cluster_scoped("", "v1", "Node", name),

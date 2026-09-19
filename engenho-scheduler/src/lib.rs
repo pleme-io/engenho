@@ -23,10 +23,13 @@
 //!         ↓
 //!   filter: spec.nodeName missing OR empty
 //!         ↓
+//!   candidates ← StoreMesh::list("", "v1", "Node", None)
+//!     each Node's Ready derived from its Lease (ObservedNode::project)
+//!         ↓
 //!   for each pending pod:
-//!     candidates ← StoreMesh::list("", "v1", "Node", None)
-//!     filter: not Quarantined, not unschedulable
-//!     SchedulingStrategy::pick(pod, candidates) → NodeBinding
+//!     filter: fits the node's remaining capacity
+//!     SchedulingStrategy::pick(pod, candidates)
+//!       (skips cordoned nodes and nodes whose derived Ready is not True)
 //!         ↓
 //!     StoreMesh::propose(Patch { key=pod_key, patch={"spec":{"nodeName":"node-X"}}})
 //! ```
@@ -42,6 +45,7 @@ pub mod config_bridge;
 pub mod error;
 pub mod fit;
 pub mod ledger;
+pub mod observed;
 pub mod predicates;
 pub mod preemption;
 pub mod scheduler;
@@ -51,5 +55,6 @@ pub use config_bridge::make_scheduling_strategy;
 pub use error::SchedulerError;
 pub use fit::{NodeResources, PodRequests, fits, node_allocatable, pod_requests};
 pub use ledger::{CapacityHold, Headroom, NodeLedger, holds_capacity};
+pub use observed::ObservedNode;
 pub use scheduler::{Scheduler, TickReport};
 pub use strategy::{RoundRobinStrategy, SchedulingStrategy};

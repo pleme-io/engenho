@@ -5,6 +5,8 @@
 //! RoundRobinStrategy. The test is the architectural proof that
 //! the engenho substrate hosts production K8s controllers.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +16,7 @@ use engenho_store::{
     command::{Reason, ResourceCommand},
     default_config,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 async fn boot_store() -> Arc<StoreMesh> {
     let router = InProcessRouter::new();
@@ -29,13 +31,28 @@ async fn boot_store() -> Arc<StoreMesh> {
     store
 }
 
+/// A heartbeating node that stores `Ready=True`.
 async fn put_node(store: &StoreMesh, name: &str) {
+    put_node_storing(store, name, json!([{ "type": "Ready", "status": "True" }])).await;
+    common::put_fresh_lease(store, name).await;
+}
+
+/// Write only the Node object, with `conditions` as its stored
+/// `status.conditions` (`Value::Null` omits the field). No Lease.
+async fn put_node_storing(store: &StoreMesh, name: &str, conditions: Value) {
     // Nodes now advertise status.allocatable (M0.1 item 10): the
     // resource-fit predicate treats absent allocatable as zero-free, so a
     // realistic node carries cpu/memory. (The pods these tests bind
     // request NOTHING, so they'd fit even a zero-sized node — but a sized
     // node is the truthful shape + guards the predicate doesn't reject a
     // zero-request pod against a sized node.)
+    let mut status = json!({
+        "capacity": { "cpu": "4", "memory": "8Gi" },
+        "allocatable": { "cpu": "4", "memory": "8Gi" },
+    });
+    if !conditions.is_null() {
+        status["conditions"] = conditions;
+    }
     store
         .propose(ResourceCommand::Put {
             key: ResourceKey::cluster_scoped("", "v1", "Node", name),
@@ -44,11 +61,7 @@ async fn put_node(store: &StoreMesh, name: &str) {
                 "apiVersion": "v1",
                 "metadata": { "name": name },
                 "spec": { "unschedulable": false },
-                "status": {
-                    "capacity": { "cpu": "4", "memory": "8Gi" },
-                    "allocatable": { "cpu": "4", "memory": "8Gi" },
-                    "conditions": [{ "type": "Ready", "status": "True" }]
-                }
+                "status": status,
             }),
             expected: None,
             reason: Reason::Operator,
@@ -202,6 +215,8 @@ async fn scheduler_reports_skipped_when_no_schedulable_nodes() {
         })
         .await
         .unwrap();
+    // Heartbeating, so the CORDON is what keeps the pod off it.
+    common::put_fresh_lease(&store, "cordoned").await;
     put_pending_pod(&store, "lonely").await;
 
     let sched = Scheduler::new(store.clone(), RoundRobinStrategy::new(), None);
@@ -257,4 +272,110 @@ async fn scheduler_namespace_filter_works() {
     drop(sched);
     let mesh = Arc::try_unwrap(store).ok().expect("only owner left");
     mesh.terminate().await.unwrap();
+}
+
+// =================================================================
+// T1.3d: the scheduler reads readiness through the Lease projection
+// =================================================================
+
+/// Tick once over one pending pod and return (report, where it landed).
+async fn schedule_one(store: &Arc<StoreMesh>) -> (engenho_scheduler::TickReport, Option<String>) {
+    put_pending_pod(store, "p").await;
+    let sched = Scheduler::new(store.clone(), RoundRobinStrategy::new(), None);
+    let report = sched.tick().await.unwrap();
+    drop(sched);
+    (report, pod_node_name(store, "p").await)
+}
+
+async fn teardown(store: Arc<StoreMesh>) {
+    let mesh = Arc::try_unwrap(store).ok().expect("only owner left");
+    mesh.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_node_whose_lease_went_stale_gets_no_pod_though_storage_says_ready() {
+    // The rio failure: the kubelet wedged and the Node kept its last
+    // published Ready=True. The apiserver serves Unknown for it; the
+    // scheduler must not place onto it either.
+    let store = boot_store().await;
+    put_node_storing(
+        &store,
+        "wedged",
+        json!([{ "type": "Ready", "status": "True" }]),
+    )
+    .await;
+    common::put_lease(&store, "wedged", common::STALE_RENEW_TIME).await;
+
+    let (report, landed) = schedule_one(&store).await;
+    assert_eq!(landed, None, "a pod was bound to a node with a stale lease");
+    assert_eq!(report.bound.len(), 0);
+    assert_eq!(report.skipped_no_node, 1);
+    teardown(store).await;
+}
+
+#[tokio::test]
+async fn a_node_with_no_conditions_and_no_lease_gets_no_pod() {
+    // Was "no status yet, assume schedulable". Nobody has heard from this
+    // node, so its Ready is Unknown.
+    let store = boot_store().await;
+    put_node_storing(&store, "silent", Value::Null).await;
+
+    let (report, landed) = schedule_one(&store).await;
+    assert_eq!(landed, None, "a pod was bound to a node never heard from");
+    assert_eq!(report.skipped_no_node, 1);
+    teardown(store).await;
+}
+
+#[tokio::test]
+async fn a_node_with_no_ready_condition_and_no_lease_gets_no_pod() {
+    // Was "no Ready condition yet, assume schedulable".
+    let store = boot_store().await;
+    put_node_storing(
+        &store,
+        "silent",
+        json!([{ "type": "MemoryPressure", "status": "False" }]),
+    )
+    .await;
+
+    let (report, landed) = schedule_one(&store).await;
+    assert_eq!(landed, None, "a pod was bound to a node never heard from");
+    assert_eq!(report.skipped_no_node, 1);
+    teardown(store).await;
+}
+
+#[tokio::test]
+async fn a_fresh_lease_makes_a_node_stored_unknown_schedulable() {
+    // The shape a node registers with (Ready=Unknown, never updated). Its
+    // first heartbeat makes it schedulable, whether or not the kubelet has
+    // republished the Node yet: readiness is derived, not stored.
+    let store = boot_store().await;
+    put_node_storing(
+        &store,
+        "booting",
+        json!([{ "type": "Ready", "status": "Unknown", "reason": "NodeStatusNeverUpdated" }]),
+    )
+    .await;
+    common::put_fresh_lease(&store, "booting").await;
+
+    let (report, landed) = schedule_one(&store).await;
+    assert_eq!(landed.as_deref(), Some("booting"), "{report:?}");
+    teardown(store).await;
+}
+
+#[tokio::test]
+async fn with_a_live_node_available_the_pod_never_lands_on_the_wedged_one() {
+    // Sorted first, so a scheduler reading storage would pick it.
+    let store = boot_store().await;
+    put_node_storing(
+        &store,
+        "a-wedged",
+        json!([{ "type": "Ready", "status": "True" }]),
+    )
+    .await;
+    common::put_lease(&store, "a-wedged", common::STALE_RENEW_TIME).await;
+    put_node(&store, "b-live").await;
+
+    let (report, landed) = schedule_one(&store).await;
+    assert_eq!(landed.as_deref(), Some("b-live"), "{report:?}");
+    teardown(store).await;
 }
