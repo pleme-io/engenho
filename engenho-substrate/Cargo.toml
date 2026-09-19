@@ -10,15 +10,18 @@ readme.workspace = true
 categories.workspace = true
 keywords.workspace = true
 authors.workspace = true
-description = "engenho-substrate — shared helpers extracted to the third-site rule. atomic_write (fsync-anchored tmp+rename), magic-headered blob encoding, file-format versioning. The substrate building blocks that compose under engenho-store::persistence, kasou's machine-identifier, and tend's daemon state."
+description = "engenho-substrate — the substrate leaf: every module a shipped engenho crate references (derivations and caches, receipts, quorum, ledgers, verifiers, rollout gates, freshness, owned tasks), with engenho-substrate-core re-exported whole so every engenho_substrate:: path keeps resolving."
 
 [dependencies]
+# The tokio-free core. Re-exported whole from lib.rs. The path + version
+# pair is what `[workspace.dependencies]` would hold; it lives here until
+# the root manifest lists the substrate family.
+engenho-substrate-core = { path = "../engenho-substrate-core", version = "0.53.118" }
 async-trait        = { workspace = true }
 futures            = { workspace = true }
 thiserror          = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
-serde_yaml         = { workspace = true }
 tokio              = { workspace = true, features = ["sync", "macros", "rt"] }
 blake3             = "1"
 

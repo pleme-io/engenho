@@ -12,15 +12,27 @@ categories.workspace = true
 keywords.workspace = true
 description = "engenho-teia — the NATS fabric layer for engenho. Carries Raft RPC, watch streams, content sync, attestation receipts, and observability events across one typed transport. See docs/FABRIC.md."
 
+# ── NATS is fenced off, not deleted (docs/IMPROVEMENT-PLAN.md §5.1) ──────
+# A NATS server is a second process every node would need: a sidecar under
+# another name, which the one-binary rule forbids. engenho's fabric is
+# `fabric: in_binary` (engenho-config). teia stays as a typed draft: its
+# subject grammar and connection config build with no feature; the client
+# that dials NATS, and every crate it pulls in, exists only under
+# `teia-nats`. Off by default; CI builds with `--all-features`.
+# `tests/nats_fence.rs` fails if a default build can reach async-nats again.
+[features]
+default = []
+teia-nats = ["dep:async-nats", "dep:futures", "dep:tokio", "dep:tracing"]
+
 [dependencies]
-async-nats         = { workspace = true }
+async-nats         = { workspace = true, optional = true }
 async-trait        = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 thiserror          = { workspace = true }
-tokio              = { workspace = true }
-tracing            = { workspace = true }
-futures            = { workspace = true }
+tokio              = { workspace = true, optional = true }
+tracing            = { workspace = true, optional = true }
+futures            = { workspace = true, optional = true }
 anyhow             = { workspace = true }
 
 engenho-types      = { workspace = true }
@@ -28,3 +40,6 @@ engenho-config     = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+# tests/nats_fence.rs reads this manifest; same 0.8 line the workspace
+# already resolves (engenho-fonte-cli, engenho-substrate-core).
+toml = "0.8"

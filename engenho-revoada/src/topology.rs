@@ -31,8 +31,10 @@
 //! Strategies are pluggable — operators can also implement
 //! [`TopologyStrategy`] for custom shapes.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::num::NonZeroUsize;
 
+use engenho_substrate::Tally;
 use serde::{Deserialize, Serialize};
 
 /// Typed role identifier. Every node holds 0 or 1 of these.
@@ -201,23 +203,39 @@ impl RoleAssignment {
             .count()
     }
 
-    /// **Not a majority check yet.** A voting node is always
-    /// `Active`, and every `Active` node is eligible, so the
-    /// eligible-voting count always equals the voting count and this
-    /// returns `true` whenever at least one voter exists. Nothing
-    /// calls it. A real check needs the configured voter set to count
-    /// against; revoada's split-brain safety waits on it
-    /// (docs/IMPROVEMENT-PLAN.md §5.3).
+    /// The configured voter set: every node whose committed role votes
+    /// (Master or Bootstrap).
     #[must_use]
-    pub fn has_majority(&self) -> bool {
-        let voting = self.voting_count();
-        let eligible_voting: usize = self
-            .assignments
+    pub fn voters(&self) -> BTreeSet<&NodeId> {
+        self.assignments
             .iter()
-            .filter(|(_, s)| s.is_eligible() && s.role().map(Role::is_voting).unwrap_or(false))
-            .count();
-        voting > 0 && voting * 2 > eligible_voting.saturating_sub(voting).max(0)
-            || (voting > 0 && eligible_voting <= 1)
+            .filter(|(_, s)| s.role().is_some_and(Role::is_voting))
+            .map(|(n, _)| n)
+            .collect()
+    }
+
+    /// True when `reachable` holds a strict majority of the configured
+    /// voters (`voters / 2 + 1` of them). It counts through the one
+    /// quorum fold ([`Tally`]): a reachable node that is not a
+    /// configured voter does not count, a node listed twice counts
+    /// once, and an assignment with no voters has no majority.
+    ///
+    /// A majority check is not a safety property on its own. The
+    /// promotion path does not call this yet, and the votes it would
+    /// count are not durable (docs/IMPROVEMENT-PLAN.md §5.3).
+    #[must_use]
+    pub fn has_majority<'a>(&self, reachable: impl IntoIterator<Item = &'a NodeId>) -> bool {
+        let voters = self.voters();
+        let Some(configured) = NonZeroUsize::new(voters.len()) else {
+            return false;
+        };
+        let mut tally = Tally::majority_of(configured);
+        for node in reachable {
+            if voters.contains(node) {
+                tally.record(node, ());
+            }
+        }
+        tally.verdict().is_reached()
     }
 }
 
@@ -738,6 +756,18 @@ impl TopologyReactor {
         let current = self.current.lock().unwrap().clone();
         let mut tx = Vec::new();
 
+        // A node listed twice is one node: it must neither count twice
+        // toward the strategy's minimum nor be handed to `assign` twice
+        // (which would re-assign it a second role). First-seen order is
+        // kept, because `assign` gives roles in list order.
+        let mut seen = HashSet::new();
+        let eligible_now: Vec<NodeId> = eligible_now
+            .iter()
+            .filter(|id| seen.insert(*id))
+            .cloned()
+            .collect();
+        let eligible_now = eligible_now.as_slice();
+
         // 1. Admit new eligible nodes.
         for id in eligible_now {
             if current.get(id).is_none() {
@@ -752,7 +782,7 @@ impl TopologyReactor {
         // from {N standby nodes} to {target shape} in a single
         // observe_membership call.
         let no_active_masters = current.nodes_with_role(Role::Master).is_empty();
-        if no_active_masters && eligible_now.len() >= self.strategy.min_nodes() {
+        if no_active_masters && self.enough_to_form(eligible_now) {
             if let Ok(target) = self.strategy.assign(eligible_now) {
                 for (id, state) in &target.assignments {
                     if let Some(role) = state.role() {
@@ -795,6 +825,21 @@ impl TopologyReactor {
             }
         }
         tx
+    }
+
+    /// True when `eligible` holds at least the strategy's minimum of
+    /// distinct nodes, counted through the one quorum fold ([`Tally`]).
+    /// A strategy that needs no nodes is always satisfiable here; its
+    /// own `assign` decides.
+    fn enough_to_form(&self, eligible: &[NodeId]) -> bool {
+        let Some(min) = NonZeroUsize::new(self.strategy.min_nodes()) else {
+            return true;
+        };
+        let mut tally = Tally::new(min);
+        for id in eligible {
+            tally.record(id, ());
+        }
+        tally.verdict().is_reached()
     }
 
     /// Apply a committed transition to the local view. Called by
@@ -1060,6 +1105,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── has_majority: counts reachable voters against the configured set ──
+    //
+    // It used to return true whenever any voter existed, whatever was
+    // reachable. It now folds through the one quorum fold.
+
+    fn five_voters_two_workers() -> (RoleAssignment, Vec<NodeId>, Vec<NodeId>) {
+        let voters = ids(5);
+        let workers = vec![NodeId::new("w-0"), NodeId::new("w-1")];
+        let mut a = RoleAssignment::new();
+        for v in &voters {
+            a.set(v.clone(), NodeState::Active(Role::Master));
+        }
+        for w in &workers {
+            a.set(w.clone(), NodeState::Active(Role::Worker));
+        }
+        (a, voters, workers)
+    }
+
+    #[test]
+    fn has_majority_needs_a_strict_majority_of_configured_voters() {
+        let (a, v, _) = five_voters_two_workers();
+        assert!(!a.has_majority(&v[..2]), "2 of 5 voters is a minority");
+        assert!(a.has_majority(&v[..3]), "3 of 5 voters is a majority");
+        assert!(a.has_majority(&v), "all voters is a majority");
+        assert!(!a.has_majority([]), "nothing reachable is no majority");
+    }
+
+    #[test]
+    fn has_majority_ignores_reachable_non_voters() {
+        let (a, v, w) = five_voters_two_workers();
+        let reachable: Vec<&NodeId> = v[..2].iter().chain(&w).collect();
+        assert!(
+            !a.has_majority(reachable),
+            "2 voters + 2 workers is still 2 of 5 voters"
+        );
+        let stranger = NodeId::new("not-in-the-assignment");
+        let reachable: Vec<&NodeId> = v[..2].iter().chain([&stranger]).collect();
+        assert!(!a.has_majority(reachable));
+    }
+
+    #[test]
+    fn has_majority_counts_a_voter_listed_twice_once() {
+        let (a, v, _) = five_voters_two_workers();
+        let reachable = [&v[0], &v[0], &v[1], &v[1]];
+        assert!(!a.has_majority(reachable));
+    }
+
+    #[test]
+    fn has_majority_is_false_on_an_even_split() {
+        let mut a = RoleAssignment::new();
+        let v = ids(4);
+        for n in &v {
+            a.set(n.clone(), NodeState::Active(Role::Master));
+        }
+        assert!(!a.has_majority(&v[..2]), "2 of 4 is not a strict majority");
+        assert!(a.has_majority(&v[..3]));
+    }
+
+    #[test]
+    fn has_majority_counts_only_active_voting_roles() {
+        let mut a = RoleAssignment::new();
+        let v = ids(3);
+        a.set(v[0].clone(), NodeState::Active(Role::Bootstrap));
+        a.set(v[1].clone(), NodeState::Failed);
+        a.set(v[2].clone(), NodeState::Standby);
+        assert_eq!(a.voters().len(), 1, "only the bootstrap node votes");
+        assert!(a.has_majority(&v[..1]));
+        assert!(!a.has_majority(&v[1..]));
+        assert!(
+            !RoleAssignment::new().has_majority(&v),
+            "no voters, no majority"
+        );
+    }
+
+    // ── observe_membership: the bootstrap promotion gate ──
+    //
+    // The gate compared the length of the eligible list with the
+    // strategy's minimum, so one node listed three times satisfied a
+    // three-node Quorum3M. It now counts distinct nodes through the
+    // one quorum fold, and hands `assign` a list without repeats.
+
+    #[test]
+    fn a_node_listed_three_times_does_not_bootstrap_quorum_3m() {
+        let r = TopologyReactor::new(Box::new(Quorum3M));
+        let a = NodeId::new("a");
+        let tx = r.observe_membership(&[a.clone(), a.clone(), a.clone()], &[]);
+        assert_eq!(
+            tx,
+            vec![Transition::Admit(a)],
+            "one node is one admit, no promotion"
+        );
+    }
+
+    #[test]
+    fn a_repeated_node_is_not_assigned_a_second_role() {
+        let r = TopologyReactor::new(Box::new(Quorum3M));
+        let n = ids(3);
+        let listed = [n[0].clone(), n[1].clone(), n[2].clone(), n[0].clone()];
+        let tx = r.observe_membership(&listed, &[]);
+        r.apply_transitions(&tx);
+        let current = r.current();
+        assert_eq!(current.voting_count(), 3, "{tx:?}");
+        assert!(Quorum3M.validate(&current).is_ok(), "{current:?}");
     }
 
     fn strategies() -> Vec<Box<dyn TopologyStrategy>> {

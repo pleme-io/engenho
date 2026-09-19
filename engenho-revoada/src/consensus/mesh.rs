@@ -22,6 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use engenho_substrate::{OwnedTask, TaskStop};
 use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
@@ -66,7 +67,10 @@ pub struct RaftMesh {
     node_id: RaftNodeId,
     listen_addr: String,
     router: InProcessRouter,
-    rpc_task: tokio::task::JoinHandle<()>,
+    /// The inbound-RPC pump. It holds a `Raft` clone and this node's RPC
+    /// receiver, so [`RaftMesh::terminate`] stops it and AWAITS it before
+    /// shutting the core down; dropping the mesh aborts it.
+    rpc_task: OwnedTask,
     /// Ed25519 keypair (clone — store owns the canonical copy).
     /// Exposed via `node_identity()` so external callers can sign
     /// detached payloads (e.g. saguão passport requests).
@@ -122,7 +126,7 @@ impl RaftMesh {
         // Spawn the request-handler loop that pumps incoming RPCs
         // from peers (via the router) into the local Raft instance.
         let raft_for_rpc = raft.clone();
-        let rpc_task = tokio::spawn(async move {
+        let rpc_task = OwnedTask::spawn(async move {
             while let Some(req) = rx_rpc.recv().await {
                 match req {
                     RpcRequest::AppendEntries(rpc, reply) => {
@@ -291,9 +295,20 @@ impl RaftMesh {
     }
 
     /// Stop the Raft node + drop the router registration.
+    ///
+    /// On return the inbound-RPC pump is gone: its `Raft` clone and its RPC
+    /// receiver have been dropped, so a peer still holding a route to this
+    /// node sees it closed. Aborting the pump without awaiting it only held
+    /// that by luck — when the core's own shutdown happened to yield — and a
+    /// core that had already stopped (as after a fatal error) does not yield.
     pub async fn terminate(self) -> Result<(), RaftError> {
         self.router.deregister(self.node_id).await;
-        self.rpc_task.abort();
+        if self.rpc_task.stop().await == TaskStop::Panicked {
+            tracing::error!(
+                node_id = self.node_id,
+                "raft RPC pump had panicked before terminate; inbound RPCs were not being served"
+            );
+        }
         // openraft's `shutdown` is the canonical termination signal.
         let _ = self.raft.shutdown().await;
         Ok(())
@@ -316,4 +331,73 @@ pub fn default_config(cluster_name: &str) -> Result<Arc<Config>, RaftError> {
         .validate()
         .map_err(|e| RaftError::ConfigInvalid(e.to_string()))?;
     Ok(Arc::new(validated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generous: only a pump that is never stopped exceeds it.
+    const PUMP_GONE_WITHIN: Duration = Duration::from_secs(5);
+
+    async fn started_mesh(router: &InProcessRouter, node_id: RaftNodeId) -> RaftMesh {
+        let config = default_config("owned-rpc-pump").expect("valid test config");
+        RaftMesh::start(node_id, "in-process://1".into(), router.clone(), config)
+            .await
+            .expect("mesh starts")
+    }
+
+    /// A peer that looked up this node's route before `terminate` must see
+    /// that route closed the moment `terminate` returns. The core is stopped
+    /// first, as after a fatal error: then shutdown has nothing to wait on,
+    /// which is exactly when an un-awaited abort let `terminate` return with
+    /// the pump still alive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminate_closes_a_peers_route_even_when_the_core_had_already_stopped() {
+        let router = InProcessRouter::new();
+        let mesh = started_mesh(&router, 1).await;
+        let peer_route = router.lookup(1).await.expect("node 1 is registered");
+
+        mesh.raft.shutdown().await.expect("core stops");
+        mesh.terminate().await.expect("terminate");
+
+        assert!(
+            peer_route.is_closed(),
+            "terminate returned while the RPC pump still held this node's receiver"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminate_closes_a_peers_route_with_the_core_running() {
+        let router = InProcessRouter::new();
+        let mesh = started_mesh(&router, 1).await;
+        let peer_route = router.lookup(1).await.expect("node 1 is registered");
+
+        mesh.terminate().await.expect("terminate");
+
+        assert!(
+            peer_route.is_closed(),
+            "terminate returned while the RPC pump still held this node's receiver"
+        );
+    }
+
+    /// A mesh dropped without `terminate` must not leave its pump running
+    /// forever, holding a `Raft` clone and serving a node nobody owns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_mesh_stops_its_rpc_pump() {
+        let router = InProcessRouter::new();
+        let mesh = started_mesh(&router, 1).await;
+        // The router keeps its own sender, so only stopping the pump can
+        // close this route.
+        let peer_route = router.lookup(1).await.expect("node 1 is registered");
+
+        drop(mesh);
+
+        assert!(
+            tokio::time::timeout(PUMP_GONE_WITHIN, peer_route.closed())
+                .await
+                .is_ok(),
+            "a dropped mesh left its RPC pump running"
+        );
+    }
 }

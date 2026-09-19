@@ -34,8 +34,6 @@ spec:
               value: {{ .Values.global.cluster.name | quote }}
             - name: ENGENHO_STORE_URL
               value: "http://{{ include "engenho.fullname" . }}-apiserver:{{ .Values.apiserver.http.port }}"
-            - name: ENGENHO_NATS_URL
-              value: {{ include "engenho.natsURL" . | quote }}
             - name: ENGENHO_NAMESPACE
               value: {{ .Values.controllers.namespace | quote }}
             - name: ENGENHO_FALLBACK_INTERVAL

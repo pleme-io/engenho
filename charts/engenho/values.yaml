@@ -15,11 +15,10 @@ global:
     pullPolicy: IfNotPresent
     tag: "v0.6.0"
   cluster:
-    # Logical cluster identifier — used in NATS subject prefix
-    # (engenho.{cluster}.*) so multiple engenho clusters can share
-    # one NATS supercluster.
+    # Logical cluster identifier — the `engenho.io/cluster` label and the
+    # ENGENHO_CLUSTER env var on every component.
     name: "engenho-local"
-    # Region identifier — used by Vector + NATS leaf-node routing
+    # Region identifier — the `engenho.io/region` label, used by Vector
     # for locality + observability tagging.
     region: "default"
 
@@ -61,37 +60,15 @@ config:
     podName: true
 
 # ============================================================
-#   NATS — fabric carrier (engenho-teia rides this)
+#   No NATS. NATS is not engenho's fabric (IMPROVEMENT-PLAN §5.1):
+#   the fabric is in-binary, and this chart deploys no broker. The
+#   engenho-teia NATS client exists only under the `teia-nats` cargo
+#   feature (off by default); a build that turns it on brings its
+#   own NATS server.
 # ============================================================
-nats:
-  enabled: true
-  config:
-    cluster:
-      enabled: true
-      replicas: 3
-    jetstream:
-      enabled: true
-      fileStore:
-        enabled: true
-        pvc:
-          enabled: true
-          size: 20Gi
-    leafnodes:
-      enabled: false
-      # Set to true + populate remotes for cross-region federation.
-      # remotes:
-      #   - url: nats://hub.engenho.global:7422
-      #     credentials: /etc/nats/leaf.creds
-  service:
-    enabled: true
-    ports:
-      nats: { enabled: true, port: 4222 }
-      leafnodes: { enabled: false, port: 7422 }
-      gateways: { enabled: false, port: 7522 }
-      monitor: { enabled: true, port: 8222 }
 
 # ============================================================
-#   Vector — observability pipeline (consumes NATS engenho.*)
+#   Vector — observability pipeline
 # ============================================================
 vector:
   enabled: true
@@ -104,22 +81,12 @@ vector:
     sources:
       kubernetes_logs:
         type: kubernetes_logs
-      engenho_health:
-        type: nats
-        url: "nats://engenho-nats:4222"
-        subject: "engenho.>.health.>"
-        queue: "vector-health"
-      engenho_attestation:
-        type: nats
-        url: "nats://engenho-nats:4222"
-        subject: "engenho.>.attestation.>"
-        queue: "vector-attestation"
     sinks:
       # Default: VictoriaLogs in cluster. Override to ship to Datadog
       # / Splunk for SaaS-tier observability.
       victorialogs:
         type: loki
-        inputs: ["kubernetes_logs", "engenho_health"]
+        inputs: ["kubernetes_logs"]
         endpoint: "http://victorialogs:9428"
         encoding: { codec: json }
         labels: { source: vector, cluster: "{{ .Values.global.cluster.name }}" }
@@ -133,9 +100,7 @@ store:
   image:
     repository: engenho-store
   raft:
-    # Port the in-cluster Raft RPC carrier listens on. At F2 (NATS
-    # transport) this becomes irrelevant — RPC flows via NATS
-    # subjects. Until then it's the tonic-based fallback.
+    # Port the in-cluster Raft RPC carrier listens on.
     port: 7777
   storage:
     size: 50Gi

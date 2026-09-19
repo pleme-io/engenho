@@ -1,6 +1,8 @@
 //! Property: orçamento Budget invariants.
 
-use engenho_substrate::{Budget, BudgetError, FrozenClock};
+use engenho_substrate::FrozenClock;
+
+use engenho_substrate_incubator::{Budget, BudgetError};
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use std::sync::Arc;

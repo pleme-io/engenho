@@ -15,9 +15,10 @@
 //!   * which container backend the kubelet drives (`kubelet_backend`)
 //!   * how long to wait for raft leadership before giving up
 //!
-//! Mirrors [`crate::KubeletBackendKind`] — the typed backend choice
-//! lives here (config side) and `engenho_kubelet::KubeletBackendKind`
-//! is the runtime-side mirror the assembly layer converts to.
+//! [`KubeletBackendKind`] is the ONE backend-choice type. `engenho-kubelet`
+//! depends on this crate and re-exports it rather than mirroring it, so a
+//! parsed config's choice reaches the kubelet as-is, with no second enum to
+//! convert to and no mapping to drift (I39).
 
 use std::path::PathBuf;
 
@@ -28,10 +29,12 @@ use crate::error::ConfigError;
 use crate::node_local::{LoopbackAddr, NodeLocalListener};
 use crate::tls::TlsConfig;
 
-/// Operator-facing kubelet backend choice — config-side mirror of
-/// `engenho_kubelet::KubeletBackendKind`. Lives here so `engenho-config`
-/// has no dependency on `engenho-kubelet` (the assembly layer maps one
-/// to the other).
+/// Operator-facing kubelet backend choice — the only one.
+///
+/// It lives here, not in `engenho-kubelet`, because the kubelet depends on
+/// this crate and not the reverse. The kubelet re-exports this type
+/// (`engenho_kubelet::config_bridge::KubeletBackendKind`) and builds its
+/// runtime straight from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KubeletBackendKind {
@@ -42,10 +45,18 @@ pub enum KubeletBackendKind {
     /// none of them speaks podman's libpod API, so a kubelet that can only
     /// drive podman is locked to one runtime.
     ///
-    /// Not the default: `logs` is a typed refusal until the CRI log-format
-    /// parser lands (CRI has no read-log RPC — the runtime writes a FILE the
-    /// kubelet must parse), so this backend is selected deliberately rather
-    /// than inherited. See `runtime.cri_endpoint` for where it dials.
+    /// ★ REFUSED (T5.9, pending-cri). The CRI backend still silently drops
+    /// part of every Pod it runs, so [`RuntimeConfig::validate`] rejects this
+    /// arm with [`ConfigError::KubeletBackendRefused`] — every path that
+    /// parses a config refuses it before anything boots. The kubelet refuses
+    /// to construct it too, and its refusal names each missing part; this
+    /// crate does not depend on the kubelet and does not copy that list. See
+    /// [`Self::selection_refusal`] for how the two refusals are held to one
+    /// answer.
+    ///
+    /// The variant is kept (★★ MODULARIZE, DON'T DELETE), so `cri` still
+    /// parses to this typed refusal rather than to an unknown-variant error.
+    /// It dials the well-known CRI sockets; there is no endpoint setting.
     Cri,
     /// podman over its libpod REST API on the unix socket — **the default**.
     ///
@@ -88,6 +99,42 @@ pub enum KubeletBackendKind {
     /// silently fall back to a VM.
     #[serde(rename = "native")]
     Native,
+}
+
+impl KubeletBackendKind {
+    /// Why a config may not select this backend, or `None` when it may.
+    ///
+    /// Decided from the kind alone, so [`RuntimeConfig::validate`] refuses a
+    /// node's config before anything boots, whatever sockets the host serves.
+    ///
+    /// ★ A POLICY HELD TO EVIDENCE BY A TEST, NOT A TYPE. The kubelet answers
+    /// the same question from evidence (its list of what the CRI backend still
+    /// drops), which this crate cannot see. `engenho-kubelet`'s `config_bridge`
+    /// tests fail when the two answers differ for any kind, in either
+    /// direction: closing the last CRI gap turns them red until this arm is
+    /// lifted as well.
+    #[must_use]
+    pub const fn selection_refusal(self) -> Option<KubeletBackendRefusal> {
+        match self {
+            Self::Cri => Some(KubeletBackendRefusal::CriIncomplete),
+            Self::PodmanApi | Self::Podman | Self::Fake | Self::Native => None,
+        }
+    }
+}
+
+/// Why a config may not select a kubelet backend.
+///
+/// Carried by [`ConfigError::KubeletBackendRefused`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum KubeletBackendRefusal {
+    /// `cri`: the CRI backend still silently drops part of every Pod it runs,
+    /// and the kubelet refuses to construct it (pending-cri).
+    #[error(
+        "`cri` is refused until the CRI backend carries every part of a Pod \
+         (pending-cri; the kubelet's own refusal names each missing part); \
+         select `podman_api` or `native`"
+    )]
+    CriIncomplete,
 }
 
 /// Process-level assembly config.
@@ -482,6 +529,10 @@ impl RuntimeConfig {
     ///   * `leadership_timeout_seconds` is zero (boot would never wait
     ///     for raft leadership and the first `propose` would fail)
     ///
+    /// Returns [`ConfigError::KubeletBackendRefused`] when `kubelet_backend`
+    /// names a backend the kubelet refuses to construct (`cri`, T5.9; see
+    /// [`KubeletBackendKind::selection_refusal`]).
+    ///
     /// Returns [`ConfigError::NodeLocalListener`] when `kubelet_listen_addr`
     /// or `etcd_listen_addr` holds anything but a loopback `IP:port` literal
     /// (see [`Self::node_local_addr`]).
@@ -503,6 +554,9 @@ impl RuntimeConfig {
                 field: "runtime.leadership_timeout_seconds".into(),
                 reason: "leadership timeout must be > 0".into(),
             });
+        }
+        if let Some(refusal) = self.kubelet_backend.selection_refusal() {
+            return Err(ConfigError::KubeletBackendRefused(refusal));
         }
         for listener in NodeLocalListener::ALL {
             self.node_local_addr(listener)?;
@@ -570,11 +624,15 @@ mod backend_kind_wire {
     /// The Nix enum and the serde name must agree, or a declared value produces
     /// a config engenho refuses to parse.
     ///
-    /// These strings live in two repositories — `nix/typed-config.nix`'s
-    /// `types.enum [ "podman_api" "podman" "cri" "fake" "native" ]` and this enum's
+    /// These strings live in two places — `nix/typed-config.nix`'s
+    /// `types.enum [ "podman_api" "podman" "fake" "native" ]` and this enum's
     /// `rename_all = "snake_case"`. Nothing but this test connects them, and the
     /// failure is at DAEMON START on the node, long after the nix build went
     /// green.
+    ///
+    /// `cri` is a wire name here and deliberately absent from the nix enum:
+    /// [`super::RuntimeConfig::validate`] refuses it (T5.9), so nix refuses it
+    /// at eval rather than render a config the daemon will not start on.
     #[test]
     fn the_wire_names_are_exactly_what_the_nix_enum_offers() {
         let cases = [
@@ -1029,5 +1087,79 @@ mod visibility_tests {
         // engenho's `Dialect` records about not copying `spec.executor`.
         assert!(serde_yaml::from_str::<KubeconfigVisibility>("groups").is_err());
         assert!(serde_yaml::from_str::<KubeconfigVisibility>("Group").is_err());
+    }
+}
+
+/// T5.9 at the parse boundary: `kubelet_backend: cri` is refused when the
+/// config is parsed, and nothing a node runs today is.
+#[cfg(test)]
+mod backend_refusal {
+    use super::{KubeletBackendKind, KubeletBackendRefusal};
+    use crate::{ConfigError, EngenhoConfig};
+    use shikumi::TieredConfig;
+
+    #[test]
+    fn yaml_selecting_cri_is_refused_when_the_config_is_parsed() {
+        match EngenhoConfig::from_yaml_with_defaults("runtime:\n  kubelet_backend: cri\n") {
+            Err(ConfigError::KubeletBackendRefused(KubeletBackendRefusal::CriIncomplete)) => {}
+            other => panic!("`kubelet_backend: cri` must be refused at parse, got {other:?}"),
+        }
+    }
+
+    /// The struct path too: a config built in code (as `Runtime::start_with_backend`
+    /// callers do) is refused by the same `validate` every parse path runs.
+    #[test]
+    fn a_config_built_in_code_with_cri_fails_validation() {
+        let mut cfg = EngenhoConfig::prescribed_default();
+        cfg.runtime.kubelet_backend = KubeletBackendKind::Cri;
+        assert!(
+            matches!(
+                cfg.validate(),
+                Err(ConfigError::KubeletBackendRefused(
+                    KubeletBackendRefusal::CriIncomplete
+                ))
+            ),
+            "validate must refuse cri"
+        );
+    }
+
+    /// rio and plo run `podman_api`, ryn runs `native`: the refusal strands
+    /// none of them, nor the shell-out or fake backends.
+    #[test]
+    fn every_backend_a_node_can_run_still_parses() {
+        let cases = [
+            ("podman_api", KubeletBackendKind::PodmanApi),
+            ("podman", KubeletBackendKind::Podman),
+            ("fake", KubeletBackendKind::Fake),
+            ("native", KubeletBackendKind::Native),
+        ];
+        for (wire, want) in cases {
+            let yaml = format!("runtime:\n  kubelet_backend: {wire}\n");
+            let cfg = EngenhoConfig::from_yaml_with_defaults(&yaml)
+                .unwrap_or_else(|e| panic!("`{wire}` must parse: {e}"));
+            assert_eq!(cfg.runtime.kubelet_backend, want);
+            assert_eq!(
+                want.selection_refusal(),
+                None,
+                "{want:?} must be selectable"
+            );
+        }
+    }
+
+    /// An operator reading the boot failure learns the field, the backend,
+    /// and a backend that works.
+    #[test]
+    fn the_refusal_names_the_field_the_backend_and_what_to_select() {
+        let shown =
+            ConfigError::KubeletBackendRefused(KubeletBackendRefusal::CriIncomplete).to_string();
+        assert!(
+            shown.contains("runtime.kubelet_backend"),
+            "names the field: {shown}"
+        );
+        assert!(shown.contains("`cri`"), "names the backend: {shown}");
+        assert!(
+            shown.contains("podman_api"),
+            "names a backend that works: {shown}"
+        );
     }
 }

@@ -31,24 +31,24 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::command_runner::{CommandRequest, CommandRunner};
-use crate::derivation::Drv;
-use crate::shape::{RenderedArtifact, ShapeError, ShapeRenderer, WorkloadShape};
+use engenho_substrate::derivation::Drv;
+use engenho_substrate::shape::{RenderedArtifact, ShapeError, ShapeRenderer, WorkloadShape};
 
-crate::async_closure_type! {
+engenho_substrate::async_closure_type! {
     /// Operator-supplied source-reference generator. Given a Drv,
     /// returns the URI skopeo should read from (e.g.
     /// "docker-archive:/nix/store/{hash}-image.tar").
     pub type OciSourceRef = sync (&Drv) -> String;
 }
 
-crate::async_closure_type! {
+engenho_substrate::async_closure_type! {
     /// Operator-supplied destination-reference generator. Given a Drv,
     /// returns the URI skopeo should write to (e.g.
     /// "oci-archive:/tmp/{drv_hash_hex}-oci.tar").
     pub type OciDestRef = sync (&Drv) -> String;
 }
 
-crate::async_closure_type! {
+engenho_substrate::async_closure_type! {
     /// Optional accessor that reads the destination bytes back after
     /// a successful skopeo run. Production wires this to `std::fs::read`
     /// on the dest path; absence yields a synthetic artifact.
@@ -217,7 +217,7 @@ impl ShapeRenderer for OciImageRenderer {
 mod tests {
     use super::*;
     use crate::command_runner::{CommandResponse, FakeCommandRunner};
-    use crate::derivation::DrvHash;
+    use engenho_substrate::derivation::DrvHash;
 
     fn d(tag: &[u8]) -> Drv {
         Drv::synthetic(DrvHash::from_bytes(tag), "x86_64-linux")

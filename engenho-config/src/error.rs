@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 use crate::node_local::{ListenerAddrRejection, NodeLocalListener};
+use crate::runtime::KubeletBackendRefusal;
 
 /// Errors a config can return at parse/validate time.
 #[derive(Debug, Clone, Error)]
@@ -37,6 +38,12 @@ pub enum ConfigError {
         /// Why its address was refused.
         rejection: ListenerAddrRejection,
     },
+
+    /// `runtime.kubelet_backend` names a backend the kubelet refuses to
+    /// construct (T5.9). Refused when the config is parsed, so a node
+    /// carrying it never boots.
+    #[error("invalid field runtime.kubelet_backend: {0}")]
+    KubeletBackendRefused(KubeletBackendRefusal),
 }
 
 impl ConfigError {
@@ -48,6 +55,7 @@ impl ConfigError {
             Self::Incoherent(_) => "incoherent",
             Self::InvalidField { .. } => "invalid_field",
             Self::NodeLocalListener { .. } => "node_local_listener",
+            Self::KubeletBackendRefused(_) => "kubelet_backend_refused",
         }
     }
 }
@@ -75,6 +83,10 @@ mod tests {
             }
             .kind(),
             "node_local_listener"
+        );
+        assert_eq!(
+            ConfigError::KubeletBackendRefused(KubeletBackendRefusal::CriIncomplete).kind(),
+            "kubelet_backend_refused"
         );
     }
 }

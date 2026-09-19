@@ -31,15 +31,16 @@
 //! `Transient` then makes them scope-bound + receipt-attested for
 //! free.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use thiserror::Error;
 
-use crate::ledger::{LedgerError, MaterializationLedger};
-use crate::receipt::{MaterializationReceipt, NodeId, ReceiptKind};
-use crate::roca::StageId;
+use engenho_substrate::ledger::{LedgerError, MaterializationLedger};
+use engenho_substrate::receipt::{MaterializationReceipt, NodeId, ReceiptKind};
+use engenho_substrate::roca::StageId;
 
 /// Errors a Disposable can surface.
 #[derive(Debug, Clone, Error)]
@@ -69,7 +70,7 @@ pub enum DisposableError {
     Ledger(String),
 }
 
-crate::impl_error_kind! {
+engenho_substrate::impl_error_kind! {
     DisposableError {
         (Materialize(_)) => "materialize",
         (Dispose(_)) => "dispose",
@@ -127,7 +128,7 @@ pub struct Transient<D: Disposable> {
     ledger: Arc<dyn MaterializationLedger>,
     emitter: NodeId,
     stage_id: StageId,
-    clock: Arc<dyn crate::relogio::Clock>,
+    clock: Arc<dyn engenho_substrate::relogio::Clock>,
 }
 
 impl<D: Disposable> Transient<D> {
@@ -150,7 +151,7 @@ impl<D: Disposable> Transient<D> {
             ledger,
             emitter,
             stage_id,
-            Arc::new(crate::relogio::WallClock),
+            Arc::new(engenho_substrate::relogio::WallClock),
         )
     }
 
@@ -162,7 +163,7 @@ impl<D: Disposable> Transient<D> {
         ledger: Arc<dyn MaterializationLedger>,
         emitter: NodeId,
         stage_id: StageId,
-        clock: Arc<dyn crate::relogio::Clock>,
+        clock: Arc<dyn engenho_substrate::relogio::Clock>,
     ) -> Self {
         Self {
             disposable,
@@ -231,7 +232,7 @@ impl<D: Disposable> Transient<D> {
             subject,                             // evidence = subject (faithful nodes converge)
         );
         self.ledger
-            .ingest(&self.stage_id, 1, &receipt)
+            .ingest(&self.stage_id, NonZeroUsize::MIN, &receipt)
             .await
             .map_err(DisposableError::from)?;
         Ok(())
@@ -253,7 +254,7 @@ impl<D: Disposable> Transient<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::MemoryLedger;
+    use engenho_substrate::ledger::MemoryLedger;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Test Disposable that tracks materialize + dispose calls.
@@ -473,7 +474,9 @@ mod tests {
         // same receipt timestamps, deterministically reproducible.
         let disp = Arc::new(FakeDisposable::new("fake"));
         let ledger = Arc::new(MemoryLedger::new());
-        let clock = Arc::new(crate::relogio::FrozenClock::at(1_700_000_000_000));
+        let clock = Arc::new(engenho_substrate::relogio::FrozenClock::at(
+            1_700_000_000_000,
+        ));
         let t = Transient::with_clock(
             disp.clone(),
             ledger.clone(),

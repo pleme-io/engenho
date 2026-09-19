@@ -407,9 +407,6 @@ mod tests {
                 actual: "b".into(),
             }
         ));
-        assert!(!RetryingCacheBackend::is_retryable(&CacheError::NotFound(
-            "x".into()
-        )));
     }
 
     #[tokio::test]

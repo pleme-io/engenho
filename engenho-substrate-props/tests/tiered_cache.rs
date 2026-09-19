@@ -157,7 +157,7 @@ proptest_with_env! {
             let cache = TieredCache::new(dyns);
             let blob = nar(payload_b);
             cache.put_nar(&blob).await.unwrap();
-            let got = cache.get_nar(&blob.hash).await.unwrap();
+            let got = cache.get_nar(blob.hash()).await.unwrap();
             assert_eq!(got, Some(blob));
         });
     }

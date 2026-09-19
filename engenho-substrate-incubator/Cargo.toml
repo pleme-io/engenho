@@ -1,0 +1,31 @@
+[package]
+name = "engenho-substrate-incubator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+authors.workspace = true
+description = "engenho-substrate-incubator — substrate modules no shipped engenho crate references: pesquisa (search), orcamento (budget), compose_ir, oci_renderer, command_runner, fake_shell, disposable. Kept, fenced out of the shipped closure; a module graduates to engenho-substrate the day a shipped crate needs it."
+# Drafts are not published: nothing shipped may depend on this crate.
+publish = false
+
+[dependencies]
+# The leaf. This edge is also the fence: the leaf can never depend on
+# the incubator, because Cargo rejects the cycle.
+engenho-substrate  = { path = "../engenho-substrate" }
+async-trait        = { workspace = true }
+futures            = { workspace = true }
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+serde_yaml         = { workspace = true }
+tokio              = { workspace = true, features = ["sync", "macros", "rt"] }
+blake3             = "1"
+
+[dev-dependencies]
+tokio              = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread"] }

@@ -47,10 +47,10 @@ proptest_with_env! {
     #[test]
     fn nar_blob_from_bytes_invariants(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
         let blob = NarBlob::from_bytes(bytes.clone());
-        assert_eq!(blob.size, bytes.len() as u64);
-        assert_eq!(blob.bytes, bytes);
+        assert_eq!(blob.size(), bytes.len() as u64);
+        assert_eq!(blob.bytes(), bytes.as_slice());
         // Hash equals direct NarHash::from_bytes — round-trip identity.
-        assert_eq!(blob.hash, NarHash::from_bytes(&bytes));
+        assert_eq!(blob.hash(), &NarHash::from_bytes(&bytes));
     }
 
     /// Two NarBlobs with same content are equal.

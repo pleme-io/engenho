@@ -67,7 +67,7 @@ impl InProcessRouter {
         self.nodes.lock().await.remove(&node_id);
     }
 
-    async fn lookup(&self, node_id: RaftNodeId) -> Option<mpsc::Sender<RpcRequest>> {
+    pub(crate) async fn lookup(&self, node_id: RaftNodeId) -> Option<mpsc::Sender<RpcRequest>> {
         self.nodes.lock().await.get(&node_id).cloned()
     }
 }

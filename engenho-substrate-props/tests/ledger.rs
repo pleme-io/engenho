@@ -1,11 +1,10 @@
 //! Property: MemoryLedger invariants.
 
-use engenho_substrate::{
-    LedgerKey, MaterializationLedger, MemoryLedger, QuorumOutcome, ReceiptKind, StageId,
-};
-use engenho_substrate_props::helpers::sample_receipt as receipt;
+use engenho_substrate::{LedgerKey, MaterializationLedger, MemoryLedger, ReceiptKind, StageId};
+use engenho_substrate_props::helpers::{sample_emitter, sample_receipt as receipt, threshold_in};
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
+use std::num::NonZeroUsize;
 
 fn key(stage: &str, subject: [u8; 32]) -> LedgerKey {
     LedgerKey {
@@ -22,7 +21,7 @@ proptest_with_env! {
         engenho_substrate_props::block_on(async {
             let ledger = MemoryLedger::new();
             let r = receipt(subject, node);
-            ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
+            ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
             let out = ledger.outcome(&key("s", subject)).await.unwrap();
             assert!(out.is_some());
     });
@@ -35,11 +34,37 @@ proptest_with_env! {
         engenho_substrate_props::block_on(async {
             let ledger = MemoryLedger::new();
             let r = receipt(subject, node);
-            ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
-            let out2 = ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
+            ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
+            let out2 = ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
             // Second ingest succeeds; outcome is Reached (threshold=1 met by single node).
-            assert!(matches!(out2, QuorumOutcome::Reached { .. }));
+            assert!(out2.is_reached());
     });
+    }
+
+    /// Reading a slot returns exactly the verdict its last ingest
+    /// returned, whatever the threshold: the read path asks the
+    /// tracker instead of re-deriving a verdict without the threshold.
+    #[test]
+    fn outcome_equals_the_last_ingest_verdict(
+        threshold in threshold_in(1..6),
+        subject in any::<[u8; 32]>(),
+        votes in proptest::collection::vec((0u8..6, 0u8..3), 1..12),
+    ) {
+        engenho_substrate_props::block_on(async {
+            let ledger = MemoryLedger::new();
+            for (node, evidence) in &votes {
+                let r = engenho_substrate::MaterializationReceipt::new(
+                    ReceiptKind::Shape("test".into()),
+                    subject,
+                    sample_emitter(*node),
+                    0,
+                    [*evidence; 32],
+                );
+                let ingested = ledger.ingest(&StageId::new("s"), threshold, &r).await.unwrap();
+                let read = ledger.outcome(&key("s", subject)).await.unwrap();
+                assert_eq!(read, Some(ingested));
+            }
+        });
     }
 
     /// Threshold-of-1 with single ingest reaches quorum immediately.
@@ -48,8 +73,8 @@ proptest_with_env! {
         engenho_substrate_props::block_on(async {
             let ledger = MemoryLedger::new();
             let r = receipt(subject, node);
-            let out = ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
-            assert!(matches!(out, QuorumOutcome::Reached { .. }));
+            let out = ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
+            assert!(out.is_reached());
     });
     }
 
@@ -59,7 +84,7 @@ proptest_with_env! {
         engenho_substrate_props::block_on(async {
             let ledger = MemoryLedger::new();
             let r = receipt(subject, node);
-            ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
+            ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
             assert!(ledger.outcome(&key("s", subject)).await.unwrap().is_some());
             ledger.forget_stage(&StageId::new("s")).await.unwrap();
             assert!(ledger.outcome(&key("s", subject)).await.unwrap().is_none());
@@ -75,7 +100,7 @@ proptest_with_env! {
             let ledger = MemoryLedger::new();
             for (i, s) in subjects.iter().enumerate() {
                 let r = receipt(*s, i as u8);
-                ledger.ingest(&StageId::new("s"), 1, &r).await.unwrap();
+                ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
             }
             let len = ledger.len().await;
             // BTreeSet dedup — distinct subjects produce distinct keys.

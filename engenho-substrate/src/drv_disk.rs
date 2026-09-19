@@ -100,33 +100,26 @@ impl DerivationCacheBackend for DiskDerivationCache {
         if !path.exists() {
             return Ok(None);
         }
+        // Loading re-derives the blob's address from its bytes and refuses
+        // a record that disagrees (NarBlob's deserialiser). What is left to
+        // check is that the file under this name holds the blob asked for.
         let blob: NarBlob =
             MagicBlob::<NarBlob>::load_from(MAGIC_NAR_V1, &path).map_err(map_err)?;
-        // Re-verify the blob's claimed hash matches its bytes —
-        // defense in depth on top of MagicBlob's outer hash.
-        let actual = NarHash::from_bytes(&blob.bytes);
-        if &actual != hash {
+        if blob.hash() != hash {
             return Err(CacheError::HashMismatch {
                 requested: hash.to_hex(),
-                actual: actual.to_hex(),
+                actual: blob.hash().to_hex(),
             });
         }
         Ok(Some(blob))
     }
 
     async fn put_nar(&self, blob: &NarBlob) -> Result<(), CacheError> {
-        let actual = NarHash::from_bytes(&blob.bytes);
-        if actual != blob.hash {
-            return Err(CacheError::HashMismatch {
-                requested: blob.hash.to_hex(),
-                actual: actual.to_hex(),
-            });
-        }
         let mb = MagicBlob {
             magic: MAGIC_NAR_V1,
             value: blob.clone(),
         };
-        mb.save_to(&self.nar_path(&blob.hash)).map_err(map_err)
+        mb.save_to(&self.nar_path(blob.hash())).map_err(map_err)
     }
 
     async fn list_realisations(&self, drv_hash: &DrvHash) -> Result<Vec<Realisation>, CacheError> {
@@ -198,7 +191,7 @@ mod tests {
         let cache = DiskDerivationCache::new(&root);
         let blob = NarBlob::from_bytes(b"hello-nar".to_vec());
         cache.put_nar(&blob).await.unwrap();
-        let got = cache.get_nar(&blob.hash).await.unwrap();
+        let got = cache.get_nar(blob.hash()).await.unwrap();
         assert_eq!(got, Some(blob));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -252,18 +245,46 @@ mod tests {
         assert_eq!(cache.name(), "disk");
     }
 
+    /// A sound blob stored under another blob's name is served as a
+    /// `HashMismatch`, never as the value asked for.
     #[tokio::test]
-    async fn put_nar_rejects_hash_mismatch() {
-        let root = temp_root("badnar");
+    async fn get_nar_refuses_a_file_holding_another_blob() {
+        let root = temp_root("misfiled");
         let _ = std::fs::remove_dir_all(&root);
         let cache = DiskDerivationCache::new(&root);
-        let bad = NarBlob {
-            hash: NarHash::from_bytes(b"different"),
-            size: 5,
-            bytes: b"hello".to_vec(),
-        };
-        let err = cache.put_nar(&bad).await.unwrap_err();
+        let stored = NarBlob::from_bytes(b"hello".to_vec());
+        cache.put_nar(&stored).await.unwrap();
+        let asked = NarHash::from_bytes(b"other");
+        std::fs::rename(cache.nar_path(stored.hash()), cache.nar_path(&asked)).unwrap();
+        let err = cache.get_nar(&asked).await.unwrap_err();
         assert_eq!(err.kind(), "hash_mismatch");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★ T5.6: a record on disk whose `hash` is not its bytes' BLAKE3 —
+    /// written by anything, with a valid outer checksum, under the name its
+    /// forged hash promises — is refused on load. `get_nar` no longer
+    /// re-hashes the bytes itself; this holds only because `NarBlob`'s
+    /// deserialiser does, so a plain derived `Deserialize` turns it red.
+    #[tokio::test]
+    async fn get_nar_refuses_a_self_inconsistent_record() {
+        let root = temp_root("forged");
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = DiskDerivationCache::new(&root);
+        let claimed = NarHash::from_bytes(b"what the name promises");
+        let forged = serde_json::json!({
+            "hash": claimed,
+            "size": 5,
+            "bytes": b"hello".to_vec(),
+        });
+        MagicBlob {
+            magic: MAGIC_NAR_V1,
+            value: forged,
+        }
+        .save_to(&cache.nar_path(&claimed))
+        .unwrap();
+        let res = cache.get_nar(&claimed).await;
+        assert!(res.is_err(), "a forged record must not be served: {res:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

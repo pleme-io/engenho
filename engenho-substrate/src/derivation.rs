@@ -131,23 +131,145 @@ impl Drv {
 
 /// Content-addressed NAR blob. The NAR is the canonical
 /// Nix-Archive serialization of a /nix/store path's directory tree.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Sealed: the address and the length are derived from the bytes, never
+/// supplied. The fields are private and [`NarBlob::from_bytes`] is the one
+/// constructor; deserialisation goes through it too and refuses a record
+/// whose stored `hash` or `size` disagrees with its bytes
+/// ([`NarBlobError`]). A blob whose address is not the BLAKE3 of its own
+/// payload therefore has no code path, and a cache never has to re-check
+/// one it was handed.
+///
+/// ```compile_fail
+/// // The struct literal that used to build a lying blob no longer compiles.
+/// use engenho_substrate::{NarBlob, NarHash};
+/// let _ = NarBlob { hash: NarHash::from_bytes(b"other"), size: 5, bytes: b"hello".to_vec() };
+/// ```
+///
+/// ```compile_fail
+/// // Nor can a sound blob be edited into a lying one.
+/// use engenho_substrate::NarBlob;
+/// let mut blob = NarBlob::from_bytes(b"hello".to_vec());
+/// blob.bytes = b"other".to_vec();
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "NarBlobRecord")]
 pub struct NarBlob {
     /// BLAKE3 of `bytes`. Address for the content tier.
-    pub hash: NarHash,
-    /// Byte length (kept separate for fast metadata queries).
-    pub size: u64,
+    hash: NarHash,
     /// The bytes themselves.
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 impl NarBlob {
-    /// Build a blob from raw bytes; computes hash + size.
+    /// Build a blob from raw bytes; the hash and size are derived from them.
     #[must_use]
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         let hash = NarHash::from_bytes(&bytes);
-        let size = bytes.len() as u64;
-        Self { hash, size, bytes }
+        Self { hash, bytes }
+    }
+
+    /// BLAKE3 of the bytes: the blob's address in the content tier.
+    #[must_use]
+    pub fn hash(&self) -> &NarHash {
+        &self.hash
+    }
+
+    /// Byte length of the payload.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    /// The payload.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Take the payload, dropping the (derived) address.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Why a stored NAR record was refused at the parse boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum NarBlobError {
+    /// The record's `hash` is not the BLAKE3 of its bytes.
+    #[error("nar record says hash {recorded}, its bytes hash to {derived}")]
+    HashMismatch {
+        /// The hash the record carried.
+        recorded: NarHash,
+        /// The hash of the bytes it carried.
+        derived: NarHash,
+    },
+    /// The record's `size` is not the length of its bytes.
+    #[error("nar record says {recorded} bytes, it carries {derived}")]
+    SizeMismatch {
+        /// The size the record carried.
+        recorded: u64,
+        /// The length of the bytes it carried.
+        derived: u64,
+    },
+}
+
+crate::impl_error_kind! {
+    NarBlobError {
+        { HashMismatch { .. } } => "hash_mismatch",
+        { SizeMismatch { .. } } => "size_mismatch",
+    }
+}
+
+/// The on-the-wire shape of a [`NarBlob`]: `hash`, `size`, `bytes`, in that
+/// order. Unchanged from before the seal, so every record already written
+/// still reads; only the checks on the way in are new.
+#[derive(Deserialize)]
+struct NarBlobRecord {
+    hash: NarHash,
+    size: u64,
+    bytes: Vec<u8>,
+}
+
+/// Borrowed twin of [`NarBlobRecord`] for writing, so serialising a blob
+/// never copies its payload.
+#[derive(Serialize)]
+struct NarBlobRecordRef<'a> {
+    hash: &'a NarHash,
+    size: u64,
+    bytes: &'a [u8],
+}
+
+impl TryFrom<NarBlobRecord> for NarBlob {
+    type Error = NarBlobError;
+
+    fn try_from(record: NarBlobRecord) -> Result<Self, Self::Error> {
+        let blob = Self::from_bytes(record.bytes);
+        if blob.hash != record.hash {
+            return Err(NarBlobError::HashMismatch {
+                recorded: record.hash,
+                derived: blob.hash,
+            });
+        }
+        if blob.size() != record.size {
+            return Err(NarBlobError::SizeMismatch {
+                recorded: record.size,
+                derived: blob.size(),
+            });
+        }
+        Ok(blob)
+    }
+}
+
+impl Serialize for NarBlob {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        NarBlobRecordRef {
+            hash: &self.hash,
+            size: self.size(),
+            bytes: &self.bytes,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -173,8 +295,9 @@ pub enum CacheError {
     /// Backend (iroh, NATS, local disk) returned an error.
     #[error("backend: {0}")]
     Backend(String),
-    /// Hash mismatch — a returned blob didn't match its requested hash.
-    /// Surface this loudly so corrupt caches don't silently propagate.
+    /// Hash mismatch — a backend served a blob whose address is not the
+    /// one requested, or a stored file failed its outer checksum. Surface
+    /// this loudly so corrupt caches don't silently propagate.
     #[error("hash mismatch: requested {requested}, got {actual}")]
     HashMismatch {
         /// What the caller asked for.
@@ -182,16 +305,18 @@ pub enum CacheError {
         /// What the cache served.
         actual: String,
     },
-    /// Item not found in this cache. Caller may try a higher tier.
-    #[error("not found: {0}")]
-    NotFound(String),
 }
+
+// Absence is not an error: every lookup returns `Ok(None)` (or an empty
+// `Vec`) for a key the cache does not hold, and the caller may try a
+// higher tier. There is deliberately no "not found" variant here; nothing
+// produced one, and a second spelling of absence is one a caller could
+// match on while the real answer arrived as `None`.
 
 crate::impl_error_kind! {
     CacheError {
         (Backend(_)) => "backend",
         { HashMismatch { .. } } => "hash_mismatch",
-        (NotFound(_)) => "not_found",
     }
 }
 
@@ -211,7 +336,7 @@ pub trait DerivationCacheBackend: Send + Sync {
     /// Backend identifier for telemetry.
     fn name(&self) -> &'static str;
 
-    /// Look up a derivation by hash. None = not in this cache.
+    /// Look up a derivation by hash. `Ok(None)` = not in this cache.
     ///
     /// # Errors
     /// [`CacheError::Backend`] on backend failure.
@@ -224,10 +349,13 @@ pub trait DerivationCacheBackend: Send + Sync {
     /// [`CacheError::Backend`] on backend failure.
     async fn put_drv(&self, drv: &Drv) -> Result<(), CacheError>;
 
-    /// Fetch a NAR blob by hash. Backends MUST verify the returned
-    /// bytes BLAKE3-hash to `hash` before returning; on mismatch they
-    /// MUST return [`CacheError::HashMismatch`] (not silently serve
-    /// corrupt content).
+    /// Fetch a NAR blob by hash. `Ok(None)` = not in this cache.
+    ///
+    /// A [`NarBlob`] is self-consistent by construction (its address is the
+    /// BLAKE3 of its bytes), so what a backend must still check is that the
+    /// blob it serves is the one asked for: a blob whose `hash()` is not
+    /// `hash` MUST come back as [`CacheError::HashMismatch`], never as a
+    /// value.
     ///
     /// # Errors
     /// [`CacheError::Backend`], [`CacheError::HashMismatch`].
@@ -309,36 +437,15 @@ impl DerivationCacheBackend for MemoryDerivationCache {
     }
 
     async fn get_nar(&self, hash: &NarHash) -> Result<Option<NarBlob>, CacheError> {
-        let blob = self.inner.lock().await.nars.get(hash).cloned();
-        // Trait contract: backends MUST verify the returned bytes
-        // hash to `hash`. The memory backend trivially does (we
-        // stored under the right key) but we still recompute on the
-        // way out — costs ~µs, catches every-other-day corruption
-        // we couldn't otherwise see in tests.
-        if let Some(b) = &blob {
-            let actual = NarHash::from_bytes(&b.bytes);
-            if &actual != hash {
-                return Err(CacheError::HashMismatch {
-                    requested: hash.to_hex(),
-                    actual: actual.to_hex(),
-                });
-            }
-        }
-        Ok(blob)
+        // Every entry is keyed by its own `hash()` (see put_nar), so the
+        // blob under `hash` is the blob asked for.
+        Ok(self.inner.lock().await.nars.get(hash).cloned())
     }
 
     async fn put_nar(&self, blob: &NarBlob) -> Result<(), CacheError> {
-        // Verify the caller's claim matches the bytes (NarBlob is a
-        // value with declared hash — we don't trust it blindly).
-        let actual = NarHash::from_bytes(&blob.bytes);
-        if actual != blob.hash {
-            return Err(CacheError::HashMismatch {
-                requested: blob.hash.to_hex(),
-                actual: actual.to_hex(),
-            });
-        }
+        // No claim to check: a NarBlob's address is derived from its bytes.
         let mut s = self.inner.lock().await;
-        s.nars.insert(blob.hash.clone(), blob.clone());
+        s.nars.insert(blob.hash().clone(), blob.clone());
         Ok(())
     }
 
@@ -417,8 +524,87 @@ mod tests {
     #[test]
     fn nar_blob_from_bytes_computes_hash_and_size() {
         let blob = NarBlob::from_bytes(b"hello".to_vec());
-        assert_eq!(blob.size, 5);
-        assert_eq!(blob.hash, NarHash::from_bytes(b"hello"));
+        assert_eq!(blob.size(), 5);
+        assert_eq!(blob.hash(), &NarHash::from_bytes(b"hello"));
+        assert_eq!(blob.bytes(), b"hello");
+        assert_eq!(blob.into_bytes(), b"hello".to_vec());
+    }
+
+    /// The wire record of a sound blob, as `serde_json::Value`, so a test
+    /// can tamper with one field and hand it back.
+    fn wire(bytes: &[u8]) -> serde_json::Value {
+        serde_json::to_value(NarBlob::from_bytes(bytes.to_vec())).unwrap()
+    }
+
+    /// ★ T5.6: a record whose hash is not its bytes' BLAKE3 used to
+    /// deserialise into a `NarBlob` that lied about its address. It is now
+    /// refused at the parse boundary, naming both hashes.
+    #[test]
+    fn deserialising_a_record_with_a_foreign_hash_is_refused() {
+        let mut v = wire(b"hello");
+        v["hash"] = wire(b"other")["hash"].clone();
+        let err = serde_json::from_value::<NarBlob>(v).unwrap_err();
+        let expected = NarBlobError::HashMismatch {
+            recorded: NarHash::from_bytes(b"other"),
+            derived: NarHash::from_bytes(b"hello"),
+        };
+        assert_eq!(err.to_string(), expected.to_string());
+    }
+
+    /// ★ T5.6: the size is derived from the bytes too; a record that
+    /// disagrees is refused rather than trusted for "fast metadata".
+    #[test]
+    fn deserialising_a_record_with_a_wrong_size_is_refused() {
+        let mut v = wire(b"hello");
+        v["size"] = serde_json::json!(4);
+        let err = serde_json::from_value::<NarBlob>(v).unwrap_err();
+        let expected = NarBlobError::SizeMismatch {
+            recorded: 4,
+            derived: 5,
+        };
+        assert_eq!(err.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn deserialising_a_record_without_a_size_is_refused() {
+        let mut v = wire(b"hello");
+        v.as_object_mut().unwrap().remove("size");
+        assert!(serde_json::from_value::<NarBlob>(v).is_err());
+    }
+
+    /// The seal changed what is checked on the way in, not the bytes on
+    /// the wire: records written before it still read, field for field.
+    #[test]
+    fn wire_shape_is_hash_size_bytes() {
+        let v = wire(b"abc");
+        assert_eq!(
+            v["hash"],
+            serde_json::to_value(NarHash::from_bytes(b"abc")).unwrap()
+        );
+        assert_eq!(v["size"], serde_json::json!(3));
+        assert_eq!(v["bytes"], serde_json::json!([97, 98, 99]));
+        assert_eq!(v.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn nar_blob_error_kinds_are_stable() {
+        let h = NarHash::from_bytes(b"x");
+        assert_eq!(
+            NarBlobError::HashMismatch {
+                recorded: h.clone(),
+                derived: h
+            }
+            .kind(),
+            "hash_mismatch"
+        );
+        assert_eq!(
+            NarBlobError::SizeMismatch {
+                recorded: 1,
+                derived: 2
+            }
+            .kind(),
+            "size_mismatch"
+        );
     }
 
     #[test]
@@ -456,7 +642,7 @@ mod tests {
     async fn cache_put_get_nar_round_trip() {
         let cache = MemoryDerivationCache::new();
         let blob = NarBlob::from_bytes(b"nar-content".to_vec());
-        let h = blob.hash.clone();
+        let h = blob.hash().clone();
         assert_eq!(cache.get_nar(&h).await.unwrap(), None);
         cache.put_nar(&blob).await.unwrap();
         let got = cache.get_nar(&h).await.unwrap();
@@ -464,17 +650,19 @@ mod tests {
         assert_eq!(cache.nar_count().await, 1);
     }
 
+    /// Absence is `Ok(None)` for both lookups — the only spelling of "not
+    /// here" a caller can receive.
     #[tokio::test]
-    async fn cache_put_nar_rejects_hash_mismatch() {
+    async fn cache_absence_is_ok_none() {
         let cache = MemoryDerivationCache::new();
-        // Construct a blob claiming a hash that doesn't match its bytes.
-        let bad = NarBlob {
-            hash: NarHash::from_bytes(b"different"),
-            size: 5,
-            bytes: b"hello".to_vec(),
-        };
-        let err = cache.put_nar(&bad).await.unwrap_err();
-        assert_eq!(err.kind(), "hash_mismatch");
+        assert_eq!(
+            cache.get_drv(&DrvHash::from_bytes(b"no")).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            cache.get_nar(&NarHash::from_bytes(b"no")).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -589,7 +777,29 @@ mod tests {
             .kind(),
             "hash_mismatch"
         );
-        assert_eq!(CacheError::NotFound("x".into()).kind(), "not_found");
+    }
+
+    /// ★ T5.6: `CacheError` is exactly `{Backend, HashMismatch}`. Nothing
+    /// ever produced `NotFound` (absence is `Ok(None)`); this match has no
+    /// wildcard, so a third variant — that one or any other — is E0004
+    /// here, and has to be argued for.
+    #[test]
+    fn cache_error_has_no_absence_variant() {
+        fn tag(e: &CacheError) -> &'static str {
+            match e {
+                CacheError::Backend(_) => "backend",
+                CacheError::HashMismatch { .. } => "hash_mismatch",
+            }
+        }
+        for e in [
+            CacheError::Backend("x".into()),
+            CacheError::HashMismatch {
+                requested: "a".into(),
+                actual: "b".into(),
+            },
+        ] {
+            assert_eq!(tag(&e), e.kind());
+        }
     }
 
     #[test]

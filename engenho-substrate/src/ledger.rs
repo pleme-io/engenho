@@ -15,16 +15,19 @@
 //!
 //! - Ingests [`MaterializationReceipt`] / [`VerificationReceipt`]
 //! - Routes to [`QuorumTracker`] keyed by (stage_id, kind, subject)
-//! - Returns typed [`QuorumOutcome`] per query
+//! - Returns the tracker's own [`QuorumVerdict`] per query. A backend
+//!   never folds receipts itself: the verdict is sealed, so the only way
+//!   to answer is to ask the tracker.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::quorum::{QuorumOutcome, QuorumTracker};
+use crate::quorum::{QuorumTracker, QuorumVerdict};
 use crate::receipt::{MaterializationReceipt, ReceiptKind};
 use crate::roca::StageId;
 
@@ -60,23 +63,26 @@ pub trait MaterializationLedger: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Ingest a receipt against the given stage. Returns the
-    /// post-ingest outcome for the tracker.
+    /// post-ingest verdict for the tracker. `threshold` is fixed by the
+    /// first receipt for a slot; later receipts for the same slot are
+    /// counted against that threshold.
     ///
     /// # Errors
     /// [`LedgerError::Backend`] on backend failure.
     async fn ingest(
         &self,
         stage_id: &StageId,
-        threshold: usize,
+        threshold: NonZeroUsize,
         receipt: &MaterializationReceipt,
-    ) -> Result<QuorumOutcome, LedgerError>;
+    ) -> Result<QuorumVerdict, LedgerError>;
 
-    /// Query the current outcome for a tracked slot. Returns
-    /// `None` if no receipts have been recorded for that slot yet.
+    /// Query the current verdict for a tracked slot, counted against
+    /// the slot's own threshold. Returns `None` if no receipts have
+    /// been recorded for that slot yet.
     ///
     /// # Errors
     /// [`LedgerError::Backend`] on backend failure.
-    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumOutcome>, LedgerError>;
+    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumVerdict>, LedgerError>;
 
     /// Forget every receipt for a stage — useful after eviction
     /// or rollback of a Plantio.
@@ -129,9 +135,9 @@ impl MaterializationLedger for MemoryLedger {
     async fn ingest(
         &self,
         stage_id: &StageId,
-        threshold: usize,
+        threshold: NonZeroUsize,
         receipt: &MaterializationReceipt,
-    ) -> Result<QuorumOutcome, LedgerError> {
+    ) -> Result<QuorumVerdict, LedgerError> {
         let key = LedgerKey {
             stage_id: stage_id.clone(),
             kind: receipt.kind.clone(),
@@ -144,47 +150,9 @@ impl MaterializationLedger for MemoryLedger {
         Ok(tracker.ingest(receipt))
     }
 
-    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumOutcome>, LedgerError> {
+    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumVerdict>, LedgerError> {
         let state = self.inner.read().await;
-        match state.trackers.get(key) {
-            None => Ok(None),
-            Some(t) => {
-                // Re-ingest nothing to obtain the current outcome
-                // — QuorumTracker only computes on mutation. Cheap
-                // workaround: clone + ingest the same receipt's
-                // emitter (no-op since most-recent-evidence wins).
-                // Instead, surface the typed outcome by inspecting
-                // the tracker's accessors.
-                let confirmed = t.confirmed_count();
-                let variants = t.evidence_variants();
-                // Threshold is internal to the tracker; reconstruct
-                // by reading its public surface.
-                // (QuorumTracker's threshold is private — the outcome
-                // it returned on ingest IS the source of truth. Here
-                // we mirror its logic so the read path doesn't lie.)
-                let outcome = if confirmed == 0 {
-                    QuorumOutcome::Pending {
-                        confirmed: 0,
-                        threshold: 1,
-                    }
-                } else if variants > 1 {
-                    QuorumOutcome::Dissent {
-                        confirmed,
-                        evidence_variants: variants,
-                    }
-                } else {
-                    // No way to distinguish Reached vs Pending without
-                    // knowing the threshold. Return Reached when
-                    // confirmed > 0 + variants == 1; consumers should
-                    // ingest fresh receipts for authoritative state.
-                    QuorumOutcome::Reached {
-                        confirmed,
-                        threshold: confirmed,
-                    }
-                };
-                Ok(Some(outcome))
-            }
-        }
+        Ok(state.trackers.get(key).map(QuorumTracker::verdict))
     }
 
     async fn forget_stage(&self, stage_id: &StageId) -> Result<(), LedgerError> {
@@ -197,7 +165,20 @@ impl MaterializationLedger for MemoryLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quorum::QuorumState;
     use crate::receipt::{MaterializationReceipt, NodeId, ReceiptKind};
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("test thresholds are non-zero")
+    }
+
+    fn key() -> LedgerKey {
+        LedgerKey {
+            stage_id: stage(),
+            kind: ReceiptKind::Drv,
+            subject: [7u8; 32],
+        }
+    }
 
     fn rcpt(emitter: u8, evidence: u8) -> MaterializationReceipt {
         MaterializationReceipt::for_drv([7u8; 32], NodeId::new([emitter; 32]), 100, [evidence; 32])
@@ -217,72 +198,100 @@ mod tests {
     #[tokio::test]
     async fn ingest_creates_tracker_for_new_key() {
         let l = MemoryLedger::new();
-        l.ingest(&stage(), 3, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(3), &rcpt(1, 5)).await.unwrap();
         assert_eq!(l.len().await, 1);
     }
 
     #[tokio::test]
     async fn ingest_routes_by_stage_id() {
         let l = MemoryLedger::new();
-        l.ingest(&StageId::new("a"), 3, &rcpt(1, 5)).await.unwrap();
-        l.ingest(&StageId::new("b"), 3, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&StageId::new("a"), nz(3), &rcpt(1, 5))
+            .await
+            .unwrap();
+        l.ingest(&StageId::new("b"), nz(3), &rcpt(1, 5))
+            .await
+            .unwrap();
         assert_eq!(l.len().await, 2);
     }
 
     #[tokio::test]
     async fn ingest_reaches_quorum_with_distinct_emitters() {
         let l = MemoryLedger::new();
-        let o1 = l.ingest(&stage(), 3, &rcpt(1, 5)).await.unwrap();
-        assert!(matches!(o1, QuorumOutcome::Pending { confirmed: 1, .. }));
-        let o2 = l.ingest(&stage(), 3, &rcpt(2, 5)).await.unwrap();
-        assert!(matches!(o2, QuorumOutcome::Pending { confirmed: 2, .. }));
-        let o3 = l.ingest(&stage(), 3, &rcpt(3, 5)).await.unwrap();
-        assert!(matches!(
-            o3,
-            QuorumOutcome::Reached {
-                confirmed: 3,
-                threshold: 3
-            }
-        ));
+        let o1 = l.ingest(&stage(), nz(3), &rcpt(1, 5)).await.unwrap();
+        assert_eq!((o1.state(), o1.confirmed()), (QuorumState::Pending, 1));
+        let o2 = l.ingest(&stage(), nz(3), &rcpt(2, 5)).await.unwrap();
+        assert_eq!((o2.state(), o2.confirmed()), (QuorumState::Pending, 2));
+        let o3 = l.ingest(&stage(), nz(3), &rcpt(3, 5)).await.unwrap();
+        assert!(o3.is_reached());
+        assert_eq!((o3.confirmed(), o3.threshold()), (3, nz(3)));
     }
 
     #[tokio::test]
     async fn dissent_surfaces_when_evidence_disagrees() {
         let l = MemoryLedger::new();
-        l.ingest(&stage(), 2, &rcpt(1, 5)).await.unwrap();
-        let o = l.ingest(&stage(), 2, &rcpt(2, 6)).await.unwrap();
-        assert!(matches!(o, QuorumOutcome::Dissent { .. }));
+        l.ingest(&stage(), nz(2), &rcpt(1, 5)).await.unwrap();
+        let o = l.ingest(&stage(), nz(2), &rcpt(2, 6)).await.unwrap();
+        assert_eq!(o.state(), QuorumState::Dissent);
+    }
+
+    // The read path used to re-derive the verdict without the slot's
+    // threshold: any agreeing confirmation read back as `Reached` and
+    // any disagreement as `Dissent`. It now returns the tracker's own
+    // verdict, so a read and the ingest that preceded it agree.
+
+    #[tokio::test]
+    async fn outcome_counts_against_the_slots_threshold() {
+        let l = MemoryLedger::new();
+        let ingested = l.ingest(&stage(), nz(3), &rcpt(1, 5)).await.unwrap();
+        let read = l.outcome(&key()).await.unwrap().expect("slot exists");
+        assert_eq!(read.state(), QuorumState::Pending, "1 of 3 is not a quorum");
+        assert_eq!((read.confirmed(), read.threshold()), (1, nz(3)));
+        assert_eq!(read, ingested);
+    }
+
+    #[tokio::test]
+    async fn outcome_reports_disagreement_below_threshold_as_pending() {
+        let l = MemoryLedger::new();
+        l.ingest(&stage(), nz(3), &rcpt(1, 5)).await.unwrap();
+        let ingested = l.ingest(&stage(), nz(3), &rcpt(2, 6)).await.unwrap();
+        let read = l.outcome(&key()).await.unwrap().expect("slot exists");
+        assert_eq!(read.state(), QuorumState::Pending);
+        assert_eq!(read, ingested);
+    }
+
+    #[tokio::test]
+    async fn later_receipts_count_against_the_first_threshold() {
+        let l = MemoryLedger::new();
+        l.ingest(&stage(), nz(3), &rcpt(1, 5)).await.unwrap();
+        let v = l.ingest(&stage(), nz(1), &rcpt(2, 5)).await.unwrap();
+        assert_eq!((v.state(), v.threshold()), (QuorumState::Pending, nz(3)));
     }
 
     #[tokio::test]
     async fn outcome_returns_none_for_unknown_key() {
         let l = MemoryLedger::new();
-        let key = LedgerKey {
-            stage_id: stage(),
-            kind: ReceiptKind::Drv,
-            subject: [7u8; 32],
-        };
-        assert!(l.outcome(&key).await.unwrap().is_none());
+        assert!(l.outcome(&key()).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn outcome_returns_some_after_ingest() {
         let l = MemoryLedger::new();
-        l.ingest(&stage(), 1, &rcpt(1, 5)).await.unwrap();
-        let key = LedgerKey {
-            stage_id: stage(),
-            kind: ReceiptKind::Drv,
-            subject: [7u8; 32],
-        };
-        assert!(l.outcome(&key).await.unwrap().is_some());
+        l.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
+        assert!(l.outcome(&key()).await.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn forget_stage_drops_all_its_trackers() {
         let l = MemoryLedger::new();
-        l.ingest(&StageId::new("a"), 3, &rcpt(1, 5)).await.unwrap();
-        l.ingest(&StageId::new("a"), 3, &rcpt(2, 5)).await.unwrap();
-        l.ingest(&StageId::new("b"), 3, &rcpt(1, 5)).await.unwrap();
+        l.ingest(&StageId::new("a"), nz(3), &rcpt(1, 5))
+            .await
+            .unwrap();
+        l.ingest(&StageId::new("a"), nz(3), &rcpt(2, 5))
+            .await
+            .unwrap();
+        l.ingest(&StageId::new("b"), nz(3), &rcpt(1, 5))
+            .await
+            .unwrap();
         assert_eq!(l.len().await, 2);
         l.forget_stage(&StageId::new("a")).await.unwrap();
         assert_eq!(l.len().await, 1);
@@ -299,24 +308,13 @@ mod tests {
     #[tokio::test]
     async fn duplicate_emitter_doesnt_double_count() {
         let l = MemoryLedger::new();
-        l.ingest(&stage(), 3, &rcpt(1, 5)).await.unwrap();
-        l.ingest(&stage(), 3, &rcpt(1, 5)).await.unwrap();
-        l.ingest(&stage(), 3, &rcpt(1, 5)).await.unwrap();
-        // Same emitter → still 1 confirmation.
-        let key = LedgerKey {
-            stage_id: stage(),
-            kind: ReceiptKind::Drv,
-            subject: [7u8; 32],
-        };
-        let outcome = l.outcome(&key).await.unwrap().unwrap();
-        match outcome {
-            QuorumOutcome::Pending { confirmed, .. } | QuorumOutcome::Reached { confirmed, .. } => {
-                assert_eq!(confirmed, 1);
-            }
-            QuorumOutcome::Dissent { confirmed, .. } => {
-                assert_eq!(confirmed, 1);
-            }
-        }
+        l.ingest(&stage(), nz(3), &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(3), &rcpt(1, 5)).await.unwrap();
+        l.ingest(&stage(), nz(3), &rcpt(1, 5)).await.unwrap();
+        // Same emitter → still 1 confirmation, so still pending.
+        let verdict = l.outcome(&key()).await.unwrap().unwrap();
+        assert_eq!(verdict.confirmed(), 1);
+        assert_eq!(verdict.state(), QuorumState::Pending);
     }
 
     #[tokio::test]

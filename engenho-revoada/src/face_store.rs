@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::face::{
-    FaceError, FaceWatchEvent, FaceWatchEventKind, FaceWatchStream, ResourceFormat, ResourceRef,
+    FaceError, FaceWatchEvent, FaceWatchEventKind, FaceWatchStream, MpscWatchStream,
+    ResourceFormat, ResourceRef,
 };
 use crate::format::AdapterRegistry;
 
@@ -311,7 +312,7 @@ impl InMemoryStore {
             kind_filter: kind.to_string(),
             namespace_filter: namespace.map(str::to_string),
         });
-        Ok(Box::new(MpscWatchStream { rx }))
+        Ok(Box::new(MpscWatchStream::new(rx)))
     }
 }
 
@@ -331,16 +332,47 @@ impl std::fmt::Debug for InMemoryStore {
     }
 }
 
-/// mpsc-based watch stream used by every face's `watch_resources`.
-struct MpscWatchStream {
-    rx: std::sync::mpsc::Receiver<FaceWatchEvent>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::face::WatchPoll;
+    use std::time::Duration;
 
-impl FaceWatchStream for MpscWatchStream {
-    fn next_event(&mut self) -> Result<Option<FaceWatchEvent>, FaceError> {
-        match self.rx.recv() {
-            Ok(event) => Ok(Some(event)),
-            Err(_) => Ok(None),
-        }
+    fn pod(name: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {name}\n  namespace: default\nspec:\n  containers:\n    - name: c\n      image: nginx\n"
+        )
+        .into_bytes()
+    }
+
+    /// The bounded wait reports each of its three outcomes, and "nothing yet"
+    /// comes back within the bound instead of blocking until an event.
+    #[test]
+    fn poll_event_reports_idle_then_the_event_then_the_end() {
+        let store = InMemoryStore::new("poll-event");
+        let mut stream = store
+            .watch("Pod", Some("default"), ResourceFormat::Yaml)
+            .expect("watch opens");
+
+        assert_eq!(
+            stream.poll_event(Duration::from_millis(10)).expect("poll"),
+            WatchPoll::Idle
+        );
+
+        store.apply(ResourceFormat::Yaml, &pod("a")).expect("apply");
+        assert!(
+            matches!(
+                stream.poll_event(Duration::from_secs(5)).expect("poll"),
+                WatchPoll::Event(_)
+            ),
+            "an applied Pod must arrive as an event"
+        );
+
+        drop(store);
+        assert_eq!(
+            stream.poll_event(Duration::from_secs(5)).expect("poll"),
+            WatchPoll::Ended,
+            "a stream whose face store is gone has ended; it is not idle"
+        );
     }
 }

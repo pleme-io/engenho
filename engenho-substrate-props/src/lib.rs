@@ -1,8 +1,12 @@
 //! # engenho-substrate-props
 //!
-//! Property-based tests for engenho-substrate's typed primitives.
-//! Pure-test crate — no production exports. Every test asserts a
-//! TYPED INVARIANT that must hold for every well-formed input.
+//! Property-based tests for engenho-substrate's typed primitives: the
+//! tokio-free core (`engenho-substrate-core`), the leaf
+//! (`engenho-substrate`) and, as a dev-dependency only, the modules no
+//! shipped crate references (`engenho-substrate-incubator`: pesquisa's
+//! `EnsaioId` / `Linhagem`, `ComposeIr`, `Budget`, `OciImageRenderer`,
+//! `CommandRunner`). Pure-test crate — no production exports. Every test
+//! asserts a TYPED INVARIANT that must hold for every well-formed input.
 //!
 //! ## Why a separate crate
 //!

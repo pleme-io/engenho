@@ -89,7 +89,7 @@ pub use fabric::{
 };
 pub use face::{
     BareMetalSupervisorFace, Face, FaceError, FaceWatchEvent, FaceWatchEventKind, FaceWatchStream,
-    KubernetesFace, NomadFace, PureRaftFace, ResourceFormat, ResourceRef, SystemdFace,
+    KubernetesFace, NomadFace, PureRaftFace, ResourceFormat, ResourceRef, SystemdFace, WatchPoll,
     instantiate as instantiate_face,
 };
 

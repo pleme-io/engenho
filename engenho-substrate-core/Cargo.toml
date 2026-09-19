@@ -1,0 +1,27 @@
+[package]
+name = "engenho-substrate-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+authors.workspace = true
+description = "engenho-substrate-core — the tokio-free core of engenho's substrate: typed error kinds, names, hex and BLAKE3 hash newtypes, fingerprints, atomic writes, magic-headered blobs, redaction and clocks. No async runtime is a dependency, so none can be used here."
+
+# The core's promise is its dependency set: no async runtime, no async
+# trait machinery. `tests/tokio_free.rs` reads this table back and fails
+# when one appears. Anything that needs tokio belongs in engenho-substrate
+# (the leaf), which re-exports this crate whole.
+[dependencies]
+thiserror          = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+blake3             = "1"
+
+[dev-dependencies]
+# Reads this manifest back in tests/tokio_free.rs.
+toml               = "0.8"

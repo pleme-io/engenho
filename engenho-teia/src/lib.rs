@@ -12,8 +12,16 @@
 //!   optional JWT credentials, leaf-node remotes for federation.
 //! - [`subject::ClusterScope`] — typed subject builder. Subjects
 //!   are constructed from primitives, never string-formatted ad-hoc.
-//! - [`TeiaClient`] — wraps `async_nats::Client` with the typed
-//!   subject + payload encoding.
+//! - `TeiaClient` — wraps `async_nats::Client` with the typed
+//!   subject + payload encoding. **Only under the `teia-nats` feature.**
+//!
+//! ## Fenced off (docs/IMPROVEMENT-PLAN.md §5.1)
+//!
+//! NATS is not engenho's fabric: a NATS server is a second process on every
+//! node, a sidecar under another name. engenho-config's `fabric` is
+//! `in_binary`. This crate stays as a typed draft; with default features it
+//! is the subject grammar and the connection config and nothing that dials
+//! a socket. `teia-nats` (off by default) adds the client and async-nats.
 //!
 //! ## Channels (per FABRIC.md)
 //!
@@ -32,11 +40,13 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+#[cfg(feature = "teia-nats")]
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod subject;
 
+#[cfg(feature = "teia-nats")]
 pub use client::TeiaClient;
 pub use config::{LeafNodeRemote, TeiaConfig};
 pub use error::TeiaError;

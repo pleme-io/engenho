@@ -30,8 +30,6 @@ spec:
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - name: ENGENHO_CLUSTER
               value: {{ .Values.global.cluster.name | quote }}
-            - name: ENGENHO_NATS_URL
-              value: {{ include "engenho.natsURL" . | quote }}
             - name: ENGENHO_GOSSIP_PORT
               value: {{ .Values.revoada.gossip.port | quote }}
             - name: ENGENHO_PHI_THRESHOLD

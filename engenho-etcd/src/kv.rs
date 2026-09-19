@@ -78,35 +78,96 @@ pub fn to_key_value(obj: &StoredObject, plural: &str, namespaced: bool) -> KeyVa
 /// `range_end == prefix_range_end(key)`. Recognising that here rather than
 /// in the transport is what lets the store answer with one collection scan
 /// instead of a full keyspace walk.
+///
+/// A shape is answered in two steps, and both live here so the transport
+/// cannot get either wrong: scan the store under [`Self::scan_prefix`], then
+/// keep the keys [`Self::contains`] accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RangeShape {
     /// A single key.
     Point(String),
     /// Every key under a prefix.
     Prefix(String),
-    /// An explicit `[start, end)` interval that is not a clean prefix.
-    Interval { start: String, end: String },
+    /// An explicit `[start, end)` interval that is not a clean prefix. Kept
+    /// as bytes, because etcd compares keys as bytes.
+    Interval { start: Vec<u8>, end: Vec<u8> },
+    /// `range_end == "\0"` with any other key: every key at or after this
+    /// one (`etcdctl get --from-key`).
+    FromKey(Vec<u8>),
     /// `key == "\0"` and `range_end == "\0"` — etcd's "the whole keyspace".
     All,
 }
 
+impl RangeShape {
+    /// The prefix every key in this range starts with: the one collection
+    /// scan that can answer it, before [`Self::contains`] narrows it.
+    ///
+    /// ★ AN INTERVAL SCANS THE PREFIX ITS TWO BOUNDS SHARE, NOT ITS START.
+    /// Every key `k` with `start <= k < end` begins with the longest common
+    /// prefix of `start` and `end`: a key that differed from it earlier
+    /// would sort below `start` or at/above `end`. Scanning under `start`
+    /// instead answered `[/registry/pods/a, /registry/pods/c)` with the keys
+    /// under `/registry/pods/a` alone, silently dropping `/registry/pods/b`.
+    /// The shared prefix is cut back to a whole UTF-8 character, which only
+    /// widens the scan.
+    ///
+    /// An unbounded range (`All`, `FromKey`) narrows nothing, and scans `""`.
+    #[must_use]
+    pub fn scan_prefix(&self) -> String {
+        match self {
+            Self::Point(key) => key.clone(),
+            Self::Prefix(prefix) => prefix.clone(),
+            Self::Interval { start, end } => {
+                let shared = start.iter().zip(end).take_while(|(a, b)| a == b).count();
+                let bytes = &start[..shared];
+                match std::str::from_utf8(bytes) {
+                    Ok(text) => text.to_owned(),
+                    // Only the first `valid_up_to` bytes are known to be
+                    // whole characters, and they are a prefix of `bytes`.
+                    Err(cut) => String::from_utf8_lossy(&bytes[..cut.valid_up_to()]).into_owned(),
+                }
+            }
+            Self::FromKey(_) | Self::All => String::new(),
+        }
+    }
+
+    /// Whether `key` is in this range, compared as bytes the way etcd does.
+    #[must_use]
+    pub fn contains(&self, key: &[u8]) -> bool {
+        match self {
+            Self::Point(point) => key == point.as_bytes(),
+            Self::Prefix(prefix) => key.starts_with(prefix.as_bytes()),
+            Self::Interval { start, end } => start.as_slice() <= key && key < end.as_slice(),
+            Self::FromKey(start) => start.as_slice() <= key,
+            Self::All => true,
+        }
+    }
+}
+
 /// Classify a raw `(key, range_end)` pair.
+///
+/// The encodings are upstream's (`RangeRequest` in the vendored
+/// `rpc.proto`): no `range_end` is one key; `range_end == "\0"` is every
+/// key at or after `key`, and every key at all when `key` is `"\0"` too;
+/// `key` plus one is a prefix; anything else is `[key, range_end)`.
 #[must_use]
 pub fn range_shape(key: &[u8], range_end: &[u8]) -> RangeShape {
-    // etcd spells "from here to the end of the keyspace" as a single zero
-    // byte, and "everything" as key=\0 with that end.
     if range_end.is_empty() {
         return RangeShape::Point(String::from_utf8_lossy(key).into_owned());
     }
-    if key == [0] && range_end == [0] {
-        return RangeShape::All;
+    if range_end == [0] {
+        return if key == [0] {
+            RangeShape::All
+        } else {
+            RangeShape::FromKey(key.to_vec())
+        };
     }
     if range_end == keyspace::prefix_range_end(key).as_slice() {
         return RangeShape::Prefix(String::from_utf8_lossy(key).into_owned());
     }
     RangeShape::Interval {
-        start: String::from_utf8_lossy(key).into_owned(),
-        end: String::from_utf8_lossy(range_end).into_owned(),
+        start: key.to_vec(),
+        end: range_end.to_vec(),
     }
 }
 
@@ -229,10 +290,83 @@ mod tests {
         assert_eq!(
             range_shape(b"/registry/a", b"/registry/z"),
             RangeShape::Interval {
-                start: "/registry/a".into(),
-                end: "/registry/z".into(),
+                start: b"/registry/a".to_vec(),
+                end: b"/registry/z".to_vec(),
             }
         );
+    }
+
+    /// `range_end == "\0"` is upstream's "every key at or after `key`". Read
+    /// as an interval ending at `"\0"`, it matched nothing — every key sorts
+    /// above a zero byte — and `etcdctl get --from-key` answered with an
+    /// empty range that reads exactly like an empty cluster.
+    #[test]
+    fn a_zero_range_end_is_every_key_from_the_start_on() {
+        let shape = range_shape(b"/registry/pods/default/b", &[0]);
+        assert_eq!(
+            shape,
+            RangeShape::FromKey(b"/registry/pods/default/b".to_vec())
+        );
+        assert!(shape.contains(b"/registry/pods/default/b"), "inclusive");
+        assert!(shape.contains(b"/registry/secrets/default/token"));
+        assert!(!shape.contains(b"/registry/pods/default/a"));
+        assert_eq!(
+            shape.scan_prefix(),
+            "",
+            "an unbounded range narrows nothing"
+        );
+    }
+
+    /// Every key of the 699-key k3s corpus that falls inside an interval
+    /// starts with the prefix that interval scans — so the scan never drops
+    /// a key the interval holds.
+    #[test]
+    fn an_interval_scans_a_prefix_every_key_inside_it_shares() {
+        let corpus: Vec<&[u8]> = include_str!("../tests/fixtures/k3s-registry-keys.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("/registry/"))
+            .map(str::as_bytes)
+            .collect();
+        let intervals: [(&[u8], &[u8]); 5] = [
+            (b"/registry/pods/a", b"/registry/pods/z"),
+            (
+                b"/registry/configmaps/kube-system/c",
+                b"/registry/configmaps/kube-system/l",
+            ),
+            (b"/registry/a", b"/registry/z"),
+            (b"/registry/leases/", b"/registry/secrets/"),
+            (b"/", b"0"),
+        ];
+        for (start, end) in intervals {
+            let shape = range_shape(start, end);
+            let prefix = shape.scan_prefix();
+            let inside: Vec<&&[u8]> = corpus.iter().filter(|k| shape.contains(k)).collect();
+            assert!(!inside.is_empty(), "the corpus has keys in {shape:?}");
+            for key in inside {
+                assert!(
+                    key.starts_with(prefix.as_bytes()),
+                    "{} is in {shape:?} but outside its scan prefix {prefix:?}",
+                    String::from_utf8_lossy(key)
+                );
+            }
+        }
+        assert_eq!(
+            range_shape(b"/registry/pods/default/a", b"/registry/pods/default/c").scan_prefix(),
+            "/registry/pods/default/"
+        );
+    }
+
+    /// The shared prefix of two bounds can end inside a multi-byte
+    /// character; the scan backs off to the last whole one.
+    #[test]
+    fn an_interval_prefix_never_splits_a_character() {
+        // `è` is C3 A8 and `é` is C3 A9: the bounds share the C3. (`/r/è`
+        // alone would be a clean prefix of `/r/é`, so the start goes on.)
+        let shape = range_shape("/r/è1".as_bytes(), "/r/é".as_bytes());
+        assert!(matches!(shape, RangeShape::Interval { .. }), "{shape:?}");
+        assert_eq!(shape.scan_prefix(), "/r/");
+        assert!(shape.contains("/r/è2".as_bytes()));
     }
 
     #[test]

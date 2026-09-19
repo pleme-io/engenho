@@ -32,7 +32,8 @@
 //!      ([`crate::consensus`]'s store), so a restarted node forgets the
 //!      vote it cast and the entries it acknowledged;
 //!    - [`RoleAssignment::has_majority`](crate::topology::RoleAssignment::has_majority)
-//!      is true whenever any voter exists;
+//!      counts reachable voters against the configured voter set, but
+//!      nothing on the promotion path calls it;
 //!    - [`TopologyReactor`](crate::topology::TopologyReactor) proposes a
 //!      promotion from its own gossip view, with no quorum check.
 //!

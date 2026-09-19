@@ -26,8 +26,6 @@ spec:
           env:
             - name: ENGENHO_CLUSTER
               value: {{ .Values.global.cluster.name | quote }}
-            - name: ENGENHO_NATS_URL
-              value: {{ include "engenho.natsURL" . | quote }}
             - name: ENGENHO_STORE_PEERS
               value: "{{ include "engenho.fullname" . }}-store.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.store.raft.port }}"
             - name: ENGENHO_HTTP_PORT

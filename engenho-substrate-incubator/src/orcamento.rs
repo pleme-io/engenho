@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::relogio::{Clock, Instant};
+use engenho_substrate::relogio::{Clock, Instant};
 
 /// Budget errors.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -56,7 +56,7 @@ pub enum BudgetError {
     },
 }
 
-crate::impl_error_kind! {
+engenho_substrate::impl_error_kind! {
     BudgetError {
         { Exhausted { .. } } => "exhausted",
         { OverCapacity { .. } } => "over_capacity",
@@ -240,18 +240,18 @@ impl Budget {
     }
 }
 
-crate::impl_named_field!(Budget);
+engenho_substrate::impl_named_field!(Budget);
 
 // `Budget` is `Observable` — `BudgetSnapshot` plugs directly into
 // a `mirante::ObservationChannel`. v0.92: routed through canonical
 // `impl_observable!` macro (TSR extraction).
-crate::impl_observable!(Budget, BudgetSnapshot);
+engenho_substrate::impl_observable!(Budget, BudgetSnapshot);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::named::Named;
-    use crate::relogio::FrozenClock;
+    use engenho_substrate::named::Named;
+    use engenho_substrate::relogio::FrozenClock;
 
     fn budget(cap: u64, rate: u64, t0: u64) -> (Budget, Arc<FrozenClock>) {
         let clock = Arc::new(FrozenClock::at(t0));

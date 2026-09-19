@@ -9,8 +9,10 @@
 //! display-only artifacts for dashboards) — codifying that contract.
 
 use engenho_substrate::{
-    BudgetSnapshot, ChildCountSnapshot, MiranteSnapshot, ReplayCursorSnapshot, SubscriberSnapshot,
+    ChildCountSnapshot, MiranteSnapshot, ReplayCursorSnapshot, SubscriberSnapshot,
 };
+
+use engenho_substrate_incubator::BudgetSnapshot;
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 

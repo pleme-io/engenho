@@ -221,13 +221,18 @@ in
         `/Users/x/data-evil`, and a path containing `..` is refused.
       '';
 
-      kubeletBackend = optional (types.enum [ "podman_api" "podman" "cri" "fake" "native" ]) ''
+      # `cri` is deliberately NOT offered. engenho refuses it when its config is
+      # parsed (T5.9, pending-cri: the CRI backend still drops part of every
+      # Pod), so offering it here would let a green eval render a config the
+      # daemon will not start on. It returns to this list when engenho lifts
+      # that refusal (engenho-config `KubeletBackendKind::selection_refusal`).
+      kubeletBackend = optional (types.enum [ "podman_api" "podman" "fake" "native" ]) ''
         Container runtime the kubelet drives.
 
         `native` runs each container as a NATIVE HOST PROCESS out of a realised
         Nix closure, with no container runtime underneath it at all. It is the
-        only backend that runs a workload on darwin without a Linux VM -- the
-        other three all end at a Linux runtime, which on macOS means
+        only backend that runs a workload on darwin without a Linux VM -- both
+        podman arms end at a Linux runtime, which on macOS means
         podman-machine. It accepts `nix:/nix/store/...` images and REFUSES OCI
         references rather than falling back, so a node set to `native` cannot
         silently end up running its pods in a VM.
@@ -253,6 +258,9 @@ in
 
         `fake` runs NOTHING — the mock backend, correct for a
         control-plane-only node and wrong anywhere pods must actually run.
+
+        `cri` is not offered: engenho refuses it when its config is parsed,
+        because its CRI backend still drops part of every Pod (pending-cri).
 
         ★ Both podman arms drive the SAME container store; the difference is
         entirely client-side. Switching between them does not migrate, restart
@@ -375,25 +383,47 @@ in
         "Grace period before topology reacts to a membership change.";
     };
 
+    fabric = optional (types.enum [ "in_binary" ]) ''
+      How engenho's parts reach one another. `in_binary` is the only value and
+      engenho's own default, so leaving this unset is equivalent. There is no
+      NATS value: NATS is not engenho's fabric (docs/IMPROVEMENT-PLAN.md §5.1).
+    '';
+
+    # ── DEPRECATED, KEPT (MODULARIZE, DON'T DELETE) ─────────────────────────
+    # engenho no longer reads a `teia` section: `fabric: in_binary` replaced it
+    # (§5.1). The options stay declared because removing them would break
+    # evaluation for any consumer that still sets them. Setting any of them
+    # renders NOTHING and raises a `warnings` entry instead; see `config.warnings`
+    # below.
     teia = {
       servers = mkOption {
         type = types.listOf types.str;
         default = [ ];
         example = [ "nats://127.0.0.1:4222" ];
-        description = "NATS servers for the teia mesh. Empty keeps the default.";
+        description = ''
+          DEPRECATED and ignored: engenho does not read a `teia` section
+          (NATS is not engenho's fabric). Setting it raises a warning.
+        '';
       };
-      cluster = optional types.str ''
-        teia subject namespace.
-
-        NOTE: engenho currently defaults this to the literal `engenho-local`,
-        INDEPENDENTLY of `cluster.name` — a second hardcoded copy of the
-        cluster identity. Until that is derived upstream, set both together or
-        neither.
-      '';
-      credentialsPath = optional types.path "NATS credentials file.";
-      connectTimeoutSeconds = optional types.ints.unsigned "NATS connect timeout.";
+      cluster = optional types.str
+        "DEPRECATED and ignored (teia subject namespace). Setting it raises a warning.";
+      credentialsPath = optional types.path
+        "DEPRECATED and ignored (NATS credentials file). Setting it raises a warning.";
+      connectTimeoutSeconds = optional types.ints.unsigned
+        "DEPRECATED and ignored (NATS connect timeout). Setting it raises a warning.";
     };
   };
+
+  # A deprecated `teia` option that is set is an operator who believes it does
+  # something. It does not, so say so at eval, once, naming what replaced it.
+  # "Set" is exactly "the old render would have emitted a `teia` section":
+  # `prune` below dropped `[ ]` and `null`, so those are the unset values.
+  config.warnings =
+    let t = config.services.engenho.config.teia;
+    in lib.optional
+      (t.servers != [ ] || t.cluster != null || t.credentialsPath != null
+        || t.connectTimeoutSeconds != null)
+      "services.engenho.config.teia is deprecated and ignored: NATS is not engenho's fabric, and engenho no longer reads a `teia` section. Its replacement is `services.engenho.config.fabric = \"in_binary\"`, which is also the default. Remove the teia settings.";
 
   # ── The projection: typed options → the trio's YAML `settings` ──────────
   #
@@ -478,11 +508,8 @@ in
         min_nodes = cfg.revoada.topology.minNodes;
         grace_period_seconds = cfg.revoada.topology.gracePeriodSeconds;
       };
-      teia = {
-        servers = cfg.teia.servers;
-        cluster = cfg.teia.cluster;
-        credentials_path = cfg.teia.credentialsPath;
-        connect_timeout_seconds = cfg.teia.connectTimeoutSeconds;
-      };
+      fabric = cfg.fabric;
+      # No `teia`: engenho does not read it (§5.1). The deprecated options
+      # above warn instead of rendering.
     });
 }

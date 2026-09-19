@@ -102,7 +102,7 @@ pub enum CommandError {
     Io(String),
 }
 
-crate::impl_error_kind! {
+engenho_substrate::impl_error_kind! {
     CommandError {
         (Spawn(_)) => "spawn",
         (Io(_)) => "io",
