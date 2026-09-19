@@ -155,7 +155,7 @@ pub struct Change {
 
 /// The typed "requested revision has been compacted away" error —
 /// the 410 Gone equivalent. Returned by
-/// [`crate::state::ResourceCatalog::changes_since`] when the caller
+/// [`crate::state::ResourceCatalog::changes_after`] when the caller
 /// asks for history below the compaction watermark.
 ///
 /// `requested` is the revision the caller passed; `compacted` is the

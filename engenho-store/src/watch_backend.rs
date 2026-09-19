@@ -66,7 +66,7 @@ use tokio::sync::mpsc;
 use crate::owned_task::{OwnedTask, TaskStop};
 use crate::revision::{Change, CompactedTooOld, Revision};
 use crate::state::ResourceCatalog;
-use crate::watch::{WatchEvent, WatchEventKind};
+use crate::watch::{ChangeShape, WatchEvent};
 
 /// Default per-watcher buffer — mirrors the legacy broadcast capacity
 /// so the migration is behaviorally familiar.
@@ -178,6 +178,49 @@ impl WatchSignal {
     }
 }
 
+/// One streamed item carrying the WHOLE committed change: what the
+/// per-watcher channel holds, and what [`WatchStream::next_change`] hands
+/// out.
+///
+/// A [`WatchSignal::Event`] carries one image of the object, already turned
+/// into an event kind for a watch with no selector. That is not enough for
+/// a watch WITH one: an update that takes an object out of its view has to
+/// be told from one that never entered it, and only the prior image can
+/// tell them apart. [`crate::watch::project`] reads both images off the
+/// change.
+///
+/// The change is the `Arc` the catalog built at apply time, shared with
+/// the history ring and every other watcher: sending it copies no object.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChangeSignal {
+    /// A committed change, with its post-image and its prior.
+    Change(Arc<Change>),
+    /// A periodic progress marker; see [`WatchSignal::Bookmark`].
+    Bookmark(Revision),
+}
+
+impl ChangeSignal {
+    /// The revision this signal carries (the change's revision or the
+    /// bookmark's). Used to track `last_seen` + ordering.
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        match self {
+            ChangeSignal::Change(change) => change.revision,
+            ChangeSignal::Bookmark(rev) => *rev,
+        }
+    }
+}
+
+impl From<ChangeSignal> for WatchSignal {
+    /// The event a watch with no selector sees: [`watch_event_from_change`].
+    fn from(signal: ChangeSignal) -> Self {
+        match signal {
+            ChangeSignal::Change(change) => WatchSignal::Event(watch_event_from_change(&change)),
+            ChangeSignal::Bookmark(rev) => WatchSignal::Bookmark(rev),
+        }
+    }
+}
+
 /// The shared terminal-Gone slot. The producer side (apply / feeder)
 /// arms it exactly once on overflow; the [`WatchStream`] observes it
 /// promptly (via [`GoneSlot::armed`] in its `select!`) AND on a clean
@@ -275,9 +318,9 @@ impl WatchOpts {
 /// registry; the apply path fans events to it via non-blocking
 /// `try_send`.
 struct WatcherHandle {
-    /// The live event/bookmark sender. Bounded; `try_send` is
+    /// The live change/bookmark sender. Bounded; `try_send` is
     /// non-blocking so the apply path never awaits a slow consumer.
-    tx: mpsc::Sender<WatchSignal>,
+    tx: mpsc::Sender<ChangeSignal>,
     /// The replay high-water revision captured under the lock at
     /// subscription. The live fan-out drops any straggler
     /// `revision <= boundary` (belt-and-suspenders against
@@ -314,7 +357,7 @@ impl WatcherHandle {
     /// closed/overflowed handles. On `Full` the handle is armed with a
     /// typed [`WatchGone::Overflow`] — never a silent drop, never a
     /// block.
-    fn try_enqueue(&mut self, signal: WatchSignal) -> HandleSendOutcome {
+    fn try_enqueue(&mut self, signal: ChangeSignal) -> HandleSendOutcome {
         if self.overflowed {
             return HandleSendOutcome::Dead;
         }
@@ -450,8 +493,9 @@ impl WatcherRegistry {
                 current,
             });
         }
-        let replay = catalog.changes_since(opts.from).map_err(WatchGone::from)?;
-        Ok(self.register_captured(replay, current, opts))
+        // The ring's own `Arc`s: the replay shares each change, copying none.
+        let replay = catalog.changes_after(opts.from).map_err(WatchGone::from)?;
+        Ok(self.register_shared(replay.cloned(), current, opts))
     }
 
     /// Register a LIVE-TAIL watcher (no replay, no bookmarks) starting at
@@ -471,7 +515,11 @@ impl WatcherRegistry {
         let current = catalog.revision();
         // Nothing is retained past the current revision, so the replay
         // from it is empty.
-        self.register_captured(Vec::new(), current, &WatchOpts::live_tail(current, buffer))
+        self.register_shared(
+            std::iter::empty(),
+            current,
+            &WatchOpts::live_tail(current, buffer),
+        )
     }
 
     /// Register a watcher from an ALREADY-CAPTURED replay + boundary,
@@ -479,7 +527,7 @@ impl WatcherRegistry {
     ///
     /// Lets callers that can't split-borrow the catalog + the registry
     /// from one lock guard (e.g. via a `tokio::MutexGuard`'s `Deref`)
-    /// read `changes_since` / `revision` first, bind the owned `replay`
+    /// read the replay window / `revision` first, bind the owned `replay`
     /// + Copy `boundary`, then call this with only `&mut self`. The
     /// reads + this call MUST happen under the SAME catalog lock for the
     /// handoff to be atomic.
@@ -508,9 +556,20 @@ impl WatcherRegistry {
         boundary: Revision,
         opts: &WatchOpts,
     ) -> WatchStream {
+        self.register_shared(replay.into_iter().map(Arc::new), boundary, opts)
+    }
+
+    /// [`Self::register_captured`] over changes already shared: the ring's
+    /// own `Arc`s, so the replay copies no change.
+    fn register_shared(
+        &mut self,
+        replay: impl IntoIterator<Item = Arc<Change>>,
+        boundary: Revision,
+        opts: &WatchOpts,
+    ) -> WatchStream {
         // Allocate the bounded channel + build the handle.
         let capacity = opts.buffer.max(1);
-        let (tx, rx) = mpsc::channel::<WatchSignal>(capacity);
+        let (tx, rx) = mpsc::channel::<ChangeSignal>(capacity);
         let gone = Arc::new(GoneSlot::default());
         // last_seen starts at the resume point: the consumer has
         // logically "seen" everything up to `from`.
@@ -535,8 +594,7 @@ impl WatcherRegistry {
         // on the first non-delivered outcome (overflow / closed) — there
         // is no point pushing more into a dead channel.
         for change in replay {
-            let ev = watch_event_from_change(&change);
-            if handle.try_enqueue(WatchSignal::Event(ev)) != HandleSendOutcome::Sent {
+            if handle.try_enqueue(ChangeSignal::Change(change)) != HandleSendOutcome::Sent {
                 break;
             }
         }
@@ -555,18 +613,28 @@ impl WatcherRegistry {
         }
     }
 
+    /// Fan one change that did not come from a catalog commit (a test
+    /// harness driving the registry by hand) to every live watcher. The
+    /// stores fan the `Arc`s the catalog committed through the crate-private
+    /// `fan_shared`, which this wraps.
+    pub fn fan_change(&mut self, change: &Change) {
+        self.fan_shared(&Arc::new(change.clone()));
+    }
+
     /// Fan one committed change to every live watcher whose
     /// `boundary < change.revision`. Called UNDER THE CATALOG LOCK by
-    /// the apply path, right after `WatchHistory::commit` has run.
+    /// the apply path, right after `WatchHistory::commit` has run, once
+    /// for each of [`crate::state::ApplyOutcome::changes`].
     ///
-    /// Builds the typed [`WatchEvent`] from the [`Change`] + the
-    /// resource op (Added vs Modified is decided by whether this Put
-    /// was a create).
+    /// Every watcher gets the same `Arc` the history ring holds: the fan-out
+    /// under the lock is a reference count per watcher, never a copy of the
+    /// object. Turning the change into an event happens on the consumer's
+    /// side ([`WatchStream::next`], or [`crate::watch::project`] for a
+    /// watch with a selector).
     ///
     /// Non-blocking: each delivery is `try_send`. Full → typed Gone +
     /// reap (never a silent drop, never a block). Closed → reap.
-    pub fn fan_change(&mut self, change: &Change) {
-        let ev = watch_event_from_change(change);
+    pub(crate) fn fan_shared(&mut self, change: &Arc<Change>) {
         let boundary_floor = change.revision;
         self.handles.retain_mut(|h| {
             // Dup-freedom invariant: a watcher only receives events
@@ -574,7 +642,8 @@ impl WatcherRegistry {
             if h.boundary >= boundary_floor {
                 return true;
             }
-            !h.try_enqueue(WatchSignal::Event(ev.clone())).should_reap()
+            !h.try_enqueue(ChangeSignal::Change(Arc::clone(change)))
+                .should_reap()
         });
     }
 
@@ -605,7 +674,7 @@ impl WatcherRegistry {
             if !due || h.last_bookmarked_rev == Some(current) {
                 return true;
             }
-            match h.tx.try_send(WatchSignal::Bookmark(current)) {
+            match h.tx.try_send(ChangeSignal::Bookmark(current)) {
                 Ok(()) => {
                     if current > h.last_seen {
                         h.last_seen = current;
@@ -629,13 +698,13 @@ impl WatcherRegistry {
     }
 }
 
-/// Build the typed [`WatchEvent`] for a committed [`Change`].
+/// Build the typed [`WatchEvent`] a watch with NO selector sees for a
+/// committed [`Change`].
 ///
-/// Added vs Modified for a `Put` is derived from the change itself:
-/// `change.prior.is_none()` means a first-create (Added); `Some(_)`
-/// means a replace/patch (Modified) — the EXACT same distinction
+/// The kind is [`ChangeShape::unfiltered`]: a first create (no prior) is
+/// Added, a replace/patch (a prior) Modified — the EXACT same distinction
 /// `ResourceCatalog::apply` makes when it returns `ResourceOp::Created`
-/// vs `Replaced`. A `Delete` is always `Deleted`. The event's `object`
+/// vs `Replaced` — and a `Delete` is always `Deleted`. The event's `object`
 /// is the change's post-image (the tombstone for a delete — never
 /// Null), and `resource_version` is the global MVCC revision.
 ///
@@ -643,18 +712,14 @@ impl WatcherRegistry {
 /// replay + live take the same exact path with no extra state — the
 /// boundary handoff can't disagree on Added/Modified for the same
 /// revision.
+///
+/// A watch WITH a selector must not filter this event on its `object`: an
+/// update that takes an object out of the selector would be dropped rather
+/// than sent as DELETED. It reads [`WatchStream::next_change`] and
+/// [`crate::watch::project`]s each change instead.
 #[must_use]
 pub fn watch_event_from_change(change: &Change) -> WatchEvent {
-    let kind = match change.kind {
-        crate::revision::ChangeKind::Put => {
-            if change.prior.is_none() {
-                WatchEventKind::Added
-            } else {
-                WatchEventKind::Modified
-            }
-        }
-        crate::revision::ChangeKind::Delete => WatchEventKind::Deleted,
-    };
+    let kind = ChangeShape::of(change).unfiltered();
     WatchEvent {
         kind,
         object: change.value.clone(),
@@ -668,7 +733,7 @@ pub fn watch_event_from_change(change: &Change) -> WatchEvent {
 /// then ends.
 #[derive(Debug)]
 pub struct WatchStream {
-    rx: mpsc::Receiver<WatchSignal>,
+    rx: mpsc::Receiver<ChangeSignal>,
     gone: Arc<GoneSlot>,
     last_seen: Revision,
     terminal_emitted: bool,
@@ -690,7 +755,21 @@ impl WatchStream {
     ///
     /// Never surfaces `broadcast::RecvError::Lagged` — overflow is the
     /// typed [`WatchGone::Overflow`].
+    ///
+    /// Each event is the one a watch with NO selector sees
+    /// ([`watch_event_from_change`]). A watch with a selector reads
+    /// [`Self::next_change`] instead.
     pub async fn next(&mut self) -> Option<Result<WatchSignal, WatchGone>> {
+        Some(self.next_change().await?.map(WatchSignal::from))
+    }
+
+    /// Next signal, carrying the whole committed change: [`Self::next`]
+    /// before the change is turned into an event, with the same ordering,
+    /// the same single terminal `Err` and the same `None`.
+    ///
+    /// What a watch filtered by a selector reads, so it can
+    /// [`crate::watch::project`] each change over both of its images.
+    pub async fn next_change(&mut self) -> Option<Result<ChangeSignal, WatchGone>> {
         if self.terminal_emitted {
             return None;
         }
@@ -748,6 +827,12 @@ impl WatchStream {
     /// non-draining case — it means "empty for now"; use [`Self::next`]
     /// to park for the next signal.
     pub fn try_next(&mut self) -> Option<Result<WatchSignal, WatchGone>> {
+        Some(self.try_next_change()?.map(WatchSignal::from))
+    }
+
+    /// Non-blocking [`Self::next_change`], with [`Self::try_next`]'s
+    /// meaning of `None`.
+    pub fn try_next_change(&mut self) -> Option<Result<ChangeSignal, WatchGone>> {
         if self.terminal_emitted {
             return None;
         }
@@ -770,7 +855,7 @@ impl WatchStream {
 
     /// In drain-then-Gone mode: deliver one buffered event, or — when
     /// the buffer is empty — the single terminal Gone.
-    fn next_while_draining(&mut self) -> Result<WatchSignal, WatchGone> {
+    fn next_while_draining(&mut self) -> Result<ChangeSignal, WatchGone> {
         match self.rx.try_recv() {
             Ok(signal) => Ok(self.account(signal)),
             Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
@@ -786,7 +871,7 @@ impl WatchStream {
     }
 
     /// On a clean channel close: surface an armed Gone (once) or `None`.
-    fn close_or_gone(&mut self) -> Option<Result<WatchSignal, WatchGone>> {
+    fn close_or_gone(&mut self) -> Option<Result<ChangeSignal, WatchGone>> {
         if let Some(gone) = self.gone.take() {
             self.terminal_emitted = true;
             Some(Err(gone))
@@ -796,7 +881,7 @@ impl WatchStream {
     }
 
     /// Track `last_seen` as each signal flows past.
-    fn account(&mut self, signal: WatchSignal) -> WatchSignal {
+    fn account(&mut self, signal: ChangeSignal) -> ChangeSignal {
         let rev = signal.revision();
         if rev > self.last_seen {
             self.last_seen = rev;
@@ -945,6 +1030,7 @@ mod tests {
     use super::*;
     use crate::resource::ResourceKey;
     use crate::revision::{ChangeKind, VersionMeta};
+    use crate::watch::WatchEventKind;
 
     fn pod_key(name: &str) -> ResourceKey {
         ResourceKey::namespaced("", "v1", "Pod", "default", name)
@@ -1665,6 +1751,48 @@ mod tests {
                     }),
                     "{from} is past the head"
                 ),
+            }
+        }
+    }
+
+    /// T3.7: the catalog builds each change once, at apply time. The ring,
+    /// every live watcher and every later replay hold that one allocation,
+    /// so the fan-out under the catalog lock copies no object however many
+    /// watchers there are.
+    #[tokio::test]
+    async fn every_watcher_shares_the_change_the_catalog_committed() {
+        let mut cat = ResourceCatalog::default();
+        let mut reg = WatcherRegistry::new();
+        let mut first = reg.register_live_tail(&cat, 8);
+        let mut second = reg.register_live_tail(&cat, 8);
+        let out = cat.apply(
+            &crate::command::ResourceCommand::Put {
+                key: pod_key("p"),
+                value: serde_json::json!({"spec": {"big": "x".repeat(4096)}}),
+                expected: None,
+                reason: crate::command::Reason::Operator,
+            },
+            1,
+            1,
+        );
+        for change in out.changes() {
+            reg.fan_shared(change);
+        }
+        let committed = out.change.as_ref().expect("a create commits a change");
+        let mut replaying = reg
+            .register(&cat, &WatchOpts::from_revision(Revision::ZERO))
+            .expect("nothing is compacted");
+        for (who, stream) in [
+            ("first live watcher", &mut first),
+            ("second live watcher", &mut second),
+            ("replaying watcher", &mut replaying),
+        ] {
+            match stream.try_next_change() {
+                Some(Ok(ChangeSignal::Change(got))) => assert!(
+                    Arc::ptr_eq(&got, committed),
+                    "the {who} holds a copy, not the change the catalog committed"
+                ),
+                other => panic!("the {who} got {other:?}, not the change"),
             }
         }
     }

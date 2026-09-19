@@ -1279,7 +1279,7 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         // Buffer the committed changes; we fan them to watchers AFTER
         // the fsync (durable-before-observable) but BEFORE dropping the
         // lock (so the replay→live handoff stays atomic).
-        let mut committed: Vec<crate::revision::Change> = Vec::new();
+        let mut committed: Vec<std::sync::Arc<crate::revision::Change>> = Vec::new();
         // Track whether last_membership changed so we persist it.
         let mut membership_changed = false;
         // Indexes skipped because the image already held them (T3.4).
@@ -1316,9 +1316,9 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
                             .apply_logged(logged, log_id.leader_id.term, log_id.index);
                     let op = outcome.op;
                     let patch_error = outcome.patch_error.clone();
-                    if let Some(change) = outcome.change {
-                        committed.push(change);
-                    }
+                    // Every change the entry committed, first and the rest:
+                    // a live watcher sees what a replaying one does.
+                    committed.extend(outcome.changes().cloned());
                     (op, patch_error)
                 }
                 EntryPayload::Membership(m) => {
@@ -1386,7 +1386,7 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         // same `state` lock). Non-blocking try_send (overflow → typed Gone,
         // never silent, never blocks).
         for change in &committed {
-            state.watchers.fan_change(change);
+            state.watchers.fan_shared(change);
         }
         drop(state);
         Ok(results)

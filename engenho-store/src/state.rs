@@ -247,7 +247,10 @@ pub struct ApplyOutcome {
     /// for a no-op. Carries the post-image, the prior object (so the
     /// Deleted event always has the real prior, never Null), the
     /// stamped revision, and the per-key version metadata.
-    pub change: Option<Change>,
+    ///
+    /// Built once, here, at apply time: the history ring and every watcher
+    /// share this one allocation (T3.7).
+    pub change: Option<Arc<Change>>,
     /// The typed patch-interpreter error string when `op ==
     /// [`ResourceOp::PatchRejected`]`; `None` otherwise. The apiserver maps
     /// it to the correct typed `ApiError` (415 for server-side apply,
@@ -262,7 +265,7 @@ pub struct ApplyOutcome {
     /// with one `mod_revision`, and splitting them would be observable on
     /// the wire. Empty for every single-key command, so no existing caller
     /// changes behaviour.
-    pub extra_changes: Vec<Change>,
+    pub extra_changes: Vec<Arc<Change>>,
 }
 
 impl ApplyOutcome {
@@ -281,12 +284,30 @@ impl ApplyOutcome {
     /// An outcome carrying a committed [`Change`].
     #[must_use]
     pub fn with_change(op: ResourceOp, change: Change) -> Self {
+        Self::committed(op, Arc::new(change), Vec::new())
+    }
+
+    /// An outcome carrying one committed revision: `first`, plus every
+    /// further key the same command touched at that revision.
+    fn committed(op: ResourceOp, first: Arc<Change>, rest: Vec<Arc<Change>>) -> Self {
         Self {
             op,
-            change: Some(change),
+            change: Some(first),
             patch_error: None,
-            extra_changes: Vec::new(),
+            extra_changes: rest,
         }
+    }
+
+    /// Every change this outcome committed, in the order the history
+    /// records them: [`Self::change`], then [`Self::extra_changes`]. Empty
+    /// for a no-op.
+    ///
+    /// The one list both the history ring and the live watch fan-out are
+    /// fed from, so a live watcher and one replaying the ring see the same
+    /// changes for one revision: a transaction's second key is not a replay
+    /// -only event.
+    pub fn changes(&self) -> impl Iterator<Item = &Arc<Change>> {
+        self.change.iter().chain(&self.extra_changes)
     }
 
     /// A [`ResourceOp::PatchRejected`] outcome carrying the typed patch
@@ -630,7 +651,7 @@ impl ResourceCatalog {
         let taken = compares.iter().all(|c| self.eval_compare(c));
         let branch = if taken { success } else { failure };
 
-        let mut changes: Vec<Change> = Vec::new();
+        let mut changes: Vec<Arc<Change>> = Vec::new();
         for op in branch {
             let outcome = match op {
                 // etcd: a Put is a revision even when the value is the same,
@@ -654,11 +675,7 @@ impl ResourceCatalog {
         let mut iter = changes.into_iter();
         match iter.next() {
             None => ApplyOutcome::no_change(ResourceOp::NoOp),
-            Some(first) => {
-                let mut out = ApplyOutcome::with_change(ResourceOp::Replaced, first);
-                out.extra_changes = iter.collect();
-                out
-            }
+            Some(first) => ApplyOutcome::committed(ResourceOp::Replaced, first, iter.collect()),
         }
     }
 
@@ -1142,16 +1159,7 @@ impl ResourceCatalog {
         // resourceVersion follows the bump (so a watcher's CAS sees the new
         // rev); generation is spec-intent and unchanged by a metadata-only
         // deletionTimestamp stamp, so it is preserved verbatim.
-        if let Some(meta_obj) = terminating
-            .as_object_mut()
-            .and_then(|o| o.get_mut("metadata"))
-            .and_then(|m| m.as_object_mut())
-        {
-            meta_obj.insert(
-                "resourceVersion".to_string(),
-                serde_json::Value::String(rev.to_string()),
-            );
-        }
+        stamp_resource_version(&mut terminating, rev);
 
         self.resources
             .insert(key.clone(), (terminating.clone(), version_meta));
@@ -1352,10 +1360,15 @@ impl ResourceCatalog {
         &self.history
     }
 
-    /// All committed changes with `revision > rv`, in revision order.
+    /// All committed changes with `revision > rv`, in revision order: the
+    /// watch-replay window. A client that last saw revision `rv` resumes by
+    /// replaying exactly these changes.
     ///
-    /// This is the watch-replay primitive: a client that last saw
-    /// revision `rv` resumes by replaying exactly these changes.
+    /// Each item is the ring's own `Arc`, so a reader that keeps a change
+    /// (the watch replay) shares it rather than copying it, and one that
+    /// keeps only some (the etcd façade's prefix filter) copies nothing it
+    /// drops. The one definition of the window and of its refusal, so no
+    /// reader can drift from the watch replay's rule.
     ///
     /// # Errors
     ///
@@ -1363,23 +1376,18 @@ impl ResourceCatalog {
     /// the requested resume point has been compacted away (the 410
     /// Gone equivalent). Asking from exactly `compacted_revision` (or
     /// above) is always honored.
-    pub fn changes_since(&self, rv: Revision) -> Result<Vec<Change>, CompactedTooOld> {
-        Ok(self.changes_after(rv)?.cloned().collect())
-    }
-
-    /// [`Self::changes_since`] by reference: the same window and the same
-    /// refusal, with nothing cloned. The one definition of both, so a
-    /// reader that clones only the changes it keeps (the etcd façade's
-    /// prefix filter) cannot drift from the watch replay's rule.
-    ///
-    /// # Errors
-    ///
-    /// [`CompactedTooOld`] when `rv < compacted_revision`.
     pub(crate) fn changes_after(
         &self,
         rv: Revision,
-    ) -> Result<impl Iterator<Item = &Change>, CompactedTooOld> {
+    ) -> Result<impl Iterator<Item = &Arc<Change>>, CompactedTooOld> {
         self.history.since(rv)
+    }
+
+    /// [`Self::changes_after`], copied out: for tests that compare whole
+    /// windows by value.
+    #[cfg(test)]
+    pub fn changes_since(&self, rv: Revision) -> Result<Vec<Change>, CompactedTooOld> {
+        Ok(self.changes_after(rv)?.map(|c| Change::clone(c)).collect())
     }
 
     /// List resources matching (group, version, kind), optionally
@@ -1659,17 +1667,28 @@ fn stamp_identity(
 /// the per-revision pass every Put, Patch and server-side apply shares, run
 /// only once the write is known to commit.
 fn stamp_revision(value: &mut serde_json::Value, rev: Revision, generation: i64) {
+    stamp_resource_version(value, rev);
     let Some(meta_obj) = metadata_mut(value) else {
         return;
     };
     meta_obj.insert(
-        "resourceVersion".to_string(),
-        serde_json::Value::String(rev.to_string()),
-    );
-    meta_obj.insert(
         "generation".to_string(),
         serde_json::Value::Number(generation.into()),
     );
+}
+
+/// Stamp `metadata.resourceVersion = rev` on `value`, creating `metadata`
+/// when absent; a `value` that is not an object is left alone. The one
+/// writer of the field: the commit path, the Terminating stamp, and a watch
+/// event that carries an object at a revision other than its own (a DELETED
+/// built from the prior image, T3.7) all go through it.
+pub(crate) fn stamp_resource_version(value: &mut serde_json::Value, rev: Revision) {
+    if let Some(meta_obj) = metadata_mut(value) {
+        meta_obj.insert(
+            "resourceVersion".to_string(),
+            serde_json::Value::String(rev.to_string()),
+        );
+    }
 }
 
 /// Set `metadata.deletionTimestamp` to the REPLICATED `ts` string,
@@ -2003,7 +2022,7 @@ mod tests {
             "podinfo:6"
         );
         // prior carries the same last-known object.
-        let prior = change.prior.unwrap();
+        let prior = change.prior.as_ref().unwrap();
         assert_eq!(prior.get("spec").unwrap().get("replicas").unwrap(), 3);
     }
 

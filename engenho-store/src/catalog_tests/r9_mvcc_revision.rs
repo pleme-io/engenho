@@ -302,7 +302,10 @@ fn delete_change_is_a_tombstone_with_prior() {
         change.value.get("spec").unwrap().get("image").unwrap(),
         "podinfo:6"
     );
-    let prior = change.prior.expect("delete prior is the last-known object");
+    let prior = change
+        .prior
+        .as_ref()
+        .expect("delete prior is the last-known object");
     assert_eq!(prior.get("spec").unwrap().get("replicas").unwrap(), 3);
 }
 

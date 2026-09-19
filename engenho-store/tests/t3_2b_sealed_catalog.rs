@@ -33,7 +33,7 @@ use engenho_store::{
 };
 use serde_json::json;
 use support::{
-    bytes_allocated_by, durable_mesh, memory_mesh, put, release_secret,
+    bytes_allocated_by, durable_mesh, memory_mesh, put, release_secret, replay_as_events,
     seed_bulk_then_one_configmap,
 };
 
@@ -715,13 +715,16 @@ fn pod(name: &str) -> ResourceKey {
     ResourceKey::namespaced("", "v1", "Pod", "default", name)
 }
 
-/// A replay from revision zero is the one read whose cost IS the ring, by
-/// design; it is the positive control that the counter counts and the seed
-/// is big enough to tell a clone from a scalar.
+/// Draining a replay from revision zero as events is the one read whose cost
+/// IS the ring, by design ([`replay_as_events`]); it is the positive control
+/// that the counter counts and the seed is big enough to tell a clone from a
+/// scalar.
 async fn ring_bytes(mesh: &StoreMesh) -> usize {
-    let (replay, bytes) =
-        bytes_allocated_by(mesh.watch_from(WatchOpts::from_revision(Revision::ZERO))).await;
-    drop(replay.expect("nothing is compacted yet"));
+    let (events, bytes) = replay_as_events(mesh).await;
+    assert_eq!(
+        events, 201,
+        "the whole ring: 200 Secret rewrites and the ConfigMap"
+    );
     assert!(
         bytes > 2 * 1024 * 1024,
         "positive control: replaying the ring allocated only {bytes} bytes — the counting \

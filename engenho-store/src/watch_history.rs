@@ -48,9 +48,20 @@
 //! One contract is debug-asserted rather than typed: each change handed to
 //! [`WatchHistory::commit`] carries the revision [`WatchHistory::next_revision`]
 //! named. The catalog stamps every change of a command from that one call.
+//!
+//! ## One allocation per change (T3.7)
+//!
+//! The ring holds `Arc<Change>`: the catalog builds each change once, at
+//! apply time, and the ring, the live fan-out and every replay share that
+//! one allocation. A change carries both of its images (the post-image and
+//! the prior), and a watch filtered by a selector needs both to tell an
+//! object leaving its view from one it never saw, so handing each watcher
+//! its own deep copy would cost two objects per watcher per change, under
+//! the lock `apply` holds.
 
 use std::collections::{VecDeque, vec_deque};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use crate::revision::{Change, CompactedTooOld, Revision};
 
@@ -66,6 +77,10 @@ pub(crate) const DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(DEFAUL
     None => NonZeroUsize::MIN,
 };
 
+/// A run of retained changes, oldest first: one side of a
+/// [`WatchHistory::split`].
+pub(crate) type Window<'a> = vec_deque::Iter<'a, Arc<Change>>;
+
 /// The watch-replay ring together with the floor it backs, the head it runs
 /// up to, and the most changes it may hold. See the module docs for the
 /// promise and for the four operations that keep it.
@@ -73,7 +88,7 @@ pub(crate) const DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(DEFAUL
 pub(crate) struct WatchHistory {
     /// Every change above `floor`, oldest first, grouped by revision. Never
     /// longer than `capacity`.
-    ring: VecDeque<Change>,
+    ring: VecDeque<Arc<Change>>,
     /// The compaction floor. Every change above it is in `ring`; none at or
     /// below it is.
     floor: Revision,
@@ -147,10 +162,7 @@ impl WatchHistory {
     /// `rv` and the floor are gone, so no replay from `rv` can be complete.
     /// Resuming from exactly the floor, or from anywhere above it, is always
     /// honoured, and past the head it replays nothing.
-    pub(crate) fn split(
-        &self,
-        rv: Revision,
-    ) -> Result<(vec_deque::Iter<'_, Change>, vec_deque::Iter<'_, Change>), CompactedTooOld> {
+    pub(crate) fn split(&self, rv: Revision) -> Result<(Window<'_>, Window<'_>), CompactedTooOld> {
         if rv < self.floor {
             return Err(CompactedTooOld {
                 requested: rv,
@@ -168,10 +180,7 @@ impl WatchHistory {
     /// # Errors
     ///
     /// [`CompactedTooOld`] when `rv` is below the floor.
-    pub(crate) fn since(
-        &self,
-        rv: Revision,
-    ) -> Result<vec_deque::Iter<'_, Change>, CompactedTooOld> {
+    pub(crate) fn since(&self, rv: Revision) -> Result<Window<'_>, CompactedTooOld> {
         self.split(rv).map(|(_, after)| after)
     }
 
@@ -186,7 +195,10 @@ impl WatchHistory {
     /// is ever retained. A revision with more changes than the whole ring
     /// evicts itself: the ring empties and the floor reaches the head, the
     /// honest answer when the ring cannot hold it.
-    pub(crate) fn commit(&mut self, first: &Change, rest: &[Change]) -> Revision {
+    ///
+    /// The ring keeps a reference to each change, not a copy: the caller's
+    /// `Arc`s are the ones the live fan-out sends.
+    pub(crate) fn commit(&mut self, first: &Arc<Change>, rest: &[Arc<Change>]) -> Revision {
         let revision = self.next_revision();
         debug_assert!(
             std::iter::once(first)
@@ -194,7 +206,7 @@ impl WatchHistory {
                 .all(|c| c.revision == revision),
             "every change of one commit carries the revision next_revision() named"
         );
-        self.ring.push_back(first.clone());
+        self.ring.push_back(Arc::clone(first));
         self.ring.extend(rest.iter().cloned());
         self.head = revision;
         while self.ring.len() > self.capacity.get() {
@@ -251,7 +263,7 @@ impl WatchHistory {
 
     /// Every retained change, oldest first.
     #[cfg(test)]
-    pub(crate) fn iter(&self) -> vec_deque::Iter<'_, Change> {
+    pub(crate) fn iter(&self) -> Window<'_> {
         self.ring.iter()
     }
 }
@@ -268,21 +280,21 @@ mod tests {
     }
 
     /// One change to key `name`, stamped at `revision`.
-    fn change(revision: Revision, name: &str) -> Change {
-        Change {
+    fn change(revision: Revision, name: &str) -> Arc<Change> {
+        Arc::new(Change {
             revision,
             key: ResourceKey::namespaced("", "v1", "ConfigMap", "default", name),
             kind: ChangeKind::Put,
             value: serde_json::json!({ "name": name }),
             prior: None,
             version_meta: VersionMeta::created_at(revision),
-        }
+        })
     }
 
     /// Commit one revision touching `keys` keys; returns what was committed.
-    fn commit_n(h: &mut WatchHistory, keys: usize) -> Vec<Change> {
+    fn commit_n(h: &mut WatchHistory, keys: usize) -> Vec<Arc<Change>> {
         let revision = h.next_revision();
-        let group: Vec<Change> = (0..keys)
+        let group: Vec<Arc<Change>> = (0..keys)
             .map(|i| change(revision, &format!("r{}-k{i}", revision.get())))
             .collect();
         let recorded = h.commit(&group[0], &group[1..]);
@@ -290,7 +302,7 @@ mod tests {
         group
     }
 
-    fn revisions<'a>(changes: impl Iterator<Item = &'a Change>) -> Vec<u64> {
+    fn revisions<'a>(changes: impl Iterator<Item = &'a Arc<Change>>) -> Vec<u64> {
         changes.map(|c| c.revision.get()).collect()
     }
 
@@ -486,7 +498,7 @@ mod tests {
                 Some(head) => WatchHistory::loaded_at(Revision(head), cap(capacity)),
                 None => WatchHistory::new(cap(capacity)),
             };
-            let mut log: Vec<Change> = Vec::new();
+            let mut log: Vec<Arc<Change>> = Vec::new();
             let mut model_floor = h.floor();
             assert_sealed(&h)?;
             for op in ops {
@@ -511,10 +523,10 @@ mod tests {
                 }
                 assert_sealed(&h)?;
                 prop_assert_eq!(h.floor(), model_floor);
-                let above: Vec<&Change> = log.iter().filter(|c| c.revision > model_floor).collect();
+                let above: Vec<&Arc<Change>> = log.iter().filter(|c| c.revision > model_floor).collect();
                 prop_assert_eq!(h.iter().collect::<Vec<_>>(), above);
                 for rv in model_floor.get()..=h.head().get() + 1 {
-                    let expected: Vec<&Change> = log.iter().filter(|c| c.revision.get() > rv).collect();
+                    let expected: Vec<&Arc<Change>> = log.iter().filter(|c| c.revision.get() > rv).collect();
                     prop_assert_eq!(
                         h.since(Revision(rv)).map(Iterator::collect::<Vec<_>>),
                         Ok(expected)

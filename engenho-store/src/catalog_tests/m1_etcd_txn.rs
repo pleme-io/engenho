@@ -97,8 +97,7 @@ fn t2_one_transaction_is_one_revision_across_every_key() {
     }
 
     // T5: all three changes are reported, and all at the same revision.
-    let all: Vec<&crate::revision::Change> =
-        out.change.iter().chain(out.extra_changes.iter()).collect();
+    let all: Vec<&std::sync::Arc<crate::revision::Change>> = out.changes().collect();
     assert_eq!(all.len(), 3, "every mutated key must be reported");
     assert!(all.iter().all(|c| c.revision == rev));
 }

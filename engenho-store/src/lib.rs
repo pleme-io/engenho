@@ -147,5 +147,5 @@ pub use ssa::{ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome, apply
 pub use state::{ApplyOutcome, DEFAULT_HISTORY_CAPACITY, check_precondition, unchanged};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
-pub use watch::{WatchEvent, WatchEventKind};
-pub use watch_backend::{WatchGone, WatchOpts, WatchSignal, WatchStream};
+pub use watch::{ChangeShape, Projection, WatchEvent, WatchEventKind, project};
+pub use watch_backend::{ChangeSignal, WatchGone, WatchOpts, WatchSignal, WatchStream};

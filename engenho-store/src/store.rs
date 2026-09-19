@@ -432,21 +432,22 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
                         guard
                             .catalog
                             .apply_logged(logged, log_id.leader_id.term, log_id.index);
-                    // Fan the committed change to live watchers WHILE
+                    // Fan the committed changes to live watchers WHILE
                     // STILL HOLDING the catalog lock — this closes the
                     // replay→live race window entirely (the legacy
                     // post-drop broadcast left a gap/dup window). The
-                    // catalog returns the committed Change, so the
-                    // Deleted event carries the REAL prior object (the
-                    // tombstone), never Null. `fan_change` derives
-                    // Added vs Modified from `change.prior` + uses
-                    // non-blocking try_send (overflow → typed Gone,
-                    // never a silent drop, never a block on a slow
-                    // consumer).
+                    // catalog returns every change it committed, each
+                    // carrying the REAL prior object, never Null, and
+                    // each the one `Arc` the history ring holds too, so
+                    // the fan-out copies no object. Every change of the
+                    // revision goes out, not just the first: a live
+                    // watcher sees what a replaying one does. Non-blocking
+                    // try_send (overflow → typed Gone, never a silent
+                    // drop, never a block on a slow consumer).
                     let op = outcome.op;
                     let patch_error = outcome.patch_error.clone();
-                    if let Some(change) = outcome.change {
-                        guard.watchers.fan_change(&change);
+                    for change in outcome.changes() {
+                        guard.watchers.fan_shared(change);
                     }
                     (op, patch_error)
                 }
