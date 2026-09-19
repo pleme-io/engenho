@@ -1,6 +1,19 @@
-//! Property: write_atomic round-trip + tmp_path_for invariants.
+//! Property: write_atomic round-trips, and never tears or leaks a temp file.
+//!
+//! ★ CORRECTED 2026-09-19. This file asserted two properties of
+//! `tmp_path_for`, which `35e2e45` made private — and it went unnoticed because
+//! test.yml was already red for unrelated reasons, so HEAD's test suite simply
+//! stopped compiling.
+//!
+//! One of them, `tmp_path_appends_tmp_suffix`, was not a property worth porting.
+//! It pinned the DETERMINISTIC `<path>.tmp` name, and that determinism was the
+//! defect `35e2e45` fixed: two concurrent writers of one target shared a temp
+//! file, so one could publish the other's half-written bytes. The test did not
+//! merely fail to catch the race — it asserted the precondition for it. It is
+//! deleted rather than rewritten, and `concurrent_writers_never_tear_or_leak`
+//! pins the property the fix actually guarantees.
 
-use engenho_substrate::{AtomicWriteError, tmp_path_for, write_atomic};
+use engenho_substrate::{AtomicWriteError, write_atomic};
 use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,27 +56,65 @@ proptest_with_env! {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// tmp_path_for appends ".tmp" to the path's last component.
+    /// After a successful write the target's directory holds the target and
+    /// nothing else — no temp file under ANY name.
+    ///
+    /// The old form checked `!tmp_path_for(&path).exists()`, i.e. one predicted
+    /// name. A leak under a different name passed it. Listing the directory is
+    /// name-agnostic, which is the only honest way to assert "no temp survives"
+    /// once temp names are unique.
     #[test]
-    fn tmp_path_appends_tmp_suffix(name in "[a-zA-Z0-9_.-]{1,32}") {
-        let base = std::env::temp_dir().join(&name);
-        let tmp = tmp_path_for(&base);
-        let want = std::env::temp_dir().join(format!("{name}.tmp"));
-        assert_eq!(tmp, want);
+    fn no_temp_file_survives_a_successful_write(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+        let dir = unique_temp_path("no-tmp-left");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.bin");
+        write_atomic(&path, &bytes).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("target.bin")],
+            "the directory must hold only the target; found {entries:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// After successful write_atomic, the tmp file does NOT exist
-    /// (it was renamed to the canonical path).
+    /// Many writers racing on ONE target: every write succeeds, the result is
+    /// exactly one writer's complete payload, and no temp file is left behind.
+    ///
+    /// This is the property the deterministic `<path>.tmp` name violated, and
+    /// no test in the tree asserted it — the previous file pinned the name
+    /// that made the race possible. Payloads are uniform per writer, so a torn
+    /// file (bytes from two writers, or a truncated one) is detectable by
+    /// content alone.
     #[test]
-    fn tmp_file_does_not_persist_after_success(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
-        let path = unique_temp_path("no-tmp-left");
-        let tmp = tmp_path_for(&path);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&tmp);
-        write_atomic(&path, &bytes).unwrap();
-        assert!(!tmp.exists(), "tmp file persisted after rename: {tmp:?}");
-        assert!(path.exists(), "canonical path missing: {path:?}");
-        let _ = std::fs::remove_file(&path);
+    fn concurrent_writers_never_tear_or_leak(writers in 2usize..8, len in 1usize..2048) {
+        let dir = unique_temp_path("race");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.bin");
+        let handles: Vec<_> = (0..writers)
+            .map(|w| {
+                let path = path.clone();
+                let payload = vec![u8::try_from(w).unwrap(); len];
+                std::thread::spawn(move || write_atomic(&path, &payload))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got.len(), len, "a torn write changed the length");
+        let first = got[0];
+        assert!(got.iter().all(|b| *b == first),
+            "bytes from more than one writer — a torn publish");
+        assert!(usize::from(first) < writers, "payload from no writer at all");
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries.len(), 1, "a temp file leaked under the race: {entries:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// write_atomic creates parent dirs if missing.
