@@ -46,7 +46,7 @@ use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
 use engenho_types::kind::GroupVersionKind;
 use tracing::{error, info, warn};
 
-use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, TickState, Wiring};
+use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, TickLoop, Wiring};
 use crate::error::{RuntimeError, ShutdownStage, StrongCounts};
 use crate::health::{Health, Row, Tallied, Tally, Windows};
 use crate::node_lease::NodeLease;
@@ -2747,7 +2747,12 @@ impl<'a> Parts<'a> {
     fn task(&self, child: Child, before: &Children) -> Option<ChildTask> {
         match child {
             Child::Driver(driver) => Some(self.driver(driver)),
-            Child::Listener(listener) => Some(self.listener(listener)),
+            Child::Listener(listener) => Some(listener_task(
+                listener,
+                self.config,
+                Arc::downgrade(&self.kubelet),
+                self.store,
+            )),
             // Renewed by the kubelet's row, so built from it. The kubelet is
             // walked first and always enabled; were it absent, the lease
             // would have nothing to renew by, and is not spawned.
@@ -2776,8 +2781,7 @@ impl<'a> Parts<'a> {
         controller: C,
     ) -> ChildTask {
         drive(
-            Child::Driver(driver),
-            driver.tick_state(),
+            TickLoop::Driver(driver),
             controller,
             self.store,
             self.windows,
@@ -2981,40 +2985,49 @@ impl<'a> Parts<'a> {
             ),
         }
     }
+}
 
-    /// A listener's body: bind and serve, and bind again whenever that ends
-    /// ([`serve_rebinding`], T2.7).
-    fn listener(&self, listener: Listener) -> ChildTask {
-        let beat = Arc::new(Heartbeat::new());
-        match listener {
-            Listener::KubeletHttp => {
-                let api: Arc<dyn engenho_kubelet::server::KubeletApi> = Arc::new(WeakKubeletApi {
-                    kubelet: Arc::downgrade(&self.kubelet),
-                });
-                let addr = self.config.runtime.kubelet_listen_addr.clone();
-                ChildTask::new(
-                    beat.clone(),
-                    serve_rebinding(listener, beat, move || {
-                        serve_kubelet_http(addr.clone(), api.clone())
-                    }),
-                )
-            }
-            Listener::EtcdFacade => {
-                let addr = self.config.runtime.etcd_listen_addr.clone();
-                let etcd_store = crate::etcd_facade::MeshEtcdStore::new(self.store);
-                ChildTask::new(
-                    beat.clone(),
-                    serve_rebinding(listener, beat, move || {
-                        serve_etcd_facade(addr.clone(), etcd_store.clone())
-                    }),
-                )
-            }
+/// A listener's body: bind and serve at the address `config` gives it, and
+/// bind again whenever that ends or panics ([`serve_rebinding`], T2.7).
+///
+/// The one place a listener's body is built: the runtime's walk and the
+/// fault-injection matrix (W6) both call it. `kubelet` is held weakly — a
+/// strong `Arc<Kubelet>` behind the :10250 router keeps the store alive past
+/// shutdown ([`WeakKubeletApi`]).
+pub(crate) fn listener_task(
+    listener: Listener,
+    config: &EngenhoConfig,
+    kubelet: std::sync::Weak<Kubelet>,
+    store: &Arc<StoreMesh>,
+) -> ChildTask {
+    let beat = Arc::new(Heartbeat::new());
+    match listener {
+        Listener::KubeletHttp => {
+            let api: Arc<dyn engenho_kubelet::server::KubeletApi> =
+                Arc::new(WeakKubeletApi { kubelet });
+            let addr = config.runtime.kubelet_listen_addr.clone();
+            ChildTask::new(
+                beat.clone(),
+                serve_rebinding(listener, beat, move || {
+                    serve_kubelet_http(addr.clone(), api.clone())
+                }),
+            )
+        }
+        Listener::EtcdFacade => {
+            let addr = config.runtime.etcd_listen_addr.clone();
+            let etcd_store = crate::etcd_facade::MeshEtcdStore::new(store);
+            ChildTask::new(
+                beat.clone(),
+                serve_rebinding(listener, beat, move || {
+                    serve_etcd_facade(addr.clone(), etcd_store.clone())
+                }),
+            )
         }
     }
 }
 
-/// Wrap `controller` in a `WatchDriver` as the catalog says `child` (a
-/// driver, or the node lease) runs, with `tick_state` its catalog row.
+/// Wrap `controller` in a `WatchDriver` as the catalog says `tick_loop` (a
+/// driver, or the node lease) runs.
 ///
 /// * Woken by exactly the kinds the controller declares it reads (T1.7).
 ///   This is the only place a driver's filter is built, and it takes nothing
@@ -3023,9 +3036,11 @@ impl<'a> Parts<'a> {
 ///   The three controllers whose crates do not declare yet are declared
 ///   beside their spawn ([`DeclaredHere`]), as reads, and the read census
 ///   holds those to their sources too.
-/// * A panic in its tick is handled by the driver's catalog [`TickState`]
-///   (T2.7): contained and re-ticked for a Stateless driver, fatal to the
-///   child for a Stateful one. The catalog row is the only source of it.
+/// * A panic in its tick is handled by the loop's catalog
+///   [`TickState`](crate::TickState) (T2.7): contained and re-ticked for a
+///   Stateless driver, fatal to the child for a Stateful one. It is read
+///   here off the tick loop's own row ([`TickLoop::tick_state`]), so no
+///   call to this function can drive a loop by another row.
 /// * Its ticks are counted ([`Tallied`], T2.8): by how each ended, for
 ///   `controller_runtime_reconcile_total`, and by whether it landed a write,
 ///   for the propose-rate detector. A tick it has run longer than the
@@ -3033,9 +3048,8 @@ impl<'a> Parts<'a> {
 ///   stalled by liveness: one threshold, from `windows`. Its fallback and
 ///   debounce are read from the same value, so liveness's idle window is
 ///   derived from the fallback the loop runs on.
-fn drive<C: Controller + DeclaresReads + 'static>(
-    child: Child,
-    tick_state: TickState,
+pub(crate) fn drive<C: Controller + DeclaresReads + 'static>(
+    tick_loop: TickLoop,
     controller: C,
     store: &Arc<StoreMesh>,
     windows: Windows,
@@ -3046,12 +3060,12 @@ fn drive<C: Controller + DeclaresReads + 'static>(
         debounce: windows.debounce(),
         fallback_interval: windows.fallback(),
         stuck_tick_after: windows.stuck_tick_after(),
-        tick_state,
+        tick_state: tick_loop.tick_state(),
     };
     let controller_type = controller.controller_type();
     // Named by the catalog, like its liveness row and its last-tick gauge,
     // so every family says `controller="<child>"` in one vocabulary.
-    let tally = Arc::new(Tally::new(child.name()));
+    let tally = Arc::new(Tally::new(tick_loop.child().name()));
     let watch = WatchDriver::new(
         Tallied::new(controller, tally.clone()),
         store.clone(),
@@ -3072,8 +3086,7 @@ pub(crate) fn drive_node_lease(
     windows: Windows,
 ) -> ChildTask {
     drive(
-        Child::NodeLease,
-        Child::NODE_LEASE_TICK_STATE,
+        TickLoop::NodeLease,
         NodeLease::new(store.clone(), node, kubelet, windows),
         store,
         windows.node_lease(),
@@ -3722,8 +3735,7 @@ mod tests {
         let children = Children::spawn_catalog(&config, |child, _| {
             (child == Child::Driver(driver)).then(|| {
                 drive(
-                    child,
-                    driver.tick_state(),
+                    TickLoop::Driver(driver),
                     DeclaredHere::new(PanicsEveryTick, Reads::nothing()),
                     &store,
                     Windows::of(&config.controllers).with_fallback(PANIC_FALLBACK),

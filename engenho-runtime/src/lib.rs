@@ -52,9 +52,16 @@
 //! A panic in a driver's tick is contained only when the catalog says the
 //! driver is [`TickState::Stateless`]: it is counted and the fallback
 //! re-ticks it. A [`TickState::Stateful`] driver's panic ends it, and it is
-//! Dead. A listener whose serve ends binds again on a growing backoff. Every
-//! panic in the process, caught or not, is counted by the hook behind
-//! [`PanicCounter`], which [`Runtime::start`] installs.
+//! Dead. A listener whose serve ends, or panics, binds again on a growing
+//! backoff. Every panic in the process, caught or not, is counted by the
+//! hook behind [`PanicCounter`], which [`Runtime::start`] installs.
+//!
+//! ## Every fault, every child (W6)
+//!
+//! [`Child::supervision`] declares what the supervisor does when a
+//! [`Fault`] — a panic, a hang, an error return, a bind failure — strikes
+//! each child ([`Supervision`]), derived from the catalog's rows. A test
+//! matrix strikes every child with every fault and holds the runtime to it.
 //!
 //! ## The node lease (T1.3c)
 //!
@@ -111,6 +118,8 @@ pub mod etcd_facade;
 mod child;
 mod dormant;
 mod error;
+#[cfg(test)]
+mod fault_matrix;
 mod health;
 #[cfg(test)]
 mod impl_census;
@@ -125,8 +134,8 @@ mod runtime;
 mod testing;
 
 pub use child::{
-    Child, ChildHandle, ChildState, Children, DeadChild, DeathCause, Driver, Listener, TickState,
-    Wiring,
+    Child, ChildHandle, ChildState, Children, DeadChild, DeathCause, Driver, Fault, Listener,
+    Supervision, TickState, Wiring,
 };
 pub use dormant::{Dormant, DormantReason};
 pub use error::{RuntimeError, ShutdownStage};

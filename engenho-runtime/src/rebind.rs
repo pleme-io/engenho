@@ -13,7 +13,8 @@
 //! ## What it does now
 //!
 //! [`serve_rebinding`] runs one bind-and-serve attempt at a time, forever.
-//! After each attempt ends it records `Halted`, waits the next step of
+//! After each attempt ends it records `Halted` (`Panicked` if the attempt
+//! panicked), waits the next step of
 //! [`REBIND`] (the same [`Curve`] every retry in the controllers reads), and
 //! tries again. A port that stays taken is retried forever but never
 //! hot-looped. An attempt that served for at least the curve's cap made
@@ -24,13 +25,32 @@
 //! The heartbeat tells a reader which of the two states the listener is in:
 //! in flight while an attempt runs (binding, then serving), and `Halted`
 //! with nothing in flight while it waits to rebind.
+//!
+//! ## A panic in an attempt (W6)
+//!
+//! An attempt that panicked used to end the listener's task: the child was
+//! Dead, nothing respawns a Dead child, and the port stayed closed for the
+//! life of the process — the very outcome the rebind exists to prevent,
+//! reached by a different road. The fault-injection matrix found it. An
+//! attempt is now contained the way a Stateless tick is: its panic is
+//! counted (it ends `Panicked`, which the heartbeat counts), and the
+//! listener backs off and binds again like any attempt that ended.
+//!
+//! Containing it is sound because an attempt holds nothing across attempts:
+//! `serve` builds each one afresh from clones, and what a listener serves
+//! (the kubelet, the store) it reaches only from request tasks, which its
+//! server spawns and tokio already isolates. A panic that comes back on
+//! every attempt is retried on the curve, never hot-looped, and counted
+//! each time.
 
 use std::convert::Infallible;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::task::Poll;
 
-use engenho_controllers::{Curve, Heartbeat, Streak, TickClass};
-use tracing::warn;
+use engenho_controllers::{Curve, Heartbeat, PanicMessage, Streak, TickClass};
+use tracing::{error, warn};
 
 use crate::child::Listener;
 
@@ -39,8 +59,8 @@ use crate::child::Listener;
 pub(crate) const REBIND: Curve = Curve::from_millis::<1_000, 60_000>();
 
 /// Run `serve` — one bind-and-serve attempt of `listener` — again every time
-/// it ends, waiting the next step of [`REBIND`] in between. It never
-/// returns.
+/// it ends or panics, waiting the next step of [`REBIND`] in between. It
+/// never returns, and a panic in an attempt does not end it.
 ///
 /// `serve` owns its logging: it says why its bind failed or its server
 /// stopped. This says only that the listener is not serving and when it will
@@ -58,8 +78,20 @@ where
     loop {
         beat.begin();
         let began = tokio::time::Instant::now();
-        serve().await;
-        beat.end(TickClass::Halted);
+        let ended = match contained(serve()).await {
+            Ok(()) => TickClass::Halted,
+            Err(panic) => {
+                error!(
+                    listener = listener.name(),
+                    %panic,
+                    "listener's serve PANICKED and was contained; it holds nothing across \
+                     attempts, so it binds again after the backoff"
+                );
+                TickClass::Panicked
+            }
+        };
+        // `Panicked` is counted as a panic by the heartbeat itself.
+        beat.end(ended);
         if began.elapsed() >= REBIND.cap() {
             misses.reset();
         }
@@ -71,6 +103,26 @@ where
         );
         tokio::time::sleep(after).await;
     }
+}
+
+/// Run `fut` to completion, turning a panic in any poll of it into `Err`.
+/// After a panic the future is never polled again.
+///
+/// `AssertUnwindSafe` is the caller's claim: here, that a listener's attempt
+/// holds nothing across attempts (see the module docs).
+///
+/// `pending-dedup: contained` — this is
+/// `engenho_controllers::contain::contained`, line for line, which is
+/// `pub(crate)` in its crate. Export it there and this copy is deleted.
+async fn contained<F: Future>(fut: F) -> Result<F::Output, PanicMessage> {
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(payload) => Poll::Ready(Err(PanicMessage::of(payload.as_ref()))),
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -214,5 +266,43 @@ mod tests {
         assert_eq!(serving.last_class, None, "{serving:?}");
         assert!(!waiting.in_flight(), "{waiting:?}");
         assert_eq!(waiting.last_class, Some(TickClass::Halted), "{waiting:?}");
+    }
+
+    /// An attempt that panics does not end the listener: the panic is
+    /// counted, the heartbeat says `Panicked` with nothing in flight, and
+    /// the listener binds again on the same curve as a failed bind — the
+    /// port is not lost for the life of the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_serve_that_panics_is_counted_and_binds_again() {
+        let beat = Arc::new(Heartbeat::new());
+        let attempts = Attempts::new(|_| Duration::ZERO);
+        let task = tokio::spawn(serve_rebinding(Listener::EtcdFacade, beat.clone(), {
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    attempts.attempt().await;
+                    panic!("the serve attempt tripped over something");
+                }
+            }
+        }));
+
+        // Attempts at 0 s, 1 s and 3 s; at 3.5 s it waits for the one at 7 s.
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        let waiting = beat.snapshot();
+        let ended = task.is_finished();
+        task.abort();
+        let _ = task.await;
+
+        assert!(!ended, "a panicking attempt ended the listener's task");
+        assert_eq!(
+            attempts.gaps(),
+            [REBIND.base(), REBIND.base() * 2],
+            "a panicking attempt is retried on the rebind curve"
+        );
+        assert_eq!(waiting.panics, 3, "every panic is counted: {waiting:?}");
+        assert_eq!(waiting.ticks_started, 3, "{waiting:?}");
+        assert!(!waiting.in_flight(), "{waiting:?}");
+        assert_eq!(waiting.last_class, Some(TickClass::Panicked), "{waiting:?}");
     }
 }

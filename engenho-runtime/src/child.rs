@@ -47,8 +47,28 @@
 //! driver: a Stateless driver contains a panicking tick, counts it and is
 //! re-ticked by the next event or the fallback, so its task never ends; a
 //! Stateful driver's panic ends its task, and the set above marks it Dead —
-//! for the kubelet, Dead is the park. A listener whose serve ends rebinds on
-//! a growing backoff. See [`engenho_controllers::contain`].
+//! for the kubelet, Dead is the park. A listener whose serve ends, or
+//! panics, rebinds on a growing backoff: an attempt holds nothing across
+//! attempts. See [`engenho_controllers::contain`].
+//!
+//! ## What every fault does (W6)
+//!
+//! [`Child::supervision`] declares, for every child and every [`Fault`] — a
+//! panic, a hang past the stuck window, an error return, a bind failure —
+//! what the supervisor does about it: a [`Supervision`]. It is derived from
+//! the rows above (a tick loop's [`TickState`], a listener's row), never
+//! written a second time. The fault-injection matrix (`fault_matrix`, a
+//! test) strikes every child in [`Child::all`] with every fault and holds
+//! the runtime to that declaration. A new child shape or fault with no row
+//! is E0004 in the declaration and in the matrix's injector; a new driver
+//! or listener joins the matrix through [`Child::all`] with no new line.
+//!
+//! A tick loop's [`TickState`] reaches its driver through
+//! [`TickLoop::tick_state`]: the runtime's one driving function takes the
+//! tick loop, not a tick state, so no call to it can drive a loop by a row
+//! other than its own. (A `WatchDriver` built by hand, outside that
+//! function, bypasses the catalog altogether — the same gap as a task
+//! spawned outside it, below.)
 //!
 //! Still only caught: a task spawned OUTSIDE this catalog (T0.4's
 //! `disallowed-methods` on every spawn path, once clippy blocks).
@@ -228,6 +248,23 @@ impl Listener {
         }
     }
 
+    /// What the supervisor does when `fault` strikes this listener.
+    ///
+    /// Every listener runs one bind-and-serve attempt at a time and builds
+    /// each attempt afresh from what it was spawned with; what it serves
+    /// (the kubelet, the store) it reaches only from request tasks, which
+    /// its server spawns. So an attempt that fails, returns or panics
+    /// leaves nothing torn behind, and the listener binds again.
+    #[must_use]
+    pub const fn supervision(self, fault: Fault) -> Supervision {
+        match self {
+            Self::KubeletHttp | Self::EtcdFacade => match fault {
+                Fault::Panic | Fault::Error | Fault::BindFailure => Supervision::Rebinds,
+                Fault::Hang => Supervision::Unobserved,
+            },
+        }
+    }
+
     /// Whether the config binds this listener. An empty `etcd_listen_addr`
     /// disables the façade.
     #[must_use]
@@ -281,10 +318,34 @@ impl Child {
     /// than ticks.
     #[must_use]
     pub const fn tick_state(self) -> Option<TickState> {
+        match self.tick_loop() {
+            Some(tick_loop) => Some(tick_loop.tick_state()),
+            None => None,
+        }
+    }
+
+    /// The child as a tick loop; `None` for a listener.
+    #[must_use]
+    pub(crate) const fn tick_loop(self) -> Option<TickLoop> {
         match self {
-            Self::Driver(d) => Some(d.tick_state()),
+            Self::Driver(d) => Some(TickLoop::Driver(d)),
+            Self::NodeLease => Some(TickLoop::NodeLease),
             Self::Listener(_) => None,
-            Self::NodeLease => Some(Self::NODE_LEASE_TICK_STATE),
+        }
+    }
+
+    /// What the supervisor does when `fault` strikes this child (W6).
+    ///
+    /// Derived from the child's own rows — a tick loop's [`TickState`], a
+    /// listener's [`Listener::supervision`] — so it cannot disagree with
+    /// what the runtime drives the child by. The fault-injection matrix
+    /// holds the runtime to it.
+    #[must_use]
+    pub const fn supervision(self, fault: Fault) -> Supervision {
+        match self {
+            Self::Driver(d) => TickLoop::Driver(d).supervision(fault),
+            Self::NodeLease => TickLoop::NodeLease.supervision(fault),
+            Self::Listener(l) => l.supervision(fault),
         }
     }
 
@@ -304,6 +365,115 @@ impl Child {
 impl fmt::Display for Child {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+/// A child whose body is a tick loop behind a `WatchDriver`: a driver, or
+/// the node lease. Every child but a listener.
+///
+/// The runtime's one driving function takes this, not a [`TickState`]: the
+/// tick state a loop is driven by is read off its catalog row here, so it
+/// cannot be handed a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickLoop {
+    /// A controller loop.
+    Driver(Driver),
+    /// The node-lease renewal loop.
+    NodeLease,
+}
+
+impl TickLoop {
+    /// The catalog child this loop is.
+    #[must_use]
+    pub(crate) const fn child(self) -> Child {
+        match self {
+            Self::Driver(d) => Child::Driver(d),
+            Self::NodeLease => Child::NodeLease,
+        }
+    }
+
+    /// The loop's catalog row: what a panic in its tick does.
+    #[must_use]
+    pub(crate) const fn tick_state(self) -> TickState {
+        match self {
+            Self::Driver(d) => d.tick_state(),
+            Self::NodeLease => Child::NODE_LEASE_TICK_STATE,
+        }
+    }
+
+    /// What the supervisor does when `fault` strikes this loop.
+    const fn supervision(self, fault: Fault) -> Supervision {
+        match fault {
+            Fault::Panic => match self.tick_state() {
+                TickState::Stateless => Supervision::Contained,
+                TickState::Stateful => Supervision::Dead,
+            },
+            // The tick is never cancelled (`WatchDriverConfig::stuck_tick_after`):
+            // cancelling mid-tick strands whatever the tick already did.
+            Fault::Hang => Supervision::Stalled,
+            Fault::Error => Supervision::Retried,
+            Fault::BindFailure => Supervision::Inapplicable,
+        }
+    }
+}
+
+engenho_controllers::closed_enum! {
+    /// A fault the supervisor must answer for, in any child (W6).
+    ///
+    /// The fault-injection matrix strikes every child in [`Child::all`] with
+    /// every one of these; [`Child::supervision`] says what must happen.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Fault {
+        /// The child's unit of work panics: a tick loop's tick, a
+        /// listener's bind-and-serve attempt.
+        Panic,
+        /// The unit of work never ends: a tick in flight past the stuck-tick
+        /// window, a serve attempt that never returns.
+        Hang,
+        /// The unit of work fails and returns: a tick's Transient `Err`, a
+        /// listener's server returning.
+        Error,
+        /// The child cannot bind its port.
+        BindFailure,
+    }
+}
+
+engenho_controllers::closed_enum! {
+    /// What the supervisor does when a [`Fault`] strikes a child, as the
+    /// catalog declares it ([`Child::supervision`]). Each variant says what is
+    /// observable afterwards, because that is what the matrix checks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Supervision {
+        /// Contained: each panic is counted in the child's heartbeat, the child
+        /// keeps running, and the next event or fallback ticks it again.
+        /// Liveness reads it alive. A Stateless tick loop's panic.
+        Contained,
+        /// The child's task ends: [`Children::next_dead`] reports it panicked,
+        /// it is marked Dead after one tick, and liveness reads it Dead. It is
+        /// never re-ticked or respawned. A Stateful tick loop's panic: a tick
+        /// over the state the panic tore would act on something no longer true.
+        Dead,
+        /// The failure is classified in the child's heartbeat, the child keeps
+        /// running, and it ticks again (a Transient failure on the retry curve,
+        /// or sooner on the fallback). Liveness reads it alive: a failing
+        /// controller is still ticking, and its failures are counted in its
+        /// reconcile metrics, not in its liveness.
+        Retried,
+        /// The tick is never cancelled and no second tick starts beside it: the
+        /// child keeps running with one tick in flight, and liveness reads it
+        /// stalled since the tick began once the stuck window has passed.
+        Stalled,
+        /// The listener stops serving and says so — its heartbeat is not in
+        /// flight and liveness reads it stalled — and it binds again on the
+        /// rebind curve. Its task keeps running. A panic is counted too.
+        Rebinds,
+        /// The supervisor cannot see this fault. A listener's serve in flight is
+        /// read as serving, so a serve that never returns reads alive whether or
+        /// not it accepts anything. A named blind spot, not a verdict of health:
+        /// seeing it needs a probe of the port itself.
+        Unobserved,
+        /// The fault cannot strike this child: a tick loop binds no port.
+        Inapplicable,
     }
 }
 
@@ -753,17 +923,24 @@ mod tests {
 
     /// Every per-child fact is an exhaustive match, so a new variant without
     /// its row is E0004 — but only while no arm is a wildcard. This keeps it
-    /// that way for this module's non-test code.
+    /// that way for this module's non-test code, and for the fault-injection
+    /// matrix, whose injector is the same kind of row (W6).
     #[test]
     fn the_child_catalog_has_no_wildcard_arm() {
-        let src = include_str!("child.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap_or(src);
-        let offenders: Vec<(usize, &str)> = code
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim_start().starts_with("//"))
-            .filter(|(_, line)| line.contains("_ =>") || line.contains("| _"))
-            .map(|(i, line)| (i + 1, line))
+        let files = [
+            ("child.rs", include_str!("child.rs")),
+            ("fault_matrix.rs", include_str!("fault_matrix.rs")),
+        ];
+        let offenders: Vec<(&str, usize, &str)> = files
+            .iter()
+            .flat_map(|(file, src)| {
+                let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+                code.lines()
+                    .enumerate()
+                    .filter(|(_, line)| !line.trim_start().starts_with("//"))
+                    .filter(|(_, line)| line.contains("_ =>") || line.contains("| _"))
+                    .map(|(i, line)| (*file, i + 1, line))
+            })
             .collect();
         assert!(
             offenders.is_empty(),

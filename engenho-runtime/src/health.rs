@@ -24,7 +24,7 @@
 //! | child | in flight | not in flight |
 //! |---|---|---|
 //! | tick loop (a driver, the node lease) | alive until the tick is older than the stuck window, then stalled since it began | alive until the last tick ended longer ago than the idle window, then stalled since it ended |
-//! | listener | serving: alive | halted, waiting to rebind: stalled since it halted |
+//! | listener | serving: alive (a serve that accepts nothing reads the same: W6's `Unobserved` row) | halted or panicked, waiting to rebind: stalled since it ended |
 //!
 //! A child that has never beaten is [`Liveness::Unknown`], which no health
 //! endpoint renders as ok.
@@ -166,6 +166,15 @@ impl Windows {
     #[must_use]
     pub const fn with_fallback(self, fallback: Duration) -> Self {
         Self { fallback, ..self }
+    }
+
+    /// The same windows with a stuck-tick threshold of `stuck`, so a test
+    /// can watch a hung tick go stalled in a second rather than two minutes.
+    /// Test-only until `controllers.stuck_tick_after_seconds` lands.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_stuck_tick_after(self, stuck: Duration) -> Self {
+        Self { stuck, ..self }
     }
 
     /// The windows the node lease is driven on and judged by: its fallback
