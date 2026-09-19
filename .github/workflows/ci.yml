@@ -1,8 +1,9 @@
 name: ci
 
 # Thin shim — the real gate is .github/workflows/test.yml.
-# This just evaluates the flake (catches eval errors) but does NOT
-# compile or test any crates. See test.yml header for full rationale.
+# This evaluates the flake and every check it declares, but builds none of
+# them, so it does NOT compile or test any crates. See test.yml header for
+# full rationale.
 
 on:
   push:
@@ -58,12 +59,28 @@ jobs:
       - name: delta freshness (Cargo.lock <-> Cargo.gen.lock)
         run: nix run github:pleme-io/gen -- confirm
 
-      # The broad flake check stays NON-fatal deliberately, and that is not
-      # laziness: the flake's only check is `checks.<system>.typed-config`,
-      # an eval-time test of the module trio's typed options, and it compiles
-      # no Rust (test.yml's header explains why), so `nix flake check` here is
-      # a smoke signal rather than a contract. Narrow-and-fatal beats
-      # broad-and-advisory — the freshness tie above is the invariant with
-      # teeth.
-      - run: nix flake check
-        continue-on-error: true
+      # ── THE CHECK SURFACE, EVALUATED ON EVERY SYSTEM (fatal) ────────────
+      # `--no-build` evaluates every `checks.<system>.*`, and `--all-systems`
+      # does so for the darwin systems too, where ryn runs engenho. Nothing is
+      # built. The step fails when:
+      #   * one output layer in flake.nix replaces another's checks.
+      #     `checks.<system>.flake-surface` throws at evaluation, naming the
+      #     checks that went missing. A plain `//` between the layers had left
+      #     `typed-config` as the flake's only check (integration item I36);
+      #   * the module trio's typed options misbehave. `typed-config` asserts
+      #     at evaluation;
+      #   * substrate refuses the `tests.cargo` declaration, or
+      #     .config/nextest.toml stops naming the live-oracle binaries that
+      #     `checks.<system>.tests` skips.
+      #
+      # Why not build: `checks.build` compiles engenho through buildRustCrate,
+      # and `checks.tests` compiles and runs the whole workspace's tests in a
+      # ~17 GB target, more than this runner's disk. Neither is built here.
+      # test.yml stays the compile-and-test gate until `checks.tests` is built
+      # green on rio; then test.yml's cargo legs fold into `nix flake check`.
+      #
+      # This step used to be a plain `nix flake check` with
+      # `continue-on-error: true`, a verdict CI computed and then discarded.
+      # Evaluation is cheap and deterministic, so it is fatal now.
+      - name: flake checks evaluate (every system, nothing built)
+        run: nix flake check --no-build --all-systems

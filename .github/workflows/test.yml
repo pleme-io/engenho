@@ -5,19 +5,17 @@ name: test
 #
 # WHY IT EXISTS (read before "simplifying" it back into ci.yml).
 #
-# `ci.yml` runs two Nix steps: `gen confirm` (fatal; the Cargo.lock <->
-# Cargo.gen.lock tie) and a non-fatal `nix flake check`. It stopped being a
-# shim onto substrate's `cargo-ci.yml` in 4757f50; the argument below is
-# unchanged. `nix flake check` builds only `checks.<system>.*`, and
-# engenho's flake declares exactly one: `checks.<system>.typed-config` (since
-# 51e702a), an eval-time test of the Nix module trio's typed options that
-# stubs the trio's `settings` rather than building engenho. It compiles no
-# Rust, so ci.yml proves the flake and its typed module surface evaluate and
-# says nothing about the crates. On the sibling repo
-# `forge` this was proven by probe: a clean tree exited 0, a `compile_error!`
-# in a test module exited 0, and LITERAL NON-RUST GARBAGE in a function body
-# ALSO exited 0 — every run printing "(build skipped)". The crate was never
-# compiled, not merely untested.
+# `ci.yml` runs two Nix steps, both fatal: `gen confirm` (the Cargo.lock <->
+# Cargo.gen.lock tie) and `nix flake check --no-build --all-systems`. It
+# stopped being a shim onto substrate's `cargo-ci.yml` in 4757f50. The flake
+# declares five checks per system (build, gen-confirm, tests, typed-config,
+# flake-surface), but ci.yml only EVALUATES them. It compiles no Rust, so it
+# proves the flake and its check surface evaluate and says nothing about the
+# crates. How little that says was proven by probe on the sibling repo
+# `forge`, whose flake check compiled no Rust: a clean tree exited 0, a
+# `compile_error!` in a test module exited 0, and LITERAL NON-RUST GARBAGE in
+# a function body ALSO exited 0 — every run printing "(build skipped)". The
+# crate was never compiled, not merely untested.
 #
 # WHY NOT FIX IT AT THE LOAD-BEARING LAYER INSTEAD (Operating Principle #2).
 # The right fix is for the flake to expose real `checks` so `nix flake check`
@@ -26,16 +24,20 @@ name: test
 # `lockfile-builder.nix`, the engine `substrate.rust.workspace` routes to,
 # had no test runner.
 #
-# THE FIX HAS LANDED UPSTREAM; ENGENHO HAS NOT ADOPTED IT (improvement plan
-# T0.9). Substrate 83bab67 added an opt-in runner:
-# `substrate.rust.workspace { tests.cargo.runs = [ … ]; }` yields
-# `checks.<system>.tests`, `cargo test --frozen` over a vendor dir built from
-# Cargo.lock, reading this repo's [profile.*] itself. engenho's flake.lock
-# pins substrate fcd3514, which predates it. Pending: bump that input,
-# declare `tests.cargo` in flake.nix, and check that the five private git
-# dependencies vendor inside Nix. Until then THIS workflow is what stands
-# between engenho and an un-compiled merge; afterwards its cargo steps can
-# collapse into the flake. Building an in-repo `checks` by hand would be a
+# ENGENHO HAS ADOPTED THE FIX; NOTHING HAS BUILT IT YET (improvement plan
+# T0.9, integration item I36). Substrate 83bab67 added an opt-in runner, and
+# flake.lock pins substrate 1eb48fe, which carries it. flake.nix declares
+# `tests.cargo`, so `checks.<system>.tests` runs `cargo test --frozen` over a
+# vendor dir built from Cargo.lock, reading this repo's [profile.*] itself.
+# Its two runs are this workflow's selection: every target with every
+# feature, then the doctests. The live-oracle binaries stay out, read from
+# .config/nextest.toml, and so do the five engenho-kubelet tests that realise
+# a closure with a real `nix build`, because the build sandbox has no Nix
+# daemon. The vendor dir needs no credentials: Cargo.lock has no git source.
+# The check needs a ~17 GB target and has not been built anywhere yet. Once
+# it is built green on rio, this workflow's cargo legs fold into
+# `nix flake check`. Until then THIS workflow is what stands between engenho
+# and an un-compiled merge. Building an in-repo `checks` by hand would be a
 # SECOND, divergent Rust build path; Operating Principle #1 forbids that.
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,13 +45,15 @@ name: test
 # 35418242848 and 35421804575 (2026-09-19). Both used `cargo test`; the test
 # leg below now runs nextest over the same tests.
 #
-# Cargo.lock has git dependencies on five pleme-io repos (tameshi · cofre ·
-# promessa · sui · tatara), and cargo resolves the whole lock graph whatever
-# the features, so every cargo command fetches them. `git-credentials` rewrites
-# github.com URLs to carry BOT_PAT. In both runs BOT_PAT arrived non-empty (the
-# step log prints `bot-pat: ***`) and every private dependency resolved: the
-# engenho-diff compile leg was green and the test leg built and ran the whole
-# workspace.
+# Cargo.lock has no git dependency: none of its 765 sources is git (counted
+# 2026-09-19). The last 24, on nine pleme-io repos (caixa · cofre · gen ·
+# promessa · shigoto · shikumi · sui · tameshi · tatara), left in e1986fa
+# (2026-08-04). So cargo fetches from crates.io alone, and the
+# `git-credentials` steps below, which rewrite github.com URLs to carry
+# BOT_PAT, have no private dependency to carry today.
+# In both runs BOT_PAT arrived non-empty (the step log prints `bot-pat: ***`),
+# the engenho-diff compile leg was green, and the test leg built and ran the
+# whole workspace.
 #
 # Why it arrives: engenho is PUBLIC (`gh repo view` -> PUBLIC; the org posture
 # catalog, pangea-architectures workspaces/pleme-io-opensource/org.yaml,

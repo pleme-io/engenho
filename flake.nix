@@ -9,11 +9,80 @@
     nixpkgs.follows = "substrate/nixpkgs";
   };
 
-  outputs = { substrate, nixpkgs, ... }:
+  outputs = { self, substrate, nixpkgs, ... }:
     let
+      inherit (nixpkgs) lib;
+
+      # ── checks.<system>.tests: `cargo test` over the workspace ─────────
+      # Substrate 83bab67's opt-in runner (lib/build/rust/workspace-tests.nix):
+      # `cargo test --frozen` over a vendor dir built from Cargo.lock, reading
+      # this repo's [profile.*] itself. The two runs are test.yml's gate: every
+      # target with every feature (engenho gates real code behind with-tameshi,
+      # with-sui-eval, openapi-roundtrip, mock, …), then the doctests, which
+      # `--all-targets` leaves out. Both runs share one build tree. Both pass
+      # `--no-fail-fast`, as test.yml does: a red build then reports every
+      # failing test binary, not the first, so one ~17 GB build is enough to
+      # count what is red.
+      #
+      # System libraries. Of the -sys crates in Cargo.lock only openssl-sys
+      # needs one from nixpkgs (pkg-config + openssl; sui-store turns reqwest's
+      # `default-tls` on, see the OCI comment below). aws-lc-sys 0.41 (cc
+      # builder, no cmake unless asked), libsqlite3-sys (sqlx's `bundled`),
+      # lzma-sys and zstd-sys compile their vendored C with stdenv's cc, and
+      # the darwin ones (core-foundation, security-framework,
+      # system-configuration, fsevent, kqueue) link frameworks from stdenv's
+      # SDK, so they need nothing here.
+      #
+      # Tests the build sandbox cannot run, skipped by exact name (libtest
+      # `--exact --skip`), each for a fact about the sandbox:
+      #   * the live-oracle binaries. They diff engenho against a live
+      #     Kubernetes cluster, and the sandbox has none. The names are read
+      #     from .config/nextest.toml's default filter, the one list every
+      #     nextest gate uses, so they are not restated here. Each binary holds
+      #     one test named after it, which is what lets a binary name serve as
+      #     a test name.
+      #   * the engenho-kubelet tests that realise a closure with a real
+      #     `nix build`. The sandbox has no Nix daemon. test.yml still runs them.
+      # A skip that stops matching (a renamed test, a second test in an oracle
+      # binary) lets the test run and fail on the missing oracle or daemon, so
+      # drift turns this check red rather than quietly skipping more.
+      nextestDefaultFilter =
+        (builtins.fromTOML (builtins.readFile ./.config/nextest.toml)).profile.default.default-filter;
+      oracleBinaries = lib.concatLists (builtins.filter builtins.isList
+        (builtins.split "binary\\(=([A-Za-z0-9_]+)\\)" nextestDefaultFilter));
+      needsNixDaemon = [
+        # engenho-kubelet/tests/native_runs_a_real_closure.rs
+        "a_nix_closure_runs_as_a_native_process_and_its_output_is_readable"
+        "a_signalled_container_reports_its_signal_not_a_clean_exit"
+        "a_container_sees_only_its_declared_environment"
+        "a_workload_ignoring_sigterm_is_sigkilled_after_the_pods_grace_and_reaped"
+        # engenho-kubelet/tests/native_runs_postgres.rs
+        "postgres_runs_natively_under_the_kubelet_from_a_nix_closure"
+      ];
+      sandboxSkips =
+        if oracleBinaries == [ ]
+        then throw ''
+          engenho flake: .config/nextest.toml's profile.default.default-filter
+          names no `binary(=…)`, so checks.tests would run the live-oracle
+          binaries in a sandbox with no oracle. Name them there, one binary each.
+        ''
+        else oracleBinaries ++ needsNixDaemon;
+      testsCargo = {
+        runs = [
+          {
+            args = [ "--workspace" "--all-features" "--all-targets" "--no-fail-fast" ];
+            harnessArgs = [ "--exact" ] ++ lib.concatMap (name: [ "--skip" name ]) sandboxSkips;
+          }
+          { args = [ "--workspace" "--all-features" "--doc" "--no-fail-fast" ]; }
+        ];
+        nativeBuildInputs = [ "pkg-config" ];
+        buildInputs = [ "openssl" ];
+      };
+
       base = substrate.rust.workspace {
         src = ./.;
         member = "engenho";
+        tests.cargo = testsCargo;
       };
 
       # `engenho-mcp` — the MCP surface for engenho-managed clusters (crate
@@ -46,11 +115,12 @@
         member = "engenho-cluster-config-render";
       };
       mcpSystems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
-      withMcp = nixpkgs.lib.genAttrs mcpSystems (system:
-        (base.packages.${system} or { }) // {
-          engenho-mcp = mcpBase.packages.${system}.default;
-          engenho-cluster-config-render = renderBase.packages.${system}.default;
-        });
+      # The secondary members only; `mergeOutputs` below lays them over
+      # base's packages per system.
+      memberPackages = lib.genAttrs mcpSystems (system: {
+        engenho-mcp = mcpBase.packages.${system}.default;
+        engenho-cluster-config-render = renderBase.packages.${system}.default;
+      });
 
       # ============================================================
       # OCI images — Nix-native, Pillar 8 (no Dockerfiles). Restores
@@ -116,13 +186,7 @@
       };
       # Linux-only — dockerTools images have no meaning on darwin systems.
       imageSystems = [ "x86_64-linux" "aarch64-linux" ];
-    in
-    base // {
-      packages = nixpkgs.lib.genAttrs mcpSystems (system:
-        withMcp.${system} // (
-          if builtins.elem system imageSystems then imageAttrs else { }
-        ));
-    } // (
+
       # ── The module trio ────────────────────────────────────────────────
       # engenho's `main.rs` has documented this integration since it was
       # written ("the verb the substrate `mkModuleTrio` factory invokes"),
@@ -135,49 +199,125 @@
       # deliberate: it puts the option path at `services.engenho.*` on ALL
       # THREE arms, which is what lets one typed-config module serve them
       # all instead of three copies with three chances to drift.
-      let
-        trio = (import "${substrate}/lib/module-trio.nix" {
-          inherit (nixpkgs) lib;
-        }).mkModuleTrio {
-          name = "engenho";
-          description = "engenho — typed, attested, Rust-native Kubernetes runtime";
-          binaryName = "engenho";
-          packageAttr = "engenho";
-          hmNamespace = "services";
+      trio = (import "${substrate}/lib/module-trio.nix" {
+        inherit lib;
+      }).mkModuleTrio {
+        name = "engenho";
+        description = "engenho — typed, attested, Rust-native Kubernetes runtime";
+        binaryName = "engenho";
+        packageAttr = "engenho";
+        hmNamespace = "services";
 
-          # Both arms, because engenho is legitimately either: a per-user
-          # local cluster on a workstation (HM user agent), or the node
-          # runtime on a server (system daemon). `daemonSubcommand` matches
-          # engenho's actual CLI verb — the bare form boots the daemon too,
-          # but naming it keeps the generated unit self-describing.
-          withSystemDaemon = true;
-          withUserDaemon = true;
-          daemonSubcommand = "daemon";
+        # Both arms, because engenho is legitimately either: a per-user
+        # local cluster on a workstation (HM user agent), or the node
+        # runtime on a server (system daemon). `daemonSubcommand` matches
+        # engenho's actual CLI verb — the bare form boots the daemon too,
+        # but naming it keeps the generated unit self-describing.
+        withSystemDaemon = true;
+        withUserDaemon = true;
+        daemonSubcommand = "daemon";
 
-          # engenho reads shikumi TieredConfig, so the YAML the trio deploys
-          # IS its file tier. Defaults stay EMPTY on purpose: engenho's own
-          # progressive fold already supplies prescribed defaults, and a key
-          # written here would be read as an explicit operator opinion that
-          # SUPPRESSES that fold — including the derived per-node cluster
-          # name. See nix/typed-config.nix's `prune`.
-          withShikumiConfig = true;
-          shikumiDefaults = { };
-        };
-        # The typed surface rides with every arm, so a consumer gets one
-        # import and gets eval-time type checking with it.
-        withTyped = m: { imports = [ m ./nix/typed-config.nix ]; };
-      in
+        # engenho reads shikumi TieredConfig, so the YAML the trio deploys
+        # IS its file tier. Defaults stay EMPTY on purpose: engenho's own
+        # progressive fold already supplies prescribed defaults, and a key
+        # written here would be read as an explicit operator opinion that
+        # SUPPRESSES that fold — including the derived per-node cluster
+        # name. See nix/typed-config.nix's `prune`.
+        withShikumiConfig = true;
+        shikumiDefaults = { };
+      };
+      # The typed surface rides with every arm, so a consumer gets one
+      # import and gets eval-time type checking with it.
+      withTyped = m: { imports = [ m ./nix/typed-config.nix ]; };
+
+      pkgsFor = system: nixpkgs.legacyPackages.${system};
+
+      # ── One merge for every output layer ───────────────────────────────
+      # The layers used to be joined with a plain `//`, which replaces an
+      # output that both sides declare. The module-trio layer declared
+      # `checks` for typed-config, and so `checks.<system>` lost base's
+      # `build` and `gen-confirm`: `nix flake check` built typed-config
+      # alone (integration item I36).
+      #
+      # Per-system outputs now merge per system, and a name that two layers
+      # both declare is an evaluation error: an output such as
+      # `nixosModules`, or an attribute inside a per-system output such as
+      # `checks.x86_64-linux.build`. No layer can replace another's output
+      # without the flake failing to evaluate.
+      perSystemOutputs = [ "packages" "checks" "apps" "devShells" ];
+      disjointUnion = where: lhs: rhs:
+        let clash = builtins.attrNames (builtins.intersectAttrs lhs rhs);
+        in
+          if clash == [ ] then lhs // rhs
+          else throw ''
+            engenho flake: ${where} declares ${lib.concatStringsSep ", " clash} in two
+            layers. mergeOutputs never lets one layer replace another's output;
+            declare it in one layer.
+          '';
+      mergeOutputs = lhs: rhs:
+        let
+          mergeShared = name:
+            if builtins.elem name perSystemOutputs
+            then lib.zipAttrsWith
+              (system: sets: lib.foldl' (disjointUnion "${name}.${system}") { } sets)
+              [ lhs.${name} rhs.${name} ]
+            else disjointUnion "the flake" { ${name} = lhs.${name}; } { ${name} = rhs.${name}; };
+        in
+          lhs // rhs // lib.genAttrs (builtins.attrNames (builtins.intersectAttrs lhs rhs)) mergeShared;
+
+      # ── checks.<system>.flake-surface ──────────────────────────────────
+      # An evaluation-time check (it builds nothing) of what `nix flake check`
+      # is given:
+      #   1. mergeOutputs keeps both layers' checks for a system, and throws
+      #      when two layers declare the same check.
+      #   2. The flake's OWN output (`self`, so the real merge, not a copy of
+      #      it) carries every check below on this system.
+      # Put a plain `//` back between the layers and (2) fails evaluation,
+      # naming the checks that went missing.
+      requiredChecks = [ "build" "gen-confirm" "tests" "typed-config" ];
+      mergeKeepsBoth =
+        (mergeOutputs { checks.s = { a = 1; }; } { checks.s = { b = 2; }; }).checks.s == { a = 1; b = 2; };
+      mergeRefusesClash =
+        !(builtins.tryEval (builtins.deepSeq
+          (mergeOutputs { checks.s = { a = 1; }; } { checks.s = { a = 2; }; }) true)).success;
+      flakeSurface = system:
+        let missing = lib.subtractLists (builtins.attrNames self.checks.${system}) requiredChecks;
+        in
+          if !mergeKeepsBoth
+          then throw "engenho flake: mergeOutputs dropped a layer's checks for a system."
+          else if !mergeRefusesClash
+          then throw "engenho flake: mergeOutputs let one layer replace another's check."
+          else if missing != [ ]
+          then throw ''
+            engenho flake: checks.${system} is missing ${lib.concatStringsSep ", " missing}.
+            `nix flake check` would not build them. A layer merged with a plain
+            `//` replaces every check the layers before it declared.
+          ''
+          else (pkgsFor system).runCommand "engenho-flake-surface" { } "touch $out";
+    in
+    lib.foldl' mergeOutputs { } [
+      base
+
       {
-        # Eval-time proof for the typed surface (IFD-free — it stubs the
-        # trio's `settings` option rather than building engenho, so it runs
-        # anywhere `nix flake check` does). Red-run verified: weakening the
-        # kubeletBackend enum, and disabling the null-prune, each turn it red.
-        checks = nixpkgs.lib.genAttrs mcpSystems (system: {
-          typed-config = import ./nix/tests/typed-config-test.nix {
-            pkgs = import nixpkgs { inherit system; };
-          };
-        });
+        packages = lib.genAttrs mcpSystems (system:
+          memberPackages.${system}
+          // lib.optionalAttrs (builtins.elem system imageSystems) imageAttrs);
+      }
 
+      {
+        checks = lib.genAttrs mcpSystems (system: {
+          # Eval-time proof for the typed surface (IFD-free — it stubs the
+          # trio's `settings` option rather than building engenho, so it runs
+          # anywhere `nix flake check` does). Red-run verified: weakening the
+          # kubeletBackend enum, and disabling the null-prune, each turn it red.
+          typed-config = import ./nix/tests/typed-config-test.nix {
+            pkgs = pkgsFor system;
+          };
+          flake-surface = flakeSurface system;
+        });
+      }
+
+      {
         nixosModules.default = withTyped trio.nixosModule;
         nixosModules.engenho = withTyped trio.nixosModule;
         darwinModules.default = withTyped trio.darwinModule;
@@ -185,5 +325,5 @@
         homeManagerModules.default = withTyped trio.homeManagerModule;
         homeManagerModules.engenho = withTyped trio.homeManagerModule;
       }
-    );
+    ];
 }

@@ -24,10 +24,35 @@ tatara similarly. Engenho follows the same shape.
 ### `.github/workflows/ci.yml` — every commit
 
   No longer a substrate shim (4757f50). After `pleme-io/actions/nix-setup`
-  it runs `nix run github:pleme-io/gen -- confirm` (fatal: the
-  `Cargo.lock` ↔ `Cargo.gen.lock` tie) and a non-fatal `nix flake
-  check`, whose only check is the eval-time `checks.typed-config`. It
-  compiles no Rust; `test.yml` is the gate that does.
+  it runs two fatal steps: `nix run github:pleme-io/gen -- confirm` (the
+  `Cargo.lock` ↔ `Cargo.gen.lock` tie) and `nix flake check --no-build
+  --all-systems`, which evaluates every check on every system and builds
+  none. It compiles no Rust; `test.yml` is the gate that does.
+
+  The flake's checks, per system (flake.nix):
+
+  | Check | What building it proves | Built in CI? |
+  |---|---|---|
+  | `build` | the `engenho` binary compiles through substrate's buildRustCrate path (`Cargo.gen.lock`) | no |
+  | `gen-confirm` | `Cargo.gen.lock` matches `Cargo.lock` | no (ci.yml's `gen confirm` step runs the same check) |
+  | `tests` | `cargo test --frozen` over a vendor dir built from `Cargo.lock`: every target with every feature, then the doctests. Skips the live-oracle binaries (named in `.config/nextest.toml`) and the five engenho-kubelet tests that realise a closure with a real `nix build`. Needs a ~17 GB target | no; not yet built anywhere |
+  | `typed-config` | the module trio's typed options (asserts at evaluation) | evaluated |
+  | `flake-surface` | every output layer's checks survive the merge (asserts at evaluation) | evaluated |
+
+  `flake-surface` exists because the flake used to join its output
+  layers with a plain `//`, which let the module-trio layer's `checks`
+  replace substrate's: `checks.<system>` held `typed-config` alone, and
+  `build` and `gen-confirm` never ran (integration item I36). The layers
+  now go through one `mergeOutputs`, which merges per-system outputs per
+  system and fails evaluation when two layers declare the same name, so
+  inside it no layer can replace another's check. Joining layers some
+  other way, a plain `//` again, is caught only by `flake-surface`, which
+  fails evaluation when any of `build`, `gen-confirm`, `tests` or
+  `typed-config` is missing from the flake's own output. That part is a
+  CI gate, not a type.
+
+  Destination (improvement plan T0.9): once `checks.tests` is built
+  green on rio, `test.yml`'s cargo legs fold into `nix flake check`.
 
 ### `.github/workflows/release.yml` — on `v*` tag
 
@@ -153,8 +178,10 @@ push + helm chart push would fail with `unauthorized`.
     --all-features` with substrate's pinned nextest. Which tests run
     is set by `.config/nextest.toml`, the same file substrate's release
     gate reads; the measured count is in CLAUDE.md § Test count.
-  * `nix flake check` (non-fatal, in ci.yml) evaluates the flake and
-    runs `checks.typed-config`; it compiles no Rust.
+  * `nix flake check --no-build --all-systems` (fatal, in ci.yml)
+    evaluates every check on every system, which runs the
+    evaluation-time assertions in `typed-config` and `flake-surface`;
+    it compiles no Rust.
   * `ci/cargo-profiles.test.tlisp` (test.yml, job `ci-contract-tests`)
     runs `ci/cargo-profiles.tlisp` against the real `Cargo.toml` and
     workflows: `[profile.release]` stays at opt-level 3, the level the
