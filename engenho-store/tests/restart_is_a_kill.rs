@@ -1124,8 +1124,10 @@ async fn replay_scenario(rec: &mut Recorder) {
 
     // Finalizers: a stamped delete goes Terminating, a second delete is a
     // no-op, clearing the finalizers removes; an unstamped delete of a
-    // finalizer-bearing object.
-    for name in ["fin", "fin-unstamped"] {
+    // finalizer-bearing object (the clockless shape logs from before T3.6
+    // hold, which `delete()` no longer builds); a GC `delete()`, which
+    // carries its clock and goes Terminating.
+    for name in ["fin", "fin-unstamped", "fin-gc"] {
         rec.write(ResourceCommand::put(
             pod(name),
             json!({
@@ -1154,8 +1156,15 @@ async fn replay_scenario(rec: &mut Recorder) {
         Reason::Controller,
     ))
     .await;
-    rec.write(ResourceCommand::delete(
+    rec.write(ResourceCommand::delete_at(
         pod("fin-unstamped"),
+        None,
+        Reason::GarbageCollector,
+        None,
+    ))
+    .await;
+    rec.write(ResourceCommand::delete(
+        pod("fin-gc"),
         Reason::GarbageCollector,
     ))
     .await;

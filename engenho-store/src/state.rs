@@ -1122,13 +1122,12 @@ impl ResourceCatalog {
 
         // First delete on a finalizer-bearing object: stamp
         // deletionTimestamp from the REPLICATED scalar (deterministic).
-        // A None scalar here (an unconditional GC delete that didn't
-        // freeze a boundary clock) means we have no timestamp to stamp —
-        // leave the object untouched (NoOp) rather than invent a
-        // non-replicated value. The apiserver delete path always threads
-        // a frozen timestamp for finalizer-bearing objects, so the
-        // operator-driven path always reaches the Terminating stamp; a
-        // controller/GC pass that wants the stamp threads it too.
+        // A None scalar here means we have no timestamp to stamp — leave
+        // the object untouched (NoOp) rather than invent a non-replicated
+        // value. Since T3.6 `ResourceCommand::delete()` always carries a
+        // clock, so None arrives only from `delete_at(.., None)`, a struct
+        // literal, or a log entry written before T3.6 — and that entry
+        // must replay exactly as it did when it was written.
         let Some(ts) = deletion_timestamp else {
             return ApplyOutcome::no_change(ResourceOp::NoOp);
         };
@@ -2627,10 +2626,9 @@ mod tests {
     #[test]
     fn delete_with_finalizer_but_no_timestamp_is_noop() {
         // A finalizer-bearing object deleted WITHOUT a replicated timestamp
-        // (an unconditional GC delete that didn't freeze a boundary clock):
-        // we don't invent a non-replicated value, so it's a NoOp (object
-        // kept, no churn). The apiserver path always threads a timestamp for
-        // finalizer-bearing objects, so this is only the controller/GC edge.
+        // (the clockless shape a pre-T3.6 log entry carries): we don't
+        // invent a non-replicated value, so it's a NoOp (object kept, no
+        // churn). `ResourceCommand::delete()` no longer builds this shape.
         let mut cat = ResourceCatalog::default();
         let k = pod_key("held-no-ts");
         put_with_finalizer(&mut cat, &k, 1);
@@ -3287,5 +3285,154 @@ mod uid_tests {
             !u.contains("ConfigMap"),
             "a uid must not leak the kind: {u}"
         );
+    }
+}
+
+// ── T3.6 — a delete carries its clock ─────────────────────────────────────
+
+#[cfg(test)]
+mod a_delete_carries_its_clock {
+    use super::*;
+    use crate::command::Reason;
+    use serde_json::json;
+
+    fn pod(name: &str) -> ResourceKey {
+        ResourceKey::namespaced("", "v1", "Pod", "default", name)
+    }
+
+    /// A pod; `finalizers` decides whether a delete can remove it at once.
+    fn pod_body(name: &str, finalizers: &[&str]) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default", "finalizers": finalizers},
+            "spec": {"containers": [{"name": "c", "image": "img:1"}]}
+        })
+    }
+
+    /// A catalog holding `value` at `key`, committed at revision 1.
+    fn holding(key: &ResourceKey, value: serde_json::Value) -> ResourceCatalog {
+        let mut cat = ResourceCatalog::default();
+        cat.apply(
+            &ResourceCommand::put(key.clone(), value, Reason::Operator),
+            1,
+            1,
+        );
+        cat
+    }
+
+    fn deletion_timestamp(cat: &ResourceCatalog, key: &ResourceKey) -> Option<String> {
+        cat.get(key)
+            .and_then(|v| v["metadata"]["deletionTimestamp"].as_str())
+            .map(str::to_owned)
+    }
+
+    fn carried(cmd: &ResourceCommand) -> Option<String> {
+        match cmd {
+            ResourceCommand::Delete {
+                deletion_timestamp, ..
+            } => deletion_timestamp.clone(),
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    /// The controller and GC shape. Before T3.6 this delete came out as a
+    /// `NoOp` on a finalizer-bearing object — nothing stamped, nothing
+    /// removed — so the writer proposed it again on every tick.
+    #[test]
+    fn a_controller_delete_of_a_finalizer_bearing_object_goes_terminating() {
+        let k = pod("held");
+        let mut cat = holding(&k, pod_body("held", &["example.com/hold"]));
+
+        let before = engenho_types::time::now_rfc3339_utc();
+        let cmd = ResourceCommand::delete(k.clone(), Reason::GarbageCollector);
+        let after = engenho_types::time::now_rfc3339_utc();
+        let out = cat.apply(&cmd, 1, 2);
+
+        assert_eq!(
+            out.op,
+            ResourceOp::DeletionPending,
+            "a clocked delete of a finalizer-bearing object goes Terminating"
+        );
+        assert_eq!(cat.revision(), Revision(2), "the stamp is a real change");
+        let stamped = deletion_timestamp(&cat, &k).expect("kept, now Terminating");
+        // Fixed-width RFC3339 Zulu strings order chronologically.
+        assert!(
+            before <= stamped && stamped <= after,
+            "stamped with the instant the constructor read: {before} <= {stamped} <= {after}"
+        );
+        assert_eq!(
+            Some(stamped),
+            carried(&cmd),
+            "every replica stamps the command's bytes, never its own clock"
+        );
+        assert_eq!(
+            cat.get(&k).map(|v| v["metadata"]["finalizers"].clone()),
+            Some(json!(["example.com/hold"])),
+            "the finalizer still holds the object"
+        );
+    }
+
+    /// Unchanged by T3.6: a finalizer-free object is removed at once.
+    #[test]
+    fn a_controller_delete_of_a_finalizer_free_object_still_removes_it() {
+        let k = pod("plain");
+        let mut cat = holding(&k, pod_body("plain", &[]));
+        let out = cat.apply(
+            &ResourceCommand::delete(k.clone(), Reason::Controller),
+            1,
+            2,
+        );
+        assert_eq!(out.op, ResourceOp::Deleted);
+        assert!(cat.get(&k).is_none(), "removed, not stamped");
+        assert_eq!(cat.revision(), Revision(2));
+    }
+
+    /// The log holds clockless deletes in two spellings: the field absent
+    /// (written before it existed) and the field `null` (written by the
+    /// clockless `delete()` before T3.6). Both replay exactly as they did.
+    #[test]
+    fn a_clockless_log_entry_replays_exactly_as_before() {
+        for spelling in [None, Some(serde_json::Value::Null)] {
+            let k = pod("old");
+            let mut wire = json!({
+                "kind": "delete",
+                "key": k,
+                "expected": null,
+                "reason": "garbage_collector"
+            });
+            if let Some(ts) = spelling.clone() {
+                wire["deletion_timestamp"] = ts;
+            }
+            let entry: LoggedCommand = serde_json::from_value(wire).unwrap();
+            assert_eq!(
+                carried(entry.command()),
+                None,
+                "{spelling:?}: decodes clockless"
+            );
+
+            // Finalizer-bearing: left exactly as it was.
+            let before = holding(&k, pod_body("old", &["example.com/hold"]));
+            let mut after = before.clone();
+            let out = after.apply_logged(&entry, 1, 2);
+            assert_eq!(out.op, ResourceOp::NoOp, "{spelling:?}: no clock, no stamp");
+            assert!(out.change.is_none(), "{spelling:?}: no event");
+            assert_eq!(
+                after.revision(),
+                before.revision(),
+                "{spelling:?}: no revision"
+            );
+            assert_eq!(after.history, before.history, "{spelling:?}: no history");
+            assert_eq!(
+                after.resources, before.resources,
+                "{spelling:?}: stored object untouched"
+            );
+
+            // Finalizer-free: removed, as always.
+            let mut cat = holding(&k, pod_body("old", &[]));
+            let out = cat.apply_logged(&entry, 1, 2);
+            assert_eq!(out.op, ResourceOp::Deleted, "{spelling:?}");
+            assert!(cat.get(&k).is_none(), "{spelling:?}: removed");
+        }
     }
 }
