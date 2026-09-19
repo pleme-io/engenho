@@ -4,18 +4,25 @@
 //! # RUN THESE SERIALLY — the suite is not parallel-safe
 //!
 //! ```text
-//! ENGENHO_ORACLE_KUBECONFIG=<path> cargo test -p engenho-diff --jobs 1 -- --test-threads=1
+//! ENGENHO_ORACLE_KUBECONFIG=<path> cargo nextest run --profile oracle
 //! ```
 //!
-//! Cargo runs test BINARIES concurrently, and these four share one oracle
-//! cluster and one in-process engenho. Measured 2026-08-09 against a real
-//! upstream kind v1.34.0 oracle: all four pass individually and serially, and
-//! running them the default (parallel) way fails one with a spurious
-//! `MissingResource:.:engenho` — one binary observing state another had
-//! already torn down. That is a harness artifact, **not** an engenho
-//! divergence, and it is exactly the kind of false red that gets a real gate
-//! disabled. Isolation (per-binary namespaces) is the durable fix;
+//! `.config/nextest.toml` is the one contract for this. Its `oracle` profile
+//! selects every integration binary in this crate, and its `live-oracle` test
+//! group (`max-threads = 1`) runs them one at a time under every profile.
+//! nextest otherwise runs binaries concurrently, and these four share one
+//! oracle cluster. Measured 2026-08-09 against a real upstream kind v1.34.0
+//! oracle: all four pass individually and serially, and run concurrently one
+//! fails with a spurious `MissingResource:.:engenho`, one binary observing
+//! state another had already torn down. That is a harness artifact, **not**
+//! an engenho divergence, and it is exactly the kind of false red that gets a
+//! real gate disabled. Isolation (per-binary namespaces) is the durable fix;
 //! until then, serial.
+//!
+//! `cargo test -p engenho-diff` also runs them one after another, but not
+//! because of that file, which cargo does not read: cargo runs test binaries
+//! in sequence, and each of these holds a single test. `--test-threads=1` and
+//! `--jobs 1` change neither (`--jobs` limits the build).
 //!
 //! # The oracle
 //!
@@ -47,7 +54,8 @@ use engenho_diff::{
     Verdict, cotejo,
 };
 
-/// The live k3s oracle kubeconfig (`~/.kube/engenho-local-tunnel.yaml`).
+/// The oracle's kubeconfig: `ENGENHO_ORACLE_KUBECONFIG`, else
+/// `~/.kube/engenho-local-tunnel.yaml`.
 #[must_use]
 pub fn oracle_kubeconfig() -> PathBuf {
     // ENGENHO_ORACLE_KUBECONFIG first. The path was hardcoded to a hand-built
@@ -97,9 +105,10 @@ pub async fn load_oracle() -> K3sTarget {
         .unwrap_or_else(|e| panic!("cannot load oracle kubeconfig {kubeconfig:?}: {e}"));
     if let Some(Verdict::ReferenceUnreachable) = k3s.preflight().await {
         panic!(
-            "Verdict::ReferenceUnreachable — the k3s oracle at {kubeconfig:?} did not answer \
-             GET /api/v1. A live differential run cannot proceed. (Is the tunnel up? \
-             ssh -f -N -L 16443:127.0.0.1:6443 root@192.168.64.10)"
+            "Verdict::ReferenceUnreachable — the oracle at {kubeconfig:?} did not answer \
+             GET /api/v1. A live differential run cannot proceed. Point \
+             ENGENHO_ORACLE_KUBECONFIG at a live cluster's kubeconfig (a kind cluster \
+             pinned to v1.34 works) and run `cargo nextest run --profile oracle`."
         );
     }
     k3s
