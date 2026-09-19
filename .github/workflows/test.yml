@@ -21,27 +21,22 @@ name: test
 #
 # WHY NOT FIX IT AT THE LOAD-BEARING LAYER INSTEAD (Operating Principle #2).
 # The right fix is for the flake to expose real `checks` so `nix flake check`
-# compiles + tests hermetically. That is BLOCKED OUTSIDE SUBSTRATE, and the
-# block was verified here rather than assumed:
-#   * `runTests` is a crate2nix-generated-Cargo.nix concept. nixpkgs'
-#     `buildRustCrate` has no such argument.
-#   * `substrate/lib/build/rust/lockfile-builder.nix` — the engine engenho
-#     actually uses — has ZERO occurrences of `runTests`. (The single fleet
-#     occurrence is `crate2nix-builders.nix:240`, and it reads `= false`.)
-#   * engenho's flake.nix calls `substrate.rust.workspace`, which routes
-#     `mk-rust-workspace.nix` -> `lockfile-builder.nix`. Confirmed, not
-#     inferred. There is no committed `Cargo.nix` under the gen delta-only
-#     doctrine, so the crate2nix path is not available either.
-# Building an in-repo `checks` would mean a SECOND, divergent Rust build path
-# next to the gen/lockfile-builder one. Operating Principle #1 forbids that.
+# compiles + tests hermetically. Until 2026-09-19 that was blocked in
+# substrate: nixpkgs' `buildRustCrate` has no `runTests`, and
+# `lockfile-builder.nix`, the engine `substrate.rust.workspace` routes to,
+# had no test runner.
 #
-# THE SUBSTRATE FOLLOW-UP, RECORDED HERE RATHER THAN ROUTED AROUND SILENTLY:
-#   substrate/lib/build/rust/lockfile-builder.nix should grow a `runTests`
-#   (or a sibling `mkWorkspaceChecks`) so `substrate.rust.workspace` can
-#   expose `checks.<system>.test`. Until it does, `nix flake check` remains
-#   structurally incapable of compiling any gen-pattern consumer, and THIS
-#   workflow is what stands between engenho and an un-compiled merge.
-#   When that lands, this workflow's cargo steps can collapse into the flake.
+# THE FIX HAS LANDED UPSTREAM; ENGENHO HAS NOT ADOPTED IT (improvement plan
+# T0.9). Substrate 83bab67 added an opt-in runner:
+# `substrate.rust.workspace { tests.cargo.runs = [ … ]; }` yields
+# `checks.<system>.tests`, `cargo test --frozen` over a vendor dir built from
+# Cargo.lock, reading this repo's [profile.*] itself. engenho's flake.lock
+# pins substrate fcd3514, which predates it. Pending: bump that input,
+# declare `tests.cargo` in flake.nix, and check that the five private git
+# dependencies vendor inside Nix. Until then THIS workflow is what stands
+# between engenho and an un-compiled merge; afterwards its cargo steps can
+# collapse into the flake. Building an in-repo `checks` by hand would be a
+# SECOND, divergent Rust build path; Operating Principle #1 forbids that.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # PRIVATE DEPENDENCIES AND WHAT IS STILL RED — measured on main in runs
@@ -283,8 +278,18 @@ jobs:
   # .github/workflows/mutation.yml.
   # Second step: pleme-io/actions/tlisp-test runs each ci/<name>.test.tlisp
   # against ci/<name>.tlisp. min-files is the number of suites that exist
-  # (release-contract, mutation-gate), so losing one is red, not a smaller
-  # green. The first step pins the tatara-script tlisp-test reuses from PATH.
+  # (release-contract, mutation-gate, cargo-profiles), so losing one is red,
+  # not a smaller green; mutation-gate's suite fails if the floor and the
+  # count disagree. The first step pins the tatara-script tlisp-test reuses
+  # from PATH.
+  # cargo-profiles has no job of its own: its suite's first test runs the
+  # whole check against the real Cargo.toml, .cargo/config.toml and every
+  # workflow (improvement plan T0.9). It fails if [profile.release] leaves
+  # opt-level 3, the level the Nix-built daemon is compiled at; if
+  # [profile.stress] stops declaring opt-level 3 with debug assertions and
+  # overflow checks on; if a step that raises PROPTEST_CASES builds with
+  # `--release` or without the stress profile; or if a workflow env or a
+  # cargo config overrides either profile from outside Cargo.toml.
   # ───────────────────────────────────────────────────────────────────────────
   ci-contract-tests:
     name: ci/*.test.tlisp + mutation-gate lists
@@ -299,4 +304,4 @@ jobs:
           MUTATION_GATE_MODE: lint
       - uses: pleme-io/actions/tlisp-test@main
         with:
-          min-files: 2
+          min-files: 3

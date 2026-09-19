@@ -116,6 +116,14 @@ push + helm chart push would fail with `unauthorized`.
     gate reads; the measured count is in CLAUDE.md § Test count.
   * `nix flake check` (non-fatal, in ci.yml) evaluates the flake and
     runs `checks.typed-config`; it compiles no Rust.
+  * `ci/cargo-profiles.test.tlisp` (test.yml, job `ci-contract-tests`)
+    runs `ci/cargo-profiles.tlisp` against the real `Cargo.toml` and
+    workflows: `[profile.release]` stays at opt-level 3, the level the
+    Nix-built daemon is compiled at; `[profile.stress]` declares
+    opt-level 3 with debug assertions and overflow checks on; every
+    step that raises `PROPTEST_CASES` selects it and never `--release`.
+    deep-test.yml's `property-stress` job is that step, over the whole
+    workspace.
   * `ci/release-contract.tlisp` (test.yml, job `release-contract`)
     checks that release.yml moves `:latest` only in `promote-latest`,
     after `release-assets`; `ci/release-contract.test.tlisp` (job

@@ -10,7 +10,7 @@ name: deep-test
 #   deep-test  — "has the WORLD moved under us?"       Slow, cross-OS, stress,
 #                coverage, advisories. Time-triggered, NON-blocking by trigger.
 # Concretely deep-test owns four things test.yml deliberately does not: a
-# macOS leg, a 4x proptest case count, a coverage artifact, and a RustSec
+# macOS leg, a 4,096-case proptest run, a coverage artifact, and a RustSec
 # advisory scan. None of those belong on the PR critical path; all of them
 # rot silently if nobody ever runs them.
 # Mutation testing is scheduled too, but it is not here: it also gates pushes
@@ -122,8 +122,28 @@ jobs:
       - name: cargo test --doc
         run: cargo test --workspace --all-features --locked --doc --no-fail-fast
 
-  # ── Property-test stress: 4x the default case count ─────────────────────
-  # Distinct scope from test.yml, which runs proptest at its default budget.
+  # ── Property-test stress: 4,096 cases per property ──────────────────────
+  # Distinct scope from test.yml, which runs each property at its default
+  # budget (256, or 128 in three engenho-substrate-props suites).
+  #
+  # PROFILE. Built with Cargo.toml's [profile.stress], not `--release`.
+  # `--release` turns debug assertions and overflow checks off, so this lane
+  # used to check LESS per case than the default run. [profile.stress] is
+  # opt-level 3 with both checks on. nextest's own `--profile` names a nextest
+  # profile; the cargo profile is `--cargo-profile`. ci/cargo-profiles.tlisp
+  # (test.yml) fails a step that raises PROPTEST_CASES without selecting it.
+  #
+  # SELECTION. The whole workspace, filtered only by .config/nextest.toml. The
+  # lane used to pass `proptest`, a substring filter on test NAMES. Only tests
+  # named that way matched: engenho-kubelet's two `mod proptests` and two
+  # `proptest_*` functions in engenho-revoada's cross_face_verbs.rs. The
+  # `proptest!` blocks in the other ~55 files (every engenho-substrate-props
+  # suite, engenho-store's r9_mvcc_revision, engenho-types'
+  # determinism_proptest) are named for what they prove, so the 4,096-case
+  # lane never ran them. Tests with no property run once more under the
+  # optimised profile. --no-tests=fail keeps an empty selection red; cargo
+  # test exits 0 on that shape (measured by substrate 2026-08-06; see the
+  # cargo-nextest package in its flake.nix).
   property-stress:
     name: proptest stress (4k cases)
     runs-on: ubuntu-latest
@@ -144,14 +164,10 @@ jobs:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
       - name: install substrate's pinned cargo-nextest
         run: nix profile install github:pleme-io/substrate#cargo-nextest
-      # `proptest` is a test-name substring filter, intersected with the
-      # config's default-filter. --no-tests=fail turns a filter that matches
-      # nothing into a red run. cargo test exits 0 on that shape (measured by
-      # substrate 2026-08-06; see the cargo-nextest package in its flake.nix).
       - name: proptest stress
         run: >-
-          cargo nextest run --workspace --all-features --locked --release
-          --no-fail-fast --no-tests=fail proptest
+          cargo nextest run --workspace --all-targets --all-features --locked
+          --cargo-profile stress --no-fail-fast --no-tests=fail
 
   # ── Coverage artifact ───────────────────────────────────────────────────
   coverage:

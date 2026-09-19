@@ -96,14 +96,21 @@
     (assert (>= nix-at 0) "a leg installs Nix through nix-setup")
     (assert (> gate-at nix-at) "and only then runs the gate")))
 
-(deftest "test.yml lints the lists and runs every ci/*.test.tlisp"
+;; The suites tlisp-test discovers: its `find` walks the repository and skips
+;; .git, target and node_modules.
+(define (t:suites)
+  (filter (fn (p) (not (re-match? "(^|/)(\\.git|target|node_modules)/" p))) (glob "**/*.test.tlisp")))
+
+(deftest "test.yml lints the lists and runs every *.test.tlisp, with a floor equal to their count"
   (let* ((wf (yaml-parse (read-file ".github/workflows/test.yml")))
-         (steps (mg:get (mg:get (mg:get wf "jobs") "ci-contract-tests") "steps")))
+         (steps (mg:get (mg:get (mg:get wf "jobs") "ci-contract-tests") "steps"))
+         (floor (mg:n (length (t:suites)))))
+    (assert (>= (length (t:suites)) 3) "the suites were found: mutation-gate, release-contract, cargo-profiles")
     (assert (any? (fn (s) (equal? (mg:get (mg:get s "env") "MUTATION_GATE_MODE") "lint")) steps) "lint on every push")
     (assert (any? (fn (s) (and (string-starts-with? (mg:get s "uses") "pleme-io/actions/tlisp-test@")
-                               (equal? (mg:n (mg:get (mg:get s "with") "min-files")) "2")))
+                               (equal? (mg:n (mg:get (mg:get s "with") "min-files")) floor)))
                   steps)
-      "tlisp-test with a floor of 2 files")))
+      (string-append "tlisp-test with min-files equal to the " floor " suites that exist, so losing one is red"))))
 
 ;; ── The lists' rules ─────────────────────────────────────────────────────
 

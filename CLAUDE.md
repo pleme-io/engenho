@@ -155,6 +155,10 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 nix build                          # release build via substrate.rust.workspace
 nix flake check                    # ⚠ compiles no Rust — see § CI + gating
+
+# property tests at 4,096 cases, as deep-test.yml runs them:
+PROPTEST_CASES=4096 cargo nextest run --workspace --all-targets \
+  --all-features --locked --cargo-profile stress --no-fail-fast
 ```
 
 Every flag above is load-bearing:
@@ -180,6 +184,27 @@ Every flag above is load-bearing:
   on its own. That is what makes test.yml, `deep-test.yml`, substrate's
   release gate and a local run select the same tests. See § Live-oracle
   tests.
+
+### Cargo profiles: the daemon never reads them
+
+`nix build` compiles every crate with nixpkgs' `buildRustCrate`
+(`release = true`), which calls rustc directly with `-C opt-level=3` and
+no LTO. No `[profile.*]` in `Cargo.toml` reaches the daemon. Cargo reads
+them for the two binaries in each GitHub Release (`cargo build
+--release`), the property-stress lane and every test run:
+
+| Profile | Used by | Settings that matter |
+|---|---|---|
+| `release` | release.yml's engenho-mcp and engenho-cluster-config-render | `opt-level = 3`, the daemon's level. It was `"z"`, 1.7-1.9x slower on serde_json round trips |
+| `stress` | deep-test.yml `property-stress`, `--cargo-profile stress` | `opt-level = 3` with `debug-assertions` and `overflow-checks` on. `--release` turned both off |
+
+`ci/cargo-profiles.tlisp` checks both on every push (its suite runs in
+test.yml's `ci-contract-tests`). It also fails on a step that raises
+`PROPTEST_CASES` without the stress profile, and on a
+`CARGO_PROFILE_RELEASE_*` / `CARGO_PROFILE_STRESS_*` env or a
+`.cargo/config` `[profile]` that would override either from outside
+`Cargo.toml`. Under nextest, `--profile` names a nextest profile; the
+cargo profile is `--cargo-profile`.
 
 ### Test count (measured 2026-07-27, not estimated)
 
@@ -242,23 +267,25 @@ engenho. On sibling repo `forge`, a flake with no Rust checks was probed:
 clean tree → exit 0; `compile_error!` in a test module → exit 0; literal
 non-Rust garbage in a function body → **exit 0**.
 
-The load-bearing fix — the flake exposing Rust `checks` — is **blocked
-outside this repo**, verified rather than assumed: `runTests` is a
-crate2nix-generated-`Cargo.nix` concept, nixpkgs' `buildRustCrate` has
-no such argument, and `substrate/lib/build/rust/lockfile-builder.nix`
-(the engine `substrate.rust.workspace` actually routes to, via
-`mk-rust-workspace.nix`) has **zero** occurrences of it. Building an
-in-repo `checks` would mean a second, divergent Rust build path —
-Operating Principle #1 forbids it. **Substrate follow-up:** give
-`lockfile-builder.nix` a `runTests`/`mkWorkspaceChecks` so
-`substrate.rust.workspace` can expose `checks.<system>.test`; until
-then `nix flake check` cannot compile any gen-pattern consumer.
+The load-bearing fix — the flake exposing Rust `checks` — now exists
+upstream and engenho has **not adopted it yet**. Substrate 83bab67
+(2026-09-19) added an opt-in runner: `substrate.rust.workspace {
+tests.cargo.runs = [ … ]; }` yields `checks.<system>.tests`, which runs
+`cargo test --frozen` over a vendor directory built from this repo's
+`Cargo.lock`, and reads this repo's `[profile.*]` itself (so
+`--profile stress` means `[profile.stress]`). engenho's `flake.lock`
+pins substrate fcd3514, which predates it. Adoption is pending: bump
+the substrate input, declare `tests.cargo` in `flake.nix`, and check
+that the five private git dependencies vendor inside Nix. Only then can
+test.yml's cargo legs fold into `nix flake check`. Building an in-repo
+`checks` by hand would be a second, divergent Rust build path, which
+Operating Principle #1 forbids.
 
 | Workflow | Trigger | Scope | Blocking |
 |---|---|---|---|
-| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy, + `ci/nix-on-runner.tlisp` (Nix installed only via `pleme-io/actions/nix-setup`, before any step needing it), + `ci/release-contract.tlisp` (release.yml moves `:latest` only after the gate), + `ci-contract-tests`: every `ci/*.test.tlisp` and a lint of the mutation gate's two lists | yes |
+| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy, + `ci/nix-on-runner.tlisp` (Nix installed only via `pleme-io/actions/nix-setup`, before any step needing it), + `ci/release-contract.tlisp` (release.yml moves `:latest` only after the gate), + `ci-contract-tests`: every `ci/*.test.tlisp` (release-contract, mutation-gate, cargo-profiles, whose suite checks `Cargo.toml`'s release and stress profiles and every stress lane) and a lint of the mutation gate's two lists | yes |
 | `release.yml` | `v*` tag | 2 binaries, 4 arch images, 2 multi-arch indexes, 1 chart, exact tags only; then `release-assets` (needs every publishing job, finds all 23 assets) and `promote-latest` (moves `:latest` per image). A red leg or a missing asset leaves `:latest` where it was | — |
-| `deep-test.yml` | schedule + dispatch | breadth — macOS leg, 4k-case proptest stress, coverage artifact, `cargo audit` | no |
+| `deep-test.yml` | schedule + dispatch | breadth — macOS leg, the whole workspace under `[profile.stress]` with `PROPTEST_CASES=4096`, coverage artifact, `cargo audit` | no |
 | `mutation.yml` | schedule + dispatch; push + PR touching a seam | `cargo mutants` over `ci/seam-files.txt`: every mutant nightly, the changed lines on a push. A surviving mutant fails unless `ci/mutants-allowlist.txt` says why (`ci/mutation-gate.tlisp`) | yes, on a push that touches a seam |
 | `ci.yml` | push + PR | `gen confirm` (fatal lock tie) + `nix flake check` (non-fatal; runs `checks.typed-config`, compiles no Rust) | fails only on `gen confirm` |
 

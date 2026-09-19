@@ -1,5 +1,5 @@
 ;; release-contract.test.tlisp — (deftest …) suite for ci/release-contract.tlisp.
-;; Run by pleme-io/actions/tlisp-test (test.yml, job release-contract) as
+;; Run by pleme-io/actions/tlisp-test (test.yml, job ci-contract-tests) as
 ;; stdlib + unit + this file with TLISP_TEST=1, from the repository root.
 ;;
 ;; The first two tests read the real .github/workflows/release.yml, so they

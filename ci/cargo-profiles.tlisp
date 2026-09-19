@@ -1,0 +1,269 @@
+;; cargo-profiles — Cargo.toml's [profile.*] says what cargo builds with, and
+;; the property-stress lane builds with a profile that checks what the
+;; default test run checks.
+;;
+;; WHY (improvement plan T0.9, buildci-6).
+;;   * [profile.release] said opt-level = "z" (size). The engenho daemon never
+;;     reads it: flake.nix -> substrate.rust.workspace -> lockfile-builder.nix
+;;     builds every crate with nixpkgs' buildRustCrate and `release = true`,
+;;     which calls rustc directly with `-C opt-level=3` and no LTO
+;;     (build-rust-crate/build-crate.nix:31). The only artifacts that read the
+;;     profile are the ones cargo builds: release.yml's engenho-mcp and
+;;     engenho-cluster-config-render binaries (rust-binary-release.yml ->
+;;     pleme-io/actions/rust-cross-build, `cargo build --release`). They were
+;;     a slower build of the same code, 1.7-1.9x on serde_json round trips.
+;;   * deep-test.yml's 4,096-case proptest lane built with `--release`, which
+;;     compiles out every `debug_assert!` (among them engenho-store's
+;;     revision check in state.rs) and integer overflow checks. The stress
+;;     lane checked LESS per case than the 256-case default run it was meant
+;;     to deepen.
+;;
+;; RULES:
+;;   release  [profile.release] declares opt-level 3, the level the Nix-built
+;;            daemon is compiled at, so the two build paths agree.
+;;   stress   [profile.stress] exists, names what it inherits, and declares
+;;            each property the lane depends on itself, not by inheritance:
+;;            opt-level 3, debug-assertions true, overflow-checks true, and
+;;            strip false (the lane sets RUST_BACKTRACE=1; a stripped binary
+;;            prints a backtrace with no function names).
+;;   lane     every workflow step that runs cargo tests with PROPTEST_CASES
+;;            raised above proptest's default (256), at workflow, job or step
+;;            level, selects the stress profile: `--cargo-profile stress`
+;;            under nextest (nextest's own `--profile` names a NEXTEST
+;;            profile), `--profile stress` under cargo, and never `--release`
+;;            or `-r`. At least one such step must exist, or the profile is
+;;            declared for nothing.
+;;   source   no workflow env sets CARGO_PROFILE_RELEASE_* or
+;;            CARGO_PROFILE_STRESS_*, and no .cargo/config(.toml) declares
+;;            [profile.release] or [profile.stress]. Either would override
+;;            Cargo.toml without Cargo.toml showing it.
+;;
+;; TIER: a CI gate, not a type. It reads the TOML and YAML cargo and the
+;; runner read, so a profile edited back to "z", a stress lane moved back to
+;; `--release`, or an override from outside Cargo.toml fails before merge. It
+;; matches commands by text: a test run hidden behind a script is invisible to
+;; it. It says nothing about the daemon, whose flags nixpkgs owns; the 3
+;; below mirrors build-crate.nix and is not read from it.
+;;
+;; Exit codes: 0 clean · 1 a rule is broken · 3 nothing was examined (no
+;; Cargo.toml profile table, or no workflow): the check proved nothing, which
+;; is not the same as finding nothing wrong.
+;;
+;; Tests: ci/cargo-profiles.test.tlisp (tlisp-test sets TLISP_TEST=1, which
+;; loads these definitions and skips the main at the bottom). CI runs this
+;; check only through that suite, in test.yml's ci-contract-tests: its first
+;; test applies every rule to the real repository, so a job running the main
+;; as well would be a second copy of the same check. Run the main locally:
+;;   tatara-script ci/cargo-profiles.tlisp
+
+(define prof:MANIFEST "Cargo.toml")
+(define prof:CARGO-CONFIGS (list ".cargo/config.toml" ".cargo/config"))
+(define prof:STRESS "stress")
+
+;; The level nixpkgs' buildRustCrate compiles every `release = true` crate
+;; at (build-rust-crate/build-crate.nix:31, `-C opt-level=3`).
+(define prof:DAEMON-OPT-LEVEL 3)
+
+;; proptest's default case count (ProptestConfig::default().cases).
+(define prof:PROPTEST-DEFAULT-CASES 256)
+
+;; What [profile.stress] must declare itself, as (key value) pairs.
+(define prof:STRESS-DECLARES
+  (list (list "opt-level" 3)
+        (list "debug-assertions" true)
+        (list "overflow-checks" true)
+        (list "strip" false)))
+
+;; The profiles this check owns, and the env prefix cargo reads an override
+;; of each from. An override of any other profile is out of scope.
+(define prof:OWNED (list "release" prof:STRESS))
+(define prof:OWNED-ENV-PREFIXES (list "CARGO_PROFILE_RELEASE_" "CARGO_PROFILE_STRESS_"))
+
+;; Each pattern is searched in a step's `run` text with a space appended, so
+;; a flag at the very end still ends in whitespace.
+(define prof:RUNS-NEXTEST "(^|\\s)cargo\\s+(llvm-cov\\s+)?nextest\\s")
+(define prof:RUNS-CARGO-TEST "(^|\\s)cargo\\s+(llvm-cov\\s+)?test\\s")
+(define prof:NEXTEST-STRESS "\\s--cargo-profile(\\s+|=)stress\\s")
+(define prof:CARGO-STRESS "\\s--profile(\\s+|=)stress\\s")
+(define prof:RELEASE-FLAG "\\s(--release|-r)\\s")
+
+;; ── Reading parsed TOML and YAML ─────────────────────────────────────────
+;; toml-parse and yaml-parse both yield a table as a list of (key value).
+
+(define (prof:get al key) (if (list? al) (alist-get al key "") ""))
+
+(define (prof:has-key? al key)
+  (and (list? al) (any? (fn (e) (and (list? e) (equal? (car e) key))) al)))
+
+(define (prof:table al key) (let ((v (prof:get al key))) (if (list? v) v (list))))
+
+(define (prof:n x) (string-format "{}" x))
+
+;; `3` and `"3"` are the same opt-level to cargo; compare by rendering.
+(define (prof:same? a b) (equal? (prof:n a) (prof:n b)))
+
+;; A number from an env value: 4096, "4096". Anything else is 0.
+(define (prof:int v)
+  (cond
+    ((integer? v) v)
+    ((and (string? v) (re-match? "^\\s*[0-9]+\\s*$" v)) (string->number (string-trim v)))
+    (else 0)))
+
+;; ── Rules over Cargo.toml ────────────────────────────────────────────────
+
+(define (prof:release-violations manifest)
+  (let* ((release (prof:table (prof:table manifest "profile") "release"))
+         (at "[profile.release]: "))
+    (cond
+      ((not (prof:has-key? (prof:table manifest "profile") "release"))
+        (list (string-append at "missing; cargo's release build would silently change with its defaults")))
+      ((not (prof:has-key? release "opt-level"))
+        (list (string-append at "declares no opt-level; declare " (prof:n prof:DAEMON-OPT-LEVEL) ", the level the Nix-built daemon is compiled at")))
+      ((not (prof:same? (prof:get release "opt-level") prof:DAEMON-OPT-LEVEL))
+        (list (string-append at "opt-level is `" (prof:n (prof:get release "opt-level")) "`; the Nix-built daemon is compiled at "
+                (prof:n prof:DAEMON-OPT-LEVEL) " (buildRustCrate), so the cargo-built release binaries would be a different build of the same code")))
+      (else (list)))))
+
+(define (prof:stress-violations manifest)
+  (let* ((profiles (prof:table manifest "profile"))
+         (stress (prof:table profiles prof:STRESS))
+         (at "[profile.stress]: "))
+    (if (not (prof:has-key? profiles prof:STRESS))
+      (list (string-append at "missing; the property-stress lane has no profile of its own"))
+      (append
+        (if (equal? (prof:get stress "inherits") "")
+          (list (string-append at "needs `inherits`; cargo refuses a custom profile without one, but only when a build selects it"))
+          (list))
+        (filter (fn (s) (not (equal? s "")))
+          (map
+            (fn (pair)
+              (let ((key (car pair)) (want (car (cdr pair))))
+                (cond
+                  ((not (prof:has-key? stress key))
+                    (string-append at "declares no `" key "`; declare `" key " = " (prof:n want) "` here rather than inherit it"))
+                  ((not (prof:same? (prof:get stress key) want))
+                    (string-append at "`" key "` is `" (prof:n (prof:get stress key)) "`, not `" (prof:n want) "`"))
+                  (else ""))))
+            prof:STRESS-DECLARES))))))
+
+(define (prof:config-violations path config)
+  (map (fn (name) (string-append path " declares [profile." name "]; it overrides Cargo.toml without Cargo.toml showing it"))
+    (filter (fn (name) (prof:has-key? (prof:table config "profile") name)) prof:OWNED)))
+
+;; ── Rules over the workflows ─────────────────────────────────────────────
+
+(define (prof:as-list v) (if (list? v) v (list)))
+
+(define (prof:owned-env-key? key)
+  (any? (fn (prefix) (string-starts-with? key prefix)) prof:OWNED-ENV-PREFIXES))
+
+(define (prof:env-violations where env)
+  (map (fn (e) (string-append where " sets `" (car e) "`; it overrides Cargo.toml without Cargo.toml showing it"))
+    (filter (fn (e) (and (list? e) (string? (car e)) (prof:owned-env-key? (car e)))) (prof:as-list env))))
+
+(define (prof:step-label st)
+  (let ((name (prof:get st "name")))
+    (if (equal? name "") (string-append "step `" (prof:get st "run") "`") (string-append "step `" name "`"))))
+
+(define (prof:runs-tests? run)
+  (let ((text (string-append run " ")))
+    (or (re-match? prof:RUNS-NEXTEST text) (re-match? prof:RUNS-CARGO-TEST text))))
+
+;; Nothing, or the one problem with a stress step's command.
+(define (prof:stress-step-problem run)
+  (let ((text (string-append " " run " ")))
+    (cond
+      ((re-match? prof:RELEASE-FLAG text)
+        "builds with `--release`, which turns debug assertions and overflow checks off")
+      ((and (re-match? prof:RUNS-NEXTEST text) (not (re-match? prof:NEXTEST-STRESS text)))
+        (if (re-match? prof:CARGO-STRESS text)
+          "passes `--profile stress`, which names a NEXTEST profile; the cargo profile is `--cargo-profile stress`"
+          "does not select the stress profile (`--cargo-profile stress`)"))
+      ((and (not (re-match? prof:RUNS-NEXTEST text)) (not (re-match? prof:CARGO-STRESS text)))
+        "does not select the stress profile (`--profile stress`)")
+      (else ""))))
+
+(define (prof:raises-cases? env) (> (prof:int (prof:get env "PROPTEST_CASES")) prof:PROPTEST-DEFAULT-CASES))
+
+;; (violations stress-steps) for one parsed workflow named `wf-name`.
+(define (prof:workflow-report wf-name wf)
+  (let ((wf-env (prof:get wf "env")))
+    (reduce
+      (fn (acc entry)
+        (let* ((job-name (car entry))
+               (job (car (cdr entry)))
+               (job-env (prof:get job "env"))
+               (at (string-append wf-name " job `" job-name "`"))
+               (job-acc
+                 (list (append (car acc) (prof:env-violations at job-env)) (car (cdr acc)))))
+          (reduce
+            (fn (acc2 st)
+              (let* ((step-env (prof:get st "env"))
+                     (run (prof:get st "run"))
+                     (sat (string-append at " " (prof:step-label st)))
+                     (env-vs (prof:env-violations sat step-env))
+                     (stress? (and (string? run) (prof:runs-tests? run)
+                                   (or (prof:raises-cases? wf-env) (prof:raises-cases? job-env) (prof:raises-cases? step-env))))
+                     (problem (if stress? (prof:stress-step-problem run) "")))
+                (list
+                  (append (car acc2) env-vs
+                    (if (equal? problem "") (list) (list (string-append sat " raises PROPTEST_CASES but " problem))))
+                  (+ (car (cdr acc2)) (if stress? 1 0)))))
+            job-acc
+            (prof:as-list (prof:get job "steps")))))
+      (list (prof:env-violations (string-append wf-name " (workflow env)") wf-env) 0)
+      (prof:as-list (prof:get wf "jobs")))))
+
+;; (violations stress-steps) over a list of (name parsed-workflow).
+(define (prof:workflows-report named)
+  (reduce
+    (fn (acc pair)
+      (let ((r (prof:workflow-report (car pair) (car (cdr pair)))))
+        (list (append (car acc) (car r)) (+ (car (cdr acc)) (car (cdr r))))))
+    (list (list) 0)
+    named))
+
+;; ── Everything, as one list of violation lines ──────────────────────────
+;; `configs` is a list of (path parsed-config) for the cargo configs present.
+
+(define (prof:violations manifest configs named-workflows)
+  (let ((wr (prof:workflows-report named-workflows)))
+    (append
+      (prof:release-violations manifest)
+      (prof:stress-violations manifest)
+      (reduce (fn (acc c) (append acc (prof:config-violations (car c) (car (cdr c))))) (list) configs)
+      (car wr)
+      (if (= (car (cdr wr)) 0)
+        (list "no workflow step runs cargo tests with PROPTEST_CASES above 256, so [profile.stress] is declared for nothing")
+        (list)))))
+
+;; ── Loading the real files ───────────────────────────────────────────────
+
+(define (prof:load-manifest)
+  (if (path-exists? prof:MANIFEST) (toml-parse (read-file prof:MANIFEST)) (list)))
+
+(define (prof:load-configs)
+  (map (fn (p) (list p (toml-parse (read-file p)))) (filter (fn (p) (path-exists? p)) prof:CARGO-CONFIGS)))
+
+(define (prof:load-workflows)
+  (map (fn (p) (list p (yaml-parse (read-file p))))
+    (append (glob ".github/workflows/*.yml") (glob ".github/workflows/*.yaml"))))
+
+(define (prof:main)
+  (let* ((manifest (prof:load-manifest))
+         (workflows (prof:load-workflows))
+         (vs (prof:violations manifest (prof:load-configs) workflows))
+         (stress-steps (car (cdr (prof:workflows-report workflows)))))
+    (when (or (= (length (prof:table manifest "profile")) 0) (= (length workflows) 0))
+      (print-line (string-append "FATAL: no [profile] table in " prof:MANIFEST ", or no workflow; the check proved nothing"))
+      (exit 3))
+    (for-each (fn (v) (print-line (string-append "FAIL " v))) vs)
+    (print-line
+      (string-append "cargo profiles: " (prof:n (length (prof:table manifest "profile"))) " declared · "
+        (prof:n (length workflows)) " workflows · " (prof:n stress-steps) " stress steps · violations: "
+        (prof:n (length vs))))
+    (exit (if (> (length vs) 0) 1 0))))
+
+(cond
+  ((equal? (env-get "TLISP_TEST" "") "1") (print-line "TLISP_TEST=1: cargo-profiles loaded; main skipped"))
+  (else (prof:main)))

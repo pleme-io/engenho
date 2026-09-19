@@ -1,0 +1,221 @@
+;; cargo-profiles.test.tlisp — (deftest …) suite for ci/cargo-profiles.tlisp.
+;; Run by pleme-io/actions/tlisp-test (test.yml, job ci-contract-tests) as
+;; stdlib + unit + this file with TLISP_TEST=1, from the repository root.
+;;
+;; The first tests read the real Cargo.toml, .cargo/config.toml and
+;; .github/workflows, so they fail when the repository breaks a rule. The
+;; rest run the check against a small fixture that keeps every rule, then
+;; against one mutation per rule, so each rule is shown to fire on the defect
+;; it names and to stay quiet on its near miss.
+
+(define (t:has? vs needle) (any? (fn (v) (string-contains? v needle)) vs))
+
+(define t:MANIFEST "
+[workspace]
+members = [\"a\"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
+
+[profile.stress]
+inherits = \"release\"
+opt-level = 3
+debug-assertions = true
+overflow-checks = true
+lto = false
+strip = false
+")
+
+(define t:WORKFLOW "
+on:
+  schedule:
+    - cron: '0 7 * * *'
+jobs:
+  property-stress:
+    runs-on: ubuntu-latest
+    env:
+      PROPTEST_CASES: '4096'
+    steps:
+      - uses: actions/checkout@v4
+      - name: install nextest
+        run: nix profile install github:pleme-io/substrate#cargo-nextest
+      - name: stress
+        run: >-
+          cargo nextest run --workspace --all-features --locked
+          --cargo-profile stress --no-fail-fast --no-tests=fail
+  plain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: default budget, default profile
+        run: cargo nextest run --workspace --release
+")
+
+(define (t:toml text) (toml-parse text))
+(define (t:wf text) (list (list "fixture.yml" (yaml-parse text))))
+
+;; Every violation for a manifest text and a workflow text, with no cargo config.
+(define (t:vs manifest-text workflow-text)
+  (prof:violations (t:toml manifest-text) (list) (t:wf workflow-text)))
+
+;; A fixture with one substring replaced; the replacement must happen, or the
+;; mutation test would silently check the unmutated fixture.
+(define (t:swap text from to)
+  (assert (string-contains? text from) (string-append "fixture no longer contains: " from))
+  (string-replace text from to))
+
+(define (t:manifest-mutant from to) (t:vs (t:swap t:MANIFEST from to) t:WORKFLOW))
+(define (t:workflow-mutant from to) (t:vs t:MANIFEST (t:swap t:WORKFLOW from to)))
+
+;; ── The real repository ──────────────────────────────────────────────────
+
+(deftest "the real Cargo.toml, cargo config and workflows keep every rule"
+  (let* ((manifest (prof:load-manifest))
+         (workflows (prof:load-workflows))
+         (vs (prof:violations manifest (prof:load-configs) workflows)))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (> (length workflows) 0) "workflows were read")
+    (assert (= (length vs) 0) "no violation in the repository")))
+
+(deftest "the real release profile builds at the daemon's opt-level"
+  (let ((release (prof:table (prof:table (prof:load-manifest) "profile") "release")))
+    (assert (prof:same? (prof:get release "opt-level") 3) "[profile.release] opt-level is 3, as buildRustCrate compiles the daemon")))
+
+(deftest "the real stress profile is optimised and keeps both checks on"
+  (let ((stress (prof:table (prof:table (prof:load-manifest) "profile") "stress")))
+    (assert (prof:same? (prof:get stress "opt-level") 3) "opt-level 3")
+    (assert (equal? (prof:get stress "debug-assertions") true) "debug assertions on")
+    (assert (equal? (prof:get stress "overflow-checks") true) "overflow checks on")
+    (assert (equal? (prof:get stress "strip") false) "not stripped, so a backtrace names functions")))
+
+(deftest "the real deep-test.yml runs its property-stress job under the stress profile"
+  (let* ((wf (yaml-parse (read-file ".github/workflows/deep-test.yml")))
+         (report (prof:workflow-report "deep-test.yml" wf))
+         (job (prof:get (prof:get wf "jobs") "property-stress"))
+         (runs (filter (fn (r) (and (string? r) (prof:runs-tests? r)))
+                 (map (fn (st) (prof:get st "run")) (prof:as-list (prof:get job "steps"))))))
+    (assert (= (length (car report)) 0) "deep-test.yml keeps the lane rule")
+    (assert (>= (car (cdr report)) 1) "and has a stress step")
+    (assert (prof:raises-cases? (prof:get job "env")) "property-stress raises PROPTEST_CASES")
+    (assert (> (length runs) 0) "property-stress runs tests")
+    (for-each
+      (fn (r)
+        (assert (re-match? prof:NEXTEST-STRESS (string-append " " r " ")) (string-append "selects the stress profile: " r))
+        (assert (not (re-match? prof:RELEASE-FLAG (string-append " " r " "))) (string-append "never --release: " r)))
+      runs)))
+
+;; ── The fixture, clean ───────────────────────────────────────────────────
+
+(deftest "the fixture keeps every rule; a --release run at the default budget is not a stress lane"
+  (let ((vs (t:vs t:MANIFEST t:WORKFLOW)))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (= (length vs) 0) "clean fixture, though job `plain` says --release")
+    (assert (= (car (cdr (prof:workflows-report (t:wf t:WORKFLOW)))) 1)
+      "exactly one stress step: the nextest run, not the `nix profile install ...#cargo-nextest` step")))
+
+;; ── release ──────────────────────────────────────────────────────────────
+
+(deftest "release at opt-level z is refused"
+  (let ((vs (t:manifest-mutant "codegen-units = 1\nlto = true\nopt-level = 3" "codegen-units = 1\nlto = true\nopt-level = \"z\"")))
+    (assert (t:has? vs "[profile.release]: opt-level is `z`") "names the value")))
+
+(deftest "release at any level but 3 is refused, not just z"
+  (let ((vs (t:manifest-mutant "codegen-units = 1\nlto = true\nopt-level = 3" "codegen-units = 1\nlto = true\nopt-level = 2")))
+    (assert (t:has? vs "[profile.release]: opt-level is `2`") "2 is refused too"))
+  (let ((vs (t:manifest-mutant "codegen-units = 1\nlto = true\nopt-level = 3" "codegen-units = 1\nlto = true\nopt-level = \"3\"")))
+    (assert (not (t:has? vs "[profile.release]")) "\"3\" is the same level to cargo")))
+
+(deftest "release that leaves opt-level to cargo's default is refused"
+  (let ((vs (t:manifest-mutant "codegen-units = 1\nlto = true\nopt-level = 3\n" "codegen-units = 1\nlto = true\n")))
+    (assert (t:has? vs "[profile.release]: declares no opt-level") "must be stated")))
+
+;; ── stress ───────────────────────────────────────────────────────────────
+
+(deftest "a missing stress profile is refused"
+  (let ((vs (t:manifest-mutant "[profile.stress]" "[profile.other]")))
+    (assert (t:has? vs "[profile.stress]: missing") "named")))
+
+(deftest "a stress profile without inherits is refused"
+  (let ((vs (t:manifest-mutant "inherits = \"release\"\n" "")))
+    (assert (t:has? vs "[profile.stress]: needs `inherits`") "cargo would refuse it only when selected")))
+
+(deftest "a stress profile that turns a check off, or inherits it, is refused"
+  (let ((vs (t:manifest-mutant "debug-assertions = true" "debug-assertions = false")))
+    (assert (t:has? vs "[profile.stress]: `debug-assertions` is `false`, not `true`") "debug assertions off"))
+  (let ((vs (t:manifest-mutant "overflow-checks = true\n" "")))
+    (assert (t:has? vs "[profile.stress]: declares no `overflow-checks`") "inherited from release means off"))
+  (let ((vs (t:manifest-mutant "lto = false\nstrip = false" "lto = false\nstrip = true")))
+    (assert (t:has? vs "[profile.stress]: `strip` is `true`, not `false`") "a stripped backtrace names nothing"))
+  (let ((vs (t:manifest-mutant "inherits = \"release\"\nopt-level = 3" "inherits = \"release\"\nopt-level = 1")))
+    (assert (t:has? vs "[profile.stress]: `opt-level` is `1`, not `3`") "unoptimised stress would not finish")))
+
+;; ── lane ─────────────────────────────────────────────────────────────────
+
+(deftest "a stress lane built with --release is refused"
+  (let ((vs (t:workflow-mutant "--cargo-profile stress --no-fail-fast" "--release --no-fail-fast")))
+    (assert (t:has? vs "job `property-stress` step `stress` raises PROPTEST_CASES but builds with `--release`") "the old deep-test shape"))
+  (let ((vs (t:workflow-mutant "--cargo-profile stress --no-fail-fast" "-r --cargo-profile stress --no-fail-fast")))
+    (assert (t:has? vs "builds with `--release`") "-r is --release to nextest, and wins over nothing")))
+
+(deftest "a stress lane that selects no profile is refused"
+  (let ((vs (t:workflow-mutant "--cargo-profile stress --no-fail-fast" "--no-fail-fast")))
+    (assert (t:has? vs "does not select the stress profile (`--cargo-profile stress`)") "the dev profile is not the stress profile")))
+
+(deftest "nextest's --profile names a nextest profile, not the cargo one"
+  (let ((vs (t:workflow-mutant "--cargo-profile stress" "--profile stress")))
+    (assert (t:has? vs "passes `--profile stress`, which names a NEXTEST profile") "the trap is named")))
+
+(deftest "cargo test takes --profile stress, and --cargo-profile=stress is the same flag"
+  (let ((vs (t:workflow-mutant "cargo nextest run --workspace --all-features --locked\n          --cargo-profile stress"
+                               "cargo test --workspace --all-features --locked\n          --profile stress")))
+    (assert (= (length vs) 0) "cargo test --profile stress is accepted"))
+  (let ((vs (t:workflow-mutant "cargo nextest run --workspace --all-features --locked\n          --cargo-profile stress"
+                               "cargo test --workspace --all-features --locked")))
+    (assert (t:has? vs "does not select the stress profile (`--profile stress`)") "cargo test with no profile is refused"))
+  (let ((vs (t:workflow-mutant "--cargo-profile stress" "--cargo-profile=stress")))
+    (assert (= (length vs) 0) "the = form is accepted")))
+
+(deftest "PROPTEST_CASES raised at step or workflow level makes a stress lane too"
+  (let* ((moved (t:swap t:WORKFLOW "    env:\n      PROPTEST_CASES: '4096'\n" ""))
+         (at-step (t:swap moved "      - name: stress\n" "      - name: stress\n        env:\n          PROPTEST_CASES: 8192\n"))
+         (at-wf (t:swap moved "jobs:\n" "env:\n  PROPTEST_CASES: '4096'\njobs:\n")))
+    (assert (t:has? (t:vs t:MANIFEST (t:swap at-step "--cargo-profile stress --no-fail-fast" "--release --no-fail-fast"))
+                    "step `stress` raises PROPTEST_CASES but builds with `--release`")
+      "step-level env counts")
+    (assert (t:has? (t:vs t:MANIFEST at-wf) "job `plain` step `default budget, default profile` raises PROPTEST_CASES but builds with `--release`")
+      "workflow-level env reaches every job")))
+
+(deftest "a case count at or below proptest's default is not a stress lane"
+  (let ((vs (t:workflow-mutant "PROPTEST_CASES: '4096'" "PROPTEST_CASES: '256'")))
+    (assert (t:has? vs "no workflow step runs cargo tests with PROPTEST_CASES above 256") "256 is the default budget"))
+  (let ((vs (t:workflow-mutant "PROPTEST_CASES: '4096'" "PROPTEST_CASES: 'lots'")))
+    (assert (t:has? vs "[profile.stress] is declared for nothing") "an unparseable count is not a raised one")))
+
+(deftest "a stress profile no workflow runs is refused"
+  (let ((vs (t:workflow-mutant "    env:\n      PROPTEST_CASES: '4096'\n" "")))
+    (assert (t:has? vs "[profile.stress] is declared for nothing") "dead profile named")))
+
+;; ── source ───────────────────────────────────────────────────────────────
+
+(deftest "a workflow env that overrides an owned profile is refused; other profiles are out of scope"
+  (let ((vs (t:workflow-mutant "      PROPTEST_CASES: '4096'\n" "      PROPTEST_CASES: '4096'\n      CARGO_PROFILE_STRESS_DEBUG_ASSERTIONS: 'false'\n")))
+    (assert (t:has? vs "job `property-stress` sets `CARGO_PROFILE_STRESS_DEBUG_ASSERTIONS`") "job env"))
+  (let ((vs (t:workflow-mutant "jobs:\n" "env:\n  CARGO_PROFILE_RELEASE_OPT_LEVEL: z\njobs:\n")))
+    (assert (t:has? vs "(workflow env) sets `CARGO_PROFILE_RELEASE_OPT_LEVEL`") "workflow env"))
+  (let ((vs (t:workflow-mutant "      - name: default budget, default profile\n"
+                               "      - name: default budget, default profile\n        env:\n          CARGO_PROFILE_RELEASE_LTO: 'false'\n")))
+    (assert (t:has? vs "step `default budget, default profile` sets `CARGO_PROFILE_RELEASE_LTO`") "step env"))
+  (let ((vs (t:workflow-mutant "jobs:\n" "env:\n  CARGO_PROFILE_DEV_DEBUG: '0'\njobs:\n")))
+    (assert (= (length vs) 0) "the dev profile is not owned here")))
+
+(deftest "a cargo config that declares an owned profile is refused"
+  (let ((vs (prof:violations (t:toml t:MANIFEST)
+              (list (list ".cargo/config.toml" (t:toml "[net]\ngit-fetch-with-cli = true\n[profile.release]\nopt-level = \"z\"\n")))
+              (t:wf t:WORKFLOW))))
+    (assert (t:has? vs ".cargo/config.toml declares [profile.release]") "named"))
+  (let ((vs (prof:violations (t:toml t:MANIFEST)
+              (list (list ".cargo/config.toml" (t:toml "[net]\ngit-fetch-with-cli = true\n[profile.dev]\ndebug = 0\n")))
+              (t:wf t:WORKFLOW))))
+    (assert (= (length vs) 0) "[net] and [profile.dev] are not owned here")))

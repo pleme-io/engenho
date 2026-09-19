@@ -142,10 +142,56 @@ ed25519-dalek          = { version = "2", features = ["pkcs8", "pem"] }
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 
-[profile]
+# ── Cargo profiles: who reads them, and who never does (plan T0.9) ────────
+#
+# THE ENGENHO DAEMON NEVER READS THESE. The binary that runs on rio, ryn and
+# plo is built by Nix: flake.nix -> substrate.rust.workspace ->
+# lib/build/rust/lockfile-builder.nix, which compiles every crate with
+# nixpkgs' buildRustCrate and `release = true`. buildRustCrate calls rustc
+# directly, not cargo, so no [profile.*] section reaches it: it passes
+# `-C opt-level=3` and no LTO (build-rust-crate/build-crate.nix:31), whatever
+# is written below. Nothing here changes what runs in a cluster.
+#
+# Cargo does read them, for:
+#   release  the engenho-mcp and engenho-cluster-config-render binaries in
+#            every GitHub Release (release.yml -> substrate
+#            rust-binary-release.yml -> pleme-io/actions/rust-cross-build,
+#            `cargo build --release`), and any `cargo install`.
+#   stress   deep-test.yml's property-stress job, 4,096 cases per property
+#            (`cargo nextest run --cargo-profile stress`).
+#   dev      every other local and CI test run (cargo's defaults).
+#
+# ci/cargo-profiles.tlisp checks both sections below on every push (its suite
+# runs in test.yml's ci-contract-tests), and fails if a workflow env or a
+# .cargo/config overrides either from outside this file.
 
 [profile.release]
 codegen-units = 1
 lto = true
-opt-level = "z"
+# 3, the level the Nix-built daemon is compiled at. It was "z" (size), which
+# measured 1.7-1.9x slower on serde_json round trips, a cost only these two
+# cargo-built binaries paid. This deviates from the fleet's "z" convention on
+# purpose, for that measured cost.
+opt-level = 3
 strip = true
+
+# Property tests at a raised case count. Optimised so 4,096 cases finish, and
+# checking everything the default test run checks. The lane used to build
+# with `--release`, which compiles out every `debug_assert!` (among them
+# engenho-store's revision check in state.rs) and integer overflow checks, so
+# it checked less per case than the 256-case run it was meant to deepen.
+# Each property is declared here, not inherited, so a change to
+# [profile.release] cannot quietly change what the stress lane checks.
+[profile.stress]
+inherits = "release"
+opt-level = 3
+debug-assertions = true
+overflow-checks = true
+# release's fat LTO and single codegen unit would be paid again for each of
+# the ~160 test binaries; nothing above depends on either.
+lto = false
+codegen-units = 16
+# The lane sets RUST_BACKTRACE=1. A stripped binary prints a backtrace with no
+# function names, which is the one thing a failing stress case needs.
+strip = false
+debug = false
