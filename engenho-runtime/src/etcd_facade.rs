@@ -289,6 +289,13 @@ impl EtcdWatchStore for MeshEtcdStore {
     /// and reached the client twice. The store's `watch_from` captures the
     /// replay and attaches the live tail under ONE lock, so replay → live
     /// has no gap, no duplicate and no reorder by construction.
+    ///
+    /// That lock is raced in engenho-store's `tests/r7_6_resumable_watch.rs`
+    /// (`gap_freedom_*`, `nonempty_replay_boundary_ordering_*`). The one
+    /// read this adds before it, `current`, is both the revision a `Now`
+    /// watch is acknowledged at and the revision its replay starts after,
+    /// so a change landing between the two calls is replayed: the façade
+    /// opens no window of its own.
     async fn watch_from(
         &self,
         prefix: &str,

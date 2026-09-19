@@ -820,10 +820,6 @@ pub enum WatchEnd {
     /// The client asked to cancel this watch.
     #[error("watch cancelled by client")]
     CancelledByClient,
-    /// The client chose a `watch_id` already open on this stream. Accepting
-    /// it would merge two watches into one from the client's side.
-    #[error("a watch with this id is already open on this stream")]
-    DuplicateWatchId,
 }
 
 impl WatchEnd {
@@ -833,10 +829,7 @@ impl WatchEnd {
     pub fn compact_revision(&self) -> i64 {
         match self {
             Self::Compacted { compact_revision } => *compact_revision,
-            Self::Overflow { .. }
-            | Self::StoreGone(_)
-            | Self::CancelledByClient
-            | Self::DuplicateWatchId => 0,
+            Self::Overflow { .. } | Self::StoreGone(_) | Self::CancelledByClient => 0,
         }
     }
 
@@ -847,10 +840,27 @@ impl WatchEnd {
         match self {
             Self::Compacted { compact_revision } => *compact_revision,
             Self::Overflow { last_seen } => *last_seen,
-            Self::StoreGone(_) | Self::CancelledByClient | Self::DuplicateWatchId => 0,
+            Self::StoreGone(_) | Self::CancelledByClient => 0,
         }
     }
 }
+
+/// etcd's `InvalidWatchID`: the id of a response that is about no watch.
+pub const INVALID_WATCH_ID: i64 = -1;
+
+/// A create that named a `watch_id` already open on this stream.
+///
+/// ★ NOT A [`WatchEnd`], BECAUSE IT ENDS NO WATCH. The watch that holds the
+/// id is still open and still the client's. A refusal sent under that id —
+/// a `canceled` response for watch 7 — tells the client its open watch 7
+/// is over while events for 7 keep arriving, which is the merge this
+/// refusal exists to prevent. So a duplicate has its own type and one
+/// builder, [`duplicate_id_response`], which takes no watch id at all:
+/// the refusal cannot name the open watch. The text is upstream's, word
+/// for word (`mvcc.ErrWatcherDuplicateID`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("mvcc: duplicate watch ID provided on the WatchStream")]
+pub struct DuplicateWatchId;
 
 /// One step of an open watch: an event, or the one reason it ended.
 #[derive(Debug, Clone, PartialEq)]
@@ -955,6 +965,27 @@ pub fn canceled_response(id: ServerIdentity, watch_id: i64, end: &WatchEnd) -> W
         canceled: true,
         compact_revision: end.compact_revision(),
         cancel_reason: end.to_string(),
+        fragment: false,
+        events: Vec::new(),
+    }
+}
+
+/// Build etcd's refusal of a create whose `watch_id` is already open: ONE
+/// response, `created` and `canceled` together, under [`INVALID_WATCH_ID`].
+///
+/// There is no `watch_id` parameter, so this refusal cannot be sent under
+/// the id of the watch that is still open (see [`DuplicateWatchId`]). The
+/// header revision is `0`, the same "knows none" every other refusal that
+/// has no revision of its own carries.
+#[must_use]
+pub fn duplicate_id_response(id: ServerIdentity) -> WatchResponse {
+    WatchResponse {
+        header: Some(header(id, 0)),
+        watch_id: INVALID_WATCH_ID,
+        created: true,
+        canceled: true,
+        compact_revision: 0,
+        cancel_reason: DuplicateWatchId.to_string(),
         fragment: false,
         events: Vec::new(),
     }
@@ -1117,10 +1148,12 @@ pub async fn run_watch_loop<S, R>(
                 } else {
                     create.watch_id
                 };
-                let created = if open.contains_key(&watch_id) {
-                    CreatedWatch::refused(identity, watch_id, &WatchEnd::DuplicateWatchId)
+                // A client-chosen id already open is refused under no id
+                // at all: the open watch keeps it, and keeps running.
+                if open.contains_key(&watch_id) {
+                    replies.push(Ok(duplicate_id_response(identity)));
                 } else {
-                    create_watch(
+                    match create_watch(
                         store.as_ref(),
                         identity,
                         watch_id,
@@ -1128,15 +1161,15 @@ pub async fn run_watch_loop<S, R>(
                         create.start_revision,
                     )
                     .await
-                };
-                match created {
-                    CreatedWatch::Open { ack, feed } => {
-                        replies.push(Ok(ack));
-                        opened = Some((watch_id, feed));
-                    }
-                    CreatedWatch::Refused { ack, cancel } => {
-                        replies.push(Ok(ack));
-                        replies.push(Ok(cancel));
+                    {
+                        CreatedWatch::Open { ack, feed } => {
+                            replies.push(Ok(ack));
+                            opened = Some((watch_id, feed));
+                        }
+                        CreatedWatch::Refused { ack, cancel } => {
+                            replies.push(Ok(ack));
+                            replies.push(Ok(cancel));
+                        }
                     }
                 }
             }
@@ -1471,23 +1504,58 @@ mod watch_tests {
         assert_ne!(out[0].watch_id, out[1].watch_id);
     }
 
+    /// A second create for an open client-chosen id is refused the way etcd
+    /// refuses it: one response, `created` and `canceled`, under the invalid
+    /// id -1. Sent under 7 instead, the refusal reads as "watch 7 is over"
+    /// while watch 7 keeps delivering, which is the merge it is meant to
+    /// prevent.
     #[tokio::test]
     async fn a_client_chosen_id_already_open_is_refused_not_merged() {
+        let st = FakeWatch {
+            steps: vec![WatchStep::Event(event(5))],
+            ..FakeWatch::default()
+        };
         let out = drive(
-            FakeWatch::default(),
+            st,
             vec![
                 create_req_with_id("/registry/pods/", 0, 7),
                 create_req_with_id("/registry/services/", 0, 7),
                 create_req("/registry/", 0),
             ],
-            4,
+            6,
         )
         .await;
-        assert!(out[0].created && !out[0].canceled && out[0].watch_id == 7);
-        assert!(out[1].created && out[1].watch_id == 7, "acknowledged");
-        assert!(out[2].canceled && out[2].watch_id == 7, "then refused");
-        assert_eq!(out[2].cancel_reason, WatchEnd::DuplicateWatchId.to_string());
-        assert_ne!(out[3].watch_id, 7, "a server-assigned id skips an open one");
+        // Two acks, one refusal, and one event for each open watch.
+        assert_eq!(out.len(), 5, "{out:?}");
+        let about =
+            |id: i64| -> Vec<&WatchResponse> { out.iter().filter(|r| r.watch_id == id).collect() };
+
+        let refusals = about(INVALID_WATCH_ID);
+        assert_eq!(refusals.len(), 1, "{out:?}");
+        assert!(refusals[0].created && refusals[0].canceled, "{out:?}");
+        assert_eq!(refusals[0].cancel_reason, DuplicateWatchId.to_string());
+
+        let seven = about(7);
+        assert!(
+            seven.iter().all(|r| !r.canceled),
+            "the refusal must not cancel the open watch 7: {out:?}"
+        );
+        assert!(seven[0].created, "7 is acknowledged first");
+        assert_eq!(
+            seven.iter().filter(|r| !r.events.is_empty()).count(),
+            1,
+            "and keeps delivering: {out:?}"
+        );
+
+        let assigned: Vec<&WatchResponse> = out
+            .iter()
+            .filter(|r| r.created && !r.canceled && r.watch_id != 7)
+            .collect();
+        assert_eq!(assigned.len(), 1, "{out:?}");
+        assert_ne!(
+            assigned[0].watch_id, INVALID_WATCH_ID,
+            "a server-assigned id is a real one, and skips the open 7"
+        );
     }
 
     #[tokio::test]
