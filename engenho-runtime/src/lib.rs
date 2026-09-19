@@ -71,6 +71,18 @@
 //! dies, stops heartbeating, and the node reads `NotReady` one grace period
 //! later; a long tick inside the window (an image pull) keeps it Ready.
 //!
+//! ## The container runtime's health (W8)
+//!
+//! A [`Relister`] lists every container the runtime holds through the
+//! [`Relist`] seam and writes the outcome into a [`RelistLedger`], whose one
+//! judgement is a [`RuntimeHealth`]: healthy while the last successful
+//! relist began within [`RELIST_THRESHOLD`] (upstream's PLEG health). Built
+//! over that ledger, the node lease renews only while the runtime is healthy
+//! too. `pending-runtime-relist`: the kubelet's `ContainerRuntime` cannot
+//! relist yet, so the relister is [`Dormant`] and the runtime builds the
+//! lease over [`RuntimeHealthSource::Unobserved`], renewing by the kubelet
+//! alone.
+//!
 //! ## Health (T2.8)
 //!
 //! `/livez`, `/healthz`, `/readyz` and the runtime's `/metrics` families are
@@ -130,6 +142,7 @@ mod panics;
 mod read_census;
 mod rebind;
 mod runtime;
+mod runtime_health;
 #[cfg(test)]
 mod testing;
 
@@ -144,3 +157,7 @@ pub use health::{CONTINUOUS_AFTER, Health, ProposeRate, ProposeWindow, Pulse, SP
 pub use node_registration::NodeRegistrationError;
 pub use panics::PanicCounter;
 pub use runtime::Runtime;
+pub use runtime_health::{
+    RELIST_PERIOD, RELIST_THRESHOLD, Relist, RelistFault, RelistLedger, Relisted, Relister,
+    RuntimeHealth, RuntimeHealthSource, RuntimeSight, Staleness,
+};

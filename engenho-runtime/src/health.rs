@@ -292,8 +292,9 @@ impl Pulse {
 
 /// `at` on the wall clock: `wall_now` less `at`'s age on the monotonic clock
 /// the heartbeat stamps with. Every age comes from that one clock; the wall
-/// only writes the instant down.
-fn wall_of(at: Instant, now: Instant, wall_now: WallInstant) -> WallInstant {
+/// only writes the instant down. The runtime's relist ledger
+/// ([`crate::runtime_health`]) writes its instants down the same way.
+pub(crate) fn wall_of(at: Instant, now: Instant, wall_now: WallInstant) -> WallInstant {
     let age_ms = u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX);
     WallInstant::from_ms(wall_now.physical_ms.saturating_sub(age_ms))
 }

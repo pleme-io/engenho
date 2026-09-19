@@ -53,6 +53,7 @@ use crate::node_lease::NodeLease;
 use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
 use crate::rebind::serve_rebinding;
+use crate::runtime_health::RuntimeHealthSource;
 
 /// The assembled single-node runtime. Owns the store spine, the
 /// apiserver, every child task (drivers + listeners, one owned set), and the
@@ -2764,11 +2765,17 @@ impl<'a> Parts<'a> {
                     );
                     return None;
                 };
+                // pending-runtime-relist: nothing relists the container
+                // runtime yet (`ContainerRuntime` has no relist method), so
+                // the lease renews by the kubelet alone and says so once.
+                // Waking it: a `Child::RuntimeRelist` driving a `Relister`
+                // over the backend, and its ledger here.
                 Some(drive_node_lease(
                     self.store,
                     &self.config.runtime.node_name,
                     kubelet,
                     self.windows,
+                    RuntimeHealthSource::Unobserved,
                 ))
             }
         }
@@ -3078,16 +3085,18 @@ pub(crate) fn drive<C: Controller + DeclaresReads + 'static>(
 /// The node lease's body (T1.3c): [`NodeLease`] behind a `WatchDriver` on
 /// the lease's own windows ([`Windows::node_lease`], the ones liveness
 /// judges it by), renewing `node`'s Lease while `kubelet`'s row is alive as
-/// `windows` (the runtime's, the ones `/livez` judges the kubelet by) say.
+/// `windows` (the runtime's, the ones `/livez` judges the kubelet by) say,
+/// and `runtime` does not hold it back (W8).
 pub(crate) fn drive_node_lease(
     store: &Arc<StoreMesh>,
     node: &str,
     kubelet: Row,
     windows: Windows,
+    runtime: RuntimeHealthSource,
 ) -> ChildTask {
     drive(
         TickLoop::NodeLease,
-        NodeLease::new(store.clone(), node, kubelet, windows),
+        NodeLease::new(store.clone(), node, kubelet, windows, runtime),
         store,
         windows.node_lease(),
     )

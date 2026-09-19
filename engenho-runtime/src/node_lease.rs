@@ -28,6 +28,19 @@
 //! | stalled: a tick in flight past the stuck window, or idle past the idle window | withheld, so the node reads `NotReady` one [`GRACE_PERIOD`] after the last renewal |
 //! | dead: its task ended | withheld from the next check |
 //!
+//! The container runtime is the second input (W8). Built over the relists'
+//! ledger ([`RuntimeHealthSource::Relisted`]), the lease renews only while
+//! the runtime is also [`RuntimeHealth::Healthy`](crate::RuntimeHealth):
+//!
+//! | the runtime's relists | the lease |
+//! |---|---|
+//! | the last success began within the relist threshold | renewed while the kubelet is alive |
+//! | none has succeeded yet (booting, or the first ones failed) | withheld, looked at again in [`RECHECK`] |
+//! | the last success began longer ago (failing, or a relist hung) | withheld, so the node reads `NotReady` one [`GRACE_PERIOD`] after the last renewal, however alive the kubelet is |
+//!
+//! A kubelet whose ticks finish against a dead runtime no longer keeps its
+//! node Ready.
+//!
 //! `renewTime` is a `MicroTime`, as upstream writes it: two renewals are
 //! never the same bytes, so the store never answers one `Unchanged`.
 //!
@@ -49,9 +62,14 @@
 //!   That write cannot keep a wedged or dead kubelet's node Ready (it is
 //!   made only when a tick begins), but it is a second writer; deleting it
 //!   is the kubelet's half of T1.3c.
-//! * Not yet an input: the container runtime's own health (W8, the
-//!   `RuntimeHealth` relist). A kubelet whose ticks finish against a dead runtime still
-//!   renews.
+//! * The lease and the runtime's health reading cannot disagree about the
+//!   runtime: the lease reads the one judgement of the relists' ledger
+//!   ([`RuntimeSight::permits_renewal`]). Structural, within this crate.
+//! * `pending-runtime-relist`: in production the runtime is not observed
+//!   yet. Nothing relists it (the kubelet's `ContainerRuntime` has no relist
+//!   method), so the runtime builds the lease over
+//!   [`RuntimeHealthSource::Unobserved`], and it renews by the kubelet alone,
+//!   as before W8. It logs that once. See [`crate::runtime_health`].
 //! * A dead engenho process renews nothing and publishes nothing; saying so
 //!   takes a peer reading the lease (`pending-node-lifecycle-controller`).
 //!
@@ -74,17 +92,20 @@ use tracing::{info, warn};
 
 use crate::child::Child;
 use crate::health::{Row, Windows};
+use crate::runtime_health::{RELIST_THRESHOLD, RuntimeHealthSource, RuntimeSight};
 
 /// How soon the lease looks again after a check that renewed nothing.
 ///
-/// A check is an atomic read of the kubelet's heartbeat, so looking often
-/// costs nothing, and a node whose kubelet finishes its first tick, or
-/// recovers from a stall, is renewed within a second rather than within a
+/// A check is an atomic read of the kubelet's heartbeat and of the relists'
+/// ledger, so looking often costs nothing, and a node whose kubelet
+/// finishes its first tick, or whose runtime answers again, is renewed
+/// within a second rather than within a
 /// [`RENEW_INTERVAL`](engenho_controllers::node_lease::RENEW_INTERVAL).
 pub(crate) const RECHECK: Duration = Duration::from_secs(1);
 
 /// The node-lease controller: one check per tick, renewing this node's
-/// Lease only while the kubelet's row is alive.
+/// Lease only while the kubelet's row is alive and the container runtime,
+/// where it is observed, is healthy.
 pub(crate) struct NodeLease {
     store: Arc<StoreMesh>,
     node: String,
@@ -93,26 +114,74 @@ pub(crate) struct NodeLease {
     /// The windows the kubelet is judged against: the runtime's, the ones
     /// `/livez` judges it against.
     windows: Windows,
+    /// Where the container runtime's health is read from (W8).
+    runtime: RuntimeHealthSource,
     /// The kubelet's liveness at the last check, so a change is logged once
     /// rather than on every check. Log state only: no decision reads it.
     last: Mutex<Option<Liveness>>,
+    /// The runtime's reading at the last check, by name, for the same.
+    last_runtime: Mutex<Option<&'static str>>,
 }
 
 impl NodeLease {
     /// The lease for `node`, renewed while `kubelet` is alive as `windows`
-    /// judge it.
+    /// judge it and `runtime` does not hold it back.
     pub(crate) fn new(
         store: Arc<StoreMesh>,
         node: impl Into<String>,
         kubelet: Row,
         windows: Windows,
+        runtime: RuntimeHealthSource,
     ) -> Self {
         Self {
             store,
             node: node.into(),
             kubelet,
             windows,
+            runtime,
             last: Mutex::new(None),
+            last_runtime: Mutex::new(None),
+        }
+    }
+
+    /// Log the runtime's reading when it differs in kind from the last
+    /// check's.
+    fn note_runtime(&self, runtime: &RuntimeSight) {
+        let was = self
+            .last_runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(runtime.as_str());
+        if was == Some(runtime.as_str()) {
+            return;
+        }
+        let node = self.node.as_str();
+        match runtime {
+            RuntimeSight::Blind => info!(
+                node,
+                "node lease renews by the kubelet alone: nothing relists the container runtime \
+                 (pending-runtime-relist)"
+            ),
+            RuntimeSight::Judged(health) if health.is_healthy() => {
+                info!(
+                    node,
+                    "node lease: the container runtime answers its relists"
+                );
+            }
+            RuntimeSight::Judged(health) if was.is_none() => info!(
+                node,
+                %health,
+                "node lease withheld until the container runtime answers a relist"
+            ),
+            RuntimeSight::Judged(health) => warn!(
+                node,
+                %health,
+                threshold_s = RELIST_THRESHOLD.get().as_secs(),
+                grace_s = GRACE_PERIOD.as_secs(),
+                "node lease withheld: the container runtime has not answered a relist within the \
+                 threshold, so the node reads NotReady once its lease is older than the grace \
+                 period"
+            ),
         }
     }
 
@@ -152,21 +221,23 @@ impl Controller for NodeLease {
         Child::NodeLease.name()
     }
 
-    /// Judge the kubelet's row; renew the Lease if it is alive, otherwise
-    /// write nothing and ask to be ticked again in [`RECHECK`].
+    /// Judge the kubelet's row and the runtime's relists; renew the Lease if
+    /// the kubelet is alive and the runtime permits it, otherwise write
+    /// nothing and ask to be ticked again in [`RECHECK`].
     ///
     /// The write is unconditional: a heartbeat is last-writer-wins, and a
     /// lost compare-and-swap would read as a dead node.
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
-        let kubelet = self
-            .kubelet
-            .liveness(self.windows, Instant::now(), WallClock.now());
+        let (now, wall_now) = (Instant::now(), WallClock.now());
+        let kubelet = self.kubelet.liveness(self.windows, now, wall_now);
+        let runtime = self.runtime.sight(now, wall_now);
         self.note(kubelet);
+        self.note_runtime(&runtime);
         let mut report = ReconcileReport {
             objects_examined: 1,
             ..ReconcileReport::default()
         };
-        if !kubelet.is_alive() {
+        if !kubelet.is_alive() || !runtime.permits_renewal() {
             return Ok(ReconcileOutcome::new(
                 report,
                 ReconcileResult::Requeue(RECHECK),
@@ -207,7 +278,8 @@ mod tests {
     use super::*;
     use crate::child::{ChildTask, Children, Driver};
     use crate::runtime::drive_node_lease;
-    use crate::testing::single_voter_store;
+    use crate::runtime_health::{RELIST_PERIOD, RelistLedger, Relister};
+    use crate::testing::{RelistAnswer, ScriptedRuntime, single_voter_store};
 
     const NODE: &str = "node-A";
 
@@ -250,9 +322,18 @@ mod tests {
         }
     }
 
+    /// The lease over `kubelet`, with the runtime unobserved: the kubelet
+    /// alone decides, as in production until something relists.
     async fn lease_for(kubelet: &Kubelet) -> (Arc<StoreMesh>, NodeLease) {
+        lease_over(kubelet, RuntimeHealthSource::Unobserved).await
+    }
+
+    async fn lease_over(
+        kubelet: &Kubelet,
+        runtime: RuntimeHealthSource,
+    ) -> (Arc<StoreMesh>, NodeLease) {
         let store = single_voter_store("node-lease").await;
-        let lease = NodeLease::new(store.clone(), NODE, kubelet.row(), windows());
+        let lease = NodeLease::new(store.clone(), NODE, kubelet.row(), windows(), runtime);
         (store, lease)
     }
 
@@ -487,9 +568,15 @@ mod tests {
         let mut kubelet = Some(scripted_kubelet(wedge.clone()).1);
         let children = Children::spawn_catalog(&config, |child, before| match child {
             Child::Driver(Driver::Kubelet) => kubelet.take(),
-            Child::NodeLease => before
-                .row(Child::Driver(Driver::Kubelet))
-                .map(|row| drive_node_lease(&store, NODE, row, windows())),
+            Child::NodeLease => before.row(Child::Driver(Driver::Kubelet)).map(|row| {
+                drive_node_lease(
+                    &store,
+                    NODE,
+                    row,
+                    windows(),
+                    RuntimeHealthSource::Unobserved,
+                )
+            }),
             Child::Driver(_) | Child::Listener(_) => None,
         });
         assert_eq!(
@@ -565,5 +652,174 @@ mod tests {
             verdicts.contains(&true) && verdicts.contains(&false),
             "HARNESS PRECONDITION: the steps cover both verdicts: {verdicts:?}"
         );
+    }
+
+    // ── the container runtime (W8) ────────────────────────────────────
+
+    /// A relister over a runtime the test scripts, and the lease's source
+    /// over the relister's ledger.
+    fn relisted() -> (Arc<ScriptedRuntime>, Relister, RuntimeHealthSource) {
+        let runtime = Arc::new(ScriptedRuntime::default());
+        let ledger = Arc::new(RelistLedger::new());
+        let relister = Relister::new(runtime.clone(), ledger.clone());
+        (runtime, relister, RuntimeHealthSource::Relisted(ledger))
+    }
+
+    /// Upstream's "PLEG has yet to be successful": however alive the kubelet
+    /// is, a node whose runtime has never answered a relist is not vouched
+    /// for, and is the moment it answers.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_whose_runtime_has_never_answered_a_relist_gets_no_lease() {
+        let kubelet = Kubelet::spawn();
+        kubelet.ticks();
+        let (runtime, relister, source) = relisted();
+        let (store, lease) = lease_over(&kubelet, source).await;
+
+        runtime.set(RelistAnswer::Fails);
+        let _ = relister.tick().await;
+        let result = check(&lease).await;
+        assert_eq!(
+            stored(&store).await,
+            None,
+            "a lease for a node whose runtime has never answered a relist"
+        );
+        assert_eq!(result, ReconcileResult::Requeue(RECHECK));
+
+        runtime.set(RelistAnswer::Lists);
+        let _ = relister.tick().await;
+        assert_eq!(
+            check(&lease).await,
+            ReconcileResult::Done,
+            "the runtime answered and the kubelet is alive"
+        );
+        assert!(stored(&store).await.is_some());
+    }
+
+    /// The case W8 closes: the kubelet ticks on, every tick finishing,
+    /// against a runtime that has stopped answering. Relists that fail
+    /// inside the threshold are tolerated, as upstream tolerates them; once
+    /// none has succeeded for the threshold the lease is renewed no more, and
+    /// the node reads `NotReady` one grace period later.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_runtime_stops_the_renewals_while_the_kubelet_ticks_on() {
+        let kubelet = Kubelet::spawn();
+        let (runtime, relister, source) = relisted();
+        let (store, lease) = lease_over(&kubelet, source).await;
+        let _ = relister.tick().await;
+        kubelet.ticks();
+        assert_eq!(
+            check(&lease).await,
+            ReconcileResult::Done,
+            "HARNESS PRECONDITION: renewed while the runtime answers"
+        );
+
+        runtime.set(RelistAnswer::Fails);
+        let threshold = RELIST_THRESHOLD.get();
+        let span = threshold + GRACE_PERIOD + RENEW_INTERVAL;
+        let mut last = renew_time(&store).await;
+        let mut renewed_at = Vec::new();
+        let mut elapsed = Duration::ZERO;
+        while elapsed < span {
+            tokio::time::advance(secs(1)).await;
+            elapsed += secs(1);
+            kubelet.ticks();
+            let _ = relister.tick().await;
+            let _ = check(&lease).await;
+            let now = renew_time(&store).await;
+            if now != last {
+                renewed_at.push(elapsed);
+                last = now;
+            }
+        }
+
+        assert!(
+            kubelet
+                .row()
+                .liveness(windows(), Instant::now(), WallClock.now())
+                .is_alive(),
+            "HARNESS PRECONDITION: the kubelet is alive throughout"
+        );
+        let inside = usize::try_from(threshold.as_secs()).unwrap();
+        assert_eq!(
+            renewed_at.iter().filter(|at| **at <= threshold).count(),
+            inside,
+            "every check inside the threshold renewed, failing relists and all: {renewed_at:?}"
+        );
+        let after: Vec<&Duration> = renewed_at.iter().filter(|at| **at > threshold).collect();
+        assert!(
+            after.is_empty(),
+            "the lease was renewed at {after:?}, after no relist had succeeded for {threshold:?}"
+        );
+        let since_renewal = span.saturating_sub(renewed_at.last().copied().unwrap_or_default());
+        assert_eq!(
+            readiness(Some(since_renewal)),
+            NodeReadiness::Stale,
+            "a node whose runtime is dead reads NotReady, its lease unrenewed for {since_renewal:?}"
+        );
+    }
+
+    /// The lease child as the runtime would drive it over a relister: it
+    /// renews on its interval while the runtime answers, stops once the
+    /// runtime has not answered for the threshold, and renews again as soon
+    /// as it answers. The kubelet ticks throughout.
+    #[tokio::test(start_paused = true)]
+    async fn the_lease_child_holds_the_node_back_while_its_runtime_is_dead() {
+        let store = single_voter_store("node-lease-runtime").await;
+        let config = EngenhoConfig::prescribed_default();
+        let never = Arc::new(tokio::sync::Notify::new());
+        let mut kubelet = Some(scripted_kubelet(never).1);
+        let (runtime, relister, source) = relisted();
+        let relisting = tokio::spawn(async move {
+            loop {
+                let _ = relister.tick().await;
+                tokio::time::sleep(RELIST_PERIOD).await;
+            }
+        });
+        let children = Children::spawn_catalog(&config, |child, before| match child {
+            Child::Driver(Driver::Kubelet) => kubelet.take(),
+            Child::NodeLease => before
+                .row(Child::Driver(Driver::Kubelet))
+                .map(|row| drive_node_lease(&store, NODE, row, windows(), source.clone())),
+            Child::Driver(_) | Child::Listener(_) => None,
+        });
+        assert_eq!(
+            children.len(),
+            2,
+            "HARNESS PRECONDITION: kubelet and lease spawned"
+        );
+
+        let answering = renewals_over(&store, RENEW_INTERVAL * 5).await;
+        assert!(
+            (3..=6).contains(&answering.len()),
+            "about one renewal per {RENEW_INTERVAL:?} while the runtime answers: {answering:?}"
+        );
+
+        runtime.set(RelistAnswer::Fails);
+        let threshold = RELIST_THRESHOLD.get();
+        let inside = usize::try_from(threshold.as_secs() / RENEW_INTERVAL.as_secs()).unwrap();
+        let failing = renewals_over(&store, threshold + GRACE_PERIOD + RENEW_INTERVAL).await;
+        assert!(
+            failing.len() <= inside + 1,
+            "renewals kept coming after the runtime had not answered a relist for {threshold:?}: \
+             {} of them: {failing:?}",
+            failing.len()
+        );
+        assert!(
+            failing.len() >= inside / 2,
+            "relists failing inside the threshold stopped the renewals early: {failing:?}"
+        );
+        let quiet = renewals_over(&store, GRACE_PERIOD + RENEW_INTERVAL).await;
+        assert!(
+            quiet.is_empty(),
+            "a node whose runtime is dead is renewed no more: {quiet:?}"
+        );
+
+        runtime.set(RelistAnswer::Lists);
+        let back = renewals_over(&store, RENEW_INTERVAL * 2).await;
+        assert!(
+            !back.is_empty(),
+            "the lease is renewed again once the runtime answers a relist"
+        );
+        relisting.abort();
     }
 }

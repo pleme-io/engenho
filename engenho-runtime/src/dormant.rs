@@ -36,6 +36,8 @@ use engenho_controllers::{
     TieredCacheReconciler,
 };
 
+use crate::runtime_health::Relister;
+
 engenho_controllers::closed_enum! {
     /// Every controller type compiled into engenho that no driver runs.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,6 +64,12 @@ engenho_controllers::closed_enum! {
         TieredCache,
         /// The event-channel adapter that ticks a wrapped controller.
         EventDriven,
+        /// The container runtime's relister (W8), whose ledger the node
+        /// lease renews by. Before it is wired in, the kubelet's
+        /// `ContainerRuntime` must relist, in every backend. It then runs as
+        /// its own tick loop (a `Child`, not a `Driver`), and the lease is
+        /// built over its ledger.
+        RuntimeRelist,
     }
 }
 
@@ -92,6 +100,10 @@ engenho_controllers::closed_enum! {
         /// The runtime's `WatchDriver` already drives every controller from
         /// store events, which is the job this adapter was written for.
         SupersededByWatchDriver,
+        /// It lists every container through a relist the kubelet's
+        /// `ContainerRuntime` does not have yet, so there is nothing to
+        /// build it over (`pending-runtime-relist`).
+        NoRuntimeRelist,
     }
 }
 
@@ -108,6 +120,7 @@ impl Dormant {
             Self::DrvBuild => "drv-build",
             Self::TieredCache => "tiered-cache",
             Self::EventDriven => "event-driven",
+            Self::RuntimeRelist => "runtime-relist",
         }
     }
 
@@ -127,6 +140,7 @@ impl Dormant {
             // Generic over its event type; the unit event stands for them
             // all (the catalog compares a type by crate and name).
             Self::EventDriven => of::<EventDrivenController<()>>(),
+            Self::RuntimeRelist => of::<Relister>(),
         }
     }
 
@@ -140,6 +154,7 @@ impl Dormant {
             Self::Plantio => DormantReason::NoRocaPlane,
             Self::Drv | Self::DrvBuild | Self::TieredCache => DormantReason::NoDerivationPlane,
             Self::EventDriven => DormantReason::SupersededByWatchDriver,
+            Self::RuntimeRelist => DormantReason::NoRuntimeRelist,
         }
     }
 }
@@ -163,6 +178,9 @@ impl fmt::Display for DormantReason {
                 "the roça plane is assembled only by PlantioPipeline, which no binary calls"
             }
             Self::SupersededByWatchDriver => "superseded by the runtime's WatchDriver",
+            Self::NoRuntimeRelist => {
+                "no container runtime relists yet: the kubelet's ContainerRuntime has no relist"
+            }
         })
     }
 }
