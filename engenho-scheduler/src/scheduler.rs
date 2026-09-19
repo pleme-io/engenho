@@ -1,5 +1,6 @@
 //! The reconcile loop.
 
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::error::SchedulerError;
+use crate::filter::{Diagnosis, Filtered, filter};
 use crate::fit::pod_requests;
 use crate::ledger::{NodeLedger, node_name_of};
 use crate::observed::ObservedNode;
@@ -47,20 +49,23 @@ impl Scheduler {
     ///    derive each Node's `Ready` from its Lease ([`Self::observe`]).
     /// 2. Open a [`NodeLedger`]: each Node's allocatable minus the
     ///    effective requests of every pod bound there that still holds
-    ///    capacity (the resource-fit **Filter** stage's accumulator).
-    /// 3. For each pending Pod (empty/missing `spec.nodeName`): compute
-    ///    its effective requests ([`pod_requests`]); filter Nodes to those that
-    ///    currently FIT the request; ask the strategy to pick from the
-    ///    fitting subset only; on a pick, patch `spec.nodeName` AND
-    ///    debit the ledger so a later Pod in the SAME tick can't
-    ///    overcommit that Node; on NO fitting node, leave the Pod
-    ///    unbound + write a typed `PodScheduled=False /
-    ///    reason=Unschedulable` status.
+    ///    capacity.
+    /// 3. For each pending Pod (empty/missing `spec.nodeName`), run the
+    ///    Filter stage ([`filter`]): every [`crate::FilterPlugin`] against
+    ///    every observed node. Then, by its outcome:
+    ///    - **Feasible**: the strategy picks one node from the non-empty
+    ///      feasible set; patch `spec.nodeName` and debit the ledger, so a
+    ///      later Pod in the SAME tick cannot overcommit that node.
+    ///    - **Infeasible**: leave the Pod unbound and give it a
+    ///      `PodScheduled=False / reason=Unschedulable` condition whose
+    ///      message says how many nodes each plugin excluded. Written only
+    ///      when the Pod does not already carry that exact condition.
+    ///    - **No nodes observed**: write nothing. There is no reason to
+    ///      report, only an absence of nodes.
     ///
-    /// The fit predicate runs in FRONT of the strategy — exactly the
-    /// upstream kube-scheduler `Filter (Predicates) → Score (Strategy)`
-    /// split. The strategy stays pure over its candidate set and is
-    /// never handed a node the Pod can't fit.
+    /// The Filter stage runs in FRONT of the strategy — upstream
+    /// kube-scheduler's `Filter → Score` split. The strategy is never handed a
+    /// node a plugin rejected, nor an empty set.
     ///
     /// # Errors
     ///
@@ -92,34 +97,32 @@ impl Scheduler {
             }
             report.pending_pods += 1;
 
-            // Resource-fit Filter: restrict candidates to nodes that fit
-            // THIS pod's request given the ledger's current balances.
             let req = pod_requests(pod_value);
-            let fitting: Vec<ObservedNode> = observed
-                .iter()
-                .filter(|n| n.name().is_some_and(|name| ledger.fits(name, &req)))
-                .cloned()
-                .collect();
-
-            if fitting.is_empty() {
-                report.unschedulable_no_fit += 1;
-                warn!(
-                    pod = %pod_key.label(),
-                    nodes = report.nodes_available,
-                    "no node fits pod's resource requests; staying Pending"
-                );
-                self.mark_unschedulable(pod_key, report.nodes_available)
-                    .await?;
-                continue;
-            }
-
-            let Some(node_name) = self.strategy.pick(pod_value, &fitting).await else {
-                report.skipped_no_node += 1;
-                warn!(
-                    pod = %pod_key.label(),
-                    "no schedulable node available; pod stays pending"
-                );
-                continue;
+            let node_name = match filter(pod_value, &req, &observed, &ledger) {
+                Filtered::Feasible(feasible) => self.strategy.pick(pod_value, &feasible).await,
+                Filtered::Infeasible(diagnosis) => {
+                    report.unschedulable += 1;
+                    warn!(
+                        pod = %pod_key.label(),
+                        %diagnosis,
+                        "no node passes every filter; staying Pending"
+                    );
+                    if self
+                        .mark_unschedulable(pod_key, pod_value, &diagnosis)
+                        .await?
+                    {
+                        report.unschedulable_written += 1;
+                    }
+                    continue;
+                }
+                Filtered::NoNodesObserved => {
+                    report.no_nodes_observed += 1;
+                    debug!(
+                        pod = %pod_key.label(),
+                        "no Node observed; pod stays Pending, nothing written"
+                    );
+                    continue;
+                }
             };
             debug!(
                 pod = %pod_key.label(),
@@ -150,8 +153,8 @@ impl Scheduler {
             info!(
                 bound = report.bound.len(),
                 pending = report.pending_pods,
-                skipped = report.skipped_no_node,
-                unschedulable = report.unschedulable_no_fit,
+                unschedulable = report.unschedulable,
+                no_nodes_observed = report.no_nodes_observed,
                 "scheduler tick done"
             );
         }
@@ -183,28 +186,27 @@ impl Scheduler {
         observed
     }
 
-    /// Write a typed `PodScheduled=False / reason=Unschedulable` status
-    /// condition onto a pod that fits no node — mirroring upstream
-    /// kube-scheduler. The Pod is NOT bound; its `spec.nodeName` stays
-    /// absent (so "Pending" is still the absence of a binding), but the
-    /// reason is now machine-readable instead of an invisible omission.
+    /// Give a pod no node admits a `PodScheduled=False /
+    /// reason=Unschedulable` condition carrying `diagnosis`, mirroring
+    /// upstream kube-scheduler. The Pod is NOT bound; its `spec.nodeName`
+    /// stays absent, so "Pending" is still the absence of a binding.
+    ///
+    /// Returns whether it wrote. A pod that already carries this exact
+    /// condition is left alone: the scheduler watches Pods, so rewriting an
+    /// unchanged condition every tick would wake the scheduler on its own
+    /// write.
     async fn mark_unschedulable(
         &self,
         pod_key: &ResourceKey,
-        node_count: usize,
-    ) -> Result<(), SchedulerError> {
+        pod: &Value,
+        diagnosis: &Diagnosis,
+    ) -> Result<bool, SchedulerError> {
+        let condition = unschedulable_condition(diagnosis);
+        if already_marked(pod, &condition) {
+            return Ok(false);
+        }
         let patch = serde_json::json!({
-            "status": {
-                "phase": "Pending",
-                "conditions": [{
-                    "type": "PodScheduled",
-                    "status": "False",
-                    "reason": "Unschedulable",
-                    "message": format!(
-                        "0/{node_count} nodes are available: insufficient cpu/memory"
-                    ),
-                }]
-            }
+            "status": { "phase": "Pending", "conditions": [condition] }
         });
         self.store
             .propose(ResourceCommand::patch(
@@ -213,7 +215,7 @@ impl Scheduler {
                 Reason::Scheduler,
             ))
             .await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Strategy in use (for telemetry / introspection).
@@ -221,6 +223,31 @@ impl Scheduler {
     pub fn strategy_name(&self) -> &'static str {
         self.strategy.name()
     }
+}
+
+/// The condition an unschedulable pod carries.
+fn unschedulable_condition(diagnosis: &Diagnosis) -> Value {
+    serde_json::json!({
+        "type": "PodScheduled",
+        "status": "False",
+        "reason": "Unschedulable",
+        "message": diagnosis.to_string(),
+    })
+}
+
+/// Does `pod` already carry `condition` (by type, status, reason and message)
+/// with phase `Pending`?
+fn already_marked(pod: &Value, condition: &Value) -> bool {
+    const KEYS: [&str; 4] = ["type", "status", "reason", "message"];
+    pod.pointer("/status/phase").and_then(Value::as_str) == Some("Pending")
+        && pod
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|c| KEYS.iter().all(|k| c.get(k) == condition.get(k)))
+            })
 }
 
 /// Third-site extraction: Scheduler is the FIRST `Controller`
@@ -252,20 +279,11 @@ impl Controller for Scheduler {
         })?;
         Ok(ReconcileReport {
             objects_examined: report.pods_examined,
-            // Both binds AND Unschedulable-status writes mutate objects.
-            objects_changed: report.bound.len() + report.unschedulable_no_fit,
-            objects_skipped: report.skipped_no_node,
-            note: if report.pending_pods > 0 {
-                Some(format!(
-                    "{} pending → {} bound, {} unschedulable, {} skipped",
-                    report.pending_pods,
-                    report.bound.len(),
-                    report.unschedulable_no_fit,
-                    report.skipped_no_node
-                ))
-            } else {
-                None
-            },
+            // Binds AND Unschedulable-condition writes mutate objects.
+            objects_changed: report.bound.len() + report.unschedulable_written,
+            // Pending pods this tick examined and did not write.
+            objects_skipped: report.left_untouched(),
+            note: (report.pending_pods > 0).then(|| report.to_string()),
         }
         .into())
     }
@@ -277,15 +295,42 @@ pub struct TickReport {
     pub pods_examined: usize,
     pub nodes_available: usize,
     pub pending_pods: usize,
-    /// Pending pods left unbound because no node that fit them was
-    /// schedulable: each was cordoned, or its Lease-derived `Ready` was not
-    /// `True`. Distinct from `unschedulable_no_fit`.
-    pub skipped_no_node: usize,
-    /// Pending pods left unbound because no node had enough free
-    /// cpu/memory to fit the pod's requests. Each such pod gets a typed
-    /// `PodScheduled=False / reason=Unschedulable` status.
-    pub unschedulable_no_fit: usize,
+    /// Pending pods no observed node admitted: every node was rejected by
+    /// some [`crate::FilterPlugin`]. Each carries a `PodScheduled=False /
+    /// reason=Unschedulable` condition naming the rejections.
+    pub unschedulable: usize,
+    /// Of [`Self::unschedulable`], the pods whose condition was written this
+    /// tick. The rest already carried the identical condition.
+    pub unschedulable_written: usize,
+    /// Pending pods left untouched because the scheduler observed no Node
+    /// at all. Nothing is written for them.
+    pub no_nodes_observed: usize,
     pub bound: Vec<Binding>,
+}
+
+impl TickReport {
+    /// Pending pods this tick neither bound nor wrote a condition for.
+    #[must_use]
+    pub fn left_untouched(&self) -> usize {
+        self.no_nodes_observed.saturating_add(
+            self.unschedulable
+                .saturating_sub(self.unschedulable_written),
+        )
+    }
+}
+
+impl fmt::Display for TickReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} pending → {} bound, {} unschedulable ({} written), {} with no node observed",
+            self.pending_pods,
+            self.bound.len(),
+            self.unschedulable,
+            self.unschedulable_written,
+            self.no_nodes_observed
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -330,5 +375,33 @@ mod tests {
     fn is_pending_with_nodename_is_not_pending() {
         let p = json!({"spec": {"nodeName": "node-1"}});
         assert!(!is_pending(&p));
+    }
+
+    fn condition(message: &str) -> Value {
+        json!({ "type": "PodScheduled", "status": "False",
+                "reason": "Unschedulable", "message": message })
+    }
+
+    #[test]
+    fn a_pod_already_carrying_the_condition_is_not_rewritten() {
+        let want = condition("0/1 nodes are available: 1 node(s) were unschedulable.");
+        let mut carried = want.clone();
+        carried["lastTransitionTime"] = json!("2026-09-19T12:00:00Z");
+        let pod = json!({ "status": { "phase": "Pending", "conditions": [
+            { "type": "Initialized", "status": "True" }, carried
+        ] } });
+        assert!(already_marked(&pod, &want));
+    }
+
+    #[test]
+    fn a_changed_message_or_phase_is_rewritten() {
+        let want = condition("0/2 nodes are available: 2 node(s) were unschedulable.");
+        let stale_message = json!({ "status": { "phase": "Pending", "conditions": [
+            condition("0/1 nodes are available: 1 node(s) were unschedulable.")
+        ] } });
+        assert!(!already_marked(&stale_message, &want));
+        let no_phase = json!({ "status": { "conditions": [want.clone()] } });
+        assert!(!already_marked(&no_phase, &want));
+        assert!(!already_marked(&json!({}), &want));
     }
 }

@@ -17,6 +17,11 @@
 //! ★ PURE FUNCTIONS OVER `serde_json::Value`, matching `fit.rs`, so every
 //! rule is testable without a cluster and the Filter stage stays a fold of
 //! independent predicates rather than one tangled condition.
+//!
+//! ★ WIRED THROUGH [`crate::filter::FilterPlugin`]. Each predicate here is the
+//! body of one plugin (`Cordon`, `NodeName`, `NodeSelector`,
+//! `TaintToleration`), and the fold, its order and the rejection vocabulary
+//! live there, once. Until T5.7 these functions had tests and no caller.
 
 use serde_json::Value;
 
@@ -195,56 +200,16 @@ pub fn tolerates(pod: &Value, taint: &Taint) -> bool {
     })
 }
 
-/// Why a node was rejected. Carried rather than collapsed to a bool so the
-/// scheduler can report `FailedScheduling` with the actual reason — "0/3
-/// nodes are available: 2 node(s) had untolerated taint" is actionable;
-/// "no node fits" is not.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Rejection {
-    Cordoned,
-    NodeNameMismatch,
-    NodeSelectorMismatch,
-    UntoleratedTaint { key: String },
-}
-
-impl Rejection {
-    /// The clause upstream puts in the FailedScheduling message.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        match self {
-            Self::Cordoned => "node(s) were unschedulable".to_string(),
-            Self::NodeNameMismatch => "node(s) didn't match the requested node name".to_string(),
-            Self::NodeSelectorMismatch => "node(s) didn't match Pod's node selector".to_string(),
-            Self::UntoleratedTaint { key } => {
-                format!("node(s) had untolerated taint {{{key}}}")
-            }
-        }
-    }
-}
-
-/// Run every non-resource predicate. `None` ⇒ the node is a candidate.
+/// The first scheduling-blocking taint on `node` that `pod` does not
+/// tolerate, or `None` when the pod tolerates them all.
 ///
-/// Ordered cheapest-first, and the order is also most-specific-first so the
-/// reported reason is the one an operator can act on: a cordoned node
-/// should say "cordoned", not "taint", even though a cordon usually implies
-/// one.
+/// "First" is the node's own taint order, so the taint a rejection names is
+/// stable across ticks.
 #[must_use]
-pub fn reject_reason(pod: &Value, node: &Value) -> Option<Rejection> {
-    if is_cordoned(node) {
-        return Some(Rejection::Cordoned);
-    }
-    if !node_name_matches(pod, node) {
-        return Some(Rejection::NodeNameMismatch);
-    }
-    if !matches_node_selector(pod, node) {
-        return Some(Rejection::NodeSelectorMismatch);
-    }
-    for taint in blocking_taints(node) {
-        if !tolerates(pod, &taint) {
-            return Some(Rejection::UntoleratedTaint { key: taint.key });
-        }
-    }
-    None
+pub fn untolerated_taint(pod: &Value, node: &Value) -> Option<Taint> {
+    blocking_taints(node)
+        .into_iter()
+        .find(|taint| !tolerates(pod, taint))
 }
 
 #[cfg(test)]
@@ -266,22 +231,40 @@ mod tests {
         json!({ "metadata": { "name": "p" }, "spec": spec })
     }
 
-    #[test]
-    fn a_bare_pod_fits_a_bare_node() {
-        // Anti-vacuity: a predicate set that rejected everything would pass
-        // every negative test below.
-        assert_eq!(reject_reason(&pod(json!({})), &node("n", json!({}))), None);
+    fn untolerated_key(pod: &Value, node: &Value) -> Option<String> {
+        untolerated_taint(pod, node).map(|t| t.key)
     }
 
     #[test]
-    fn a_cordoned_node_is_excluded() {
+    fn a_bare_pod_passes_every_predicate_on_a_bare_node() {
+        // Anti-vacuity: predicates that rejected everything would pass every
+        // negative test below.
+        let (p, n) = (pod(json!({})), node("n", json!({})));
+        assert!(!is_cordoned(&n));
+        assert!(node_name_matches(&p, &n));
+        assert!(matches_node_selector(&p, &n));
+        assert_eq!(untolerated_taint(&p, &n), None);
+    }
+
+    #[test]
+    fn a_cordon_is_an_explicit_true_and_nothing_else() {
         // kubectl cordon is the most direct instruction an operator can
-        // give a scheduler; ignoring it means draining does not drain.
-        let n = node("n", json!({ "spec": { "unschedulable": true } }));
-        assert_eq!(
-            reject_reason(&pod(json!({})), &n),
-            Some(Rejection::Cordoned)
-        );
+        // give a scheduler; ignoring it means draining does not drain. An
+        // absent or non-boolean field is not a cordon.
+        assert!(is_cordoned(&node(
+            "n",
+            json!({ "spec": { "unschedulable": true } })
+        )));
+        for spec in [
+            json!({}),
+            json!({ "unschedulable": false }),
+            json!({ "unschedulable": "true" }),
+        ] {
+            assert!(
+                !is_cordoned(&node("n", json!({ "spec": spec.clone() }))),
+                "{spec}"
+            );
+        }
     }
 
     #[test]
@@ -293,43 +276,42 @@ mod tests {
         let plain = node("plain", json!({}));
 
         let wants_gpu = pod(json!({ "nodeSelector": { "gpu": "true" } }));
-        assert_eq!(reject_reason(&wants_gpu, &gpu), None);
-        assert_eq!(
-            reject_reason(&wants_gpu, &plain),
-            Some(Rejection::NodeSelectorMismatch)
-        );
+        assert!(matches_node_selector(&wants_gpu, &gpu));
+        assert!(!matches_node_selector(&wants_gpu, &plain));
 
         // AND across keys, and EXACT value — not a subset, not a prefix.
         let wants_two = pod(json!({ "nodeSelector": { "gpu": "true", "zone": "b" } }));
-        assert_eq!(
-            reject_reason(&wants_two, &gpu),
-            Some(Rejection::NodeSelectorMismatch)
-        );
+        assert!(!matches_node_selector(&wants_two, &gpu));
         let wrong_value = pod(json!({ "nodeSelector": { "gpu": "yes" } }));
-        assert_eq!(
-            reject_reason(&wrong_value, &gpu),
-            Some(Rejection::NodeSelectorMismatch)
-        );
+        assert!(!matches_node_selector(&wrong_value, &gpu));
     }
 
     #[test]
-    fn an_untolerated_taint_excludes_and_names_the_key() {
-        // "2 node(s) had untolerated taint {node-role...}" is actionable;
-        // "no node fits" is not.
+    fn an_untolerated_taint_is_found_and_named() {
         let tainted = node(
             "cp",
             json!({ "spec": { "taints": [
                 { "key": "node-role.kubernetes.io/control-plane", "effect": "NoSchedule" }
             ] } }),
         );
-        let r = reject_reason(&pod(json!({})), &tainted);
         assert_eq!(
-            r,
-            Some(Rejection::UntoleratedTaint {
-                key: "node-role.kubernetes.io/control-plane".to_string()
-            })
+            untolerated_key(&pod(json!({})), &tainted).as_deref(),
+            Some("node-role.kubernetes.io/control-plane")
         );
-        assert!(r.unwrap().describe().contains("untolerated taint"));
+    }
+
+    #[test]
+    fn the_first_untolerated_taint_in_node_order_is_the_one_named() {
+        let tainted = node(
+            "n",
+            json!({ "spec": { "taints": [
+                { "key": "tolerated", "effect": "NoSchedule" },
+                { "key": "second", "effect": "NoSchedule" },
+                { "key": "third", "effect": "NoExecute" }
+            ] } }),
+        );
+        let p = pod(json!({ "tolerations": [ { "key": "tolerated", "operator": "Exists" } ] }));
+        assert_eq!(untolerated_key(&p, &tainted).as_deref(), Some("second"));
     }
 
     #[test]
@@ -343,13 +325,13 @@ mod tests {
         let exact = pod(json!({ "tolerations": [
             { "key": "dedicated", "operator": "Equal", "value": "db", "effect": "NoSchedule" }
         ] }));
-        assert_eq!(reject_reason(&exact, &tainted), None);
+        assert_eq!(untolerated_taint(&exact, &tainted), None);
 
         // Wrong value must NOT tolerate.
         let wrong = pod(json!({ "tolerations": [
             { "key": "dedicated", "operator": "Equal", "value": "cache" }
         ] }));
-        assert!(reject_reason(&wrong, &tainted).is_some());
+        assert!(untolerated_taint(&wrong, &tainted).is_some());
     }
 
     #[test]
@@ -364,7 +346,7 @@ mod tests {
             ] } }),
         );
         let wildcard = pod(json!({ "tolerations": [ { "operator": "Exists" } ] }));
-        assert_eq!(reject_reason(&wildcard, &tainted), None);
+        assert_eq!(untolerated_taint(&wildcard, &tainted), None);
     }
 
     #[test]
@@ -377,7 +359,7 @@ mod tests {
                 { "key": "spot", "effect": "PreferNoSchedule" }
             ] } }),
         );
-        assert_eq!(reject_reason(&pod(json!({})), &soft), None);
+        assert_eq!(untolerated_taint(&pod(json!({})), &soft), None);
         assert!(blocking_taints(&soft).is_empty());
     }
 
@@ -389,7 +371,7 @@ mod tests {
             "n",
             json!({ "spec": { "taints": [ { "key": "k", "effect": "Mystery" } ] } }),
         );
-        assert!(reject_reason(&pod(json!({})), &weird).is_some());
+        assert!(untolerated_taint(&pod(json!({})), &weird).is_some());
     }
 
     #[test]
@@ -402,27 +384,21 @@ mod tests {
         let scoped = pod(json!({ "tolerations": [
             { "key": "k", "operator": "Exists", "effect": "NoSchedule" }
         ] }));
-        assert!(reject_reason(&scoped, &no_execute).is_some());
+        assert!(untolerated_taint(&scoped, &no_execute).is_some());
     }
 
     #[test]
-    fn a_node_name_pin_does_not_defeat_a_taint() {
-        // Quietly honouring the pin would let it override a restriction the
-        // operator set precisely to keep pods off.
-        let tainted = node(
-            "target",
-            json!({ "spec": { "taints": [ { "key": "k", "effect": "NoSchedule" } ] } }),
-        );
-        let pinned = pod(json!({ "nodeName": "target" }));
-        assert!(matches!(
-            reject_reason(&pinned, &tainted),
-            Some(Rejection::UntoleratedTaint { .. })
+    fn a_node_name_pin_matches_only_its_own_node() {
+        let target = node("target", json!({}));
+        assert!(node_name_matches(
+            &pod(json!({ "nodeName": "target" })),
+            &target
         ));
-        // And a pin to a DIFFERENT node excludes this one.
-        let elsewhere = pod(json!({ "nodeName": "other" }));
-        assert_eq!(
-            reject_reason(&elsewhere, &node("target", json!({}))),
-            Some(Rejection::NodeNameMismatch)
-        );
+        assert!(!node_name_matches(
+            &pod(json!({ "nodeName": "other" })),
+            &target
+        ));
+        // An empty pin is no pin.
+        assert!(node_name_matches(&pod(json!({ "nodeName": "" })), &target));
     }
 }

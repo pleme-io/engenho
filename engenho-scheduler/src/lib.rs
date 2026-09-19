@@ -27,11 +27,14 @@
 //!     each Node's Ready derived from its Lease (ObservedNode::project)
 //!         ↓
 //!   for each pending pod:
-//!     filter: fits the node's remaining capacity
-//!     SchedulingStrategy::pick(pod, candidates)
-//!       (skips cordoned nodes and nodes whose derived Ready is not True)
+//!     filter(pod, nodes): every FilterPlugin, in order
+//!       NodeReady → Cordon → NodeName → NodeSelector
+//!         → TaintToleration → Resources
 //!         ↓
-//!     StoreMesh::propose(Patch { key=pod_key, patch={"spec":{"nodeName":"node-X"}}})
+//!     Feasible(set)     → SchedulingStrategy::pick(pod, &set) -> String
+//!                         StoreMesh::propose(Patch {"spec":{"nodeName":"node-X"}})
+//!     Infeasible(why)   → PodScheduled=False / Unschedulable, message = why
+//!     NoNodesObserved   → nothing written
 //! ```
 //!
 //! The strategy is pluggable — `RoundRobinStrategy` is the default;
@@ -43,6 +46,7 @@
 pub mod affinity;
 pub mod config_bridge;
 pub mod error;
+pub mod filter;
 pub mod fit;
 pub mod ledger;
 pub mod observed;
@@ -53,6 +57,9 @@ pub mod strategy;
 
 pub use config_bridge::make_scheduling_strategy;
 pub use error::SchedulerError;
+pub use filter::{
+    Candidate, Diagnosis, Feasible, FilterPlugin, Filtered, Rejection, admit, filter,
+};
 pub use fit::{NodeResources, PodRequests, fits, node_allocatable, pod_requests};
 pub use ledger::{CapacityHold, Headroom, NodeLedger, holds_capacity};
 pub use observed::ObservedNode;

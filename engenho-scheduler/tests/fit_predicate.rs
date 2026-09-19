@@ -157,11 +157,7 @@ async fn over_request_pod_stays_pending_with_unschedulable_status() {
 
     assert_eq!(report.pending_pods, 1);
     assert_eq!(report.bound.len(), 0, "over-request pod must NOT bind");
-    assert_eq!(report.unschedulable_no_fit, 1);
-    assert_eq!(
-        report.skipped_no_node, 0,
-        "node exists, it just doesn't fit"
-    );
+    assert_eq!(report.unschedulable, 1);
 
     let pod = get_pod(&store, "greedy").await.unwrap();
     assert!(
@@ -171,6 +167,15 @@ async fn over_request_pod_stays_pending_with_unschedulable_status() {
     assert!(
         is_unschedulable(&pod),
         "greedy pod must carry PodScheduled=False/Unschedulable; got {pod:#}"
+    );
+    // The node exists and is ready; it just doesn't fit, and the message
+    // says so rather than blaming readiness.
+    let message = pod
+        .pointer("/status/conditions/0/message")
+        .and_then(Value::as_str);
+    assert_eq!(
+        message,
+        Some("0/1 nodes are available: 1 node(s) had insufficient cpu/memory.")
     );
 
     teardown(store, sched).await;
@@ -257,7 +262,7 @@ async fn no_within_tick_overcommit_of_a_single_node() {
         "exactly ONE pod binds; the running free-map must decrement within the tick"
     );
     assert_eq!(
-        report.unschedulable_no_fit, 1,
+        report.unschedulable, 1,
         "the other pod is Unschedulable (no room left after the first bind)"
     );
 
@@ -328,7 +333,7 @@ async fn terminal_bound_pods_release_their_node_capacity() {
     let sched = Scheduler::new(store.clone(), RoundRobinStrategy::new(), None);
     let report = sched.tick().await.unwrap();
 
-    assert_eq!(report.unschedulable_no_fit, 0, "terminal pods hold nothing");
+    assert_eq!(report.unschedulable, 0, "terminal pods hold nothing");
     assert_eq!(report.bound.len(), 1);
     assert_eq!(report.bound[0].node_name, "node-1");
 
@@ -349,7 +354,7 @@ async fn a_bound_pod_whose_phase_is_not_terminal_keeps_its_capacity() {
         let report = sched.tick().await.unwrap();
 
         assert_eq!(report.bound.len(), 0, "phase {phase} must hold the core");
-        assert_eq!(report.unschedulable_no_fit, 1);
+        assert_eq!(report.unschedulable, 1);
 
         teardown(store, sched).await;
     }
@@ -396,7 +401,7 @@ async fn a_pending_pods_init_container_peak_must_fit_the_node() {
             usize::from(binds),
             "{cores}-core node: the init container's 2 cores decide the fit"
         );
-        assert_eq!(report.unschedulable_no_fit, usize::from(!binds));
+        assert_eq!(report.unschedulable, usize::from(!binds));
 
         teardown(store, sched).await;
     }

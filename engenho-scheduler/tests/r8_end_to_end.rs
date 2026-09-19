@@ -110,7 +110,7 @@ async fn scheduler_binds_single_pending_pod_to_only_available_node() {
     let report = sched.tick().await.unwrap();
     assert_eq!(report.pending_pods, 1);
     assert_eq!(report.bound.len(), 1);
-    assert_eq!(report.skipped_no_node, 0);
+    assert_eq!(report.unschedulable, 0);
     assert_eq!(report.bound[0].node_name, "node-1");
 
     assert_eq!(
@@ -198,8 +198,25 @@ async fn scheduler_skips_already_bound_pods() {
     mesh.terminate().await.unwrap();
 }
 
+/// The message of the pod's `PodScheduled=False / Unschedulable` condition.
+async fn unschedulable_message(store: &StoreMesh, name: &str) -> Option<String> {
+    let pod = store
+        .get(&ResourceKey::namespaced("", "v1", "Pod", "default", name))
+        .await?;
+    pod.pointer("/status/conditions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|c| {
+            c.get("type").and_then(Value::as_str) == Some("PodScheduled")
+                && c.get("reason").and_then(Value::as_str) == Some("Unschedulable")
+        })?
+        .get("message")
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
 #[tokio::test]
-async fn scheduler_reports_skipped_when_no_schedulable_nodes() {
+async fn a_pod_whose_only_node_is_cordoned_is_marked_unschedulable() {
     let store = boot_store().await;
     // Add an unschedulable node.
     store
@@ -223,10 +240,14 @@ async fn scheduler_reports_skipped_when_no_schedulable_nodes() {
     let report = sched.tick().await.unwrap();
     assert_eq!(report.pending_pods, 1);
     assert_eq!(report.bound.len(), 0);
-    assert_eq!(report.skipped_no_node, 1);
+    assert_eq!(report.unschedulable, 1);
 
-    // Pod is still unbound.
+    // Pod is still unbound, and says why.
     assert!(pod_node_name(&store, "lonely").await.is_none());
+    assert_eq!(
+        unschedulable_message(&store, "lonely").await.as_deref(),
+        Some("0/1 nodes are available: 1 node(s) were unschedulable.")
+    );
 
     drop(sched);
     let mesh = Arc::try_unwrap(store).ok().expect("only owner left");
@@ -309,7 +330,11 @@ async fn a_node_whose_lease_went_stale_gets_no_pod_though_storage_says_ready() {
     let (report, landed) = schedule_one(&store).await;
     assert_eq!(landed, None, "a pod was bound to a node with a stale lease");
     assert_eq!(report.bound.len(), 0);
-    assert_eq!(report.skipped_no_node, 1);
+    assert_eq!(report.unschedulable, 1);
+    assert_eq!(
+        unschedulable_message(&store, "p").await.as_deref(),
+        Some("0/1 nodes are available: 1 node(s) were not ready.")
+    );
     teardown(store).await;
 }
 
@@ -322,7 +347,11 @@ async fn a_node_with_no_conditions_and_no_lease_gets_no_pod() {
 
     let (report, landed) = schedule_one(&store).await;
     assert_eq!(landed, None, "a pod was bound to a node never heard from");
-    assert_eq!(report.skipped_no_node, 1);
+    assert_eq!(report.unschedulable, 1);
+    assert_eq!(
+        unschedulable_message(&store, "p").await.as_deref(),
+        Some("0/1 nodes are available: 1 node(s) were not ready.")
+    );
     teardown(store).await;
 }
 
@@ -339,7 +368,11 @@ async fn a_node_with_no_ready_condition_and_no_lease_gets_no_pod() {
 
     let (report, landed) = schedule_one(&store).await;
     assert_eq!(landed, None, "a pod was bound to a node never heard from");
-    assert_eq!(report.skipped_no_node, 1);
+    assert_eq!(report.unschedulable, 1);
+    assert_eq!(
+        unschedulable_message(&store, "p").await.as_deref(),
+        Some("0/1 nodes are available: 1 node(s) were not ready.")
+    );
     teardown(store).await;
 }
 

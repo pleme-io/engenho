@@ -15,8 +15,9 @@
 //! from was schedulable outright.
 //!
 //! [`ObservedNode`] has one constructor, [`ObservedNode::project`], and it runs
-//! that same projection. A strategy receives `&[ObservedNode]`, so a strategy
-//! cannot be handed a Node whose readiness came from storage.
+//! that same projection. The Filter stage ([`crate::filter`]) judges only
+//! `ObservedNode`s, and its `NodeReady` plugin reads [`ObservedNode::is_ready`],
+//! so no node reaches a strategy on the strength of a stored readiness.
 //!
 //! ## What the type does NOT guarantee
 //!
@@ -63,18 +64,6 @@ impl ObservedNode {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         node_name_of(&self.value)
-    }
-
-    /// `spec.unschedulable == true`: the node is cordoned.
-    ///
-    /// An absent or non-boolean field is not a cordon. That is upstream's
-    /// meaning of the field, and a cordon is an explicit act.
-    #[must_use]
-    pub fn is_cordoned(&self) -> bool {
-        self.value
-            .pointer("/spec/unschedulable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
     }
 
     /// The projected `Ready` condition's status is `"True"`.
@@ -167,16 +156,12 @@ mod tests {
     }
 
     #[test]
-    fn cordon_is_explicit() {
-        let fresh = fresh_lease("n");
-        let cordoned = ObservedNode::project(
-            json!({ "metadata": { "name": "n" }, "spec": { "unschedulable": true } }),
-            Some(&fresh),
+    fn the_projection_keeps_the_node_name() {
+        let n = ObservedNode::project(
+            json!({ "metadata": { "name": "n" } }),
+            Some(&fresh_lease("n")),
             NOW,
         );
-        assert!(cordoned.is_cordoned());
-        let open = ObservedNode::project(json!({ "metadata": { "name": "n" } }), Some(&fresh), NOW);
-        assert!(!open.is_cordoned());
-        assert_eq!(open.name(), Some("n"));
+        assert_eq!(n.name(), Some("n"));
     }
 }

@@ -999,9 +999,10 @@ impl Kubelet {
     /// heartbeat every 10s and nothing ever read it, so the Node's condition
     /// stayed the literal `{"type":"Ready","status":"True"}` that
     /// `register_node` stamps once at boot — for the life of the process, on
-    /// every node. The scheduler CONSUMES that value
-    /// (`engenho-scheduler/src/strategy.rs`'s `is_schedulable`), so it was a
-    /// constant standing in for a health signal, not an unused field.
+    /// every node. The scheduler consumed that value, so it was a constant
+    /// standing in for a health signal, not an unused field. (The scheduler's
+    /// `FilterPlugin::NodeReady`, `engenho-scheduler/src/filter.rs`, now
+    /// derives `Ready` from the Lease itself.)
     ///
     /// ── ★ WHY IT DERIVES FROM THE LEASE AS READ BACK, NOT FROM `now()` ────
     /// Judging our own liveness from our own clock is circular: this code only
