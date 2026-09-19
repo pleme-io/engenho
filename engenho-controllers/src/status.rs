@@ -34,16 +34,33 @@
 //! 3. **Typed emission.** The status JSON is authored as a typed
 //!    `serde_json::Value` (the store is opaque-JSON); no `format!()` of
 //!    JSON.
+//!
+//! ## The second shape: an edit of the object as read (T2.5)
+//!
+//! [`write_status_cas`] writes a status computed from what the controller
+//! LISTED, so after a conflict it cannot recompute: it drops the write and
+//! the next watch-wake starts over. [`edit_status_cas`] is for a status
+//! that is a function of the object itself, such as one condition set by
+//! type ([`upsert_condition_cas`]). It reads the object, asks the edit what
+//! to write, writes that at the revision it read, and on a conflict reads
+//! again and retries exactly once. Its outcome names each way nothing was
+//! written ([`StatusEditOutcome`]), where [`StatusWriteOutcome::NoChange`]
+//! folds "already current" and "no revision" into one arm.
+//!
+//! The reads and writes go through [`CasEnv`], the store in production
+//! ([`StoreCasEnv`]) and a fake that races a concurrent writer in tests.
 
+use async_trait::async_trait;
 use engenho_store::{
     ApplyResult, StoreMesh,
     command::{Reason, ResourceCommand},
     resource::ResourceKey,
     revision::Revision,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::{debug, warn};
 
+use crate::condition::{DesiredCondition, upsert_condition};
 use crate::effect::{Effect, Refusal};
 use crate::error::ControllerError;
 use crate::meta::{DefaultedInt, ShapeError};
@@ -183,31 +200,248 @@ pub async fn write_status_cas(
 /// every op the store can return is placed, so a refusal of any kind is
 /// reported refused and only a landed patch is `Written`.
 fn read_answer(key: &ResourceKey, expected: Revision, answer: &ApplyResult) -> StatusWriteOutcome {
-    let effect = Effect::of(answer.op);
-    match effect {
-        Effect::Rejected(Refusal::Conflict) => {
-            // A concurrent spec change advanced mod_revision between the
-            // list and this write. Benign — dropped; the next watch-wake
-            // re-reads fresh state and recomputes.
-            debug!(
-                key = %key.label(),
-                expected = %expected,
-                "status write conflicted with a concurrent spec change; dropping (will recompute on next wake)"
-            );
-        }
-        Effect::Rejected(refusal @ (Refusal::PatchRejected | Refusal::ApplyConflict)) => {
-            // The store refused the patch itself. Nothing was written, and
-            // proposing the same patch again will not change that.
-            warn!(
-                key = %key.label(),
-                %refusal,
-                detail = answer.patch_error.as_deref().unwrap_or(""),
-                "status write refused; nothing was written"
-            );
-        }
-        Effect::Written(_) | Effect::Unchanged => {}
+    let effect = read_effect(key, answer);
+    if effect == Effect::Rejected(Refusal::Conflict) {
+        // A concurrent spec change advanced mod_revision between the
+        // list and this write. Benign — dropped; the next watch-wake
+        // re-reads fresh state and recomputes.
+        debug!(
+            key = %key.label(),
+            expected = %expected,
+            "status write conflicted with a concurrent spec change; dropping (will recompute on next wake)"
+        );
     }
     StatusWriteOutcome::Proposed(effect)
+}
+
+/// What the store did with a proposed status patch, logging a refusal of
+/// the patch itself. A conflict is the caller's to explain: one drops the
+/// write, the other retries it.
+fn read_effect(key: &ResourceKey, answer: &ApplyResult) -> Effect {
+    let effect = Effect::of(answer.op);
+    if let Effect::Rejected(refusal @ (Refusal::PatchRejected | Refusal::ApplyConflict)) = effect {
+        // The store refused the patch itself. Nothing was written, and
+        // proposing the same patch again will not change that.
+        warn!(
+            key = %key.label(),
+            %refusal,
+            detail = answer.patch_error.as_deref().unwrap_or(""),
+            "status write refused; nothing was written"
+        );
+    }
+    effect
+}
+
+/// The reads and writes of a read-modify-write: read the object, and write
+/// an RFC 7396 merge patch conditioned on the revision read.
+///
+/// [`StoreCasEnv`] in production; a fake in tests, which can move the
+/// object between the read and the write.
+#[async_trait]
+pub trait CasEnv: Send + Sync {
+    /// The live object at `key`, if any.
+    async fn get(&self, key: &ResourceKey) -> Option<Value>;
+
+    /// Merge `patch` into the object at `key` if it is still at revision
+    /// `pinned`, and return the store's answer.
+    ///
+    /// # Errors
+    ///
+    /// [`ControllerError::Store`] on a transport failure. A refused write
+    /// is an answer (`ResourceOp::Conflict`, …), not an error.
+    async fn patch_at(
+        &self,
+        key: &ResourceKey,
+        patch: Value,
+        pinned: Revision,
+    ) -> Result<ApplyResult, ControllerError>;
+}
+
+/// [`CasEnv`] over the store, writing as one [`Reason`].
+#[derive(Clone, Copy)]
+pub struct StoreCasEnv<'a> {
+    store: &'a StoreMesh,
+    reason: Reason,
+}
+
+impl<'a> StoreCasEnv<'a> {
+    /// Read `store`, and write to it as `reason` (the scheduler writes as
+    /// [`Reason::Scheduler`], a controller as [`Reason::Controller`]).
+    #[must_use]
+    pub const fn new(store: &'a StoreMesh, reason: Reason) -> Self {
+        Self { store, reason }
+    }
+}
+
+#[async_trait]
+impl CasEnv for StoreCasEnv<'_> {
+    async fn get(&self, key: &ResourceKey) -> Option<Value> {
+        self.store.get(key).await
+    }
+
+    async fn patch_at(
+        &self,
+        key: &ResourceKey,
+        patch: Value,
+        pinned: Revision,
+    ) -> Result<ApplyResult, ControllerError> {
+        Ok(self
+            .store
+            .propose(ResourceCommand::patch_cas(
+                key.clone(),
+                patch,
+                Some(pinned),
+                self.reason,
+            ))
+            .await?)
+    }
+}
+
+/// What an edit makes of the object it was handed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatusEdit {
+    /// The object already says what the edit would write.
+    Current,
+    /// The object no longer calls for this edit: it moved on since the
+    /// caller decided to make it (a pod bound in the meantime).
+    Superseded,
+    /// Merge these fields into `.status`.
+    Write(Map<String, Value>),
+}
+
+/// Outcome of an [`edit_status_cas`] call. Every arm but `Proposed` means
+/// nothing was proposed, and each says why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusEditOutcome {
+    /// The object already carries the edit. No Raft round trip, no event.
+    Unchanged,
+    /// The edit no longer applies ([`StatusEdit::Superseded`]).
+    Superseded,
+    /// There is no object at the key.
+    Absent,
+    /// The object has no parseable `metadata.resourceVersion` to write at.
+    /// An unconditional write could clobber a concurrent one, so none is
+    /// made.
+    NoRevision,
+    /// A patch was proposed at the revision read, and this is what the
+    /// store did with it. When the first attempt conflicted, this is the
+    /// answer to the one retry.
+    Proposed(Effect),
+}
+
+impl StatusEditOutcome {
+    /// What this call did, as one [`Effect`]: nothing proposed is
+    /// `Unchanged`.
+    pub const fn effect(self) -> Effect {
+        match self {
+            Self::Unchanged | Self::Superseded | Self::Absent | Self::NoRevision => {
+                Effect::Unchanged
+            }
+            Self::Proposed(effect) => effect,
+        }
+    }
+
+    /// True iff a status patch landed.
+    #[must_use]
+    pub const fn changed(self) -> bool {
+        self.effect().landed()
+    }
+}
+
+/// Read the object at `key`, ask `edit` what to merge into its `.status`,
+/// and write that at the revision read. On a conflict, read again and retry
+/// exactly once.
+///
+/// The retry re-runs `edit` on the object as re-read, so it writes on top of
+/// whatever the concurrent writer did, and finds `Unchanged` or `Superseded`
+/// when that writer made the edit unnecessary. A second conflict is
+/// returned as `Proposed(Rejected(Conflict))`; the write that moved the
+/// object fires a watch event, which re-ticks the caller.
+///
+/// # Errors
+///
+/// [`ControllerError::Store`] on a transport failure, and
+/// [`ControllerError::Shape`] when `edit` finds the object malformed. A
+/// write the store refused is an outcome, not an error.
+pub async fn edit_status_cas<E, F>(
+    env: &E,
+    key: &ResourceKey,
+    edit: F,
+) -> Result<StatusEditOutcome, ControllerError>
+where
+    E: CasEnv + ?Sized,
+    F: Fn(&Value) -> Result<StatusEdit, ShapeError> + Sync,
+{
+    match edit_once(env, key, &edit).await? {
+        StatusEditOutcome::Proposed(Effect::Rejected(Refusal::Conflict)) => {
+            debug!(
+                key = %key.label(),
+                "status edit conflicted with a concurrent write; reading again and retrying once"
+            );
+            edit_once(env, key, &edit).await
+        }
+        outcome => Ok(outcome),
+    }
+}
+
+/// One read, one edit, at most one write.
+async fn edit_once<E, F>(
+    env: &E,
+    key: &ResourceKey,
+    edit: &F,
+) -> Result<StatusEditOutcome, ControllerError>
+where
+    E: CasEnv + ?Sized,
+    F: Fn(&Value) -> Result<StatusEdit, ShapeError> + Sync,
+{
+    let Some(object) = env.get(key).await else {
+        return Ok(StatusEditOutcome::Absent);
+    };
+    let fields = match edit(&object)? {
+        StatusEdit::Current => return Ok(StatusEditOutcome::Unchanged),
+        StatusEdit::Superseded => return Ok(StatusEditOutcome::Superseded),
+        StatusEdit::Write(fields) => fields,
+    };
+    let Some(pinned) = resource_version_of(&object) else {
+        debug!(
+            key = %key.label(),
+            "status edit skipped: the object has no parseable resourceVersion"
+        );
+        return Ok(StatusEditOutcome::NoRevision);
+    };
+    let mut patch = Map::new();
+    patch.insert("status".to_owned(), Value::Object(fields));
+    let answer = env.patch_at(key, Value::Object(patch), pinned).await?;
+    Ok(StatusEditOutcome::Proposed(read_effect(key, &answer)))
+}
+
+/// Set one condition on the object at `key`, by type
+/// ([`upsert_condition`]), writing at the revision read and retrying once
+/// on a conflict ([`edit_status_cas`]).
+///
+/// `Unchanged` when the object already carries the condition: nothing is
+/// proposed, so a controller that asserts the same condition every tick does
+/// not wake itself. `now` is the RFC 3339 instant recorded as
+/// `lastTransitionTime` when the status transitions.
+///
+/// # Errors
+///
+/// As [`edit_status_cas`].
+pub async fn upsert_condition_cas<E>(
+    env: &E,
+    key: &ResourceKey,
+    desired: &DesiredCondition,
+    now: &str,
+) -> Result<StatusEditOutcome, ControllerError>
+where
+    E: CasEnv + ?Sized,
+{
+    edit_status_cas(env, key, |object| {
+        Ok(upsert_condition(object, desired, now)?
+            .into_status_fields()
+            .map_or(StatusEdit::Current, StatusEdit::Write))
+    })
+    .await
 }
 
 /// True iff `pod` reports a `status.conditions[type=Ready,status=True]`.

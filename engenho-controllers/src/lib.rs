@@ -35,6 +35,7 @@ pub mod build_backend_roceiro;
 mod closed_enum;
 pub mod cluster_ip;
 pub mod cni_status;
+pub mod condition;
 pub mod contain;
 pub mod controller;
 pub mod crd;
@@ -70,6 +71,7 @@ pub mod owner;
 pub mod pdb;
 pub mod plantio;
 pub mod plantio_pipeline;
+pub mod pod_scheduling;
 pub mod pod_template;
 pub mod pv_binder;
 pub mod reads;
@@ -149,6 +151,7 @@ pub use engenho_substrate::FrozenClock;
     note = "use engenho_substrate::FrozenClock directly (ms precision)"
 )]
 pub type FixedClock = engenho_substrate::FrozenClock;
+pub use condition::{ConditionStatus, ConditionUpsert, DesiredCondition, upsert_condition};
 pub use curve::{Curve, Streak};
 pub use meta::{
     Container, DefaultedInt, FieldPath, JsonKind, ObjectMeta, REPLICAS, ShapeError, array_mut,
@@ -169,6 +172,10 @@ pub use plantio_pipeline::{
     LedgerChoice, LedgerWrappers, NodeResolverChoice, PipelineConfig, PlantioPipeline,
     RoceiroChoice, bootstrap_pipeline,
 };
+pub use pod_scheduling::{
+    BindOutcome, Binding, DEFAULT_SCHEDULER, PodSchedulingState, Schedulable, bind_cas,
+    mark_unschedulable_cas,
+};
 pub use pod_template::{NormalizedTemplate, POD_TEMPLATE_HASH_LABEL, TemplateHash};
 pub use pv_binder::{
     ClaimUid, ENGENHO_LOCAL_PATH_PROVISIONER, FakeProvisionerEnv, HostProvisionerEnv,
@@ -185,7 +192,8 @@ pub use service_router::{
 };
 pub use statefulset::StatefulSetController;
 pub use status::{
-    GENERATION, StatusWriteOutcome, generation_of, pod_is_ready, resource_version_of,
+    CasEnv, GENERATION, StatusEdit, StatusEditOutcome, StatusWriteOutcome, StoreCasEnv,
+    edit_status_cas, generation_of, pod_is_ready, resource_version_of, upsert_condition_cas,
     write_status_cas,
 };
 pub use store_ledger::{DEFAULT_RECEIPT_NAMESPACE, StoreBackedLedger};
