@@ -605,6 +605,11 @@ async fn after_a_restart_a_never_pod_past_init_is_failed_not_rerun() {
         cs[0]["state"]["terminated"]["reason"],
         "ContainerStatusUnknown"
     );
+    assert!(
+        backend.containers().await.is_empty(),
+        "nothing the old kubelet started is left in the runtime: the running app \
+         container and the completed init container are both torn down"
+    );
 
     teardown(store, kubelet).await;
 }

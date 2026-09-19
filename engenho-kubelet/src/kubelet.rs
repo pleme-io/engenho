@@ -218,6 +218,52 @@ enum Readopted {
     /// Settled without starting anything: a lost `Never` pod, published
     /// `Failed`.
     Settled,
+    /// A run the previous process left could not be torn down, or even seen,
+    /// this tick ([`Unreaped`]). Nothing is started beside it and no status
+    /// claims it ended; the next tick tries again.
+    Held,
+}
+
+/// A run a previous kubelet process left that this tick could not tear down.
+///
+/// ── ★ A LOST RUN IS REAPED BEFORE ANYTHING IS DECIDED ABOUT IT ─────────────
+/// On podman (CLI) and CRI the containers outlive the kubelet. Publishing a
+/// lost `Never` pod `terminated` while its container still runs is a false
+/// status, and the replacement `JobController` creates would run BESIDE it —
+/// the double run the lost-pod rule exists to prevent, made concurrent. So
+/// the lost run is stopped and removed first, and when that fails nothing is
+/// written and nothing started.
+struct Unreaped {
+    container: String,
+    container_id: String,
+    cause: KubeletError,
+}
+
+impl std::fmt::Display for Unreaped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not tear down container {} ({}) left by a previous kubelet process ({}); \
+             pod held: nothing started, no status written this tick",
+            self.container, self.container_id, self.cause
+        )
+    }
+}
+
+/// The event text for a lost run the kubelet found still running and killed.
+struct KilledLostRun<'a> {
+    container: &'a str,
+}
+
+impl std::fmt::Display for KilledLostRun<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Stopping container {}: a previous kubelet process left it running and this runtime \
+             cannot re-adopt it",
+            self.container
+        )
+    }
 }
 
 /// A container whose status poll FAILED this tick — the runtime could not be
@@ -1940,6 +1986,11 @@ impl Kubelet {
     /// place. Under a restarting policy it goes on to the start path, which
     /// counts the restart ([`StartedAs`]). A runtime that adopts running
     /// containers goes straight to the start path, which adopts them.
+    ///
+    /// Before either, every run the stored status names is torn down
+    /// ([`Self::reap_lost_runs`]): a runtime that cannot hand a container
+    /// back may still be RUNNING it, and neither a `Failed` status nor a
+    /// fresh start may go out beside it.
     async fn readopt(
         &self,
         key: &ResourceKey,
@@ -1948,6 +1999,11 @@ impl Kubelet {
     ) -> Result<Readopted, ControllerError> {
         if self.backend.readoption() != crate::backend::Readoption::Cannot {
             return Ok(Readopted::Start);
+        }
+        if let Err(unreaped) = self.reap_lost_runs(key, value).await {
+            warn!(pod = %key.label(), %unreaped, "lost run not torn down");
+            report.objects_skipped += 1;
+            return Ok(Readopted::Held);
         }
         let stored = Self::stored_containers(value, "containerStatuses");
         match crate::lifecycle::reconcile_lost_pod(Self::pod_restart_policy(value), &stored) {
@@ -1966,6 +2022,55 @@ impl Kubelet {
             }
             LostPod::NothingLost => Ok(Readopted::Start),
         }
+    }
+
+    /// Stop THEN remove every container the pod's stored status names — app
+    /// containers first, then init containers (sidecars outlive the app, as
+    /// upstream orders termination) — on a runtime that cannot re-adopt them.
+    ///
+    /// The runtime is ASKED first, so "already gone" is an answer rather than
+    /// a guess read out of an error string: `Ok(None)` is done; a container
+    /// it still has is torn down (a running one gets a `Killing` event); a
+    /// poll or a teardown that fails is [`Unreaped`], and the caller holds
+    /// the pod. A run published with no container id cannot be asked about
+    /// and is passed over.
+    ///
+    /// Tier: this reaches what the RUNTIME can see. The native backend's
+    /// table starts empty in a new process, so a native workload that
+    /// outlived the old one is invisible here — only launchd killing the
+    /// job's process group stops it (plan edge 12, `pending-native-orphan`).
+    async fn reap_lost_runs(&self, key: &ResourceKey, value: &Value) -> Result<(), Unreaped> {
+        for field in ["containerStatuses", "initContainerStatuses"] {
+            for lost in Self::stored_containers(value, field) {
+                let Some(id) = lost.run().and_then(|r| r.container_id.as_deref()) else {
+                    continue;
+                };
+                let unreaped = |cause| Unreaped {
+                    container: lost.name().to_string(),
+                    container_id: id.to_string(),
+                    cause,
+                };
+                let still_running = match self.backend.status(id).await {
+                    Ok(None) => continue,
+                    Ok(Some(held)) => held.is_running(),
+                    Err(cause) => return Err(unreaped(cause)),
+                };
+                if still_running {
+                    let why = KilledLostRun {
+                        container: lost.name(),
+                    };
+                    info!(pod = %key.label(), container_id = id, %why, "reaping lost run");
+                    self.emit(
+                        key,
+                        engenho_controllers::event_recorder::Reason::Killing,
+                        why.to_string(),
+                    )
+                    .await;
+                }
+                self.cleanup_container(id).await.map_err(unreaped)?;
+            }
+        }
+        Ok(())
     }
 
     /// Publish a lost `restartPolicy: Never` pod `Failed` (see
@@ -2420,8 +2525,9 @@ impl Controller for Kubelet {
                         continue;
                     }
                     // ── ★ NO RECORD IS NOT "NEVER STARTED" — see `readopt`.
-                    if self.readopt(key, value, &mut report).await? == Readopted::Settled {
-                        continue;
+                    match self.readopt(key, value, &mut report).await? {
+                        Readopted::Start => {}
+                        Readopted::Settled | Readopted::Held => continue,
                     }
                     self.start_bound_pod(key, value, &mut report, &mut soonest_requeue)
                         .await?;

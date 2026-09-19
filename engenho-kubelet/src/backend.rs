@@ -613,9 +613,14 @@ pub enum Readoption {
     /// copy. A container that STOPPED while no kubelet watched is replaced,
     /// not adopted — its exit is not recovered (`pending-readopt-exited`).
     AdoptsRunning,
-    /// A container a previous process started is out of reach: the kubelet
-    /// cannot see it, adopt it, or learn how it ended. A pod whose stored
-    /// status shows such a container is an exit nobody observed.
+    /// A container a previous process started cannot be adopted, and how it
+    /// ended cannot be learned. A pod whose stored status shows such a
+    /// container is an exit nobody observed.
+    ///
+    /// It is NOT necessarily gone: podman (CLI) and CRI keep running it. The
+    /// kubelet tears down whatever the runtime still holds under the stored
+    /// id before it publishes the pod or starts it again; a native workload
+    /// is out of the runtime's sight entirely (its table is per-process).
     ///
     /// The conservative arm, hence the `Default` — it can only make the
     /// kubelet refuse to re-run something, never re-run something twice.
@@ -777,6 +782,10 @@ struct FakeState {
     /// container that has not started, and without this seam nothing could
     /// tell the two apart.
     status_faults: BTreeMap<String, String>,
+    /// Container IDS whose `stop` fails with this backend message, leaving
+    /// the container as it was. Seeded via [`FakeBackend::seed_stop_fault`].
+    /// A teardown that did not happen must not be reported as one that did.
+    stop_faults: BTreeMap<String, String>,
 }
 
 /// How a [`FakeBackend`] exec fails without the command ever answering.
@@ -847,6 +856,21 @@ impl FakeBackend {
     /// The runtime answers `status` for `container_id` again.
     pub async fn clear_status_fault(&self, container_id: &str) {
         self.inner.lock().await.status_faults.remove(container_id);
+    }
+
+    /// Make every `stop` of `container_id` fail with `message` until
+    /// [`FakeBackend::clear_stop_fault`]. The container keeps running.
+    pub async fn seed_stop_fault(&self, container_id: &str, message: impl Into<String>) {
+        self.inner
+            .lock()
+            .await
+            .stop_faults
+            .insert(container_id.to_string(), message.into());
+    }
+
+    /// The runtime stops `container_id` again.
+    pub async fn clear_stop_fault(&self, container_id: &str) {
+        self.inner.lock().await.stop_faults.remove(container_id);
     }
 
     /// Snapshot of all containers currently tracked.
@@ -1121,6 +1145,9 @@ impl ContainerRuntime for FakeBackend {
 
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
         let mut state = self.inner.lock().await;
+        if let Some(message) = state.stop_faults.get(container_id) {
+            return Err(KubeletError::Backend(message.clone()));
+        }
         if let Some(s) = state.containers.get_mut(container_id) {
             s.state = crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(0));
         }
