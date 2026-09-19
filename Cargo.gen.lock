@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "16ce173a234fea4e2777a76dc779dadc0a8cb511000ff1d1fc229611d57d8e85",
+  "cargo_lock_sha256": "2605b50e29f001e6abc9c41689e6673c8748d3c71e9d2190fa98b4e5b67b63cc",
   "manifest_sha256": {
-    "Cargo.toml": "88e7f03e75efbb49c0f14dcdc8bc4d6c5bc46a4b9d854a7dabcefbdb83e3f7b4",
+    "Cargo.toml": "fa338977673f1e7f3f219b61103d38a0fda8e10d771815cb6409cba2b60d07e3",
     "engenho-apiserver/Cargo.toml": "dd8ed22200247d6e30cbd121f61cf79de3c9bc3f83946ddd4519d6626b03ac33",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
@@ -18,7 +18,6 @@
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
     "engenho-kubelet/Cargo.toml": "61f3b57b809bf3b6a8680f57d32637a7a4e414337f2cda04f2c1db2500f02fae",
-    "engenho-machines/Cargo.toml": "7722f5b1de0b7af3d290f6b36bdea89e36ab888853f23a6432792ddd9640c442",
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
     "engenho-runtime/Cargo.toml": "1bb074d1b048ced7b852c243698ed6dab8b4ea4d2b1eb1537067e10ab7579665",
@@ -6372,54 +6371,6 @@
             "tree": "host"
           }
         ],
-        "features": []
-      },
-      "engenho-machines-0.53.118": {
-        "runtime_dependencies": [
-          {
-            "name": "engenho_substrate",
-            "package_key": "engenho-substrate-0.53.118",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "engenho_sui_typescape",
-            "package_key": "engenho-sui-typescape-0.53.118",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "serde",
-            "package_key": "serde-1.0.228",
-            "kind": "normal",
-            "features": [
-              "derive"
-            ],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "thiserror",
-            "package_key": "thiserror-2.0.18",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
-        "build_dependencies": [],
         "features": []
       },
       "engenho-mcp-0.53.118": {
@@ -39045,13 +38996,6 @@
       "build_script": "build.rs",
       "lib_target": {
         "name": "engenho_kubelet",
-        "path": "src/lib.rs"
-      }
-    },
-    "engenho-machines-0.53.118": {
-      "edition": "2024",
-      "lib_target": {
-        "name": "engenho_machines",
         "path": "src/lib.rs"
       }
     },

@@ -1,0 +1,327 @@
+;; doc-sources — a document names only code that exists.
+;;
+;; WHY (improvement plan T5.3, class D: declared-but-unbound artifacts).
+;;   docs/STATE-MACHINES.md said SM ③ (topology) and SM ⑥ (materialization)
+;;   were formalized in engenho-machines. That crate held a model of each
+;;   machine, and both models contradicted the code they named:
+;;   * MaterializationMachine went to a terminal Dissent on the first
+;;     disagreeing confirmation and counted confirmations, not emitters.
+;;     QuorumTracker (engenho-substrate/src/quorum.rs) counts distinct
+;;     emitters, stays Pending below its threshold whatever the evidence, and
+;;     leaves Dissent when the dissenter re-emits.
+;;   * TopologyNodeMachine had an Evicted state and refused out-of-order
+;;     events. revoada's TopologyReactor::apply_transition maps Evict to
+;;     Failed and applies every event from every state.
+;;   The crate had no reverse dependency and was in no binary, so nothing
+;;   noticed; the doc kept pointing at the model instead of the code. The
+;;   crate is deleted and the doc names the code. This check keeps it that
+;;   way: a pointer that stops resolving fails CI.
+;;
+;; RULES, for each document in src:DOCS:
+;;   root    a repository path the document names starts at a directory
+;;           that exists here, or at a declared external repository
+;;           (src:EXTERNAL).
+;;   crate   no path starts at a directory holding a Cargo.toml that is not
+;;           a workspace member. Such a crate is built and tested by nothing.
+;;   exists  every such path exists, each alternative of a {a,b} group
+;;           included; a path ending in `/` is a directory.
+;;   item    `path.rs::Item` names an item the file declares (struct, enum,
+;;           trait, type, fn, const, static, mod or union).
+;;           `path.rs::Item::member` also needs `fn member`, or a variant
+;;           line `member`, in that file.
+;;   source  in every table with a `Source` column, each row names at least
+;;           one repository path in that column.
+;;
+;; WHAT COUNTS AS A PATH. A backtick span outside a fenced block, made of
+;; path characters, containing `/`, and ending in `/` or a known extension,
+;; optionally followed by `::Item`; and every relative Markdown link target,
+;; resolved from the document's directory. `start/status/stop/remove` is
+;; prose, not a path.
+;;
+;; TIER: a CI gate, not a type. Declarations are matched by text: an item
+;; declared through a macro (define_hash_newtype!) is not seen, and
+;; `Item::member` proves the file declares a fn or variant of that name,
+;; not that it belongs to Item. A path with no trailing `/` and no known
+;; extension is not checked. External repositories, and links that leave
+;; this one, are not read.
+;;
+;; Exit codes: 0 clean · 1 a rule is broken · 3 nothing was examined (no
+;; document, or no workspace member): the check proved nothing, which is
+;; not the same as finding nothing wrong.
+;;
+;; Tests: ci/doc-sources.test.tlisp (tlisp-test sets TLISP_TEST=1, which
+;; loads these definitions and skips the main at the bottom). CI runs this
+;; check only through that suite, in test.yml's ci-contract-tests: its first
+;; test applies every rule to the real repository. Run the main locally:
+;;   tatara-script ci/doc-sources.tlisp
+
+(define src:DOCS (list "docs/STATE-MACHINES.md" "docs/TYPESCAPE.md"))
+(define src:MANIFEST "Cargo.toml")
+
+;; Roots that name another repository, as (root why). Not read.
+(define src:EXTERNAL
+  (list (list "kikai" "pleme-io/kikai, the cluster-lifecycle backend (SM ①)")))
+
+(define src:PATH-CHARS "[A-Za-z0-9_.{},/-]")
+(define src:EXTENSIONS "\\.(rs|md|toml|nix|ya?ml|tlisp|lisp|json|txt|proto)$")
+(define src:IDENT "[A-Za-z_][A-Za-z0-9_]*")
+(define src:ITEM-KEYWORDS "(struct|enum|trait|type|fn|const|static|mod|union)")
+
+(define (src:n x) (string-format "{}" x))
+
+;; ── Reading a Markdown document ──────────────────────────────────────────
+
+;; (line-number text) for every line outside a fenced code block. A fence
+;; line itself is dropped.
+(define (src:prose-lines text)
+  (car (cdr
+    (reduce
+      (fn (acc line)
+        (let ((in-fence (car acc)) (out (car (cdr acc))) (no (car (cdr (cdr acc)))))
+          (if (string-starts-with? (string-trim line) "```")
+            (list (not in-fence) out (+ no 1))
+            (list in-fence (if in-fence out (append out (list (list no line)))) (+ no 1)))))
+      (list false (list) 1)
+      (string-split text "\n")))))
+
+;; `path.rs::Item::member` -> (path "Item::member"); `dir/` -> (dir "").
+;; Anything that is not path-shaped -> the empty list.
+(define (src:parse-code-span span)
+  (let ((m (re-captures
+             (string-append "^(" src:PATH-CHARS "+?)(::(" src:IDENT "(::" src:IDENT ")?))?$")
+             span)))
+    (if (nil? m)
+      (list)
+      (let ((path (car (cdr m)))
+            (item (let ((i (car (cdr (cdr (cdr m)))))) (if (nil? i) "" i))))
+        (if (and (string-contains? path "/")
+                 (not (string-starts-with? path "/"))
+                 (or (string-ends-with? path "/") (re-match? src:EXTENSIONS path)))
+          (list path item)
+          (list))))))
+
+;; Join a link target onto the document's directory and fold `.`/`..`.
+;; "" when the target leaves the repository.
+(define (src:resolve-link doc target)
+  (let* ((dir (reverse (cdr (reverse (string-split doc "/")))))
+         (trailing (string-ends-with? target "/"))
+         ;; (inside? segments): inside? turns false once `..` climbs past the root.
+         (folded
+           (reduce
+             (fn (acc seg)
+               (let ((inside (car acc)) (segs (car (cdr acc))))
+                 (cond
+                   ((not inside) acc)
+                   ((or (equal? seg "") (equal? seg ".")) acc)
+                   ((equal? seg "..")
+                     (if (= (length segs) 0) (list false segs) (list true (reverse (cdr (reverse segs))))))
+                   (else (list true (append segs (list seg)))))))
+             (list true dir)
+             (string-split target "/"))))
+    (if (or (not (car folded)) (= (length (car (cdr folded))) 0))
+      ""
+      (string-append (string-join "/" (car (cdr folded))) (if trailing "/" "")))))
+
+;; A link target this check reads: relative, and not a bare anchor.
+(define (src:local-link? target)
+  (not (or (string-contains? target "://")
+           (string-starts-with? target "#")
+           (string-starts-with? target "mailto:"))))
+
+(define (src:strip-anchor target) (car (string-split target "#")))
+
+;; Every path reference on one line, as (line kind path item). kind is
+;; "code" or "link".
+(define (src:line-refs doc no line)
+  (append
+    (reduce
+      (fn (acc span)
+        (let ((p (src:parse-code-span (string-replace span "`" ""))))
+          (if (= (length p) 0) acc (append acc (list (list no "code" (car p) (car (cdr p))))))))
+      (list)
+      (re-find-all "`[^`]+`" line))
+    (reduce
+      (fn (acc m)
+        (let ((target (src:strip-anchor (string-replace (string-replace m "](" "") ")" ""))))
+          (if (and (not (equal? target "")) (src:local-link? target))
+            (let ((path (src:resolve-link doc target)))
+              (if (equal? path "") acc (append acc (list (list no "link" path "")))))
+            acc)))
+      (list)
+      (re-find-all "\\]\\([^)\\s]+\\)" line))))
+
+(define (src:refs doc text)
+  (reduce (fn (acc l) (append acc (src:line-refs doc (car l) (car (cdr l))))) (list) (src:prose-lines text)))
+
+;; ── The filesystem, as values ────────────────────────────────────────────
+;; fs is (exists? dir? read): the real one wraps the primitives; the tests
+;; build one from a list of (path text).
+
+(define (src:fs-exists? fs p) ((car fs) p))
+(define (src:fs-dir? fs p) ((car (cdr fs)) p))
+(define (src:fs-read fs p) ((car (cdr (cdr fs))) p))
+
+(define (src:real-fs)
+  (list (fn (p) (path-exists? p)) (fn (p) (is-dir? p)) (fn (p) (read-file p))))
+
+;; ── Rules over one reference ─────────────────────────────────────────────
+
+;; `a/{b,c}.rs` -> (a/b.rs a/c.rs), any number of groups.
+(define (src:expand path)
+  (let ((m (re-captures "^([^{]*)\\{([^{}]*)\\}(.*)$" path)))
+    (if (nil? m)
+      (list path)
+      (reduce
+        (fn (acc alt)
+          (append acc (src:expand (string-append (car (cdr m)) alt (car (cdr (cdr (cdr m))))))))
+        (list)
+        (string-split (car (cdr (cdr m))) ",")))))
+
+(define (src:root path) (car (string-split path "/")))
+
+(define (src:external-root? root) (any? (fn (e) (equal? (car e) root)) src:EXTERNAL))
+
+(define (src:without-slash p) (re-replace "/+$" p ""))
+
+;; The first problem with one expanded path, or "".
+(define (src:path-problem fs members path)
+  (let ((root (src:root path)))
+    (cond
+      ((src:external-root? root) "")
+      ((not (src:fs-dir? fs root))
+        (string-append "starts at `" root "/`, which is not a directory in this repository or a declared external one"))
+      ((and (src:fs-exists? fs (string-append root "/Cargo.toml")) (not (any? (fn (m) (equal? m root)) members)))
+        (string-append "starts at `" root "/`, a crate that is not a workspace member; nothing builds or tests it"))
+      ((string-ends-with? path "/")
+        (if (src:fs-dir? fs (src:without-slash path)) "" (string-append "`" path "` is not a directory")))
+      ((not (src:fs-exists? fs path)) (string-append "`" path "` does not exist"))
+      (else ""))))
+
+(define (src:declares? text name)
+  (re-match? (string-append "\\b" src:ITEM-KEYWORDS "\\s+" name "\\b") text))
+
+(define (src:declares-member? text name)
+  (or (re-match? (string-append "\\bfn\\s+" name "\\b") text)
+      (re-match? (string-append "(?m)^\\s*" name "\\s*([,({]|$)") text)))
+
+;; The first problem with `path::item`, or "". Checked only once the path
+;; resolves and is not external.
+(define (src:item-problem fs path item)
+  (if (or (equal? item "") (src:external-root? (src:root path)))
+    ""
+    (let* ((text (src:fs-read fs path))
+           (parts (string-split item "::"))
+           (name (car parts)))
+      (cond
+        ((not (src:declares? text name))
+          (string-append "`" path "` declares no item `" name "`"))
+        ((and (> (length parts) 1) (not (src:declares-member? text (car (cdr parts)))))
+          (string-append "`" path "` declares no fn or variant `" (car (cdr parts)) "`"))
+        (else "")))))
+
+;; Every violation for one reference (line kind path item).
+(define (src:ref-violations doc fs members ref)
+  (let* ((no (car ref)) (path (car (cdr (cdr ref)))) (item (car (cdr (cdr (cdr ref)))))
+         (at (string-append doc ":" (src:n no) ": "))
+         (path-problems
+           (filter (fn (s) (not (equal? s "")))
+             (map (fn (p) (src:path-problem fs members p)) (src:expand path)))))
+    (cond
+      ((> (length path-problems) 0) (map (fn (s) (string-append at s)) path-problems))
+      (else
+        (let ((ip (src:item-problem fs path item)))
+          (if (equal? ip "") (list) (list (string-append at ip))))))))
+
+;; ── Rule over tables: a `Source` column names a path in every row ────────
+
+(define (src:cells line)
+  (let ((parts (string-split (string-trim line) "|")))
+    (map (fn (c) (string-trim c)) (reverse (cdr (reverse (cdr parts)))))))
+
+(define (src:table-line? line) (string-starts-with? (string-trim line) "|"))
+(define (src:separator? line) (re-match? "^\\s*\\|\\s*:?-{3,}" line))
+
+(define (src:index-of xs x)
+  (car (cdr (reduce (fn (acc y) (let ((i (car acc)) (found (car (cdr acc))))
+                                  (list (+ i 1) (if (and (< found 0) (equal? y x)) i found))))
+                    (list 0 -1) xs))))
+
+;; Violations for rows whose Source cell names no path.
+(define (src:source-violations doc text)
+  (car
+    (reduce
+      (fn (acc l)
+        (let* ((vs (car acc)) (col (car (cdr acc))) (prev (car (cdr (cdr acc))))
+               (no (car l)) (line (car (cdr l))))
+          (cond
+            ((not (src:table-line? line)) (list vs -1 ""))
+            ((src:separator? line)
+              (list vs (if (src:table-line? prev) (src:index-of (src:cells prev) "Source") -1) line))
+            ((< col 0) (list vs col line))
+            (else
+              (let* ((cells (src:cells line))
+                     (row (if (> (length cells) 0) (car cells) "")))
+                (if (and (> (length cells) col) (> (length (src:line-refs doc no (nth col cells))) 0))
+                  (list vs col line)
+                  (list (append vs (list (string-append doc ":" (src:n no) ": the row `" row "` names no source path")))
+                        col line)))))))
+      (list (list) -1 "")
+      (src:prose-lines text))))
+
+;; ── One document, then all of them ───────────────────────────────────────
+
+(define (src:doc-violations doc text fs members)
+  (append
+    (reduce (fn (acc ref) (append acc (src:ref-violations doc fs members ref))) (list) (src:refs doc text))
+    (src:source-violations doc text)))
+
+;; docs: a list of (path present? text).
+(define (src:doc-present? d) (car (cdr d)))
+(define (src:doc-text d) (car (cdr (cdr d))))
+
+(define (src:violations docs fs members)
+  (reduce
+    (fn (acc d)
+      (append acc
+        (if (src:doc-present? d)
+          (src:doc-violations (car d) (src:doc-text d) fs members)
+          (list (string-append (car d) ": listed in src:DOCS but absent")))))
+    (list)
+    docs))
+
+;; ── Loading the real repository ──────────────────────────────────────────
+
+(define (src:load-members)
+  (if (path-exists? src:MANIFEST)
+    (let* ((manifest (toml-parse (read-file src:MANIFEST)))
+           (ws (alist-get manifest "workspace" (list)))
+           (ms (if (list? ws) (alist-get ws "members" (list)) (list))))
+      (if (list? ms) ms (list)))
+    (list)))
+
+(define (src:load-docs)
+  (map (fn (p) (if (path-exists? p) (list p true (read-file p)) (list p false ""))) src:DOCS))
+
+;; How many path references the present documents hold.
+(define (src:ref-count docs)
+  (reduce (fn (acc d) (+ acc (length (src:refs (car d) (src:doc-text d))))) 0
+    (filter src:doc-present? docs)))
+
+(define (src:main)
+  (let* ((members (src:load-members))
+         (docs (src:load-docs))
+         (read (filter src:doc-present? docs))
+         (refs (src:ref-count docs))
+         (vs (src:violations docs (src:real-fs) members)))
+    (when (or (= (length read) 0) (= (length members) 0))
+      (print-line "FATAL: no document read, or no workspace member in Cargo.toml; the check proved nothing")
+      (exit 3))
+    (for-each (fn (v) (print-line (string-append "FAIL " v))) vs)
+    (print-line
+      (string-append "doc sources: " (src:n (length read)) " documents · " (src:n refs)
+        " path references · " (src:n (length members)) " workspace members · violations: " (src:n (length vs))))
+    (exit (if (> (length vs) 0) 1 0))))
+
+(cond
+  ((equal? (env-get "TLISP_TEST" "") "1") (print-line "TLISP_TEST=1: doc-sources loaded; main skipped"))
+  (else (src:main)))

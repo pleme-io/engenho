@@ -278,9 +278,9 @@ jobs:
   # .github/workflows/mutation.yml.
   # Second step: pleme-io/actions/tlisp-test runs each ci/<name>.test.tlisp
   # against ci/<name>.tlisp. min-files is the number of suites that exist
-  # (release-contract, mutation-gate, cargo-profiles), so losing one is red,
-  # not a smaller green; mutation-gate's suite fails if the floor and the
-  # count disagree. The first step pins the tatara-script tlisp-test reuses
+  # (release-contract, mutation-gate, cargo-profiles, doc-sources), so
+  # losing one is red, not a smaller green; mutation-gate's suite fails if
+  # the floor and the count disagree. The first step pins the tatara-script tlisp-test reuses
   # from PATH.
   # cargo-profiles has no job of its own: its suite's first test runs the
   # whole check against the real Cargo.toml, .cargo/config.toml and every
@@ -290,6 +290,12 @@ jobs:
   # overflow checks on; if a step that raises PROPTEST_CASES builds with
   # `--release` or without the stress profile; or if a workflow env or a
   # cargo config overrides either profile from outside Cargo.toml.
+  # doc-sources has no job of its own either: its suite's first tests run the
+  # check against docs/STATE-MACHINES.md and docs/TYPESCAPE.md (improvement
+  # plan T5.3). They fail if either names a path that does not exist, a path
+  # into a crate that is not a workspace member, a `path.rs::Item` that file
+  # does not declare, or an index row with no source; and if
+  # engenho-machines comes back.
   # ───────────────────────────────────────────────────────────────────────────
   ci-contract-tests:
     name: ci/*.test.tlisp + mutation-gate lists
@@ -304,4 +310,4 @@ jobs:
           MUTATION_GATE_MODE: lint
       - uses: pleme-io/actions/tlisp-test@main
         with:
-          min-files: 3
+          min-files: 4

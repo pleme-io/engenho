@@ -228,6 +228,8 @@ gate. The gate now runs nextest over `.config/nextest.toml`, which skips
 only the four oracle binaries, so engenho-diff's **34** mocked library
 unit tests now run in the gate (measured 2026-09-19 with nextest 0.9.136,
 `-p engenho-diff --all-features`: 34 run, 34 pass, 4 binaries skipped).
+`engenho-machines` and its 14 `#[test]`s, which the gate-scope row
+counts, were deleted on 2026-09-19 (improvement plan T5.3).
 The whole workspace has not been re-counted under nextest yet.
 
 The doctest leg is **41 of 42 `ignore`d** — close to a vacuous guard
@@ -283,7 +285,7 @@ Operating Principle #1 forbids.
 
 | Workflow | Trigger | Scope | Blocking |
 |---|---|---|---|
-| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy, + `ci/nix-on-runner.tlisp` (Nix installed only via `pleme-io/actions/nix-setup`, before any step needing it), + `ci/release-contract.tlisp` (release.yml moves `:latest` only after the gate), + `ci-contract-tests`: every `ci/*.test.tlisp` (release-contract, mutation-gate, cargo-profiles, whose suite checks `Cargo.toml`'s release and stress profiles and every stress lane) and a lint of the mutation gate's two lists | yes |
+| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy, + `ci/nix-on-runner.tlisp` (Nix installed only via `pleme-io/actions/nix-setup`, before any step needing it), + `ci/release-contract.tlisp` (release.yml moves `:latest` only after the gate), + `ci-contract-tests`: every `ci/*.test.tlisp` (release-contract, mutation-gate, cargo-profiles, whose suite checks `Cargo.toml`'s release and stress profiles and every stress lane, and doc-sources, whose suite checks that `docs/STATE-MACHINES.md` and `docs/TYPESCAPE.md` name only paths and items that exist) and a lint of the mutation gate's two lists | yes |
 | `release.yml` | `v*` tag | 2 binaries, 4 arch images, 2 multi-arch indexes, 1 chart, exact tags only; then `release-assets` (needs every publishing job, finds all 23 assets) and `promote-latest` (moves `:latest` per image). A red leg or a missing asset leaves `:latest` where it was | — |
 | `deep-test.yml` | schedule + dispatch | breadth — macOS leg, the whole workspace under `[profile.stress]` with `PROPTEST_CASES=4096`, coverage artifact, `cargo audit` | no |
 | `mutation.yml` | schedule + dispatch; push + PR touching a seam | `cargo mutants` over `ci/seam-files.txt`: every mutant nightly, the changed lines on a push. A surviving mutant fails unless `ci/mutants-allowlist.txt` says why (`ci/mutation-gate.tlisp`) | yes, on a push that touches a seam |

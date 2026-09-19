@@ -1688,17 +1688,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "engenho-machines"
-version = "0.53.118"
-dependencies = [
- "engenho-substrate",
- "engenho-sui-typescape",
- "proptest",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "engenho-mcp"
 version = "0.53.118"
 dependencies = [

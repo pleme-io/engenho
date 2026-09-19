@@ -23,7 +23,6 @@ members = [
   "engenho-sui-typescape",
   "engenho-fonte",
   "engenho-fonte-cli",
-  "engenho-machines",
   "engenho-diff",
   "engenho-cni",
   "engenho-csi",

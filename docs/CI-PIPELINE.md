@@ -126,6 +126,14 @@ push + helm chart push would fail with `unauthorized`.
     workspace. Values are compared by TOML type, as cargo reads them:
     `opt-level = "3"`, `opt-level = 3.0` and `debug-assertions = "true"`
     fail the check, as cargo refuses each of them.
+  * `ci/doc-sources.test.tlisp` (test.yml, job `ci-contract-tests`)
+    runs `ci/doc-sources.tlisp` against `docs/STATE-MACHINES.md` and
+    `docs/TYPESCAPE.md`: every repository path they name exists, none
+    starts at a crate directory outside the workspace, every
+    `path.rs::Item` names an item that file declares, and every row of a
+    table with a `Source` column names a path. Declarations are matched
+    by text, so an item declared through a macro is not seen. The suite
+    also fails if `engenho-machines` comes back (improvement plan T5.3).
   * `ci/release-contract.tlisp` (test.yml, job `release-contract`)
     checks that release.yml moves `:latest` only in `promote-latest`,
     after `release-assets`; `ci/release-contract.test.tlisp` (job

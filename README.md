@@ -132,7 +132,7 @@ the `M0.0` line this replaces.
 | API machinery | server-side apply (+`managedFields`), WATCH, label selectors, resourceVersion, API **defaulting** and **validation** (core kinds), field selectors incl. `spec.nodeName`/`status.phase` — all working |
 | controller chain | Deployment → ReplicaSet → Pod reconciles end to end |
 | endpoints serving | `/healthz` `/readyz` `/livez` `/version` (`v1.34.0`) `/api` `/apis` `/openapi/v3` |
-| crates | 24 workspace members; `engenho-datastore`, `-cni`, `-kubeproxy`, `-dns`, `-localpath`, `-ca`, `-caixa`, `-mesh`, `-gateway`, `-attest`, `-cli` are TARGET names above and do **not** exist yet |
+| crates | 26 workspace members (Cargo.toml `members`, counted 2026-09-19 after `engenho-machines` was deleted); `engenho-datastore`, `-kubeproxy`, `-dns`, `-localpath`, `-ca`, `-caixa`, `-mesh`, `-gateway`, `-attest`, `-cli` are TARGET names above and do **not** exist yet |
 
 ## The load-bearing insight: interfaces are the contract, technology is not
 
