@@ -61,8 +61,8 @@ use crate::health;
 use crate::object_body::ObjectBody;
 use crate::openapi::ApiDoc;
 use crate::params::{
-    DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, error_line,
-    event_line, gvk_ns_matches,
+    DryRun, InitialEvents, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line,
+    error_line, event_line, gvk_ns_matches,
 };
 use crate::watch_end::{AfterGone, WatchProgress};
 use crate::watch_start::{WatchRefusal, WatchStart};
@@ -1280,11 +1280,26 @@ async fn do_list_or_watch(
     if watch {
         watch_response(h, namespace, p, sel, codec).await
     } else {
+        p.validate_list()?;
         // Paged path when `limit` or `continue` is present; otherwise the
         // unbounded atomic-rv LIST envelope (back-compat: no continue /
         // remainingItemCount fields emitted).
         let limit = p.limit()?;
         let continue_token = p.continue_token()?;
+        // A LIST that names a revision is served from state at least that
+        // fresh: wait for the store to reach it, or answer upstream's 504
+        // (crate::list_floor). A continued page reads the snapshot its token
+        // carries, which the first page already held to this floor.
+        if continue_token.is_none()
+            && let ResumePoint::At(floor) = p.resume_point()?
+        {
+            crate::list_floor::await_revision(
+                h.as_ref(),
+                floor,
+                crate::list_floor::LIST_WAIT_FOR_REVISION,
+            )
+            .await?;
+        }
         if limit > 0 || continue_token.is_some() {
             let (items, rv, cont, remaining) = h
                 .list_page(namespace.as_deref(), &sel, limit, continue_token)
@@ -1382,18 +1397,22 @@ async fn watch_response(
     // while their LIST (already projected) succeeded.
     let partial = matches!(codec, ResponseCodec::PartialMetadata);
     let requested: ResumePoint = p.resume_point()?;
+    let initial = p.watch_initial_events()?;
     let mut from = requested;
 
-    // ── streaming lists (K8s 1.27 `sendInitialEvents`) ──
+    // ── initial state as events (streaming lists, K8s 1.27 ──
+    // ── `sendInitialEvents`, and the legacy watch it defaults to) ──
     //
     // The client asked for the current state to arrive AS watch events
-    // instead of issuing a separate LIST. Snapshot first, then open the
-    // stream AT that snapshot's revision — opening the stream first would
-    // leave a window in which a change lands after the stream registers but
-    // before the snapshot is taken, and the client would see it twice; the
-    // reverse order can only ever REPLAY, never drop.
+    // instead of issuing a separate LIST, or sent a legacy watch from ""/"0"
+    // that kube-apiserver defaults to the same (params::InitialEvents).
+    // Snapshot first, then open the stream AT that snapshot's revision —
+    // opening the stream first would leave a window in which a change lands
+    // after the stream registers but before the snapshot is taken, and the
+    // client would see it twice; the reverse order can only ever REPLAY,
+    // never drop.
     let mut prelude: Vec<Bytes> = Vec::new();
-    if p.send_initial_events {
+    if let InitialEvents::Snapshot { end_bookmark } = initial {
         let (items, rv) = h.list_at(namespace.as_deref(), &sel).await?;
         // The snapshot answers "state not older than resourceVersion". A
         // resourceVersion the snapshot has not reached would get older state
@@ -1415,10 +1434,13 @@ async fn watch_response(
                 watch_gvk(gvk, partial),
             ));
         }
-        // The terminator. Without this annotation a kube-rs `watcher` /
-        // client-go reflector stays in its initializing state forever even
-        // though every object above was delivered.
-        prelude.push(bookmark_line(rv, gvk, true));
+        // The terminator, for a client that asked for bookmarks. Without
+        // this annotation a kube-rs `watcher` / client-go reflector stays in
+        // its initializing state forever even though every object above was
+        // delivered. A client that did not ask gets none, as upstream.
+        if end_bookmark {
+            prelude.push(bookmark_line(rv, gvk, true));
+        }
         from = ResumePoint::At(rv);
     }
 
@@ -1493,7 +1515,7 @@ async fn watch_response(
                     return Some((Ok::<Bytes, Infallible>(line), st));
                 }
                 Some(Ok(WatchSignal::Bookmark(rev))) => {
-                    if st.progress.bookmarks() {
+                    if st.progress.forwards_bookmark(rev) {
                         let api_version = st.handler.api_version();
                         let gvk = WatchGvk {
                             api_version: &api_version,
@@ -1503,7 +1525,8 @@ async fn watch_response(
                         st.progress.delivered(rev);
                         return Some((Ok(line), st));
                     }
-                    // Bookmarks not requested → drop + keep streaming.
+                    // Bookmarks not requested, or one at the watch's start
+                    // that moves the client nowhere → drop + keep streaming.
                     continue;
                 }
                 Some(Err(gone)) => {
@@ -1567,8 +1590,7 @@ async fn watch_response(
     });
 
     // The initial-events replay, then the live stream. `prelude` is empty
-    // unless `sendInitialEvents=true`, so the ordinary watch path is
-    // byte-for-byte what it was.
+    // unless the watch sends its initial state (params::InitialEvents).
     let body = Body::from_stream(futures::StreamExt::chain(
         futures::stream::iter(prelude.into_iter().map(Ok::<Bytes, Infallible>)),
         live,
@@ -2573,6 +2595,15 @@ mod tests {
                 "fake handler: list_page not exercised".into(),
             ))
         }
+        async fn current_revision(&self) -> engenho_store::Revision {
+            // The head of a fake history, or where an unused fake stands.
+            match self.watch.lock().as_deref() {
+                Ok(FakeWatch::History(history)) => {
+                    history.changes.last().map_or(Revision(10), |c| c.revision)
+                }
+                _ => Revision::ZERO,
+            }
+        }
         async fn watch_stream(
             &self,
             _ns: Option<&str>,
@@ -2889,8 +2920,8 @@ mod tests {
     /// The one overflow a retry can change: the buffer filled with nothing
     /// newer than the stream's opening revision, so timing decided it, not
     /// history. A one-slot buffer holding the bookmark at 10 does that when
-    /// the change at 11 arrives. The watch forwards the bookmark and ends
-    /// with the 429.
+    /// the change at 11 arrives. The watch drops that bookmark (it is at the
+    /// watch's start, so it moves the client nowhere) and ends with the 429.
     #[tokio::test]
     async fn an_overflow_with_nothing_past_the_opening_revision_ends_with_an_in_band_429() {
         let mut registry = engenho_store::watch_backend::WatcherRegistry::new();
@@ -2908,9 +2939,8 @@ mod tests {
         drop(registry);
 
         let lines = pod_watch_lines(stream, true).await;
-        assert_eq!(line_types(&lines), ["BOOKMARK", "ERROR"], "{lines:?}");
-        assert_eq!(line_rv(&lines[0]), "10");
-        let status = &lines[1]["object"];
+        assert_eq!(line_types(&lines), ["ERROR"], "{lines:?}");
+        let status = &lines[0]["object"];
         assert_eq!(status["kind"], "Status");
         assert_eq!(status["code"], 429, "{status}");
         assert_eq!(status["reason"], "TooManyRequests");

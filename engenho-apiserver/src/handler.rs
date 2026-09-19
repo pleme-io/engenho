@@ -185,6 +185,11 @@ pub trait ResourceHandler: Send + Sync + 'static {
 
     async fn list(&self, namespace: Option<&str>) -> Result<Value, ApiError>;
 
+    /// The store's current revision, read without reading any object: what a
+    /// LIST that names a `resourceVersion` waits on
+    /// ([`crate::list_floor::await_revision`]).
+    async fn current_revision(&self) -> Revision;
+
     /// LIST the items + the snapshot resourceVersion captured ATOMICALLY
     /// from the SAME catalog clone, with selectors applied apiserver-side.
     ///
@@ -501,6 +506,10 @@ pub struct StoreBackedHandler {
     /// delegates to it; when `None`, `/log` returns a typed `NotFound` (no
     /// fake-empty log). Installed by the runtime via [`Self::with_log_reader`].
     log_reader: Option<Arc<dyn PodLogReader>>,
+    /// How often a watch that asked for bookmarks gets one while the store's
+    /// revision advances. [`WATCH_BOOKMARK_EVERY`] unless
+    /// [`Self::with_bookmark_every`] set it.
+    bookmark_every: Duration,
 }
 
 impl StoreBackedHandler {
@@ -574,7 +583,21 @@ impl StoreBackedHandler {
             namespace_lifecycle: false,
             crd_schema: None,
             log_reader: None,
+            bookmark_every: WATCH_BOOKMARK_EVERY,
         }
+    }
+
+    /// Set how often a watch that asked for bookmarks gets one (builder
+    /// style). The runtime keeps [`WATCH_BOOKMARK_EVERY`]; a test that
+    /// observes bookmarks shortens it rather than waiting five seconds per
+    /// bookmark. A zero cadence would disable bookmarks for every client that
+    /// asked for them, so it is refused: the cadence stays unchanged.
+    #[must_use]
+    pub fn with_bookmark_every(mut self, every: Duration) -> Self {
+        if !every.is_zero() {
+            self.bookmark_every = every;
+        }
+        self
     }
 
     /// Install an in-process [`PodLogReader`] (the kubelet adapter) so this
@@ -1053,6 +1076,11 @@ impl ResourceHandler for StoreBackedHandler {
         Ok(self.list_response(items, rv, None, None))
     }
 
+    async fn current_revision(&self) -> Revision {
+        // A scalar read under the store's lock: no catalog clone (T3.2b).
+        self.store.current_revision().await
+    }
+
     async fn list_at(
         &self,
         namespace: Option<&str>,
@@ -1255,7 +1283,7 @@ impl ResourceHandler for StoreBackedHandler {
             from: from_rev,
             buffer: WATCH_CHANNEL_CAPACITY,
             bookmark_every: if allow_bookmarks {
-                WATCH_BOOKMARK_EVERY
+                self.bookmark_every
             } else {
                 Duration::ZERO
             },

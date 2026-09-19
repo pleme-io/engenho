@@ -12,7 +12,9 @@
 //!   4. GVK/namespace filter excludes other resources.
 //!   5. labelSelector filter (LIST + WATCH).
 //!   6. Bookmark passthrough (+ opt-out + resume-from-bookmark).
-//!   7. rv=0/absent = most recent, no replay.
+//!   7. rv=0/absent = the current state as ADDED, then live (upstream's
+//!      sendInitialEvents default); an explicit sendInitialEvents=false replays
+//!      nothing.
 //!   8. A WATCH ahead of the store → an in-band 410, never served from the
 //!      current revision (T3.9a); a WATCH at the store's revision is served.
 //!
@@ -426,13 +428,18 @@ async fn watch_filters_other_kinds_and_namespaces() {
     post_pod(&client, addr, "default", &pod_body("seed-pod")).await;
     post_cm(&client, addr, "default", "seed-cm").await;
 
-    // WATCH pods in default from MostRecent (no replay).
+    // WATCH pods in default from "0". kube-apiserver v1.34 defaults such a
+    // watch to sendInitialEvents, so it begins with the current state: the
+    // seed pod, and not the ConfigMap.
     let mut watch = open_watch(
         &client,
         addr,
         "/api/v1/namespaces/default/pods?watch=true&resourceVersion=0",
     )
     .await;
+    let initial = watch.next_event().await;
+    assert_eq!(initial["type"], "ADDED");
+    assert_eq!(initial["object"]["metadata"]["name"], "seed-pod");
 
     // POST another ConfigMap (advances revision) AND a pod in a DIFFERENT
     // namespace (advances revision) — both must be filtered out — then a
@@ -441,7 +448,7 @@ async fn watch_filters_other_kinds_and_namespaces() {
     post_pod(&client, addr, "kube-system", &pod_body("other-ns-pod")).await;
     post_pod(&client, addr, "default", &pod_body("wanted")).await;
 
-    // The first (and only) event the pod-watch in default delivers is
+    // The first (and only) live event the pod-watch in default delivers is
     // "wanted" — the ConfigMap + cross-namespace pod were filtered out
     // even though they advanced the shared revision.
     let ev = watch.next_event().await;
@@ -510,6 +517,13 @@ async fn label_selector_filters_list_and_watch() {
         "/api/v1/namespaces/default/pods?watch=true&resourceVersion=0&labelSelector=app=web",
     )
     .await;
+
+    // A watch from "0" begins with the current state (kube-apiserver's
+    // sendInitialEvents default), and the selector filters that too: web1,
+    // never api1.
+    let initial = watch.next_event().await;
+    assert_eq!(initial["type"], "ADDED");
+    assert_eq!(initial["object"]["metadata"]["name"], "web1");
 
     // Create one matching + one non-matching pod; only the matching one
     // streams.
@@ -643,11 +657,16 @@ async fn watch_stream_disables_bookmarks_when_not_requested() {
 }
 
 // =================================================================
-// 7. rv=0/absent = most recent, no replay
+// 7. rv=0/absent = the current state first, unless sendInitialEvents=false
 // =================================================================
 
+/// kube-apiserver v1.34 defaults a watch with no resourceVersion (or "0")
+/// that names neither sendInitialEvents nor resourceVersionMatch to
+/// sendInitialEvents=true (`SetListOptionsDefaults`): it begins with a
+/// synthetic ADDED for every object, as the API docs promise. Until the
+/// watch-410 oracle this test pinned the opposite (no replay).
 #[tokio::test]
-async fn watch_most_recent_does_not_replay_existing() {
+async fn watch_most_recent_begins_with_the_current_state() {
     let (_store, server) = boot_store_and_server().await;
     let addr = server.local_addr();
     let client = reqwest::Client::new();
@@ -657,26 +676,53 @@ async fn watch_most_recent_does_not_replay_existing() {
         post_pod(&client, addr, "default", &pod_body(n)).await;
     }
 
-    // WATCH ?watch=true (no resourceVersion) → MostRecent, NO replay.
     let mut watch = open_watch(&client, addr, "/api/v1/namespaces/default/pods?watch=true").await;
+    let mut initial = Vec::new();
+    for _ in 0..3 {
+        let ev = watch.next_event().await;
+        assert_eq!(ev["type"], "ADDED", "{ev}");
+        initial.push(ev["object"]["metadata"]["name"].clone());
+    }
+    assert_eq!(initial, ["e1", "e2", "e3"], "the current state, first");
 
-    // Create a 4th pod.
+    // Then the live tail: a 4th pod at rv 4.
+    post_pod(&client, addr, "default", &pod_body("e4")).await;
+    let ev = watch.next_event().await;
+    assert_eq!(ev["type"], "ADDED");
+    assert_eq!(ev["object"]["metadata"]["name"], "e4");
+    assert_eq!(ev_rv(&ev), 4);
+
+    drop(watch);
+    server.shutdown().await.unwrap();
+}
+
+/// sendInitialEvents=false (with the NotOlderThan it requires) is the one way
+/// to watch from now with no state.
+#[tokio::test]
+async fn watch_most_recent_without_initial_events_replays_nothing() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    for n in ["e1", "e2", "e3"] {
+        post_pod(&client, addr, "default", &pod_body(n)).await;
+    }
+    let mut watch = open_watch(
+        &client,
+        addr,
+        "/api/v1/namespaces/default/pods?watch=true&resourceVersion=0\
+         &sendInitialEvents=false&resourceVersionMatch=NotOlderThan",
+    )
+    .await;
     post_pod(&client, addr, "default", &pod_body("e4")).await;
 
     // Exactly that one ADDED line streams (no replay of e1..e3).
     let ev = watch.next_event().await;
-    assert_eq!(ev.get("type").unwrap(), "ADDED");
+    assert_eq!(ev["type"], "ADDED");
     assert_eq!(
-        ev.get("object")
-            .unwrap()
-            .get("metadata")
-            .unwrap()
-            .get("name")
-            .unwrap(),
-        "e4",
-        "MostRecent watch delivers only the post-subscribe write"
+        ev["object"]["metadata"]["name"], "e4",
+        "a watch from now delivers only the post-subscribe write"
     );
-    // The delivered rv is 4 — none of the existing 3 replayed.
     assert_eq!(ev_rv(&ev), 4);
 
     drop(watch);
@@ -1072,5 +1118,138 @@ async fn streaming_list_the_store_has_reached_is_served() {
     );
 
     drop(watch);
+    server.shutdown().await.unwrap();
+}
+
+// =================================================================
+// 9. A LIST never serves state older than the resourceVersion it names
+// =================================================================
+
+/// `?resourceVersion=N` on a LIST means "not older than N". A LIST at a
+/// revision the store has not reached waits for it (kube-apiserver's 3 s
+/// `blockTimeout`) and then serves state that includes it. Until the
+/// watch-410 oracle it was answered at once from the older current state,
+/// with a resourceVersion below the one asked for.
+#[tokio::test]
+async fn a_list_ahead_of_the_store_is_served_once_the_store_reaches_it() {
+    let (store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+    post_pod(&client, addr, "default", &pod_body("before")).await;
+    let ahead = store.current_revision().await.get() + 1;
+
+    let list = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .get(format!(
+                    "http://{addr}/api/v1/namespaces/default/pods?resourceVersion={ahead}"
+                ))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!list.is_finished(), "the LIST waits for revision {ahead}");
+    post_pod(&client, addr, "default", &pod_body("after")).await;
+
+    let resp = list.await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let rv: u64 = body["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        rv >= ahead,
+        "served at {rv}, asked for not older than {ahead}"
+    );
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["metadata"]["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"after"), "{names:?}");
+
+    server.shutdown().await.unwrap();
+}
+
+/// A LIST the store never catches up with is upstream's 504: reason
+/// `Timeout`, cause `ResourceVersionTooLarge`, and `Retry-After` from
+/// `details.retryAfterSeconds`.
+#[tokio::test]
+async fn a_list_ahead_of_a_store_that_stays_behind_is_a_504_too_large() {
+    let (store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let current = store.current_revision().await.get();
+    let started = std::time::Instant::now();
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/namespaces/default/pods?resourceVersion={}",
+            current + 5
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() >= engenho_apiserver::list_floor::LIST_WAIT_FOR_REVISION,
+        "the LIST waited before it gave up"
+    );
+    assert_eq!(resp.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    let status: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status["reason"], "Timeout", "{status}");
+    assert_eq!(status["code"], 504);
+    assert_eq!(
+        status["details"]["causes"][0]["reason"], "ResourceVersionTooLarge",
+        "{status}"
+    );
+    assert_eq!(status["details"]["retryAfterSeconds"], 1);
+    server.shutdown().await.unwrap();
+}
+
+/// kube-apiserver validates list/watch options before any watch exists:
+/// the answer is an HTTP 422 `Invalid`, never a stream.
+#[tokio::test]
+async fn invalid_list_and_watch_options_are_a_422_before_any_stream() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+    for query in [
+        "watch=true&sendInitialEvents=true",
+        "watch=true&sendInitialEvents=true&resourceVersionMatch=Exact",
+        "watch=true&resourceVersionMatch=NotOlderThan",
+        "sendInitialEvents=true",
+        "resourceVersionMatch=NotOlderThan",
+    ] {
+        let resp = client
+            .get(format!(
+                "http://{addr}/api/v1/namespaces/default/pods?{query}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{query}"
+        );
+        let status: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(status["reason"], "Invalid", "{query}: {status}");
+        assert!(
+            status["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("ListOptions.meta.k8s.io \"\" is invalid: ")),
+            "{query}: {status}"
+        );
+    }
     server.shutdown().await.unwrap();
 }

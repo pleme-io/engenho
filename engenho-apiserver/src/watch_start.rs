@@ -25,10 +25,9 @@
 //! A refusal is rendered as HTTP 200 carrying one `ERROR` watch line whose
 //! object is `Status{code: 410, reason: "Expired"}`, followed by a clean
 //! close. That is the shape kube-apiserver's watch cache uses for a too-old
-//! revision. It is deliberately NOT an HTTP 410, and NOT upstream's HTTP 504
-//! for a too-large revision, because of how kube-rs, the client
-//! pangea-operator uses, reacts to each. From kube-runtime 0.99
-//! `watcher.rs`:
+//! revision. It is deliberately NOT an HTTP 410, because of how kube-rs, the
+//! client pangea-operator uses, reacts to each. From kube-runtime `watcher.rs`
+//! (0.99, and still in 4.2.0):
 //!
 //!   * any watch-START error, whatever its HTTP status, leaves the watcher in
 //!     `InitListed { resource_version }`, and it re-issues the SAME watch.
@@ -39,6 +38,23 @@
 //! client-go reads the same in-band 410 as an expired resourceVersion and
 //! relists too, so one shape serves both clients.
 //!
+//! ## Ahead of the store: a deliberate deviation
+//!
+//! kube-apiserver v1.34 does not refuse a watch whose revision is ahead of
+//! its cache. A plain watch is accepted at once and sends nothing until the
+//! cache passes the revision; only a `sendInitialEvents` watch waits (3 s)
+//! and then ends with an in-band `504 Timeout` (cause
+//! `ResourceVersionTooLarge`). engenho refuses both at once with the 410
+//! above (T3.9a): it reads the store itself rather than a cache fed from it,
+//! so a revision it has not reached is more likely one from a history it no
+//! longer holds (a restore, a replay that renumbered revisions) than one it
+//! is about to reach, and accepting it would leave that client's cache
+//! silently stale. The cost falls on a replica that is merely behind: its
+//! client relists where upstream's would have waited. The oracle rows that
+//! disagree are declared deviations in `tests/oracle_watch_410.rs`. A LIST
+//! ahead of the store, by contrast, waits and answers upstream's 504
+//! ([`crate::list_floor`]).
+//!
 //! [`WatchRefusal`] has no `IntoResponse` and no conversion into
 //! [`ApiError`](crate::ApiError), so the router cannot render one as an HTTP status by
 //! accident, and [`WatchStart`] makes the router handle the refusal before
@@ -48,7 +64,7 @@ use bytes::Bytes;
 use engenho_store::{Revision, WatchStream};
 
 use crate::error::status_object;
-use crate::params::{ResumePoint, error_line};
+use crate::params::{ResumePoint, TooLargeResourceVersion, error_line};
 use crate::watch_end::Compacted;
 
 /// What opening a watch produced.
@@ -83,12 +99,10 @@ pub struct WatchRefusal(Refusal);
 /// matching on it reads engenho the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 enum Refusal {
-    /// The client named a revision the store has not reached.
-    #[error("Too large resource version: {requested}, current: {current}")]
-    AheadOfStore {
-        requested: Revision,
-        current: Revision,
-    },
+    /// The client named a revision the store has not reached. The same fact
+    /// a LIST reports as a 504 ([`crate::list_floor`]).
+    #[error(transparent)]
+    AheadOfStore(TooLargeResourceVersion),
     /// The client named a revision below the compaction floor.
     #[error(transparent)]
     Compacted(Compacted),
@@ -96,19 +110,15 @@ enum Refusal {
 
 impl WatchRefusal {
     /// The refusal for a resume point the store has not reached, or `None`
-    /// when the store can serve it.
+    /// when the store can serve it ([`ResumePoint::ahead_of`]).
     ///
     /// `ResumePoint::MostRecent` is never ahead: it means "from wherever the
     /// store is now". An explicit `At(current)` is servable too: it starts
     /// at the store's revision and replays nothing.
     #[must_use]
     pub fn ahead_of(from: ResumePoint, current: Revision) -> Option<Self> {
-        match from {
-            ResumePoint::At(requested) if requested > current => {
-                Some(Self(Refusal::AheadOfStore { requested, current }))
-            }
-            ResumePoint::At(_) | ResumePoint::MostRecent => None,
-        }
+        from.ahead_of(current)
+            .map(|too_large| Self(Refusal::AheadOfStore(too_large)))
     }
 
     /// The one line a refused watch sends before it closes: an `ERROR` event
