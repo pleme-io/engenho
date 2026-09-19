@@ -21,7 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
+      # The shared install step (pinned installer, `sandbox = relaxed`), not
+      # an inline installer. See pleme-io/actions/nix-setup/action.yml.
+      - uses: pleme-io/actions/nix-setup@main
 
       # ── THE FATAL GATE — the delta-freshness tie ────────────────────────
       # `gen confirm` is a pure OFFLINE check: it recomputes sha256(Cargo.lock)
@@ -57,9 +59,11 @@ jobs:
         run: nix run github:pleme-io/gen -- confirm
 
       # The broad flake check stays NON-fatal deliberately, and that is not
-      # laziness: this flake exposes no real `checks.<system>.*` (test.yml's
-      # header explains why), so `nix flake check` here is a smoke signal
-      # rather than a contract. Narrow-and-fatal beats broad-and-advisory —
-      # the freshness tie above is the invariant with teeth.
+      # laziness: the flake's only check is `checks.<system>.typed-config`,
+      # an eval-time test of the module trio's typed options, and it compiles
+      # no Rust (test.yml's header explains why), so `nix flake check` here is
+      # a smoke signal rather than a contract. Narrow-and-fatal beats
+      # broad-and-advisory — the freshness tie above is the invariant with
+      # teeth.
       - run: nix flake check
         continue-on-error: true

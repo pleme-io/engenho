@@ -1,0 +1,124 @@
+;; nix-on-runner — every CI step that needs Nix gets it, from the one shared
+;; install step, before it runs.
+;;
+;; WHY (improvement plan T0.1). Runs 35418242848 and 35421804575 went red on
+;; three engenho-kubelet tests that realise a closure with a real `nix build`,
+;; each panicking `could not run nix ...: No such file or directory`, because
+;; test.yml installed no Nix before the test leg. And a day earlier this repo
+;; grew five inline `DeterminateSystems/nix-installer-action` copies, one per
+;; job, each with its own nix.conf. Both are the same class: Nix reaching a
+;; job by accident rather than through one declared step.
+;;
+;; RULES, per job of every .github/workflows/*.yml:
+;;   seam   no step uses DeterminateSystems/nix-installer-action directly.
+;;          Nix is installed only by pleme-io/actions/nix-setup, which owns
+;;          the installer pin and the nix.conf (sandbox = relaxed, tokens).
+;;   order  a step that calls `nix`, or that EXECUTES tests (`cargo nextest`,
+;;          `cargo llvm-cov nextest`, or `cargo test` without `--no-run`),
+;;          comes after a nix-setup step in the same job. A test leg runs the
+;;          three tests that call nix, and nextest is itself fetched with nix.
+;;
+;; TIER: a CI gate, not a type. It reads the YAML the runner reads, so it
+;; catches a removed or misordered step. It matches commands by text, so a
+;; test run hidden behind a script or an alias is invisible to it.
+;;
+;; Exit codes: 0 clean · 1 a rule is broken · 3 the scan examined nothing
+;; (no workflow, or no step that needs Nix): the gate proved nothing, which is
+;; not the same as finding nothing wrong.
+
+(define SEAM-PREFIX "pleme-io/actions/nix-setup@")
+(define BARE-INSTALLER "DeterminateSystems/nix-installer-action")
+;; Each pattern is searched in the step's `run` text with a space appended,
+;; so a command at the very end of the text still ends in whitespace.
+(define CALLS-NIX "(^|\\s)nix\\s")
+(define RUNS-NEXTEST "(^|\\s)cargo\\s+(llvm-cov\\s+)?nextest\\s")
+(define RUNS-CARGO-TEST "(^|\\s)cargo\\s+test\\s")
+(define COMPILE-ONLY "\\s--no-run\\s")
+
+(define (needs-nix? run)
+  (let ((text (string-append run " ")))
+    (or (re-match? CALLS-NIX text)
+        (re-match? RUNS-NEXTEST text)
+        (and (re-match? RUNS-CARGO-TEST text)
+             (not (re-match? COMPILE-ONLY text))))))
+
+(define (fail-line wf job msg)
+  (print-line (string-append "FAIL " wf " job `" job "`: " msg)))
+
+(define (step-label st)
+  (let ((name (alist-get st "name" "")))
+    (if (equal? name "")
+      (string-append "step `" (alist-get st "uses" (alist-get st "run" "?")) "`")
+      (string-append "step `" name "`"))))
+
+;; Fold one job's steps in order. State: (seen-seam failures consumers).
+(define (check-job wf job steps)
+  (let ((final
+          (reduce
+            (fn (state st)
+              (let ((seen (car state))
+                    (fails (car (cdr state)))
+                    (consumers (car (cdr (cdr state))))
+                    (uses (alist-get st "uses" ""))
+                    (run (alist-get st "run" "")))
+                (cond
+                  ((string-starts-with? uses BARE-INSTALLER)
+                    (fail-line wf job
+                      (string-append (step-label st)
+                        " installs Nix directly; use " SEAM-PREFIX "main"))
+                    (list seen (+ fails 1) consumers))
+                  ((string-starts-with? uses SEAM-PREFIX)
+                    (list true fails consumers))
+                  ((needs-nix? run)
+                    (if seen
+                      (list seen fails (+ consumers 1))
+                      (begin
+                        (fail-line wf job
+                          (string-append (step-label st)
+                            " needs Nix but no " SEAM-PREFIX " step precedes it"))
+                        (list seen (+ fails 1) (+ consumers 1)))))
+                  (else state))))
+            (list false 0 0)
+            steps)))
+    (list (car (cdr final)) (car (cdr (cdr final))))))
+
+;; Returns (failures consumers) summed over the workflow's jobs. A job that
+;; calls a reusable workflow has no `steps` and contributes nothing. yaml-parse
+;; yields each mapping entry as a two-element list (key value), not a dotted
+;; pair, so the value is (car (cdr entry)).
+(define (check-workflow wf)
+  (let ((jobs (alist-get (yaml-parse (read-file wf)) "jobs" (list))))
+    (reduce
+      (fn (acc entry)
+        (let ((r (check-job wf (car entry)
+                   (alist-get (car (cdr entry)) "steps" (list)))))
+          (list (+ (car acc) (car r)) (+ (car (cdr acc)) (car (cdr r))))))
+      (list 0 0)
+      jobs)))
+
+(define workflows
+  (append (glob ".github/workflows/*.yml") (glob ".github/workflows/*.yaml")))
+
+(define totals
+  (reduce
+    (fn (acc wf)
+      (let ((r (check-workflow wf)))
+        (list (+ (car acc) (car r)) (+ (car (cdr acc)) (car (cdr r))))))
+    (list 0 0)
+    workflows))
+
+(define failures (car totals))
+(define consumers (car (cdr totals)))
+
+(print-line
+  (string-append
+    "workflows examined: " (string-format "{}" (length workflows))
+    " · steps needing Nix: " (string-format "{}" consumers)
+    " · failures: " (string-format "{}" failures)))
+
+(when (or (= (length workflows) 0) (= consumers 0))
+  (print-line
+    "FATAL: nothing to check -- no workflow, or no step that needs Nix; the scan proved nothing")
+  (exit 3))
+
+(exit (if (> failures 0) 1 0))

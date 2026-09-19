@@ -154,7 +154,7 @@ cargo fmt --all -- --check                 # formatting gate
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 nix build                          # release build via substrate.rust.workspace
-nix flake check                    # ⚠ compiles NOTHING — see § CI + gating
+nix flake check                    # ⚠ compiles no Rust — see § CI + gating
 ```
 
 Every flag above is load-bearing:
@@ -232,14 +232,17 @@ where the oracle *does* exist and they are the entire point).
 
 ## CI + gating
 
-**`nix flake check` compiles nothing, and neither does `ci.yml`.**
-`ci.yml` is a shim onto substrate's `cargo-ci.yml`, whose whole body is
-`nix flake check`. That builds only `checks.<system>.*`, and engenho's
-flake declares **none**. On sibling repo `forge` this was proven by
-probe: clean tree → exit 0; `compile_error!` in a test module → exit 0;
-literal non-Rust garbage in a function body → **exit 0**.
+**`nix flake check` compiles no Rust, and neither does `ci.yml`.**
+`ci.yml` runs `gen confirm` (fatal: the `Cargo.lock` ↔ `Cargo.gen.lock`
+tie) and a non-fatal `nix flake check`. That builds only
+`checks.<system>.*`, and the flake declares one:
+`checks.<system>.typed-config` (since 51e702a), an eval-time test of the
+module trio's typed options that stubs `settings` instead of building
+engenho. On sibling repo `forge`, a flake with no Rust checks was probed:
+clean tree → exit 0; `compile_error!` in a test module → exit 0; literal
+non-Rust garbage in a function body → **exit 0**.
 
-The load-bearing fix — the flake exposing real `checks` — is **blocked
+The load-bearing fix — the flake exposing Rust `checks` — is **blocked
 outside this repo**, verified rather than assumed: `runTests` is a
 crate2nix-generated-`Cargo.nix` concept, nixpkgs' `buildRustCrate` has
 no such argument, and `substrate/lib/build/rust/lockfile-builder.nix`
@@ -253,9 +256,9 @@ then `nix flake check` cannot compile any gen-pattern consumer.
 
 | Workflow | Trigger | Scope | Blocking |
 |---|---|---|---|
-| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy | yes |
+| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy, + `ci/nix-on-runner.tlisp` (Nix installed only via `pleme-io/actions/nix-setup`, before any step needing it) | yes |
 | `deep-test.yml` | schedule + dispatch | breadth — macOS leg, 4k-case proptest stress, coverage artifact, `cargo audit` | no |
-| `ci.yml` | push + PR | `nix flake check` (compiles nothing today — kept so the flake still evaluates) | — |
+| `ci.yml` | push + PR | `gen confirm` (fatal lock tie) + `nix flake check` (non-fatal; runs `checks.typed-config`, compiles no Rust) | fails only on `gen confirm` |
 
 `deep-test.yml` deliberately has **no** `push`/`pull_request` trigger:
 it ran on every PR while permanently red, which is how a never-green
@@ -266,27 +269,39 @@ because it fails on advisories published against the dependency tree
 (i.e. on the calendar, with no change to this repo); making it blocking
 manufactures exactly the permanently-red gate this split removes.
 
-> **⚠ Both workflows are currently blocked on one operator action.**
-> `Cargo.lock` has git deps on five **private** pleme-io repos —
-> `tameshi`, `cofre`, `promessa`, `sui`, `tatara` — and cargo resolves
-> the whole lock graph regardless of features, so *every* cargo command
-> needs them. `pleme-io` is on the GitHub **Free** plan, where org
-> secrets reach **public** repos only; engenho is **private** with no
-> repo-level secrets, so `secrets.BOT_PAT` arrives empty and the
-> repo-scoped `GITHUB_TOKEN` cannot read a sibling private repo. Fix:
-> `gh secret set BOT_PAT --repo pleme-io/engenho` — the same
-> repo-level-`BOT_PAT` workaround pangea-operator already carries. The
-> workflows are wired correctly and need no edit once it exists.
->
-> Local builds do **not** reproduce this: `~/.cargo/git` holds
-> credentialed checkouts, so a workstation is green while CI is red.
-> That divergence is why the failure survived unnoticed for months.
+**Private deps resolve in CI; what is still red** (runs 35418242848
+and 35421804575, 2026-09-19). `Cargo.lock` has git deps on five
+pleme-io repos (`tameshi`, `cofre`, `promessa`, `sui`, `tatara`), and
+cargo resolves the whole lock graph whatever the features. BOT_PAT
+arrives set (`bot-pat: ***` in the step log) and they resolve: engenho
+is **public**, and on the GitHub Free plan an org secret reaches public
+repos. The org posture catalog (`pangea-architectures`
+`workspaces/pleme-io-opensource/org.yaml`) declares it `visibility:
+public` with `actions_secrets: []`. If engenho goes private again, the
+fix is an `actions_secrets` row there, never `gh secret set`.
+
+The test leg's reds in both runs, 7 tests in 4 binaries:
+
+| Binary | Tests | Cause |
+|---|---|---|
+| `engenho-kubelet --test native_runs_a_real_closure` | 2 | no `nix` on the runner |
+| `engenho-kubelet --test native_runs_postgres` | 1 | no `nix` on the runner |
+| `engenho-runtime --test m0_1_single_node_convergence` | 1 | `StoreStillShared { strong_count: 2 }` at shutdown |
+| `engenho-runtime --test m0_6_namespaced_reconcile` | 3 | `StoreStillShared { strong_count: 2 }` at shutdown |
+
+The nix tests fail rather than skip on purpose; `test.yml` now installs
+Nix before the test leg through `pleme-io/actions/nix-setup`. The
+StoreStillShared failures are a code defect (improvement plan T2.1).
+
+Local builds do **not** reproduce credential problems: `~/.cargo/git`
+holds credentialed checkouts, so a workstation can be green while CI is
+red.
 
 ## Substrate integration (no escape hatches)
 
 | Primitive | How engenho uses it |
 |---|---|
-| `substrate.rust.workspace` | `flake.nix` — the gen/`Cargo.gen.lock` pattern (routes `mk-rust-workspace.nix` → `lockfile-builder.nix`; no crate2nix, no committed `Cargo.nix`). Note it exposes **no `checks`** — see § CI + gating |
+| `substrate.rust.workspace` | `flake.nix` — the gen/`Cargo.gen.lock` pattern (routes `mk-rust-workspace.nix` → `lockfile-builder.nix`; no crate2nix, no committed `Cargo.nix`). Note it exposes **no Rust `checks`** — see § CI + gating |
 | `tatara` | engenho is a tatara binary; every subsystem under `defguest` daemon mode (small surgery in `pleme-io/tatara/docs/daemon-supervision.md`) |
 | `shigoto` | Every controller's reconcile loop is a `shigoto::Dag`; watch dispatch is fan-out wave execution |
 | `shikumi` | All operator config (engenho.lisp, per-component YAML overrides) typed |

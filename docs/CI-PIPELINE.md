@@ -23,13 +23,11 @@ tatara similarly. Engenho follows the same shape.
 
 ### `.github/workflows/ci.yml` — every commit
 
-  Delegates to: `pleme-io/substrate/.github/workflows/cargo-ci.yml@main`
-
-  Which runs `nix flake check` — that evaluates substrate's
-  `rust-workspace-release-flake` helper, builds via crate2nix,
-  and runs whatever `checks.<system>.*` the flake exposes.
-
-  Total engenho file size: 21 lines (95% header + the `uses:` clause).
+  No longer a substrate shim (4757f50). After `pleme-io/actions/nix-setup`
+  it runs `nix run github:pleme-io/gen -- confirm` (fatal: the
+  `Cargo.lock` ↔ `Cargo.gen.lock` tie) and a non-fatal `nix flake
+  check`, whose only check is the eval-time `checks.typed-config`. It
+  compiles no Rust; `test.yml` is the gate that does.
 
 ### `.github/workflows/release.yml` — on `v*` tag
 
@@ -99,8 +97,8 @@ push + helm chart push would fail with `unauthorized`.
     --all-features` with substrate's pinned nextest. Which tests run
     is set by `.config/nextest.toml`, the same file substrate's release
     gate reads; the measured count is in CLAUDE.md § Test count.
-  * `nix flake check` validates the flake outputs (apps, packages,
-    overlays).
+  * `nix flake check` (non-fatal, in ci.yml) evaluates the flake and
+    runs `checks.typed-config`; it compiles no Rust.
   * `nix build .#default` validates the workspace builds.
 
 ## What release produces

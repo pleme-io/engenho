@@ -33,18 +33,20 @@ name: deep-test
 #     Already fixed in-tree — it is a git dep now, and a repo-wide grep for
 #     `path = "../../` returns 0 hits. Recorded so it is not reintroduced.
 #
-#   RC-2 (2026-07-17 -> now) — private git deps, no credential. THE LIVE ONE.
-#     See test.yml's header for the full diagnosis and the one-line operator
-#     fix (a REPO-level BOT_PAT). Both workflows are blocked on that same
-#     secret; both are wired correctly to work the moment it exists.
+#   RC-2 (2026-07-17 -> resolved) — private git deps, no credential.
+#     No longer live: engenho is public, so the org-level BOT_PAT reaches it,
+#     and in runs 35418242848 and 35421804575 (2026-09-19) every private dep
+#     resolved. What is still red is in test.yml's header.
 #
 # THREE FALSE CLAIMS IN THE PREVIOUS VERSION OF THIS FILE, ALL REMOVED:
 #
-#   1. "free public-repo tier ... fan-out is free". engenho is PRIVATE
-#      (`gh repo view pleme-io/engenho` -> PRIVATE). Its Actions minutes are
-#      BILLABLE, and the macOS half of the old 30-job matrix billed at the
-#      10x macOS multiplier. The fan-out was not free; it was the most
-#      expensive possible way to produce no signal.
+#   1. "free public-repo tier ... fan-out is free". engenho was PRIVATE
+#      then (`gh repo view pleme-io/engenho` -> PRIVATE). Its Actions minutes
+#      were BILLABLE, and the macOS half of the old 30-job matrix billed at
+#      the 10x macOS multiplier. The fan-out was not free; it was the most
+#      expensive possible way to produce no signal. (engenho is PUBLIC as of
+#      2026-09-19, so minutes no longer bill; the matrix stays cut because it
+#      produced no signal.)
 #   2. The hardcoded 15-crate matrix claimed to be "one job per workspace
 #      crate". The workspace has 24 members. NINE were in no test path at
 #      all — including `engenho`, the main binary, and `engenho-fonte`, the
@@ -101,7 +103,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: deep-${{ matrix.os }}
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: pleme-io/actions/nix-setup@main
         with:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
       - name: install substrate's pinned cargo-nextest
@@ -134,7 +136,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: proptest-stress
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: pleme-io/actions/nix-setup@main
         with:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
       - name: install substrate's pinned cargo-nextest
@@ -167,7 +169,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: pleme-io/actions/nix-setup@main
         with:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
       - name: install substrate's pinned cargo-nextest

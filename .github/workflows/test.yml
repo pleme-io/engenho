@@ -5,10 +5,15 @@ name: test
 #
 # WHY IT EXISTS (read before "simplifying" it back into ci.yml).
 #
-# `ci.yml` is a shim onto substrate's `cargo-ci.yml`, whose entire body is
-# `nix flake check`. `nix flake check` builds only `checks.<system>.*`, and
-# engenho's flake declares NONE (it is `substrate.rust.workspace` + image
-# grafts — see flake.nix). So ci.yml compiles nothing. On the sibling repo
+# `ci.yml` runs two Nix steps: `gen confirm` (fatal; the Cargo.lock <->
+# Cargo.gen.lock tie) and a non-fatal `nix flake check`. It stopped being a
+# shim onto substrate's `cargo-ci.yml` in 4757f50; the argument below is
+# unchanged. `nix flake check` builds only `checks.<system>.*`, and
+# engenho's flake declares exactly one: `checks.<system>.typed-config` (since
+# 51e702a), an eval-time test of the Nix module trio's typed options that
+# stubs the trio's `settings` rather than building engenho. It compiles no
+# Rust, so ci.yml proves the flake and its typed module surface evaluate and
+# says nothing about the crates. On the sibling repo
 # `forge` this was proven by probe: a clean tree exited 0, a `compile_error!`
 # in a test module exited 0, and LITERAL NON-RUST GARBAGE in a function body
 # ALSO exited 0 — every run printing "(build skipped)". The crate was never
@@ -39,31 +44,41 @@ name: test
 #   When that lands, this workflow's cargo steps can collapse into the flake.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚠ KNOWN BLOCKER — THIS GATE CANNOT GO GREEN UNTIL AN OPERATOR ACTS.
+# PRIVATE DEPENDENCIES AND WHAT IS STILL RED — measured on main in runs
+# 35418242848 and 35421804575 (2026-09-19). Both used `cargo test`; the test
+# leg below now runs nextest over the same tests.
 #
-# engenho's Cargo.lock has git dependencies on FIVE PRIVATE pleme-io repos:
-#   tameshi · cofre · promessa · sui · tatara      (verified via `gh repo view`)
-# Cargo resolves the WHOLE lock graph regardless of which features are on, so
-# EVERY cargo command — even `cargo test -p engenho-types` — must fetch them.
+# Cargo.lock has git dependencies on five pleme-io repos (tameshi · cofre ·
+# promessa · sui · tatara), and cargo resolves the whole lock graph whatever
+# the features, so every cargo command fetches them. `git-credentials` rewrites
+# github.com URLs to carry BOT_PAT. In both runs BOT_PAT arrived non-empty (the
+# step log prints `bot-pat: ***`) and every private dependency resolved: the
+# engenho-diff compile leg was green and the test leg built and ran the whole
+# workspace.
 #
-# `pleme-io` is on the GitHub FREE plan (`gh api orgs/pleme-io` -> plan: free,
-# 747 private repos). On Free, an ORG secret reaches PUBLIC repos only.
-# engenho is PRIVATE and has NO repo-level secrets (`gh secret list` -> empty).
-# Therefore `secrets.BOT_PAT` arrives EMPTY here, `git-credentials` falls back
-# to the repo-scoped GITHUB_TOKEN, and GITHUB_TOKEN cannot read a sibling
-# private repo. Result:
+# Why it arrives: engenho is PUBLIC (`gh repo view` -> PUBLIC; the org posture
+# catalog, pangea-architectures workspaces/pleme-io-opensource/org.yaml,
+# declares `visibility: public`), and on the GitHub Free plan an org secret
+# reaches public repos. No repo-level secret is needed, and the catalog
+# declares none (`actions_secrets: []`). If engenho is ever made private, the
+# fix is an `actions_secrets` row in that catalog, never `gh secret set` (★★
+# PLATFORM-MEDIATED INFRASTRUCTURE).
 #
-#   fatal: could not read Username for 'https://github.com'
-#   error: failed to get `tameshi` as a dependency of package `engenho-fonte`
-#
-# THE FIX IS ONE OPERATOR ACTION, NOT A CODE CHANGE:
-#   gh secret set BOT_PAT --repo pleme-io/engenho --body '<org PAT>'
-# This is the same repo-level-BOT_PAT workaround pangea-operator already
-# carries for exactly this reason. The wiring below is already correct and
-# needs NO edit once that secret exists.
-#
-# This is wired red-but-correct ON PURPOSE. A gate that is honest about being
-# blocked beats a shim that prints green over an un-compiled crate.
+# The test leg's reds, identical in both runs: 7 tests in 4 binaries.
+#   * 3 need a `nix` binary the runner did not have. Each panicked with
+#     `could not run nix ...: No such file or directory`:
+#       engenho-kubelet --test native_runs_a_real_closure   (2 tests)
+#       engenho-kubelet --test native_runs_postgres         (1 test)
+#     They fail rather than skip on purpose: they are the only tests that run
+#     a real native process. Nix is now installed before the test leg, through
+#     pleme-io/actions/nix-setup (below).
+#   * 4 fail graceful shutdown with `StoreStillShared { strong_count: 2 }`:
+#       engenho-runtime --test m0_1_single_node_convergence (1 test)
+#       engenho-runtime --test m0_6_namespaced_reconcile    (3 tests)
+#     A second holder of the store outlives shutdown. That is a code defect
+#     (improvement plan T2.1), not a CI problem.
+# Expected next run: red only on those two engenho-runtime binaries. Any other
+# red is a new finding, to be recorded rather than skipped.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -121,17 +136,25 @@ jobs:
       - name: compile engenho-diff (live-oracle crate — compiled, not run)
         run: cargo test -p engenho-diff --all-targets --all-features --locked --no-run
 
-      # ── The test runner: substrate's nextest, the release gate's own ────
-      # Nix is installed here ONLY to fetch nextest from substrate's pin, the
-      # same `github:pleme-io/substrate#cargo-nextest` that substrate's
-      # rust-auto-release test gate runs. Both gates therefore run one nextest
-      # build over one selection file, .config/nextest.toml. The installer's
-      # github-token is rate-limit headroom for a public fetch; the `||`
-      # fallback is the release gate's own, for the reason written there.
+      # ── Nix on the runner: the test runner AND three tests need it ──────
+      # Two consumers, so this step must stay BEFORE the nextest leg:
+      #   1. nextest itself, fetched from substrate's pin below, the same
+      #      `github:pleme-io/substrate#cargo-nextest` that substrate's
+      #      rust-auto-release test gate runs. Both gates therefore run one
+      #      nextest build over one selection file, .config/nextest.toml.
+      #   2. engenho-kubelet's native_runs_a_real_closure (2 tests) and
+      #      native_runs_postgres (1 test), which realise their closures with
+      #      a real `nix build`. Without Nix they fail with `could not run nix
+      #      ...: No such file or directory` (run 35418242848).
+      # The install is pleme-io/actions/nix-setup, the shared copy of this
+      # step (pinned installer, `sandbox = relaxed`, access-tokens), not a
+      # third inline one. The token is only rate-limit headroom here: every
+      # flake fetched is public (substrate, its pleme-io inputs skill-lint and
+      # tatara-lisp, nixpkgs). The `||` fallback is the release gate's own.
       # `nix profile install` lands the binary in ~/.nix-profile/bin, which
       # the installer has already put on PATH, so the leg below is the same
       # `cargo nextest run` a developer types locally.
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: pleme-io/actions/nix-setup@main
         with:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
       - name: install substrate's pinned cargo-nextest
@@ -209,3 +232,21 @@ jobs:
           shared-key: clippy-ubuntu
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
         continue-on-error: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Nix on the runner, as a checked contract (improvement plan T0.1). Three
+  # tests realise closures with a real `nix build`, and nextest is fetched
+  # with nix, so every job that runs tests or calls nix must install Nix
+  # first, and only through pleme-io/actions/nix-setup. ci/nix-on-runner.tlisp
+  # reads every workflow in .github/workflows and fails on a direct
+  # nix-installer-action or on a Nix-needing step with no nix-setup before it.
+  # It is a separate job so a red here names the contract, not a test.
+  # ───────────────────────────────────────────────────────────────────────────
+  nix-on-runner:
+    name: nix on the runner (workflow contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/nix-on-runner.tlisp
