@@ -14,15 +14,17 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-/// Error returned by every `KubeClient` / `Watcher` / `Informer` /
-/// `Reconciler` operation.
+/// Error returned by every `KubeClient` / `Watcher` / `Informer`
+/// operation.
+///
+/// Each variant's doc names its retry class; `classify` is held to it by
+/// the test `every_variant_classifies_as_its_doc_says`.
 #[derive(Debug, Error)]
 pub enum KubeError {
     /// HTTP-layer error before the apiserver responded (TCP reset,
-    /// TLS failure, DNS resolution, request build). Always [`Transient`]:
+    /// TLS failure, DNS resolution, request build). Always
+    /// [`Transient`](FailureKind::Transient):
     /// the caller should retry with backoff.
-    ///
-    /// [`Transient`]: FailureKind::Transient
     #[error("network error: {0}")]
     Network(String),
 
@@ -41,36 +43,34 @@ pub enum KubeError {
     },
 
     /// JSON/YAML/Protobuf deserialization failed. Almost always
-    /// [`Declarative`] — the wire shape doesn't match our typed
+    /// [`Declarative`](FailureKind::Declarative) — the wire shape doesn't match our typed
     /// expectation and retrying won't fix it.
-    ///
-    /// [`Declarative`]: FailureKind::Declarative
     #[error("decode error: {0}")]
     Decode(String),
 
-    /// JSON/YAML/Protobuf serialization failed. [`Declarative`].
+    /// JSON/YAML/Protobuf serialization failed. [`Declarative`](FailureKind::Declarative).
     #[error("encode error: {0}")]
     Encode(String),
 
     /// Auth setup failed (kubeconfig parse, token exec plugin,
-    /// client cert load). [`Declarative`] — won't fix by retrying.
+    /// client cert load). [`Declarative`](FailureKind::Declarative) — won't fix by retrying.
     #[error("auth error: {0}")]
     Auth(String),
 
     /// The watch stream ended at the server side. The caller should
     /// re-list + re-watch from the new resourceVersion.
-    /// [`Transient`].
+    /// [`Transient`](FailureKind::Transient).
     #[error("watch closed by server")]
     WatchClosed,
 
     /// Watch event is too old for the cache — apiserver gave us a
     /// 410 Gone on `?resourceVersion=N`. The informer must trigger
-    /// a relist. [`Transient`] (but expensive).
+    /// a relist. [`Transient`](FailureKind::Transient) (but expensive).
     #[error("resourceVersion {0} expired — relist required")]
     ResourceVersionExpired(String),
 
     /// Resource not found. Often expected (e.g. GET-on-deleted);
-    /// the caller decides what it means. Classified [`Declarative`]
+    /// the caller decides what it means. Classified [`Declarative`](FailureKind::Declarative)
     /// for the "GET X-by-name where X never existed" case; reactive
     /// controllers treat it as a stop signal, not a retry signal.
     #[error("not found: {0}")]
@@ -185,12 +185,10 @@ impl KubeError {
         }
     }
 
-    /// Suggested retry delay, if [`Transient`]. `None` for declarative
+    /// Suggested retry delay, if [`Transient`](FailureKind::Transient). `None` for declarative
     /// errors. Default: 1s for network, 5s for TooManyRequests, 0
     /// (immediate) for the `Conflict` retry-loop. Callers MAY override
     /// (e.g., exponential backoff).
-    ///
-    /// [`Transient`]: FailureKind::Transient
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
@@ -257,6 +255,59 @@ mod tests {
             message: "calm down".into(),
         };
         assert_eq!(e.retry_after(), Some(Duration::from_secs(5)));
+    }
+
+    /// Each variant's doc states its retry class; this holds `classify`
+    /// to what the docs say (I20). The match is exhaustive, so a variant
+    /// added to `KubeError` does not compile here until someone writes
+    /// down whether its doc names a class. `Other`, and the status kinds
+    /// the `ApiStatus` doc does not name, have no documented class.
+    #[test]
+    fn every_variant_classifies_as_its_doc_says() {
+        use FailureKind::{Declarative, Transient};
+        fn documented(e: &KubeError) -> Option<FailureKind> {
+            match e {
+                KubeError::Network(_)
+                | KubeError::WatchClosed
+                | KubeError::ResourceVersionExpired(_) => Some(Transient),
+                KubeError::Decode(_)
+                | KubeError::Encode(_)
+                | KubeError::Auth(_)
+                | KubeError::NotFound(_) => Some(Declarative),
+                // "`Conflict` is retryable with backoff, `Forbidden` is
+                // declarative (don't retry)."
+                KubeError::ApiStatus { kind, .. } => match kind {
+                    ApiStatusKind::Conflict => Some(Transient),
+                    ApiStatusKind::Forbidden => Some(Declarative),
+                    _ => None,
+                },
+                KubeError::Other(_) => None,
+            }
+        }
+        let api = |kind| KubeError::ApiStatus {
+            code: 0,
+            kind,
+            message: String::new(),
+        };
+        let every = [
+            KubeError::Network("reset".into()),
+            api(ApiStatusKind::Conflict),
+            api(ApiStatusKind::Forbidden),
+            KubeError::Decode("bad json".into()),
+            KubeError::Encode("bad value".into()),
+            KubeError::Auth("no token".into()),
+            KubeError::WatchClosed,
+            KubeError::ResourceVersionExpired("7".into()),
+            KubeError::NotFound("pods/x".into()),
+        ];
+        for e in &every {
+            let doc = documented(e);
+            assert!(
+                doc.is_some(),
+                "{e:?} is sampled but has no documented class"
+            );
+            assert_eq!(Some(e.classify()), doc, "{e:?} classifies against its doc");
+        }
     }
 
     #[test]

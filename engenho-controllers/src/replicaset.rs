@@ -2,11 +2,16 @@
 //! `spec.replicas` per ReplicaSet.
 //!
 //! The reconciliation rule:
-//!   * count Pods owned by the ReplicaSet (controller-owned)
+//!   * count the LIVE Pods owned by the `ReplicaSet` (controller-owned,
+//!     not Terminating — upstream's `FilterActivePods`)
 //!   * if count < replicas: create the difference (each Pod cloned
 //!     from `spec.template` + owner-referenced + named uniquely)
-//!   * if count > replicas: delete the excess (eviction by name
-//!     order for predictability)
+//!   * if count > replicas: delete the excess among the live pods
+//!     (eviction by name order for predictability)
+//!
+//! A Terminating pod is on its way out: it is not counted, never chosen
+//! for eviction, and still holds its name, so its replacement takes the
+//! next free index rather than its own.
 //!
 //! No scheduling here — that's the scheduler's job. The Pods get
 //! created without `spec.nodeName`; the scheduler binds them in
@@ -26,7 +31,7 @@ use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::{ObjectMeta, REPLICAS, ShapeError};
 use crate::owned_children::{
-    OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
+    OwnedChildrenReconciler, ParentGvk, ReconcileDelta, live_children, pod_from_template,
 };
 use crate::owner::{OwnerReference, owner_ref_for};
 use crate::reads::gvk;
@@ -164,7 +169,12 @@ impl OwnedChildrenReconciler for ReplicaSetController {
         // (an Event on it) with nothing created or evicted — never the
         // default's count.
         let desired = REPLICAS.read(rs_value)?.max(0) as usize;
-        let observed = owned_pods.len();
+        // A Terminating pod is already going: counting it would leave the
+        // set a replica short until its finalizers clear, and evicting it
+        // again would be a delete that changes nothing while a live pod the
+        // count needs gone stays (I3).
+        let live: Vec<&(ResourceKey, Value)> = live_children(owned_pods).collect();
+        let observed = live.len();
 
         // Fixpoint — nothing to create or evict.
         if observed == desired {
@@ -197,6 +207,8 @@ impl OwnedChildrenReconciler for ReplicaSetController {
             // the lowest free index instead recreates `<rs>-0` (the freed
             // slot), so the survivor `<rs>-1` is never touched. Names stay
             // deterministic for tests; self-heal after a middle delete works.
+            // Every owned pod, Terminating ones included: a Terminating pod
+            // still holds its name until its finalizers clear.
             let used = used_indices(rs_value.name(), owned_pods);
             let free = free_indices(&used, desired - observed);
             for idx in free {
@@ -214,12 +226,12 @@ impl OwnedChildrenReconciler for ReplicaSetController {
                 });
             }
         } else {
-            // observed > desired — evict the excess by name order (highest
-            // names first) for deterministic eviction.
+            // observed > desired — evict the excess live pods by name order
+            // (highest names first) for deterministic eviction.
             let to_delete = observed - desired;
-            let mut owned_sorted: Vec<&(ResourceKey, Value)> = owned_pods.iter().collect();
-            owned_sorted.sort_by(|a, b| a.0.name.cmp(&b.0.name));
-            for (pod_key, _) in owned_sorted.iter().rev().take(to_delete) {
+            let mut live_sorted = live;
+            live_sorted.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+            for (pod_key, _) in live_sorted.iter().rev().take(to_delete) {
                 commands.push(ResourceCommand::delete(
                     (*pod_key).clone(),
                     Reason::Controller,
@@ -236,13 +248,16 @@ impl OwnedChildrenReconciler for ReplicaSetController {
         owned_now: &[(ResourceKey, Value)],
         observed_generation: i64,
     ) -> Option<Value> {
-        // Status computed from the LIVE owned pods AFTER the reconcile
-        // delta. readyReplicas counts Ready=True pods; availableReplicas
-        // == readyReplicas at M0.1 (no minReadySeconds);
-        // fullyLabeledReplicas == replicas.
-        let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
-        let ready = i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
-            .unwrap_or(i64::MAX);
+        // Status computed from the owned pods AFTER the reconcile delta,
+        // counting only the live ones (upstream `calculateStatus` over
+        // `FilterActivePods`): a Terminating pod is not a replica.
+        // readyReplicas counts Ready=True pods; availableReplicas ==
+        // readyReplicas at M0.1 (no minReadySeconds); fullyLabeledReplicas
+        // == replicas.
+        let live: Vec<&(ResourceKey, Value)> = live_children(owned_now).collect();
+        let replicas = i64::try_from(live.len()).unwrap_or(i64::MAX);
+        let ready =
+            i64::try_from(live.iter().filter(|(_, p)| pod_is_ready(p)).count()).unwrap_or(i64::MAX);
         Some(json!({
             "replicas": replicas,
             "readyReplicas": ready,

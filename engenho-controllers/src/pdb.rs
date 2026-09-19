@@ -17,7 +17,7 @@
 //!   * `currentHealthy` = matched pods that are Ready (status.conditions
 //!     `Ready=True`).
 //!   * `desiredHealthy` is resolved from the `minAvailable` / `maxUnavailable`
-//!     [`IntOrString`] (mutually exclusive; int → that number, `"N%"` →
+//!     [`IntOrString`](engenho_types::primitives::int_or_string::IntOrString) (mutually exclusive; int → that number, `"N%"` →
 //!     `ceil(N/100 × expectedPods)`):
 //!       - `minAvailable` set ⇒ `desiredHealthy = resolve(minAvailable)`.
 //!       - `maxUnavailable` set ⇒ `desiredHealthy = expectedPods − resolve(maxUnavailable)`.
@@ -100,7 +100,7 @@ impl PodDisruptionBudgetController {
             .unwrap_or(false)
     }
 
-    /// Resolve a `minAvailable` / `maxUnavailable` [`IntOrString`] against a
+    /// Resolve a `minAvailable` / `maxUnavailable` `IntOrString` against a
     /// pod total. A bare integer JSON value resolves to itself; a string of
     /// the form `"N%"` resolves to `ceil(N/100 × total)` (K8s rounds the
     /// percentage UP for `minAvailable`/`maxUnavailable`); any other shape

@@ -260,6 +260,28 @@ impl SweepReport {
         self.retry_after = Some(self.retry_after.map_or(after, |d| d.min(after)));
     }
 
+    /// One tally for a tick that ran two sweeps, this one first: the counts
+    /// add, the retry owed is the earlier of the two, and the note is the
+    /// later sweep's when it gave one.
+    ///
+    /// A controller whose tick walks two kinds keeps a [`Sweep`] per kind,
+    /// because a sweep forgets every object it did not see fail; one sweep
+    /// over both would forget the other kind's failures each time.
+    #[must_use]
+    pub fn then(self, later: Self) -> Self {
+        Self {
+            changed: self.changed + later.changed,
+            unchanged: self.unchanged + later.unchanged,
+            skipped: self.skipped + later.skipped,
+            failed: self.failed + later.failed,
+            note: later.note.or(self.note),
+            retry_after: match (self.retry_after, later.retry_after) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+        }
+    }
+
     /// Log this tally for `controller`, at WARN when anything failed.
     pub fn log(&self, controller: &str) {
         let note = self.note.unwrap_or("");
@@ -546,6 +568,10 @@ impl Sweep {
 /// ```
 macro_rules! impl_sweep_event_sink {
     ($controller:ty) => {
+        $crate::sweep::impl_sweep_event_sink!($controller: sweep);
+    };
+    // A controller that keeps one sweep per kind it walks names each field.
+    ($controller:ty: $($field:ident),+ $(,)?) => {
         impl $controller {
             /// Builder: wire the sink this controller announces a failed
             /// object through — a Warning Event on that object, once per
@@ -555,7 +581,7 @@ macro_rules! impl_sweep_event_sink {
                 mut self,
                 events: ::std::sync::Arc<dyn $crate::event_recorder::EventSink>,
             ) -> Self {
-                self.sweep = self.sweep.with_event_sink(events);
+                $(self.$field = self.$field.with_event_sink(::std::sync::Arc::clone(&events));)+
                 self
             }
         }
@@ -630,6 +656,38 @@ mod tests {
 
     fn sweep_with(events: Arc<CollectingEventSink>) -> Sweep {
         Sweep::new("test-controller", Reason::ProvisioningFailed).with_event_sink(events)
+    }
+
+    /// Two sweeps in one tick fold into one tally: counts add, the earlier
+    /// retry wins, and a later sweep with nothing to say keeps the earlier
+    /// note.
+    #[test]
+    fn two_sweeps_fold_into_one_tally() {
+        let mut first = SweepReport::default();
+        first.record(&answer("new").unwrap());
+        first.record(&ObjectOutcome::skipped_because("first"));
+        first.owe(Duration::from_secs(4));
+        let mut later = SweepReport::default();
+        later.record(&ObjectOutcome::Unchanged);
+        later.owe(Duration::from_secs(2));
+
+        let both = first.then(later);
+
+        assert_eq!(
+            (
+                both.changed(),
+                both.unchanged(),
+                both.skipped(),
+                both.failed()
+            ),
+            (1, 1, 1, 0)
+        );
+        assert_eq!(both.examined(), 3);
+        assert_eq!(both.note(), Some("first"));
+        assert_eq!(both.retry_after(), Some(Duration::from_secs(2)));
+        let mut noted = SweepReport::default();
+        noted.record(&ObjectOutcome::skipped_because("later"));
+        assert_eq!(both.then(noted).note(), Some("later"));
     }
 
     async fn run(

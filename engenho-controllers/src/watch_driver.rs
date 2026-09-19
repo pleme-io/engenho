@@ -317,6 +317,16 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
     config: WatchDriverConfig,
     beat: Arc<Heartbeat>,
 ) -> Infallible {
+    // Every field is bound by name, with no `..`: a field added to
+    // WatchDriverConfig does not compile here (E0027) until the loop
+    // consumes it — a config knob nothing reads cannot ship.
+    let WatchDriverConfig {
+        filter,
+        debounce,
+        fallback_interval,
+        stuck_tick_after,
+        tick_state,
+    } = config;
     let name = controller.name();
     let mut rx = subscribe(store.as_ref(), name, Duration::ZERO).await;
     // Re-subscribes since the last delivered event: reset whenever a
@@ -329,8 +339,8 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
     // there is no second one to pile up.
     let mut ticker = Ticker {
         controller,
-        stuck_after: config.stuck_tick_after,
-        tick_state: config.tick_state,
+        stuck_after: stuck_tick_after,
+        tick_state,
         slot: RequeueSlot::default(),
         failures: ConsecutiveFailures::default(),
         beat,
@@ -338,11 +348,11 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
 
     info!(
         controller = name,
-        debounce_ms = millis(config.debounce),
-        fallback_s = if config.fallback_interval == Duration::MAX {
+        debounce_ms = millis(debounce),
+        fallback_s = if fallback_interval == Duration::MAX {
             0
         } else {
-            config.fallback_interval.as_secs()
+            fallback_interval.as_secs()
         },
         "watch driver started"
     );
@@ -366,17 +376,17 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
     // the way a closed `ResultChan` sends upstream's reflector back
     // through `ListAndWatch`.
     loop {
-        match wait_for_relevant_event(rx.as_mut(), &config, ticker.slot).await {
+        match wait_for_relevant_event(rx.as_mut(), &filter, fallback_interval, ticker.slot).await {
             EventOrTimer::Event => {
                 resubscribes.reset();
                 // Coalesce the burst, then tick once.
-                tokio::time::sleep(config.debounce).await;
+                tokio::time::sleep(debounce).await;
                 // A terminal can surface mid-drain. It is returned, never
                 // swallowed: the stream emits it EXACTLY ONCE, so dropping
                 // it here is how the subscription became silently dead.
                 let gone = rx
                     .as_mut()
-                    .and_then(|stream| drain_pending(stream, name, &config));
+                    .and_then(|stream| drain_pending(stream, name, &filter));
                 ticker.tick().await;
                 if let Some(gone) = gone {
                     warn!(
@@ -623,10 +633,11 @@ enum EventOrTimer {
 /// `min(fallback, requeue)` unless the stream says something first.
 async fn wait_for_relevant_event(
     rx: Option<&mut WatchStream>,
-    config: &WatchDriverConfig,
+    filter: &KindFilter,
+    fallback_interval: Duration,
     slot: RequeueSlot,
 ) -> EventOrTimer {
-    let fallback = tokio::time::sleep(config.fallback_interval);
+    let fallback = tokio::time::sleep(fallback_interval);
     tokio::pin!(fallback);
     let requeue = slot.due();
     tokio::pin!(requeue);
@@ -645,7 +656,7 @@ async fn wait_for_relevant_event(
             biased;
             res = rx.next() => match res {
                 Some(Ok(WatchSignal::Event(ev))) => {
-                    if config.filter.matches(&ev) {
+                    if filter.matches(&ev) {
                         return EventOrTimer::Event;
                     }
                     // Else loop — wait for the next signal.
@@ -676,12 +687,12 @@ async fn wait_for_relevant_event(
 fn drain_pending(
     stream: &mut WatchStream,
     controller_name: &'static str,
-    config: &WatchDriverConfig,
+    filter: &KindFilter,
 ) -> Option<WatchGone> {
     while let Some(item) = stream.try_next() {
         match item {
             Ok(WatchSignal::Event(ev)) => {
-                if config.filter.matches(&ev) {
+                if filter.matches(&ev) {
                     debug!(controller = controller_name, key = %ev.key.label(), "coalesced event");
                 }
             }
@@ -853,9 +864,8 @@ mod tests {
     #[test]
     fn a_terminal_reached_while_coalescing_is_returned_to_the_caller() {
         let mut stream = overflowed_stream();
-        let config = WatchDriverConfig::default();
 
-        let gone = drain_pending(&mut stream, "t", &config);
+        let gone = drain_pending(&mut stream, "t", &KindFilter::All);
 
         assert!(
             gone.is_some(),
@@ -871,9 +881,8 @@ mod tests {
     #[tokio::test]
     async fn the_drained_stream_is_finished_so_the_terminal_is_the_only_notice() {
         let mut stream = overflowed_stream();
-        let config = WatchDriverConfig::default();
 
-        let _ = drain_pending(&mut stream, "t", &config);
+        let _ = drain_pending(&mut stream, "t", &KindFilter::All);
 
         assert!(
             stream.next().await.is_none(),
@@ -1217,6 +1226,35 @@ mod tests {
         assert!(
             s.ticks + 1 >= EVENTS,
             "{} ticks for {EVENTS} events: the driver stopped ticking a failing controller",
+            s.ticks
+        );
+    }
+
+    /// `WatchDriverConfig::fallback_interval`'s doc says `Duration::MAX`
+    /// disables the fallback. Nothing checked it (I20): a driver with no
+    /// events and that fallback never ticks, while the same quiet day with
+    /// a finite fallback ticks once per interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_fallback_of_duration_max_never_fires() {
+        let day = Duration::from_secs(24 * 3600);
+
+        let disabled = Probe::new(Answer::Done);
+        let s = drive(&disabled, &Feed::new(), Duration::MAX, None, day).await;
+        assert_eq!(
+            s.ticks, 0,
+            "{} ticks in a quiet day with the fallback disabled",
+            s.ticks
+        );
+
+        // The control: the same quiet day with a 30 s fallback. Each wait
+        // starts after the previous 100 ms tick returns.
+        let enabled = Probe::new(Answer::Done);
+        let s = drive(&enabled, &Feed::new(), FALLBACK, None, day).await;
+        let period = u64::try_from((FALLBACK + TICK_TAKES).as_millis()).unwrap();
+        let expected = u64::try_from(day.as_millis()).unwrap() / period;
+        assert!(
+            s.ticks.abs_diff(expected) <= 1,
+            "{} fallback ticks in a quiet day, expected about {expected}",
             s.ticks
         );
     }

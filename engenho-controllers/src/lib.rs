@@ -4,27 +4,35 @@
 //!
 //!   * [`Controller`] trait — the second-site extraction of the
 //!     reconcile-loop shape (first site: `engenho-scheduler`'s
-//!     `Scheduler`). Future controllers all implement this.
+//!     `Scheduler`, which implements it too). Every controller here
+//!     implements it.
 //!   * [`replicaset::ReplicaSetController`] — first concrete
 //!     impl. Watches ReplicaSets, creates/deletes Pods so the
 //!     observed replica count matches `spec.replicas`.
+//!   * [`WatchDriver`] — the event loop that drives one controller from
+//!     store events, a requeue slot and a fallback timer. The daemon runs
+//!     each controller it spawns under one.
 //!   * [`runtime::ControllerRuntime`] — runs N controllers on a
-//!     shared tokio scheduler with per-controller intervals.
+//!     shared tokio scheduler with per-controller intervals, for
+//!     embedders and tests; the daemon does not use it.
 //!
 //! ## Why this is its own crate (not part of engenho-scheduler)
 //!
 //! The scheduler is one controller. The controllers crate is the
 //! HOME for all the others. Per the prime directive, the SHARED
-//! trait + runtime live here; engenho-scheduler keeps its
-//! `Scheduler` impl and will optionally implement [`Controller`]
-//! at R9.5 (cheap mechanical edit).
+//! trait + drivers live here; engenho-scheduler keeps its
+//! `Scheduler` and implements [`Controller`] for it.
 //!
 //! ## Owner references
 //!
 //! K8s controllers track ownership via `metadata.ownerReferences`.
-//! [`owner::set_owner_reference`] is the typed helper. Garbage
-//! collection of orphaned children is R9.7.
+//! [`owner::set_owner_reference`] is the typed helper; [`gc`] collects
+//! the dependents whose owners are gone.
 
+// A doc link to an item that does not exist is a comment naming code that
+// is not there (plan class D). This makes `cargo doc` refuse one. Tier: a
+// gate only where rustdoc runs; plain builds and tests never read it.
+#![deny(rustdoc::broken_intra_doc_links)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
@@ -35,6 +43,7 @@ pub mod build_backend_roceiro;
 mod closed_enum;
 pub mod cluster_ip;
 pub mod cni_status;
+pub mod condition;
 pub mod contain;
 pub mod controller;
 pub mod crd;
@@ -70,8 +79,10 @@ pub mod owner;
 pub mod pdb;
 pub mod plantio;
 pub mod plantio_pipeline;
+pub mod pod_scheduling;
 pub mod pod_template;
 pub mod pv_binder;
+pub mod pvc_protection;
 pub mod reads;
 pub mod replicaset;
 pub mod roceiro;
@@ -149,6 +160,7 @@ pub use engenho_substrate::FrozenClock;
     note = "use engenho_substrate::FrozenClock directly (ms precision)"
 )]
 pub type FixedClock = engenho_substrate::FrozenClock;
+pub use condition::{ConditionStatus, ConditionUpsert, DesiredCondition, upsert_condition};
 pub use curve::{Curve, Streak};
 pub use meta::{
     Container, DefaultedInt, FieldPath, JsonKind, ObjectMeta, REPLICAS, ShapeError, array_mut,
@@ -169,11 +181,17 @@ pub use plantio_pipeline::{
     LedgerChoice, LedgerWrappers, NodeResolverChoice, PipelineConfig, PlantioPipeline,
     RoceiroChoice, bootstrap_pipeline,
 };
+pub use pod_scheduling::{
+    BindOutcome, Binding, DEFAULT_SCHEDULER, PodSchedulingState, Schedulable, bind_cas,
+    mark_unschedulable_cas,
+};
 pub use pod_template::{NormalizedTemplate, POD_TEMPLATE_HASH_LABEL, TemplateHash};
 pub use pv_binder::{
     ClaimUid, ENGENHO_LOCAL_PATH_PROVISIONER, FakeProvisionerEnv, HostProvisionerEnv,
-    LOCAL_PATH_PROVISIONER, NoVolumeIdentity, ProvisionerEnv, PvBinderController, PvName,
+    LOCAL_PATH_PROVISIONER, LocalPathDir, NoVolumeIdentity, ProvisionerEnv, PvBinderController,
+    PvName, ReclaimError, ReclaimPolicy, Unreclaimable,
 };
+pub use pvc_protection::{PVC_PROTECTION_FINALIZER, PvcProtectionController};
 pub use reads::{DeclaresReads, Reads, gvk};
 pub use replicaset::ReplicaSetController;
 pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};
@@ -185,7 +203,8 @@ pub use service_router::{
 };
 pub use statefulset::StatefulSetController;
 pub use status::{
-    GENERATION, StatusWriteOutcome, generation_of, pod_is_ready, resource_version_of,
+    CasEnv, GENERATION, StatusEdit, StatusEditOutcome, StatusWriteOutcome, StoreCasEnv,
+    edit_status_cas, generation_of, pod_is_ready, resource_version_of, upsert_condition_cas,
     write_status_cas,
 };
 pub use store_ledger::{DEFAULT_RECEIPT_NAMESPACE, StoreBackedLedger};

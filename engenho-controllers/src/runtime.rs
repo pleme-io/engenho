@@ -1,16 +1,13 @@
 //! `ControllerRuntime` — runs N [`Controller`] impls on a shared
 //! tokio runtime with per-controller intervals.
 //!
-//! Operator code instantiates one [`ControllerRuntime`], registers
-//! controllers, calls [`ControllerRuntime::run`] which spawns
-//! per-controller tick loops. Each loop logs the [`ReconcileReport`]
-//! after every tick.
+//! An embedder instantiates one [`ControllerRuntime`], registers
+//! controllers, and calls [`ControllerRuntime::spawn`], which spawns one
+//! interval tick loop per controller. Each loop logs how every tick ended.
 //!
-//! At R9 the runtime is the simplest possible thing: a Vec of
-//! controllers + per-controller intervals. R9.5+ may add leader
-//! election (only one runtime instance ticks; others stand by),
-//! priority queues, and shared work queues — but the trait surface
-//! doesn't change.
+//! The daemon does not run controllers this way: it runs each one under a
+//! [`WatchDriver`](crate::WatchDriver) as a child of engenho-runtime's
+//! closed catalog (see [`ControllerRuntime::spawn`]).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -21,7 +18,7 @@ use tokio::task::JoinHandle;
 use crate::controller::Controller;
 use crate::watch_driver::{ConsecutiveFailures, log_tick, next_wake};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct RuntimeConfig {
     /// Default reconcile interval if a controller doesn't specify one.
     pub default_interval: Duration,
@@ -40,8 +37,20 @@ impl Default for RuntimeConfig {
 /// individual controllers can still override per-registration.
 impl From<&engenho_config::ControllersConfig> for RuntimeConfig {
     fn from(top: &engenho_config::ControllersConfig) -> Self {
+        // Every field is named, so a field added to ControllersConfig does
+        // not compile here (E0027) until someone decides whether this
+        // runtime reads it.
+        let engenho_config::ControllersConfig {
+            // Not read: this runtime has no per-controller gate, no
+            // namespace scope and no event debounce. It ticks whatever is
+            // registered, on an interval.
+            enable: _,
+            namespace: _,
+            debounce_milliseconds: _,
+            fallback_interval_seconds,
+        } = top;
         Self {
-            default_interval: Duration::from_secs(u64::from(top.fallback_interval_seconds)),
+            default_interval: Duration::from_secs(u64::from(*fallback_interval_seconds)),
         }
     }
 }
@@ -53,22 +62,26 @@ impl From<engenho_config::ControllersConfig> for RuntimeConfig {
 }
 
 pub struct ControllerRuntime {
-    config: RuntimeConfig,
+    /// The interval a controller registered without one ticks at.
+    default_interval: Duration,
     controllers: Vec<(Arc<dyn Controller>, Duration)>,
 }
 
 impl ControllerRuntime {
     #[must_use]
     pub fn new(config: RuntimeConfig) -> Self {
+        // Destructured with no `..`: a field added to RuntimeConfig does
+        // not compile here (E0027) until this constructor consumes it.
+        let RuntimeConfig { default_interval } = config;
         Self {
-            config,
+            default_interval,
             controllers: Vec::new(),
         }
     }
 
     /// Register a controller with the default interval.
     pub fn register<C: Controller + 'static>(&mut self, controller: C) -> &mut Self {
-        let interval = self.config.default_interval;
+        let interval = self.default_interval;
         self.controllers.push((Arc::new(controller), interval));
         self
     }

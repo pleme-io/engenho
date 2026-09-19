@@ -196,14 +196,19 @@ mod tests {
     use super::*;
 
     /// Every op, and what it means. Written as a table so a new variant is
-    /// a new row here as well as an arm in `of`.
-    const EVERY_OP: [(ResourceOp, Effect); 9] = [
+    /// a new row here as well as an arm in `of`. [`row`] is exhaustive, so
+    /// a new variant does not compile until it is given a slot here too;
+    /// `every_row_sits_in_its_slot` fails when a slot and the table
+    /// disagree. (A slot past the end with no row is caught only by the
+    /// reader of this table: nothing enumerates `ResourceOp`.)
+    const EVERY_OP: [(ResourceOp, Effect); 10] = [
         (ResourceOp::Created, Effect::Written(Landed(()))),
         (ResourceOp::Replaced, Effect::Written(Landed(()))),
         (ResourceOp::Patched, Effect::Written(Landed(()))),
         (ResourceOp::Deleted, Effect::Written(Landed(()))),
         (ResourceOp::DeletionPending, Effect::Written(Landed(()))),
         (ResourceOp::NoOp, Effect::Unchanged),
+        (ResourceOp::Unchanged, Effect::Unchanged),
         (ResourceOp::Conflict, Effect::Rejected(Refusal::Conflict)),
         (
             ResourceOp::PatchRejected,
@@ -214,6 +219,38 @@ mod tests {
             Effect::Rejected(Refusal::ApplyConflict),
         ),
     ];
+
+    /// The slot of `op` in [`EVERY_OP`]. Exhaustive with no wildcard: a new
+    /// `ResourceOp` does not compile until it has one.
+    const fn row(op: ResourceOp) -> usize {
+        match op {
+            ResourceOp::Created => 0,
+            ResourceOp::Replaced => 1,
+            ResourceOp::Patched => 2,
+            ResourceOp::Deleted => 3,
+            ResourceOp::DeletionPending => 4,
+            ResourceOp::NoOp => 5,
+            ResourceOp::Unchanged => 6,
+            ResourceOp::Conflict => 7,
+            ResourceOp::PatchRejected => 8,
+            ResourceOp::ApplyConflict => 9,
+        }
+    }
+
+    #[test]
+    fn every_row_sits_in_its_slot() {
+        for (slot, (op, _)) in EVERY_OP.iter().enumerate() {
+            assert_eq!(row(*op), slot, "{op:?} sits in the wrong row");
+        }
+    }
+
+    /// T3.5's `Unchanged` (an identical Put or Patch: no revision, no
+    /// event) is no change, the same as a delete the store answered `NoOp`.
+    #[test]
+    fn an_identical_write_is_not_a_change() {
+        assert_eq!(Effect::of(ResourceOp::Unchanged), Effect::Unchanged);
+        assert!(!Effect::of(ResourceOp::Unchanged).landed());
+    }
 
     #[test]
     fn only_an_op_that_changed_the_catalog_landed() {

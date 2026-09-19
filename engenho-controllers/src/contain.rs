@@ -27,8 +27,9 @@
 //!   half-updated, a std `Mutex` the panic poisoned, a tokio lock guarding a
 //!   torn value. Re-ticking over that is acting on state that is no longer
 //!   true. The driver does not contain the panic; it ends the child's task,
-//!   the runtime marks it Dead, and liveness shows it. For the kubelet, Dead
-//!   is the park.
+//!   and the runtime marks it Dead and logs it at ERROR. `/livez` reports it
+//!   only once a liveness source reads the children (T2.8); until then the
+//!   ERROR line is the notice. For the kubelet, Dead is the park.
 //!
 //! When in doubt a child is Stateful: the wrong answer in that direction
 //! costs availability, the wrong answer in the other costs correctness.

@@ -105,7 +105,6 @@ pub struct MutatingWebhook {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebhookClientConfig {
     /// `clientConfig.url` — a fully-qualified `https://…/path` endpoint.
-    /// `Some` is the supported path today.
     pub url: Option<String>,
     /// `clientConfig.service` — an in-cluster Service ref. Resolved to the
     /// Service's allocated ClusterIP via a [`ServiceResolver`] when one is
@@ -847,13 +846,25 @@ impl MutatingWebhookPlugin {
     }
 
     /// Resolve the endpoint + invoke the [`WebhookCaller`], parsing the
-    /// response. A `service` ref with no `url` is a typed deferral error.
+    /// response. A `url` wins over a `service` ref; a `service` ref alone is
+    /// resolved through the [`ServiceResolver`]; neither is
+    /// [`WebhookError::NoEndpoint`]. The `caBundle` goes to the caller with
+    /// every call.
     async fn call_one(
         &self,
         webhook: &MutatingWebhook,
         review_req: &Value,
     ) -> Result<WebhookResponse, WebhookError> {
-        let endpoint = match (&webhook.client_config.url, &webhook.client_config.service) {
+        // Bound by name with no `..`: a `clientConfig` field added to
+        // WebhookClientConfig does not compile here (E0027) until the call
+        // path consumes it, so a parsed security control cannot be dropped
+        // on the way to the caller.
+        let WebhookClientConfig {
+            url,
+            service,
+            ca_bundle,
+        } = &webhook.client_config;
+        let endpoint = match (url, service) {
             (Some(url), _) => url.clone(),
             (None, Some(svc)) => self.resolve_service_endpoint(&webhook.name, svc).await?,
             (None, None) => {
@@ -866,7 +877,7 @@ impl MutatingWebhookPlugin {
             .caller
             .call(
                 &endpoint,
-                webhook.client_config.ca_bundle.as_deref(),
+                ca_bundle.as_deref(),
                 webhook.timeout_seconds,
                 review_req,
             )
@@ -1065,6 +1076,8 @@ struct MockCallerState {
     errors: std::collections::BTreeMap<String, String>,
     /// (endpoint, timeout, request) call log.
     calls: Vec<(String, u32, Value)>,
+    /// The `caBundle` each call carried, in call order.
+    ca_bundles: Vec<Option<String>>,
 }
 
 impl MockWebhookCaller {
@@ -1095,6 +1108,11 @@ impl MockWebhookCaller {
     /// The recorded calls `(endpoint, timeout_seconds, request)`.
     pub async fn calls(&self) -> Vec<(String, u32, Value)> {
         self.inner.lock().await.calls.clone()
+    }
+
+    /// The `caBundle` each recorded call carried, in call order.
+    pub async fn ca_bundles(&self) -> Vec<Option<String>> {
+        self.inner.lock().await.ca_bundles.clone()
     }
 
     /// Convenience: a `JSONPatch` `AdmissionReview` response from RFC6902 ops.
@@ -1174,7 +1192,7 @@ impl WebhookCaller for MockWebhookCaller {
     async fn call(
         &self,
         endpoint: &str,
-        _ca_bundle: Option<&str>,
+        ca_bundle: Option<&str>,
         timeout_seconds: u32,
         review_request: &Value,
     ) -> Result<Value, String> {
@@ -1184,6 +1202,7 @@ impl WebhookCaller for MockWebhookCaller {
             timeout_seconds,
             review_request.clone(),
         ));
+        state.ca_bundles.push(ca_bundle.map(str::to_string));
         if let Some(msg) = state.errors.get(endpoint) {
             return Err(msg.clone());
         }
@@ -1662,6 +1681,108 @@ mod tests {
             other => panic!("expected Deny, got {other:?}"),
         }
         assert_eq!(caller.calls().await.len(), 0);
+    }
+
+    // ── The `clientConfig` doc claims, bound (I20) ──────────────────────
+    //
+    // WebhookClientConfig's docs say a `url` wins over a `service` ref and
+    // that the `caBundle` is "threaded to the caller, surfaced never
+    // dropped". Nothing checked either: the mock caller discarded the
+    // bundle, so a call path that passed `None` stayed green.
+
+    /// A `clientConfig` carrying both a `url` and a `service` ref.
+    fn url_and_service_config(url: &str, ca_bundle: Option<&str>) -> Value {
+        let mut client = json!({
+            "url": url,
+            "service": { "namespace": "mesh", "name": "injector", "port": 8443 }
+        });
+        if let Some(bundle) = ca_bundle {
+            client["caBundle"] = json!(bundle);
+        }
+        json!({
+            "kind": "MutatingWebhookConfiguration",
+            "webhooks": [{
+                "name": "both.mesh.io",
+                "clientConfig": client,
+                "rules": [{
+                    "operations": ["CREATE"], "apiGroups": [""],
+                    "apiVersions": ["v1"], "resources": ["pods"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_url_wins_over_a_service_ref() {
+        let url = "https://inject.example/mutate";
+        let source = Arc::new(StaticConfigSource::new(vec![url_and_service_config(
+            url, None,
+        )]));
+        let caller = Arc::new(MockWebhookCaller::new());
+        caller
+            .set_response(url, MockWebhookCaller::allow_review("u"))
+            .await;
+        // The service ref WOULD resolve, so only precedence keeps it unused.
+        let resolver = Arc::new(MockServiceResolver::new().with("mesh", "injector", "10.96.0.5"));
+        let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer())
+            .with_resolver(resolver);
+
+        let decision = plugin.review(&pod_request()).await.unwrap();
+
+        assert!(
+            matches!(decision, AdmissionDecision::Allow),
+            "expected Allow, got {decision:?}"
+        );
+        let endpoints: Vec<String> = caller.calls().await.into_iter().map(|c| c.0).collect();
+        assert_eq!(
+            endpoints,
+            vec![url.to_string()],
+            "the url must win over the service ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ca_bundle_reaches_the_caller_on_both_endpoint_paths() {
+        let bundle = "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t";
+        // Path 1: a url.
+        let url = "https://inject.example/mutate";
+        let source = Arc::new(StaticConfigSource::new(vec![url_and_service_config(
+            url,
+            Some(bundle),
+        )]));
+        let caller = Arc::new(MockWebhookCaller::new());
+        caller
+            .set_response(url, MockWebhookCaller::allow_review("u"))
+            .await;
+        let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer());
+        let _ = plugin.review(&pod_request()).await.unwrap();
+        assert_eq!(
+            caller.ca_bundles().await,
+            vec![Some(bundle.to_string())],
+            "the caBundle was dropped on the url path"
+        );
+
+        // Path 2: a service ref resolved to its ClusterIP.
+        let mut cfg = service_ref_config("mesh", "injector", 8443, "/mutate");
+        cfg["webhooks"][0]["clientConfig"]["caBundle"] = json!(bundle);
+        let source = Arc::new(StaticConfigSource::new(vec![cfg]));
+        let caller = Arc::new(MockWebhookCaller::new());
+        caller
+            .set_response(
+                "https://10.96.0.5:8443/mutate",
+                MockWebhookCaller::allow_review("u"),
+            )
+            .await;
+        let resolver = Arc::new(MockServiceResolver::new().with("mesh", "injector", "10.96.0.5"));
+        let plugin = MutatingWebhookPlugin::new(source, caller.clone(), pluralizer())
+            .with_resolver(resolver);
+        let _ = plugin.review(&pod_request()).await.unwrap();
+        assert_eq!(
+            caller.ca_bundles().await,
+            vec![Some(bundle.to_string())],
+            "the caBundle was dropped on the service-ref path"
+        );
     }
 
     #[test]

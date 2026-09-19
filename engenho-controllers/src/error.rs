@@ -5,6 +5,7 @@ use shigoto_types::failure::FailureKind;
 
 use crate::contain::PanicMessage;
 use crate::meta::ShapeError;
+use crate::pv_binder::ReclaimError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControllerError {
@@ -23,6 +24,12 @@ pub enum ControllerError {
     #[error("internal: {0}")]
     Internal(String),
 
+    /// A Released volume could not be reclaimed under its policy. Typed so
+    /// its class is the variant's, never its wording: an unreclaimable
+    /// volume is Declarative, a deleter that failed this time is Transient.
+    #[error("reclaim: {0}")]
+    Reclaim(#[from] ReclaimError),
+
     /// The tick panicked, and the driver contained it (T2.7).
     ///
     /// Made only by the [`crate::WatchDriver`] around a whole tick of a
@@ -39,6 +46,7 @@ engenho_substrate::impl_error_kind! {
         (InvalidResource(_)) => "invalid_resource",
         (Shape(_)) => "shape",
         (Internal(_)) => "internal",
+        (Reclaim(_)) => "reclaim",
         (Panicked(_)) => "panicked",
     }
 }
@@ -71,6 +79,7 @@ impl ControllerError {
     ///     shigoto: an extra retry on the growing curve is cheaper than
     ///     wedging a controller over a condition that would have cleared.
     ///   * `Store` — by [`store_class`].
+    ///   * `Reclaim` — by [`ReclaimError::class`].
     ///   * `Panicked` — Declarative: no targeted retry. A panic is a bug
     ///     meeting the data it trips on, and a retry a second later meets the
     ///     same data. The next event (the data changed) or the fallback
@@ -85,6 +94,7 @@ impl ControllerError {
                 FailureKind::Declarative
             }
             Self::Internal(_) => FailureKind::Transient,
+            Self::Reclaim(e) => e.class(),
         }
     }
 }
@@ -126,13 +136,16 @@ impl ControllerError {
     ///     malformed; its neighbours' are not.
     ///   * `Internal` — Item. It wraps a controller's own work on one
     ///     object (a directory it provisions, a tree it copies).
+    ///   * `Reclaim` — Item. It is one volume's backing storage.
     ///   * `Panicked` — Sweep. The panic ended the whole tick, sweep and all;
     ///     the driver makes it around the tick, never inside one.
     #[must_use]
     pub const fn scope(&self) -> ErrorScope {
         match self {
             Self::Store(e) => store_scope(e),
-            Self::InvalidResource(_) | Self::Shape(_) | Self::Internal(_) => ErrorScope::Item,
+            Self::InvalidResource(_) | Self::Shape(_) | Self::Internal(_) | Self::Reclaim(_) => {
+                ErrorScope::Item
+            }
             Self::Panicked(_) => ErrorScope::Sweep,
         }
     }
@@ -180,6 +193,7 @@ const fn store_class(e: &StoreError) -> FailureKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pv_binder::Unreclaimable;
 
     /// A `StoreError::Persist`, built the way `FjallStore` builds one.
     fn persist() -> StoreError {
@@ -206,6 +220,10 @@ mod tests {
             ),
             (ControllerError::Shape(shape_error()), "shape"),
             (ControllerError::Internal("x".into()), "internal"),
+            (
+                ControllerError::Reclaim(ReclaimError::Unreclaimable(Unreclaimable::NoDeleter)),
+                "reclaim",
+            ),
             (ControllerError::Panicked(PanicMessage::Opaque), "panicked"),
         ] {
             assert_eq!(e.kind(), k);
@@ -232,6 +250,12 @@ mod tests {
                 | ControllerError::Shape(_)
                 | ControllerError::Panicked(_) => FailureKind::Declarative,
                 ControllerError::Internal(_) => FailureKind::Transient,
+                ControllerError::Reclaim(r) => match r {
+                    ReclaimError::Unreclaimable(_) => FailureKind::Declarative,
+                    ReclaimError::RemoveDir(_) | ReclaimError::CsiDelete { .. } => {
+                        FailureKind::Transient
+                    }
+                },
             };
             (e, want)
         }
@@ -245,6 +269,16 @@ mod tests {
             row(ControllerError::InvalidResource(m())),
             row(ControllerError::Shape(shape_error())),
             row(ControllerError::Internal(m())),
+            row(ControllerError::Reclaim(ReclaimError::Unreclaimable(
+                Unreclaimable::UnsupportedPolicy,
+            ))),
+            row(ControllerError::Reclaim(ReclaimError::RemoveDir(
+                std::io::Error::other("busy"),
+            ))),
+            row(ControllerError::Reclaim(ReclaimError::CsiDelete {
+                driver: m(),
+                reason: m(),
+            })),
             row(ControllerError::Panicked(PanicMessage::Text(m()))),
         ]
     }
@@ -265,7 +299,8 @@ mod tests {
                 },
                 ControllerError::InvalidResource(_)
                 | ControllerError::Shape(_)
-                | ControllerError::Internal(_) => ErrorScope::Item,
+                | ControllerError::Internal(_)
+                | ControllerError::Reclaim(_) => ErrorScope::Item,
                 ControllerError::Panicked(_) => ErrorScope::Sweep,
             };
             (e, want)
@@ -276,7 +311,7 @@ mod tests {
     #[test]
     fn store_errors_and_panics_stop_a_sweep_and_nothing_else_does() {
         let rows = every_scope();
-        assert_eq!(rows.len(), 9, "one row per variant");
+        assert_eq!(rows.len(), 12, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.scope(), want, "{e:?}");
         }
@@ -285,7 +320,7 @@ mod tests {
     #[test]
     fn every_error_variant_maps_to_its_retry_class() {
         let rows = every_variant();
-        assert_eq!(rows.len(), 9, "one row per variant");
+        assert_eq!(rows.len(), 12, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.classify(), want, "{e:?}");
         }

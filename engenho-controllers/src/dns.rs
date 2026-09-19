@@ -1,10 +1,10 @@
-//! R12 — DNS controller (CoreDNS-equivalent).
+//! R12 — DNS controller.
 //!
 //! For each Service in the store, register a DNS A record
-//! `{service}.{namespace}.svc.cluster.local → clusterIP`. Pluggable
-//! [`DnsBackend`] trait — InMemoryDnsZone (tests + small clusters)
-//! + ZoneFileBackend (writes a CoreDNS-compatible zone file for
-//! production deployments).
+//! `{service}.{namespace}.svc.cluster.local → clusterIP` in a pluggable
+//! [`DnsBackend`] ([`InMemoryDnsZone`] is the in-memory one). Whether the
+//! daemon runs this controller, and why not, is recorded once, in
+//! engenho-runtime's dormant-controller catalog (`Dormant::Dns`).
 //!
 //! ## Reconcile rule
 //!
@@ -13,10 +13,6 @@
 //! 3. Diff against backend's installed records.
 //! 4. upsert mismatches; remove orphans.
 //! 5. Idempotent — re-tick is no-op.
-//!
-//! Service-discovery for Pods + cross-Pod resolution uses
-//! `kubernetes.default.svc.cluster.local` style names. Operators
-//! point pod resolv.conf at the engenho-coredns sidecar.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

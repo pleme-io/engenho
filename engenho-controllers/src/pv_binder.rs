@@ -40,6 +40,19 @@
 //! nothing renames a bound volume, and a claim whose PV was written but not
 //! yet bound finds it again through its `claimRef` uid.
 //!
+//! ## Released, then reclaimed
+//!
+//! Each tick also walks the PVs, after the claims ([`lifecycle`]): a PV
+//! whose claim is gone goes `Released`, and its reclaim policy decides the
+//! rest — `Delete` removes the backing storage and then the PV, `Retain`
+//! keeps it `Released` until an operator clears its `claimRef`. A claim
+//! that pvc-protection still holds is not gone
+//! ([`crate::pvc_protection`]).
+//!
+//! Every claim write is at the revision the claim was read at, so a bind
+//! never overwrites what another writer did since the list: the
+//! pvc-protection finalizer, a `deletionTimestamp`, or the claim's delete.
+//!
 //! ## volumeBindingMode
 //!
 //! `Immediate` (the default + only mode this brick provisions in) provisions
@@ -66,6 +79,7 @@
 //! is no `todo!()` / `unimplemented!()` / `panic!()` anywhere in the path.
 
 mod identity;
+mod lifecycle;
 
 use std::sync::Arc;
 
@@ -86,10 +100,13 @@ use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::reads::{DeclaresReads, Reads, gvk};
+use crate::status::resource_version_of;
 use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
 use crate::volume_snapshot::{SNAPSHOT_GROUP, SNAPSHOT_VERSION};
 
 pub use identity::{ClaimUid, LocalPathDir, NoVolumeIdentity, PvName};
+use lifecycle::PROVISIONED_BY;
+pub use lifecycle::{ReclaimError, ReclaimPolicy, Unreclaimable};
 
 /// The local-path provisioner identifier. A StorageClass whose
 /// `provisioner` is this string (the rancher.io/local-path de-facto
@@ -122,6 +139,10 @@ const SNAPSHOT_NOT_READY: &str = "PVC names a VolumeSnapshot dataSource that is 
 
 /// The report note for a `WaitForFirstConsumer` claim.
 const WAIT_FOR_FIRST_CONSUMER: &str = "WaitForFirstConsumer PVC left Pending (deferred)";
+
+/// The report note for a claim that cannot be written at a known revision.
+const CLAIM_NO_REVISION: &str = "PVC carries no resourceVersion, so a bind cannot be written at \
+     the revision it was read at; left for the next pass";
 
 /// The report note for a claim whose derived PV name is already held by a
 /// PV that is not bound to it. Nothing is overwritten and nothing is
@@ -189,6 +210,19 @@ pub trait ProvisionerEnv: Send + Sync {
     /// Pending — an EMPTY volume presented as a restored one is the silent
     /// wrong answer this whole controller refuses to give.
     fn restore_tree(&self, src: &str, dst: &str) -> Result<(), String>;
+
+    /// Remove a Released local-path volume's backing directory, and
+    /// everything in it. Already absent is success: a retry after a PV
+    /// delete that did not land removes nothing twice.
+    ///
+    /// Takes a [`LocalPathDir`], whose only constructor derives it from a
+    /// validated claim uid, namespace and name under the provisioner's
+    /// root, so this seam cannot be asked to remove any other path.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error. The volume stays Released and the removal is retried.
+    fn remove_dir(&self, dir: &LocalPathDir<'_>) -> std::io::Result<()>;
 }
 
 /// Production [`ProvisionerEnv`] — `std::fs::create_dir_all` rooted under the
@@ -211,6 +245,15 @@ impl ProvisionerEnv for HostProvisionerEnv {
             dst,
         )
     }
+
+    /// `remove_dir_all` does not follow a symlink it meets, the directory
+    /// itself included: a link is removed, never its target.
+    fn remove_dir(&self, dir: &LocalPathDir<'_>) -> std::io::Result<()> {
+        match std::fs::remove_dir_all(dir.to_string()) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            done => done,
+        }
+    }
 }
 
 /// The PV/PVC binder controller + local-path dynamic provisioner.
@@ -230,9 +273,14 @@ pub struct PvBinderController {
     csi: Arc<dyn CsiProvisioner>,
     /// Per-claim isolation: one claim's failure costs only that claim.
     sweep: Sweep,
+    /// Per-volume isolation for the lifecycle walk. Its own sweep, because
+    /// a sweep forgets the failures of every object it did not see: one
+    /// sweep over both kinds would forget the claims' each time it walked
+    /// the volumes.
+    volume_sweep: Sweep,
 }
 
-impl_sweep_event_sink!(PvBinderController);
+impl_sweep_event_sink!(PvBinderController: sweep, volume_sweep);
 
 impl PvBinderController {
     /// New binder with the production [`HostProvisionerEnv`]. `local_path_root`
@@ -250,6 +298,7 @@ impl PvBinderController {
             env: Arc::new(HostProvisionerEnv),
             csi: Arc::new(NoCsiProvisioner),
             sweep: Sweep::new(COMPONENT, EventReason::ProvisioningFailed),
+            volume_sweep: Sweep::new(COMPONENT, EventReason::VolumeFailedDelete),
         }
     }
 
@@ -269,6 +318,7 @@ impl PvBinderController {
             env,
             csi: Arc::new(NoCsiProvisioner),
             sweep: Sweep::new(COMPONENT, EventReason::ProvisioningFailed),
+            volume_sweep: Sweep::new(COMPONENT, EventReason::VolumeFailedDelete),
         }
     }
 
@@ -545,7 +595,7 @@ impl PvBinderController {
             "metadata": {
                 "name": pv_name,
                 "annotations": {
-                    "pv.kubernetes.io/provisioned-by": ENGENHO_LOCAL_PATH_PROVISIONER
+                    PROVISIONED_BY: ENGENHO_LOCAL_PATH_PROVISIONER
                 }
             },
             "spec": {
@@ -709,7 +759,7 @@ impl PvBinderController {
             "kind": "PersistentVolume",
             "metadata": {
                 "name": pv_name,
-                "annotations": { "pv.kubernetes.io/provisioned-by": provisioner }
+                "annotations": { PROVISIONED_BY: provisioner }
             },
             "spec": {
                 // The DRIVER's capacity, which may exceed the request: a
@@ -759,6 +809,9 @@ impl PvBinderController {
         pv_name: &str,
         pv: Value,
     ) -> Result<ObjectOutcome, ControllerError> {
+        let Some(claim_revision) = resource_version_of(pvc) else {
+            return Ok(ObjectOutcome::skipped_because(CLAIM_NO_REVISION));
+        };
         let volume_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", pv_name);
         let applied = self
             .store
@@ -781,21 +834,61 @@ impl PvBinderController {
             Effect::Unchanged => return Ok(ObjectOutcome::skipped_because(PV_NAME_TAKEN)),
             refused @ Effect::Rejected(_) => return Ok(ObjectOutcome::from(refused)),
         };
+        // At the claim's revision: a claim that moved since it was read
+        // finds this PV through its claimRef uid on the next pass.
         let claim = self
-            .put(pvc_key.clone(), Self::bind_pvc(pvc.clone(), pv_name))
+            .put(
+                pvc_key.clone(),
+                Self::bind_pvc(pvc.clone(), pv_name),
+                Some(claim_revision),
+            )
             .await?;
         Ok(ObjectOutcome::from(volume.and(claim)))
     }
 
-    /// Write a Put for a resource value (Controller reason), and say what
-    /// the store did with it.
-    async fn put(&self, key: ResourceKey, value: Value) -> Result<Effect, ControllerError> {
+    /// Bind the listed claim to the existing PV `volume`: the claim first,
+    /// at the revision it was listed at, then the volume. A claim that
+    /// moved since is refused and nothing is bound; the next pass binds it
+    /// as it now stands.
+    async fn bind_existing(
+        &self,
+        (claim_key, listed): (&ResourceKey, &Value),
+        claim_revision: engenho_store::revision::Revision,
+        (volume_key, volume): (&ResourceKey, &Value),
+        claim: &ClaimId<'_>,
+    ) -> Result<Effect, ControllerError> {
+        let bound_claim = Self::bind_pvc(listed.clone(), &volume_key.name);
+        let written = self
+            .put(claim_key.clone(), bound_claim, Some(claim_revision))
+            .await?;
+        if let Effect::Rejected(_) = written {
+            return Ok(written);
+        }
+        let bound_volume = self
+            .put(
+                volume_key.clone(),
+                Self::bind_pv(volume.clone(), claim),
+                None,
+            )
+            .await?;
+        debug!(pvc = %claim_key.label(), pv = %volume_key.name, "bound PVC to existing PV");
+        Ok(written.and(bound_volume))
+    }
+
+    /// Write a Put for a resource value (Controller reason) at `expected`
+    /// (unconditional when `None`), and say what the store did with it.
+    async fn put(
+        &self,
+        key: ResourceKey,
+        value: Value,
+        expected: Option<engenho_store::revision::Revision>,
+    ) -> Result<Effect, ControllerError> {
         let applied = self
             .store
             .propose(ResourceCommand::Put {
                 key,
                 value,
-                expected: None,
+                expected,
                 reason: Reason::Controller,
             })
             .await?;
@@ -890,6 +983,14 @@ impl PvBinderController {
         }
         let pvc_ns = pvc_key.namespace.as_deref().unwrap_or("default");
         let pvc_name = &pvc_key.name;
+        // Every write to the claim is at the revision it was listed at. A
+        // Put of the listed copy made blind would overwrite whatever landed
+        // since: the pvc-protection finalizer, a deletionTimestamp — or the
+        // claim's delete itself, which a blind Put undoes by creating it
+        // again.
+        let Some(claim_revision) = resource_version_of(pvc) else {
+            return Ok(ObjectOutcome::skipped_because(CLAIM_NO_REVISION));
+        };
 
         // 0. IDENTITY. Every volume this claim is given — found or made —
         //    is tied to it by uid, so a claim with no usable uid has nothing
@@ -909,14 +1010,13 @@ impl PvBinderController {
         let candidate =
             Self::static_candidate(&view.pvs, pvc, &claim, pre_bound, &claimed_this_tick);
         if let Some((pv_key, pv)) = candidate {
-            let volume_name = pv_key.name.clone();
-            let bound_pvc = Self::bind_pvc(pvc.clone(), &volume_name);
-            let bound_pv = Self::bind_pv(pv.clone(), &claim);
-            let claim = self.put(pvc_key.clone(), bound_pvc).await?;
-            let volume = self.put(pv_key.clone(), bound_pv).await?;
-            debug!(pvc = %pvc_key.label(), pv = %volume_name, "bound PVC to existing PV");
-            claimed_this_tick.push(volume_name);
-            return Ok(ObjectOutcome::from(claim.and(volume)));
+            let bound = self
+                .bind_existing((pvc_key, pvc), claim_revision, (pv_key, pv), &claim)
+                .await?;
+            if !matches!(bound, Effect::Rejected(_)) {
+                claimed_this_tick.push(pv_key.name.clone());
+            }
+            return Ok(ObjectOutcome::from(bound));
         }
 
         // A pre-bound PVC whose named PV isn't available this pass waits;
@@ -1091,13 +1191,22 @@ impl Controller for PvBinderController {
         let claimed_this_tick = tokio::sync::Mutex::new(Vec::new());
 
         let (this, view, claimed) = (self, &view, &claimed_this_tick);
-        let report = self
+        let claims = self
             .sweep
             .run(&pvcs, |pvc_key, pvc| async move {
                 ObjectOutcome::settle(this.reconcile_claim(pvc_key, pvc, view, claimed).await)
             })
             .await?;
-        Ok(report.into())
+        // Then the volumes, as listed at the top of the tick. A PV bound or
+        // provisioned above is not among them; it is walked next tick.
+        let listed_claims = &pvcs;
+        let volumes = self
+            .volume_sweep
+            .run(&view.pvs, |pv_key, pv| async move {
+                ObjectOutcome::settle(this.reconcile_volume(pv_key, pv, listed_claims).await)
+            })
+            .await?;
+        Ok(claims.then(volumes).into())
     }
 }
 
@@ -1108,6 +1217,7 @@ impl Controller for PvBinderController {
 pub struct FakeProvisionerEnv {
     ensured: std::sync::Mutex<Vec<String>>,
     restored: std::sync::Mutex<Vec<(String, String)>>,
+    removed: std::sync::Mutex<Vec<String>>,
 }
 
 impl FakeProvisionerEnv {
@@ -1128,6 +1238,15 @@ impl FakeProvisionerEnv {
     pub fn restored_trees(&self) -> Vec<(String, String)> {
         self.restored.lock().unwrap().clone()
     }
+
+    /// The directories the mock was asked to remove, in call order.
+    #[must_use]
+    pub fn removed_dirs(&self) -> Vec<String> {
+        self.removed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl ProvisionerEnv for FakeProvisionerEnv {
@@ -1145,6 +1264,14 @@ impl ProvisionerEnv for FakeProvisionerEnv {
             .lock()
             .unwrap()
             .push((src.to_string(), dst.to_string()));
+        Ok(())
+    }
+
+    fn remove_dir(&self, dir: &LocalPathDir<'_>) -> std::io::Result<()> {
+        self.removed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(dir.to_string());
         Ok(())
     }
 }
@@ -1635,6 +1762,9 @@ mod tests {
         fn restore_tree(&self, _src: &str, _dst: &str) -> Result<(), String> {
             Ok(())
         }
+        fn remove_dir(&self, _dir: &LocalPathDir<'_>) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     async fn default_local_path_class(store: &StoreMesh) {
@@ -1838,8 +1968,8 @@ mod tests {
     }
 
     /// ★ THE DEFECT. A claim is provisioned, deleted, and created again
-    /// under the same namespace and name. Its PV is not reclaimed (nothing
-    /// reclaims yet), so it is still in the store. The new claim is a new
+    /// under the same namespace and name. Its PV goes Released on the tick
+    /// that notices, and is still in the store on that tick. The new claim is a new
     /// object with a new uid, and must get a new volume: on HEAD it was
     /// handed the same `pvc-<ns>-<name>` PV, re-Put over itself, and the
     /// same directory with the deleted claim's data in it.
@@ -1875,10 +2005,14 @@ mod tests {
             "the recreated claim must not mount the deleted claim's directory"
         );
         assert_eq!(second_pv["spec"]["claimRef"]["uid"], "uid-second");
+        let first_after = store.get(&pv_key(&first_pv_name)).await.unwrap();
         assert_eq!(
-            store.get(&pv_key(&first_pv_name)).await.unwrap(),
-            first_pv,
-            "the deleted claim's PV is left exactly as it was"
+            first_after["spec"], first_pv["spec"],
+            "the deleted claim's PV is not taken over: its claimRef and directory are its own"
+        );
+        assert_eq!(
+            first_after["status"]["phase"], "Released",
+            "its claim is gone, so it is Released"
         );
         let dirs = env.ensured_dirs();
         assert_eq!(dirs.len(), 2, "{dirs:?}");
@@ -1886,9 +2020,10 @@ mod tests {
     }
 
     /// An Available PV whose claimRef names this namespace and name but an
-    /// EARLIER uid is the earlier claim's (upstream would call it Released).
-    /// A new claim of the same name must not bind it — on HEAD the claimRef
-    /// was compared by namespace and name only.
+    /// EARLIER uid is the earlier claim's, and that claim is gone: the PV is
+    /// Released (upstream's call too). A new claim of the same name must
+    /// not bind it — on HEAD the claimRef was compared by namespace and
+    /// name only.
     #[tokio::test]
     async fn a_pv_reserved_for_an_earlier_claim_of_the_same_name_is_not_bound() {
         let store = live_store().await;
@@ -1916,7 +2051,7 @@ mod tests {
 
         assert_ne!(phase(&store, "data").await, "Bound");
         let pv = store.get(&pv_key("vol-old")).await.unwrap();
-        assert_eq!(pv["status"]["phase"], "Available");
+        assert_eq!(pv["status"]["phase"], "Released");
         assert_eq!(pv["spec"]["claimRef"]["uid"], "uid-old");
     }
 
@@ -2049,6 +2184,15 @@ mod tests {
                      "claimRef": {"namespace": "ns1", "name": "other", "uid": "uid-other"}},
             "status": {"phase": "Bound"}});
         put_op(&store, pv_key("pvc-uid-data"), foreign).await;
+        // The other claim exists and holds it, so the PV is Bound for real.
+        put_op(
+            &store,
+            pvc_key("ns1", "other"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                   "metadata": {"name": "other", "namespace": "ns1", "uid": "uid-other"},
+                   "spec": {"volumeName": "pvc-uid-data"}, "status": {"phase": "Bound"}}),
+        )
+        .await;
         let before = store.get(&pv_key("pvc-uid-data")).await.unwrap();
         put_claim(&store, "data", sized()).await;
         let env = Arc::new(FakeProvisionerEnv::new());
@@ -2108,10 +2252,13 @@ mod tests {
         assert_ne!(phase(&store, "data").await, "Bound");
     }
 
-    /// A CSI driver that records every name it is asked to create under.
+    /// A CSI driver that records every name it is asked to create under,
+    /// and every volume it is asked to delete.
     #[derive(Default)]
     struct RecordingDriver {
         names: std::sync::Mutex<Vec<String>>,
+        deleted: std::sync::Mutex<Vec<(String, String)>>,
+        refuse_deletes: bool,
     }
 
     #[async_trait]
@@ -2130,7 +2277,14 @@ mod tests {
                 volume_attributes: std::collections::BTreeMap::new(),
             })
         }
-        async fn delete_volume(&self, _driver: &str, _handle: &str) -> Result<(), String> {
+        async fn delete_volume(&self, driver: &str, handle: &str) -> Result<(), String> {
+            if self.refuse_deletes {
+                return Err("volume is attached".into());
+            }
+            self.deleted
+                .lock()
+                .unwrap()
+                .push((driver.to_string(), handle.to_string()));
             Ok(())
         }
     }
@@ -2209,6 +2363,483 @@ mod tests {
         let pv = store.get(&pv_key("pvc-uid-db-2")).await.unwrap();
         assert_eq!(pv["spec"]["csi"]["volumeHandle"], "vol-pvc-uid-db-2");
         assert_eq!(pv["spec"]["claimRef"]["uid"], "uid-db-2");
+    }
+
+    // ── Released, then reclaimed (W9) ────────────────────────────────
+
+    /// The directory the binder derives for claim `ns1/<name>` (uid
+    /// `uid-<name>`) under the test root.
+    fn local_dir(name: &str) -> String {
+        ["/data/local-path/pvc-uid-", name, "_ns1_", name].concat()
+    }
+
+    /// The default local-path class, reclaiming by `policy`.
+    async fn local_path_class_reclaiming(store: &StoreMesh, policy: &str) {
+        put_op(
+            store,
+            sc_key("local-path"),
+            json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
+                   "metadata": {"name": "local-path",
+                                "annotations": {"storageclass.kubernetes.io/is-default-class": "true"}},
+                   "provisioner": "rancher.io/local-path",
+                   "reclaimPolicy": policy,
+                   "volumeBindingMode": "Immediate"}),
+        )
+        .await;
+    }
+
+    async fn volume(store: &StoreMesh, name: &str) -> Option<Value> {
+        store.get(&pv_key(name)).await
+    }
+
+    /// Provision `ns1/<name>` and bind it, then delete the claim.
+    async fn provision_then_delete_claim(store: &StoreMesh, c: &PvBinderController, name: &str) {
+        put_claim(store, name, sized()).await;
+        c.tick().await.unwrap();
+        assert_eq!(
+            phase(store, name).await,
+            "Bound",
+            "precondition: {name} bound"
+        );
+        delete_claim(store, name).await;
+    }
+
+    /// A PV standing Bound to claim `ns1/<claim>` (uid `uid-<claim>`),
+    /// which does not exist: `extra` is merged over its body.
+    async fn put_orphan_volume(store: &StoreMesh, name: &str, claim: &str, extra: &Value) {
+        let mut pv = json!({"apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": name},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                     "persistentVolumeReclaimPolicy": "Delete",
+                     "claimRef": {"namespace": "ns1", "name": claim,
+                                  "uid": (["uid-", claim].concat())}},
+            "status": {"phase": "Bound"}});
+        json_patch_merge(&mut pv, extra);
+        put_op(store, pv_key(name), pv).await;
+    }
+
+    /// RFC 7396, enough for fixtures.
+    fn json_patch_merge(target: &mut Value, patch: &Value) {
+        if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
+            for (k, v) in p {
+                if v.is_null() {
+                    t.remove(k);
+                } else if v.is_object() && t.get(k).is_some_and(Value::is_object) {
+                    json_patch_merge(t.get_mut(k).unwrap(), v);
+                } else {
+                    t.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    /// ★ Bound → Released → deleted. Under `Delete` the volume is first
+    /// Released with its directory still there, then its directory is
+    /// removed and the PV with it — the one directory derived for the
+    /// claim, and nothing else.
+    #[tokio::test]
+    async fn a_deleted_claims_volume_is_released_then_deleted_with_its_directory() {
+        let store = live_store().await;
+        local_path_class_reclaiming(&store, "Delete").await;
+        let env = Arc::new(FakeProvisionerEnv::new());
+        let c = PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone());
+        provision_then_delete_claim(&store, &c, "data").await;
+
+        c.tick().await.unwrap();
+        let released = volume(&store, "pvc-uid-data")
+            .await
+            .expect("Released is a state the volume is seen in");
+        assert_eq!(released["status"]["phase"], "Released");
+        assert!(env.removed_dirs().is_empty(), "{:?}", env.removed_dirs());
+
+        for _ in 0..2 {
+            c.tick().await.unwrap();
+        }
+        assert!(volume(&store, "pvc-uid-data").await.is_none(), "PV deleted");
+        assert_eq!(env.removed_dirs(), vec![local_dir("data")]);
+    }
+
+    /// Bound → Released, and `Retain` keeps it there: the PV, its claimRef
+    /// and its directory all stay.
+    #[tokio::test]
+    async fn a_retained_volume_stays_released_with_its_directory() {
+        let store = live_store().await;
+        local_path_class_reclaiming(&store, "Retain").await;
+        let env = Arc::new(FakeProvisionerEnv::new());
+        let c = PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone());
+        provision_then_delete_claim(&store, &c, "data").await;
+
+        for _ in 0..3 {
+            c.tick().await.unwrap();
+        }
+
+        let pv = volume(&store, "pvc-uid-data").await.expect("retained");
+        assert_eq!(pv["status"]["phase"], "Released");
+        assert_eq!(pv["spec"]["claimRef"]["uid"], "uid-data");
+        assert!(env.removed_dirs().is_empty(), "{:?}", env.removed_dirs());
+    }
+
+    /// Released → Available: an operator frees a retained volume by
+    /// clearing its claimRef's uid, and a claim can then bind it.
+    #[tokio::test]
+    async fn a_freed_retained_volume_becomes_available_and_binds_again() {
+        let store = live_store().await;
+        local_path_class_reclaiming(&store, "Retain").await;
+        let c = binder(store.clone());
+        provision_then_delete_claim(&store, &c, "data").await;
+        c.tick().await.unwrap();
+        let mut pv = volume(&store, "pvc-uid-data").await.unwrap();
+        assert_eq!(pv["status"]["phase"], "Released");
+
+        pv["spec"]["claimRef"]["uid"] = Value::Null;
+        put_op(&store, pv_key("pvc-uid-data"), pv).await;
+        c.tick().await.unwrap();
+        assert_eq!(
+            volume(&store, "pvc-uid-data").await.unwrap()["status"]["phase"],
+            "Available"
+        );
+
+        put_claim_as(
+            &store,
+            "data",
+            json!("uid-again"),
+            json!({"accessModes": ["ReadWriteOnce"], "storageClassName": "local-path",
+                   "volumeName": "pvc-uid-data",
+                   "resources": {"requests": {"storage": "1Gi"}}}),
+        )
+        .await;
+        c.tick().await.unwrap();
+        assert_eq!(phase(&store, "data").await, "Bound");
+        let rebound = volume(&store, "pvc-uid-data").await.unwrap();
+        assert_eq!(rebound["status"]["phase"], "Bound");
+        assert_eq!(rebound["spec"]["claimRef"]["uid"], "uid-again");
+    }
+
+    /// A claim that is Terminating still exists: pvc-protection is holding
+    /// it for a pod, and its volume stays Bound with its directory.
+    #[tokio::test]
+    async fn a_terminating_claim_keeps_its_volume_bound() {
+        let store = live_store().await;
+        local_path_class_reclaiming(&store, "Delete").await;
+        let env = Arc::new(FakeProvisionerEnv::new());
+        let c = PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone());
+        put_claim(&store, "data", sized()).await;
+        c.tick().await.unwrap();
+        let mut held = store.get(&pvc_key("ns1", "data")).await.unwrap();
+        held["metadata"]["finalizers"] = json!([crate::pvc_protection::PVC_PROTECTION_FINALIZER]);
+        put_op(&store, pvc_key("ns1", "data"), held).await;
+        store
+            .propose(ResourceCommand::delete(
+                pvc_key("ns1", "data"),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            c.tick().await.unwrap();
+        }
+
+        let pv = volume(&store, "pvc-uid-data").await.expect("kept");
+        assert_eq!(pv["status"]["phase"], "Bound");
+        assert!(env.removed_dirs().is_empty(), "{:?}", env.removed_dirs());
+    }
+
+    /// The tick's list is not the judge of a claim being gone: a claim the
+    /// list missed, the store still has, and its volume is left Bound.
+    #[tokio::test]
+    async fn a_claim_missing_from_the_list_is_asked_for_again() {
+        let store = live_store().await;
+        put_claim(&store, "data", sized()).await;
+        put_orphan_volume(&store, "vol", "data", &json!({})).await;
+        let pv = volume(&store, "vol").await.unwrap();
+
+        let outcome = binder(store.clone())
+            .reconcile_volume(&pv_key("vol"), &pv, &[])
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, ObjectOutcome::Unchanged), "{outcome:?}");
+        assert_eq!(volume(&store, "vol").await.unwrap(), pv);
+    }
+
+    /// A binder scoped to one namespace did not list another's claims, so
+    /// it never judges a volume whose claim lives there.
+    #[tokio::test]
+    async fn a_scoped_binder_leaves_another_namespaces_volume_alone() {
+        let store = live_store().await;
+        put_orphan_volume(
+            &store,
+            "vol",
+            "gone",
+            &json!({"spec": {"claimRef": {"namespace": "ns2"}}}),
+        )
+        .await;
+        let before = volume(&store, "vol").await.unwrap();
+        let env = Arc::new(FakeProvisionerEnv::new());
+        let c = PvBinderController::with_env(
+            store.clone(),
+            Some("ns1".into()),
+            "/data/local-path",
+            env.clone(),
+        );
+
+        for _ in 0..3 {
+            c.tick().await.unwrap();
+        }
+
+        assert_eq!(volume(&store, "vol").await.unwrap(), before);
+        assert!(env.removed_dirs().is_empty());
+    }
+
+    /// A volume that cannot be reclaimed goes Failed, says why, keeps its
+    /// storage, and is announced once — not once per sweep.
+    #[tokio::test]
+    async fn an_unreclaimable_volume_fails_once_and_keeps_its_storage() {
+        let local = json!({"metadata": {"annotations":
+            {"pv.kubernetes.io/provisioned-by": ENGENHO_LOCAL_PATH_PROVISIONER}}});
+        let cases = [
+            // A local-path PV pointing somewhere the provisioner never made.
+            (
+                "pvc-uid-a",
+                "a",
+                {
+                    let mut v = local.clone();
+                    json_patch_merge(&mut v, &json!({"spec": {"hostPath": {"path": "/"}}}));
+                    v
+                },
+                Unreclaimable::ForeignDirectory,
+            ),
+            // A legacy name: not derived from the uid.
+            (
+                "pvc-ns1-b",
+                "b",
+                {
+                    let mut v = local.clone();
+                    json_patch_merge(
+                        &mut v,
+                        &json!({"spec": {"hostPath": {"path": "/data/local-path/ns1-b"}}}),
+                    );
+                    v
+                },
+                Unreclaimable::ForeignDirectory,
+            ),
+            // Nobody provisioned it.
+            (
+                "vol-c",
+                "c",
+                json!({"spec": {"hostPath": {"path": "/srv/c"}}}),
+                Unreclaimable::NoDeleter,
+            ),
+            // A policy engenho does not run.
+            (
+                "vol-d",
+                "d",
+                json!({"spec": {"persistentVolumeReclaimPolicy": "Recycle",
+                                "hostPath": {"path": "/srv/d"}}}),
+                Unreclaimable::UnsupportedPolicy,
+            ),
+        ];
+        for (pv_name, claim, extra, why) in cases {
+            let store = live_store().await;
+            put_orphan_volume(&store, pv_name, claim, &extra).await;
+            let env = Arc::new(FakeProvisionerEnv::new());
+            let events = Arc::new(crate::event_recorder::CollectingEventSink::new());
+            let c =
+                PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone())
+                    .with_event_sink(events.clone());
+
+            for _ in 0..4 {
+                c.tick().await.unwrap();
+            }
+
+            let pv = volume(&store, pv_name).await.expect("kept");
+            assert_eq!(pv["status"]["phase"], "Failed", "{pv_name}");
+            assert_eq!(pv["status"]["message"], why.message(), "{pv_name}");
+            assert!(
+                env.removed_dirs().is_empty(),
+                "{pv_name}: {:?}",
+                env.removed_dirs()
+            );
+            let recorded = events.drain();
+            assert_eq!(recorded.len(), 1, "{pv_name}: {recorded:?}");
+            assert_eq!(
+                recorded[0].reason,
+                crate::event_recorder::Reason::VolumeFailedDelete
+            );
+            assert_eq!(recorded[0].involved.name, pv_name);
+        }
+    }
+
+    /// Another provisioner's volume stays Released for that provisioner to
+    /// delete; engenho touches neither it nor its storage.
+    #[tokio::test]
+    async fn another_provisioners_volume_stays_released() {
+        let store = live_store().await;
+        put_orphan_volume(
+            &store,
+            "pvc-uid-data",
+            "data",
+            &json!({"metadata": {"annotations":
+                       {"pv.kubernetes.io/provisioned-by": "rancher.io/local-path"}},
+                   "spec": {"hostPath": {"path": local_dir("data")}}}),
+        )
+        .await;
+        let env = Arc::new(FakeProvisionerEnv::new());
+        let c = PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone());
+
+        for _ in 0..3 {
+            c.tick().await.unwrap();
+        }
+
+        let pv = volume(&store, "pvc-uid-data").await.expect("kept");
+        assert_eq!(pv["status"]["phase"], "Released");
+        assert!(env.removed_dirs().is_empty());
+    }
+
+    /// A CSI volume under `Delete` is deleted through the driver that
+    /// provisioned it, then the PV goes.
+    #[tokio::test]
+    async fn a_csi_volume_is_deleted_through_its_driver() {
+        let store = live_store().await;
+        csi_class(&store).await;
+        let driver = Arc::new(RecordingDriver::default());
+        let c = binder(store.clone()).with_csi(driver.clone());
+        put_claim(&store, "db", csi_claim_spec()).await;
+        c.tick().await.unwrap();
+        assert_eq!(phase(&store, "db").await, "Bound");
+        delete_claim(&store, "db").await;
+
+        for _ in 0..3 {
+            c.tick().await.unwrap();
+        }
+
+        assert_eq!(
+            *driver.deleted.lock().unwrap(),
+            vec![("csi.example.com".to_string(), "vol-pvc-uid-db".to_string())]
+        );
+        assert!(volume(&store, "pvc-uid-db").await.is_none());
+    }
+
+    /// A deleter that fails leaves the volume Released, with its PV, and
+    /// the sweep owes it a retry rather than waiting for the fallback.
+    #[tokio::test]
+    async fn a_failed_delete_keeps_the_volume_and_is_retried() {
+        let store = live_store().await;
+        csi_class(&store).await;
+        let driver = Arc::new(RecordingDriver {
+            refuse_deletes: true,
+            ..RecordingDriver::default()
+        });
+        let c = binder(store.clone()).with_csi(driver.clone());
+        put_claim(&store, "db", csi_claim_spec()).await;
+        c.tick().await.unwrap();
+        delete_claim(&store, "db").await;
+        c.tick().await.unwrap();
+
+        let outcome = c.tick().await.unwrap();
+
+        let pv = volume(&store, "pvc-uid-db").await.expect("kept");
+        assert_eq!(pv["status"]["phase"], "Released");
+        assert_eq!(outcome.sweep.unwrap().failed(), 1);
+        assert_eq!(
+            outcome.result,
+            crate::ReconcileResult::Requeue(crate::TRANSIENT_RETRY.base())
+        );
+    }
+
+    // ── a bind never overwrites what landed since the list ───────────
+
+    /// A claim deleted after the binder listed it stays deleted: the bind
+    /// is written at the revision read, so it cannot create the claim again.
+    #[tokio::test]
+    async fn a_bind_never_resurrects_a_deleted_claim() {
+        let store = live_store().await;
+        put_claim(
+            &store,
+            "data",
+            json!({"accessModes": ["ReadWriteOnce"], "storageClassName": "manual",
+                   "resources": {"requests": {"storage": "1Gi"}}}),
+        )
+        .await;
+        put_op(
+            &store,
+            pv_key("vol-a"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "vol-a"},
+                   "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                            "storageClassName": "manual"},
+                   "status": {"phase": "Available"}}),
+        )
+        .await;
+        let listed = store.get(&pvc_key("ns1", "data")).await.unwrap();
+        let view = TickView {
+            pvs: store.list("", "v1", "PersistentVolume", None).await,
+            storage_classes: Vec::new(),
+            snapshots: Vec::new(),
+            snapshot_contents: Vec::new(),
+        };
+        delete_claim(&store, "data").await;
+
+        binder(store.clone())
+            .reconcile_claim(
+                &pvc_key("ns1", "data"),
+                &listed,
+                &view,
+                &tokio::sync::Mutex::new(Vec::new()),
+            )
+            .await
+            .unwrap();
+
+        assert!(store.get(&pvc_key("ns1", "data")).await.is_none());
+        let pv = volume(&store, "vol-a").await.unwrap();
+        assert!(pv["spec"].get("claimRef").is_none(), "{pv}");
+    }
+
+    /// A finalizer that landed after the binder listed the claim survives
+    /// the bind: the stale bind is refused, and the next pass binds the
+    /// claim as it now stands.
+    #[tokio::test]
+    async fn a_bind_never_erases_a_finalizer_written_since_the_list() {
+        let store = live_store().await;
+        default_local_path_class(&store).await;
+        put_claim(&store, "data", sized()).await;
+        let listed = store.get(&pvc_key("ns1", "data")).await.unwrap();
+        let mut protected = listed.clone();
+        protected["metadata"]["finalizers"] =
+            json!([crate::pvc_protection::PVC_PROTECTION_FINALIZER]);
+        put_op(&store, pvc_key("ns1", "data"), protected).await;
+        let view = TickView {
+            pvs: Vec::new(),
+            storage_classes: store
+                .list("storage.k8s.io", "v1", "StorageClass", None)
+                .await,
+            snapshots: Vec::new(),
+            snapshot_contents: Vec::new(),
+        };
+        let c = binder(store.clone());
+
+        c.reconcile_claim(
+            &pvc_key("ns1", "data"),
+            &listed,
+            &view,
+            &tokio::sync::Mutex::new(Vec::new()),
+        )
+        .await
+        .unwrap();
+        let after_stale = store.get(&pvc_key("ns1", "data")).await.unwrap();
+        assert_eq!(
+            after_stale["metadata"]["finalizers"],
+            json!([crate::pvc_protection::PVC_PROTECTION_FINALIZER])
+        );
+
+        c.tick().await.unwrap();
+        let bound = store.get(&pvc_key("ns1", "data")).await.unwrap();
+        assert_eq!(bound["status"]["phase"], "Bound");
+        assert_eq!(
+            bound["metadata"]["finalizers"],
+            json!([crate::pvc_protection::PVC_PROTECTION_FINALIZER])
+        );
     }
 }
 

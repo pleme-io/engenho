@@ -1,8 +1,9 @@
 //! `GcController` — orphan-reference garbage collector.
 //!
-//! K8s rule: any resource with `metadata.ownerReferences[].controller=true`
-//! pointing at a non-existent owner is an orphan and must be deleted
-//! (matches kube-controller-manager's garbage collector).
+//! K8s rule: a dependent is deleted when NONE of its
+//! `metadata.ownerReferences` names a solid owner (kube-controller-manager's
+//! garbage collector). References to owners that are gone are removed from a
+//! dependent that still has a live one.
 //!
 //! ## The owner is resolved from the ownerReference, never from a list
 //!
@@ -32,6 +33,33 @@
 //! says so: the owner is absent at its own coordinates, or an object with
 //! that name exists under a DIFFERENT uid (the owner was recreated, so
 //! this dependent belongs to a dead generation).
+//!
+//! ## Every owner reference, classified (I19 GC oracle)
+//!
+//! Checked row by row against upstream's garbage collector (v1.34.0,
+//! `tests/oracle_gc.rs`). Three things the controlling-owner-only reading
+//! got wrong, each a way to delete a dependent upstream keeps:
+//!
+//! - **Only the controller was consulted.** Upstream classifies EVERY
+//!   ownerReference and deletes only when none is solid; with some solid
+//!   and some dangling it patches the dangling ones out and keeps the
+//!   object. A pod whose controller is gone but whose other owner lives is
+//!   kept now, and the dead reference is removed.
+//! - **An unserved apiVersion read as Absent.** `extensions/v1beta1`
+//!   Deployment for an owner stored as `apps/v1` was looked up at a key
+//!   nothing is written under, found missing, and the pod deleted.
+//!   Resolution goes through the served catalog ([`ServedKinds`]), pinned
+//!   to the reference's exact group/version; a miss is [`Unresolvable`] and
+//!   the dependent is left alone.
+//! - **The foreground finalizer was ignored.** An owner being deleted with
+//!   `foregroundDeletion` waits for its dependents; it is not solid.
+//!
+//! The DEPENDENT side is still a scan of two kinds (Pods, `ReplicaSets`).
+//! Widening it to every served kind is refused (`IMPROVEMENT-PLAN` §9): it
+//! would put every kind's objects through this path on every tick.
+
+mod collect;
+mod served;
 
 use std::sync::Arc;
 
@@ -39,14 +67,26 @@ use async_trait::async_trait;
 use engenho_store::{
     ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
+    revision::Revision,
 };
+use serde_json::{Value, json};
 use tracing::debug;
+
+pub use collect::{
+    Candidate, Classification, Classified, Collected, Decision, FOREGROUND_DELETION, GcEnv,
+    OwnerState, classify, collect, owner_references, owner_state,
+};
+pub use served::{ServedKind, ServedKinds, Unresolvable};
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
-use crate::owner::controlling_owner;
 use crate::reads::{DeclaresReads, Reads};
+
+/// The dependent kinds gc scans. Owners are resolved from each reference
+/// through the served catalog, so this list does not bound which OWNERS
+/// are recognised; it bounds which DEPENDENTS are collected.
+const DEPENDENT_KINDS: [(&str, &str, &str); 2] = [("", "v1", "Pod"), ("apps", "v1", "ReplicaSet")];
 
 pub struct GcController {
     store: Arc<StoreMesh>,
@@ -58,89 +98,68 @@ impl GcController {
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
         Self { store, namespace }
     }
+
+    /// Every kind served right now: the compiled-in catalog plus each
+    /// stored CRD's served versions.
+    async fn served(&self) -> ServedKinds {
+        let crds = self
+            .store
+            .list(
+                "apiextensions.k8s.io",
+                "v1",
+                "CustomResourceDefinition",
+                None,
+            )
+            .await;
+        ServedKinds::builtin().with_crds(crds.iter().map(|(_, crd)| crd))
+    }
 }
 
-/// What a live lookup of a dependent's controller actually established.
-///
-/// Three outcomes, never two: "I could not resolve this" is its own state
-/// and is NOT rounded into "absent". Collapsing them is the defect this
-/// enum exists to make unrepresentable — a missing arm is a compile error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OwnerPresence {
-    /// The owner exists at its own coordinates with the recorded uid.
-    Alive,
-    /// Positively observed as gone, or present under a different uid.
-    Absent,
-    /// The ownerReference could not be turned into coordinates to look up
-    /// (an unparseable `apiVersion`). Never a reason to delete.
-    Unresolvable,
+/// [`GcEnv`] over the store. Every write carries the revision it is pinned
+/// to, and a delete carries its clock (T3.6).
+struct StoreEnv<'a> {
+    store: &'a StoreMesh,
 }
 
-impl GcController {
-    /// Resolve a dependent's controller by ITS OWN apiVersion + kind.
-    ///
-    /// A namespaced dependent's owner is either in the same namespace or
-    /// cluster-scoped, so both are tried before anything is called absent.
-    async fn owner_presence(
+#[async_trait]
+impl GcEnv for StoreEnv<'_> {
+    async fn get(&self, key: &ResourceKey) -> Option<Value> {
+        self.store.get(key).await
+    }
+
+    async fn delete(&self, key: &ResourceKey, pinned: Revision) -> Result<Effect, ControllerError> {
+        let applied = self
+            .store
+            .propose(ResourceCommand::delete_at(
+                key.clone(),
+                Some(pinned),
+                Reason::GarbageCollector,
+                Some(engenho_types::time::now_rfc3339_utc()),
+            ))
+            .await?;
+        Ok(Effect::of(applied.op))
+    }
+
+    async fn replace_owner_references(
         &self,
-        child: &ResourceKey,
-        owner: &crate::owner::OwnerReference,
-    ) -> OwnerPresence {
-        let Some((group, version)) = split_api_version(&owner.api_version) else {
-            return OwnerPresence::Unresolvable;
-        };
-
-        let mut candidates: Vec<ResourceKey> = Vec::new();
-        if let Some(ns) = child.namespace.as_deref() {
-            candidates.push(ResourceKey::namespaced(
-                group.clone(),
-                version.clone(),
-                owner.kind.clone(),
-                ns.to_string(),
-                owner.name.clone(),
-            ));
-        }
-        candidates.push(ResourceKey::cluster_scoped(
-            group,
-            version,
-            owner.kind.clone(),
-            owner.name.clone(),
-        ));
-
-        for key in &candidates {
-            if let Some(found) = self.store.get(key).await {
-                return if uid_of(&found).as_deref() == Some(owner.uid.as_str()) {
-                    OwnerPresence::Alive
-                } else {
-                    // Same coordinates, different object: the owner was
-                    // recreated and this dependent belongs to the dead one.
-                    OwnerPresence::Absent
-                };
-            }
-        }
-        OwnerPresence::Absent
+        key: &ResourceKey,
+        references: Vec<Value>,
+        pinned: Revision,
+    ) -> Result<Effect, ControllerError> {
+        // An RFC 7396 merge of a list replaces the list: upstream's JSON
+        // merge-patch form of this write, with its resourceVersion
+        // precondition.
+        let applied = self
+            .store
+            .propose(ResourceCommand::patch_cas(
+                key.clone(),
+                json!({"metadata": {"ownerReferences": references}}),
+                Some(pinned),
+                Reason::GarbageCollector,
+            ))
+            .await?;
+        Ok(Effect::of(applied.op))
     }
-}
-
-/// `"apps/v1"` -> `("apps", "v1")`; `"v1"` -> `("", "v1")`.
-///
-/// Anything else is unresolvable rather than guessed — a wrong guess here
-/// deletes a live workload.
-fn split_api_version(api_version: &str) -> Option<(String, String)> {
-    match api_version.split_once('/') {
-        Some((g, v)) if !g.is_empty() && !v.is_empty() => Some((g.to_string(), v.to_string())),
-        Some(_) => None,
-        None if !api_version.is_empty() => Some((String::new(), api_version.to_string())),
-        None => None,
-    }
-}
-
-fn uid_of(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("metadata")
-        .and_then(|m| m.get("uid"))
-        .and_then(|u| u.as_str())
-        .map(ToString::to_string)
 }
 
 /// Every kind: it looks an owner up by whatever kind the dependent's
@@ -161,38 +180,38 @@ impl Controller for GcController {
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let mut report = ReconcileReport::default();
         let ns = self.namespace.as_deref();
+        let served = self.served().await;
+        let env = StoreEnv { store: &self.store };
 
-        // Build the set of existing parent UIDs (anything we'd
-        // potentially own). We're conservative and gather UIDs
-        // from all kinds we know controllers create:
-        //   - Deployment (parents of ReplicaSet)
-        //   - ReplicaSet (parents of Pod)
-        // Plus any other kind a future R9.x might add — extend
-        // this list in lockstep.
-        for (group, version, kind) in [("", "v1", "Pod"), ("apps", "v1", "ReplicaSet")] {
-            let children = self.store.list(group, version, kind, ns).await;
-            report.objects_examined += children.len();
-            for (key, value) in children {
-                let Some(owner) = controlling_owner(&value) else {
+        for (group, version, kind) in DEPENDENT_KINDS {
+            let dependents = self.store.list(group, version, kind, ns).await;
+            report.objects_examined += dependents.len();
+            for (key, value) in dependents {
+                let Some(candidate) = Candidate::listed(key, &value) else {
                     continue;
                 };
-                match self.owner_presence(&key, &owner).await {
-                    OwnerPresence::Alive | OwnerPresence::Unresolvable => continue,
-                    OwnerPresence::Absent => {}
+                match collect(&env, &served, &candidate).await? {
+                    Collected::Deleted(effect) => {
+                        debug!(dependent = %candidate.key.label(), "deleted: no owner is solid");
+                        report.record(effect);
+                    }
+                    Collected::ReferencesRemoved { uids, effect } => {
+                        debug!(
+                            dependent = %candidate.key.label(),
+                            removed = ?uids,
+                            "removed owner references that are not solid"
+                        );
+                        report.record(effect);
+                    }
+                    Collected::Unresolvable(why) => {
+                        debug!(dependent = %candidate.key.label(), %why, "left alone");
+                    }
+                    Collected::BeingDeleted
+                    | Collected::ItemGone
+                    | Collected::NoOwners
+                    | Collected::Unpinned
+                    | Collected::Kept => {}
                 }
-                debug!(
-                    child = %key.label(),
-                    orphan_uid = %owner.uid,
-                    owner_kind = %owner.kind,
-                    "deleting orphan"
-                );
-                let applied = self
-                    .store
-                    .propose(ResourceCommand::delete(key, Reason::GarbageCollector))
-                    .await?;
-                // A finalizer-bearing orphan with no timestamp to stamp,
-                // or one already gone, is a NoOp: no change to count.
-                report.record(Effect::of(applied.op));
             }
         }
         Ok(report.into())
@@ -201,10 +220,9 @@ impl Controller for GcController {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
 
-    use crate::owner::{OwnerReference, set_owner_reference};
+    use crate::owner::{OwnerReference, controlling_owner, set_owner_reference};
 
     fn owner_ref(uid: &str) -> OwnerReference {
         OwnerReference {

@@ -1483,6 +1483,7 @@ dependencies = [
  "chrono",
  "engenho-cni",
  "engenho-config",
+ "engenho-oracle",
  "engenho-store",
  "engenho-substrate",
  "engenho-types",

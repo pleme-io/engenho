@@ -4,10 +4,17 @@
 //! The composition story today requires 8+ Arc::new calls to wire
 //! the full pipeline. This builder collapses that to one call:
 //!
-//! ```ignore
-//! let pipeline = PlantioPipeline::build(config).await?;
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use engenho_controllers::{Controller, ControllerError, PipelineConfig, PlantioPipeline};
+//! # async fn example(store: Arc<engenho_store::StoreMesh>) -> Result<(), ControllerError> {
+//! let pipeline = PlantioPipeline::build(PipelineConfig::minimal(store));
 //! pipeline.controller.tick().await?;
+//! # Ok(())
+//! # }
 //! ```
+//!
+//! (The example is compiled: `build` is synchronous and cannot fail.)
 //!
 //! ## What the builder does
 //!
@@ -160,8 +167,20 @@ pub struct PlantioPipeline {
 impl PlantioPipeline {
     /// Build the pipeline from typed config.
     pub fn build(config: PipelineConfig) -> Self {
+        // Every field, and every wrapper flag, is bound by name with no
+        // `..`: a field added to either struct does not compile here
+        // (E0027) until the builder wires it.
+        let PipelineConfig {
+            store,
+            roceiro,
+            ledger,
+            ledger_wrappers: LedgerWrappers { broadcast, gossip },
+            resolver,
+            namespace,
+        } = config;
+
         // 1. Roceiro.
-        let roceiro: Arc<dyn Roceiro> = match config.roceiro {
+        let roceiro: Arc<dyn Roceiro> = match roceiro {
             RoceiroChoice::Fake => Arc::new(FakeRoceiro::new()),
             RoceiroChoice::BuildBackend {
                 build,
@@ -172,9 +191,9 @@ impl PlantioPipeline {
         };
 
         // 2. Base ledger.
-        let base_ledger: Arc<dyn MaterializationLedger> = match config.ledger {
+        let base_ledger: Arc<dyn MaterializationLedger> = match ledger {
             LedgerChoice::Memory => Arc::new(MemoryLedger::new()),
-            LedgerChoice::StoreBacked => Arc::new(StoreBackedLedger::new(config.store.clone())),
+            LedgerChoice::StoreBacked => Arc::new(StoreBackedLedger::new(store.clone())),
             LedgerChoice::Custom(l) => l,
         };
 
@@ -182,7 +201,7 @@ impl PlantioPipeline {
         let (broadcast_handle, after_broadcast): (
             Option<Arc<BroadcastLedger>>,
             Arc<dyn MaterializationLedger>,
-        ) = if config.ledger_wrappers.broadcast {
+        ) = if broadcast {
             let bcast = Arc::new(BroadcastLedger::new(base_ledger));
             (Some(bcast.clone()), bcast as Arc<dyn MaterializationLedger>)
         } else {
@@ -190,32 +209,31 @@ impl PlantioPipeline {
         };
 
         // 4. Wrap with Gossip?
-        let final_ledger: Arc<dyn MaterializationLedger> =
-            if let Some(transport) = config.ledger_wrappers.gossip {
-                Arc::new(GossipLedger::new(after_broadcast, transport))
-            } else {
-                after_broadcast
-            };
+        let final_ledger: Arc<dyn MaterializationLedger> = if let Some(transport) = gossip {
+            Arc::new(GossipLedger::new(after_broadcast, transport))
+        } else {
+            after_broadcast
+        };
 
         // 5. Resolver.
-        let resolver: Arc<dyn NodeResolver> = match config.resolver {
+        let resolver: Arc<dyn NodeResolver> = match resolver {
             NodeResolverChoice::Static(nodes) => Arc::new(StaticNodeResolver::new(nodes)),
             NodeResolverChoice::StoreBackedClusterWide => {
-                Arc::new(StoreBackedNodeResolver::cluster_wide(config.store.clone()))
+                Arc::new(StoreBackedNodeResolver::cluster_wide(store.clone()))
             }
-            NodeResolverChoice::StoreBackedNamespace(ns) => Arc::new(
-                StoreBackedNodeResolver::with_namespace(config.store.clone(), ns),
-            ),
+            NodeResolverChoice::StoreBackedNamespace(ns) => {
+                Arc::new(StoreBackedNodeResolver::with_namespace(store.clone(), ns))
+            }
             NodeResolverChoice::Custom(r) => r,
         };
 
         // 6. Controller.
         let controller = Arc::new(PlantioController::new(
-            config.store,
+            store,
             roceiro.clone(),
             final_ledger.clone(),
             resolver.clone(),
-            config.namespace,
+            namespace,
         ));
 
         Self {
@@ -258,17 +276,6 @@ pub fn bootstrap_pipeline(store: Arc<StoreMesh>, nodes: Vec<NodeId>) -> PlantioP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engenho_substrate::Stage;
-
-    fn make_store_stub() -> Arc<StoreMesh> {
-        // We don't actually need a live store for these tests —
-        // we test pipeline shape, not end-to-end reconcile. Real
-        // integration tests use the live store fixture.
-        // Here: skip via #[ignore] when StoreMesh::stub isn't
-        // available. The pipeline-shape tests below use fields
-        // that don't dispatch into the store.
-        unimplemented!("integration tests use a live StoreMesh; see plantio_integration_test")
-    }
 
     // Pure-shape tests that don't need a store.
     #[test]
@@ -300,20 +307,5 @@ mod tests {
             NodeResolverChoice::Static(nodes) => assert!(nodes.is_empty()),
             _ => panic!("default should be empty Static"),
         }
-    }
-
-    // Stage marker test — keep the stage type in scope (without
-    // it pulled-in, the file is technically valid but the unused
-    // import doesn't show up as a useful sanity check).
-    #[test]
-    fn stage_imports_compile() {
-        let _ = std::any::type_name::<Stage>();
-    }
-
-    // Avoid unused-import warning for the stubbed helper.
-    #[test]
-    #[ignore]
-    fn _stub_keeps_import() {
-        let _ = make_store_stub;
     }
 }

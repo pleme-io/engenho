@@ -67,7 +67,7 @@ impl EndpointsController {
         Self::with_clock(store, namespace, wall_clock)
     }
 
-    /// Construct with a pinned [`Clock`] — the unit-test determinism seam
+    /// Construct with a pinned [`CreateClock`] — the unit-test determinism seam
     /// for the `creationTimestamp` boundary stamp.
     #[must_use]
     pub fn with_clock(

@@ -1,7 +1,8 @@
 //! Roceiro — the materializer trait.
 //!
-//! Wraps a [`BuildBackend`] (existing) + a [`Verifier`] (existing)
-//! into one typed surface the [`PlantioController`] dispatches:
+//! Wraps a [`BuildBackend`](crate::drv_build::BuildBackend) + a
+//! [`Verifier`](engenho_substrate::Verifier) into one typed surface the
+//! [`PlantioController`](crate::plantio::PlantioController) dispatches:
 //! "materialize this Stage on this node, run its verifiers,
 //! return a typed MaterializationReceipt."
 //!
