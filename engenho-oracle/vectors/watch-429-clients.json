@@ -1,0 +1,1527 @@
+{
+  "source": [
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/tools/cache/reflector.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/tools/cache/reflector_test.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/tools/cache/retry_with_deadline.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/tools/cache/controller.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/tools/pager/pager.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/rest/request.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/rest/with_retry.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/rest/urlbackoff.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/rest/client.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/rest/watch/decoder.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/features/known_features.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/api/errors/errors.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/util/wait/backoff.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/util/wait/wait.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/util/net/util.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/util/net/http.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/watch/streamwatcher.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/responsewriters/writers.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/util.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/errors.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/features/kube_features.go@v1.34.0",
+    "kube-rs/kube/kube-runtime/src/watcher.rs@4.2.0",
+    "kube-rs/kube/kube-runtime/src/utils/stream_backoff.rs@4.2.0",
+    "kube-rs/kube/kube-runtime/src/utils/backoff_reset_timer.rs@4.2.0",
+    "kube-rs/kube/kube-runtime/src/utils/watch_ext.rs@4.2.0",
+    "kube-rs/kube/kube-runtime/src/controller/mod.rs@4.2.0",
+    "kube-rs/kube/kube-client/src/client/mod.rs@4.2.0",
+    "kube-rs/kube/kube-client/src/client/retry.rs@4.2.0",
+    "kube-rs/kube/kube-client/src/client/builder.rs@4.2.0",
+    "kube-rs/kube/kube-client/src/config/mod.rs@4.2.0",
+    "kube-rs/kube/kube-client/src/api/core_methods.rs@4.2.0",
+    "kube-rs/kube/kube-core/src/watch.rs@4.2.0",
+    "kube-rs/kube/Cargo.toml@4.2.0",
+    "Xuanwo/backon/backon/src/backoff/exponential.rs@v1.6.0",
+    "Xuanwo/backon/backon/src/backoff/exponential.rs@v1.3.0",
+    "Xuanwo/backon/backon/src/backoff/exponential.rs@v1.4.0",
+    "Xuanwo/backon/backon/src/backoff/exponential.rs@v1.4.1",
+    "tower-rs/tower/tower/src/retry/backoff.rs@tower-0.5.2"
+  ],
+  "cases": [
+    {
+      "name": "classify_code_429_unknown_reason_is_too_many_requests",
+      "client": "client-go",
+      "input": {
+        "status": {
+          "code": 429,
+          "reason": ""
+        }
+      },
+      "expected": {
+        "IsTooManyRequests": true,
+        "IsGone": false,
+        "IsResourceExpired": false,
+        "IsInternalError": false
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:IsTooManyRequests (L724)"
+    },
+    {
+      "name": "classify_reason_too_many_requests_with_non_429_code",
+      "client": "client-go",
+      "input": {
+        "status": {
+          "code": 500,
+          "reason": "TooManyRequests"
+        }
+      },
+      "expected": {
+        "IsTooManyRequests": true,
+        "IsInternalError": false
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:IsTooManyRequests + IsInternalError (code fallback only when reason is not in knownReasons)",
+      "naive_trap": "matching on HTTP code alone would call this an internal error"
+    },
+    {
+      "name": "classify_code_429_wins_even_with_known_other_reason",
+      "client": "client-go",
+      "input": {
+        "status": {
+          "code": 429,
+          "reason": "Expired"
+        }
+      },
+      "expected": {
+        "IsTooManyRequests": true,
+        "IsResourceExpired": true,
+        "isExpiredError": true
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:IsTooManyRequests comment 'does not check that the reason is unknown'",
+      "naive_trap": "IsTooManyRequests is the ONLY Is* predicate whose code fallback ignores a known reason; both predicates are true at once"
+    },
+    {
+      "name": "classify_code_410_unknown_reason_is_gone",
+      "client": "client-go",
+      "input": {
+        "status": {
+          "code": 410,
+          "reason": ""
+        }
+      },
+      "expected": {
+        "IsGone": true,
+        "IsResourceExpired": false,
+        "isExpiredError": true
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:IsGone (L573); client-go/tools/cache/reflector.go:isExpiredError (L1040)"
+    },
+    {
+      "name": "classify_code_410_reason_expired_is_not_gone_but_is_expired",
+      "client": "client-go",
+      "input": {
+        "status": {
+          "code": 410,
+          "reason": "Expired"
+        }
+      },
+      "expected": {
+        "IsGone": false,
+        "IsResourceExpired": true,
+        "isExpiredError": true
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:IsGone ('Expired' is a known reason so code fallback is skipped); reflector.go:isExpiredError"
+    },
+    {
+      "name": "classify_code_410_with_known_non_gone_reason_is_not_expired",
+      "client": "client-go",
+      "input": {
+        "status": {
+          "code": 410,
+          "reason": "TooManyRequests"
+        }
+      },
+      "expected": {
+        "IsGone": false,
+        "IsResourceExpired": false,
+        "isExpiredError": false,
+        "IsTooManyRequests": true
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:IsGone/IsResourceExpired/IsTooManyRequests",
+      "naive_trap": "a code-410 => relist rule relists here; client-go backs off and re-watches instead"
+    },
+    {
+      "name": "classify_reason_expired_with_code_500",
+      "client": "client-go",
+      "input": {
+        "status": {
+          "code": 500,
+          "reason": "Expired"
+        }
+      },
+      "expected": {
+        "IsResourceExpired": true,
+        "isExpiredError": true,
+        "IsInternalError": false
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:IsResourceExpired (reason-only, L587)"
+    },
+    {
+      "name": "classify_code_504_unknown_reason_is_timeout",
+      "client": "client-go",
+      "input": {
+        "status": {
+          "code": 504,
+          "reason": ""
+        }
+      },
+      "expected": {
+        "IsTimeout": true,
+        "IsServerTimeout": false,
+        "IsInternalError": false
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:IsTimeout (L688), IsServerTimeout (reason-only)"
+    },
+    {
+      "name": "generic_http_error_mapping_non_status_body",
+      "client": "client-go",
+      "input": {
+        "http_status_codes": [
+          410,
+          429,
+          500,
+          502,
+          503,
+          504
+        ],
+        "body": "non-Status text"
+      },
+      "expected": {
+        "410": {
+          "reason": "",
+          "IsGone": true
+        },
+        "429": {
+          "reason": "TooManyRequests",
+          "IsTooManyRequests": true
+        },
+        "500": {
+          "reason": "InternalError",
+          "IsInternalError": true
+        },
+        "502": {
+          "reason": "InternalError",
+          "IsInternalError": true
+        },
+        "503": {
+          "reason": "ServiceUnavailable"
+        },
+        "504": {
+          "reason": "Timeout",
+          "IsTimeout": true
+        },
+        "all": {
+          "details.causes[0].type": "UnexpectedServerResponse",
+          "details.retryAfterSeconds": "value of numeric Retry-After header, else 0"
+        }
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:NewGenericServerResponse (L436); client-go/rest/request.go:newUnstructuredResponseError"
+    },
+    {
+      "name": "inband_error_event_object_not_a_status",
+      "client": "client-go",
+      "input": {
+        "watch_events": [
+          {
+            "type": "ERROR",
+            "object": {
+              "kind": "Pod"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "error_type": "UnexpectedObjectError",
+        "reflector_branch": "default (log 'Warning: watch ended with error')",
+        "next_action": "return nil from watch(); backoff; relist"
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:FromObject (L123); reflector.go:handleAnyWatch L901-902, watch() L567-571"
+    },
+    {
+      "name": "inband_error_unstructured_status_wrong_apiversion",
+      "client": "client-go",
+      "input": {
+        "watch_events": [
+          {
+            "type": "ERROR",
+            "object": {
+              "kind": "Status",
+              "apiVersion": "v2",
+              "code": 429
+            }
+          }
+        ],
+        "decoded_as": "runtime.Unstructured"
+      },
+      "expected": {
+        "error_type": "UnexpectedObjectError",
+        "IsTooManyRequests": false,
+        "next_action": "relist (default branch), NOT backoff+rewatch"
+      },
+      "upstream_ref": "apimachinery/pkg/api/errors/errors.go:FromObject (apiVersion must be 'v1' or 'meta.k8s.io/v1')"
+    },
+    {
+      "name": "rest_watch_http_429_numeric_retry_after_retried_inside_rest_client",
+      "client": "client-go",
+      "input": {
+        "http_responses": "every attempt: 429, header Retry-After: 2",
+        "request_maxRetries": 10,
+        "env_KUBE_CLIENT_BACKOFF": "unset"
+      },
+      "expected": {
+        "http_attempts": 11,
+        "sleep_before_each_retry_s": 2,
+        "client_side_rate_limiter_consulted_before_first_attempt": false,
+        "error_surfaced_to_reflector": {
+          "code": 429,
+          "IsTooManyRequests": true
+        },
+        "reflector_action": "backoffManager.Backoff() then re-watch at LastSyncResourceVersion; no LIST",
+        "client_side_rate_limiter_consulted_before_each_retry": "yes, when the client has one (r.rateLimiter != nil, e.g. rest.Config QPS)"
+      },
+      "upstream_ref": "client-go/rest/request.go:Watch (L758-829), NewRequest maxRetries:10 (L166); rest/with_retry.go:IsNextRetry (L148-193), Before (L195-236), checkWait (L309); rest/client.go:readExpBackoffConfig -> NoBackoff",
+      "naive_trap": "the reflector never sees the first 10 429s; the server hint is honoured at the HTTP layer, not by the reflector backoff"
+    },
+    {
+      "name": "rest_watch_http_429_without_retry_after_not_retried",
+      "client": "client-go",
+      "input": {
+        "http_responses": [
+          "429 (no Retry-After)"
+        ]
+      },
+      "expected": {
+        "http_attempts": 1,
+        "error_surfaced_to_reflector": {
+          "code": 429
+        },
+        "reflector_action": "backoff, re-watch, no LIST"
+      },
+      "upstream_ref": "client-go/rest/with_retry.go:checkWait (returns false when header missing); reflector.go:watch L527-538 isWatchErrorRetriable"
+    },
+    {
+      "name": "rest_watch_http_429_http_date_retry_after_not_retried",
+      "client": "client-go",
+      "input": {
+        "http_responses": [
+          "429, Retry-After: Wed, 21 Oct 2015 07:28:00 GMT"
+        ]
+      },
+      "expected": {
+        "http_attempts": 1,
+        "details.retryAfterSeconds": 0
+      },
+      "upstream_ref": "client-go/rest/request.go:retryAfterSeconds (strconv.Atoi only, L1378)",
+      "naive_trap": "RFC 9110 allows an HTTP-date Retry-After; client-go silently ignores it"
+    },
+    {
+      "name": "rest_watch_retry_after_zero_and_negative",
+      "client": "client-go",
+      "input": {
+        "http_responses": [
+          "429, Retry-After: 0",
+          "429, Retry-After: -1"
+        ]
+      },
+      "expected": {
+        "retried": true,
+        "sleep_s": 0
+      },
+      "upstream_ref": "client-go/rest/request.go:retryAfterSeconds (Atoi accepts '0' and '-1'); rest/urlbackoff.go:NoBackoff.SleepWithContext"
+    },
+    {
+      "name": "rest_watch_5xx_with_retry_after_retried_410_is_not",
+      "client": "client-go",
+      "input": {
+        "http_responses": [
+          "504, Retry-After: 1",
+          "503, Retry-After: 1",
+          "500, Retry-After: 1",
+          "410, Retry-After: 1"
+        ]
+      },
+      "expected": {
+        "504": "retried",
+        "503": "retried",
+        "500": "retried",
+        "410": "not retried; error surfaced immediately"
+      },
+      "upstream_ref": "client-go/rest/with_retry.go:checkWait ('any 500 error code and 429 can trigger a wait')"
+    },
+    {
+      "name": "rest_watch_body_status_overrides_http_code",
+      "client": "client-go",
+      "input": {
+        "http_status": 429,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "kind": "Status",
+          "apiVersion": "v1",
+          "status": "Failure",
+          "code": 410,
+          "reason": "Expired"
+        }
+      },
+      "expected": {
+        "returned_error": {
+          "code": 410,
+          "reason": "Expired"
+        },
+        "IsTooManyRequests": false,
+        "reflector_action": "Watch returns err -> ListAndWatch returns err -> DefaultWatchErrorHandler (isExpiredError, V(4)) -> backoff -> LIST"
+      },
+      "upstream_ref": "client-go/rest/request.go:Result.Error (L1489, decodes body Status when cause is UnexpectedServerResponse); reflector.go:isWatchErrorRetriable (L1081)",
+      "naive_trap": "the decoded body Status replaces the synthesized error, so the HTTP code no longer decides the branch"
+    },
+    {
+      "name": "rest_watch_body_status_not_failure_keeps_http_code",
+      "client": "client-go",
+      "input": {
+        "http_status": 429,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "kind": "Status",
+          "apiVersion": "v1",
+          "status": "",
+          "code": 410
+        }
+      },
+      "expected": {
+        "returned_error": {
+          "code": 429,
+          "reason": "TooManyRequests"
+        }
+      },
+      "upstream_ref": "client-go/rest/request.go:Result.Error ('because we default the kind, we *must* check for StatusFailure')"
+    },
+    {
+      "name": "rest_body_retry_after_seconds_without_header_is_ignored",
+      "client": "client-go",
+      "input": {
+        "http_status": 429,
+        "headers": {},
+        "body": {
+          "kind": "Status",
+          "apiVersion": "v1",
+          "status": "Failure",
+          "code": 429,
+          "reason": "TooManyRequests",
+          "details": {
+            "retryAfterSeconds": 5
+          }
+        }
+      },
+      "expected": {
+        "http_attempts": 1,
+        "reflector_wait": "backoffManager value, not 5s"
+      },
+      "upstream_ref": "client-go/rest/with_retry.go:checkWait (header only); reflector.go:watch L529-536"
+    },
+    {
+      "name": "rest_watch_transport_eof_exhausts_then_empty_watch",
+      "client": "client-go",
+      "input": {
+        "transport_error_every_attempt": "io.EOF",
+        "request_maxRetries": 10
+      },
+      "expected": {
+        "http_attempts": 11,
+        "sleep_before_each_retry_s": 1,
+        "Watch_returns": "watch.NewEmptyWatch(), nil",
+        "reflector_action": "handleWatch sees closed channel; watchDuration >= 10s (start taken before the request) so NOT VeryShortWatchError; returns nil; immediate re-watch, no backoff, no LIST"
+      },
+      "upstream_ref": "client-go/rest/request.go:Watch isErrRetryableFunc (IsProbableEOF||IsTimeout) L774-780 and L818-820; rest/with_retry.go:retryAfterResponse (synthetic 500 + Retry-After '1'); reflector.go:watch L512, handleAnyWatch L975-980",
+      "naive_trap": "treating the empty watch as a very-short watch would trigger a relist"
+    },
+    {
+      "name": "rest_watch_connection_refused_not_retried_by_rest_but_retriable_by_reflector",
+      "client": "client-go",
+      "input": {
+        "transport_error": "ECONNREFUSED"
+      },
+      "expected": {
+        "http_attempts": 1,
+        "reflector_action": "isWatchErrorRetriable=true -> backoff -> re-watch at LastSyncResourceVersion; no LIST"
+      },
+      "upstream_ref": "apimachinery/pkg/util/net/util.go:IsConnectionRefused; reflector.go:isWatchErrorRetriable (L1081-1091); reflector_test.go:TestReflectorListAndWatchInitConnBackoff"
+    },
+    {
+      "name": "reflector_establishment_429_then_inband_429",
+      "client": "client-go",
+      "input": {
+        "watch_calls": [
+          "returns error 429 (NewTooManyRequests, retryAfter 1)",
+          "returns watcher with one in-band ERROR Status 429",
+          "returns already-stopped watcher"
+        ]
+      },
+      "expected": {
+        "backoffManager_Backoff_calls": 2,
+        "ListAndWatch_error": null
+      },
+      "upstream_ref": "client-go/tools/cache/reflector_test.go:TestBackoffOnTooManyRequests (L815)"
+    },
+    {
+      "name": "reflector_establishment_429_x4_no_relist",
+      "client": "client-go",
+      "input": {
+        "watch_calls": [
+          "429",
+          "429",
+          "429",
+          "429",
+          "stopped watcher"
+        ]
+      },
+      "expected": {
+        "list_calls": 1,
+        "watch_calls": 5
+      },
+      "upstream_ref": "client-go/tools/cache/reflector_test.go:TestNoRelistOnTooManyRequests (L861)"
+    },
+    {
+      "name": "reflector_inband_429_rewatch_from_last_event_rv",
+      "client": "client-go",
+      "input": {
+        "list_rv": "10",
+        "watch_events": [
+          {
+            "type": "ADDED",
+            "rv": "11"
+          },
+          {
+            "type": "MODIFIED",
+            "rv": "12"
+          },
+          {
+            "type": "ERROR",
+            "status": {
+              "code": 429,
+              "reason": "TooManyRequests"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "store_contains_rv_12": true,
+        "backoff_calls": 1,
+        "list_calls": 1,
+        "next_watch_options": {
+          "resourceVersion": "12",
+          "allowWatchBookmarks": true,
+          "timeoutSeconds_range": [
+            300,
+            600
+          ]
+        },
+        "watchErrorHandler_called": false
+      },
+      "upstream_ref": "reflector.go:handleAnyWatch setLastSyncResourceVersion per event (L958); watch() L514-526 and L556-563; reflector_test.go:TestWatchTimeout"
+    },
+    {
+      "name": "reflector_inband_429_retry_after_seconds_ignored",
+      "client": "client-go",
+      "input": {
+        "watch_events": [
+          {
+            "type": "ERROR",
+            "status": {
+              "code": 429,
+              "reason": "TooManyRequests",
+              "details": {
+                "retryAfterSeconds": 30
+              }
+            }
+          }
+        ]
+      },
+      "expected": {
+        "wait": "backoffManager.Backoff() only (first: [0.8s,1.6s)), retryAfterSeconds unused"
+      },
+      "upstream_ref": "reflector.go:watch L556-563 (no SuggestsClientDelay call anywhere in reflector.go)"
+    },
+    {
+      "name": "reflector_inband_410_relists_from_last_sync_rv_after_backoff",
+      "client": "client-go",
+      "input": {
+        "list_rv": "10",
+        "watch_events": [
+          {
+            "type": "ADDED",
+            "rv": "57"
+          },
+          {
+            "type": "ERROR",
+            "status": {
+              "code": 410,
+              "reason": "Expired"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "watch_returns": null,
+        "ListAndWatch_returns": null,
+        "watchErrorHandler_called": false,
+        "isLastSyncResourceVersionUnavailable": false,
+        "BackoffUntil_sleep_before_relist": true,
+        "next_list_options": {
+          "resourceVersion": "57",
+          "limit": 0
+        }
+      },
+      "upstream_ref": "reflector.go:watch L551-555 ('Don't set LastSyncResourceVersionUnavailable'), L571; RunWithContext L359-363 (BackoffUntil sliding=true); relistResourceVersion L1002-1018; list L607-620 (PageSize=0 for RV not in {'','0'})",
+      "naive_trap": "relisting immediately, or relisting with RV='' ; client-go waits a backoff and lists at the last seen RV"
+    },
+    {
+      "name": "reflector_relist_after_410_list_also_410_falls_back_to_rv_empty",
+      "client": "client-go",
+      "input": {
+        "list_responses": {
+          "0": "list rv 10 (4 pods)",
+          "10": "410 Expired",
+          "": "list rv 11 (8 pods)"
+        },
+        "runs": 2
+      },
+      "expected": {
+        "list_call_rvs": [
+          "0",
+          "10",
+          ""
+        ],
+        "final_store_size": 8,
+        "backoff_between_rv10_and_rv_empty": false
+      },
+      "upstream_ref": "reflector_test.go:TestReflectorExpiredExactResourceVersion (L1212); reflector.go:list L624-633"
+    },
+    {
+      "name": "reflector_relist_too_large_rv_three_error_shapes",
+      "client": "client-go",
+      "input": {
+        "list_responses": {
+          "0": "list rv 20",
+          "20": "504 Timeout with cause type ResourceVersionTooLarge",
+          "30": "504 Timeout with cause message 'Too large resource version'",
+          "40": "504 Timeout message 'Timeout: Too large resource version'",
+          "": "list rv 30, then 40, then 50"
+        },
+        "runs": 4
+      },
+      "expected": {
+        "list_call_rvs": [
+          "0",
+          "20",
+          "",
+          "30",
+          "",
+          "40",
+          ""
+        ]
+      },
+      "upstream_ref": "reflector_test.go:TestReflectorFullListIfTooLarge (L1346); reflector.go:isTooLargeResourceVersionError (L1048-1077)"
+    },
+    {
+      "name": "reflector_list_continue_page_expired_full_list_at_same_rv",
+      "client": "client-go",
+      "input": {
+        "WatchListPageSize": 4,
+        "list_responses": {
+          "rv=0,limit=4": "rv 10, 4 pods",
+          "rv=10,limit=4": "rv 11, continue C1",
+          "rv='',continue=C1,limit=4": "410 Expired",
+          "rv=10,limit=0": "rv 11, 8 pods"
+        }
+      },
+      "expected": {
+        "list_call_rvs": [
+          "0",
+          "10",
+          "",
+          "10"
+        ],
+        "final_store_size": 8,
+        "isLastSyncResourceVersionUnavailable_set": false
+      },
+      "upstream_ref": "reflector_test.go:TestReflectorFullListIfExpired (L1272); pager.go:list L114-124"
+    },
+    {
+      "name": "reflector_list_continue_page_gone_reason_skips_pager_fallback",
+      "client": "client-go",
+      "input": {
+        "WatchListPageSize": 4,
+        "list_responses": {
+          "rv=10,limit=4": "rv 11, continue C1",
+          "rv='',continue=C1,limit=4": "410 with reason 'Gone' (not 'Expired')"
+        }
+      },
+      "expected": {
+        "pager_full_list_fallback": false,
+        "reflector_sets_unavailable": true,
+        "next_list": {
+          "resourceVersion": "",
+          "limit": 4
+        }
+      },
+      "upstream_ref": "pager.go:list L114 (IsResourceExpired only) vs reflector.go:list L624 (isExpiredError = IsResourceExpired || IsGone)",
+      "naive_trap": "pager and reflector use different 410 predicates"
+    },
+    {
+      "name": "reflector_inband_internal_error_retries_off_by_default",
+      "client": "client-go",
+      "input": {
+        "MaxInternalErrorRetryDuration": "0s",
+        "watch_events_each_call": [
+          {
+            "type": "ERROR",
+            "status": {
+              "code": 500,
+              "reason": "InternalError",
+              "message": "etcdserver: no leader"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "internal_error_retries": 0,
+        "action": "default branch -> return nil -> backoff -> LIST"
+      },
+      "upstream_ref": "reflector_test.go:TestRetryInternalError case 'retries off' (L914); informers never set MaxInternalErrorRetryDuration (controller.go)"
+    },
+    {
+      "name": "reflector_inband_internal_error_retry_window_no_backoff",
+      "client": "client-go",
+      "input": {
+        "MaxInternalErrorRetryDuration": "30s",
+        "clock_step_per_watch": "1s",
+        "watch_events_each_call": [
+          {
+            "type": "ERROR",
+            "status": {
+              "code": 500,
+              "reason": "InternalError"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "retries": 31,
+        "backoffManager_calls_during_retries": 0,
+        "retries_with_1min_clock_jump_at_call_10": 40
+      },
+      "upstream_ref": "reflector_test.go:TestRetryInternalError (L906-978); retry_with_deadline.go:After (L54, reset if >=1min since last error), ShouldRetry (L67, <= maxRetryDuration); reflector.go:watch L564-566 (continue, no backoff)"
+    },
+    {
+      "name": "reflector_inband_504_timeout_relists_at_last_sync_rv",
+      "client": "client-go",
+      "input": {
+        "last_sync_rv": "57",
+        "watch_events": [
+          {
+            "type": "ERROR",
+            "status": {
+              "code": 504,
+              "reason": "Timeout",
+              "details": {
+                "causes": [
+                  {
+                    "type": "ResourceVersionTooLarge"
+                  }
+                ],
+                "retryAfterSeconds": 1
+              }
+            }
+          }
+        ]
+      },
+      "expected": {
+        "branch": "default",
+        "backoff_before_relist": true,
+        "next_list_rv": "57",
+        "then_if_list_too_large": {
+          "next_list_rv": ""
+        }
+      },
+      "upstream_ref": "reflector.go:watch L548-571 (no TooLarge check on the watch path); list L624-633",
+      "naive_trap": "a too-large-RV watch error does not flip the reflector to RV='' until the LIST also fails"
+    },
+    {
+      "name": "reflector_http_504_at_establishment_is_listandwatch_error",
+      "client": "client-go",
+      "input": {
+        "http_responses": [
+          "504 (no Retry-After)"
+        ]
+      },
+      "expected": {
+        "isWatchErrorRetriable": false,
+        "ListAndWatch_returns_error": true,
+        "watchErrorHandler": "HandleError 'Failed to watch'",
+        "then": "BackoffUntil backoff -> LIST at lastSyncRV -> WATCH"
+      },
+      "upstream_ref": "reflector.go:watch L527-538; DefaultWatchErrorHandler L193-206; RunWithContext L359-363"
+    },
+    {
+      "name": "reflector_http_410_at_establishment_relists_not_from_rv_empty",
+      "client": "client-go",
+      "input": {
+        "last_sync_rv": "57",
+        "http_responses": [
+          "410 Status reason Expired"
+        ]
+      },
+      "expected": {
+        "ListAndWatch_returns_error": true,
+        "watchErrorHandler": "isExpiredError -> V(4) log only",
+        "next_list_rv": "57"
+      },
+      "upstream_ref": "reflector.go:watch L538; DefaultWatchErrorHandler L195-199; relistResourceVersion L1002-1018"
+    },
+    {
+      "name": "reflector_precedence_expired_checked_before_429_on_watch_path",
+      "client": "client-go",
+      "input": {
+        "useWatchList": false,
+        "watch_events": [
+          {
+            "type": "ERROR",
+            "status": {
+              "code": 429,
+              "reason": "Expired"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "branch": "isExpiredError",
+        "action": "return nil -> backoff -> LIST at lastSyncRV",
+        "rewatch_without_list": false
+      },
+      "upstream_ref": "reflector.go:watch switch order L550-557"
+    },
+    {
+      "name": "reflector_precedence_429_checked_before_expired_on_watchlist_path",
+      "client": "client-go",
+      "input": {
+        "useWatchList": true,
+        "phase": "initial watch-list stream",
+        "watch_events": [
+          {
+            "type": "ERROR",
+            "status": {
+              "code": 429,
+              "reason": "Expired"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "branch": "isWatchErrorRetriable",
+        "action": "stop watcher, backoff (not interruptible by stop), retry watch-list at same RV",
+        "isLastSyncResourceVersionUnavailable": false
+      },
+      "upstream_ref": "reflector.go:watchList isErrorRetriableWithSideEffectsFn L712-727 (429 test first, <-Backoff().C() with no stopCh select)",
+      "naive_trap": "the two reflector paths order the same two predicates differently"
+    },
+    {
+      "name": "reflector_watchlist_410_retries_immediately_with_rv_empty",
+      "client": "client-go",
+      "input": {
+        "useWatchList": true,
+        "watch_events": [
+          {
+            "type": "ERROR",
+            "status": {
+              "code": 410,
+              "reason": "Expired"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "backoff": false,
+        "isLastSyncResourceVersionUnavailable": true,
+        "next_watch_options": {
+          "resourceVersion": "",
+          "sendInitialEvents": true,
+          "resourceVersionMatch": "NotOlderThan"
+        }
+      },
+      "upstream_ref": "reflector.go:watchList L718-725, L743-756; rewatchResourceVersion L1021-1030"
+    },
+    {
+      "name": "reflector_watchlist_other_error_falls_back_to_list",
+      "client": "client-go",
+      "input": {
+        "useWatchList": true,
+        "watch_start_error": {
+          "code": 504,
+          "reason": "Timeout"
+        }
+      },
+      "expected": {
+        "fallbackToList": true,
+        "action": "LIST then WATCH in the same ListAndWatch call"
+      },
+      "upstream_ref": "reflector.go:ListAndWatchWithContext L415-434"
+    },
+    {
+      "name": "reflector_watchlist_disabled_by_default_in_v1_34",
+      "client": "client-go",
+      "input": {
+        "feature_gate": "WatchListClient",
+        "override": null
+      },
+      "expected": {
+        "enabled": false,
+        "prerelease": "Beta"
+      },
+      "upstream_ref": "client-go/features/known_features.go L82"
+    },
+    {
+      "name": "reflector_normal_watch_close_rewatches_without_backoff",
+      "client": "client-go",
+      "input": {
+        "watch": "HTTP 200, >=1 event or >=1s duration, then clean close (EOF)"
+      },
+      "expected": {
+        "handleWatch_error": null,
+        "backoff": false,
+        "list": false,
+        "next": "immediate WATCH at LastSyncResourceVersion"
+      },
+      "upstream_ref": "reflector.go:watch loop L501-573 (only err != nil returns); streamwatcher.go:receive io.EOF (L109)"
+    },
+    {
+      "name": "reflector_very_short_empty_watch_relists",
+      "client": "client-go",
+      "input": {
+        "watch": "HTTP 200, closed after <1s with 0 events"
+      },
+      "expected": {
+        "error": "VeryShortWatchError",
+        "branch": "default",
+        "action": "return nil -> backoff -> LIST"
+      },
+      "upstream_ref": "reflector.go:handleAnyWatch L975-978; watch L567-571"
+    },
+    {
+      "name": "reflector_short_watch_with_only_a_bookmark_is_not_very_short",
+      "client": "client-go",
+      "input": {
+        "watch_events": [
+          {
+            "type": "BOOKMARK",
+            "rv": "60"
+          }
+        ],
+        "duration": "<1s",
+        "then": "close"
+      },
+      "expected": {
+        "eventCount": 1,
+        "error": null,
+        "next": "immediate WATCH at rv 60"
+      },
+      "upstream_ref": "reflector.go:handleAnyWatch L950-962 (eventCount++ for bookmarks)"
+    },
+    {
+      "name": "reflector_short_watch_with_only_wrong_type_objects_is_very_short",
+      "client": "client-go",
+      "input": {
+        "expected_type": "Pod",
+        "watch_events": [
+          {
+            "type": "ADDED",
+            "object_kind": "Service"
+          }
+        ],
+        "duration": "<1s",
+        "then": "close"
+      },
+      "expected": {
+        "eventCount": 0,
+        "error": "VeryShortWatchError",
+        "action": "backoff -> LIST"
+      },
+      "upstream_ref": "reflector.go:handleAnyWatch L904-908 (continue before eventCount++); reflector_test.go:TestReflectorWatchHandler ('rejected' Service not stored)"
+    },
+    {
+      "name": "stream_decode_error_becomes_inband_500",
+      "client": "client-go",
+      "input": {
+        "watch_stream_line": {
+          "type": "FOO",
+          "object": {}
+        }
+      },
+      "expected": {
+        "synthesized_event": {
+          "type": "ERROR",
+          "status": {
+            "code": 500,
+            "reason": "InternalError",
+            "details.causes[-1].type": "ClientWatchDecoding"
+          }
+        },
+        "reflector_action_default_config": "relist (IsInternalError but MaxInternalErrorRetryDuration=0)"
+      },
+      "upstream_ref": "client-go/rest/watch/decoder.go:Decode ('got invalid watch event type'); apimachinery/pkg/watch/streamwatcher.go:receive L109; client-go/rest/request.go:newStreamWatcher (NewClientErrorReporter 500 'ClientWatchDecoding'); errors.go:ErrorReporter.AsObject L850"
+    },
+    {
+      "name": "stream_unexpected_eof_is_silent_close",
+      "client": "client-go",
+      "input": {
+        "watch_stream": "truncated mid-frame (io.ErrUnexpectedEOF) or net timeout"
+      },
+      "expected": {
+        "error_event_emitted": false,
+        "result_channel_closed": true
+      },
+      "upstream_ref": "apimachinery/pkg/watch/streamwatcher.go:receive (EOF/UnexpectedEOF/IsProbableEOF/IsTimeout do not emit ERROR)"
+    },
+    {
+      "name": "reflector_backoff_schedule_defaults",
+      "client": "client-go",
+      "input": {
+        "NewExponentialBackoffManager": {
+          "init": "800ms",
+          "max": "30s",
+          "reset": "2m",
+          "factor": 2.0,
+          "jitter": 1.0
+        },
+        "consecutive_backoffs": 8
+      },
+      "expected": {
+        "sleep_ranges_s": [
+          [
+            0.8,
+            1.6
+          ],
+          [
+            1.6,
+            3.2
+          ],
+          [
+            3.2,
+            6.4
+          ],
+          [
+            6.4,
+            12.8
+          ],
+          [
+            12.8,
+            25.6
+          ],
+          [
+            25.6,
+            51.2
+          ],
+          [
+            30,
+            60
+          ],
+          [
+            30,
+            60
+          ]
+        ],
+        "range_semantics": "[lo, hi)",
+        "cap_applies_to": "base duration, not the jittered sleep"
+      },
+      "upstream_ref": "reflector.go:NewReflectorWithOptions L283; wait/backoff.go:delay (L98-130), NewExponentialBackoffManager (L370); wait/wait.go:Jitter (L92)",
+      "naive_trap": "clamping the jittered sleep to 30s; the 6th sleep can reach 51.2s and steady state is [30s,60s)"
+    },
+    {
+      "name": "reflector_backoff_reset_after_quiet_period",
+      "client": "client-go",
+      "input": {
+        "gap_between_Backoff_calls": [
+          "2m0s",
+          "2m0.001s"
+        ]
+      },
+      "expected": {
+        "2m0s": "no reset (strict >)",
+        "2m0.001s": "reset to base 800ms"
+      },
+      "upstream_ref": "wait/backoff.go:exponentialBackoffManagerImpl.getNextBackoff (L390-398)"
+    },
+    {
+      "name": "reflector_backoff_state_shared_by_429_and_relist",
+      "client": "client-go",
+      "input": {
+        "sequence_within_2m": [
+          "in-band 429",
+          "in-band 429",
+          "in-band 410"
+        ]
+      },
+      "expected": {
+        "sleep_after_first_429_s": [
+          0.8,
+          1.6
+        ],
+        "sleep_after_second_429_s": [
+          1.6,
+          3.2
+        ],
+        "sleep_before_relist_after_410_s": [
+          3.2,
+          6.4
+        ]
+      },
+      "upstream_ref": "reflector.go: one r.backoffManager used by watch() L561 and by RunWithContext/BackoffUntil L363"
+    },
+    {
+      "name": "reflector_init_conn_backoff_bounds_from_test",
+      "client": "client-go",
+      "input": {
+        "backoffManager": {
+          "init": "1ms",
+          "max": "50ms",
+          "reset": "100ms",
+          "factor": 2.0,
+          "jitter": 1.0
+        },
+        "cases": [
+          {
+            "ECONNREFUSED_count": 5
+          },
+          {
+            "ECONNREFUSED_count": 40
+          }
+        ]
+      },
+      "expected": [
+        {
+          "elapsed_ms_range": [
+            32,
+            64
+          ]
+        },
+        {
+          "elapsed_ms_range": [
+            3500,
+            4000
+          ]
+        }
+      ],
+      "upstream_ref": "reflector_test.go:TestReflectorListAndWatchInitConnBackoff (L728-803)"
+    },
+    {
+      "name": "apiserver_mirrors_retry_after_seconds_into_header",
+      "client": "server-context",
+      "input": {
+        "error_status": {
+          "code": 429,
+          "details": {
+            "retryAfterSeconds": 3
+          }
+        }
+      },
+      "expected": {
+        "response_header": {
+          "Retry-After": "3"
+        },
+        "applies_to_any_code_when_retryAfterSeconds_gt_0": true
+      },
+      "upstream_ref": "apiserver/pkg/endpoints/handlers/responsewriters/writers.go:ErrorNegotiated (L381-388)"
+    },
+    {
+      "name": "apiserver_unready_watch_cache_returns_http_429",
+      "client": "server-context",
+      "input": {
+        "ResilientWatchCacheInitialization": "GA, locked on in 1.34",
+        "cache_downtime_s": [
+          0,
+          10,
+          20,
+          30,
+          60
+        ]
+      },
+      "expected": {
+        "transport": "HTTP-level error (before any watcher is created)",
+        "code": 429,
+        "retryAfterSeconds": {
+          "0": 1,
+          "10": 1,
+          "20": 3,
+          "30": 6,
+          "60": 30
+        }
+      },
+      "upstream_ref": "apiserver/pkg/storage/cacher/cacher.go:Watch L500-505; cacher/util.go:calculateRetryAfterForUnreadyCache (L51: int(min(30,max(1,exp(0.06*s))))); features/kube_features.go L386-389"
+    },
+    {
+      "name": "apiserver_post_admission_watch_errors_are_inband",
+      "client": "server-context",
+      "input": {
+        "watch_rv": "too old (compacted) or too large"
+      },
+      "expected": {
+        "http_status": 200,
+        "events": [
+          "single ERROR event carrying the Status"
+        ],
+        "then": "stream closed",
+        "non_status_error_wrapped_as": {
+          "code": 500,
+          "reason": "InternalError"
+        }
+      },
+      "upstream_ref": "apiserver/pkg/storage/cacher/cacher.go:Watch L558-615 ('other errors must fail with a watch event of type ERROR'), newErrWatcher L1311"
+    },
+    {
+      "name": "apiserver_too_large_rv_error_shape",
+      "client": "server-context",
+      "input": {
+        "minimumResourceVersion": 100,
+        "currentRevision": 90,
+        "retrySeconds": 1
+      },
+      "expected": {
+        "code": 504,
+        "reason": "Timeout",
+        "message": "Timeout: Too large resource version: 100, current: 90",
+        "details": {
+          "retryAfterSeconds": 1,
+          "causes": [
+            {
+              "type": "ResourceVersionTooLarge"
+            }
+          ]
+        }
+      },
+      "upstream_ref": "apiserver/pkg/storage/errors.go:NewTooLargeResourceVersionError (L233); apimachinery errors.go:NewTimeoutError"
+    },
+    {
+      "name": "kube_rs_inband_410_resets_to_empty_and_relists_at_most_recent",
+      "client": "kube-rs",
+      "input": {
+        "state": "Watching{rv:'57'}",
+        "stream_item": {
+          "type": "ERROR",
+          "object": {
+            "code": 410,
+            "reason": "Expired"
+          }
+        },
+        "config": "default"
+      },
+      "expected": {
+        "emitted": "Err(Error::WatchError)",
+        "next_state": "Empty",
+        "next_poll": "Ok(Event::Init) then LIST with resourceVersion unset (ListSemantic::MostRecent), limit 500"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs:step_trampolined Watching/Error (L686-701), Config::default (L266-279), to_list_params (L392-407)",
+      "naive_trap": "client-go relists at the last seen RV; kube-rs relists with no RV (quorum read)"
+    },
+    {
+      "name": "kube_rs_inband_429_keeps_stream_then_rewatches_same_rv",
+      "client": "kube-rs",
+      "input": {
+        "state": "Watching{rv:'57'}",
+        "stream_items": [
+          {
+            "type": "ERROR",
+            "object": {
+              "code": 429
+            }
+          },
+          "end of stream"
+        ]
+      },
+      "expected": {
+        "emitted": [
+          "Err(Error::WatchError)"
+        ],
+        "state_after_error": "Watching{rv:'57', same stream}",
+        "state_after_end": "InitListed{rv:'57'}",
+        "relist": false
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs:step_trampolined L686-701, L714"
+    },
+    {
+      "name": "kube_rs_relist_decision_uses_code_only",
+      "client": "kube-rs",
+      "input": {
+        "inband_statuses": [
+          {
+            "code": 500,
+            "reason": "Expired"
+          },
+          {
+            "code": 410,
+            "reason": "TooManyRequests"
+          },
+          {
+            "code": 410,
+            "reason": ""
+          }
+        ]
+      },
+      "expected": {
+        "relist": [
+          false,
+          true,
+          true
+        ],
+        "client_go_relist_for_same_inputs": [
+          true,
+          false,
+          true
+        ]
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs L688 ('if err.code == 410'); client-go reflector.go:watch L550-557",
+      "naive_trap": "the two clients disagree on the first two inputs; a server must keep code and reason consistent"
+    },
+    {
+      "name": "kube_rs_http_level_410_never_relists",
+      "client": "kube-rs",
+      "input": {
+        "state": "InitListed{rv:'57'}",
+        "watch_http_response": {
+          "status": 410,
+          "body": {
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "code": 410,
+            "reason": "Expired"
+          }
+        }
+      },
+      "expected": {
+        "api_watch_result": "Ok(stream) (request_events never checks the HTTP status)",
+        "first_item": "Err(Error::Api(Status code 410))",
+        "emitted": "Err(Error::WatchFailed)",
+        "state_after_end": "InitListed{rv:'57'}",
+        "relist": false,
+        "steady_state": "re-watch at rv 57 forever (paced only by the caller's backoff)"
+      },
+      "upstream_ref": "kube-client/src/client/mod.rs:request_events (L340-400: no handle_api_errors; non-WatchEvent line parsed as Status -> Err(Error::Api)); kube-client/src/api/core_methods.rs:watch (L551-564); kube-runtime/src/watcher.rs L703-714",
+      "naive_trap": "a server that sends 410 as an HTTP status (not as an in-band ERROR event) traps kube-rs watchers in a loop"
+    },
+    {
+      "name": "kube_rs_watch_start_transport_error_stays_initlisted",
+      "client": "kube-rs",
+      "input": {
+        "state": "InitListed{rv:'57'}",
+        "api_watch": "Err(connection refused)"
+      },
+      "expected": {
+        "emitted": "Err(Error::WatchStartFailed)",
+        "next_state": "InitListed{rv:'57'}",
+        "relist": false
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs:step_trampolined InitListed (L635-655)"
+    },
+    {
+      "name": "kube_rs_http_retry_layer_statuses",
+      "client": "kube-rs",
+      "input": {
+        "config.default_retry": true,
+        "http_status": [
+          429,
+          503,
+          504,
+          500,
+          502,
+          410
+        ]
+      },
+      "expected": {
+        "retried_by_http_layer": {
+          "429": true,
+          "503": true,
+          "504": true,
+          "500": false,
+          "502": false,
+          "410": false
+        },
+        "max_retries_per_request": 15,
+        "applies_to_watch_requests": true
+      },
+      "upstream_ref": "kube-client/src/client/retry.rs:is_retryable_status (L114), server_retry (L108); client/builder.rs L251; config/mod.rs default_retry: true (L199)"
+    },
+    {
+      "name": "kube_rs_http_retry_sleep_formula",
+      "client": "kube-rs",
+      "input": {
+        "retry_index_i": [
+          0,
+          1,
+          14
+        ],
+        "Retry-After": [
+          null,
+          "10"
+        ]
+      },
+      "expected": {
+        "backoff_base": "5ms * 2^i capped at 1000s",
+        "backoff_sleep": "base + min(base * 2.0 * U[0,1), 1000s - base)",
+        "with_numeric_Retry-After": "sleep Retry-After seconds if now+Retry-After >= backoff deadline, else the backoff",
+        "non_integer_Retry-After": "ignored",
+        "i=0_no_header_ms": [
+          5,
+          15
+        ],
+        "i=14_no_header_s": [
+          81.92,
+          245.76
+        ],
+        "precision_note": "tower computes jitter as Duration::new(trunc(base_secs*j), base_subsec_nanos*j) with j=U[0,1)*2.0, so the whole-seconds part is truncated; ranges are approximate at the top end"
+      },
+      "upstream_ref": "kube-client/src/client/retry.rs:RetryPolicy::new (L86-87 passes 2.0 as tower's jitter arg), retry (L138-160); tower/src/retry/backoff.rs:ExponentialBackoffMaker::new(min,max,jitter,rng), base(), jitter(), next_backoff()",
+      "naive_trap": "the 2.0 is tower's jitter, not a growth factor; growth is fixed at x2 by tower"
+    },
+    {
+      "name": "kube_rs_http_429_after_retry_exhaustion",
+      "client": "kube-rs",
+      "input": {
+        "state": "InitListed{rv:'57'}",
+        "every_http_attempt": "429 with Status body"
+      },
+      "expected": {
+        "http_attempts": 16,
+        "emitted": "Err(Error::WatchFailed(Error::Api(429)))",
+        "state_after_end": "InitListed{rv:'57'}",
+        "relist": false
+      },
+      "upstream_ref": "kube-client/src/client/retry.rs (15 retries); client/mod.rs:request_events; kube-runtime/src/watcher.rs L640-643, L703-714"
+    },
+    {
+      "name": "kube_rs_list_error_restarts_listing",
+      "client": "kube-rs",
+      "input": {
+        "state": "InitPage{continue:'C1'}",
+        "list_error": "any (410, 429, 504, ...)"
+      },
+      "expected": {
+        "emitted": "Err(Error::InitialListFailed)",
+        "next_state": "Empty",
+        "next_poll": "Ok(Event::Init), list restarts from page 1 (continue token dropped)"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs:step_trampolined InitPage (L578-585), Empty (L522-527)"
+    },
+    {
+      "name": "kube_rs_streaming_list_nonfatal_error_then_close_restarts_initial",
+      "client": "kube-rs",
+      "input": {
+        "initial_list_strategy": "StreamingList",
+        "state": "InitialWatch",
+        "stream_items": [
+          {
+            "type": "ERROR",
+            "object": {
+              "code": 429
+            }
+          },
+          "end of stream"
+        ]
+      },
+      "expected": {
+        "state_after_error": "InitialWatch (same stream)",
+        "state_after_end": "Empty",
+        "next": "new initial watch with sendInitialEvents at version '0'"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs:step_trampolined InitialWatch (L610-633), Empty/StreamingList (L528-529)"
+    },
+    {
+      "name": "kube_rs_default_backoff_schedule",
+      "client": "kube-rs",
+      "input": {
+        "DefaultBackoff": "ResetTimerBackoff(ExponentialBackoff(800ms, 30s, 2.0, jitter=true), 120s)",
+        "consecutive_errors": 8
+      },
+      "expected": {
+        "base_s": [
+          0.8,
+          1.6,
+          3.2,
+          6.4,
+          12.8,
+          25.6,
+          30,
+          30
+        ],
+        "sleep_backon_ge_1_4_1": "[base, 2*base)",
+        "sleep_backon_1_3_0_to_1_4_0": "[base, base + 0.8s)",
+        "kube_rs_requirement": "backon = \"1.3\" (so the resolved version decides the jitter)"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs:DefaultBackoff (L978-988), ExponentialBackoff::new (L925); backon exponential.rs next() @v1.6.0 (jitter = cur*rand) vs @v1.3.0/@v1.4.0 (jitter = min_delay*rand); kube Cargo.toml L39"
+    },
+    {
+      "name": "kube_rs_backoff_resets_on_any_ok_item",
+      "client": "kube-rs",
+      "input": {
+        "stream": [
+          "Err(WatchError 410)",
+          "Ok(Event::Init)",
+          "Err(InitialListFailed)"
+        ]
+      },
+      "expected": {
+        "sleep_after_first_err_s": [
+          0.8,
+          1.6
+        ],
+        "reset_on_init": true,
+        "sleep_after_second_err_s": [
+          0.8,
+          1.6
+        ]
+      },
+      "upstream_ref": "kube-runtime/src/utils/stream_backoff.rs:poll_next (L72-93: reset on any Ok)",
+      "naive_trap": "client-go keeps growing its shared backoff across a 410 relist; kube-rs resets on the Init marker"
+    },
+    {
+      "name": "kube_rs_reset_timer_backoff_test",
+      "client": "kube-rs",
+      "input": {
+        "inner": "LinearBackoff(2s)",
+        "reset_after": "60s",
+        "advances_s": [
+          0,
+          40,
+          40,
+          80,
+          80
+        ]
+      },
+      "expected": {
+        "next_s": [
+          2,
+          4,
+          6,
+          2,
+          2
+        ]
+      },
+      "upstream_ref": "kube-runtime/src/utils/backoff_reset_timer.rs:should_reset_when_timer_expires (L68)"
+    },
+    {
+      "name": "kube_rs_raw_watcher_has_no_backoff",
+      "client": "kube-rs",
+      "input": {
+        "stream": "watcher(api, cfg) without .default_backoff()",
+        "consecutive_errors": 3
+      },
+      "expected": {
+        "sleep_between_retries": 0,
+        "controller_default": "Controller wraps its trigger stream in DefaultBackoff"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs watcher() docs 'Recovery' (L775-785); utils/watch_ext.rs:default_backoff (L25); controller/mod.rs trigger_backoff (L757)"
+    }
+  ]
+}

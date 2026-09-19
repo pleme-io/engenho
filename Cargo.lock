@@ -1720,6 +1720,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "engenho-oracle"
+version = "0.53.118"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "engenho-revoada"
 version = "0.53.118"
 dependencies = [
