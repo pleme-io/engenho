@@ -36,8 +36,11 @@
 //!
 //! ## Tier
 //!
-//! **parse-time-rejected** at the create boundary. Not unrepresentable: the
-//! store still accepts any `Value`, so this is a check that must be CALLED.
+//! **parse-time-rejected** at the write boundary: the one write pipeline
+//! (`handler/write_plan.rs`) calls it for every verb — POST, PUT, PATCH and
+//! server-side apply. Not unrepresentable: the store still accepts any
+//! `Value`, so this is a check that must be CALLED, and a controller writing
+//! straight to the store is never checked.
 
 use serde_json::Value;
 

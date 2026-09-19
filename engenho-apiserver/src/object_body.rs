@@ -43,8 +43,11 @@
 //! * a mutating webhook's body is re-normalized after admission (upstream
 //!   decodes the patched object the same way), so an admitted body is covered
 //!   too — by the handler calling `normalize` again, not by a type;
-//! * objects stored before this landed, and objects written by PATCH or
-//!   server-side apply, can still carry the nulls. Readers still need T4.3's
+//! * since the one write pipeline (T4.5, `handler/write_plan.rs`), the object
+//!   a PATCH or server-side apply would STORE — the merged candidate, not the
+//!   patch — is normalized too, so no write through the apiserver stores the
+//!   nulls. Objects stored before these landed, and objects controllers write
+//!   straight to the store, can still carry them: readers still need T4.3's
 //!   total access.
 //!
 //! Status codes follow upstream, not a guess: a body upstream cannot decode is
