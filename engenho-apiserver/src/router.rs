@@ -45,8 +45,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
 use engenho_kube_proto::{
-    self as kube_proto, CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type,
-    response_wants_protobuf,
+    CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type, response_wants_protobuf,
 };
 use engenho_store::{Revision, WatchEventKind, WatchSignal, WatchStream};
 use engenho_types::auth::UserInfo;
@@ -67,6 +66,7 @@ use crate::params::{
     DryRun, InitialEvents, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line,
     error_line, event_line, gvk_ns_matches,
 };
+use crate::proto_transcode::{self, Decoded, Losses};
 use crate::watch_end::{AfterGone, WatchProgress};
 use crate::watch_start::{WatchRefusal, WatchStart};
 
@@ -827,10 +827,11 @@ fn serve_openapi_v3_document(group: &str, version: &str) -> Result<Response, Api
 // client construction and never renegotiates — a 415 is a TERMINAL error,
 // not a fall-back-to-JSON trigger (proven empirically). So the write
 // handlers extract the raw body + headers themselves and dispatch on
-// Content-Type through the typed `engenho-kube-proto` codec, with a
-// proper ApiError-rendered 415 K8s Status for anything else (NEVER axum's
-// built-in plain-text JsonRejection). The downstream handler/store/
-// admission/read-back pipeline stays serde_json::Value-typed.
+// Content-Type through the descriptor-driven transcoder
+// (`crate::proto_transcode`), with a proper ApiError-rendered 415 K8s Status
+// for anything else (NEVER axum's built-in plain-text JsonRejection). The
+// downstream handler/store/admission/read-back pipeline stays
+// serde_json::Value-typed.
 
 /// The codec to use for a RESPONSE body, negotiated from the request
 /// `Accept` header. kubectl's typed clientset sends
@@ -840,7 +841,9 @@ fn serve_openapi_v3_document(group: &str, version: &str) -> Result<Response, Api
 #[derive(Clone, Copy)]
 enum ResponseCodec {
     Json,
-    Protobuf,
+    /// Protobuf preferred, and whether the same `Accept` also takes JSON:
+    /// the answer when this object has no exact protobuf form.
+    Protobuf(JsonFallback),
     /// `Accept: application/json;as=Table;v=1;g=meta.k8s.io` — server-side
     /// printing. kubectl and k9s BOTH default to this for list views and let
     /// the server choose the columns; without it they receive a plain List and
@@ -907,9 +910,41 @@ impl ResponseCodec {
             // than ignoring the preference.
             Ok(ResponseCodec::PartialMetadata)
         } else if response_wants_protobuf(accept) {
-            Ok(ResponseCodec::Protobuf)
+            Ok(ResponseCodec::Protobuf(JsonFallback::from_accept(accept)))
         } else {
             Ok(ResponseCodec::Json)
+        }
+    }
+}
+
+/// Whether a protobuf-preferring `Accept` also takes JSON.
+///
+/// Every client-go protobuf client sends
+/// `application/vnd.kubernetes.protobuf,application/json` and picks its
+/// decoder from the RESPONSE `Content-Type`, so for it a JSON answer is a
+/// correct answer. That is what lets a kind with no vendored message (a
+/// custom resource, `batch/v1`, …) and an object whose protobuf would lose
+/// data both be served exactly, instead of a 400 or a silently smaller body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonFallback {
+    /// `Accept` also names `application/json`, `application/*` or `*/*`.
+    Admitted,
+    /// `Accept` names protobuf and nothing JSON satisfies.
+    Refused,
+}
+
+impl JsonFallback {
+    fn from_accept(accept: &str) -> Self {
+        let admits_json = accept.split(',').any(|range| {
+            let media = range.split(';').next().unwrap_or("").trim();
+            media.eq_ignore_ascii_case("application/json")
+                || media.eq_ignore_ascii_case("application/*")
+                || media == "*/*"
+        });
+        if admits_json {
+            Self::Admitted
+        } else {
+            Self::Refused
         }
     }
 }
@@ -941,16 +976,31 @@ fn handler_gvk(h: &Arc<dyn ResourceHandler>) -> Gvk {
     Gvk::new(h.api_version(), h.kind())
 }
 
+/// Decode a write request body that is not stored as the object (a
+/// `/status` or `/scale` PUT, a `TokenRequest`). See [`decode_body`]; what a
+/// protobuf transcode could not carry is answered with warnings only where
+/// the body IS the object ([`decode_object_body`]).
+fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Value, ApiError> {
+    decode_body(headers, raw).map(|decoded| decoded.value)
+}
+
+/// Decode a protobuf request body through the descriptor-driven transcoder.
+/// A kind with no vendored message is a 415, as a custom resource's
+/// protobuf body is upstream.
+pub(crate) fn decode_protobuf_body(raw: &[u8]) -> Result<Decoded, ApiError> {
+    proto_transcode::decode(raw).map_err(proto_transcode::TranscodeError::into_request_error)
+}
+
 /// Decode a write request body into the `serde_json::Value` the handler
 /// pipeline expects, dispatching on `Content-Type`:
 ///
 ///   * `application/json` (or absent → JSON) → `serde_json::from_slice`.
-///   * `application/vnd.kubernetes.protobuf` → the typed
-///     `engenho-kube-proto` codec (magic + `runtime.Unknown` + per-kind
-///     `DynamicMessage` → Value).
+///   * `application/vnd.kubernetes.protobuf` → [`decode_protobuf_body`]
+///     (magic + `runtime.Unknown` + the kind's message, transcoded to the
+///     JSON upstream serves).
 ///   * anything else → a typed [`ApiError::UnsupportedMediaType`] (HTTP
 ///     415, proper K8s `Status` body) — NOT axum's plain-text rejection.
-fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Value, ApiError> {
+fn decode_body(headers: &HeaderMap, raw: &[u8]) -> Result<Decoded, ApiError> {
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -958,9 +1008,13 @@ fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Valu
     let media = content_type.split(';').next().unwrap_or("").trim();
     if media.is_empty() || media.eq_ignore_ascii_case("application/json") {
         serde_json::from_slice(raw)
+            .map(|value| Decoded {
+                value,
+                losses: Losses::default(),
+            })
             .map_err(|e| ApiError::BadRequest(format!("invalid JSON request body: {e}")))
     } else if is_protobuf_content_type(content_type) {
-        Ok(kube_proto::decode_protobuf(raw)?)
+        decode_protobuf_body(raw)
     } else {
         Err(ApiError::UnsupportedMediaType(format!(
             "the body of the request was in an unsupported format - \
@@ -989,9 +1043,16 @@ fn decode_object_body(
         ObjectBody::normalize(h.group(), h.kind(), body)
             .map_err(|e| e.request_error(h.version(), h.kind()))
     };
+    let Decoded { value, losses } = decode_body(headers, raw)?;
+    // A protobuf body can carry what the transcode cannot keep (a field
+    // number newer than the vendored descriptors): stored without it, and
+    // the client is told, as a dropped JSON field is told under `Warn`.
+    for loss in losses.iter() {
+        border.warnings.add(&loss);
+    }
     // A mis-shaped body is refused before its fields are judged: upstream's
     // decoder reports a type error instead of any strict error it collected.
-    let mut body = normalize(decode_write_body(headers, raw)?)?.into_value();
+    let mut body = normalize(value)?.into_value();
     border.check_object(h, headers, raw, &mut body)?;
     // Dropping a field leaves a normalized object normalized; this only
     // re-seals it as the `ObjectBody` the pipeline takes.
@@ -1102,10 +1163,12 @@ fn decode_patch(
     }
 
     if is_protobuf_content_type(content_type) {
-        // A protobuf full-object replace (rare): decode via the codec, typed
-        // as a merge (full-object replace).
+        // A protobuf full-object replace (rare): decode via the transcoder,
+        // typed as a merge (full-object replace). A patch has no warnings
+        // channel here, so a loss (a wire field newer than the descriptors)
+        // is dropped exactly as an upstream v1.34 apiserver drops it.
         let _ = gvk;
-        let v = kube_proto::decode_protobuf(raw)?;
+        let v = decode_protobuf_body(raw)?.value;
         return Ok((v, PatchType::Merge));
     }
 
@@ -1182,15 +1245,44 @@ fn render_object(
             let projected = crate::table::to_partial_object_metadata(&value);
             Ok((status, Json(projected)).into_response())
         }
-        ResponseCodec::Protobuf => {
-            // The read-back Value carries apiVersion+kind from
-            // inject_type_meta; the codec re-derives the per-kind
-            // descriptor from `gvk` (the handler's GVK), so the response
-            // wraps correctly even if the stored object omitted TypeMeta.
-            let bytes = kube_proto::encode_response(gvk, &value)?;
-            Ok((status, [(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)], bytes).into_response())
-        }
+        // The transcoder derives the kind's message from `gvk` (the
+        // handler's GVK), so the response wraps correctly even if the stored
+        // object omitted TypeMeta. JSON answers whenever protobuf would not
+        // be exact and the client takes JSON: a kind with no vendored
+        // message, a stored value with no protobuf form, or a known loss.
+        ResponseCodec::Protobuf(fallback) => match (proto_transcode::encode(gvk, &value), fallback)
+        {
+            (Ok(encoded), JsonFallback::Admitted) if encoded.losses.is_empty() => {
+                Ok(protobuf_response(status, encoded.bytes))
+            }
+            (Ok(encoded), JsonFallback::Admitted) => {
+                tracing::debug!(
+                    kind = %gvk.kind,
+                    losses = ?encoded.losses,
+                    "protobuf would not be exact; answering JSON"
+                );
+                Ok((status, Json(value)).into_response())
+            }
+            (Err(error), JsonFallback::Admitted) => {
+                tracing::debug!(kind = %gvk.kind, %error, "no protobuf form; answering JSON");
+                Ok((status, Json(value)).into_response())
+            }
+            // The client reads nothing else: the closest protobuf there is,
+            // with what it lost named in warnings.
+            (Ok(encoded), JsonFallback::Refused) => {
+                let mut warnings = Warnings::default();
+                for loss in encoded.losses.iter() {
+                    warnings.add(&loss);
+                }
+                Ok(warnings.attach(Ok(protobuf_response(status, encoded.bytes))))
+            }
+            (Err(error), JsonFallback::Refused) => Err(error.into_response_error()),
+        },
     }
+}
+
+fn protobuf_response(status: StatusCode, bytes: Bytes) -> Response {
+    (status, [(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)], bytes).into_response()
 }
 
 // ── shared per-verb bodies (core + grouped wrappers reuse these) ───────
@@ -1335,7 +1427,7 @@ async fn do_delete(
     // — Deployment, ConfigMap, … — is in the proto pool). The Status-Success
     // fallback only arises when no object existed; `Status` lives in
     // meta/v1, NOT the core/v1 package the kube-proto map reaches, so
-    // encoding it as protobuf would hit `CodecError::UncatalogedKind`.
+    // encoding it as protobuf would hit `TranscodeError::Uncataloged`.
     // Render that one value as JSON regardless of Accept. This is invisible
     // to conformance: the conformance DELETE always targets an existing
     // object (object path → protobuf works).

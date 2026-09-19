@@ -56,6 +56,7 @@
 //! object that does not decode is `apierrors.NewInternalError` (500,
 //! `admission/plugin/webhook/mutating/dispatcher.go`).
 
+use std::borrow::Cow;
 use std::fmt;
 
 use serde_json::{Map, Value};
@@ -219,29 +220,44 @@ impl fmt::Display for JsonKind {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FieldPath(Vec<Segment>);
 
+/// A field name is borrowed when the border names it in source and owned when
+/// it comes from a runtime schema: the protobuf transcoder
+/// ([`crate::proto_transcode`]) reports paths through descriptors, whose names
+/// live in the descriptor pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Segment {
-    Field(&'static str),
+    Field(Cow<'static, str>),
     Key(String),
     Index(usize),
 }
 
 impl FieldPath {
     fn fields(names: &[&'static str]) -> Self {
-        Self(names.iter().copied().map(Segment::Field).collect())
+        Self(
+            names
+                .iter()
+                .map(|name| Segment::Field(Cow::Borrowed(*name)))
+                .collect(),
+        )
     }
 
     fn field(mut self, name: &'static str) -> Self {
-        self.0.push(Segment::Field(name));
+        self.0.push(Segment::Field(Cow::Borrowed(name)));
         self
     }
 
-    fn key(mut self, key: &str) -> Self {
+    /// Descend into a field whose name is not known at compile time.
+    pub(crate) fn named(mut self, name: &str) -> Self {
+        self.0.push(Segment::Field(Cow::Owned(name.to_owned())));
+        self
+    }
+
+    pub(crate) fn key(mut self, key: &str) -> Self {
         self.0.push(Segment::Key(key.to_owned()));
         self
     }
 
-    fn index(mut self, index: usize) -> Self {
+    pub(crate) fn index(mut self, index: usize) -> Self {
         self.0.push(Segment::Index(index));
         self
     }

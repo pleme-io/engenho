@@ -22,7 +22,7 @@ use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use engenho_kube_proto::{self as kube_proto, is_protobuf_content_type};
+use engenho_kube_proto::is_protobuf_content_type;
 use engenho_types::auth::UserInfo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -346,7 +346,7 @@ fn decode_sar_body<T: DeserializeOwned + Default>(
             serde_json::from_slice(raw)
                 .map_err(|e| ApiError::BadRequest(format!("invalid {kind} JSON body: {e}")))?
         } else if is_protobuf_content_type(content_type) {
-            kube_proto::decode_protobuf(raw)?
+            crate::router::decode_protobuf_body(raw)?.value
         } else {
             return Err(ApiError::UnsupportedMediaType(format!(
                 "the body of the {kind} request was in an unsupported format; got {media:?}"

@@ -334,17 +334,11 @@ pub(crate) fn too_many_requests_object(
     .to_value()
 }
 
-/// A protobuf-codec failure at the HTTP boundary becomes an
-/// [`ApiError::BadRequest`] — bad magic, an uncataloged kind, or an
-/// undecodable object body are all malformed-request conditions (HTTP
-/// 400 with a proper K8s `Status`), never a panic. The codec is a TOTAL
-/// function returning typed errors; this is the single mapping into the
-/// apiserver's error surface.
-impl From<engenho_kube_proto::CodecError> for ApiError {
-    fn from(e: engenho_kube_proto::CodecError) -> Self {
-        ApiError::BadRequest(e.to_string())
-    }
-}
+// A protobuf transcode failure has no `From` into `ApiError` on purpose: the
+// same failure is a client error on a request body and the server's on a
+// response, so the mapping is chosen by direction
+// (`proto_transcode::TranscodeError::{into_request_error,
+// into_response_error}`), never by a `?` that cannot tell them apart.
 
 /// Build the standard Kubernetes RBAC forbidden message for a denied request —
 /// the exact `forbidden: User "<u>" cannot <verb> resource "<resource>" in API

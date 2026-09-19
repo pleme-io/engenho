@@ -56,6 +56,12 @@ engenho-types      = { workspace = true }
 engenho-store      = { workspace = true }
 engenho-controllers = { workspace = true }
 engenho-kube-proto = { workspace = true }
+# The protobuf transcoder (src/proto_transcode.rs) walks the descriptors
+# engenho-kube-proto compiles, at the versions that crate already pins, and
+# renders metav1.Time/MicroTime through engenho-types' chrono surface.
+prost              = "0.14"
+prost-reflect      = "0.16"
+chrono             = "0.4"
 # ErrorKind trait + impl_error_kind! macro — stable .kind() tags.
 engenho-substrate  = { workspace = true }
 

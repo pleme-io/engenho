@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "71772a8012e67559e941d0ae5e7f3df9bcc2e2a9a2e41ce62fa58eed3b33397f",
+  "cargo_lock_sha256": "54dc3b9dfd08b1ddaff9afc926dea7ef8b63183a5e3bbe29248652d7752e6177",
   "manifest_sha256": {
     "Cargo.toml": "04cf79221801b8562c19d8a3bcbf45a55f2886ba7d654cd6a523bd856736a98c",
-    "engenho-apiserver/Cargo.toml": "cbfcc73989c47581206c732e25122bbecad0badee14f2555a91a1c33f438579b",
+    "engenho-apiserver/Cargo.toml": "95b6377538af933cc2ffb4135b0ac3baeaf6609c0df8b06eccb9a25796bbf27f",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-cni/Cargo.toml": "18a964f983410b945d3e150fe0f2a33635fe63aaadb02f9425a20eac53f39908",
@@ -4310,6 +4310,16 @@
             "tree": "target"
           },
           {
+            "name": "chrono",
+            "package_key": "chrono-0.4.44",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "ed25519_dalek",
             "package_key": "ed25519-dalek-2.2.0",
             "kind": "normal",
@@ -4395,6 +4405,26 @@
           {
             "name": "percent_encoding",
             "package_key": "percent-encoding-2.3.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "prost",
+            "package_key": "prost-0.14.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "prost_reflect",
+            "package_key": "prost-reflect-0.16.4",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,

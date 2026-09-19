@@ -47,6 +47,7 @@ pub mod openapi;
 pub mod params;
 pub mod pki;
 pub mod pod_logs;
+pub mod proto_transcode;
 pub mod router;
 pub mod sa_token;
 pub mod scale;
