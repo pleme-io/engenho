@@ -114,6 +114,15 @@ pub struct RouterState {
     /// both from ONE `SaKeypair`, so a mintable token is always a verifiable
     /// one.
     pub token_issuer: Option<Arc<crate::sa_token::SaIssuer>>,
+    /// The process's rollout-gate ledger: what every gate in `Shadow` has
+    /// allowed that `Enforce` would have refused. `/metrics` renders it as
+    /// `engenho_would_reject_total{gate,reason}`.
+    ///
+    /// Defaults to a ledger private to this router that logs through
+    /// [`crate::metrics::log_would_reject`]. The runtime installs the ONE
+    /// ledger it shares with every other gate-owning component via
+    /// [`Self::with_would_reject_ledger`], so one scrape shows every gate.
+    pub would_reject: Arc<engenho_substrate::WouldRejectLedger>,
 }
 
 impl RouterState {
@@ -136,7 +145,22 @@ impl RouterState {
             // No signing key by default: `/token` answers a typed error until
             // the runtime installs the cluster's keypair. NEVER a stub token.
             token_issuer: None,
+            would_reject: Arc::new(engenho_substrate::WouldRejectLedger::new(
+                crate::metrics::log_would_reject,
+            )),
         }
+    }
+
+    /// Install the process-wide rollout-gate ledger. Builder style mirroring
+    /// [`Self::with_authorizer`]; the runtime passes the same `Arc` to every
+    /// component that owns a gate, so `/metrics` counts all of them.
+    #[must_use]
+    pub fn with_would_reject_ledger(
+        mut self,
+        ledger: Arc<engenho_substrate::WouldRejectLedger>,
+    ) -> Self {
+        self.would_reject = ledger;
+        self
     }
 
     /// Install the ServiceAccount token minter. Builder style mirroring

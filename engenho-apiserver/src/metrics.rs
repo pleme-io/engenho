@@ -173,9 +173,85 @@ pub fn apiserver_families(
     ]
 }
 
+/// The one metric family every rollout gate reports through.
+///
+/// engenho-native: upstream has no shadow gates. Shares its vocabulary with
+/// the Event reason [`engenho_substrate::WouldReject::EVENT_REASON`].
+pub const WOULD_REJECT_TOTAL: &str = "engenho_would_reject_total";
+
+/// `engenho_would_reject_total{gate,reason}`: what each gate in
+/// [`engenho_substrate::Rollout::Shadow`] allowed that `Enforce` would have
+/// refused.
+///
+/// Label order is fixed (`gate`, then `reason`) and the samples keep the
+/// ledger's order, so the series set is stable from scrape to scrape.
+#[must_use]
+pub fn would_reject_family(counts: &[engenho_substrate::WouldRejectCount]) -> MetricFamily {
+    MetricFamily {
+        name: WOULD_REJECT_TOTAL.into(),
+        help: "Refusals a gate in shadow rollout allowed that enforce would have made, by gate and reason.".into(),
+        kind: MetricType::Counter,
+        samples: counts
+            .iter()
+            .map(|c| Sample {
+                labels: vec![
+                    ("gate".into(), c.gate.into()),
+                    ("reason".into(), c.reason.into()),
+                ],
+                #[allow(clippy::cast_precision_loss)]
+                value: c.count as f64,
+            })
+            .collect(),
+    }
+}
+
+/// The production log hook for a [`engenho_substrate::WouldRejectLedger`]:
+/// one structured WARN per refusal a Shadow gate allowed.
+pub fn log_would_reject(event: &engenho_substrate::WouldReject<'_>) {
+    tracing::warn!(
+        gate = event.gate,
+        reason = event.reason,
+        subject = %event.subject,
+        event_reason = engenho_substrate::WouldReject::EVENT_REASON,
+        "shadow gate allowed what enforce would refuse"
+    );
+}
+
+/// Everything `GET /metrics` serves, rendered from the router's state.
+#[must_use]
+pub fn render_state(state: &crate::router::RouterState) -> String {
+    let mut families = apiserver_families(&[], state.handler_set().len(), 0);
+    families.push(would_reject_family(&state.would_reject.snapshot()));
+    render(&families)
+}
+
+/// `GET /metrics` — render the apiserver's families.
+pub async fn metrics(
+    axum::extract::State(state): axum::extract::State<crate::router::RouterState>,
+) -> impl axum::response::IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        render_state(&state),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engenho_substrate::{Gate, RejectReason, Rollout, WouldRejectLedger};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct Stale;
+
+    impl RejectReason for Stale {
+        fn label(&self) -> &'static str {
+            "stale"
+        }
+    }
 
     fn fam(name: &str, samples: Vec<Sample>) -> MetricFamily {
         MetricFamily {
@@ -257,18 +333,62 @@ mod tests {
         assert!(out.contains("engenho_store_revision 41"));
         assert!(out.contains("apiserver_registered_resources 52"));
     }
-}
 
-/// `GET /metrics` — render the apiserver's families.
-pub async fn metrics(
-    axum::extract::State(state): axum::extract::State<crate::router::RouterState>,
-) -> impl axum::response::IntoResponse {
-    let families = apiserver_families(&[], state.handler_set().len(), 0);
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        render(&families),
-    )
+    #[test]
+    fn would_reject_is_one_counter_labelled_by_gate_then_reason() {
+        let out = render(&[would_reject_family(&[
+            engenho_substrate::WouldRejectCount {
+                gate: "boot_tripwire",
+                reason: "stale",
+                count: 2,
+            },
+            engenho_substrate::WouldRejectCount {
+                gate: "rbac",
+                reason: "no_rule",
+                count: 5,
+            },
+        ])]);
+        assert!(
+            out.contains("# TYPE engenho_would_reject_total counter\n"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("engenho_would_reject_total{gate=\"boot_tripwire\",reason=\"stale\"} 2\n"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("engenho_would_reject_total{gate=\"rbac\",reason=\"no_rule\"} 5\n"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn a_shadow_gate_refusal_reaches_the_scrape_and_an_enforced_one_does_not() {
+        let state = crate::router::RouterState::new(vec![]);
+        let shadow = Gate::new("shadow_gate", Rollout::Shadow);
+        let enforce = Gate::new("enforce_gate", Rollout::Enforce);
+        let _ = shadow.judge(Err(Stale), &state.would_reject, &"ns/a");
+        let _ = shadow.judge(Err(Stale), &state.would_reject, &"ns/b");
+        let _ = enforce.judge(Err(Stale), &state.would_reject, &"ns/c");
+        let out = render_state(&state);
+        assert!(
+            out.contains("engenho_would_reject_total{gate=\"shadow_gate\",reason=\"stale\"} 2\n"),
+            "got: {out}"
+        );
+        assert!(!out.contains("enforce_gate"), "got: {out}");
+    }
+
+    #[test]
+    fn the_scrape_reads_the_ledger_the_runtime_shares() {
+        // Gates outside the apiserver (store, scheduler) count into the
+        // runtime's ledger; the scrape must read THAT one, not a private one.
+        let shared = Arc::new(WouldRejectLedger::new(log_would_reject));
+        let state =
+            crate::router::RouterState::new(vec![]).with_would_reject_ledger(shared.clone());
+        let elsewhere = Gate::new("scheduler_filter", Rollout::Shadow);
+        let _ = elsewhere.judge(Err(Stale), &shared, &"ns/pod");
+        assert!(render_state(&state).contains(
+            "engenho_would_reject_total{gate=\"scheduler_filter\",reason=\"stale\"} 1\n"
+        ));
+    }
 }

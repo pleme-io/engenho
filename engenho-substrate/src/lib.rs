@@ -17,6 +17,8 @@
 //!     `DerivationCacheBackend` pluggable trait. Sui-as-substrate:
 //!     derivations become a location-independent typed value the
 //!     engenho fabric can move + cache anywhere.
+//!   * [`rollout`] — one `Rollout{Shadow, Enforce}` gate type plus the
+//!     would-reject ledger every tightened check reports through
 
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
@@ -55,6 +57,7 @@ pub mod replay;
 pub mod retrying_cache;
 pub mod risca;
 pub mod roca;
+pub mod rollout;
 pub mod selo;
 pub mod shape;
 pub mod shape_renderers;
@@ -115,6 +118,10 @@ pub use risca::{REDACTED, Redact, Risca, redact_credit_card, redact_email, redac
 pub use roca::{
     ConfirmacaoPolicy, JobTarget, MaterializationJob, Placement, Plantio, PlantioError, Stage,
     StageId,
+};
+pub use rollout::{
+    Gate, Proceed, Refused, RejectReason, Rollout, WouldReject, WouldRejectCount, WouldRejectHook,
+    WouldRejectLedger,
 };
 pub use selo::{Selo, SeloError, SeloIssuer};
 pub use shape::{RenderedArtifact, ShapeError, ShapeRenderer, WorkloadShape};
