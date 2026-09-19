@@ -73,7 +73,7 @@ pub mod volume;
 pub use backend::{
     ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeExecFault, FakeNetProber,
     HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage,
-    PullPolicy, TcpProbeTarget, TokioNetProber,
+    PullPolicy, Readoption, TcpProbeTarget, TokioNetProber,
 };
 pub use config_bridge::{make_container_runtime, make_container_runtime_with_apiserver};
 pub use csi_materializer::{

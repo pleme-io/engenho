@@ -444,24 +444,39 @@ impl InspectResponse {
 }
 
 impl InspectState {
-    /// The run state this block describes.
+    /// The run state this block describes, decoded from libpod's `Status`.
     ///
-    /// An exit code is only meaningful once the container is terminal.
-    /// Reporting 0 for a RUNNING container is how a healthy workload gets read
-    /// as a clean exit and restarted, so a running container carries none.
+    /// ── ★ `created` IS NOT `exited` ───────────────────────────────────────
+    /// Keying on the `Running` flag alone read every not-running container as
+    /// an exit with whatever `ExitCode` said — and a container that was
+    /// created and never ran carries `ExitCode: 0`. That is a clean exit
+    /// nobody observed, and under `restartPolicy: Never` a `Succeeded` pod
+    /// that never ran its process. `Status` says which it is:
     ///
-    /// libpod's `ExitCode` has already folded a signal into `128 + n`, so a
-    /// stopped container is always an [`ExitDisposition::Code`]. Decoding
-    /// `Status` (`created` is not `exited`) is T1.2 commit 2; until then this
-    /// keys on `Running` exactly as before.
+    ///   * `running`, `paused`, `stopping` — the process exists: Running.
+    ///     Paused is frozen, not ended; a restart would kill it.
+    ///   * `exited`, `stopped` — ended, and `ExitCode` is how. libpod has
+    ///     already folded a signal into `128 + n`, so it is a
+    ///     [`ExitDisposition::Code`].
+    ///   * `created`, `configured`, `initialized` — never ran: Created.
+    ///   * `removing`, `unknown`, or any string this code has not seen:
+    ///     Unknown. An unrecognised state is not evidence of anything.
+    ///   * no `Status` at all: fall back on `Running`, and a not-running
+    ///     container with no state string is Unknown, never an exit.
+    ///
+    /// An exit code is only meaningful once the container is terminal, so a
+    /// running container carries none.
     ///
     /// [`ExitDisposition::Code`]: crate::cri::ExitDisposition::Code
     #[must_use]
     pub fn run_state(&self) -> crate::cri::RunState {
-        if self.running {
-            crate::cri::RunState::Running
-        } else {
-            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(self.exit_code))
+        use crate::cri::{ExitDisposition, RunState};
+        match self.status.as_str() {
+            "running" | "paused" | "stopping" => RunState::Running,
+            "exited" | "stopped" => RunState::Exited(ExitDisposition::Code(self.exit_code)),
+            "created" | "configured" | "initialized" => RunState::Created,
+            "" if self.running => RunState::Running,
+            _ => RunState::Unknown,
         }
     }
 }
@@ -1279,6 +1294,14 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         "podman-api"
     }
 
+    /// `start` inspects the deterministic name first and adopts a running
+    /// container it finds (the ADOPT-OR-REPLACE block below). A stopped one is
+    /// removed and recreated, so an exit that happened while no kubelet
+    /// watched is not recovered (`pending-readopt-exited`).
+    fn readoption(&self) -> crate::backend::Readoption {
+        crate::backend::Readoption::AdoptsRunning
+    }
+
     async fn start(
         &self,
         spec: &ContainerSpec,
@@ -1359,7 +1382,7 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         // it lists the runtime's containers on sync and adopts or removes what
         // it finds, rather than assuming its own memory is the truth.
         if let Some(existing) = self.api.inspect(&spec.name).await? {
-            if existing.state.running {
+            if existing.state.run_state().is_running() {
                 // Already doing what was asked. Adopting is not merely the
                 // cheap path: recreating would stop a healthy container and
                 // change its IP for no reason the manifest asked for.
@@ -2014,6 +2037,58 @@ mod tests {
         assert_eq!(r.id, "deadbeef");
         assert!(r.state.running);
         assert_eq!(r.pod_ip().as_deref(), Some("10.89.1.9"));
+    }
+
+    /// ★ T1.2 c2: libpod's `Status` decides the run state, not the `Running`
+    /// flag. A container created and never run carries `ExitCode: 0`; read
+    /// through the flag alone it was a clean exit — a `Never` pod `Succeeded`
+    /// without its process ever running.
+    #[test]
+    fn inspect_status_is_decoded_not_inferred_from_the_running_flag() {
+        use crate::cri::{ExitDisposition, RunState};
+        let state = |status: &str, running: bool, exit_code: i32| {
+            InspectState {
+                status: status.to_string(),
+                running,
+                exit_code,
+            }
+            .run_state()
+        };
+        assert_eq!(
+            state("created", false, 0),
+            RunState::Created,
+            "created is not exited"
+        );
+        assert_eq!(state("configured", false, 0), RunState::Created);
+        assert_eq!(state("initialized", false, 0), RunState::Created);
+        assert_eq!(state("running", true, 0), RunState::Running);
+        assert_eq!(
+            state("paused", false, 0),
+            RunState::Running,
+            "frozen, not ended"
+        );
+        assert_eq!(state("stopping", true, 0), RunState::Running);
+        assert_eq!(
+            state("exited", false, 3),
+            RunState::Exited(ExitDisposition::Code(3))
+        );
+        assert_eq!(
+            state("stopped", false, 137),
+            RunState::Exited(ExitDisposition::Code(137))
+        );
+        assert_eq!(state("removing", false, 0), RunState::Unknown);
+        assert_eq!(state("unknown", false, 0), RunState::Unknown);
+        assert_eq!(
+            state("something-new", false, 0),
+            RunState::Unknown,
+            "a state string this code has not seen is not evidence of an exit"
+        );
+        assert_eq!(state("", true, 0), RunState::Running);
+        assert_eq!(
+            state("", false, 0),
+            RunState::Unknown,
+            "no state string and not running is not an exit 0"
+        );
     }
 
     #[test]

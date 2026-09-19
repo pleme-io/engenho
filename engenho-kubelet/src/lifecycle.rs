@@ -31,6 +31,7 @@
 //! container is observed `Running` again on the next tick. There is no
 //! `todo!()` / `panic!()` / placeholder `Ok`.
 
+use crate::backend::Readoption;
 use crate::cri::{ExitDisposition, RunState};
 use engenho_types::curated_enums::PodPhase;
 use serde::{Deserialize, Serialize};
@@ -157,6 +158,22 @@ impl Termination {
             Self::Observed(d) if d.is_success() => "Completed",
             Self::Observed(_) => "Error",
             Self::Unknown => Self::UNKNOWN_REASON,
+        }
+    }
+
+    /// Read back a termination from its wire form — the inverse of
+    /// [`Self::exit_code`] / [`Self::reason`] up to the one thing the wire
+    /// folds away: a signal arrives as the code `128 + n`, which is still
+    /// not a success.
+    ///
+    /// The `ContainerStatusUnknown` reason, or no readable code at all, is
+    /// [`Self::Unknown`] — an absent code is never read as a clean exit.
+    #[must_use]
+    pub fn from_wire(exit_code: Option<i64>, reason: Option<&str>) -> Self {
+        let code = exit_code.and_then(|c| i32::try_from(c).ok());
+        match (reason, code) {
+            (Some(Self::UNKNOWN_REASON), _) | (_, None) => Self::Unknown,
+            (_, Some(code)) => Self::Observed(ExitDisposition::Code(code)),
         }
     }
 }
@@ -453,11 +470,11 @@ pub struct ContainerStatusOut {
 ///
 ///   * **Empty** (no containers) → `Pending` (degenerate; a pod with no
 ///     containers is rejected upstream, but the fold is total).
-///   * **Any container `Waiting` AND never started** (no `container_id`) →
+///   * **Any container `Waiting` AND never started** (`!ever_started`) →
 ///     `Pending`. The pod is not `Running` until every container is up at
-///     least once. A container that IS waiting but HAS a `container_id` has
-///     run before — a `CrashLoopBackOff` hold — and upstream keeps that pod
-///     `Running`, so it does not force `Pending` here. Reporting `Pending`
+///     least once. A container that IS waiting but HAS started before is a
+///     `CrashLoopBackOff` hold, and upstream keeps that pod `Running`, so it
+///     does not force `Pending` here. Reporting `Pending`
 ///     for a crash-looping pod would make it indistinguishable from one
 ///     still pulling its image, which is the opposite diagnosis.
 ///   * **All containers `Running`** → `Running`.
@@ -507,22 +524,28 @@ pub fn reconcile_pod_phase(
         return (PodPhase::Pending, statuses);
     }
 
+    // ── ★ "NEVER STARTED" IS THE LATCH, NOT A PROXY FOR IT ────────────────
+    // This read `container_id.is_none()`, which is true of a container that
+    // has not started AND of anything a caller built without an id — and the
+    // kubelet used to build exactly that for a container it merely failed to
+    // POLL, so an inspect error rendered a running pod Pending. The kubelet
+    // latches `ever_started` from its own record; the fold reads the latch.
     let any_never_started = observations
         .iter()
-        .any(|o| matches!(o.state, ContainerState::Waiting { .. }) && o.container_id.is_none());
+        .any(|o| matches!(o.state, ContainerState::Waiting { .. }) && !o.ever_started);
     if any_never_started {
         // Not every container is up yet → Pending. Never a fake Running.
         return (PodPhase::Pending, statuses);
     }
 
-    // A container held in backoff has a container_id and is not Running, so
-    // it falls through the all_running check below to the restartable logic
-    // — where it has no exit code and so is not "restartable this instant".
-    // Handled explicitly: a pod whose only non-Running container is backing
-    // off is in a restart cycle, which is Running.
+    // A container held in backoff has run and is not Running, so it falls
+    // through the all_running check below to the restartable logic — where
+    // it has no exit and so is not "restartable this instant". Handled
+    // explicitly: a pod whose only non-Running container is backing off is
+    // in a restart cycle, which is Running.
     let any_backing_off = observations
         .iter()
-        .any(|o| matches!(o.state, ContainerState::Waiting { .. }) && o.container_id.is_some());
+        .any(|o| matches!(o.state, ContainerState::Waiting { .. }) && o.ever_started);
     if any_backing_off && restart_policy != RestartPolicy::Never {
         return (PodPhase::Running, statuses);
     }
@@ -758,6 +781,192 @@ pub fn reconcile_pod_phase_with_init(
     }
 }
 
+// ── Re-adoption: what the STORED status says a lost kubelet had started ────
+
+/// One earlier run of a container, as the pod's stored status recorded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredRun {
+    /// `containerStatuses[].containerID`, when it was written.
+    pub container_id: Option<String>,
+    /// `containerStatuses[].restartCount`.
+    pub restart_count: u32,
+}
+
+/// One container as the pod's stored status last described it — all a
+/// kubelet that has no local record of the pod can still know about it.
+///
+/// ── ★ THE STORED STATUS IS THE ONLY SURVIVING WITNESS ─────────────────────
+/// The kubelet's record of what it started lives in process memory. After a
+/// restart, a pod bound to this node with no local record is either one that
+/// never ran, or one a previous kubelet process ran — and the published
+/// status is what tells the two apart. Treating the second as the first is
+/// the defect this type exists to prevent: the pod was started again from
+/// scratch, a `restartPolicy: Never` Job pod re-run in place, with nothing in
+/// its status to say so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredContainer {
+    /// No run was ever published for it.
+    NotStarted {
+        /// `containerStatuses[].name`.
+        name: String,
+    },
+    /// It was UP when last published — running, or held between restarts —
+    /// so how it ended, if it has, nobody observed.
+    Up {
+        /// `containerStatuses[].name`.
+        name: String,
+        /// The run the status recorded.
+        run: StoredRun,
+    },
+    /// It had ENDED, and the ending was observed and published.
+    Ended {
+        /// `containerStatuses[].name`.
+        name: String,
+        /// The run the status recorded.
+        run: StoredRun,
+        /// How it ended, read back from the wire.
+        exit: Termination,
+    },
+}
+
+impl StoredContainer {
+    /// The container's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::NotStarted { name } | Self::Up { name, .. } | Self::Ended { name, .. } => name,
+        }
+    }
+
+    /// The published run, if it ever started.
+    #[must_use]
+    pub fn run(&self) -> Option<&StoredRun> {
+        match self {
+            Self::NotStarted { .. } => None,
+            Self::Up { run, .. } | Self::Ended { run, .. } => Some(run),
+        }
+    }
+
+    /// This container's status in a pod that will not be run again: a run
+    /// nobody saw end is [`Termination::Unknown`]; an ending that was
+    /// observed keeps what was observed; a container that never started is
+    /// still `Waiting` — never a termination it did not have.
+    #[must_use]
+    pub fn lost_status(&self) -> ContainerStatusOut {
+        let (state, run) = match self {
+            Self::NotStarted { .. } => (ContainerState::creating(), None),
+            Self::Up { run, .. } => (ContainerState::terminated(Termination::Unknown), Some(run)),
+            Self::Ended { run, exit, .. } => (ContainerState::terminated(*exit), Some(run)),
+        };
+        ContainerStatusOut {
+            name: self.name().to_string(),
+            ready: false,
+            state,
+            container_id: run.and_then(|r| r.container_id.clone()),
+            restart_count: run.map_or(0, |r| r.restart_count),
+        }
+    }
+}
+
+/// What the kubelet does with a bound pod it has no local record of, on a
+/// runtime that cannot re-adopt what a previous kubelet process started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LostPod {
+    /// No container was up when the status was last published: nothing was
+    /// lost. Start it the ordinary way.
+    NothingLost,
+    /// Some container was up, and the policy restarts an exit nobody
+    /// observed. Start it again — each container that had run is a counted
+    /// restart ([`StartedAs::Restarted`]), not a first start.
+    Restart,
+    /// Some container was up and the policy is `Never`: it must not be run
+    /// again, and it cannot succeed — an unobserved exit is never a success.
+    /// The pod is `Failed`, with these container statuses.
+    Failed(Vec<ContainerStatusOut>),
+}
+
+/// PURE re-adoption decision for a pod whose local record is gone, on a
+/// runtime that cannot re-adopt. `stored` is the pod's APP containers as its
+/// stored status last described them.
+///
+/// Upstream's shape: a container the kubelet knew was running and can no
+/// longer find is terminated with `ContainerStatusUnknown` / 137; if the pod
+/// is not deleted "it's been restarted — increment restart count", and under
+/// `Never` no new sandbox is created, so the pod ends `Failed`.
+#[must_use]
+pub fn reconcile_lost_pod(restart_policy: RestartPolicy, stored: &[StoredContainer]) -> LostPod {
+    if !stored
+        .iter()
+        .any(|c| matches!(c, StoredContainer::Up { .. }))
+    {
+        return LostPod::NothingLost;
+    }
+    // The one restart decision there is, asked about the one exit there is.
+    if restart_policy.should_restart(Termination::Unknown) {
+        return LostPod::Restart;
+    }
+    LostPod::Failed(stored.iter().map(StoredContainer::lost_status).collect())
+}
+
+/// How a container the start path just brought up relates to the run the
+/// stored status recorded for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartedAs {
+    /// No earlier run was published: a first start.
+    Fresh,
+    /// The runtime handed back the SAME container the status recorded: the
+    /// run continues, and so does its restart count.
+    Adopted {
+        /// The count carried over unchanged.
+        restart_count: u32,
+    },
+    /// A new container replaces an earlier run whose end this kubelet did
+    /// not see: a restart, and it is counted.
+    Restarted {
+        /// The earlier run's count plus one.
+        restart_count: u32,
+    },
+}
+
+impl StartedAs {
+    /// Relate the container `started_id`, started by a runtime with
+    /// `readoption`, to the earlier run `prior`.
+    ///
+    /// ── ★ AN ID MATCH IS AN ADOPTION ONLY WHERE ADOPTION EXISTS ───────────
+    /// The native backend derives a container's id from
+    /// `namespace/pod/container`, so a process started fresh after a kubelet
+    /// restart carries the SAME id as the run the old kubelet lost. Reading
+    /// that as "the same container" would leave the restart uncounted on
+    /// exactly the node the rule exists for. On a runtime that cannot
+    /// re-adopt, every start over a published run is a restart.
+    #[must_use]
+    pub fn of(prior: Option<&StoredRun>, started_id: &str, readoption: Readoption) -> Self {
+        match prior {
+            None => Self::Fresh,
+            Some(run)
+                if readoption == Readoption::AdoptsRunning
+                    && run.container_id.as_deref() == Some(started_id) =>
+            {
+                Self::Adopted {
+                    restart_count: run.restart_count,
+                }
+            }
+            Some(run) => Self::Restarted {
+                restart_count: run.restart_count.saturating_add(1),
+            },
+        }
+    }
+
+    /// The restart count the new record starts from.
+    #[must_use]
+    pub fn restart_count(self) -> u32 {
+        match self {
+            Self::Fresh => 0,
+            Self::Adopted { restart_count } | Self::Restarted { restart_count } => restart_count,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +1116,181 @@ mod tests {
         assert_eq!(
             Termination::from_run_state(RunState::Created),
             Some(Termination::Unknown)
+        );
+    }
+
+    // ── T1.2 c2: the latch, and re-adoption ─────────────────────────────
+
+    /// A container that has started is never re-reported as not yet started,
+    /// whatever else its observation lacks: the fold reads the latch.
+    #[test]
+    fn a_started_waiting_container_is_not_pending() {
+        let held = ContainerObservation::waiting("a").with_ever_started(true);
+        for policy in [RestartPolicy::Always, RestartPolicy::OnFailure] {
+            let (phase, _) = reconcile_pod_phase(policy, std::slice::from_ref(&held));
+            assert_eq!(phase, PodPhase::Running, "{policy:?}");
+        }
+        // Control: the same state, never started, is Pending.
+        let (phase, _) = reconcile_pod_phase(RestartPolicy::Always, &[waiting("a")]);
+        assert_eq!(phase, PodPhase::Pending);
+    }
+
+    fn up(name: &str, id: &str, restarts: u32) -> StoredContainer {
+        StoredContainer::Up {
+            name: name.into(),
+            run: StoredRun {
+                container_id: Some(id.into()),
+                restart_count: restarts,
+            },
+        }
+    }
+
+    #[test]
+    fn a_lost_pod_with_nothing_up_lost_nothing() {
+        let stored = vec![
+            StoredContainer::NotStarted { name: "a".into() },
+            StoredContainer::Ended {
+                name: "b".into(),
+                run: StoredRun {
+                    container_id: Some("id-b".into()),
+                    restart_count: 2,
+                },
+                exit: ExitDisposition::Code(1).into(),
+            },
+        ];
+        for policy in [
+            RestartPolicy::Always,
+            RestartPolicy::OnFailure,
+            RestartPolicy::Never,
+        ] {
+            assert_eq!(
+                reconcile_lost_pod(policy, &stored),
+                LostPod::NothingLost,
+                "{policy:?}"
+            );
+        }
+        assert_eq!(
+            reconcile_lost_pod(RestartPolicy::Never, &[]),
+            LostPod::NothingLost
+        );
+    }
+
+    #[test]
+    fn a_lost_run_restarts_under_a_restarting_policy() {
+        let stored = vec![up("a", "id-a", 0)];
+        assert_eq!(
+            reconcile_lost_pod(RestartPolicy::Always, &stored),
+            LostPod::Restart
+        );
+        assert_eq!(
+            reconcile_lost_pod(RestartPolicy::OnFailure, &stored),
+            LostPod::Restart,
+            "an unobserved exit is not a success, so OnFailure restarts it"
+        );
+    }
+
+    #[test]
+    fn a_lost_run_under_never_fails_the_pod_and_invents_nothing() {
+        let stored = vec![
+            up("a", "id-a", 3),
+            StoredContainer::Ended {
+                name: "b".into(),
+                run: StoredRun {
+                    container_id: Some("id-b".into()),
+                    restart_count: 0,
+                },
+                exit: ExitDisposition::Code(0).into(),
+            },
+            StoredContainer::NotStarted { name: "c".into() },
+        ];
+        let LostPod::Failed(statuses) = reconcile_lost_pod(RestartPolicy::Never, &stored) else {
+            panic!("Never + a lost run must fail the pod");
+        };
+        // The run nobody saw end: Unknown, with the id and count it had.
+        assert_eq!(
+            statuses[0].state,
+            ContainerState::terminated(Termination::Unknown)
+        );
+        assert_eq!(statuses[0].container_id.as_deref(), Some("id-a"));
+        assert_eq!(statuses[0].restart_count, 3);
+        // An ending that WAS observed keeps what was observed.
+        assert_eq!(
+            statuses[1].state,
+            ContainerState::terminated(ExitDisposition::Code(0))
+        );
+        // A container that never started is not given a termination.
+        assert!(matches!(statuses[2].state, ContainerState::Waiting { .. }));
+        assert_eq!(statuses[2].container_id, None);
+        assert!(statuses.iter().all(|s| !s.ready));
+    }
+
+    #[test]
+    fn a_container_started_over_a_published_run_is_adopted_or_counted() {
+        let prior = StoredRun {
+            container_id: Some("id-1".into()),
+            restart_count: 4,
+        };
+        let adopts = Readoption::AdoptsRunning;
+        assert_eq!(StartedAs::of(None, "id-9", adopts), StartedAs::Fresh);
+        assert_eq!(
+            StartedAs::of(None, "id-9", Readoption::Cannot).restart_count(),
+            0
+        );
+        assert_eq!(
+            StartedAs::of(Some(&prior), "id-1", adopts),
+            StartedAs::Adopted { restart_count: 4 },
+            "the same container continues its run"
+        );
+        assert_eq!(
+            StartedAs::of(Some(&prior), "id-2", adopts),
+            StartedAs::Restarted { restart_count: 5 },
+            "a new container over a lost run is a counted restart"
+        );
+        let unnamed = StoredRun {
+            container_id: None,
+            restart_count: 0,
+        };
+        assert_eq!(
+            StartedAs::of(Some(&unnamed), "id-2", adopts).restart_count(),
+            1,
+            "a run with no published id cannot be the one just started"
+        );
+    }
+
+    /// ★ The native backend's ids are `namespace/pod/container`: a fresh
+    /// process after a kubelet restart has the SAME id as the lost run. On a
+    /// runtime that cannot re-adopt, that is still a restart, and it counts.
+    #[test]
+    fn an_id_match_is_not_an_adoption_on_a_runtime_that_cannot_adopt() {
+        let prior = StoredRun {
+            container_id: Some("default/job/main".into()),
+            restart_count: 0,
+        };
+        assert_eq!(
+            StartedAs::of(Some(&prior), "default/job/main", Readoption::Cannot),
+            StartedAs::Restarted { restart_count: 1 }
+        );
+    }
+
+    #[test]
+    fn a_wire_termination_reads_back_without_inventing_success() {
+        assert_eq!(
+            Termination::from_wire(Some(0), Some("Completed")),
+            Termination::Observed(ExitDisposition::Code(0))
+        );
+        assert_eq!(
+            Termination::from_wire(Some(137), Some(Termination::UNKNOWN_REASON)),
+            Termination::Unknown
+        );
+        assert_eq!(
+            Termination::from_wire(None, Some("Completed")),
+            Termination::Unknown,
+            "no code is not a zero code"
+        );
+        assert_eq!(
+            Termination::from_wire(Some(i64::MAX), Some("Error")),
+            Termination::Unknown,
+            "an unrepresentable code is not a code"
         );
     }
 
@@ -1432,6 +1816,20 @@ mod proptests {
                 prop_assert_eq!(phase, PodPhase::Succeeded);
             } else {
                 prop_assert_eq!(phase, PodPhase::Failed);
+            }
+        }
+
+        /// Reading a termination back from the wire keeps whether it was a
+        /// success — a signal folds to its `128 + n` code, an Unknown stays
+        /// Unknown, and nothing becomes a success on the round trip.
+        #[test]
+        fn a_termination_survives_the_wire_round_trip(t in termination_strategy()) {
+            let back = Termination::from_wire(Some(i64::from(t.exit_code())), Some(t.reason()));
+            prop_assert_eq!(back.is_success(), t.is_success());
+            prop_assert_eq!(back.exit_code(), t.exit_code());
+            prop_assert_eq!(back.reason(), t.reason());
+            if matches!(t, Termination::Unknown) {
+                prop_assert_eq!(back, Termination::Unknown);
             }
         }
 

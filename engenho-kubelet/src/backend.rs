@@ -595,6 +595,34 @@ impl ExecOutcome {
     }
 }
 
+/// Whether a container a PREVIOUS kubelet process started is still within
+/// this runtime's reach.
+///
+/// ── ★ THE KUBELET'S RECORD OF WHAT IT STARTED IS IN-PROCESS ─────────────
+/// A kubelet restart forgets every pod it was running. What happens next is a
+/// property of the RUNTIME, not of the kubelet: podman keeps the containers
+/// and can hand a running one back by name; a native backend's workloads were
+/// children of the process that just went away. Reading a container the
+/// kubelet can no longer reach as "never started" is how a
+/// `restartPolicy: Never` Job pod was re-run in place on every ryn restart —
+/// so the kubelet asks, and each backend has to answer (no default).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Readoption {
+    /// `start` finds a RUNNING container a previous process left under the
+    /// pod's deterministic name and adopts it instead of starting a second
+    /// copy. A container that STOPPED while no kubelet watched is replaced,
+    /// not adopted — its exit is not recovered (`pending-readopt-exited`).
+    AdoptsRunning,
+    /// A container a previous process started is out of reach: the kubelet
+    /// cannot see it, adopt it, or learn how it ended. A pod whose stored
+    /// status shows such a container is an exit nobody observed.
+    ///
+    /// The conservative arm, hence the `Default` — it can only make the
+    /// kubelet refuse to re-run something, never re-run something twice.
+    #[default]
+    Cannot,
+}
+
 /// The pluggable container runtime trait. Pure runtime —
 /// host-effecting; no I/O in trait shape, but every method
 /// performs side-effecting work on the host.
@@ -602,6 +630,11 @@ impl ExecOutcome {
 pub trait ContainerRuntime: Send + Sync {
     /// Stable identifier for telemetry.
     fn name(&self) -> &'static str;
+
+    /// Whether this runtime can hand back a container a previous kubelet
+    /// process started. See [`Readoption`]. Required, not defaulted: a new
+    /// backend must say which it is.
+    fn readoption(&self) -> Readoption;
 
     /// Run `argv` inside a previously-started container (`podman exec <id>
     /// <argv...>`). The SOLE runtime capability the exec-probe path needs —
@@ -679,6 +712,16 @@ pub trait ContainerRuntime: Send + Sync {
 #[derive(Default, Clone)]
 pub struct FakeBackend {
     inner: Arc<Mutex<FakeState>>,
+    /// What this fake says about containers a previous kubelet started.
+    /// [`Readoption::Cannot`] unless [`FakeBackend::with_readoption`] says
+    /// otherwise — the native backend's answer, and the case the kubelet has
+    /// to be careful about.
+    readoption: Readoption,
+    /// Mint a container's id from its spec name, the way the native backend
+    /// derives `namespace/pod/container` — so a fresh start after a kubelet
+    /// restart carries the same id as the run the old kubelet lost. Set by
+    /// [`FakeBackend::with_ids_from_names`].
+    ids_from_names: bool,
 }
 
 #[derive(Default)]
@@ -728,6 +771,12 @@ struct FakeState {
     /// rather than answering with an exit code. Seeded via
     /// [`FakeBackend::seed_exec_fault`]. Takes precedence over the exec queue.
     exec_faults: BTreeMap<String, FakeExecFault>,
+    /// Container IDS whose `status` poll fails with this backend message, as
+    /// an unreachable podman socket would. Seeded via
+    /// [`FakeBackend::seed_status_fault`]. A poll that cannot answer is not a
+    /// container that has not started, and without this seam nothing could
+    /// tell the two apart.
+    status_faults: BTreeMap<String, String>,
 }
 
 /// How a [`FakeBackend`] exec fails without the command ever answering.
@@ -754,6 +803,10 @@ pub enum FakeEvent {
     Stop(String),
     /// `remove(container_id)`.
     Remove(String),
+    /// `start(spec)` found a running container already holding the spec's
+    /// name and handed it back instead of starting a second copy (only under
+    /// [`Readoption::AdoptsRunning`]); spec name captured.
+    Adopt(String),
 }
 
 impl FakeBackend {
@@ -761,6 +814,39 @@ impl FakeBackend {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This backend, answering [`ContainerRuntime::readoption`] with
+    /// `readoption`. Under [`Readoption::AdoptsRunning`] `start` adopts a
+    /// running container that already holds the spec's name, as the podman
+    /// API backend does.
+    #[must_use]
+    pub fn with_readoption(mut self, readoption: Readoption) -> Self {
+        self.readoption = readoption;
+        self
+    }
+
+    /// This backend, minting each container's id from its spec name instead
+    /// of a counter — the native backend's deterministic ids.
+    #[must_use]
+    pub fn with_ids_from_names(mut self) -> Self {
+        self.ids_from_names = true;
+        self
+    }
+
+    /// Make every `status` poll of `container_id` fail with `message` until
+    /// [`FakeBackend::clear_status_fault`].
+    pub async fn seed_status_fault(&self, container_id: &str, message: impl Into<String>) {
+        self.inner
+            .lock()
+            .await
+            .status_faults
+            .insert(container_id.to_string(), message.into());
+    }
+
+    /// The runtime answers `status` for `container_id` again.
+    pub async fn clear_status_fault(&self, container_id: &str) {
+        self.inner.lock().await.status_faults.remove(container_id);
     }
 
     /// Snapshot of all containers currently tracked.
@@ -917,6 +1003,10 @@ impl ContainerRuntime for FakeBackend {
         "fake"
     }
 
+    fn readoption(&self) -> Readoption {
+        self.readoption
+    }
+
     async fn exec(
         &self,
         container_id: &str,
@@ -966,8 +1056,36 @@ impl ContainerRuntime for FakeBackend {
         if let Some(msg) = state.seeded_start_failures.get(&spec.name) {
             return Err(KubeletError::Backend(msg.clone()));
         }
+        if self.readoption == Readoption::AdoptsRunning {
+            // The podman API backend's adopt-or-replace, in miniature: a
+            // running container under this name is handed back; a stopped one
+            // is dropped so the create below takes the name.
+            let holders: Vec<String> = state
+                .id_to_name
+                .iter()
+                .filter(|(_, name)| **name == spec.name)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in holders {
+                match state.containers.get(&id) {
+                    Some(held) if held.is_running() => {
+                        let adopted = held.clone();
+                        state.events.push(FakeEvent::Adopt(spec.name.clone()));
+                        return Ok(adopted);
+                    }
+                    _ => {
+                        state.containers.remove(&id);
+                        state.id_to_name.remove(&id);
+                    }
+                }
+            }
+        }
         state.next_id += 1;
-        let container_id = format!("fake-{:08x}", state.next_id);
+        let container_id = if self.ids_from_names {
+            spec.name.clone()
+        } else {
+            format!("fake-{:08x}", state.next_id)
+        };
         let pod_ip = format!("10.42.0.{}", state.next_id % 250);
         let status = ContainerStatus::running(container_id.clone(), pod_ip);
         state
@@ -994,13 +1112,11 @@ impl ContainerRuntime for FakeBackend {
     }
 
     async fn status(&self, container_id: &str) -> Result<Option<ContainerStatus>, KubeletError> {
-        Ok(self
-            .inner
-            .lock()
-            .await
-            .containers
-            .get(container_id)
-            .cloned())
+        let state = self.inner.lock().await;
+        if let Some(message) = state.status_faults.get(container_id) {
+            return Err(KubeletError::Backend(message.clone()));
+        }
+        Ok(state.containers.get(container_id).cloned())
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
@@ -1783,6 +1899,13 @@ impl PodmanBackend {
 impl ContainerRuntime for PodmanBackend {
     fn name(&self) -> &'static str {
         "podman"
+    }
+
+    /// The CLI's `start` answers a name collision with `rm -f` + re-run, so
+    /// what a previous process left is replaced, never handed back
+    /// (`pending-adopt-parity`, below).
+    fn readoption(&self) -> Readoption {
+        Readoption::Cannot
     }
 
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {

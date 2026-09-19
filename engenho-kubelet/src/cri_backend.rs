@@ -374,6 +374,13 @@ impl ContainerRuntime for CriBackend {
         "cri"
     }
 
+    /// The runtime keeps its containers, but this backend's sandbox map is
+    /// in-process and `start` always creates; nothing here lists the runtime
+    /// to find what a previous kubelet left (`pending-cri-readopt`).
+    fn readoption(&self) -> crate::backend::Readoption {
+        crate::backend::Readoption::Cannot
+    }
+
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
         // `ExecSync`, not the streaming `Exec`: the trait returns a completed
         // outcome, and streaming `Exec` returns only a URL that needs a

@@ -20,9 +20,14 @@
 //!   * **Running-status reconciliation** — a bound Pod already in `local`
 //!     is polled via `backend.status`; still-running stays `Running`,
 //!     terminated maps its [`Termination`] → `Succeeded | Failed` (only an
-//!     observed exit 0 succeeds; a signal or an unobserved exit fails). A vanished
-//!     container (no backend record) clears the local entry so the next
-//!     tick re-creates it (a managed bound Pod converges back to running).
+//!     observed exit 0 succeeds; a signal or an unobserved exit fails). A
+//!     vanished container (no backend record) is an unobserved exit: restarted
+//!     under a restarting policy, latched `Failed` under `Never`. A poll that
+//!     FAILS withholds the pod's status write rather than inventing a state.
+//!   * **Re-adoption** — a bound Pod with no local record whose stored status
+//!     shows a container up, on a runtime that cannot re-adopt
+//!     ([`crate::backend::Readoption::Cannot`]), is an unobserved exit too:
+//!     `Failed` under `Never`, otherwise restarted with the restart counted.
 //!
 //! Every status write goes through [`write_status_cas`] (item-5
 //! optimistic concurrency); the kubelet issues NO unconditional
@@ -50,8 +55,8 @@ use tracing::{debug, info, warn};
 use crate::backend::{ContainerRuntime, ContainerSpec, LogOptions, NetProber, TokioNetProber};
 use crate::error::KubeletError;
 use crate::lifecycle::{
-    ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, Termination,
-    reconcile_pod_phase,
+    ContainerObservation, ContainerState, ContainerStatusOut, LostPod, RestartPolicy, StartedAs,
+    StoredContainer, StoredRun, Termination, reconcile_pod_phase,
 };
 use crate::pod_volume::{
     MountSource, PodVolumeSource, PodmanVolumeMaterializer, VolumeMaterializer, VolumeResolveError,
@@ -167,19 +172,115 @@ struct ProbeOutcome {
 /// was success. Here the split and the [`Termination`] come from ONE
 /// [`Termination::from_run_state`], so a stopped container cannot reach a
 /// caller without its exit, and there is no `Option` left to default.
+///
+/// ── ★ A VANISHED CONTAINER IS DOWN, NOT GONE ──────────────────────────────
+/// The runtime no longer knowing a container the kubelet started is not a
+/// third case: it is a container that is not up, whose end nobody saw —
+/// [`Termination::Unknown`], handled by the same restart-or-latch decision as
+/// any other exit. It used to clear the pod's whole local record so the next
+/// tick "re-created" it, which re-ran a `restartPolicy: Never` pod in place
+/// and reset every sibling's restart count.
 enum Polled {
     /// Up right now.
     Running(crate::backend::ContainerStatus),
-    /// Down; the status as polled plus how it ended.
-    Down(crate::backend::ContainerStatus, Termination),
+    /// Down: how it ended, and the address it last had (K8s keeps it).
+    Down {
+        pod_ip: Option<String>,
+        exit: Termination,
+    },
 }
 
 impl Polled {
-    fn of(status: crate::backend::ContainerStatus) -> Self {
+    /// `None` is a container the runtime no longer knows.
+    fn of(status: Option<crate::backend::ContainerStatus>) -> Self {
+        let Some(status) = status else {
+            return Self::Down {
+                pod_ip: None,
+                exit: Termination::Unknown,
+            };
+        };
         match Termination::from_run_state(status.state) {
             None => Self::Running(status),
-            Some(exit) => Self::Down(status, exit),
+            Some(exit) => Self::Down {
+                pod_ip: status.pod_ip,
+                exit,
+            },
         }
+    }
+}
+
+/// What [`Kubelet::readopt`] decided for a pod with no local record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Readopted {
+    /// Hand it to the start path (a first start, a counted restart, or an
+    /// adoption — the start path tells them apart).
+    Start,
+    /// Settled without starting anything: a lost `Never` pod, published
+    /// `Failed`.
+    Settled,
+}
+
+/// A container whose status poll FAILED this tick — the runtime could not be
+/// asked, which says nothing about the container.
+///
+/// ── ★ A POLL THAT FAILED WRITES NOTHING ───────────────────────────────────
+/// Every render path used to push `Waiting{ContainerCreating}` for it, "so the
+/// pod doesn't flip terminal on a transient inspect error" — and so a running
+/// pod was published `Pending` with a container that had never started, on
+/// every podman hiccup. A tick that could not see a container withholds the
+/// pod's status write; the last published status stands until a poll answers.
+struct Unseen {
+    container: String,
+    cause: KubeletError,
+}
+
+impl std::fmt::Display for Unseen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "status poll of container {} failed ({}); pod status withheld this tick",
+            self.container, self.cause
+        )
+    }
+}
+
+/// The event text for a container the start path brought up, by how it
+/// relates to the run the stored status recorded ([`StartedAs`]).
+struct StartedEvent<'a> {
+    container: &'a str,
+    started: StartedAs,
+}
+
+impl std::fmt::Display for StartedEvent<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.started {
+            StartedAs::Fresh => write!(f, "Started container {}", self.container),
+            StartedAs::Adopted { .. } => {
+                write!(f, "Adopted running container {}", self.container)
+            }
+            StartedAs::Restarted { restart_count } => write!(
+                f,
+                "Restarted container {}: its previous run ended unobserved (restart #{restart_count})",
+                self.container
+            ),
+        }
+    }
+}
+
+/// The event text for a container a lost `restartPolicy: Never` pod had
+/// running: why the pod is `Failed` rather than re-run.
+struct LostUnderNever<'a> {
+    container: &'a str,
+}
+
+impl std::fmt::Display for LostUnderNever<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Container {} was running when this kubelet lost its record of it; the runtime \
+             cannot re-adopt it and restartPolicy Never forbids running it again",
+            self.container
+        )
     }
 }
 
@@ -1785,6 +1886,142 @@ impl Kubelet {
         )
     }
 
+    /// Read `status.<field>` (`containerStatuses` / `initContainerStatuses`)
+    /// back into what each entry says ran — the only witness a kubelet with
+    /// no local record of the pod has left. An entry without a name is
+    /// skipped: it describes nothing this kubelet can match.
+    fn stored_containers(pod: &Value, field: &str) -> Vec<StoredContainer> {
+        pod.get("status")
+            .and_then(|s| s.get(field))
+            .and_then(Value::as_array)
+            .map(|entries| entries.iter().filter_map(Self::stored_container).collect())
+            .unwrap_or_default()
+    }
+
+    /// One `containerStatuses[]` entry → [`StoredContainer`]. `terminated` is
+    /// an observed end; `running`, or an id with no termination (a container
+    /// held between restarts), is a run nobody has seen end; anything else
+    /// never started.
+    fn stored_container(entry: &Value) -> Option<StoredContainer> {
+        let name = entry.get("name")?.as_str()?.to_string();
+        let run = StoredRun {
+            container_id: entry
+                .get("containerID")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            restart_count: entry
+                .get("restartCount")
+                .and_then(Value::as_u64)
+                .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
+        };
+        let state = entry.get("state");
+        if let Some(t) = state.and_then(|s| s.get("terminated")) {
+            let exit = Termination::from_wire(
+                t.get("exitCode").and_then(Value::as_i64),
+                t.get("reason").and_then(Value::as_str),
+            );
+            return Some(StoredContainer::Ended { name, run, exit });
+        }
+        if state.and_then(|s| s.get("running")).is_some() || run.container_id.is_some() {
+            return Some(StoredContainer::Up { name, run });
+        }
+        Some(StoredContainer::NotStarted { name })
+    }
+
+    /// Decide what a bound pod with NO local record is, before the start path
+    /// treats it as new.
+    ///
+    /// ── ★ NO RECORD IS NOT "NEVER STARTED" ────────────────────────────────
+    /// After a kubelet restart every pod arrives here. On a runtime that
+    /// cannot hand back what the previous process started, a pod whose
+    /// stored status shows a container up is an exit nobody observed: under
+    /// `Never` it is published `Failed` here and not run a second time in
+    /// place. Under a restarting policy it goes on to the start path, which
+    /// counts the restart ([`StartedAs`]). A runtime that adopts running
+    /// containers goes straight to the start path, which adopts them.
+    async fn readopt(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        report: &mut ReconcileReport,
+    ) -> Result<Readopted, ControllerError> {
+        if self.backend.readoption() != crate::backend::Readoption::Cannot {
+            return Ok(Readopted::Start);
+        }
+        let stored = Self::stored_containers(value, "containerStatuses");
+        match crate::lifecycle::reconcile_lost_pod(Self::pod_restart_policy(value), &stored) {
+            LostPod::Failed(statuses) => {
+                self.fail_lost_pod(key, value, &stored, &statuses, report)
+                    .await?;
+                Ok(Readopted::Settled)
+            }
+            LostPod::Restart => {
+                info!(
+                    pod = %key.label(),
+                    backend = self.backend.name(),
+                    "no record of a pod the runtime cannot re-adopt; restarting it, restarts counted"
+                );
+                Ok(Readopted::Start)
+            }
+            LostPod::NothingLost => Ok(Readopted::Start),
+        }
+    }
+
+    /// Publish a lost `restartPolicy: Never` pod `Failed` (see
+    /// [`LostPod::Failed`]) without starting anything. The pod keeps its last
+    /// address, and a pod with init containers keeps them as published — they
+    /// had completed, or its app containers could not have run.
+    async fn fail_lost_pod(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        stored: &[StoredContainer],
+        statuses: &[ContainerStatusOut],
+        report: &mut ReconcileReport,
+    ) -> Result<(), ControllerError> {
+        use engenho_types::curated_enums::PodPhase;
+        let pod_ip = value.pointer("/status/podIP").and_then(Value::as_str);
+        let has_init = value
+            .pointer("/spec/initContainers")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty());
+        let desired = if has_init {
+            let init_statuses: Vec<ContainerStatusOut> =
+                Self::stored_containers(value, "initContainerStatuses")
+                    .iter()
+                    .map(StoredContainer::lost_status)
+                    .collect();
+            Self::build_pod_status_with_init(
+                value,
+                PodPhase::Failed,
+                &init_statuses,
+                statuses,
+                pod_ip,
+                /* initialized */ true,
+                /* has_init */ true,
+            )
+        } else {
+            Self::build_pod_status(value, PodPhase::Failed, statuses, pod_ip)
+        };
+        for lost in stored
+            .iter()
+            .filter(|c| matches!(c, StoredContainer::Up { .. }))
+        {
+            let why = LostUnderNever {
+                container: lost.name(),
+            };
+            warn!(pod = %key.label(), %why, "lost pod published Failed");
+            self.emit(
+                key,
+                engenho_controllers::event_recorder::Reason::Failed,
+                why.to_string(),
+            )
+            .await;
+        }
+        self.write_pod_status(key, value, &desired, report).await
+    }
+
     fn pod_is_bound_to(pod_value: &Value, node_name: &str) -> bool {
         pod_value
             .get("spec")
@@ -2180,6 +2417,10 @@ impl Controller for Kubelet {
                     // (don't restart a Succeeded/Failed pod we've
                     // forgotten — restartPolicy:Never, item-9 scope).
                     if Self::pod_already_terminal(value) {
+                        continue;
+                    }
+                    // ── ★ NO RECORD IS NOT "NEVER STARTED" — see `readopt`.
+                    if self.readopt(key, value, &mut report).await? == Readopted::Settled {
                         continue;
                     }
                     self.start_bound_pod(key, value, &mut report, &mut soonest_requeue)
@@ -2774,6 +3015,11 @@ impl Kubelet {
         // yet recorded. (On a partial prior start the record already holds
         // some containers; this is start-only-the-missing.)
         let mut started_any = false;
+        // What the stored status says ran before — the only witness left when
+        // this kubelet has no record of the pod (see `StoredContainer`). A
+        // container started over a published run is an adoption or a counted
+        // restart, never a restart count silently reset to 0.
+        let prior_runs = Self::stored_containers(value, "containerStatuses");
         for (cname, mut spec) in specs {
             // Skip containers already started (membership guard — never a
             // spurious restart).
@@ -2867,6 +3113,14 @@ impl Kubelet {
             match self.backend.start(&spec).await {
                 Ok(status) => {
                     self.start_failures.lock().await.remove(&backoff_key);
+                    let started = StartedAs::of(
+                        prior_runs
+                            .iter()
+                            .find(|c| c.name() == cname)
+                            .and_then(StoredContainer::run),
+                        &status.container_id,
+                        self.backend.readoption(),
+                    );
                     let mut local = self.local.lock().await;
                     let entry = local.entry(key.clone()).or_default();
                     // Record this pod's emptyDir volume names ONCE so
@@ -2895,7 +3149,7 @@ impl Kubelet {
                         cname.clone(),
                         ContainerRecord {
                             container_id: status.container_id.clone(),
-                            restart_count: 0,
+                            restart_count: started.restart_count(),
                             // Attach the parsed probe state (its runtimes are
                             // stamped at `now`, the start instant). Default
                             // (all-None) for a container with no probes.
@@ -2914,7 +3168,11 @@ impl Kubelet {
                     self.emit(
                         key,
                         engenho_controllers::event_recorder::Reason::Started,
-                        format!("Started container {cname}"),
+                        StartedEvent {
+                            container: &cname,
+                            started,
+                        }
+                        .to_string(),
                     )
                     .await;
                 }
@@ -3271,10 +3529,11 @@ impl Kubelet {
         Ok(new_status)
     }
 
-    /// Poll one container, split into [`Polled::Running`] / [`Polled::Down`].
-    /// `Ok(None)` is a container the backend no longer knows.
-    async fn poll(&self, container_id: &str) -> Result<Option<Polled>, KubeletError> {
-        Ok(self.backend.status(container_id).await?.map(Polled::of))
+    /// Poll one container, split into [`Polled::Running`] / [`Polled::Down`]
+    /// (a container the backend no longer knows is `Down` / Unknown). `Err`
+    /// is a poll that could not be made — see [`Unseen`].
+    async fn poll(&self, container_id: &str) -> Result<Polled, KubeletError> {
+        Ok(Polled::of(self.backend.status(container_id).await?))
     }
 
     /// (C) Poll the backend for EVERY container of a started Pod, fold the
@@ -3334,7 +3593,9 @@ impl Kubelet {
         let now = self.now();
         let mut observations: Vec<ContainerObservation> = Vec::with_capacity(specs.len());
         let mut pod_ip: Option<String> = None;
-        let mut vanished = false;
+        // The first container this tick could not poll. Anything in it
+        // withholds the status write below — see `Unseen`.
+        let mut unseen: Option<Unseen> = None;
         // The first container (manifest order) whose probe has been blind long
         // enough to raise ProbeBlind on the pod.
         let mut pod_blind: Option<ProbeBlindCondition> = None;
@@ -3348,7 +3609,7 @@ impl Kubelet {
                 continue;
             };
             match self.poll(&record.container_id).await {
-                Ok(Some(Polled::Running(s))) => {
+                Ok(Polled::Running(s)) => {
                     if let Some(ip) = &s.pod_ip {
                         pod_ip.get_or_insert_with(|| ip.clone());
                     }
@@ -3460,10 +3721,14 @@ impl Kubelet {
                         });
                     }
                 }
-                Ok(Some(Polled::Down(s, exit))) => {
-                    // Terminated. Retain the last pod_ip (K8s keeps it).
-                    if let Some(ip) = &s.pod_ip {
-                        pod_ip.get_or_insert_with(|| ip.clone());
+                Ok(Polled::Down {
+                    pod_ip: last_ip,
+                    exit,
+                }) => {
+                    // Terminated — or vanished, which is Terminated with an
+                    // exit nobody saw. Retain the last pod_ip (K8s keeps it).
+                    if let Some(ip) = last_ip {
+                        pod_ip.get_or_insert(ip);
                     }
                     // restartPolicy: restart THIS one container if the policy
                     // says so (Always, or OnFailure + anything but an observed
@@ -3607,38 +3872,35 @@ impl Kubelet {
                         ));
                     }
                 }
-                Ok(None) => {
-                    // The backend lost THIS container out-of-band. Clear the
-                    // whole pod's local entry so the next tick re-creates it
-                    // (a managed bound pod converges back to running). One
-                    // vanished container forces a full re-create — simplest
-                    // safe behavior at this brick.
-                    vanished = true;
-                }
-                Err(e) => {
-                    warn!(
-                        pod = %key.label(),
-                        container = %cname,
-                        error = %e,
-                        "container status poll failed; retrying next tick"
-                    );
-                    report.objects_skipped += 1;
-                    // Treat as Waiting so the pod doesn't flip terminal on a
-                    // transient inspect error.
-                    observations.push(ContainerObservation::waiting(cname));
+                Err(cause) => {
+                    // No observation: there is nothing true to push. The
+                    // other containers still get their restart decisions;
+                    // only the write is withheld.
+                    unseen.get_or_insert(Unseen {
+                        container: cname.clone(),
+                        cause,
+                    });
                 }
             }
         }
 
-        if vanished {
-            self.local.lock().await.remove(key);
-            debug!(
-                pod = %key.label(),
-                "backend lost a container; clearing local entry to re-create next tick"
-            );
-            report.objects_changed += 1;
+        if let Some(unseen) = unseen {
+            warn!(pod = %key.label(), %unseen, "pod status withheld");
+            report.objects_skipped += 1;
             return Ok(());
         }
+
+        // ── ★ `ever_started` IS LATCHED FROM THE RECORD, AS ON THE INIT PATH ──
+        // A record exists exactly when this kubelet started the container, and
+        // that — not the container's state this instant — is what the fold's
+        // Pending decision reads.
+        let observations: Vec<ContainerObservation> = observations
+            .into_iter()
+            .map(|o| {
+                let started = lp.containers.contains_key(&o.name);
+                o.with_ever_started(started)
+            })
+            .collect();
 
         // Fold the observations → pod phase + per-container statuses, render,
         // and CAS-write. The pure reconcile_pod_phase is the interpreter; this
@@ -3865,14 +4127,17 @@ impl Kubelet {
             match lp.init_containers.get(cname) {
                 None => observations.push(mark(ContainerObservation::waiting(cname))),
                 Some(record) => match self.poll(&record.container_id).await {
-                    Ok(Some(Polled::Running(_))) => {
+                    Ok(Polled::Running(_)) => {
                         observations.push(mark(ContainerObservation::running(
                             cname,
                             &record.container_id,
                             record.restart_count,
                         )));
                     }
-                    Ok(Some(Polled::Down(_, exit))) => {
+                    // Exited, or lost by the backend (an Unknown exit): the
+                    // sequencer restarts it under the policy or fails the pod
+                    // — a lost init container is not re-run under `Never`.
+                    Ok(Polled::Down { exit, .. }) => {
                         observations.push(mark(ContainerObservation::terminated(
                             cname,
                             &record.container_id,
@@ -3880,20 +4145,18 @@ impl Kubelet {
                             record.restart_count,
                         )));
                     }
-                    Ok(None) => {
-                        // Backend lost this init container out-of-band → treat
-                        // as Waiting so it re-starts on the AwaitInit path.
-                        observations.push(mark(ContainerObservation::waiting(cname)));
-                    }
-                    Err(e) => {
-                        warn!(
-                            pod = %key.label(),
-                            container = %cname,
-                            error = %e,
-                            "init container status poll failed; treating as Waiting"
-                        );
+                    Err(cause) => {
+                        // The sequence cannot be advanced on a guess: acting
+                        // on a fabricated Waiting would (re)start a container
+                        // that may be running. Nothing moves, nothing is
+                        // written; the next tick polls again.
+                        let unseen = Unseen {
+                            container: cname.clone(),
+                            cause,
+                        };
+                        warn!(pod = %key.label(), %unseen, "init sequence held");
                         report.objects_skipped += 1;
-                        observations.push(mark(ContainerObservation::waiting(cname)));
+                        return Ok(());
                     }
                 },
             }
@@ -3990,7 +4253,17 @@ impl Kubelet {
                 // Re-read the (possibly just-updated) init records so the
                 // rendered initContainerStatuses reflect the freshly-started /
                 // restarted container.
-                let init_statuses = self.init_statuses_current(key, init_specs).await;
+                let init_statuses = match self.init_statuses_current(key, init_specs).await {
+                    Ok(statuses) => statuses,
+                    Err(unseen) => {
+                        warn!(pod = %key.label(), %unseen, "pod status withheld");
+                        report.objects_skipped += 1;
+                        let next =
+                            soonest_requeue.map_or(MIN_PROBE_REQUEUE, |d| d.min(MIN_PROBE_REQUEUE));
+                        *soonest_requeue = Some(next);
+                        return Ok(());
+                    }
+                };
                 let desired = Self::build_pod_status_with_init(
                     value,
                     engenho_types::curated_enums::PodPhase::Pending,
@@ -4143,11 +4416,15 @@ impl Kubelet {
     /// polling each (used on the AwaitInit path so the just-started/restarted
     /// active container shows Running, prior ones Terminated exit 0, later ones
     /// Waiting). Order follows `init_specs`.
+    ///
+    /// # Errors
+    /// [`Unseen`] for the first container whose poll failed: there is no
+    /// truthful state to render for it, so the caller writes nothing.
     async fn init_statuses_current(
         &self,
         key: &ResourceKey,
         init_specs: &[(String, ContainerSpec)],
-    ) -> Vec<ContainerStatusOut> {
+    ) -> Result<Vec<ContainerStatusOut>, Unseen> {
         let lp = self
             .local
             .lock()
@@ -4167,10 +4444,15 @@ impl Kubelet {
                 },
                 Some(record) => {
                     let state = match self.poll(&record.container_id).await {
-                        Ok(Some(Polled::Running(_))) => ContainerState::Running,
-                        Ok(Some(Polled::Down(_, exit))) => ContainerState::terminated(exit),
-                        // Vanished / poll error → Waiting (will re-start).
-                        _ => ContainerState::creating(),
+                        Ok(Polled::Running(_)) => ContainerState::Running,
+                        // Exited, or vanished (an Unknown exit).
+                        Ok(Polled::Down { exit, .. }) => ContainerState::terminated(exit),
+                        Err(cause) => {
+                            return Err(Unseen {
+                                container: cname.clone(),
+                                cause,
+                            });
+                        }
                     };
                     ContainerStatusOut {
                         name: cname.clone(),
@@ -4183,7 +4465,7 @@ impl Kubelet {
             };
             out.push(status_out);
         }
-        out
+        Ok(out)
     }
 
     /// Stream a container's logs. The apiserver's Pod `/log` subresource calls
@@ -5197,6 +5479,60 @@ mod tests {
         assert_eq!(term["exitCode"], 137);
         assert_eq!(term["reason"], "Error");
         assert!(status.get("podIP").is_none());
+    }
+
+    /// ★ T1.2 c2: what a stored `containerStatuses[]` entry says ran. A
+    /// terminated entry is an observed end (read back from the wire), a
+    /// running entry — or one holding an id between restarts — is a run
+    /// nobody has seen end, and only an entry with neither never started.
+    #[test]
+    fn a_stored_status_entry_reads_back_as_what_it_published() {
+        let pod = json!({"status": {"containerStatuses": [
+            {"name": "up", "containerID": "c1", "restartCount": 2,
+             "state": {"running": {}}},
+            {"name": "held", "containerID": "c2", "restartCount": 5,
+             "state": {"waiting": {"reason": "CrashLoopBackOff"}}},
+            {"name": "done", "containerID": "c3", "restartCount": 0,
+             "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}},
+            {"name": "lost", "containerID": "c4", "restartCount": 0,
+             "state": {"terminated": {"exitCode": 137, "reason": "ContainerStatusUnknown"}}},
+            {"name": "never", "restartCount": 0,
+             "state": {"waiting": {"reason": "ContainerCreating"}}},
+            {"state": {"running": {}}}
+        ]}});
+        let stored = Kubelet::stored_containers(&pod, "containerStatuses");
+        let run = |id: &str, restart_count| StoredRun {
+            container_id: Some(id.into()),
+            restart_count,
+        };
+        assert_eq!(
+            stored,
+            vec![
+                StoredContainer::Up {
+                    name: "up".into(),
+                    run: run("c1", 2)
+                },
+                StoredContainer::Up {
+                    name: "held".into(),
+                    run: run("c2", 5)
+                },
+                StoredContainer::Ended {
+                    name: "done".into(),
+                    run: run("c3", 0),
+                    exit: crate::cri::ExitDisposition::Code(0).into(),
+                },
+                StoredContainer::Ended {
+                    name: "lost".into(),
+                    run: run("c4", 0),
+                    exit: Termination::Unknown,
+                },
+                StoredContainer::NotStarted {
+                    name: "never".into()
+                },
+            ],
+            "an entry with no name describes nothing and is skipped"
+        );
+        assert!(Kubelet::stored_containers(&json!({}), "containerStatuses").is_empty());
     }
 
     /// ★ T1.2 wire shape: a signal death and an unobserved exit each render

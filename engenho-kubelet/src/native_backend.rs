@@ -29,7 +29,9 @@
 //! ran workloads unconfined while reporting success is the exact failure shape
 //! this crate keeps finding.
 
-use crate::backend::{ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions};
+use crate::backend::{
+    ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, Readoption,
+};
 use crate::cri::{ExitDisposition, RunState};
 use crate::error::KubeletError;
 use crate::image_source::ImageSource;
@@ -402,6 +404,13 @@ impl NativeBackend {
 impl ContainerRuntime for NativeBackend {
     fn name(&self) -> &'static str {
         "native"
+    }
+
+    /// A native workload is a child process tracked in this backend's
+    /// in-memory table; a new kubelet process starts with an empty table and
+    /// no handle on what the old one spawned.
+    fn readoption(&self) -> Readoption {
+        Readoption::Cannot
     }
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {

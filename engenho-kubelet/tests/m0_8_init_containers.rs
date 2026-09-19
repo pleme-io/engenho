@@ -448,3 +448,163 @@ async fn no_init_pod_starts_app_immediately_initialized_true() {
 
     teardown(store, kubelet).await;
 }
+
+// ── T1.2 c2 — an init container the kubelet cannot see, or has lost ───────
+
+/// A status poll of the active init container that ERRORS used to become a
+/// fabricated `Waiting{ContainerCreating}` — rendered over a running init
+/// container, and fed to the sequencer as "start it". Nothing moves and
+/// nothing is written until a poll answers.
+#[tokio::test]
+async fn a_failed_init_status_poll_withholds_the_write() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_init(
+        &store,
+        "p7",
+        "node-A",
+        "Always",
+        &[("setup", "img-setup")],
+        &[("web", "img-web")],
+    )
+    .await;
+    kubelet.tick().await.unwrap();
+    let init_id = id_for_spec_name(&backend, "default_p7_init-setup")
+        .await
+        .expect("init container tracked");
+    let before = store.get(&pod_key("p7")).await.unwrap();
+    assert!(
+        init_container_statuses(&before)[0]["state"]["running"].is_object(),
+        "control"
+    );
+
+    backend
+        .seed_status_fault(&init_id, "podman socket: connection refused")
+        .await;
+    kubelet.tick().await.unwrap();
+
+    let pod = store.get(&pod_key("p7")).await.unwrap();
+    assert_eq!(
+        pod["status"], before["status"],
+        "a tick that could not see the init container publishes nothing"
+    );
+    assert!(init_container_statuses(&pod)[0]["state"]["running"].is_object());
+    assert_eq!(
+        count_starts_named(&backend.events().await, "default_p7_init-setup"),
+        1,
+        "and does not start it again"
+    );
+
+    backend.clear_status_fault(&init_id).await;
+    kubelet.tick().await.unwrap();
+    let pod = store.get(&pod_key("p7")).await.unwrap();
+    assert!(init_container_statuses(&pod)[0]["state"]["running"].is_object());
+
+    teardown(store, kubelet).await;
+}
+
+/// An init container the runtime lost is an exit nobody observed: under
+/// `Never` the pod fails — it is not run a second time — and under a
+/// restarting policy it is restarted with the restart counted.
+#[tokio::test]
+async fn a_vanished_init_container_is_an_unobserved_exit() {
+    for (policy, phase, init_starts) in [("Never", "Failed", 1), ("OnFailure", "Pending", 2)] {
+        let store = boot_store().await;
+        let backend = Arc::new(FakeBackend::new());
+        let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+        put_pod_with_init(
+            &store,
+            "p8",
+            "node-A",
+            policy,
+            &[("setup", "img-setup")],
+            &[("web", "img-web")],
+        )
+        .await;
+        kubelet.tick().await.unwrap();
+        let init_id = id_for_spec_name(&backend, "default_p8_init-setup")
+            .await
+            .expect("init container tracked");
+
+        use engenho_kubelet::ContainerRuntime;
+        backend.remove(&init_id).await.unwrap();
+        kubelet.tick().await.unwrap();
+
+        let pod = store.get(&pod_key("p8")).await.unwrap();
+        assert_eq!(pod_phase(&pod).as_deref(), Some(phase), "{policy}");
+        let events = backend.events().await;
+        assert_eq!(
+            count_starts_named(&events, "default_p8_init-setup"),
+            init_starts,
+            "{policy}"
+        );
+        assert_eq!(count_starts_named(&events, "default_p8_web"), 0, "{policy}");
+        let ics = init_container_statuses(&pod);
+        if policy == "Never" {
+            assert_eq!(
+                ics[0]["state"]["terminated"]["reason"],
+                "ContainerStatusUnknown"
+            );
+        } else {
+            assert_eq!(ics[0]["restartCount"], 1, "the restart is counted");
+        }
+
+        teardown(store, kubelet).await;
+    }
+}
+
+/// ★ After a kubelet restart, a `Never` pod past init — its app container up
+/// when the old kubelet went away — is Failed, not re-run from its first init
+/// container. The init container that was OBSERVED to complete keeps saying
+/// so; only the run nobody saw end is Unknown.
+#[tokio::test]
+async fn after_a_restart_a_never_pod_past_init_is_failed_not_rerun() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let first = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_init(
+        &store,
+        "p9",
+        "node-A",
+        "Never",
+        &[("setup", "img-setup")],
+        &[("web", "img-web")],
+    )
+    .await;
+    first.tick().await.unwrap();
+    let init_id = id_for_spec_name(&backend, "default_p9_init-setup")
+        .await
+        .expect("init container tracked");
+    backend.set_exit(&init_id, 0).await;
+    first.tick().await.unwrap();
+    assert_eq!(
+        pod_phase(&store.get(&pod_key("p9")).await.unwrap()).as_deref(),
+        Some("Running"),
+        "control"
+    );
+    drop(first);
+
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    kubelet.tick().await.unwrap();
+
+    let events = backend.events().await;
+    assert_eq!(count_starts_named(&events, "default_p9_init-setup"), 1);
+    assert_eq!(count_starts_named(&events, "default_p9_web"), 1);
+    let pod = store.get(&pod_key("p9")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Failed"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("True")
+    );
+    let ics = init_container_statuses(&pod);
+    assert_eq!(ics[0]["state"]["terminated"]["exitCode"], 0);
+    assert_eq!(ics[0]["state"]["terminated"]["reason"], "Completed");
+    let cs = container_statuses(&pod);
+    assert_eq!(
+        cs[0]["state"]["terminated"]["reason"],
+        "ContainerStatusUnknown"
+    );
+
+    teardown(store, kubelet).await;
+}
