@@ -72,9 +72,10 @@ async fn owned_children_tick_defaults_result_to_done() {
 
     let ctrl = ReplicaSetController::new(store.clone(), Some("default".into()));
     let outcome = ctrl.tick().await.unwrap();
-    // Behavior-preserving counts: 2 pods + 1 status write.
+    // One ReplicaSet examined and changed (its 2 pods + its status are the
+    // writes made for it; the sweep counts objects).
     assert_eq!(outcome.report.objects_examined, 1);
-    assert_eq!(outcome.report.objects_changed, 3);
+    assert_eq!(outcome.report.objects_changed, 1);
     // The typed requeue decision defaults to Done.
     assert_eq!(outcome.result, ReconcileResult::Done);
     assert_eq!(outcome.result.requeue_after(), None);

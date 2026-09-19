@@ -30,20 +30,33 @@ use engenho_store::{
 use serde_json::{Value, json};
 
 use crate::error::ControllerError;
+use crate::event_recorder::Reason as EventReason;
 use crate::meta::ObjectMeta;
 use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
 use crate::owner::{owner_ref_for, set_owner_reference};
 use crate::status::observed_generation;
+use crate::sweep::{Sweep, impl_sweep_event_sink};
 
 pub struct DeploymentController {
     store: Arc<StoreMesh>,
     namespace: Option<String>,
+    /// Per-Deployment isolation (`ReplicaSetCreateError` on an Item
+    /// failure). The `ReplicaSet` body is built fresh, so the owner-reference
+    /// write cannot meet a wrong shape today; the failure path is the
+    /// family's, shared through the blanket.
+    sweep: Sweep,
 }
+
+impl_sweep_event_sink!(DeploymentController);
 
 impl DeploymentController {
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
-        Self { store, namespace }
+        Self {
+            store,
+            namespace,
+            sweep: Sweep::new("deployment-controller", EventReason::ReplicaSetCreateError),
+        }
     }
 
     /// Deterministic hash of `spec.template`. Production K8s uses
@@ -144,6 +157,10 @@ impl OwnedChildrenReconciler for DeploymentController {
         self.namespace.as_deref()
     }
 
+    fn sweep(&self) -> &Sweep {
+        &self.sweep
+    }
+
     async fn reconcile_one(
         &self,
         d_value: &Value,
@@ -205,7 +222,7 @@ impl OwnedChildrenReconciler for DeploymentController {
                 if let Some((rs_name, mut rs_value)) =
                     Self::build_replicaset_from(d_value, &desired_hash)
                 {
-                    set_owner_reference(&mut rs_value, owner_ref.clone());
+                    set_owner_reference(&mut rs_value, owner_ref.clone())?;
                     // Key the RS under the PARENT Deployment's namespace —
                     // the same namespace the blanket gathers `owned_rs` from
                     // (by owner-ref). Using the controller's scope namespace

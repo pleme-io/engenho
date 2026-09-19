@@ -31,23 +31,38 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::error::ControllerError;
+use crate::event_recorder::Reason as EventReason;
 use crate::meta::ObjectMeta;
+use crate::meta::{ShapeError, array_mut};
 use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
-use crate::owner::{owner_ref_for, set_owner_reference};
+use crate::owned_children::{TEMPLATE, pod_from_template};
+use crate::owner::{OwnerReference, owner_ref_for};
 use crate::status::{observed_generation, pod_is_ready};
+use crate::sweep::{Sweep, impl_sweep_event_sink};
+
+/// Where a pod's volumes live.
+const POD_VOLUMES: &[&str] = &["spec", "volumes"];
 
 /// StatefulSet controller — peer to ReplicaSetController with
 /// ordered identity semantics.
 pub struct StatefulSetController {
     store: Arc<StoreMesh>,
     namespace: Option<String>,
+    /// Per-StatefulSet isolation (`FailedCreate` on a malformed template).
+    sweep: Sweep,
 }
+
+impl_sweep_event_sink!(StatefulSetController);
 
 impl StatefulSetController {
     /// Construct with optional namespace scope.
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
-        Self { store, namespace }
+        Self {
+            store,
+            namespace,
+            sweep: Sweep::new("statefulset-controller", EventReason::FailedCreate),
+        }
     }
 
     /// Build a Pod from the StatefulSet template at ordinal `i`.
@@ -68,29 +83,32 @@ impl StatefulSetController {
     /// to the deterministic per-pod PVC name `{template}-{sts}-{ordinal}`
     /// (the K8s naming contract) so the wiring is CORRECT the moment PVCs
     /// land — no rename needed.
-    fn build_pod(sts: &Value, ordinal: usize) -> Option<(String, Value)> {
-        let sts_name = sts.name()?;
-        let sts_namespace = sts
-            .namespace()
-            .map_or_else(|| "default".to_string(), |c| c.to_owned());
-        let template = sts.get("spec").and_then(|s| s.get("template"))?;
-        let mut pod = template.clone();
-        let pod_obj = pod.as_object_mut()?;
-        pod_obj.insert("kind".into(), Value::String("Pod".into()));
-        pod_obj.insert("apiVersion".into(), Value::String("v1".into()));
+    ///
+    /// `Ok(None)` when the `StatefulSet` has no name or no template.
+    ///
+    /// # Errors
+    ///
+    /// [`ShapeError`] when the template, its `spec`, or its `spec.volumes`
+    /// has the wrong JSON shape.
+    fn build_pod(
+        sts: &Value,
+        ordinal: usize,
+        owner: OwnerReference,
+    ) -> Result<Option<(String, Value)>, ShapeError> {
+        let Some(sts_name) = sts.name() else {
+            return Ok(None);
+        };
+        let sts_namespace = sts.namespace().unwrap_or("default");
         let pod_name = format!("{sts_name}-{ordinal}");
-        let metadata = pod_obj
-            .entry("metadata".to_string())
-            .or_insert_with(|| json!({}));
-        let m = metadata.as_object_mut()?;
-        m.insert("name".into(), Value::String(pod_name.clone()));
-        m.insert("namespace".into(), Value::String(sts_namespace));
+        let Some(mut pod) = pod_from_template(sts, &pod_name, Some(sts_namespace), owner)? else {
+            return Ok(None);
+        };
 
         // Per-pod PVC volume wiring from volumeClaimTemplates (deterministic
         // name; provisioning itself is a separate gap — see doc above).
-        Self::wire_pvc_volumes(sts, pod_obj, sts_name, ordinal);
+        Self::wire_pvc_volumes(sts, &mut pod, sts_name, ordinal).map_err(|e| e.under(TEMPLATE))?;
 
-        Some((pod_name, pod))
+        Ok(Some((pod_name, pod)))
     }
 
     /// Materialize `spec.volumeClaimTemplates` into real per-pod PVCs.
@@ -173,32 +191,21 @@ impl StatefulSetController {
     /// present on the pod template.
     fn wire_pvc_volumes(
         sts: &Value,
-        pod_obj: &mut serde_json::Map<String, Value>,
+        pod: &mut Value,
         sts_name: &str,
         ordinal: usize,
-    ) {
+    ) -> Result<(), ShapeError> {
         let Some(vcts) = sts
             .get("spec")
             .and_then(|s| s.get("volumeClaimTemplates"))
             .and_then(|v| v.as_array())
         else {
-            return;
+            return Ok(());
         };
         if vcts.is_empty() {
-            return;
+            return Ok(());
         }
-        let spec = pod_obj
-            .entry("spec".to_string())
-            .or_insert_with(|| json!({}));
-        let Some(spec_obj) = spec.as_object_mut() else {
-            return;
-        };
-        let volumes = spec_obj
-            .entry("volumes".to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let Some(arr) = volumes.as_array_mut() else {
-            return;
-        };
+        let arr = array_mut(pod, POD_VOLUMES)?;
         for vct in vcts {
             let Some(tmpl_name) = vct
                 .get("metadata")
@@ -221,6 +228,7 @@ impl StatefulSetController {
                 "persistentVolumeClaim": { "claimName": claim_name }
             }));
         }
+        Ok(())
     }
 
     /// The deterministic per-pod PVC name for a volumeClaimTemplate:
@@ -263,6 +271,10 @@ impl OwnedChildrenReconciler for StatefulSetController {
 
     fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
+    }
+
+    fn sweep(&self) -> &Sweep {
+        &self.sweep
     }
 
     async fn reconcile_one(
@@ -345,10 +357,10 @@ impl OwnedChildrenReconciler for StatefulSetController {
             if existing_ordinals.contains(&ordinal) {
                 continue;
             }
-            let Some((pod_name, mut pod)) = Self::build_pod(sts_value, ordinal) else {
+            let Some((pod_name, pod)) = Self::build_pod(sts_value, ordinal, owner_ref.clone())?
+            else {
                 continue;
             };
-            set_owner_reference(&mut pod, owner_ref.clone());
             let pod_key = ResourceKey::namespaced("", "v1", "Pod", &pod_ns, &pod_name);
             debug!(sts = sts_name, ordinal, "creating ordered pod");
             commands.push(ResourceCommand::Put {
@@ -401,6 +413,17 @@ mod tests {
     use crate::controller::Controller; // brings `.tick()` (blanket via OwnedChildrenReconciler) into scope
     use serde_json::json;
 
+    fn sts_owner() -> OwnerReference {
+        OwnerReference {
+            api_version: "apps/v1".into(),
+            kind: "StatefulSet".into(),
+            name: "web".into(),
+            uid: "uid-sts".into(),
+            controller: true,
+            block_owner_deletion: true,
+        }
+    }
+
     #[test]
     fn ordinal_of_parses_correct_format() {
         assert_eq!(StatefulSetController::ordinal_of("web-0", "web"), Some(0));
@@ -434,7 +457,9 @@ mod tests {
             }
         });
         for ord in [0usize, 1, 7] {
-            let (name, pod) = StatefulSetController::build_pod(&sts, ord).unwrap();
+            let (name, pod) = StatefulSetController::build_pod(&sts, ord, sts_owner())
+                .unwrap()
+                .unwrap();
             assert_eq!(name, format!("web-{ord}"));
             assert_eq!(pod.get("kind").unwrap(), "Pod");
             assert_eq!(pod.get("metadata").unwrap().get("name").unwrap(), &name);
@@ -469,7 +494,9 @@ mod tests {
                 "spec": {"containers": [{"name": "c", "image": "img"}]}
             }}
         });
-        let (name, pod) = StatefulSetController::build_pod(&sts, 0).unwrap();
+        let (name, pod) = StatefulSetController::build_pod(&sts, 0, sts_owner())
+            .unwrap()
+            .unwrap();
         assert_eq!(name, "vm-0");
         assert_eq!(
             pod.get("metadata").unwrap().get("namespace").unwrap(),
@@ -483,7 +510,9 @@ mod tests {
             "metadata": {"name": "web"},
             "spec": {"template": {"spec": {"containers": []}}}
         });
-        let (_, pod) = StatefulSetController::build_pod(&sts, 0).unwrap();
+        let (_, pod) = StatefulSetController::build_pod(&sts, 0, sts_owner())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             pod.get("metadata").unwrap().get("namespace").unwrap(),
             "default"
@@ -518,7 +547,9 @@ mod tests {
                 }
             }
         });
-        let (_, pod) = StatefulSetController::build_pod(&sts, 1).unwrap();
+        let (_, pod) = StatefulSetController::build_pod(&sts, 1, sts_owner())
+            .unwrap()
+            .unwrap();
         let volumes = pod
             .get("spec")
             .and_then(|s| s.get("volumes"))
@@ -550,7 +581,9 @@ mod tests {
                 }}
             }
         });
-        let (_, pod) = StatefulSetController::build_pod(&sts, 0).unwrap();
+        let (_, pod) = StatefulSetController::build_pod(&sts, 0, sts_owner())
+            .unwrap()
+            .unwrap();
         let volumes = pod
             .get("spec")
             .and_then(|s| s.get("volumes"))
@@ -567,7 +600,9 @@ mod tests {
             "metadata": {"name": "vm"},
             "spec": {"template": {"spec": {"containers": []}}}
         });
-        let (_, pod) = StatefulSetController::build_pod(&sts, 0).unwrap();
+        let (_, pod) = StatefulSetController::build_pod(&sts, 0, sts_owner())
+            .unwrap()
+            .unwrap();
         // No volumeClaimTemplates → no volumes injected.
         assert!(pod.get("spec").and_then(|s| s.get("volumes")).is_none());
     }
@@ -630,10 +665,7 @@ mod tests {
     async fn ordinal_naming_and_namespace_inherited() {
         let store = test_store().await;
         let uid = seed_sts(&store, "monitoring", "vm", 3).await;
-        let c = StatefulSetController {
-            store: store.clone(),
-            namespace: None,
-        };
+        let c = StatefulSetController::new(store.clone(), None);
         c.tick().await.unwrap();
 
         let names = owned_pod_names(&store, "monitoring", &uid).await;
@@ -648,10 +680,7 @@ mod tests {
     async fn scale_up_adds_the_next_highest_ordinal() {
         let store = test_store().await;
         let uid = seed_sts(&store, "default", "vm", 1).await;
-        let c = StatefulSetController {
-            store: store.clone(),
-            namespace: None,
-        };
+        let c = StatefulSetController::new(store.clone(), None);
         c.tick().await.unwrap();
         assert_eq!(owned_pod_names(&store, "default", &uid).await, vec!["vm-0"]);
 
@@ -675,10 +704,7 @@ mod tests {
     async fn scale_down_removes_the_highest_ordinals() {
         let store = test_store().await;
         let uid = seed_sts(&store, "default", "vm", 3).await;
-        let c = StatefulSetController {
-            store: store.clone(),
-            namespace: None,
-        };
+        let c = StatefulSetController::new(store.clone(), None);
         c.tick().await.unwrap();
         assert_eq!(
             owned_pod_names(&store, "default", &uid).await,
@@ -702,10 +728,7 @@ mod tests {
     async fn statefulset_no_thrash_stable_across_ticks() {
         let store = test_store().await;
         let _uid = seed_sts(&store, "default", "vm", 2).await;
-        let c = StatefulSetController {
-            store: store.clone(),
-            namespace: None,
-        };
+        let c = StatefulSetController::new(store.clone(), None);
         c.tick().await.unwrap();
         let rev_a = store.current_catalog().await.revision();
         for _ in 0..3 {

@@ -82,11 +82,11 @@ async fn deployment_creates_replicaset_with_correct_replicas() {
     let dc = DeploymentController::new(store.clone(), Some("default".into()));
 
     let report = dc.tick().await.unwrap();
-    // 1 RS created + 1 Deployment .status write (item-8): the freshly
-    // created RS has no status yet, so the aggregated Deployment status
-    // (replicas:0 + observedGeneration) differs from the empty live
-    // status and is written.
-    assert_eq!(report.objects_changed, 2);
+    // The one Deployment changed: its RS was created AND its .status
+    // written (item-8: the freshly created RS has no status yet, so the
+    // aggregated Deployment status differs from the empty live status).
+    // The sweep counts changed objects, not the writes made for them.
+    assert_eq!(report.objects_changed, 1);
     assert_eq!(replicaset_count_owned_by(&store, &dep_uid).await, 1);
 
     // The RS has the desired replicas.
@@ -176,7 +176,8 @@ async fn deployment_rollout_creates_new_replicaset_for_template_change() {
     // Tick — should create a NEW RS for the new template + scale
     // the OLD RS to 0.
     let report = dc.tick().await.unwrap();
-    assert!(report.objects_changed >= 2); // new RS + scale old to 0
+    // The Deployment changed (new RS + old scaled to 0 — counted by object).
+    assert_eq!(report.objects_changed, 1);
 
     let owned_rs_count = replicaset_count_owned_by(&store, &dep_uid).await;
     assert_eq!(owned_rs_count, 2); // revision history retained

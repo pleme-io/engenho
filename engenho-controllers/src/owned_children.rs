@@ -26,9 +26,10 @@
 //!     computed from the LIVE children AFTER the delta committed.
 //!
 //! The blanket `impl<T: OwnedChildrenReconciler> Controller for T` runs
-//! the shared skeleton exactly once, in the same order, with the same
-//! [`ReconcileReport`] bookkeeping the hand-written ticks performed —
-//! so the migration is behavior-preserving by construction.
+//! the shared skeleton exactly once per parent, in the same order the
+//! hand-written ticks did. Its report counts parents (changed, unchanged,
+//! skipped, failed), not the writes made for them; see
+//! [`crate::sweep::SweepReport`].
 //!
 //! ## Out of family (left as raw `impl Controller`)
 //!
@@ -38,17 +39,104 @@
 //! Per the Prime Directive's "stop at diminishing returns," the blanket
 //! is NOT over-fit to those two outliers; if a third selector-shaped
 //! controller ripens, a sibling `SelectorReconciler` trait is the move.
+//!
+//! ## One parent's failure is that parent's (T4.3)
+//!
+//! The blanket runs each parent through the controller's
+//! [`Sweep`](crate::sweep::Sweep): an Item-scoped error from one parent —
+//! a template of the wrong JSON type, reported as
+//! [`ControllerError::Shape`] — becomes a Warning Event on that parent and
+//! the sweep moves to the next one. Only a store error still ends the tick.
+//! Before this, the templated-child writers panicked on a wrong-shaped
+//! template (`expect("ownerReferences must be array")`), and the panic took
+//! the controller task and every parent after it in the list.
+//!
+//! [`pod_from_template`] is the one place a Pod is cloned from a parent's
+//! `spec.template`, and every write into the clone goes through the total
+//! accessors in [`crate::meta`], so a wrong shape is an error naming the
+//! field in the PARENT (`spec.template.metadata.ownerReferences`), never a
+//! panic and never a silent skip.
 
 use async_trait::async_trait;
 use engenho_store::{StoreMesh, command::ResourceCommand, resource::ResourceKey};
 use serde_json::Value;
 
-use crate::controller::{Controller, ReconcileOutcome, ReconcileReport, ReconcileResult};
+use crate::controller::{Controller, ReconcileOutcome};
 use crate::create_stamp::{CreateClock, stamp_create_timestamp, wall_clock};
 use crate::error::ControllerError;
-use crate::meta::ObjectMeta;
-use crate::owner::is_owned_by;
+use crate::meta::{ObjectMeta, ShapeError, object_mut};
+use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
 use crate::status::write_status_cas;
+use crate::sweep::{ObjectOutcome, Sweep};
+
+/// The parent field a templated child is cloned from.
+pub const TEMPLATE: &[&str] = &["spec", "template"];
+
+/// A Pod cloned from `parent`'s `spec.template`: `kind`/`apiVersion`
+/// stamped, `metadata.name` set to `name`, `metadata.namespace` to
+/// `namespace` when given, and owned by `owner`.
+///
+/// `Ok(None)` when the parent declares no template (absent or `null`) —
+/// nothing to clone, the caller creates nothing.
+///
+/// # Errors
+///
+/// [`ShapeError`] when the template, its `metadata`, or its
+/// `metadata.ownerReferences` holds the wrong JSON type. The path is
+/// re-anchored under [`TEMPLATE`], so it names the field the operator
+/// declared on the parent.
+pub fn pod_from_template(
+    parent: &Value,
+    name: &str,
+    namespace: Option<&str>,
+    owner: OwnerReference,
+) -> Result<Option<Value>, ShapeError> {
+    let Some(template) = parent
+        .get("spec")
+        .and_then(|s| s.get("template"))
+        .filter(|t| !t.is_null())
+    else {
+        return Ok(None);
+    };
+    let mut pod = template.clone();
+    stamp_pod(&mut pod, name, namespace, owner).map_err(|e| e.under(TEMPLATE))?;
+    Ok(Some(pod))
+}
+
+/// The writes [`pod_from_template`] makes into its clone, with paths
+/// relative to the clone.
+fn stamp_pod(
+    pod: &mut Value,
+    name: &str,
+    namespace: Option<&str>,
+    owner: OwnerReference,
+) -> Result<(), ShapeError> {
+    let root = object_mut(pod, &[])?;
+    root.insert("kind".into(), Value::from("Pod"));
+    root.insert("apiVersion".into(), Value::from("v1"));
+    let metadata = object_mut(pod, &["metadata"])?;
+    metadata.insert("name".into(), Value::from(name));
+    if let Some(ns) = namespace {
+        metadata.insert("namespace".into(), Value::from(ns));
+    }
+    set_owner_reference(pod, owner)?;
+    Ok(())
+}
+
+/// The object at `path` inside a Pod built by [`pod_from_template`], for a
+/// controller's own additions (a `DaemonSet`'s `spec.nodeName`, a Job's
+/// `spec.restartPolicy`); a wrong shape is reported under [`TEMPLATE`].
+///
+/// # Errors
+///
+/// [`ShapeError`] when a step of `path` in the template holds the wrong
+/// JSON type.
+pub fn template_object_mut<'v>(
+    pod: &'v mut Value,
+    path: &'static [&'static str],
+) -> Result<&'v mut serde_json::Map<String, Value>, ShapeError> {
+    object_mut(pod, path).map_err(|e| e.under(TEMPLATE))
+}
 
 /// `(group, version, kind)` of a child kind the parent owns. Borrowed
 /// `'static` literals — every controller passes its own canonical
@@ -108,8 +196,8 @@ impl ParentGvk {
 /// typed [`ResourceCommand`]s — never `format!()` of JSON.
 #[derive(Debug, Default)]
 pub struct ReconcileDelta {
-    /// Commands to propose, in order. Each committed command bumps
-    /// `ReconcileReport.objects_changed`.
+    /// Commands to propose, in order. A parent any of whose commands (or
+    /// whose status write) committed is one changed object in the report.
     pub commands: Vec<ResourceCommand>,
 }
 
@@ -152,6 +240,12 @@ pub trait OwnedChildrenReconciler: Send + Sync {
     /// Optional namespace scope (`None` = all namespaces).
     fn namespace(&self) -> Option<&str>;
 
+    /// The per-parent isolation runner the blanket sweeps through. Built
+    /// with the controller's upstream component name and the reason a
+    /// failed parent is announced under; its event sink is wired by the
+    /// controller's `with_event_sink` builder.
+    fn sweep(&self) -> &Sweep;
+
     /// The boundary clock the blanket reads ONCE per created child to
     /// freeze `metadata.creationTimestamp` into the replicated `Put`
     /// (see [`crate::create_stamp`]). Defaults to the production
@@ -164,12 +258,13 @@ pub trait OwnedChildrenReconciler: Send + Sync {
     /// The ONLY per-controller child-reconcile logic: given one live
     /// parent + the owned children gathered BEFORE this delta, return
     /// the typed child delta (creates / evictions / scales). The blanket
-    /// proposes each command in order, bumping `objects_changed`.
+    /// proposes each command in order.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError`] only on a genuine store/serialize
-    /// failure encountered while computing the delta.
+    /// A store failure while computing the delta ends the sweep; an
+    /// Item-scoped error ([`ControllerError::Shape`] for a template of the
+    /// wrong JSON type) fails this parent only, with an Event on it.
     async fn reconcile_one(
         &self,
         parent: &Value,
@@ -218,76 +313,94 @@ impl<T: OwnedChildrenReconciler> Controller for T {
 
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         let gvk = self.parent_gvk();
-        let store = self.store();
-        let child_kinds = self.child_kinds();
 
-        // S1 — list parents + record objects_examined.
-        let parents = store
+        // S1 — list parents. The sweep counts them (examined is the sum of
+        // the per-parent outcomes).
+        let parents = self
+            .store()
             .list(gvk.group, gvk.version, gvk.kind, self.namespace())
             .await;
-        let mut report = ReconcileReport::default();
-        report.objects_examined = parents.len();
 
-        for (parent_key, parent_value) in &parents {
-            // S2 — skip parents the apiserver hasn't stamped a uid on yet.
-            let Some(uid) = parent_value.uid() else {
-                tracing::debug!(
-                    parent = %parent_key.label(),
-                    "skipping parent with no metadata.uid"
-                );
-                report.objects_skipped += 1;
-                continue;
-            };
-            let uid = uid.to_string();
-            let ns = parent_key.namespace.as_deref();
-
-            // S3/S4 — gather the owned children (pre-delta) the per-parent
-            // logic reconciles against. Owner-ref construction itself is
-            // the per-controller logic's concern (it calls
-            // owner::owner_ref_for with its own apiVersion literal); the
-            // blanket only orchestrates the gather/propose/status order.
-            let owned = gather_owned(store, child_kinds, &uid, ns).await;
-
-            // S5 — the ONLY per-controller child reconcile. Propose each
-            // typed command in order, bumping objects_changed per commit.
-            //
-            // creationTimestamp boundary stamp (★★ determinism): a `Put`
-            // of a key NOT yet in the store is a CREATE — freeze
-            // `metadata.creationTimestamp` from ONE clock read HERE (the
-            // leader boundary, before propose) so every Raft replica
-            // replays identical bytes. An update-shaped `Put` (key exists)
-            // is left untouched: the field is create-time, never bumped.
-            let delta = self.reconcile_one(parent_value, &owned).await?;
-            for mut command in delta.commands {
-                if let ResourceCommand::Put { key, value, .. } = &mut command {
-                    if store.get(key).await.is_none() {
-                        stamp_create_timestamp(value, self.create_clock());
-                    }
-                }
-                store.propose(command).await?;
-                report.objects_changed += 1;
-            }
-
-            // S6 — re-list owned children AFTER the delta committed (the
-            // store applies proposals synchronously) so the status math
-            // reflects this tick's own creates/deletes. Then write the
-            // CAS status (the same `write_status_cas` primitive the
-            // hand-written ticks used).
-            let owned_after = gather_owned(store, child_kinds, &uid, ns).await;
-            if let Some(desired_status) = self.compute_status(parent_value, &owned_after) {
-                if write_status_cas(store, parent_key, parent_value, &desired_status)
-                    .await?
-                    .changed()
-                {
-                    report.objects_changed += 1;
-                }
-            }
-        }
-
-        // Owned-children controllers don't opt into requeue at this brick;
-        // result defaults to Done → drivers behave exactly as before.
-        Ok(ReconcileOutcome::new(report, ReconcileResult::Done))
+        // S2–S6 per parent, isolated: an Item-scoped failure is recorded
+        // against its parent (Event, once per resourceVersion) and the
+        // sweep continues; a store failure ends the tick, as before.
+        let report = self
+            .sweep()
+            .run(&parents, |parent_key, parent_value| async move {
+                ObjectOutcome::settle(reconcile_parent(self, parent_key, parent_value).await)
+            })
+            .await?;
+        Ok(ReconcileOutcome::from(report))
     }
+}
+
+/// One parent's S2–S6, written with ordinary `?`; the sweep decides by the
+/// error's scope whether it ends this parent or the tick.
+async fn reconcile_parent<T: OwnedChildrenReconciler + ?Sized>(
+    this: &T,
+    parent_key: &ResourceKey,
+    parent_value: &Value,
+) -> Result<ObjectOutcome, ControllerError> {
+    let store = this.store();
+    let child_kinds = this.child_kinds();
+
+    // S2 — skip parents the apiserver hasn't stamped a uid on yet.
+    let Some(uid) = parent_value.uid() else {
+        tracing::debug!(
+            parent = %parent_key.label(),
+            "skipping parent with no metadata.uid"
+        );
+        return Ok(ObjectOutcome::SKIPPED);
+    };
+    let ns = parent_key.namespace.as_deref();
+
+    // S3/S4 — gather the owned children (pre-delta) the per-parent logic
+    // reconciles against. Owner-ref construction itself is the
+    // per-controller logic's concern (it calls owner::owner_ref_for with
+    // its own apiVersion literal); the blanket only orchestrates the
+    // gather/propose/status order.
+    let owned = gather_owned(store, child_kinds, uid, ns).await;
+
+    // S5 — the ONLY per-controller child reconcile. The whole delta is
+    // computed before anything is proposed, so a parent that fails here
+    // has had nothing written for it.
+    //
+    // creationTimestamp boundary stamp (★★ determinism): a `Put` of a key
+    // NOT yet in the store is a CREATE — freeze
+    // `metadata.creationTimestamp` from ONE clock read HERE (the leader
+    // boundary, before propose) so every Raft replica replays identical
+    // bytes. An update-shaped `Put` (key exists) is left untouched: the
+    // field is create-time, never bumped.
+    let delta = this.reconcile_one(parent_value, &owned).await?;
+    let mut changed = false;
+    for mut command in delta.commands {
+        if let ResourceCommand::Put { key, value, .. } = &mut command
+            && store.get(key).await.is_none()
+        {
+            stamp_create_timestamp(value, this.create_clock());
+        }
+        store.propose(command).await?;
+        changed = true;
+    }
+
+    // S6 — re-list owned children AFTER the delta committed (the store
+    // applies proposals synchronously) so the status math reflects this
+    // tick's own creates/deletes. Then write the CAS status (the same
+    // `write_status_cas` primitive the hand-written ticks used).
+    let owned_after = gather_owned(store, child_kinds, uid, ns).await;
+    if let Some(desired_status) = this.compute_status(parent_value, &owned_after)
+        && write_status_cas(store, parent_key, parent_value, &desired_status)
+            .await?
+            .changed()
+    {
+        changed = true;
+    }
+
+    Ok(if changed {
+        ObjectOutcome::Changed
+    } else {
+        ObjectOutcome::Unchanged
+    })
 }
 
 #[cfg(test)]
@@ -323,6 +436,19 @@ mod tests {
     /// creationTimestamp on the CREATE Put, frozen at the boundary.
     struct WidgetReconciler {
         store: Arc<StoreMesh>,
+        sweep: Sweep,
+    }
+
+    impl WidgetReconciler {
+        fn new(store: Arc<StoreMesh>) -> Self {
+            Self {
+                store,
+                sweep: Sweep::new(
+                    "widget-controller",
+                    crate::event_recorder::Reason::FailedCreate,
+                ),
+            }
+        }
     }
 
     #[async_trait]
@@ -343,6 +469,9 @@ mod tests {
         fn namespace(&self) -> Option<&str> {
             None
         }
+        fn sweep(&self) -> &Sweep {
+            &self.sweep
+        }
         fn create_clock(&self) -> CreateClock {
             fixed_clock
         }
@@ -360,7 +489,7 @@ mod tests {
                 "kind": "Gadget", "apiVersion": "demo/v1",
                 "metadata": {"name": "g", "namespace": ns}
             });
-            crate::owner::set_owner_reference(&mut child, owner);
+            crate::owner::set_owner_reference(&mut child, owner)?;
             let key = ResourceKey::namespaced("demo", "v1", "Gadget", &ns, "g");
             Ok(ReconcileDelta::from_commands(vec![ResourceCommand::Put {
                 key,
@@ -394,9 +523,7 @@ mod tests {
             .await
             .unwrap();
 
-        let c = WidgetReconciler {
-            store: store.clone(),
-        };
+        let c = WidgetReconciler::new(store.clone());
         let out = c.tick().await.unwrap();
         assert!(out.objects_changed >= 1, "the child was created");
 
@@ -432,9 +559,7 @@ mod tests {
             .await
             .unwrap();
 
-        let c = WidgetReconciler {
-            store: store.clone(),
-        };
+        let c = WidgetReconciler::new(store.clone());
         // First tick creates the child + stamps the timestamp.
         c.tick().await.unwrap();
         let key = ResourceKey::namespaced("demo", "v1", "Gadget", "team-y", "g");

@@ -6,9 +6,12 @@
 //! Service→Endpoints, etc. — extract once + reuse.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use crate::meta::ObjectMeta;
+use crate::meta::{ObjectMeta, ShapeError, array_mut};
+
+/// Where a child's owner references live.
+pub const OWNER_REFERENCES: &[&str] = &["metadata", "ownerReferences"];
 
 /// K8s `OwnerReference` shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,36 +39,56 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+impl OwnerReference {
+    /// The wire object: the same bytes `serde_json::to_value` produces for
+    /// this type (pinned by `to_value_matches_serde_for_every_flag`), built
+    /// without a fallible serializer so writing a reference cannot fail.
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        let mut out = Map::new();
+        out.insert("apiVersion".into(), Value::from(self.api_version.as_str()));
+        out.insert("kind".into(), Value::from(self.kind.as_str()));
+        out.insert("name".into(), Value::from(self.name.as_str()));
+        out.insert("uid".into(), Value::from(self.uid.as_str()));
+        if self.controller {
+            out.insert("controller".into(), Value::Bool(true));
+        }
+        if self.block_owner_deletion {
+            out.insert("blockOwnerDeletion".into(), Value::Bool(true));
+        }
+        Value::Object(out)
+    }
+}
+
 /// Write an `ownerReferences` entry into `child`'s metadata,
 /// pointing at `owner`. Idempotent — won't duplicate an existing
 /// reference with the same uid.
 ///
-/// Mutates `child` in place. Returns true if a reference was added.
-pub fn set_owner_reference(child: &mut Value, owner_ref: OwnerReference) -> bool {
-    let metadata = child
-        .as_object_mut()
-        .expect("child must be a JSON object")
-        .entry("metadata".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let metadata_obj = metadata.as_object_mut().expect("metadata must be object");
-    let owner_refs = metadata_obj
-        .entry("ownerReferences".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let arr = owner_refs
-        .as_array_mut()
-        .expect("ownerReferences must be array");
-    // Idempotence: if a ref with the same uid exists, no-op.
-    let already_present = arr.iter().any(|r| {
-        r.get("uid")
-            .and_then(|u| u.as_str())
-            .map(|u| u == owner_ref.uid)
-            .unwrap_or(false)
-    });
+/// Mutates `child` in place. Returns `Ok(true)` if a reference was added,
+/// `Ok(false)` if one with the same uid was already there.
+///
+/// Total over the child's shape (see [`crate::meta::array_mut`]): an absent
+/// or `null` `metadata` or `ownerReferences` is treated as empty.
+///
+/// # Errors
+///
+/// [`ShapeError`] when `child`, its `metadata`, or its `ownerReferences`
+/// holds the wrong JSON type. The child is left unchanged, and the caller
+/// skips that object; it used to panic here, taking every object after it
+/// in the sweep down with it.
+pub fn set_owner_reference(
+    child: &mut Value,
+    owner_ref: OwnerReference,
+) -> Result<bool, ShapeError> {
+    let refs = array_mut(child, OWNER_REFERENCES)?;
+    let already_present = refs
+        .iter()
+        .any(|r| r.get("uid").and_then(Value::as_str) == Some(owner_ref.uid.as_str()));
     if already_present {
-        return false;
+        return Ok(false);
     }
-    arr.push(serde_json::to_value(&owner_ref).expect("OwnerReference serializes"));
-    true
+    refs.push(owner_ref.to_value());
+    Ok(true)
 }
 
 /// Read the controlling owner of `child` (the ownerRef with
@@ -143,7 +166,7 @@ mod tests {
     #[test]
     fn set_owner_reference_adds_new_entry() {
         let mut pod = json!({"metadata": {"name": "p1"}, "spec": {}});
-        let added = set_owner_reference(&mut pod, rs_owner());
+        let added = set_owner_reference(&mut pod, rs_owner()).unwrap();
         assert!(added);
         let refs = pod
             .get("metadata")
@@ -160,9 +183,9 @@ mod tests {
     #[test]
     fn set_owner_reference_is_idempotent_by_uid() {
         let mut pod = json!({"metadata": {"name": "p1"}});
-        assert!(set_owner_reference(&mut pod, rs_owner()));
+        assert!(set_owner_reference(&mut pod, rs_owner()).unwrap());
         // Second call returns false (no-op).
-        assert!(!set_owner_reference(&mut pod, rs_owner()));
+        assert!(!set_owner_reference(&mut pod, rs_owner()).unwrap());
         let refs = pod
             .get("metadata")
             .unwrap()
@@ -176,7 +199,7 @@ mod tests {
     #[test]
     fn controlling_owner_returns_ctrl_ref() {
         let mut pod = json!({"metadata": {"name": "p"}});
-        set_owner_reference(&mut pod, rs_owner());
+        set_owner_reference(&mut pod, rs_owner()).unwrap();
         let owner = controlling_owner(&pod).expect("owner");
         assert_eq!(owner.uid, "uid-rs-1");
         assert_eq!(owner.kind, "ReplicaSet");
@@ -198,7 +221,7 @@ mod tests {
     #[test]
     fn is_owned_by_matches_uid() {
         let mut pod = json!({"metadata": {"name": "p"}});
-        set_owner_reference(&mut pod, rs_owner());
+        set_owner_reference(&mut pod, rs_owner()).unwrap();
         assert!(is_owned_by(&pod, "uid-rs-1"));
         assert!(!is_owned_by(&pod, "uid-other"));
     }
@@ -221,6 +244,60 @@ mod tests {
         assert!(owner_ref_for(&no_uid, "apps/v1", "ReplicaSet").is_none());
         let no_name = json!({"metadata": {"uid": "u"}});
         assert!(owner_ref_for(&no_name, "apps/v1", "ReplicaSet").is_none());
+    }
+
+    /// `null` metadata or ownerReferences is the empty case: the reference
+    /// is written. On HEAD before T4.3 both panicked ("ownerReferences must
+    /// be array" / "metadata must be object").
+    #[test]
+    fn null_metadata_or_owner_references_is_written_not_a_panic() {
+        for mut child in [
+            json!({"metadata": {"name": "p", "ownerReferences": null}}),
+            json!({"metadata": null}),
+            json!({}),
+        ] {
+            assert_eq!(set_owner_reference(&mut child, rs_owner()), Ok(true));
+            assert!(is_owned_by(&child, "uid-rs-1"), "{child}");
+        }
+    }
+
+    /// The wrong type is an error naming the path, and the child is left
+    /// exactly as it was.
+    #[test]
+    fn a_wrong_shape_is_an_error_and_writes_nothing() {
+        for (child, path) in [
+            (
+                json!({"metadata": {"ownerReferences": "x"}}),
+                "metadata.ownerReferences",
+            ),
+            (
+                json!({"metadata": {"ownerReferences": {}}}),
+                "metadata.ownerReferences",
+            ),
+            (json!({"metadata": 3}), "metadata"),
+            (json!("not-an-object"), "the object itself"),
+        ] {
+            let mut written = child.clone();
+            let err = set_owner_reference(&mut written, rs_owner()).unwrap_err();
+            assert!(err.to_string().starts_with(path), "{err}");
+            assert_eq!(written, child, "nothing written on a shape error");
+        }
+    }
+
+    /// The hand-built wire object is byte-identical to serde's, for every
+    /// combination of the two skip-if-false flags.
+    #[test]
+    fn to_value_matches_serde_for_every_flag() {
+        for controller in [false, true] {
+            for block_owner_deletion in [false, true] {
+                let r = OwnerReference {
+                    controller,
+                    block_owner_deletion,
+                    ..rs_owner()
+                };
+                assert_eq!(r.to_value(), serde_json::to_value(&r).unwrap());
+            }
+        }
     }
 
     #[test]

@@ -45,17 +45,19 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use engenho_store::StoreMesh;
 use engenho_store::command::{Reason as CommandReason, ResourceCommand};
+use engenho_store::{ResourceKey, StoreMesh};
 
-use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome};
 use crate::error::ControllerError;
 use crate::event_recorder::{EventRecord, EventSink, InvolvedObject, NullEventSink, Reason};
+use crate::meta::{ShapeError, object_mut};
 use crate::network_policy::{
     Direction, NetworkPolicyEnforcer, NetworkPolicyRule, PeerSelector, PolicyDatapath, PortSpec,
 };
+use crate::sweep::{ObjectOutcome, Sweep};
 
 /// The annotation carrying the enforcement verdict, so the distinction is
 /// machine-queryable (`kubectl get netpol -o json`) and not only visible in
@@ -311,27 +313,27 @@ pub fn already_annotated(policy: &Value, datapath: PolicyDatapath) -> bool {
         == Some(enforcement_value(datapath))
 }
 
+/// Where a policy's annotations live.
+const ANNOTATIONS: &[&str] = &["metadata", "annotations"];
+
 /// The policy with the enforcement verdict annotated.
-#[must_use]
-pub fn annotated(policy: &Value, datapath: PolicyDatapath) -> Value {
+///
+/// Absent or `null` `metadata`/`annotations` are the empty case and get
+/// the annotation.
+///
+/// # Errors
+///
+/// [`ShapeError`] when the policy, its `metadata`, or its `annotations`
+/// holds the wrong JSON type. It used to `expect` here, and the panic took
+/// the controller task with it, so no policy after the malformed one was
+/// ever annotated.
+pub fn annotated(policy: &Value, datapath: PolicyDatapath) -> Result<Value, ShapeError> {
     let mut out = policy.clone();
-    let meta = out
-        .as_object_mut()
-        .expect("policy is an object")
-        .entry("metadata")
-        .or_insert_with(|| json!({}));
-    let anns = meta
-        .as_object_mut()
-        .expect("metadata is an object")
-        .entry("annotations")
-        .or_insert_with(|| json!({}));
-    anns.as_object_mut()
-        .expect("annotations is an object")
-        .insert(
-            ENFORCEMENT_ANNOTATION.to_string(),
-            json!(enforcement_value(datapath)),
-        );
-    out
+    object_mut(&mut out, ANNOTATIONS)?.insert(
+        ENFORCEMENT_ANNOTATION.to_string(),
+        Value::from(enforcement_value(datapath)),
+    );
+    Ok(out)
 }
 
 /// The message an operator reads when a policy restricts nothing.
@@ -356,7 +358,13 @@ pub struct NetworkPolicyController {
     store: Arc<StoreMesh>,
     enforcer: Arc<dyn NetworkPolicyEnforcer>,
     events: Arc<dyn EventSink>,
+    /// Per-policy isolation: a policy whose annotations cannot be written
+    /// gets a `FailedUpdate` Event and the others are still annotated.
+    sweep: Sweep,
 }
+
+/// The component this controller signs its Events with.
+const COMPONENT: &str = "network-policy-controller";
 
 impl NetworkPolicyController {
     /// New controller over `store`, installing through `enforcer`.
@@ -366,15 +374,94 @@ impl NetworkPolicyController {
             store,
             enforcer,
             events: Arc::new(NullEventSink),
+            sweep: Sweep::new(COMPONENT, Reason::FailedUpdate),
         }
     }
 
-    /// Builder: wire the event sink so a computed-only policy is visible in
-    /// `kubectl describe`.
+    /// Builder: wire the event sink so a computed-only policy, and a policy
+    /// whose verdict cannot be annotated, is visible in `kubectl describe`.
     #[must_use]
     pub fn with_event_sink(mut self, events: Arc<dyn EventSink>) -> Self {
+        self.sweep = self.sweep.with_event_sink(events.clone());
         self.events = events;
         self
+    }
+
+    /// One policy: install its rules, then annotate the verdict (and, on a
+    /// computed-only datapath, say so once, on the transition).
+    ///
+    /// A failed rule install or a failed store write is a skip, as it
+    /// always was here; a policy whose annotations have the wrong shape is
+    /// an Item failure the sweep announces on the policy.
+    async fn reconcile_policy(
+        &self,
+        key: &ResourceKey,
+        policy: &Value,
+        rules: &[NetworkPolicyRule],
+        datapath: PolicyDatapath,
+        now: &str,
+    ) -> Result<ObjectOutcome, ControllerError> {
+        let mut refused = false;
+        for rule in rules {
+            if self.enforcer.upsert(rule).await.is_err() {
+                refused = true;
+            }
+        }
+
+        if already_annotated(policy, datapath) {
+            return Ok(if refused {
+                ObjectOutcome::skipped_because("enforcer refused a rule")
+            } else {
+                ObjectOutcome::Unchanged
+            });
+        }
+        let desired = annotated(policy, datapath)?;
+        if self
+            .store
+            .propose(ResourceCommand::Put {
+                key: key.clone(),
+                value: desired,
+                expected: None,
+                reason: CommandReason::Controller,
+            })
+            .await
+            .is_err()
+        {
+            return Ok(ObjectOutcome::SKIPPED);
+        }
+
+        // The event fires only on the transition — the annotation check
+        // above already returned for a policy seen on a previous tick —
+        // so this does not spam one event per policy per tick.
+        if datapath == PolicyDatapath::Computed {
+            let meta = policy.get("metadata");
+            self.events
+                .record(EventRecord {
+                    involved: InvolvedObject {
+                        api_version: "networking.k8s.io/v1".into(),
+                        kind: "NetworkPolicy".into(),
+                        namespace: meta
+                            .and_then(|m| m.get("namespace"))
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        name: meta
+                            .and_then(|m| m.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        uid: meta
+                            .and_then(|m| m.get("uid"))
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                    },
+                    reason: Reason::NetworkPolicyNotEnforced,
+                    message: not_enforced_message(self.enforcer.name()),
+                    component: COMPONENT.into(),
+                    timestamp: now.to_string(),
+                })
+                .await;
+        }
+        Ok(ObjectOutcome::Changed)
     }
 }
 
@@ -385,7 +472,6 @@ impl Controller for NetworkPolicyController {
     }
 
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
-        let mut report = ReconcileReport::default();
         let datapath = self.enforcer.datapath();
         let now = engenho_types::time::now_rfc3339_utc();
 
@@ -393,93 +479,62 @@ impl Controller for NetworkPolicyController {
             .store
             .list("networking.k8s.io", "v1", "NetworkPolicy", None)
             .await;
-        report.objects_examined = policies.len();
 
-        // Every rule id this pass believes should exist. Anything the
-        // enforcer holds that is NOT here belongs to a deleted policy and
-        // is reaped below — which is how a `kubectl delete netpol` actually
-        // stops enforcing, rather than leaving the filter installed forever.
-        let mut desired_ids: Vec<String> = Vec::new();
+        // Every policy's rules, translated once. The ids are every rule
+        // this pass believes should exist: anything the enforcer holds that
+        // is NOT among them belongs to a deleted policy and is reaped below
+        // — which is how a `kubectl delete netpol` actually stops
+        // enforcing, rather than leaving the filter installed forever.
+        let rules: BTreeMap<&ResourceKey, Vec<NetworkPolicyRule>> = policies
+            .iter()
+            .map(|(key, policy)| (key, translate(policy)))
+            .collect();
+        let desired_ids: Vec<&str> = rules
+            .values()
+            .flatten()
+            .map(|rule| rule.policy_id.as_str())
+            .collect();
 
-        for (key, policy) in policies {
-            for rule in translate(&policy) {
-                desired_ids.push(rule.policy_id.clone());
-                if self.enforcer.upsert(&rule).await.is_err() {
-                    report.objects_skipped += 1;
-                }
-            }
-
-            if already_annotated(&policy, datapath) {
-                continue;
-            }
-            let desired = annotated(&policy, datapath);
-            if self
-                .store
-                .propose(ResourceCommand::Put {
-                    key,
-                    value: desired,
-                    expected: None,
-                    reason: CommandReason::Controller,
-                })
-                .await
-                .is_ok()
-            {
-                report.objects_changed += 1;
-            } else {
-                report.objects_skipped += 1;
-                continue;
-            }
-
-            // The event fires only on the transition — the annotation check
-            // above already returned for a policy seen on a previous tick —
-            // so this does not spam one event per policy per tick.
-            if datapath == PolicyDatapath::Computed {
-                let meta = policy.get("metadata");
-                self.events
-                    .record(EventRecord {
-                        involved: InvolvedObject {
-                            api_version: "networking.k8s.io/v1".into(),
-                            kind: "NetworkPolicy".into(),
-                            namespace: meta
-                                .and_then(|m| m.get("namespace"))
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string),
-                            name: meta
-                                .and_then(|m| m.get("name"))
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            uid: meta
-                                .and_then(|m| m.get("uid"))
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string),
-                        },
-                        reason: Reason::NetworkPolicyNotEnforced,
-                        message: not_enforced_message(self.enforcer.name()),
-                        component: "network-policy-controller".into(),
-                        timestamp: now.clone(),
-                    })
-                    .await;
-            }
-        }
+        // Each policy isolated: one whose annotations have the wrong shape
+        // is announced on itself, and every other policy is still installed
+        // and annotated. Nothing here returns a store error (a failed write
+        // is a skip), so the sweep always reaches the reap.
+        let rules = &rules;
+        let now = now.as_str();
+        let report = self
+            .sweep
+            .run(&policies, |key, policy| async move {
+                let policy_rules = rules.get(key).map_or(&[][..], Vec::as_slice);
+                ObjectOutcome::settle(
+                    self.reconcile_policy(key, policy, policy_rules, datapath, now)
+                        .await,
+                )
+            })
+            .await?;
 
         // Reap rules whose policy is gone.
+        let mut reaped = 0;
         if let Ok(installed) = self.enforcer.list().await {
             for rule in installed {
-                if !desired_ids.contains(&rule.policy_id) {
+                if !desired_ids.contains(&rule.policy_id.as_str()) {
                     let _ = self.enforcer.remove(&rule.policy_id).await;
-                    report.objects_changed += 1;
+                    reaped += 1;
                 }
             }
         }
 
-        Ok(ReconcileOutcome::from(report))
+        // A reaped rule belongs to no listed policy, so the sweep did not
+        // count it; the legacy counter still does.
+        let mut outcome = ReconcileOutcome::from(report);
+        outcome.report.objects_changed += reaped;
+        Ok(outcome)
     }
 }
 
 #[cfg(test)]
 mod translate_tests {
     use super::*;
+    use serde_json::json;
 
     fn policy(spec: Value) -> Value {
         json!({
@@ -640,23 +695,24 @@ mod translate_tests {
 #[cfg(test)]
 mod honesty_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn the_annotation_records_the_verdict_and_is_idempotent() {
         let p = json!({ "metadata": { "name": "p" } });
         assert!(!already_annotated(&p, PolicyDatapath::Computed));
-        let once = annotated(&p, PolicyDatapath::Computed);
+        let once = annotated(&p, PolicyDatapath::Computed).unwrap();
         assert!(already_annotated(&once, PolicyDatapath::Computed));
         // A rewrite every tick advances the store revision forever — the
         // hot-loop class the node lease already hit in this codebase.
-        assert_eq!(once, annotated(&once, PolicyDatapath::Computed));
+        assert_eq!(once, annotated(&once, PolicyDatapath::Computed).unwrap());
     }
 
     #[test]
     fn a_computed_annotation_does_not_satisfy_an_installed_check() {
         // The direction that matters: a policy that is NOT enforced must
         // never read as enforced.
-        let p = annotated(&json!({}), PolicyDatapath::Computed);
+        let p = annotated(&json!({}), PolicyDatapath::Computed).unwrap();
         assert!(!already_annotated(&p, PolicyDatapath::Installed));
     }
 
@@ -666,10 +722,36 @@ mod honesty_tests {
             "metadata": { "name": "p", "namespace": "ns",
                           "annotations": { "keep": "me" } }
         });
-        let out = annotated(&p, PolicyDatapath::Installed);
+        let out = annotated(&p, PolicyDatapath::Installed).unwrap();
         assert_eq!(out["metadata"]["name"], "p");
         assert_eq!(out["metadata"]["namespace"], "ns");
         assert_eq!(out["metadata"]["annotations"]["keep"], "me");
+    }
+
+    /// `null` annotations (or metadata) are the empty case: annotated, not a
+    /// panic. On HEAD before T4.3 this was `expect("annotations is an
+    /// object")`.
+    #[test]
+    fn null_annotations_or_metadata_are_annotated() {
+        for p in [
+            json!({ "metadata": { "name": "p", "annotations": null } }),
+            json!({ "metadata": null }),
+        ] {
+            let out = annotated(&p, PolicyDatapath::Installed).unwrap();
+            assert!(already_annotated(&out, PolicyDatapath::Installed), "{p}");
+        }
+    }
+
+    /// The wrong type is an error naming the field, never a panic.
+    #[test]
+    fn a_wrong_shaped_annotations_field_is_an_error() {
+        let p = json!({ "metadata": { "name": "p", "annotations": ["x"] } });
+        assert_eq!(
+            annotated(&p, PolicyDatapath::Computed)
+                .unwrap_err()
+                .to_string(),
+            "metadata.annotations is an array, expected an object"
+        );
     }
 
     #[test]

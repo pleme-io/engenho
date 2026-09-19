@@ -81,6 +81,22 @@ pub enum Reason {
     SuccessfulCreate,
     /// A ReplicaSet deleted a pod.
     SuccessfulDelete,
+    /// A workload controller could not create a child from its parent's
+    /// template (`ReplicaSet`, `StatefulSet`, `DaemonSet` and `Job` pods;
+    /// `CronJob` jobs). Upstream's `FailedCreatePodReason`. Emitted by the
+    /// owned-children sweep and the `CronJob` sweep, on the parent.
+    FailedCreate,
+    /// A controller could not update an object it maintains. Upstream's
+    /// `StatefulSet` `Failed<Verb>` string for `update`. Emitted by the
+    /// `NetworkPolicy` controller when a policy's enforcement annotation
+    /// cannot be written.
+    FailedUpdate,
+    /// The Deployment controller could not create a `ReplicaSet`. Upstream's
+    /// `deploymentutil.FailedRSCreateReason`.
+    ReplicaSetCreateError,
+    /// The Endpoints controller could not write a Service's `Endpoints` or
+    /// `EndpointSlice`. Upstream's `FailedToUpdateEndpoint`.
+    FailedToUpdateEndpoint,
     /// A PersistentVolumeClaim was bound.
     ProvisioningSucceeded,
     /// A `PersistentVolumeClaim` could not be provisioned, for a reason that
@@ -113,6 +129,10 @@ impl Reason {
             Self::ScalingReplicaSet => "ScalingReplicaSet",
             Self::SuccessfulCreate => "SuccessfulCreate",
             Self::SuccessfulDelete => "SuccessfulDelete",
+            Self::FailedCreate => "FailedCreate",
+            Self::FailedUpdate => "FailedUpdate",
+            Self::ReplicaSetCreateError => "ReplicaSetCreateError",
+            Self::FailedToUpdateEndpoint => "FailedToUpdateEndpoint",
             Self::ProvisioningSucceeded => "ProvisioningSucceeded",
             Self::ProvisioningFailed => "ProvisioningFailed",
             Self::NetworkPolicyNotEnforced => "NetworkPolicyNotEnforced",
@@ -132,6 +152,10 @@ impl Reason {
             | Self::BackOff
             | Self::FailedScheduling
             | Self::ProvisioningFailed
+            | Self::FailedCreate
+            | Self::FailedUpdate
+            | Self::ReplicaSetCreateError
+            | Self::FailedToUpdateEndpoint
             | Self::NetworkPolicyNotEnforced => Severity::Warning,
             _ => Severity::Normal,
         }
@@ -248,6 +272,20 @@ mod tests {
         assert_eq!(Reason::SuccessfulCreate.as_str(), "SuccessfulCreate");
         // k8s.io/kubernetes pkg/controller/volume/events.ProvisioningFailed.
         assert_eq!(Reason::ProvisioningFailed.as_str(), "ProvisioningFailed");
+        // pkg/controller/controller_utils.go FailedCreatePodReason.
+        assert_eq!(Reason::FailedCreate.as_str(), "FailedCreate");
+        // pkg/controller/statefulset recordPodEvent("update").
+        assert_eq!(Reason::FailedUpdate.as_str(), "FailedUpdate");
+        // pkg/controller/deployment/util FailedRSCreateReason.
+        assert_eq!(
+            Reason::ReplicaSetCreateError.as_str(),
+            "ReplicaSetCreateError"
+        );
+        // pkg/controller/endpoint FailedToUpdateEndpoint.
+        assert_eq!(
+            Reason::FailedToUpdateEndpoint.as_str(),
+            "FailedToUpdateEndpoint"
+        );
     }
 
     #[test]
@@ -259,6 +297,10 @@ mod tests {
             Reason::BackOff,
             Reason::FailedScheduling,
             Reason::ProvisioningFailed,
+            Reason::FailedCreate,
+            Reason::FailedUpdate,
+            Reason::ReplicaSetCreateError,
+            Reason::FailedToUpdateEndpoint,
         ] {
             assert_eq!(r.severity(), Severity::Warning, "{} must warn", r.as_str());
         }

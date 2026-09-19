@@ -93,7 +93,8 @@ async fn a_pod_owned_by_a_statefulset_is_not_an_orphan() {
             controller: true,
             block_owner_deletion: true,
         },
-    );
+    )
+    .unwrap();
     put(&store, &pod_key, pod).await;
 
     let gc = GcController::new(store.clone(), None);
@@ -132,7 +133,8 @@ async fn a_pod_whose_owner_does_not_exist_is_still_collected() {
             controller: true,
             block_owner_deletion: true,
         },
-    );
+    )
+    .unwrap();
     put(&store, &pod_key, pod).await;
 
     let gc = GcController::new(store.clone(), None);
@@ -180,7 +182,8 @@ async fn a_uid_mismatch_on_a_live_name_still_orphans() {
             controller: true,
             block_owner_deletion: true,
         },
-    );
+    )
+    .unwrap();
     put(&store, &pod_key, pod).await;
 
     let gc = GcController::new(store.clone(), None);

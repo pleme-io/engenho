@@ -23,54 +23,64 @@ use engenho_store::{
 use serde_json::{Value, json};
 
 use crate::error::ControllerError;
-use crate::meta::ObjectMeta;
-use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
-use crate::owner::{owner_ref_for, set_owner_reference};
+use crate::event_recorder::Reason as EventReason;
+use crate::meta::{ObjectMeta, ShapeError};
+use crate::owned_children::{
+    ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
+};
+use crate::owner::{OwnerReference, owner_ref_for};
 use crate::status::{observed_generation, pod_is_ready};
+use crate::sweep::{Sweep, impl_sweep_event_sink};
 
 pub struct ReplicaSetController {
     store: Arc<StoreMesh>,
     /// Optional namespace scope. None = all namespaces.
     namespace: Option<String>,
+    /// Per-`ReplicaSet` isolation: a `ReplicaSet` whose template has the wrong
+    /// shape gets a `FailedCreate` Event and the others still converge.
+    sweep: Sweep,
 }
+
+impl_sweep_event_sink!(ReplicaSetController);
 
 impl ReplicaSetController {
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
-        Self { store, namespace }
+        Self {
+            store,
+            namespace,
+            sweep: Sweep::new("replicaset-controller", EventReason::FailedCreate),
+        }
     }
 
-    /// Construct a Pod object from a ReplicaSet's `spec.template`.
-    /// Names the Pod `{rs_name}-{index}-{random}`; the index +
-    /// random suffix make names deterministic for tests + readable
-    /// for operators.
-    fn build_pod_from_template(rs: &Value, index: usize) -> Option<(String, Value)> {
-        let rs_name = rs.name()?;
+    /// Construct a Pod object from a `ReplicaSet`'s `spec.template`,
+    /// owned by `owner`. Names the Pod `{rs_name}-{index}`, deterministic
+    /// for tests + readable for operators.
+    ///
+    /// `Ok(None)` when the `ReplicaSet` has no name or no template.
+    ///
+    /// # Errors
+    ///
+    /// [`ShapeError`] when the template has the wrong JSON shape.
+    fn build_pod_from_template(
+        rs: &Value,
+        index: usize,
+        owner: OwnerReference,
+    ) -> Result<Option<(String, Value)>, ShapeError> {
+        let Some(rs_name) = rs.name() else {
+            return Ok(None);
+        };
         // Pod lives in the SAME namespace as its parent ReplicaSet — the
         // namespace the blanket gathers owned pods from. Never the
         // controller's scope namespace (an all-namespace controller has none).
-        let rs_namespace = rs
-            .namespace()
-            .map_or_else(|| "default".to_string(), |c| c.to_owned());
-        let template = rs.get("spec").and_then(|s| s.get("template"))?;
-        let mut pod = template.clone();
-        // Ensure pod is an object
-        let pod_obj = pod.as_object_mut()?;
-        // Wrap with kind + apiVersion at the top
-        pod_obj.insert("kind".into(), Value::String("Pod".into()));
-        pod_obj.insert("apiVersion".into(), Value::String("v1".into()));
+        let rs_namespace = rs.namespace().unwrap_or("default");
         // Generate a deterministic-ish name: {rs}-{index}
         // (Production K8s uses random hashes; for R9 we keep it
         // deterministic for test reproducibility. R9.5+ can swap
         // in nanoid if name collisions matter.)
         let pod_name = format!("{rs_name}-{index}");
-        let metadata = pod_obj
-            .entry("metadata".to_string())
-            .or_insert_with(|| json!({}));
-        let metadata_obj = metadata.as_object_mut()?;
-        metadata_obj.insert("name".into(), Value::String(pod_name.clone()));
-        metadata_obj.insert("namespace".into(), Value::String(rs_namespace));
-        Some((pod_name, pod))
+        let pod = pod_from_template(rs, &pod_name, Some(rs_namespace), owner)?;
+        Ok(pod.map(|pod| (pod_name, pod)))
     }
 }
 
@@ -135,6 +145,10 @@ impl OwnedChildrenReconciler for ReplicaSetController {
         self.namespace.as_deref()
     }
 
+    fn sweep(&self) -> &Sweep {
+        &self.sweep
+    }
+
     async fn reconcile_one(
         &self,
         rs_value: &Value,
@@ -177,10 +191,11 @@ impl OwnedChildrenReconciler for ReplicaSetController {
             let used = used_indices(rs_value.name(), owned_pods);
             let free = free_indices(&used, desired - observed);
             for idx in free {
-                let Some((pod_name, mut pod)) = Self::build_pod_from_template(rs_value, idx) else {
+                let Some((pod_name, pod)) =
+                    Self::build_pod_from_template(rs_value, idx, owner_ref.clone())?
+                else {
                     continue;
                 };
-                set_owner_reference(&mut pod, owner_ref.clone());
                 let pod_key = ResourceKey::namespaced("", "v1", "Pod", &pod_ns, &pod_name);
                 commands.push(ResourceCommand::Put {
                     key: pod_key,
@@ -244,6 +259,17 @@ mod tests {
         assert_eq!(rs.spec_i64("replicas", 1), 5);
     }
 
+    fn rs_owner() -> OwnerReference {
+        OwnerReference {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            name: "rs1".into(),
+            uid: "uid-rs1".into(),
+            controller: true,
+            block_owner_deletion: true,
+        }
+    }
+
     #[test]
     fn build_pod_from_template_sets_name_and_metadata() {
         let rs = json!({
@@ -255,7 +281,9 @@ mod tests {
                 }
             }
         });
-        let (name, pod) = ReplicaSetController::build_pod_from_template(&rs, 0).unwrap();
+        let (name, pod) = ReplicaSetController::build_pod_from_template(&rs, 0, rs_owner())
+            .unwrap()
+            .unwrap();
         assert_eq!(name, "rs1-0");
         assert_eq!(pod.get("kind").unwrap(), "Pod");
         assert_eq!(pod.get("apiVersion").unwrap(), "v1");
@@ -289,7 +317,9 @@ mod tests {
                 "spec": {"containers": [{"name": "c", "image": "img"}]}
             }}
         });
-        let (name, pod) = ReplicaSetController::build_pod_from_template(&rs, 2).unwrap();
+        let (name, pod) = ReplicaSetController::build_pod_from_template(&rs, 2, rs_owner())
+            .unwrap()
+            .unwrap();
         assert_eq!(name, "rs1-2");
         assert_eq!(
             pod.get("metadata").unwrap().get("namespace").unwrap(),

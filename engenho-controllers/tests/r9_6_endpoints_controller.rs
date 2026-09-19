@@ -99,9 +99,10 @@ async fn endpoints_materialize_for_matching_ready_pods() {
     let ctrl = EndpointsController::new(store.clone(), Some("default".into()));
     let report = ctrl.tick().await.unwrap();
     assert_eq!(report.objects_examined, 1);
-    // Two objects materialize per Service: the legacy Endpoints AND the
-    // modern discovery.k8s.io/v1 EndpointSlice (parallel projections).
-    assert_eq!(report.objects_changed, 2);
+    // The one Service changed: its legacy Endpoints AND its modern
+    // discovery.k8s.io/v1 EndpointSlice materialized (parallel projections,
+    // asserted below). The sweep counts changed Services, not writes.
+    assert_eq!(report.objects_changed, 1);
 
     let ips = endpoint_ips(&store, "podinfo").await;
     assert_eq!(ips, vec!["10.0.0.1", "10.0.0.2"]);
@@ -189,8 +190,8 @@ async fn endpoints_update_when_pod_added() {
     // Add a second pod.
     put_ready_pod(&store, "p2", json!({"app": "podinfo"}), "10.0.0.2").await;
     let report = ctrl.tick().await.unwrap();
-    // Both the Endpoints AND the EndpointSlice re-converge with the new pod.
-    assert_eq!(report.objects_changed, 2);
+    // The Service re-converged (Endpoints AND EndpointSlice) with the new pod.
+    assert_eq!(report.objects_changed, 1);
     assert_eq!(
         endpoint_ips(&store, "podinfo").await,
         vec!["10.0.0.1", "10.0.0.2"]

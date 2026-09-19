@@ -2647,8 +2647,22 @@ fn spawn_drivers(
     // mounts, with nothing anywhere explaining the difference.
     let csi_drivers = engenho_kubelet::DriverTable::new();
 
+    // The event sink, built once and shared by every producer below. It
+    // lives here rather than inside the kubelet block because the workload
+    // controllers, the pv-binder and the NetworkPolicy controller need it
+    // too, and two sinks over one store would be two independent lossy
+    // buffers for one cluster's events. The workload controllers announce a
+    // parent they cannot reconcile (a template of the wrong shape) on that
+    // parent, and carry on with the rest.
+    let events: Arc<dyn engenho_controllers::event_recorder::EventSink> = Arc::new(
+        engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
+            store: store.clone(),
+        })),
+    );
+
     if enable.deployment {
-        let c = DeploymentController::new(store.clone(), ns.clone());
+        let c =
+            DeploymentController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
         handles.push(
             WatchDriver::new(
                 c,
@@ -2659,19 +2673,21 @@ fn spawn_drivers(
         );
     }
     if enable.replicaset {
-        let c = ReplicaSetController::new(store.clone(), ns.clone());
+        let c =
+            ReplicaSetController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
         handles.push(
             WatchDriver::new(c, store.clone(), driver_config(&["ReplicaSet", "Pod"])).spawn(),
         );
     }
     if enable.statefulset {
-        let c = StatefulSetController::new(store.clone(), ns.clone());
+        let c =
+            StatefulSetController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
         handles.push(
             WatchDriver::new(c, store.clone(), driver_config(&["StatefulSet", "Pod"])).spawn(),
         );
     }
     if enable.daemonset {
-        let c = DaemonSetController::new(store.clone(), ns.clone());
+        let c = DaemonSetController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
         handles.push(
             WatchDriver::new(
                 c,
@@ -2682,7 +2698,7 @@ fn spawn_drivers(
         );
     }
     if enable.job {
-        let c = JobController::new(store.clone(), ns.clone());
+        let c = JobController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
         handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Job", "Pod"])).spawn());
     }
     // CronJob: parses spec.schedule (5-field cron) against the WallClock and
@@ -2692,7 +2708,8 @@ fn spawn_drivers(
     // the fallback tick is what actually drives the time-based firing (a
     // CronJob has no spec edit each minute to wake a pure event watch).
     if enable.cronjob {
-        let c = CronJobController::new(store.clone(), Arc::new(WallClock), ns.clone());
+        let c = CronJobController::new(store.clone(), Arc::new(WallClock), ns.clone())
+            .with_event_sink(events.clone());
         handles
             .push(WatchDriver::new(c, store.clone(), driver_config(&["CronJob", "Job"])).spawn());
     }
@@ -2708,7 +2725,7 @@ fn spawn_drivers(
         );
     }
     if enable.endpoints {
-        let c = EndpointsController::new(store.clone(), ns.clone());
+        let c = EndpointsController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
         handles.push(
             WatchDriver::new(
                 c,
@@ -2773,16 +2790,6 @@ fn spawn_drivers(
         let c = NamespaceController::new(store.clone(), ns.clone());
         handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Namespace"])).spawn());
     }
-
-    // The event sink, built once and shared by every producer below. It
-    // lives here rather than inside the kubelet block because the pv-binder
-    // and the NetworkPolicy controller need it too, and two sinks over one
-    // store would be two independent lossy buffers for one cluster's events.
-    let events: Arc<dyn engenho_controllers::event_recorder::EventSink> = Arc::new(
-        engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
-            store: store.clone(),
-        })),
-    );
 
     // PV/PVC binder: binds Pending PersistentVolumeClaims to matching
     // Available PersistentVolumes (capacity ≥ request, accessModes ⊇ requested,

@@ -51,12 +51,20 @@ use engenho_store::{
 };
 use serde_json::{Value, json};
 
-use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome};
 use crate::error::ControllerError;
-use crate::meta::ObjectMeta;
-use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
-use crate::owner::{owner_ref_for, set_owner_reference};
+use crate::event_recorder::Reason as EventReason;
+use crate::meta::{ObjectMeta, ShapeError, object_mut};
+use crate::owned_children::{
+    ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
+    template_object_mut,
+};
+use crate::owner::{OwnerReference, owner_ref_for, set_owner_reference};
 use crate::status::observed_generation;
+use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
+
+/// Where a `CronJob`'s job labels are declared.
+const JOB_TEMPLATE_LABELS: &[&str] = &["spec", "jobTemplate", "metadata", "labels"];
 
 // Clock primitives previously defined here have been consolidated to
 // engenho_substrate::relogio (Clock + WallClock + FrozenClock). The
@@ -85,13 +93,21 @@ pub fn fixed_clock(unix_secs: u64) -> std::sync::Arc<FrozenClock> {
 pub struct JobController {
     store: Arc<StoreMesh>,
     namespace: Option<String>,
+    /// Per-Job isolation (`FailedCreate` on a malformed template).
+    sweep: Sweep,
 }
+
+impl_sweep_event_sink!(JobController);
 
 impl JobController {
     /// New controller with optional namespace scope.
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
-        Self { store, namespace }
+        Self {
+            store,
+            namespace,
+            sweep: Sweep::new("job-controller", EventReason::FailedCreate),
+        }
     }
 
     fn pod_phase_is(pod: &Value, phase: &str) -> bool {
@@ -101,29 +117,31 @@ impl JobController {
             == Some(phase)
     }
 
-    /// Build a Pod from the Job template + index.
-    fn build_pod(job: &Value, idx: usize) -> Option<(String, Value)> {
-        let job_name = job.name()?;
-        let template = job.get("spec").and_then(|s| s.get("template"))?;
-        let mut pod = template.clone();
-        let pod_obj = pod.as_object_mut()?;
-        pod_obj.insert("kind".into(), Value::String("Pod".into()));
-        pod_obj.insert("apiVersion".into(), Value::String("v1".into()));
+    /// Build a Pod from the Job template + index, owned by `owner`.
+    ///
+    /// `Ok(None)` when the Job has no name or no template.
+    ///
+    /// # Errors
+    ///
+    /// [`ShapeError`] when the template (or its `spec`) has the wrong JSON
+    /// shape.
+    fn build_pod(
+        job: &Value,
+        idx: usize,
+        owner: OwnerReference,
+    ) -> Result<Option<(String, Value)>, ShapeError> {
+        let Some(job_name) = job.name() else {
+            return Ok(None);
+        };
         let pod_name = format!("{job_name}-{idx}");
-        let metadata = pod_obj
-            .entry("metadata".to_string())
-            .or_insert_with(|| json!({}));
-        let m = metadata.as_object_mut()?;
-        m.insert("name".into(), Value::String(pod_name.clone()));
+        let Some(mut pod) = pod_from_template(job, &pod_name, None, owner)? else {
+            return Ok(None);
+        };
         // RestartPolicy: Never (Jobs don't restart pods).
-        let spec = pod_obj
-            .entry("spec".to_string())
-            .or_insert_with(|| json!({}));
-        if let Some(s) = spec.as_object_mut() {
-            s.entry("restartPolicy".to_string())
-                .or_insert(Value::String("Never".into()));
-        }
-        Some((pod_name, pod))
+        template_object_mut(&mut pod, &["spec"])?
+            .entry("restartPolicy")
+            .or_insert(Value::String("Never".into()));
+        Ok(Some((pod_name, pod)))
     }
 }
 
@@ -148,6 +166,10 @@ impl OwnedChildrenReconciler for JobController {
 
     fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
+    }
+
+    fn sweep(&self) -> &Sweep {
+        &self.sweep
     }
 
     async fn reconcile_one(
@@ -204,10 +226,9 @@ impl OwnedChildrenReconciler for JobController {
             while existing_indices.contains(&idx) {
                 idx += 1;
             }
-            let Some((pod_name, mut pod)) = Self::build_pod(job_value, idx) else {
+            let Some((pod_name, pod)) = Self::build_pod(job_value, idx, owner_ref.clone())? else {
                 break;
             };
-            set_owner_reference(&mut pod, owner_ref.clone());
             let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
             commands.push(ResourceCommand::Put {
                 key: pod_key,
@@ -300,7 +321,12 @@ pub struct CronJobController {
     store: Arc<StoreMesh>,
     clock: Arc<dyn Clock>,
     namespace: Option<String>,
+    /// Per-`CronJob` isolation: a `CronJob` whose `jobTemplate` has the wrong
+    /// shape gets a `FailedCreate` Event and the others still fire.
+    sweep: Sweep,
 }
+
+impl_sweep_event_sink!(CronJobController);
 
 impl CronJobController {
     /// New controller with the given clock + optional namespace scope.
@@ -310,6 +336,7 @@ impl CronJobController {
             store,
             clock,
             namespace,
+            sweep: Sweep::new("cronjob-controller", EventReason::FailedCreate),
         }
     }
 
@@ -337,9 +364,20 @@ impl CronJobController {
     /// `spec` AND any template metadata labels/annotations are carried
     /// over). `ts` is the scheduled time in unix seconds — it names the
     /// Job `{cronjob}-{ts}`.
-    fn build_job(cj: &Value, ts: u64) -> Option<(String, Value)> {
-        let cj_name = cj.name()?;
-        let template = cj.get("spec").and_then(|s| s.get("jobTemplate"))?;
+    ///
+    /// `Ok(None)` when the `CronJob` has no name or no `jobTemplate`.
+    ///
+    /// # Errors
+    ///
+    /// [`ShapeError`] when `spec.jobTemplate.metadata.labels` is not an
+    /// object (absent or `null` is an empty label set).
+    fn build_job(cj: &Value, ts: u64) -> Result<Option<(String, Value)>, ShapeError> {
+        let Some(cj_name) = cj.name() else {
+            return Ok(None);
+        };
+        let Some(template) = cj.get("spec").and_then(|s| s.get("jobTemplate")) else {
+            return Ok(None);
+        };
         let job_spec = template.get("spec").cloned().unwrap_or_else(|| json!({}));
         let job_name = format!("{cj_name}-{ts}");
         // Carry over the jobTemplate's metadata.labels (if any) onto the
@@ -349,18 +387,18 @@ impl CronJobController {
             .get("metadata")
             .and_then(|m| m.get("labels"))
             .cloned()
-            .unwrap_or_else(|| json!({}));
-        if let Some(obj) = labels.as_object_mut() {
-            obj.entry("engenho.io/cronjob".to_string())
-                .or_insert_with(|| Value::String(cj_name.to_string()));
-        }
+            .unwrap_or(Value::Null);
+        object_mut(&mut labels, &[])
+            .map_err(|e| e.under(JOB_TEMPLATE_LABELS))?
+            .entry("engenho.io/cronjob")
+            .or_insert_with(|| Value::String(cj_name.to_string()));
         let job = json!({
             "kind": "Job",
             "apiVersion": "batch/v1",
             "metadata": {"name": job_name, "labels": labels},
             "spec": job_spec,
         });
-        Some((job_name, job))
+        Ok(Some((job_name, job)))
     }
 
     /// Jobs in `owned` that are still active (no `Complete`/`Failed`
@@ -393,24 +431,36 @@ impl Controller for CronJobController {
             .list("batch", "v1", "CronJob", self.namespace.as_deref())
             .await;
         let now = self.clock.unix_secs();
-        let mut report = ReconcileReport {
-            objects_examined: cjs.len(),
-            ..ReconcileReport::default()
-        };
-        for (cj_key, cj_value) in &cjs {
-            match self.reconcile_one_cronjob(cj_key, cj_value, now).await? {
-                CronTickOutcome::Fired => report.objects_changed += 2,
-                CronTickOutcome::Skipped => report.objects_skipped += 1,
-                CronTickOutcome::NotDue => {}
-            }
-        }
-        Ok(report.into())
+        // Each CronJob isolated: one whose jobTemplate cannot be built is
+        // announced on itself and the rest still fire; a store failure
+        // ends the tick, as before.
+        let report = self
+            .sweep
+            .run(&cjs, |cj_key, cj_value| async move {
+                ObjectOutcome::settle(
+                    self.reconcile_one_cronjob(cj_key, cj_value, now)
+                        .await
+                        .map(ObjectOutcome::from),
+                )
+            })
+            .await?;
+        Ok(ReconcileOutcome::from(report))
     }
 }
 
-/// One CronJob's per-tick outcome — drives the aggregate report counters.
+impl From<CronTickOutcome> for ObjectOutcome {
+    fn from(outcome: CronTickOutcome) -> Self {
+        match outcome {
+            CronTickOutcome::Fired => Self::Changed,
+            CronTickOutcome::Skipped => Self::SKIPPED,
+            CronTickOutcome::NotDue => Self::Unchanged,
+        }
+    }
+}
+
+/// One `CronJob`'s per-tick outcome — becomes its sweep outcome.
 enum CronTickOutcome {
-    /// A Job was created (+ status patched): two store writes.
+    /// A Job was created (+ status patched): the `CronJob` changed.
     Fired,
     /// The slot was deliberately skipped (suspended / bad schedule /
     /// Forbid-with-active / missed-deadline): recorded as a skip.
@@ -469,6 +519,19 @@ impl CronJobController {
             }
         }
 
+        // Build the Job, and its owner reference, BEFORE the concurrency
+        // gate: a jobTemplate of the wrong shape fails this CronJob before
+        // `Replace` deletes the running Job it was going to replace.
+        let built = match Self::build_job(cj_value, due)? {
+            Some((job_name, mut job)) => {
+                if let Some(owner_ref) = owner_ref_for(cj_value, "batch/v1", "CronJob") {
+                    set_owner_reference(&mut job, owner_ref)?;
+                }
+                Some((job_name, job))
+            }
+            None => None,
+        };
+
         let cj_uid = cj_value
             .get("metadata")
             .and_then(|m| m.get("uid"))
@@ -502,13 +565,10 @@ impl CronJobController {
             ConcurrencyPolicy::Allow | ConcurrencyPolicy::Forbid => {}
         }
 
-        // Build + create the Job, owner-referenced back to the CronJob.
-        let Some((job_name, mut job)) = Self::build_job(cj_value, due) else {
+        // Create the Job built above, owner-referenced back to the CronJob.
+        let Some((job_name, job)) = built else {
             return Ok(CronTickOutcome::Skipped);
         };
-        if let Some(owner_ref) = owner_ref_for(cj_value, "batch/v1", "CronJob") {
-            set_owner_reference(&mut job, owner_ref);
-        }
         let job_key = ResourceKey::namespaced("batch", "v1", "Job", job_ns, &job_name);
         self.store
             .propose(ResourceCommand::Put {
@@ -665,7 +725,13 @@ mod tests {
                 }
             }
         });
-        let (name, pod) = JobController::build_pod(&j, 0).unwrap();
+        let owner = owner_ref_for(
+            &json!({"metadata": {"name": "compute", "uid": "u"}}),
+            "batch/v1",
+            "Job",
+        )
+        .unwrap();
+        let (name, pod) = JobController::build_pod(&j, 0, owner).unwrap().unwrap();
         assert_eq!(name, "compute-0");
         assert_eq!(
             pod.get("spec").unwrap().get("restartPolicy").unwrap(),
@@ -709,7 +775,9 @@ mod tests {
                 }
             }
         });
-        let (name, job) = CronJobController::build_job(&cj, 1_700_000_000).unwrap();
+        let (name, job) = CronJobController::build_job(&cj, 1_700_000_000)
+            .unwrap()
+            .unwrap();
         assert_eq!(name, "nightly-1700000000");
         assert_eq!(job.get("kind").unwrap(), "Job");
         assert_eq!(job.get("apiVersion").unwrap(), "batch/v1");
@@ -825,7 +893,7 @@ mod tests {
                 "cronjob"
             }
             async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
-                Ok(ReconcileReport::default().into())
+                Ok(crate::controller::ReconcileReport::default().into())
             }
         }
         assert_eq!(F.name(), "cronjob");
@@ -901,7 +969,9 @@ mod tests {
         let c = CronJobController::new(store.clone(), clock.clone(), None);
 
         let out = c.tick().await.unwrap();
-        assert_eq!(out.objects_changed, 2, "one Job create + one status patch");
+        // One CronJob changed (its Job created and its status patched): the
+        // sweep counts objects, not writes.
+        assert_eq!(out.objects_changed, 1, "the one CronJob fired");
 
         let jobs = list_jobs(&store).await;
         assert_eq!(jobs.len(), 1, "exactly one Job created");
@@ -1069,5 +1139,96 @@ mod tests {
         let out2 = c.tick().await.unwrap();
         assert_eq!(out2.objects_changed, 0, "no double-fire within a minute");
         assert_eq!(list_jobs(&store).await.len(), 1);
+    }
+
+    // ── T4.3: a malformed jobTemplate costs that CronJob only ──
+
+    /// A jobTemplate whose `metadata.labels` is not an object fails THAT
+    /// `CronJob` with a `FailedCreate` Event naming the field, before its
+    /// `Replace` policy deletes the running Job; the `CronJob` listed after
+    /// it still fires. Before T4.3 the labels were copied onto the Job
+    /// verbatim (a Job whose labels are a string) AFTER the active Job had
+    /// been deleted.
+    #[tokio::test]
+    async fn a_malformed_job_template_fails_that_cronjob_before_replace_deletes_anything() {
+        let store = test_store("cronjob-t43").await;
+        let mut bad = cronjob_value("a-bad", "* * * * *", 0);
+        bad["spec"]["concurrencyPolicy"] = json!("Replace");
+        bad["spec"]["jobTemplate"]["metadata"] = json!({"labels": "oops"});
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "a-bad"),
+            bad,
+        )
+        .await;
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "b-clean"),
+            cronjob_value("b-clean", "* * * * *", 0),
+        )
+        .await;
+        // The malformed CronJob's running Job, which Replace would delete.
+        let running = ResourceKey::namespaced("batch", "v1", "Job", "default", "a-bad-60");
+        put(
+            &store,
+            running.clone(),
+            json!({
+                "kind": "Job", "apiVersion": "batch/v1",
+                "metadata": {"name": "a-bad-60", "namespace": "default",
+                    "ownerReferences": [{"uid": "a-bad-uid", "controller": true}]},
+                "status": {"active": 1}
+            }),
+        )
+        .await;
+
+        let events = Arc::new(crate::event_recorder::CollectingEventSink::new());
+        let c = CronJobController::new(store.clone(), Arc::new(FrozenClock::at(120_000)), None)
+            .with_event_sink(events.clone());
+        let out = c
+            .tick()
+            .await
+            .expect("one malformed CronJob is not the tick's failure");
+        let sweep = out.sweep.expect("the CronJob tick runs through its sweep");
+        assert_eq!((sweep.failed(), sweep.changed()), (1, 1));
+
+        assert!(
+            store.get(&running).await.is_some(),
+            "the running Job was not deleted for a Job that cannot be built"
+        );
+        let jobs = list_jobs(&store).await;
+        assert!(
+            jobs.iter()
+                .any(|(k, v)| k.name == "b-clean-120" && owned_by(v, "b-clean-uid")),
+            "the CronJob after the malformed one still fired: {jobs:?}"
+        );
+        assert!(
+            !jobs.iter().any(|(k, _)| k.name == "a-bad-120"),
+            "no Job from the malformed template"
+        );
+
+        let recorded = events.drain();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].reason, EventReason::FailedCreate);
+        assert_eq!(recorded[0].involved.name, "a-bad");
+        assert!(
+            recorded[0]
+                .message
+                .contains("spec.jobTemplate.metadata.labels is a string, expected an object"),
+            "{}",
+            recorded[0].message
+        );
+    }
+
+    /// `null` labels are the empty case: the Job is built and carries the
+    /// convenience label (before T4.3 it got `labels: null` and no label).
+    #[test]
+    fn null_job_template_labels_are_the_empty_label_set() {
+        let mut cj = cronjob_value("n", "* * * * *", 0);
+        cj["spec"]["jobTemplate"]["metadata"] = json!({"labels": null});
+        let (_, job) = CronJobController::build_job(&cj, 60).unwrap().unwrap();
+        assert_eq!(
+            job["metadata"]["labels"],
+            json!({"engenho.io/cronjob": "n"})
+        );
     }
 }

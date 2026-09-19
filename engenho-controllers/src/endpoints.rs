@@ -36,12 +36,14 @@ use engenho_store::{
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome};
 use crate::create_stamp::{CreateClock, stamp_create_timestamp, wall_clock};
 use crate::error::ControllerError;
+use crate::event_recorder::Reason as EventReason;
 use crate::meta::ObjectMeta;
 use crate::owner::{owner_ref_for, set_owner_reference};
 use crate::selector::{matches_labels, service_selector};
+use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
 
 pub struct EndpointsController {
     store: Arc<StoreMesh>,
@@ -51,16 +53,16 @@ pub struct EndpointsController {
     /// [`crate::create_stamp`]). Production = [`wall_clock`]; unit tests
     /// pin a fixed instant via [`Self::with_clock`].
     create_clock: CreateClock,
+    /// Per-Service isolation (`FailedToUpdateEndpoint` on an Item failure).
+    sweep: Sweep,
 }
+
+impl_sweep_event_sink!(EndpointsController);
 
 impl EndpointsController {
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
-        Self {
-            store,
-            namespace,
-            create_clock: wall_clock,
-        }
+        Self::with_clock(store, namespace, wall_clock)
     }
 
     /// Construct with a pinned [`Clock`] — the unit-test determinism seam
@@ -75,6 +77,7 @@ impl EndpointsController {
             store,
             namespace,
             create_clock: clock,
+            sweep: Sweep::new("endpoint-controller", EventReason::FailedToUpdateEndpoint),
         }
     }
 
@@ -242,15 +245,15 @@ impl EndpointsController {
     /// Reconcile the EndpointSlice for a Service: owner-ref it, stamp the
     /// creationTimestamp on create, and write it only when the slice body
     /// changed (idempotent). Mirrors the Endpoints reconcile shape so both
-    /// projections share one convergence discipline.
+    /// projections share one convergence discipline. Returns whether it
+    /// wrote.
     async fn reconcile_endpoint_slice(
         &self,
         namespace: &str,
         svc_name: &str,
         mut slice: Value,
         owner_ref: crate::owner::OwnerReference,
-        report: &mut ReconcileReport,
-    ) -> Result<(), ControllerError> {
+    ) -> Result<bool, ControllerError> {
         let slice_key = ResourceKey::namespaced(
             "discovery.k8s.io",
             "v1",
@@ -258,12 +261,12 @@ impl EndpointsController {
             namespace,
             svc_name,
         );
-        set_owner_reference(&mut slice, owner_ref);
+        set_owner_reference(&mut slice, owner_ref)?;
 
         let existing = self.store.get(&slice_key).await;
         if let Some(ref current) = existing {
             if slice_bodies_equivalent(current, &slice) {
-                return Ok(());
+                return Ok(false);
             }
         } else {
             // First materialization: freeze the creationTimestamp from one
@@ -279,8 +282,7 @@ impl EndpointsController {
                 reason: Reason::Controller,
             })
             .await?;
-        report.objects_changed += 1;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -295,109 +297,118 @@ impl Controller for EndpointsController {
             .store
             .list("", "v1", "Service", self.namespace.as_deref())
             .await;
-        let mut report = ReconcileReport::default();
-        report.objects_examined = services.len();
+        // Each Service isolated: an Item failure is announced on that
+        // Service and the rest still converge; a store failure ends the
+        // tick, as before.
+        let report = self
+            .sweep
+            .run(&services, |svc_key, svc_value| async move {
+                ObjectOutcome::settle(self.reconcile_service(svc_key, svc_value).await)
+            })
+            .await?;
+        Ok(ReconcileOutcome::from(report))
+    }
+}
 
-        for (svc_key, svc_value) in &services {
-            let Some(selector) = service_selector(svc_value) else {
-                report.objects_skipped += 1;
-                continue;
-            };
-            let Some(owner_ref) = owner_ref_for(svc_value, "v1", "Service") else {
-                report.objects_skipped += 1;
-                continue;
-            };
-            let ns = svc_key.namespace.as_deref();
-            let all_pods = self.store.list("", "v1", "Pod", ns).await;
+impl EndpointsController {
+    /// One Service's `Endpoints` + `EndpointSlice`.
+    async fn reconcile_service(
+        &self,
+        svc_key: &ResourceKey,
+        svc_value: &Value,
+    ) -> Result<ObjectOutcome, ControllerError> {
+        let Some(selector) = service_selector(svc_value) else {
+            return Ok(ObjectOutcome::SKIPPED);
+        };
+        let Some(owner_ref) = owner_ref_for(svc_value, "v1", "Service") else {
+            return Ok(ObjectOutcome::SKIPPED);
+        };
+        let ns = svc_key.namespace.as_deref();
+        let all_pods = self.store.list("", "v1", "Pod", ns).await;
 
-            // The pods backing this Service, kept so a NAMED targetPort can be
-            // resolved against the containerPort that actually declares it.
-            let matched_pods: Vec<&Value> = all_pods
-                .iter()
-                .filter(|(_, pod)| matches_labels(pod, selector))
-                .filter(|(_, pod)| Self::pod_is_ready(pod))
-                .map(|(_, pod)| pod)
-                .collect();
+        // The pods backing this Service, kept so a NAMED targetPort can be
+        // resolved against the containerPort that actually declares it.
+        let matched_pods: Vec<&Value> = all_pods
+            .iter()
+            .filter(|(_, pod)| matches_labels(pod, selector))
+            .filter(|(_, pod)| Self::pod_is_ready(pod))
+            .map(|(_, pod)| pod)
+            .collect();
 
-            // Filter to ready, ip-bearing pods matching the selector.
-            let mut addresses: Vec<(String, String)> = all_pods
-                .iter()
-                .filter(|(_, pod)| matches_labels(pod, selector))
-                .filter(|(_, pod)| Self::pod_is_ready(pod))
-                .filter_map(|(_, pod)| {
-                    let ip = Self::pod_ip(pod)?.to_string();
-                    let name = pod
-                        .get("metadata")
-                        .and_then(|m| m.get("name"))
-                        .and_then(|n| n.as_str())?
-                        .to_string();
-                    Some((ip, name))
-                })
-                .collect();
-            // Deterministic order for tests + diffing.
-            addresses.sort();
+        // Filter to ready, ip-bearing pods matching the selector.
+        let mut addresses: Vec<(String, String)> = all_pods
+            .iter()
+            .filter(|(_, pod)| matches_labels(pod, selector))
+            .filter(|(_, pod)| Self::pod_is_ready(pod))
+            .filter_map(|(_, pod)| {
+                let ip = Self::pod_ip(pod)?.to_string();
+                let name = pod
+                    .get("metadata")
+                    .and_then(|m| m.get("name"))
+                    .and_then(|n| n.as_str())?
+                    .to_string();
+                Some((ip, name))
+            })
+            .collect();
+        // Deterministic order for tests + diffing.
+        addresses.sort();
 
-            let endpoints_ns = ns.unwrap_or("default");
-            let svc_name = svc_value.name().unwrap_or("");
-            let endpoints_key =
-                ResourceKey::namespaced("", "v1", "Endpoints", endpoints_ns, svc_name);
+        let endpoints_ns = ns.unwrap_or("default");
+        let svc_name = svc_value.name().unwrap_or("");
+        let endpoints_key = ResourceKey::namespaced("", "v1", "Endpoints", endpoints_ns, svc_name);
 
-            // Build the EndpointSlice from the SAME resolved address set
-            // (borrowed before `addresses` is moved into build_endpoints).
-            let slice_body = Self::build_endpoint_slice(svc_value, &addresses, &matched_pods);
+        // Build the EndpointSlice from the SAME resolved address set
+        // (borrowed before `addresses` is moved into build_endpoints).
+        let slice_body = Self::build_endpoint_slice(svc_value, &addresses, &matched_pods);
 
-            // Check if existing Endpoints already matches what we'd write.
-            let existing = self.store.get(&endpoints_key).await;
-            let mut new_endpoints = Self::build_endpoints(svc_value, addresses, &matched_pods);
-            set_owner_reference(&mut new_endpoints, owner_ref.clone());
+        // Check if existing Endpoints already matches what we'd write.
+        let existing = self.store.get(&endpoints_key).await;
+        let mut new_endpoints = Self::build_endpoints(svc_value, addresses, &matched_pods);
+        set_owner_reference(&mut new_endpoints, owner_ref.clone())?;
 
-            // Emit the EndpointSlice (parallel projection). Done before the
-            // Endpoints early-return so the slice converges even when the
-            // Endpoints subsets are unchanged (e.g. first slice on an
-            // already-materialized Endpoints).
-            self.reconcile_endpoint_slice(
-                endpoints_ns,
-                svc_name,
-                slice_body,
-                owner_ref.clone(),
-                &mut report,
-            )
+        // Emit the EndpointSlice (parallel projection). Done before the
+        // Endpoints early-return so the slice converges even when the
+        // Endpoints subsets are unchanged (e.g. first slice on an
+        // already-materialized Endpoints).
+        let slice_written = self
+            .reconcile_endpoint_slice(endpoints_ns, svc_name, slice_body, owner_ref.clone())
             .await?;
 
-            if let Some(ref current) = existing {
-                if subsets_equivalent(current, &new_endpoints) {
-                    continue;
-                }
-            } else {
-                // CREATE (no existing Endpoints): freeze creationTimestamp
-                // from ONE boundary clock read so kubectl AGE renders. An
-                // UPDATE (existing) is left untouched — never bumped.
-                stamp_create_timestamp(&mut new_endpoints, self.create_clock);
+        if let Some(ref current) = existing {
+            if subsets_equivalent(current, &new_endpoints) {
+                return Ok(if slice_written {
+                    ObjectOutcome::Changed
+                } else {
+                    ObjectOutcome::Unchanged
+                });
             }
-
-            debug!(
-                svc = %svc_key.label(),
-                endpoint_count = new_endpoints
-                    .get("subsets")
-                    .and_then(|s| s.get(0))
-                    .and_then(|s| s.get("addresses"))
-                    .and_then(|a| a.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0),
-                "writing endpoints"
-            );
-
-            self.store
-                .propose(ResourceCommand::Put {
-                    key: endpoints_key,
-                    value: new_endpoints,
-                    expected: None,
-                    reason: Reason::Controller,
-                })
-                .await?;
-            report.objects_changed += 1;
+        } else {
+            // CREATE (no existing Endpoints): freeze creationTimestamp
+            // from ONE boundary clock read so kubectl AGE renders. An
+            // UPDATE (existing) is left untouched — never bumped.
+            stamp_create_timestamp(&mut new_endpoints, self.create_clock);
         }
-        Ok(report.into())
+
+        debug!(
+            svc = %svc_key.label(),
+            endpoint_count = new_endpoints
+                .get("subsets")
+                .and_then(|s| s.get(0))
+                .and_then(|s| s.get("addresses"))
+                .and_then(|a| a.as_array())
+                .map_or(0, Vec::len),
+            "writing endpoints"
+        );
+
+        self.store
+            .propose(ResourceCommand::Put {
+                key: endpoints_key,
+                value: new_endpoints,
+                expected: None,
+                reason: Reason::Controller,
+            })
+            .await?;
+        Ok(ObjectOutcome::Changed)
     }
 }
 
@@ -689,7 +700,7 @@ mod tests {
                 "endpoints"
             }
             async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
-                Ok(ReconcileReport::default().into())
+                Ok(crate::controller::ReconcileReport::default().into())
             }
         }
         assert_eq!(Fake.name(), "endpoints");

@@ -3,6 +3,8 @@
 use engenho_store::StoreError;
 use shigoto_types::failure::FailureKind;
 
+use crate::meta::ShapeError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ControllerError {
     #[error("store error during reconcile: {0}")]
@@ -10,6 +12,12 @@ pub enum ControllerError {
 
     #[error("invalid resource: {0}")]
     InvalidResource(String),
+
+    /// A stored object has the wrong JSON type where a controller has to
+    /// write. Typed, not flattened into `InvalidResource`'s string, so the
+    /// path and the type found survive to the Event.
+    #[error("malformed object: {0}")]
+    Shape(#[from] ShapeError),
 
     #[error("internal: {0}")]
     Internal(String),
@@ -19,6 +27,7 @@ engenho_substrate::impl_error_kind! {
     ControllerError {
         (Store(_)) => "store",
         (InvalidResource(_)) => "invalid_resource",
+        (Shape(_)) => "shape",
         (Internal(_)) => "internal",
     }
 }
@@ -43,6 +52,8 @@ impl ControllerError {
     ///
     ///   * `InvalidResource` — Declarative. A malformed declaration does
     ///     not fix itself by being retried.
+    ///   * `Shape` — Declarative, for the same reason: the object holds the
+    ///     wrong JSON type until someone edits it.
     ///   * `Internal` — Transient. It wraps I/O and serialization failures
     ///     in a controller's own work (provisioning a directory, copying a
     ///     snapshot, a store round-trip); the conservative default, as in
@@ -53,7 +64,7 @@ impl ControllerError {
     pub const fn classify(&self) -> FailureKind {
         match self {
             Self::Store(e) => store_class(e),
-            Self::InvalidResource(_) => FailureKind::Declarative,
+            Self::InvalidResource(_) | Self::Shape(_) => FailureKind::Declarative,
             Self::Internal(_) => FailureKind::Transient,
         }
     }
@@ -92,15 +103,15 @@ impl ControllerError {
     /// (E0004) until someone says whether it may stop a sweep.
     ///
     ///   * `Store` — Sweep, for every [`StoreError`]; see [`store_scope`].
-    ///   * `InvalidResource` — Item. One object's declaration is malformed;
-    ///     its neighbours' are not.
+    ///   * `InvalidResource`, `Shape` — Item. One object's declaration is
+    ///     malformed; its neighbours' are not.
     ///   * `Internal` — Item. It wraps a controller's own work on one
     ///     object (a directory it provisions, a tree it copies).
     #[must_use]
     pub const fn scope(&self) -> ErrorScope {
         match self {
             Self::Store(e) => store_scope(e),
-            Self::InvalidResource(_) | Self::Internal(_) => ErrorScope::Item,
+            Self::InvalidResource(_) | Self::Shape(_) | Self::Internal(_) => ErrorScope::Item,
         }
     }
 }
@@ -142,6 +153,11 @@ const fn store_class(e: &StoreError) -> FailureKind {
 mod tests {
     use super::*;
 
+    fn shape_error() -> ShapeError {
+        let mut v = serde_json::json!({"metadata": "x"});
+        crate::meta::object_mut(&mut v, &["metadata"]).unwrap_err()
+    }
+
     #[test]
     fn error_kind_is_stable() {
         for (e, k) in [
@@ -153,6 +169,7 @@ mod tests {
                 ControllerError::InvalidResource("x".into()),
                 "invalid_resource",
             ),
+            (ControllerError::Shape(shape_error()), "shape"),
             (ControllerError::Internal("x".into()), "internal"),
         ] {
             assert_eq!(e.kind(), k);
@@ -173,7 +190,9 @@ mod tests {
                     | StoreError::InitializeFailed(_)
                     | StoreError::Fatal(_) => FailureKind::Declarative,
                 },
-                ControllerError::InvalidResource(_) => FailureKind::Declarative,
+                ControllerError::InvalidResource(_) | ControllerError::Shape(_) => {
+                    FailureKind::Declarative
+                }
                 ControllerError::Internal(_) => FailureKind::Transient,
             };
             (e, want)
@@ -185,6 +204,7 @@ mod tests {
             row(ControllerError::Store(StoreError::ClientWriteFailed(m()))),
             row(ControllerError::Store(StoreError::Fatal(m()))),
             row(ControllerError::InvalidResource(m())),
+            row(ControllerError::Shape(shape_error())),
             row(ControllerError::Internal(m())),
         ]
     }
@@ -202,9 +222,9 @@ mod tests {
                     | StoreError::InitializeFailed(_)
                     | StoreError::Fatal(_) => ErrorScope::Sweep,
                 },
-                ControllerError::InvalidResource(_) | ControllerError::Internal(_) => {
-                    ErrorScope::Item
-                }
+                ControllerError::InvalidResource(_)
+                | ControllerError::Shape(_)
+                | ControllerError::Internal(_) => ErrorScope::Item,
             };
             (e, want)
         }
@@ -214,7 +234,7 @@ mod tests {
     #[test]
     fn store_errors_stop_a_sweep_and_nothing_else_does() {
         let rows = every_scope();
-        assert_eq!(rows.len(), 6, "one row per variant");
+        assert_eq!(rows.len(), 7, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.scope(), want, "{e:?}");
         }
@@ -223,7 +243,7 @@ mod tests {
     #[test]
     fn every_error_variant_maps_to_its_retry_class() {
         let rows = every_variant();
-        assert_eq!(rows.len(), 6, "one row per variant");
+        assert_eq!(rows.len(), 7, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.classify(), want, "{e:?}");
         }

@@ -139,7 +139,7 @@ pub use engenho_substrate::FrozenClock;
 )]
 pub type FixedClock = engenho_substrate::FrozenClock;
 pub use curve::{Curve, Streak};
-pub use meta::ObjectMeta;
+pub use meta::{Container, FieldPath, JsonKind, ObjectMeta, ShapeError, array_mut, object_mut};
 pub use namespace::{NamespaceController, namespaced_kinds};
 pub use network_policy::{
     CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,

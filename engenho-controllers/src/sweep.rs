@@ -520,6 +520,32 @@ impl Sweep {
     }
 }
 
+/// Give a controller that owns a `sweep: Sweep` field its event-sink
+/// builder. Invoked in the controller's own module (the field is private
+/// there), once per controller, so the builder is written once:
+///
+/// ```ignore
+/// crate::sweep::impl_sweep_event_sink!(ReplicaSetController);
+/// ```
+macro_rules! impl_sweep_event_sink {
+    ($controller:ty) => {
+        impl $controller {
+            /// Builder: wire the sink this controller announces a failed
+            /// object through — a Warning Event on that object, once per
+            /// resourceVersion (see [`crate::sweep::Sweep`]).
+            #[must_use]
+            pub fn with_event_sink(
+                mut self,
+                events: ::std::sync::Arc<dyn $crate::event_recorder::EventSink>,
+            ) -> Self {
+                self.sweep = self.sweep.with_event_sink(events);
+                self
+            }
+        }
+    };
+}
+pub(crate) use impl_sweep_event_sink;
+
 /// `metadata.resourceVersion`, if the object carries one.
 fn resource_version(value: &ResourceValue) -> Option<String> {
     value

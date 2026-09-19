@@ -61,8 +61,8 @@ use tracing::debug;
 use crate::controller::{Controller, ReconcileOutcome};
 use crate::csi_provisioner::{CsiCreateRequest, CsiProvisioner, NoCsiProvisioner, parse_quantity};
 use crate::error::ControllerError;
-use crate::event_recorder::{EventSink, Reason as EventReason};
-use crate::sweep::{ObjectOutcome, Sweep};
+use crate::event_recorder::Reason as EventReason;
+use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
 
 /// The local-path provisioner identifier. A StorageClass whose
 /// `provisioner` is this string (the rancher.io/local-path de-facto
@@ -175,6 +175,8 @@ pub struct PvBinderController {
     sweep: Sweep,
 }
 
+impl_sweep_event_sink!(PvBinderController);
+
 impl PvBinderController {
     /// New binder with the production [`HostProvisionerEnv`]. `local_path_root`
     /// is typically `<data_dir>/local-path`.
@@ -217,14 +219,6 @@ impl PvBinderController {
     #[must_use]
     pub fn with_csi(mut self, csi: Arc<dyn CsiProvisioner>) -> Self {
         self.csi = csi;
-        self
-    }
-
-    /// Builder: wire the event sink a claim that cannot be provisioned is
-    /// reported through (`ProvisioningFailed`, on the claim).
-    #[must_use]
-    pub fn with_event_sink(mut self, events: Arc<dyn EventSink>) -> Self {
-        self.sweep = self.sweep.with_event_sink(events);
         self
     }
 

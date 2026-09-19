@@ -78,8 +78,9 @@ async fn rs_controller_creates_missing_pods_to_meet_replicas() {
     let ctrl = ReplicaSetController::new(store.clone(), Some("default".into()));
     let report = ctrl.tick().await.unwrap();
     assert_eq!(report.objects_examined, 1);
-    // 3 Pods created + 1 .status write (item-8).
-    assert_eq!(report.objects_changed, 4);
+    // The one ReplicaSet changed (3 Pods created + its .status written,
+    // item-8); the sweep counts changed objects, not writes.
+    assert_eq!(report.objects_changed, 1);
     assert_eq!(owned_pod_count(&store, &uid).await, 3);
 
     drop(ctrl);
@@ -129,8 +130,8 @@ async fn rs_controller_evicts_excess_when_replicas_decreases() {
         .unwrap();
 
     let report = ctrl.tick().await.unwrap();
-    // 3 deletions + 1 .status write (replicas 4 → 1).
-    assert_eq!(report.objects_changed, 4);
+    // The ReplicaSet changed (3 deletions + .status, replicas 4 → 1).
+    assert_eq!(report.objects_changed, 1);
     assert_eq!(owned_pod_count(&store, &uid).await, 1);
 
     drop(ctrl);
@@ -159,8 +160,8 @@ async fn rs_controller_scales_up_after_increasing_replicas() {
         .unwrap();
 
     let report = ctrl.tick().await.unwrap();
-    // 4 new pods + 1 .status write (replicas 1 → 5).
-    assert_eq!(report.objects_changed, 5);
+    // The ReplicaSet changed (4 new pods + .status, replicas 1 → 5).
+    assert_eq!(report.objects_changed, 1);
     assert_eq!(owned_pod_count(&store, &uid).await, 5);
 
     drop(ctrl);
@@ -177,8 +178,8 @@ async fn rs_controller_handles_two_replicasets_independently() {
 
     let report = ctrl.tick().await.unwrap();
     assert_eq!(report.objects_examined, 2);
-    // (2 pods + 1 status) for rs-a + (3 pods + 1 status) for rs-b = 7.
-    assert_eq!(report.objects_changed, 7);
+    // Both ReplicaSets changed (2 pods + status, 3 pods + status).
+    assert_eq!(report.objects_changed, 2);
     assert_eq!(owned_pod_count(&store, &uid_a).await, 2);
     assert_eq!(owned_pod_count(&store, &uid_b).await, 3);
 

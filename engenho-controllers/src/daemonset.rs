@@ -46,22 +46,35 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::error::ControllerError;
-use crate::meta::ObjectMeta;
-use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
-use crate::owner::{owner_ref_for, set_owner_reference};
+use crate::event_recorder::Reason as EventReason;
+use crate::meta::{ObjectMeta, ShapeError};
+use crate::owned_children::{
+    ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
+    template_object_mut,
+};
+use crate::owner::{OwnerReference, owner_ref_for};
 use crate::status::{observed_generation, pod_is_ready};
+use crate::sweep::{Sweep, impl_sweep_event_sink};
 
 /// DaemonSet controller — one node-pinned Pod per schedulable node.
 pub struct DaemonSetController {
     store: Arc<StoreMesh>,
     namespace: Option<String>,
+    /// Per-DaemonSet isolation (`FailedCreate` on a malformed template).
+    sweep: Sweep,
 }
+
+impl_sweep_event_sink!(DaemonSetController);
 
 impl DaemonSetController {
     /// Construct with optional namespace scope (`None` = all namespaces).
     #[must_use]
     pub fn new(store: Arc<StoreMesh>, namespace: Option<String>) -> Self {
-        Self { store, namespace }
+        Self {
+            store,
+            namespace,
+            sweep: Sweep::new("daemonset-controller", EventReason::FailedCreate),
+        }
     }
 
     /// A node's `metadata.name`, if present.
@@ -88,33 +101,30 @@ impl DaemonSetController {
     /// namespace the blanket gathers owned pods from. Never the
     /// controller's scope namespace (an all-namespace controller has
     /// none). Mirrors `ReplicaSetController::build_pod_from_template`.
-    fn build_pod_for_node(ds: &Value, node_name: &str) -> Option<(String, Value)> {
-        let ds_name = ds.name()?;
-        let ds_namespace = ds
-            .namespace()
-            .map_or_else(|| "default".to_string(), |c| c.to_owned());
-        let template = ds.get("spec").and_then(|s| s.get("template"))?;
-        let mut pod = template.clone();
-        let pod_obj = pod.as_object_mut()?;
-        pod_obj.insert("kind".into(), Value::String("Pod".into()));
-        pod_obj.insert("apiVersion".into(), Value::String("v1".into()));
-
+    ///
+    /// `Ok(None)` when the `DaemonSet` has no name or no template.
+    ///
+    /// # Errors
+    ///
+    /// [`ShapeError`] when the template (or its `spec`) has the wrong JSON
+    /// shape. It used to skip such a template's `spec` silently, creating a
+    /// pod the scheduler would then place on ANY node.
+    fn build_pod_for_node(
+        ds: &Value,
+        node_name: &str,
+        owner: OwnerReference,
+    ) -> Result<Option<(String, Value)>, ShapeError> {
+        let Some(ds_name) = ds.name() else {
+            return Ok(None);
+        };
+        let ds_namespace = ds.namespace().unwrap_or("default");
         let pod_name = format!("{ds_name}-{node_name}");
-        let metadata = pod_obj
-            .entry("metadata".to_string())
-            .or_insert_with(|| json!({}));
-        let m = metadata.as_object_mut()?;
-        m.insert("name".into(), Value::String(pod_name.clone()));
-        m.insert("namespace".into(), Value::String(ds_namespace));
-
+        let Some(mut pod) = pod_from_template(ds, &pod_name, Some(ds_namespace), owner)? else {
+            return Ok(None);
+        };
         // Node-pin: pre-set spec.nodeName so the scheduler never binds it.
-        let spec = pod_obj
-            .entry("spec".to_string())
-            .or_insert_with(|| json!({}));
-        if let Some(spec_obj) = spec.as_object_mut() {
-            spec_obj.insert("nodeName".into(), Value::String(node_name.to_string()));
-        }
-        Some((pod_name, pod))
+        template_object_mut(&mut pod, &["spec"])?.insert("nodeName".into(), Value::from(node_name));
+        Ok(Some((pod_name, pod)))
     }
 
     /// The node an owned pod is pinned to (`spec.nodeName`), if present.
@@ -147,6 +157,10 @@ impl OwnedChildrenReconciler for DaemonSetController {
 
     fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
+    }
+
+    fn sweep(&self) -> &Sweep {
+        &self.sweep
     }
 
     async fn reconcile_one(
@@ -192,10 +206,11 @@ impl OwnedChildrenReconciler for DaemonSetController {
             if covered.contains(node_name) {
                 continue;
             }
-            let Some((pod_name, mut pod)) = Self::build_pod_for_node(ds_value, node_name) else {
+            let Some((pod_name, pod)) =
+                Self::build_pod_for_node(ds_value, node_name, owner_ref.clone())?
+            else {
                 continue;
             };
-            set_owner_reference(&mut pod, owner_ref.clone());
             let pod_key = ResourceKey::namespaced("", "v1", "Pod", &pod_ns, &pod_name);
             debug!(node = %node_name, pod = %pod_name, "creating node-pinned daemon pod");
             commands.push(ResourceCommand::Put {
@@ -308,6 +323,17 @@ mod tests {
         store.get(&key).await.unwrap().uid().unwrap().to_string()
     }
 
+    fn ds_owner() -> OwnerReference {
+        OwnerReference {
+            api_version: "apps/v1".into(),
+            kind: "DaemonSet".into(),
+            name: "ds".into(),
+            uid: "uid-ds".into(),
+            controller: true,
+            block_owner_deletion: true,
+        }
+    }
+
     // ── unit: pure helpers ────────────────────────────────────────────
 
     #[test]
@@ -333,7 +359,9 @@ mod tests {
                 "spec": {"containers": [{"name": "c", "image": "img"}]}
             }}
         });
-        let (name, pod) = DaemonSetController::build_pod_for_node(&ds, "node-A").unwrap();
+        let (name, pod) = DaemonSetController::build_pod_for_node(&ds, "node-A", ds_owner())
+            .unwrap()
+            .unwrap();
         assert_eq!(name, "vector-node-A");
         assert_eq!(pod.get("kind").unwrap(), "Pod");
         // Namespace inherited from the parent DS — NOT "default".
@@ -361,7 +389,9 @@ mod tests {
             "metadata": {"name": "ds"},
             "spec": {"template": {"spec": {"containers": []}}}
         });
-        let (_, pod) = DaemonSetController::build_pod_for_node(&ds, "n1").unwrap();
+        let (_, pod) = DaemonSetController::build_pod_for_node(&ds, "n1", ds_owner())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             pod.get("metadata").unwrap().get("namespace").unwrap(),
             "default"
@@ -378,10 +408,7 @@ mod tests {
         seed_node(&store, "node-C", false).await; // cordoned → no pod
         let uid = seed_ds(&store, "observability", "vector").await;
 
-        let c = DaemonSetController {
-            store: store.clone(),
-            namespace: None,
-        };
+        let c = DaemonSetController::new(store.clone(), None);
         c.tick().await.unwrap();
 
         // Exactly 2 pods (one per schedulable node), both in the DS namespace,
@@ -416,10 +443,7 @@ mod tests {
         seed_node(&store, "node-A", true).await;
         let uid = seed_ds(&store, "default", "ds").await;
 
-        let c = DaemonSetController {
-            store: store.clone(),
-            namespace: None,
-        };
+        let c = DaemonSetController::new(store.clone(), None);
         c.tick().await.unwrap();
         let pod_key = ResourceKey::namespaced("", "v1", "Pod", "default", "ds-node-A");
         assert!(
@@ -448,10 +472,7 @@ mod tests {
         seed_node(&store, "node-B", true).await;
         let _uid = seed_ds(&store, "default", "ds").await;
 
-        let c = DaemonSetController {
-            store: store.clone(),
-            namespace: None,
-        };
+        let c = DaemonSetController::new(store.clone(), None);
         c.tick().await.unwrap();
         assert!(
             store
@@ -512,10 +533,7 @@ mod tests {
         seed_node(&store, "node-B", true).await;
         let _uid = seed_ds(&store, "default", "ds").await;
 
-        let c = DaemonSetController {
-            store: store.clone(),
-            namespace: None,
-        };
+        let c = DaemonSetController::new(store.clone(), None);
         c.tick().await.unwrap();
         let rev_a = store.current_catalog().await.revision();
         // Several idle ticks: at the fixpoint nothing is proposed.
@@ -533,10 +551,7 @@ mod tests {
         seed_node(&store, "node-B", true).await;
         seed_ds(&store, "default", "ds").await;
 
-        let c = DaemonSetController {
-            store: store.clone(),
-            namespace: None,
-        };
+        let c = DaemonSetController::new(store.clone(), None);
         c.tick().await.unwrap();
 
         let ds = store

@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn owner_uid_returns_controller_uid() {
         let mut pod = json!({"metadata": {"name": "p"}});
-        set_owner_reference(&mut pod, owner_ref("uid-123"));
+        set_owner_reference(&mut pod, owner_ref("uid-123")).unwrap();
         assert_eq!(
             controlling_owner(&pod).map(|o| o.uid),
             Some("uid-123".into())
