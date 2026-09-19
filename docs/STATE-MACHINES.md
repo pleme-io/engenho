@@ -318,7 +318,10 @@ topology, promessas}`; `PromessaKind = Compliance | CostBudget |
 CustomerKpi | Sla | Security`. **Maturity:** mock-universe is the
 always-on default; real role impls are feature-gated M1.1–M1.5
 (`with-shikumi/-sui-eval/-revoada/-tameshi/-mirante`). `ProvacaoConduit`
-wraps the conduit for deterministic fault injection.
+wraps the conduit for deterministic fault injection. The one binary that
+runs this loop, `engenho-fonte` (`engenho-fonte-cli`), is a mock-universe
+harness: cargo builds it only with `--features mock-universe`, and it logs
+the `Universe` it resolved for each slot at startup (T5.5).
 
 ---
 

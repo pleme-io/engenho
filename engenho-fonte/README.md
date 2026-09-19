@@ -120,19 +120,30 @@ let s = parse_tlisp(r#"(defsistema "rio"
 Round-trip: `to_authoring_form(&s)` renders any Sistema back to the canonical
 `(defsistema …)` lisp form; parse_tlisp consumes it.
 
-## Operator-facing daemon
+## The `engenho-fonte` binary is a mock-universe harness
 
-`engenho-fonte-cli` (sibling crate) ships a binary that wires the full loop:
+`engenho-fonte-cli` (sibling crate) runs the loop as a process. Only the
+watch (`ShikumiWatcher`) and the eval (`SuiEvaluator`) are real. The
+proposer is a `SystemController` over the four `Mock*Reconciler`s, or with
+`--with-revoada` a single-node `PureRaftFace` whose store is an in-memory
+map. The attester, publisher, anomaly chain and remediation handler are
+mocks too. Nothing it records survives the process.
+
+So it is fenced. Cargo builds the binary only when the `mock-universe`
+feature is named:
 
 ```bash
-engenho-fonte --file ./sistemas/rio.nix
-engenho-fonte --file ./sistemas/rio.nix --with-revoada
-engenho-fonte --file ./sistemas/rio.nix --log-level debug
+cargo run -p engenho-fonte-cli --features mock-universe -- --file ./sistemas/rio.nix
+cargo run -p engenho-fonte-cli --features mock-universe -- --file ./sistemas/rio.nix --with-revoada
 ```
 
-Internally: shikumi notify → sui eval → SystemController + KubeAppReconciler
-+ LinhagemAnomalyChain → MockAttester → MockPublisher (or real backends
-behind feature flags).
+Without the feature, `cargo build --bin engenho-fonte` is refused and a
+workspace build skips the target. At startup the binary resolves the
+`Universe{Mock, Real}` of every slot from the concrete types it wired. It
+then logs one line naming each slot's universe; under `mock` that line is a
+warning. Each tick is logged in that universe's words, so a mock tick reads
+`tick handled by a mock universe; not a convergence` and never
+`convergence tick completed`.
 
 ## Pillar alignment
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "2605b50e29f001e6abc9c41689e6673c8748d3c71e9d2190fa98b4e5b67b63cc",
+  "cargo_lock_sha256": "d8f76a74e2212c440a83a0eb59de17fc253f1f455d7258e32bf1027a1ac3184c",
   "manifest_sha256": {
     "Cargo.toml": "fa338977673f1e7f3f219b61103d38a0fda8e10d771815cb6409cba2b60d07e3",
     "engenho-apiserver/Cargo.toml": "dd8ed22200247d6e30cbd121f61cf79de3c9bc3f83946ddd4519d6626b03ac33",
@@ -12,7 +12,7 @@
     "engenho-csi/Cargo.toml": "1e80780c1c952308203895db7e3cac22d1f7e6465cacb9d698060412e56d4c97",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
     "engenho-etcd/Cargo.toml": "317b6fd67d6f09f733ea06e938cc987bda0908861ab91c22ae1716a723445ef0",
-    "engenho-fonte-cli/Cargo.toml": "650eb2c143e2d16dd0f02a56a9f73035f83652349b83daf33f9caa582c8ca8a7",
+    "engenho-fonte-cli/Cargo.toml": "370c6b06297206379f4ad84b91baa3c51796f1a5b8563d7ce127752cc59f1612",
     "engenho-fonte/Cargo.toml": "a074bc92449afc5b002c35965f1c0e8f86754064d7bf7e6d86cb7c496c5bfd1e",
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
@@ -5693,6 +5693,16 @@
           {
             "name": "engenho_revoada",
             "package_key": "engenho-revoada-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
