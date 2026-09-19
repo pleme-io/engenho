@@ -128,7 +128,7 @@ fn h4_a_revision_below_the_watermark_is_refused_not_approximated() {
     put(&mut cat, "c", "3", 3);
     put(&mut cat, "d", "4", 4);
 
-    let compacted = cat.compacted_revision;
+    let compacted = cat.compacted_revision();
     assert!(compacted.get() > 0, "the ring must have evicted something");
 
     let err = cat
@@ -164,12 +164,12 @@ fn c1_compact_advances_the_watermark_and_only_forwards() {
     put(&mut cat, "c", "3", 3);
 
     assert_eq!(cat.compact(mid), mid, "watermark moves to the target");
-    assert_eq!(cat.compacted_revision, mid);
+    assert_eq!(cat.compacted_revision(), mid);
 
     // Backwards is a no-op, not a rewind: rewinding would promise history
     // that has already been dropped.
     assert_eq!(cat.compact(Revision(1)), mid);
-    assert_eq!(cat.compacted_revision, mid);
+    assert_eq!(cat.compacted_revision(), mid);
 
     // Beyond the present is clamped — you cannot compact away revisions
     // that do not exist yet.

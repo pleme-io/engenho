@@ -33,7 +33,7 @@ use engenho_store::{
 };
 use serde_json::json;
 use support::{
-    bytes_allocated_by, durable_mesh, memory_mesh, put, release_secret,
+    bytes_allocated_by, durable_mesh, memory_mesh, put, release_secret, replay_as_events,
     seed_bulk_then_one_configmap,
 };
 
@@ -64,6 +64,10 @@ const DECLARED: &[(&str, &str, Bound)] = &[
     ("StoreMesh", "list", Bound::Scope),
     ("StoreMesh", "list_at_revision", Bound::Scope),
     ("StoreMesh", "list_page_at_revision", Bound::Page),
+    // T3.9b: a page read under a ReadConsistency, from the present or
+    // rewound to a retained revision; either way one scope's page, and a
+    // past read clones only the page (`t3_9b_read_consistency`).
+    ("StoreMesh", "list_page_consistent", Bound::Page),
     ("InMemoryStore", "list_at_revision", Bound::Scope),
     ("InMemoryStore", "list_page_at_revision", Bound::Page),
     ("FjallStore", "list_at_revision", Bound::Scope),
@@ -715,13 +719,16 @@ fn pod(name: &str) -> ResourceKey {
     ResourceKey::namespaced("", "v1", "Pod", "default", name)
 }
 
-/// A replay from revision zero is the one read whose cost IS the ring, by
-/// design; it is the positive control that the counter counts and the seed
-/// is big enough to tell a clone from a scalar.
+/// Draining a replay from revision zero as events is the one read whose cost
+/// IS the ring, by design ([`replay_as_events`]); it is the positive control
+/// that the counter counts and the seed is big enough to tell a clone from a
+/// scalar.
 async fn ring_bytes(mesh: &StoreMesh) -> usize {
-    let (replay, bytes) =
-        bytes_allocated_by(mesh.watch_from(WatchOpts::from_revision(Revision::ZERO))).await;
-    drop(replay.expect("nothing is compacted yet"));
+    let (events, bytes) = replay_as_events(mesh).await;
+    assert_eq!(
+        events, 201,
+        "the whole ring: 200 Secret rewrites and the ConfigMap"
+    );
     assert!(
         bytes > 2 * 1024 * 1024,
         "positive control: replaying the ring allocated only {bytes} bytes — the counting \

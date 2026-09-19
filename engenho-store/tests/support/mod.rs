@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_store::command::{Reason, ResourceCommand};
-use engenho_store::{InProcessRouter, ResourceKey, StoreMesh, default_config};
+use engenho_store::revision::Revision;
+use engenho_store::{InProcessRouter, ResourceKey, StoreMesh, WatchOpts, default_config};
 use serde_json::json;
 
 // =================================================================
@@ -74,6 +75,31 @@ pub async fn bytes_allocated_by<F: Future>(fut: F) -> (F::Output, usize) {
     let out = fut.await;
     let bytes = ARMED_BYTES.with(|c| c.replace(None)).unwrap_or(0);
     (out, bytes)
+}
+
+/// Replay the whole ring and drain it as events, on this thread: returns how
+/// many events it held and the bytes that allocated.
+///
+/// Each event carries its own copy of a retained post-image, so this is the
+/// public read whose cost IS the ring, by design: the positive control every
+/// allocation bound in these suites is measured against. Until T3.7 opening
+/// the replay was enough, because registering cloned every retained change;
+/// the replay now shares the ring's changes and copies nothing until a
+/// change is turned into an event (`t3_7_relabel_out_of_selector` pins
+/// that).
+pub async fn replay_as_events(mesh: &StoreMesh) -> (usize, usize) {
+    bytes_allocated_by(async {
+        let mut replay = mesh
+            .watch_from(WatchOpts::from_revision(Revision::ZERO))
+            .await
+            .expect("nothing is compacted yet");
+        let mut events = 0usize;
+        while let Some(Ok(signal)) = replay.try_next() {
+            events += usize::from(signal.is_event());
+        }
+        events
+    })
+    .await
 }
 
 // =================================================================

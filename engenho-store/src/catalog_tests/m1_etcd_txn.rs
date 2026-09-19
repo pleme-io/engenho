@@ -21,6 +21,9 @@
 //!   * T5 history completeness — every mutated key appears in `history`,
 //!     so a watcher resuming from before the Txn sees ALL of it, never a
 //!     torn half.
+//!   * T6 whole or not at all (T3.3 seal) — when the ring overflows, a
+//!     transaction leaves it whole, so the ring never keeps part of one at
+//!     its floor, where no replay could reach it.
 
 use crate::command::{Reason, ResourceCommand, TxnCompare, TxnOp};
 use crate::revision::Revision;
@@ -94,8 +97,7 @@ fn t2_one_transaction_is_one_revision_across_every_key() {
     }
 
     // T5: all three changes are reported, and all at the same revision.
-    let all: Vec<&crate::revision::Change> =
-        out.change.iter().chain(out.extra_changes.iter()).collect();
+    let all: Vec<&std::sync::Arc<crate::revision::Change>> = out.changes().collect();
     assert_eq!(all.len(), 3, "every mutated key must be reported");
     assert!(all.iter().all(|c| c.revision == rev));
 }
@@ -116,6 +118,48 @@ fn t5_a_watcher_resuming_before_the_txn_sees_all_of_it() {
         "a torn half-transaction is the failure this guards"
     );
     assert!(changes.iter().all(|c| c.revision == cat.revision()));
+}
+
+// ── T6 ────────────────────────────────────────────────────────────────
+
+/// A ring of three changes, then a one-key write, a two-key transaction and
+/// another two-key transaction. The last commit overflows the ring by two:
+/// revision 1 must leave, and so must ALL of revision 2. Evicting change by
+/// change would keep one key of revision 2 at the floor, a change the ring
+/// holds but no replay from the floor can ever return.
+#[test]
+fn t6_an_overflowing_ring_evicts_a_transaction_whole() {
+    let mut cat = ResourceCatalog::with_history_capacity(3);
+    apply(
+        &mut cat,
+        &ResourceCommand::put(pod_key("a"), pod("a"), Reason::Operator),
+        1,
+    );
+    apply(
+        &mut cat,
+        &txn(vec![], vec![put_op("b"), put_op("c")], vec![]),
+        2,
+    );
+    apply(
+        &mut cat,
+        &txn(vec![], vec![put_op("d"), put_op("e")], vec![]),
+        3,
+    );
+
+    let floor = cat.compacted_revision();
+    assert_eq!((floor, cat.revision()), (Revision(2), Revision(3)));
+    let replay = cat.changes_since(floor).expect("resuming from the floor");
+    assert_eq!(
+        replay.len(),
+        cat.history().len(),
+        "everything the ring retains is replayable from its floor"
+    );
+    assert!(
+        cat.history().iter().all(|c| c.revision > floor),
+        "no key of an evicted transaction may stay behind at the floor"
+    );
+    let keys: Vec<&str> = replay.iter().map(|c| c.key.name.as_str()).collect();
+    assert_eq!(keys, ["d", "e"], "the newest transaction is kept whole");
 }
 
 // ── T1 + T3 ───────────────────────────────────────────────────────────

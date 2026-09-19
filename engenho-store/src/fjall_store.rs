@@ -783,8 +783,12 @@ impl FjallStore {
     ///
     /// # Errors
     ///
-    /// [`WatchGone::CompactedTooOld`] when `opts.from` is below the
-    /// compaction watermark (no channel is allocated).
+    /// No channel is allocated for either refusal:
+    ///
+    /// * [`WatchGone::AheadOfStore`] when `opts.from` is past the current
+    ///   revision, judged under this lock (T3.9a).
+    /// * [`WatchGone::CompactedTooOld`] when `opts.from` is below the
+    ///   compaction watermark.
     pub async fn watch_from(&self, opts: WatchOpts) -> Result<WatchStream, WatchGone> {
         // Registration enqueues the replay IN REVISION ORDER before the
         // handle is reachable by `fan_change` — all under THIS lock, so
@@ -801,14 +805,20 @@ impl FjallStore {
     /// typed [`WatchGone::Overflow`] instead of a silent
     /// `broadcast::RecvError::Lagged`.
     ///
+    /// The start is read under the SAME guard the registration holds, so a
+    /// rewind (a snapshot install) cannot land between the two and leave a
+    /// start ahead of the store.
+    ///
     /// # Errors
     ///
-    /// Never errors in practice (live-tail resumes from the current
-    /// revision); the `Result` matches `watch_from`.
+    /// Never: the live tail starts at the current revision. The `Result`
+    /// matches `watch_from`.
     pub async fn watch_subscribe(&self) -> Result<WatchStream, WatchGone> {
-        let from = self.inner.state.lock().await.catalog.revision();
-        self.watch_from(WatchOpts::live_tail(from, WATCH_CHANNEL_CAPACITY))
-            .await
+        let mut guard = self.inner.state.lock().await;
+        let state = &mut *guard;
+        Ok(state
+            .watchers
+            .register_live_tail(&state.catalog, WATCH_CHANNEL_CAPACITY))
     }
 
     /// Active watch subscriber count (live registry size).
@@ -1269,7 +1279,7 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         // Buffer the committed changes; we fan them to watchers AFTER
         // the fsync (durable-before-observable) but BEFORE dropping the
         // lock (so the replay→live handoff stays atomic).
-        let mut committed: Vec<crate::revision::Change> = Vec::new();
+        let mut committed: Vec<std::sync::Arc<crate::revision::Change>> = Vec::new();
         // Track whether last_membership changed so we persist it.
         let mut membership_changed = false;
         // Indexes skipped because the image already held them (T3.4).
@@ -1306,9 +1316,9 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
                             .apply_logged(logged, log_id.leader_id.term, log_id.index);
                     let op = outcome.op;
                     let patch_error = outcome.patch_error.clone();
-                    if let Some(change) = outcome.change {
-                        committed.push(change);
-                    }
+                    // Every change the entry committed, first and the rest:
+                    // a live watcher sees what a replaying one does.
+                    committed.extend(outcome.changes().cloned());
                     (op, patch_error)
                 }
                 EntryPayload::Membership(m) => {
@@ -1376,7 +1386,7 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         // same `state` lock). Non-blocking try_send (overflow → typed Gone,
         // never silent, never blocks).
         for change in &committed {
-            state.watchers.fan_change(change);
+            state.watchers.fan_shared(change);
         }
         drop(state);
         Ok(results)
@@ -1807,6 +1817,47 @@ mod tests {
         );
     }
 
+    /// T3.9a: the live tail reads its start under the guard its registration
+    /// holds. A rewind (a snapshot install) queued on the state lock right
+    /// behind the subscriber lands after the whole subscription, never
+    /// between reading the start and attaching at it, where the start would
+    /// be ahead of the rewound catalog and the live tail refused.
+    #[tokio::test]
+    async fn a_rewind_queued_behind_a_live_tail_cannot_split_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = FjallStore::open(tmp.path().join("src")).unwrap();
+        log_and_apply(&mut src, 2).await;
+        let snap = src
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let mut store = FjallStore::open(tmp.path().join("dst")).unwrap();
+        log_and_apply(&mut store, 5).await;
+
+        let held = store.inner.state.lock().await;
+        let for_tail = store.clone();
+        let mut for_rewind = store.clone();
+        let (tail, install) = crate::watch_backend::run_queued_behind(
+            held,
+            async move { for_tail.watch_subscribe().await },
+            async move { for_rewind.install_snapshot(&snap.meta, snap.snapshot).await },
+        )
+        .await;
+        install.unwrap();
+        assert_eq!(
+            store.current_revision().await,
+            Revision(2),
+            "precondition: the install rewound the store"
+        );
+        assert!(
+            tail.is_ok(),
+            "a live tail is never refused, whatever queues behind it: {:?}",
+            tail.err()
+        );
+    }
+
     /// An installed snapshot IS the durable image, so `flush` afterwards has
     /// nothing to write — even when the store had unwritten applies before.
     #[tokio::test]
@@ -1850,7 +1901,7 @@ mod tests {
         let cat = s2.read_catalog(ResourceCatalog::clone).await;
         assert_eq!(cat.len(), 1);
         assert!(cat.get(&key).is_some());
-        assert_eq!(cat.current_revision, Revision(1));
+        assert_eq!(cat.revision(), Revision(1));
         let (_, meta) = cat.get_with_meta(&key).unwrap();
         assert_eq!(meta, VersionMeta::created_at(Revision(1)));
         // Applied position survived → store is initialized on reopen.
@@ -1873,7 +1924,7 @@ mod tests {
                 .unwrap();
         }
         let src_cat = src.read_catalog(ResourceCatalog::clone).await;
-        let src_rev = src_cat.current_revision;
+        let src_rev = src_cat.revision();
         assert!(src_rev.get() >= 4);
 
         // Build snapshot from src.
@@ -1888,13 +1939,13 @@ mod tests {
             .await
             .unwrap();
         let dst_cat = dst.read_catalog(ResourceCatalog::clone).await;
-        assert_eq!(dst_cat.current_revision, src_rev);
+        assert_eq!(dst_cat.revision(), src_rev);
         // T3.3: the source evicted nothing, so its floor is 0 and its ring
         // backs every revision. A snapshot carries no ring, so the
         // destination's floor is the installed revision, and a watch below
         // it is a 410 rather than an empty replay.
-        assert_eq!(src_cat.compacted_revision, Revision::ZERO);
-        assert_eq!(dst_cat.compacted_revision, src_rev);
+        assert_eq!(src_cat.compacted_revision(), Revision::ZERO);
+        assert_eq!(dst_cat.compacted_revision(), src_rev);
         assert_eq!(
             dst.watch_from(WatchOpts::live_tail(Revision::ZERO, 16))
                 .await

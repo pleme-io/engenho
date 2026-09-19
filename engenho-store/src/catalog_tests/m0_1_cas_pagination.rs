@@ -100,7 +100,7 @@ fn cas_stale_rv_conflicts_and_leaves_state_unchanged() {
         // before, and normalize last_applied to compare the full serde
         // bytes too.
         let snapshot_resources = cat.resources.clone();
-        let snapshot_history: Vec<_> = cat.history.iter().cloned().collect();
+        let snapshot_history: Vec<_> = cat.history().iter().cloned().collect();
         let snapshot_rev = cat.revision();
         // A clone with last_applied pre-advanced to the index the conflict
         // will land on — everything else must match byte-for-byte.
@@ -145,7 +145,7 @@ fn cas_stale_rv_conflicts_and_leaves_state_unchanged() {
             "{variant}: resources UNCHANGED"
         );
         assert_eq!(
-            cat.history.iter().cloned().collect::<Vec<_>>(),
+            cat.history().iter().cloned().collect::<Vec<_>>(),
             snapshot_history,
             "{variant}: history UNCHANGED (no new entry)"
         );

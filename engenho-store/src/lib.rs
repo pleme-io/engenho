@@ -106,6 +106,7 @@ pub mod network;
 pub mod owned_task;
 pub mod pagination;
 pub mod patch_apply;
+pub mod read;
 pub mod resource;
 pub mod revision;
 pub mod ssa;
@@ -114,6 +115,10 @@ pub mod store;
 pub mod type_config;
 pub mod watch;
 pub mod watch_backend;
+/// The watch-replay ring, its compaction floor, the head revision and the
+/// ring's capacity as one sealed value (T3.3). Crate-private, like the
+/// catalog that holds it.
+mod watch_history;
 
 /// The catalog-level suites that were integration tests until T3.2b sealed
 /// the catalog: they drive `ResourceCatalog` directly, which only code
@@ -137,11 +142,12 @@ pub use patch_apply::{
     Gvk, JsonPath, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody, PatchDirective,
     PatchError, PatchSchemaEnv, apply as apply_patch_algorithm,
 };
+pub use read::{ReadConsistency, ReadRefused};
 pub use resource::{ListScope, ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 pub use ssa::{ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome, apply_ssa};
 pub use state::{ApplyOutcome, DEFAULT_HISTORY_CAPACITY, check_precondition, unchanged};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
-pub use watch::{WatchEvent, WatchEventKind};
-pub use watch_backend::{WatchGone, WatchOpts, WatchSignal, WatchStream};
+pub use watch::{ChangeShape, Projection, WatchEvent, WatchEventKind, project};
+pub use watch_backend::{ChangeSignal, WatchGone, WatchOpts, WatchSignal, WatchStream};

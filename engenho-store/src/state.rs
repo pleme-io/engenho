@@ -22,15 +22,18 @@
 //! (NOT the Raft log index).
 //!
 //! A bounded in-memory history ring records every committed
-//! [`Change`]; it is the watch-replay source. When the ring
-//! overflows `history_capacity`, the oldest entry is evicted and the
-//! `compacted_revision` watermark advances. Reads / watches that ask
-//! for history below the watermark get a typed [`CompactedTooOld`].
-//! The ring is never persisted, so a catalog loaded from disk or from
-//! a snapshot starts with its watermark AT its current revision.
+//! [`Change`]; it is the watch-replay source. The ring, its compaction
+//! floor, the current revision and the ring's capacity are one sealed
+//! value, `WatchHistory` (T3.3): when the ring overflows its capacity the
+//! oldest whole revision is evicted and the floor rises to it. Reads /
+//! watches that ask for history below the floor get a typed
+//! [`CompactedTooOld`]. The ring is never persisted, so a catalog loaded
+//! from disk or from a snapshot starts with its floor AT its current
+//! revision.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use engenho_types::patch::PatchType;
@@ -40,9 +43,13 @@ use crate::command::{
 };
 use crate::pagination::{ListPage, PageAtRevision};
 use crate::patch_apply::{self, Gvk, OpenApiPatchEnv, PatchBody, PatchError, PatchSchemaEnv};
+use crate::read::{ReadConsistency, ReadPoint, ReadRefused};
 use crate::resource::{ListScope, ResourceKey, ResourceValue};
 use crate::revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 use crate::ssa;
+use crate::watch_history::{self, WatchHistory, Window};
+
+pub use crate::watch_history::DEFAULT_HISTORY_CAPACITY;
 
 /// Optimistic-concurrency precondition check (the CAS heart). Pure
 /// function over the caller's expected revision + the key's live
@@ -202,12 +209,6 @@ impl OnIdentical {
     }
 }
 
-/// Default bound on the in-memory history ring. 8192 committed
-/// mutations is enough to cover the recent window + the live tail
-/// every local watch consumer replays; older revisions fall below
-/// `compacted_revision`.
-pub const DEFAULT_HISTORY_CAPACITY: usize = 8192;
-
 /// How faithful a historical read's [`VersionMeta`] is.
 ///
 /// The VALUE at a past revision is always exact — it is reconstructed by
@@ -247,7 +248,10 @@ pub struct ApplyOutcome {
     /// for a no-op. Carries the post-image, the prior object (so the
     /// Deleted event always has the real prior, never Null), the
     /// stamped revision, and the per-key version metadata.
-    pub change: Option<Change>,
+    ///
+    /// Built once, here, at apply time: the history ring and every watcher
+    /// share this one allocation (T3.7).
+    pub change: Option<Arc<Change>>,
     /// The typed patch-interpreter error string when `op ==
     /// [`ResourceOp::PatchRejected`]`; `None` otherwise. The apiserver maps
     /// it to the correct typed `ApiError` (415 for server-side apply,
@@ -262,7 +266,7 @@ pub struct ApplyOutcome {
     /// with one `mod_revision`, and splitting them would be observable on
     /// the wire. Empty for every single-key command, so no existing caller
     /// changes behaviour.
-    pub extra_changes: Vec<Change>,
+    pub extra_changes: Vec<Arc<Change>>,
 }
 
 impl ApplyOutcome {
@@ -281,12 +285,30 @@ impl ApplyOutcome {
     /// An outcome carrying a committed [`Change`].
     #[must_use]
     pub fn with_change(op: ResourceOp, change: Change) -> Self {
+        Self::committed(op, Arc::new(change), Vec::new())
+    }
+
+    /// An outcome carrying one committed revision: `first`, plus every
+    /// further key the same command touched at that revision.
+    fn committed(op: ResourceOp, first: Arc<Change>, rest: Vec<Arc<Change>>) -> Self {
         Self {
             op,
-            change: Some(change),
+            change: Some(first),
             patch_error: None,
-            extra_changes: Vec::new(),
+            extra_changes: rest,
         }
+    }
+
+    /// Every change this outcome committed, in the order the history
+    /// records them: [`Self::change`], then [`Self::extra_changes`]. Empty
+    /// for a no-op.
+    ///
+    /// The one list both the history ring and the live watch fan-out are
+    /// fed from, so a live watcher and one replaying the ring see the same
+    /// changes for one revision: a transaction's second key is not a replay
+    /// -only event.
+    pub fn changes(&self) -> impl Iterator<Item = &Arc<Change>> {
+        self.change.iter().chain(&self.extra_changes)
     }
 
     /// A [`ResourceOp::PatchRejected`] outcome carrying the typed patch
@@ -330,7 +352,7 @@ impl ApplyOutcome {
 /// global MVCC counter consumers stamp resourceVersion from).
 ///
 /// ── ★ SEALED (T3.2b): `pub(crate)`, and no `pub fn` may hand it out ─────
-/// The catalog carries `history`, the 8192-entry watch-replay ring whose
+/// The catalog carries `history`, the 8192-change watch-replay ring whose
 /// entries each hold a full post-image AND a full pre-image. While the type
 /// was public, `current_catalog()` returned it by value, and every caller
 /// that wanted one integer (`.revision()`, `.last_applied_index`) paid a deep
@@ -349,20 +371,15 @@ pub(crate) struct ResourceCatalog {
     pub resources: BTreeMap<ResourceKey, (ResourceValue, VersionMeta)>,
     pub last_applied_term: u64,
     pub last_applied_index: u64,
-    /// Global MVCC revision counter — advances by 1 per real
-    /// mutation. `Revision(0)` means "no write has happened yet".
-    pub current_revision: Revision,
-    /// Bounded history ring — the watch-replay source.
-    pub history: VecDeque<Change>,
-    /// The compaction floor: every change with a revision above it is
-    /// in `history`. Reads / watches below this return
-    /// [`CompactedTooOld`]. `Revision(0)` means nothing has been
-    /// compacted yet. A catalog loaded from disk or a snapshot starts
-    /// with an empty ring, so its floor starts at `current_revision`.
-    pub compacted_revision: Revision,
-    /// Max entries retained in `history` before the oldest is evicted
-    /// (advancing `compacted_revision`).
-    pub history_capacity: usize,
+    /// The global MVCC revision counter, the watch-replay ring, its
+    /// compaction floor and its capacity, as ONE sealed value (T3.3). The
+    /// revision advances by exactly 1 per real mutation, and only by
+    /// [`WatchHistory::commit`], which records that mutation's changes in
+    /// the same step: a revision with no history behind it, or a floor the
+    /// ring does not back, has no code path. Private, so no line in the
+    /// crate can swap it out from under the resources whose revisions it
+    /// counts.
+    history: WatchHistory,
     /// Strategic-merge schema resolver — the [`PatchSchemaEnv`] the patch
     /// interpreter consults for per-list merge strategies. NOT part of the
     /// converged/serialized state (it's a stateless, deterministic lookup
@@ -379,10 +396,7 @@ impl std::fmt::Debug for ResourceCatalog {
             .field("resources", &self.resources)
             .field("last_applied_term", &self.last_applied_term)
             .field("last_applied_index", &self.last_applied_index)
-            .field("current_revision", &self.current_revision)
             .field("history", &self.history)
-            .field("compacted_revision", &self.compacted_revision)
-            .field("history_capacity", &self.history_capacity)
             // patch_env intentionally elided (trait object, no Debug).
             .finish_non_exhaustive()
     }
@@ -401,10 +415,7 @@ impl Default for ResourceCatalog {
             resources: BTreeMap::new(),
             last_applied_term: 0,
             last_applied_index: 0,
-            current_revision: Revision::ZERO,
-            history: VecDeque::new(),
-            compacted_revision: Revision::ZERO,
-            history_capacity: DEFAULT_HISTORY_CAPACITY,
+            history: WatchHistory::default(),
             patch_env: default_patch_env(),
         }
     }
@@ -413,15 +424,15 @@ impl Default for ResourceCatalog {
 impl PartialEq for ResourceCatalog {
     /// Equality covers the durable, convergence-relevant state:
     /// resources (value + version metadata), applied position, and
-    /// the global revision. The history ring + capacity are a local
-    /// replay buffer, not part of the converged state, so they're
-    /// excluded — two nodes that applied the same command sequence
-    /// are equal even if one has compacted more of its ring.
+    /// the global revision. The history ring, its floor and its capacity
+    /// are a local replay buffer, not part of the converged state, so
+    /// they're excluded — two nodes that applied the same command
+    /// sequence are equal even if one has compacted more of its ring.
     fn eq(&self, other: &Self) -> bool {
         self.resources == other.resources
             && self.last_applied_term == other.last_applied_term
             && self.last_applied_index == other.last_applied_index
-            && self.current_revision == other.current_revision
+            && self.revision() == other.revision()
     }
 }
 
@@ -447,8 +458,8 @@ impl Serialize for ResourceCatalog {
         state.serialize_field("resources", &entries)?;
         state.serialize_field("last_applied_term", &self.last_applied_term)?;
         state.serialize_field("last_applied_index", &self.last_applied_index)?;
-        state.serialize_field("current_revision", &self.current_revision)?;
-        state.serialize_field("compacted_revision", &self.compacted_revision)?;
+        state.serialize_field("current_revision", &self.history.head())?;
+        state.serialize_field("compacted_revision", &self.history.floor())?;
         state.end()
     }
 }
@@ -483,14 +494,13 @@ impl<'de> Deserialize<'de> for ResourceCatalog {
         // every resume point below the load revision is an honest
         // `CompactedTooOld` (a 410: relist), and every change applied
         // after the load lands in the ring above the floor.
+        // `WatchHistory::loaded_at` is the only constructor that starts
+        // above revision 0, and it takes no floor to believe.
         Ok(Self {
             resources: h.resources.into_iter().collect(),
             last_applied_term: h.last_applied_term,
             last_applied_index: h.last_applied_index,
-            current_revision: h.current_revision,
-            history: VecDeque::new(),
-            compacted_revision: h.current_revision,
-            history_capacity: DEFAULT_HISTORY_CAPACITY,
+            history: WatchHistory::loaded_at(h.current_revision, watch_history::DEFAULT_CAPACITY),
             patch_env: default_patch_env(),
         })
     }
@@ -510,7 +520,9 @@ impl ResourceCatalog {
     )]
     pub fn with_history_capacity(history_capacity: usize) -> Self {
         Self {
-            history_capacity: history_capacity.max(1),
+            history: WatchHistory::new(
+                NonZeroUsize::new(history_capacity).unwrap_or(NonZeroUsize::MIN),
+            ),
             ..Self::default()
         }
     }
@@ -548,9 +560,9 @@ impl ResourceCatalog {
     ///   * Any real mutation advances `current_revision` by exactly
     ///     1, stamps `metadata.resourceVersion = <revision>` (NOT the
     ///     Raft index), preserves/sets `metadata.uid`, updates the
-    ///     per-key [`VersionMeta`], and pushes a [`Change`] onto the
-    ///     history ring (evicting the front + advancing
-    ///     `compacted_revision` when over capacity).
+    ///     per-key [`VersionMeta`], and commits its [`Change`]s to the
+    ///     history as one revision ([`WatchHistory::commit`]: the oldest
+    ///     whole revisions leave and the floor rises when over capacity).
     fn apply_under(
         &mut self,
         cmd: &ResourceCommand,
@@ -560,7 +572,7 @@ impl ResourceCatalog {
     ) -> ApplyOutcome {
         // Tentatively reserve the next revision; only committed if the
         // mutation is real (not a no-op).
-        let rev = self.current_revision.next();
+        let rev = self.history.next_revision();
         let on_identical = OnIdentical::under(semantics);
         let outcome = match cmd {
             ResourceCommand::Put {
@@ -602,32 +614,14 @@ impl ResourceCatalog {
         self.last_applied_index = index;
         if let Some(change) = &outcome.change {
             // Commit the revision + record history only for real
-            // mutations. The stamped revision is exactly `rev`.
-            debug_assert_eq!(change.revision, rev);
-            self.current_revision = rev;
-            self.push_history(change.clone());
-            // A transaction commits EVERY key it touched at the SAME
-            // revision — see `ResourceCommand::Txn`. Empty for every
-            // single-key command, so this is a no-op on the hot path.
-            for extra in &outcome.extra_changes {
-                debug_assert_eq!(extra.revision, rev);
-                self.push_history(extra.clone());
-            }
+            // mutations, in one step. The stamped revision is exactly
+            // `rev`. A transaction commits EVERY key it touched at the
+            // SAME revision (see `ResourceCommand::Txn`), so its extra
+            // changes go in with the first, whole; they are empty for
+            // every single-key command.
+            self.history.commit(change, &outcome.extra_changes);
         }
         outcome
-    }
-
-    /// Push a change onto the ring, evicting the oldest + advancing
-    /// the compaction watermark when over capacity.
-    fn push_history(&mut self, change: Change) {
-        self.history.push_back(change);
-        while self.history.len() > self.history_capacity {
-            if let Some(evicted) = self.history.pop_front() {
-                // The lowest retained revision is now the revision of
-                // the NEW front. Anything <= evicted.revision is gone.
-                self.compacted_revision = evicted.revision;
-            }
-        }
     }
 
     /// Apply an atomic multi-key transaction — etcd `Txn` semantics.
@@ -658,7 +652,7 @@ impl ResourceCatalog {
         let taken = compares.iter().all(|c| self.eval_compare(c));
         let branch = if taken { success } else { failure };
 
-        let mut changes: Vec<Change> = Vec::new();
+        let mut changes: Vec<Arc<Change>> = Vec::new();
         for op in branch {
             let outcome = match op {
                 // etcd: a Put is a revision even when the value is the same,
@@ -682,11 +676,7 @@ impl ResourceCatalog {
         let mut iter = changes.into_iter();
         match iter.next() {
             None => ApplyOutcome::no_change(ResourceOp::NoOp),
-            Some(first) => {
-                let mut out = ApplyOutcome::with_change(ResourceOp::Replaced, first);
-                out.extra_changes = iter.collect();
-                out
-            }
+            Some(first) => ApplyOutcome::committed(ResourceOp::Replaced, first, iter.collect()),
         }
     }
 
@@ -1170,16 +1160,7 @@ impl ResourceCatalog {
         // resourceVersion follows the bump (so a watcher's CAS sees the new
         // rev); generation is spec-intent and unchanged by a metadata-only
         // deletionTimestamp stamp, so it is preserved verbatim.
-        if let Some(meta_obj) = terminating
-            .as_object_mut()
-            .and_then(|o| o.get_mut("metadata"))
-            .and_then(|m| m.as_object_mut())
-        {
-            meta_obj.insert(
-                "resourceVersion".to_string(),
-                serde_json::Value::String(rev.to_string()),
-            );
-        }
+        stamp_resource_version(&mut terminating, rev);
 
         self.resources
             .insert(key.clone(), (terminating.clone(), version_meta));
@@ -1205,7 +1186,7 @@ impl ResourceCatalog {
     ///
     /// ★ WHY AN EXPLICIT OPERATION AND NOT JUST THE RING. Compaction here
     /// has always been implicit: the bounded history ring evicts its oldest
-    /// entry once it overflows `history_capacity`. That is a CAPACITY
+    /// revision once it overflows its capacity. That is a CAPACITY
     /// policy, and etcd's `Compact` is an OPERATOR one — "I have taken a
     /// backup, reclaim everything older". A façade cannot synthesize it
     /// from the ring, because the caller names a revision the ring knows
@@ -1232,19 +1213,7 @@ impl ResourceCatalog {
         )
     )]
     pub fn compact(&mut self, target: Revision) -> Revision {
-        let target = Revision(target.get().min(self.current_revision.get()));
-        if target.get() <= self.compacted_revision.get() {
-            return self.compacted_revision;
-        }
-        while self
-            .history
-            .front()
-            .is_some_and(|c| c.revision.get() <= target.get())
-        {
-            self.history.pop_front();
-        }
-        self.compacted_revision = target;
-        self.compacted_revision
+        self.history.compact(target)
     }
 
     /// Reconstruct the whole keyspace as of `rev` — etcd's
@@ -1278,63 +1247,43 @@ impl ResourceCatalog {
         &self,
         rev: Revision,
     ) -> Result<BTreeMap<ResourceKey, HistoricalEntry>, CompactedTooOld> {
-        if rev < self.compacted_revision {
-            return Err(CompactedTooOld {
-                requested: rev,
-                compacted: self.compacted_revision,
-            });
-        }
+        // The one refusal rule the watch replay also uses: below the floor,
+        // the changes that would rewind the map are gone.
+        let (through, after) = self.history.split(rev)?;
+        let floor = self.history.floor();
 
-        // Start from the present and walk backwards.
-        let mut state: BTreeMap<ResourceKey, HistoricalEntry> = self
-            .resources
-            .iter()
-            .map(|(k, (v, m))| {
-                (
-                    k.clone(),
-                    HistoricalEntry {
-                        value: v.clone(),
-                        meta: *m,
-                        fidelity: MetaFidelity::Exact,
-                    },
-                )
-            })
-            .collect();
-
-        // Undo every change strictly newer than `rev`, newest first. After
-        // undoing change C, the entry holds C's PRE-image; its metadata is
-        // whatever an older retained change to the same key says, which the
-        // second pass below supplies.
-        for c in self.history.iter().rev().filter(|c| c.revision > rev) {
-            match &c.prior {
-                Some(prior) => {
-                    let e = state.entry(c.key.clone()).or_insert(HistoricalEntry {
-                        value: prior.clone(),
-                        meta: c.version_meta,
-                        fidelity: MetaFidelity::ModRevisionFloor,
-                    });
-                    e.value = prior.clone();
-                    // create_revision is stable across modifications, so it
-                    // survives the undo; mod_revision/version do not and are
-                    // corrected below.
-                    e.meta = VersionMeta {
-                        create_revision: c.version_meta.create_revision,
-                        mod_revision: self.compacted_revision,
-                        version: 1,
+        // The values: the present with every change newer than `rev`
+        // undone. A key whose entry came back through an undo keeps the
+        // undone change's create_revision (stable across modifications);
+        // its mod_revision/version are not recoverable from that change and
+        // are corrected below where an older retained change allows.
+        let mut state: BTreeMap<ResourceKey, HistoricalEntry> =
+            rewind(self.resources.iter(), after, |_| true)
+                .into_iter()
+                .map(|(key, as_of)| {
+                    let entry = match as_of {
+                        AsOf::Live(value, meta) => HistoricalEntry {
+                            value: value.clone(),
+                            meta,
+                            fidelity: MetaFidelity::Exact,
+                        },
+                        AsOf::Undone { value, by } => HistoricalEntry {
+                            value: value.clone(),
+                            meta: VersionMeta {
+                                create_revision: by.version_meta.create_revision,
+                                mod_revision: floor,
+                                version: 1,
+                            },
+                            fidelity: MetaFidelity::ModRevisionFloor,
+                        },
                     };
-                    e.fidelity = MetaFidelity::ModRevisionFloor;
-                }
-                // No pre-image ⇒ the key was CREATED by this change, so it
-                // did not exist at `rev`.
-                None => {
-                    state.remove(&c.key);
-                }
-            }
-        }
+                    (key.clone(), entry)
+                })
+                .collect();
 
         // Second pass: for every key still present, the newest retained
         // change at or before `rev` gives its exact metadata.
-        for c in self.history.iter().filter(|c| c.revision <= rev) {
+        for c in through {
             if let Some(e) = state.get_mut(&c.key) {
                 e.meta = c.version_meta;
                 e.fidelity = MetaFidelity::Exact;
@@ -1377,21 +1326,32 @@ impl ResourceCatalog {
     /// lock to get a consistent list-then-watch resume point.
     #[must_use]
     pub fn revision(&self) -> Revision {
-        self.current_revision
+        self.history.head()
     }
 
     /// The compaction watermark: every change above it is retained in
-    /// the history ring. A catalog loaded from disk or a snapshot
-    /// starts with this equal to [`Self::revision`].
+    /// the history ring, and none at or below it. A catalog loaded from
+    /// disk or a snapshot starts with this equal to [`Self::revision`].
     #[must_use]
     pub fn compacted_revision(&self) -> Revision {
-        self.compacted_revision
+        self.history.floor()
     }
 
-    /// All committed changes with `revision > rv`, in revision order.
+    /// The sealed history, for tests that inspect the ring itself.
+    #[cfg(test)]
+    pub(crate) fn history(&self) -> &WatchHistory {
+        &self.history
+    }
+
+    /// All committed changes with `revision > rv`, in revision order: the
+    /// watch-replay window. A client that last saw revision `rv` resumes by
+    /// replaying exactly these changes.
     ///
-    /// This is the watch-replay primitive: a client that last saw
-    /// revision `rv` resumes by replaying exactly these changes.
+    /// Each item is the ring's own `Arc`, so a reader that keeps a change
+    /// (the watch replay) shares it rather than copying it, and one that
+    /// keeps only some (the etcd façade's prefix filter) copies nothing it
+    /// drops. The one definition of the window and of its refusal, so no
+    /// reader can drift from the watch replay's rule.
     ///
     /// # Errors
     ///
@@ -1399,29 +1359,18 @@ impl ResourceCatalog {
     /// the requested resume point has been compacted away (the 410
     /// Gone equivalent). Asking from exactly `compacted_revision` (or
     /// above) is always honored.
-    pub fn changes_since(&self, rv: Revision) -> Result<Vec<Change>, CompactedTooOld> {
-        Ok(self.changes_after(rv)?.cloned().collect())
-    }
-
-    /// [`Self::changes_since`] by reference: the same window and the same
-    /// refusal, with nothing cloned. The one definition of both, so a
-    /// reader that clones only the changes it keeps (the etcd façade's
-    /// prefix filter) cannot drift from the watch replay's rule.
-    ///
-    /// # Errors
-    ///
-    /// [`CompactedTooOld`] when `rv < compacted_revision`.
     pub(crate) fn changes_after(
         &self,
         rv: Revision,
-    ) -> Result<impl Iterator<Item = &Change>, CompactedTooOld> {
-        if rv < self.compacted_revision {
-            return Err(CompactedTooOld {
-                requested: rv,
-                compacted: self.compacted_revision,
-            });
-        }
-        Ok(self.history.iter().filter(move |c| c.revision > rv))
+    ) -> Result<impl Iterator<Item = &Arc<Change>>, CompactedTooOld> {
+        self.history.since(rv)
+    }
+
+    /// [`Self::changes_after`], copied out: for tests that compare whole
+    /// windows by value.
+    #[cfg(test)]
+    pub fn changes_since(&self, rv: Revision) -> Result<Vec<Change>, CompactedTooOld> {
+        Ok(self.changes_after(rv)?.map(|c| Change::clone(c)).collect())
     }
 
     /// List resources matching (group, version, kind), optionally
@@ -1461,7 +1410,7 @@ impl ResourceCatalog {
             .range(&self.resources, None)
             .map(|(k, (v, _))| (k.clone(), v.clone()))
             .collect();
-        (items, self.current_revision)
+        (items, self.revision())
     }
 
     /// One page of resources matching (group, version, kind), optionally
@@ -1497,12 +1446,9 @@ impl ResourceCatalog {
     /// continue token's `snapshot_rev` is only the envelope
     /// `resourceVersion` LABEL — it is NOT a read-isolation mechanism.
     ///
-    /// DESTINATION (deferred): revision-indexed historical reads — page
-    /// each request against the catalog AS OF the token's snapshot
-    /// revision, which requires retaining historical MVCC views (a
-    /// per-key revision history / time-travel index), not the single live
-    /// materialized map M0.1 keeps. Until then, do not claim snapshot
-    /// consistency for the page series.
+    /// A page AS OF a revision is [`Self::read_page`] at
+    /// [`ReadConsistency::Exact`] (T3.9b): it rewinds the scope through the
+    /// retained changes' pre-images, with no second index.
     #[must_use]
     #[cfg_attr(
         not(test),
@@ -1537,17 +1483,83 @@ impl ResourceCatalog {
         after: Option<&ResourceKey>,
         limit: usize,
     ) -> PageAtRevision {
-        let page = self.page(scope, after, limit);
-        PageAtRevision {
-            items: page
-                .items
-                .into_iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            revision: self.current_revision,
-            next: page.next,
-            remaining: page.remaining,
+        self.page(scope, after, limit).cloned_at(self.revision())
+    }
+
+    /// One page of `scope` under `consistency` (T3.9b), judged and read
+    /// under the one borrow of this catalog, so the revision it was judged
+    /// against is the revision it is read at. See [`crate::read`] for the
+    /// table.
+    ///
+    /// * Served from the head, it is [`Self::list_page_at_revision`].
+    /// * Served from the past ([`ReadConsistency::Exact`] below the head),
+    ///   the scope is rewound to that revision by undoing the retained
+    ///   changes newer than it, and the page is cut from the rewound scope.
+    ///   The page reports that revision, so a page series that reads every
+    ///   page at the first page's revision is one snapshot: a write landing
+    ///   between two pages does not show on the second. That costs the
+    ///   scope's size plus the changes since the revision, all by reference;
+    ///   only the page's own items are cloned.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadRefused::TooLarge`] for a revision past the head,
+    /// [`ReadRefused::Expired`] for an exact revision below the compaction
+    /// floor.
+    pub fn read_page(
+        &self,
+        scope: ListScope<'_>,
+        after: Option<&ResourceKey>,
+        limit: usize,
+        consistency: ReadConsistency,
+    ) -> Result<PageAtRevision, ReadRefused> {
+        match self.read_point(consistency)? {
+            ReadPoint::Head => Ok(self.list_page_at_revision(scope, after, limit)),
+            ReadPoint::Past(rev) => {
+                let past = rewind(
+                    scope.range(&self.resources, None),
+                    self.history.since(rev)?,
+                    |key| scope.contains(key),
+                );
+                // `past` holds only the scope's keys, so the cursor needs no
+                // clamping: a start bound with an unbounded end never
+                // inverts, and a cursor past the scope reads nothing.
+                let from = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+                let run = past
+                    .range::<ResourceKey, _>((from, std::ops::Bound::Unbounded))
+                    .map(|(key, as_of)| (*key, as_of.value()));
+                Ok(page_of(run, limit).cloned_at(rev))
+            }
         }
+    }
+
+    /// One key under `consistency` (T3.9b): [`Self::read_page`] for a single
+    /// key, rewinding only that key's own changes when it reads the past.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_page`].
+    pub fn read_one(
+        &self,
+        key: &ResourceKey,
+        consistency: ReadConsistency,
+    ) -> Result<Option<ResourceValue>, ReadRefused> {
+        match self.read_point(consistency)? {
+            ReadPoint::Head => Ok(self.get(key).cloned()),
+            ReadPoint::Past(rev) => Ok(rewind(
+                self.resources.get_key_value(key).into_iter(),
+                self.history.since(rev)?,
+                |changed| changed == key,
+            )
+            .get(key)
+            .map(|as_of| as_of.value().clone())),
+        }
+    }
+
+    /// Judge `consistency` against this catalog's head and floor, read
+    /// together from its one history.
+    fn read_point(&self, consistency: ReadConsistency) -> Result<ReadPoint, ReadRefused> {
+        consistency.judge(self.history.head(), self.history.floor())
     }
 
     fn page(
@@ -1556,38 +1568,12 @@ impl ResourceCatalog {
         after: Option<&ResourceKey>,
         limit: usize,
     ) -> ListPage<'_> {
-        let mut run = scope
-            .range(&self.resources, after)
-            .map(|(k, (v, _))| (k, v));
-
-        // limit == 0 → unbounded: take all matching items after `after`.
-        if limit == 0 {
-            return ListPage {
-                items: run.collect(),
-                next: None,
-                remaining: 0,
-            };
-        }
-
-        // Collected, not `Vec::with_capacity(limit)`: `limit` is the
-        // client's number, and reserving it up front would let one request
-        // ask for any amount of memory.
-        let items: Vec<(&ResourceKey, &ResourceValue)> = run.by_ref().take(limit).collect();
-
-        // Count the rest of the scope to set `next` + `remaining`. `next` is
-        // the last EMITTED key iff at least one more item follows the page.
-        let remaining = u64::try_from(run.count()).unwrap_or(u64::MAX);
-        let next = if remaining > 0 {
-            items.last().map(|(k, _)| (*k).clone())
-        } else {
-            None
-        };
-
-        ListPage {
-            items,
-            next,
-            remaining,
-        }
+        page_of(
+            scope
+                .range(&self.resources, after)
+                .map(|(k, (v, _))| (k, v)),
+            limit,
+        )
     }
 
     /// Total resource count (across all kinds + namespaces).
@@ -1614,6 +1600,103 @@ impl ResourceCatalog {
     pub fn is_empty(&self) -> bool {
         self.resources.is_empty()
     }
+}
+
+/// Cut one page from `run`, a scope's entries in key order that sort after
+/// the cursor: up to `limit` items (`0` takes them all), the cursor for the
+/// next page, and how many remain after it. The one paging rule for the
+/// present and the past.
+fn page_of<'m>(
+    mut run: impl Iterator<Item = (&'m ResourceKey, &'m ResourceValue)>,
+    limit: usize,
+) -> ListPage<'m> {
+    // limit == 0 → unbounded: take all matching items after the cursor.
+    if limit == 0 {
+        return ListPage {
+            items: run.collect(),
+            next: None,
+            remaining: 0,
+        };
+    }
+
+    // Collected, not `Vec::with_capacity(limit)`: `limit` is the client's
+    // number, and reserving it up front would let one request ask for any
+    // amount of memory.
+    let items: Vec<(&ResourceKey, &ResourceValue)> = run.by_ref().take(limit).collect();
+
+    // Count the rest of the scope to set `next` + `remaining`. `next` is the
+    // last EMITTED key iff at least one more item follows the page.
+    let remaining = u64::try_from(run.count()).unwrap_or(u64::MAX);
+    let next = if remaining > 0 {
+        items.last().map(|(k, _)| (*k).clone())
+    } else {
+        None
+    };
+
+    ListPage {
+        items,
+        next,
+        remaining,
+    }
+}
+
+/// One entry of a selection as it was at a past revision, by reference.
+#[derive(Clone, Copy, Debug)]
+enum AsOf<'a> {
+    /// No retained change newer than the revision touched it: its value and
+    /// metadata are the live ones.
+    Live(&'a ResourceValue, VersionMeta),
+    /// Brought back by undoing `by`, the oldest change newer than the
+    /// revision that touched it: `value` is that change's pre-image.
+    Undone {
+        value: &'a ResourceValue,
+        by: &'a Change,
+    },
+}
+
+impl<'a> AsOf<'a> {
+    fn value(self) -> &'a ResourceValue {
+        match self {
+            Self::Live(value, _) | Self::Undone { value, .. } => value,
+        }
+    }
+}
+
+/// Rewind a selection to the revision `newer` was split at: start from its
+/// `present` entries and undo every change in `newer` that `selects` names,
+/// newest first. A change with a pre-image puts it back (a modification or
+/// a delete undone); a change without one created its key, so the key goes.
+///
+/// ★ NO SECOND INDEX: every retained [`Change`] carries its pre-image, so the
+/// past is the present with the newer changes undone, and the window a past
+/// read can reach is exactly the retained window. Everything is borrowed
+/// from the catalog and its ring; a caller clones only what it returns.
+///
+/// `present` must hold every live key `selects` names, and nothing else, so
+/// the rewound map is exactly the selection at that revision.
+fn rewind<'a>(
+    present: impl Iterator<Item = (&'a ResourceKey, &'a (ResourceValue, VersionMeta))>,
+    newer: Window<'a>,
+    selects: impl Fn(&ResourceKey) -> bool,
+) -> BTreeMap<&'a ResourceKey, AsOf<'a>> {
+    let mut state: BTreeMap<&'a ResourceKey, AsOf<'a>> = present
+        .map(|(key, (value, meta))| (key, AsOf::Live(value, *meta)))
+        .collect();
+    for change in newer.rev() {
+        let change: &'a Change = change;
+        if !selects(&change.key) {
+            continue;
+        }
+        match &change.prior {
+            Some(value) => {
+                state.insert(&change.key, AsOf::Undone { value, by: change });
+            }
+            None => {
+                state.remove(&change.key);
+            }
+        }
+    }
+    state
 }
 
 /// Borrow `value.spec` if present.
@@ -1701,17 +1784,28 @@ fn stamp_identity(
 /// the per-revision pass every Put, Patch and server-side apply shares, run
 /// only once the write is known to commit.
 fn stamp_revision(value: &mut serde_json::Value, rev: Revision, generation: i64) {
+    stamp_resource_version(value, rev);
     let Some(meta_obj) = metadata_mut(value) else {
         return;
     };
     meta_obj.insert(
-        "resourceVersion".to_string(),
-        serde_json::Value::String(rev.to_string()),
-    );
-    meta_obj.insert(
         "generation".to_string(),
         serde_json::Value::Number(generation.into()),
     );
+}
+
+/// Stamp `metadata.resourceVersion = rev` on `value`, creating `metadata`
+/// when absent; a `value` that is not an object is left alone. The one
+/// writer of the field: the commit path, the Terminating stamp, and a watch
+/// event that carries an object at a revision other than its own (a DELETED
+/// built from the prior image, T3.7) all go through it.
+pub(crate) fn stamp_resource_version(value: &mut serde_json::Value, rev: Revision) {
+    if let Some(meta_obj) = metadata_mut(value) {
+        meta_obj.insert(
+            "resourceVersion".to_string(),
+            serde_json::Value::String(rev.to_string()),
+        );
+    }
 }
 
 /// Set `metadata.deletionTimestamp` to the REPLICATED `ts` string,
@@ -2045,7 +2139,7 @@ mod tests {
             "podinfo:6"
         );
         // prior carries the same last-known object.
-        let prior = change.prior.unwrap();
+        let prior = change.prior.as_ref().unwrap();
         assert_eq!(prior.get("spec").unwrap().get("replicas").unwrap(), 3);
     }
 
@@ -2185,8 +2279,8 @@ mod tests {
         // One more put on a tracked key so we can assert its meta.
         put(&mut cat, &k, serde_json::json!({"spec": {}}), 6); // rev 6 (create)
         put(&mut cat, &k, serde_json::json!({"spec": {"x": 1}}), 7); // rev 7 (bump)
-        assert_eq!(cat.current_revision, Revision(7));
-        assert_eq!(cat.compacted_revision, Revision(5));
+        assert_eq!(cat.revision(), Revision(7));
+        assert_eq!(cat.compacted_revision(), Revision(5));
         let (_, meta_before) = cat.get_with_meta(&k).unwrap();
         assert_eq!(meta_before.create_revision, Revision(6));
         assert_eq!(meta_before.mod_revision, Revision(7));
@@ -2197,12 +2291,12 @@ mod tests {
         let back: ResourceCatalog = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(
-            back.current_revision,
+            back.revision(),
             Revision(7),
             "current_revision survives serde"
         );
         assert_eq!(
-            back.compacted_revision,
+            back.compacted_revision(),
             Revision(7),
             "the floor on load is the current revision, not the writer's floor of 5: \
              the ring that backed revisions 6 and 7 did not survive serde"
@@ -2214,7 +2308,7 @@ mod tests {
         );
         // History is deliberately not persisted (rebuilt by replay).
         assert!(back.history.is_empty());
-        assert_eq!(back.history_capacity, DEFAULT_HISTORY_CAPACITY);
+        assert_eq!(back.history.capacity().get(), DEFAULT_HISTORY_CAPACITY);
     }
 
     /// Round-trip `cat` through its disk form.

@@ -13,28 +13,32 @@
 
 mod support;
 
-use engenho_store::revision::Revision;
-use engenho_store::{ResourceKey, StoreMesh, WatchOpts};
+use engenho_store::{ResourceKey, StoreMesh};
 use serde_json::json;
-use support::{bytes_allocated_by, durable_mesh, memory_mesh, put, seed_bulk_then_one_configmap};
+use support::{
+    bytes_allocated_by, durable_mesh, memory_mesh, put, replay_as_events,
+    seed_bulk_then_one_configmap,
+};
 /// The page must cost what it returns. The positive control measures a
 /// replay of the whole ring with the same instrument, so a broken counter or
 /// a seed too small to tell the two apart fails loudly instead of passing.
 ///
 /// Until T3.2b the control cloned the whole catalog. That read no longer
-/// exists outside the crate; a replay from revision zero is the one public
-/// read whose cost IS the ring, by design — it clones every retained change,
-/// post-image and pre-image.
+/// exists outside the crate; draining a replay from revision zero as events
+/// is the one public read whose cost IS the ring, by design (see
+/// [`replay_as_events`]).
 async fn assert_a_page_allocates_only_its_items(mesh: &StoreMesh) {
     seed_bulk_then_one_configmap(mesh).await;
 
-    let (replay, ring_bytes) =
-        bytes_allocated_by(mesh.watch_from(WatchOpts::from_revision(Revision::ZERO))).await;
-    drop(replay.expect("nothing is compacted yet"));
+    let (events, ring_bytes) = replay_as_events(mesh).await;
+    assert_eq!(
+        events, 201,
+        "the whole ring: 200 Secret rewrites and the ConfigMap"
+    );
     assert!(
         ring_bytes > 2 * 1024 * 1024,
-        "positive control: replaying the ring allocated only {ring_bytes} bytes — the \
-         counting allocator or the seed is broken, so the bound below would prove nothing"
+        "positive control: replaying the ring as events allocated only {ring_bytes} bytes — \
+         the counting allocator or the seed is broken, so the bound below would prove nothing"
     );
 
     let ((items, _rev, next, remaining), page_bytes) = bytes_allocated_by(

@@ -15,3 +15,4 @@ mod m1_etcd_txn;
 mod m1_mvcc_historical;
 mod r9_mvcc_revision;
 mod t3_2a_paged_list;
+mod t3_9b_read_consistency;

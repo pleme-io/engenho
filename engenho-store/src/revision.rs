@@ -155,15 +155,16 @@ pub struct Change {
 
 /// The typed "requested revision has been compacted away" error —
 /// the 410 Gone equivalent. Returned by
-/// [`crate::state::ResourceCatalog::changes_since`] when the caller
+/// [`crate::state::ResourceCatalog::changes_after`] when the caller
 /// asks for history below the compaction watermark.
 ///
 /// `requested` is the revision the caller passed; `compacted` is the
-/// catalog's current `compacted_revision` (the lowest revision still
-/// retained in the history ring).
+/// catalog's current `compacted_revision`: the compaction floor, the oldest
+/// revision a watch may resume from. Every change above it is retained and
+/// none at or below it, so the oldest retained change is above it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "requested revision {requested} has been compacted (lowest retained revision is {compacted})"
+    "requested revision {requested} has been compacted (the compaction floor is {compacted}: resume from it or later)"
 )]
 pub struct CompactedTooOld {
     pub requested: Revision,
