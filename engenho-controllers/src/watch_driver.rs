@@ -114,11 +114,17 @@ impl KindFilter {
         Self::Kinds(vec![name.into()])
     }
 
-    fn matches(&self, ev: &WatchEvent) -> bool {
+    /// Whether an event on an object of `kind` wakes the controller.
+    #[must_use]
+    pub fn wakes_on(&self, kind: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Kinds(list) => list.iter().any(|k| k == &ev.key.kind),
+            Self::Kinds(list) => list.iter().any(|k| k == kind),
         }
+    }
+
+    fn matches(&self, ev: &WatchEvent) -> bool {
+        self.wakes_on(&ev.key.kind)
     }
 }
 
@@ -184,6 +190,13 @@ impl<C: Controller + 'static> WatchDriver<C> {
     #[must_use]
     pub fn heartbeat(&self) -> Arc<Heartbeat> {
         self.beat.clone()
+    }
+
+    /// Which events wake this driver's controller. Read it before
+    /// [`run`](Self::run) consumes the driver.
+    #[must_use]
+    pub fn wakes(&self) -> &KindFilter {
+        &self.config.filter
     }
 
     /// The event loop. It never returns: the `Infallible` output makes a

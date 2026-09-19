@@ -47,6 +47,7 @@ use thiserror::Error;
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
+use crate::reads::{DeclaresReads, Reads, gvk};
 
 /// Resource scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,6 +413,17 @@ impl CrdController {
             .values()
             .cloned()
             .collect()
+    }
+}
+
+/// The CRDs whose served versions it registers handlers for.
+impl DeclaresReads for CrdController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[gvk(
+            "apiextensions.k8s.io",
+            "v1",
+            "CustomResourceDefinition",
+        )])
     }
 }
 

@@ -14,11 +14,19 @@
 //!
 //! * A driver loop that returns: `WatchDriver::run` is `-> Infallible`, so it
 //!   is a type error (E0308). A child's task ends only by panic or abort.
-//! * A child with no name, no wake filter or no [`TickState`]: every fact
-//!   about a child is an exhaustive `match` with no wildcard arm, so a new
-//!   variant without its row is E0004. The no-wildcard rule is held by
+//! * A child with no name or no [`TickState`]: every fact about a child is
+//!   an exhaustive `match` with no wildcard arm, so a new variant without
+//!   its row is E0004. The no-wildcard rule is held by
 //!   `clippy::wildcard_enum_match_arm` (denied in this module) and by a test
 //!   that scans this file — a gate, not a type.
+//! * A driver whose controller declares no reads (T1.7): a driver's wake
+//!   filter is not a row here. The runtime derives it from the controller's
+//!   declared reads ([`engenho_controllers::DeclaresReads`]) and drives no
+//!   controller without them (E0277). That the filter really is built from
+//!   the declaration, and that the declaration names what the controller's
+//!   source reads, is a test, not a type: each spawned driver's [`Wiring`]
+//!   records both halves so the test can check the drivers actually
+//!   spawned.
 //! * A driver or listener that is declared but never walked: [`Driver::ALL`]
 //!   and [`Listener::ALL`] are generated from the enums' own variant lists by
 //!   `closed_enum!`. The three top-level shapes are walked by
@@ -43,7 +51,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use engenho_config::{ControllerEnable, EngenhoConfig};
-use engenho_controllers::{Heartbeat, KindFilter};
+use engenho_controllers::{Heartbeat, KindFilter, Reads};
 use tokio::task::{Id, JoinSet};
 use tracing::error;
 
@@ -120,31 +128,6 @@ pub enum TickState {
     Stateful,
 }
 
-/// Which store events wake a driver.
-///
-/// These are the lists that used to be written inline at each spawn site;
-/// T1.7 derives them from each controller's declared reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Wakes {
-    /// Every committed mutation.
-    All,
-    /// Only events whose kind is one of these (canonical K8s kind names).
-    Kinds(&'static [&'static str]),
-}
-
-impl Wakes {
-    /// The `WatchDriver` filter this becomes.
-    #[must_use]
-    pub fn filter(self) -> KindFilter {
-        match self {
-            Self::All => KindFilter::All,
-            Self::Kinds(kinds) => {
-                KindFilter::Kinds(kinds.iter().map(|k| (*k).to_owned()).collect())
-            }
-        }
-    }
-}
-
 impl Driver {
     /// Stable name, for logs and liveness rows.
     #[must_use]
@@ -170,46 +153,6 @@ impl Driver {
             Self::CsiRegistrar => "csi-registrar",
             Self::CniStatus => "cni-status",
             Self::Kubelet => "kubelet",
-        }
-    }
-
-    /// Which events wake this driver. The fallback tick runs regardless.
-    #[must_use]
-    pub const fn wakes_on(self) -> Wakes {
-        match self {
-            Self::Deployment => Wakes::Kinds(&["Deployment", "ReplicaSet"]),
-            Self::ReplicaSet => Wakes::Kinds(&["ReplicaSet", "Pod"]),
-            Self::StatefulSet => Wakes::Kinds(&["StatefulSet", "Pod"]),
-            Self::DaemonSet => Wakes::Kinds(&["DaemonSet", "Pod", "Node"]),
-            Self::Job => Wakes::Kinds(&["Job", "Pod"]),
-            // The fallback tick is what drives the time-based firing: a
-            // CronJob has no spec edit each minute to wake a pure watch.
-            Self::CronJob => Wakes::Kinds(&["CronJob", "Job"]),
-            Self::PodDisruptionBudget => Wakes::Kinds(&["PodDisruptionBudget", "Pod"]),
-            Self::Endpoints => Wakes::Kinds(&["Service", "Pod", "Endpoints", "EndpointSlice"]),
-            Self::ServiceRouting => Wakes::Kinds(&["Service", "Endpoints", "EndpointSlice"]),
-            Self::Gc => Wakes::All,
-            Self::Namespace => Wakes::Kinds(&["Namespace"]),
-            Self::PvBinder => {
-                Wakes::Kinds(&["PersistentVolumeClaim", "PersistentVolume", "StorageClass"])
-            }
-            Self::VolumeSnapshot => Wakes::Kinds(&[
-                "VolumeSnapshot",
-                "PersistentVolumeClaim",
-                "PersistentVolume",
-            ]),
-            Self::Crd => Wakes::Kinds(&["CustomResourceDefinition"]),
-            Self::Scheduler => Wakes::Kinds(&["Pod", "Node"]),
-            Self::ServedCapability => {
-                Wakes::Kinds(&["APIService", "FlowSchema", "PriorityLevelConfiguration"])
-            }
-            Self::NetworkPolicy => Wakes::Kinds(&["NetworkPolicy"]),
-            // Registration is a filesystem event, not a store one, so this
-            // rides the fallback tick rather than waking on writes it can
-            // never be caused by.
-            Self::CsiRegistrar => Wakes::Kinds(&["CSINode"]),
-            Self::CniStatus => Wakes::Kinds(&["Node"]),
-            Self::Kubelet => Wakes::Kinds(&["Pod"]),
         }
     }
 
@@ -362,20 +305,69 @@ impl fmt::Display for Child {
     }
 }
 
-/// A child's body, ready to spawn: the future and the heartbeat it writes.
+/// What a driver's controller reads, and which events wake the driver, as
+/// the runtime wired it (T1.7).
+///
+/// The runtime builds `wakes` from `reads` and from nothing else; both are
+/// recorded so the claim "a driver wakes on every kind its controller reads"
+/// can be checked against the drivers actually spawned, not against the
+/// function that is supposed to build them.
+#[derive(Debug, Clone)]
+pub struct Wiring {
+    reads: Reads,
+    wakes: KindFilter,
+}
+
+impl Wiring {
+    /// Pair a controller's declared reads with the filter its driver got.
+    pub(crate) fn new(reads: Reads, wakes: KindFilter) -> Self {
+        Self { reads, wakes }
+    }
+
+    /// Every kind the controller declares it reads.
+    #[must_use]
+    pub fn reads(&self) -> &Reads {
+        &self.reads
+    }
+
+    /// Which events wake the driver.
+    #[must_use]
+    pub fn wakes(&self) -> &KindFilter {
+        &self.wakes
+    }
+}
+
+/// A child's body, ready to spawn: the future, the heartbeat it writes and,
+/// for a driver, its [`Wiring`].
 pub(crate) struct ChildTask {
     beat: Arc<Heartbeat>,
+    wiring: Option<Wiring>,
     run: Pin<Box<dyn Future<Output = Infallible> + Send + 'static>>,
 }
 
 impl ChildTask {
-    /// A body that never returns, recording into `beat`.
+    /// A body that never returns, recording into `beat`. For a child that
+    /// is not woken by store events (a listener).
     pub(crate) fn new(
         beat: Arc<Heartbeat>,
         run: impl Future<Output = Infallible> + Send + 'static,
     ) -> Self {
         Self {
             beat,
+            wiring: None,
+            run: Box::pin(run),
+        }
+    }
+
+    /// A driver's body: as [`Self::new`], plus what wakes it and why.
+    pub(crate) fn driver(
+        beat: Arc<Heartbeat>,
+        wiring: Wiring,
+        run: impl Future<Output = Infallible> + Send + 'static,
+    ) -> Self {
+        Self {
+            beat,
+            wiring: Some(wiring),
             run: Box::pin(run),
         }
     }
@@ -428,6 +420,7 @@ pub struct DeadChild {
 #[derive(Debug, Clone)]
 pub struct ChildHandle {
     beat: Arc<Heartbeat>,
+    wiring: Option<Wiring>,
     state: ChildState,
 }
 
@@ -436,6 +429,13 @@ impl ChildHandle {
     #[must_use]
     pub fn beat(&self) -> &Arc<Heartbeat> {
         &self.beat
+    }
+
+    /// What the child's controller reads and what wakes it; `None` for a
+    /// child no store event wakes (a listener).
+    #[must_use]
+    pub fn wiring(&self) -> Option<&Wiring> {
+        self.wiring.as_ref()
     }
 
     /// What the supervisor has seen of the child's task.
@@ -483,6 +483,7 @@ impl Children {
             child,
             ChildHandle {
                 beat: task.beat,
+                wiring: task.wiring,
                 state: ChildState::Running,
             },
         );
@@ -634,17 +635,6 @@ mod tests {
             Child::all().count(),
             "two children share a name"
         );
-    }
-
-    /// An empty kind list would be a driver no event can ever wake.
-    #[test]
-    fn every_driver_wakes_on_something() {
-        for d in Driver::ALL {
-            match d.wakes_on() {
-                Wakes::All => {}
-                Wakes::Kinds(kinds) => assert!(!kinds.is_empty(), "{d:?} wakes on nothing"),
-            }
-        }
     }
 
     /// The plan's one explicit classification: the kubelet's `local` map

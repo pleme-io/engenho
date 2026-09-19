@@ -55,6 +55,7 @@ use tracing::{debug, info};
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
+use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::status::write_status_cas;
 
 /// The Kubernetes namespace finalizer — gates a Namespace's removal until
@@ -206,6 +207,17 @@ impl NamespaceController {
         }
 
         Ok(())
+    }
+}
+
+/// The Namespaces, and every namespaced kind the cascade lists in a
+/// Terminating one, from the same [`namespaced_kinds`] table the sweep
+/// walks. A child's deletion wakes it, so a namespace finishes draining when
+/// its last object goes rather than a fallback interval later.
+impl DeclaresReads for NamespaceController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[gvk("", "v1", "Namespace")])
+            .and(namespaced_kinds().map(|d| gvk(d.group, d.version, d.kind)))
     }
 }
 

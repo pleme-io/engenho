@@ -49,12 +49,13 @@ use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::{ObjectMeta, ShapeError};
 use crate::owned_children::{
-    ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
-    template_object_mut,
+    OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template, template_object_mut,
 };
 use crate::owner::{OwnerReference, owner_ref_for};
+use crate::reads::gvk;
 use crate::status::pod_is_ready;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
+use engenho_types::kind::GroupVersionKind;
 
 /// DaemonSet controller — one node-pinned Pod per schedulable node.
 pub struct DaemonSetController {
@@ -146,9 +147,15 @@ impl OwnedChildrenReconciler for DaemonSetController {
         ParentGvk::new("apps", "v1", "DaemonSet", "apps/v1")
     }
 
-    fn child_kinds(&self) -> &'static [ChildKind] {
-        const CHILD_KINDS: &[ChildKind] = &[ChildKind::new("", "v1", "Pod")];
+    fn child_kinds(&self) -> &'static [GroupVersionKind] {
+        const CHILD_KINDS: &[GroupVersionKind] = &[gvk("", "v1", "Pod")];
         CHILD_KINDS
+    }
+
+    /// The Nodes it places one pod on each of.
+    fn also_reads(&self) -> &'static [GroupVersionKind] {
+        const ALSO: &[GroupVersionKind] = &[gvk("", "v1", "Node")];
+        ALSO
     }
 
     fn store(&self) -> &StoreMesh {

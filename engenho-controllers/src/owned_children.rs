@@ -20,6 +20,8 @@
 //!   * [`OwnedChildrenReconciler::parent_gvk`] — the parent it sweeps,
 //!   * [`OwnedChildrenReconciler::child_kinds`] — the child kind(s) it
 //!     gathers as owned children,
+//!   * [`OwnedChildrenReconciler::also_reads`] — any kind its per-parent
+//!     logic reads beyond those two,
 //!   * [`OwnedChildrenReconciler::reconcile_one`] — the per-parent child
 //!     delta (typed [`ResourceCommand`]s, never `format!()` of JSON),
 //!   * [`OwnedChildrenReconciler::compute_status`] — the `.status` JSON
@@ -30,6 +32,13 @@
 //! hand-written ticks did. Its report counts parents (changed, unchanged,
 //! skipped, failed), not the writes made for them; see
 //! [`crate::sweep::SweepReport`].
+//!
+//! A second blanket, `impl<T: OwnedChildrenReconciler> DeclaresReads for
+//! T`, declares what the controller reads from the same three answers: the
+//! parent kind and child kinds the skeleton lists, plus
+//! [`OwnedChildrenReconciler::also_reads`]. The runtime derives the
+//! driver's wake filter from that (T1.7), so the kinds the skeleton reads
+//! and the kinds that wake it cannot disagree.
 //!
 //! ## Out of family (left as raw `impl Controller`)
 //!
@@ -59,6 +68,7 @@
 
 use async_trait::async_trait;
 use engenho_store::{StoreMesh, command::ResourceCommand, resource::ResourceKey};
+use engenho_types::kind::GroupVersionKind;
 use serde_json::Value;
 
 use crate::controller::{Controller, ReconcileOutcome};
@@ -67,6 +77,7 @@ use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::meta::{ObjectMeta, ShapeError, object_mut};
 use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
+use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::status::{generation_of, write_status_cas};
 use crate::sweep::{ObjectOutcome, Sweep};
 
@@ -139,27 +150,6 @@ pub fn template_object_mut<'v>(
     object_mut(pod, path).map_err(|e| e.under(TEMPLATE))
 }
 
-/// `(group, version, kind)` of a child kind the parent owns. Borrowed
-/// `'static` literals — every controller passes its own canonical
-/// strings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChildKind {
-    pub group: &'static str,
-    pub version: &'static str,
-    pub kind: &'static str,
-}
-
-impl ChildKind {
-    #[must_use]
-    pub const fn new(group: &'static str, version: &'static str, kind: &'static str) -> Self {
-        Self {
-            group,
-            version,
-            kind,
-        }
-    }
-}
-
 /// The `(group, version, kind)` of the parent an owned-children
 /// controller sweeps, plus the `apiVersion` literal its owner-refs
 /// stamp. A typed struct (not a bare tuple) so the four fields can't be
@@ -189,6 +179,13 @@ impl ParentGvk {
             kind,
             api_version,
         }
+    }
+
+    /// The parent's `(group, version, kind)`, without the owner-ref
+    /// `apiVersion`.
+    #[must_use]
+    pub const fn gvk(self) -> GroupVersionKind {
+        gvk(self.group, self.version, self.kind)
     }
 }
 
@@ -233,7 +230,15 @@ pub trait OwnedChildrenReconciler: Send + Sync {
     /// by `is_owned_by(child, parent_uid)`). Usually a single kind
     /// (ReplicaSet→Pod, Deployment→ReplicaSet); the slice supports
     /// controllers that own more than one child kind.
-    fn child_kinds(&self) -> &'static [ChildKind];
+    fn child_kinds(&self) -> &'static [GroupVersionKind];
+
+    /// Every kind [`Self::reconcile_one`] reads from the store beyond the
+    /// parent and child kinds (the Nodes a `DaemonSet` places a pod on, the
+    /// claims a `StatefulSet` creates if absent). `&[]` when it reads none.
+    ///
+    /// No default: an implementer states it, so a read in `reconcile_one`
+    /// is not left out of the wake filter by forgetting to override one.
+    fn also_reads(&self) -> &'static [GroupVersionKind];
 
     /// The store handle the blanket lists + proposes through.
     fn store(&self) -> &StoreMesh;
@@ -298,7 +303,7 @@ pub trait OwnedChildrenReconciler: Send + Sync {
 /// `is_owned_by(child, uid)` is applied for the family.
 async fn gather_owned(
     store: &StoreMesh,
-    child_kinds: &'static [ChildKind],
+    child_kinds: &'static [GroupVersionKind],
     parent_uid: &str,
     ns: Option<&str>,
 ) -> Vec<(ResourceKey, Value)> {
@@ -340,6 +345,18 @@ impl<T: OwnedChildrenReconciler> Controller for T {
             })
             .await?;
         Ok(ReconcileOutcome::from(report))
+    }
+}
+
+/// What an owned-children controller reads: the parent kind and the child
+/// kinds its skeleton lists, and whatever its per-parent logic reads
+/// besides. The same three answers drive the reads, so the wake filter
+/// derived from this cannot miss a kind the skeleton lists.
+impl<T: OwnedChildrenReconciler> DeclaresReads for T {
+    fn reads(&self) -> Reads {
+        Reads::of(&[self.parent_gvk().gvk()])
+            .and(self.child_kinds().iter().copied())
+            .and(self.also_reads().iter().copied())
     }
 }
 
@@ -466,9 +483,13 @@ mod tests {
         fn parent_gvk(&self) -> ParentGvk {
             ParentGvk::new("demo", "v1", "Widget", "demo/v1")
         }
-        fn child_kinds(&self) -> &'static [ChildKind] {
-            const CK: &[ChildKind] = &[ChildKind::new("demo", "v1", "Gadget")];
+        fn child_kinds(&self) -> &'static [GroupVersionKind] {
+            const CK: &[GroupVersionKind] = &[gvk("demo", "v1", "Gadget")];
             CK
+        }
+        fn also_reads(&self) -> &'static [GroupVersionKind] {
+            const ALSO: &[GroupVersionKind] = &[gvk("demo", "v1", "Sprocket")];
+            ALSO
         }
         fn store(&self) -> &StoreMesh {
             &self.store
@@ -613,11 +634,33 @@ mod tests {
     }
 
     #[test]
-    fn child_kind_construction() {
-        let c = ChildKind::new("", "v1", "Pod");
-        assert_eq!(c.group, "");
-        assert_eq!(c.version, "v1");
-        assert_eq!(c.kind, "Pod");
+    fn parent_gvk_drops_only_the_api_version() {
+        let g = ParentGvk::new("apps", "v1", "ReplicaSet", "apps/v1").gvk();
+        assert_eq!(g, gvk("apps", "v1", "ReplicaSet"));
+    }
+
+    /// The wake filter is derived from these reads (T1.7): the parent the
+    /// skeleton lists, the children it gathers, and what the per-parent
+    /// logic reads besides — and nothing it does not read.
+    #[tokio::test]
+    async fn an_owned_children_controller_reads_its_parent_children_and_extras() {
+        let c = WidgetReconciler::new(test_store().await);
+        let reads = c.reads();
+        assert_eq!(
+            reads.kinds(),
+            Some(
+                &[
+                    gvk("demo", "v1", "Widget"),
+                    gvk("demo", "v1", "Gadget"),
+                    gvk("demo", "v1", "Sprocket"),
+                ][..]
+            )
+        );
+        let wakes = reads.filter();
+        for kind in ["Widget", "Gadget", "Sprocket"] {
+            assert!(wakes.wakes_on(kind), "{kind} does not wake it");
+        }
+        assert!(!wakes.wakes_on("Pod"));
     }
 
     #[test]

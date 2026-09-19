@@ -26,11 +26,13 @@ use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::{ObjectMeta, REPLICAS, ShapeError};
 use crate::owned_children::{
-    ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
+    OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
 };
 use crate::owner::{OwnerReference, owner_ref_for};
+use crate::reads::gvk;
 use crate::status::pod_is_ready;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
+use engenho_types::kind::GroupVersionKind;
 
 pub struct ReplicaSetController {
     store: Arc<StoreMesh>,
@@ -132,9 +134,13 @@ impl OwnedChildrenReconciler for ReplicaSetController {
         ParentGvk::new("apps", "v1", "ReplicaSet", "apps/v1")
     }
 
-    fn child_kinds(&self) -> &'static [ChildKind] {
-        const CHILD_KINDS: &[ChildKind] = &[ChildKind::new("", "v1", "Pod")];
+    fn child_kinds(&self) -> &'static [GroupVersionKind] {
+        const CHILD_KINDS: &[GroupVersionKind] = &[gvk("", "v1", "Pod")];
         CHILD_KINDS
+    }
+
+    fn also_reads(&self) -> &'static [GroupVersionKind] {
+        &[]
     }
 
     fn store(&self) -> &StoreMesh {

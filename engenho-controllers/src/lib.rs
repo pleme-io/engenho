@@ -71,6 +71,7 @@ pub mod plantio;
 pub mod plantio_pipeline;
 pub mod pod_template;
 pub mod pv_binder;
+pub mod reads;
 pub mod replicaset;
 pub mod roceiro;
 pub mod runtime;
@@ -154,7 +155,7 @@ pub use network_policy::{
     CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,
     NetworkPolicyEnforcer, NetworkPolicyError, NetworkPolicyRule, PeerSelector, PortSpec,
 };
-pub use owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
+pub use owned_children::{OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
 pub use owner::{
     OwnerReference, controlling_owner, is_owned_by, owner_ref_for, set_owner_reference,
 };
@@ -169,6 +170,7 @@ pub use pv_binder::{
     ClaimUid, ENGENHO_LOCAL_PATH_PROVISIONER, FakeProvisionerEnv, HostProvisionerEnv,
     LOCAL_PATH_PROVISIONER, NoVolumeIdentity, ProvisionerEnv, PvBinderController, PvName,
 };
+pub use reads::{DeclaresReads, Reads, gvk};
 pub use replicaset::ReplicaSetController;
 pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};
 pub use runtime::{ControllerRuntime, RuntimeConfig};

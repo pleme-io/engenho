@@ -43,6 +43,7 @@ use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::ObjectMeta;
 use crate::owner::{owner_ref_for, set_owner_reference};
+use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::selector::{matches_labels, service_selector};
 use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
 
@@ -285,6 +286,19 @@ impl EndpointsController {
             })
             .await?;
         Ok(Effect::of(applied.op))
+    }
+}
+
+/// The Services it projects, the Pods their selectors match, and the
+/// Endpoints and `EndpointSlice` it compares against before writing.
+impl DeclaresReads for EndpointsController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[
+            gvk("", "v1", "Service"),
+            gvk("", "v1", "Pod"),
+            gvk("", "v1", "Endpoints"),
+            gvk("discovery.k8s.io", "v1", "EndpointSlice"),
+        ])
     }
 }
 

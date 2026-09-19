@@ -68,6 +68,7 @@ use tokio::sync::Mutex;
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
+use crate::reads::{DeclaresReads, Reads, gvk};
 
 /// A single routing entry — one ClusterIP:port → set of pod backends.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -920,6 +921,15 @@ impl ServiceRoutingController {
 
     fn service_id(namespace: &str, name: &str) -> String {
         format!("{namespace}/{name}")
+    }
+}
+
+/// The Services it routes and the Endpoints that back them. It reads no
+/// `EndpointSlice`: the hand list this replaced woke it on those too, for
+/// nothing.
+impl DeclaresReads for ServiceRoutingController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[gvk("", "v1", "Service"), gvk("", "v1", "Endpoints")])
     }
 }
 

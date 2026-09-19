@@ -36,10 +36,12 @@ use serde_json::{Value, json};
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::{DefaultedInt, ObjectMeta, REPLICAS, ShapeError, warn_unreadable};
-use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
+use crate::owned_children::{OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
 use crate::owner::{owner_ref_for, set_owner_reference};
 use crate::pod_template::{NormalizedTemplate, POD_TEMPLATE_HASH_LABEL, TemplateHash};
+use crate::reads::gvk;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
+use engenho_types::kind::GroupVersionKind;
 
 /// The counts a `ReplicaSet`'s controller writes into its status, which a
 /// Deployment's status sums. Absent is 0: a `ReplicaSet` the controller
@@ -138,9 +140,13 @@ impl OwnedChildrenReconciler for DeploymentController {
         ParentGvk::new("apps", "v1", "Deployment", "apps/v1")
     }
 
-    fn child_kinds(&self) -> &'static [ChildKind] {
-        const CHILD_KINDS: &[ChildKind] = &[ChildKind::new("apps", "v1", "ReplicaSet")];
+    fn child_kinds(&self) -> &'static [GroupVersionKind] {
+        const CHILD_KINDS: &[GroupVersionKind] = &[gvk("apps", "v1", "ReplicaSet")];
         CHILD_KINDS
+    }
+
+    fn also_reads(&self) -> &'static [GroupVersionKind] {
+        &[]
     }
 
     fn store(&self) -> &StoreMesh {

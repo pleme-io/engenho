@@ -34,11 +34,13 @@ use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::ObjectMeta;
 use crate::meta::{REPLICAS, ShapeError, array_mut};
-use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
+use crate::owned_children::{OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
 use crate::owned_children::{TEMPLATE, pod_from_template};
 use crate::owner::{OwnerReference, owner_ref_for};
+use crate::reads::gvk;
 use crate::status::pod_is_ready;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
+use engenho_types::kind::GroupVersionKind;
 
 /// Where a pod's volumes live.
 const POD_VOLUMES: &[&str] = &["spec", "volumes"];
@@ -260,9 +262,17 @@ impl OwnedChildrenReconciler for StatefulSetController {
         ParentGvk::new("apps", "v1", "StatefulSet", "apps/v1")
     }
 
-    fn child_kinds(&self) -> &'static [ChildKind] {
-        const CHILD_KINDS: &[ChildKind] = &[ChildKind::new("", "v1", "Pod")];
+    fn child_kinds(&self) -> &'static [GroupVersionKind] {
+        const CHILD_KINDS: &[GroupVersionKind] = &[gvk("", "v1", "Pod")];
         CHILD_KINDS
+    }
+
+    /// The claims it creates from `volumeClaimTemplates` when absent: a
+    /// claim deleted out from under a replica is recreated on the event,
+    /// not a fallback interval later.
+    fn also_reads(&self) -> &'static [GroupVersionKind] {
+        const ALSO: &[GroupVersionKind] = &[gvk("", "v1", "PersistentVolumeClaim")];
+        ALSO
     }
 
     fn store(&self) -> &StoreMesh {

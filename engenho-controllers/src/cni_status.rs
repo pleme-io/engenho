@@ -42,6 +42,7 @@ use engenho_store::resource::ResourceKey;
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
+use crate::reads::{DeclaresReads, Reads, gvk};
 
 /// Whether the plugin chain is executed or only computed.
 pub const INSTALL_ANNOTATION: &str = "engenho.io/cni-install";
@@ -177,6 +178,13 @@ impl CniStatusController {
                 }
             }
         }
+    }
+}
+
+/// This node's Node object, which it publishes the resolved network onto.
+impl DeclaresReads for CniStatusController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[gvk("", "v1", "Node")])
     }
 }
 

@@ -59,6 +59,7 @@ use crate::meta::{ShapeError, object_mut};
 use crate::network_policy::{
     Direction, NetworkPolicyEnforcer, NetworkPolicyRule, PeerSelector, PolicyDatapath, PortSpec,
 };
+use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::sweep::{ObjectOutcome, Sweep};
 
 /// The annotation carrying the enforcement verdict, so the distinction is
@@ -466,6 +467,13 @@ impl NetworkPolicyController {
                 .await;
         }
         Ok(ObjectOutcome::from(effect))
+    }
+}
+
+/// The policies it translates into enforcer rules.
+impl DeclaresReads for NetworkPolicyController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[gvk("networking.k8s.io", "v1", "NetworkPolicy")])
     }
 }
 

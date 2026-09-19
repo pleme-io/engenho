@@ -15,14 +15,16 @@ use engenho_config::{
     ResolvedDatapath,
 };
 use engenho_controllers::{
-    Controller, CrdController, CronJobController, DaemonSetController, DeploymentController,
-    DynamicHandlerSink, EndpointsController, FakeRouter, GcController, Heartbeat, IptablesRouter,
-    IpvsRouter, JobController, NamespaceController, PodDisruptionBudgetController,
-    PvBinderController, ReplicaSetController, ServiceRouter, ServiceRoutingController,
-    StatefulSetController, TickClass, WallClock, WatchDriver, WatchDriverConfig,
+    Controller, ControllerError, CrdController, CronJobController, DaemonSetController,
+    DeclaresReads, DeploymentController, DynamicHandlerSink, EndpointsController, FakeRouter,
+    GcController, Heartbeat, IptablesRouter, IpvsRouter, JobController, NamespaceController,
+    PodDisruptionBudgetController, PvBinderController, Reads, ReconcileOutcome,
+    ReplicaSetController, ServiceRouter, ServiceRoutingController, StatefulSetController,
+    TickClass, WallClock, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
     event_recorder::EventSink,
+    gvk,
 };
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_kubelet::config_bridge::KubeletBackendKind;
@@ -40,9 +42,10 @@ use engenho_types::generated_v1_34::rbac_v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
 };
 use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
+use engenho_types::kind::GroupVersionKind;
 use tracing::{info, warn};
 
-use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener};
+use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, Wiring};
 use crate::error::RuntimeError;
 
 /// The assembled single-node runtime. Owns the store spine, the
@@ -2534,6 +2537,69 @@ fn spawn_children(
     (children, parts.kubelet)
 }
 
+/// A controller whose own crate does not declare what it reads yet, with
+/// the declaration made here, beside its spawn site.
+///
+/// `pending-declared-reads: kubelet, csi-registrar, scheduler`. They live
+/// in engenho-kubelet and engenho-scheduler, outside the change that
+/// introduced [`DeclaresReads`]; each `impl DeclaresReads` belongs beside
+/// its type, and this wrapper is deleted when the three move there. Until
+/// then their kinds were read off their ticks, and the read census in this
+/// module's tests scans those crates' sources to hold them to it.
+struct DeclaredHere<C> {
+    controller: C,
+    reads: Reads,
+}
+
+impl<C> DeclaredHere<C> {
+    fn new(controller: C, reads: Reads) -> Self {
+        Self { controller, reads }
+    }
+}
+
+#[async_trait::async_trait]
+impl<C: Controller> Controller for DeclaredHere<C> {
+    fn name(&self) -> &'static str {
+        self.controller.name()
+    }
+
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+        self.controller.tick().await
+    }
+}
+
+impl<C> DeclaresReads for DeclaredHere<C> {
+    fn reads(&self) -> Reads {
+        self.reads.clone()
+    }
+}
+
+/// What the kubelet's tick reads: the Pods (it keeps those bound to its
+/// node), its own Node and node Lease (the Ready condition is judged from
+/// the Lease read back out of the store), the Services it resolves into a
+/// pod's environment and host aliases, and the `ConfigMaps`, Secrets,
+/// `ServiceAccounts`, claims and volumes a pod's volumes and env name.
+///
+/// The Lease and Node are also what it writes, once per renewal and on a
+/// readiness change: its own write wakes it once more, bounded, never in a
+/// loop. The filter is by kind, so a Lease renewed by any other holder
+/// wakes it too; a filter narrowed to its own objects is not built yet.
+const KUBELET_READS: &[GroupVersionKind] = &[
+    gvk("", "v1", "Pod"),
+    gvk("", "v1", "Node"),
+    gvk("coordination.k8s.io", "v1", "Lease"),
+    gvk("", "v1", "Service"),
+    gvk("", "v1", "ConfigMap"),
+    gvk("", "v1", "Secret"),
+    gvk("", "v1", "ServiceAccount"),
+    gvk("", "v1", "PersistentVolumeClaim"),
+    gvk("", "v1", "PersistentVolume"),
+];
+
+/// What the scheduler's tick reads: the Pods it binds and the Nodes it
+/// binds them to.
+const SCHEDULER_READS: &[GroupVersionKind] = &[gvk("", "v1", "Pod"), gvk("", "v1", "Node")];
+
 /// What every catalog child is built from, assembled ONCE before the walk.
 ///
 /// The shared pieces live here rather than inside any one child's arm
@@ -2610,16 +2676,24 @@ impl<'a> Parts<'a> {
         }
     }
 
-    /// Wrap `controller` in a `WatchDriver` configured from its catalog row.
-    fn watch<C: Controller + 'static>(&self, driver: Driver, controller: C) -> ChildTask {
+    /// Wrap `controller` in a `WatchDriver` woken by exactly the kinds it
+    /// declares it reads (T1.7). This is the only place a driver's filter is
+    /// built, and it takes nothing but the declaration: a controller that
+    /// declares no reads cannot be driven (E0277), and no list of what wakes
+    /// a driver is written anywhere. The three controllers whose crates do
+    /// not declare yet are declared beside their spawn ([`DeclaredHere`]),
+    /// as reads, and the read census holds those to their sources too.
+    fn watch<C: Controller + DeclaresReads + 'static>(&self, controller: C) -> ChildTask {
+        let reads = controller.reads();
         let config = WatchDriverConfig {
-            filter: driver.wakes_on().filter(),
+            filter: reads.filter(),
             debounce: self.debounce,
             fallback_interval: self.fallback,
             stuck_tick_after: STUCK_TICK_AFTER,
         };
         let watch = WatchDriver::new(controller, self.store.clone(), config);
-        ChildTask::new(watch.heartbeat(), watch.run())
+        let wiring = Wiring::new(reads, watch.wakes().clone());
+        ChildTask::driver(watch.heartbeat(), wiring, watch.run())
     }
 
     #[allow(
@@ -2631,42 +2705,33 @@ impl<'a> Parts<'a> {
         let ns = || self.ns.clone();
         let events = || self.events.clone();
         match driver {
-            Driver::Deployment => self.watch(
-                driver,
-                DeploymentController::new(store.clone(), ns()).with_event_sink(events()),
-            ),
-            Driver::ReplicaSet => self.watch(
-                driver,
-                ReplicaSetController::new(store.clone(), ns()).with_event_sink(events()),
-            ),
-            Driver::StatefulSet => self.watch(
-                driver,
-                StatefulSetController::new(store.clone(), ns()).with_event_sink(events()),
-            ),
-            Driver::DaemonSet => self.watch(
-                driver,
-                DaemonSetController::new(store.clone(), ns()).with_event_sink(events()),
-            ),
-            Driver::Job => self.watch(
-                driver,
-                JobController::new(store.clone(), ns()).with_event_sink(events()),
-            ),
+            Driver::Deployment => {
+                self.watch(DeploymentController::new(store.clone(), ns()).with_event_sink(events()))
+            }
+            Driver::ReplicaSet => {
+                self.watch(ReplicaSetController::new(store.clone(), ns()).with_event_sink(events()))
+            }
+            Driver::StatefulSet => self
+                .watch(StatefulSetController::new(store.clone(), ns()).with_event_sink(events())),
+            Driver::DaemonSet => {
+                self.watch(DaemonSetController::new(store.clone(), ns()).with_event_sink(events()))
+            }
+            Driver::Job => {
+                self.watch(JobController::new(store.clone(), ns()).with_event_sink(events()))
+            }
             // CronJob: parses spec.schedule (5-field cron) against the
             // WallClock and creates a batch/v1 Job from the jobTemplate on
             // schedule; the JobController then runs that Job's Pods.
             Driver::CronJob => self.watch(
-                driver,
                 CronJobController::new(store.clone(), Arc::new(WallClock), ns())
                     .with_event_sink(events()),
             ),
-            Driver::PodDisruptionBudget => self.watch(
-                driver,
-                PodDisruptionBudgetController::new(store.clone(), ns()),
-            ),
-            Driver::Endpoints => self.watch(
-                driver,
-                EndpointsController::new(store.clone(), ns()).with_event_sink(events()),
-            ),
+            Driver::PodDisruptionBudget => {
+                self.watch(PodDisruptionBudgetController::new(store.clone(), ns()))
+            }
+            Driver::Endpoints => {
+                self.watch(EndpointsController::new(store.clone(), ns()).with_event_sink(events()))
+            }
             // Service routing: resolves Service + Endpoints → typed
             // ServiceRoutes and drives the platform-selected datapath
             // backend. The backend is chosen by `networking.datapath_mode`
@@ -2686,16 +2751,14 @@ impl<'a> Parts<'a> {
                     mode = ?self.config.networking.datapath_mode,
                     "service routing backend selected"
                 );
-                self.watch(
-                    driver,
-                    ServiceRoutingController::new(store.clone(), backend, ns()),
-                )
+                self.watch(ServiceRoutingController::new(store.clone(), backend, ns()))
             }
-            Driver::Gc => self.watch(driver, GcController::new(store.clone(), ns())),
+            Driver::Gc => self.watch(GcController::new(store.clone(), ns())),
             // Namespace: cascade-deletion of a Terminating namespace's
-            // contents + finalizer clear; the fallback tick drains it over a
-            // few reconcile cycles.
-            Driver::Namespace => self.watch(driver, NamespaceController::new(store.clone(), ns())),
+            // contents + finalizer clear. It reads every namespaced kind, so
+            // each child's deletion wakes it; the fallback tick covers the
+            // rest of the drain.
+            Driver::Namespace => self.watch(NamespaceController::new(store.clone(), ns())),
             // PV/PVC binder: binds Pending claims to matching Available PVs
             // and dynamically provisions a node-local hostPath PV (under
             // data_dir/local-path) when no static PV matches. A claim that
@@ -2710,7 +2773,6 @@ impl<'a> Parts<'a> {
                     .to_string_lossy()
                     .into_owned();
                 self.watch(
-                    driver,
                     PvBinderController::new(store.clone(), ns(), local_path_root)
                         .with_csi(Arc::new(engenho_kubelet::DriverCsiProvisioner::new(
                             self.csi_drivers.clone(),
@@ -2729,7 +2791,6 @@ impl<'a> Parts<'a> {
                     .to_string_lossy()
                     .into_owned();
                 self.watch(
-                    driver,
                     engenho_controllers::volume_snapshot::VolumeSnapshotController::new(
                         store.clone(),
                         snapshot_root,
@@ -2742,19 +2803,18 @@ impl<'a> Parts<'a> {
             // become routable + discoverable with no parallel codepath. The
             // fallback tick covers a CRD installed before the driver
             // subscribed.
-            Driver::Crd => self.watch(
-                driver,
-                CrdController::new(store.clone(), self.handler_sink.clone()),
-            ),
+            Driver::Crd => self.watch(CrdController::new(store.clone(), self.handler_sink.clone())),
             // Scheduler: pending Pod → spec.nodeName.
-            Driver::Scheduler => self.watch(driver, self.scheduler.clone()),
+            Driver::Scheduler => self.watch(DeclaredHere::new(
+                self.scheduler.clone(),
+                Reads::of(SCHEDULER_READS),
+            )),
             // Served-capability honesty: truthful status conditions on the
             // kinds engenho advertises in discovery but does not implement
             // (APIService, FlowSchema, PriorityLevelConfiguration). Without
             // it an aggregated APIService registers successfully while every
             // request to its group silently goes nowhere.
             Driver::ServedCapability => self.watch(
-                driver,
                 engenho_controllers::served_capability::ServedCapabilityController::new(
                     store.clone(),
                 ),
@@ -2771,7 +2831,6 @@ impl<'a> Parts<'a> {
                     engenho_controllers::network_policy::ComputedNetworkPolicyEnforcer::new(),
                 );
                 self.watch(
-                    driver,
                     engenho_controllers::network_policy_controller::NetworkPolicyController::new(
                         store.clone(),
                         enforcer,
@@ -2783,26 +2842,32 @@ impl<'a> Parts<'a> {
             // keep the driver table in sync. Without it the whole CSI plane
             // is inert — a driver deploys, creates its sockets, and nothing
             // ever dials them.
-            Driver::CsiRegistrar => self.watch(
-                driver,
+            //
+            // It reads nothing from the store: registration is a filesystem
+            // event, so no store event wakes it and the fallback tick drives
+            // the scan.
+            Driver::CsiRegistrar => self.watch(DeclaredHere::new(
                 engenho_kubelet::CsiRegistrarController::new(
                     &self.config.runtime.data_dir,
                     self.csi_drivers.clone(),
                 ),
-            ),
+                Reads::nothing(),
+            )),
             // CNI status: publish which network config this node resolved
             // and whether its plugin chain is executed or merely planned.
-            Driver::CniStatus => self.watch(
-                driver,
-                engenho_controllers::cni_status::CniStatusController::new(
+            Driver::CniStatus => {
+                self.watch(engenho_controllers::cni_status::CniStatusController::new(
                     store.clone(),
                     self.config.runtime.node_name.clone(),
                     std::path::PathBuf::from(CNI_CONFIG_DIR),
                     CNI_INSTALL,
-                ),
-            ),
+                ))
+            }
             // Kubelet: bound Pod → container via the backend.
-            Driver::Kubelet => self.watch(driver, self.kubelet.clone()),
+            Driver::Kubelet => self.watch(DeclaredHere::new(
+                self.kubelet.clone(),
+                Reads::of(KUBELET_READS),
+            )),
         }
     }
 
@@ -3282,8 +3347,9 @@ mod tests {
 
     use super::*;
     use crate::child::{ChildHandle, ChildState};
+    use crate::read_census::{Census, Section};
     use engenho_config::KubeletBackendKind as CfgKind;
-    use engenho_controllers::Beat;
+    use engenho_controllers::{Beat, KindFilter};
     use std::collections::BTreeSet;
 
     // ── host capacity ────────────────────────────────────────────────────
@@ -3612,6 +3678,179 @@ mod tests {
                 .is_none()
         );
         rt.shutdown().await.unwrap();
+    }
+
+    // ── T1.7: a driver wakes on every kind its controller reads ──────────
+    //
+    // A driver's filter is derived from its controller's declared reads.
+    // These hold the SPAWNED drivers to that — what the runtime actually
+    // wired, not the function that is supposed to wire it — and hold each
+    // declaration to the reads its controller's source makes.
+
+    /// Where each driver's controller reads from. An exhaustive match: a
+    /// driver added without its sources is E0004, so no spawned controller
+    /// escapes the census.
+    fn controller_sources(driver: Driver) -> Vec<Section> {
+        macro_rules! file {
+            ($path:literal) => {
+                Section::file($path, include_str!(concat!("../../", $path)))
+            };
+        }
+        macro_rules! section {
+            ($path:literal, $from:literal, $until:expr) => {
+                Section::between($path, include_str!(concat!("../../", $path)), $from, $until)
+            };
+        }
+        match driver {
+            Driver::Deployment => vec![file!("engenho-controllers/src/deployment.rs")],
+            Driver::ReplicaSet => vec![file!("engenho-controllers/src/replicaset.rs")],
+            Driver::StatefulSet => vec![file!("engenho-controllers/src/statefulset.rs")],
+            Driver::DaemonSet => vec![file!("engenho-controllers/src/daemonset.rs")],
+            Driver::Job => vec![section!(
+                "engenho-controllers/src/job.rs",
+                "pub struct JobController",
+                Some("pub struct CronJobController")
+            )],
+            Driver::CronJob => vec![section!(
+                "engenho-controllers/src/job.rs",
+                "pub struct CronJobController",
+                None
+            )],
+            Driver::PodDisruptionBudget => vec![file!("engenho-controllers/src/pdb.rs")],
+            Driver::Endpoints => vec![file!("engenho-controllers/src/endpoints.rs")],
+            Driver::ServiceRouting => vec![file!("engenho-controllers/src/service_router.rs")],
+            Driver::Gc => vec![file!("engenho-controllers/src/gc.rs")],
+            Driver::Namespace => vec![file!("engenho-controllers/src/namespace.rs")],
+            Driver::PvBinder => vec![
+                file!("engenho-controllers/src/pv_binder.rs"),
+                file!("engenho-controllers/src/pv_binder/identity.rs"),
+            ],
+            Driver::VolumeSnapshot => vec![file!("engenho-controllers/src/volume_snapshot.rs")],
+            Driver::Crd => vec![file!("engenho-controllers/src/crd.rs")],
+            Driver::Scheduler => vec![file!("engenho-scheduler/src/scheduler.rs")],
+            Driver::ServedCapability => {
+                vec![file!("engenho-controllers/src/served_capability.rs")]
+            }
+            Driver::NetworkPolicy => {
+                vec![file!(
+                    "engenho-controllers/src/network_policy_controller.rs"
+                )]
+            }
+            Driver::CsiRegistrar => vec![section!(
+                "engenho-kubelet/src/csi_materializer.rs",
+                "pub struct CsiRegistrarController",
+                None
+            )],
+            Driver::CniStatus => vec![file!("engenho-controllers/src/cni_status.rs")],
+            Driver::Kubelet => vec![file!("engenho-kubelet/src/kubelet.rs")],
+        }
+    }
+
+    /// For every spawned driver, every kind its controller reads wakes it:
+    /// each kind it declares, and each kind its source reads by literal.
+    /// A controller reading a kind missing from its filter fails here —
+    /// whether the kind was never declared or the filter was not built
+    /// from the declaration.
+    #[tokio::test]
+    async fn every_driver_wakes_on_every_kind_its_controller_reads() {
+        let rt = Runtime::start(ephemeral_test_config()).await.unwrap();
+        let mut undeclared: BTreeSet<(Driver, String)> = BTreeSet::new();
+        let mut sleeps_through: BTreeSet<(Driver, String)> = BTreeSet::new();
+        for &driver in Driver::ALL {
+            let wiring = rt
+                .children()
+                .get(Child::Driver(driver))
+                .and_then(ChildHandle::wiring)
+                .unwrap_or_else(|| panic!("{driver:?} was not spawned with its wiring"));
+            let (reads, wakes) = (wiring.reads(), wiring.wakes());
+            let census = Census::of(&controller_sources(driver));
+
+            if census.every && reads.kinds().is_some() {
+                undeclared.insert((driver, "every kind (the whole catalog)".to_owned()));
+            }
+            for kind in &census.kinds {
+                if !reads.includes(kind) {
+                    undeclared.insert((driver, kind.clone()));
+                }
+                if !wakes.wakes_on(kind) {
+                    sleeps_through.insert((driver, kind.clone()));
+                }
+            }
+            match reads.kinds() {
+                Some(declared) => {
+                    for kind in declared {
+                        if !wakes.wakes_on(kind.kind) {
+                            sleeps_through.insert((driver, kind.kind.to_owned()));
+                        }
+                    }
+                }
+                None => {
+                    if !matches!(wakes, KindFilter::All) {
+                        sleeps_through.insert((driver, "every kind".to_owned()));
+                    }
+                }
+            }
+        }
+        rt.shutdown().await.unwrap();
+
+        assert!(
+            undeclared.is_empty(),
+            "a controller reads a kind it does not declare: {undeclared:?}"
+        );
+        assert!(
+            sleeps_through.is_empty(),
+            "a driver does not wake on a kind its controller reads: {sleeps_through:?}"
+        );
+    }
+
+    /// The positive control for the test above: the census, run on the
+    /// real sources, sees the reads the old hand-written filters missed.
+    /// A census gone blind would pass every controller vacuously.
+    #[test]
+    fn the_census_sees_the_reads_the_hand_lists_missed() {
+        let seen = |driver| Census::of(&controller_sources(driver)).kinds;
+        assert!(seen(Driver::StatefulSet).contains("PersistentVolumeClaim"));
+        assert!(seen(Driver::DaemonSet).contains("Node"));
+        let binder = seen(Driver::PvBinder);
+        assert!(binder.contains("VolumeSnapshot") && binder.contains("VolumeSnapshotContent"));
+        let kubelet = seen(Driver::Kubelet);
+        for kind in [
+            "Pod",
+            "Node",
+            "Service",
+            "ConfigMap",
+            "Secret",
+            "ServiceAccount",
+            "PersistentVolumeClaim",
+            "PersistentVolume",
+        ] {
+            assert!(kubelet.contains(kind), "the kubelet census missed {kind}");
+        }
+        assert_eq!(
+            seen(Driver::Scheduler).into_iter().collect::<Vec<_>>(),
+            ["Node", "Pod"]
+        );
+        let registrar = Census::of(&controller_sources(Driver::CsiRegistrar));
+        assert!(registrar.kinds.is_empty() && registrar.computed == 0);
+    }
+
+    /// The CSI registrar reads nothing from the store, so no store event
+    /// wakes it: registration is a filesystem event the fallback tick scans
+    /// for. The hand list this replaced woke it on `CSINode`, a kind it
+    /// never reads.
+    #[tokio::test]
+    async fn a_driver_whose_controller_reads_nothing_wakes_on_nothing() {
+        let rt = Runtime::start(ephemeral_test_config()).await.unwrap();
+        let wiring = rt
+            .children()
+            .get(Child::Driver(Driver::CsiRegistrar))
+            .and_then(ChildHandle::wiring)
+            .cloned()
+            .expect("the CSI registrar is spawned with its wiring");
+        rt.shutdown().await.unwrap();
+        assert_eq!(wiring.reads().kinds(), Some(&[][..]));
+        assert!(!wiring.wakes().wakes_on("CSINode"));
+        assert!(!wiring.wakes().wakes_on("Pod"));
     }
 }
 

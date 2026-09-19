@@ -45,6 +45,7 @@ use engenho_store::command::{Reason, ResourceCommand};
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
+use crate::reads::{DeclaresReads, Reads, gvk};
 
 /// The condition type engenho uses to declare that a kind's behaviour is
 /// not implemented on this server.
@@ -363,6 +364,19 @@ impl ServedCapabilityController {
     #[must_use]
     pub fn new(store: Arc<StoreMesh>) -> Self {
         Self { store }
+    }
+}
+
+/// Every inert kind, from the same [`InertKind::all`] its tick walks.
+impl DeclaresReads for ServedCapabilityController {
+    fn reads(&self) -> Reads {
+        InertKind::all()
+            .into_iter()
+            .map(|kind| {
+                let (group, version) = kind.group_version();
+                gvk(group, version, kind.kind_name())
+            })
+            .collect()
     }
 }
 

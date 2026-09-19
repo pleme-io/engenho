@@ -85,7 +85,9 @@ use crate::csi_provisioner::{CsiCreateRequest, CsiProvisioner, NoCsiProvisioner,
 use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
+use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
+use crate::volume_snapshot::{SNAPSHOT_GROUP, SNAPSHOT_VERSION};
 
 pub use identity::{ClaimUid, LocalPathDir, NoVolumeIdentity, PvName};
 
@@ -1025,6 +1027,21 @@ impl PvBinderController {
         debug!(pvc = %pvc_key.label(), pv = %volume_name, ?outcome, "local-path provision");
         claimed_this_tick.push(volume_name);
         Ok(outcome)
+    }
+}
+
+/// Claims, the volumes and classes that satisfy them, and the snapshots a
+/// claim with a `dataSource` is restored from. A snapshot turning
+/// `readyToUse` wakes the binder, so the claim waiting on it binds then.
+impl DeclaresReads for PvBinderController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[
+            gvk("", "v1", "PersistentVolumeClaim"),
+            gvk("", "v1", "PersistentVolume"),
+            gvk("storage.k8s.io", "v1", "StorageClass"),
+            gvk(SNAPSHOT_GROUP, SNAPSHOT_VERSION, "VolumeSnapshot"),
+            gvk(SNAPSHOT_GROUP, SNAPSHOT_VERSION, "VolumeSnapshotContent"),
+        ])
     }
 }
 

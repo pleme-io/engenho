@@ -57,6 +57,7 @@ use serde_json::{Value, json};
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
+use crate::reads::{DeclaresReads, Reads, gvk};
 
 /// The snapshot API group.
 pub const SNAPSHOT_GROUP: &str = "snapshot.storage.k8s.io";
@@ -189,6 +190,18 @@ impl VolumeSnapshotController {
             .and_then(|s| s.get("readyToUse"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
+    }
+}
+
+/// The snapshots it takes, and the claim and volume each one copies. The
+/// `VolumeSnapshotContent` it writes is output, not input.
+impl DeclaresReads for VolumeSnapshotController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[
+            gvk(SNAPSHOT_GROUP, SNAPSHOT_VERSION, "VolumeSnapshot"),
+            gvk("", "v1", "PersistentVolumeClaim"),
+            gvk("", "v1", "PersistentVolume"),
+        ])
     }
 }
 

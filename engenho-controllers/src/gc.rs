@@ -46,6 +46,7 @@ use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::owner::controlling_owner;
+use crate::reads::{DeclaresReads, Reads};
 
 pub struct GcController {
     store: Arc<StoreMesh>,
@@ -140,6 +141,15 @@ fn uid_of(value: &serde_json::Value) -> Option<String> {
         .and_then(|m| m.get("uid"))
         .and_then(|u| u.as_str())
         .map(ToString::to_string)
+}
+
+/// Every kind: it looks an owner up by whatever kind the dependent's
+/// owner reference names, which it cannot know ahead of time, so any event
+/// may be the deletion that orphans something.
+impl DeclaresReads for GcController {
+    fn reads(&self) -> Reads {
+        Reads::every()
+    }
 }
 
 #[async_trait]

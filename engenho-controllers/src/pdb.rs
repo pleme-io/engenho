@@ -41,6 +41,7 @@ use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::meta::warn_unreadable;
+use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::selector::{matches_labels, selector_match_labels};
 use crate::status::generation_of;
 
@@ -176,6 +177,16 @@ impl PodDisruptionBudgetController {
             disruptions_allowed: read("disruptionsAllowed")?,
             observed_generation: read("observedGeneration")?,
         })
+    }
+}
+
+/// The budgets, and the Pods their selectors count.
+impl DeclaresReads for PodDisruptionBudgetController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[
+            gvk("policy", "v1", "PodDisruptionBudget"),
+            gvk("", "v1", "Pod"),
+        ])
     }
 }
 

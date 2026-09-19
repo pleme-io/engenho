@@ -57,11 +57,12 @@ use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::{DefaultedInt, ObjectMeta, ShapeError, int_at, object_mut};
 use crate::owned_children::{
-    ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
-    template_object_mut,
+    OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template, template_object_mut,
 };
 use crate::owner::{OwnerReference, owner_ref_for, set_owner_reference};
+use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
+use engenho_types::kind::GroupVersionKind;
 
 /// Where a `CronJob`'s job labels are declared.
 const JOB_TEMPLATE_LABELS: &[&str] = &["spec", "jobTemplate", "metadata", "labels"];
@@ -167,9 +168,13 @@ impl OwnedChildrenReconciler for JobController {
         ParentGvk::new("batch", "v1", "Job", "batch/v1")
     }
 
-    fn child_kinds(&self) -> &'static [ChildKind] {
-        const CHILD_KINDS: &[ChildKind] = &[ChildKind::new("", "v1", "Pod")];
+    fn child_kinds(&self) -> &'static [GroupVersionKind] {
+        const CHILD_KINDS: &[GroupVersionKind] = &[gvk("", "v1", "Pod")];
         CHILD_KINDS
+    }
+
+    fn also_reads(&self) -> &'static [GroupVersionKind] {
+        &[]
     }
 
     fn store(&self) -> &StoreMesh {
@@ -467,6 +472,15 @@ impl Controller for CronJobController {
             })
             .await?;
         Ok(ReconcileOutcome::from(report))
+    }
+}
+
+/// The `CronJob`s it fires, and the Jobs they own (the concurrency policy
+/// counts the active ones). Time itself wakes nothing: the fallback tick is
+/// what fires a schedule.
+impl DeclaresReads for CronJobController {
+    fn reads(&self) -> Reads {
+        Reads::of(&[gvk("batch", "v1", "CronJob"), gvk("batch", "v1", "Job")])
     }
 }
 

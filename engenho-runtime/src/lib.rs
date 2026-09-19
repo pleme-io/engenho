@@ -33,7 +33,9 @@
 //! Each controller/scheduler/kubelet is wrapped in a
 //! [`engenho_controllers::WatchDriver`] with a per-controller
 //! [`engenho_controllers::KindFilter`] so the chain converges in ms,
-//! with a periodic fallback as the safety net.
+//! with a periodic fallback as the safety net. The filter is derived from
+//! the kinds the controller declares it reads
+//! ([`engenho_controllers::DeclaresReads`], T1.7), never written by hand.
 //!
 //! ## Owned children (T2.6)
 //!
@@ -71,11 +73,13 @@ pub mod etcd_facade;
 
 mod child;
 mod error;
+#[cfg(test)]
+mod read_census;
 mod runtime;
 
 pub use child::{
     Child, ChildHandle, ChildState, Children, DeadChild, DeathCause, Driver, Listener, TickState,
-    Wakes,
+    Wiring,
 };
 pub use error::RuntimeError;
 pub use etcd_facade::MeshEtcdStore;
