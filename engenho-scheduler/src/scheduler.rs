@@ -19,28 +19,54 @@ use crate::filter::{Diagnosis, Filtered, filter};
 use crate::fit::pod_requests;
 use crate::ledger::{NodeLedger, node_name_of};
 use crate::observed::ObservedNode;
+use crate::scope::NamespaceScope;
 use crate::strategy::SchedulingStrategy;
 
 /// The scheduler.
 pub struct Scheduler {
     store: Arc<StoreMesh>,
     strategy: Box<dyn SchedulingStrategy>,
-    /// Namespace filter — `None` means all namespaces.
-    namespace: Option<String>,
+    /// Which pods this scheduler places.
+    scope: NamespaceScope,
 }
 
 impl Scheduler {
+    /// A scheduler over `store` placing pods from `namespace`, where `None`
+    /// and `Some("")` both mean every namespace.
+    ///
+    /// Operator config goes through [`Scheduler::from_config`] instead, which
+    /// reads every field of `SchedulerConfig`.
     #[must_use]
     pub fn new<S: SchedulingStrategy + 'static>(
         store: Arc<StoreMesh>,
         strategy: S,
         namespace: Option<String>,
     ) -> Self {
+        Self::assemble(store, Box::new(strategy), NamespaceScope::from(namespace))
+    }
+
+    /// The one place a `Scheduler` is put together.
+    pub(crate) fn assemble(
+        store: Arc<StoreMesh>,
+        strategy: Box<dyn SchedulingStrategy>,
+        scope: NamespaceScope,
+    ) -> Self {
         Self {
             store,
-            strategy: Box::new(strategy),
-            namespace,
+            strategy,
+            scope,
         }
+    }
+
+    /// The store this scheduler reads and writes.
+    pub(crate) fn store(&self) -> &Arc<StoreMesh> {
+        &self.store
+    }
+
+    /// Which pods this scheduler places.
+    #[must_use]
+    pub fn scope(&self) -> &NamespaceScope {
+        &self.scope
     }
 
     /// One reconcile tick.
@@ -73,7 +99,7 @@ impl Scheduler {
     pub async fn tick(&self) -> Result<TickReport, SchedulerError> {
         let pods = self
             .store
-            .list("", "v1", "Pod", self.namespace.as_deref())
+            .list("", "v1", "Pod", self.scope.list_filter())
             .await;
         let nodes = self.store.list("", "v1", "Node", None).await;
 
@@ -275,6 +301,7 @@ impl Controller for Scheduler {
             SchedulerError::UnsupportedStrategy { requested } => {
                 ControllerError::Internal(format!("unsupported scheduling strategy: {requested:?}"))
             }
+            e @ SchedulerError::ZeroTickInterval => ControllerError::Internal(e.to_string()),
             SchedulerError::Internal(s) => ControllerError::Internal(s),
         })?;
         Ok(ReconcileReport {

@@ -19,7 +19,7 @@
 //! ## Architecture
 //!
 //! ```text
-//!   StoreMesh::list("", "v1", "Pod", None)
+//!   StoreMesh::list("", "v1", "Pod", scope)   scope ← scheduler.namespace
 //!         ↓
 //!   filter: spec.nodeName missing OR empty
 //!         ↓
@@ -53,9 +53,10 @@ pub mod observed;
 pub mod predicates;
 pub mod preemption;
 pub mod scheduler;
+pub mod scope;
 pub mod strategy;
 
-pub use config_bridge::make_scheduling_strategy;
+pub use config_bridge::{ConfiguredScheduler, make_scheduling_strategy};
 pub use error::SchedulerError;
 pub use filter::{
     Candidate, Diagnosis, Feasible, FilterPlugin, Filtered, Rejection, admit, filter,
@@ -64,4 +65,5 @@ pub use fit::{NodeResources, PodRequests, fits, node_allocatable, pod_requests};
 pub use ledger::{CapacityHold, Headroom, NodeLedger, holds_capacity};
 pub use observed::ObservedNode;
 pub use scheduler::{Scheduler, TickReport};
+pub use scope::{NamespaceScope, ScopedNamespace};
 pub use strategy::{RoundRobinStrategy, SchedulingStrategy};
