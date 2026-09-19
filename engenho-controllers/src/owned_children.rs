@@ -63,6 +63,7 @@ use serde_json::Value;
 
 use crate::controller::{Controller, ReconcileOutcome};
 use crate::create_stamp::{CreateClock, stamp_create_timestamp, wall_clock};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::meta::{ObjectMeta, ShapeError, object_mut};
 use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
@@ -384,15 +385,16 @@ async fn reconcile_parent<T: OwnedChildrenReconciler + ?Sized>(
     // bytes. An update-shaped `Put` (key exists) is left untouched: the
     // field is create-time, never bumped.
     let delta = this.reconcile_one(parent_value, &owned).await?;
-    let mut changed = false;
+    // What this parent's writes did, read off each op the store returned:
+    // a child delete the store answered NoOp (already gone) is no change.
+    let mut effect = Effect::Unchanged;
     for mut command in delta.commands {
         if let ResourceCommand::Put { key, value, .. } = &mut command
             && store.get(key).await.is_none()
         {
             stamp_create_timestamp(value, this.create_clock());
         }
-        store.propose(command).await?;
-        changed = true;
+        effect = effect.and(Effect::of(store.propose(command).await?.op));
     }
 
     // S6 — re-list owned children AFTER the delta committed (the store
@@ -400,19 +402,12 @@ async fn reconcile_parent<T: OwnedChildrenReconciler + ?Sized>(
     // tick's own creates/deletes. Then write the CAS status (the same
     // `write_status_cas` primitive the hand-written ticks used).
     let owned_after = gather_owned(store, child_kinds, uid, ns).await;
-    if let Some(desired_status) = this.compute_status(parent_value, &owned_after, generation)
-        && write_status_cas(store, parent_key, parent_value, &desired_status)
-            .await?
-            .changed()
-    {
-        changed = true;
+    if let Some(desired_status) = this.compute_status(parent_value, &owned_after, generation) {
+        let status = write_status_cas(store, parent_key, parent_value, &desired_status).await?;
+        effect = effect.and(status.effect());
     }
 
-    Ok(if changed {
-        ObjectOutcome::Changed
-    } else {
-        ObjectOutcome::Unchanged
-    })
+    Ok(ObjectOutcome::from(effect))
 }
 
 #[cfg(test)]

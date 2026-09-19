@@ -52,6 +52,7 @@ use engenho_store::{
 use serde_json::{Value, json};
 
 use crate::controller::{Controller, ReconcileOutcome};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::{DefaultedInt, ObjectMeta, ShapeError, int_at, object_mut};
@@ -472,7 +473,7 @@ impl Controller for CronJobController {
 impl From<CronTickOutcome> for ObjectOutcome {
     fn from(outcome: CronTickOutcome) -> Self {
         match outcome {
-            CronTickOutcome::Fired => Self::Changed,
+            CronTickOutcome::Fired(effect) => Self::from(effect),
             CronTickOutcome::Skipped => Self::SKIPPED,
             CronTickOutcome::NotDue => Self::Unchanged,
         }
@@ -481,8 +482,9 @@ impl From<CronTickOutcome> for ObjectOutcome {
 
 /// One `CronJob`'s per-tick outcome — becomes its sweep outcome.
 enum CronTickOutcome {
-    /// A Job was created (+ status patched): the `CronJob` changed.
-    Fired,
+    /// A Job was proposed (+ status patched), and this is what those
+    /// writes did: the `CronJob` changed only if one of them landed.
+    Fired(Effect),
     /// The slot was deliberately skipped (suspended / bad schedule /
     /// Forbid-with-active / missed-deadline): recorded as a skip.
     Skipped,
@@ -533,7 +535,8 @@ impl CronJobController {
         if let Some(deadline) = int_at(cj_value, STARTING_DEADLINE_SECONDS)? {
             let deadline = u64::try_from(deadline.max(0)).unwrap_or(0);
             if now.saturating_sub(due) > deadline {
-                self.patch_last_schedule(cj_key, due, None).await?;
+                // A skip whatever this write did: the slot was not run.
+                let _skip_recorded = self.patch_last_schedule(cj_key, due, None).await?;
                 return Ok(CronTickOutcome::Skipped);
             }
         }
@@ -570,7 +573,8 @@ impl CronJobController {
         match policy {
             ConcurrencyPolicy::Forbid if !active.is_empty() => {
                 // A prior run is still active → skip, but record the skip.
-                self.patch_last_schedule(cj_key, due, None).await?;
+                // A skip whatever this write did: the slot was not run.
+                let _skip_recorded = self.patch_last_schedule(cj_key, due, None).await?;
                 return Ok(CronTickOutcome::Skipped);
             }
             ConcurrencyPolicy::Replace => {
@@ -589,7 +593,8 @@ impl CronJobController {
             return Ok(CronTickOutcome::Skipped);
         };
         let job_key = ResourceKey::namespaced("batch", "v1", "Job", job_ns, &job_name);
-        self.store
+        let created = self
+            .store
             .propose(ResourceCommand::Put {
                 key: job_key,
                 value: job,
@@ -605,9 +610,10 @@ impl CronJobController {
             "name": job_name,
             "namespace": job_ns,
         });
-        self.patch_last_schedule(cj_key, due, Some(active_ref))
+        let status = self
+            .patch_last_schedule(cj_key, due, Some(active_ref))
             .await?;
-        Ok(CronTickOutcome::Fired)
+        Ok(CronTickOutcome::Fired(Effect::of(created.op).and(status)))
     }
 
     /// Patch the CronJob's `status.lastScheduleTime` (always) and — when a
@@ -617,7 +623,7 @@ impl CronJobController {
         cj_key: &ResourceKey,
         due: u64,
         active_ref: Option<Value>,
-    ) -> Result<(), ControllerError> {
+    ) -> Result<Effect, ControllerError> {
         let status = match active_ref {
             Some(r) => json!({
                 "lastScheduleTime": unix_to_rfc3339(due),
@@ -625,14 +631,15 @@ impl CronJobController {
             }),
             None => json!({ "lastScheduleTime": unix_to_rfc3339(due) }),
         };
-        self.store
+        let applied = self
+            .store
             .propose(ResourceCommand::patch(
                 cj_key.clone(),
                 json!({ "status": status }),
                 Reason::Controller,
             ))
             .await?;
-        Ok(())
+        Ok(Effect::of(applied.op))
     }
 }
 

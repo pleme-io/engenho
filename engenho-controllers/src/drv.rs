@@ -32,6 +32,7 @@ use engenho_substrate::{DerivationCacheBackend, DrvHash};
 use serde_json::{Value, json};
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// Controller that propagates derivation state from a cache backend
@@ -157,7 +158,8 @@ impl Controller for DrvController {
                 continue;
             }
 
-            self.store
+            let applied = self
+                .store
                 .propose(ResourceCommand::patch(
                     cr_key.clone(),
                     json!({
@@ -169,7 +171,7 @@ impl Controller for DrvController {
                     Reason::Controller,
                 ))
                 .await?;
-            report.objects_changed += 1;
+            report.record(Effect::of(applied.op));
         }
         Ok(report.into())
     }

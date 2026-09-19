@@ -40,6 +40,7 @@ use engenho_store::command::{Reason, ResourceCommand};
 use engenho_store::resource::ResourceKey;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// Whether the plugin chain is executed or only computed.
@@ -211,7 +212,7 @@ impl Controller for CniStatusController {
             })
             .await
         {
-            Ok(_) => report.objects_changed = 1,
+            Ok(applied) => report.record(Effect::of(applied.op)),
             Err(_) => report.objects_skipped = 1,
         }
         Ok(ReconcileOutcome::from(report))

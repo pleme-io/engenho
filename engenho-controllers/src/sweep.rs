@@ -66,6 +66,7 @@ use shigoto_types::failure::FailureKind;
 
 use crate::controller::{ReconcileOutcome, ReconcileReport, ReconcileResult};
 use crate::curve::Streak;
+use crate::effect::{Effect, Landed};
 use crate::error::{ControllerError, ErrorScope};
 use crate::event_recorder::{EventRecord, EventSink, InvolvedObject, NullEventSink, Reason};
 use crate::watch_driver::TRANSIENT_RETRY;
@@ -73,8 +74,10 @@ use crate::watch_driver::TRANSIENT_RETRY;
 /// What reconciling one object did. A sweep records exactly one per object.
 #[derive(Debug)]
 pub enum ObjectOutcome {
-    /// A write was made for this object.
-    Changed,
+    /// A write made for this object landed. The [`Landed`] comes only from
+    /// an [`Effect`] that observed it, so an object cannot be reported
+    /// changed on the strength of a write having been attempted.
+    Changed(Landed),
     /// Examined and already converged: nothing to write.
     Unchanged,
     /// Deliberately not acted on this pass — waiting on something outside
@@ -84,6 +87,20 @@ pub enum ObjectOutcome {
     /// This object's reconcile failed with an Item-scoped error. Built only
     /// by [`ControllerError::triage`].
     Failed(ItemFailure),
+}
+
+/// A per-object outcome from what its write did: landed is Changed, a
+/// write that changed nothing is Unchanged, and a write the store refused
+/// is a Skip carrying the refusal as its note. The object is left as it
+/// was, and the next tick re-reads it.
+impl From<Effect> for ObjectOutcome {
+    fn from(effect: Effect) -> Self {
+        match effect {
+            Effect::Written(landed) => Self::Changed(landed),
+            Effect::Unchanged => Self::Unchanged,
+            Effect::Rejected(refusal) => Self::skipped_because(refusal.note()),
+        }
+    }
 }
 
 impl ObjectOutcome {
@@ -227,7 +244,7 @@ impl SweepReport {
 
     fn record(&mut self, outcome: &ObjectOutcome) {
         match outcome {
-            ObjectOutcome::Changed => self.changed += 1,
+            ObjectOutcome::Changed(_) => self.changed += 1,
             ObjectOutcome::Unchanged => self.unchanged += 1,
             ObjectOutcome::Skipped { note } => {
                 self.skipped += 1;
@@ -580,6 +597,7 @@ mod tests {
     use super::*;
     use crate::event_recorder::CollectingEventSink;
     use engenho_store::StoreError;
+    use engenho_store::command::ResourceOp;
     use serde_json::json;
 
     fn obj(name: &str, rv: &str) -> (ResourceKey, ResourceValue) {
@@ -606,7 +624,7 @@ mod tests {
             ))),
             "settled" => Ok(ObjectOutcome::Unchanged),
             "waiting" => Ok(ObjectOutcome::skipped_because("waiting on a driver")),
-            _ => Ok(ObjectOutcome::Changed),
+            _ => Ok(ObjectOutcome::from(Effect::of(ResourceOp::Created))),
         }
     }
 
@@ -672,6 +690,35 @@ mod tests {
             assert_eq!(legacy.objects_changed, report.changed());
             assert_eq!(legacy.objects_skipped, report.skipped());
         }
+    }
+
+    /// An object is changed only if its write landed: a `NoOp` is unchanged
+    /// and a refused write is a skip naming the refusal, and neither is
+    /// tallied as a change.
+    #[tokio::test]
+    async fn an_object_is_changed_only_when_its_write_landed() {
+        let sweep = sweep_with(Arc::new(CollectingEventSink::new()));
+        let objects = objs(&["created", "noop", "conflict"]);
+        let report = sweep
+            .run(&objects, |key, _value| {
+                let op = match key.name.as_str() {
+                    "created" => ResourceOp::Created,
+                    "noop" => ResourceOp::NoOp,
+                    _ => ResourceOp::Conflict,
+                };
+                std::future::ready(Ok(ObjectOutcome::from(Effect::of(op))))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.changed(), report.unchanged(), report.skipped()),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            report.note(),
+            Some(crate::effect::Refusal::Conflict.note()),
+            "the skip says the store refused the write"
+        );
     }
 
     #[tokio::test]
@@ -787,7 +834,7 @@ mod tests {
         // and the sweep owes nothing.
         let report = sweep
             .run(&objects, |_key, _value| {
-                std::future::ready(Ok(ObjectOutcome::Changed))
+                std::future::ready(Ok(ObjectOutcome::from(Effect::of(ResourceOp::Replaced))))
             })
             .await
             .unwrap();

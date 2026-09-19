@@ -38,6 +38,7 @@ use tracing::debug;
 
 use crate::controller::{Controller, ReconcileOutcome};
 use crate::create_stamp::{CreateClock, stamp_create_timestamp, wall_clock};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::ObjectMeta;
@@ -245,15 +246,15 @@ impl EndpointsController {
     /// Reconcile the EndpointSlice for a Service: owner-ref it, stamp the
     /// creationTimestamp on create, and write it only when the slice body
     /// changed (idempotent). Mirrors the Endpoints reconcile shape so both
-    /// projections share one convergence discipline. Returns whether it
-    /// wrote.
+    /// projections share one convergence discipline. Returns what the
+    /// write did (`Unchanged` when none was needed).
     async fn reconcile_endpoint_slice(
         &self,
         namespace: &str,
         svc_name: &str,
         mut slice: Value,
         owner_ref: crate::owner::OwnerReference,
-    ) -> Result<bool, ControllerError> {
+    ) -> Result<Effect, ControllerError> {
         let slice_key = ResourceKey::namespaced(
             "discovery.k8s.io",
             "v1",
@@ -266,7 +267,7 @@ impl EndpointsController {
         let existing = self.store.get(&slice_key).await;
         if let Some(ref current) = existing {
             if slice_bodies_equivalent(current, &slice) {
-                return Ok(false);
+                return Ok(Effect::Unchanged);
             }
         } else {
             // First materialization: freeze the creationTimestamp from one
@@ -274,7 +275,8 @@ impl EndpointsController {
             stamp_create_timestamp(&mut slice, self.create_clock);
         }
 
-        self.store
+        let applied = self
+            .store
             .propose(ResourceCommand::Put {
                 key: slice_key,
                 value: slice,
@@ -282,7 +284,7 @@ impl EndpointsController {
                 reason: Reason::Controller,
             })
             .await?;
-        Ok(true)
+        Ok(Effect::of(applied.op))
     }
 }
 
@@ -370,17 +372,13 @@ impl EndpointsController {
         // Endpoints early-return so the slice converges even when the
         // Endpoints subsets are unchanged (e.g. first slice on an
         // already-materialized Endpoints).
-        let slice_written = self
+        let slice = self
             .reconcile_endpoint_slice(endpoints_ns, svc_name, slice_body, owner_ref.clone())
             .await?;
 
         if let Some(ref current) = existing {
             if subsets_equivalent(current, &new_endpoints) {
-                return Ok(if slice_written {
-                    ObjectOutcome::Changed
-                } else {
-                    ObjectOutcome::Unchanged
-                });
+                return Ok(ObjectOutcome::from(slice));
             }
         } else {
             // CREATE (no existing Endpoints): freeze creationTimestamp
@@ -400,7 +398,8 @@ impl EndpointsController {
             "writing endpoints"
         );
 
-        self.store
+        let applied = self
+            .store
             .propose(ResourceCommand::Put {
                 key: endpoints_key,
                 value: new_endpoints,
@@ -408,7 +407,7 @@ impl EndpointsController {
                 reason: Reason::Controller,
             })
             .await?;
-        Ok(ObjectOutcome::Changed)
+        Ok(ObjectOutcome::from(slice.and(Effect::of(applied.op))))
     }
 }
 

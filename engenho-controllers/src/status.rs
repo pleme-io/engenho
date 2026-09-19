@@ -21,49 +21,63 @@
 //!    `metadata.resourceVersion` AS SEEN THIS TICK. If a concurrent spec
 //!    change (operator scale) committed between the controller's list and
 //!    this write, `mod_revision` advanced, the precondition fails, and
-//!    the store returns [`ResourceOp::Conflict`]. We treat that as a
-//!    benign retry ([`StatusWriteOutcome::Conflict`]) — the write is
-//!    dropped, the next watch-wake re-reads fresh state and recomputes. A
-//!    status write thus NEVER clobbers a concurrent spec change.
+//!    the store returns `ResourceOp::Conflict`. That is a benign retry
+//!    (`Proposed(Rejected(Conflict))`) — the write is dropped, the next
+//!    watch-wake re-reads fresh state and recomputes. A status write thus
+//!    NEVER clobbers a concurrent spec change.
+//!
+//!    What the store did is read through [`Effect::of`], never by testing
+//!    for one op: a patch the store refused for any reason
+//!    (`PatchRejected`, `ApplyConflict`) is reported refused, not
+//!    `Written`.
 //!
 //! 3. **Typed emission.** The status JSON is authored as a typed
 //!    `serde_json::Value` (the store is opaque-JSON); no `format!()` of
 //!    JSON.
 
 use engenho_store::{
-    StoreMesh,
-    command::{Reason, ResourceCommand, ResourceOp},
+    ApplyResult, StoreMesh,
+    command::{Reason, ResourceCommand},
     resource::ResourceKey,
     revision::Revision,
 };
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::effect::{Effect, Refusal};
 use crate::error::ControllerError;
 use crate::meta::{DefaultedInt, ShapeError};
 
 /// Outcome of a [`write_status_cas`] call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusWriteOutcome {
-    /// The status differed (or `observedGeneration` was behind) and the
-    /// patch committed.
-    Written,
-    /// The computed status already matched the live one AND
-    /// `observedGeneration == generation` — nothing was proposed
-    /// (the idempotent-skip hot-loop defense).
+    /// Nothing was proposed: the computed status already matched the live
+    /// one (which carries `observedGeneration`, so the generation has been
+    /// observed too), or the parent had no resourceVersion to CAS against.
+    /// The idempotent-skip hot-loop defense: no Raft round trip.
     NoChange,
-    /// The CAS precondition failed: a concurrent spec change advanced the
-    /// object's `mod_revision` between this tick's list and the status
-    /// write. Benign — dropped; the next watch-wake recomputes.
-    Conflict,
+    /// A status patch was proposed, and this is what the store did with it:
+    /// `Written` when it landed, `Rejected(Conflict)` when a concurrent spec
+    /// change moved the object first (benign — the next watch-wake
+    /// recomputes), `Rejected(PatchRejected | ApplyConflict)` when the store
+    /// refused the patch itself.
+    Proposed(Effect),
 }
 
 impl StatusWriteOutcome {
-    /// True iff a command actually committed (used to bump
-    /// `ReconcileReport.objects_changed`).
+    /// What this call did, as one [`Effect`]: nothing proposed is
+    /// `Unchanged`.
+    pub const fn effect(self) -> Effect {
+        match self {
+            Self::NoChange => Effect::Unchanged,
+            Self::Proposed(effect) => effect,
+        }
+    }
+
+    /// True iff a status patch landed.
     #[must_use]
-    pub fn changed(self) -> bool {
-        matches!(self, Self::Written)
+    pub const fn changed(self) -> bool {
+        self.effect().landed()
     }
 }
 
@@ -125,8 +139,8 @@ fn live_status(value: &Value) -> Value {
 /// # Errors
 ///
 /// [`ControllerError::Store`] only on a genuine store/transport failure.
-/// A CAS precondition failure is NOT an error — it returns
-/// [`StatusWriteOutcome::Conflict`].
+/// A write the store refused is NOT an error — it returns
+/// `Proposed(Effect::Rejected(_))`, naming the refusal.
 pub async fn write_status_cas(
     store: &StoreMesh,
     key: &ResourceKey,
@@ -162,18 +176,38 @@ pub async fn write_status_cas(
         ))
         .await?;
 
-    if result.op == ResourceOp::Conflict {
-        // A concurrent spec change advanced mod_revision between the list
-        // and this write. Benign — drop it; the next watch-wake re-reads
-        // fresh state and recomputes. NEVER unwrap/error on Conflict.
-        debug!(
-            key = %key.label(),
-            expected = %expected,
-            "status write conflicted with a concurrent spec change; dropping (will recompute on next wake)"
-        );
-        return Ok(StatusWriteOutcome::Conflict);
+    Ok(read_answer(key, expected, &result))
+}
+
+/// Read the store's answer to a proposed status patch, by [`Effect::of`]:
+/// every op the store can return is placed, so a refusal of any kind is
+/// reported refused and only a landed patch is `Written`.
+fn read_answer(key: &ResourceKey, expected: Revision, answer: &ApplyResult) -> StatusWriteOutcome {
+    let effect = Effect::of(answer.op);
+    match effect {
+        Effect::Rejected(Refusal::Conflict) => {
+            // A concurrent spec change advanced mod_revision between the
+            // list and this write. Benign — dropped; the next watch-wake
+            // re-reads fresh state and recomputes.
+            debug!(
+                key = %key.label(),
+                expected = %expected,
+                "status write conflicted with a concurrent spec change; dropping (will recompute on next wake)"
+            );
+        }
+        Effect::Rejected(refusal @ (Refusal::PatchRejected | Refusal::ApplyConflict)) => {
+            // The store refused the patch itself. Nothing was written, and
+            // proposing the same patch again will not change that.
+            warn!(
+                key = %key.label(),
+                %refusal,
+                detail = answer.patch_error.as_deref().unwrap_or(""),
+                "status write refused; nothing was written"
+            );
+        }
+        Effect::Written(_) | Effect::Unchanged => {}
     }
-    Ok(StatusWriteOutcome::Written)
+    StatusWriteOutcome::Proposed(effect)
 }
 
 /// True iff `pod` reports a `status.conditions[type=Ready,status=True]`.
@@ -252,10 +286,56 @@ mod tests {
         assert!(!pod_is_ready(&no_status));
     }
 
+    fn answer(op: engenho_store::command::ResourceOp) -> ApplyResult {
+        ApplyResult {
+            op,
+            ..ApplyResult::default()
+        }
+    }
+
+    /// A status patch the store refused is reported refused, naming why —
+    /// never `Written`. Only `Conflict` used to be read; `PatchRejected` and
+    /// `ApplyConflict` fell through to `Written`, so a controller counted a
+    /// status change the catalog never saw.
     #[test]
-    fn outcome_changed_only_for_written() {
-        assert!(StatusWriteOutcome::Written.changed());
+    fn a_refused_status_patch_is_reported_refused() {
+        use engenho_store::command::ResourceOp;
+        let key = ResourceKey::namespaced("apps", "v1", "Deployment", "ns", "web");
+        for (op, refusal) in [
+            (ResourceOp::Conflict, Refusal::Conflict),
+            (ResourceOp::PatchRejected, Refusal::PatchRejected),
+            (ResourceOp::ApplyConflict, Refusal::ApplyConflict),
+        ] {
+            let outcome = read_answer(&key, Revision(7), &answer(op));
+            assert_eq!(
+                outcome,
+                StatusWriteOutcome::Proposed(Effect::Rejected(refusal)),
+                "{op:?}"
+            );
+            assert!(!outcome.changed(), "{op:?} wrote nothing");
+        }
+        assert!(read_answer(&key, Revision(7), &answer(ResourceOp::Patched)).changed());
+        assert_eq!(
+            read_answer(&key, Revision(7), &answer(ResourceOp::NoOp)).effect(),
+            Effect::Unchanged
+        );
+    }
+
+    #[test]
+    fn outcome_changed_only_when_the_patch_landed() {
+        use engenho_store::command::ResourceOp;
+        assert!(StatusWriteOutcome::Proposed(Effect::of(ResourceOp::Patched)).changed());
         assert!(!StatusWriteOutcome::NoChange.changed());
-        assert!(!StatusWriteOutcome::Conflict.changed());
+        for refused in [
+            ResourceOp::Conflict,
+            ResourceOp::PatchRejected,
+            ResourceOp::ApplyConflict,
+            ResourceOp::NoOp,
+        ] {
+            assert!(
+                !StatusWriteOutcome::Proposed(Effect::of(refused)).changed(),
+                "{refused:?} wrote nothing"
+            );
+        }
     }
 }

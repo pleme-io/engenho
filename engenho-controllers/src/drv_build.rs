@@ -31,6 +31,7 @@ use tracing::debug;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::drv::DrvController;
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// One build's output bundle — realisations + the NAR blobs
@@ -258,7 +259,8 @@ impl Controller for DrvBuildController {
                 Ok(r) => r,
                 Err(e) => {
                     // Surface the failure into the CR status.
-                    self.store
+                    let applied = self
+                        .store
                         .propose(ResourceCommand::patch(
                             cr_key.clone(),
                             json!({
@@ -270,14 +272,15 @@ impl Controller for DrvBuildController {
                             Reason::Controller,
                         ))
                         .await?;
-                    report.objects_changed += 1;
+                    report.record(Effect::of(applied.op));
                     continue;
                 }
             };
 
-            // Ingest into the cache.
-            Self::ingest(&self.cache, &result).await?;
-            report.objects_changed += 1;
+            // Ingest into the cache. Its error ends the tick, as before; a
+            // change is counted only once the ingest returned Ok.
+            let ingested = Effect::applied(Self::ingest(&self.cache, &result).await)?;
+            report.record(ingested);
         }
         Ok(report.into())
     }

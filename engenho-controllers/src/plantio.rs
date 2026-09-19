@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::roceiro::Roceiro;
 
@@ -293,14 +294,15 @@ impl Controller for PlantioController {
             });
 
             // Patch CR.
-            self.store
+            let applied = self
+                .store
                 .propose(ResourceCommand::patch(
                     cr_key.clone(),
                     new_status,
                     Reason::Controller,
                 ))
                 .await?;
-            report.objects_changed += 1;
+            report.record(Effect::of(applied.op));
         }
         Ok(report.into())
     }

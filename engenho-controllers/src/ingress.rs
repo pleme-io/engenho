@@ -24,6 +24,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// One ingress routing rule — public hostname + path → service backend.
@@ -611,20 +612,16 @@ impl Controller for IngressController {
 
         for (key, route) in &desired {
             if installed_keys.get(key) != Some(route) {
-                self.backend
-                    .upsert(route)
-                    .await
+                let applied = Effect::applied(self.backend.upsert(route).await)
                     .map_err(|e| ControllerError::Internal(e.to_string()))?;
-                report.objects_changed += 1;
+                report.record(applied);
             }
         }
         for key in installed_keys.keys() {
             if !desired.contains_key(key) {
-                self.backend
-                    .remove(&key.0, &key.1, &key.2)
-                    .await
+                let applied = Effect::applied(self.backend.remove(&key.0, &key.1, &key.2).await)
                     .map_err(|e| ControllerError::Internal(e.to_string()))?;
-                report.objects_changed += 1;
+                report.record(applied);
             }
         }
         Ok(report.into())

@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use engenho_substrate::{DerivationCacheBackend, DrvHash};
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// Source of "items of interest" for proactive promotion.
@@ -137,11 +138,9 @@ impl Controller for TieredCacheReconciler {
                         .map_err(|e| ControllerError::Internal(e.to_string()))?
                         .is_some();
                     if !exists {
-                        self.tiers[dst_idx]
-                            .put_drv(&drv)
-                            .await
+                        let applied = Effect::applied(self.tiers[dst_idx].put_drv(&drv).await)
                             .map_err(|e| ControllerError::Internal(e.to_string()))?;
-                        report.objects_changed += 1;
+                        report.record(applied);
                     }
                     // Promote realisations (idempotent — backend dedupes by output_name).
                     for r in &realisations {

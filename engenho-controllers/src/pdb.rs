@@ -38,6 +38,7 @@ use engenho_store::{
 use serde_json::{Value, json};
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::meta::warn_unreadable;
 use crate::selector::{matches_labels, selector_match_labels};
@@ -244,7 +245,8 @@ impl Controller for PodDisruptionBudgetController {
                 continue;
             }
 
-            self.store
+            let applied = self
+                .store
                 .propose(ResourceCommand::patch(
                     pdb_key.clone(),
                     json!({
@@ -259,7 +261,7 @@ impl Controller for PodDisruptionBudgetController {
                     Reason::Controller,
                 ))
                 .await?;
-            report.objects_changed += 1;
+            report.record(Effect::of(applied.op));
         }
         Ok(report.into())
     }

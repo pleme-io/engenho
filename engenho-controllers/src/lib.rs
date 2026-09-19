@@ -47,6 +47,7 @@ pub mod deployment;
 pub mod dns;
 pub mod drv;
 pub mod drv_build;
+pub mod effect;
 pub mod endpoints;
 pub mod error;
 pub mod event_driven;
@@ -115,6 +116,7 @@ pub use dns::{
 };
 pub use drv::DrvController;
 pub use drv_build::{BuildBackend, BuildError, BuildResult, DrvBuildController, FakeBuildBackend};
+pub use effect::{Effect, Landed, Refusal};
 pub use endpoints::EndpointsController;
 pub use error::{ControllerError, ErrorScope};
 pub use event_driven::EventDrivenController;

@@ -469,6 +469,9 @@ impl Controller for CrdController {
             for (key, entry) in &desired {
                 let needs_register = reg.get(key) != Some(entry);
                 if needs_register {
+                    // An in-process handler-table insert that cannot fail
+                    // (the sink returns nothing to read): the call is the
+                    // effect. Not a store write.
                     self.sink.register_crd(CrdHandlerSpec::from(entry));
                     reg.insert(key.clone(), entry.clone());
                     report.objects_changed += 1;
@@ -487,10 +490,12 @@ impl Controller for CrdController {
                 .filter(|k| !desired.contains_key(*k))
                 .cloned()
                 .collect();
+            // The sink says whether a handler was actually there to remove;
+            // that answer is the change, not the attempt.
             for key in stale {
-                self.sink.unregister_crd(&key.0, &key.1, &key.2);
+                let removed = self.sink.unregister_crd(&key.0, &key.1, &key.2);
                 reg.remove(&key);
-                report.objects_changed += 1;
+                report.objects_changed += usize::from(removed);
             }
         }
 

@@ -46,11 +46,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tracing::warn;
 
 use engenho_store::command::{Reason as CommandReason, ResourceCommand};
 use engenho_store::{ResourceKey, StoreMesh};
 
 use crate::controller::{Controller, ReconcileOutcome};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::event_recorder::{EventRecord, EventSink, InvolvedObject, NullEventSink, Reason};
 use crate::meta::{ShapeError, object_mut};
@@ -416,7 +418,7 @@ impl NetworkPolicyController {
             });
         }
         let desired = annotated(policy, datapath)?;
-        if self
+        let Ok(applied) = self
             .store
             .propose(ResourceCommand::Put {
                 key: key.clone(),
@@ -425,15 +427,17 @@ impl NetworkPolicyController {
                 reason: CommandReason::Controller,
             })
             .await
-            .is_err()
-        {
+        else {
             return Ok(ObjectOutcome::SKIPPED);
-        }
+        };
+        let effect = Effect::of(applied.op);
 
         // The event fires only on the transition — the annotation check
         // above already returned for a policy seen on a previous tick —
-        // so this does not spam one event per policy per tick.
-        if datapath == PolicyDatapath::Computed {
+        // so this does not spam one event per policy per tick. And only
+        // when the annotation landed: a write that changed nothing
+        // announced nothing.
+        if datapath == PolicyDatapath::Computed && effect.landed() {
             let meta = policy.get("metadata");
             self.events
                 .record(EventRecord {
@@ -461,7 +465,7 @@ impl NetworkPolicyController {
                 })
                 .await;
         }
-        Ok(ObjectOutcome::Changed)
+        Ok(ObjectOutcome::from(effect))
     }
 }
 
@@ -512,21 +516,30 @@ impl Controller for NetworkPolicyController {
             })
             .await?;
 
-        // Reap rules whose policy is gone.
-        let mut reaped = 0;
+        // A reaped rule belongs to no listed policy, so the sweep did not
+        // count it; the legacy counter does, for each removal that landed.
+        let mut outcome = ReconcileOutcome::from(report);
+
+        // Reap rules whose policy is gone. A removal the enforcer refused
+        // is not a change: the filter is still installed, and a deleted
+        // policy is still being enforced, so it is said once per tick at
+        // WARN until the removal lands.
         if let Ok(installed) = self.enforcer.list().await {
             for rule in installed {
-                if !desired_ids.contains(&rule.policy_id.as_str()) {
-                    let _ = self.enforcer.remove(&rule.policy_id).await;
-                    reaped += 1;
+                if desired_ids.contains(&rule.policy_id.as_str()) {
+                    continue;
+                }
+                match Effect::applied(self.enforcer.remove(&rule.policy_id).await) {
+                    Ok(effect) => outcome.report.record(effect),
+                    Err(error) => warn!(
+                        policy_id = %rule.policy_id,
+                        enforcer = self.enforcer.name(),
+                        %error,
+                        "a deleted policy's rule could not be removed; it is still enforced"
+                    ),
                 }
             }
         }
-
-        // A reaped rule belongs to no listed policy, so the sweep did not
-        // count it; the legacy counter still does.
-        let mut outcome = ReconcileOutcome::from(report);
-        outcome.report.objects_changed += reaped;
         Ok(outcome)
     }
 }

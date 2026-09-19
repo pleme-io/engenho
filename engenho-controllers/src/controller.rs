@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::sweep::SweepReport;
 
@@ -164,6 +165,19 @@ pub struct ReconcileReport {
 }
 
 impl ReconcileReport {
+    /// Count one write by what it did, never by the fact that it was made.
+    ///
+    /// A write that landed is a change. One the store accepted and did
+    /// nothing with is not counted. One the store refused is a skip: the
+    /// object was reached and left as it was.
+    pub fn record(&mut self, effect: Effect) {
+        match effect {
+            Effect::Written(_) => self.objects_changed += 1,
+            Effect::Unchanged => {}
+            Effect::Rejected(_) => self.objects_skipped += 1,
+        }
+    }
+
     /// Convenience: log this report at info level via the
     /// `tracing` crate. The runtime calls this after each tick.
     pub fn log(&self, controller_name: &str) {
@@ -215,6 +229,26 @@ mod tests {
         assert_eq!(r.objects_changed, 0);
         assert_eq!(r.objects_skipped, 0);
         assert!(r.note.is_none());
+    }
+
+    /// A write is counted by what it did: landed is a change, a `NoOp` is
+    /// nothing, a refusal is a skip. Never "a write was made, add one".
+    #[test]
+    fn a_report_counts_writes_by_their_effect() {
+        use engenho_store::command::ResourceOp;
+        let mut r = ReconcileReport::default();
+        for op in [
+            ResourceOp::Created,
+            ResourceOp::Patched,
+            ResourceOp::NoOp,
+            ResourceOp::NoOp,
+            ResourceOp::Conflict,
+            ResourceOp::PatchRejected,
+        ] {
+            r.record(Effect::of(op));
+        }
+        assert_eq!(r.objects_changed, 2, "only the two writes that landed");
+        assert_eq!(r.objects_skipped, 2, "the two refusals");
     }
 
     #[test]

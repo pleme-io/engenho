@@ -60,6 +60,7 @@ use tracing::debug;
 
 use crate::controller::{Controller, ReconcileOutcome};
 use crate::csi_provisioner::{CsiCreateRequest, CsiProvisioner, NoCsiProvisioner, parse_quantity};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
@@ -552,7 +553,7 @@ impl PvBinderController {
         pvc_name: &str,
         sc: &Value,
         provisioner: &str,
-    ) -> Result<(), ControllerError> {
+    ) -> Result<Effect, ControllerError> {
         let pv_name = format!("pvc-{pvc_ns}-{pvc_name}");
         let requested = pvc
             .get("spec")
@@ -659,7 +660,7 @@ impl PvBinderController {
         // which made a store that could not commit look like one claim's
         // problem and let the sweep carry on writing into it.
         let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
-        self.put(pv_key, pv).await?;
+        let volume = self.put(pv_key, pv).await?;
 
         let mut bound_pvc = pvc.clone();
         if let Some(spec) = bound_pvc.get_mut("spec").and_then(Value::as_object_mut) {
@@ -667,14 +668,14 @@ impl PvBinderController {
         }
         set_phase(&mut bound_pvc, "Bound");
         let pvc_key = ResourceKey::namespaced("", "v1", "PersistentVolumeClaim", pvc_ns, pvc_name);
-        self.put(pvc_key, bound_pvc).await?;
-
-        Ok(())
+        Ok(volume.and(self.put(pvc_key, bound_pvc).await?))
     }
 
-    /// Write a Put for a resource value (Controller reason).
-    async fn put(&self, key: ResourceKey, value: Value) -> Result<(), ControllerError> {
-        self.store
+    /// Write a Put for a resource value (Controller reason), and say what
+    /// the store did with it.
+    async fn put(&self, key: ResourceKey, value: Value) -> Result<Effect, ControllerError> {
+        let applied = self
+            .store
             .propose(ResourceCommand::Put {
                 key,
                 value,
@@ -682,7 +683,7 @@ impl PvBinderController {
                 reason: Reason::Controller,
             })
             .await?;
-        Ok(())
+        Ok(Effect::of(applied.op))
     }
 }
 
@@ -764,11 +765,11 @@ impl PvBinderController {
             let pv_name = pv_key.name.clone();
             let bound_pvc = Self::bind_pvc(pvc.clone(), &pv_name);
             let bound_pv = Self::bind_pv(pv.clone(), pvc, pvc_ns, pvc_name);
-            self.put(pvc_key.clone(), bound_pvc).await?;
-            self.put(pv_key.clone(), bound_pv).await?;
+            let claim = self.put(pvc_key.clone(), bound_pvc).await?;
+            let volume = self.put(pv_key.clone(), bound_pv).await?;
             debug!(pvc = %pvc_key.label(), pv = %pv_name, "bound PVC to existing PV");
             claimed_this_tick.push(pv_name);
-            return Ok(ObjectOutcome::Changed);
+            return Ok(ObjectOutcome::from(claim.and(volume)));
         }
 
         // A pre-bound PVC whose named PV isn't available this pass waits;
@@ -800,9 +801,10 @@ impl PvBinderController {
             if Self::is_wait_for_first_consumer(Some(sc)) {
                 return Ok(ObjectOutcome::SKIPPED);
             }
-            self.provision_csi(pvc, pvc_ns, pvc_name, sc, provisioner)
-                .await?;
-            return Ok(ObjectOutcome::Changed);
+            return Ok(ObjectOutcome::from(
+                self.provision_csi(pvc, pvc_ns, pvc_name, sc, provisioner)
+                    .await?,
+            ));
         }
         if Self::is_wait_for_first_consumer(Some(sc)) {
             // WaitForFirstConsumer: leave Pending until a Pod references the
@@ -853,13 +855,13 @@ impl PvBinderController {
             debug!(pvc = %pvc_key.label(), snapshot = %snap_name, "restored PV data from snapshot");
         }
         let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
-        self.put(pv_key, dyn_pv).await?;
+        let volume = self.put(pv_key, dyn_pv).await?;
         // Bind the PVC to the freshly-provisioned PV.
         let bound_pvc = Self::bind_pvc(pvc.clone(), &pv_name);
-        self.put(pvc_key.clone(), bound_pvc).await?;
+        let claim = self.put(pvc_key.clone(), bound_pvc).await?;
         debug!(pvc = %pvc_key.label(), pv = %pv_name, "dynamically provisioned + bound local-path PV");
         claimed_this_tick.push(pv_name);
-        Ok(ObjectOutcome::Changed)
+        Ok(ObjectOutcome::from(volume.and(claim)))
     }
 }
 

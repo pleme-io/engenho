@@ -43,6 +43,7 @@ use engenho_store::{
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::owner::controlling_owner;
 
@@ -175,10 +176,13 @@ impl Controller for GcController {
                     owner_kind = %owner.kind,
                     "deleting orphan"
                 );
-                self.store
+                let applied = self
+                    .store
                     .propose(ResourceCommand::delete(key, Reason::GarbageCollector))
                     .await?;
-                report.objects_changed += 1;
+                // A finalizer-bearing orphan with no timestamp to stamp,
+                // or one already gone, is a NoOp: no change to count.
+                report.record(Effect::of(applied.op));
             }
         }
         Ok(report.into())

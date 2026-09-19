@@ -11,14 +11,15 @@
 //!     spec change committed between the controller's read and its status
 //!     write is NEVER clobbered (the stale-rv patch conflicts + drops);
 //!   * the shared [`write_status_cas`] returns the typed
-//!     [`StatusWriteOutcome`] (Written / NoChange / Conflict).
+//!     [`StatusWriteOutcome`]: `NoChange` when nothing was proposed, else
+//!     `Proposed(effect)` — what the store did (landed / refused).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_controllers::{
-    Controller, DeploymentController, JobController, ReplicaSetController, StatefulSetController,
-    is_owned_by,
+    Controller, DeploymentController, Effect, JobController, Refusal, ReplicaSetController,
+    StatefulSetController, is_owned_by,
     status::{StatusWriteOutcome, write_status_cas},
 };
 use engenho_store::{
@@ -417,9 +418,10 @@ async fn status_write_conflicts_with_concurrent_spec_change_and_does_not_clobber
         .unwrap();
     assert_eq!(
         outcome,
-        StatusWriteOutcome::Conflict,
+        StatusWriteOutcome::Proposed(Effect::Rejected(Refusal::Conflict)),
         "stale-rv status write must conflict (not clobber)"
     );
+    assert!(!outcome.changed(), "a conflicted status write is no change");
 
     // The concurrent spec change survives intact + no stale status landed.
     let live = store.get(&rs_key).await.unwrap();
@@ -462,7 +464,10 @@ async fn status_write_succeeds_with_current_rv_then_noop_on_reissue() {
     let outcome = write_status_cas(&store, &rs_key, &parent, &desired)
         .await
         .unwrap();
-    assert_eq!(outcome, StatusWriteOutcome::Written);
+    assert!(
+        matches!(outcome, StatusWriteOutcome::Proposed(Effect::Written(_))),
+        "{outcome:?}"
+    );
 
     // Re-read the (now status-bearing) object + re-issue the SAME status →
     // NoChange, and the catalog revision must not advance.

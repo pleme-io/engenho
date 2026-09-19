@@ -45,7 +45,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{Reason, ResourceCommand, ResourceOp},
+    command::{Reason, ResourceCommand},
     resource::ResourceKey,
 };
 use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor};
@@ -53,6 +53,7 @@ use serde_json::Value;
 use tracing::{debug, info};
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::status::write_status_cas;
 
@@ -108,9 +109,14 @@ impl NamespaceController {
     /// Sweep one Terminating namespace: delete every namespaced object in
     /// it, set `status.phase = Terminating`, and — when empty — clear the
     /// `kubernetes` finalizer (which removes the namespace via the store's
-    /// finalizer-release rule). Returns the number of mutations made.
-    async fn sweep(&self, ns_name: &str, ns_obj: &Value) -> Result<usize, ControllerError> {
-        let mut changed = 0usize;
+    /// finalizer-release rule). Every write is recorded on `report` by what
+    /// the store did with it.
+    async fn sweep(
+        &self,
+        ns_name: &str,
+        ns_obj: &Value,
+        report: &mut ReconcileReport,
+    ) -> Result<(), ControllerError> {
         // Freeze ONE boundary clock read for THIS sweep — threaded into
         // every child delete so a finalizer-bearing child gets a Terminating
         // deletionTimestamp (the store's finalizer gate stamps it from this
@@ -124,12 +130,8 @@ impl NamespaceController {
         // 1. status.phase = Terminating (idempotent via write_status_cas).
         let ns_key = ResourceKey::cluster_scoped("", "v1", "Namespace", ns_name);
         let desired_status = serde_json::json!({ "phase": "Terminating" });
-        if write_status_cas(&self.store, &ns_key, ns_obj, &desired_status)
-            .await?
-            .changed()
-        {
-            changed += 1;
-        }
+        let status = write_status_cas(&self.store, &ns_key, ns_obj, &desired_status).await?;
+        report.record(status.effect());
 
         // 2. Delete every namespaced object in this namespace across all
         //    served namespaced kinds.
@@ -163,9 +165,7 @@ impl NamespaceController {
                     ))
                     .await?;
                 // Only a real removal / Terminating stamp counts as a change.
-                if matches!(out.op, ResourceOp::Deleted | ResourceOp::DeletionPending) {
-                    changed += 1;
-                }
+                report.record(Effect::of(out.op));
             }
         }
 
@@ -196,9 +196,7 @@ impl NamespaceController {
                         Reason::GarbageCollector,
                     ))
                     .await?;
-                if matches!(out.op, ResourceOp::Patched | ResourceOp::Deleted) {
-                    changed += 1;
-                }
+                report.record(Effect::of(out.op));
             }
         } else {
             debug!(
@@ -207,7 +205,7 @@ impl NamespaceController {
             );
         }
 
-        Ok(changed)
+        Ok(())
     }
 }
 
@@ -237,7 +235,7 @@ impl Controller for NamespaceController {
                 continue;
             }
             let ns_name = &key.name;
-            report.objects_changed += self.sweep(ns_name, &ns_obj).await?;
+            self.sweep(ns_name, &ns_obj, &mut report).await?;
         }
 
         // Done — the WatchDriver fallback tick re-runs until each

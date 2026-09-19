@@ -37,6 +37,7 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::meta::{DefaultedInt, REPLICAS, warn_unreadable};
 
@@ -282,14 +283,15 @@ impl Controller for HorizontalPodAutoscalerController {
                 target_value,
                 "HPA scaling"
             );
-            self.store
+            let applied = self
+                .store
                 .propose(ResourceCommand::patch(
                     target_key,
                     json!({"spec": {"replicas": desired}}),
                     Reason::Controller,
                 ))
                 .await?;
-            report.objects_changed += 1;
+            report.record(Effect::of(applied.op));
         }
         Ok(report.into())
     }

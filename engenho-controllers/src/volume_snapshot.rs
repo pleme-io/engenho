@@ -55,6 +55,7 @@ use engenho_store::{
 use serde_json::{Value, json};
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// The snapshot API group.
@@ -327,7 +328,8 @@ impl Controller for VolumeSnapshotController {
                 "creationTime": engenho_types::time::now_rfc3339_utc(),
                 "restoreSize": size,
             });
-            self.store
+            let applied = self
+                .store
                 .propose(ResourceCommand::Put {
                     key: ResourceKey::namespaced(
                         SNAPSHOT_GROUP,
@@ -341,7 +343,7 @@ impl Controller for VolumeSnapshotController {
                     reason: Reason::Controller,
                 })
                 .await?;
-            report.objects_changed += 1;
+            report.record(Effect::of(applied.op));
         }
 
         Ok(report.into())

@@ -66,6 +66,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// A single routing entry — one ClusterIP:port → set of pod backends.
@@ -965,24 +966,22 @@ impl Controller for ServiceRoutingController {
             .await
             .map_err(|e| ControllerError::Internal(e.to_string()))?;
 
-        // Upserts: in desired but not installed identically.
+        // Upserts: in desired but not installed identically. A backend
+        // error ends the tick uncounted; only a call that returned Ok is a
+        // change.
         for (id, route) in &desired {
             if installed.get(id) != Some(route) {
-                self.backend
-                    .upsert(route)
-                    .await
+                let applied = Effect::applied(self.backend.upsert(route).await)
                     .map_err(|e| ControllerError::Internal(e.to_string()))?;
-                report.objects_changed += 1;
+                report.record(applied);
             }
         }
         // Removes: in installed but not in desired.
         for id in installed.keys() {
             if !desired.contains_key(id) {
-                self.backend
-                    .remove(id)
-                    .await
+                let applied = Effect::applied(self.backend.remove(id).await)
                     .map_err(|e| ControllerError::Internal(e.to_string()))?;
-                report.objects_changed += 1;
+                report.record(applied);
             }
         }
         Ok(report.into())

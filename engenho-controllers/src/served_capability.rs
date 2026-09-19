@@ -43,6 +43,7 @@ use engenho_store::StoreMesh;
 use engenho_store::command::{Reason, ResourceCommand};
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// The condition type engenho uses to declare that a kind's behaviour is
@@ -402,7 +403,7 @@ impl Controller for ServedCapabilityController {
                     })
                     .await
                 {
-                    Ok(_) => report.objects_changed += 1,
+                    Ok(applied) => report.record(Effect::of(applied.op)),
                     // Never fatal: failing to annotate an inert object must
                     // not stop the rest of the control plane. The next tick
                     // retries, and the object is no worse off than the

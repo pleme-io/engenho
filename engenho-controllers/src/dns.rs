@@ -28,6 +28,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// Default cluster DNS suffix (matches CoreDNS convention).
@@ -416,20 +417,16 @@ impl Controller for DnsController {
 
         for (fqdn, record) in &desired {
             if installed.get(fqdn) != Some(record) {
-                self.backend
-                    .upsert(record)
-                    .await
+                let applied = Effect::applied(self.backend.upsert(record).await)
                     .map_err(|e| ControllerError::Internal(e.to_string()))?;
-                report.objects_changed += 1;
+                report.record(applied);
             }
         }
         for fqdn in installed.keys() {
             if !desired.contains_key(fqdn) {
-                self.backend
-                    .remove(fqdn)
-                    .await
+                let applied = Effect::applied(self.backend.remove(fqdn).await)
                     .map_err(|e| ControllerError::Internal(e.to_string()))?;
-                report.objects_changed += 1;
+                report.record(applied);
             }
         }
 
