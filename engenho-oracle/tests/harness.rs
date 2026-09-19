@@ -1,7 +1,7 @@
 //! The harness is closed in both directions: every row is claimed, and every
 //! exemption is live. Each rule has one row here that breaks it.
 
-use engenho_oracle::{Answer, Case, Deviation, Failure, OutOfScope, Table, Vector, run};
+use engenho_oracle::{Answer, Case, Deviation, Failure, OutOfScope, Scope, Table, Vector, run};
 use serde_json::{Value, json};
 
 /// Three rows over two kinds. Kinds come from `input.kind` in the prober table.
@@ -126,10 +126,7 @@ fn an_unclaimed_row_fails() {
 
 #[test]
 fn an_out_of_scope_kind_claims_its_rows() {
-    let skip = [OutOfScope {
-        kind: "beta",
-        why: "no counterpart",
-    }];
+    let skip = [OutOfScope::kind("beta", "no counterpart")];
     let report = run(&table(), &skip, NO_DEV, |c: &Case| {
         if kind(c) == "beta" {
             Answer::NotChecked
@@ -143,26 +140,25 @@ fn an_out_of_scope_kind_claims_its_rows() {
 
 #[test]
 fn a_stale_out_of_scope_kind_fails() {
-    let skip = [OutOfScope {
-        kind: "gamma",
-        why: "no such kind",
-    }];
+    let skip = [OutOfScope::kind("gamma", "no such kind")];
     let got = failures(run(&table(), &skip, NO_DEV, faithful));
     assert!(
-        matches!(&got[..], [Failure::StaleOutOfScope { kind: "gamma" }]),
+        matches!(
+            &got[..],
+            [Failure::StaleOutOfScope {
+                scope: Scope::Kind("gamma")
+            }]
+        ),
         "{got:?}"
     );
 }
 
 #[test]
 fn checking_an_out_of_scope_kind_fails() {
-    let skip = [OutOfScope {
-        kind: "beta",
-        why: "said out of scope",
-    }];
+    let skip = [OutOfScope::kind("beta", "said out of scope")];
     let got = failures(run(&table(), &skip, NO_DEV, faithful));
     assert!(
-        matches!(&got[..], [Failure::CheckedOutOfScope { case, kind: "beta" }] if case == "b1"),
+        matches!(&got[..], [Failure::CheckedOutOfScope { case, scope: Scope::Kind("beta") }] if case == "b1"),
         "{got:?}"
     );
 }
@@ -209,10 +205,7 @@ fn a_deviation_on_a_missing_or_unchecked_row_fails() {
         "{got:?}"
     );
 
-    let skip = [OutOfScope {
-        kind: "beta",
-        why: "no counterpart",
-    }];
+    let skip = [OutOfScope::kind("beta", "no counterpart")];
     let dev = [Deviation {
         case: "b1",
         why: "not checked",
@@ -233,14 +226,8 @@ fn a_deviation_on_a_missing_or_unchecked_row_fails() {
 #[test]
 fn checking_nothing_fails() {
     let skip = [
-        OutOfScope {
-            kind: "alpha",
-            why: "x",
-        },
-        OutOfScope {
-            kind: "beta",
-            why: "y",
-        },
+        OutOfScope::kind("alpha", "x"),
+        OutOfScope::kind("beta", "y"),
     ];
     let got = failures(run(&table(), &skip, NO_DEV, |_: &Case| Answer::NotChecked));
     assert!(matches!(&got[..], [Failure::Vacuous]), "{got:?}");
@@ -248,10 +235,7 @@ fn checking_nothing_fails() {
 
 #[test]
 fn every_failure_is_reported_not_just_the_first() {
-    let skip = [OutOfScope {
-        kind: "gamma",
-        why: "stale",
-    }];
+    let skip = [OutOfScope::kind("gamma", "stale")];
     let got = failures(run(&table(), &skip, NO_DEV, |c: &Case| {
         match c.name.as_str() {
             "a1" => Answer::Checked(json!({"y": 0})),
@@ -271,4 +255,53 @@ fn duplicate_row_names_are_rejected() {
     let err = Table::parse(Vector::ProberResults, &json.to_string()).expect_err("rejected");
     assert!(err.to_string().contains("two rows named"), "{err}");
     let _: Value = json;
+}
+
+#[test]
+fn a_row_scoped_declaration_claims_only_that_row() {
+    let skip = [OutOfScope::case("a2", "decided outside the adapter's code")];
+    let report = run(&table(), &skip, NO_DEV, |c: &Case| {
+        if c.name == "a2" {
+            Answer::NotChecked
+        } else {
+            faithful(c)
+        }
+    })
+    .expect("passes");
+    assert_eq!((report.checked, report.out_of_scope), (2, 1));
+
+    // Its sibling of the same kind is not covered by it.
+    let got = failures(run(&table(), &skip, NO_DEV, |c: &Case| {
+        if kind(c) == "alpha" {
+            Answer::NotChecked
+        } else {
+            faithful(c)
+        }
+    }));
+    assert!(
+        matches!(&got[..], [Failure::Unclaimed { case, .. }] if case == "a1"),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_stale_or_checked_row_declaration_fails() {
+    let skip = [OutOfScope::case("zz", "no such row")];
+    let got = failures(run(&table(), &skip, NO_DEV, faithful));
+    assert!(
+        matches!(
+            &got[..],
+            [Failure::StaleOutOfScope {
+                scope: Scope::Case("zz")
+            }]
+        ),
+        "{got:?}"
+    );
+
+    let skip = [OutOfScope::case("b1", "said out of scope")];
+    let got = failures(run(&table(), &skip, NO_DEV, faithful));
+    assert!(
+        matches!(&got[..], [Failure::CheckedOutOfScope { case, scope: Scope::Case("b1") }] if case == "b1"),
+        "{got:?}"
+    );
 }

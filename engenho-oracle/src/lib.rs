@@ -204,13 +204,52 @@ impl Table {
     }
 }
 
-/// A row kind engenho has no counterpart for, and why.
+/// What an out-of-scope declaration covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Every row of this kind, exactly as [`Table::kinds`] reports it.
+    Kind(&'static str),
+    /// One row, by name. For a kind engenho answers only in part: a row whose
+    /// situation is decided outside the code the adapter drives.
+    Case(&'static str),
+}
+
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Kind(k) => write!(f, "kind {k:?}"),
+            Self::Case(c) => write!(f, "row {c:?}"),
+        }
+    }
+}
+
+/// Rows engenho has no counterpart for, and why.
 #[derive(Debug, Clone, Copy)]
 pub struct OutOfScope {
-    /// The kind, exactly as [`Table::kinds`] reports it.
-    pub kind: &'static str,
-    /// Why no engenho code answers this row.
+    /// Which rows.
+    pub scope: Scope,
+    /// Why no engenho code answers them.
     pub why: &'static str,
+}
+
+impl OutOfScope {
+    /// Every row of `kind`.
+    #[must_use]
+    pub const fn kind(kind: &'static str, why: &'static str) -> Self {
+        Self {
+            scope: Scope::Kind(kind),
+            why,
+        }
+    }
+
+    /// The one row named `case`.
+    #[must_use]
+    pub const fn case(case: &'static str, why: &'static str) -> Self {
+        Self {
+            scope: Scope::Case(case),
+            why,
+        }
+    }
 }
 
 /// A checked row where engenho deliberately differs from upstream.
@@ -249,12 +288,12 @@ pub enum Failure {
         why: &'static str,
         got: Value,
     },
-    /// A row nobody checked whose kind is not declared out of scope.
+    /// A row nobody checked that no out-of-scope declaration covers.
     Unclaimed { case: String, kind: String },
-    /// An out-of-scope kind that does not occur in the table.
-    StaleOutOfScope { kind: &'static str },
-    /// An out-of-scope kind that the adapter checked after all.
-    CheckedOutOfScope { case: String, kind: &'static str },
+    /// An out-of-scope declaration naming a kind or row the table does not have.
+    StaleOutOfScope { scope: Scope },
+    /// A row declared out of scope that the adapter checked after all.
+    CheckedOutOfScope { case: String, scope: Scope },
     /// A deviation naming a row the table does not have.
     DeviationNoSuchRow { case: &'static str },
     /// A deviation on a row the adapter did not check.
@@ -287,13 +326,13 @@ impl fmt::Display for Failure {
                     "{case}: kind {kind:?} is neither checked nor declared out of scope"
                 )
             }
-            Self::StaleOutOfScope { kind } => {
-                write!(f, "out-of-scope kind {kind:?} does not occur in the table")
+            Self::StaleOutOfScope { scope } => {
+                write!(f, "out-of-scope {scope} does not occur in the table")
             }
-            Self::CheckedOutOfScope { case, kind } => {
+            Self::CheckedOutOfScope { case, scope } => {
                 write!(
                     f,
-                    "{case}: kind {kind:?} is declared out of scope but was checked"
+                    "{case}: {scope} is declared out of scope but was checked"
                 )
             }
             Self::DeviationNoSuchRow { case } => write!(f, "deviation names no row: {case:?}"),
@@ -398,21 +437,32 @@ pub fn run(
     let mut report = Report::default();
     let mut failures = Vec::new();
     let kinds = table.kinds();
-    let skip: BTreeMap<&str, &OutOfScope> = out_of_scope.iter().map(|o| (o.kind, o)).collect();
+    let names: BTreeSet<&str> = table.cases.iter().map(|c| c.name.as_str()).collect();
+    // A row's declaration: its own name first, then its kind.
+    let covering = |case: &Case, kind: &str| -> Option<Scope> {
+        out_of_scope.iter().map(|o| o.scope).find(|s| match s {
+            Scope::Case(c) => *c == case.name,
+            Scope::Kind(k) => *k == kind,
+        })
+    };
     let deviating: BTreeSet<&str> = deviations.iter().map(|d| d.case).collect();
     let mut checked_rows = BTreeSet::new();
     let mut disagreeing_rows = BTreeSet::new();
 
     for o in out_of_scope {
-        if !kinds.contains(o.kind) {
-            failures.push(Failure::StaleOutOfScope { kind: o.kind });
+        let present = match o.scope {
+            Scope::Kind(k) => kinds.contains(k),
+            Scope::Case(c) => names.contains(c),
+        };
+        if !present {
+            failures.push(Failure::StaleOutOfScope { scope: o.scope });
         }
     }
 
     for case in &table.cases {
         let kind = table.kind_of(case);
         match adapter(case) {
-            Answer::NotChecked => match skip.get(kind.as_str()) {
+            Answer::NotChecked => match covering(case, &kind) {
                 Some(_) => report.out_of_scope += 1,
                 None => failures.push(Failure::Unclaimed {
                     case: case.name.clone(),
@@ -420,10 +470,10 @@ pub fn run(
                 }),
             },
             Answer::Checked(got) => {
-                if let Some(o) = skip.get(kind.as_str()) {
+                if let Some(scope) = covering(case, &kind) {
                     failures.push(Failure::CheckedOutOfScope {
                         case: case.name.clone(),
-                        kind: o.kind,
+                        scope,
                     });
                 }
                 report.checked += 1;
