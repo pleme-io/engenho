@@ -453,7 +453,7 @@ fn subjects_match(subjects: &[Subject], user: &UserInfo, default_sa_ns: Option<&
 /// `true` iff `rule` grants `attrs`.
 ///
 ///   * Non-resource request: the verb must match AND the path must match one of
-///     the rule's `non_resource_urls` (exact OR a trailing `/*` prefix-glob).
+///     the rule's `non_resource_urls` per [`non_resource_url_matches`].
 ///   * Resource request: the verb and apiGroup must each match (`*` wildcard
 ///     accepted on each), the resource must match per [`resource_matches`],
 ///     AND (`resource_names` empty OR `attrs.name ∈ resource_names`).
@@ -551,18 +551,20 @@ fn resource_name_matches(resource_names: &[String], name: Option<&str>) -> bool 
     }
 }
 
-/// `true` iff the non-resource `url` matches the rule pattern `pat`. A pattern
-/// ending in `/*` is a prefix-glob (`/apis/*` matches `/apis/apps/v1`); a bare
-/// `*` matches anything; otherwise an exact match.
+/// `true` iff the rule pattern `pat` grants the non-resource `url`. Upstream's
+/// `NonResourceURLMatches` (`pkg/apis/rbac/v1/evaluation_helpers.go@v1.34.0`)
+/// grants on exactly three shapes:
+///
+///   * `*` — every path;
+///   * the exact path;
+///   * a pattern ending in `*` — every path that starts with the pattern
+///     minus its trailing `*`s.
+///
+/// So `/apis/*` grants `/apis/v1` and `/apis/` but not `/apis`, which a rule
+/// must list on its own (the bootstrap roles do), and `/foo*` grants
+/// `/foobar`.
 fn non_resource_url_matches(pat: &str, url: &str) -> bool {
-    if pat == "*" {
-        return true;
-    }
-    if let Some(prefix) = pat.strip_suffix("/*") {
-        // `/apis/*` matches `/apis` itself AND any `/apis/...` subpath.
-        return url == prefix || url.starts_with(&[prefix, "/"].concat());
-    }
-    pat == url
+    pat == "*" || pat == url || (pat.ends_with('*') && url.starts_with(pat.trim_end_matches('*')))
 }
 
 /// Wrap any [`Authorizer`] as `Arc<dyn Authorizer>` — the shape `RouterState`
@@ -1072,6 +1074,12 @@ mod tests {
             authz.authorize(&nr("get", "/apis/apps/v1")).await,
             Decision::Allow
         );
+        // /api is granted by its own entry, not by a /api/* glob: the rule
+        // lists /api and no /api/*, so /api/v1 is not granted.
+        assert_eq!(
+            authz.authorize(&nr("get", "/api/v1")).await,
+            Decision::NoOpinion
+        );
         // A resource URL is NOT granted by this non-resource rule.
         assert_eq!(
             authz
@@ -1086,6 +1094,20 @@ mod tests {
                 .await,
             Decision::NoOpinion
         );
+    }
+
+    /// Any trailing `*` is a prefix, not only `/*`: upstream trims every
+    /// trailing `*` and prefix-matches what is left
+    /// (`strings.TrimRight(ruleURL, "*")`, evaluation_helpers.go@v1.34.0). No
+    /// upstream table row covers a star without a slash, so this pins it.
+    #[test]
+    fn a_trailing_star_without_a_slash_is_a_prefix() {
+        assert!(non_resource_url_matches("/metrics*", "/metrics"));
+        assert!(non_resource_url_matches("/metrics*", "/metrics/cadvisor"));
+        assert!(non_resource_url_matches("/metrics*", "/metricsfoo"));
+        assert!(!non_resource_url_matches("/metrics*", "/metric"));
+        assert!(non_resource_url_matches("/logs/**", "/logs/x"));
+        assert!(!non_resource_url_matches("/logs/**", "/logs"));
     }
 
     #[tokio::test]
@@ -1478,6 +1500,77 @@ mod tests {
                         (r("verb2", "group2", "resource1", "subresource2"), false),
                         (r("verb2", "group1", "resource2", "subresource1"), false),
                         (r("verb2", "group2", "resource2", "subresource1"), false),
+                    ],
+                },
+            ]);
+        }
+
+        /// `nonresourceRequest(verb).URL(url)`.
+        fn nonresource_request(verb: &str, url: &str) -> Attributes {
+            Attributes {
+                user: user("", &[]),
+                verb: verb.to_string(),
+                group: String::new(),
+                version: String::new(),
+                resource: String::new(),
+                subresource: None,
+                namespace: None,
+                name: None,
+                non_resource_url: Some(url.to_string()),
+            }
+        }
+
+        /// `TestRuleMatches`, the non-resource cases.
+        #[test]
+        fn test_rule_matches_nonresource_requests() {
+            let n = nonresource_request;
+            assert_rule_matches(&[
+                RuleMatchesCase {
+                    name: "star nonresource, exact match other",
+                    rule: rule(&["verb1"], &[], &[], &["*"]),
+                    requests_to_expected: vec![
+                        (n("verb1", "/foo"), true),
+                        (n("verb1", "/foo/bar"), true),
+                        (n("verb1", "/foo/baz"), true),
+                        (n("verb1", "/foo/bar/one"), true),
+                        (n("verb1", "/foo/baz/one"), true),
+                        (n("verb2", "/foo"), false),
+                        (n("verb2", "/foo/bar"), false),
+                        (n("verb2", "/foo/baz"), false),
+                        (n("verb2", "/foo/bar/one"), false),
+                        (n("verb2", "/foo/baz/one"), false),
+                    ],
+                },
+                RuleMatchesCase {
+                    name: "star nonresource subpath",
+                    rule: rule(&["verb1"], &[], &[], &["/foo/*"]),
+                    requests_to_expected: vec![
+                        (n("verb1", "/foo"), false),
+                        (n("verb1", "/foo/bar"), true),
+                        (n("verb1", "/foo/baz"), true),
+                        (n("verb1", "/foo/bar/one"), true),
+                        (n("verb1", "/foo/baz/one"), true),
+                        (n("verb1", "/notfoo"), false),
+                        (n("verb1", "/notfoo/bar"), false),
+                        (n("verb1", "/notfoo/baz"), false),
+                        (n("verb1", "/notfoo/bar/one"), false),
+                        (n("verb1", "/notfoo/baz/one"), false),
+                    ],
+                },
+                RuleMatchesCase {
+                    name: "star verb, exact nonresource",
+                    rule: rule(&["*"], &[], &[], &["/foo", "/foo/bar/one"]),
+                    requests_to_expected: vec![
+                        (n("verb1", "/foo"), true),
+                        (n("verb1", "/foo/bar"), false),
+                        (n("verb1", "/foo/baz"), false),
+                        (n("verb1", "/foo/bar/one"), true),
+                        (n("verb1", "/foo/baz/one"), false),
+                        (n("verb2", "/foo"), true),
+                        (n("verb2", "/foo/bar"), false),
+                        (n("verb2", "/foo/baz"), false),
+                        (n("verb2", "/foo/bar/one"), true),
+                        (n("verb2", "/foo/baz/one"), false),
                     ],
                 },
             ]);

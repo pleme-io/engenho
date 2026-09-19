@@ -47,7 +47,7 @@
        :do "for each matched binding, resolve roleRef => ClusterRole (cluster) or Role (in the binding's namespace). RoleBinding may reference a ClusterRole (applied in-ns). Dangling roleRef => skip + warn (NoOpinion contribution, NOT a hard error)")
     (d match-rules
        :resource     "verb in rule.verbs|* AND group in rule.apiGroups|* AND rule.resources holds * | the exact key (resource, or resource/sub) | */sub AND (rule.resourceNames empty OR name in rule.resourceNames) => Allow. A bare resource never grants its subresources; a subresource grant never grants its parent; resource/* is not a pattern. Upstream ResourceMatches, pkg/apis/rbac/v1/evaluation_helpers.go@v1.34.0"
-       :non-resource "verb in rule.verbs|* AND path matches a rule.nonResourceURLs entry (exact | trailing /* prefix-glob) => Allow")
+       :non-resource "verb in rule.verbs|* AND a rule.nonResourceURLs entry is * | the exact path | ends in * and the path starts with it minus its trailing *s => Allow. /apis/* does not grant /apis. Upstream NonResourceURLMatches, pkg/apis/rbac/v1/evaluation_helpers.go@v1.34.0")
     (e default
        :do "no rule matched => NoOpinion"))
 
