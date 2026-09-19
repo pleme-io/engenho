@@ -23,7 +23,7 @@
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
     "engenho-runtime/Cargo.toml": "3e13d396eb3b50c98b251b81ab2241e844b186c095621723b5f63e6736445ede",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
-    "engenho-store/Cargo.toml": "8b378fa9e3e1223b200168b5ff6f7a03c6dcc42fd6fb670576aaf0a9af5a80f1",
+    "engenho-store/Cargo.toml": "c1630fdd51788287b06e85c72280af36a0953aa3b94f751dd64137ae2c59d404",
     "engenho-substrate-core/Cargo.toml": "3bc0b7054258b721c4ac21dc36f7bf1b949352bb0d345171db6f812461d5bf8b",
     "engenho-substrate-incubator/Cargo.toml": "97fc8cd31503b2fba136f5b55614ad07345cfbfa44cc59b9a7ddc378140be5d4",
     "engenho-substrate-props/Cargo.toml": "d5a75c33f45b46eddd6d7d4a7166e002f10b0787e57dc35bbbdd1521e126bec6",
@@ -6912,16 +6912,6 @@
             "tree": "target"
           },
           {
-            "name": "engenho_teia",
-            "package_key": "engenho-teia-0.53.118",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
             "name": "engenho_types",
             "package_key": "engenho-types-0.53.118",
             "kind": "normal",
@@ -7030,7 +7020,9 @@
           }
         ],
         "build_dependencies": [],
-        "features": []
+        "features": [
+          "default"
+        ]
       },
       "engenho-substrate-0.53.118": {
         "runtime_dependencies": [

@@ -520,7 +520,10 @@ mod tests {
         let tick = tick_of(4, 1, 2, 2, 1);
         let mut expected = ReconcileReport::default();
         expected.objects_examined = 6;
-        expected.objects_changed = 3;
+        // Counted the way every count is (T1.8): three landed writes.
+        for _ in 0..3 {
+            expected.record(engenho_controllers::Effect::answered(true));
+        }
         expected.objects_skipped = 1;
         expected.note = Some(tick.to_string());
         assert_eq!(

@@ -81,6 +81,7 @@ engenho_controllers::closed_enum! {
         Namespace,
         PvBinder,
         VolumeSnapshot,
+        PvcProtection,
         Crd,
         Scheduler,
         ServedCapability,
@@ -137,6 +138,7 @@ impl Driver {
             Self::Namespace => "namespace",
             Self::PvBinder => "pv-binder",
             Self::VolumeSnapshot => "volume-snapshot",
+            Self::PvcProtection => "pvc-protection",
             Self::Crd => "crd",
             Self::Scheduler => "scheduler",
             Self::ServedCapability => "served-capability",
@@ -163,6 +165,7 @@ impl Driver {
             | Self::Namespace
             | Self::PvBinder
             | Self::VolumeSnapshot
+            | Self::PvcProtection
             | Self::ServedCapability
             | Self::CniStatus => TickState::Stateless,
             // The `local` pod map lives across ticks.
@@ -200,8 +203,9 @@ impl Driver {
             Self::Namespace => enable.namespace,
             // The snapshot controller snapshots the directories the binder
             // provisions; enabling one without the other yields a controller
-            // that can only ever decline.
-            Self::PvBinder | Self::VolumeSnapshot => enable.pv_binder,
+            // that can only ever decline. pvc-protection guards the claims the
+            // binder binds, so it runs whenever the binder does.
+            Self::PvBinder | Self::VolumeSnapshot | Self::PvcProtection => enable.pv_binder,
             Self::Crd => enable.crd,
             Self::Scheduler
             | Self::ServedCapability

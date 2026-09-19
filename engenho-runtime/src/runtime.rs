@@ -18,9 +18,9 @@ use engenho_controllers::{
     Controller, ControllerError, ControllerType, CrdController, CronJobController,
     DaemonSetController, DeclaresReads, DeploymentController, DynamicHandlerSink,
     EndpointsController, FakeRouter, GcController, Heartbeat, IptablesRouter, IpvsRouter,
-    JobController, NamespaceController, PodDisruptionBudgetController, PvBinderController, Reads,
-    ReconcileOutcome, ReplicaSetController, ServiceRouter, ServiceRoutingController,
-    StatefulSetController, WallClock, WatchDriver, WatchDriverConfig,
+    JobController, NamespaceController, PodDisruptionBudgetController, PvBinderController,
+    PvcProtectionController, Reads, ReconcileOutcome, ReplicaSetController, ServiceRouter,
+    ServiceRoutingController, StatefulSetController, WallClock, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
     event_recorder::EventSink,
@@ -2680,6 +2680,12 @@ impl<'a> Parts<'a> {
             // each child's deletion wakes it; the fallback tick covers the
             // rest of the drain.
             Driver::Namespace => self.watch(driver, NamespaceController::new(store.clone(), ns())),
+            // A claim in use by a pod carries kubernetes.io/pvc-protection and is
+            // not removed while in use; a Bound PV whose claim is gone goes
+            // Released and is reclaimed per its policy (W9).
+            Driver::PvcProtection => {
+                self.watch(driver, PvcProtectionController::new(store.clone(), ns()))
+            }
             // PV/PVC binder: binds Pending claims to matching Available PVs
             // and dynamically provisions a node-local hostPath PV (under
             // data_dir/local-path) when no static PV matches. A claim that
@@ -3362,18 +3368,19 @@ mod tests {
         );
         // Drivers: the reconciler set (deployment, replicaset, statefulset,
         // daemonset, job, cronjob, endpoints, pdb, service_routing, gc,
-        // namespace, pv_binder, volume_snapshot, crd) + served_capability +
+        // namespace, pv_binder, volume_snapshot, pvc_protection, crd) + served_capability +
         // scheduler + kubelet.
         //
         // This count is deliberately pinned: a driver that stops being
         // spawned is invisible at runtime (the cluster simply stops
         // converging that kind), so the arithmetic here is the tripwire.
         // Moving it is correct ONLY alongside an intentional change to the
-        // driver set — which is what added served_capability, and now
-        // volume_snapshot (19 → 20). Every driver in the catalog is on in
-        // this config, so it is also the catalog's size.
-        assert_eq!(running_drivers(&rt), 20);
-        assert_eq!(Driver::ALL.len(), 20);
+        // driver set — which is what added served_capability, then
+        // volume_snapshot (19 → 20), and now pvc_protection (20 → 21, W9).
+        // Every driver in the catalog is on in this config, so it is also the
+        // catalog's size.
+        assert_eq!(running_drivers(&rt), 21);
+        assert_eq!(Driver::ALL.len(), 21);
         rt.shutdown().await.unwrap();
     }
 
@@ -3669,11 +3676,11 @@ mod tests {
     #[tokio::test]
     async fn disabling_service_routing_drops_one_driver() {
         // Gating works: turning off enable.service_routing removes exactly
-        // one spawned driver (20 → 19).
+        // one spawned driver (21 → 20).
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(running_drivers(&rt), 19);
+        assert_eq!(running_drivers(&rt), 20);
         assert!(
             rt.children()
                 .get(Child::Driver(Driver::ServiceRouting))
@@ -3723,6 +3730,7 @@ mod tests {
             Driver::ServiceRouting => vec![file!("engenho-controllers/src/service_router.rs")],
             Driver::Gc => vec![file!("engenho-controllers/src/gc.rs")],
             Driver::Namespace => vec![file!("engenho-controllers/src/namespace.rs")],
+            Driver::PvcProtection => vec![file!("engenho-controllers/src/pvc_protection.rs")],
             Driver::PvBinder => vec![
                 file!("engenho-controllers/src/pv_binder.rs"),
                 file!("engenho-controllers/src/pv_binder/identity.rs"),

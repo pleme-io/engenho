@@ -22,12 +22,19 @@ tracing            = { workspace = true }
 anyhow             = { workspace = true }
 
 engenho-types      = { workspace = true }
-engenho-teia       = { workspace = true }
+# The NATS Raft transport is fenced off with engenho-teia's client
+# (docs/IMPROVEMENT-PLAN.md §5.1, T5.2): only under `teia-nats`, off by
+# default. The shipped Raft transport is the in-process router.
+engenho-teia       = { workspace = true, optional = true }
 engenho-substrate  = { workspace = true }
 futures            = { workspace = true }
 openraft           = { workspace = true }
 fjall              = { workspace = true }
 blake3             = "1"
+
+[features]
+default = []
+teia-nats = ["dep:engenho-teia", "engenho-teia/teia-nats"]
 
 [target.'cfg(unix)'.dependencies]
 # flock(2) for the data-dir lock. Unix-only on purpose: the lock is a real

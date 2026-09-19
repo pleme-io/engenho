@@ -100,7 +100,9 @@ pub mod data_dir_lock;
 pub mod drv_committal;
 pub mod fjall_store;
 pub mod mesh;
+#[cfg(feature = "teia-nats")]
 pub mod nats_listener;
+#[cfg(feature = "teia-nats")]
 pub mod nats_network;
 pub mod network;
 pub mod owned_task;
@@ -133,7 +135,9 @@ pub use drv_committal::{
 };
 pub use fjall_store::{FjallStore, Flushed, IMAGE_GATE, ImageInconsistency, ImageTripwire};
 pub use mesh::{MeshFlushed, Quiesced, StoreError, StoreMesh, default_config};
+#[cfg(feature = "teia-nats")]
 pub use nats_listener::NatsListener;
+#[cfg(feature = "teia-nats")]
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
 pub use network::InProcessRouter;
 pub use owned_task::{OwnedTask, TaskStop};
