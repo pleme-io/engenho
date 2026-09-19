@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use shikumi::TieredConfig;
 
 use crate::error::ConfigError;
+use crate::node_local::{LoopbackAddr, NodeLocalListener};
 use crate::tls::TlsConfig;
 
 /// Operator-facing kubelet backend choice — config-side mirror of
@@ -246,9 +247,13 @@ pub struct RuntimeConfig {
     /// :10250 behind webhook authn/authz, which engenho does not have yet.
     /// Binding every interface by default would publish unauthenticated
     /// exec on the node. Loopback keeps it usable for the apiserver on the
-    /// same host (the single-binary layout today) and reachable from
-    /// elsewhere only by an explicit operator decision. Widen it when the
-    /// authn gate exists, not before.
+    /// same host (the single-binary layout today).
+    ///
+    /// ★ LOOPBACK IS ALSO THE ONLY THING [`Self::validate`] ACCEPTS (T4.9).
+    /// An operator decision cannot widen it either: `0.0.0.0`, a LAN or
+    /// tailnet address, and a hostname are all refused with
+    /// [`ConfigError::NodeLocalListener`]. The refusal lifts when :10250 has
+    /// authentication, not before. See [`crate::NodeLocalListener`].
     pub kubelet_listen_addr: String,
 
     /// Where the etcd v3 FAÇADE binds — upstream's :2379.
@@ -269,6 +274,8 @@ pub struct RuntimeConfig {
     /// which bounds the exposure to disclosure rather than mutation — but
     /// the whole cluster state, Secrets included, is a disclosure worth
     /// keeping on the loopback interface until the TLS gate exists.
+    /// [`Self::validate`] refuses any other address (T4.9), the same way it
+    /// refuses one for :10250.
     ///
     /// Empty string DISABLES the listener, which is what tests use.
     pub etcd_listen_addr: String,
@@ -474,6 +481,10 @@ impl RuntimeConfig {
     ///   * `listen_addr` is empty (the apiserver has nowhere to bind)
     ///   * `leadership_timeout_seconds` is zero (boot would never wait
     ///     for raft leadership and the first `propose` would fail)
+    ///
+    /// Returns [`ConfigError::NodeLocalListener`] when `kubelet_listen_addr`
+    /// or `etcd_listen_addr` holds anything but a loopback `IP:port` literal
+    /// (see [`Self::node_local_addr`]).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.node_name.is_empty() {
             return Err(ConfigError::InvalidField {
@@ -493,8 +504,41 @@ impl RuntimeConfig {
                 reason: "leadership timeout must be > 0".into(),
             });
         }
+        for listener in NodeLocalListener::ALL {
+            self.node_local_addr(listener)?;
+        }
         self.tls.validate()?;
         Ok(())
+    }
+
+    /// The address `listener` binds, proven loopback, or `None` when its field
+    /// is empty and nothing binds.
+    ///
+    /// This is the value a listener should bind: a [`LoopbackAddr`] cannot
+    /// hold any other address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::NodeLocalListener`] when the field holds an
+    /// address that is not on loopback, or that is not an `IP:port` literal
+    /// and so cannot be proven to be.
+    pub fn node_local_addr(
+        &self,
+        listener: NodeLocalListener,
+    ) -> Result<Option<LoopbackAddr>, ConfigError> {
+        let raw = match listener {
+            NodeLocalListener::Kubelet => &self.kubelet_listen_addr,
+            NodeLocalListener::EtcdFacade => &self.etcd_listen_addr,
+        };
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        raw.parse::<LoopbackAddr>()
+            .map(Some)
+            .map_err(|rejection| ConfigError::NodeLocalListener {
+                listener,
+                rejection,
+            })
     }
 
     /// The effective CA cert path: explicit `tls.ca_cert_path` or the
@@ -774,6 +818,152 @@ impl KubeconfigVisibility {
         match self {
             Self::Private => 0o600,
             Self::Group => 0o640,
+        }
+    }
+}
+
+// ── Node-local listeners (T4.9) ───────────────────────────────────────────
+// The kubelet (:10250) and the etcd facade (:2379) cannot authenticate their
+// callers yet, so `validate()` accepts loopback for both and nothing else.
+#[cfg(test)]
+mod node_local_listener_tests {
+    use std::net::SocketAddr;
+
+    use super::RuntimeConfig;
+    use crate::error::ConfigError;
+    use crate::node_local::{ListenerAddrRejection, LoopbackAddr, NodeLocalListener};
+    use shikumi::TieredConfig;
+
+    fn with_addr(listener: NodeLocalListener, raw: &str) -> RuntimeConfig {
+        let mut cfg = RuntimeConfig::prescribed_default();
+        match listener {
+            NodeLocalListener::Kubelet => cfg.kubelet_listen_addr = raw.into(),
+            NodeLocalListener::EtcdFacade => cfg.etcd_listen_addr = raw.into(),
+        }
+        cfg
+    }
+
+    #[test]
+    fn the_prescribed_defaults_bind_loopback() {
+        let cfg = RuntimeConfig::prescribed_default();
+        for listener in NodeLocalListener::ALL {
+            let addr = cfg
+                .node_local_addr(listener)
+                .unwrap_or_else(|e| panic!("{listener}: {e}"))
+                .unwrap_or_else(|| panic!("{listener} must bind by default"));
+            assert!(addr.socket_addr().ip().is_loopback(), "{listener}: {addr}");
+        }
+    }
+
+    #[test]
+    fn loopback_v4_is_accepted_for_every_listener() {
+        for listener in NodeLocalListener::ALL {
+            // rio's real kubelet override is 127.0.0.1:10251.
+            for raw in ["127.0.0.1:10251", "127.0.0.1:0", "127.0.0.2:2379"] {
+                let cfg = with_addr(listener, raw);
+                cfg.validate()
+                    .unwrap_or_else(|e| panic!("{listener} {raw}: {e}"));
+                let want: SocketAddr = raw.parse().unwrap();
+                assert_eq!(
+                    cfg.node_local_addr(listener)
+                        .unwrap()
+                        .map(LoopbackAddr::socket_addr),
+                    Some(want)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loopback_v6_is_accepted_for_every_listener() {
+        for listener in NodeLocalListener::ALL {
+            for raw in ["[::1]:10250", "[::1]:2379", "[::ffff:127.0.0.1]:10250"] {
+                let cfg = with_addr(listener, raw);
+                cfg.validate()
+                    .unwrap_or_else(|e| panic!("{listener} {raw}: {e}"));
+                let want: SocketAddr = raw.parse().unwrap();
+                assert_eq!(
+                    cfg.node_local_addr(listener)
+                        .unwrap()
+                        .map(LoopbackAddr::socket_addr),
+                    Some(want)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_loopback_is_refused_for_every_listener_naming_the_listener() {
+        for listener in NodeLocalListener::ALL {
+            for raw in [
+                "0.0.0.0:10250",
+                "[::]:2379",
+                "192.168.1.10:10250",
+                "100.64.0.1:2379",
+                "[fe80::1]:10250",
+            ] {
+                let want: SocketAddr = raw.parse().unwrap();
+                match with_addr(listener, raw).validate() {
+                    Err(ConfigError::NodeLocalListener {
+                        listener: got,
+                        rejection: ListenerAddrRejection::NotLoopback(addr),
+                    }) => {
+                        assert_eq!(got, listener, "{raw} blamed the wrong listener");
+                        assert_eq!(addr, want);
+                    }
+                    other => panic!("{listener} {raw}: expected NotLoopback, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_hostname_is_refused_because_it_cannot_be_proven_loopback() {
+        for listener in NodeLocalListener::ALL {
+            for raw in ["localhost:10250", "rio.tailnet:2379", "127.0.0.1"] {
+                match with_addr(listener, raw).validate() {
+                    Err(ConfigError::NodeLocalListener {
+                        listener: got,
+                        rejection: ListenerAddrRejection::NotALiteral(addr),
+                    }) => {
+                        assert_eq!(got, listener);
+                        assert_eq!(addr, raw);
+                    }
+                    other => panic!("{listener} {raw}: expected NotALiteral, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_address_binds_nothing_and_is_accepted() {
+        for listener in NodeLocalListener::ALL {
+            let cfg = with_addr(listener, "");
+            cfg.validate().unwrap_or_else(|e| panic!("{listener}: {e}"));
+            assert_eq!(cfg.node_local_addr(listener).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_a_field_the_operator_can_actually_set() {
+        // The error tells the operator which key to fix. If a field is renamed
+        // and `NodeLocalListener::field` is not, the message points at nothing.
+        let serialized = serde_yaml::to_value(RuntimeConfig::prescribed_default()).unwrap();
+        for listener in NodeLocalListener::ALL {
+            let key = listener
+                .field()
+                .strip_prefix("runtime.")
+                .unwrap_or_else(|| panic!("{listener}: field is not under runtime."));
+            assert!(
+                serialized.get(key).is_some(),
+                "{listener}: `{key}` is not a RuntimeConfig key"
+            );
+            let err = with_addr(listener, "0.0.0.0:1").validate().unwrap_err();
+            assert!(
+                err.to_string().contains(listener.field()),
+                "{listener}: the refusal must name {}, got {err}",
+                listener.field()
+            );
         }
     }
 }
