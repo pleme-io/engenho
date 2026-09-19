@@ -103,7 +103,9 @@ pub use attestation::{
     tameshi_attestation_webhook,
 };
 pub use build_backend_roceiro::BuildBackendRoceiro;
-pub use controller::{Controller, ReconcileOutcome, ReconcileReport, ReconcileResult};
+pub use controller::{
+    Controller, ControllerType, ReconcileOutcome, ReconcileReport, ReconcileResult,
+};
 pub use crd::{
     CrdController, CrdEntry, CrdError, CrdHandlerSpec, CrdNames, CrdScope, CrdSpec, CrdVersion,
     DynamicHandlerSink,

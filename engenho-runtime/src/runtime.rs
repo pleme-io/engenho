@@ -15,12 +15,12 @@ use engenho_config::{
     ResolvedDatapath,
 };
 use engenho_controllers::{
-    Controller, ControllerError, CrdController, CronJobController, DaemonSetController,
-    DeclaresReads, DeploymentController, DynamicHandlerSink, EndpointsController, FakeRouter,
-    GcController, Heartbeat, IptablesRouter, IpvsRouter, JobController, NamespaceController,
-    PodDisruptionBudgetController, PvBinderController, Reads, ReconcileOutcome,
-    ReplicaSetController, ServiceRouter, ServiceRoutingController, StatefulSetController,
-    TickClass, WallClock, WatchDriver, WatchDriverConfig,
+    Controller, ControllerError, ControllerType, CrdController, CronJobController,
+    DaemonSetController, DeclaresReads, DeploymentController, DynamicHandlerSink,
+    EndpointsController, FakeRouter, GcController, Heartbeat, IptablesRouter, IpvsRouter,
+    JobController, NamespaceController, PodDisruptionBudgetController, PvBinderController, Reads,
+    ReconcileOutcome, ReplicaSetController, ServiceRouter, ServiceRoutingController,
+    StatefulSetController, TickClass, WallClock, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
     event_recorder::EventSink,
@@ -2566,6 +2566,10 @@ impl<C: Controller> Controller for DeclaredHere<C> {
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         self.controller.tick().await
     }
+
+    fn controller_type(&self) -> ControllerType {
+        self.controller.controller_type()
+    }
 }
 
 impl<C> DeclaresReads for DeclaredHere<C> {
@@ -2691,8 +2695,9 @@ impl<'a> Parts<'a> {
             fallback_interval: self.fallback,
             stuck_tick_after: STUCK_TICK_AFTER,
         };
+        let controller_type = controller.controller_type();
         let watch = WatchDriver::new(controller, self.store.clone(), config);
-        let wiring = Wiring::new(reads, watch.wakes().clone());
+        let wiring = Wiring::new(controller_type, reads, watch.wakes().clone());
         ChildTask::driver(watch.heartbeat(), wiring, watch.run())
     }
 
@@ -3346,11 +3351,13 @@ mod tests {
     }
 
     use super::*;
+    use crate::Dormant;
     use crate::child::{ChildHandle, ChildState};
+    use crate::impl_census::{Implementors, workspace_sources};
     use crate::read_census::{Census, Section};
     use engenho_config::KubeletBackendKind as CfgKind;
     use engenho_controllers::{Beat, KindFilter};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     // ── host capacity ────────────────────────────────────────────────────
 
@@ -3851,6 +3858,101 @@ mod tests {
         assert_eq!(wiring.reads().kinds(), Some(&[][..]));
         assert!(!wiring.wakes().wakes_on("CSINode"));
         assert!(!wiring.wakes().wakes_on("Pod"));
+    }
+
+    // ── T5.11: every controller type is spawned or declared dormant ──────
+    //
+    // Rust cannot list a trait's implementors, so the list comes from the
+    // impl census over the workspace's shipped source — a CI gate, not a
+    // type. It is held against the types the SPAWNED drivers record, not
+    // against a second list of what the runtime is supposed to spawn.
+
+    /// A controller type as both the census and the catalog can name it.
+    fn crate_and_name(t: ControllerType) -> (String, String) {
+        (t.krate().to_owned(), t.ident().to_owned())
+    }
+
+    /// The adapters that hand `Controller` to another controller instead of
+    /// being one. Each forwards `controller_type`, so no driver ever records
+    /// one. A new adapter fails the gate until it is named here: that a type
+    /// only forwards is a claim someone has to make.
+    const FORWARDING: &[(&str, &str)] = &[
+        ("engenho_controllers", "Arc"),
+        ("engenho_runtime", "DeclaredHere"),
+    ];
+
+    #[tokio::test]
+    async fn every_controller_type_is_spawned_or_dormant() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the runtime crate sits inside the workspace");
+        let census = Implementors::of(&workspace_sources(root), "Controller");
+        let implemented: BTreeMap<(String, String), String> = census
+            .concrete
+            .iter()
+            .map(|i| ((i.krate.clone(), i.ident.clone()), i.path.clone()))
+            .collect();
+
+        let rt = Runtime::start(ephemeral_test_config()).await.unwrap();
+        let wirings: Vec<Wiring> = rt
+            .children()
+            .iter()
+            .filter_map(|(_, handle)| handle.wiring().cloned())
+            .collect();
+        rt.shutdown().await.unwrap();
+        let spawned: BTreeSet<(String, String)> = wirings
+            .iter()
+            .map(|w| crate_and_name(w.controller()))
+            .collect();
+        let dormant: BTreeSet<(String, String)> = Dormant::ALL
+            .iter()
+            .map(|d| crate_and_name(d.controller_type()))
+            .collect();
+
+        // Positive controls: a census gone blind, or drivers that record no
+        // type, would pass the gate below vacuously.
+        assert_eq!(
+            wirings.len(),
+            Driver::ALL.len(),
+            "every driver records the controller it runs"
+        );
+        let unseen: Vec<&(String, String)> = spawned
+            .iter()
+            .chain(&dormant)
+            .filter(|t| !implemented.contains_key(*t))
+            .collect();
+        assert!(
+            unseen.is_empty(),
+            "the census does not see these controller types: {unseen:?}"
+        );
+        let forwarding: BTreeSet<(String, String)> = census
+            .forwarding
+            .iter()
+            .map(|i| (i.krate.clone(), i.ident.clone()))
+            .collect();
+        let named: BTreeSet<(String, String)> = FORWARDING
+            .iter()
+            .map(|(k, i)| ((*k).to_owned(), (*i).to_owned()))
+            .collect();
+        assert_eq!(
+            forwarding, named,
+            "the adapters forwarding Controller are not the ones FORWARDING names"
+        );
+
+        // The gate.
+        let neither: Vec<(&(String, String), &String)> = implemented
+            .iter()
+            .filter(|(t, _)| !spawned.contains(*t) && !dormant.contains(*t))
+            .collect();
+        assert!(
+            neither.is_empty(),
+            "a Controller type is neither run by a Driver nor declared Dormant: {neither:?}"
+        );
+        let both: Vec<&(String, String)> = spawned.intersection(&dormant).collect();
+        assert!(
+            both.is_empty(),
+            "a Dormant controller is run by a Driver; delete its row: {both:?}"
+        );
     }
 }
 

@@ -51,7 +51,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use engenho_config::{ControllerEnable, EngenhoConfig};
-use engenho_controllers::{Heartbeat, KindFilter, Reads};
+use engenho_controllers::{ControllerType, Heartbeat, KindFilter, Reads};
 use tokio::task::{Id, JoinSet};
 use tracing::error;
 
@@ -305,23 +305,39 @@ impl fmt::Display for Child {
     }
 }
 
-/// What a driver's controller reads, and which events wake the driver, as
-/// the runtime wired it (T1.7).
+/// Which controller a driver runs, what it reads, and which events wake the
+/// driver, as the runtime wired it (T1.7, T5.11).
 ///
 /// The runtime builds `wakes` from `reads` and from nothing else; both are
 /// recorded so the claim "a driver wakes on every kind its controller reads"
 /// can be checked against the drivers actually spawned, not against the
-/// function that is supposed to build them.
+/// function that is supposed to build them. `controller` is recorded for
+/// the same reason: "every controller type is spawned or dormant"
+/// ([`crate::Dormant`]) is checked against the types the spawned drivers
+/// really run.
 #[derive(Debug, Clone)]
 pub struct Wiring {
+    controller: ControllerType,
     reads: Reads,
     wakes: KindFilter,
 }
 
 impl Wiring {
-    /// Pair a controller's declared reads with the filter its driver got.
-    pub(crate) fn new(reads: Reads, wakes: KindFilter) -> Self {
-        Self { reads, wakes }
+    /// Record the controller a driver runs, its declared reads, and the
+    /// filter its driver got.
+    pub(crate) fn new(controller: ControllerType, reads: Reads, wakes: KindFilter) -> Self {
+        Self {
+            controller,
+            reads,
+            wakes,
+        }
+    }
+
+    /// The type that does the driver's reconciling (never an adapter
+    /// around it).
+    #[must_use]
+    pub fn controller(&self) -> ControllerType {
+        self.controller
     }
 
     /// Every kind the controller declares it reads.

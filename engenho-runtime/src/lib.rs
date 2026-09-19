@@ -46,6 +46,14 @@
 //! [`Runtime::next_dead_child`] reports it, marked Dead and logged at ERROR,
 //! and `main` watches for it beside its stop signal. There is no respawn.
 //!
+//! ## Dormant controllers (T5.11)
+//!
+//! Every type that implements [`engenho_controllers::Controller`] is either
+//! the controller behind a catalog [`Driver`] or a [`Dormant`] row, which
+//! names the type and says why nothing runs it ([`DormantReason`]). A row
+//! names its type through the compiler; that no controller type is in
+//! neither is a test over the workspace's source — a CI gate, not a type.
+//!
 //! ## Boot order (strict)
 //!
 //! 1. `config.validate()`
@@ -72,7 +80,10 @@
 pub mod etcd_facade;
 
 mod child;
+mod dormant;
 mod error;
+#[cfg(test)]
+mod impl_census;
 #[cfg(test)]
 mod read_census;
 mod runtime;
@@ -81,6 +92,7 @@ pub use child::{
     Child, ChildHandle, ChildState, Children, DeadChild, DeathCause, Driver, Listener, TickState,
     Wiring,
 };
+pub use dormant::{Dormant, DormantReason};
 pub use error::RuntimeError;
 pub use etcd_facade::MeshEtcdStore;
 pub use runtime::Runtime;

@@ -126,9 +126,11 @@ impl Census {
     }
 }
 
-/// A token of Rust source, as much of it as the census needs.
+/// A token of Rust source, as much of it as the census needs. Shared with
+/// the impl census (T5.11), which reads the same sources for a different
+/// question.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Tok {
+pub(crate) enum Tok {
     Ident(String),
     Str(String),
     Punct(char),
@@ -139,7 +141,7 @@ enum Tok {
 /// Lex `src` into tokens, dropping comments and whitespace. String, raw
 /// string and char literals are read whole, so text inside them is never
 /// mistaken for code.
-fn lex(src: &str) -> Vec<Tok> {
+pub(crate) fn lex(src: &str) -> Vec<Tok> {
     let chars: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -290,7 +292,7 @@ fn skip_char_or_lifetime(chars: &[char], i: usize) -> usize {
 }
 
 /// `tokens` without any item annotated `#[cfg(test)]`.
-fn strip_test_items(tokens: &[Tok]) -> Vec<Tok> {
+pub(crate) fn strip_test_items(tokens: &[Tok]) -> Vec<Tok> {
     let mut out = Vec::with_capacity(tokens.len());
     let mut i = 0;
     while i < tokens.len() {
