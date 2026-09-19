@@ -332,6 +332,12 @@ async fn volume_attributes_are_carried_to_the_driver_unchanged() {
         ) -> Result<(), engenho_kubelet::pod_volume::VolumeResolveError> {
             Ok(())
         }
+        async fn remove_materialized(
+            &self,
+            _: &engenho_kubelet::pod_volume::MaterializedDir,
+        ) -> Result<(), engenho_kubelet::pod_volume::VolumeResolveError> {
+            Ok(())
+        }
         async fn publish_csi(
             &self,
             _: &str,

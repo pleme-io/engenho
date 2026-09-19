@@ -18,6 +18,11 @@
 //! `pg_ctl` returns 1 and `psql` reports "Unix-domain socket path ... is too
 //! long". Hence `/tmp/eng-pg-*` rather than a nested temp dir.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "drives the native runtime directly; no kubelet in the loop"
+)]
+
 use engenho_kubelet::backend::{ContainerRuntime, ContainerSpec, LogOptions, PodIdentity};
 use engenho_kubelet::native_backend::{Isolation, NativeBackend};
 use engenho_kubelet::pod_volume::{MountSource, ResolvedMount};
@@ -94,7 +99,7 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
         // already expects — which is the only shape a native process can
         // honour, and which `verify_mounts` enforces.
         mounts: vec![ResolvedMount {
-            source: MountSource::HostDir(data.clone()),
+            source: MountSource::UserHostPath(data.clone()),
             mount_path: data.to_string_lossy().into_owned(),
             read_only: false,
             sub_path: None,
@@ -119,7 +124,7 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
     };
 
     let started = backend.start(&spec).await.expect("postgres must start");
-    assert!(started.running);
+    assert!(started.is_running());
 
     // Wait for it to accept connections, bounded — never an unbounded wait, and
     // never a fixed sleep that passes on a fast machine and flakes on a slow one.
@@ -171,7 +176,7 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
         .expect("status")
         .expect("tracked");
     assert!(
-        live.running,
+        live.is_running(),
         "postgres must still be running while it serves"
     );
 
@@ -184,7 +189,7 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
             .await
             .expect("status")
             .expect("tracked");
-        if !s.running {
+        if !s.is_running() {
             stopped = true;
             break;
         }

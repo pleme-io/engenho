@@ -22,6 +22,24 @@ pub enum KubeletError {
         /// Why it's invalid.
         reason: String,
     },
+
+    /// The runtime refused to drop a container's record because the
+    /// container's process has not been reaped yet — it is still inside its
+    /// SIGTERM → SIGKILL window, or was never stopped.
+    ///
+    /// Not a failure: the stop is in flight and the record goes once the
+    /// process is waited on. Distinct from [`Self::Backend`] so a caller can
+    /// retry soon and quietly instead of reporting a broken runtime, and so a
+    /// replacement is never started beside a process that is still alive.
+    #[error("container {container_id} has not been reaped yet; its record stays until it is")]
+    NotReaped {
+        /// The container whose process is still owed a wait.
+        container_id: String,
+    },
+
+    /// A volume could not be torn down.
+    #[error("volume teardown: {0}")]
+    VolumeTeardown(crate::pod_volume::VolumeResolveError),
 }
 
 engenho_substrate::impl_error_kind! {
@@ -29,6 +47,8 @@ engenho_substrate::impl_error_kind! {
         (Store(_)) => "store",
         (Backend(_)) => "backend",
         { InvalidPod { .. } } => "invalid_pod",
+        { NotReaped { .. } } => "not_reaped",
+        (VolumeTeardown(_)) => "volume_teardown",
     }
 }
 
@@ -47,6 +67,13 @@ mod tests {
             }
             .kind(),
             "invalid_pod"
+        );
+        assert_eq!(
+            KubeletError::NotReaped {
+                container_id: "c".into()
+            }
+            .kind(),
+            "not_reaped"
         );
     }
 }

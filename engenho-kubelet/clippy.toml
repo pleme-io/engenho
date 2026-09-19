@@ -1,0 +1,17 @@
+# engenho-kubelet — crate-local clippy config.
+#
+# clippy reads ONE clippy.toml per crate (the first found walking up from
+# the manifest), so this REPLACES the workspace root's. The root carries no
+# settings today (comments only), so nothing is lost; if it ever gains some,
+# copy them here.
+#
+# ── Every container start goes through the start curve (T2.4) ─────────────
+# `Kubelet::launch` is the one place the kubelet may call the runtime's
+# `start`: it takes a `StartPermit`, which only `StartLedger::permit` builds,
+# and it records the attempt's outcome on the same curve. A call that goes
+# around it retries a failing start at the sync loop's speed (measured as
+# `pitr-lab/mysql-0` started twice a second). Implementations and tests of
+# the runtime itself carry a targeted allow.
+disallowed-methods = [
+  { path = "engenho_kubelet::backend::ContainerRuntime::start", reason = "start containers through Kubelet::launch, which asks the start curve first (T2.4)" },
+]

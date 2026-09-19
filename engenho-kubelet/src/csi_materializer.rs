@@ -38,7 +38,9 @@ use tokio::sync::Mutex;
 use engenho_csi::client::CsiClient;
 use engenho_csi::pb;
 
-use crate::pod_volume::{CsiPublishRequest, MountSource, VolumeMaterializer, VolumeResolveError};
+use crate::pod_volume::{
+    CsiPublishRequest, MaterializedDir, MountSource, VolumeMaterializer, VolumeResolveError,
+};
 
 /// Where a driver is reached, and what it can do.
 ///
@@ -252,6 +254,12 @@ impl VolumeMaterializer for CsiVolumeMaterializer {
         volume: &str,
     ) -> Result<(), VolumeResolveError> {
         self.base.remove_empty_dir(namespace, pod, volume).await
+    }
+
+    async fn remove_materialized(&self, dir: &MaterializedDir) -> Result<(), VolumeResolveError> {
+        // The base wrote it (`materialize_files` delegates), so the base
+        // removes it.
+        self.base.remove_materialized(dir).await
     }
 
     async fn publish_csi(

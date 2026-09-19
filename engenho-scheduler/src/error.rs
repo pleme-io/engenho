@@ -25,6 +25,14 @@ pub enum SchedulerError {
         requested: SchedulerStrategyKind,
     },
 
+    /// `scheduler.tick_interval_seconds` was zero. It is the scheduler's
+    /// fallback tick, the one that runs when no Pod or Node event wakes it,
+    /// and a zero interval would re-run the scheduler back to back.
+    #[error(
+        "scheduler.tick_interval_seconds is 0; the fallback tick would re-run the scheduler back to back"
+    )]
+    ZeroTickInterval,
+
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -37,6 +45,7 @@ impl SchedulerError {
             Self::NoSchedulableNodes => "no_schedulable_nodes",
             Self::InvalidPodMetadata => "invalid_pod_metadata",
             Self::UnsupportedStrategy { .. } => "unsupported_strategy",
+            Self::ZeroTickInterval => "zero_tick_interval",
             Self::Internal(_) => "internal",
         }
     }
@@ -61,6 +70,7 @@ mod tests {
                 },
                 "unsupported_strategy",
             ),
+            (SchedulerError::ZeroTickInterval, "zero_tick_interval"),
             (SchedulerError::Internal("x".into()), "internal"),
         ] {
             assert_eq!(e.kind(), k);

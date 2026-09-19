@@ -17,6 +17,9 @@
 //!     that tick arms NO Requeue (byte-identical-to-today regression).
 //!   * tcpSocket via FakeNetProber: refused→ok flips readiness.
 //!   * httpGet via FakeNetProber: 2xx/3xx pass, 4xx/5xx fail.
+//!   * BLIND: a probe that observes nothing (the runtime cannot run the exec)
+//!     never restarts; it emits one Warning per streak and raises
+//!     `ProbeBlind=True`, which resolves to `False` once it sees again.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -599,6 +602,109 @@ async fn grpc_probe_is_unsupported_skips_pod() {
         "grpc probe → pod skipped (documented deferral)"
     );
     assert_eq!(count_starts(&backend.events().await), 0);
+
+    teardown(store, kubelet).await;
+}
+
+// ── 11 — a probe that cannot SEE never restarts; it says so instead ───────
+//
+// T1.1. The runtime refuses every exec (podman socket down), so the liveness
+// probe observes nothing. Before, that collapsed into `Failure` and three of
+// them restarted a container nobody had looked at. Now it is `Blind`: no
+// restart, one Warning per streak, and `ProbeBlind=True` on the pod once the
+// probe has been blind for its own `failureThreshold` runs. The same pod then
+// shows the control: when the runtime recovers and the probe OBSERVES three
+// failures, it restarts.
+
+#[tokio::test]
+async fn a_liveness_probe_the_runtime_cannot_run_never_restarts_and_says_so() {
+    use engenho_controllers::event_recorder::{CollectingEventSink, Reason as EventReason};
+    use engenho_kubelet::FakeExecFault;
+
+    let store = boot_store("probes-blind").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let events = Arc::new(CollectingEventSink::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock())
+        .with_event_sink(events.clone());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "livenessProbe": {
+            "exec": { "command": ["sh", "-c", "test -f /tmp/alive"] },
+            "periodSeconds": 1,
+            "failureThreshold": 3
+        }
+    });
+    put_pod_container(&store, "p1", container, "Always").await;
+    backend
+        .seed_exec_fault(
+            "default_p1_main",
+            FakeExecFault::Unavailable("podman socket: connection refused".into()),
+        )
+        .await;
+
+    kubelet.tick().await.unwrap();
+    for _ in 0..10 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "a probe that observed nothing must not restart the container"
+    );
+    assert_eq!(restart_count(&pod, 0), Some(0));
+    assert_eq!(
+        condition_status(&pod, "ProbeBlind").as_deref(),
+        Some("True"),
+        "ten blind runs past a threshold of 3 must be on the pod: {pod}"
+    );
+    let reason = pod["status"]["conditions"]
+        .as_array()
+        .and_then(|cs| cs.iter().find(|c| c["type"] == "ProbeBlind"))
+        .and_then(|c| c["reason"].as_str());
+    assert_eq!(reason, Some("RuntimeUnavailable"));
+    let blind_warnings: Vec<String> = events
+        .drain()
+        .into_iter()
+        .filter(|e| e.reason == EventReason::Unhealthy)
+        .map(|e| e.message)
+        .collect();
+    assert_eq!(
+        blind_warnings.len(),
+        1,
+        "one Warning per blind streak, not one per period: {blind_warnings:?}"
+    );
+    assert!(
+        blind_warnings[0].contains("liveness probe of container main observed nothing"),
+        "{blind_warnings:?}"
+    );
+
+    // The runtime recovers and the probe now OBSERVES the workload failing.
+    backend.clear_exec_fault("default_p1_main").await;
+    backend.set_default_exec(ExecOutcome::failure(1)).await;
+    for _ in 0..4 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert!(
+        count_starts(&backend.events().await) >= 2,
+        "control: three OBSERVED failures do restart"
+    );
+    assert_eq!(
+        condition_status(&pod, "ProbeBlind").as_deref(),
+        Some("False"),
+        "seeing again resolves the condition rather than deleting it: {pod}"
+    );
 
     teardown(store, kubelet).await;
 }

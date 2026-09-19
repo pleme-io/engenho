@@ -12,12 +12,30 @@
 //!     handler (grpc) is a typed [`ProbeParseError::UnsupportedHandler`]
 //!     (documented deferral, NOT a silent skip).
 //!   * **Interpreter** — [`fold_probe_observation`] + [`aggregate_container_readiness`],
-//!     PURE functions that fold a [`ProbeObservation`] (`Success`/`Failure`,
-//!     already reduced from the exec exit-code / http status / tcp connect by
-//!     the I/O shell) + the per-probe [`ProbeRuntime`] threshold counters into
-//!     a [`ProbeVerdict`] `(ready, needs_restart, startup_done)`. No I/O, no
-//!     podman, no socket — so the WHOLE probe-verdict logic is unit-testable
+//!     PURE functions that fold a [`ProbeObservation`] (`Success`/`Failure`/
+//!     `Blind`, already reduced from the exec exit-code / http status / tcp
+//!     connect by the I/O shell) + the per-probe [`ProbeRuntime`] threshold
+//!     counters into a [`ProbeVerdict`] `(ready, trip, startup_done)`. No I/O,
+//!     no podman, no socket — so the WHOLE probe-verdict logic is unit-testable
 //!     (and proptest-able) against mocks with zero container runtime.
+//!
+//! ## A restart needs an observed failure
+//!
+//! A probe run has THREE outcomes, not two. `Success` and `Failure` are
+//! answers from the workload. [`ProbeObservation::Blind`] is the absence of an
+//! answer — no address to dial, a runtime that could not run the exec, a
+//! request the prober could not form — and it says nothing about the workload.
+//! Upstream's prober worker handles it the same way ("prober error, throw away
+//! the result"): the run is stamped, neither counter moves, and the latched
+//! verdict stands.
+//!
+//! The restart decision is a [`ProbeTrip`], not a `bool`. Its fields are
+//! private and its only constructor lives in the private `trip` submodule,
+//! inside the one function that also counts an observed failure — so nothing
+//! outside that submodule (the kubelet included) can mint a restart, and
+//! minting one IS counting a failure. That part is a compile error, not a
+//! convention. That the Blind arm never calls it is pinned by tests, which is
+//! a gate, not a type.
 //!
 //! The kubelet's `reconcile_running` ([`crate::kubelet`]) is the I/O shell: it
 //! decides which probes are *due* (period + initialDelay), runs each handler
@@ -44,12 +62,16 @@
 //! authoring surface for probes, when it lands, mirrors the lifecycle border
 //! the same way.
 
+use std::fmt;
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::backend::{ContainerRuntime, HttpProbeTarget, NetProber, TcpProbeTarget};
+use crate::backend::{ContainerRuntime, HttpProbeTarget, NetProber, ProbeIoError, TcpProbeTarget};
+
+pub use trip::{ProbeTrip, TripKind};
 
 // =====================================================================
 // Typed border
@@ -60,8 +82,8 @@ use crate::backend::{ContainerRuntime, HttpProbeTarget, NetProber, TcpProbeTarge
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ProbeKind {
-    /// Drives container restart: failing past `failureThreshold` ⇒
-    /// `needs_restart`.
+    /// Drives container restart: OBSERVED failures past `failureThreshold` ⇒
+    /// a [`ProbeTrip`].
     Liveness,
     /// Drives the container's `ready` bit (→ `containerStatuses[].ready` →
     /// the pod `Ready`/`ContainersReady` conditions): passing past
@@ -72,6 +94,24 @@ pub enum ProbeKind {
     /// `successThreshold` (`startup_done`), readiness is forced false AND
     /// liveness restart is suppressed.
     Startup,
+}
+
+impl ProbeKind {
+    /// The lower-case name upstream uses in its probe events (`liveness`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeKind::Liveness => "liveness",
+            ProbeKind::Readiness => "readiness",
+            ProbeKind::Startup => "startup",
+        }
+    }
+}
+
+impl fmt::Display for ProbeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// HTTP scheme for an `httpGet` probe. Closed enum; defaults to
@@ -424,6 +464,10 @@ pub struct ProbeRuntime {
     pub started_at: Instant,
     /// The latched gate: readiness ⇒ ready, startup ⇒ done, liveness unused.
     pub gate_satisfied: bool,
+    /// The current run of [`ProbeObservation::Blind`] results, `None` once
+    /// the probe observes the workload again (either way). Blind results move
+    /// neither counter above; this is where they are counted instead.
+    pub blind: Option<BlindStreak>,
 }
 
 impl ProbeRuntime {
@@ -436,7 +480,28 @@ impl ProbeRuntime {
             last_run: None,
             started_at: now,
             gate_satisfied: false,
+            blind: None,
         }
+    }
+
+    /// How many runs in a row observed nothing (`0` when the last run
+    /// observed the workload).
+    #[must_use]
+    pub fn consecutive_blind(&self) -> u32 {
+        self.blind.map_or(0, |b| b.consecutive.get())
+    }
+
+    /// The cause, once this probe has been blind for as many consecutive runs
+    /// as it would have taken a FAILING probe to trip (`failureThreshold`).
+    ///
+    /// Derived from the probe's own threshold rather than a second constant:
+    /// the question an operator is asking is "would this have acted by now if
+    /// it could see?", and the threshold is that probe's answer to it.
+    #[must_use]
+    pub fn sustained_blindness(&self, spec: &ProbeSpec) -> Option<BlindCause> {
+        self.blind
+            .filter(|b| b.consecutive.get() >= spec.timing.failure_threshold)
+            .map(|b| b.cause)
     }
 
     /// `true` iff the probe is past its `initialDelay` window at `now` (the
@@ -484,30 +549,234 @@ impl ProbeRuntime {
 // Observation + verdict
 // =====================================================================
 
+/// Why a probe run observed NOTHING about the workload.
+///
+/// Not a failed check — the check was never put. Each arm names what was
+/// missing, so the Warning an operator reads says which side is broken: the
+/// pod's address, the container runtime, or the probe definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlindCause {
+    /// An httpGet/tcpSocket probe had nothing to dial: the backend reported
+    /// no pod IP.
+    NoTargetAddress,
+    /// The container runtime, or the transport to it, could not run an exec
+    /// probe. The command never ran, so its exit status is unknown.
+    RuntimeUnavailable,
+    /// The prober could not form the request (an unparsable URL, a client it
+    /// could not build, a header it could not encode). Nothing was sent.
+    ProberSetup,
+}
+
+impl BlindCause {
+    /// The `reason` a pod condition or event carries (upstream CamelCase).
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            BlindCause::NoTargetAddress => "NoTargetAddress",
+            BlindCause::RuntimeUnavailable => "RuntimeUnavailable",
+            BlindCause::ProberSetup => "ProberSetup",
+        }
+    }
+}
+
+impl fmt::Display for BlindCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            BlindCause::NoTargetAddress => "the pod reports no address to dial",
+            BlindCause::RuntimeUnavailable => "the container runtime could not run the probe",
+            BlindCause::ProberSetup => "the prober could not form the request",
+        })
+    }
+}
+
+/// A run of consecutive [`ProbeObservation::Blind`] results on one probe.
+///
+/// `consecutive` is a `NonZeroU32` so "a streak of zero" — which would read as
+/// blind and not-blind at once — cannot be built; not blind is `None` on
+/// [`ProbeRuntime::blind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlindStreak {
+    /// The cause of the most recent Blind result in the run.
+    pub cause: BlindCause,
+    /// How many Blind results in a row.
+    pub consecutive: NonZeroU32,
+}
+
+impl BlindStreak {
+    /// The streak after one more Blind result with `cause`.
+    #[must_use]
+    pub fn extend(previous: Option<BlindStreak>, cause: BlindCause) -> Self {
+        Self {
+            cause,
+            consecutive: previous.map_or(NonZeroU32::MIN, |p| p.consecutive.saturating_add(1)),
+        }
+    }
+}
+
+/// What an operator reads when a probe goes blind — the Warning event's
+/// message and the `ProbeBlind` pod condition's message. One `Display`, so
+/// the two cannot drift, and no count in it, so a condition that carries it
+/// renders byte-identically on every tick the cause is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlindNotice<'a> {
+    /// The container the probe belongs to.
+    pub container: &'a str,
+    /// Which probe.
+    pub kind: ProbeKind,
+    /// What it could not do.
+    pub cause: BlindCause,
+}
+
+impl fmt::Display for BlindNotice<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} probe of container {} observed nothing: {}; the result was discarded \
+             and the container will not be restarted on it",
+            self.kind, self.container, self.cause
+        )
+    }
+}
+
 /// The reduced result of running ONE probe handler — the runtime/net layer
 /// collapsed exit-code / http-status / connect-result (and any timeout / I/O
-/// error) into one of these two before the fold sees it.
+/// error) into one of these three before the fold sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProbeObservation {
     /// The probe passed this run (exec exit 0 / http 2xx-3xx / tcp connect ok).
     Success,
-    /// The probe failed this run (non-zero exit / non-2xx-3xx / connect refused
-    /// / timeout / I/O error).
+    /// The workload answered and the answer was no: a non-zero exit (127
+    /// included — the command was looked for inside the container), a status
+    /// outside 200..400, a refused or reset connection, a timeout.
     Failure,
+    /// Nothing was observed: see [`BlindCause`]. Moves no counter and can
+    /// never produce a [`ProbeTrip`].
+    Blind(BlindCause),
 }
 
-/// The per-probe verdict the fold produces. The exact `(ready, needs_restart,
-/// startup_done)` tuple. Only the field matching the probe's [`ProbeKind`] is
-/// meaningful; the others stay at their identity (`false`).
+/// The per-probe verdict the fold produces. Only the fields matching the
+/// probe's [`ProbeKind`] are meaningful; the others stay at their identity
+/// (`false` / `None`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProbeVerdict {
     /// Readiness verdict (meaningful for [`ProbeKind::Readiness`]).
     pub ready: bool,
-    /// Liveness/startup restart verdict (meaningful for [`ProbeKind::Liveness`]
-    /// + [`ProbeKind::Startup`]).
-    pub needs_restart: bool,
+    /// The restart request (liveness / startup only). `Some` only when THIS
+    /// fold counted an observed failure at or past `failureThreshold`; there
+    /// is no other way to build one.
+    pub trip: Option<ProbeTrip>,
     /// Startup-gate verdict (meaningful for [`ProbeKind::Startup`]).
     pub startup_done: bool,
+    /// `Some` only on the fold that STARTED a blind streak, so the caller
+    /// emits one Warning per streak rather than one per period.
+    pub entered_blind: Option<BlindCause>,
+}
+
+/// The restart witness. A private submodule because Rust privacy is per
+/// module: [`ProbeTrip`]'s fields are private HERE, so the only code that can
+/// build one is this module's `record_observed_failure` — which is also the
+/// only code that counts a failure.
+mod trip {
+    use std::fmt;
+
+    use super::{ProbeKind, ProbeRuntime, ProbeSpec};
+
+    /// Which probe tripped. Readiness has no arm: it never restarts anything.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TripKind {
+        /// `livenessProbe`.
+        Liveness,
+        /// `startupProbe`.
+        Startup,
+    }
+
+    impl fmt::Display for TripKind {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(match self {
+                TripKind::Liveness => "liveness",
+                TripKind::Startup => "startup",
+            })
+        }
+    }
+
+    /// Evidence that a liveness or startup probe OBSERVED `failureThreshold`
+    /// consecutive failures — the only thing that may restart a container on
+    /// a probe's say-so.
+    ///
+    /// ```compile_fail,E0451
+    /// // Private fields: no code outside `probe::trip` can mint a restart.
+    /// let _ = engenho_kubelet::ProbeTrip {
+    ///     kind: engenho_kubelet::TripKind::Liveness,
+    ///     consecutive_failures: 3,
+    /// };
+    /// ```
+    ///
+    /// The same path compiles when only READ, so the snippet above fails on
+    /// privacy and not on a typo:
+    ///
+    /// ```
+    /// fn restarts_on(t: engenho_kubelet::ProbeTrip) -> (engenho_kubelet::TripKind, u32) {
+    ///     (t.kind(), t.consecutive_failures())
+    /// }
+    /// ```
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ProbeTrip {
+        kind: TripKind,
+        consecutive_failures: u32,
+    }
+
+    impl ProbeTrip {
+        /// Which probe tripped.
+        #[must_use]
+        pub fn kind(self) -> TripKind {
+            self.kind
+        }
+
+        /// How many consecutive observed failures it took.
+        #[must_use]
+        pub fn consecutive_failures(self) -> u32 {
+            self.consecutive_failures
+        }
+    }
+
+    impl fmt::Display for ProbeTrip {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "{} probe failed {} consecutive times",
+                self.kind, self.consecutive_failures
+            )
+        }
+    }
+
+    /// Count ONE observed failure and return the trip if it crossed the
+    /// threshold. The sole constructor of [`ProbeTrip`]: calling it is
+    /// counting a failure, so a trip without a counted failure cannot exist.
+    ///
+    /// Readiness crossing the threshold clears its gate and returns `None` —
+    /// an unready container is taken out of rotation, never restarted.
+    pub(super) fn record_observed_failure(
+        spec: &ProbeSpec,
+        rt: &mut ProbeRuntime,
+    ) -> Option<ProbeTrip> {
+        rt.consecutive_failures = rt.consecutive_failures.saturating_add(1);
+        rt.consecutive_successes = 0;
+        if rt.consecutive_failures < spec.timing.failure_threshold {
+            return None;
+        }
+        let kind = match spec.kind {
+            ProbeKind::Readiness => {
+                rt.gate_satisfied = false;
+                return None;
+            }
+            ProbeKind::Liveness => TripKind::Liveness,
+            ProbeKind::Startup => TripKind::Startup,
+        };
+        Some(ProbeTrip {
+            kind,
+            consecutive_failures: rt.consecutive_failures,
+        })
+    }
 }
 
 /// PURE probe fold — update the counters + emit the verdict. NO I/O.
@@ -520,14 +789,20 @@ pub struct ProbeVerdict {
 ///     ⇒ `ready=true`; startup ⇒ `startup_done=true`).
 ///   * **Failure** → `consecutive_failures += 1`, `consecutive_successes = 0`;
 ///     once `failures >= failure_threshold` the trip fires (readiness
-///     ⇒ `ready=false`; liveness/startup ⇒ `needs_restart=true`).
+///     ⇒ `ready=false`; liveness/startup ⇒ `trip = Some(..)`).
+///   * **Blind** → neither counter moves, the blind streak grows, and the
+///     latched verdict is returned unchanged. Upstream's prober worker does
+///     the same with a probe error: "throw away the result".
+///
+/// Success and Failure both end a blind streak: the probe saw the workload.
 ///
 /// `rt.gate_satisfied` is the latched gate (readiness=ready / startup=done);
 /// the verdict mirrors it for readiness/startup so a steady-passing probe
 /// keeps reporting `ready=true` / `startup_done=true` between threshold edges.
 ///
-/// `now` stamps `rt.last_run` (the period reference) — the caller has already
-/// decided the probe is due.
+/// `now` stamps `rt.last_run` (the period reference) for every outcome,
+/// Blind included, so a blind probe keeps its cadence instead of retrying
+/// every tick — the caller has already decided the probe is due.
 #[must_use]
 pub fn fold_probe_observation(
     spec: &ProbeSpec,
@@ -540,6 +815,7 @@ pub fn fold_probe_observation(
 
     match obs {
         ProbeObservation::Success => {
+            rt.blind = None;
             rt.consecutive_successes = rt.consecutive_successes.saturating_add(1);
             rt.consecutive_failures = 0;
             if rt.consecutive_successes >= spec.timing.success_threshold {
@@ -547,16 +823,12 @@ pub fn fold_probe_observation(
             }
         }
         ProbeObservation::Failure => {
-            rt.consecutive_failures = rt.consecutive_failures.saturating_add(1);
-            rt.consecutive_successes = 0;
-            if rt.consecutive_failures >= spec.timing.failure_threshold {
-                match spec.kind {
-                    // Readiness: a failure trip clears the ready gate.
-                    ProbeKind::Readiness => rt.gate_satisfied = false,
-                    // Liveness/startup: a failure trip requests a restart.
-                    ProbeKind::Liveness | ProbeKind::Startup => verdict.needs_restart = true,
-                }
-            }
+            rt.blind = None;
+            verdict.trip = trip::record_observed_failure(spec, rt);
+        }
+        ProbeObservation::Blind(cause) => {
+            verdict.entered_blind = rt.blind.is_none().then_some(cause);
+            rt.blind = Some(BlindStreak::extend(rt.blind, cause));
         }
     }
 
@@ -589,7 +861,7 @@ pub fn fold_probe_observation(
 ///     onward (`may_run_restart_probes = true`).
 ///
 /// Note: the startup probe ITSELF can still request a restart (a container that
-/// never boots IS restarted); that is the startup probe's own `needs_restart`
+/// never boots IS restarted); that is the startup probe's own `trip`
 /// verdict, handled by the kubelet separately — `may_run_restart_probes` here
 /// gates only the LIVENESS restart during the startup window.
 //
@@ -628,14 +900,19 @@ pub fn aggregate_container_readiness(
 /// Run ONE probe handler against the live runtime + net seams, reducing the
 /// result to a [`ProbeObservation`]. The SOLE place that touches the runtime
 /// `exec` or the [`NetProber`] — so the fold tests never need real exec /
-/// http / tcp. Every handler is bounded by `spec.timing.timeout`; a timeout or
-/// any I/O error maps to [`ProbeObservation::Failure`] (NOT an error that
-/// aborts the tick — a failing probe is a normal, expected signal).
+/// http / tcp. Every handler is bounded by `spec.timing.timeout`. Nothing here
+/// aborts the tick: a failing or blind probe is a normal, expected signal.
+///
+/// The split between Failure and Blind is "did the workload answer?":
+///
+/// | handler | Failure (the workload said no) | Blind (nothing was asked) |
+/// |---|---|---|
+/// | exec | non-zero exit, 127 included; timeout | the runtime or its transport returned an error |
+/// | httpGet | status outside 200..400; refused, reset, TLS, malformed; timeout | no pod IP; the request could not be formed |
+/// | tcpSocket | refused; timeout | no pod IP |
 ///
 /// `container_id` is the exec target (container-scoped); `pod_ip` is the
-/// http/tcp target (network-scoped). A handler whose target is unavailable
-/// (e.g. http/tcp with no pod IP yet) maps to `Failure` — the probe simply
-/// hasn't passed yet.
+/// http/tcp target (network-scoped).
 pub async fn run_handler(
     spec: &ProbeSpec,
     runtime: &dyn ContainerRuntime,
@@ -648,9 +925,18 @@ pub async fn run_handler(
         ProbeHandler::Exec { command } => {
             let fut = runtime.exec(container_id, command);
             match tokio::time::timeout(timeout, fut).await {
-                // Exit 0 = healthy; any non-zero / I/O error / timeout = failure.
                 Ok(Ok(outcome)) if outcome.exit_code == 0 => ProbeObservation::Success,
-                _ => ProbeObservation::Failure,
+                // The command ran and exited non-zero. 127 ("not found") is a
+                // failure too: the command was looked for INSIDE the container.
+                Ok(Ok(_)) => ProbeObservation::Failure,
+                // The runtime never ran the command, so there is no exit status
+                // to judge. Upstream counts this as a probe error and discards it.
+                Ok(Err(e)) => {
+                    tracing::debug!(container_id, error = %e, "exec probe could not run");
+                    ProbeObservation::Blind(BlindCause::RuntimeUnavailable)
+                }
+                // Ran past timeoutSeconds: upstream counts a timeout as a failure.
+                Err(_elapsed) => ProbeObservation::Failure,
             }
         }
         ProbeHandler::HttpGet {
@@ -660,8 +946,9 @@ pub async fn run_handler(
             host,
             headers,
         } => {
+            // No address is not a failed check — nothing could be dialled.
             let Some(ip) = pod_ip else {
-                return ProbeObservation::Failure;
+                return ProbeObservation::Blind(BlindCause::NoTargetAddress);
             };
             let target = HttpProbeTarget {
                 ip: ip.to_string(),
@@ -675,12 +962,14 @@ pub async fn run_handler(
             match tokio::time::timeout(timeout, net_prober.http_get(&target)).await {
                 // K8s: 2xx/3xx is healthy.
                 Ok(Ok(status)) if (200..400).contains(&status) => ProbeObservation::Success,
-                _ => ProbeObservation::Failure,
+                Ok(Ok(_)) => ProbeObservation::Failure,
+                Ok(Err(e)) => net_error_observation(&e),
+                Err(_elapsed) => ProbeObservation::Failure,
             }
         }
         ProbeHandler::TcpSocket { port, host } => {
             let Some(ip) = pod_ip else {
-                return ProbeObservation::Failure;
+                return ProbeObservation::Blind(BlindCause::NoTargetAddress);
             };
             let target = TcpProbeTarget {
                 ip: ip.to_string(),
@@ -690,8 +979,27 @@ pub async fn run_handler(
             };
             match tokio::time::timeout(timeout, net_prober.tcp_connect(&target)).await {
                 Ok(Ok(())) => ProbeObservation::Success,
-                _ => ProbeObservation::Failure,
+                Ok(Err(e)) => net_error_observation(&e),
+                Err(_elapsed) => ProbeObservation::Failure,
             }
+        }
+    }
+}
+
+/// Classify a network prober error. Exhaustive with no wildcard, so a new
+/// [`ProbeIoError`] variant cannot land without someone deciding whether the
+/// workload answered.
+fn net_error_observation(e: &ProbeIoError) -> ProbeObservation {
+    match e {
+        // The request went out and the workload did not answer well — upstream
+        // counts every transport error on a SENT probe as a failure.
+        ProbeIoError::Connect { .. } | ProbeIoError::Timeout { .. } | ProbeIoError::Io(_) => {
+            ProbeObservation::Failure
+        }
+        // Nothing was sent.
+        ProbeIoError::Setup { .. } => {
+            tracing::debug!(error = %e, "network probe could not be set up");
+            ProbeObservation::Blind(BlindCause::ProberSetup)
         }
     }
 }
@@ -784,14 +1092,20 @@ mod tests {
 
         // Two failures: below threshold 3 → no restart.
         assert!(
-            !fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now)
+                .trip
+                .is_none()
         );
         assert!(
-            !fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now)
+                .trip
+                .is_none()
         );
         // Third consecutive failure → needs_restart.
         assert!(
-            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now)
+                .trip
+                .is_some()
         );
     }
 
@@ -807,10 +1121,14 @@ mod tests {
         assert_eq!(rt.consecutive_failures, 0);
         // One more failure is NOT enough now (need 2 consecutive again).
         assert!(
-            !fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now)
+                .trip
+                .is_none()
         );
         assert!(
-            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now)
+                .trip
+                .is_some()
         );
     }
 
@@ -834,10 +1152,14 @@ mod tests {
         let spec = exec_spec(ProbeKind::Startup, 1, 2);
         let mut rt = ProbeRuntime::new(now);
         assert!(
-            !fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now)
+                .trip
+                .is_none()
         );
         assert!(
-            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).needs_restart
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now)
+                .trip
+                .is_some()
         );
     }
 
@@ -1134,7 +1456,7 @@ mod proptests {
         }
 
         /// Liveness: a run of exactly `failure_threshold` consecutive failures
-        /// sets needs_restart on the last one, never before.
+        /// yields a trip on the last one, never before.
         #[test]
         fn liveness_failure_threshold_honored_exactly(
             threshold in 1u32..6,
@@ -1145,9 +1467,9 @@ mod proptests {
             for i in 1..=threshold {
                 let v = fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now);
                 if i < threshold {
-                    prop_assert!(!v.needs_restart, "restart before threshold at i={i}");
+                    prop_assert!(v.trip.is_none(), "restart before threshold at i={i}");
                 } else {
-                    prop_assert!(v.needs_restart, "restart at threshold i={i}");
+                    prop_assert!(v.trip.is_some(), "restart at threshold i={i}");
                 }
             }
         }
@@ -1227,10 +1549,15 @@ mod probe_address {
 
     // ── A missing address is not "no opinion" ──────────────────────────
     //
-    // `run_handler` maps an http/tcp probe with no pod IP to `Failure`. That
-    // is the right local choice — there is nothing to dial — but it means a
-    // backend reporting no address makes a HEALTHY workload indistinguishable
-    // from a broken one, forever.
+    // `run_handler` USED to map an http/tcp probe with no pod IP to `Failure`.
+    // There is nothing to dial, but "could not ask" is not "asked and was told
+    // no": it made a backend reporting no address indistinguishable from a
+    // broken workload, and a failing startup probe restarts.
+    //
+    // Since T1.1 it is `Blind(NoTargetAddress)`: the run is discarded, nothing
+    // is restarted, and the pod says why (a Warning, then `ProbeBlind`). The
+    // probe still can never PASS without an address, so the native backend
+    // must still report the loopback — the incident below is why.
     //
     // Measured on ryn 2026-09-18: the native backend returned `pod_ip: None`
     // on the stated reasoning that "inventing one would be worse than
@@ -1276,7 +1603,7 @@ mod probe_address {
     }
 
     #[tokio::test]
-    async fn the_same_healthy_workload_fails_when_it_reports_no_address() {
+    async fn the_same_healthy_workload_is_blind_not_failing_when_it_reports_no_address() {
         let runtime = FakeBackend::new();
         let net = FakeNetProber::new();
         // Identical seeding: the workload is healthy either way.
@@ -1286,9 +1613,429 @@ mod probe_address {
 
         assert_eq!(
             obs,
-            ProbeObservation::Failure,
-            "a backend that reports no address makes a healthy pod unprobeable; \
-             this is why the native backend must report the loopback"
+            ProbeObservation::Blind(BlindCause::NoTargetAddress),
+            "no address means nothing was asked — Blind, never a Failure that \
+             counts toward restarting a healthy pod"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tcp_probe_with_no_address_is_blind_too() {
+        let spec = ProbeSpec {
+            handler: ProbeHandler::TcpSocket {
+                port: ProbePort(8080),
+                host: None,
+            },
+            ..http_spec()
+        };
+        let net = FakeNetProber::new();
+        net.set_default_tcp(true).await;
+
+        let obs = run_handler(&spec, &FakeBackend::new(), &net, "cid", None).await;
+
+        assert_eq!(obs, ProbeObservation::Blind(BlindCause::NoTargetAddress));
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "starts a FakeBackend container to probe; no kubelet in the loop"
+)]
+mod blind {
+    //! T1.1: a restart needs an OBSERVED failure. Blind runs move no counter,
+    //! trip nothing, and hand back the verdict that was already latched.
+    use super::*;
+    use crate::backend::{ContainerSpec, FakeBackend, FakeExecFault, FakeNetProber};
+    use crate::{ContainerRuntime, ExecOutcome};
+
+    const NO_ADDRESS: ProbeObservation = ProbeObservation::Blind(BlindCause::NoTargetAddress);
+
+    fn spec(kind: ProbeKind, success_threshold: u32, failure_threshold: u32) -> ProbeSpec {
+        ProbeSpec {
+            kind,
+            handler: ProbeHandler::Exec {
+                command: vec!["true".into()],
+            },
+            timing: ProbeTiming {
+                initial_delay: Duration::ZERO,
+                period: Duration::from_secs(10),
+                timeout: Duration::from_secs(1),
+                success_threshold,
+                failure_threshold,
+            },
+        }
+    }
+
+    // ── the fold ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_thousand_blind_runs_trip_nothing_while_three_failures_do() {
+        for (kind, expected) in [
+            (ProbeKind::Liveness, TripKind::Liveness),
+            (ProbeKind::Startup, TripKind::Startup),
+        ] {
+            let spec = spec(kind, 1, 3);
+            let now = Instant::now();
+
+            let mut rt = ProbeRuntime::new(now);
+            for i in 0..1000 {
+                let v = fold_probe_observation(&spec, &mut rt, NO_ADDRESS, now);
+                assert_eq!(v.trip, None, "{kind}: blind run {i} tripped a restart");
+            }
+            assert_eq!(
+                rt.consecutive_failures, 0,
+                "{kind}: blind counted as failure"
+            );
+            assert_eq!(rt.consecutive_blind(), 1000);
+
+            // Control: the same spec and three OBSERVED failures do trip, on
+            // the third and not before.
+            let mut rt = ProbeRuntime::new(now);
+            let trips: Vec<Option<ProbeTrip>> = (0..3)
+                .map(|_| {
+                    fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).trip
+                })
+                .collect();
+            assert_eq!(trips[..2], [None, None], "{kind}: tripped early");
+            let trip = trips[2].unwrap_or_else(|| panic!("{kind}: third failure must trip"));
+            assert_eq!(trip.kind(), expected);
+            assert_eq!(trip.consecutive_failures(), 3);
+        }
+    }
+
+    #[test]
+    fn blind_runs_neither_advance_nor_reset_the_failure_streak() {
+        let spec = spec(ProbeKind::Liveness, 1, 3);
+        let now = Instant::now();
+        let mut rt = ProbeRuntime::new(now);
+
+        for _ in 0..2 {
+            let v = fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now);
+            assert_eq!(v.trip, None);
+        }
+        for _ in 0..1000 {
+            let v = fold_probe_observation(&spec, &mut rt, NO_ADDRESS, now);
+            assert_eq!(
+                v.trip, None,
+                "blind runs must not complete a failure streak"
+            );
+        }
+        assert_eq!(
+            rt.consecutive_failures, 2,
+            "blind runs must not reset it either"
+        );
+        assert!(
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now)
+                .trip
+                .is_some(),
+            "the third OBSERVED failure trips, however many blind runs sat between"
+        );
+    }
+
+    #[test]
+    fn blind_runs_neither_advance_nor_reset_the_success_streak() {
+        let spec = spec(ProbeKind::Readiness, 2, 3);
+        let now = Instant::now();
+        let mut rt = ProbeRuntime::new(now);
+
+        assert!(!fold_probe_observation(&spec, &mut rt, ProbeObservation::Success, now).ready);
+        for _ in 0..5 {
+            assert!(
+                !fold_probe_observation(&spec, &mut rt, NO_ADDRESS, now).ready,
+                "a blind run is not a success"
+            );
+        }
+        assert_eq!(rt.consecutive_successes, 1);
+        assert!(
+            fold_probe_observation(&spec, &mut rt, ProbeObservation::Success, now).ready,
+            "the second OBSERVED success latches ready"
+        );
+    }
+
+    #[test]
+    fn blind_hands_back_the_latched_verdict() {
+        let now = Instant::now();
+
+        // A ready container stays ready while its probe is blind…
+        let readiness = spec(ProbeKind::Readiness, 1, 3);
+        let mut rt = ProbeRuntime::new(now);
+        assert!(fold_probe_observation(&readiness, &mut rt, ProbeObservation::Success, now).ready);
+        for _ in 0..1000 {
+            assert!(fold_probe_observation(&readiness, &mut rt, NO_ADDRESS, now).ready);
+        }
+        // …and an unready one stays unready.
+        let mut rt = ProbeRuntime::new(now);
+        for _ in 0..1000 {
+            assert!(!fold_probe_observation(&readiness, &mut rt, NO_ADDRESS, now).ready);
+        }
+
+        // A completed startup stays complete.
+        let startup = spec(ProbeKind::Startup, 1, 3);
+        let mut rt = ProbeRuntime::new(now);
+        assert!(
+            fold_probe_observation(&startup, &mut rt, ProbeObservation::Success, now).startup_done
+        );
+        let v = fold_probe_observation(&startup, &mut rt, NO_ADDRESS, now);
+        assert!(v.startup_done);
+        assert_eq!(v.trip, None);
+    }
+
+    #[test]
+    fn a_blind_run_keeps_the_probe_on_its_period() {
+        let spec = spec(ProbeKind::Liveness, 1, 3);
+        let start = Instant::now();
+        let mut rt = ProbeRuntime::new(start);
+        assert!(rt.is_due(&spec, start));
+
+        let _ = fold_probe_observation(&spec, &mut rt, NO_ADDRESS, start);
+
+        assert_eq!(rt.last_run, Some(start), "a blind run is still a run");
+        assert!(!rt.is_due(&spec, start), "not retried every tick");
+        assert!(rt.is_due(&spec, start + spec.timing.period));
+    }
+
+    #[test]
+    fn one_warning_per_blind_streak() {
+        let spec = spec(ProbeKind::Liveness, 1, 3);
+        let now = Instant::now();
+        let mut rt = ProbeRuntime::new(now);
+        let runtime_down = ProbeObservation::Blind(BlindCause::RuntimeUnavailable);
+
+        let first = fold_probe_observation(&spec, &mut rt, NO_ADDRESS, now);
+        assert_eq!(first.entered_blind, Some(BlindCause::NoTargetAddress));
+        // Still blind, even for a different reason: the same streak.
+        let second = fold_probe_observation(&spec, &mut rt, runtime_down, now);
+        assert_eq!(second.entered_blind, None);
+        assert_eq!(
+            rt.blind.map(|b| (b.cause, b.consecutive.get())),
+            Some((BlindCause::RuntimeUnavailable, 2))
+        );
+
+        // Seeing the workload ends the streak, either way it answers.
+        for answer in [ProbeObservation::Success, ProbeObservation::Failure] {
+            let _ = fold_probe_observation(&spec, &mut rt, answer, now);
+            assert_eq!(rt.blind, None, "{answer:?} must end the blind streak");
+            let again = fold_probe_observation(&spec, &mut rt, NO_ADDRESS, now);
+            assert_eq!(again.entered_blind, Some(BlindCause::NoTargetAddress));
+        }
+    }
+
+    #[test]
+    fn blindness_is_sustained_at_the_probes_own_failure_threshold() {
+        let spec = spec(ProbeKind::Liveness, 1, 3);
+        let now = Instant::now();
+        let mut rt = ProbeRuntime::new(now);
+
+        for _ in 0..2 {
+            let _ = fold_probe_observation(&spec, &mut rt, NO_ADDRESS, now);
+            assert_eq!(rt.sustained_blindness(&spec), None);
+        }
+        let _ = fold_probe_observation(&spec, &mut rt, NO_ADDRESS, now);
+        assert_eq!(
+            rt.sustained_blindness(&spec),
+            Some(BlindCause::NoTargetAddress)
+        );
+        let _ = fold_probe_observation(&spec, &mut rt, ProbeObservation::Success, now);
+        assert_eq!(rt.sustained_blindness(&spec), None);
+    }
+
+    // ── the I/O shell ────────────────────────────────────────────────────
+
+    fn http(timeout: Duration) -> ProbeSpec {
+        ProbeSpec {
+            handler: ProbeHandler::HttpGet {
+                path: "/healthz".into(),
+                port: ProbePort(8080),
+                scheme: HttpScheme::Http,
+                host: None,
+                headers: Vec::new(),
+            },
+            timing: ProbeTiming {
+                timeout,
+                ..spec(ProbeKind::Liveness, 1, 3).timing
+            },
+            ..spec(ProbeKind::Liveness, 1, 3)
+        }
+    }
+
+    #[tokio::test]
+    async fn http_2xx_and_3xx_pass_and_the_boundary_is_399_to_400() {
+        let net = FakeNetProber::new();
+        let cases = [
+            (199, ProbeObservation::Failure),
+            (200, ProbeObservation::Success),
+            (399, ProbeObservation::Success),
+            (400, ProbeObservation::Failure),
+            (500, ProbeObservation::Failure),
+        ];
+        net.seed_http("10.0.0.1", 8080, "/healthz", cases.map(|(s, _)| s))
+            .await;
+        let spec = http(Duration::from_secs(1));
+        for (status, expected) in cases {
+            let got = run_handler(&spec, &FakeBackend::new(), &net, "cid", Some("10.0.0.1")).await;
+            assert_eq!(got, expected, "HTTP {status}");
+        }
+    }
+
+    /// A net prober that answers every request the same way, or never.
+    struct Scripted(Option<Result<u16, ProbeIoError>>);
+
+    #[async_trait::async_trait]
+    impl NetProber for Scripted {
+        async fn http_get(&self, _: &HttpProbeTarget) -> Result<u16, ProbeIoError> {
+            match &self.0 {
+                Some(answer) => answer.clone(),
+                None => std::future::pending().await,
+            }
+        }
+        async fn tcp_connect(&self, _: &TcpProbeTarget) -> Result<(), ProbeIoError> {
+            match &self.0 {
+                Some(answer) => answer.clone().map(|_| ()),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_the_prober_could_not_form_is_blind() {
+        let setup = Scripted(Some(Err(ProbeIoError::Setup {
+            stage: crate::backend::ProbeSetupStage::Request,
+            reason: "invalid header".into(),
+        })));
+        let got = run_handler(
+            &http(Duration::from_secs(1)),
+            &FakeBackend::new(),
+            &setup,
+            "cid",
+            Some("10.0.0.1"),
+        )
+        .await;
+        assert_eq!(got, ProbeObservation::Blind(BlindCause::ProberSetup));
+    }
+
+    #[tokio::test]
+    async fn a_sent_request_that_is_refused_or_times_out_is_a_failure() {
+        let refused = Scripted(Some(Err(ProbeIoError::Connect {
+            target: "10.0.0.1:8080".into(),
+            reason: "connection refused".into(),
+        })));
+        let hung = Scripted(None);
+        for (label, net) in [("refused", &refused), ("timeout", &hung)] {
+            let got = run_handler(
+                &http(Duration::from_millis(20)),
+                &FakeBackend::new(),
+                net,
+                "cid",
+                Some("10.0.0.1"),
+            )
+            .await;
+            assert_eq!(got, ProbeObservation::Failure, "{label}");
+        }
+    }
+
+    #[test]
+    fn every_prober_error_is_classified_by_whether_anything_was_sent() {
+        let sent = [
+            ProbeIoError::Connect {
+                target: "t".into(),
+                reason: "r".into(),
+            },
+            ProbeIoError::Timeout { target: "t".into() },
+            ProbeIoError::Io("tls".into()),
+        ];
+        for e in sent {
+            assert_eq!(net_error_observation(&e), ProbeObservation::Failure, "{e}");
+        }
+        let unsent = ProbeIoError::Setup {
+            stage: crate::backend::ProbeSetupStage::Url,
+            reason: "r".into(),
+        };
+        assert_eq!(
+            net_error_observation(&unsent),
+            ProbeObservation::Blind(BlindCause::ProberSetup)
+        );
+    }
+
+    async fn started(backend: &FakeBackend) -> String {
+        let spec = ContainerSpec {
+            name: "default_p_main".into(),
+            image: "busybox".into(),
+            ..ContainerSpec::default()
+        };
+        match backend.start(&spec).await {
+            Ok(status) => status.container_id,
+            Err(e) => panic!("fake start: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exec_the_runtime_could_not_run_is_blind() {
+        let backend = FakeBackend::new();
+        let id = started(&backend).await;
+        backend
+            .seed_exec_fault(
+                "default_p_main",
+                FakeExecFault::Unavailable("podman socket refused".into()),
+            )
+            .await;
+
+        let got = run_handler(
+            &spec(ProbeKind::Liveness, 1, 3),
+            &backend,
+            &FakeNetProber::new(),
+            &id,
+            None,
+        )
+        .await;
+
+        assert_eq!(got, ProbeObservation::Blind(BlindCause::RuntimeUnavailable));
+    }
+
+    #[tokio::test]
+    async fn an_exec_that_ran_and_said_no_is_a_failure_127_included() {
+        let backend = FakeBackend::new();
+        let id = started(&backend).await;
+        backend
+            .seed_exec(
+                "default_p_main",
+                [
+                    ExecOutcome::failure(1),
+                    ExecOutcome::failure(127),
+                    ExecOutcome::success(),
+                ],
+            )
+            .await;
+        let spec = spec(ProbeKind::Liveness, 1, 3);
+        let net = FakeNetProber::new();
+
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(run_handler(&spec, &backend, &net, &id, None).await);
+        }
+
+        assert_eq!(
+            got,
+            [
+                ProbeObservation::Failure,
+                ProbeObservation::Failure,
+                ProbeObservation::Success
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exec_that_outlives_its_timeout_is_a_failure() {
+        let backend = FakeBackend::new();
+        let id = started(&backend).await;
+        backend
+            .seed_exec_fault("default_p_main", FakeExecFault::Hang)
+            .await;
+        let mut spec = spec(ProbeKind::Liveness, 1, 3);
+        spec.timing.timeout = Duration::from_millis(20);
+
+        let got = run_handler(&spec, &backend, &FakeNetProber::new(), &id, None).await;
+
+        assert_eq!(got, ProbeObservation::Failure);
     }
 }

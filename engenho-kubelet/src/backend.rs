@@ -6,7 +6,7 @@
 //! receive a typed `ContainerSpec` + return a typed
 //! `ContainerStatus`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -347,6 +347,60 @@ impl Resources {
     }
 }
 
+/// How long a container gets between `SIGTERM` and `SIGKILL` when it is
+/// stopped — the pod's `spec.terminationGracePeriodSeconds`.
+///
+/// ── ★ READ FROM THE POD, FLOORED THE WAY UPSTREAM FLOORS IT ─────────────
+/// Upstream defaults an absent field to 30 s
+/// (`DefaultTerminationGracePeriodSeconds`) and its kubelet never gives a
+/// container less than 2 s (`minimumGracePeriodInSeconds` in
+/// `kuberuntime_container.go`, "always give containers a minimal shutdown
+/// window to avoid unnecessary SIGKILLs"). A negative value is clamped the
+/// same way: since v1.27 upstream reads it as 1 s, which the floor lifts to 2.
+///
+/// The only constructors apply that floor, so a zero-length window — a stop
+/// that is really a `SIGKILL` — cannot be built. A value that is not an
+/// integer is read as the default: the longer window is the conservative
+/// guess for a field whose job is to protect a shutdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminationGrace(Duration);
+
+impl TerminationGrace {
+    /// Upstream's default for a pod that declares none.
+    pub const DEFAULT: Self = Self(Duration::from_secs(30));
+    /// Upstream kubelet's floor: no container gets less.
+    pub const MINIMUM: Duration = Duration::from_secs(2);
+
+    /// A grace of `seconds`, floored at [`Self::MINIMUM`]. Negative seconds
+    /// floor too.
+    #[must_use]
+    pub fn from_seconds(seconds: i64) -> Self {
+        let declared = Duration::from_secs(u64::try_from(seconds).unwrap_or(0));
+        Self(declared.max(Self::MINIMUM))
+    }
+
+    /// The grace a Pod declares in `spec.terminationGracePeriodSeconds`, or
+    /// [`Self::DEFAULT`] when it declares none.
+    #[must_use]
+    pub fn of_pod(pod: &serde_json::Value) -> Self {
+        pod.pointer("/spec/terminationGracePeriodSeconds")
+            .and_then(serde_json::Value::as_i64)
+            .map_or(Self::DEFAULT, Self::from_seconds)
+    }
+
+    /// The window itself.
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for TerminationGrace {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Which Pod this container belongs to, as separate typed fields.
 ///
 /// ── ★ THE JOIN IS LOSSY AND THE CODE SAYS SO ──────────────────────────────
@@ -486,6 +540,11 @@ pub struct ContainerSpec {
     /// this field existed. See [`Resources`] for why an unparseable bound is a
     /// distinct state rather than an absent one.
     pub resources: Resources,
+    /// The pod's `SIGTERM` → `SIGKILL` window, carried to the runtime at
+    /// start so a stop can honour it without a second lookup. A backend that
+    /// stops with its own fixed timeout ignores it today; the native backend
+    /// escalates on it.
+    pub termination_grace: TerminationGrace,
 }
 
 /// Status the backend reports back.
@@ -493,12 +552,19 @@ pub struct ContainerSpec {
 pub struct ContainerStatus {
     /// Opaque backend handle identifying the running container.
     pub container_id: String,
-    /// Whether the container is currently up.
-    pub running: bool,
+    /// What the runtime says the container's process is doing.
+    ///
+    /// ── ★ ONE FIELD, NOT `running: bool` + `exit_code: Option<i32>` ────────
+    /// The pair admitted `running: false, exit_code: None` — stopped, with no
+    /// word on how — and every reader resolved that with `unwrap_or(0)`, i.e.
+    /// as a clean exit. A container killed by `SIGKILL` has exactly that shape (a
+    /// signal has no exit code), so it was published as `Succeeded`. In
+    /// [`RunState`] a stopped container either carries its
+    /// [`ExitDisposition`](crate::cri::ExitDisposition) or is explicitly
+    /// `Unknown`; there is no third, defaultable spelling.
+    pub state: crate::cri::RunState,
     /// Pod-network IP assigned to the container (None until network setup).
     pub pod_ip: Option<String>,
-    /// Optional exit code if the container has terminated.
-    pub exit_code: Option<i32>,
 }
 
 impl ContainerStatus {
@@ -507,10 +573,15 @@ impl ContainerStatus {
     pub fn running(container_id: impl Into<String>, pod_ip: impl Into<String>) -> Self {
         Self {
             container_id: container_id.into(),
-            running: true,
+            state: crate::cri::RunState::Running,
             pod_ip: Some(pod_ip.into()),
-            exit_code: None,
         }
+    }
+
+    /// Whether the container is up right now.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.state.is_running()
     }
 }
 
@@ -583,6 +654,39 @@ impl ExecOutcome {
     }
 }
 
+/// Whether a container a PREVIOUS kubelet process started is still within
+/// this runtime's reach.
+///
+/// ── ★ THE KUBELET'S RECORD OF WHAT IT STARTED IS IN-PROCESS ─────────────
+/// A kubelet restart forgets every pod it was running. What happens next is a
+/// property of the RUNTIME, not of the kubelet: podman keeps the containers
+/// and can hand a running one back by name; a native backend's workloads were
+/// children of the process that just went away. Reading a container the
+/// kubelet can no longer reach as "never started" is how a
+/// `restartPolicy: Never` Job pod was re-run in place on every ryn restart —
+/// so the kubelet asks, and each backend has to answer (no default).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Readoption {
+    /// `start` finds a RUNNING container a previous process left under the
+    /// pod's deterministic name and adopts it instead of starting a second
+    /// copy. A container that STOPPED while no kubelet watched is replaced,
+    /// not adopted — its exit is not recovered (`pending-readopt-exited`).
+    AdoptsRunning,
+    /// A container a previous process started cannot be adopted, and how it
+    /// ended cannot be learned. A pod whose stored status shows such a
+    /// container is an exit nobody observed.
+    ///
+    /// It is NOT necessarily gone: podman (CLI) and CRI keep running it. The
+    /// kubelet tears down whatever the runtime still holds under the stored
+    /// id before it publishes the pod or starts it again; a native workload
+    /// is out of the runtime's sight entirely (its table is per-process).
+    ///
+    /// The conservative arm, hence the `Default` — it can only make the
+    /// kubelet refuse to re-run something, never re-run something twice.
+    #[default]
+    Cannot,
+}
+
 /// The pluggable container runtime trait. Pure runtime —
 /// host-effecting; no I/O in trait shape, but every method
 /// performs side-effecting work on the host.
@@ -590,6 +694,11 @@ impl ExecOutcome {
 pub trait ContainerRuntime: Send + Sync {
     /// Stable identifier for telemetry.
     fn name(&self) -> &'static str;
+
+    /// Whether this runtime can hand back a container a previous kubelet
+    /// process started. See [`Readoption`]. Required, not defaulted: a new
+    /// backend must say which it is.
+    fn readoption(&self) -> Readoption;
 
     /// Run `argv` inside a previously-started container (`podman exec <id>
     /// <argv...>`). The SOLE runtime capability the exec-probe path needs —
@@ -629,16 +738,30 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Stop a running container.
     ///
+    /// Idempotent: stopping a container that already exited, or one the
+    /// runtime no longer has, is success. The kubelet reads every stop's
+    /// result, so a runtime that reported "already gone" as an error would
+    /// wedge the restart of a container that vanished.
+    ///
+    /// A stop may return before the process is gone: the native backend
+    /// hands the process to a termination task (`SIGTERM`, then `SIGKILL`
+    /// after [`ContainerSpec::termination_grace`], then reap) so the caller's
+    /// tick never waits out a grace period.
+    ///
     /// # Errors
     ///
     /// Returns [`KubeletError::Backend`] if the backend cannot stop.
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError>;
 
-    /// Drop the container's record; equivalent to `docker rm`.
+    /// Drop the container's record; equivalent to `docker rm`. Removing a
+    /// container the runtime no longer has is success.
     ///
     /// # Errors
     ///
-    /// Returns [`KubeletError::Backend`] on failure.
+    /// [`KubeletError::NotReaped`] while the container's process has not been
+    /// reaped — its stop is still in flight. The record stays, and so does
+    /// the name, so a replacement cannot be started beside it.
+    /// [`KubeletError::Backend`] on any other failure.
     async fn remove(&self, container_id: &str) -> Result<(), KubeletError>;
 
     /// Stream a container's stdout/stderr log. The `kubectl logs <pod>
@@ -667,6 +790,16 @@ pub trait ContainerRuntime: Send + Sync {
 #[derive(Default, Clone)]
 pub struct FakeBackend {
     inner: Arc<Mutex<FakeState>>,
+    /// What this fake says about containers a previous kubelet started.
+    /// [`Readoption::Cannot`] unless [`FakeBackend::with_readoption`] says
+    /// otherwise — the native backend's answer, and the case the kubelet has
+    /// to be careful about.
+    readoption: Readoption,
+    /// Mint a container's id from its spec name, the way the native backend
+    /// derives `namespace/pod/container` — so a fresh start after a kubelet
+    /// restart carries the same id as the run the old kubelet lost. Set by
+    /// [`FakeBackend::with_ids_from_names`].
+    ids_from_names: bool,
 }
 
 #[derive(Default)]
@@ -712,6 +845,43 @@ struct FakeState {
     /// status at all on a total start failure shipped. A fake that can only
     /// succeed cannot prove what happens when reality refuses.
     seeded_start_failures: BTreeMap<String, String>,
+    /// Every `start` call per CONTAINER NAME, failed ones included. The
+    /// operations log records only starts that happened, so without this a
+    /// start retried in a hot loop against a seeded failure left no trace.
+    start_attempts: BTreeMap<String, usize>,
+    /// Container NAMES whose every `exec` misbehaves at the RUNTIME level
+    /// rather than answering with an exit code. Seeded via
+    /// [`FakeBackend::seed_exec_fault`]. Takes precedence over the exec queue.
+    exec_faults: BTreeMap<String, FakeExecFault>,
+    /// Container IDS whose `status` poll fails with this backend message, as
+    /// an unreachable podman socket would. Seeded via
+    /// [`FakeBackend::seed_status_fault`]. A poll that cannot answer is not a
+    /// container that has not started, and without this seam nothing could
+    /// tell the two apart.
+    status_faults: BTreeMap<String, String>,
+    /// Container IDS whose `stop` fails with this backend message, leaving
+    /// the container as it was. Seeded via [`FakeBackend::seed_stop_fault`].
+    /// A teardown that did not happen must not be reported as one that did.
+    stop_faults: BTreeMap<String, String>,
+    /// Container IDs whose `remove` is refused as
+    /// [`KubeletError::NotReaped`], leaving the record — the native backend's
+    /// answer while a stopped process is inside its grace period. Seeded via
+    /// [`FakeBackend::hold_unreaped`].
+    unreaped: BTreeSet<String>,
+}
+
+/// How a [`FakeBackend`] exec fails without the command ever answering.
+///
+/// The two cases a prober must tell apart from a non-zero exit: the runtime
+/// returned an error (the command never ran — a probe is Blind), and the
+/// runtime never returned at all (the probe times out — a Failure).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FakeExecFault {
+    /// `exec` returns `Err(KubeletError::Backend(message))`, as a podman
+    /// socket that refuses the connection would.
+    Unavailable(String),
+    /// `exec` never completes.
+    Hang,
 }
 
 /// Operation log entry for `FakeBackend`. Tests assert this shape
@@ -724,6 +894,10 @@ pub enum FakeEvent {
     Stop(String),
     /// `remove(container_id)`.
     Remove(String),
+    /// `start(spec)` found a running container already holding the spec's
+    /// name and handed it back instead of starting a second copy (only under
+    /// [`Readoption::AdoptsRunning`]); spec name captured.
+    Adopt(String),
 }
 
 impl FakeBackend {
@@ -731,6 +905,70 @@ impl FakeBackend {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This backend, answering [`ContainerRuntime::readoption`] with
+    /// `readoption`. Under [`Readoption::AdoptsRunning`] `start` adopts a
+    /// running container that already holds the spec's name, as the podman
+    /// API backend does.
+    #[must_use]
+    pub fn with_readoption(mut self, readoption: Readoption) -> Self {
+        self.readoption = readoption;
+        self
+    }
+
+    /// This backend, minting each container's id from its spec name instead
+    /// of a counter — the native backend's deterministic ids.
+    #[must_use]
+    pub fn with_ids_from_names(mut self) -> Self {
+        self.ids_from_names = true;
+        self
+    }
+
+    /// Make every `status` poll of `container_id` fail with `message` until
+    /// [`FakeBackend::clear_status_fault`].
+    pub async fn seed_status_fault(&self, container_id: &str, message: impl Into<String>) {
+        self.inner
+            .lock()
+            .await
+            .status_faults
+            .insert(container_id.to_string(), message.into());
+    }
+
+    /// The runtime answers `status` for `container_id` again.
+    pub async fn clear_status_fault(&self, container_id: &str) {
+        self.inner.lock().await.status_faults.remove(container_id);
+    }
+
+    /// Make every `stop` of `container_id` fail with `message` until
+    /// [`FakeBackend::clear_stop_fault`]. The container keeps running.
+    pub async fn seed_stop_fault(&self, container_id: &str, message: impl Into<String>) {
+        self.inner
+            .lock()
+            .await
+            .stop_faults
+            .insert(container_id.to_string(), message.into());
+    }
+
+    /// The runtime stops `container_id` again.
+    pub async fn clear_stop_fault(&self, container_id: &str) {
+        self.inner.lock().await.stop_faults.remove(container_id);
+    }
+
+    /// Refuse every `remove` of `container_id` as
+    /// [`KubeletError::NotReaped`] until [`FakeBackend::reap`] — a stop whose
+    /// process is still inside its grace period.
+    pub async fn hold_unreaped(&self, container_id: &str) {
+        self.inner
+            .lock()
+            .await
+            .unreaped
+            .insert(container_id.to_string());
+    }
+
+    /// The held process has been reaped; `remove` succeeds again.
+    pub async fn reap(&self, container_id: &str) {
+        self.inner.lock().await.unreaped.remove(container_id);
     }
 
     /// Snapshot of all containers currently tracked.
@@ -755,27 +993,39 @@ impl FakeBackend {
             .await
             .containers
             .values()
-            .filter(|s| s.running)
+            .filter(|s| s.is_running())
             .count()
     }
 
     /// Test hook: simulate a container exiting ON ITS OWN with
     /// `exit_code` (distinct from an operator-initiated [`stop`]). Flips
-    /// the tracked container to `running == false` + records the exit
-    /// code, WITHOUT emitting a [`FakeEvent::Stop`] — modeling a process
-    /// that terminated by itself rather than being told to. The kubelet's
-    /// running-status poll then observes the terminated container on its
-    /// next tick.
+    /// the tracked container to [`RunState::Exited`](crate::cri::RunState)
+    /// with that code, WITHOUT emitting a [`FakeEvent::Stop`] — modeling a
+    /// process that terminated by itself rather than being told to. The
+    /// kubelet's running-status poll then observes the terminated container
+    /// on its next tick.
     ///
     /// No-op (silently) if `container_id` isn't tracked — mirrors a
     /// best-effort host observation.
     ///
     /// [`stop`]: ContainerRuntime::stop
     pub async fn set_exit(&self, container_id: &str, exit_code: i32) {
+        self.set_run_state(
+            container_id,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(exit_code)),
+        )
+        .await;
+    }
+
+    /// Test hook: set what the runtime reports for `container_id` to any
+    /// [`RunState`](crate::cri::RunState) — a signal death
+    /// (`Exited(Signal(9))`), or a container the runtime has lost track of
+    /// (`Unknown`), which [`Self::set_exit`] cannot express. Same no-op rule
+    /// for an untracked id, and likewise emits no [`FakeEvent`].
+    pub async fn set_run_state(&self, container_id: &str, run_state: crate::cri::RunState) {
         let mut state = self.inner.lock().await;
         if let Some(s) = state.containers.get_mut(container_id) {
-            s.running = false;
-            s.exit_code = Some(exit_code);
+            s.state = run_state;
         }
     }
 
@@ -797,6 +1047,28 @@ impl FakeBackend {
             .await
             .seeded_start_failures
             .insert(container_name.to_string(), message.into());
+    }
+
+    /// How many times `start` was called for `container_name`, whether it
+    /// succeeded or not.
+    pub async fn start_attempts(&self, container_name: &str) -> usize {
+        self.inner
+            .lock()
+            .await
+            .start_attempts
+            .get(container_name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `start` succeeds for `container_name` again — the cause of a
+    /// [`FakeBackend::seed_start_failure`] was fixed.
+    pub async fn clear_start_failure(&self, container_name: &str) {
+        self.inner
+            .lock()
+            .await
+            .seeded_start_failures
+            .remove(container_name);
     }
 
     pub async fn seed_log(&self, container_name: &str, content: impl Into<String>) {
@@ -850,12 +1122,33 @@ impl FakeBackend {
     pub async fn set_default_exec(&self, outcome: ExecOutcome) {
         self.inner.lock().await.default_exec = Some(outcome);
     }
+
+    /// Test hook: make every `exec` against the container of name
+    /// `container_name` fail in the RUNTIME with `fault` instead of answering
+    /// with an exit code. Applies until [`FakeBackend::clear_exec_fault`].
+    pub async fn seed_exec_fault(&self, container_name: &str, fault: FakeExecFault) {
+        self.inner
+            .lock()
+            .await
+            .exec_faults
+            .insert(container_name.to_string(), fault);
+    }
+
+    /// Test hook: the runtime recovers — `exec` against `container_name`
+    /// answers with exit codes again (the seeded queue, then the default).
+    pub async fn clear_exec_fault(&self, container_name: &str) {
+        self.inner.lock().await.exec_faults.remove(container_name);
+    }
 }
 
 #[async_trait]
 impl ContainerRuntime for FakeBackend {
     fn name(&self) -> &'static str {
         "fake"
+    }
+
+    fn readoption(&self) -> Readoption {
+        self.readoption
     }
 
     async fn exec(
@@ -873,6 +1166,22 @@ impl ContainerRuntime for FakeBackend {
         // Resolve the spec NAME this id was started under, then pop the front
         // of its seeded queue; fall back to the configured default (success).
         let name = state.id_to_name.get(container_id).cloned();
+        match name
+            .as_deref()
+            .and_then(|n| state.exec_faults.get(n))
+            .cloned()
+        {
+            Some(FakeExecFault::Unavailable(message)) => {
+                return Err(KubeletError::Backend(message));
+            }
+            Some(FakeExecFault::Hang) => {
+                // Release the lock first: a hung exec must not also wedge
+                // every other call into the fake.
+                drop(state);
+                return std::future::pending().await;
+            }
+            None => {}
+        }
         let popped = name
             .as_deref()
             .and_then(|n| state.seeded_exec_by_name.get_mut(n))
@@ -885,14 +1194,43 @@ impl ContainerRuntime for FakeBackend {
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
         let mut state = self.inner.lock().await;
+        *state.start_attempts.entry(spec.name.clone()).or_default() += 1;
         // A seeded start failure short-circuits BEFORE any state mutation, so
         // a failed start leaves no container, no id, and no log — exactly as a
         // real spawn failure does.
         if let Some(msg) = state.seeded_start_failures.get(&spec.name) {
             return Err(KubeletError::Backend(msg.clone()));
         }
+        if self.readoption == Readoption::AdoptsRunning {
+            // The podman API backend's adopt-or-replace, in miniature: a
+            // running container under this name is handed back; a stopped one
+            // is dropped so the create below takes the name.
+            let holders: Vec<String> = state
+                .id_to_name
+                .iter()
+                .filter(|(_, name)| **name == spec.name)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in holders {
+                match state.containers.get(&id) {
+                    Some(held) if held.is_running() => {
+                        let adopted = held.clone();
+                        state.events.push(FakeEvent::Adopt(spec.name.clone()));
+                        return Ok(adopted);
+                    }
+                    _ => {
+                        state.containers.remove(&id);
+                        state.id_to_name.remove(&id);
+                    }
+                }
+            }
+        }
         state.next_id += 1;
-        let container_id = format!("fake-{:08x}", state.next_id);
+        let container_id = if self.ids_from_names {
+            spec.name.clone()
+        } else {
+            format!("fake-{:08x}", state.next_id)
+        };
         let pod_ip = format!("10.42.0.{}", state.next_id % 250);
         let status = ContainerStatus::running(container_id.clone(), pod_ip);
         state
@@ -919,20 +1257,20 @@ impl ContainerRuntime for FakeBackend {
     }
 
     async fn status(&self, container_id: &str) -> Result<Option<ContainerStatus>, KubeletError> {
-        Ok(self
-            .inner
-            .lock()
-            .await
-            .containers
-            .get(container_id)
-            .cloned())
+        let state = self.inner.lock().await;
+        if let Some(message) = state.status_faults.get(container_id) {
+            return Err(KubeletError::Backend(message.clone()));
+        }
+        Ok(state.containers.get(container_id).cloned())
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
         let mut state = self.inner.lock().await;
+        if let Some(message) = state.stop_faults.get(container_id) {
+            return Err(KubeletError::Backend(message.clone()));
+        }
         if let Some(s) = state.containers.get_mut(container_id) {
-            s.running = false;
-            s.exit_code = Some(0);
+            s.state = crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(0));
         }
         state.events.push(FakeEvent::Stop(container_id.to_string()));
         Ok(())
@@ -940,6 +1278,11 @@ impl ContainerRuntime for FakeBackend {
 
     async fn remove(&self, container_id: &str) -> Result<(), KubeletError> {
         let mut state = self.inner.lock().await;
+        if state.unreaped.contains(container_id) {
+            return Err(KubeletError::NotReaped {
+                container_id: container_id.to_string(),
+            });
+        }
         state.containers.remove(container_id);
         state.specs.remove(container_id);
         state.logs.remove(container_id);
@@ -1377,19 +1720,15 @@ impl PodmanBackend {
         // (M0.7 kubelet-volumes) Already-resolved volume mounts → `-v` pairs,
         // emitted AFTER `--name` and BEFORE the `-e` env pairs (deterministic,
         // unit-assertable position; preserved in `spec.mounts` order). A
-        // HostDir source uses the absolute host path; a NamedVolume uses the
+        // host-path source uses the absolute host path; a NamedVolume uses the
         // volume name. `:ro` is appended when the mount is read-only
         // (configMap/secret default; emptyDir read-write). Empty `spec.mounts`
         // (a pod with no volumes) emits nothing → byte-identical argv to before
         // this brick.
         for m in &spec.mounts {
-            let src = match &m.source {
-                crate::pod_volume::MountSource::HostDir(p) => p.display().to_string(),
-                crate::pod_volume::MountSource::EmptyDirHostDir(p) => p.display().to_string(),
-                crate::pod_volume::MountSource::NamedVolume(n) => n.clone(),
-                crate::pod_volume::MountSource::PvcHostDir { path, .. } => {
-                    path.display().to_string()
-                }
+            let src = match m.source.bind_source() {
+                crate::pod_volume::BindSource::Path(p) => p.display().to_string(),
+                crate::pod_volume::BindSource::Volume(n) => n.to_string(),
             };
             let spec_str = if m.read_only {
                 format!("{src}:{}:ro", m.mount_path)
@@ -1560,7 +1899,11 @@ impl PodmanBackend {
     /// `podman stop` argv for `id`.
     #[must_use]
     pub fn stop_argv(id: &str) -> Vec<String> {
-        vec!["stop".to_string(), id.to_string()]
+        // `--ignore`: a container podman no longer has is already stopped.
+        // Without it `podman stop` exits non-zero on a missing container, and
+        // the kubelet — which reads every stop's result — could never restart
+        // a container that vanished.
+        vec!["stop".to_string(), "--ignore".to_string(), id.to_string()]
     }
 
     /// `podman rm -f` argv for `id`. `-f` force-stops then removes;
@@ -1609,8 +1952,18 @@ impl PodmanBackend {
                 "podman inspect output unexpected shape: {text}"
             )));
         }
-        let running = parts[0] == "true";
-        let exit_code = parts[1].parse::<i32>().ok();
+        let state = if parts[0] == "true" {
+            crate::cri::RunState::Running
+        } else {
+            // Stopped. An unreadable code is NOT a zero: it is a stop nobody
+            // observed the cause of, and it stays `Unknown` so the kubelet
+            // cannot report it as a clean exit.
+            parts[1]
+                .parse::<i32>()
+                .map_or(crate::cri::RunState::Unknown, |code| {
+                    crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(code))
+                })
+        };
         let pod_ip = if parts[2].is_empty() {
             None
         } else {
@@ -1618,9 +1971,8 @@ impl PodmanBackend {
         };
         Ok(ContainerStatus {
             container_id: container_id.to_string(),
-            running,
+            state,
             pod_ip,
-            exit_code,
         })
     }
 
@@ -1700,6 +2052,13 @@ impl PodmanBackend {
 impl ContainerRuntime for PodmanBackend {
     fn name(&self) -> &'static str {
         "podman"
+    }
+
+    /// The CLI's `start` answers a name collision with `rm -f` + re-run, so
+    /// what a previous process left is replaced, never handed back
+    /// (`pending-adopt-parity`, below).
+    fn readoption(&self) -> Readoption {
+        Readoption::Cannot
     }
 
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
@@ -1832,19 +2191,18 @@ impl ContainerRuntime for PodmanBackend {
         // per-network `pod_ip` instead of always `None`, closing the
         // one-tick empty-Endpoints window. The IP is usually assigned by
         // the time `run` returns the container id; if it isn't yet (rare
-        // race) we fall back to `running: true, pod_ip: None` — the
+        // race) we fall back to `RunState::Running, pod_ip: None` — the
         // kubelet's reconcile_running poll converges it on the next tick,
         // so this is a latency optimization, not a correctness dependency.
         // An inspect error here is non-fatal for the same reason: the
         // container DID start (run succeeded); we just couldn't read its IP
         // yet, so we return the started status and let the poll path retry.
         match self.status(&container_id).await {
-            Ok(Some(observed)) if observed.running => Ok(observed),
+            Ok(Some(observed)) if observed.is_running() => Ok(observed),
             _ => Ok(ContainerStatus {
                 container_id,
-                running: true,
+                state: crate::cri::RunState::Running,
                 pod_ip: None, // not yet readable; status() poll converges it
-                exit_code: None,
             }),
         }
     }
@@ -1965,9 +2323,11 @@ pub struct TcpProbeTarget {
     pub timeout: Duration,
 }
 
-/// Typed I/O failure for a network probe. The prober's `run_handler` maps ANY
-/// of these to a probe `Failure` (never aborts the tick) — so this error never
-/// escapes the prober, but it's typed for diagnostics + the mock contract.
+/// Typed I/O failure for a network probe. It never escapes the prober and never
+/// aborts the tick; `run_handler` classifies each variant exhaustively. A
+/// request that went out and was answered badly is a probe `Failure`
+/// (`Connect`, `Timeout`, `Io`). A request that was never sent (`Setup`) is
+/// `Blind`: it says nothing about the workload and can never restart it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProbeIoError {
     /// The connection was refused / reset / unreachable.
@@ -1984,9 +2344,39 @@ pub enum ProbeIoError {
         /// `ip:port` label.
         target: String,
     },
-    /// Any other I/O error (DNS, TLS, malformed response).
+    /// Any other I/O error on a SENT request (DNS, TLS, malformed response).
     #[error("probe io error: {0}")]
     Io(String),
+    /// The prober could not form the request, so nothing was sent.
+    #[error("probe could not be set up ({stage}): {reason}")]
+    Setup {
+        /// Which step of forming the request failed.
+        stage: ProbeSetupStage,
+        /// Underlying reason.
+        reason: String,
+    },
+}
+
+/// Which step of forming a network probe request failed — before anything
+/// reached the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSetupStage {
+    /// The probe URL did not parse.
+    Url,
+    /// The HTTP client could not be built.
+    Client,
+    /// The request could not be assembled (for example an invalid header).
+    Request,
+}
+
+impl std::fmt::Display for ProbeSetupStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ProbeSetupStage::Url => "url",
+            ProbeSetupStage::Client => "client",
+            ProbeSetupStage::Request => "request",
+        })
+    }
 }
 
 /// The network-probe seam: httpGet + tcpSocket against the routable pod IP.
@@ -2039,13 +2429,19 @@ impl NetProber for TokioNetProber {
             format!("/{}", target.path)
         };
         let url = reqwest::Url::parse(&format!("{}://{authority}{path}", target.scheme.as_str()))
-            .map_err(|e| ProbeIoError::Io(format!("bad probe url: {e}")))?;
+            .map_err(|e| ProbeIoError::Setup {
+            stage: ProbeSetupStage::Url,
+            reason: e.to_string(),
+        })?;
         let client = reqwest::Client::builder()
             .timeout(target.timeout)
             // Probes accept self-signed certs (K8s does not verify probe TLS).
             .danger_accept_invalid_certs(true)
             .build()
-            .map_err(|e| ProbeIoError::Io(format!("http client build: {e}")))?;
+            .map_err(|e| ProbeIoError::Setup {
+                stage: ProbeSetupStage::Client,
+                reason: e.to_string(),
+            })?;
         let mut req = client.get(url);
         // Host override → Host header; custom headers appended.
         if let Some(host) = &target.host {
@@ -2056,6 +2452,12 @@ impl NetProber for TokioNetProber {
         }
         match req.send().await {
             Ok(resp) => Ok(resp.status().as_u16()),
+            // reqwest defers an invalid header to `send`; it never reached the
+            // wire, so it is a setup error, not an answer from the workload.
+            Err(e) if e.is_builder() => Err(ProbeIoError::Setup {
+                stage: ProbeSetupStage::Request,
+                reason: e.to_string(),
+            }),
             Err(e) if e.is_timeout() => Err(ProbeIoError::Timeout { target: authority }),
             Err(e) if e.is_connect() => Err(ProbeIoError::Connect {
                 target: authority,
@@ -2188,6 +2590,10 @@ impl NetProber for FakeNetProber {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests of the runtime itself call its start directly"
+)]
 mod tests {
     use super::*;
 
@@ -2202,7 +2608,7 @@ mod tests {
             ..Default::default()
         };
         let status = backend.start(&spec).await.unwrap();
-        assert!(status.running);
+        assert!(status.is_running());
         assert!(status.pod_ip.is_some());
         assert!(status.container_id.starts_with("fake-"));
         assert_eq!(backend.running_count().await, 1);
@@ -2221,8 +2627,10 @@ mod tests {
         let s = backend.start(&spec).await.unwrap();
         backend.stop(&s.container_id).await.unwrap();
         let after = backend.status(&s.container_id).await.unwrap().unwrap();
-        assert!(!after.running);
-        assert_eq!(after.exit_code, Some(0));
+        assert_eq!(
+            after.state,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(0))
+        );
     }
 
     #[tokio::test]
@@ -2273,8 +2681,10 @@ mod tests {
         let s = backend.start(&spec).await.unwrap();
         backend.set_exit(&s.container_id, 137).await;
         let after = backend.status(&s.container_id).await.unwrap().unwrap();
-        assert!(!after.running);
-        assert_eq!(after.exit_code, Some(137));
+        assert_eq!(
+            after.state,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(137))
+        );
         // set_exit models a self-exit, NOT an operator stop — only the
         // Start event was recorded.
         let events = backend.events().await;
@@ -2296,7 +2706,10 @@ mod tests {
         backend.set_exit(&s.container_id, 0).await;
         assert_eq!(backend.running_count().await, 0);
         let after = backend.status(&s.container_id).await.unwrap().unwrap();
-        assert_eq!(after.exit_code, Some(0));
+        assert_eq!(
+            after.state,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(0))
+        );
     }
 
     #[test]
@@ -2443,6 +2856,8 @@ mod tests {
             // same argv it did before the field existed, which is exactly what
             // these tests pin.
             resources: Resources::default(),
+            // Stop-time only; no argv carries it.
+            termination_grace: TerminationGrace::default(),
             // No Pod identity: these argv tests construct a spec directly, not
             // through the Pod path, and a backend that needs identity must
             // check `is_present()` rather than assume it.
@@ -2938,7 +3353,10 @@ mod tests {
 
     #[test]
     fn stop_argv_maps_id() {
-        assert_eq!(PodmanBackend::stop_argv("abc123"), vec!["stop", "abc123"]);
+        assert_eq!(
+            PodmanBackend::stop_argv("abc123"),
+            vec!["stop", "--ignore", "abc123"]
+        );
     }
 
     #[test]
@@ -3133,8 +3551,9 @@ mod tests {
     #[test]
     fn parse_inspect_running_with_ip() {
         let s = PodmanBackend::parse_inspect("cid", "true|0|10.88.0.4").unwrap();
-        assert!(s.running);
-        assert_eq!(s.exit_code, Some(0));
+        // podman prints ExitCode 0 for a running container; it is not an
+        // exit and must not be read as one.
+        assert_eq!(s.state, crate::cri::RunState::Running);
         assert_eq!(s.pod_ip.as_deref(), Some("10.88.0.4"));
         assert_eq!(s.container_id, "cid");
     }
@@ -3142,15 +3561,25 @@ mod tests {
     #[test]
     fn parse_inspect_terminated_no_ip() {
         let s = PodmanBackend::parse_inspect("cid", "false|137|").unwrap();
-        assert!(!s.running);
-        assert_eq!(s.exit_code, Some(137));
+        assert_eq!(
+            s.state,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(137))
+        );
         assert!(s.pod_ip.is_none());
+    }
+
+    #[test]
+    fn parse_inspect_unreadable_exit_code_is_unknown_not_zero() {
+        // A stopped container whose code cannot be read was a clean exit
+        // under `unwrap_or(0)`. It is a stop nobody observed the cause of.
+        let s = PodmanBackend::parse_inspect("cid", "false|<no value>|").unwrap();
+        assert_eq!(s.state, crate::cri::RunState::Unknown);
     }
 
     #[test]
     fn parse_inspect_trims_trailing_newline() {
         let s = PodmanBackend::parse_inspect("cid", "true|0|10.88.0.4\n").unwrap();
-        assert!(s.running);
+        assert!(s.is_running());
         assert_eq!(s.pod_ip.as_deref(), Some("10.88.0.4"));
     }
 
@@ -3172,8 +3601,7 @@ mod tests {
     fn parse_inspect_per_network_ip_is_surfaced() {
         // The fixed behavior: a non-empty per-network IP → pod_ip Some.
         let s = PodmanBackend::parse_inspect("cid", "true|0|10.89.0.4").unwrap();
-        assert!(s.running);
-        assert_eq!(s.exit_code, Some(0));
+        assert_eq!(s.state, crate::cri::RunState::Running);
         assert_eq!(s.pod_ip.as_deref(), Some("10.89.0.4"));
     }
 
@@ -3186,7 +3614,7 @@ mod tests {
         // above); this proves an empty third field still maps to None so
         // an unbound / not-yet-networked container is honestly reported.
         let s = PodmanBackend::parse_inspect("cid", "true|0|").unwrap();
-        assert!(s.running);
+        assert!(s.is_running());
         assert!(
             s.pod_ip.is_none(),
             "empty per-network IP must yield pod_ip None"
@@ -3283,6 +3711,62 @@ mod kubernetes_service_env_tests {
 }
 
 #[cfg(test)]
+mod probe_setup_tests {
+    //! A request the prober could not FORM never reached the workload, so it
+    //! must come back as `ProbeIoError::Setup` — which the prober reads as
+    //! Blind — and never as a transport error, which it reads as Failure.
+    //! These run the real `TokioNetProber`; neither case opens a socket.
+    use super::*;
+
+    fn target(ip: &str, headers: Vec<(String, String)>) -> HttpProbeTarget {
+        HttpProbeTarget {
+            ip: ip.to_string(),
+            port: 8080,
+            path: "/healthz".to_string(),
+            scheme: HttpScheme::Http,
+            host: None,
+            headers,
+            timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_that_cannot_be_encoded_is_a_setup_error() {
+        let bad = vec![("bad header\n".to_string(), "v".to_string())];
+        let got = TokioNetProber::new()
+            .http_get(&target("127.0.0.1", bad))
+            .await;
+        assert!(
+            matches!(
+                got,
+                Err(ProbeIoError::Setup {
+                    stage: ProbeSetupStage::Request,
+                    ..
+                })
+            ),
+            "an unencodable header is a setup error, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_that_cannot_form_a_url_is_a_setup_error() {
+        let got = TokioNetProber::new()
+            .http_get(&target("not an address", Vec::new()))
+            .await;
+        assert!(
+            matches!(
+                got,
+                Err(ProbeIoError::Setup {
+                    stage: ProbeSetupStage::Url,
+                    ..
+                })
+            ),
+            "an unparsable URL is a setup error, got {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod name_conflict_tests {
     use super::is_name_conflict;
 
@@ -3325,5 +3809,43 @@ mod name_conflict_tests {
         ] {
             assert!(!is_name_conflict(msg), "must NOT reclaim on: {msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod termination_grace_tests {
+    use super::TerminationGrace;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn of(spec: &serde_json::Value) -> Duration {
+        TerminationGrace::of_pod(&json!({ "spec": spec })).duration()
+    }
+
+    /// The pod's own grace is honoured, and the two upstream rules around
+    /// it hold: absent means 30 s, and nothing gets less than 2 s — a
+    /// zero-length window would make every stop a SIGKILL.
+    #[test]
+    fn the_pods_grace_is_read_defaulted_and_floored_as_upstream_does() {
+        assert_eq!(
+            of(&json!({ "terminationGracePeriodSeconds": 45 })),
+            Duration::from_secs(45)
+        );
+        assert_eq!(of(&json!({})), Duration::from_secs(30), "absent → 30 s");
+        assert_eq!(
+            of(&json!({ "terminationGracePeriodSeconds": 0 })),
+            Duration::from_secs(2),
+            "0 → the 2 s floor, never an immediate SIGKILL"
+        );
+        assert_eq!(
+            of(&json!({ "terminationGracePeriodSeconds": -5 })),
+            Duration::from_secs(2),
+            "negative → the floor"
+        );
+        assert_eq!(
+            of(&json!({ "terminationGracePeriodSeconds": "soon" })),
+            Duration::from_secs(30),
+            "not an integer → the default, the longer window"
+        );
     }
 }

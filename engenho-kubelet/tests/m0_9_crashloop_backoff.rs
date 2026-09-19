@@ -106,7 +106,7 @@ async fn live_id(backend: &FakeBackend) -> String {
         .containers()
         .await
         .into_iter()
-        .find(|(_, s)| s.running)
+        .find(|(_, s)| s.is_running())
         .map(|(id, _)| id)
         .expect("a running container")
 }

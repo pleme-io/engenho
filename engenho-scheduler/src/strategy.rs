@@ -1,31 +1,34 @@
 //! The scheduling strategy trait + the canonical
 //! [`RoundRobinStrategy`] impl.
 //!
-//! Strategies are PURE: given the pending Pod + the list of
-//! candidate Nodes, return the chosen node name (or None if
-//! nothing is schedulable). The scheduler does the I/O.
+//! A strategy is the **Score** stage. It is handed a [`Feasible`], the
+//! non-empty set of nodes every [`crate::FilterPlugin`] admitted, and returns
+//! the name of one of them. It does no filtering of its own and has no "found
+//! nothing" answer: [`Feasible`] can only be built by [`crate::filter`], and
+//! it is never empty. The scheduler does the I/O.
 //!
-//! Strategies are also STATEFUL (carry their own state across
-//! ticks); `RoundRobinStrategy` keeps a rotating cursor so
-//! consecutive pods land on different nodes.
+//! Strategies are STATEFUL (carry their own state across ticks);
+//! `RoundRobinStrategy` keeps a rotating cursor so consecutive pods land on
+//! different nodes.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use serde_json::Value;
+
+use crate::filter::Feasible;
 
 #[async_trait]
 pub trait SchedulingStrategy: Send + Sync {
     /// Stable identifier — telemetry + audit.
     fn name(&self) -> &'static str;
 
-    /// Pick a node for `pod` from `candidates`. Return `None` if
-    /// no candidate is suitable.
+    /// Pick the node `pod` is bound to, from `feasible`.
     ///
-    /// Both `pod` and `candidates` are full K8s JSON resources
-    /// (the substrate keeps them opaque; per-kind typed handlers
-    /// land at R7.5c).
-    async fn pick<'a>(&self, pod: &'a Value, candidates: &'a [Value]) -> Option<String>;
+    /// `pod` is the full K8s JSON resource. Every candidate in `feasible`
+    /// passed every filter plugin for this pod, including readiness derived
+    /// from its Lease and the pod's resource fit against this tick's ledger.
+    async fn pick<'a>(&self, pod: &'a Value, feasible: &'a Feasible<'a>) -> String;
 }
 
 /// Blanket impl so the boxed trait object that
@@ -41,37 +44,22 @@ impl SchedulingStrategy for Box<dyn SchedulingStrategy> {
         (**self).name()
     }
 
-    async fn pick<'a>(&self, pod: &'a Value, candidates: &'a [Value]) -> Option<String> {
-        (**self).pick(pod, candidates).await
+    async fn pick<'a>(&self, pod: &'a Value, feasible: &'a Feasible<'a>) -> String {
+        (**self).pick(pod, feasible).await
     }
 }
 
-/// Round-robin across schedulable nodes. Cursor advances on every
-/// pick so consecutive pods spread evenly.
-///
-/// Treats a node as unschedulable when:
-///   * `spec.unschedulable == true` (cordoned)
-///   * `status.conditions[Ready].status != "True"`
+/// Round-robin across the feasible nodes. The cursor advances on every pick
+/// so consecutive pods spread evenly.
+#[derive(Debug, Default)]
 pub struct RoundRobinStrategy {
-    cursor: Mutex<usize>,
-}
-
-impl Default for RoundRobinStrategy {
-    fn default() -> Self {
-        Self {
-            cursor: Mutex::new(0),
-        }
-    }
+    cursor: AtomicUsize,
 }
 
 impl RoundRobinStrategy {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    fn schedulable_nodes<'a>(candidates: &'a [Value]) -> Vec<&'a Value> {
-        candidates.iter().filter(|n| is_schedulable(n)).collect()
     }
 }
 
@@ -81,147 +69,98 @@ impl SchedulingStrategy for RoundRobinStrategy {
         "round_robin"
     }
 
-    async fn pick<'a>(&self, _pod: &'a Value, candidates: &'a [Value]) -> Option<String> {
-        let schedulable = Self::schedulable_nodes(candidates);
-        if schedulable.is_empty() {
-            return None;
-        }
-        let mut cursor = self.cursor.lock().unwrap();
-        let chosen = &schedulable[*cursor % schedulable.len()];
-        *cursor = cursor.wrapping_add(1);
-        chosen
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-            .map(String::from)
-    }
-}
-
-/// Returns `true` if the node is healthy + not cordoned.
-pub fn is_schedulable(node: &Value) -> bool {
-    let unsched = node
-        .get("spec")
-        .and_then(|s| s.get("unschedulable"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if unsched {
-        return false;
-    }
-    let conditions = node
-        .get("status")
-        .and_then(|s| s.get("conditions"))
-        .and_then(|c| c.as_array());
-    let Some(conditions) = conditions else {
-        // No status yet — assume schedulable (newly-registered node)
-        return true;
-    };
-    let ready = conditions
-        .iter()
-        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready"));
-    match ready {
-        Some(r) => r.get("status").and_then(|s| s.as_str()) == Some("True"),
-        // No Ready condition yet — assume schedulable
-        None => true,
+    async fn pick<'a>(&self, _pod: &'a Value, feasible: &'a Feasible<'a>) -> String {
+        // `fetch_add` wraps on overflow, and `nth_wrapping` is total.
+        let turn = self.cursor.fetch_add(1, Ordering::Relaxed);
+        feasible.nth_wrapping(turn).name().to_owned()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::{Filtered, filter};
+    use crate::fit::pod_requests;
+    use crate::ledger::NodeLedger;
+    use crate::observed::ObservedNode;
+    use engenho_controllers::node_lease::lease_value;
     use serde_json::json;
 
-    fn ready_node(name: &str) -> Value {
+    const NOW: &str = "2026-09-19T12:00:00Z";
+
+    /// A lease renewed just now.
+    fn fresh(name: &str) -> Value {
+        lease_value(name, &engenho_types::time::now_rfc3339_utc(), 0)
+    }
+
+    /// A lease last renewed years ago: far past the grace period.
+    fn stale(name: &str) -> Value {
+        lease_value(name, "2020-01-01T00:00:00Z", 0)
+    }
+
+    fn node(name: &str, unschedulable: bool) -> Value {
         json!({
             "kind": "Node",
             "apiVersion": "v1",
             "metadata": { "name": name },
-            "spec": { "unschedulable": false },
+            "spec": { "unschedulable": unschedulable },
             "status": {
+                "allocatable": { "cpu": "4", "memory": "8Gi" },
                 "conditions": [{ "type": "Ready", "status": "True" }]
             }
         })
     }
 
-    fn unready_node(name: &str) -> Value {
-        json!({
-            "kind": "Node",
-            "apiVersion": "v1",
-            "metadata": { "name": name },
-            "status": {
-                "conditions": [{ "type": "Ready", "status": "False" }]
-            }
-        })
+    fn ready_node(name: &str) -> ObservedNode {
+        ObservedNode::project(node(name, false), Some(&fresh(name)), NOW)
     }
 
-    fn cordoned_node(name: &str) -> Value {
-        json!({
-            "kind": "Node",
-            "apiVersion": "v1",
-            "metadata": { "name": name },
-            "spec": { "unschedulable": true },
-            "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
-        })
+    fn stale_node(name: &str) -> ObservedNode {
+        ObservedNode::project(node(name, false), Some(&stale(name)), NOW)
+    }
+
+    fn cordoned_node(name: &str) -> ObservedNode {
+        ObservedNode::project(node(name, true), Some(&fresh(name)), NOW)
     }
 
     fn pending_pod() -> Value {
-        json!({
-            "metadata": { "name": "p" },
-            "spec": {}
-        })
+        json!({ "metadata": { "name": "p" }, "spec": {} })
     }
 
-    #[test]
-    fn is_schedulable_classifies_correctly() {
-        assert!(is_schedulable(&ready_node("a")));
-        assert!(!is_schedulable(&unready_node("b")));
-        assert!(!is_schedulable(&cordoned_node("c")));
-    }
-
-    #[test]
-    fn is_schedulable_assumes_true_when_no_status() {
-        let n = json!({"metadata": {"name": "x"}});
-        assert!(is_schedulable(&n));
+    /// Pick `n` times for one pod over `nodes`, through the Filter stage.
+    async fn picks(strategy: &RoundRobinStrategy, nodes: &[ObservedNode], n: usize) -> Vec<String> {
+        let pod = pending_pod();
+        let ledger = NodeLedger::seed(nodes.iter().map(ObservedNode::value), []);
+        let Filtered::Feasible(feasible) = filter(&pod, &pod_requests(&pod), nodes, &ledger) else {
+            panic!("the fixture has a feasible node");
+        };
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(strategy.pick(&pod, &feasible).await);
+        }
+        out
     }
 
     #[tokio::test]
     async fn round_robin_picks_each_node_in_sequence() {
         let strategy = RoundRobinStrategy::new();
-        let nodes = vec![ready_node("a"), ready_node("b"), ready_node("c")];
-        let pod = pending_pod();
-        // 3 picks → a, b, c (in BTreeMap-sorted order over input, but
-        // round-robin actually iterates in input order from the candidates list)
-        let pick1 = strategy.pick(&pod, &nodes).await;
-        let pick2 = strategy.pick(&pod, &nodes).await;
-        let pick3 = strategy.pick(&pod, &nodes).await;
-        let pick4 = strategy.pick(&pod, &nodes).await; // wraps to a
-        assert_eq!(pick1, Some("a".into()));
-        assert_eq!(pick2, Some("b".into()));
-        assert_eq!(pick3, Some("c".into()));
-        assert_eq!(pick4, Some("a".into()));
+        let nodes = [ready_node("a"), ready_node("b"), ready_node("c")];
+        // Round-robin iterates the feasible nodes in observed order, and wraps.
+        assert_eq!(picks(&strategy, &nodes, 4).await, ["a", "b", "c", "a"]);
     }
 
     #[tokio::test]
-    async fn round_robin_skips_unschedulable() {
+    async fn round_robin_rotates_over_the_feasible_nodes_only() {
+        // The cordoned and the stale node never reach the strategy: the
+        // Filter stage removed them, so the cursor rotates over {b, d}.
         let strategy = RoundRobinStrategy::new();
-        let nodes = vec![
+        let nodes = [
             cordoned_node("a"),
             ready_node("b"),
-            unready_node("c"),
+            stale_node("c"),
             ready_node("d"),
         ];
-        let pod = pending_pod();
-        let p1 = strategy.pick(&pod, &nodes).await;
-        let p2 = strategy.pick(&pod, &nodes).await;
-        assert_eq!(p1, Some("b".into()));
-        assert_eq!(p2, Some("d".into()));
-    }
-
-    #[tokio::test]
-    async fn round_robin_returns_none_when_no_candidates() {
-        let strategy = RoundRobinStrategy::new();
-        let nodes = vec![cordoned_node("a"), unready_node("b")];
-        let pod = pending_pod();
-        assert!(strategy.pick(&pod, &nodes).await.is_none());
+        assert_eq!(picks(&strategy, &nodes, 3).await, ["b", "d", "b"]);
     }
 
     #[tokio::test]

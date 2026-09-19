@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_controllers::Controller;
-use engenho_kubelet::{ContainerRuntime, FakeBackend, Kubelet, LogOptions};
+use engenho_kubelet::cri::{ExitDisposition, RunState};
+use engenho_kubelet::{ContainerRuntime, FakeBackend, Kubelet, LogOptions, Readoption};
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
@@ -332,6 +333,7 @@ async fn exit_zero_drives_succeeded() {
     );
     let term = &pod["status"]["containerStatuses"][0]["state"]["terminated"];
     assert_eq!(term["exitCode"], 0);
+    assert_eq!(term["reason"], "Completed");
 
     // No new Start: exactly one Start across the lifetime.
     assert_eq!(count_starts(&backend.events().await), 1);
@@ -382,6 +384,469 @@ async fn exit_nonzero_drives_failed() {
     teardown(store, kubelet).await;
 }
 
+// ── T1.2 — how a container ended, carried to the Pod phase ───────────────
+
+/// ★ Live on ryn before T1.2: a `SIGKILL`ed `restartPolicy: Never` container
+/// has no exit code, the kubelet read the absence as 0, and the pod was
+/// published `Succeeded` — which JobController then counted as a completion.
+#[tokio::test]
+async fn a_sigkilled_never_pod_is_failed_not_succeeded() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_pod(&store, "p1", "img", Some("node-A")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    backend
+        .set_run_state(&cid, RunState::Exited(ExitDisposition::Signal(9)))
+        .await;
+    kubelet.tick().await.unwrap();
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        pod_phase(&pod).as_deref(),
+        Some("Failed"),
+        "a killed container is not a successful one"
+    );
+    let term = &pod["status"]["containerStatuses"][0]["state"]["terminated"];
+    assert_eq!(term["exitCode"], 137, "SIGKILL renders as 128+9");
+    assert_eq!(term["reason"], "Error");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "Never: no restart"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// An exit nobody observed: upstream renders it terminated / 137 /
+/// `ContainerStatusUnknown`, and under `Never` the pod is Failed.
+#[tokio::test]
+async fn an_unobserved_exit_under_never_is_failed_as_container_status_unknown() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_pod(&store, "p1", "img", Some("node-A")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    backend.set_run_state(&cid, RunState::Unknown).await;
+    kubelet.tick().await.unwrap();
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Failed"));
+    let term = &pod["status"]["containerStatuses"][0]["state"]["terminated"];
+    assert_eq!(term["exitCode"], 137);
+    assert_eq!(term["reason"], "ContainerStatusUnknown");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "Never: no restart"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// Under `OnFailure` an unobserved exit and a signal death are failures, so
+/// both are restarted rather than latched `Succeeded`.
+#[tokio::test]
+async fn under_on_failure_a_signal_or_unobserved_exit_is_restarted() {
+    for run_state in [
+        RunState::Exited(ExitDisposition::Signal(9)),
+        RunState::Unknown,
+    ] {
+        let store = boot_store().await;
+        let backend = Arc::new(FakeBackend::new());
+        let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+        put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("OnFailure")).await;
+        kubelet.tick().await.unwrap();
+        let cid = first_container_id(&backend).await;
+
+        backend.set_run_state(&cid, run_state).await;
+        kubelet.tick().await.unwrap();
+
+        assert_eq!(
+            count_starts(&backend.events().await),
+            2,
+            "{run_state:?} under OnFailure must be restarted"
+        );
+        assert_eq!(
+            pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
+            Some("Running"),
+            "{run_state:?}"
+        );
+
+        teardown(store, kubelet).await;
+    }
+}
+
+// ── T1.2 c2 — re-adoption: no local record is not "never started" ───────
+//
+// A kubelet restart forgets every pod. A pod whose STORED status shows a
+// container up, on a runtime that cannot hand back what the previous process
+// started, is an exit nobody observed — not a pod that has yet to run.
+
+/// Simulate a kubelet restart: a fresh `Kubelet` over the same store and the
+/// same runtime, with no memory of what the old one started.
+fn restarted_kubelet(store: &Arc<StoreMesh>, backend: &Arc<FakeBackend>) -> Kubelet {
+    Kubelet::new(store.clone(), backend.clone(), "node-A")
+}
+
+/// ★ THE ryn DEFECT. A running `restartPolicy: Never` pod survived every
+/// kubelet restart by being started again from scratch — a Job pod run twice,
+/// in place, with restartCount 0 and nothing in its status to say so.
+#[tokio::test]
+async fn after_a_restart_a_running_never_pod_is_not_rerun_in_place() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    assert_eq!(
+        backend.readoption(),
+        Readoption::Cannot,
+        "control: this runtime cannot hand back a container"
+    );
+    let first = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod(&store, "job-1", "img", Some("node-A")).await;
+    first.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+    let before = store.get(&pod_key("job-1")).await.unwrap();
+    assert_eq!(pod_phase(&before).as_deref(), Some("Running"));
+    drop(first);
+
+    let kubelet = restarted_kubelet(&store, &backend);
+    kubelet.tick().await.unwrap();
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "a Never pod that already ran must not be started a second time"
+    );
+    let pod = store.get(&pod_key("job-1")).await.unwrap();
+    assert_eq!(
+        pod_phase(&pod).as_deref(),
+        Some("Failed"),
+        "it cannot succeed: how its container ended was never observed"
+    );
+    let status = &container_statuses(&pod)[0];
+    assert_eq!(
+        status["state"]["terminated"]["reason"],
+        "ContainerStatusUnknown"
+    );
+    assert_eq!(status["state"]["terminated"]["exitCode"], 137);
+    assert_eq!(
+        status["containerID"].as_str(),
+        Some(cid.as_str()),
+        "the run it reports is the one that happened"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// ★ On podman (CLI) and CRI the container OUTLIVES the kubelet. Publishing
+/// the lost run `terminated` while it still runs is a false status, and the
+/// replacement JobController creates would run beside it — the double run,
+/// made concurrent. The lost run is stopped and removed BEFORE the pod is
+/// published Failed.
+#[tokio::test]
+async fn after_a_restart_a_lost_never_run_is_torn_down_before_the_pod_is_failed() {
+    use engenho_kubelet::backend::FakeEvent;
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let first = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod(&store, "job-1", "img", Some("node-A")).await;
+    first.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+    drop(first);
+    assert!(
+        backend.status(&cid).await.unwrap().unwrap().is_running(),
+        "control: the runtime still runs what the old kubelet started"
+    );
+
+    let kubelet = restarted_kubelet(&store, &backend);
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        backend.status(&cid).await.unwrap(),
+        None,
+        "the lost run is not left running with no record anywhere"
+    );
+    let events = backend.events().await;
+    let stop = events
+        .iter()
+        .position(|e| *e == FakeEvent::Stop(cid.clone()));
+    let remove = events
+        .iter()
+        .position(|e| *e == FakeEvent::Remove(cid.clone()));
+    assert!(
+        matches!((stop, remove), (Some(s), Some(r)) if s < r),
+        "stop THEN remove: {events:?}"
+    );
+    assert_eq!(count_starts(&events), 1, "and nothing started in its place");
+    let pod = store.get(&pod_key("job-1")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Failed"));
+
+    teardown(store, kubelet).await;
+}
+
+/// A lost run the runtime cannot be ASKED about, or will not stop, holds the
+/// pod: no `Failed` claiming it ended, and no second copy started beside it.
+/// When the runtime answers again the run is torn down and the pod settles.
+#[tokio::test]
+async fn a_lost_run_that_cannot_be_torn_down_holds_the_pod() {
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        Poll,
+        Stop,
+    }
+    let cases = [Some("Never"), None]
+        .into_iter()
+        .flat_map(|policy| [(policy, Fault::Stop), (policy, Fault::Poll)]);
+    for (policy, fault) in cases {
+        let store = boot_store().await;
+        let backend = Arc::new(FakeBackend::new());
+        let first = Kubelet::new(store.clone(), backend.clone(), "node-A");
+        put_pod_with_policy(&store, "p", "img", Some("node-A"), policy).await;
+        first.tick().await.unwrap();
+        let cid = first_container_id(&backend).await;
+        let before = store.get(&pod_key("p")).await.unwrap();
+        drop(first);
+
+        match fault {
+            Fault::Poll => {
+                backend
+                    .seed_status_fault(&cid, "podman socket: connection refused")
+                    .await;
+            }
+            Fault::Stop => {
+                backend
+                    .seed_stop_fault(&cid, "podman stop: timed out")
+                    .await
+            }
+        }
+        let kubelet = restarted_kubelet(&store, &backend);
+        kubelet.tick().await.unwrap();
+        kubelet.tick().await.unwrap();
+
+        let case = (policy, fault);
+        assert_eq!(
+            count_starts(&backend.events().await),
+            1,
+            "{case:?}: nothing starts beside a run that may still be up"
+        );
+        let pod = store.get(&pod_key("p")).await.unwrap();
+        assert_eq!(
+            pod["status"], before["status"],
+            "{case:?}: no status claims the run ended"
+        );
+        match fault {
+            Fault::Poll => backend.clear_status_fault(&cid).await,
+            Fault::Stop => backend.clear_stop_fault(&cid).await,
+        }
+        assert!(
+            backend.status(&cid).await.unwrap().unwrap().is_running(),
+            "{case:?}: control: the lost run is still up"
+        );
+
+        kubelet.tick().await.unwrap();
+
+        assert_eq!(
+            backend.status(&cid).await.unwrap(),
+            None,
+            "{case:?}: torn down once the runtime answers"
+        );
+        let pod = store.get(&pod_key("p")).await.unwrap();
+        let (phase, starts, restarts) = match policy {
+            Some("Never") => ("Failed", 1, 0),
+            _ => ("Running", 2, 1),
+        };
+        assert_eq!(pod_phase(&pod).as_deref(), Some(phase), "{case:?}");
+        assert_eq!(count_starts(&backend.events().await), starts, "{case:?}");
+        assert_eq!(
+            container_statuses(&pod)[0]["restartCount"],
+            restarts,
+            "{case:?}"
+        );
+
+        teardown(store, kubelet).await;
+    }
+}
+
+/// Under a restarting policy the lost pod is started again — and the
+/// restart is counted, not reset to a first start.
+#[tokio::test]
+async fn after_a_restart_an_always_pod_is_restarted_and_the_restart_counted() {
+    // The second runtime shape is ryn's: it cannot re-adopt, AND it derives a
+    // container's id from its name, so the fresh process has the lost run's
+    // id. An id match there is not an adoption, and the restart still counts.
+    // (A fresh fake per case: `FakeBackend::clone` shares its state.)
+    let cases = [None, Some("OnFailure")]
+        .into_iter()
+        .flat_map(|policy| [(policy, "counter ids"), (policy, "name-derived ids")]);
+    for (policy, ids) in cases {
+        let runtime = match ids {
+            "name-derived ids" => FakeBackend::new().with_ids_from_names(),
+            _ => FakeBackend::new(),
+        };
+        let store = boot_store().await;
+        let backend = Arc::new(runtime);
+        let first = Kubelet::new(store.clone(), backend.clone(), "node-A");
+        put_pod_with_policy(&store, "web", "img", Some("node-A"), policy).await;
+        first.tick().await.unwrap();
+        drop(first);
+
+        let kubelet = restarted_kubelet(&store, &backend);
+        kubelet.tick().await.unwrap();
+
+        assert_eq!(
+            count_starts(&backend.events().await),
+            2,
+            "{policy:?} / {ids}"
+        );
+        let pod = store.get(&pod_key("web")).await.unwrap();
+        assert_eq!(
+            pod_phase(&pod).as_deref(),
+            Some("Running"),
+            "{policy:?} / {ids}"
+        );
+        assert_eq!(
+            container_statuses(&pod)[0]["restartCount"],
+            1,
+            "{policy:?} / {ids}: the run the old kubelet lost is a restart"
+        );
+        assert_eq!(
+            container_id_count(&backend).await,
+            1,
+            "{policy:?} / {ids}: the lost run is torn down, not left running beside its restart"
+        );
+
+        teardown(store, kubelet).await;
+    }
+}
+
+/// A pod that never got a container up before the restart is still just a
+/// pod to start: the rule reads the stored status, it does not refuse pods.
+#[tokio::test]
+async fn after_a_restart_a_pod_that_never_started_is_started_normally() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    backend
+        .seed_start_failure("default_job-2_main", "image not known")
+        .await;
+    let first = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod(&store, "job-2", "img", Some("node-A")).await;
+    first.tick().await.unwrap();
+    assert_eq!(
+        pod_phase(&store.get(&pod_key("job-2")).await.unwrap()).as_deref(),
+        Some("Pending"),
+        "control: nothing ever started"
+    );
+    drop(first);
+
+    let fixed = Arc::new(FakeBackend::new());
+    let kubelet = restarted_kubelet(&store, &fixed);
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(count_starts(&fixed.events().await), 1);
+    let pod = store.get(&pod_key("job-2")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
+    assert_eq!(container_statuses(&pod)[0]["restartCount"], 0);
+
+    teardown(store, kubelet).await;
+}
+
+/// On a runtime that CAN hand back a running container, the restarted
+/// kubelet adopts it: no second copy, no failure, and the restart count the
+/// container had earned is kept.
+#[tokio::test]
+async fn after_a_restart_an_adopting_runtime_keeps_the_running_container_and_its_count() {
+    use engenho_kubelet::backend::FakeEvent;
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new().with_readoption(Readoption::AdoptsRunning));
+    let first = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_policy(&store, "web", "img", Some("node-A"), None).await;
+    first.tick().await.unwrap();
+    // Earn one restart before the kubelet goes away.
+    let cid = first_container_id(&backend).await;
+    backend.set_exit(&cid, 1).await;
+    first.tick().await.unwrap();
+    let pod = store.get(&pod_key("web")).await.unwrap();
+    assert_eq!(container_statuses(&pod)[0]["restartCount"], 1, "control");
+    let live_id = container_statuses(&pod)[0]["containerID"].clone();
+    drop(first);
+
+    let kubelet = restarted_kubelet(&store, &backend);
+    kubelet.tick().await.unwrap();
+
+    let events = backend.events().await;
+    assert_eq!(count_starts(&events), 2, "no third copy was started");
+    assert!(events.contains(&FakeEvent::Adopt("default_web_main".into())));
+    let pod = store.get(&pod_key("web")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
+    let status = &container_statuses(&pod)[0];
+    assert_eq!(status["containerID"], live_id, "the same container");
+    assert_eq!(
+        status["restartCount"], 1,
+        "adopting a container is not restarting it, and does not reset it"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── T1.2 c2 — a poll that failed is not a container that never started ───
+
+/// ★ A status poll that errors used to render the container
+/// `Waiting{ContainerCreating}` with no id — a running pod published
+/// `Pending` on every podman hiccup. The write is withheld instead: the last
+/// published status stands until a poll answers.
+#[tokio::test]
+async fn a_failed_status_poll_withholds_the_write_instead_of_reporting_never_started() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_policy(&store, "web", "img", Some("node-A"), None).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+    let before = store.get(&pod_key("web")).await.unwrap();
+    assert_eq!(pod_phase(&before).as_deref(), Some("Running"), "control");
+
+    backend
+        .seed_status_fault(&cid, "podman socket: connection refused")
+        .await;
+    kubelet.tick().await.unwrap();
+
+    let pod = store.get(&pod_key("web")).await.unwrap();
+    assert_eq!(
+        pod["status"], before["status"],
+        "a tick that could not see the container publishes nothing"
+    );
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
+    assert!(
+        container_statuses(&pod)[0]["state"]
+            .get("waiting")
+            .is_none(),
+        "a running container is never re-reported as not yet started"
+    );
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "and not restarted"
+    );
+
+    // The runtime answers again: reconciliation resumes where it was.
+    backend.clear_status_fault(&cid).await;
+    kubelet.tick().await.unwrap();
+    let pod = store.get(&pod_key("web")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
+    assert_eq!(count_starts(&backend.events().await), 1);
+
+    teardown(store, kubelet).await;
+}
+
 // ── Test 5 — still-running stays running, no spurious restart ─────────────
 
 #[tokio::test]
@@ -419,15 +884,21 @@ async fn still_running_stays_running_no_extra_start() {
     teardown(store, kubelet).await;
 }
 
-// ── Test 6 — vanished container is re-created next tick ───────────────────
+// ── Test 6 — a vanished container is an exit nobody observed ─────────────
+//
+// It used to clear the pod's whole local record so the next tick "re-created"
+// it — which re-ran a restartPolicy:Never pod in place. A container the
+// runtime lost is down with an Unknown exit, decided like any other exit.
 
+/// Under a restarting policy the lost container is restarted in place, and
+/// the restart is counted.
 #[tokio::test]
-async fn vanished_container_is_recreated() {
+async fn a_vanished_container_is_restarted_and_counted_under_always() {
     let store = boot_store().await;
     let backend = Arc::new(FakeBackend::new());
     let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
 
-    put_pod(&store, "p1", "img", Some("node-A")).await;
+    put_pod_with_policy(&store, "p1", "img", Some("node-A"), None).await;
     kubelet.tick().await.unwrap();
     let cid = first_container_id(&backend).await;
     assert_eq!(count_starts(&backend.events().await), 1);
@@ -437,23 +908,50 @@ async fn vanished_container_is_recreated() {
     backend.remove(&cid).await.unwrap();
     assert!(backend.status(&cid).await.unwrap().is_none());
 
-    // Tick: kubelet observes the gap, clears local. Pod stays bound.
     kubelet.tick().await.unwrap();
-
-    // Next tick re-creates the container → a managed bound pod converges
-    // back to running.
-    let report = kubelet.tick().await.unwrap();
-    assert!(report.objects_changed >= 1);
     assert_eq!(
         count_starts(&backend.events().await),
         2,
         "container re-created"
     );
     assert_eq!(backend.running_count().await, 1);
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
     assert_eq!(
-        pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
-        Some("Running")
+        container_statuses(&pod)[0]["restartCount"],
+        1,
+        "the lost run is a restart, and it is counted"
     );
+
+    teardown(store, kubelet).await;
+}
+
+/// Under `Never` a lost container is not run a second time: the pod is
+/// Failed, and says the container's status could not be determined.
+#[tokio::test]
+async fn a_vanished_never_container_fails_the_pod_instead_of_rerunning_it() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_pod(&store, "p1", "img", Some("node-A")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+    backend.remove(&cid).await.unwrap();
+
+    kubelet.tick().await.unwrap();
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "Never: a lost container is not re-run"
+    );
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Failed"));
+    let term = &container_statuses(&pod)[0]["state"]["terminated"];
+    assert_eq!(term["reason"], "ContainerStatusUnknown");
+    assert_eq!(term["exitCode"], 137);
 
     teardown(store, kubelet).await;
 }
@@ -803,4 +1301,132 @@ async fn total_start_failure_still_writes_pending_status() {
         Some(false),
         "an un-started container is not ready"
     );
+}
+
+// ── T2.10 — a restart reads its stop and remove results ─────────────────
+//
+// `restart_container` discarded both with `let _`, then started the
+// replacement regardless: beside an old container the runtime had refused to
+// stop, or — on the native backend — beside a process still inside its grace
+// period. Each is two copies of one workload.
+
+/// A replacement is never started beside an old container the runtime
+/// refused to stop. Once the runtime stops it, the restart goes ahead.
+#[tokio::test]
+async fn a_restart_never_starts_a_replacement_beside_a_container_that_would_not_stop() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("OnFailure")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    backend.set_exit(&cid, 1).await;
+    backend
+        .seed_stop_fault(&cid, "podman stop: timed out")
+        .await;
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "no replacement beside a container the runtime would not stop"
+    );
+    assert!(
+        backend.status(&cid).await.unwrap().is_some(),
+        "the old container was not removed out from under its failed stop"
+    );
+
+    backend.clear_stop_fault(&cid).await;
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "control: once it stops, the restart goes ahead"
+    );
+    assert_eq!(backend.status(&cid).await.unwrap(), None, "old one removed");
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(container_statuses(&pod)[0]["restartCount"], 1);
+
+    teardown(store, kubelet).await;
+}
+
+/// A restart waits for the old process to be REAPED — the native backend
+/// refuses to drop it while it is inside its grace period — and asks to be
+/// re-ticked soon rather than on the next sweep.
+///
+/// `Always`, because the fake's `stop` rewrites the container's exit to 0;
+/// the restart path under test is the same one every policy takes.
+#[tokio::test]
+async fn a_restart_waits_for_the_old_process_to_be_reaped() {
+    use engenho_controllers::ReconcileResult;
+
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("Always")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    backend.set_exit(&cid, 1).await;
+    backend.hold_unreaped(&cid).await;
+    let outcome = kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "no replacement while the old process is unreaped"
+    );
+    assert!(
+        matches!(
+            outcome.result,
+            ReconcileResult::Requeue(_) | ReconcileResult::RequeueWithProgress(_)
+        ),
+        "the kubelet must come back soon, got {:?}",
+        outcome.result
+    );
+
+    backend.reap(&cid).await;
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "restarted once reaped"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// The pod's `terminationGracePeriodSeconds` reaches the runtime with the
+/// container it governs — the native backend escalates on exactly this value.
+#[tokio::test]
+async fn the_pods_termination_grace_reaches_the_runtime() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    store
+        .propose(ResourceCommand::Put {
+            key: pod_key("pg"),
+            value: json!({
+                "kind": "Pod", "apiVersion": "v1",
+                "metadata": { "name": "pg" },
+                "spec": {
+                    "nodeName": "node-A",
+                    "terminationGracePeriodSeconds": 90,
+                    "containers": [{ "name": "main", "image": "img" }]
+                }
+            }),
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await
+        .unwrap();
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+    let spec = backend.spec_of(&cid).await.expect("started");
+    assert_eq!(spec.termination_grace.duration(), Duration::from_secs(90));
+
+    teardown(store, kubelet).await;
 }

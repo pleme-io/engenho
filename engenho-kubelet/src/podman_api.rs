@@ -427,6 +427,58 @@ impl InspectResponse {
             Some(settings.ip_address.clone())
         }
     }
+
+    /// The kubelet's view of this container: its id, run state and address.
+    ///
+    /// One conversion for both the post-start read-back and the status poll,
+    /// so the two cannot disagree about what a stopped container means.
+    #[must_use]
+    pub fn into_container_status(self) -> crate::backend::ContainerStatus {
+        let pod_ip = self.pod_ip();
+        crate::backend::ContainerStatus {
+            container_id: self.id,
+            state: self.state.run_state(),
+            pod_ip,
+        }
+    }
+}
+
+impl InspectState {
+    /// The run state this block describes, decoded from libpod's `Status`.
+    ///
+    /// ── ★ `created` IS NOT `exited` ───────────────────────────────────────
+    /// Keying on the `Running` flag alone read every not-running container as
+    /// an exit with whatever `ExitCode` said — and a container that was
+    /// created and never ran carries `ExitCode: 0`. That is a clean exit
+    /// nobody observed, and under `restartPolicy: Never` a `Succeeded` pod
+    /// that never ran its process. `Status` says which it is:
+    ///
+    ///   * `running`, `paused`, `stopping` — the process exists: Running.
+    ///     Paused is frozen, not ended; a restart would kill it.
+    ///   * `exited`, `stopped` — ended, and `ExitCode` is how. libpod has
+    ///     already folded a signal into `128 + n`, so it is a
+    ///     [`ExitDisposition::Code`].
+    ///   * `created`, `configured`, `initialized` — never ran: Created.
+    ///   * `removing`, `unknown`, or any string this code has not seen:
+    ///     Unknown. An unrecognised state is not evidence of anything.
+    ///   * no `Status` at all: fall back on `Running`, and a not-running
+    ///     container with no state string is Unknown, never an exit.
+    ///
+    /// An exit code is only meaningful once the container is terminal, so a
+    /// running container carries none.
+    ///
+    /// [`ExitDisposition::Code`]: crate::cri::ExitDisposition::Code
+    #[must_use]
+    pub fn run_state(&self) -> crate::cri::RunState {
+        use crate::cri::{ExitDisposition, RunState};
+        match self.status.as_str() {
+            "running" | "paused" | "stopping" => RunState::Running,
+            "exited" | "stopped" => RunState::Exited(ExitDisposition::Code(self.exit_code)),
+            "created" | "configured" | "initialized" => RunState::Created,
+            "" if self.running => RunState::Running,
+            _ => RunState::Unknown,
+        }
+    }
 }
 
 /// Map engenho's [`PullPolicy`] onto libpod's `pull_policy` string.
@@ -449,18 +501,17 @@ pub fn pull_policy_value(policy: PullPolicy) -> &'static str {
 /// Translate one resolved mount into libpod's shape.
 ///
 /// Mirrors [`crate::backend::PodmanBackend`]'s argv rendering exactly —
-/// `HostDir` and `PvcHostDir` are bind mounts of a host path, `NamedVolume` is
-/// a podman volume — because the two backends must place the same bytes at the
+/// every host-path source is a bind mount, `NamedVolume` is a podman volume —
+/// read through the one [`MountSource::bind_source`](crate::pod_volume::MountSource::bind_source)
+/// mapping — because the two backends must place the same bytes at the
 /// same container path. A mount that differs between backends is a workload
 /// that behaves differently depending on how the kubelet was configured, which
 /// is the worst kind of difference: invisible until something reads a file.
 fn to_libpod_mount(m: &crate::pod_volume::ResolvedMount) -> Mount {
-    use crate::pod_volume::MountSource;
-    let (source, mount_type) = match &m.source {
-        MountSource::HostDir(p) => (p.display().to_string(), "bind"),
-        MountSource::EmptyDirHostDir(p) => (p.display().to_string(), "bind"),
-        MountSource::PvcHostDir { path, .. } => (path.display().to_string(), "bind"),
-        MountSource::NamedVolume(n) => (n.clone(), "volume"),
+    use crate::pod_volume::BindSource;
+    let (source, mount_type) = match m.source.bind_source() {
+        BindSource::Path(p) => (p.display().to_string(), "bind"),
+        BindSource::Volume(n) => (n.to_string(), "volume"),
     };
     // subPath: bind the *specific file or subdirectory* inside the resolved
     // source, not the whole volume. Without this, a `volumeMount.subPath:
@@ -1242,6 +1293,14 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         "podman-api"
     }
 
+    /// `start` inspects the deterministic name first and adopts a running
+    /// container it finds (the ADOPT-OR-REPLACE block below). A stopped one is
+    /// removed and recreated, so an exit that happened while no kubelet
+    /// watched is not recovered (`pending-readopt-exited`).
+    fn readoption(&self) -> crate::backend::Readoption {
+        crate::backend::Readoption::AdoptsRunning
+    }
+
     async fn start(
         &self,
         spec: &ContainerSpec,
@@ -1322,7 +1381,7 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         // it lists the runtime's containers on sync and adopts or removes what
         // it finds, rather than assuming its own memory is the truth.
         if let Some(existing) = self.api.inspect(&spec.name).await? {
-            if existing.state.running {
+            if existing.state.run_state().is_running() {
                 // Already doing what was asked. Adopting is not merely the
                 // cheap path: recreating would stop a healthy container and
                 // change its IP for no reason the manifest asked for.
@@ -1334,9 +1393,8 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
                 );
                 return Ok(crate::backend::ContainerStatus {
                     container_id: existing.id,
-                    running: true,
+                    state: crate::cri::RunState::Running,
                     pod_ip,
-                    exit_code: None,
                 });
             }
             // Present but not running: a dead predecessor holding the name.
@@ -1360,28 +1418,15 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         // does not have.
         let status = self.api.inspect(&created.id).await?;
         Ok(match status {
-            Some(i) => {
-                let pod_ip = i.pod_ip();
-                crate::backend::ContainerStatus {
-                    container_id: i.id,
-                    running: i.state.running,
-                    pod_ip,
-                    exit_code: if i.state.running {
-                        None
-                    } else {
-                        Some(i.state.exit_code)
-                    },
-                }
-            }
+            Some(i) => i.into_container_status(),
             // Created and started, then gone before the read: a container that
-            // exits instantly. Report it as not-running with no exit code
-            // rather than inventing one — the reconciler's next tick will see
-            // the real terminal state.
+            // exits instantly. Report it as `Unknown` — stopped, cause never
+            // observed — rather than inventing an exit code; the reconciler's
+            // next tick will see the real terminal state.
             None => crate::backend::ContainerStatus {
                 container_id: created.id,
-                running: false,
+                state: crate::cri::RunState::Unknown,
                 pod_ip: None,
-                exit_code: None,
             },
         })
     }
@@ -1390,22 +1435,11 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         &self,
         container_id: &str,
     ) -> Result<Option<crate::backend::ContainerStatus>, KubeletError> {
-        Ok(self.api.inspect(container_id).await?.map(|i| {
-            let pod_ip = i.pod_ip();
-            crate::backend::ContainerStatus {
-                container_id: i.id,
-                running: i.state.running,
-                pod_ip,
-                // An exit code is only meaningful once the container is
-                // terminal. Reporting 0 for a RUNNING container is how a
-                // healthy workload gets read as a clean exit and restarted.
-                exit_code: if i.state.running {
-                    None
-                } else {
-                    Some(i.state.exit_code)
-                },
-            }
-        }))
+        Ok(self
+            .api
+            .inspect(container_id)
+            .await?
+            .map(InspectResponse::into_container_status))
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
@@ -1596,6 +1630,7 @@ mod tests {
             resources: crate::backend::Resources::default(),
             pod: crate::backend::PodIdentity::default(),
             init_kind: crate::lifecycle::InitKind::Regular,
+            termination_grace: crate::backend::TerminationGrace::default(),
         };
         let req = create_request(&spec, Some("engenho-net"));
 
@@ -1834,7 +1869,7 @@ mod tests {
             name: "c".to_string(),
             image: "img".to_string(),
             mounts: vec![crate::pod_volume::ResolvedMount {
-                source: crate::pod_volume::MountSource::HostDir("/host/cm".into()),
+                source: crate::pod_volume::MountSource::UserHostPath("/host/cm".into()),
                 mount_path: "/etc/config".to_string(),
                 read_only: true,
                 sub_path: None,
@@ -1904,7 +1939,7 @@ mod tests {
         // defect. A per-field assertion on mounts[0] passes happily while
         // mounts 1..n are dropped.
         let mk = |n: u8| crate::pod_volume::ResolvedMount {
-            source: crate::pod_volume::MountSource::HostDir(format!("/h/{n}").into()),
+            source: crate::pod_volume::MountSource::UserHostPath(format!("/h/{n}").into()),
             mount_path: format!("/c/{n}"),
             read_only: false,
             sub_path: None,
@@ -2002,5 +2037,84 @@ mod tests {
         assert_eq!(r.id, "deadbeef");
         assert!(r.state.running);
         assert_eq!(r.pod_ip().as_deref(), Some("10.89.1.9"));
+    }
+
+    /// ★ T1.2 c2: libpod's `Status` decides the run state, not the `Running`
+    /// flag. A container created and never run carries `ExitCode: 0`; read
+    /// through the flag alone it was a clean exit — a `Never` pod `Succeeded`
+    /// without its process ever running.
+    #[test]
+    fn inspect_status_is_decoded_not_inferred_from_the_running_flag() {
+        use crate::cri::{ExitDisposition, RunState};
+        let state = |status: &str, running: bool, exit_code: i32| {
+            InspectState {
+                status: status.to_string(),
+                running,
+                exit_code,
+            }
+            .run_state()
+        };
+        assert_eq!(
+            state("created", false, 0),
+            RunState::Created,
+            "created is not exited"
+        );
+        assert_eq!(state("configured", false, 0), RunState::Created);
+        assert_eq!(state("initialized", false, 0), RunState::Created);
+        assert_eq!(state("running", true, 0), RunState::Running);
+        assert_eq!(
+            state("paused", false, 0),
+            RunState::Running,
+            "frozen, not ended"
+        );
+        assert_eq!(state("stopping", true, 0), RunState::Running);
+        assert_eq!(
+            state("exited", false, 3),
+            RunState::Exited(ExitDisposition::Code(3))
+        );
+        assert_eq!(
+            state("stopped", false, 137),
+            RunState::Exited(ExitDisposition::Code(137))
+        );
+        assert_eq!(state("removing", false, 0), RunState::Unknown);
+        assert_eq!(state("unknown", false, 0), RunState::Unknown);
+        assert_eq!(
+            state("something-new", false, 0),
+            RunState::Unknown,
+            "a state string this code has not seen is not evidence of an exit"
+        );
+        assert_eq!(state("", true, 0), RunState::Running);
+        assert_eq!(
+            state("", false, 0),
+            RunState::Unknown,
+            "no state string and not running is not an exit 0"
+        );
+    }
+
+    #[test]
+    fn a_running_container_carries_no_exit_and_a_stopped_one_carries_its_code() {
+        // libpod reports ExitCode 0 for a RUNNING container. Surfacing it
+        // would read a healthy workload as a clean exit.
+        let running = InspectState {
+            status: "running".to_string(),
+            running: true,
+            exit_code: 0,
+        };
+        assert_eq!(running.run_state(), crate::cri::RunState::Running);
+        let killed = InspectState {
+            status: "exited".to_string(),
+            running: false,
+            exit_code: 137,
+        };
+        assert_eq!(
+            killed.run_state(),
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(137))
+        );
+        assert!(
+            !killed
+                .run_state()
+                .exit()
+                .is_some_and(crate::cri::ExitDisposition::is_success)
+        );
     }
 }

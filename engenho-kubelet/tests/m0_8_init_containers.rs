@@ -39,8 +39,21 @@ fn pod_key(name: &str) -> ResourceKey {
     ResourceKey::namespaced("", "v1", "Pod", "default", name)
 }
 
+/// A regular init container: runs to completion before the next one starts.
+fn regular(name: &str, image: &str) -> Value {
+    json!({ "name": name, "image": image })
+}
+
+/// A native sidecar (KEP-753): an init container declaring
+/// `restartPolicy: Always`. It is started, never awaited, and runs alongside
+/// the app containers.
+fn sidecar(name: &str, image: &str) -> Value {
+    json!({ "name": name, "image": image, "restartPolicy": "Always" })
+}
+
 /// Put a Pod with the given init + app containers + restartPolicy, bound to a
-/// node. `inits` and `apps` are `(name, image)` pairs.
+/// node. `inits` and `apps` are `(name, image)` pairs; every init container is
+/// a regular one.
 async fn put_pod_with_init(
     store: &StoreMesh,
     name: &str,
@@ -49,10 +62,20 @@ async fn put_pod_with_init(
     inits: &[(&str, &str)],
     apps: &[(&str, &str)],
 ) {
-    let init_arr: Vec<Value> = inits
-        .iter()
-        .map(|(n, i)| json!({ "name": n, "image": i }))
-        .collect();
+    let init_arr: Vec<Value> = inits.iter().map(|(n, i)| regular(n, i)).collect();
+    put_pod(store, name, node_name, restart_policy, init_arr, apps).await;
+}
+
+/// Put a Pod whose init containers are given as rendered JSON (so a test can
+/// mix [`regular`] and [`sidecar`]), bound to `node_name`.
+async fn put_pod(
+    store: &StoreMesh,
+    name: &str,
+    node_name: &str,
+    restart_policy: &str,
+    init_arr: Vec<Value>,
+    apps: &[(&str, &str)],
+) {
     let app_arr: Vec<Value> = apps
         .iter()
         .map(|(n, i)| json!({ "name": n, "image": i }))
@@ -445,6 +468,369 @@ async fn no_init_pod_starts_app_immediately_initialized_true() {
     );
     // Ready True (all app containers running).
     assert_eq!(condition_status(&pod, "Ready").as_deref(), Some("True"));
+
+    teardown(store, kubelet).await;
+}
+
+// ── T1.2 c2 — an init container the kubelet cannot see, or has lost ───────
+
+/// A status poll of the active init container that ERRORS used to become a
+/// fabricated `Waiting{ContainerCreating}` — rendered over a running init
+/// container, and fed to the sequencer as "start it". Nothing moves and
+/// nothing is written until a poll answers.
+#[tokio::test]
+async fn a_failed_init_status_poll_withholds_the_write() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_init(
+        &store,
+        "p7",
+        "node-A",
+        "Always",
+        &[("setup", "img-setup")],
+        &[("web", "img-web")],
+    )
+    .await;
+    kubelet.tick().await.unwrap();
+    let init_id = id_for_spec_name(&backend, "default_p7_init-setup")
+        .await
+        .expect("init container tracked");
+    let before = store.get(&pod_key("p7")).await.unwrap();
+    assert!(
+        init_container_statuses(&before)[0]["state"]["running"].is_object(),
+        "control"
+    );
+
+    backend
+        .seed_status_fault(&init_id, "podman socket: connection refused")
+        .await;
+    kubelet.tick().await.unwrap();
+
+    let pod = store.get(&pod_key("p7")).await.unwrap();
+    assert_eq!(
+        pod["status"], before["status"],
+        "a tick that could not see the init container publishes nothing"
+    );
+    assert!(init_container_statuses(&pod)[0]["state"]["running"].is_object());
+    assert_eq!(
+        count_starts_named(&backend.events().await, "default_p7_init-setup"),
+        1,
+        "and does not start it again"
+    );
+
+    backend.clear_status_fault(&init_id).await;
+    kubelet.tick().await.unwrap();
+    let pod = store.get(&pod_key("p7")).await.unwrap();
+    assert!(init_container_statuses(&pod)[0]["state"]["running"].is_object());
+
+    teardown(store, kubelet).await;
+}
+
+/// An init container the runtime lost is an exit nobody observed: under
+/// `Never` the pod fails — it is not run a second time — and under a
+/// restarting policy it is restarted with the restart counted.
+#[tokio::test]
+async fn a_vanished_init_container_is_an_unobserved_exit() {
+    for (policy, phase, init_starts) in [("Never", "Failed", 1), ("OnFailure", "Pending", 2)] {
+        let store = boot_store().await;
+        let backend = Arc::new(FakeBackend::new());
+        let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+        put_pod_with_init(
+            &store,
+            "p8",
+            "node-A",
+            policy,
+            &[("setup", "img-setup")],
+            &[("web", "img-web")],
+        )
+        .await;
+        kubelet.tick().await.unwrap();
+        let init_id = id_for_spec_name(&backend, "default_p8_init-setup")
+            .await
+            .expect("init container tracked");
+
+        use engenho_kubelet::ContainerRuntime;
+        backend.remove(&init_id).await.unwrap();
+        kubelet.tick().await.unwrap();
+
+        let pod = store.get(&pod_key("p8")).await.unwrap();
+        assert_eq!(pod_phase(&pod).as_deref(), Some(phase), "{policy}");
+        let events = backend.events().await;
+        assert_eq!(
+            count_starts_named(&events, "default_p8_init-setup"),
+            init_starts,
+            "{policy}"
+        );
+        assert_eq!(count_starts_named(&events, "default_p8_web"), 0, "{policy}");
+        let ics = init_container_statuses(&pod);
+        if policy == "Never" {
+            assert_eq!(
+                ics[0]["state"]["terminated"]["reason"],
+                "ContainerStatusUnknown"
+            );
+        } else {
+            assert_eq!(ics[0]["restartCount"], 1, "the restart is counted");
+        }
+
+        teardown(store, kubelet).await;
+    }
+}
+
+/// ★ After a kubelet restart, a `Never` pod past init — its app container up
+/// when the old kubelet went away — is Failed, not re-run from its first init
+/// container. The init container that was OBSERVED to complete keeps saying
+/// so; only the run nobody saw end is Unknown.
+#[tokio::test]
+async fn after_a_restart_a_never_pod_past_init_is_failed_not_rerun() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let first = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_init(
+        &store,
+        "p9",
+        "node-A",
+        "Never",
+        &[("setup", "img-setup")],
+        &[("web", "img-web")],
+    )
+    .await;
+    first.tick().await.unwrap();
+    let init_id = id_for_spec_name(&backend, "default_p9_init-setup")
+        .await
+        .expect("init container tracked");
+    backend.set_exit(&init_id, 0).await;
+    first.tick().await.unwrap();
+    assert_eq!(
+        pod_phase(&store.get(&pod_key("p9")).await.unwrap()).as_deref(),
+        Some("Running"),
+        "control"
+    );
+    drop(first);
+
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    kubelet.tick().await.unwrap();
+
+    let events = backend.events().await;
+    assert_eq!(count_starts_named(&events, "default_p9_init-setup"), 1);
+    assert_eq!(count_starts_named(&events, "default_p9_web"), 1);
+    let pod = store.get(&pod_key("p9")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Failed"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("True")
+    );
+    let ics = init_container_statuses(&pod);
+    assert_eq!(ics[0]["state"]["terminated"]["exitCode"], 0);
+    assert_eq!(ics[0]["state"]["terminated"]["reason"], "Completed");
+    let cs = container_statuses(&pod);
+    assert_eq!(
+        cs[0]["state"]["terminated"]["reason"],
+        "ContainerStatusUnknown"
+    );
+    assert!(
+        backend.containers().await.is_empty(),
+        "nothing the old kubelet started is left in the runtime: the running app \
+         container and the completed init container are both torn down"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── T2.4 c1 — a pod with a native sidecar starts its app containers ───────
+
+/// Position of the first `Start` of `name` in the backend's operation log.
+fn first_start_of(events: &[FakeEvent], name: &str) -> Option<usize> {
+    events
+        .iter()
+        .position(|e| matches!(e, FakeEvent::Start(n) if n == name))
+}
+
+/// Assert `before` was started, and started earlier than `after`.
+fn assert_started_before(events: &[FakeEvent], before: &str, after: &str) {
+    let b = first_start_of(events, before);
+    let a = first_start_of(events, after);
+    assert!(
+        matches!((b, a), (Some(b), Some(a)) if b < a),
+        "{before} must start before {after}: {events:?}"
+    );
+}
+
+/// ★ THE DEFECT. The sequencer reports "nothing blocks, only sidecars to
+/// start" once every regular init container has succeeded. That arm latched
+/// `init_complete` and returned, and every later tick took the running-pod
+/// path, which observes app containers but never starts one — so a pod whose
+/// only init container is a sidecar (the common native-sidecar mesh shape)
+/// sat Pending forever with its app container never started.
+#[tokio::test]
+async fn a_pod_whose_only_init_container_is_a_sidecar_starts_its_app_containers() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod(
+        &store,
+        "p10",
+        "node-A",
+        "Always",
+        vec![sidecar("proxy", "img-proxy")],
+        &[("web", "img-web")],
+    )
+    .await;
+
+    kubelet.tick().await.unwrap();
+    let ev = backend.events().await;
+    assert_eq!(count_starts_named(&ev, "default_p10_init-proxy"), 1);
+    assert_eq!(
+        count_starts_named(&ev, "default_p10_web"),
+        1,
+        "the app container starts once the sidecar has started: {ev:?}"
+    );
+    assert_started_before(&ev, "default_p10_init-proxy", "default_p10_web");
+
+    let pod = store.get(&pod_key("p10")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("True")
+    );
+    let cs = container_statuses(&pod);
+    assert_eq!(cs.len(), 1);
+    assert_eq!(cs[0]["name"], "web");
+    assert!(cs[0]["state"]["running"].is_object());
+
+    // Converged: further ticks start nothing a second time.
+    kubelet.tick().await.unwrap();
+    kubelet.tick().await.unwrap();
+    let ev = backend.events().await;
+    assert_eq!(count_starts_named(&ev, "default_p10_init-proxy"), 1);
+    assert_eq!(count_starts_named(&ev, "default_p10_web"), 1);
+    assert_eq!(
+        pod_phase(&store.get(&pod_key("p10")).await.unwrap()).as_deref(),
+        Some("Running")
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// The same arm, reached the other way: a sidecar declared AFTER the last
+/// regular init container is the only thing left to start once that regular
+/// container succeeds. The app containers must follow it, not wait forever.
+#[tokio::test]
+async fn a_sidecar_after_the_last_regular_init_container_lets_the_apps_start() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod(
+        &store,
+        "p11",
+        "node-A",
+        "Always",
+        vec![regular("setup", "img-setup"), sidecar("proxy", "img-proxy")],
+        &[("web", "img-web")],
+    )
+    .await;
+
+    // Tick 1: only the regular init container runs; nothing after it starts.
+    kubelet.tick().await.unwrap();
+    let ev = backend.events().await;
+    assert_eq!(count_starts_named(&ev, "default_p11_init-setup"), 1);
+    assert_eq!(count_starts_named(&ev, "default_p11_init-proxy"), 0);
+    assert_eq!(count_starts_named(&ev, "default_p11_web"), 0);
+
+    let setup_id = id_for_spec_name(&backend, "default_p11_init-setup")
+        .await
+        .expect("init container tracked");
+    backend.set_exit(&setup_id, 0).await;
+
+    // Tick 2: setup succeeded → the sidecar starts, then the app container.
+    kubelet.tick().await.unwrap();
+    let ev = backend.events().await;
+    assert_eq!(count_starts_named(&ev, "default_p11_init-proxy"), 1);
+    assert_eq!(
+        count_starts_named(&ev, "default_p11_web"),
+        1,
+        "the app container starts after the trailing sidecar: {ev:?}"
+    );
+    assert_started_before(&ev, "default_p11_init-proxy", "default_p11_web");
+
+    let pod = store.get(&pod_key("p11")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("True")
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// A sidecar gates the app containers until it has STARTED (KEP-753): if its
+/// start fails, no app container starts, the pod stays Pending and
+/// uninitialized, and the sidecar is retried on its start curve — once it can
+/// start, the app containers follow. Starting the apps regardless, or latching
+/// init as done over a sidecar that never ran, would each strand the pod a
+/// different way; retrying it on every tick is the hot loop the curve exists
+/// to stop.
+#[tokio::test]
+async fn an_app_container_never_starts_before_its_sidecar_has_started() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let clock = engenho_kubelet::kubelet::TestClock::new();
+    let kubelet =
+        Kubelet::new(store.clone(), backend.clone(), "node-A").with_clock(clock.as_clock());
+    backend
+        .seed_start_failure("default_p12_init-proxy", "image not known")
+        .await;
+    put_pod(
+        &store,
+        "p12",
+        "node-A",
+        "Always",
+        vec![sidecar("proxy", "img-proxy")],
+        &[("web", "img-web")],
+    )
+    .await;
+
+    for _ in 0..3 {
+        kubelet.tick().await.unwrap();
+    }
+    let ev = backend.events().await;
+    assert_eq!(
+        count_starts_named(&ev, "default_p12_web"),
+        0,
+        "no app container starts ahead of its sidecar: {ev:?}"
+    );
+    let pod = store.get(&pod_key("p12")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Pending"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("False")
+    );
+
+    assert_eq!(
+        backend.start_attempts("default_p12_init-proxy").await,
+        1,
+        "three ticks inside the 10s the failure earned attempt the sidecar once"
+    );
+
+    // The cause is fixed: once the curve allows, the sidecar is retried and
+    // the app follows.
+    backend.clear_start_failure("default_p12_init-proxy").await;
+    clock.advance(std::time::Duration::from_secs(10));
+    kubelet.tick().await.unwrap();
+    let ev = backend.events().await;
+    assert_eq!(
+        count_starts_named(&ev, "default_p12_init-proxy"),
+        1,
+        "the sidecar is retried once it can start: {ev:?}"
+    );
+    assert_eq!(count_starts_named(&ev, "default_p12_web"), 1);
+    assert_started_before(&ev, "default_p12_init-proxy", "default_p12_web");
+    let pod = store.get(&pod_key("p12")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
+    assert_eq!(
+        condition_status(&pod, "Initialized").as_deref(),
+        Some("True")
+    );
 
     teardown(store, kubelet).await;
 }

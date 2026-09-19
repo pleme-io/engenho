@@ -13,7 +13,9 @@
 //!   * Backends:
 //!       * [`backend::FakeBackend`] — in-memory, deterministic, for tests
 //!       * [`backend::PodmanBackend`] — shell-out to `podman` for local Mac/Linux
-//!       * (future R10.5) CriBackend, RunwasiBackend
+//!       * [`cri_backend::CriBackend`] — CRI over gRPC; refused at
+//!         construction while [`cri_backend::UNSUPPORTED`] is non-empty
+//!       * (future) `RunwasiBackend`
 //!
 //! ## Reconcile loop
 //!
@@ -51,6 +53,8 @@ pub mod image_source;
 pub mod kubelet;
 pub mod lifecycle;
 pub mod native_backend;
+/// Publishing the node `Ready` condition with a precondition (T1.3b).
+mod node_readiness;
 /// Node lease + readiness derivation.
 ///
 /// ── ★ MOVED TO `engenho-controllers` 2026-09-14, RE-EXPORTED HERE ─────────
@@ -71,10 +75,13 @@ pub mod server;
 pub mod volume;
 
 pub use backend::{
-    ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeNetProber, HttpProbeTarget,
-    LogOptions, NetProber, PodmanBackend, ProbeIoError, PullPolicy, TcpProbeTarget, TokioNetProber,
+    ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeExecFault, FakeNetProber,
+    HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage,
+    PullPolicy, Readoption, TcpProbeTarget, TerminationGrace, TokioNetProber,
 };
-pub use config_bridge::{make_container_runtime, make_container_runtime_with_apiserver};
+pub use config_bridge::{
+    BackendRefused, make_container_runtime, make_container_runtime_with_apiserver,
+};
 pub use csi_materializer::{
     CsiRegistrarController, CsiVolumeMaterializer, DriverCsiProvisioner, DriverTable,
     RegisteredDriver,
@@ -85,14 +92,15 @@ pub use lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
 };
 pub use pod_volume::{
-    FakeVolumeMaterializer, MountSource, NoServiceAccountProjection, PodVolumeSource,
-    PodmanVolumeMaterializer, ResolvedMount, SA_MOUNT_PATH, ServiceAccountProjector,
-    VolumeMaterializer, VolumeResolveError, resolve_pod_volumes,
+    BindSource, FakeVolumeMaterializer, MaterializedDir, MountSource, NoServiceAccountProjection,
+    PodVolumeSource, PodmanVolumeMaterializer, ResolvedMount, SA_MOUNT_PATH,
+    ServiceAccountProjector, VolumeMaterializer, VolumeResolveError, VolumeTeardown,
+    resolve_pod_volumes, teardown_obligation,
 };
 pub use probe::{
-    HttpScheme, ProbeHandler, ProbeKind, ProbeObservation, ProbeParseError, ProbePort,
-    ProbeRuntime, ProbeSpec, ProbeTiming, ProbeVerdict, aggregate_container_readiness,
-    fold_probe_observation, run_handler,
+    BlindCause, BlindNotice, BlindStreak, HttpScheme, ProbeHandler, ProbeKind, ProbeObservation,
+    ProbeParseError, ProbePort, ProbeRuntime, ProbeSpec, ProbeTiming, ProbeTrip, ProbeVerdict,
+    TripKind, aggregate_container_readiness, fold_probe_observation, run_handler,
 };
 pub use volume::{
     AccessMode, FakeVolumeBackend, FakeVolumeEvent, HostPathVolumeBackend, MountedVolume,

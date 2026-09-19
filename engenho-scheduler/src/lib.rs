@@ -19,16 +19,22 @@
 //! ## Architecture
 //!
 //! ```text
-//!   StoreMesh::list("", "v1", "Pod", None)
+//!   StoreMesh::list("", "v1", "Pod", scope)   scope ← scheduler.namespace
 //!         ↓
 //!   filter: spec.nodeName missing OR empty
 //!         ↓
-//!   for each pending pod:
-//!     candidates ← StoreMesh::list("", "v1", "Node", None)
-//!     filter: not Quarantined, not unschedulable
-//!     SchedulingStrategy::pick(pod, candidates) → NodeBinding
+//!   candidates ← StoreMesh::list("", "v1", "Node", None)
+//!     each Node's Ready derived from its Lease (ObservedNode::project)
 //!         ↓
-//!     StoreMesh::propose(Patch { key=pod_key, patch={"spec":{"nodeName":"node-X"}}})
+//!   for each pending pod:
+//!     filter(pod, nodes): every FilterPlugin, in order
+//!       NodeReady → Cordon → NodeName → NodeSelector
+//!         → TaintToleration → Resources
+//!         ↓
+//!     Feasible(set)     → SchedulingStrategy::pick(pod, &set) -> String
+//!                         StoreMesh::propose(Patch {"spec":{"nodeName":"node-X"}})
+//!     Infeasible(why)   → PodScheduled=False / Unschedulable, message = why
+//!     NoNodesObserved   → nothing written
 //! ```
 //!
 //! The strategy is pluggable — `RoundRobinStrategy` is the default;
@@ -40,14 +46,24 @@
 pub mod affinity;
 pub mod config_bridge;
 pub mod error;
+pub mod filter;
 pub mod fit;
+pub mod ledger;
+pub mod observed;
 pub mod predicates;
 pub mod preemption;
 pub mod scheduler;
+pub mod scope;
 pub mod strategy;
 
-pub use config_bridge::make_scheduling_strategy;
+pub use config_bridge::{ConfiguredScheduler, make_scheduling_strategy};
 pub use error::SchedulerError;
-pub use fit::{NodeResources, PodRequests, fits, free_on_node, node_allocatable, pod_requests};
+pub use filter::{
+    Candidate, Diagnosis, Feasible, FilterPlugin, Filtered, Rejection, admit, filter,
+};
+pub use fit::{NodeResources, PodRequests, fits, node_allocatable, pod_requests};
+pub use ledger::{CapacityHold, Headroom, NodeLedger, holds_capacity};
+pub use observed::ObservedNode;
 pub use scheduler::{Scheduler, TickReport};
+pub use scope::{NamespaceScope, ScopedNamespace};
 pub use strategy::{RoundRobinStrategy, SchedulingStrategy};

@@ -28,7 +28,8 @@
 //! without sleeping — the same `TestClock` discipline the probe engine
 //! already uses.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Upstream's initial delay after the first crash.
 pub const BASE_DELAY: Duration = Duration::from_secs(10);
@@ -40,6 +41,11 @@ pub const MAX_DELAY: Duration = Duration::from_secs(300);
 ///
 /// Without this a container that recovers stays penalised forever.
 pub const RESET_AFTER: Duration = Duration::from_secs(600);
+
+/// The waiting reason of a container held off before its next start. The
+/// exact upstream string: `kubectl get pods` prints it in the STATUS column
+/// and every alerting rule matches on it.
+pub const CRASH_LOOP_BACK_OFF: &str = "CrashLoopBackOff";
 
 /// What the kubelet should do with a terminated, restartable container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,9 +65,7 @@ impl BackoffDecision {
     pub fn waiting_reason(self) -> Option<&'static str> {
         match self {
             Self::Restart => None,
-            // The exact upstream string. `kubectl get pods` prints this in
-            // the STATUS column and every alerting rule matches on it.
-            Self::Wait { .. } => Some("CrashLoopBackOff"),
+            Self::Wait { .. } => Some(CRASH_LOOP_BACK_OFF),
         }
     }
 }
@@ -140,6 +144,131 @@ pub fn decide_start(failures: u32, since_last_attempt: Duration) -> BackoffDecis
         BackoffDecision::Wait {
             remaining: owed - since_last_attempt,
         }
+    }
+}
+
+// ── THE START LEDGER: every start attempt of a container asks it first ──
+
+/// Consecutive failed starts per container, and when the last attempt was.
+///
+/// ★ ONE GATE FOR EVERY START. The kubelet starts a container from three
+/// places: the first start of a pod's containers, a restart after an exit or
+/// a probe failure, and the init sequence. Only the first of them consulted
+/// [`decide_start`], so a start that kept failing anywhere else was retried
+/// at the sync loop's speed — the shape measured as `pitr-lab/mysql-0` being
+/// retried twice a second. A launch now needs a [`StartPermit`], and the only
+/// constructor of one is [`StartLedger::permit`], which says no while the
+/// container is owed a wait. So a start that skips the curve cannot be
+/// written through the permit path; a call that goes around the permit to the
+/// runtime is still possible and is caught by the kubelet's tests, not by the
+/// compiler.
+///
+/// Keyed by pod, then container. Kubernetes requires container names to be
+/// unique across a pod's init and app containers, so one map serves both.
+#[derive(Debug, Default)]
+pub struct StartLedger {
+    failures: HashMap<String, HashMap<String, (u32, Instant)>>,
+}
+
+/// Leave to make ONE start attempt of one container.
+///
+/// Built only by [`StartLedger::permit`] and consumed by
+/// [`StartLedger::succeeded`] or [`StartLedger::failed`], so the outcome of
+/// an attempt is recorded against the container the permit was issued for.
+/// Not `Clone`: one permit, one attempt.
+#[derive(Debug)]
+#[must_use = "a permit is leave to start one container; record the attempt's outcome with it"]
+pub struct StartPermit {
+    pod: String,
+    container: String,
+    at: Instant,
+}
+
+/// The ledger refused a start: the container's last starts failed and the
+/// curve still owes a wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartHeld {
+    /// How much longer until the next attempt is allowed.
+    pub remaining: Duration,
+    /// The consecutive failed starts that earned the wait.
+    pub consecutive_failures: u32,
+}
+
+/// What a failed start cost: how many in a row, and when the next attempt is
+/// allowed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartFailed {
+    /// Consecutive failed starts, this one included.
+    pub consecutive_failures: u32,
+    /// The wait the curve now owes before the next attempt.
+    pub next_attempt_in: Duration,
+}
+
+impl StartLedger {
+    /// Leave to start `container` of `pod` at `now`, or how long it must
+    /// still wait.
+    ///
+    /// A container with no failed start on record is always allowed: the
+    /// first attempt is immediate, as [`decide_start`] says.
+    ///
+    /// # Errors
+    ///
+    /// [`StartHeld`] while the curve owes a wait after a failed start.
+    pub fn permit(
+        &self,
+        pod: &str,
+        container: &str,
+        now: Instant,
+    ) -> Result<StartPermit, StartHeld> {
+        if let Some(&(failures, last)) = self.failures.get(pod).and_then(|c| c.get(container))
+            && let BackoffDecision::Wait { remaining } =
+                decide_start(failures, now.saturating_duration_since(last))
+        {
+            return Err(StartHeld {
+                remaining,
+                consecutive_failures: failures,
+            });
+        }
+        Ok(StartPermit {
+            pod: pod.to_string(),
+            container: container.to_string(),
+            at: now,
+        })
+    }
+
+    /// The attempt started the container: its failure count is cleared.
+    pub fn succeeded(&mut self, permit: StartPermit) {
+        let StartPermit { pod, container, .. } = permit;
+        if let Some(containers) = self.failures.get_mut(&pod) {
+            containers.remove(&container);
+            if containers.is_empty() {
+                self.failures.remove(&pod);
+            }
+        }
+    }
+
+    /// The attempt failed: one more consecutive failure, stamped at the
+    /// instant the permit was issued.
+    pub fn failed(&mut self, permit: StartPermit) -> StartFailed {
+        let entry = self
+            .failures
+            .entry(permit.pod)
+            .or_default()
+            .entry(permit.container)
+            .or_insert((0, permit.at));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = permit.at;
+        StartFailed {
+            consecutive_failures: entry.0,
+            next_attempt_in: delay_for(entry.0),
+        }
+    }
+
+    /// Forget every pod `keep` rejects. A pod that is gone takes its
+    /// penalties with it, so the ledger does not grow for the process's
+    /// lifetime and a recreated pod of the same name starts clean.
+    pub fn retain_pods(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.failures.retain(|pod, _| keep(pod));
     }
 }
 
@@ -280,5 +409,98 @@ mod tests {
             BackoffDecision::Restart,
             "a capped penalty still expires; backoff never becomes give-up"
         );
+    }
+
+    // ── StartLedger: the gate every start attempt goes through ──────────
+
+    #[test]
+    fn a_container_with_no_failed_start_is_always_permitted() {
+        let ledger = StartLedger::default();
+        assert!(ledger.permit("default/p", "app", Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn a_failed_start_holds_that_container_and_no_other() {
+        let t0 = Instant::now();
+        let mut ledger = StartLedger::default();
+        let permit = ledger.permit("default/p", "app", t0).unwrap();
+        let failed = ledger.failed(permit);
+        assert_eq!(
+            failed,
+            StartFailed {
+                consecutive_failures: 1,
+                next_attempt_in: S(10),
+            }
+        );
+        assert_eq!(
+            ledger.permit("default/p", "app", t0 + S(3)).unwrap_err(),
+            StartHeld {
+                remaining: S(7),
+                consecutive_failures: 1,
+            }
+        );
+        // A sibling, and the same name in another pod, are not penalised.
+        assert!(ledger.permit("default/p", "sidecar", t0).is_ok());
+        assert!(ledger.permit("default/q", "app", t0).is_ok());
+        // The wait expires on the curve.
+        assert!(ledger.permit("default/p", "app", t0 + S(10)).is_ok());
+    }
+
+    #[test]
+    fn a_successful_start_clears_the_penalty() {
+        let t0 = Instant::now();
+        let mut ledger = StartLedger::default();
+        for n in 0..4u64 {
+            let permit = ledger
+                .permit("default/p", "app", t0 + S(1_000 * n))
+                .unwrap();
+            let _ = ledger.failed(permit);
+        }
+        let permit = ledger.permit("default/p", "app", t0 + S(10_000)).unwrap();
+        ledger.succeeded(permit);
+        // The next failure is the FIRST again: a 10s wait, not 160s.
+        let permit = ledger.permit("default/p", "app", t0 + S(10_001)).unwrap();
+        assert_eq!(ledger.failed(permit).next_attempt_in, S(10));
+    }
+
+    /// The T2.4 bound, as arithmetic: a start that always fails, asked about
+    /// once a second for an hour, is let through at most 16 times — 10s
+    /// doubling to the 5-minute cap — and is still being retried at the end.
+    #[test]
+    fn a_start_that_always_fails_is_attempted_at_most_sixteen_times_an_hour() {
+        let t0 = Instant::now();
+        let mut ledger = StartLedger::default();
+        let mut attempts = Vec::new();
+        for second in 0..3_600u64 {
+            let now = t0 + S(second);
+            if let Ok(permit) = ledger.permit("default/p", "app", now) {
+                attempts.push(second);
+                let _ = ledger.failed(permit);
+            }
+        }
+        let first: Vec<u64> = attempts.iter().copied().take(8).collect();
+        assert!(
+            attempts.len() <= 16,
+            "at most 16 attempts in an hour, got {} (first at {first:?})",
+            attempts.len()
+        );
+        assert!(
+            attempts.last().is_some_and(|last| *last >= 3_600 - 300),
+            "the cap is a ceiling on the wait, never a stop: last attempt at {:?}",
+            attempts.last()
+        );
+    }
+
+    #[test]
+    fn a_pod_that_is_gone_takes_its_penalties_with_it() {
+        let t0 = Instant::now();
+        let mut ledger = StartLedger::default();
+        for pod in ["default/gone", "default/kept"] {
+            let permit = ledger.permit(pod, "app", t0).unwrap();
+            let _ = ledger.failed(permit);
+        }
+        ledger.retain_pods(|pod| pod == "default/kept");
+        assert!(ledger.permit("default/gone", "app", t0).is_ok());
+        assert!(ledger.permit("default/kept", "app", t0).is_err());
     }
 }
