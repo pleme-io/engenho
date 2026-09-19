@@ -3,16 +3,21 @@
 //! ★ WHAT THIS TURNS ON. Until this module every piece of the façade was
 //! correct and unreachable: the keyspace, the bijection, the wire types and
 //! the KV semantics were all tested in isolation with nothing able to call
-//! them. This is the seam that makes `etcdctl` work, and with it the whole
-//! class of tools that speak etcd and nothing else — backup, DR, Velero,
-//! anything pointed at `--etcd-servers`.
+//! them. This is the seam that makes `etcdctl get`, `etcdctl watch` and
+//! `etcdctl endpoint status` work, and any tool that reads the keyspace
+//! with `Range`. It does NOT make snapshot backup work (`Snapshot` is
+//! refused, below), nor a kube-apiserver pointed at `--etcd-servers` (it
+//! writes through `Txn`, holds `Lease`s and calls `Compact`, none of which
+//! is served). Velero is not a client of this at all: it backs up through
+//! the Kubernetes API.
 //!
-//! ★ THE SERVICE SPLIT IS UPSTREAM'S, and the scope is fixed by
-//! `theory/ENGENHO.md` §III.2 rather than by what happened to be easy:
-//! `KV`, `Watch`, `Lease`, `Maintenance` are served; `Auth` returns
-//! permission-denied because engenho's authn lives at the apiserver. No
-//! other RPCs. The contract is "what the upstream kube-apiserver actually
-//! calls", not "all of etcd".
+//! ★ THE SERVICE SPLIT IS UPSTREAM'S. What is served today is `KV` (reads
+//! only), `Watch` and `Maintenance`. This crate implements no `Lease`,
+//! `Cluster` or `Auth` service, and the runtime mounts none, so a call to
+//! one gets the transport's bare `Unimplemented`. `theory/ENGENHO.md`
+//! §III.2 is the DESIGN target — "what the upstream kube-apiserver actually
+//! calls", with the full write path, `Lease`, and `Auth` as
+//! permission-denied stubs — and this file does not reach it.
 //!
 //! ★ UNIMPLEMENTED RPCs RETURN `Unimplemented`, NEVER A PLAUSIBLE EMPTY
 //! SUCCESS. An etcd client that receives `Ok` with an empty result treats
@@ -30,10 +35,18 @@ use crate::pb::etcdserverpb::{
 
 /// Identifies this server in every response header.
 ///
-/// etcd clients read `cluster_id`/`member_id` to detect that they have been
-/// repointed at a DIFFERENT cluster mid-session — a real safety check, so
-/// the values must be stable for a given engenho instance rather than
-/// regenerated per response.
+/// `cluster_id`/`member_id` must be stable for a given engenho instance,
+/// never regenerated per response: a caller that records them would
+/// otherwise see a different cluster on every call.
+///
+/// ★ WHAT THE DEFAULT DOES NOT GIVE. [`ServerIdentity::default`] is one
+/// constant, and the runtime serves it on every node of every cluster. So
+/// two engenho clusters report the same `cluster_id`, and every member of
+/// one reports the same `member_id` — and, in `Status`, names itself the
+/// leader. A caller that uses these ids to tell clusters or members apart,
+/// for instance to notice it has been repointed at a DIFFERENT cluster,
+/// cannot. Ids derived from the cluster and node names fix it; they belong
+/// where those names are known, which is the runtime.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerIdentity {
     pub cluster_id: u64,
@@ -42,9 +55,9 @@ pub struct ServerIdentity {
 
 impl Default for ServerIdentity {
     fn default() -> Self {
-        // Fixed, non-zero, and deliberately not random: a client that
-        // reconnects must see the same identity or it will conclude the
-        // cluster was replaced and refuse to continue.
+        // Fixed, non-zero, and deliberately not random, so a client that
+        // reconnects sees the same identity. Also the same for every
+        // engenho cluster and member: see the type's docs.
         Self {
             cluster_id: 0xE0_6E_74_68_6F_00_00_01,
             member_id: 0xE0_6E_74_68_6F_00_00_02,
@@ -105,9 +118,9 @@ pub trait EtcdRevision: Send + Sync + 'static {
 
 /// A read-only KV service.
 ///
-/// ★ READ-ONLY IS A DELIBERATE FIRST RUNG, and it is the rung that
-/// delivers the contract's value: `etcdctl get`, every backup tool and
-/// every inspection path are reads. Writes go through engenho's own
+/// ★ READ-ONLY IS A DELIBERATE FIRST RUNG: `etcdctl get`, a keyspace dump
+/// and every inspection path are reads. (A snapshot backup is a read too,
+/// and it is refused: see `Maintenance.Snapshot`.) Writes go through engenho's own
 /// apiserver, which owns admission, defaulting and validation — accepting
 /// a raw etcd `Put` would let a client bypass all three and store an
 /// object no apiserver would have admitted. Making the write path a typed
@@ -176,25 +189,13 @@ impl<S: EtcdReadStore> etcdserverpb::kv_server::Kv for ReadOnlyKv<S> {
     ) -> Result<Response<RangeResponse>, Status> {
         let req = request.into_inner();
         let shape = crate::kv::range_shape(&req.key, &req.range_end);
-        let prefix = match &shape {
-            crate::kv::RangeShape::Point(k) => k.clone(),
-            crate::kv::RangeShape::Prefix(p) => p.clone(),
-            crate::kv::RangeShape::All => crate::keyspace::REGISTRY_ROOT.to_string(),
-            // An arbitrary interval is not refused — it is served as the
-            // widest prefix that contains it and then filtered, which is
-            // correct if slower. Refusing would break `etcdctl get a b`.
-            crate::kv::RangeShape::Interval { start, .. } => start.clone(),
-        };
-
-        let RangeAt { mut kvs, revision } = self.store.range_at(&prefix).await?;
-        if let crate::kv::RangeShape::Point(k) = &shape {
-            kvs.retain(|kv| kv.key == k.as_bytes());
-        }
-        if let crate::kv::RangeShape::Interval { start, end } = &shape {
-            kvs.retain(|kv| {
-                kv.key.as_slice() >= start.as_bytes() && kv.key.as_slice() < end.as_bytes()
-            });
-        }
+        // Every shape is answered the same way: one scan under the prefix
+        // all its keys share, then the shape's own membership test. An
+        // interval or a `--from-key` range is served, not refused — refusing
+        // would break `etcdctl get a b` — and its scan prefix is chosen so
+        // the filter never has a key to recover that the scan dropped.
+        let RangeAt { mut kvs, revision } = self.store.range_at(&shape.scan_prefix()).await?;
+        kvs.retain(|kv| shape.contains(&kv.key));
 
         let total = i64::try_from(kvs.len()).unwrap_or(i64::MAX);
         let (kvs, more) = crate::kv::assemble_range(kvs, req.limit);
@@ -386,6 +387,65 @@ mod tests {
         assert_eq!(r.kvs[0].key, b"/registry/pods/default/a".to_vec());
     }
 
+    fn keys_of(r: &RangeResponse) -> Vec<String> {
+        r.kvs
+            .iter()
+            .map(|k| String::from_utf8_lossy(&k.key).into_owned())
+            .collect()
+    }
+
+    /// `etcdctl get <a> <c>` asks for every key in `[a, c)`. It used to be
+    /// scanned under `a` alone, so `b` — inside the interval, outside that
+    /// prefix — was silently missing from an `Ok` answer.
+    #[tokio::test]
+    async fn an_interval_returns_every_key_between_its_bounds() {
+        let s = svc(&[
+            ("default", "a"),
+            ("default", "ab"),
+            ("default", "b"),
+            ("default", "c"),
+        ]);
+        let r = range_of(
+            &s,
+            RangeRequest {
+                key: b"/registry/pods/default/a".to_vec(),
+                range_end: b"/registry/pods/default/c".to_vec(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            keys_of(&r),
+            vec![
+                "/registry/pods/default/a",
+                "/registry/pods/default/ab",
+                "/registry/pods/default/b",
+            ]
+        );
+        assert_eq!(r.count, 3);
+    }
+
+    /// `etcdctl get <k> --from-key` sends `range_end = "\0"`: every key at
+    /// or after `k`. It used to answer an empty `Ok` — the shape of an empty
+    /// cluster, the answer this façade exists never to give by accident.
+    #[tokio::test]
+    async fn a_from_key_range_returns_every_key_at_or_after_it() {
+        let s = svc(&[("default", "a"), ("default", "b"), ("other", "c")]);
+        let r = range_of(
+            &s,
+            RangeRequest {
+                key: b"/registry/pods/default/b".to_vec(),
+                range_end: vec![0],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            keys_of(&r),
+            vec!["/registry/pods/default/b", "/registry/pods/other/c"]
+        );
+    }
+
     #[tokio::test]
     async fn count_is_the_total_matched_not_the_page_length() {
         // A paginating client sizes remaining work from `count`; reporting
@@ -503,12 +563,15 @@ mod tests {
 // features to attempt. Without it a tool concludes the endpoint is not
 // etcd at all and gives up before reaching the KV service that works.
 //
-// ★ `db_size` IS REPORTED HONESTLY OR NOT AT ALL. Capacity dashboards and
-// the `etcd_mvcc_db_total_size_in_bytes` alerting family read it, and a
-// fabricated number would drive real alerts. engenho's store is a
-// journalled segment store whose on-disk size is not a single figure; the
-// caller supplies it or it is reported as 0, which reads as "unknown"
-// rather than as "empty".
+// ★ `db_size` IS REPORTED AS MEASURED OR `Status` IS REFUSED. Capacity
+// dashboards and the `etcd_mvcc_db_total_size_in_bytes` alerting family
+// read it, so a fabricated number would drive real alerts. And 0 is not a
+// safe "unknown": `etcdctl endpoint status` divides by this field, and a 0
+// panicked it with an integer divide by zero when real etcdctl was pointed
+// at this façade (2026-08-30, recorded in engenho-runtime's
+// `etcd_facade.rs`). engenho's store has no single file to stat, so the
+// store supplies a measured size; a missing or zero one is refused with
+// `Unavailable` ([`DbSizeUnmeasured`]) instead of being sent.
 // ─────────────────────────────────────────────────────────────────────
 
 use crate::pb::etcdserverpb::{
@@ -527,15 +590,38 @@ pub trait EtcdStatusStore: EtcdRevision {
     ///
     /// [`StoreGone`] once the store has been dropped.
     async fn applied_index(&self) -> Result<u64, StoreGone>;
-    /// On-disk size in bytes if the backend can report one cheaply.
+    /// The store's size in bytes, as measured, or `None` if it cannot be.
     ///
-    /// `None` becomes 0. A guess here would drive real capacity alerts off
-    /// a number nobody measured.
+    /// `None`, or a size that is not positive, makes `Status` answer
+    /// `Unavailable` ([`DbSizeUnmeasured`]) rather than send a 0: etcdctl
+    /// divides by this field. A guess here would drive real capacity alerts
+    /// off a number nobody measured.
     ///
     /// # Errors
     ///
     /// [`StoreGone`] once the store has been dropped.
     async fn db_size(&self) -> Result<Option<i64>, StoreGone>;
+}
+
+/// The store gave `Status` no size it can send.
+///
+/// ★ REFUSED, NOT SENT AS 0. `etcdctl endpoint status` divides by this
+/// field to print the in-use percentage, and a 0 there is an integer divide
+/// by zero that panics the client. A plausible substitute
+/// would be a fabricated number on a field that drives capacity alerts.
+/// `Unavailable` is the answer a client retries, and the production store
+/// always measures one, so this is reached only before it holds any object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the store behind this etcd facade reported no database size to send; a 0 would crash \
+     `etcdctl endpoint status`, which divides by it"
+)]
+pub struct DbSizeUnmeasured;
+
+impl From<DbSizeUnmeasured> for Status {
+    fn from(unmeasured: DbSizeUnmeasured) -> Self {
+        Status::unavailable(unmeasured.to_string())
+    }
 }
 
 /// The Maintenance service.
@@ -551,7 +637,12 @@ impl<S: EtcdStatusStore> etcdserverpb::maintenance_server::Maintenance for Maint
         // healthy, empty member — the answer a backup tool gates on.
         let rev = self.store.revision().await?;
         let applied = self.store.applied_index().await?;
-        let db_size = self.store.db_size().await?.unwrap_or(0);
+        let db_size = self
+            .store
+            .db_size()
+            .await?
+            .filter(|size| *size > 0)
+            .ok_or(DbSizeUnmeasured)?;
         Ok(Response::new(StatusResponse {
             header: Some(header(self.identity, rev)),
             // The etcd API version engenho's wire types were generated
@@ -652,9 +743,11 @@ mod maintenance_tests {
     use super::*;
     use crate::pb::etcdserverpb::maintenance_server::Maintenance as _;
 
-    /// `gone` answers as a store that has been dropped.
+    /// `gone` answers as a store that has been dropped; `size` is the
+    /// database size it reports.
     struct FakeStatus {
         gone: bool,
+        size: Option<i64>,
     }
 
     impl FakeStatus {
@@ -676,13 +769,17 @@ mod maintenance_tests {
             self.live().map(|()| 123)
         }
         async fn db_size(&self) -> Result<Option<i64>, StoreGone> {
-            self.live().map(|()| None)
+            self.live().map(|()| self.size)
         }
     }
 
     fn svc() -> MaintenanceSvc<FakeStatus> {
+        sized(Some(4096))
+    }
+
+    fn sized(size: Option<i64>) -> MaintenanceSvc<FakeStatus> {
         MaintenanceSvc {
-            store: FakeStatus { gone: false },
+            store: FakeStatus { gone: false, size },
             identity: ServerIdentity::default(),
         }
     }
@@ -692,7 +789,10 @@ mod maintenance_tests {
         // Zeros read as a healthy, empty member; `etcdctl endpoint status`
         // and every backup tool gate on this call.
         let s = MaintenanceSvc {
-            store: FakeStatus { gone: true },
+            store: FakeStatus {
+                gone: true,
+                size: Some(4096),
+            },
             identity: ServerIdentity::default(),
         };
         let status = s
@@ -729,17 +829,32 @@ mod maintenance_tests {
         assert!(r.errors.is_empty());
     }
 
+    /// This used to pin the opposite: an unknown size sent as 0, on the
+    /// belief that a client reads 0 as "unknown". etcdctl divides by it and
+    /// panics. Neither 0 nor a guess goes out; `Status` is refused instead.
     #[tokio::test]
-    async fn an_unknown_db_size_is_zero_not_a_guess() {
+    async fn an_unmeasured_db_size_refuses_status_and_never_sends_zero() {
+        for size in [None, Some(0), Some(-1)] {
+            let status = sized(size)
+                .status(Request::new(StatusRequest::default()))
+                .await
+                .expect_err("no size etcdctl can divide by, so no Status");
+            assert_eq!(status.code(), tonic::Code::Unavailable, "{size:?}");
+            assert_eq!(status.message(), DbSizeUnmeasured.to_string(), "{size:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_measured_db_size_is_sent_as_measured() {
         // Capacity dashboards and the etcd db-size alert family read this;
-        // a fabricated number would drive real alerts.
-        let r = svc()
+        // it carries the store's number and nothing else.
+        let r = sized(Some(4096))
             .status(Request::new(StatusRequest::default()))
             .await
-            .unwrap()
+            .expect("status")
             .into_inner();
-        assert_eq!(r.db_size, 0);
-        assert_eq!(r.db_size_in_use, 0);
+        assert_eq!(r.db_size, 4096);
+        assert_eq!(r.db_size_in_use, 4096);
     }
 
     #[tokio::test]
@@ -806,7 +921,10 @@ mod maintenance_tests {
 // cancelling — and every one of them reaches the client as a `canceled`
 // response carrying that reason. A stream that simply stops is a client
 // that believes it is still tracking the cluster. `WatchFeed::next` has no
-// "nothing" answer, so an end without a reason does not type-check.
+// "nothing" answer, so an end without a reason does not type-check. Two
+// ends are not a per-watch `canceled`: a client that hangs up has nobody
+// left to tell, and a progress request that finds the store gone ends the
+// whole stream, and every watch on it, with gRPC `Unavailable`.
 //
 // ★ `created` IS NOT COSMETIC. etcd sends a response with `created: true`
 // and no events to acknowledge a watch before any data flows. A client
@@ -970,8 +1088,8 @@ pub trait EtcdWatchStore: EtcdRevision {
 /// The Watch service.
 ///
 /// The store is held in an `Arc` because each watch runs in its own task:
-/// a borrow could not outlive the request, and cloning the store per watch
-/// would give each one a different view of the same cluster.
+/// a borrow could not outlive the request, and an `Arc` shares the one
+/// store without asking `S` to be `Clone`.
 pub struct WatchSvc<S> {
     pub store: std::sync::Arc<S>,
     pub identity: ServerIdentity,

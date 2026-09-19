@@ -13,6 +13,13 @@
 //!
 //! Establish the interface first; then do as we like underneath.
 //!
+//! ★ WHAT IS MET TODAY, so the thesis is not read as done. Of the three
+//! verbs above only the first is met: `Range`, `Watch` and
+//! `Maintenance.Status` answer. `Snapshot` is refused, and a kube-apiserver
+//! pointed at `--etcd-servers` cannot run against this façade: it writes
+//! through `Txn`, holds `Lease`s and calls `Compact`, and none of them is
+//! served. engenho is not yet a drop-in for k3s's etcd.
+//!
 //! ## What is here
 //!
 //! * [`keyspace`] — the `/registry` layout: how a Kubernetes object is
@@ -29,23 +36,53 @@
 //!
 //! * [`server`] — the gRPC services: a read-only `KV`, `Watch` and
 //!   `Maintenance`, over three store traits. `engenho-runtime`'s
-//!   `MeshEtcdStore` implements them over the live store and serves them
-//!   on the configured etcd listen address.
+//!   `MeshEtcdStore` implements the traits over the live store, and the
+//!   runtime mounts these three services, and only these, on
+//!   `runtime.etcd_listen_addr` when that field is set.
 //!
-//! ## The two rules the services keep (T3.8)
+//! ## Who can call it: anyone who can reach the socket
 //!
-//! * **A gone store is `Unavailable`, never an empty answer.** Every store
-//!   trait returns `Result<_, server::StoreGone>`; an `Ok` Range with no
-//!   keys at revision 0 is indistinguishable from an empty cluster.
+//! The façade authenticates nobody. There is no TLS, no client certificate
+//! and no authorization, and `Range` returns every object the store serves
+//! — Secrets included — as the JSON it holds. Its one control is where it
+//! binds: `engenho-config` refuses a `runtime.etcd_listen_addr` that is not
+//! a loopback `IP:port` literal until the façade has mutual TLS
+//! (`NodeLocalListener::EtcdFacade`, T4.9). That is a check at config
+//! validation, not a type. And loopback keeps the façade off the network,
+//! not away from the host: any process sharing the host's network
+//! namespace can read it, which on a node running the native backend is
+//! every workload.
+//!
+//! ## The rules the services keep (T3.8)
+//!
+//! * **A gone store is never an empty answer.** Every read trait returns
+//!   `Result<_, server::StoreGone>`, and `watch_from` the `WatchEnd` that
+//!   carries it. `Range`, `Status`, `Alarm` and `Defragment` answer a gone
+//!   store with gRPC `Unavailable`; a watch, opening or open, ends with a
+//!   `canceled` response whose reason names it; a progress request ends
+//!   the whole watch stream `Unavailable`. An `Ok` Range with no keys at
+//!   revision 0 would be indistinguishable from an empty cluster.
 //! * **A watch is one atomic `watch_from(prefix, start)`**, and every end
 //!   of it — compaction, overflow, the store going away, a client cancel —
-//!   reaches the client as a `canceled` response carrying its reason.
+//!   is sent as a `canceled` response carrying its reason. The exceptions
+//!   are a client that hangs up, which has nobody left to tell, and the
+//!   progress request above.
+//! * **Every `Range` shape is answered, none by accident empty**: a point,
+//!   a prefix, an interval and `--from-key` are each one scan under the
+//!   prefix all their keys share, then filtered ([`kv::RangeShape`]).
+//! * **`Status` never sends a database size of 0**, which crashes
+//!   `etcdctl endpoint status`; an unmeasured size is `Unavailable`
+//!   ([`server::DbSizeUnmeasured`]).
 //!
 //! ## What is NOT here
 //!
 //! Writes (`Put`, `DeleteRange`, `Txn`, `Compact`) and `Snapshot` are
-//! refused with a typed `Unimplemented` that says why; `Lease` and `Auth`
-//! are not served.
+//! refused with `Unimplemented` and a message saying why; `Hash`, `HashKV`,
+//! `MoveLeader` and `Downgrade` are refused with `Unimplemented` too. No
+//! `Lease`, `Cluster` or `Auth` service is implemented here or mounted by
+//! the runtime, so a call to one gets the transport's bare
+//! `Unimplemented`. Every node of every engenho cluster reports the same
+//! `cluster_id` and `member_id` (see [`server::ServerIdentity`]).
 
 pub mod keyspace;
 pub mod kv;
@@ -61,9 +98,10 @@ pub mod pb {
     pub mod mvccpb {
         include!(concat!(env!("OUT_DIR"), "/mvccpb.rs"));
     }
-    /// `authpb` — role/user messages. Present because `etcdserverpb`
-    /// imports it; engenho's authn lives at the apiserver, so the `Auth`
-    /// RPCs are permission-denied stubs (theory/ENGENHO.md III.2).
+    /// `authpb` — role/user messages. Present only because `etcdserverpb`
+    /// imports it. No `Auth` service is implemented or mounted, and the
+    /// façade authenticates no caller at all (see the crate docs);
+    /// theory/ENGENHO.md §III.2's permission-denied stubs are design only.
     pub mod authpb {
         include!(concat!(env!("OUT_DIR"), "/authpb.rs"));
     }
