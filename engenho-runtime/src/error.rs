@@ -13,6 +13,18 @@ pub enum RuntimeError {
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
 
+    /// A config field asks for something this runtime does not do (I21):
+    /// an operator PKI, a multi-master formation, a consistency tier the
+    /// store does not serve. Refused before anything is probed or written.
+    #[error(transparent)]
+    Unhonoured(#[from] crate::Unhonoured),
+
+    /// The scheduler could not be built from `scheduler.*` (T5.8): an
+    /// unimplemented strategy or a zero tick. `validate()` refuses both
+    /// first; this is the constructor's own guard.
+    #[error(transparent)]
+    Scheduler(#[from] engenho_scheduler::SchedulerError),
+
     /// The store mesh failed to start, initialize, or take leadership; or,
     /// at a stop, to write its durable image
     /// ([`engenho_store::StoreError::Persist`], from the stop's flush or
@@ -173,6 +185,8 @@ pub enum RuntimeError {
 engenho_substrate::impl_error_kind! {
     RuntimeError {
         (Config(_)) => "config",
+        (Unhonoured(_)) => "unhonoured_config",
+        (Scheduler(_)) => "scheduler",
         (Store(_)) => "store",
         (Server(_)) => "server",
         (BackendRefused(_)) => "backend_refused",

@@ -82,12 +82,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use engenho_config::{ControllerEnable, EngenhoConfig};
+use engenho_config::ControllerEnable;
 pub use engenho_controllers::TickState;
 use engenho_controllers::{ControllerType, Heartbeat, KindFilter, PanicMessage, Reads};
 use tokio::task::{AbortHandle, Id, JoinSet};
 use tracing::error;
 
+use crate::boot_config::BootConfig;
 use crate::health::{Row, Tally};
 
 engenho_controllers::closed_enum! {
@@ -209,25 +210,43 @@ impl Driver {
 
     /// Whether `controllers.enable` turns this driver on. The drivers with
     /// no switch always run.
+    ///
+    /// The one reader of `controllers.enable`, destructured with no `..`
+    /// (I21): a new switch is E0027 here until a driver answers to it.
     #[must_use]
     pub const fn enabled(self, enable: &ControllerEnable) -> bool {
+        let ControllerEnable {
+            replicaset,
+            deployment,
+            statefulset,
+            daemonset,
+            job,
+            cronjob,
+            endpoints,
+            service_routing,
+            gc,
+            crd,
+            namespace,
+            pv_binder,
+            pdb,
+        } = enable;
         match self {
-            Self::Deployment => enable.deployment,
-            Self::ReplicaSet => enable.replicaset,
-            Self::StatefulSet => enable.statefulset,
-            Self::DaemonSet => enable.daemonset,
-            Self::Job => enable.job,
-            Self::CronJob => enable.cronjob,
-            Self::PodDisruptionBudget => enable.pdb,
-            Self::Endpoints => enable.endpoints,
-            Self::ServiceRouting => enable.service_routing,
-            Self::Gc => enable.gc,
-            Self::Namespace => enable.namespace,
+            Self::Deployment => *deployment,
+            Self::ReplicaSet => *replicaset,
+            Self::StatefulSet => *statefulset,
+            Self::DaemonSet => *daemonset,
+            Self::Job => *job,
+            Self::CronJob => *cronjob,
+            Self::PodDisruptionBudget => *pdb,
+            Self::Endpoints => *endpoints,
+            Self::ServiceRouting => *service_routing,
+            Self::Gc => *gc,
+            Self::Namespace => *namespace,
             // The snapshot controller snapshots the directories the binder
             // provisions; enabling one without the other yields a controller
             // that can only ever decline.
-            Self::PvBinder | Self::VolumeSnapshot => enable.pv_binder,
-            Self::Crd => enable.crd,
+            Self::PvBinder | Self::VolumeSnapshot => *pv_binder,
+            Self::Crd => *crd,
             Self::Scheduler
             | Self::ServedCapability
             | Self::NetworkPolicy
@@ -268,10 +287,10 @@ impl Listener {
     /// Whether the config binds this listener. An empty `etcd_listen_addr`
     /// disables the façade.
     #[must_use]
-    pub fn enabled(self, config: &EngenhoConfig) -> bool {
+    pub(crate) fn enabled(self, boot: &BootConfig) -> bool {
         match self {
             Self::KubeletHttp => true,
-            Self::EtcdFacade => !config.runtime.etcd_listen_addr.is_empty(),
+            Self::EtcdFacade => !boot.etcd_listen_addr.is_empty(),
         }
     }
 }
@@ -351,13 +370,13 @@ impl Child {
 
     /// Whether this config spawns the child.
     #[must_use]
-    pub fn enabled(self, config: &EngenhoConfig) -> bool {
+    pub(crate) fn enabled(self, boot: &BootConfig) -> bool {
         match self {
-            Self::Driver(d) => d.enabled(&config.controllers.enable),
-            Self::Listener(l) => l.enabled(config),
+            Self::Driver(d) => d.enabled(&boot.enable),
+            Self::Listener(l) => l.enabled(boot),
             // The lease proves the kubelet alive: with no kubelet there is
             // nothing for it to renew by.
-            Self::NodeLease => Driver::Kubelet.enabled(&config.controllers.enable),
+            Self::NodeLease => Driver::Kubelet.enabled(&boot.enable),
         }
     }
 }
@@ -666,18 +685,18 @@ pub struct Children {
 }
 
 impl Children {
-    /// Walk the catalog once, spawning every child `config` enables with the
+    /// Walk the catalog once, spawning every child `boot` enables with the
     /// body `build` returns for it.
     ///
     /// `build` is handed the children spawned so far, so a child can watch
     /// a sibling walked before it: the node lease reads the kubelet's
     /// [`Row`]. `build` returning `None` leaves a child unspawned.
     pub(crate) fn spawn_catalog(
-        config: &EngenhoConfig,
+        boot: &BootConfig,
         mut build: impl FnMut(Child, &Self) -> Option<ChildTask>,
     ) -> Self {
         let mut children = Self::default();
-        for child in Child::all().filter(|c| c.enabled(config)) {
+        for child in Child::all().filter(|c| c.enabled(boot)) {
             if let Some(task) = build(child, &children) {
                 children.spawn(child, task);
             }
@@ -813,8 +832,6 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
-    use shikumi::TieredConfig as _;
-
     use super::*;
 
     const DEADLINE: Duration = Duration::from_secs(5);
@@ -867,16 +884,16 @@ mod tests {
     /// a sibling's row.
     #[tokio::test]
     async fn a_child_is_built_seeing_the_children_spawned_before_it() {
-        let config = EngenhoConfig::prescribed_default();
         let mut seen = None;
-        let children = Children::spawn_catalog(&config, |child, before| match child {
-            Child::Driver(Driver::Kubelet) => Some(body(std::future::pending()).1),
-            Child::NodeLease => {
-                seen = Some(before.row(Child::Driver(Driver::Kubelet)).is_some());
-                Some(body(std::future::pending()).1)
-            }
-            Child::Driver(_) | Child::Listener(_) => None,
-        });
+        let children =
+            Children::spawn_catalog(&BootConfig::prescribed(), |child, before| match child {
+                Child::Driver(Driver::Kubelet) => Some(body(std::future::pending()).1),
+                Child::NodeLease => {
+                    seen = Some(before.row(Child::Driver(Driver::Kubelet)).is_some());
+                    Some(body(std::future::pending()).1)
+                }
+                Child::Driver(_) | Child::Listener(_) => None,
+            });
         assert_eq!(
             seen,
             Some(true),
@@ -890,10 +907,10 @@ mod tests {
 
     #[test]
     fn the_node_lease_is_enabled_wherever_the_kubelet_runs() {
-        let config = EngenhoConfig::prescribed_default();
-        assert!(Child::Driver(Driver::Kubelet).enabled(&config));
+        let boot = BootConfig::prescribed();
+        assert!(Child::Driver(Driver::Kubelet).enabled(&boot));
         assert!(
-            Child::NodeLease.enabled(&config),
+            Child::NodeLease.enabled(&boot),
             "a node whose kubelet runs renews its lease"
         );
     }

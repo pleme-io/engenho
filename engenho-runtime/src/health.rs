@@ -34,8 +34,10 @@
 //! tick liveness reports as stalled: the two thresholds are one value, not
 //! two constants that agree today. A driver's fallback and debounce are read
 //! off the same value, so the idle window is derived from the fallback the
-//! loop really runs on. The node lease runs on its own fallback
-//! ([`Windows::node_lease`]), and is driven and judged by that one value.
+//! loop really runs on. Two loops run on a fallback of their own, the
+//! scheduler (`scheduler.tick_interval_seconds`) and the node lease
+//! ([`Windows::node_lease`]); [`Windows::of_child`] picks each loop's windows,
+//! and both the driver and the judge read them from there.
 //!
 //! One row's judgement ([`Row::liveness`]) is also what the node lease
 //! renews by: the lease is renewed only while the kubelet's row is alive
@@ -91,7 +93,6 @@ use engenho_apiserver::{
     ChildLiveness, DrainState, LastTick, LivenessSource, MetricsSnapshot, MetricsSource,
     ReconcileCount, ReconcileResult,
 };
-use engenho_config::ControllersConfig;
 use engenho_controllers::node_lease::RENEW_INTERVAL;
 use engenho_controllers::{
     Beat, Controller, ControllerError, ControllerType, Heartbeat, RESUBSCRIBE, ReconcileOutcome,
@@ -122,7 +123,7 @@ use crate::panics::PanicCounter;
 ///
 /// `pending-config: controllers.stuck_tick_after_seconds` — the field
 /// belongs in engenho-config. Until it lands, this is the value
-/// [`Windows::of`] reads, and the only place it is written.
+/// [`Windows::new`] reads, and the only place it is written.
 pub(crate) const STUCK_TICK_AFTER: Duration = Duration::from_secs(120);
 
 /// How many recent seconds the propose-rate detector looks at.
@@ -149,16 +150,39 @@ pub struct Windows {
     stuck: Duration,
     fallback: Duration,
     debounce: Duration,
+    /// The scheduler's own fallback (`scheduler.tick_interval_seconds`,
+    /// T5.8). A field rather than a default, so windows that would drive the
+    /// scheduler on the controllers' fallback cannot be built.
+    scheduler_fallback: Duration,
 }
 
 impl Windows {
-    /// The windows `controllers` implies.
+    /// The windows for loops that fall back every `fallback` and coalesce
+    /// events for `debounce`, with the scheduler falling back every
+    /// `scheduler_fallback`. The runtime builds them from its config
+    /// (`BootConfig::windows`).
     #[must_use]
-    pub fn of(controllers: &ControllersConfig) -> Self {
+    pub const fn new(fallback: Duration, debounce: Duration, scheduler_fallback: Duration) -> Self {
         Self {
             stuck: STUCK_TICK_AFTER,
-            fallback: Duration::from_secs(u64::from(controllers.fallback_interval_seconds)),
-            debounce: Duration::from_millis(u64::from(controllers.debounce_milliseconds)),
+            fallback,
+            debounce,
+            scheduler_fallback,
+        }
+    }
+
+    /// The windows `child` is driven on and judged by: the scheduler and the
+    /// node lease on their own fallback, every other loop on these.
+    ///
+    /// The one place a loop's windows are chosen. The runtime drives each
+    /// loop with this value and [`Pulse::of`] judges it with the same one, so
+    /// a loop cannot be judged on a fallback it does not run on.
+    #[must_use]
+    pub const fn of_child(self, child: Child) -> Self {
+        match child {
+            Child::Driver(Driver::Scheduler) => self.with_fallback(self.scheduler_fallback),
+            Child::NodeLease => self.node_lease(),
+            Child::Driver(_) | Child::Listener(_) => self,
         }
     }
 
@@ -247,9 +271,9 @@ impl Pulse {
     #[must_use]
     pub const fn of(child: Child, windows: Windows) -> Self {
         match child {
-            Child::Driver(_) => Self::Ticks(windows),
-            // A tick loop on its own fallback: the windows it is driven on.
-            Child::NodeLease => Self::Ticks(windows.node_lease()),
+            // The windows it is driven on: its own fallback for the
+            // scheduler and the node lease.
+            Child::Driver(_) | Child::NodeLease => Self::Ticks(windows.of_child(child)),
             Child::Listener(_) => Self::Serves,
         }
     }
@@ -762,19 +786,22 @@ mod tests {
     use std::future::Future;
 
     use engenho_apiserver::health::{CHILDREN_CHECK, Endpoint, gather};
-    use engenho_config::EngenhoConfig;
     use engenho_controllers::{ReconcileReport, ReconcileResult as Requeue, TickClass};
-    use shikumi::TieredConfig as _;
 
     use super::*;
+    use crate::boot_config::BootConfig;
     use crate::child::{ChildTask, Children, Listener};
 
     const FALLBACK_S: u64 = 30;
+    /// The scheduler's fallback, distinct from every other loop's.
+    const SCHEDULER_FALLBACK_S: u64 = 7;
 
     fn windows() -> Windows {
-        let mut controllers = EngenhoConfig::prescribed_default().controllers;
-        controllers.fallback_interval_seconds = u32::try_from(FALLBACK_S).unwrap();
-        Windows::of(&controllers)
+        Windows::new(
+            secs(FALLBACK_S),
+            Duration::from_millis(50),
+            secs(SCHEDULER_FALLBACK_S),
+        )
     }
 
     fn secs(n: u64) -> Duration {
@@ -938,10 +965,59 @@ mod tests {
             let pulse = Pulse::of(child, w);
             match child {
                 Child::Listener(_) => assert_eq!(pulse, Pulse::Serves, "{child}"),
+                Child::Driver(Driver::Scheduler) => assert_eq!(
+                    pulse,
+                    Pulse::Ticks(w.with_fallback(secs(SCHEDULER_FALLBACK_S))),
+                    "{child}"
+                ),
                 Child::Driver(_) => assert_eq!(pulse, Pulse::Ticks(w), "{child}"),
                 Child::NodeLease => assert_eq!(pulse, Pulse::Ticks(w.node_lease()), "{child}"),
             }
         }
+    }
+
+    /// T5.8: the scheduler is judged on the fallback it is driven on,
+    /// `scheduler.tick_interval_seconds`, not the controllers'. Judged on
+    /// the controllers' 30s, a scheduler falling back every 7s would read
+    /// alive for 46s after it can no longer be idle; judged on a shorter
+    /// one, a long configured tick would read stalled while idle.
+    #[test]
+    fn the_scheduler_is_judged_on_its_own_fallback() {
+        let w = windows();
+        let now = Instant::now();
+        // Idle 50s: past the scheduler's idle window (2 x 7s + the 30s
+        // re-subscribe cap + debounce), inside the controllers' (2 x 30s + ...).
+        let idle = beat(now, 3, 3, Some(secs(51)), Some(secs(50)));
+        assert!(
+            w.of_child(Child::Driver(Driver::Scheduler)).idle_after() < secs(49),
+            "precondition: 50s idle is past the scheduler's window"
+        );
+        assert!(
+            w.idle_after() > secs(50),
+            "precondition: 50s idle is inside every other driver's window"
+        );
+        assert!(
+            matches!(
+                judge(
+                    Pulse::of(Child::Driver(Driver::Scheduler), w),
+                    TaskState::Running,
+                    &idle,
+                    now
+                ),
+                Liveness::Stalled { .. }
+            ),
+            "a scheduler idle past its own window is stalled"
+        );
+        assert_eq!(
+            judge(
+                Pulse::of(Child::Driver(Driver::Gc), w),
+                TaskState::Running,
+                &idle,
+                now
+            ),
+            Liveness::Alive,
+            "the same beat is inside a 30s loop's window"
+        );
     }
 
     // ── the source, over real children ───────────────────────────────
@@ -953,8 +1029,7 @@ mod tests {
     /// Spawn exactly `bodies` through the catalog (every other child is
     /// left unspawned) and hand the rows to a fresh [`Health`].
     fn spawned(store: &Arc<StoreMesh>, mut bodies: Vec<(Child, ChildTask)>) -> (Children, Health) {
-        let config = EngenhoConfig::prescribed_default();
-        let children = Children::spawn_catalog(&config, |child, _| {
+        let children = Children::spawn_catalog(&BootConfig::prescribed(), |child, _| {
             let at = bodies.iter().position(|(c, _)| *c == child)?;
             Some(bodies.remove(at).1)
         });

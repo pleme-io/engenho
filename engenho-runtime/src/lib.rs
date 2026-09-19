@@ -136,6 +136,7 @@
 pub mod census;
 pub mod etcd_facade;
 
+mod boot_config;
 mod child;
 mod dormant;
 mod error;
@@ -155,6 +156,7 @@ mod runtime_health;
 #[cfg(test)]
 mod testing;
 
+pub use boot_config::{PkiField, Unhonoured};
 pub use child::{
     Child, ChildHandle, ChildState, Children, DeadChild, DeathCause, Driver, Fault, Listener,
     Supervision, TickState, Wiring,

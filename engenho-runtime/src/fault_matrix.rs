@@ -54,6 +54,7 @@ use engenho_substrate::{Clock as _, Liveness, WallClock};
 use shikumi::TieredConfig as _;
 use tokio::time::Instant;
 
+use crate::boot_config::BootConfig;
 use crate::child::{
     Child, ChildState, ChildTask, Children, DeathCause, Fault, Listener, Supervision, TickLoop,
 };
@@ -138,7 +139,7 @@ struct World {
     store: Arc<StoreMesh>,
     windows: Windows,
     /// Every child enabled, and both listen addresses `_taken`'s.
-    config: EngenhoConfig,
+    boot: BootConfig,
     /// Held for the whole matrix, so every bind of its address fails.
     _taken: std::net::TcpListener,
 }
@@ -153,13 +154,16 @@ impl World {
         let mut config = EngenhoConfig::prescribed_default();
         config.runtime.kubelet_listen_addr.clone_from(&addr);
         config.runtime.etcd_listen_addr = addr;
-        let windows = Windows::of(&config.controllers)
+        let boot = BootConfig::read(&config).expect("the prescribed default is run");
+        // Every loop, the scheduler's included, falls back every FALLBACK.
+        let windows = boot
+            .windows(FALLBACK)
             .with_fallback(FALLBACK)
             .with_stuck_tick_after(STUCK);
         Self {
             store: single_voter_store("fault-matrix").await,
             windows,
-            config,
+            boot,
             _taken: taken,
         }
     }
@@ -196,12 +200,9 @@ fn listener_with(listener: Listener, fault: Fault, world: &World) -> ChildTask {
             serve_rebinding(listener, beat, returning_attempt),
         ),
         // The listener's own body, binding its own address, which is taken.
-        Fault::BindFailure => listener_task(
-            listener,
-            &world.config,
-            std::sync::Weak::new(),
-            &world.store,
-        ),
+        Fault::BindFailure => {
+            listener_task(listener, &world.boot, std::sync::Weak::new(), &world.store)
+        }
     }
 }
 
@@ -341,7 +342,7 @@ async fn every_child_meets_every_fault_as_the_catalog_declares() {
         .iter()
         .map(|&fault| {
             let children =
-                Children::spawn_catalog(&world.config, |child, _| inject(child, fault, &world));
+                Children::spawn_catalog(&world.boot, |child, _| inject(child, fault, &world));
             (fault, children)
         })
         .collect();

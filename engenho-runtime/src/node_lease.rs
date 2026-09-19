@@ -268,14 +268,13 @@ impl DeclaresReads for NodeLease {
 mod tests {
     use std::convert::Infallible;
 
-    use engenho_config::EngenhoConfig;
     use engenho_controllers::node_lease::{NodeReadiness, RENEW_INTERVAL, readiness};
     use engenho_controllers::{Heartbeat, TickClass};
     use serde_json::Value;
-    use shikumi::TieredConfig as _;
     use tokio::task::JoinHandle;
 
     use super::*;
+    use crate::boot_config::BootConfig;
     use crate::child::{ChildTask, Children, Driver};
     use crate::runtime::drive_node_lease;
     use crate::runtime_health::{RELIST_PERIOD, RelistLedger, Relister};
@@ -288,7 +287,7 @@ mod tests {
     }
 
     fn windows() -> Windows {
-        Windows::of(&EngenhoConfig::prescribed_default().controllers)
+        BootConfig::prescribed_windows()
     }
 
     /// A kubelet as the lease sees it: a heartbeat the test drives, and a
@@ -563,7 +562,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_lease_child_renews_on_its_interval_until_the_kubelet_wedges() {
         let store = single_voter_store("node-lease-child").await;
-        let config = EngenhoConfig::prescribed_default();
+        let config = BootConfig::prescribed();
         let wedge = Arc::new(tokio::sync::Notify::new());
         let mut kubelet = Some(scripted_kubelet(wedge.clone()).1);
         let children = Children::spawn_catalog(&config, |child, before| match child {
@@ -765,7 +764,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_lease_child_holds_the_node_back_while_its_runtime_is_dead() {
         let store = single_voter_store("node-lease-runtime").await;
-        let config = EngenhoConfig::prescribed_default();
+        let config = BootConfig::prescribed();
         let never = Arc::new(tokio::sync::Notify::new());
         let mut kubelet = Some(scripted_kubelet(never).1);
         let (runtime, relister, source) = relisted();
