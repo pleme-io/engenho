@@ -29,9 +29,11 @@
 //!     revision state, single key `catalog` → `serde_json::to_vec(
 //!     &ResourceCatalog)`. The catalog's hand-written Serialize
 //!     already carries resources (value + VersionMeta),
-//!     last_applied_term/index, current_revision + compacted_revision
-//!     (history is rebuilt by replay). One value = all of item-1's
-//!     durable revision state.
+//!     last_applied_term/index, current_revision + compacted_revision.
+//!     The history ring is not persisted, so on load the compaction
+//!     floor is set to current_revision and the stored floor is
+//!     ignored (T3.3); the ring refills from the replay above it. One
+//!     value = all of item-1's durable revision state.
 //!
 //! ## Durability discipline
 //!
@@ -1384,6 +1386,55 @@ mod tests {
         );
     }
 
+    /// T3.3: a reopened store holds no history, so every watch resume point
+    /// below the revision it loaded is refused with the 410 a client relists
+    /// on. Resuming from exactly the loaded revision is honoured.
+    #[tokio::test]
+    async fn a_reopened_store_refuses_a_watch_below_the_revision_it_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let mut s = FjallStore::open(&dir).unwrap();
+        log_and_apply(&mut s, 3).await;
+        assert!(
+            s.watch_from(WatchOpts::live_tail(Revision::ZERO, 16))
+                .await
+                .is_ok(),
+            "before the restart the ring backs every revision"
+        );
+        let (Flushed::Persisted { last_applied } | Flushed::AlreadyDurable { last_applied }) =
+            s.flush().await.unwrap();
+        assert_eq!(last_applied, Some(log_id(3)), "the image holds all three");
+        drop(s);
+
+        let reopened = FjallStore::open(&dir).unwrap();
+        let head = reopened.current_revision().await;
+        assert_eq!(
+            head,
+            Revision(3),
+            "the flushed image holds all three writes"
+        );
+        for from in 0..head.get() {
+            assert_eq!(
+                reopened
+                    .watch_from(WatchOpts::live_tail(Revision(from), 16))
+                    .await
+                    .err(),
+                Some(WatchGone::CompactedTooOld {
+                    requested: Revision(from),
+                    compacted: head,
+                }),
+                "watch_from({from}) after a reopen must be refused: the ring did not survive"
+            );
+        }
+        assert!(
+            reopened
+                .watch_from(WatchOpts::live_tail(head, 16))
+                .await
+                .is_ok(),
+            "resuming from exactly the loaded revision is honoured"
+        );
+    }
+
     /// An installed snapshot IS the durable image, so `flush` afterwards has
     /// nothing to write — even when the store had unwritten applies before.
     #[tokio::test]
@@ -1436,7 +1487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_build_install_round_trip_preserves_revision_and_compacted() {
+    async fn snapshot_build_install_round_trip_preserves_revision_and_floors_history_at_it() {
         let dir_a = temp_dir("snap-src");
         let dir_b = temp_dir("snap-dst");
         let _ = std::fs::remove_dir_all(&dir_a);
@@ -1466,7 +1517,22 @@ mod tests {
             .unwrap();
         let dst_cat = dst.current_catalog().await;
         assert_eq!(dst_cat.current_revision, src_rev);
-        assert_eq!(dst_cat.compacted_revision, src_cat.compacted_revision);
+        // T3.3: the source evicted nothing, so its floor is 0 and its ring
+        // backs every revision. A snapshot carries no ring, so the
+        // destination's floor is the installed revision, and a watch below
+        // it is a 410 rather than an empty replay.
+        assert_eq!(src_cat.compacted_revision, Revision::ZERO);
+        assert_eq!(dst_cat.compacted_revision, src_rev);
+        assert_eq!(
+            dst.watch_from(WatchOpts::live_tail(Revision::ZERO, 16))
+                .await
+                .err(),
+            Some(WatchGone::CompactedTooOld {
+                requested: Revision::ZERO,
+                compacted: src_rev,
+            }),
+            "a watch from before the installed snapshot must be refused, not answered empty"
+        );
         // Per-key VersionMeta matches.
         let k = ResourceKey::namespaced("", "v1", "Pod", "default", "p5");
         assert_eq!(

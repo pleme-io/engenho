@@ -182,8 +182,9 @@ async fn restart_preserves_raft_log_and_does_not_reinitialize() {
 }
 
 /// Test 3 — current_revision + per-key meta survive enough puts that
-/// the revision is well above 1 (compacted_revision round-trip is
-/// proven at the unit layer in state.rs / fjall_store.rs).
+/// the revision is well above 1. The compaction floor does NOT
+/// round-trip: on load it is the current revision (T3.3), proven at the
+/// unit layer in state.rs / fjall_store.rs.
 #[tokio::test]
 async fn restart_preserves_high_revision_and_per_key_meta() {
     let dir = temp_dir("high-revision");

@@ -23,6 +23,8 @@
 //! overflows `history_capacity`, the oldest entry is evicted and the
 //! `compacted_revision` watermark advances. Reads / watches that ask
 //! for history below the watermark get a typed [`CompactedTooOld`].
+//! The ring is never persisted, so a catalog loaded from disk or from
+//! a snapshot starts with its watermark AT its current revision.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -198,9 +200,11 @@ pub struct ResourceCatalog {
     pub current_revision: Revision,
     /// Bounded history ring — the watch-replay source.
     pub history: VecDeque<Change>,
-    /// Lowest revision still retained in `history`. Reads / watches
-    /// below this return [`CompactedTooOld`]. `Revision(0)` means
-    /// nothing has been compacted yet.
+    /// The compaction floor: every change with a revision above it is
+    /// in `history`. Reads / watches below this return
+    /// [`CompactedTooOld`]. `Revision(0)` means nothing has been
+    /// compacted yet. A catalog loaded from disk or a snapshot starts
+    /// with an empty ring, so its floor starts at `current_revision`.
     pub compacted_revision: Revision,
     /// Max entries retained in `history` before the oldest is evicted
     /// (advancing `compacted_revision`).
@@ -274,9 +278,12 @@ impl PartialEq for ResourceCatalog {
 //
 // The history ring is intentionally NOT serialized: it is a local
 // watch-replay buffer rebuilt by re-applying the log, not part of
-// the converged durable state. Persisting `current_revision` +
-// `compacted_revision` keeps the contract honest across snapshot /
-// restart.
+// the converged durable state. `compacted_revision` is still WRITTEN,
+// byte for byte as before, so a blob stays readable by a previous
+// release and a replayed log still produces the recorded catalog
+// bytes (T3.1 case 5). It is NOT trusted on the way back in: see the
+// Deserialize impl below for why the floor on load is
+// `current_revision`.
 impl Serialize for ResourceCatalog {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -301,17 +308,34 @@ impl<'de> Deserialize<'de> for ResourceCatalog {
             last_applied_index: u64,
             #[serde(default)]
             current_revision: Revision,
-            #[serde(default)]
-            compacted_revision: Revision,
+            /// The floor the WRITER held. Still decoded — so the set of
+            /// blobs this reader accepts is exactly what it was — and then
+            /// deliberately dropped: it described a ring that did not
+            /// survive the trip to disk.
+            #[serde(default, rename = "compacted_revision")]
+            _stale_floor: Revision,
         }
         let h = Helper::deserialize(de)?;
+        // ★ THE FLOOR ON LOAD IS THE CURRENT REVISION (T3.3).
+        //
+        // The floor promises "every change above me is in the ring".
+        // The ring is not serialized, so a catalog that comes back from
+        // disk or from a snapshot holds NO history at all, and the only
+        // floor that promise is true of is `current_revision`. Keeping
+        // the writer's floor instead is how a restarted store answered
+        // `changes_since(0)` with `Ok(<only the changes replayed after
+        // the blob>)`: a client resumed into a strict subset of what
+        // happened and believed itself caught up. With the floor here,
+        // every resume point below the load revision is an honest
+        // `CompactedTooOld` (a 410: relist), and every change applied
+        // after the load lands in the ring above the floor.
         Ok(Self {
             resources: h.resources.into_iter().collect(),
             last_applied_term: h.last_applied_term,
             last_applied_index: h.last_applied_index,
             current_revision: h.current_revision,
             history: VecDeque::new(),
-            compacted_revision: h.compacted_revision,
+            compacted_revision: h.current_revision,
             history_capacity: DEFAULT_HISTORY_CAPACITY,
             patch_env: default_patch_env(),
         })
@@ -1153,8 +1177,9 @@ impl ResourceCatalog {
         self.current_revision
     }
 
-    /// The compaction watermark — the lowest revision still
-    /// retained in the history ring.
+    /// The compaction watermark: every change above it is retained in
+    /// the history ring. A catalog loaded from disk or a snapshot
+    /// starts with this equal to [`Self::revision`].
     #[must_use]
     pub fn compacted_revision(&self) -> Revision {
         self.compacted_revision
@@ -1881,7 +1906,9 @@ mod tests {
     fn catalog_serde_carries_revision_state() {
         // Locks item-1's serde contract independent of fjall: the
         // catalog's hand-written Serialize/Deserialize round-trips
-        // current_revision + compacted_revision + per-key VersionMeta.
+        // current_revision + per-key VersionMeta, and puts the
+        // compaction floor at current_revision on the way back in (the
+        // ring does not survive serde, so no lower floor is true — T3.3).
         // This is exactly the durable state the fjall `catalog`
         // partition persists — proving the contract here means the
         // backend gets revision survival for free.
@@ -1918,8 +1945,9 @@ mod tests {
         );
         assert_eq!(
             back.compacted_revision,
-            Revision(5),
-            "compacted_revision survives serde"
+            Revision(7),
+            "the floor on load is the current revision, not the writer's floor of 5: \
+             the ring that backed revisions 6 and 7 did not survive serde"
         );
         let (_, meta_after) = back.get_with_meta(&k).unwrap();
         assert_eq!(
@@ -1929,6 +1957,156 @@ mod tests {
         // History is deliberately not persisted (rebuilt by replay).
         assert!(back.history.is_empty());
         assert_eq!(back.history_capacity, DEFAULT_HISTORY_CAPACITY);
+    }
+
+    /// Round-trip `cat` through its disk form.
+    fn rehydrate(cat: &ResourceCatalog) -> ResourceCatalog {
+        let bytes = serde_json::to_vec(cat).expect("serialize the catalog");
+        serde_json::from_slice(&bytes).expect("deserialize the catalog")
+    }
+
+    /// T3.3: the ring does not survive the trip to disk, so a rehydrated
+    /// catalog must refuse every resume point below its load revision.
+    /// Answering from the empty ring instead would tell a client that
+    /// nothing happened between its resume point and now.
+    #[test]
+    fn a_rehydrated_catalog_refuses_every_resume_point_below_its_load_revision() {
+        // Default capacity: nothing is evicted, so the WRITER's floor is 0.
+        let mut cat = ResourceCatalog::default();
+        for i in 1..=5u64 {
+            put(
+                &mut cat,
+                &pod_key(&format!("p{i}")),
+                serde_json::json!({"i": i}),
+                i,
+            );
+        }
+        assert_eq!(cat.compacted_revision(), Revision::ZERO);
+        assert_eq!(cat.changes_since(Revision::ZERO).map(|c| c.len()), Ok(5));
+
+        let back = rehydrate(&cat);
+        assert_eq!(back.revision(), Revision(5));
+        assert_eq!(back.compacted_revision(), Revision(5));
+        for from in 0..5u64 {
+            let gone = CompactedTooOld {
+                requested: Revision(from),
+                compacted: Revision(5),
+            };
+            assert_eq!(
+                back.changes_since(Revision(from)),
+                Err(gone),
+                "changes_since({from}) after a load must be a 410, not a replay from an empty ring"
+            );
+            assert_eq!(
+                back.state_at(Revision(from)).err(),
+                Some(gone),
+                "state_at({from}) after a load must be refused, not answered with today's state"
+            );
+        }
+        // Resuming from exactly the load revision is honoured, with
+        // nothing to replay, and a read AT it is the loaded state.
+        assert_eq!(back.changes_since(Revision(5)), Ok(Vec::new()));
+        let at_load = back
+            .state_at(Revision(5))
+            .expect("a read at the load revision");
+        assert_eq!(at_load.len(), 5);
+        assert!(at_load.values().all(|e| e.fidelity == MetaFidelity::Exact));
+    }
+
+    /// T3.3: the floor on load does not freeze history — every change
+    /// applied after the load is replayable from the load revision on.
+    #[test]
+    fn changes_after_a_load_replay_from_the_load_revision() {
+        let mut cat = ResourceCatalog::default();
+        for i in 1..=3u64 {
+            put(
+                &mut cat,
+                &pod_key(&format!("p{i}")),
+                serde_json::json!({"i": i}),
+                i,
+            );
+        }
+        let mut back = rehydrate(&cat);
+        put(&mut back, &pod_key("p4"), serde_json::json!({"i": 4}), 4); // rev 4
+        put(&mut back, &pod_key("p1"), serde_json::json!({"i": 10}), 5); // rev 5
+
+        let revs: Vec<u64> = back
+            .changes_since(Revision(3))
+            .expect("resume from the load revision")
+            .iter()
+            .map(|c| c.revision.get())
+            .collect();
+        assert_eq!(revs, vec![4, 5], "every change since the load, in order");
+        assert!(
+            back.changes_since(Revision(2)).is_err(),
+            "below the load revision stays refused after new writes"
+        );
+        let at_4 = back.state_at(Revision(4)).expect("a read inside the ring");
+        assert_eq!(
+            at_4.get(&pod_key("p1")).and_then(|e| e.value.get("i")),
+            Some(&serde_json::json!(1)),
+            "a read at revision 4 undoes the rev-5 write"
+        );
+        assert!(at_4.contains_key(&pod_key("p4")));
+    }
+
+    /// T3.3 against real bytes: a catalog blob written by release
+    /// v0.53.118 carries `current_revision: 57, compacted_revision: 0`.
+    /// It still decodes, and its stale floor is not believed.
+    #[test]
+    fn a_released_blob_with_a_stale_floor_loads_with_its_floor_at_its_revision() {
+        let blob = include_bytes!("../tests/fixtures/replay/v0.53.118/catalog.json");
+        let raw: serde_json::Value = serde_json::from_slice(blob).expect("the fixture is JSON");
+        assert_eq!(
+            (
+                raw["current_revision"].as_u64(),
+                raw["compacted_revision"].as_u64()
+            ),
+            (Some(57), Some(0)),
+            "FIXTURE PRECONDITION: the released blob carries a floor below its revision"
+        );
+
+        let cat: ResourceCatalog = serde_json::from_slice(blob).expect("a released blob loads");
+        assert_eq!(cat.revision(), Revision(57));
+        assert_eq!(cat.compacted_revision(), Revision(57));
+        assert!(cat.changes_since(Revision::ZERO).is_err());
+        assert_eq!(cat.changes_since(Revision(57)), Ok(Vec::new()));
+    }
+
+    /// T3.3: whatever floor the blob names — none at all (a pre-floor
+    /// blob), one below the revision, or one above it — the loaded floor
+    /// is the loaded revision.
+    #[test]
+    fn the_floor_on_load_ignores_whatever_floor_the_blob_names() {
+        let mut cat = ResourceCatalog::default();
+        for i in 1..=4u64 {
+            put(
+                &mut cat,
+                &pod_key(&format!("p{i}")),
+                serde_json::json!({"i": i}),
+                i,
+            );
+        }
+        let disk = serde_json::to_value(&cat).expect("serialize the catalog");
+        let named: [Option<u64>; 4] = [None, Some(0), Some(2), Some(99)];
+        for floor in named {
+            let mut blob = disk.clone();
+            let obj = blob.as_object_mut().expect("the catalog is a JSON object");
+            match floor {
+                None => {
+                    obj.remove("compacted_revision");
+                }
+                Some(f) => {
+                    obj.insert("compacted_revision".into(), serde_json::json!(f));
+                }
+            }
+            let back: ResourceCatalog = serde_json::from_value(blob).expect("the blob loads");
+            assert_eq!(
+                back.compacted_revision(),
+                Revision(4),
+                "a blob naming floor {floor:?} must load with its floor at its revision"
+            );
+        }
     }
 
     /// Read `metadata.generation` off the live stored object.

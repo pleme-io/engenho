@@ -39,7 +39,8 @@
 //! that introduced them and are `#[ignore]`d with the id of the item that turns
 //! each green; that item un-ignores it. Cases 3 and 5 are green and run always;
 //! case 4 went green with T2.9-store (`terminate` flushes last) and 4b came
-//! with it.
+//! with it; case 1 went green with T3.3 (the floor on load is the current
+//! revision).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -288,8 +289,6 @@ async fn assert_no_partial_replay(mesh: &StoreMesh, head: u64) {
 /// window, then the process is gone. The catalog blob holds the first write
 /// only; the next boot replays the other three from the log.
 #[test]
-#[ignore = "red until T3.3 (the floor on load equals the current revision): after the reopen, \
-            watch_from(0) returns Ok with a strict subset instead of CompactedTooOld"]
 fn case1_drop_mid_persist_window_keeps_every_ack_and_never_replays_a_subset() {
     let (_tmp, dir) = store_dir();
     let acks = lifetime(commit_to_durable_log(&dir, &names("c1", 4)));
