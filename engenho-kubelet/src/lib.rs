@@ -46,6 +46,7 @@ pub mod config_bridge;
 pub mod cri;
 pub mod cri_backend;
 pub mod csi_materializer;
+mod env_ref;
 pub mod error;
 pub mod exec_channel;
 pub mod exec_session;
@@ -76,7 +77,7 @@ pub mod volume;
 
 pub use backend::{
     ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeExecFault, FakeNetProber,
-    HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage,
+    HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage, ProbeUrl,
     PullPolicy, Readoption, TcpProbeTarget, TerminationGrace, TokioNetProber,
 };
 pub use config_bridge::{
@@ -89,7 +90,8 @@ pub use csi_materializer::{
 pub use error::KubeletError;
 pub use kubelet::{Kubelet, SaRefreshReport, TestClock};
 pub use lifecycle::{
-    ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
+    ContainerObservation, ContainerState, ContainerStatusOut, DownAction, RestartPolicy,
+    RunningAction, down_action, reconcile_pod_phase, running_action, starts_fresh,
 };
 pub use pod_volume::{
     BindSource, FakeVolumeMaterializer, MaterializedDir, MountSource, NoServiceAccountProjection,
@@ -98,9 +100,11 @@ pub use pod_volume::{
     resolve_pod_volumes, teardown_obligation,
 };
 pub use probe::{
-    BlindCause, BlindNotice, BlindStreak, HttpScheme, ProbeHandler, ProbeKind, ProbeObservation,
-    ProbeParseError, ProbePort, ProbeRuntime, ProbeSpec, ProbeTiming, ProbeTrip, ProbeVerdict,
-    TripKind, aggregate_container_readiness, fold_probe_observation, run_handler,
+    BlindCause, BlindNotice, BlindStreak, ContainerProbes, HttpScheme, PodLifecycle, ProbeHandler,
+    ProbeKind, ProbeObservation, ProbeParseError, ProbePort, ProbeRuntime, ProbeSpec, ProbeTarget,
+    ProbeTick, ProbeTiming, ProbeTrip, ProbeVerdict, TripKind, UnresolvablePort,
+    aggregate_container_readiness, container_started, fold_probe_observation,
+    http_status_observation, run_handler,
 };
 pub use volume::{
     AccessMode, FakeVolumeBackend, FakeVolumeEvent, HostPathVolumeBackend, MountedVolume,

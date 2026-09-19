@@ -303,6 +303,59 @@ async fn liveness_failure_does_not_restart_under_never() {
     teardown(store, kubelet).await;
 }
 
+// ── 3b — …but a failed liveness probe still STOPS it under Never ──────────
+
+/// Upstream's `computePodActions` (oracle row `actions/liveness failure under
+/// Never: kill, do not restart`): a failed liveness probe kills the container
+/// under EVERY policy, and `Never` only means it is not started again. It used
+/// to be left running under `Never`, failing its probe, with the pod reported
+/// Running for as long as the process lived.
+#[tokio::test]
+async fn a_failed_liveness_probe_stops_the_container_under_never() {
+    use engenho_kubelet::backend::FakeEvent;
+    let store = boot_store("probes-liveness-never-kill").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "livenessProbe": {
+            "exec": { "command": ["false"] },
+            "periodSeconds": 1,
+            "failureThreshold": 1
+        }
+    });
+    put_pod_container(&store, "p1", container, "Never").await;
+    backend.set_default_exec(ExecOutcome::failure(1)).await;
+
+    kubelet.tick().await.unwrap();
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+    let events = backend.events().await;
+    assert!(
+        events.iter().any(|e| matches!(e, FakeEvent::Stop(_))),
+        "the container that failed its liveness probe was stopped: {events:?}"
+    );
+    assert_eq!(count_starts(&events), 1, "and not started again");
+    let pod = store.get(&pod_key("p1")).await.expect("pod present");
+    assert!(
+        matches!(
+            pod.pointer("/status/phase").and_then(Value::as_str),
+            Some("Succeeded" | "Failed")
+        ),
+        "a Never pod whose container was stopped ends terminal, not Running: {pod}"
+    );
+
+    teardown(store, kubelet).await;
+}
+
 // ── 4 — STARTUP gates liveness (no premature restart) ─────────────────────
 
 #[tokio::test]
@@ -445,6 +498,88 @@ async fn probe_pod_arms_a_requeue() {
         }
         ReconcileResult::Done => panic!("a probe-bearing pod must arm a Requeue"),
     }
+
+    teardown(store, kubelet).await;
+}
+
+// ── 6b — The requeue IS the kubelet's probe clock (I26) ───────────────────
+//
+// The kubelet schedules no timer of its own: a tick returns
+// `Requeue(soonest due)`, clamped to the 1 s floor, and the WatchDriver's
+// one requeue slot re-ticks it then. These two pin what that return value
+// is, which is the whole of the kubelet's side of the contract.
+
+/// A readiness exec probe on `period` seconds.
+fn probed(period: u64) -> Value {
+    json!({
+        "name": "main",
+        "image": "busybox",
+        "readinessProbe": {
+            "exec": { "command": ["true"] },
+            "periodSeconds": period
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_probe_due_sooner_than_the_floor_requeues_at_the_floor() {
+    let store = boot_store("probes-requeue-floor").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+    put_pod_container(&store, "p1", probed(5), "Always").await;
+    backend.set_default_exec(ExecOutcome::success()).await;
+
+    // The probe runs on the first tick, so it is next due a full period on.
+    let first = kubelet.tick().await.unwrap();
+    assert_eq!(
+        first.result,
+        ReconcileResult::Requeue(Duration::from_secs(5))
+    );
+
+    // 4.5 s later the probe is due in 0.5 s: the kubelet asks for the 1 s
+    // floor, never less.
+    clock.advance(Duration::from_millis(4500));
+    let second = kubelet.tick().await.unwrap();
+    assert_eq!(
+        second.result,
+        ReconcileResult::Requeue(Duration::from_secs(1)),
+        "a probe due in 0.5 s is requeued at the 1 s floor"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+#[tokio::test]
+async fn the_requeue_is_the_soonest_probe_due_across_pods() {
+    let store = boot_store("probes-requeue-soonest").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+    put_pod_container(&store, "slow", probed(10), "Always").await;
+    put_pod_container(&store, "fast", probed(3), "Always").await;
+    backend.set_default_exec(ExecOutcome::success()).await;
+
+    let first = kubelet.tick().await.unwrap();
+    assert_eq!(
+        first.result,
+        ReconcileResult::Requeue(Duration::from_secs(3)),
+        "one requeue, at the sooner of a 3 s and a 10 s probe"
+    );
+
+    // 1.5 s on: the 3 s probe is due in 1.5 s, the 10 s one in 8.5 s.
+    clock.advance(Duration::from_millis(1500));
+    let second = kubelet.tick().await.unwrap();
+    assert_eq!(
+        second.result,
+        ReconcileResult::Requeue(Duration::from_millis(1500))
+    );
 
     teardown(store, kubelet).await;
 }
@@ -704,6 +839,377 @@ async fn a_liveness_probe_the_runtime_cannot_run_never_restarts_and_says_so() {
         condition_status(&pod, "ProbeBlind").as_deref(),
         Some("False"),
         "seeing again resolves the condition rather than deleting it: {pod}"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── 12 — a port that does not resolve runs the pod; the probe stays put ──
+//
+// Upstream admits a probe naming a port the container does not declare
+// (validation checks only the name's syntax) and runs the pod; its prober
+// fails to resolve the port on every run and throws the run away, so the probe
+// stays at its initial value: liveness never restarts, readiness never Ready.
+// engenho used to refuse the whole pod at parse — it never started.
+
+#[tokio::test]
+async fn a_probe_whose_port_does_not_resolve_runs_the_pod_and_holds_the_probe() {
+    use engenho_controllers::event_recorder::{CollectingEventSink, Reason as EventReason};
+
+    let store = boot_store("probes-unresolvable-port").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    // The workload would pass if it were asked: nothing here may be a Failure.
+    net.set_default_http(200).await;
+    net.set_default_tcp(true).await;
+    let clock = TestClock::new();
+    let events = Arc::new(CollectingEventSink::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock())
+        .with_event_sink(events.clone());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "ports": [{ "name": "metrics", "containerPort": 9090 }],
+        "readinessProbe": {
+            "httpGet": { "path": "/healthz", "port": "http" },
+            "periodSeconds": 1,
+            "failureThreshold": 3
+        },
+        "livenessProbe": {
+            "tcpSocket": { "port": "http" },
+            "periodSeconds": 1,
+            "failureThreshold": 1
+        }
+    });
+    put_pod_container(&store, "p1", container, "Always").await;
+
+    kubelet.tick().await.unwrap();
+    for _ in 0..10 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "the pod runs, and a liveness probe that never resolved never restarts it"
+    );
+    assert_eq!(restart_count(&pod, 0), Some(0));
+    assert_eq!(pod["status"]["phase"], "Running", "{pod}");
+    assert_eq!(
+        container_ready(&pod, 0),
+        Some(false),
+        "readiness stays at its initial value: not ready"
+    );
+    let blind = pod["status"]["conditions"]
+        .as_array()
+        .and_then(|cs| cs.iter().find(|c| c["type"] == "ProbeBlind"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(blind["status"], "True", "{pod}");
+    assert_eq!(blind["reason"], "UnresolvablePort", "{pod}");
+    let warnings: Vec<String> = events
+        .drain()
+        .into_iter()
+        .filter(|e| e.reason == EventReason::Unhealthy)
+        .map(|e| e.message)
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "one Warning per probe, not one per period: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|w| w.contains("does not resolve to a port of the container")),
+        "{warnings:?}"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── 13 — a startup probe that passed is never run again ───────────────────
+//
+// Upstream skips the startup probe once the container has started
+// (worker.go:283-294, and the worker holds after its first verdict). engenho
+// kept running it, so an endpoint that later failed `failureThreshold` times
+// restarted a container that had started long ago.
+
+/// Tick until the pod reports `Ready=True` or `ticks` run out.
+async fn tick_until_ready(
+    kubelet: &Kubelet,
+    store: &StoreMesh,
+    clock: &TestClock,
+    ticks: usize,
+) -> bool {
+    for _ in 0..ticks {
+        kubelet.tick().await.unwrap();
+        let pod = store.get(&pod_key("p1")).await.unwrap();
+        if condition_status(&pod, "Ready").as_deref() == Some("True") {
+            return true;
+        }
+        clock.advance(Duration::from_millis(1100));
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_startup_probe_that_passed_is_never_run_again() {
+    let store = boot_store("probes-startup-once").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "startupProbe": {
+            "httpGet": { "path": "/started", "port": 8080 },
+            "periodSeconds": 1,
+            "failureThreshold": 2
+        }
+    });
+    put_pod_container(&store, "p1", container, "Always").await;
+    // Passes once, then the endpoint fails for good (the fake's default 503).
+    net.seed_http("10.42.0.1", 8080, "/started", [200]).await;
+
+    assert!(
+        tick_until_ready(&kubelet, &store, &clock, 6).await,
+        "the startup probe passes, so the container starts and is Ready"
+    );
+    for _ in 0..6 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "a started container is not restarted by its startup probe: {pod}"
+    );
+    assert_eq!(restart_count(&pod, 0), Some(0));
+    assert_eq!(condition_status(&pod, "Ready").as_deref(), Some("True"));
+
+    teardown(store, kubelet).await;
+}
+
+// ── 14 — liveness banks no failures during the startup window ────────────
+//
+// Upstream does not run liveness until the container has started. engenho ran
+// it and only filtered the restart, so failures counted during the window
+// tripped liveness on its first run after it — before `failureThreshold`
+// failures of a STARTED container had been observed.
+
+#[tokio::test]
+async fn liveness_banks_no_failures_during_the_startup_window() {
+    let store = boot_store("probes-startup-bank").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "startupProbe": {
+            "httpGet": { "path": "/started", "port": 8080 },
+            "periodSeconds": 1,
+            "failureThreshold": 10
+        },
+        "livenessProbe": {
+            "exec": { "command": ["sh", "-c", "test -f /tmp/alive"] },
+            "periodSeconds": 1,
+            "failureThreshold": 3
+        }
+    });
+    put_pod_container(&store, "p1", container, "Always").await;
+    // Startup fails three times, then passes. Liveness fails throughout.
+    net.seed_http("10.42.0.1", 8080, "/started", [503, 503, 503, 200])
+        .await;
+    backend.set_default_exec(ExecOutcome::failure(1)).await;
+
+    let started = tick_until_ready(&kubelet, &store, &clock, 8).await;
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert!(started, "the startup probe passes on its fourth run: {pod}");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "one liveness failure after start is below failureThreshold 3: {pod}"
+    );
+
+    // Control: three failures observed AFTER start do restart it.
+    for _ in 0..2 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "the third post-start liveness failure restarts the container"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── 15 — a pod being deleted is not restarted by its liveness probe ──────
+//
+// Upstream's worker (worker.go:265-276): once the pod has a
+// deletionTimestamp, liveness and startup are set to Success and stop, so a
+// pod on its way out is never restarted by a probe. engenho read no
+// deletionTimestamp at all, so a finalizer-held Terminating pod could be
+// liveness-restarted while it waited to go.
+
+/// Put a single-container pod that a finalizer holds once it is deleted.
+async fn put_held_pod(store: &StoreMesh, name: &str, container: Value) {
+    let value = json!({
+        "kind": "Pod",
+        "apiVersion": "v1",
+        "metadata": { "name": name, "finalizers": ["example.com/hold"] },
+        "spec": {
+            "nodeName": "node-A",
+            "restartPolicy": "Always",
+            "containers": [container]
+        }
+    });
+    store
+        .propose(ResourceCommand::Put {
+            key: pod_key(name),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await
+        .unwrap();
+}
+
+/// Delete a pod through the store's own delete, which stamps
+/// `metadata.deletionTimestamp` on a finalizer-held pod and leaves it.
+async fn delete_held_pod(store: &StoreMesh, name: &str) {
+    store
+        .propose(ResourceCommand::delete(pod_key(name), Reason::Operator))
+        .await
+        .unwrap();
+    let pod = store.get(&pod_key(name)).await.unwrap();
+    assert!(
+        pod.pointer("/metadata/deletionTimestamp").is_some(),
+        "the finalizer holds the pod Terminating: {pod}"
+    );
+}
+
+#[tokio::test]
+async fn a_pod_being_deleted_is_not_restarted_by_its_liveness_probe() {
+    let store = boot_store("probes-deleting-liveness").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "livenessProbe": {
+            "exec": { "command": ["sh", "-c", "test -f /tmp/alive"] },
+            "periodSeconds": 1,
+            "failureThreshold": 2
+        }
+    });
+    // Two identical pods; only `gone` is deleted. `kept` is the control: the
+    // same failing probe does restart a pod that is not being deleted.
+    put_held_pod(&store, "gone", container.clone()).await;
+    put_held_pod(&store, "kept", container).await;
+    backend.set_default_exec(ExecOutcome::failure(1)).await;
+
+    // Start both, and bank one failure each (threshold 2).
+    kubelet.tick().await.unwrap();
+    delete_held_pod(&store, "gone").await;
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+
+    let gone = store.get(&pod_key("gone")).await.unwrap();
+    let kept = store.get(&pod_key("kept")).await.unwrap();
+    assert_eq!(
+        restart_count(&gone, 0),
+        Some(0),
+        "a Terminating pod is not restarted by its liveness probe: {gone}"
+    );
+    assert!(
+        restart_count(&kept, 0).unwrap_or(0) >= 1,
+        "control: the same probe restarts a pod that is not being deleted: {kept}"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── 16 — a pod being deleted reads as started; readiness keeps deciding ──
+//
+// Upstream sets a Terminating pod's startup result to Success, so a container
+// still in its startup window counts as started and its readiness probe runs.
+
+#[tokio::test]
+async fn a_pod_being_deleted_reads_as_started_and_readiness_keeps_probing() {
+    let store = boot_store("probes-deleting-startup").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        // Never passes: the fake answers 503 by default.
+        "startupProbe": {
+            "httpGet": { "path": "/started", "port": 8080 },
+            "periodSeconds": 1,
+            "failureThreshold": 30
+        },
+        "readinessProbe": {
+            "exec": { "command": ["sh", "-c", "true"] },
+            "periodSeconds": 1
+        }
+    });
+    put_held_pod(&store, "p1", container).await;
+    backend.set_default_exec(ExecOutcome::success()).await;
+
+    kubelet.tick().await.unwrap();
+    clock.advance(Duration::from_millis(1100));
+    kubelet.tick().await.unwrap();
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        container_ready(&pod, 0),
+        Some(false),
+        "before the delete, the startup window holds readiness off: {pod}"
+    );
+
+    delete_held_pod(&store, "p1").await;
+    clock.advance(Duration::from_millis(1100));
+    kubelet.tick().await.unwrap();
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        container_ready(&pod, 0),
+        Some(true),
+        "once deleting, the container reads as started and readiness runs: {pod}"
+    );
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "nothing restarted"
     );
 
     teardown(store, kubelet).await;

@@ -42,7 +42,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use engenho_controllers::{
-    Controller, ControllerError, ReconcileOutcome, ReconcileReport, ReconcileResult,
+    Controller, ControllerError, Effect, ObjectOutcome, ReconcileOutcome, ReconcileReport,
+    ReconcileResult, Sweep,
     dns::DEFAULT_CLUSTER_DOMAIN,
     selector::{matches_labels, service_selector},
     status::{resource_version_of, write_status_cas},
@@ -58,13 +59,14 @@ use crate::lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, LostPod, RestartPolicy, StartedAs,
     StoredContainer, StoredRun, Termination, reconcile_pod_phase,
 };
+use crate::lifecycle::{DownAction, DownOutcome, RunningAction};
 use crate::pod_volume::{
     MountSource, PodVolumeSource, PodmanVolumeMaterializer, VolumeMaterializer, VolumeResolveError,
     VolumeTeardown, container_mounts, pod_volumes, teardown_obligation, teardowns_of,
 };
 use crate::probe::{
-    BlindCause, BlindNotice, ProbeKind, ProbeRuntime, ProbeSpec, ProbeTrip,
-    aggregate_container_readiness, fold_probe_observation, run_handler,
+    BlindCause, BlindNotice, ContainerProbes, PodLifecycle, ProbeHandler, ProbeKind, ProbeRuntime,
+    ProbeSpec, ProbeTarget, ProbeTick,
 };
 
 /// The pod condition the kubelet raises while a probe has been BLIND — unable
@@ -100,68 +102,10 @@ struct ProbeBlindCondition {
 /// service it. Mirrors the K8s min period.
 const MIN_PROBE_REQUEUE: Duration = Duration::from_secs(1);
 
-/// The three probes (liveness/readiness/startup) a container may carry, each
-/// paired with its persistent [`ProbeRuntime`] counters. Lives on the
-/// per-container [`ContainerRecord`] so the counters persist across ticks (like
-/// `restart_count`) + reset on a container restart (fresh startup window).
-///
-/// `None` for a probe the container doesn't declare. An all-`None`
-/// `ContainerProbeState` is the behavior-preserving common case: no probe ⇒
-/// `aggregate_container_readiness` returns `ready = is_running`, byte-identical
-/// to the pre-probe kubelet.
-#[derive(Clone, Debug, Default)]
-struct ContainerProbeState {
-    liveness: Option<(ProbeSpec, ProbeRuntime)>,
-    readiness: Option<(ProbeSpec, ProbeRuntime)>,
-    startup: Option<(ProbeSpec, ProbeRuntime)>,
-}
-
-impl ContainerProbeState {
-    /// `true` iff the container declares NO probes (the behavior-preserving
-    /// common case — no requeue armed, ready mirrors is_running).
-    fn is_empty(&self) -> bool {
-        self.liveness.is_none() && self.readiness.is_none() && self.startup.is_none()
-    }
-
-    /// Reset all probe runtimes to a fresh window (called on a container
-    /// restart so the startup gate re-arms + counters zero). Preserves the
-    /// parsed specs.
-    fn reset(&mut self, now: Instant) {
-        for (_, rt) in [&mut self.liveness, &mut self.readiness, &mut self.startup]
-            .into_iter()
-            .flatten()
-        {
-            *rt = ProbeRuntime::new(now);
-        }
-    }
-
-    /// The first probe (startup, readiness, liveness — a fixed order, so the
-    /// condition it feeds renders the same on every tick) that has been blind
-    /// for at least its own `failureThreshold` runs.
-    fn sustained_blindness(&self) -> Option<(ProbeKind, BlindCause)> {
-        [&self.startup, &self.readiness, &self.liveness]
-            .into_iter()
-            .flatten()
-            .find_map(|(spec, rt)| rt.sustained_blindness(spec).map(|c| (spec.kind, c)))
-    }
-}
-
-/// The aggregated probe decision for one running container this tick: its
-/// effective readiness, whether a liveness/startup verdict requests a restart,
-/// and what the probes could not see.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ProbeOutcome {
-    /// The container's effective `ready` (→ `containerStatuses[].ready`).
-    ready: bool,
-    /// `Some` iff a liveness/startup probe OBSERVED failures past its
-    /// threshold (post-gating). A blind probe cannot produce one: see
-    /// [`ProbeTrip`].
-    trip: Option<ProbeTrip>,
-    /// Probes that went blind THIS tick — one Warning each.
-    entered_blind: Vec<(ProbeKind, BlindCause)>,
-    /// A probe blind for at least its `failureThreshold` runs, if any.
-    sustained_blind: Option<(ProbeKind, BlindCause)>,
-}
+/// The name this kubelet signs its Events with (upstream's
+/// `source.component`), shared by [`Kubelet::emit`] and the per-pod
+/// [`Sweep`] so a pod's events never come from two spellings of one source.
+const KUBELET_COMPONENT: &str = "kubelet";
 
 /// One status poll of a container the kubelet started, split the only two
 /// ways the kubelet acts on it.
@@ -418,6 +362,23 @@ impl std::fmt::Display for BackOffRestarting<'_> {
     }
 }
 
+/// The event text for a running container stopped because its liveness or
+/// startup probe failed, and that will not be started again.
+struct KilledOnProbe<'a> {
+    container: &'a str,
+    trip: crate::probe::ProbeTrip,
+}
+
+impl std::fmt::Display for KilledOnProbe<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Stopping container {}: {}; it will not be restarted",
+            self.container, self.trip
+        )
+    }
+}
+
 /// The event text for a container the start path brought up, by how it
 /// relates to the run the stored status recorded ([`StartedAs`]).
 struct StartedEvent<'a> {
@@ -469,11 +430,14 @@ struct ContainerRecord {
     restart_count: u32,
     /// Per-container probe specs + runtime counters (liveness/readiness/
     /// startup). Default = all-None = no probes = behavior-preserving.
-    probes: ContainerProbeState,
-    /// When this container was (re)started. Feeds `uptime_before_exit`, which
-    /// is what lets a container that stayed up long enough earn a clean slate
-    /// instead of inheriting an old crash's penalty.
-    started_at: Option<Instant>,
+    probes: ContainerProbes,
+    /// The container's crash-loop penalty: `None` until its first restart
+    /// after an exit, then upstream's backoff entry, advanced by each
+    /// exit-driven restart and wiped by a run longer than
+    /// [`crate::backoff::RESET_AFTER`]. It is NOT derived from
+    /// `restart_count`, which never goes down — see
+    /// [`crate::backoff::CrashBackoff`].
+    crash_backoff: Option<crate::backoff::CrashBackoff>,
     /// The resolved volume mounts this container was STARTED with.
     ///
     /// ── ★ WHY THE RECORD REMEMBERS THEM ──────────────────────────────
@@ -497,14 +461,43 @@ struct ContainerRecord {
     /// backing directories outlive the container, and re-projecting here
     /// would change that documented semantic.
     mounts: Vec<crate::pod_volume::ResolvedMount>,
-    /// When the kubelet FIRST observed this container terminated. `None`
-    /// while it is running.
+    /// What the kubelet has seen of this run being down. `None` while it
+    /// is running. See [`SeenDown`].
+    down: Option<SeenDown>,
+}
+
+/// A run the kubelet has polled down: when it first saw that, and how the
+/// run ended as far as any poll of it has said.
+#[derive(Clone, Copy, Debug)]
+struct SeenDown {
+    /// The FIRST tick that saw it down.
     ///
     /// ★ FIRST observation, not most recent: the backoff clock must run from
     /// the exit, and re-stamping it every tick would reset the wait on every
     /// poll — a hold that never elapses, which is a hang wearing a
     /// CrashLoopBackOff label.
-    terminated_at: Option<Instant>,
+    at: Instant,
+    /// How it ended, folded across every poll of this run by
+    /// [`Termination::known_after`]: an exit once observed is not turned into
+    /// an unobserved one by a later poll that can no longer say (the runtime
+    /// removed the container, or reports it UNKNOWN).
+    exit: Termination,
+}
+
+impl SeenDown {
+    /// Fold this tick's poll into what the record already knew.
+    fn fold(earlier: Option<Self>, polled: Termination, now: Instant) -> Self {
+        match earlier {
+            None => Self {
+                at: now,
+                exit: polled,
+            },
+            Some(seen) => Self {
+                at: seen.at,
+                exit: Termination::known_after(Some(seen.exit), polled),
+            },
+        }
+    }
 }
 
 /// What the kubelet remembers about a Pod it started on this node.
@@ -548,9 +541,10 @@ struct LocalPod {
     /// then the next once the prior Succeeds). Empty for a pod with no init
     /// containers (the common case) — that pod's `init_complete` is true from
     /// the first reconcile and the app-start path runs identically to before
-    /// the init-container brick. Init containers do NOT carry probes (K8s does
-    /// not run liveness/readiness/startup on init containers), so each
-    /// [`ContainerRecord::probes`] stays default (all-None).
+    /// the init-container brick. Init containers carry no probes here, so
+    /// each [`ContainerRecord::probes`] stays default (all-None). Upstream
+    /// runs none on a classic init container, but does probe a native sidecar
+    /// (`restartPolicy: Always`); engenho does not yet — a gap, not a design.
     init_containers: BTreeMap<String, ContainerRecord>,
     /// `true` once every init container has Succeeded (or the pod declares no
     /// init containers). Latched: once the init sequence is `Complete`, app
@@ -570,10 +564,76 @@ struct LocalPod {
     volume_teardowns: BTreeSet<VolumeTeardown>,
 }
 
+impl LocalPod {
+    /// The app-container records.
+    fn apps(&mut self) -> &mut BTreeMap<String, ContainerRecord> {
+        &mut self.containers
+    }
+
+    /// The init-container records.
+    fn inits(&mut self) -> &mut BTreeMap<String, ContainerRecord> {
+        &mut self.init_containers
+    }
+}
+
 /// The volume name the kubelet materializes a pod's `ServiceAccount`
 /// projection under — one name at the start path, the token refresh and the
 /// teardown, so the three cannot disagree about which directory is whose.
 const SA_PROJECTION_VOLUME: &str = "kube-api-access";
+
+/// Why a pod could not be given its `ServiceAccount` credentials.
+///
+/// The pod is held `Pending` with every container `Waiting` on
+/// [`pending_reason`](Self::pending_reason), and the Display is the Warning
+/// Event on the pod — worded as upstream words the same failure of its
+/// projected `kube-api-access-*` volume, since that is the volume this is.
+#[derive(Debug)]
+enum SaProjectionFailed {
+    /// The projector could not mint the token.
+    Mint {
+        service_account: String,
+        cause: String,
+    },
+    /// The minted credentials could not be written where the pod mounts
+    /// them.
+    Write {
+        service_account: String,
+        cause: VolumeResolveError,
+    },
+}
+
+impl SaProjectionFailed {
+    /// The `waiting.reason` every container of the held pod carries.
+    fn pending_reason(&self) -> &'static str {
+        match self {
+            Self::Mint { .. } => "ServiceAccountTokenUnavailable",
+            Self::Write { cause, .. } => cause.pending_reason(),
+        }
+    }
+}
+
+impl std::fmt::Display for SaProjectionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mint {
+                service_account,
+                cause,
+            } => write!(
+                f,
+                "MountVolume.SetUp failed for volume \"{SA_PROJECTION_VOLUME}\" : failed to \
+                 fetch token for ServiceAccount \"{service_account}\": {cause}"
+            ),
+            Self::Write {
+                service_account,
+                cause,
+            } => write!(
+                f,
+                "MountVolume.SetUp failed for volume \"{SA_PROJECTION_VOLUME}\" : could not \
+                 write the credentials of ServiceAccount \"{service_account}\": {cause}"
+            ),
+        }
+    }
+}
 
 /// The kubelet's clock — a `now()` source. Defaults to [`Instant::now`];
 /// tests inject a controllable clock so probe `period` / `initialDelay`
@@ -663,10 +723,20 @@ pub struct Kubelet {
     /// whose replacement has not. An entry is cleared on success, and a pod
     /// no longer bound here is dropped at the top of every tick.
     start_ledger: Mutex<crate::backoff::StartLedger>,
+    /// Per pod, the run of volume-resolution misses on
+    /// [`crate::backoff::VOLUME_PENDING`]: how soon the kubelet asks to come
+    /// back for a pod whose volumes did not resolve. Cleared when they
+    /// resolve; a pod no longer bound here is dropped at the top of every
+    /// tick, beside the start ledger.
+    volume_pending: Mutex<crate::backoff::VolumePendingLedger>,
     /// Where lifecycle events go. Defaults to the null sink so emission is
     /// safe to add to a code path before the plumbing exists — the
     /// alternative being an `Option` check at every call site.
     events: Arc<dyn engenho_controllers::event_recorder::EventSink>,
+    /// Runs the per-pod start/observe pass so one pod's failure costs only
+    /// that pod (see [`Kubelet::reconcile_pod`]). Announces through the same
+    /// sink as `events`.
+    sweep: Sweep,
     /// When this kubelet last wrote its node lease.
     ///
     /// ★ THE CADENCE IS LOAD-BEARING, not a nicety. A heartbeat written on
@@ -706,7 +776,12 @@ impl Kubelet {
             host_path_policy: crate::pod_volume::HostPathPolicy::deny_all(),
             clock: Arc::new(Instant::now),
             start_ledger: Mutex::new(crate::backoff::StartLedger::default()),
+            volume_pending: Mutex::new(crate::backoff::VolumePendingLedger::default()),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
+            sweep: Sweep::new(
+                KUBELET_COMPONENT,
+                engenho_controllers::event_recorder::Reason::Failed,
+            ),
             sa_projector: Arc::new(crate::pod_volume::NoServiceAccountProjection),
             last_lease_renewal: Mutex::new(None),
             last_sa_refresh: Mutex::new(None),
@@ -760,6 +835,7 @@ impl Kubelet {
         mut self,
         events: Arc<dyn engenho_controllers::event_recorder::EventSink>,
     ) -> Self {
+        self.sweep = self.sweep.with_event_sink(events.clone());
         self.events = events;
         self
     }
@@ -793,7 +869,7 @@ impl Kubelet {
             None,
             reason,
             message,
-            "kubelet",
+            KUBELET_COMPONENT,
             &engenho_types::time::now_rfc3339_utc(),
         )
         .await;
@@ -897,28 +973,10 @@ impl Kubelet {
                 .unwrap_or_default();
 
             match self
-                .sa_projector
-                .project(namespace, sa_name, &key.name, pod_uid)
+                .project_service_account(namespace, sa_name, &key.name, pod_uid)
                 .await
             {
-                Ok(Some(files)) => {
-                    match self
-                        .volume_materializer
-                        .materialize_files(namespace, &key.name, SA_PROJECTION_VOLUME, &files)
-                        .await
-                    {
-                        Ok(_) => report.refreshed += 1,
-                        Err(e) => {
-                            report.failed += 1;
-                            warn!(
-                                pod = %key.label(),
-                                error = %e,
-                                "ServiceAccount token refresh could not be written; the pod \
-                                 keeps its current token until that token expires"
-                            );
-                        }
-                    }
-                }
+                Ok(Some(_)) => report.refreshed += 1,
                 // Nothing to project for this pod — not a failure.
                 Ok(None) => {}
                 Err(e) => {
@@ -926,8 +984,8 @@ impl Kubelet {
                     warn!(
                         pod = %key.label(),
                         error = %e,
-                        "ServiceAccount token refresh could not be minted; the pod keeps its \
-                         current token until that token expires"
+                        "ServiceAccount token refresh failed; the pod keeps its current token \
+                         until that token expires"
                     );
                 }
             }
@@ -1204,71 +1262,6 @@ impl Kubelet {
     /// credentials. A pod that cannot get its environment must not reach
     /// Running, because "started successfully, silently misconfigured" is
     /// the single hardest state to debug from outside.
-    /// Expand `$(VAR)` references in an env value or an argv element, using
-    /// the variables already defined for this container.
-    ///
-    /// **Kubernetes does this and every workload assumes it.** A manifest
-    /// writes `value: "source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local."`
-    /// and expects a hostname; without expansion the container receives the
-    /// literal text and fails at whatever it hands the string to — far from
-    /// the kubelet, with nothing naming it. Measured on rio 2026-09-15: Flux's
-    /// kustomize-controller logged
-    /// `Get "http://source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local./…"`
-    /// and could not fetch a single artifact, so nothing was ever applied.
-    ///
-    /// Upstream's three rules, all load-bearing:
-    ///   * only variables defined EARLIER in the list are visible — the caller
-    ///     passes the map accumulated so far, so order is the semantics;
-    ///   * `$$` escapes to a single literal `$`;
-    ///   * an UNRESOLVABLE `$(VAR)` is left exactly as written, never blanked.
-    ///     Blanking would turn a typo into a silently-empty hostname, which is
-    ///     strictly harder to debug than the unexpanded text.
-    #[must_use]
-    fn expand_env_refs(raw: &str, defined: &BTreeMap<String, String>) -> String {
-        let bytes = raw.as_bytes();
-        let mut out = String::with_capacity(raw.len());
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] != b'$' {
-                // Push the whole UTF-8 character, not the byte: indexing by
-                // byte and emitting bytes would split a multi-byte codepoint.
-                let ch = raw[i..].chars().next().unwrap_or('$');
-                out.push(ch);
-                i += ch.len_utf8();
-                continue;
-            }
-            match bytes.get(i + 1) {
-                Some(b'$') => {
-                    out.push('$');
-                    i += 2;
-                }
-                Some(b'(') => {
-                    if let Some(close) = raw[i + 2..].find(')') {
-                        let name = &raw[i + 2..i + 2 + close];
-                        if let Some(v) = defined.get(name) {
-                            out.push_str(v);
-                        } else {
-                            // Unresolvable: emit verbatim, including the
-                            // delimiters, so the operator sees what was asked
-                            // for rather than an empty string.
-                            out.push_str(&raw[i..i + 3 + close]);
-                        }
-                        i += 3 + close;
-                    } else {
-                        // No closing paren — not a reference at all.
-                        out.push('$');
-                        i += 1;
-                    }
-                }
-                _ => {
-                    out.push('$');
-                    i += 1;
-                }
-            }
-        }
-        out
-    }
-
     fn resolve_env_entry(
         namespace: &str,
         pod_name: &str,
@@ -1627,7 +1620,7 @@ impl Kubelet {
                         // container's environment, which is a different and
                         // much larger promise than the one Kubernetes makes.
                         let v = if entry.get("value").is_some() {
-                            Self::expand_env_refs(&v, &map)
+                            crate::env_ref::expand_env_refs(&v, &map)
                         } else {
                             v
                         };
@@ -1652,7 +1645,7 @@ impl Kubelet {
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|x| x.as_str())
-                            .map(|x| Self::expand_env_refs(x, &env))
+                            .map(|x| crate::env_ref::expand_env_refs(x, &env))
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default()
@@ -1757,56 +1750,56 @@ impl Kubelet {
 
     /// Parse the three probes (`livenessProbe`/`readinessProbe`/
     /// `startupProbe`) of a single `spec.containers[i]` JSON object into a
-    /// [`ContainerProbeState`], resolving named ports against the container's
-    /// own `ports[]`. The probe specs are parsed; their [`ProbeRuntime`]
-    /// counters are stamped from `now` (the container's start instant).
+    /// [`ContainerProbes`] through [`ProbeSpec::from_container`] (which
+    /// resolves named ports against the container's own `ports[]` and
+    /// expands an exec probe's `$(VAR)` references). The probe specs are
+    /// parsed; their [`ProbeRuntime`] counters are stamped from `now` (the
+    /// container's start instant).
+    ///
+    /// A port that does not resolve is NOT an error here: the container runs
+    /// and the probe stays at its initial value, blind on every run (see
+    /// [`crate::probe::UnresolvablePort`]). It is logged once, at parse, with
+    /// the name it could not find.
     ///
     /// # Errors
     ///
-    /// Propagates a [`ProbeParseError`](crate::probe::ProbeParseError) (mapped
-    /// to a typed [`KubeletError::InvalidPod`]) for a no-handler / grpc /
-    /// unresolved-port probe — the pod is skipped, NEVER a fake pass.
+    /// [`KubeletError::InvalidProbe`], carrying the
+    /// [`ProbeParseError`](crate::probe::ProbeParseError), for a no-handler /
+    /// empty-exec / grpc probe — the pod is skipped, NEVER a fake pass.
     fn parse_container_probes(
         container: &Value,
         pod_label: &str,
         now: Instant,
-    ) -> Result<ContainerProbeState, KubeletError> {
-        // Resolve the container's named ports once for port resolution.
-        let ports: Vec<(String, u16)> = container
-            .get("ports")
-            .and_then(|p| p.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| {
-                        let name = p.get("name").and_then(|n| n.as_str())?.to_string();
-                        let number = p.get("containerPort").and_then(serde_json::Value::as_i64)?;
-                        u16::try_from(number).ok().map(|n| (name, n))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let parse_one = |field: &str,
-                         kind: ProbeKind|
-         -> Result<Option<(ProbeSpec, ProbeRuntime)>, KubeletError> {
-            match container.get(field) {
-                None => Ok(None),
-                Some(probe) => {
-                    let spec = ProbeSpec::from_k8s(kind, probe, &ports).map_err(|e| {
-                        KubeletError::InvalidPod {
-                            pod: pod_label.to_string(),
-                            reason: format!("{field}: {e}"),
-                        }
-                    })?;
-                    Ok(Some((spec, ProbeRuntime::new(now))))
+    ) -> Result<ContainerProbes, KubeletError> {
+        let parse_one =
+            |kind: ProbeKind| -> Result<Option<(ProbeSpec, ProbeRuntime)>, KubeletError> {
+                let Some(spec) = ProbeSpec::from_container(kind, container).map_err(|source| {
+                    KubeletError::InvalidProbe {
+                        pod: pod_label.to_string(),
+                        kind,
+                        source,
+                    }
+                })?
+                else {
+                    return Ok(None);
+                };
+                if let ProbeHandler::HttpGet { port: Err(why), .. }
+                | ProbeHandler::TcpSocket { port: Err(why), .. } = &spec.handler
+                {
+                    warn!(
+                        pod = %pod_label,
+                        probe = %kind,
+                        reason = %why,
+                        "probe port does not resolve; the probe stays at its initial value"
+                    );
                 }
-            }
-        };
+                Ok(Some((spec, ProbeRuntime::new(now))))
+            };
 
-        Ok(ContainerProbeState {
-            liveness: parse_one("livenessProbe", ProbeKind::Liveness)?,
-            readiness: parse_one("readinessProbe", ProbeKind::Readiness)?,
-            startup: parse_one("startupProbe", ProbeKind::Startup)?,
+        Ok(ContainerProbes {
+            liveness: parse_one(ProbeKind::Liveness)?,
+            readiness: parse_one(ProbeKind::Readiness)?,
+            startup: parse_one(ProbeKind::Startup)?,
         })
     }
 
@@ -1824,7 +1817,10 @@ impl Kubelet {
     ///
     /// A terminal pod never does: its containers are not started again.
     fn awaits_app_start(pod: &Value, lp: &LocalPod) -> bool {
-        if Self::pod_already_terminal(pod) {
+        // A terminal pod, or one being deleted, starts no missing container:
+        // it is observed as it is.
+        if Self::pod_already_terminal(pod) || !crate::lifecycle::starts_fresh(PodLifecycle::of(pod))
+        {
             return false;
         }
         pod.pointer("/spec/containers")
@@ -2035,12 +2031,19 @@ impl Kubelet {
     /// a process restart) is not blindly restarted. Per item-9 scope
     /// (restartPolicy:Never), terminal Pods stay terminal.
     fn pod_already_terminal(pod: &Value) -> bool {
+        use engenho_types::curated_enums::PodPhase;
         matches!(
-            pod.get("status")
-                .and_then(|s| s.get("phase"))
-                .and_then(|p| p.as_str()),
-            Some("Succeeded" | "Failed")
+            Self::published_phase(pod),
+            Some(PodPhase::Succeeded | PodPhase::Failed)
         )
+    }
+
+    /// The phase the pod's stored status shows, read by the one typed
+    /// reader. A phase outside the closed set, or none, is `None`.
+    fn published_phase(pod: &Value) -> Option<engenho_types::curated_enums::PodPhase> {
+        use serde::Deserialize;
+        pod.pointer("/status/phase")
+            .and_then(|p| engenho_types::curated_enums::PodPhase::deserialize(p).ok())
     }
 
     /// Read `status.<field>` (`containerStatuses` / `initContainerStatuses`)
@@ -2247,30 +2250,6 @@ impl Kubelet {
             .unwrap_or(false)
     }
 
-    /// Render a single [`ContainerStatusOut`] into its
-    /// `status.containerStatuses[]` JSON entry. The typed
-    /// [`ContainerState`] enum is the render surface; `json!` inside this impl
-    /// is the allowed TYPED EMISSION site (per ★★ TYPED EMISSION rule #1).
-    fn render_container_status(cs: &ContainerStatusOut) -> Value {
-        let state = match &cs.state {
-            ContainerState::Waiting { reason } => json!({ "waiting": { "reason": reason } }),
-            ContainerState::Running => json!({ "running": {} }),
-            ContainerState::Terminated(exit) => json!({
-                "terminated": { "exitCode": exit.exit_code(), "reason": exit.reason() }
-            }),
-        };
-        let mut entry = json!({
-            "name": cs.name,
-            "ready": cs.ready,
-            "state": state,
-            "restartCount": cs.restart_count,
-        });
-        if let Some(id) = &cs.container_id {
-            entry["containerID"] = Value::String(id.clone());
-        }
-        entry
-    }
-
     /// Build the desired Pod `status` from the typed
     /// `(PodPhase, Vec<ContainerStatusOut>)` fold output + the pod's IP.
     ///
@@ -2336,6 +2315,7 @@ impl Kubelet {
         has_init: bool,
     ) -> Value {
         use engenho_types::curated_enums::PodPhase;
+        let phase = crate::lifecycle::phase_to_publish(Self::published_phase(live), phase);
         let phase_str = match phase {
             PodPhase::Pending => "Pending",
             PodPhase::Running => "Running",
@@ -2353,7 +2333,7 @@ impl Kubelet {
         let ready = containers_ready;
         let status_str = |b: bool| if b { "True" } else { "False" };
         let container_statuses: Vec<Value> =
-            statuses.iter().map(Self::render_container_status).collect();
+            statuses.iter().map(ContainerStatusOut::to_wire).collect();
         // ── ★ CONDITIONS ARE MERGED BY TYPE, NOT REPLACED ────────────────
         // This array is shipped through an RFC 7396 JSON Merge Patch, whose
         // defined semantics are "arrays replace whole". So rendering a fresh
@@ -2429,7 +2409,7 @@ impl Kubelet {
         if has_init {
             let init_container_statuses: Vec<Value> = init_statuses
                 .iter()
-                .map(Self::render_container_status)
+                .map(ContainerStatusOut::to_wire)
                 .collect();
             status["initContainerStatuses"] = Value::Array(init_container_statuses);
         }
@@ -2519,7 +2499,7 @@ impl Kubelet {
 #[async_trait]
 impl Controller for Kubelet {
     fn name(&self) -> &'static str {
-        "kubelet"
+        KUBELET_COMPONENT
     }
 
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
@@ -2551,13 +2531,17 @@ impl Controller for Kubelet {
             .collect();
         report.objects_examined = bound.len();
 
-        // A pod no longer bound here takes its start penalties with it — the
-        // one place they are dropped, and it covers a pod that never started
-        // (no local record, so the cleanup below never visits it) as well as
-        // one that did.
+        // A pod no longer bound here takes its start penalties and its
+        // volume-pending streak with it — the one place they are dropped, and
+        // it covers a pod that never started (no local record, so the cleanup
+        // below never visits it) as well as one that did.
         {
             let live: BTreeSet<String> = bound.keys().map(ResourceKey::label).collect();
             self.start_ledger
+                .lock()
+                .await
+                .retain_pods(|pod| live.contains(pod));
+            self.volume_pending
                 .lock()
                 .await
                 .retain_pods(|pod| live.contains(pod));
@@ -2587,51 +2571,63 @@ impl Controller for Kubelet {
         }
 
         // ── (B)+(C) Start + running-status reconciliation over bound set ──
-        // `soonest_requeue` accumulates the smallest next-probe-due across all
-        // bound containers, so the kubelet wakes on its OWN probe clock (a
-        // one-shot Requeue) rather than only on Pod-watch events / the coarse
-        // fallback. None = no probes anywhere = no Requeue = today's wake
-        // behavior (the behavior-preserving guarantee for no-probe pods).
-        for (key, value) in &bound {
-            // Membership decides start (B) vs poll (C); compute it under a
-            // short lock to avoid holding it across the backend await.
-            let local_entry = self.local.lock().await.get(key).cloned();
-
-            match local_entry {
-                None => {
-                    // (B) Not started locally. Skip if already terminal
-                    // (don't restart a Succeeded/Failed pod we've
-                    // forgotten — restartPolicy:Never, item-9 scope).
-                    if Self::pod_already_terminal(value) {
-                        continue;
-                    }
-                    // ── ★ NO RECORD IS NOT "NEVER STARTED" — see `readopt`.
-                    match self.readopt(key, value, &mut report).await? {
-                        Readopted::Start => {}
-                        Readopted::Settled | Readopted::Held => continue,
-                    }
-                    self.start_bound_pod(key, value, &mut report, &mut soonest_requeue)
-                        .await?;
+        // `soonest_requeue` accumulates the soonest thing this tick found
+        // coming due: a probe's next period, the end of a start or
+        // crash-loop hold, a volume or init retry, an orphan's stop still
+        // inside its grace period. The tick returns it as
+        // `Requeue(soonest)`, and the WatchDriver's one requeue slot
+        // re-ticks the kubelet then, so probes run on their own clock rather
+        // than only on Pod-watch events or the coarse fallback. The kubelet
+        // arms no timer of its own. None = nothing due = `Done`: a node with
+        // no probes wakes on events and the fallback alone.
+        //
+        // ── ★ ONE POD'S FAILURE COSTS ONLY THAT POD ──────────────────────
+        // This was a hand loop whose every step ended in `?`, so one pod's
+        // error left the whole tick: every pod after it in key order was
+        // neither started nor observed, on that tick and every tick after,
+        // for as long as the one pod kept failing. The sweep settles each
+        // pod's result by the error's SCOPE: an Item error is that pod's
+        // failure (logged, retried on its own curve, or announced on it as
+        // an Event) and the sweep moves on; only a store error, which the
+        // next pod's write would meet too, still ends the tick.
+        //
+        // The tick's report and requeue are shared across pods through a
+        // lock held for one pod's pass. Pods are reconciled one at a time
+        // (`Sweep::run` awaits each before the next), so it is never
+        // contended; it exists because each pod's future must own its
+        // borrows.
+        let pods: Vec<(ResourceKey, Value)> = bound.into_iter().collect();
+        let tally = Mutex::new(TickTally {
+            report,
+            soonest_requeue,
+        });
+        let swept = self
+            .sweep
+            .run(&pods, |key, value| {
+                let tally = &tally;
+                async move {
+                    let mut tally = tally.lock().await;
+                    let TickTally {
+                        report,
+                        soonest_requeue,
+                    } = &mut *tally;
+                    ObjectOutcome::settle(
+                        self.reconcile_pod(key, value, report, soonest_requeue)
+                            .await,
+                    )
                 }
-                Some(lp) if Self::awaits_app_start(value, &lp) => {
-                    // ── ★ START THE MISSING, THEN OBSERVE ─────────────────
-                    // A pod with a record used to be observed only, and
-                    // observing never starts anything: a container whose
-                    // first start failed after a sibling had started was
-                    // rendered Waiting forever and never retried. The start
-                    // path starts only what the record lacks, each attempt
-                    // through that container's start curve, then observes
-                    // the whole pod the same as below.
-                    self.start_bound_pod(key, value, &mut report, &mut soonest_requeue)
-                        .await?;
-                }
-                Some(lp) => {
-                    // (C) Every declared container started → poll + reconcile
-                    // running status.
-                    self.reconcile_running(key, value, &lp, &mut report, &mut soonest_requeue)
-                        .await?;
-                }
-            }
+            })
+            .await?;
+        let TickTally {
+            report,
+            mut soonest_requeue,
+        } = tally.into_inner();
+        // A pod whose failure was Transient is owed a retry on its own
+        // curve; fold it into the one requeue the tick asks for, so an
+        // isolated failure is come back to as soon as the curve says rather
+        // than on the coarse fallback.
+        if let Some(after) = swept.retry_after() {
+            Self::accumulate_requeue(&mut soonest_requeue, after);
         }
 
         if report.objects_changed > 0 {
@@ -2642,19 +2638,135 @@ impl Controller for Kubelet {
                 "kubelet tick"
             );
         }
-        // Arm a one-shot re-tick at the soonest next-probe-due (clamped to the
-        // 1s floor) so probes run on `periodSeconds`. A pod with NO probes
-        // contributes nothing → soonest_requeue stays None → ReconcileResult
-        // Done → same wake behavior as the pre-probe kubelet.
+        // Return `Requeue(soonest due)`, clamped to the 1 s floor, and the
+        // WatchDriver's one requeue slot re-ticks the kubelet then, so probes
+        // run on `periodSeconds`. The kubelet schedules nothing itself: the
+        // driver clears its slot when any tick starts and re-arms it from
+        // that tick's outcome, so there is one pending re-tick per driver,
+        // never a chain. Nothing due (no probe, no hold, no retry) → `Done`,
+        // and the next Pod-watch event or the fallback wakes it. Pinned by
+        // m0_6_kubelet_probes: `a_probe_due_sooner_than_the_floor_requeues_at_the_floor`
+        // and `the_requeue_is_the_soonest_probe_due_across_pods`.
         let result = match soonest_requeue {
             Some(after) => ReconcileResult::Requeue(after.max(MIN_PROBE_REQUEUE)),
             None => ReconcileResult::Done,
         };
-        Ok(ReconcileOutcome::new(report, result))
+        let mut outcome = ReconcileOutcome::new(report, result);
+        // The per-pod tally, beside the per-write counts: it is the one
+        // that can say a pod FAILED while the rest were reconciled.
+        outcome.sweep = Some(swept);
+        Ok(outcome)
+    }
+}
+
+/// What the per-pod pass accumulates across one tick: the legacy per-write
+/// counts and the soonest wake any pod asked for. See the sweep in
+/// [`Kubelet::tick`](Controller::tick).
+struct TickTally {
+    report: ReconcileReport,
+    soonest_requeue: Option<Duration>,
+}
+
+/// How the sweep counts one pod's pass, read off what the pass counted.
+///
+/// A pass that counted a landed write is `Changed`; one that only held
+/// something back (a start on its curve, a volume not resolved, an invalid
+/// manifest) is `Skipped`; one that did neither is `Unchanged`.
+///
+/// Tier-honest: `landed` is derived from the legacy `objects_changed`
+/// counter, whose every kubelet increment follows a store answer
+/// (`write_status_cas(..).changed()`) or a runtime `Ok`. That the counter
+/// is bumped ONLY there is CI-caught (T1.8's `NOT_YET_MIGRATED` ceiling),
+/// not a type; when those sites move to `Effect`, this reads the `Effect`.
+fn pod_outcome(landed: bool, held: bool) -> ObjectOutcome {
+    if landed {
+        ObjectOutcome::from(Effect::answered(true))
+    } else if held {
+        ObjectOutcome::SKIPPED
+    } else {
+        ObjectOutcome::Unchanged
     }
 }
 
 impl Kubelet {
+    /// One bound pod's start/observe pass, as the tick's sweep runs it.
+    ///
+    /// Errors are written with ordinary `?` and leave only this pod: the
+    /// sweep settles them by scope ([`ObjectOutcome::settle`]), so a pod
+    /// cannot end the tick for the pods after it unless the store itself
+    /// failed. The outcome is read off what the pass counted
+    /// ([`pod_outcome`]).
+    async fn reconcile_pod(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<ObjectOutcome, ControllerError> {
+        let (changed, skipped) = (report.objects_changed, report.objects_skipped);
+        self.drive_pod(key, value, report, soonest_requeue).await?;
+        Ok(pod_outcome(
+            report.objects_changed > changed,
+            report.objects_skipped > skipped,
+        ))
+    }
+
+    /// (B) start or (C) observe one bound pod, by whether this kubelet
+    /// holds a record of it.
+    async fn drive_pod(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<(), ControllerError> {
+        // Membership decides start (B) vs poll (C); compute it under a
+        // short lock to avoid holding it across the backend await.
+        let local_entry = self.local.lock().await.get(key).cloned();
+
+        match local_entry {
+            None => {
+                // (B) Not started locally. Skip if already terminal
+                // (don't restart a Succeeded/Failed pod we've
+                // forgotten — restartPolicy:Never, item-9 scope).
+                if Self::pod_already_terminal(value) {
+                    return Ok(());
+                }
+                // ── ★ NO RECORD IS NOT "NEVER STARTED" — see `readopt`.
+                match self.readopt(key, value, report).await? {
+                    Readopted::Start => {}
+                    Readopted::Settled | Readopted::Held => return Ok(()),
+                }
+                // A pod being deleted starts nothing (upstream's first check,
+                // before the policy is read).
+                if !crate::lifecycle::starts_fresh(PodLifecycle::of(value)) {
+                    debug!(pod = %key.label(), "pod is being deleted; not starting it");
+                    return Ok(());
+                }
+                self.start_bound_pod(key, value, report, soonest_requeue)
+                    .await
+            }
+            Some(lp) if Self::awaits_app_start(value, &lp) => {
+                // ── ★ START THE MISSING, THEN OBSERVE ─────────────────────
+                // A pod with a record used to be observed only, and
+                // observing never starts anything: a container whose first
+                // start failed after a sibling had started was rendered
+                // Waiting forever and never retried. The start path starts
+                // only what the record lacks, each attempt through that
+                // container's start curve, then observes the whole pod the
+                // same as below.
+                self.start_bound_pod(key, value, report, soonest_requeue)
+                    .await
+            }
+            Some(lp) => {
+                // (C) Every declared container started → poll + reconcile
+                // running status.
+                self.reconcile_running(key, value, &lp, report, soonest_requeue)
+                    .await
+            }
+        }
+    }
+
     /// (A) Delete-cleanup: local entries no longer in the bound set.
     ///
     /// A Pod we started that's absent from the freshly-listed bound set was
@@ -3041,6 +3153,16 @@ impl Kubelet {
     /// resolution error already wrote the pod Pending + armed a requeue (the
     /// caller returns without starting any container — the no-silent-wrong-
     /// answer path).
+    ///
+    /// ── ★ THE REQUEUE GROWS PER POD ─────────────────────────────────────
+    /// It was a flat 1 s, forever: a pod naming a `ConfigMap` that never
+    /// appears kept an otherwise idle kubelet ticking once a second for the
+    /// pod's whole life, each tick a warning line. The requeue is now read
+    /// off the pod's streak on [`crate::backoff::VOLUME_PENDING`] (500 ms
+    /// doubling to 2m2s, upstream's volume-retry curve), and the streak is
+    /// cleared the moment the volumes resolve. Resolution itself is never
+    /// held back: a write to a `ConfigMap`, `Secret` or claim wakes the kubelet
+    /// and the pod re-resolves at once.
     async fn resolve_or_pending(
         &self,
         key: &ResourceKey,
@@ -3054,25 +3176,126 @@ impl Kubelet {
             .resolve_pod_volume_mounts(namespace, &key.name, value)
             .await
         {
-            Ok(map) => Ok(Some(map)),
+            Ok(map) => {
+                self.volume_pending.lock().await.resolved(&key.label());
+                Ok(Some(map))
+            }
             Err(e) => {
-                let reason = e.pending_reason();
-                warn!(
-                    pod = %key.label(),
-                    error = %e,
-                    reason = reason,
-                    "volume resolution failed; pod stays Pending (no container started)"
-                );
-                self.write_pod_volume_pending(key, value, container_names, reason, report)
-                    .await?;
-                // Arm a requeue so the next tick re-resolves once the source
-                // appears (mirrors the probe-cadence requeue).
-                let next = soonest_requeue.map_or(MIN_PROBE_REQUEUE, |d| d.min(MIN_PROBE_REQUEUE));
-                *soonest_requeue = Some(next);
-                report.objects_skipped += 1;
+                self.hold_unmounted(
+                    key,
+                    value,
+                    container_names,
+                    e.pending_reason(),
+                    &e,
+                    report,
+                    soonest_requeue,
+                )
+                .await?;
                 Ok(None)
             }
         }
+    }
+
+    /// Hold a pod whose volumes — its `ServiceAccount` projection among them —
+    /// could not all be set up: every container `Waiting{reason}`, the pod
+    /// `Pending`, nothing started, and a requeue at the pod's next due miss
+    /// on [`crate::backoff::VOLUME_PENDING`].
+    ///
+    /// Returns the retry, so a caller that announces the failure does it on
+    /// a counted miss — at the curve's cadence, not the loop's.
+    #[allow(clippy::too_many_arguments)]
+    async fn hold_unmounted(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        container_names: &[String],
+        reason: &'static str,
+        cause: &(dyn std::fmt::Display + Sync),
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<crate::backoff::VolumeRetry, ControllerError> {
+        let retry = self
+            .volume_pending
+            .lock()
+            .await
+            .unresolved(&key.label(), self.now());
+        match retry {
+            // Logged at the curve's cadence, not the loop's.
+            crate::backoff::VolumeRetry::Missed {
+                consecutive,
+                next_attempt_in,
+            } => warn!(
+                pod = %key.label(),
+                error = %cause,
+                reason = reason,
+                consecutive,
+                retry_in_ms = next_attempt_in.as_millis(),
+                "pod volumes could not be set up; pod stays Pending (no container started)"
+            ),
+            crate::backoff::VolumeRetry::Early {
+                consecutive,
+                remaining,
+            } => debug!(
+                pod = %key.label(),
+                error = %cause,
+                reason = reason,
+                consecutive,
+                retry_in_ms = remaining.as_millis(),
+                "pod volumes still cannot be set up; pod stays Pending"
+            ),
+        }
+        self.write_pod_volume_pending(key, value, container_names, reason, report)
+            .await?;
+        // Come back when the pod's streak says, so a source that appears
+        // without a write this kubelet sees is still found.
+        Self::accumulate_requeue(soonest_requeue, retry.next_attempt_in());
+        report.objects_skipped += 1;
+        Ok(retry)
+    }
+
+    /// Mint `pod`'s `ServiceAccount` credentials and write them where its
+    /// containers mount them. `Ok(None)` when the projector mints nothing.
+    ///
+    /// One path for the start and the refresh, so the two cannot disagree
+    /// about which directory a token lives in or what a failure is.
+    async fn project_service_account(
+        &self,
+        namespace: &str,
+        service_account: &str,
+        pod: &str,
+        pod_uid: &str,
+    ) -> Result<Option<crate::pod_volume::ResolvedMount>, SaProjectionFailed> {
+        let files = match self
+            .sa_projector
+            .project(namespace, service_account, pod, pod_uid)
+            .await
+        {
+            Ok(Some(files)) => files,
+            Ok(None) => return Ok(None),
+            Err(cause) => {
+                return Err(SaProjectionFailed::Mint {
+                    service_account: service_account.to_string(),
+                    cause,
+                });
+            }
+        };
+        let source = self
+            .volume_materializer
+            .materialize_files(namespace, pod, SA_PROJECTION_VOLUME, &files)
+            .await
+            .map_err(|cause| SaProjectionFailed::Write {
+                service_account: service_account.to_string(),
+                cause,
+            })?;
+        Ok(Some(crate::pod_volume::ResolvedMount {
+            source,
+            mount_path: crate::pod_volume::SA_MOUNT_PATH.to_string(),
+            // Read-only, as upstream projects it. A writable credential
+            // directory lets a compromised container rewrite its own
+            // identity.
+            read_only: true,
+            sub_path: None,
+        }))
     }
 
     /// (B) Start a bound Pod's containers (one per `spec.containers[i]`) +
@@ -3193,13 +3416,15 @@ impl Kubelet {
         }
 
         // Parse the per-container probes BEFORE starting anything: a parse
-        // error (no-handler / grpc / unresolved port) skips the whole pod
-        // (NEVER a fake pass). Parsing here (not after start) means a bad probe
+        // error (no-handler / empty exec / grpc) skips the whole pod (NEVER a
+        // fake pass); a port that does not resolve is not one — that pod runs
+        // with the probe frozen, as upstream's does. Parsing here (not after
+        // start) means a bad probe
         // never even starts a container. The ProbeRuntimes are stamped at the
         // container's start instant below, but the spec parse is what can fail.
         let now = self.now();
         let pod_label = key.label().to_string();
-        let mut probe_state_by_cname: BTreeMap<String, ContainerProbeState> = BTreeMap::new();
+        let mut probe_state_by_cname: BTreeMap<String, ContainerProbes> = BTreeMap::new();
         for (cname, _spec) in &specs {
             let Some(cjson) = Self::container_json(value, cname) else {
                 continue;
@@ -3239,10 +3464,11 @@ impl Kubelet {
         // unsupported source class) does NOT start any container + does NOT
         // skip silently — it writes the pod Pending with EVERY container
         // `Waiting{ reason: <typed> }` (e.g. ConfigMapNotFound) + arms a
-        // requeue so a later-created source converges the pod to Running on a
-        // future tick. A no-volume pod returns an empty map (no store reads,
-        // no materialization) → every spec keeps `mounts: vec![]` → identical
-        // behavior to before this brick.
+        // requeue on the pod's volume-pending streak so a later-created
+        // source converges the pod to Running on a future tick. A no-volume
+        // pod returns an empty map (no store reads, no materialization) →
+        // every spec keeps `mounts: vec![]` → identical behavior to before
+        // this brick.
         // Project the pod's ServiceAccount credentials ONCE for the pod, the
         // way upstream's admission injects a `kube-api-access-*` volume into
         // every pod that has a service account. Without these three files an
@@ -3305,50 +3531,52 @@ impl Kubelet {
             .pointer("/metadata/uid")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let cnames: Vec<String> = specs.iter().map(|(c, _)| c.clone()).collect();
         let sa_mount = if !automount {
             // No projection, no materialization, no mount. The pod asked for
             // no credential and gets none.
             None
         } else {
             match self
-                .sa_projector
-                .project(namespace, sa_name, &key.name, pod_uid)
+                .project_service_account(namespace, sa_name, &key.name, pod_uid)
                 .await
             {
-                Ok(Some(files)) => {
-                    let src = self
-                        .volume_materializer
-                        .materialize_files(namespace, &key.name, SA_PROJECTION_VOLUME, &files)
-                        .await
-                        .map_err(|e| {
-                            ControllerError::Internal(format!(
-                                "materialize ServiceAccount projection: {e}"
-                            ))
-                        })?;
-                    Some(crate::pod_volume::ResolvedMount {
-                        source: src,
-                        mount_path: crate::pod_volume::SA_MOUNT_PATH.to_string(),
-                        // Read-only, as upstream projects it. A writable
-                        // credential directory lets a compromised container
-                        // rewrite its own identity.
-                        read_only: true,
-                        sub_path: None,
-                    })
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    warn!(
-                        pod = %key.label(),
-                        error = %e,
-                        "ServiceAccount projection failed; pod stays Pending"
-                    );
-                    report.objects_skipped += 1;
+                Ok(mount) => mount,
+                // ── ★ HELD, SAID, AND SKIPPED — NEVER THE TICK'S ERROR ────
+                // A write failure here was `?`-ed as `Internal`, which ended
+                // the whole tick: every pod after this one went unstarted
+                // and unobserved for as long as this one directory failed.
+                // A mint failure was the opposite and as bad — a skip with
+                // no status and no Event, so the pod showed a nodeName and
+                // nothing else. Both are now what a volume that cannot be
+                // set up is: the pod Pending with the reason on every
+                // container, a Warning on the pod at the retry curve's
+                // cadence, and a requeue on that curve.
+                Err(failed) => {
+                    let retry = self
+                        .hold_unmounted(
+                            key,
+                            value,
+                            &cnames,
+                            failed.pending_reason(),
+                            &failed,
+                            report,
+                            soonest_requeue,
+                        )
+                        .await?;
+                    if matches!(retry, crate::backoff::VolumeRetry::Missed { .. }) {
+                        self.emit(
+                            key,
+                            engenho_controllers::event_recorder::Reason::Failed,
+                            failed.to_string(),
+                        )
+                        .await;
+                    }
                     return Ok(());
                 }
             }
         };
 
-        let cnames: Vec<String> = specs.iter().map(|(c, _)| c.clone()).collect();
         let Some(resolved) = self
             .resolve_or_pending(key, value, namespace, &cnames, report, soonest_requeue)
             .await?
@@ -3461,8 +3689,10 @@ impl Kubelet {
                                 .get(&cname)
                                 .cloned()
                                 .unwrap_or_default(),
-                            started_at: Some(now),
-                            terminated_at: None,
+                            // A first start owes nothing: the penalty starts
+                            // at the first exit-driven restart.
+                            crash_backoff: None,
+                            down: None,
                             // Remember what this container was started with,
                             // so a restart can be given the same mounts.
                             mounts: spec.mounts.clone(),
@@ -3578,143 +3808,58 @@ impl Kubelet {
             .await
     }
 
-    /// Run the DUE probes of one running container, fold their verdicts into
-    /// the per-container [`ProbeRuntime`]s (persisted back into `self.local`),
-    /// and return the aggregated decision via [`ProbeOutcome`]: readiness,
-    /// the restart witness (if any), and what the probes could not see. Also
-    /// folds the container's soonest next-probe-due into `soonest_requeue`.
+    /// Run the DUE probes of one running container through
+    /// [`ContainerProbes::tick`], persist the advanced runtimes back into
+    /// `self.local`, and fold the soonest next-probe-due into
+    /// `soonest_requeue`. `pod` is the pod's lifecycle: on a Terminating pod
+    /// liveness and startup no longer run ([`ProbeKind::retired`]).
     ///
-    /// A container with NO probes short-circuits: `ready = is_running` (true,
-    /// since this is only called on a running container), no trip, nothing
-    /// blind, no requeue contributed — the behavior-preserving common case.
+    /// A container with NO probes short-circuits inside `tick`: ready (it is
+    /// running), no trip, nothing blind, no requeue contributed — the
+    /// behavior-preserving common case.
     async fn run_container_probes(
         &self,
         record: &ContainerRecord,
-        _spec: &ContainerSpec,
-        container_id: &str,
         pod_ip: Option<&str>,
+        pod: PodLifecycle,
         now: Instant,
         soonest_requeue: &mut Option<Duration>,
-    ) -> ProbeOutcome {
-        // Fast path: no probes → behavior-preserving (ready = is_running).
-        if record.probes.is_empty() {
-            return ProbeOutcome {
-                ready: true,
-                ..ProbeOutcome::default()
-            };
-        }
-
+    ) -> ProbeTick {
         // Work on a clone of the probe state so we drive the I/O without
         // holding the lock, then persist the advanced runtimes back.
         let mut probes = record.probes.clone();
-        let mut entered_blind: Vec<(ProbeKind, BlindCause)> = Vec::new();
-
-        // Helper: for one probe slot, if due, run + fold; always fold the
-        // probe's next-due into soonest_requeue.
-        // We run them sequentially: startup first (it gates the others), then
-        // readiness + liveness. The verdicts are aggregated below.
-        let mut startup_done = true;
-        let mut has_startup = false;
-        let mut startup_trip: Option<ProbeTrip> = None;
-
-        if let Some((spec, rt)) = probes.startup.as_mut() {
-            has_startup = true;
-            if rt.is_due(spec, now) {
-                let obs = run_handler(
-                    spec,
-                    &*self.backend,
-                    &*self.net_prober,
-                    container_id,
-                    pod_ip,
-                )
-                .await;
-                let verdict = fold_probe_observation(spec, rt, obs, now);
-                startup_trip = verdict.trip;
-                entered_blind.extend(verdict.entered_blind.map(|c| (spec.kind, c)));
-            }
-            startup_done = rt.gate_satisfied;
-            Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
+        let target = ProbeTarget {
+            runtime: &*self.backend,
+            net_prober: &*self.net_prober,
+            container_id: &record.container_id,
+            pod_ip,
+        };
+        let tick = probes.tick(&target, pod, now).await;
+        if probes.is_empty() {
+            // Nothing ran and nothing advanced: no requeue, nothing to keep.
+            return tick;
+        }
+        if let Some(due) = tick.next_due_in {
+            Self::accumulate_requeue(soonest_requeue, due);
         }
 
-        let mut readiness_ready = false;
-        let mut has_readiness = false;
-        if let Some((spec, rt)) = probes.readiness.as_mut() {
-            has_readiness = true;
-            if rt.is_due(spec, now) {
-                let obs = run_handler(
-                    spec,
-                    &*self.backend,
-                    &*self.net_prober,
-                    container_id,
-                    pod_ip,
-                )
-                .await;
-                let verdict = fold_probe_observation(spec, rt, obs, now);
-                entered_blind.extend(verdict.entered_blind.map(|c| (spec.kind, c)));
-            }
-            readiness_ready = rt.gate_satisfied;
-            Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
-        }
-
-        let mut liveness_trip: Option<ProbeTrip> = None;
-        if let Some((spec, rt)) = probes.liveness.as_mut() {
-            if rt.is_due(spec, now) {
-                let obs = run_handler(
-                    spec,
-                    &*self.backend,
-                    &*self.net_prober,
-                    container_id,
-                    pod_ip,
-                )
-                .await;
-                let verdict = fold_probe_observation(spec, rt, obs, now);
-                liveness_trip = verdict.trip;
-                entered_blind.extend(verdict.entered_blind.map(|c| (spec.kind, c)));
-            }
-            Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
-        }
-
-        // Aggregate the per-kind gates into effective readiness + whether
-        // liveness restart may fire (startup window suppresses it).
-        let (effective_ready, may_run_liveness) = aggregate_container_readiness(
-            startup_done,
-            readiness_ready,
-            has_startup,
-            has_readiness,
-            /* is_running */ true,
-        );
-
-        // A startup probe that itself failed past threshold ALWAYS restarts (a
-        // container that never boots IS restarted), regardless of the gate.
-        // Liveness restart only fires once the startup window has passed.
-        let trip = startup_trip.or(liveness_trip.filter(|_| may_run_liveness));
-        let sustained_blind = probes.sustained_blindness();
-
-        // Persist the advanced probe runtimes back into the local record.
+        // Persist the advanced probe runtimes back into the local record,
+        // found by container_id (stable for this tick; the cname is not
+        // threaded here).
         {
-            let key_probes = &mut probes;
             let mut local = self.local.lock().await;
-            // Find the record by container_id (the cname isn't threaded here,
-            // but container_id is stable for this tick). Iterate the pod's
-            // containers to locate it.
             for pod in local.values_mut() {
                 if let Some(rec) = pod
                     .containers
                     .values_mut()
-                    .find(|r| r.container_id == container_id)
+                    .find(|r| r.container_id == record.container_id)
                 {
-                    rec.probes = key_probes.clone();
+                    rec.probes = probes;
                     break;
                 }
             }
         }
-
-        ProbeOutcome {
-            ready: effective_ready,
-            trip,
-            entered_blind,
-            sustained_blind,
-        }
+        tick
     }
 
     /// A probe that cannot see the workload says so, and restarts nothing —
@@ -3725,7 +3870,7 @@ impl Kubelet {
         &self,
         key: &ResourceKey,
         cname: &str,
-        outcome: &ProbeOutcome,
+        outcome: &ProbeTick,
         pod_blind: &mut Option<ProbeBlindCondition>,
     ) {
         for &(kind, cause) in &outcome.entered_blind {
@@ -3836,9 +3981,16 @@ impl Kubelet {
     /// M0.2 exit-code path's start-then-remove only worked under FakeBackend,
     /// which doesn't enforce name uniqueness — surfaced live by the liveness
     /// restart bar.)
+    ///
+    /// `crash_backoff` is the penalty the replacement carries, recorded only
+    /// once it has started: the entry the crash gate advanced for an
+    /// exit-driven restart, the record's own for a probe-driven one. A restart
+    /// that never started leaves the penalty where it was, so a replacement
+    /// held on its start curve or waiting on the old container's stop is not
+    /// charged a crash each tick it waits.
     // The args are the precise restart inputs (key/value/namespace/cname/spec +
-    // old id + old restart count); threading them as one struct would add a
-    // single-use type for no clarity gain.
+    // old id + old restart count + the penalty to record); threading them as
+    // one struct would add a single-use type for no clarity gain.
     #[allow(clippy::too_many_arguments)]
     async fn restart_container(
         &self,
@@ -3849,6 +4001,7 @@ impl Kubelet {
         spec: &ContainerSpec,
         old_container_id: &str,
         old_restart_count: u32,
+        crash_backoff: Option<crate::backoff::CrashBackoff>,
     ) -> Relaunch {
         let permit = match self.start_permit(key, cname).await {
             Ok(permit) => permit,
@@ -3904,13 +4057,58 @@ impl Kubelet {
                 rec.mounts.clone_from(&restart_spec.mounts);
                 rec.container_id.clone_from(&new_status.container_id);
                 rec.restart_count = new_count;
-                rec.started_at = Some(now);
-                rec.terminated_at = None;
+                rec.crash_backoff = crash_backoff;
+                rec.down = None;
                 // Fresh startup window + zeroed probe counters on restart.
                 rec.probes.reset(now);
             }
         }
         Relaunch::Started(new_status)
+    }
+
+    /// Stop a running container whose liveness or startup probe failed, and
+    /// that will not be started again ([`RunningAction::Kill`]). `true` once
+    /// the runtime took the stop.
+    ///
+    /// ── ★ A FAILED PROBE STOPS THE CONTAINER UNDER EVERY POLICY ─────────────
+    /// Upstream kills it and, under `Never`, does not start it again: the next
+    /// poll finds it down, the policy latches the exit, and the pod ends
+    /// terminal. This used to skip the trip under `Never`, leaving a container
+    /// that had failed its liveness probe running — and the pod Running — for
+    /// as long as it lived. The stop is idempotent, so a tick that finds it
+    /// still stopping asks again.
+    async fn stop_for_probe(
+        &self,
+        key: &ResourceKey,
+        cname: &str,
+        container_id: &str,
+        trip: crate::probe::ProbeTrip,
+    ) -> bool {
+        match self.backend.stop(container_id).await {
+            Ok(()) => {
+                self.emit(
+                    key,
+                    engenho_controllers::event_recorder::Reason::Killing,
+                    KilledOnProbe {
+                        container: cname,
+                        trip,
+                    }
+                    .to_string(),
+                )
+                .await;
+                true
+            }
+            Err(cause) => {
+                warn!(
+                    pod = %key.label(),
+                    container = %cname,
+                    %trip,
+                    error = %cause,
+                    "a container that failed its probe could not be stopped"
+                );
+                false
+            }
+        }
     }
 
     /// Poll one container, split into [`Polled::Running`] / [`Polled::Down`]
@@ -3920,13 +4118,42 @@ impl Kubelet {
         Ok(Polled::of(self.backend.status(container_id).await?))
     }
 
+    /// Stamp what this tick's poll saw of a container that is down onto its
+    /// record, and return what the record now knows of the run with the
+    /// container's crash entry. `pick` chooses the records
+    /// ([`LocalPod::apps`] or [`LocalPod::inits`]). A record gone from under
+    /// the tick is answered from `snapshot`, the tick's copy of it.
+    async fn note_down(
+        &self,
+        key: &ResourceKey,
+        cname: &str,
+        pick: fn(&mut LocalPod) -> &mut BTreeMap<String, ContainerRecord>,
+        snapshot: &ContainerRecord,
+        polled: Termination,
+        now: Instant,
+    ) -> (SeenDown, Option<crate::backoff::CrashBackoff>) {
+        let mut local = self.local.lock().await;
+        match local.get_mut(key).and_then(|p| pick(p).get_mut(cname)) {
+            Some(rec) => {
+                let seen = SeenDown::fold(rec.down, polled, now);
+                rec.down = Some(seen);
+                (seen, rec.crash_backoff)
+            }
+            None => (
+                SeenDown::fold(snapshot.down, polled, now),
+                snapshot.crash_backoff,
+            ),
+        }
+    }
+
     /// (C) Poll the backend for EVERY container of a started Pod, fold the
     /// observed states into the pod phase via [`reconcile_pod_phase`], apply
     /// restartPolicy + probe verdicts (restart an exited / liveness-failing /
     /// startup-failing container under the policy; source each container's
     /// readiness from the readiness-probe verdict), and write the
     /// multi-container status. The `soonest_requeue` accumulator collects the
-    /// smallest next-probe-due so `tick` can arm a one-shot re-tick.
+    /// smallest next-probe-due (and the end of any restart hold), which
+    /// `tick` returns as `Requeue` for the `WatchDriver`'s one requeue slot.
     async fn reconcile_running(
         &self,
         key: &ResourceKey,
@@ -3975,6 +4202,9 @@ impl Kubelet {
         };
 
         let now = self.now();
+        // Read once per tick: a pod being deleted keeps its readiness probe
+        // and loses liveness and startup (see `ProbeKind::retired`).
+        let lifecycle = PodLifecycle::of(value);
         let mut observations: Vec<ContainerObservation> = Vec::with_capacity(specs.len());
         let mut pod_ip: Option<String> = None;
         // The first container this tick could not poll. Anything in it
@@ -4005,9 +4235,8 @@ impl Kubelet {
                     let outcome = self
                         .run_container_probes(
                             record,
-                            spec,
-                            &record.container_id,
                             s.pod_ip.as_deref().or(pod_ip.as_deref()),
+                            lifecycle,
                             now,
                             soonest_requeue,
                         )
@@ -4016,46 +4245,47 @@ impl Kubelet {
                     self.report_blindness(key, cname, &outcome, &mut pod_blind)
                         .await;
 
-                    if let Some(trip) = outcome.trip
-                        && restart_policy != RestartPolicy::Never
+                    match crate::lifecycle::running_action(restart_policy, lifecycle, outcome.trip)
                     {
-                        // Liveness/startup OBSERVED failures past threshold →
-                        // restart THIS container via the existing restart
-                        // machinery (restartPolicy:Never suppresses it — K8s
-                        // semantics).
-                        debug!(pod = %key.label(), container = %cname, %trip, "probe tripped");
-                        match self
-                            .restart_container(
-                                key,
-                                value,
-                                namespace,
-                                cname,
-                                spec,
-                                &record.container_id,
-                                record.restart_count,
-                            )
-                            .await
-                        {
-                            Relaunch::Started(new_status) => {
-                                if let Some(ip) = &new_status.pod_ip {
-                                    pod_ip.get_or_insert_with(|| ip.clone());
-                                }
-                                // A freshly-restarted container is not-ready
-                                // until its probes re-pass (startup gate / first
-                                // readiness success).
-                                observations.push(ContainerObservation {
-                                    name: cname.clone(),
-                                    state: ContainerState::Running,
-                                    container_id: Some(new_status.container_id.clone()),
-                                    restart_count: record.restart_count + 1,
-                                    ready: false,
-                                    // App container: the init-kind field is
-                                    // meaningless here and stays Regular.
-                                    kind: crate::lifecycle::InitKind::Regular,
-                                    ever_started: true,
-                                });
-                                report.objects_changed += 1;
-                                self.emit(
+                        RunningAction::Restart(trip) => {
+                            // Liveness/startup OBSERVED failures past threshold →
+                            // restart THIS container via the existing restart
+                            // machinery. A probe-driven restart carries the
+                            // container's crash penalty over unchanged.
+                            debug!(pod = %key.label(), container = %cname, %trip, "probe tripped");
+                            match self
+                                .restart_container(
+                                    key,
+                                    value,
+                                    namespace,
+                                    cname,
+                                    spec,
+                                    &record.container_id,
+                                    record.restart_count,
+                                    record.crash_backoff,
+                                )
+                                .await
+                            {
+                                Relaunch::Started(new_status) => {
+                                    if let Some(ip) = &new_status.pod_ip {
+                                        pod_ip.get_or_insert_with(|| ip.clone());
+                                    }
+                                    // A freshly-restarted container is not-ready
+                                    // until its probes re-pass (startup gate / first
+                                    // readiness success).
+                                    observations.push(ContainerObservation {
+                                        name: cname.clone(),
+                                        state: ContainerState::Running,
+                                        container_id: Some(new_status.container_id.clone()),
+                                        restart_count: record.restart_count + 1,
+                                        ready: false,
+                                        // App container: the init-kind field is
+                                        // meaningless here and stays Regular.
+                                        kind: crate::lifecycle::InitKind::Regular,
+                                        ever_started: true,
+                                    });
+                                    report.objects_changed += 1;
+                                    self.emit(
                                     key,
                                     engenho_controllers::event_recorder::Reason::Unhealthy,
                                     format!(
@@ -4064,96 +4294,121 @@ impl Kubelet {
                                     ),
                                 )
                                 .await;
-                                debug!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    restart_count = record.restart_count + 1,
-                                    "kubelet restarted container (probe verdict)"
-                                );
-                            }
-                            Relaunch::Held(held) => {
-                                // The replacement's last start failed and its
-                                // curve still owes a wait; the running
-                                // container was left alone.
-                                debug!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    remaining_s = held.remaining.as_secs(),
-                                    "probe-driven restart backing off"
-                                );
-                                Self::accumulate_requeue(soonest_requeue, held.remaining);
-                                observations.push(ContainerObservation {
-                                    name: cname.clone(),
-                                    state: ContainerState::Running,
-                                    container_id: Some(record.container_id.clone()),
-                                    restart_count: record.restart_count,
-                                    ready: outcome.ready,
-                                    kind: crate::lifecycle::InitKind::Regular,
-                                    ever_started: true,
-                                });
-                                report.objects_skipped += 1;
-                            }
-                            Relaunch::Failed(failed) => {
-                                Self::accumulate_requeue(
-                                    soonest_requeue,
-                                    failed.cost.next_attempt_in,
-                                );
-                                warn!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    error = %failed,
-                                    "probe-driven restart failed; retrying on the start curve"
-                                );
-                                observations.push(ContainerObservation {
-                                    name: cname.clone(),
-                                    state: ContainerState::Running,
-                                    container_id: Some(record.container_id.clone()),
-                                    restart_count: record.restart_count,
-                                    ready: outcome.ready,
-                                    kind: crate::lifecycle::InitKind::Regular,
-                                    ever_started: true,
-                                });
-                                report.objects_skipped += 1;
-                            }
-                            Relaunch::OldNotCleared(cause) => {
-                                log_old_not_cleared(key, cname, &cause);
-                                if matches!(cause, KubeletError::NotReaped { .. }) {
-                                    // Its stop is in flight; the replacement
-                                    // follows as soon as it is reaped.
-                                    Self::accumulate_requeue(soonest_requeue, MIN_PROBE_REQUEUE);
+                                    debug!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        restart_count = record.restart_count + 1,
+                                        "kubelet restarted container (probe verdict)"
+                                    );
                                 }
-                                // Still up, and being stopped for the probe it
-                                // failed: not ready.
-                                observations.push(ContainerObservation {
-                                    name: cname.clone(),
-                                    state: ContainerState::Running,
-                                    container_id: Some(record.container_id.clone()),
-                                    restart_count: record.restart_count,
-                                    ready: false,
-                                    kind: crate::lifecycle::InitKind::Regular,
-                                    ever_started: true,
-                                });
-                                report.objects_skipped += 1;
+                                Relaunch::Held(held) => {
+                                    // The replacement's last start failed and its
+                                    // curve still owes a wait; the running
+                                    // container was left alone.
+                                    debug!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        remaining_s = held.remaining.as_secs(),
+                                        "probe-driven restart backing off"
+                                    );
+                                    Self::accumulate_requeue(soonest_requeue, held.remaining);
+                                    observations.push(ContainerObservation {
+                                        name: cname.clone(),
+                                        state: ContainerState::Running,
+                                        container_id: Some(record.container_id.clone()),
+                                        restart_count: record.restart_count,
+                                        ready: outcome.ready,
+                                        kind: crate::lifecycle::InitKind::Regular,
+                                        ever_started: true,
+                                    });
+                                    report.objects_skipped += 1;
+                                }
+                                Relaunch::Failed(failed) => {
+                                    Self::accumulate_requeue(
+                                        soonest_requeue,
+                                        failed.cost.next_attempt_in,
+                                    );
+                                    warn!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        error = %failed,
+                                        "probe-driven restart failed; retrying on the start curve"
+                                    );
+                                    observations.push(ContainerObservation {
+                                        name: cname.clone(),
+                                        state: ContainerState::Running,
+                                        container_id: Some(record.container_id.clone()),
+                                        restart_count: record.restart_count,
+                                        ready: outcome.ready,
+                                        kind: crate::lifecycle::InitKind::Regular,
+                                        ever_started: true,
+                                    });
+                                    report.objects_skipped += 1;
+                                }
+                                Relaunch::OldNotCleared(cause) => {
+                                    log_old_not_cleared(key, cname, &cause);
+                                    if matches!(cause, KubeletError::NotReaped { .. }) {
+                                        // Its stop is in flight; the replacement
+                                        // follows as soon as it is reaped.
+                                        Self::accumulate_requeue(
+                                            soonest_requeue,
+                                            MIN_PROBE_REQUEUE,
+                                        );
+                                    }
+                                    // Still up, and being stopped for the probe it
+                                    // failed: not ready.
+                                    observations.push(ContainerObservation {
+                                        name: cname.clone(),
+                                        state: ContainerState::Running,
+                                        container_id: Some(record.container_id.clone()),
+                                        restart_count: record.restart_count,
+                                        ready: false,
+                                        kind: crate::lifecycle::InitKind::Regular,
+                                        ever_started: true,
+                                    });
+                                    report.objects_skipped += 1;
+                                }
                             }
                         }
-                    } else {
-                        // No restart this tick → readiness sources from the
-                        // probe verdict (REPLACING the hard-`true`). A no-probe
-                        // container's outcome.ready == is_running (true here).
-                        observations.push(ContainerObservation {
-                            name: cname.clone(),
-                            state: ContainerState::Running,
-                            container_id: Some(record.container_id.clone()),
-                            restart_count: record.restart_count,
-                            ready: outcome.ready,
-                            kind: crate::lifecycle::InitKind::Regular,
-                            ever_started: true,
-                        });
+                        RunningAction::Kill(trip) => {
+                            if self
+                                .stop_for_probe(key, cname, &record.container_id, trip)
+                                .await
+                            {
+                                report.objects_changed += 1;
+                            } else {
+                                report.objects_skipped += 1;
+                            }
+                            // Up this instant and being stopped: not ready.
+                            observations.push(ContainerObservation {
+                                name: cname.clone(),
+                                state: ContainerState::Running,
+                                container_id: Some(record.container_id.clone()),
+                                restart_count: record.restart_count,
+                                ready: false,
+                                kind: crate::lifecycle::InitKind::Regular,
+                                ever_started: true,
+                            });
+                        }
+                        RunningAction::Keep => {
+                            // No restart this tick → readiness sources from the
+                            // probe verdict (REPLACING the hard-`true`). A no-probe
+                            // container's outcome.ready == is_running (true here).
+                            observations.push(ContainerObservation {
+                                name: cname.clone(),
+                                state: ContainerState::Running,
+                                container_id: Some(record.container_id.clone()),
+                                restart_count: record.restart_count,
+                                ready: outcome.ready,
+                                kind: crate::lifecycle::InitKind::Regular,
+                                ever_started: true,
+                            });
+                        }
                     }
                 }
                 Ok(Polled::Down {
                     pod_ip: last_ip,
-                    exit,
+                    exit: polled,
                 }) => {
                     // Terminated — or vanished, which is Terminated with an
                     // exit nobody saw. Retain the last pod_ip (K8s keeps it).
@@ -4175,91 +4430,95 @@ impl Kubelet {
                     // The stamp is taken here, on the FIRST tick that sees
                     // the exit, so the delay is measured from the exit and
                     // not from whenever the operator happened to look.
-                    let backoff = if restart_policy.should_restart(exit) {
-                        let (since_exit, uptime) = {
-                            let mut local = self.local.lock().await;
-                            let rec = local.get_mut(key).and_then(|p| p.containers.get_mut(cname));
-                            match rec {
-                                Some(r) => {
-                                    let exited = *r.terminated_at.get_or_insert(now);
-                                    let uptime = r.started_at.map_or(Duration::ZERO, |st| {
-                                        exited.saturating_duration_since(st)
-                                    });
-                                    (now.saturating_duration_since(exited), uptime)
-                                }
-                                None => (Duration::ZERO, Duration::ZERO),
-                            }
-                        };
-                        crate::backoff::decide(record.restart_count, since_exit, uptime)
-                    } else {
-                        // Not restartable at all — the terminal-latch branch
-                        // below owns it. `Restart` here is never acted on.
-                        crate::backoff::BackoffDecision::Restart
-                    };
-
-                    if let crate::backoff::BackoffDecision::Wait { remaining } = backoff {
-                        // Ask to be re-ticked when the hold expires rather
-                        // than relying on the next periodic sweep: a 5-minute
-                        // cap with a 30-second sweep would restart up to
-                        // 4m30s late, and the lateness grows with the delay.
-                        let soon = soonest_requeue.get_or_insert(remaining);
-                        *soon = (*soon).min(remaining);
-                        debug!(
-                            pod = %key.label(),
-                            container = %cname,
-                            restart_count = record.restart_count,
-                            remaining_secs = remaining.as_secs(),
-                            "container held in CrashLoopBackOff"
-                        );
-                        // ★ THE EVENT THAT WAS MISSING. A pod at 149
-                        // restarts said nothing; this is the line that
-                        // would have explained it without reading podman.
-                        self.emit(
-                            key,
-                            engenho_controllers::event_recorder::Reason::BackOff,
-                            BackOffRestarting {
-                                container: cname,
-                                remaining,
-                                prior_restarts: record.restart_count,
-                            }
-                            .to_string(),
-                        )
+                    //
+                    // ★ THE PENALTY IS THE RECORD'S ENTRY, NOT ITS RESTART
+                    // COUNT: see `CrashBackoff`. A Terminating pod restarts
+                    // nothing (`down_action`), so it is never held either.
+                    //
+                    // ★ THE EXIT ACTED ON IS THE RUN'S, NOT THIS POLL'S: an
+                    // exit an earlier tick observed survives the runtime
+                    // losing the container (`SeenDown`).
+                    let (seen, entry) = self
+                        .note_down(key, cname, LocalPod::apps, record, polled, now)
                         .await;
-                        observations.push(ContainerObservation::backing_off(
+                    let exit = seen.exit;
+                    // What is published once the decision below is carried
+                    // out: one rule for every arm (`after_down`).
+                    let after = |outcome: DownOutcome<'_>| {
+                        ContainerObservation::after_down(
                             cname,
                             &record.container_id,
-                            backoff
-                                .waiting_reason()
-                                .unwrap_or(crate::backoff::CRASH_LOOP_BACK_OFF),
+                            exit,
                             record.restart_count,
-                        ));
-                        continue;
-                    }
+                            outcome,
+                        )
+                    };
+                    let gate = match crate::lifecycle::down_action(restart_policy, lifecycle, exit)
+                    {
+                        DownAction::Latch => None,
+                        DownAction::Restart => {
+                            Some(crate::backoff::crash_gate(entry, seen.at, now))
+                        }
+                    };
 
-                    if restart_policy.should_restart(exit) {
-                        match self
-                            .restart_container(
+                    match gate {
+                        Some(held @ crate::backoff::CrashGate::Hold { remaining }) => {
+                            // Ask to be re-ticked when the hold expires rather
+                            // than relying on the next periodic sweep: a 5-minute
+                            // cap with a 30-second sweep would restart up to
+                            // 4m30s late, and the lateness grows with the delay.
+                            let soon = soonest_requeue.get_or_insert(remaining);
+                            *soon = (*soon).min(remaining);
+                            debug!(
+                                pod = %key.label(),
+                                container = %cname,
+                                restart_count = record.restart_count,
+                                remaining_secs = remaining.as_secs(),
+                                "container held in CrashLoopBackOff"
+                            );
+                            // ★ THE EVENT THAT WAS MISSING. A pod at 149
+                            // restarts said nothing; this is the line that
+                            // would have explained it without reading podman.
+                            self.emit(
                                 key,
-                                value,
-                                namespace,
-                                cname,
-                                spec,
-                                &record.container_id,
-                                record.restart_count,
-                            )
-                            .await
-                        {
-                            Relaunch::Started(new_status) => {
-                                if let Some(ip) = &new_status.pod_ip {
-                                    pod_ip.get_or_insert_with(|| ip.clone());
+                                engenho_controllers::event_recorder::Reason::BackOff,
+                                BackOffRestarting {
+                                    container: cname,
+                                    remaining,
+                                    prior_restarts: record.restart_count,
                                 }
-                                observations.push(ContainerObservation::running(
+                                .to_string(),
+                            )
+                            .await;
+                            observations.push(after(DownOutcome::Held {
+                                reason: held
+                                    .waiting_reason()
+                                    .unwrap_or(crate::backoff::CRASH_LOOP_BACK_OFF),
+                            }));
+                        }
+                        Some(crate::backoff::CrashGate::Go(penalty)) => {
+                            match self
+                                .restart_container(
+                                    key,
+                                    value,
+                                    namespace,
                                     cname,
-                                    &new_status.container_id,
-                                    record.restart_count + 1,
-                                ));
-                                report.objects_changed += 1;
-                                self.emit(
+                                    spec,
+                                    &record.container_id,
+                                    record.restart_count,
+                                    Some(penalty),
+                                )
+                                .await
+                            {
+                                Relaunch::Started(new_status) => {
+                                    if let Some(ip) = &new_status.pod_ip {
+                                        pod_ip.get_or_insert_with(|| ip.clone());
+                                    }
+                                    observations.push(after(DownOutcome::Replaced {
+                                        container_id: &new_status.container_id,
+                                    }));
+                                    report.objects_changed += 1;
+                                    self.emit(
                                     key,
                                     engenho_controllers::event_recorder::Reason::Started,
                                     format!(
@@ -4268,92 +4527,80 @@ impl Kubelet {
                                     ),
                                 )
                                 .await;
-                                debug!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    restart_count = record.restart_count + 1,
-                                    "kubelet restarted exited container (restartPolicy)"
-                                );
-                            }
-                            Relaunch::Held(held) => {
-                                // The exit has served its crash backoff, but
-                                // the replacement's last START failed and its
-                                // start curve still owes a wait. Same render
-                                // and the same event as the crash hold above.
-                                Self::accumulate_requeue(soonest_requeue, held.remaining);
-                                debug!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    remaining_s = held.remaining.as_secs(),
-                                    consecutive_failures = held.consecutive_failures,
-                                    "replacement start backing off"
-                                );
-                                self.emit(
-                                    key,
-                                    engenho_controllers::event_recorder::Reason::BackOff,
-                                    BackOffRestarting {
-                                        container: cname,
-                                        remaining: held.remaining,
-                                        prior_restarts: record.restart_count,
-                                    }
-                                    .to_string(),
-                                )
-                                .await;
-                                observations.push(ContainerObservation::backing_off(
-                                    cname,
-                                    &record.container_id,
-                                    crate::backoff::CRASH_LOOP_BACK_OFF,
-                                    record.restart_count,
-                                ));
-                            }
-                            Relaunch::Failed(failed) => {
-                                // Restart failed — report the terminated state
-                                // this tick; the retry waits on the start
-                                // curve. Never silent.
-                                Self::accumulate_requeue(
-                                    soonest_requeue,
-                                    failed.cost.next_attempt_in,
-                                );
-                                warn!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    error = %failed,
-                                    "container restart failed; retrying on the start curve"
-                                );
-                                observations.push(ContainerObservation::terminated(
-                                    cname,
-                                    &record.container_id,
-                                    exit,
-                                    record.restart_count,
-                                ));
-                                report.objects_skipped += 1;
-                            }
-                            Relaunch::OldNotCleared(cause) => {
-                                // The exit stands as observed; the restart
-                                // waits until the old container is gone.
-                                log_old_not_cleared(key, cname, &cause);
-                                if matches!(cause, KubeletError::NotReaped { .. }) {
-                                    Self::accumulate_requeue(soonest_requeue, MIN_PROBE_REQUEUE);
+                                    debug!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        restart_count = record.restart_count + 1,
+                                        "kubelet restarted exited container (restartPolicy)"
+                                    );
                                 }
-                                observations.push(ContainerObservation::terminated(
-                                    cname,
-                                    &record.container_id,
-                                    exit,
-                                    record.restart_count,
-                                ));
-                                report.objects_skipped += 1;
+                                Relaunch::Held(held) => {
+                                    // The exit has served its crash backoff, but
+                                    // the replacement's last START failed and its
+                                    // start curve still owes a wait. Same render
+                                    // and the same event as the crash hold above.
+                                    Self::accumulate_requeue(soonest_requeue, held.remaining);
+                                    debug!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        remaining_s = held.remaining.as_secs(),
+                                        consecutive_failures = held.consecutive_failures,
+                                        "replacement start backing off"
+                                    );
+                                    self.emit(
+                                        key,
+                                        engenho_controllers::event_recorder::Reason::BackOff,
+                                        BackOffRestarting {
+                                            container: cname,
+                                            remaining: held.remaining,
+                                            prior_restarts: record.restart_count,
+                                        }
+                                        .to_string(),
+                                    )
+                                    .await;
+                                    observations.push(after(DownOutcome::Held {
+                                        reason: crate::backoff::CRASH_LOOP_BACK_OFF,
+                                    }));
+                                }
+                                Relaunch::Failed(failed) => {
+                                    // Restart failed — report the terminated state
+                                    // this tick; the retry waits on the start
+                                    // curve. Never silent.
+                                    Self::accumulate_requeue(
+                                        soonest_requeue,
+                                        failed.cost.next_attempt_in,
+                                    );
+                                    warn!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        error = %failed,
+                                        "container restart failed; retrying on the start curve"
+                                    );
+                                    observations.push(after(DownOutcome::NotReplaced));
+                                    report.objects_skipped += 1;
+                                }
+                                Relaunch::OldNotCleared(cause) => {
+                                    // The exit stands as observed; the restart
+                                    // waits until the old container is gone.
+                                    log_old_not_cleared(key, cname, &cause);
+                                    if matches!(cause, KubeletError::NotReaped { .. }) {
+                                        Self::accumulate_requeue(
+                                            soonest_requeue,
+                                            MIN_PROBE_REQUEUE,
+                                        );
+                                    }
+                                    observations.push(after(DownOutcome::NotReplaced));
+                                    report.objects_skipped += 1;
+                                }
                             }
                         }
-                    } else {
-                        // restartPolicy:Never (or OnFailure+zero) → terminal
-                        // latch. Leave the local entry; later ticks keep
-                        // reporting the terminal phase (idempotent-skip).
-                        observations.push(ContainerObservation::terminated(
-                            cname,
-                            &record.container_id,
-                            exit,
-                            record.restart_count,
-                        ));
+                        None => {
+                            // restartPolicy:Never (or OnFailure+zero), or a pod
+                            // being deleted → terminal latch. Leave the local
+                            // entry; later ticks keep reporting the terminal phase
+                            // (idempotent-skip).
+                            observations.push(after(DownOutcome::Latched));
+                        }
                     }
                 }
                 Err(cause) => {
@@ -4482,8 +4729,9 @@ impl Kubelet {
 
     /// Start ONE init container (the spec already carries its name/aliases/
     /// mounts) and record it under [`LocalPod::init_containers`] with a fresh
-    /// (zero) restart count + default (empty) probe state — init containers do
-    /// NOT carry probes. Returns the new container's status.
+    /// (zero) restart count + default (empty) probe state — no init container
+    /// carries probes here, sidecars included (see [`LocalPod`]). Returns the
+    /// new container's status.
     ///
     /// Started through [`Self::launch`], so it needs a permit from the init
     /// container's start curve like any other start.
@@ -4511,14 +4759,14 @@ impl Kubelet {
             ContainerRecord {
                 container_id: status.container_id.clone(),
                 restart_count,
-                // Init containers never carry probes (K8s does not run
-                // liveness/readiness/startup on init containers).
-                probes: ContainerProbeState::default(),
+                // No init container carries probes here. Upstream probes a
+                // native sidecar; engenho does not yet (see `LocalPod`).
+                probes: ContainerProbes::default(),
                 // Init containers are not subject to CrashLoopBackOff here:
-                // the init sequence has its own ordering, and stamping a
-                // start it does not read would be a field nobody consults.
-                started_at: None,
-                terminated_at: None,
+                // the init sequence has its own ordering, and an entry it does
+                // not read would be a field nobody consults.
+                crash_backoff: None,
+                down: None,
                 mounts: spec.mounts.clone(),
             },
         );
@@ -4538,8 +4786,9 @@ impl Kubelet {
     }
 
     /// INIT reconcile — the I/O driver over the pure
-    /// [`crate::lifecycle::next_init_action`] sequencer. NO probes (K8s does
-    /// not run them on init containers). Polls each init container's recorded
+    /// [`crate::lifecycle::next_init_action`] sequencer. NO probes (none on a
+    /// classic init container upstream either; a native sidecar's are a gap
+    /// here, see [`LocalPod`]). Polls each init container's recorded
     /// state, builds the ORDERED `Vec<ContainerObservation>` (Waiting if not
     /// yet recorded, Running if up, Terminated{exit} if exited), asks the pure
     /// sequencer for the next [`InitAction`], and acts:
@@ -4621,11 +4870,16 @@ impl Kubelet {
                     // Exited, or lost by the backend (an Unknown exit): the
                     // sequencer restarts it under the policy or fails the pod
                     // — a lost init container is not re-run under `Never`.
-                    Ok(Polled::Down { exit, .. }) => {
+                    Ok(Polled::Down { exit: polled, .. }) => {
+                        // An init container that exited 0 and is then lost by
+                        // the runtime has still succeeded (`SeenDown`).
+                        let (seen, _) = self
+                            .note_down(key, cname, LocalPod::inits, record, polled, self.now())
+                            .await;
                         observations.push(mark(ContainerObservation::terminated(
                             cname,
                             &record.container_id,
-                            exit,
+                            seen.exit,
                             record.restart_count,
                         )));
                     }
@@ -4761,7 +5015,7 @@ impl Kubelet {
                 self.write_pod_status(key, value, &desired, report).await?;
 
                 // Arm a near requeue so the next tick advances the sequence
-                // (mirrors the probe-cadence / volume-pending requeue floor).
+                // (the probe-cadence requeue floor).
                 let next = soonest_requeue.map_or(MIN_PROBE_REQUEUE, |d| d.min(MIN_PROBE_REQUEUE));
                 *soonest_requeue = Some(next);
                 Ok(())
@@ -5032,8 +5286,11 @@ impl Kubelet {
                 Some(record) => {
                     let state = match self.poll(&record.container_id).await {
                         Ok(Polled::Running(_)) => ContainerState::Running,
-                        // Exited, or vanished (an Unknown exit).
-                        Ok(Polled::Down { exit, .. }) => ContainerState::terminated(exit),
+                        // Exited, or vanished (an Unknown exit) — read with
+                        // what this run's record already observed (`SeenDown`).
+                        Ok(Polled::Down { exit, .. }) => ContainerState::terminated(
+                            Termination::known_after(record.down.map(|seen| seen.exit), exit),
+                        ),
                         Err(cause) => {
                             return Err(Unseen {
                                 container: cname.clone(),
@@ -5166,7 +5423,7 @@ mod env_resolution_tests {
         let mut defined = BTreeMap::new();
         defined.insert("RUNTIME_NAMESPACE".to_string(), "flux-system".to_string());
         assert_eq!(
-            Kubelet::expand_env_refs(
+            crate::env_ref::expand_env_refs(
                 "http://source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local.",
                 &defined
             ),
@@ -5180,11 +5437,11 @@ mod env_resolution_tests {
     fn a_doubled_dollar_is_an_escape_not_a_reference() {
         let defined = BTreeMap::new();
         assert_eq!(
-            Kubelet::expand_env_refs("cost is $$5", &defined),
+            crate::env_ref::expand_env_refs("cost is $$5", &defined),
             "cost is $5"
         );
         assert_eq!(
-            Kubelet::expand_env_refs("$$(NOT_A_REF)", &defined),
+            crate::env_ref::expand_env_refs("$$(NOT_A_REF)", &defined),
             "$(NOT_A_REF)"
         );
     }
@@ -5196,7 +5453,7 @@ mod env_resolution_tests {
     fn an_unresolvable_reference_is_left_verbatim_never_blanked() {
         let defined = BTreeMap::new();
         assert_eq!(
-            Kubelet::expand_env_refs("host.$(MISSING).local", &defined),
+            crate::env_ref::expand_env_refs("host.$(MISSING).local", &defined),
             "host.$(MISSING).local"
         );
     }
@@ -5205,12 +5462,12 @@ mod env_resolution_tests {
     #[test]
     fn a_bare_dollar_is_not_a_reference() {
         let defined = BTreeMap::new();
-        assert_eq!(Kubelet::expand_env_refs("100$", &defined), "100$");
+        assert_eq!(crate::env_ref::expand_env_refs("100$", &defined), "100$");
         assert_eq!(
-            Kubelet::expand_env_refs("$(unclosed", &defined),
+            crate::env_ref::expand_env_refs("$(unclosed", &defined),
             "$(unclosed"
         );
-        assert_eq!(Kubelet::expand_env_refs("a $ b", &defined), "a $ b");
+        assert_eq!(crate::env_ref::expand_env_refs("a $ b", &defined), "a $ b");
     }
 
     /// Multi-byte text must survive byte-wise scanning — emitting bytes rather
@@ -5220,7 +5477,7 @@ mod env_resolution_tests {
         let mut defined = BTreeMap::new();
         defined.insert("NS".to_string(), "café".to_string());
         assert_eq!(
-            Kubelet::expand_env_refs("日本語-$(NS)-日本語", &defined),
+            crate::env_ref::expand_env_refs("日本語-$(NS)-日本語", &defined),
             "日本語-café-日本語"
         );
     }
@@ -5233,9 +5490,9 @@ mod env_resolution_tests {
         let mut defined = BTreeMap::new();
         defined.insert("A".to_string(), "$(B)".to_string());
         defined.insert("B".to_string(), "final".to_string());
-        assert_eq!(Kubelet::expand_env_refs("$(A)", &defined), "$(B)");
+        assert_eq!(crate::env_ref::expand_env_refs("$(A)", &defined), "$(B)");
         assert_eq!(
-            Kubelet::expand_env_refs("$(A)/$(B)", &defined),
+            crate::env_ref::expand_env_refs("$(A)/$(B)", &defined),
             "$(B)/final"
         );
     }

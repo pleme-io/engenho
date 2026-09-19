@@ -304,15 +304,7 @@ impl Controller for Scheduler {
             e @ SchedulerError::ZeroTickInterval => ControllerError::Internal(e.to_string()),
             SchedulerError::Internal(s) => ControllerError::Internal(s),
         })?;
-        Ok(ReconcileReport {
-            objects_examined: report.pods_examined,
-            // Binds AND Unschedulable-condition writes mutate objects.
-            objects_changed: report.bound.len() + report.unschedulable_written,
-            // Pending pods this tick examined and did not write.
-            objects_skipped: report.left_untouched(),
-            note: (report.pending_pods > 0).then(|| report.to_string()),
-        }
-        .into())
+        Ok(report.controller_report().into())
     }
 }
 
@@ -343,6 +335,35 @@ impl TickReport {
             self.unschedulable
                 .saturating_sub(self.unschedulable_written),
         )
+    }
+
+    /// This tick as the controller runtime counts it.
+    ///
+    /// Binds and Unschedulable-condition writes both mutate a Pod, so both
+    /// are changes. A pending pod the tick neither bound nor wrote for is a
+    /// skip. The note is carried only when something was pending.
+    ///
+    /// ★ Only the counts the scheduler keeps are named. Every other field
+    /// of [`ReconcileReport`] comes from its `Default`, so a field the
+    /// controllers crate adds lands here at its default instead of breaking
+    /// this crate's build, and the scheduler never reports a count it does
+    /// not keep. Tier-honest: `..Default::default()` makes a new field
+    /// COMPILE; that it stays at its default here is a test
+    /// (`controller_report_names_only_the_counts_the_scheduler_keeps`), not
+    /// a type.
+    #[must_use]
+    #[allow(
+        clippy::needless_update,
+        reason = "every field is named today; the update is what lets engenho-controllers add one without editing this crate"
+    )]
+    pub fn controller_report(&self) -> ReconcileReport {
+        ReconcileReport {
+            objects_examined: self.pods_examined,
+            objects_changed: self.bound.len() + self.unschedulable_written,
+            objects_skipped: self.left_untouched(),
+            note: (self.pending_pods > 0).then(|| self.to_string()),
+            ..Default::default()
+        }
     }
 }
 
@@ -430,5 +451,81 @@ mod tests {
         let no_phase = json!({ "status": { "conditions": [want.clone()] } });
         assert!(!already_marked(&no_phase, &want));
         assert!(!already_marked(&json!({}), &want));
+    }
+
+    // ── I31: the controller report names only the counts the scheduler keeps ──
+
+    /// A tick with `pending` pending pods: `bound` bound, `unschedulable`
+    /// admitted by no node (of which `written` got a fresh condition), and
+    /// `no_nodes` left because no Node was observed at all.
+    fn tick_of(
+        pending: usize,
+        bound: usize,
+        unschedulable: usize,
+        written: usize,
+        no_nodes: usize,
+    ) -> TickReport {
+        TickReport {
+            pods_examined: pending + 2,
+            nodes_available: 3,
+            pending_pods: pending,
+            unschedulable,
+            unschedulable_written: written,
+            no_nodes_observed: no_nodes,
+            bound: (0..bound)
+                .map(|i| Binding {
+                    pod_key: ResourceKey::namespaced("", "v1", "Pod", "default", &i.to_string()),
+                    node_name: "node-1".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn controller_report_counts_binds_and_condition_writes_as_changes() {
+        // 6 pending: 2 bound, 3 unschedulable (1 written, 2 already
+        // carrying it), 1 with no node observed.
+        let report = tick_of(6, 2, 3, 1, 1).controller_report();
+        assert_eq!(report.objects_examined, 8);
+        assert_eq!(report.objects_changed, 3, "2 binds + 1 condition write");
+        assert_eq!(
+            report.objects_skipped, 3,
+            "2 unschedulable already marked + 1 with no node observed"
+        );
+    }
+
+    #[test]
+    fn controller_report_carries_a_note_only_when_something_was_pending() {
+        let busy = tick_of(1, 1, 0, 0, 0);
+        assert_eq!(
+            busy.controller_report().note.as_deref(),
+            Some(busy.to_string().as_str())
+        );
+        assert_eq!(tick_of(0, 0, 0, 0, 0).controller_report().note, None);
+    }
+
+    /// Every field of the runtime's report other than the four the
+    /// scheduler counts is at `ReconcileReport::default()`. When
+    /// engenho-controllers adds a field, this crate still builds (the
+    /// `..Default::default()` in `controller_report`) and this test is
+    /// what says the scheduler did not invent a value for it. The whole
+    /// value is compared through `Debug` because `ReconcileReport` has no
+    /// `PartialEq`.
+    #[test]
+    #[allow(
+        clippy::field_reassign_with_default,
+        reason = "the point is which fields move off Default; naming them one by one says so"
+    )]
+    fn controller_report_names_only_the_counts_the_scheduler_keeps() {
+        let tick = tick_of(4, 1, 2, 2, 1);
+        let mut expected = ReconcileReport::default();
+        expected.objects_examined = 6;
+        expected.objects_changed = 3;
+        expected.objects_skipped = 1;
+        expected.note = Some(tick.to_string());
+        assert_eq!(
+            format!("{:?}", tick.controller_report()),
+            format!("{expected:?}")
+        );
     }
 }

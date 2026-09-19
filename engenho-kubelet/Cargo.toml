@@ -62,3 +62,7 @@ proptest = "1"
 # costs no new third-party code.
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+# Upstream prober rows (Kubernetes v1.34.0) and the harness that runs them:
+# tests/oracle_prober.rs. Dev-only, a workspace path crate: no new third-party
+# code.
+engenho-oracle = { path = "../engenho-oracle" }

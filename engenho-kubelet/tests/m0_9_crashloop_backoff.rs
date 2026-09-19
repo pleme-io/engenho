@@ -1,7 +1,8 @@
 //! CRASHLOOP BACKOFF — proving the DECISION is wired into the LOOP.
 //!
 //! ★ WHY THIS FILE EXISTS SEPARATELY FROM `backoff.rs`'s unit tests.
-//! `backoff::decide` was correct and fully tested from the day it landed,
+//! The crash backoff decision (then `backoff::decide`, now
+//! `backoff::crash_gate`) was fully tested from the day it landed,
 //! and the kubelet restarted a failing container on EVERY tick anyway,
 //! because nothing called it. A tested pure function that no loop consults
 //! is not a feature — it is a well-tested opinion. These tests exercise the
@@ -19,6 +20,10 @@
 //!   B5 a container that stayed up past RESET_AFTER restarts immediately,
 //!      never inheriting an old crash's penalty
 //!   B6 restartPolicy:Never never restarts and never backs off
+//!   B7 the reset RE-INITIALISES the penalty: a forgiven container's next
+//!      short crash owes 10s again, not the cap its restart count would say
+//!   B8 a pod being deleted is neither restarted nor held in backoff, and a
+//!      pod that is already being deleted is never started
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -265,6 +270,152 @@ async fn b6_restart_policy_never_neither_restarts_nor_backs_off() {
         "{p}"
     );
     assert_eq!(phase(&p).as_deref(), Some("Failed"), "{p}");
+
+    drop(kubelet);
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+}
+
+/// B7 — upstream's reset re-initialises the backoff entry
+/// (`HasExpiredFunc`, kubelet.go:1004-1006, then `Next`). The kubelet read the
+/// penalty off `restartCount`, which never goes down, so the reset forgave
+/// ONE restart and the next short crash of a container with a long history
+/// owed the 5-minute cap. Oracle row: `do-backoff/container ran >600s before
+/// crashing: reset, restart immediately, entry back to initial`.
+#[tokio::test]
+async fn b7_a_forgiven_container_owes_ten_seconds_again_not_five_minutes() {
+    let store = boot_store("backoff-reset-reinit").await;
+    let backend = Arc::new(FakeBackend::new());
+    let clock = TestClock::new();
+    let kubelet =
+        Kubelet::new(store.clone(), backend.clone(), "node-A").with_clock(clock.as_clock());
+    put_pod(&store, "crasher", "Always").await;
+
+    kubelet.tick().await.unwrap();
+    crash_and_tick(&backend, &kubelet).await; // restart 1, immediate
+    // Six more short crashes, each served in full: the penalty reaches the cap.
+    for n in 2..=7 {
+        crash_and_tick(&backend, &kubelet).await;
+        clock.advance(Duration::from_secs(301));
+        kubelet.tick().await.unwrap();
+        assert_eq!(starts(&backend.events().await), n + 1, "restart {n} served");
+    }
+
+    // The replacement stays up past RESET_AFTER, then dies: restarted at once.
+    clock.advance(Duration::from_secs(700));
+    crash_and_tick(&backend, &kubelet).await;
+    assert_eq!(
+        starts(&backend.events().await),
+        9,
+        "forgiven: restarted at once"
+    );
+
+    // Its next crash is held 10s — the base, not the cap.
+    crash_and_tick(&backend, &kubelet).await;
+    assert_eq!(starts(&backend.events().await), 9, "the next crash is held");
+    clock.advance(Duration::from_secs(9));
+    kubelet.tick().await.unwrap();
+    assert_eq!(starts(&backend.events().await), 9, "still held at 9s");
+    clock.advance(Duration::from_secs(2));
+    kubelet.tick().await.unwrap();
+    assert_eq!(
+        starts(&backend.events().await),
+        10,
+        "a forgiven container's next crash owes 10s, not the 5-minute cap its restart count says"
+    );
+
+    drop(kubelet);
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+}
+
+/// Mark the pod as being deleted, the way the store leaves one that still
+/// carries a finalizer.
+async fn mark_deleting(store: &StoreMesh, name: &str) {
+    let mut value = pod(store, name).await;
+    value["metadata"]["deletionTimestamp"] = json!("2026-09-19T00:00:00Z");
+    value["metadata"]["finalizers"] = json!(["example.com/hold"]);
+    store
+        .propose(ResourceCommand::Put {
+            key: pod_key(name),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await
+        .unwrap();
+}
+
+/// B8 — upstream's `ShouldContainerBeRestarted` returns false for a pod
+/// with a deletionTimestamp before it reads the policy (helpers.go:82-117;
+/// oracle rows `scbr/deleted/*`). The kubelet read only the policy, so a
+/// crashed container of a pod waiting on its finalizers was restarted, and
+/// held in CrashLoopBackOff, for as long as the pod lingered.
+#[tokio::test]
+async fn b8_a_pod_being_deleted_is_neither_restarted_nor_held() {
+    let store = boot_store("backoff-deleting").await;
+    let backend = Arc::new(FakeBackend::new());
+    let clock = TestClock::new();
+    let kubelet =
+        Kubelet::new(store.clone(), backend.clone(), "node-A").with_clock(clock.as_clock());
+    put_pod(&store, "leaving", "Always").await;
+
+    kubelet.tick().await.unwrap();
+    assert_eq!(starts(&backend.events().await), 1, "initial start");
+
+    mark_deleting(&store, "leaving").await;
+    crash_and_tick(&backend, &kubelet).await;
+    for _ in 0..3 {
+        clock.advance(Duration::from_secs(301));
+        kubelet.tick().await.unwrap();
+    }
+    assert_eq!(
+        starts(&backend.events().await),
+        1,
+        "a pod being deleted restarts nothing"
+    );
+    let p = pod(&store, "leaving").await;
+    assert_ne!(
+        waiting_reason(&p).as_deref(),
+        Some("CrashLoopBackOff"),
+        "a container that will never be restarted is not waiting its turn: {p}"
+    );
+
+    drop(kubelet);
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+}
+
+/// B8, the other half — oracle rows `scbr/deleted/no-history/*`: a pod
+/// already being deleted when this kubelet first sees it is never started.
+#[tokio::test]
+async fn b8_a_pod_already_being_deleted_is_never_started() {
+    let store = boot_store("backoff-deleted-unstarted").await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod(&store, "gone", "Always").await;
+    mark_deleting(&store, "gone").await;
+
+    for _ in 0..3 {
+        kubelet.tick().await.unwrap();
+    }
+    assert_eq!(
+        starts(&backend.events().await),
+        0,
+        "a pod being deleted starts nothing"
+    );
 
     drop(kubelet);
     Arc::try_unwrap(store)

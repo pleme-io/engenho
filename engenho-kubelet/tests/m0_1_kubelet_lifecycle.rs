@@ -956,6 +956,93 @@ async fn a_vanished_never_container_fails_the_pod_instead_of_rerunning_it() {
     teardown(store, kubelet).await;
 }
 
+/// ★ An exit once observed is not forgotten. A `Never` pod whose container
+/// exited 0 is Succeeded, and the runtime later losing the container (a
+/// manual `podman rm`, a host clean-up) or reporting it UNKNOWN does not
+/// make it fail. The kubelet read each poll alone, so the exit became
+/// 137 / ContainerStatusUnknown and the pod Failed: a completed Job pod
+/// counted as a failure. Oracle row: `status/vanished, previous status
+/// Terminated: old status carried verbatim`.
+#[tokio::test]
+async fn a_completed_container_the_runtime_then_loses_stays_completed() {
+    for lost in ["removed", "reported unknown"] {
+        let store = boot_store().await;
+        let backend = Arc::new(FakeBackend::new());
+        let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+        put_pod(&store, "p1", "img", Some("node-A")).await;
+        kubelet.tick().await.unwrap();
+        let cid = first_container_id(&backend).await;
+        backend.set_exit(&cid, 0).await;
+        kubelet.tick().await.unwrap();
+        let pod = store.get(&pod_key("p1")).await.unwrap();
+        assert_eq!(pod_phase(&pod).as_deref(), Some("Succeeded"), "{lost}");
+
+        if lost == "removed" {
+            backend.remove(&cid).await.unwrap();
+        } else {
+            backend.set_run_state(&cid, RunState::Unknown).await;
+        }
+        kubelet.tick().await.unwrap();
+        kubelet.tick().await.unwrap();
+
+        let pod = store.get(&pod_key("p1")).await.unwrap();
+        let term = &container_statuses(&pod)[0]["state"]["terminated"];
+        assert_eq!(
+            term["exitCode"], 0,
+            "{lost}: the observed exit stands: {pod}"
+        );
+        assert_eq!(term["reason"], "Completed", "{lost}: {pod}");
+        assert_eq!(pod_phase(&pod).as_deref(), Some("Succeeded"), "{lost}");
+        assert_eq!(
+            count_starts(&backend.events().await),
+            1,
+            "{lost}: not re-run"
+        );
+
+        teardown(store, kubelet).await;
+    }
+}
+
+/// ★ A terminal phase is never left. The pod's stored status shows it
+/// Succeeded or Failed (the API is the record: an eviction, a controller,
+/// an operator wrote it) while this kubelet still holds its container; the
+/// kubelet wrote the phase its fold computed over it, `Running`. Upstream
+/// forces a phase the apiserver shows terminal back, whatever the
+/// containers say. Oracle row: `phase/apiserver phase Succeeded is sticky
+/// even though containers render unknown with restartCount 1`.
+#[tokio::test]
+async fn a_pod_published_terminal_is_never_moved_out_of_it() {
+    for terminal in ["Succeeded", "Failed"] {
+        let store = boot_store().await;
+        let backend = Arc::new(FakeBackend::new());
+        let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+        put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("Always")).await;
+        kubelet.tick().await.unwrap();
+        let mut pod = store.get(&pod_key("p1")).await.unwrap();
+        assert_eq!(pod_phase(&pod).as_deref(), Some("Running"));
+
+        pod["status"]["phase"] = json!(terminal);
+        store
+            .propose(ResourceCommand::Put {
+                key: pod_key("p1"),
+                value: pod,
+                expected: None,
+                reason: Reason::Operator,
+            })
+            .await
+            .unwrap();
+        kubelet.tick().await.unwrap();
+        kubelet.tick().await.unwrap();
+
+        let pod = store.get(&pod_key("p1")).await.unwrap();
+        assert_eq!(pod_phase(&pod).as_deref(), Some(terminal), "{pod}");
+
+        teardown(store, kubelet).await;
+    }
+}
+
 // ── Test 7 — MULTI-CONTAINER: N containers → N starts, all running ───────
 
 #[tokio::test]

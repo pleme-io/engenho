@@ -416,6 +416,117 @@ async fn missing_configmap_keeps_pod_pending_no_start() {
     teardown(store, kubelet).await;
 }
 
+// ── (d′) the missing-source requeue grows per pod, and never holds a pod back ─
+
+/// The requeue a tick asked for, if any.
+fn requeue_of(outcome: &engenho_controllers::ReconcileOutcome) -> Option<Duration> {
+    use engenho_controllers::ReconcileResult;
+    match outcome.result {
+        ReconcileResult::Requeue(after) | ReconcileResult::RequeueWithProgress(after) => {
+            Some(after)
+        }
+        ReconcileResult::Done => None,
+    }
+}
+
+/// ★ I29. A pod whose ConfigMap does not exist used to re-arm a flat 1 s
+/// requeue on every tick, forever, so an otherwise idle kubelet woke once a
+/// second for the pod's whole life. The requeue now grows on the pod's own
+/// streak (upstream's 500 ms doubling to 2m2s, never below the kubelet's 1 s
+/// floor), an early wake does not grow it, and none of it ever delays the
+/// pod once its ConfigMap is written.
+#[tokio::test]
+async fn a_missing_source_requeue_grows_per_pod_and_never_holds_the_pod_back() {
+    use engenho_kubelet::kubelet::TestClock;
+
+    let store = boot_store("vol-missing-curve").await;
+    let backend = Arc::new(FakeBackend::new());
+    let mat = Arc::new(FakeVolumeMaterializer::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_volume_materializer(mat.clone() as Arc<dyn VolumeMaterializer>)
+        .with_clock(clock.as_clock());
+    put(
+        &store,
+        pod_key("p1"),
+        json!({
+            "kind": "Pod", "apiVersion": "v1",
+            "metadata": { "name": "p1" },
+            "spec": {
+                "nodeName": "node-A",
+                "volumes": [ { "name": "cfg-vol", "configMap": { "name": "late" } } ],
+                "containers": [ {
+                    "name": "main", "image": "busybox",
+                    "volumeMounts": [ { "name": "cfg-vol", "mountPath": "/etc/cfg" } ]
+                } ]
+            }
+        }),
+    )
+    .await;
+
+    // Each tick lands exactly when the previous one asked to come back.
+    let asked_now = || async {
+        requeue_of(&kubelet.tick().await.unwrap())
+            .expect("a volume-pending pod always asks to come back")
+    };
+    let mut asked = vec![asked_now().await];
+    for _ in 0..6 {
+        clock.advance(*asked.last().unwrap());
+        asked.push(asked_now().await);
+    }
+    let secs = |s: u64| Duration::from_secs(s);
+    assert_eq!(
+        asked,
+        [
+            secs(1),
+            secs(1),
+            secs(2),
+            secs(4),
+            secs(8),
+            secs(16),
+            secs(32)
+        ],
+        "the requeue grows on the pod's streak instead of re-arming a flat second"
+    );
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        waiting_reason(&pod, 0).as_deref(),
+        Some("ConfigMapNotFound")
+    );
+
+    // Woken early (another write, another pod's timer): the pod is re-resolved
+    // but the curve does not grow; the wake is still due when it was.
+    clock.advance(secs(10));
+    assert_eq!(
+        requeue_of(&kubelet.tick().await.unwrap()),
+        Some(secs(22)),
+        "an early wake reports the time left, it does not take the next step"
+    );
+
+    // The ConfigMap is written. The streak is 32 s deep and the pod is not
+    // due for 22 s, and it starts on this very tick all the same.
+    put(
+        &store,
+        ResourceKey::namespaced("", "v1", "ConfigMap", "default", "late"),
+        json!({
+            "kind": "ConfigMap", "apiVersion": "v1",
+            "metadata": { "name": "late" },
+            "data": { "k": "v" }
+        }),
+    )
+    .await;
+    kubelet.tick().await.unwrap();
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        phase(&pod).as_deref(),
+        Some("Running"),
+        "the streak never holds back a pod whose source now exists"
+    );
+    assert_eq!(count_starts(&backend.events().await), 1);
+
+    teardown(store, kubelet).await;
+}
+
 // ── (e) no-volume pod is unchanged ─────────────────────────────────────────
 
 #[tokio::test]

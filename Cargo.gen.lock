@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "1e4093b5956f4629414e5c8ae0adf4bbf80561a47f99eedb874fb3c1e0a15f0a",
+  "cargo_lock_sha256": "7f443380e8687beeeccedb4bb54bdd80d841131872bd6871cd5c29127c9a8c03",
   "manifest_sha256": {
     "Cargo.toml": "566bc85d70b240f7e5a1cc55eddf82501c2ee299b137bfc861d72a166adf2b2a",
     "engenho-apiserver/Cargo.toml": "be7d04cd80fe124f3094eb3f147cbde15e2eabe2975858e18f9ed7ab6c190ab1",
@@ -17,7 +17,7 @@
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
-    "engenho-kubelet/Cargo.toml": "61f3b57b809bf3b6a8680f57d32637a7a4e414337f2cda04f2c1db2500f02fae",
+    "engenho-kubelet/Cargo.toml": "e6e0a52fade25343da69129b7ce04d396a15d930903084d09e564e0716fb2ee1",
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
