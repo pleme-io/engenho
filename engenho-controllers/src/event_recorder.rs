@@ -89,7 +89,8 @@ pub enum Reason {
     /// A controller could not update an object it maintains. Upstream's
     /// `StatefulSet` `Failed<Verb>` string for `update`. Emitted by the
     /// `NetworkPolicy` controller when a policy's enforcement annotation
-    /// cannot be written.
+    /// cannot be written, and by the pvc-protection controller's sweep on a
+    /// claim whose finalizers it cannot write.
     FailedUpdate,
     /// The Deployment controller could not create a `ReplicaSet`. Upstream's
     /// `deploymentutil.FailedRSCreateReason`.
@@ -103,6 +104,12 @@ pub enum Reason {
     /// retrying will not clear (its declaration is unusable). Emitted by the
     /// pv-binder's sweep on the claim itself.
     ProvisioningFailed,
+    /// A Released `PersistentVolume` could not be reclaimed under its
+    /// policy: engenho knows no deleter for it, its policy is one engenho
+    /// does not run, or its directory is not the one the local-path
+    /// provisioner derived. Upstream's `VolumeFailedDelete`. Emitted by the
+    /// pv-binder's volume sweep on the volume, once, as it goes `Failed`.
+    VolumeFailedDelete,
     // ── networking ──
     /// A NetworkPolicy was accepted and its rules computed, but no packet
     /// filter was installed — so the traffic it claims to restrict is
@@ -135,6 +142,7 @@ impl Reason {
             Self::FailedToUpdateEndpoint => "FailedToUpdateEndpoint",
             Self::ProvisioningSucceeded => "ProvisioningSucceeded",
             Self::ProvisioningFailed => "ProvisioningFailed",
+            Self::VolumeFailedDelete => "VolumeFailedDelete",
             Self::NetworkPolicyNotEnforced => "NetworkPolicyNotEnforced",
         }
     }
@@ -152,6 +160,7 @@ impl Reason {
             | Self::BackOff
             | Self::FailedScheduling
             | Self::ProvisioningFailed
+            | Self::VolumeFailedDelete
             | Self::FailedCreate
             | Self::FailedUpdate
             | Self::ReplicaSetCreateError
@@ -272,6 +281,8 @@ mod tests {
         assert_eq!(Reason::SuccessfulCreate.as_str(), "SuccessfulCreate");
         // k8s.io/kubernetes pkg/controller/volume/events.ProvisioningFailed.
         assert_eq!(Reason::ProvisioningFailed.as_str(), "ProvisioningFailed");
+        // k8s.io/kubernetes pkg/controller/volume/events.VolumeFailedDelete.
+        assert_eq!(Reason::VolumeFailedDelete.as_str(), "VolumeFailedDelete");
         // pkg/controller/controller_utils.go FailedCreatePodReason.
         assert_eq!(Reason::FailedCreate.as_str(), "FailedCreate");
         // pkg/controller/statefulset recordPodEvent("update").
@@ -297,6 +308,7 @@ mod tests {
             Reason::BackOff,
             Reason::FailedScheduling,
             Reason::ProvisioningFailed,
+            Reason::VolumeFailedDelete,
             Reason::FailedCreate,
             Reason::FailedUpdate,
             Reason::ReplicaSetCreateError,

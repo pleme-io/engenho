@@ -74,6 +74,7 @@ pub mod plantio_pipeline;
 pub mod pod_scheduling;
 pub mod pod_template;
 pub mod pv_binder;
+pub mod pvc_protection;
 pub mod reads;
 pub mod replicaset;
 pub mod roceiro;
@@ -179,8 +180,10 @@ pub use pod_scheduling::{
 pub use pod_template::{NormalizedTemplate, POD_TEMPLATE_HASH_LABEL, TemplateHash};
 pub use pv_binder::{
     ClaimUid, ENGENHO_LOCAL_PATH_PROVISIONER, FakeProvisionerEnv, HostProvisionerEnv,
-    LOCAL_PATH_PROVISIONER, NoVolumeIdentity, ProvisionerEnv, PvBinderController, PvName,
+    LOCAL_PATH_PROVISIONER, LocalPathDir, NoVolumeIdentity, ProvisionerEnv, PvBinderController,
+    PvName, ReclaimError, ReclaimPolicy, Unreclaimable,
 };
+pub use pvc_protection::{PVC_PROTECTION_FINALIZER, PvcProtectionController};
 pub use reads::{DeclaresReads, Reads, gvk};
 pub use replicaset::ReplicaSetController;
 pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};

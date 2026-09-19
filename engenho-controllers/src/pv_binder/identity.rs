@@ -96,8 +96,25 @@ impl ClaimUid {
     pub fn of(claim: &Value) -> Result<Self, NoVolumeIdentity> {
         match claim.get("metadata").and_then(|m| m.get("uid")) {
             None | Some(Value::Null) => Err(NoVolumeIdentity::UidAbsent),
-            Some(Value::String(uid)) if is_dns_label(uid) => Ok(Self(uid.clone())),
+            Some(Value::String(uid)) => Self::recorded(uid),
             Some(_) => Err(NoVolumeIdentity::UidMalformed),
+        }
+    }
+
+    /// The uid a PV's `claimRef` recorded for its claim, held to the same
+    /// rule as the claim's own: at reclaim the backing directory is derived
+    /// from it again, and a directory about to be removed is exactly where
+    /// `../..` must not reach.
+    ///
+    /// # Errors
+    ///
+    /// [`NoVolumeIdentity::UidMalformed`] when `uid` is not a lowercase DNS
+    /// label.
+    pub fn recorded(uid: &str) -> Result<Self, NoVolumeIdentity> {
+        if is_dns_label(uid) {
+            Ok(Self(uid.to_owned()))
+        } else {
+            Err(NoVolumeIdentity::UidMalformed)
         }
     }
 
@@ -311,6 +328,21 @@ mod tests {
                 pv.local_path_dir("/r", ns, name).map(|d| d.to_string()),
                 Err(NoVolumeIdentity::NameNotAPathComponent),
                 "{ns:?}/{name:?}"
+            );
+        }
+    }
+
+    /// A recorded uid is read by the claim's own rule, so reclaim derives
+    /// the directory provision derived and nothing else.
+    #[test]
+    fn a_recorded_uid_obeys_the_claims_rule() {
+        let provisioned = ClaimUid::of(&claim(&json!("u-1"))).unwrap();
+        assert_eq!(ClaimUid::recorded("u-1"), Ok(provisioned));
+        for bad in ["", "../../etc", "a/b", "UPPER"] {
+            assert_eq!(
+                ClaimUid::recorded(bad),
+                Err(NoVolumeIdentity::UidMalformed),
+                "{bad:?}"
             );
         }
     }
