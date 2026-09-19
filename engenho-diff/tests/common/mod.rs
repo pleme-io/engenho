@@ -33,10 +33,16 @@
 //! engenho. Any conformant apiserver works; a disposable `kind` cluster
 //! pinned to the target version is the reproducible choice.
 //!
-//! The m0 test predates this module and inlines the same shape; the new
-//! per-class files route through here so the boot → preflight → run → report →
-//! RATCHET pipeline lives in ONE place (★ ruthless standardization). The
-//! ratchet has TWO guards:
+//! The m0 test predated this module and inlined the same shape, down to its
+//! own copy of the unreachable-oracle hint. It routes through here now, so
+//! the boot → preflight → run → report pipeline lives in ONE place (★
+//! ruthless standardization). Its RATCHET is the one thing it still keeps:
+//! m0 asserts the observed hard divergences are a SUBSET of its baseline,
+//! where [`assert_ratchet`] below asserts EQUALITY. Those are different
+//! guards, not a duplicate — do not fold them together without deciding
+//! which one m0 should have.
+//!
+//! [`assert_ratchet`]'s ratchet has TWO guards:
 //!
 //!   * **no-new** — an observed hard divergence NOT in the file's baseline
 //!     fails (a regression, or a real gap to record).
@@ -46,31 +52,29 @@
 #![allow(dead_code)] // each test file uses a subset of these helpers.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use engenho_diff::{
-    DiffTarget, Divergence, EngenhoTarget, HttpMethod, K3sTarget, Normalizer, Operation, Severity,
-    Verdict, cotejo,
+    DiffTarget, Divergence, EngenhoTarget, HttpMethod, K3sTarget, Normalizer, Operation,
+    OracleKubeconfig, Severity, Verdict, cotejo,
 };
 
 /// The oracle's kubeconfig: `ENGENHO_ORACLE_KUBECONFIG`, else
 /// `~/.kube/engenho-local-tunnel.yaml`.
+///
+/// The resolution rule and the unreachable hint are typed values in the
+/// library (`engenho_diff::oracle`), not literals here, so no test binary can
+/// hold a second copy that drifts. `m0_core_crud_parity.rs` held one for
+/// months: it still failed loud, it just sent the operator to a tunnel to a
+/// VM that had been decommissioned.
+///
+/// # Panics
+///
+/// If neither `ENGENHO_ORACLE_KUBECONFIG` nor `HOME` is set — there is then
+/// no path to even try, which is a configuration gap, not a dead oracle.
 #[must_use]
-pub fn oracle_kubeconfig() -> PathBuf {
-    // ENGENHO_ORACLE_KUBECONFIG first. The path was hardcoded to a hand-built
-    // k3s VM's tunnel, and that VM is GONE (192.168.64.10 unreachable
-    // 2026-08-08) — which is why all four engenho-diff binaries fail with
-    // `Verdict::ReferenceUnreachable` rather than for any engenho defect. A
-    // harness whose oracle cannot be repointed dies with the machine that
-    // built it; `k3d cluster create` is reproducible where that VM was not.
-    if let Ok(p) = std::env::var("ENGENHO_ORACLE_KUBECONFIG") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    let home = std::env::var("HOME").expect("HOME set");
-    PathBuf::from(home).join(".kube/engenho-local-tunnel.yaml")
+pub fn oracle_kubeconfig() -> OracleKubeconfig {
+    OracleKubeconfig::from_env().unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// A per-run unique suffix (namespace / object names never collide across runs
@@ -99,17 +103,21 @@ pub async fn boot_engenho(kinds: &[&str]) -> EngenhoTarget {
 }
 
 /// Load the oracle + FAIL LOUD if it is unreachable (never a silent skip).
+///
+/// The ONE oracle loader in this crate's test tree — `engenho-diff`'s
+/// `no_integration_binary_loads_the_oracle_itself` unit test holds that
+/// closed.
+///
+/// # Panics
+///
+/// If the kubeconfig cannot be loaded, or if the oracle does not answer
+/// `GET /api/v1` (`OracleUnreachable`).
 pub async fn load_oracle() -> K3sTarget {
     let kubeconfig = oracle_kubeconfig();
-    let k3s = K3sTarget::from_kubeconfig(&kubeconfig)
-        .unwrap_or_else(|e| panic!("cannot load oracle kubeconfig {kubeconfig:?}: {e}"));
+    let k3s = K3sTarget::from_kubeconfig(kubeconfig.path())
+        .unwrap_or_else(|e| panic!("cannot load oracle kubeconfig {kubeconfig}: {e}"));
     if let Some(Verdict::ReferenceUnreachable) = k3s.preflight().await {
-        panic!(
-            "Verdict::ReferenceUnreachable — the oracle at {kubeconfig:?} did not answer \
-             GET /api/v1. A live differential run cannot proceed. Point \
-             ENGENHO_ORACLE_KUBECONFIG at a live cluster's kubeconfig (a kind cluster \
-             pinned to v1.34 works) and run `cargo nextest run --profile oracle`."
-        );
+        panic!("{}", kubeconfig.unreachable());
     }
     k3s
 }

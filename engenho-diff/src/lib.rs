@@ -37,6 +37,7 @@ pub mod junkyo;
 pub mod normalize;
 pub mod observe;
 pub mod op;
+pub mod oracle;
 pub mod path;
 pub mod target;
 pub mod verdict;
@@ -46,6 +47,10 @@ pub use junkyo::{DivergenceClass, Expect, MatrixReport, Outcome, adjudicate};
 pub use normalize::{Mask, Normalizer, volatile_meta};
 pub use observe::{DiffError, HttpMethod, Observation};
 pub use op::{OpKind, Operation, RestPath};
+pub use oracle::{
+    ORACLE_KUBECONFIG_ENV, ORACLE_KUBECONFIG_FALLBACK, OracleKubeconfig, OracleUnreachable,
+    OracleUnresolved,
+};
 pub use path::{JsonPath, PathSeg};
 pub use target::{DiffTarget, EngenhoTarget, K3sTarget};
 pub use verdict::{Divergence, Gvr, ParityWitness, Severity, Side, StatusCause, Verb, Verdict};
