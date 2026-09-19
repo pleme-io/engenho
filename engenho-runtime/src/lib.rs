@@ -93,6 +93,7 @@ mod dormant;
 mod error;
 #[cfg(test)]
 mod impl_census;
+mod node_registration;
 mod panics;
 #[cfg(test)]
 mod read_census;
@@ -106,5 +107,6 @@ pub use child::{
 pub use dormant::{Dormant, DormantReason};
 pub use error::RuntimeError;
 pub use etcd_facade::MeshEtcdStore;
+pub use node_registration::NodeRegistrationError;
 pub use panics::PanicCounter;
 pub use runtime::Runtime;

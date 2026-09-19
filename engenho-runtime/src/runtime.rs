@@ -47,6 +47,7 @@ use tracing::{info, warn};
 
 use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, Wiring};
 use crate::error::RuntimeError;
+use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
 use crate::rebind::serve_rebinding;
 
@@ -126,17 +127,19 @@ impl Runtime {
         }
         info!(node = %config.runtime.node_name, "store reached leadership");
 
-        // 4. Register THIS node so the scheduler has a schedulable
-        //    target (the missing brick — no other code does this).
-        register_node(&store, &config.runtime.node_name).await?;
+        // 4. Register THIS node so the scheduler has a target: create its
+        //    Node if absent, else merge only the host-owned fields — a
+        //    restart never undoes a cordon, a taint or an operator's label.
+        let node_name = &config.runtime.node_name;
+        register_node(&store, node_name, &HostOwned::measured(node_name)).await?;
 
         // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +
         //    system:discovery + system:basic-user + system:public-info-viewer
         //    ClusterRoles + their ClusterRoleBindings — BEFORE the apiserver
         //    binds, so the very first request authorizes against a seeded store.
-        //    Idempotent (Put preserves uid across restarts, same as
-        //    register_node). MUST precede step 5 so anonymous discovery + bound
-        //    roles resolve through real bindings from the first request.
+        //    Idempotent (Put preserves uid across restarts). MUST precede
+        //    step 5 so anonymous discovery + bound roles resolve through real
+        //    bindings from the first request.
         //    Seed the four system namespaces FIRST: a namespace must exist
         //    before anything namespaced can live in it, and `default` is what
         //    every client opens to.
@@ -1076,116 +1079,13 @@ async fn boot_store(config: &EngenhoConfig) -> Result<Arc<StoreMesh>, RuntimeErr
     }
 }
 
-/// Idempotent Node self-registration. Re-Put on restart is fine — the
-/// store preserves `metadata.uid` across updates. K8s shape mirrors the
-/// scheduler's `is_schedulable` expectation: `spec.unschedulable=false`
-/// + a Ready=True condition.
-///
-/// Writes `status.allocatable` (+ `status.capacity`) for cpu/memory.
-/// This is LOAD-BEARING: engenho-scheduler's M0.1 resource-fit predicate
-/// uses a zero-on-absent allocatable policy (an un-sized node fits NO
-/// pod that requests cpu/memory). Without these values, every pod that
-/// declares a request would stay Pending forever. We report the host's
-/// actual logical-CPU count + total memory so the single-node cluster
-/// advertises real capacity.
-/// Kubernetes' `kubernetes.io/arch` label speaks Go's `GOARCH`, not Rust's
-/// `std::env::consts::ARCH`.
-///
-/// The two disagree on exactly the values that matter here: Rust says
-/// `aarch64` and `x86_64` where Kubernetes says `arm64` and `amd64`. This
-/// is the difference between a label that works and a label that looks
-/// right and matches nothing — the reference pangea Postgres carries
-/// `nodeSelector: {kubernetes.io/arch: arm64}`, and against an `aarch64`
-/// label the scheduler's exact-match predicate leaves it
-/// `NodeSelectorMismatch` **forever**, with a correct-looking label
-/// visible in `kubectl get node -o yaml`.
-///
-/// Unknown architectures pass through verbatim rather than guessing: a
-/// wrong-but-plausible label is worse than an unfamiliar one, because it
-/// matches a selector that meant something else.
-#[must_use]
-fn kube_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "amd64",
-        "arm" => "arm",
-        "powerpc64" => "ppc64le",
-        "s390x" => "s390x",
-        other => other,
-    }
-}
-
-/// The `kubernetes.io/os` label, in Go's `GOOS` vocabulary.
-///
-/// Rust says `macos`; Kubernetes says `darwin`. Same failure mode as
-/// [`kube_arch`].
-#[must_use]
-fn kube_os() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    }
-}
-
-/// The well-known labels upstream's kubelet self-applies at registration.
-///
-/// Without these, `metadata.labels` is ABSENT — not sparse — and
-/// `matches_node_selector` is an exact-match AND over that map, so EVERY
-/// `nodeSelector` key fails and every pod carrying one stays Pending
-/// permanently. Measured on the live node 2026-08-30: `labels: None`.
-///
-/// The `beta.kubernetes.io/*` pair is deprecated upstream and still
-/// emitted, because charts in the wild continue to select on it and a
-/// missing label is a silent non-match rather than an error.
-#[must_use]
-fn well_known_node_labels(node_name: &str) -> serde_json::Value {
-    serde_json::json!({
-        "kubernetes.io/hostname": node_name,
-        "kubernetes.io/os": kube_os(),
-        "kubernetes.io/arch": kube_arch(),
-        "beta.kubernetes.io/os": kube_os(),
-        "beta.kubernetes.io/arch": kube_arch(),
-    })
-}
-
-async fn register_node(store: &StoreMesh, node_name: &str) -> Result<(), RuntimeError> {
-    let (cpu, memory) = host_capacity();
-    let mut value = serde_json::json!({
-        "kind": "Node",
-        "apiVersion": "v1",
-        "metadata": {
-            "name": node_name,
-            "labels": well_known_node_labels(node_name),
-        },
-        "spec": { "unschedulable": false },
-        "status": {
-            "capacity": { "cpu": cpu, "memory": memory },
-            "allocatable": { "cpu": cpu, "memory": memory },
-            "conditions": [{ "type": "Ready", "status": "True" }]
-        }
-    });
-    // Route the self-registered Node through the SAME boundary stamp the
-    // apiserver create path uses, so AGE works on the Node too. Frozen once
-    // into the replicated Put.
-    stamp_creation_timestamp_value(&mut value);
-    store
-        .propose(ResourceCommand::Put {
-            key: ResourceKey::cluster_scoped("", "v1", "Node", node_name),
-            value,
-            expected: None,
-            reason: Reason::Operator,
-        })
-        .await?;
-    info!(node = %node_name, "registered schedulable node");
-    Ok(())
-}
-
 /// Inject `metadata.creationTimestamp` (if absent) into an opaque JSON
-/// body from the typed RFC3339 boundary render — the non-handler `Put`
-/// seeders (register_node) route through this so every born object,
-/// including the self-registered Node, carries a real creationTimestamp.
-/// Mirrors the apiserver handler's `stamp_creation_timestamp`.
-fn stamp_creation_timestamp_value(body: &mut serde_json::Value) {
+/// body from the typed RFC3339 boundary render — the non-handler seeders
+/// (and node registration's create path) route through this so every born
+/// object, including the self-registered Node, carries a real
+/// creationTimestamp. Mirrors the apiserver handler's
+/// `stamp_creation_timestamp`.
+pub(crate) fn stamp_creation_timestamp_value(body: &mut serde_json::Value) {
     if let Some(obj) = body.as_object_mut() {
         let metadata = obj
             .entry("metadata".to_string())
@@ -1223,7 +1123,7 @@ const RBAC_VERSION: &str = "v1";
 /// Each seed is a TYPED Rust value (`ClusterRole`/`ClusterRoleBinding`) →
 /// `serde_json::to_value` → `ResourceCommand::Put` (TYPED EMISSION — no `json!()`
 /// of the policy bodies; only the Put envelope helper). Idempotent because Put
-/// preserves `metadata.uid` across restarts, exactly like `register_node`.
+/// preserves `metadata.uid` across restarts.
 /// The four namespaces every conformant control plane has at first boot.
 ///
 /// Upstream's kube-apiserver creates these during bootstrap, and their absence
@@ -1238,15 +1138,13 @@ const RBAC_VERSION: &str = "v1";
 /// * `kube-public` — world-readable cluster info.
 /// * `kube-node-lease` — Node heartbeat Leases (`coordination.k8s.io`).
 ///
-/// Idempotent across restarts for the same reason [`register_node`] is: the
-/// apply path preserves `metadata.uid` and `creationTimestamp` on a Put over
+/// Idempotent across restarts: the apply path preserves `metadata.uid` and `creationTimestamp` on a Put over
 /// an existing key, so re-seeding an unchanged namespace is a no-op rather
 /// than a new object identity.
 ///
 /// Each is built as a TYPED [`Namespace`] rather than a `json!()` literal, so
 /// a field that does not exist is a compile error — the shape
-/// `seed_bootstrap_rbac` established and the one `register_node` still
-/// predates.
+/// `seed_bootstrap_rbac` established.
 async fn seed_system_namespaces(store: &StoreMesh) -> Result<(), RuntimeError> {
     for name in SYSTEM_NAMESPACES {
         let ns = system_namespace(name);
@@ -1843,7 +1741,7 @@ fn host_memory_bytes() -> Option<u64> {
 /// named as `pending-node-allocatable-reservation` rather than approximated,
 /// because a made-up reservation is the same class of defect as the made-up
 /// total this replaces.
-fn host_capacity() -> (String, String) {
+pub(crate) fn host_capacity() -> (String, String) {
     let cpus = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
@@ -3192,79 +3090,6 @@ fn make_service_router(resolved: ResolvedDatapath) -> Arc<dyn ServiceRouter> {
 // `start_inner` (typed error for unimplemented strategies) and handed to
 // `spawn_children`. `Scheduler::new<S: SchedulingStrategy + 'static>`
 // accepts the box (Box<dyn Trait> implements Trait via the blanket impl).
-
-#[cfg(test)]
-mod node_label_tests {
-    use super::{kube_arch, kube_os, well_known_node_labels};
-
-    /// The labels speak Go's vocabulary, not Rust's.
-    ///
-    /// This is the whole point of the mapping: the reference pangea
-    /// Postgres selects `kubernetes.io/arch: arm64`, and Rust's
-    /// `std::env::consts::ARCH` is `aarch64` on the same machine. Emitting
-    /// the Rust spelling yields a label that reads correctly in
-    /// `kubectl get node -o yaml` and matches no selector anyone writes.
-    #[test]
-    fn labels_use_go_vocabulary_not_rust() {
-        assert_ne!(
-            kube_arch(),
-            "aarch64",
-            "kubernetes.io/arch must never be the Rust spelling"
-        );
-        assert_ne!(
-            kube_os(),
-            "macos",
-            "kubernetes.io/os must never be the Rust spelling"
-        );
-        assert!(
-            matches!(kube_arch(), "arm64" | "amd64" | "arm" | "ppc64le" | "s390x"),
-            "unexpected GOARCH rendering: {}",
-            kube_arch()
-        );
-        assert!(
-            matches!(kube_os(), "linux" | "darwin" | "windows"),
-            "unexpected GOOS rendering: {}",
-            kube_os()
-        );
-    }
-
-    /// Every well-known key upstream's kubelet self-applies is present and
-    /// non-empty. An ABSENT labels map is what made every nodeSelector fail
-    /// permanently; a present-but-partial one fails the same way, quietly.
-    #[test]
-    fn every_well_known_label_is_present_and_non_empty() {
-        let labels = well_known_node_labels("cid");
-        let obj = labels.as_object().expect("labels must be an object");
-        for key in [
-            "kubernetes.io/hostname",
-            "kubernetes.io/os",
-            "kubernetes.io/arch",
-            "beta.kubernetes.io/os",
-            "beta.kubernetes.io/arch",
-        ] {
-            let v = obj
-                .get(key)
-                .unwrap_or_else(|| panic!("missing well-known label {key}"))
-                .as_str()
-                .unwrap_or_else(|| panic!("{key} must be a string"));
-            assert!(!v.is_empty(), "{key} is empty, which matches nothing");
-        }
-        assert_eq!(obj["kubernetes.io/hostname"], "cid");
-    }
-
-    /// The deprecated beta aliases must agree with their replacements —
-    /// charts in the wild still select on them, and a disagreement would
-    /// make the same node match one selector and not its equivalent.
-    #[test]
-    fn beta_aliases_agree_with_their_replacements() {
-        let labels = well_known_node_labels("cid");
-        assert_eq!(labels["beta.kubernetes.io/os"], labels["kubernetes.io/os"]);
-        assert_eq!(
-            labels["beta.kubernetes.io/arch"],
-            labels["kubernetes.io/arch"]
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {

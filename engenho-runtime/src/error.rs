@@ -140,6 +140,10 @@ pub enum RuntimeError {
         #[source]
         source: std::io::Error,
     },
+
+    /// This node's own Node object could not be registered at boot.
+    #[error(transparent)]
+    NodeRegistration(#[from] crate::node_registration::NodeRegistrationError),
 }
 
 engenho_substrate::impl_error_kind! {
@@ -155,5 +159,6 @@ engenho_substrate::impl_error_kind! {
         { ContainerRuntimeUnavailable { .. } } => "container_runtime_unavailable",
         (Kubeconfig(_)) => "kubeconfig",
         { KubeconfigIo { .. } } => "kubeconfig_io",
+        (NodeRegistration(_)) => "node_registration",
     }
 }
