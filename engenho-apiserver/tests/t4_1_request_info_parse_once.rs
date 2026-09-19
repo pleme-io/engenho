@@ -255,10 +255,10 @@ async fn an_encoded_slash_is_judged_as_the_subresource_dispatch_serves() {
 async fn a_create_serviceaccounts_role_is_judged_on_the_token_subresource() {
     // The plan's scenario: a Role granting ONLY `create` on `serviceaccounts`.
     // Whatever the RBAC matcher decides, it decides it about the request that
-    // is actually served. Today's matcher still lets a bare parent rule reach
-    // a subresource (the escalation T4.2 closes), so this takes the Allow arm;
-    // after T4.2 it takes the 403 arm. Both arms assert agreement, and neither
-    // requires the escalation.
+    // is actually served. Since T4.2 a bare parent rule no longer reaches a
+    // subresource, so this takes the 403 arm. Both arms stay: this test pins
+    // agreement between authz and dispatch, not the matcher's reach, which
+    // `authz::tests::upstream_v1_34` and `m0_5_rbac` pin.
     let (base, server, recorder) = boot(|store| {
         Arc::new(RbacAuthorizer::new(StoreRbacEnv::new(store))) as Arc<dyn Authorizer>
     })

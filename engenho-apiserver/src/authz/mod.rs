@@ -74,7 +74,9 @@ pub struct Attributes {
     /// request.
     pub resource: String,
     /// The subresource (`status`, `scale`), if the request targets one. The
-    /// RBAC `resource` match key becomes `resource/subresource`.
+    /// RBAC `resource` match key becomes `resource/subresource`. Read it
+    /// through [`Attributes::requested_subresource`], which treats an empty
+    /// string as no subresource.
     pub subresource: Option<String>,
     /// The namespace, for a namespaced resource request. `None` for
     /// cluster-scoped or non-resource requests.
@@ -130,18 +132,22 @@ impl Attributes {
         self.non_resource_url.is_some()
     }
 
+    /// The subresource this request targets, if any. An empty string is no
+    /// subresource: upstream's `RuleAllows` combines only when
+    /// `len(GetSubresource()) > 0`, and a `SubjectAccessReview` may carry
+    /// `"subresource": ""`. Every RBAC reading of the subresource goes through
+    /// here, so `Some("")` and `None` cannot be judged differently.
+    #[must_use]
+    pub fn requested_subresource(&self) -> Option<&str> {
+        non_empty(self.subresource.as_deref())
+    }
+
     /// The RBAC resource match key: `resource` or `resource/subresource` when a
     /// subresource is targeted. Empty for a non-resource request.
     #[must_use]
     pub fn resource_key(&self) -> String {
-        match &self.subresource {
-            Some(sub) => {
-                let mut s = String::with_capacity(self.resource.len() + 1 + sub.len());
-                s.push_str(&self.resource);
-                s.push('/');
-                s.push_str(sub);
-                s
-            }
+        match self.requested_subresource() {
+            Some(sub) => [self.resource.as_str(), "/", sub].concat(),
             None => self.resource.clone(),
         }
     }
@@ -448,9 +454,11 @@ fn subjects_match(subjects: &[Subject], user: &UserInfo, default_sa_ns: Option<&
 ///
 ///   * Non-resource request: the verb must match AND the path must match one of
 ///     the rule's `non_resource_urls` (exact OR a trailing `/*` prefix-glob).
-///   * Resource request: the verb, apiGroup, and resource key must each match
-///     (`*` wildcard accepted on each), AND (`resource_names` empty OR
-///     `attrs.name ∈ resource_names`).
+///   * Resource request: the verb and apiGroup must each match (`*` wildcard
+///     accepted on each), the resource must match per [`resource_matches`],
+///     AND (`resource_names` empty OR `attrs.name ∈ resource_names`).
+///
+/// Upstream: `RuleAllows`, `plugin/pkg/auth/authorizer/rbac/rbac.go@v1.34.0`.
 fn rule_grants(rule: &PolicyRule, attrs: &Attributes) -> bool {
     if attrs.is_non_resource() {
         // A non-resource rule has non_resource_urls; a resource rule never
@@ -464,7 +472,11 @@ fn rule_grants(rule: &PolicyRule, attrs: &Attributes) -> bool {
     } else {
         verb_matches(&rule.verbs, &attrs.verb)
             && api_group_matches(&rule.api_groups, &attrs.group)
-            && resource_matches(&rule.resources, attrs)
+            && resource_matches(
+                &rule.resources,
+                &attrs.resource,
+                attrs.requested_subresource(),
+            )
             && resource_name_matches(&rule.resource_names, attrs.name.as_deref())
     }
 }
@@ -479,31 +491,50 @@ fn api_group_matches(api_groups: &[String], group: &str) -> bool {
     api_groups.iter().any(|g| g == "*" || g == group)
 }
 
-/// `true` iff the request's resource key is granted by `resources`. A subresource
-/// request (`resource/subresource`) is granted by `*`, by the exact
-/// `resource/subresource`, by `resource/*`, OR by the bare `resource` (upstream
-/// matches a subresource against the parent resource too). A base-resource
-/// request is granted by `*` or the exact `resource`.
-fn resource_matches(resources: &[String], attrs: &Attributes) -> bool {
-    let key = attrs.resource_key();
-    for r in resources {
-        if r == "*" || r == &key {
-            return true;
-        }
-        if let Some(sub) = &attrs.subresource {
-            // `resource/*` matches any subresource of `resource`.
-            let parent_glob = [attrs.resource.as_str(), "/*"].concat();
-            if r == &parent_glob {
-                return true;
-            }
-            // The bare parent `resource` matches the subresource too.
-            if r == &attrs.resource {
-                let _ = sub;
-                return true;
-            }
+/// `true` iff an entry of a rule's `resources` grants the requested `resource`
+/// (and `subresource`, when one is targeted). Upstream's `ResourceMatches`
+/// (`pkg/apis/rbac/v1/evaluation_helpers.go@v1.34.0`) grants on exactly three
+/// shapes:
+///
+///   * `*` — every resource and every subresource;
+///   * the exact combined key — `resource` for a base request,
+///     `resource/subresource` for a subresource request;
+///   * `*/subresource` — that subresource of every resource.
+///
+/// Nothing else grants. A bare `resource` does not grant its subresources:
+/// `create serviceaccounts` is not `create serviceaccounts/token`, and `get
+/// pods` is not `get pods/log`. A subresource grant does not grant its parent.
+/// `resource/*` is not a pattern upstream, so it is not one here.
+///
+/// Upstream takes the combined key and the subresource as two strings, which
+/// can disagree; this derives the combined key from its parts, so they cannot.
+/// An empty `subresource` is no subresource, as upstream's `len(...) == 0`.
+fn resource_matches(rule_resources: &[String], resource: &str, subresource: Option<&str>) -> bool {
+    let subresource = non_empty(subresource);
+    rule_resources.iter().any(|granted| {
+        granted == "*"
+            || is_combined_key(granted, resource, subresource)
+            || subresource.is_some_and(|sub| granted.strip_prefix("*/") == Some(sub))
+    })
+}
+
+/// `true` iff `granted` is exactly the combined key of the request: `resource`
+/// when no subresource is targeted, `resource/subresource` when one is.
+fn is_combined_key(granted: &str, resource: &str, subresource: Option<&str>) -> bool {
+    match subresource {
+        None => granted == resource,
+        Some(sub) => {
+            granted
+                .strip_prefix(resource)
+                .and_then(|rest| rest.strip_prefix('/'))
+                == Some(sub)
         }
     }
-    false
+}
+
+/// `None` for an absent or empty subresource, which RBAC treats the same.
+fn non_empty(subresource: Option<&str>) -> Option<&str> {
+    subresource.filter(|sub| !sub.is_empty())
 }
 
 /// `true` iff `name` (the requested instance, if any) is permitted by
@@ -883,6 +914,115 @@ mod tests {
         // pods/status only, which does NOT grant the base pods).
         let base = attrs_resource(u(), "patch", "", "pods", Some("default"), Some("p1"));
         assert_eq!(authz.authorize(&base).await, Decision::NoOpinion);
+        // A different subresource of the same parent → NoOpinion.
+        let mut other = attrs_resource(u(), "patch", "", "pods", Some("default"), Some("p1"));
+        other.subresource = Some("ephemeralcontainers".to_string());
+        assert_eq!(authz.authorize(&other).await, Decision::NoOpinion);
+    }
+
+    /// The other direction: a rule on the bare parent grants the parent and
+    /// none of its subresources. Upstream pins this in `TestAuthorizer`'s
+    /// first "test subresource resolution" case (ported below).
+    #[tokio::test]
+    async fn a_bare_parent_grant_does_not_reach_a_subresource() {
+        let mut env = MockEnv::default();
+        env.cluster_roles.insert(
+            "pod-patcher".to_string(),
+            ClusterRole {
+                metadata: meta("pod-patcher"),
+                rules: vec![PolicyRule {
+                    verbs: vec!["get".into(), "patch".into()],
+                    api_groups: vec!["".into()],
+                    resources: vec!["pods".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        env.cluster_role_bindings.push(ClusterRoleBinding {
+            metadata: meta("bind-pod-patcher"),
+            role_ref: RoleRef {
+                api_group: "rbac.authorization.k8s.io".into(),
+                kind: "ClusterRole".into(),
+                name: "pod-patcher".into(),
+            },
+            subjects: vec![Subject {
+                kind: "User".into(),
+                name: "carol".into(),
+                ..Default::default()
+            }],
+        });
+        let authz = RbacAuthorizer::new(env);
+        let u = || user("carol", &["system:authenticated"]);
+        let base = attrs_resource(u(), "patch", "", "pods", Some("default"), Some("p1"));
+        assert_eq!(authz.authorize(&base).await, Decision::Allow);
+        for (verb, sub) in [("patch", "status"), ("get", "log"), ("get", "exec")] {
+            let mut a = attrs_resource(u(), verb, "", "pods", Some("default"), Some("p1"));
+            a.subresource = Some(sub.to_string());
+            assert_eq!(
+                authz.authorize(&a).await,
+                Decision::NoOpinion,
+                "a bare `pods` grant must not reach pods/{sub}"
+            );
+        }
+        // An empty subresource is no subresource: judged as the base resource.
+        let mut empty = attrs_resource(u(), "patch", "", "pods", Some("default"), Some("p1"));
+        empty.subresource = Some(String::new());
+        assert_eq!(authz.authorize(&empty).await, Decision::Allow);
+    }
+
+    /// The live escalation T4.2 closes: a Role granting only `create` on
+    /// `serviceaccounts` let its holder mint tokens for every ServiceAccount
+    /// in the namespace through `serviceaccounts/token`.
+    #[tokio::test]
+    async fn create_serviceaccounts_does_not_grant_serviceaccounts_token() {
+        let mut env = MockEnv::default();
+        env.roles.insert(
+            ("default".to_string(), "sa-creator".to_string()),
+            Role {
+                metadata: meta("sa-creator"),
+                rules: vec![PolicyRule {
+                    verbs: vec!["create".into()],
+                    api_groups: vec!["".into()],
+                    resources: vec!["serviceaccounts".into()],
+                    ..Default::default()
+                }],
+            },
+        );
+        env.role_bindings.insert(
+            "default".to_string(),
+            vec![RoleBinding {
+                metadata: meta("bind-sa-creator"),
+                role_ref: RoleRef {
+                    api_group: "rbac.authorization.k8s.io".into(),
+                    kind: "Role".into(),
+                    name: "sa-creator".into(),
+                },
+                subjects: vec![Subject {
+                    kind: "User".into(),
+                    name: "mallory".into(),
+                    ..Default::default()
+                }],
+            }],
+        );
+        let authz = RbacAuthorizer::new(env);
+        let u = || user("mallory", &["system:authenticated"]);
+
+        // The grant itself still works: create a ServiceAccount.
+        let create_sa = attrs_resource(u(), "create", "", "serviceaccounts", Some("default"), None);
+        assert_eq!(authz.authorize(&create_sa).await, Decision::Allow);
+
+        // It does not mint a token for an existing ServiceAccount.
+        let mut mint = attrs_resource(
+            u(),
+            "create",
+            "",
+            "serviceaccounts",
+            Some("default"),
+            Some("default"),
+        );
+        mint.subresource = Some("token".to_string());
+        assert_eq!(authz.authorize(&mint).await, Decision::NoOpinion);
     }
 
     #[tokio::test]
@@ -1055,5 +1195,533 @@ mod tests {
                 .iter()
                 .any(|r| r.non_resource_urls.contains(&"*".to_string()))
         );
+    }
+
+    /// Upstream's own test tables, ported row for row. Every expected value is
+    /// upstream's, never ours: these rows are the oracle, so a row that goes
+    /// red means engenho drifted from Kubernetes, not that the row is stale.
+    ///
+    /// Source: `kubernetes/kubernetes` at tag `v1.34.0`.
+    ///
+    /// | Upstream test | File | Git blob |
+    /// |---|---|---|
+    /// | `TestResourceMatches` | `pkg/apis/rbac/helpers_test.go` | `3771044597c56f694243d18a595c2ecb41a9163b` |
+    /// | `TestRuleMatches`, `TestAuthorizer` | `plugin/pkg/auth/authorizer/rbac/rbac_test.go` | `dbfb2b891eef3eed37f6dd6c19d9669c953dfffb` |
+    ///
+    /// `TestResourceMatches` exercises `pkg/apis/rbac/helpers.go`'s
+    /// `ResourceMatches`; the authorizer calls the v1 copy in
+    /// `pkg/apis/rbac/v1/evaluation_helpers.go` (blob
+    /// `5f5edaff13a52c7231eaf8e12f1422a9bc72cbcc`). At v1.34.0 the two bodies
+    /// are identical.
+    mod upstream_v1_34 {
+        use super::*;
+
+        /// One `TestResourceMatches` row, with upstream's field names.
+        struct ResourceMatchesRow {
+            name: &'static str,
+            rule_resources: &'static [&'static str],
+            combined_requested_resource: &'static str,
+            requested_subresource: &'static str,
+            expected: bool,
+        }
+
+        /// `TestResourceMatches`, every row, in upstream's order.
+        const RESOURCE_MATCHES: &[ResourceMatchesRow] = &[
+            ResourceMatchesRow {
+                name: "all matches 01",
+                rule_resources: &["*"],
+                combined_requested_resource: "foo",
+                requested_subresource: "",
+                expected: true,
+            },
+            ResourceMatchesRow {
+                name: "checks all rules",
+                rule_resources: &["doesn't match", "*"],
+                combined_requested_resource: "foo",
+                requested_subresource: "",
+                expected: true,
+            },
+            ResourceMatchesRow {
+                name: "matches exact rule",
+                rule_resources: &["foo/bar"],
+                combined_requested_resource: "foo/bar",
+                requested_subresource: "bar",
+                expected: true,
+            },
+            ResourceMatchesRow {
+                name: "matches exact rule 02",
+                rule_resources: &["foo/bar"],
+                combined_requested_resource: "foo",
+                requested_subresource: "",
+                expected: false,
+            },
+            ResourceMatchesRow {
+                name: "matches subresource",
+                rule_resources: &["*/scale"],
+                combined_requested_resource: "foo/scale",
+                requested_subresource: "scale",
+                expected: true,
+            },
+            ResourceMatchesRow {
+                name: "doesn't match partial subresource hit",
+                rule_resources: &["foo/bar", "*/other"],
+                combined_requested_resource: "foo/other/segment",
+                requested_subresource: "other/segment",
+                expected: false,
+            },
+            ResourceMatchesRow {
+                name: "matches subresource with multiple slashes",
+                rule_resources: &["*/other/segment"],
+                combined_requested_resource: "foo/other/segment",
+                requested_subresource: "other/segment",
+                expected: true,
+            },
+            ResourceMatchesRow {
+                name: "doesn't fail on empty",
+                rule_resources: &[""],
+                combined_requested_resource: "foo/other/segment",
+                requested_subresource: "other/segment",
+                expected: false,
+            },
+            ResourceMatchesRow {
+                name: "doesn't fail on slash",
+                rule_resources: &["/"],
+                combined_requested_resource: "foo/other/segment",
+                requested_subresource: "other/segment",
+                expected: false,
+            },
+            ResourceMatchesRow {
+                name: "doesn't fail on missing subresource",
+                rule_resources: &["*/"],
+                combined_requested_resource: "foo/other/segment",
+                requested_subresource: "other/segment",
+                expected: false,
+            },
+            ResourceMatchesRow {
+                name: "doesn't match on not star",
+                rule_resources: &["*something/other/segment"],
+                combined_requested_resource: "foo/other/segment",
+                requested_subresource: "other/segment",
+                expected: false,
+            },
+            ResourceMatchesRow {
+                name: "doesn't match on something else",
+                rule_resources: &["something/other/segment"],
+                combined_requested_resource: "foo/other/segment",
+                requested_subresource: "other/segment",
+                expected: false,
+            },
+        ];
+
+        /// The resource half of upstream's combined key. Every upstream row
+        /// is `resource` or `resource/subresource`; a row that is neither
+        /// could not be expressed here, so it fails loudly.
+        fn resource_of(row: &ResourceMatchesRow) -> &'static str {
+            if row.requested_subresource.is_empty() {
+                return row.combined_requested_resource;
+            }
+            row.combined_requested_resource
+                .strip_suffix(row.requested_subresource)
+                .and_then(|r| r.strip_suffix('/'))
+                .unwrap_or_else(|| panic!("{}: combined key is not resource/subresource", row.name))
+        }
+
+        fn strings(items: &[&str]) -> Vec<String> {
+            items.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        #[test]
+        fn test_resource_matches() {
+            for row in RESOURCE_MATCHES {
+                let rule = strings(row.rule_resources);
+                let resource = resource_of(row);
+                assert_eq!(
+                    resource_matches(&rule, resource, Some(row.requested_subresource)),
+                    row.expected,
+                    "TestResourceMatches {:?}",
+                    row.name
+                );
+                // Upstream's empty string has two spellings here; both must
+                // give upstream's answer.
+                if row.requested_subresource.is_empty() {
+                    assert_eq!(
+                        resource_matches(&rule, resource, None),
+                        row.expected,
+                        "TestResourceMatches {:?} (None subresource)",
+                        row.name
+                    );
+                }
+            }
+        }
+
+        /// A policy rule the way upstream's `rbacv1helpers.NewRule` builds one.
+        fn rule(verbs: &[&str], groups: &[&str], resources: &[&str], urls: &[&str]) -> PolicyRule {
+            PolicyRule {
+                verbs: strings(verbs),
+                api_groups: strings(groups),
+                resources: strings(resources),
+                non_resource_urls: strings(urls),
+                ..Default::default()
+            }
+        }
+
+        /// `resourceRequest(verb).Group(g).Resource(r)[.Subresource(s)]`.
+        fn resource_request(verb: &str, group: &str, resource: &str, sub: &str) -> Attributes {
+            Attributes {
+                user: user("", &[]),
+                verb: verb.to_string(),
+                group: group.to_string(),
+                version: String::new(),
+                resource: resource.to_string(),
+                subresource: Some(sub.to_string()).filter(|s| !s.is_empty()),
+                namespace: None,
+                name: None,
+                non_resource_url: None,
+            }
+        }
+
+        /// One `TestRuleMatches` case: a rule and each request's expectation.
+        struct RuleMatchesCase {
+            name: &'static str,
+            rule: PolicyRule,
+            requests_to_expected: Vec<(Attributes, bool)>,
+        }
+
+        fn assert_rule_matches(cases: &[RuleMatchesCase]) {
+            for case in cases {
+                for (request, expected) in &case.requests_to_expected {
+                    assert_eq!(
+                        rule_grants(&case.rule, request),
+                        *expected,
+                        "TestRuleMatches {:?}: {request:?}",
+                        case.name
+                    );
+                }
+            }
+        }
+
+        /// `TestRuleMatches`, the resource-request cases.
+        #[test]
+        fn test_rule_matches_resource_requests() {
+            let r = resource_request;
+            assert_rule_matches(&[
+                RuleMatchesCase {
+                    name: "star verb, exact match other",
+                    rule: rule(&["*"], &["group1"], &["resource1"], &[]),
+                    requests_to_expected: vec![
+                        (r("verb1", "group1", "resource1", ""), true),
+                        (r("verb1", "group2", "resource1", ""), false),
+                        (r("verb1", "group1", "resource2", ""), false),
+                        (r("verb1", "group2", "resource2", ""), false),
+                        (r("verb2", "group1", "resource1", ""), true),
+                        (r("verb2", "group2", "resource1", ""), false),
+                        (r("verb2", "group1", "resource2", ""), false),
+                        (r("verb2", "group2", "resource2", ""), false),
+                    ],
+                },
+                RuleMatchesCase {
+                    name: "star group, exact match other",
+                    rule: rule(&["verb1"], &["*"], &["resource1"], &[]),
+                    requests_to_expected: vec![
+                        (r("verb1", "group1", "resource1", ""), true),
+                        (r("verb1", "group2", "resource1", ""), true),
+                        (r("verb1", "group1", "resource2", ""), false),
+                        (r("verb1", "group2", "resource2", ""), false),
+                        (r("verb2", "group1", "resource1", ""), false),
+                        (r("verb2", "group2", "resource1", ""), false),
+                        (r("verb2", "group1", "resource2", ""), false),
+                        (r("verb2", "group2", "resource2", ""), false),
+                    ],
+                },
+                RuleMatchesCase {
+                    name: "star resource, exact match other",
+                    rule: rule(&["verb1"], &["group1"], &["*"], &[]),
+                    requests_to_expected: vec![
+                        (r("verb1", "group1", "resource1", ""), true),
+                        (r("verb1", "group2", "resource1", ""), false),
+                        (r("verb1", "group1", "resource2", ""), true),
+                        (r("verb1", "group2", "resource2", ""), false),
+                        (r("verb2", "group1", "resource1", ""), false),
+                        (r("verb2", "group2", "resource1", ""), false),
+                        (r("verb2", "group1", "resource2", ""), false),
+                        (r("verb2", "group2", "resource2", ""), false),
+                    ],
+                },
+                RuleMatchesCase {
+                    name: "tuple expansion",
+                    rule: rule(
+                        &["verb1", "verb2"],
+                        &["group1", "group2"],
+                        &["resource1", "resource2"],
+                        &[],
+                    ),
+                    requests_to_expected: vec![
+                        (r("verb1", "group1", "resource1", ""), true),
+                        (r("verb1", "group2", "resource1", ""), true),
+                        (r("verb1", "group1", "resource2", ""), true),
+                        (r("verb1", "group2", "resource2", ""), true),
+                        (r("verb2", "group1", "resource1", ""), true),
+                        (r("verb2", "group2", "resource1", ""), true),
+                        (r("verb2", "group1", "resource2", ""), true),
+                        (r("verb2", "group2", "resource2", ""), true),
+                    ],
+                },
+                RuleMatchesCase {
+                    name: "subresource expansion",
+                    rule: rule(&["*"], &["*"], &["resource1/subresource1"], &[]),
+                    requests_to_expected: vec![
+                        (r("verb1", "group1", "resource1", "subresource1"), true),
+                        (r("verb1", "group2", "resource1", "subresource2"), false),
+                        (r("verb1", "group1", "resource2", "subresource1"), false),
+                        (r("verb1", "group2", "resource2", "subresource1"), false),
+                        (r("verb2", "group1", "resource1", "subresource1"), true),
+                        (r("verb2", "group2", "resource1", "subresource2"), false),
+                        (r("verb2", "group1", "resource2", "subresource1"), false),
+                        (r("verb2", "group2", "resource2", "subresource1"), false),
+                    ],
+                },
+            ]);
+        }
+
+        // ── TestAuthorizer ─────────────────────────────────────────────────
+
+        /// A subject the way upstream's `newRoleBinding` parses `"Kind:name"`.
+        fn subject(spec: &str) -> Subject {
+            let (kind, name) = spec
+                .split_once(':')
+                .unwrap_or_else(|| panic!("subject {spec:?} is not Kind:name"));
+            Subject {
+                kind: kind.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            }
+        }
+
+        fn cluster_role_ref(name: &str) -> RoleRef {
+            RoleRef {
+                api_group: "rbac.authorization.k8s.io".into(),
+                kind: "ClusterRole".into(),
+                name: name.to_string(),
+            }
+        }
+
+        /// `newRule(verbs, apiGroups, resources, nonResourceURLs)`: each
+        /// argument is comma-split, as upstream does.
+        fn new_rule(verbs: &str, groups: &str, resources: &str, urls: &str) -> PolicyRule {
+            let split = |s: &str| s.split(',').map(str::to_string).collect::<Vec<_>>();
+            PolicyRule {
+                verbs: split(verbs),
+                api_groups: split(groups),
+                resources: split(resources),
+                non_resource_urls: split(urls),
+                ..Default::default()
+            }
+        }
+
+        /// `&defaultAttributes{user, groups, verb, resource, subresource,
+        /// namespace, apiGroup}`. Upstream's empty namespace is a
+        /// cluster-scoped request; its groups are comma-split.
+        fn default_attributes(
+            name: &str,
+            groups: &str,
+            verb: &str,
+            resource: &str,
+            sub: &str,
+            ns: &str,
+            group: &str,
+        ) -> Attributes {
+            let groups: Vec<&str> = groups.split(',').collect();
+            Attributes {
+                user: user(name, &groups),
+                verb: verb.to_string(),
+                group: group.to_string(),
+                version: String::new(),
+                resource: resource.to_string(),
+                subresource: Some(sub.to_string()).filter(|s| !s.is_empty()),
+                namespace: Some(ns.to_string()).filter(|s| !s.is_empty()),
+                name: None,
+                non_resource_url: None,
+            }
+        }
+
+        /// `authorizer.AttributesRecord{User, Verb, Path}`.
+        fn non_resource(name: &str, groups: &[&str], verb: &str, path: &str) -> Attributes {
+            Attributes {
+                user: user(name, groups),
+                verb: verb.to_string(),
+                group: String::new(),
+                version: String::new(),
+                resource: String::new(),
+                subresource: None,
+                namespace: None,
+                name: None,
+                non_resource_url: Some(path.to_string()),
+            }
+        }
+
+        /// One `TestAuthorizer` case. Every upstream case binds only
+        /// ClusterRoles, through ClusterRoleBindings or RoleBindings.
+        #[derive(Default)]
+        struct AuthorizerCase {
+            cluster_roles: Vec<(&'static str, Vec<PolicyRule>)>,
+            /// `(namespace, clusterRoleName, subjects)`.
+            role_bindings: Vec<(&'static str, &'static str, Vec<&'static str>)>,
+            /// `(clusterRoleName, subjects)`.
+            cluster_role_bindings: Vec<(&'static str, Vec<&'static str>)>,
+            should_pass: Vec<Attributes>,
+            should_fail: Vec<Attributes>,
+        }
+
+        async fn assert_authorizer(i: usize, case: AuthorizerCase) {
+            let mut env = MockEnv::default();
+            for (name, rules) in case.cluster_roles {
+                env.cluster_roles.insert(
+                    name.to_string(),
+                    ClusterRole {
+                        metadata: meta(name),
+                        rules,
+                        ..Default::default()
+                    },
+                );
+            }
+            for (ns, role, subjects) in case.role_bindings {
+                env.role_bindings
+                    .entry(ns.to_string())
+                    .or_default()
+                    .push(RoleBinding {
+                        metadata: meta(role),
+                        role_ref: cluster_role_ref(role),
+                        subjects: subjects.into_iter().map(subject).collect(),
+                    });
+            }
+            for (role, subjects) in case.cluster_role_bindings {
+                env.cluster_role_bindings.push(ClusterRoleBinding {
+                    metadata: meta(role),
+                    role_ref: cluster_role_ref(role),
+                    subjects: subjects.into_iter().map(subject).collect(),
+                });
+            }
+            let authz = RbacAuthorizer::new(env);
+            for attrs in &case.should_pass {
+                assert_eq!(
+                    authz.authorize(attrs).await,
+                    Decision::Allow,
+                    "TestAuthorizer case {i}: incorrectly restricted {attrs:?}"
+                );
+            }
+            for attrs in &case.should_fail {
+                assert_ne!(
+                    authz.authorize(attrs).await,
+                    Decision::Allow,
+                    "TestAuthorizer case {i}: incorrectly passed {attrs:?}"
+                );
+            }
+        }
+
+        /// `TestAuthorizer`, every case, in upstream's order.
+        #[tokio::test]
+        async fn test_authorizer() {
+            let d = default_attributes;
+            let cases = vec![
+                AuthorizerCase {
+                    cluster_roles: vec![("admin", vec![new_rule("*", "*", "*", "*")])],
+                    role_bindings: vec![("ns1", "admin", vec!["User:admin", "Group:admins"])],
+                    should_pass: vec![
+                        d("admin", "", "get", "Pods", "", "ns1", ""),
+                        d("admin", "", "watch", "Pods", "", "ns1", ""),
+                        d("admin", "group1", "watch", "Foobar", "", "ns1", ""),
+                        d("joe", "admins", "watch", "Foobar", "", "ns1", ""),
+                        d("joe", "group1,admins", "watch", "Foobar", "", "ns1", ""),
+                    ],
+                    should_fail: vec![
+                        d("admin", "", "GET", "Pods", "", "ns2", ""),
+                        d("admin", "", "GET", "Nodes", "", "", ""),
+                        d("admin", "admins", "GET", "Pods", "", "ns2", ""),
+                        d("admin", "admins", "GET", "Nodes", "", "", ""),
+                    ],
+                    ..Default::default()
+                },
+                // Non-resource-url tests.
+                AuthorizerCase {
+                    cluster_roles: vec![
+                        (
+                            "non-resource-url-getter",
+                            vec![new_rule("get", "", "", "/apis")],
+                        ),
+                        ("non-resource-url", vec![new_rule("*", "", "", "/apis")]),
+                        (
+                            "non-resource-url-prefix",
+                            vec![new_rule("get", "", "", "/apis/*")],
+                        ),
+                    ],
+                    cluster_role_bindings: vec![
+                        ("non-resource-url-getter", vec!["User:foo", "Group:bar"]),
+                        ("non-resource-url", vec!["User:admin", "Group:admin"]),
+                        (
+                            "non-resource-url-prefix",
+                            vec!["User:prefixed", "Group:prefixed"],
+                        ),
+                    ],
+                    should_pass: vec![
+                        non_resource("foo", &[], "get", "/apis"),
+                        non_resource("", &["bar"], "get", "/apis"),
+                        non_resource("admin", &[], "get", "/apis"),
+                        non_resource("", &["admin"], "get", "/apis"),
+                        non_resource("admin", &[], "watch", "/apis"),
+                        non_resource("", &["admin"], "watch", "/apis"),
+                        non_resource("prefixed", &[], "get", "/apis/v1"),
+                        non_resource("", &["prefixed"], "get", "/apis/v1"),
+                        non_resource("prefixed", &[], "get", "/apis/v1/foobar"),
+                        non_resource("", &["prefixed"], "get", "/apis/v1/foorbar"),
+                    ],
+                    should_fail: vec![
+                        // wrong verb
+                        non_resource("foo", &[], "watch", "/apis"),
+                        non_resource("", &["bar"], "watch", "/apis"),
+                        // wrong path
+                        non_resource("foo", &[], "get", "/api/v1"),
+                        non_resource("", &["bar"], "get", "/api/v1"),
+                        non_resource("admin", &[], "get", "/api/v1"),
+                        non_resource("", &["admin"], "get", "/api/v1"),
+                        // not covered by prefix
+                        non_resource("prefixed", &[], "get", "/api/v1"),
+                        non_resource("", &["prefixed"], "get", "/api/v1"),
+                    ],
+                    ..Default::default()
+                },
+                // Test subresource resolution: a bare parent grants the
+                // parent only.
+                AuthorizerCase {
+                    cluster_roles: vec![("admin", vec![new_rule("*", "*", "pods", "*")])],
+                    role_bindings: vec![("ns1", "admin", vec!["User:admin", "Group:admins"])],
+                    should_pass: vec![d("admin", "", "get", "pods", "", "ns1", "")],
+                    should_fail: vec![d("admin", "", "get", "pods", "status", "ns1", "")],
+                    ..Default::default()
+                },
+                // Test subresource resolution: an exact subresource grant and
+                // a `*/subresource` grant, and neither reaches the parent.
+                AuthorizerCase {
+                    cluster_roles: vec![(
+                        "admin",
+                        vec![
+                            new_rule("*", "*", "pods/status", "*"),
+                            new_rule("*", "*", "*/scale", "*"),
+                        ],
+                    )],
+                    role_bindings: vec![("ns1", "admin", vec!["User:admin", "Group:admins"])],
+                    should_pass: vec![
+                        d("admin", "", "get", "pods", "status", "ns1", ""),
+                        d("admin", "", "get", "pods", "scale", "ns1", ""),
+                        d("admin", "", "get", "deployments", "scale", "ns1", ""),
+                        d("admin", "", "get", "anything", "scale", "ns1", ""),
+                    ],
+                    should_fail: vec![d("admin", "", "get", "pods", "", "ns1", "")],
+                    ..Default::default()
+                },
+            ];
+            for (i, case) in cases.into_iter().enumerate() {
+                assert_authorizer(i, case).await;
+            }
+        }
     }
 }
