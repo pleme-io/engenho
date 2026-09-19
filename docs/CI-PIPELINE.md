@@ -201,6 +201,20 @@ push + helm chart push would fail with `unauthorized`.
     `ci/release-contract.test.tlisp` (job
     `ci-contract-tests`) shows each of its rules firing on a fixture
     with that defect.
+  * `ci/replay-backward.tlisp` (test.yml, job `replay-backward`) is
+    the backward half of the restart oracle's replay case (improvement
+    plan T3.1 case 5). It records a raft log with this tree's
+    `record_replay_fixture` into `ENGENHO_REPLAY_FIXTURE_DIR`, checks
+    the previous release (the newest `v*` tag reachable from `HEAD^`)
+    out into a git worktree, and runs that release's own case 5 on the
+    log: a red means the previous release cannot replay what this tree
+    writes, so a rollback after a crash would not boot the same store.
+    Each tree builds into its own target directory. Until a release
+    contains the harness (v0.53.118 and older do not), the job reports
+    `predates-harness` with a warning and replays nothing; ancestry,
+    not a version number, decides that. `ci/replay-backward.test.tlisp`
+    (job `ci-contract-tests`) checks every verdict and that the job
+    exists with full history and credentials.
   * `.github/workflows/mutation.yml` runs `cargo mutants` over the
     files in `ci/seam-files.txt`: every mutant nightly, the changed
     lines on a push or PR that touches a seam. A surviving mutant fails

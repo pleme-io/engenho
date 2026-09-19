@@ -1,0 +1,149 @@
+;; replay-backward.test.tlisp — (deftest …) suite for ci/replay-backward.tlisp.
+;; Run by pleme-io/actions/tlisp-test (test.yml, job ci-contract-tests) as
+;; stdlib + unit + this file with TLISP_TEST=1, from the repository root.
+;;
+;; The first tests read the real repository: this tree's harness must carry
+;; every name the check drives, and test.yml must run the check in a job that
+;; can resolve a previous release and fetch the private dependencies. So a
+;; rename in restart_is_a_kill.rs, or a deleted job, fails here in seconds,
+;; not in the slow job. The rest run each decision on small inputs: every
+;; verdict is reached, and each near miss stays on its side of the line.
+;; The slow path itself (build, record, worktree, replay) runs only in the
+;; replay-backward job.
+
+(define (t:verdict v) (car v))
+(define (t:reason v) (car (cdr v)))
+
+;; ── The real repository ──────────────────────────────────────────────────
+
+(define t:HEAD-TEXT (read-file rb:TEST-FILE))
+
+(deftest "this tree's harness carries every name the check drives"
+  (assert (rb:declares-fn? t:HEAD-TEXT rb:RECORDER) "the recorder, fn record_replay_fixture")
+  (assert (rb:declares-fn? t:HEAD-TEXT rb:CASE5) "case 5, the replay the previous release runs")
+  (assert (rb:names-env? t:HEAD-TEXT rb:FIXTURE-DIR-ENV) "\"ENGENHO_REPLAY_FIXTURE_DIR\", where both halves meet")
+  (assert (rb:names-env? t:HEAD-TEXT rb:RECORD-ENV) "\"ENGENHO_RECORD_REPLAY_FIXTURE\", the recorder's label")
+  (assert (rb:records? t:HEAD-TEXT) "so this tree can record"))
+
+;; The job in test.yml whose steps run this script, as (name job).
+(define (t:replay-jobs)
+  (filter
+    (fn (entry)
+      (any? (fn (st) (equal? (alist-get (alist-get st "with" (list)) "script-file" "") "ci/replay-backward.tlisp"))
+        (alist-get (car (cdr entry)) "steps" (list))))
+    (alist-get (yaml-parse (read-file ".github/workflows/test.yml")) "jobs" (list))))
+
+(define (t:index-of pred steps)
+  (car (reduce
+         (fn (acc st) (if (and (< (car acc) 0) (pred st)) (list (car (cdr acc)) (+ (car (cdr acc)) 1)) (list (car acc) (+ (car (cdr acc)) 1))))
+         (list -1 0)
+         steps)))
+
+(deftest "test.yml runs the check once, with full history and the private-dependency credentials"
+  (let ((jobs (t:replay-jobs)))
+    (assert (= (length jobs) 1) "exactly one test.yml job runs ci/replay-backward.tlisp")
+    (let* ((steps (alist-get (car (cdr (car jobs))) "steps" (list)))
+           (uses (fn (prefix) (fn (st) (string-starts-with? (alist-get st "uses" "") prefix))))
+           (checkout (t:index-of (uses "actions/checkout@") steps))
+           (creds (t:index-of (uses "pleme-io/actions/git-credentials@") steps))
+           (script (t:index-of (fn (st) (equal? (alist-get (alist-get st "with" (list)) "script-file" "") "ci/replay-backward.tlisp")) steps))
+           (depth (if (< checkout 0) "" (string-format "{}" (alist-get (alist-get (nth checkout steps) "with" (list)) "fetch-depth" "")))))
+      (assert (and (>= checkout 0) (< checkout script)) "a checkout precedes the script")
+      (assert (equal? depth "0") "and fetches full history: `git describe` needs the tags, `git log -S` the history")
+      (assert (and (>= creds 0) (< creds script)) "git-credentials precedes the script: both builds fetch private git deps")
+      (assert (string-starts-with? (alist-get (nth script steps) "uses" "") "pleme-io/actions/tatara-script@")
+        "the script runs through pleme-io/actions/tatara-script"))))
+
+;; ── Plan ─────────────────────────────────────────────────────────────────
+
+;; The previous release as v0.53.118 was: no restart_is_a_kill.rs at all.
+(define t:NO-FILE "")
+;; Case 5 exists but reads no fixture directory from the environment.
+(define t:CASE5-ONLY
+  (string-append "#[test]\nfn " rb:CASE5 "() {\n    let root = Path::new(env!(\"CARGO_MANIFEST_DIR\"));\n}\n"))
+
+(deftest "a previous release that carries the harness is replayed"
+  (let ((p (rb:plan "v0.53.200" t:HEAD-TEXT t:HEAD-TEXT "descends")))
+    (assert (equal? (t:verdict p) "run") "run")
+    (assert (equal? (t:reason p) "v0.53.200") "through that release")))
+
+(deftest "a release that predates the harness is reported as not run, and exits 0"
+  (let ((p (rb:plan "v0.53.118" t:HEAD-TEXT t:NO-FILE "predates")))
+    (assert (equal? (t:verdict p) "predates-harness") "predates-harness")
+    (assert (string-contains? (t:reason p) "v0.53.118") "names the release")
+    (assert (string-contains? (t:reason p) "Nothing was replayed") "and says nothing ran")
+    (assert (= (rb:exit-of (t:verdict p)) 0) "exit 0")))
+
+(deftest "a release that descends from the harness but lacks it fails; it is never read as predating"
+  (let ((p (rb:plan "v0.54.0" t:HEAD-TEXT t:NO-FILE "descends")))
+    (assert (equal? (t:verdict p) "harness-missing") "harness-missing")
+    (assert (string-contains? (t:reason p) "renamed or removed") "says why")
+    (assert (= (rb:exit-of (t:verdict p)) 1) "exit 1")))
+
+(deftest "case 5 without the fixture-directory variable is not the harness"
+  (assert (not (rb:replays? t:CASE5-ONLY)) "the previous release could not read this tree's log")
+  (assert (equal? (t:verdict (rb:plan "v0.54.0" t:HEAD-TEXT t:CASE5-ONLY "descends")) "harness-missing")
+    "so a descendant carrying only that fails"))
+
+(deftest "a comment naming the variable is not the harness"
+  (assert (not (rb:replays? (string-append "// ENGENHO_REPLAY_FIXTURE_DIR\nfn " rb:CASE5 "() {}\n")))
+    "the variable has to be a string literal, as the harness's constant is"))
+
+(deftest "no previous release is blind, not a pass"
+  (let ((p (rb:plan "" t:HEAD-TEXT t:NO-FILE "unknown")))
+    (assert (equal? (t:verdict p) "blind") "blind")
+    (assert (string-contains? (t:reason p) "fetch-depth: 0") "names the likely cause")
+    (assert (= (rb:exit-of (t:verdict p)) 3) "exit 3")))
+
+(deftest "git unable to answer the lineage is blind"
+  (assert (equal? (t:verdict (rb:plan "v0.54.0" t:HEAD-TEXT t:NO-FILE "unknown")) "blind") "blind"))
+
+(deftest "this tree without the recorder fails before anything else is asked"
+  (let ((p (rb:plan "v0.53.200" t:CASE5-ONLY t:HEAD-TEXT "descends")))
+    (assert (equal? (t:verdict p) "harness-missing") "harness-missing")
+    (assert (string-contains? (t:reason p) "this tree's") "names this tree, not the release")))
+
+;; ── Record and replay ────────────────────────────────────────────────────
+
+(define (t:libtest name result)
+  (string-append "running 1 test\ntest " name " ... " result
+    "\n\ntest result: " (if (equal? result "ok") "ok. 1 passed; 0 failed" "FAILED. 0 passed; 1 failed")
+    "; 0 ignored; 0 measured; 14 filtered out; finished in 0.40s\n"))
+(define t:ZERO-TESTS
+  "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s\n")
+
+(deftest "a recording is usable only when the recorder ran and wrote all three files"
+  (assert (equal? (t:verdict (rb:judge-record 0 0 (t:libtest rb:RECORDER "ok") 3)) "recorded") "recorded")
+  (assert (equal? (t:verdict (rb:judge-record 0 0 (t:libtest rb:RECORDER "ok") 2)) "blind") "a file missing")
+  (assert (equal? (t:verdict (rb:judge-record 0 0 t:ZERO-TESTS 0)) "blind") "zero tests selected")
+  (assert (equal? (t:verdict (rb:judge-record 0 101 (t:libtest rb:RECORDER "FAILED") 0)) "blind") "the recorder failed")
+  (assert (equal? (t:verdict (rb:judge-record 101 -1 "" 0)) "blind") "the build failed"))
+
+(deftest "a replay passes only when case 5 itself ran and passed"
+  (let ((v (rb:judge-replay "v0.53.200" 0 0 (t:libtest rb:CASE5 "ok"))))
+    (assert (equal? (t:verdict v) "replayed") "replayed")
+    (assert (= (rb:exit-of (t:verdict v)) 0) "exit 0")))
+
+(deftest "a green run that selected zero tests is blind, not replayed"
+  (let ((v (rb:judge-replay "v0.53.200" 0 0 t:ZERO-TESTS)))
+    (assert (equal? (t:verdict v) "blind") "blind")
+    (assert (= (rb:exit-of (t:verdict v)) 3) "exit 3")))
+
+(deftest "case 5 failing in the previous release is a divergence"
+  (let ((v (rb:judge-replay "v0.53.200" 0 101 (t:libtest rb:CASE5 "FAILED"))))
+    (assert (equal? (t:verdict v) "diverged") "diverged")
+    (assert (string-contains? (t:reason v) "cannot replay what this tree writes") "says what it means")
+    (assert (= (rb:exit-of (t:verdict v)) 1) "exit 1")))
+
+(deftest "a build failure, or a crash with no test result, is blind rather than a divergence"
+  (assert (equal? (t:verdict (rb:judge-replay "v0.53.200" 101 -1 "")) "blind") "the build")
+  (assert (equal? (t:verdict (rb:judge-replay "v0.53.200" 0 101 "error: test failed, to rerun pass `--test restart_is_a_kill`")) "blind")
+    "a crash before any result"))
+
+(deftest "every verdict has its exit code, and an unknown one exits as blind"
+  (assert (= (rb:exit-of "replayed") 0) "replayed")
+  (assert (= (rb:exit-of "predates-harness") 0) "predates-harness")
+  (assert (= (rb:exit-of "diverged") 1) "diverged")
+  (assert (= (rb:exit-of "harness-missing") 1) "harness-missing")
+  (assert (= (rb:exit-of "blind") 3) "blind")
+  (assert (= (rb:exit-of "recorded") 3) "an intermediate state is not a verdict"))

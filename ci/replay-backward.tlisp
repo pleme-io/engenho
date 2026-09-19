@@ -1,0 +1,305 @@
+;; replay-backward — a log this tree writes replays through the previous
+;; release.
+;;
+;; WHY (improvement plan T3.1 case 5, integration item I28). The raft log is
+;; serde_json, and a node rolled back one release boots by replaying what the
+;; newer binary appended. Case 5 has two halves. The forward half runs in every
+;; test leg: fixtures recorded by released binaries replay through this tree.
+;; The backward half needs the PREVIOUS release's code, so it cannot live in
+;; the test file: engenho-store/tests/restart_is_a_kill.rs records a log from
+;; this tree into ENGENHO_REPLAY_FIXTURE_DIR, and the previous release's own
+;; case 5, built from its tag, replays it. This script runs both halves and
+;; says which of five things happened.
+;;
+;; WHAT IT RUNS, from the repository root:
+;;   1. The previous release: REPLAY_BACKWARD_PREVIOUS if set (any git
+;;      revision), else the newest `v*` tag reachable from HEAD^. HEAD^ and not
+;;      HEAD, because a release commit carries its own tag, and that tag is
+;;      this tree.
+;;   2. Whether that release carries the harness: its restart_is_a_kill.rs
+;;      declares case 5 and reads ENGENHO_REPLAY_FIXTURE_DIR. If not, whether
+;;      the commit that introduced the harness is one of its ancestors
+;;      (`git log -S` over HEAD's history, then `git merge-base
+;;      --is-ancestor`). Ancestry, not a version floor, so the answer holds
+;;      whatever order releases and merges land in.
+;;   3. Record, from this tree:
+;;        ENGENHO_RECORD_REPLAY_FIXTURE=working-tree ENGENHO_REPLAY_FIXTURE_DIR=<dir>
+;;        cargo test -p engenho-store --test restart_is_a_kill --locked
+;;          -- --ignored --exact record_replay_fixture
+;;   4. `git worktree add --detach <wt> <release>`, then from <wt>:
+;;        ENGENHO_REPLAY_FIXTURE_DIR=<dir>
+;;        cargo test -p engenho-store --test restart_is_a_kill --locked
+;;          -- --exact case5_recorded_release_logs_replay_forward_to_identical_state
+;;      From <wt>, not with --manifest-path, so cargo reads the release's own
+;;      .cargo/config.toml. Each build runs with --no-run first, so a build
+;;      failure is told apart from a failing replay.
+;;      The release builds into its own CARGO_TARGET_DIR, <work>/target.
+;;      Cargo names a workspace member's artifacts from its path relative to
+;;      the workspace root, so two checkouts sharing one target directory
+;;      write the same files (measured: both builds produced
+;;      restart_is_a_kill-db12072cf3c56f84), and a later build can take the
+;;      other checkout's artifact for fresh. The price is building the
+;;      dependencies twice.
+;;
+;; VERDICTS and exit codes:
+;;   replayed          0  the previous release's case 5 ran and passed on this
+;;                        tree's log.
+;;   predates-harness  0  the previous release has no harness and does not
+;;                        descend from the commit that introduced it. NOTHING
+;;                        WAS REPLAYED: the step prints a ::warning:: and says
+;;                        so in the step summary. This ends by itself at the
+;;                        first release that contains the harness.
+;;   diverged          1  the previous release's case 5 ran and failed: it
+;;                        cannot replay what this tree writes, so a rollback to
+;;                        it after a crash would not boot the same store. Plan
+;;                        §6 edge 20: a new ResourceCommand variant takes two
+;;                        releases (decoding first, emitting second), and a
+;;                        change to apply rules carries an ApplySemantics
+;;                        marker and is rolled back across only from a clean
+;;                        stop.
+;;   harness-missing   1  this tree lacks the harness, or a release that
+;;                        descends from the commit that introduced it lacks it
+;;                        (renamed or removed). Either would otherwise read as
+;;                        predates-harness for ever.
+;;   blind             3  the question could not be put: no previous release
+;;                        resolved, git could not answer, a build failed, the
+;;                        recorder wrote no fixture, or case 5 selected no
+;;                        test. It says nothing about replay compatibility.
+;;
+;; TIER: a CI gate, not a type. It proves that one scenario, the recorder's
+;; replay_scenario, replays; a command the scenario never issues is not
+;; covered. The previous release decodes results.json as this tree wrote it,
+;; so a new ResourceOp variant in those results fails the old decode, before
+;; a single entry is replayed, although ResourceOp is a response and is never
+;; logged. Measured 2026-09-19 with REPLAY_BACKWARD_PREVIOUS=7ea9ff2, the
+;; commit before T3.5 added ResourceOp::Unchanged: `diverged`, at "fixture
+;; results decode: unknown variant `Unchanged`". Such a red comes from the
+;; harness's results format, not from the log; the replay through HEAD^
+;; (same store code) was `replayed`.
+;;
+;; Tests: ci/replay-backward.test.tlisp (tlisp-test sets TLISP_TEST=1, which
+;; loads these definitions and skips the main at the bottom). The suite runs in
+;; test.yml's ci-contract-tests; the main runs in test.yml's replay-backward
+;; job. Run the main locally from the repository root:
+;;   tatara-script ci/replay-backward.tlisp
+;; with REPLAY_BACKWARD_PREVIOUS=<revision> to replay through any commit.
+
+(define rb:TEST-FILE "engenho-store/tests/restart_is_a_kill.rs")
+(define rb:PACKAGE "engenho-store")
+(define rb:TEST-BINARY "restart_is_a_kill")
+(define rb:RECORDER "record_replay_fixture")
+(define rb:CASE5 "case5_recorded_release_logs_replay_forward_to_identical_state")
+(define rb:FIXTURE-DIR-ENV "ENGENHO_REPLAY_FIXTURE_DIR")
+(define rb:RECORD-ENV "ENGENHO_RECORD_REPLAY_FIXTURE")
+(define rb:PREVIOUS-ENV "REPLAY_BACKWARD_PREVIOUS")
+;; The fixture directory the recorder writes, under ENGENHO_REPLAY_FIXTURE_DIR.
+(define rb:LABEL "working-tree")
+(define rb:FIXTURE-FILES (list "log.jsonl" "results.json" "catalog.json"))
+
+(define rb:EXIT-CODES
+  (list (list "replayed" 0) (list "predates-harness" 0)
+        (list "diverged" 1) (list "harness-missing" 1)
+        (list "blind" 3)))
+
+(define (rb:n x) (string-format "{}" x))
+
+;; An unknown verdict exits as blind: it proves nothing.
+(define (rb:exit-of verdict) (alist-get rb:EXIT-CODES verdict 3))
+
+;; ── The harness, as text ─────────────────────────────────────────────────
+
+(define (rb:declares-fn? text name) (string-contains? text (string-append "fn " name "(")))
+(define (rb:names-env? text name) (string-contains? text (string-append "\"" name "\"")))
+
+;; What the previous release must carry: case 5, reading its fixtures from
+;; ENGENHO_REPLAY_FIXTURE_DIR.
+(define (rb:replays? text)
+  (and (rb:declares-fn? text rb:CASE5) (rb:names-env? text rb:FIXTURE-DIR-ENV)))
+
+;; What this tree must carry: that, and the recorder with its label variable.
+(define (rb:records? text)
+  (and (rb:replays? text) (rb:declares-fn? text rb:RECORDER) (rb:names-env? text rb:RECORD-ENV)))
+
+;; ── Decisions: (verdict reason) ──────────────────────────────────────────
+
+;; prev: the previous release's revision, "" when none resolved.
+;; head-text, prev-text: rb:TEST-FILE at HEAD and at prev, "" when absent.
+;; lineage: "descends" when the commit that introduced the harness is an
+;; ancestor of prev, "predates" when it is not, "unknown" when git could not
+;; say. Returns ("run" prev) when the replay should run.
+(define (rb:plan prev head-text prev-text lineage)
+  (cond
+    ((not (rb:records? head-text))
+      (list "harness-missing"
+        (string-append "this tree's " rb:TEST-FILE " does not declare " rb:RECORDER " and " rb:CASE5
+          " reading " rb:FIXTURE-DIR-ENV " and " rb:RECORD-ENV ", so there is nothing to record with")))
+    ((equal? prev "")
+      (list "blind"
+        (string-append "no previous release resolved: no `v*` tag is reachable from HEAD^, and "
+          rb:PREVIOUS-ENV " is unset (a shallow checkout carries no tags; check out with fetch-depth: 0)")))
+    ((rb:replays? prev-text) (list "run" prev))
+    ((equal? lineage "predates")
+      (list "predates-harness"
+        (string-append prev " predates the backward-replay harness: its " rb:TEST-FILE
+          " has no case 5 reading " rb:FIXTURE-DIR-ENV ". Nothing was replayed.")))
+    ((equal? lineage "descends")
+      (list "harness-missing"
+        (string-append prev " descends from the commit that introduced the harness, but its " rb:TEST-FILE
+          " has no case 5 reading " rb:FIXTURE-DIR-ENV ": the harness was renamed or removed")))
+    (else
+      (list "blind"
+        (string-append "git could not say whether " prev " descends from the commit that introduced the harness")))))
+
+(define (rb:ran-ok? out name) (string-contains? out (string-append "test " name " ... ok")))
+(define (rb:ran-failed? out name) (string-contains? out (string-append "test " name " ... FAILED")))
+
+;; The recording step. present: how many of rb:FIXTURE-FILES exist, non-empty.
+;; Returns ("recorded" "") when there is a log to replay.
+(define (rb:judge-record build-status status out present)
+  (cond
+    ((not (= build-status 0))
+      (list "blind" (string-append "this tree's " rb:PACKAGE " tests did not build (exit " (rb:n build-status) "); nothing was recorded")))
+    ((and (= status 0) (rb:ran-ok? out rb:RECORDER) (= present (length rb:FIXTURE-FILES)))
+      (list "recorded" ""))
+    ((and (= status 0) (rb:ran-ok? out rb:RECORDER))
+      (list "blind" (string-append rb:RECORDER " passed but did not write " (string-join ", " rb:FIXTURE-FILES))))
+    ((= status 0)
+      (list "blind" (string-append rb:RECORDER " did not run: the filter selected no test")))
+    ((rb:ran-failed? out rb:RECORDER)
+      (list "blind" (string-append "this tree's " rb:RECORDER " failed, so there is no log to replay")))
+    (else
+      (list "blind" (string-append "recording exited " (rb:n status) " without a test result")))))
+
+;; The replay step, run by the previous release.
+(define (rb:judge-replay prev build-status status out)
+  (cond
+    ((not (= build-status 0))
+      (list "blind" (string-append prev "'s " rb:PACKAGE " tests did not build (exit " (rb:n build-status) "); nothing was replayed")))
+    ((and (= status 0) (rb:ran-ok? out rb:CASE5))
+      (list "replayed" (string-append prev " replayed this tree's log to the revisions, ops and catalog bytes it recorded")))
+    ((= status 0)
+      (list "blind" (string-append prev "'s case 5 did not run: the filter selected no test, and zero tests prove nothing")))
+    ((rb:ran-failed? out rb:CASE5)
+      (list "diverged" (string-append prev " cannot replay what this tree writes: its case 5 failed (output above)")))
+    (else
+      (list "blind" (string-append prev "'s case 5 exited " (rb:n status) " without a test result")))))
+
+;; ── Effects ──────────────────────────────────────────────────────────────
+
+(define (rb:git args) (apply exec-capture (append (list "git") args)))
+
+(define (rb:first-line s)
+  (let ((ls (filter (fn (l) (not (equal? (string-trim l) ""))) (string-split s "\n"))))
+    (if (empty? ls) "" (string-trim (car ls)))))
+
+(define (rb:previous)
+  (let ((pinned (string-trim (env-get rb:PREVIOUS-ENV ""))))
+    (if (not (equal? pinned ""))
+      pinned
+      (let ((d (rb:git (list "describe" "--tags" "--abbrev=0" "--match" "v*" "HEAD^"))))
+        (if (= (status-of d) 0) (string-trim (stdout-of d)) "")))))
+
+;; rb:TEST-FILE at rev, "" when it is absent there.
+(define (rb:file-at rev)
+  (let ((r (rb:git (list "show" (string-append rev ":" rb:TEST-FILE)))))
+    (if (= (status-of r) 0) (stdout-of r) "")))
+
+(define (rb:lineage prev)
+  (let* ((log (rb:git (list "log" "--reverse" "--format=%H" "-S" (string-append "\"" rb:FIXTURE-DIR-ENV "\"")
+                        "HEAD" "--" rb:TEST-FILE)))
+         (intro (if (= (status-of log) 0) (rb:first-line (stdout-of log)) "")))
+    (if (equal? intro "")
+      "unknown"
+      (let ((s (status-of (rb:git (list "merge-base" "--is-ancestor" intro prev)))))
+        (cond ((= s 0) "descends") ((= s 1) "predates") (else "unknown"))))))
+
+(define (rb:absolute p) (if (string-starts-with? p "/") p (path-join (cwd) p)))
+
+(define (rb:target-dir)
+  (let ((t (env-get "CARGO_TARGET_DIR" "")))
+    (rb:absolute (if (equal? t "") "target" t))))
+
+(define (rb:work-root)
+  (let ((rt (env-get "RUNNER_TEMP" "")))
+    (if (equal? rt "")
+      (path-join (rb:target-dir) "replay-backward")
+      (path-join (rb:absolute rt) "replay-backward"))))
+
+(define (rb:cargo-test tail)
+  (append (list "cargo" "test" "-p" rb:PACKAGE "--test" rb:TEST-BINARY "--locked") tail))
+
+(define (rb:output-of cap) (string-append (stdout-of cap) "\n" (stderr-of cap)))
+
+(define (rb:show! cap)
+  (print-line (stdout-of cap))
+  (print-line (stderr-of cap)))
+
+(define (rb:non-empty-file? p) (and (path-exists? p) (> (string-length (read-file p)) 0)))
+
+(define (rb:drop-worktree! wt)
+  (rb:git (list "worktree" "remove" "--force" wt))
+  (rm-rf wt)
+  (rb:git (list "worktree" "prune")))
+
+(define (rb:summary! verdict reason)
+  (let ((p (env-get "GITHUB_STEP_SUMMARY" "")))
+    (when (not (equal? p ""))
+      (write-file p
+        (string-append (if (path-exists? p) (read-file p) "")
+          "### backward replay: `" verdict "`\n\n" reason "\n")))))
+
+(define (rb:finish! v)
+  (let ((verdict (car v)) (reason (car (cdr v))))
+    (print-line (string-append "backward replay: " verdict " -- " reason))
+    (when (equal? verdict "predates-harness")
+      (print-line (string-append "::warning title=backward replay did not run::" reason)))
+    (rb:summary! verdict reason)
+    (exit (rb:exit-of verdict))))
+
+;; Build into target, then run one test: (build-status run-status output).
+(define (rb:build-and-run! target tail)
+  (env-set "CARGO_TARGET_DIR" target)
+  (let ((build (apply exec-check (rb:cargo-test (list "--no-run")))))
+    (if (= build 0)
+      (let ((cap (apply exec-capture (rb:cargo-test tail))))
+        (rb:show! cap)
+        (list build (status-of cap) (rb:output-of cap)))
+      (list build -1 ""))))
+
+(define (rb:main)
+  (let* ((root (cwd))
+         (head-text (if (path-exists? rb:TEST-FILE) (read-file rb:TEST-FILE) ""))
+         (prev (rb:previous))
+         (prev-text (if (equal? prev "") "" (rb:file-at prev)))
+         (lineage (if (or (equal? prev "") (rb:replays? prev-text)) "unknown" (rb:lineage prev)))
+         (plan (rb:plan prev head-text prev-text lineage)))
+    (print-line (string-append "previous release: " (if (equal? prev "") "(none)" prev)))
+    (when (not (equal? (car plan) "run")) (rb:finish! plan))
+    (let* ((work (rb:work-root))
+           (fixtures (path-join work "fixtures"))
+           (wt (path-join work "previous")))
+      (rb:drop-worktree! wt)
+      ;; case 5 replays EVERY directory under the fixture root, so nothing may
+      ;; be left there from an earlier run.
+      (rm-rf fixtures)
+      (mkdir-p fixtures)
+      (env-set rb:FIXTURE-DIR-ENV fixtures)
+      (env-set rb:RECORD-ENV rb:LABEL)
+      (print-line "── record: this tree writes the log")
+      (let* ((rec (rb:build-and-run! (rb:target-dir) (list "--" "--ignored" "--exact" rb:RECORDER)))
+             (present (length (filter (fn (f) (rb:non-empty-file? (path-join fixtures rb:LABEL f))) rb:FIXTURE-FILES)))
+             (recorded (rb:judge-record (car rec) (car (cdr rec)) (car (cdr (cdr rec))) present)))
+        (when (not (equal? (car recorded) "recorded")) (rb:finish! recorded))
+        (let ((add (rb:git (list "worktree" "add" "--detach" wt prev))))
+          (when (not (= (status-of add) 0))
+            (rb:finish! (list "blind" (string-append "`git worktree add " prev "` failed: " (string-trim (stderr-of add)))))))
+        (print-line (string-append "── replay: " prev " reads it"))
+        (chdir wt)
+        (let ((rep (rb:build-and-run! (path-join work "target") (list "--" "--exact" rb:CASE5))))
+          (chdir root)
+          (rb:drop-worktree! wt)
+          (rb:finish! (rb:judge-replay prev (car rep) (car (cdr rep)) (car (cdr (cdr rep))))))))))
+
+(cond
+  ((equal? (env-get "TLISP_TEST" "") "1") (print-line "TLISP_TEST=1: replay-backward loaded; main skipped"))
+  (else (rb:main)))

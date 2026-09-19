@@ -291,7 +291,8 @@ jobs:
   # Second step: pleme-io/actions/tlisp-test runs each ci/<name>.test.tlisp
   # against ci/<name>.tlisp. min-files is the number of suites that exist
   # (release-contract, mutation-gate, cargo-profiles, doc-sources, no-c-tls,
-  # nix-on-runner), so losing one is red, not a smaller green; mutation-gate's
+  # nix-on-runner, replay-backward), so losing one is red, not a smaller
+  # green; mutation-gate's
   # suite fails if the floor and the count disagree. The first step pins the
   # tatara-script tlisp-test reuses from PATH.
   # cargo-profiles has no job of its own: its suite's first test runs the
@@ -333,4 +334,46 @@ jobs:
           MUTATION_GATE_MODE: lint
       - uses: pleme-io/actions/tlisp-test@main
         with:
-          min-files: 6
+          min-files: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Backward replay (improvement plan T3.1 case 5, integration item I28). A
+  # node rolled back one release boots by replaying what the newer binary
+  # appended to its raft log. The forward half of case 5 runs in the test leg
+  # above: logs recorded by released binaries replay through this tree. This
+  # job runs the backward half, which needs the previous release's own code:
+  # ci/replay-backward.tlisp records a log from this tree with
+  # engenho-store/tests/restart_is_a_kill.rs's recorder into
+  # ENGENHO_REPLAY_FIXTURE_DIR, checks the previous release out into a git
+  # worktree, and runs THAT release's case 5 on it. The previous release is
+  # the newest `v*` tag reachable from HEAD^, which is why the checkout
+  # fetches full history. Both builds fetch the private git dependencies,
+  # hence git-credentials.
+  # Verdicts: replayed (0) · predates-harness (0, with a ::warning:: and a
+  # step-summary line saying nothing ran; it lasts only until the first
+  # release that contains the harness, v0.53.118 and older predate it) ·
+  # diverged (1: the previous release cannot replay what this tree writes;
+  # plan §6 edge 20 says how such a change ships) · harness-missing (1) ·
+  # blind (3: no previous release, a build failed, or zero tests ran).
+  # The script's decisions are tested in ci-contract-tests above
+  # (ci/replay-backward.test.tlisp), including that this job exists.
+  # ───────────────────────────────────────────────────────────────────────────
+  replay-backward:
+    name: backward replay (this tree's log through the previous release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: replay-backward
+      - uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/replay-backward.tlisp
+          version: v0.3.58
