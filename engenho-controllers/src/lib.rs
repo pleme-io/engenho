@@ -32,6 +32,7 @@ pub mod admission;
 pub mod admission_webhook;
 pub mod attestation;
 pub mod build_backend_roceiro;
+mod closed_enum;
 pub mod cluster_ip;
 pub mod cni_status;
 pub mod controller;
@@ -53,6 +54,7 @@ pub mod error;
 pub mod event_driven;
 pub mod event_recorder;
 pub mod gc;
+pub mod heartbeat;
 pub mod hpa;
 pub mod ingress;
 pub mod job;
@@ -122,6 +124,7 @@ pub use endpoints::EndpointsController;
 pub use error::{ControllerError, ErrorScope};
 pub use event_driven::EventDrivenController;
 pub use gc::GcController;
+pub use heartbeat::{Beat, Heartbeat, TickClass};
 pub use hpa::{
     FakeMetricsProvider, HorizontalPodAutoscalerController, MetricsError, MetricsProvider,
     ScaleTarget,

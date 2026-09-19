@@ -68,12 +68,24 @@
 //! re-armed itself forever, and the chains ran `tick` concurrently. The
 //! tick rate grew with uptime, and a sleeping chain kept its
 //! `Arc<StoreMesh>` alive past `handle.abort()`.
+//!
+//! ## The loop cannot return (T2.6)
+//!
+//! [`WatchDriver::run`] is `-> Infallible`. A driver loop that returns is a
+//! type error (E0308), not a silent retirement: the only ways a driver task
+//! ends are a panic and an abort, and the runtime's supervisor observes both.
+//! There is no `spawn()` here any more — the caller spawns the future into
+//! whatever owns it (the runtime's child set in production), so no driver is
+//! detached with nobody holding its join handle.
+//!
+//! Every tick is recorded in the driver's [`Heartbeat`]: when it began and
+//! ended and how it ended, readable without a lock by whoever supervises it.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_store::{StoreMesh, WatchEvent, WatchGone, WatchSignal, WatchStream};
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -82,6 +94,7 @@ use shigoto_types::failure::FailureKind;
 use crate::controller::{Controller, ReconcileOutcome};
 use crate::curve::{Curve, Streak};
 use crate::error::ControllerError;
+use crate::heartbeat::{Heartbeat, TickClass};
 
 /// Filter: which resource kinds wake this driver's controller?
 #[derive(Clone, Debug)]
@@ -146,11 +159,13 @@ impl Default for WatchDriverConfig {
 }
 
 /// The driver. Owns a `Controller` + an `Arc<StoreMesh>` +
-/// configuration. `spawn()` starts the event loop.
+/// configuration + the [`Heartbeat`] its ticks are recorded in.
+/// [`WatchDriver::run`] is the event loop.
 pub struct WatchDriver<C: Controller> {
     controller: Arc<C>,
     store: Arc<StoreMesh>,
     config: WatchDriverConfig,
+    beat: Arc<Heartbeat>,
 }
 
 impl<C: Controller + 'static> WatchDriver<C> {
@@ -160,18 +175,22 @@ impl<C: Controller + 'static> WatchDriver<C> {
             controller: Arc::new(controller),
             store,
             config,
+            beat: Arc::new(Heartbeat::new()),
         }
     }
 
-    /// Spawn the event loop. Returns a [`JoinHandle`] the caller
-    /// can abort to stop the driver.
-    pub fn spawn(self) -> JoinHandle<()> {
-        let controller = self.controller;
-        let store = self.store;
-        let config = self.config;
-        tokio::spawn(async move {
-            run(controller, store, config).await;
-        })
+    /// The heartbeat this driver's ticks are recorded in. Take it before
+    /// [`run`](Self::run) consumes the driver.
+    #[must_use]
+    pub fn heartbeat(&self) -> Arc<Heartbeat> {
+        self.beat.clone()
+    }
+
+    /// The event loop. It never returns: the `Infallible` output makes a
+    /// loop that ends a type error. The task running it ends only by panic
+    /// or abort — the caller owns the task and sees both.
+    pub async fn run(self) -> Infallible {
+        run(self.controller, self.store, self.config, self.beat).await
     }
 
     /// One tick of the inner controller — useful in tests where
@@ -262,7 +281,8 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
     controller: Arc<C>,
     store: Arc<S>,
     config: WatchDriverConfig,
-) {
+    beat: Arc<Heartbeat>,
+) -> Infallible {
     let name = controller.name();
     let mut rx = subscribe(store.as_ref(), name, Duration::ZERO).await;
     // Re-subscribes since the last delivered event: reset whenever a
@@ -278,6 +298,7 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
         stuck_after: config.stuck_tick_after,
         slot: RequeueSlot::default(),
         failures: ConsecutiveFailures::default(),
+        beat,
     };
 
     info!(
@@ -293,9 +314,10 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
 
     // ── THE LOOP NEVER RETURNS ─────────────────────────────────────────
     //
-    // There is deliberately no in-band stop: shutdown is `handle.abort()`
-    // on the `JoinHandle` `spawn()` returned, which is upstream's `stopCh`
-    // — a channel SEPARATE from the data. Conflating the two is what this
+    // And it cannot: `run` is `-> Infallible`, so a `break` or `return`
+    // here is a type error. There is deliberately no in-band stop: stopping
+    // is aborting the task that runs this future, which is upstream's
+    // `stopCh` — a channel SEPARATE from the data. Conflating the two is what this
     // loop used to do and what retired a controller for 12 hours:
     //
     //   1. a coalescing drain consumed the stream's one-shot terminal,
@@ -504,13 +526,15 @@ impl RequeueSlot {
     }
 }
 
-/// What `run` ticks through: the controller, the one requeue slot, and the
-/// driver's failed ticks in a row. `tick` is the ONLY way `run` ticks.
+/// What `run` ticks through: the controller, the one requeue slot, the
+/// driver's failed ticks in a row, and the heartbeat every tick is recorded
+/// in. `tick` is the ONLY way `run` ticks.
 struct Ticker<C: Controller + ?Sized + 'static> {
     controller: Arc<C>,
     stuck_after: Duration,
     slot: RequeueSlot,
     failures: ConsecutiveFailures,
+    beat: Arc<Heartbeat>,
 }
 
 impl<C: Controller + ?Sized + 'static> Ticker<C> {
@@ -522,7 +546,9 @@ impl<C: Controller + ?Sized + 'static> Ticker<C> {
     /// anyway.
     async fn tick(&mut self) {
         self.slot.clear();
+        self.beat.begin();
         let result = tick_observed(&self.controller, self.stuck_after).await;
+        self.beat.end(TickClass::of(&result));
         let wake = next_wake(&result, &mut self.failures);
         log_tick(self.controller.name(), &result, wake);
         if let Some(deadline) = wake.and_then(|after| Instant::now().checked_add(after)) {
@@ -544,7 +570,7 @@ enum EventOrTimer {
     /// one-shot [`WatchGone`] was already consumed, or the store dropped
     /// the sender. It means RE-SUBSCRIBE, and it is spelled that way so
     /// nobody can read it as a stop again — there is no `Shutdown`
-    /// variant to fall into. Stopping a driver is `handle.abort()`, out
+    /// variant to fall into. Stopping a driver is aborting its task, out
     /// of band, the way upstream keeps `stopCh` separate from
     /// `ResultChan`.
     StreamEnded,
@@ -1028,7 +1054,12 @@ mod tests {
             fallback_interval: fallback,
             ..WatchDriverConfig::default()
         };
-        let driver = tokio::spawn(run(probe.clone(), feed.clone(), config));
+        let driver = tokio::spawn(run(
+            probe.clone(),
+            feed.clone(),
+            config,
+            Arc::new(Heartbeat::new()),
+        ));
         let events = event_every.map(|every| {
             let feed = feed.clone();
             tokio::spawn(async move {
@@ -1288,5 +1319,81 @@ mod tests {
         assert_eq!(slot.at, Some(now + Duration::from_secs(1)));
         slot.clear();
         assert_eq!(slot, RequeueSlot::default());
+    }
+
+    // ── T2.6: the loop's ticks are recorded where a supervisor can read them
+    //
+    // The ryn defect's only evidence was a missing log line. A driver now
+    // writes every tick into its heartbeat — begun, ended, and how — so
+    // "when did the kubelet last finish a tick?" has an answer in-process.
+
+    /// Drive the real loop with `answer` for `run_for`, returning the
+    /// heartbeat it wrote.
+    async fn heartbeat_of(probe: &Arc<Probe>, run_for: Duration) -> Arc<Heartbeat> {
+        let beat = Arc::new(Heartbeat::new());
+        let config = WatchDriverConfig {
+            fallback_interval: FALLBACK,
+            ..WatchDriverConfig::default()
+        };
+        let driver = tokio::spawn(run(probe.clone(), Feed::new(), config, beat.clone()));
+        tokio::time::sleep(run_for).await;
+        driver.abort();
+        let _ = driver.await;
+        beat
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_tick_is_recorded_in_the_heartbeat_with_its_class() {
+        for (answer, class) in [
+            (Answer::Done, TickClass::Done),
+            (Answer::Requeue(REQUEUE_AFTER), TickClass::Requeued),
+            (Answer::Transient, TickClass::Transient),
+            (Answer::Declarative, TickClass::Declarative),
+        ] {
+            let probe = Probe::new(answer);
+            let beat = heartbeat_of(&probe, Duration::from_secs(95))
+                .await
+                .snapshot();
+            let ticks = probe.stats().ticks;
+
+            assert!(ticks >= 3, "{answer:?}: only {ticks} ticks in 95 s");
+            assert_eq!(
+                beat.ticks_started, ticks,
+                "{answer:?}: the heartbeat missed a tick the controller saw"
+            );
+            // The abort can land inside a tick: that one began, never ended.
+            assert!(
+                beat.ticks_finished + 1 >= beat.ticks_started,
+                "{answer:?}: {beat:?}"
+            );
+            assert_eq!(beat.last_class, Some(class), "{answer:?}: {beat:?}");
+            assert!(beat.last_end.is_some() && beat.last_start.is_some());
+        }
+    }
+
+    /// A tick that has begun and not returned reads as in flight, with the
+    /// time it began — the fact T2.8's stall detection is built on.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_in_progress_reads_as_in_flight() {
+        let probe = Probe::taking(Answer::Done, Duration::from_secs(20));
+        let beat = Arc::new(Heartbeat::new());
+        let config = WatchDriverConfig {
+            fallback_interval: FALLBACK,
+            ..WatchDriverConfig::default()
+        };
+        let driver = tokio::spawn(run(probe.clone(), Feed::new(), config, beat.clone()));
+        // The first fallback tick begins at 30 s and runs until 50 s.
+        tokio::time::sleep(FALLBACK + Duration::from_secs(5)).await;
+        let mid = beat.snapshot();
+        driver.abort();
+        let _ = driver.await;
+
+        assert!(
+            mid.in_flight(),
+            "a 20 s tick 5 s in is not in flight: {mid:?}"
+        );
+        assert_eq!((mid.ticks_started, mid.ticks_finished), (1, 0));
+        assert_eq!(mid.last_class, None, "no tick has ended yet: {mid:?}");
+        assert!(mid.last_start.is_some());
     }
 }

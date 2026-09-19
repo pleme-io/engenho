@@ -65,7 +65,7 @@ async fn driver_ticks_on_matching_event() {
             stuck_tick_after: Duration::from_secs(120),
         },
     );
-    let handle = driver.spawn();
+    let handle = tokio::spawn(driver.run());
 
     // Brief wait for the driver to subscribe.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -113,7 +113,7 @@ async fn driver_filter_skips_irrelevant_events() {
             stuck_tick_after: Duration::from_secs(120),
         },
     );
-    let handle = driver.spawn();
+    let handle = tokio::spawn(driver.run());
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Fire a NODE event — should NOT wake the Pod-filtered driver.
@@ -160,7 +160,7 @@ async fn driver_coalesces_burst_events_into_one_tick() {
             stuck_tick_after: Duration::from_secs(120),
         },
     );
-    let handle = driver.spawn();
+    let handle = tokio::spawn(driver.run());
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Fire 5 events in a tight burst.
@@ -216,7 +216,7 @@ async fn driver_fallback_timer_ticks_with_no_events() {
             stuck_tick_after: Duration::from_secs(120),
         },
     );
-    let handle = driver.spawn();
+    let handle = tokio::spawn(driver.run());
 
     // No events; just wait for the fallback timer to fire twice.
     tokio::time::sleep(Duration::from_millis(400)).await;

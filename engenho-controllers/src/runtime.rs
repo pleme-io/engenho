@@ -12,6 +12,7 @@
 //! priority queues, and shared work queues — but the trait surface
 //! doesn't change.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,32 +86,20 @@ impl ControllerRuntime {
     /// Spawn the per-controller tick loops. Returns one JoinHandle
     /// per controller. The caller can abort each handle to stop a
     /// controller individually.
+    ///
+    /// ★ NOT A PRODUCTION PATH. The daemon runs every controller as a
+    /// `Child` of engenho-runtime's closed catalog, owned by one child set
+    /// that `main` watches; nothing in the daemon calls this. It stays for
+    /// embedders and tests that want interval-only ticking — and its loops
+    /// are `-> Infallible` like a `WatchDriver`'s, so a loop that returns is
+    /// a type error here too. A controller that belongs in the daemon gets
+    /// a catalog row, not a spawn through this.
     #[must_use]
-    pub fn spawn(self) -> Vec<JoinHandle<()>> {
-        let mut handles = Vec::new();
-        for (controller, interval) in self.controllers {
-            let handle = tokio::spawn(async move {
-                // This controller's failed ticks in a row: its Transient
-                // retries grow on the same curve as a WatchDriver's.
-                let mut failures = ConsecutiveFailures::default();
-                loop {
-                    // The interval-only path consumes the typed outcome
-                    // through the SAME decision as the WatchDriver
-                    // (`next_wake`): a requeue or a Transient error re-ticks
-                    // at its delay, capped at the interval (never wait
-                    // LONGER than the fallback would); `Done` and a
-                    // Declarative error wait the normal interval. One
-                    // sequential sleep is this loop's one requeue slot.
-                    let result = controller.tick().await;
-                    let wake = next_wake(&result, &mut failures);
-                    log_tick(controller.name(), &result, wake);
-                    let next_delay = wake.map_or(interval, |after| after.min(interval));
-                    tokio::time::sleep(next_delay).await;
-                }
-            });
-            handles.push(handle);
-        }
-        handles
+    pub fn spawn(self) -> Vec<JoinHandle<Infallible>> {
+        self.controllers
+            .into_iter()
+            .map(|(controller, interval)| tokio::spawn(tick_forever(controller, interval)))
+            .collect()
     }
 
     /// Number of registered controllers (for testing + telemetry).
@@ -122,6 +111,26 @@ impl ControllerRuntime {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.controllers.is_empty()
+    }
+}
+
+/// One controller's interval loop. It never returns.
+async fn tick_forever(controller: Arc<dyn Controller>, interval: Duration) -> Infallible {
+    // This controller's failed ticks in a row: its Transient retries grow on
+    // the same curve as a WatchDriver's.
+    let mut failures = ConsecutiveFailures::default();
+    loop {
+        // The interval-only path consumes the typed outcome through the SAME
+        // decision as the WatchDriver (`next_wake`): a requeue or a Transient
+        // error re-ticks at its delay, capped at the interval (never wait
+        // LONGER than the fallback would); `Done` and a Declarative error
+        // wait the normal interval. One sequential sleep is this loop's one
+        // requeue slot.
+        let result = controller.tick().await;
+        let wake = next_wake(&result, &mut failures);
+        log_tick(controller.name(), &result, wake);
+        let next_delay = wake.map_or(interval, |after| after.min(interval));
+        tokio::time::sleep(next_delay).await;
     }
 }
 

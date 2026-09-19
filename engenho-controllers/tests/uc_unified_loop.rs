@@ -150,7 +150,7 @@ async fn requeue_result_arms_the_requeue_slot_not_swallowed() {
             stuck_tick_after: Duration::from_secs(120),
         },
     );
-    let handle = driver.spawn();
+    let handle = tokio::spawn(driver.run());
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Fire ONE Pod event → tick #1 (returns Requeue(20ms)).

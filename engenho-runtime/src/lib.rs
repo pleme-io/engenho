@@ -35,6 +35,15 @@
 //! [`engenho_controllers::KindFilter`] so the chain converges in ms,
 //! with a periodic fallback as the safety net.
 //!
+//! ## Owned children (T2.6)
+//!
+//! Every long-lived task the runtime starts — each driver, the :10250 and
+//! :2379 listeners — is a [`Child`] of one closed catalog, spawned into one
+//! [`Children`] set. A child's task cannot complete normally (its output is
+//! `Infallible`), so a task that ends has panicked or been aborted;
+//! [`Runtime::next_dead_child`] reports it, marked Dead and logged at ERROR,
+//! and `main` watches for it beside its stop signal. There is no respawn.
+//!
 //! ## Boot order (strict)
 //!
 //! 1. `config.validate()`
@@ -47,8 +56,8 @@
 //!
 //! ## Shutdown (the tricky bit)
 //!
-//! [`Runtime::shutdown`] aborts + awaits every driver JoinHandle (so
-//! the controller/scheduler/kubelet tasks drop their `Arc<StoreMesh>`
+//! [`Runtime::shutdown`] aborts + awaits every child task (so the
+//! controller/scheduler/kubelet tasks drop their `Arc<StoreMesh>`
 //! clones), shuts the apiserver down (2s grace, severs open watches —
 //! which drops the handler clones), THEN `Arc::try_unwrap`s the store
 //! and calls `terminate` (which consumes `StoreMesh` and needs the sole
@@ -60,9 +69,14 @@
 
 pub mod etcd_facade;
 
+mod child;
 mod error;
 mod runtime;
 
+pub use child::{
+    Child, ChildHandle, ChildState, Children, DeadChild, DeathCause, Driver, Listener, TickState,
+    Wakes,
+};
 pub use error::RuntimeError;
 pub use etcd_facade::MeshEtcdStore;
 pub use runtime::Runtime;

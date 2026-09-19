@@ -15,13 +15,14 @@ use engenho_config::{
     ResolvedDatapath,
 };
 use engenho_controllers::{
-    CrdController, CronJobController, DaemonSetController, DeploymentController,
-    DynamicHandlerSink, EndpointsController, FakeRouter, GcController, IptablesRouter, IpvsRouter,
-    JobController, KindFilter, NamespaceController, PodDisruptionBudgetController,
+    Controller, CrdController, CronJobController, DaemonSetController, DeploymentController,
+    DynamicHandlerSink, EndpointsController, FakeRouter, GcController, Heartbeat, IptablesRouter,
+    IpvsRouter, JobController, NamespaceController, PodDisruptionBudgetController,
     PvBinderController, ReplicaSetController, ServiceRouter, ServiceRoutingController,
-    StatefulSetController, WallClock, WatchDriver, WatchDriverConfig,
+    StatefulSetController, TickClass, WallClock, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
+    event_recorder::EventSink,
 };
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_kubelet::config_bridge::KubeletBackendKind;
@@ -39,19 +40,19 @@ use engenho_types::generated_v1_34::rbac_v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
 };
 use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
-use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener};
 use crate::error::RuntimeError;
 
 /// The assembled single-node runtime. Owns the store spine, the
-/// apiserver, every driver task, and the container backend (retained
-/// for shutdown + test inspection).
+/// apiserver, every child task (drivers + listeners, one owned set), and the
+/// container backend (retained for shutdown + test inspection).
 pub struct Runtime {
     config: EngenhoConfig,
     store: Arc<StoreMesh>,
     apiserver: ApiServer,
-    drivers: Vec<JoinHandle<()>>,
+    children: Children,
     /// Kept alive for the runtime's lifetime so the kubelet's backend
     /// outlives every driver tick; tests pass their own clone to
     /// [`Runtime::start_with_backend`] and inspect it.
@@ -293,12 +294,12 @@ impl Runtime {
         // The CRD handler sink: builds a StoreBackedHandler (admission-
         // dispatched, opaque-JSON) per served CRD version + registers it
         // into the SAME router_state. Shared (as Arc<dyn DynamicHandlerSink>)
-        // with the CrdController spawned in spawn_drivers.
+        // with the CrdController spawned in spawn_children.
         let handler_sink: Arc<dyn DynamicHandlerSink> =
             RouterHandlerSink::new(store.clone(), admission.clone(), router_state.clone())
                 .into_dyn();
         // Keep a router_state clone so the Pod `/log` handler (which needs the
-        // kubelet, built later in spawn_drivers) can be registered after the
+        // kubelet, built later in spawn_children) can be registered after the
         // kubelet exists. RouterState is Arc-backed: this clone shares the SAME
         // handler ArcSwap the apiserver dispatches on, so a `register()` here is
         // visible to in-flight requests (identical mechanism to the CRD sink).
@@ -338,12 +339,15 @@ impl Runtime {
             other => RuntimeError::Config(ConfigError::Incoherent(other.to_string())),
         })?;
 
-        // 7. Spawn the controller / scheduler / kubelet drivers (incl. the
-        //    CrdController, which registers CR handlers into the shared
-        //    router table via handler_sink). Returns the Arc<Kubelet> so the
-        //    Pod `/log` reader can be wired in.
-        let (drivers, kubelet) = spawn_drivers(&config, &store, &backend, strategy, &handler_sink);
-        info!(count = drivers.len(), "drivers spawned");
+        // 7. Spawn every child in the catalog (T2.6): the controller /
+        //    scheduler / kubelet drivers (incl. the CrdController, which
+        //    registers CR handlers into the shared router table via
+        //    handler_sink) and the :10250 kubelet + :2379 etcd-façade
+        //    listeners, into ONE owned set that `main` watches. Returns the
+        //    Arc<Kubelet> so the Pod `/log` reader can be wired in.
+        let (children, kubelet) =
+            spawn_children(&config, &store, &backend, strategy, &handler_sink);
+        info!(count = children.len(), "children spawned");
 
         // 7b. Register the Pod `/log` handler — a StoreBackedHandler for the
         //     Pod kind whose `logs` delegates to the in-process kubelet (the
@@ -353,115 +357,6 @@ impl Runtime {
         //     IS this process's kubelet, so the read is in-process. `register`
         //     keys on (group, version, plural) so it overwrites the Pod entry
         //     atomically (same swap mechanism the CRD sink uses).
-        // 7a. Bind the KUBELET's own HTTP surface (:10250).
-        //
-        //     ★ THIS IS WHAT MAKES THE SURFACE EXIST. `KubeletApi` and its
-        //     router shipped with a trait, a route table and a test double,
-        //     and nothing ever bound them — so the port was a type, not a
-        //     port. Logs worked only because the kubelet happens to share a
-        //     process with the apiserver; the moment there is a second node,
-        //     `kubectl logs` against a pod on it has no path at all.
-        //
-        //     A bind failure is logged and NOT fatal: the apiserver is
-        //     already serving, and killing a working control plane because
-        //     one auxiliary port is taken trades a partial outage for a
-        //     total one. The log line names the address so the cause is not
-        //     a mystery.
-        let kubelet_api: Arc<dyn engenho_kubelet::server::KubeletApi> = Arc::new(WeakKubeletApi {
-            kubelet: Arc::downgrade(&kubelet),
-        });
-        let kubelet_addr = config.runtime.kubelet_listen_addr.clone();
-        tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(&kubelet_addr).await {
-                Ok(listener) => {
-                    let bound = listener
-                        .local_addr()
-                        .map_or_else(|_| kubelet_addr.clone(), |a| a.to_string());
-                    info!(addr = %bound, "kubelet HTTP surface bound");
-                    let app = engenho_kubelet::server::KubeletServer::new(kubelet_api).routes();
-                    if let Err(e) = axum::serve(listener, app).await {
-                        warn!(error = %e, "kubelet HTTP surface stopped");
-                    }
-                }
-                Err(e) => warn!(
-                    addr = %kubelet_addr,
-                    error = %e,
-                    "kubelet HTTP surface could not bind; container logs and exec \
-                     are unreachable from off-process (the apiserver is unaffected)"
-                ),
-            }
-        });
-
-        // The etcd v3 façade on :2379. Same failure posture as :10250: a
-        // bind failure is a WARNING, not a boot failure — refusing to start
-        // the cluster because one auxiliary port is taken trades a partial
-        // outage for a total one.
-        //
-        // ★ THIS IS WHAT MAKES engenho DRIVABLE BY SOFTWARE THAT HAS NEVER
-        // HEARD OF IT. `etcdctl get /registry/ --prefix --keys-only`,
-        // `snapshot save`, every backup tool and every runbook that was
-        // written against etcd. engenho runs no etcd and its apiserver
-        // never speaks it — the INTERFACE is the obligation, not the
-        // technology.
-        //
-        // READ-ONLY: Kv serves Range; Put/DeleteRange/Txn are absent rather
-        // than silently dropping writes. See `etcd_facade`'s header.
-        if !config.runtime.etcd_listen_addr.is_empty() {
-            // `MeshEtcdStore` is `Clone` and holds an `Arc<StoreMesh>`
-            // inside, so every clone is the SAME store — the three services
-            // must not end up with different views of one cluster.
-            let etcd_store = crate::etcd_facade::MeshEtcdStore::new(&store);
-            let etcd_addr = config.runtime.etcd_listen_addr.clone();
-            let identity = engenho_etcd::server::ServerIdentity::default();
-            tokio::spawn(async move {
-                match tokio::net::TcpListener::bind(&etcd_addr).await {
-                    Ok(listener) => {
-                        let bound = listener
-                            .local_addr()
-                            .map_or_else(|_| etcd_addr.clone(), |a| a.to_string());
-                        info!(addr = %bound, "etcd v3 facade bound (read-only)");
-                        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-                        let kv = engenho_etcd::server::ReadOnlyKv {
-                            store: etcd_store.clone(),
-                            identity,
-                        };
-                        let maintenance = engenho_etcd::server::MaintenanceSvc {
-                            store: etcd_store.clone(),
-                            identity,
-                        };
-                        let watch =
-                            engenho_etcd::server::WatchSvc::new(Arc::new(etcd_store), identity);
-                        if let Err(e) = tonic::transport::Server::builder()
-                            .add_service(
-                                engenho_etcd::pb::etcdserverpb::kv_server::KvServer::new(kv),
-                            )
-                            .add_service(
-                                engenho_etcd::pb::etcdserverpb::watch_server::WatchServer::new(
-                                    watch,
-                                ),
-                            )
-                            .add_service(
-                                engenho_etcd::pb::etcdserverpb::maintenance_server::MaintenanceServer::new(
-                                    maintenance,
-                                ),
-                            )
-                            .serve_with_incoming(incoming)
-                            .await
-                        {
-                            warn!(error = %e, "etcd v3 facade stopped");
-                        }
-                    }
-                    Err(e) => warn!(
-                        addr = %etcd_addr,
-                        error = %e,
-                        "etcd v3 facade could not bind; etcdctl, snapshot tooling and \
-                         any --etcd-servers consumer are unreachable (the apiserver is \
-                         unaffected)"
-                    ),
-                }
-            });
-        }
-
         let log_reader: Arc<dyn engenho_apiserver::PodLogReader> =
             Arc::new(KubeletLogReader { kubelet });
         if let Some(pod_handler) = build_pod_log_handler(&store, &admission, log_reader) {
@@ -473,9 +368,24 @@ impl Runtime {
             config,
             store,
             apiserver,
-            drivers,
+            children,
             backend,
         })
+    }
+
+    /// Every child the runtime spawned, with its state and heartbeat.
+    #[must_use]
+    pub fn children(&self) -> &Children {
+        &self.children
+    }
+
+    /// Wait for the next child whose task ends. It is marked Dead and logged
+    /// at ERROR before this returns; it is NOT respawned.
+    ///
+    /// Pends forever while every child runs, and is cancel-safe, so `main`
+    /// selects on it beside its stop signal.
+    pub async fn next_dead_child(&mut self) -> DeadChild {
+        self.children.next_dead().await
     }
 
     /// The address the apiserver actually bound to (resolves the
@@ -497,12 +407,12 @@ impl Runtime {
         &self.config
     }
 
-    /// Graceful shutdown: abort + await every driver task, shut the
+    /// Graceful shutdown: abort + await every child task, shut the
     /// apiserver down (2s grace, severs open watches), then terminate
     /// the store.
     ///
     /// `terminate` consumes [`StoreMesh`] and requires the SOLE strong
-    /// `Arc` ref. The driver tasks + apiserver handlers each hold a
+    /// `Arc` ref. The child tasks + apiserver handlers each hold a
     /// clone; aborting + awaiting the tasks and shutting the apiserver
     /// down drops those clones, so `Arc::try_unwrap` then succeeds.
     ///
@@ -512,24 +422,24 @@ impl Runtime {
     /// [`RuntimeError::StoreStillShared`] if a store clone leaked past
     /// shutdown, or [`RuntimeError::Store`] on `terminate` failure.
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
-        // Abort each driver then await it so its captured Arc<StoreMesh>
+        let Self {
+            mut children,
+            apiserver,
+            store,
+            ..
+        } = self;
+        // Abort every child then await it, so its captured Arc<StoreMesh>
         // (and the controller it owns) is actually dropped before we try
-        // to unwrap the store. Awaiting an aborted JoinHandle returns a
-        // Cancelled JoinError — expected, not an error here.
-        for handle in &self.drivers {
-            handle.abort();
-        }
-        for handle in self.drivers {
-            let _ = handle.await;
-        }
+        // to unwrap the store.
+        children.stop().await;
 
         // Shut the apiserver down — severs open watch long-polls (each
         // holds a StoreBackedHandler → Arc<StoreMesh> clone) within a
         // bounded 2s grace.
-        self.apiserver.shutdown().await?;
+        apiserver.shutdown().await?;
 
         // Now the Runtime should hold the only strong ref. Take it.
-        let store = Arc::try_unwrap(self.store).map_err(|arc| RuntimeError::StoreStillShared {
+        let store = Arc::try_unwrap(store).map_err(|arc| RuntimeError::StoreStillShared {
             strong_count: Arc::strong_count(&arc),
         })?;
         store.terminate().await?;
@@ -2539,16 +2449,6 @@ fn write_kubeconfig_file(
     write_at_mode(path, contents, visibility.mode())
 }
 
-/// Build + spawn every driver gated on `controllers.enable.*`. The
-/// scheduler + kubelet always run (a single-node runtime that can't
-/// schedule or run containers is useless); the four reconcilers are
-/// individually toggleable.
-///
-/// Returns `(handles, kubelet)` — the spawned driver tasks PLUS an
-/// `Arc<Kubelet>` clone. The kubelet is built once, shared (via the
-/// `Controller for Arc<C>` blanket impl) between its WatchDriver AND the
-/// apiserver's Pod `/log` reader, so the driver's ticks + the log queries see
-/// the SAME local bookkeeping.
 /// Where CNI network configuration lives. Upstream's path, and not
 /// configurable today on purpose: every CNI installer writes here, and a
 /// configurable directory that nobody sets is a knob whose only effect is
@@ -2604,371 +2504,341 @@ const CNI_CONFIG_DIR: &str = "/etc/cni/net.d";
 /// sandbox creation, and not before.
 const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall::Planned;
 
-fn spawn_drivers(
+/// How long a single reconcile may run before the driver starts saying,
+/// once per window, that it is BLOCKED. It is never cancelled — see
+/// `watch_driver::tick_observed`, which copies the kubelet's
+/// `syncLoopHealthCheck` posture: make a stalled loop LOUD rather than abort
+/// it half-done. Measured motivation: engenho's kubelet controller was
+/// retired for 12 hours on ryn (2026-09-18) and the only evidence was the
+/// ABSENCE of its tick line among three healthy controllers.
+const STUCK_TICK_AFTER: Duration = Duration::from_secs(120);
+
+/// Build + spawn every child the catalog enables (T2.6) into ONE owned
+/// [`Children`] set: the drivers gated on `controllers.enable.*`, the
+/// always-on scheduler + kubelet (a single-node runtime that can't schedule
+/// or run containers is useless), and the :10250 / :2379 listeners.
+///
+/// Returns the set PLUS an `Arc<Kubelet>` clone. The kubelet is built once
+/// and shared (via the `Controller for Arc<C>` blanket impl) between its
+/// driver, the :10250 listener AND the apiserver's Pod `/log` reader, so all
+/// three see the SAME local bookkeeping.
+fn spawn_children(
     config: &EngenhoConfig,
     store: &Arc<StoreMesh>,
     backend: &Arc<dyn ContainerRuntime>,
     strategy: Box<dyn engenho_scheduler::SchedulingStrategy>,
     handler_sink: &Arc<dyn DynamicHandlerSink>,
-) -> (Vec<JoinHandle<()>>, Arc<Kubelet>) {
-    let mut handles = Vec::new();
+) -> (Children, Arc<Kubelet>) {
+    let parts = Parts::assemble(config, store, backend, strategy, handler_sink);
+    let children = Children::spawn_catalog(config, |child| parts.task(child));
+    (children, parts.kubelet)
+}
 
-    // Namespace scope: empty string in config means "all namespaces".
-    let ns: Option<String> = {
-        let n = &config.controllers.namespace;
-        if n.is_empty() { None } else { Some(n.clone()) }
-    };
+/// What every catalog child is built from, assembled ONCE before the walk.
+///
+/// The shared pieces live here rather than inside any one child's arm
+/// because more than one child reads each: the event sink (two sinks over
+/// one store would be two independent lossy buffers for one cluster's
+/// events), the CSI driver table, the scheduler (built once from the
+/// strategy the caller constructed fallibly) and the kubelet.
+struct Parts<'a> {
+    config: &'a EngenhoConfig,
+    store: &'a Arc<StoreMesh>,
+    handler_sink: &'a Arc<dyn DynamicHandlerSink>,
+    /// Namespace scope: `None` means all namespaces (empty in config).
+    ns: Option<String>,
+    debounce: Duration,
+    fallback: Duration,
+    /// ★ ONE CSI driver table, shared by three consumers: the registrar
+    /// fills it, the PV binder provisions through it, and the kubelet's
+    /// materializer publishes through it. Two tables would let a driver be
+    /// provisionable but not mountable — a PVC that binds and then never
+    /// mounts, with nothing anywhere explaining the difference.
+    csi_drivers: engenho_kubelet::DriverTable,
+    /// The event sink, shared by every producer. The workload controllers
+    /// announce a parent they cannot reconcile (a template of the wrong
+    /// shape) on that parent, and carry on with the rest.
+    events: Arc<dyn EventSink>,
+    scheduler: Arc<Scheduler>,
+    kubelet: Arc<Kubelet>,
+}
 
-    // How long a single reconcile may run before the driver starts saying,
-    // once per window, that it is BLOCKED. It is never cancelled — see
-    // `watch_driver::tick_observed`, which copies the kubelet's
-    // `syncLoopHealthCheck` posture: make a stalled loop LOUD rather than
-    // abort it half-done. Measured motivation: engenho's kubelet controller
-    // was retired for 12 hours on ryn (2026-09-18) and the only evidence was
-    // the ABSENCE of its tick line among three healthy controllers.
-    const STUCK_TICK_AFTER: Duration = Duration::from_secs(120);
-
-    let debounce = Duration::from_millis(u64::from(config.controllers.debounce_milliseconds));
-    let fallback = Duration::from_secs(u64::from(config.controllers.fallback_interval_seconds));
-
-    let driver_config = |kinds: &[&str]| WatchDriverConfig {
-        filter: KindFilter::Kinds(kinds.iter().map(|k| (*k).to_string()).collect()),
-        debounce,
-        fallback_interval: fallback,
-        stuck_tick_after: STUCK_TICK_AFTER,
-    };
-
-    let enable = &config.controllers.enable;
-
-    // ★ ONE CSI driver table, shared by three consumers: the registrar
-    // fills it, the PV binder provisions through it, and the kubelet's
-    // materializer publishes through it. Two tables would let a driver be
-    // provisionable but not mountable — a PVC that binds and then never
-    // mounts, with nothing anywhere explaining the difference.
-    let csi_drivers = engenho_kubelet::DriverTable::new();
-
-    // The event sink, built once and shared by every producer below. It
-    // lives here rather than inside the kubelet block because the workload
-    // controllers, the pv-binder and the NetworkPolicy controller need it
-    // too, and two sinks over one store would be two independent lossy
-    // buffers for one cluster's events. The workload controllers announce a
-    // parent they cannot reconcile (a template of the wrong shape) on that
-    // parent, and carry on with the rest.
-    let events: Arc<dyn engenho_controllers::event_recorder::EventSink> = Arc::new(
-        engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
-            store: store.clone(),
-        })),
-    );
-
-    if enable.deployment {
-        let c =
-            DeploymentController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                driver_config(&["Deployment", "ReplicaSet"]),
-            )
-            .spawn(),
+impl<'a> Parts<'a> {
+    fn assemble(
+        config: &'a EngenhoConfig,
+        store: &'a Arc<StoreMesh>,
+        backend: &Arc<dyn ContainerRuntime>,
+        strategy: Box<dyn engenho_scheduler::SchedulingStrategy>,
+        handler_sink: &'a Arc<dyn DynamicHandlerSink>,
+    ) -> Self {
+        let ns = Some(&config.controllers.namespace)
+            .filter(|n| !n.is_empty())
+            .cloned();
+        let csi_drivers = engenho_kubelet::DriverTable::new();
+        let events: Arc<dyn EventSink> = Arc::new(
+            engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
+                store: store.clone(),
+            })),
         );
-    }
-    if enable.replicaset {
-        let c =
-            ReplicaSetController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
-        handles.push(
-            WatchDriver::new(c, store.clone(), driver_config(&["ReplicaSet", "Pod"])).spawn(),
-        );
-    }
-    if enable.statefulset {
-        let c =
-            StatefulSetController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
-        handles.push(
-            WatchDriver::new(c, store.clone(), driver_config(&["StatefulSet", "Pod"])).spawn(),
-        );
-    }
-    if enable.daemonset {
-        let c = DaemonSetController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                driver_config(&["DaemonSet", "Pod", "Node"]),
-            )
-            .spawn(),
-        );
-    }
-    if enable.job {
-        let c = JobController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
-        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Job", "Pod"])).spawn());
-    }
-    // CronJob: parses spec.schedule (5-field cron) against the WallClock and
-    // creates a batch/v1 Job from the jobTemplate on schedule; the
-    // JobController above then runs that Job's Pods. Watches CronJob (its own
-    // kind) + Job (to observe owned-Job activity for the concurrency policy);
-    // the fallback tick is what actually drives the time-based firing (a
-    // CronJob has no spec edit each minute to wake a pure event watch).
-    if enable.cronjob {
-        let c = CronJobController::new(store.clone(), Arc::new(WallClock), ns.clone())
-            .with_event_sink(events.clone());
-        handles
-            .push(WatchDriver::new(c, store.clone(), driver_config(&["CronJob", "Job"])).spawn());
-    }
-    if enable.pdb {
-        let c = PodDisruptionBudgetController::new(store.clone(), ns.clone());
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                driver_config(&["PodDisruptionBudget", "Pod"]),
-            )
-            .spawn(),
-        );
-    }
-    if enable.endpoints {
-        let c = EndpointsController::new(store.clone(), ns.clone()).with_event_sink(events.clone());
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                driver_config(&["Service", "Pod", "Endpoints", "EndpointSlice"]),
-            )
-            .spawn(),
-        );
-    }
-    // Service routing: resolves Service + Endpoints → typed ServiceRoutes
-    // and drives the platform-selected datapath backend. The backend is
-    // chosen by `networking.datapath_mode` resolved against the host
-    // platform (Auto → iptables on Linux, compute-only off-Linux) so on a
-    // Darwin dev host the controller still runs + computes + observes the
-    // desired rules without ever shelling to a non-existent
-    // `iptables-restore`. Watches the same kinds the EndpointsController
-    // does (Service + Endpoints/EndpointSlice) plus the fallback tick.
-    if enable.service_routing {
-        let resolved = config
-            .networking
-            .datapath_mode
-            .resolve(cfg!(target_os = "linux"));
-        let backend = make_service_router(resolved);
-        info!(
-            datapath = backend.name(),
-            mode = ?config.networking.datapath_mode,
-            "service routing backend selected"
-        );
-        let c = ServiceRoutingController::new(store.clone(), backend, ns.clone());
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                driver_config(&["Service", "Endpoints", "EndpointSlice"]),
-            )
-            .spawn(),
-        );
-    }
-    if enable.gc {
-        let c = GcController::new(store.clone(), ns.clone());
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                WatchDriverConfig {
-                    filter: KindFilter::All,
-                    debounce,
-                    fallback_interval: fallback,
-                    stuck_tick_after: STUCK_TICK_AFTER,
-                },
-            )
-            .spawn(),
-        );
+        // The strategy was constructed fallibly by the caller (a typed error
+        // for unimplemented strategies — never a silent round-robin
+        // fallback). Built once here, so the scheduler child wraps a clone of
+        // the Arc rather than consuming the box.
+        let scheduler = Arc::new(Scheduler::new(store.clone(), strategy, ns.clone()));
+        let kubelet = build_kubelet(config, store, backend, events.clone(), &csi_drivers);
+        Self {
+            config,
+            store,
+            handler_sink,
+            ns,
+            debounce: Duration::from_millis(u64::from(config.controllers.debounce_milliseconds)),
+            fallback: Duration::from_secs(u64::from(config.controllers.fallback_interval_seconds)),
+            csi_drivers,
+            events,
+            scheduler,
+            kubelet,
+        }
     }
 
-    // Namespace: cascade-deletion of a Terminating namespace's contents +
-    // finalizer clear. Watches the cluster-scoped Namespace kind (KindFilter
-    // matches on ev.key.kind, so cluster-scoped works) PLUS the fallback tick
-    // so a Terminating namespace drains over a few reconcile cycles. Mirrors
-    // the gc block; gated on controllers.enable.namespace.
-    if enable.namespace {
-        let c = NamespaceController::new(store.clone(), ns.clone());
-        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Namespace"])).spawn());
+    /// The body of one catalog child.
+    fn task(&self, child: Child) -> Option<ChildTask> {
+        match child {
+            Child::Driver(driver) => Some(self.driver(driver)),
+            Child::Listener(listener) => Some(self.listener(listener)),
+            // T1.3c gives it a body; `Child::enabled` keeps it out until then.
+            Child::NodeLease => None,
+        }
     }
 
-    // PV/PVC binder: binds Pending PersistentVolumeClaims to matching
-    // Available PersistentVolumes (capacity ≥ request, accessModes ⊇ requested,
-    // storageClassName equal, volumeName pre-bind) and dynamically provisions a
-    // node-local hostPath PV (under data_dir/local-path) via the local-path
-    // provisioner / default StorageClass when no static PV matches. Watches the
-    // three storage kinds; the fallback tick covers a PV/SC that appears after
-    // the PVC (and vice versa). The host effect (mkdir of the local-path
-    // backing dir) is the HostProvisionerEnv default; gated on
-    // controllers.enable.pv_binder.
-    if enable.pv_binder {
-        let local_path_root = config
-            .runtime
-            .data_dir
-            .join("local-path")
-            .to_string_lossy()
-            .into_owned();
-        // Declared here so both the binder below and the kubelet further
-        // down share it. `DriverTable` is an Arc inside, so a clone is the
-        // same table.
-        // The CSI plane: ONE driver table shared by the registrar (which
-        // fills it), the provisioner (CreateVolume) and the materializer
-        // (NodePublishVolume). Two tables would let a driver be
-        // provisionable but not mountable, or the reverse.
-        // The event sink: a claim that cannot be provisioned says why on
-        // the claim (`ProvisioningFailed`), where `kubectl describe pvc`
-        // shows it.
-        let c = PvBinderController::new(store.clone(), ns.clone(), local_path_root)
-            .with_csi(Arc::new(engenho_kubelet::DriverCsiProvisioner::new(
-                csi_drivers.clone(),
-            )))
-            .with_event_sink(events.clone());
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                driver_config(&["PersistentVolumeClaim", "PersistentVolume", "StorageClass"]),
-            )
-            .spawn(),
-        );
-
-        // VolumeSnapshot: the snapshot half of the same local-path
-        // provisioner. Gated with the binder because it is meaningless
-        // without it — it snapshots the directories the binder provisions,
-        // and enabling one without the other yields a controller that can
-        // only ever decline.
-        let snapshot_root = config
-            .runtime
-            .data_dir
-            .join("snapshots")
-            .to_string_lossy()
-            .into_owned();
-        let snap = engenho_controllers::volume_snapshot::VolumeSnapshotController::new(
-            store.clone(),
-            snapshot_root,
-            Arc::new(engenho_controllers::volume_snapshot::HostSnapshotEnv),
-        );
-        handles.push(
-            WatchDriver::new(
-                snap,
-                store.clone(),
-                driver_config(&[
-                    "VolumeSnapshot",
-                    "PersistentVolumeClaim",
-                    "PersistentVolume",
-                ]),
-            )
-            .spawn(),
-        );
+    /// Wrap `controller` in a `WatchDriver` configured from its catalog row.
+    fn watch<C: Controller + 'static>(&self, driver: Driver, controller: C) -> ChildTask {
+        let config = WatchDriverConfig {
+            filter: driver.wakes_on().filter(),
+            debounce: self.debounce,
+            fallback_interval: self.fallback,
+            stuck_tick_after: STUCK_TICK_AFTER,
+        };
+        let watch = WatchDriver::new(controller, self.store.clone(), config);
+        ChildTask::new(watch.heartbeat(), watch.run())
     }
 
-    // CRD: CustomResourceDefinition → dynamic CR-handler registration. The
-    // controller registers a StoreBackedHandler per served CRD version into
-    // the shared RouterState via `handler_sink`, so CR instances become
-    // routable + discoverable with no parallel codepath. Filtered to
-    // ["CustomResourceDefinition"] so only CRD writes wake it; the fallback
-    // tick covers cold start / missed events (so a CRD installed before the
-    // driver subscribed still gets registered on the first fallback tick).
-    if enable.crd {
-        let c = CrdController::new(store.clone(), handler_sink.clone());
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                driver_config(&["CustomResourceDefinition"]),
-            )
-            .spawn(),
-        );
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per catalog driver; splitting the match would split the catalog"
+    )]
+    fn driver(&self, driver: Driver) -> ChildTask {
+        let store = self.store;
+        let ns = || self.ns.clone();
+        let events = || self.events.clone();
+        match driver {
+            Driver::Deployment => self.watch(
+                driver,
+                DeploymentController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            Driver::ReplicaSet => self.watch(
+                driver,
+                ReplicaSetController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            Driver::StatefulSet => self.watch(
+                driver,
+                StatefulSetController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            Driver::DaemonSet => self.watch(
+                driver,
+                DaemonSetController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            Driver::Job => self.watch(
+                driver,
+                JobController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            // CronJob: parses spec.schedule (5-field cron) against the
+            // WallClock and creates a batch/v1 Job from the jobTemplate on
+            // schedule; the JobController then runs that Job's Pods.
+            Driver::CronJob => self.watch(
+                driver,
+                CronJobController::new(store.clone(), Arc::new(WallClock), ns())
+                    .with_event_sink(events()),
+            ),
+            Driver::PodDisruptionBudget => self.watch(
+                driver,
+                PodDisruptionBudgetController::new(store.clone(), ns()),
+            ),
+            Driver::Endpoints => self.watch(
+                driver,
+                EndpointsController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            // Service routing: resolves Service + Endpoints → typed
+            // ServiceRoutes and drives the platform-selected datapath
+            // backend. The backend is chosen by `networking.datapath_mode`
+            // resolved against the host platform (Auto → iptables on Linux,
+            // compute-only off-Linux), so on a Darwin dev host the controller
+            // still runs + computes + observes the desired rules without ever
+            // shelling to a non-existent `iptables-restore`.
+            Driver::ServiceRouting => {
+                let resolved = self
+                    .config
+                    .networking
+                    .datapath_mode
+                    .resolve(cfg!(target_os = "linux"));
+                let backend = make_service_router(resolved);
+                info!(
+                    datapath = backend.name(),
+                    mode = ?self.config.networking.datapath_mode,
+                    "service routing backend selected"
+                );
+                self.watch(
+                    driver,
+                    ServiceRoutingController::new(store.clone(), backend, ns()),
+                )
+            }
+            Driver::Gc => self.watch(driver, GcController::new(store.clone(), ns())),
+            // Namespace: cascade-deletion of a Terminating namespace's
+            // contents + finalizer clear; the fallback tick drains it over a
+            // few reconcile cycles.
+            Driver::Namespace => self.watch(driver, NamespaceController::new(store.clone(), ns())),
+            // PV/PVC binder: binds Pending claims to matching Available PVs
+            // and dynamically provisions a node-local hostPath PV (under
+            // data_dir/local-path) when no static PV matches. A claim that
+            // cannot be provisioned says why on the claim
+            // (`ProvisioningFailed`), where `kubectl describe pvc` shows it.
+            Driver::PvBinder => {
+                let local_path_root = self
+                    .config
+                    .runtime
+                    .data_dir
+                    .join("local-path")
+                    .to_string_lossy()
+                    .into_owned();
+                self.watch(
+                    driver,
+                    PvBinderController::new(store.clone(), ns(), local_path_root)
+                        .with_csi(Arc::new(engenho_kubelet::DriverCsiProvisioner::new(
+                            self.csi_drivers.clone(),
+                        )))
+                        .with_event_sink(events()),
+                )
+            }
+            // VolumeSnapshot: the snapshot half of the same local-path
+            // provisioner — gated with the binder (see `Driver::enabled`).
+            Driver::VolumeSnapshot => {
+                let snapshot_root = self
+                    .config
+                    .runtime
+                    .data_dir
+                    .join("snapshots")
+                    .to_string_lossy()
+                    .into_owned();
+                self.watch(
+                    driver,
+                    engenho_controllers::volume_snapshot::VolumeSnapshotController::new(
+                        store.clone(),
+                        snapshot_root,
+                        Arc::new(engenho_controllers::volume_snapshot::HostSnapshotEnv),
+                    ),
+                )
+            }
+            // CRD: registers a StoreBackedHandler per served CRD version into
+            // the shared RouterState via `handler_sink`, so CR instances
+            // become routable + discoverable with no parallel codepath. The
+            // fallback tick covers a CRD installed before the driver
+            // subscribed.
+            Driver::Crd => self.watch(
+                driver,
+                CrdController::new(store.clone(), self.handler_sink.clone()),
+            ),
+            // Scheduler: pending Pod → spec.nodeName.
+            Driver::Scheduler => self.watch(driver, self.scheduler.clone()),
+            // Served-capability honesty: truthful status conditions on the
+            // kinds engenho advertises in discovery but does not implement
+            // (APIService, FlowSchema, PriorityLevelConfiguration). Without
+            // it an aggregated APIService registers successfully while every
+            // request to its group silently goes nowhere.
+            Driver::ServedCapability => self.watch(
+                driver,
+                engenho_controllers::served_capability::ServedCapabilityController::new(
+                    store.clone(),
+                ),
+            ),
+            // NetworkPolicy: translate every policy into enforcer rules AND
+            // record whether they are actually enforced. Without it a
+            // default-deny policy applies cleanly and restricts nothing, with
+            // no object anywhere saying so. The backend is
+            // `ComputedNetworkPolicyEnforcer` because engenho runs on darwin
+            // with pods in a podman VM: there is no kernel here to install a
+            // filter into — a named, operator-visible state, not a stub.
+            Driver::NetworkPolicy => {
+                let enforcer = Arc::new(
+                    engenho_controllers::network_policy::ComputedNetworkPolicyEnforcer::new(),
+                );
+                self.watch(
+                    driver,
+                    engenho_controllers::network_policy_controller::NetworkPolicyController::new(
+                        store.clone(),
+                        enforcer,
+                    )
+                    .with_event_sink(events()),
+                )
+            }
+            // CSI registration: scan `<kubelet-root>/plugins_registry` and
+            // keep the driver table in sync. Without it the whole CSI plane
+            // is inert — a driver deploys, creates its sockets, and nothing
+            // ever dials them.
+            Driver::CsiRegistrar => self.watch(
+                driver,
+                engenho_kubelet::CsiRegistrarController::new(
+                    &self.config.runtime.data_dir,
+                    self.csi_drivers.clone(),
+                ),
+            ),
+            // CNI status: publish which network config this node resolved
+            // and whether its plugin chain is executed or merely planned.
+            Driver::CniStatus => self.watch(
+                driver,
+                engenho_controllers::cni_status::CniStatusController::new(
+                    store.clone(),
+                    self.config.runtime.node_name.clone(),
+                    std::path::PathBuf::from(CNI_CONFIG_DIR),
+                    CNI_INSTALL,
+                ),
+            ),
+            // Kubelet: bound Pod → container via the backend.
+            Driver::Kubelet => self.watch(driver, self.kubelet.clone()),
+        }
     }
 
-    // Scheduler: pending Pod → spec.nodeName. Watches Pods + Nodes.
-    // The strategy was constructed fallibly by the caller (a typed error
-    // for unimplemented strategies — never a silent round-robin fallback).
-    {
-        let c = Scheduler::new(store.clone(), strategy, ns.clone());
-        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Pod", "Node"])).spawn());
+    fn listener(&self, listener: Listener) -> ChildTask {
+        let beat = Arc::new(Heartbeat::new());
+        match listener {
+            Listener::KubeletHttp => {
+                let api: Arc<dyn engenho_kubelet::server::KubeletApi> = Arc::new(WeakKubeletApi {
+                    kubelet: Arc::downgrade(&self.kubelet),
+                });
+                ChildTask::new(
+                    beat.clone(),
+                    serve_kubelet_http(self.config.runtime.kubelet_listen_addr.clone(), api, beat),
+                )
+            }
+            Listener::EtcdFacade => ChildTask::new(
+                beat.clone(),
+                serve_etcd_facade(
+                    self.config.runtime.etcd_listen_addr.clone(),
+                    crate::etcd_facade::MeshEtcdStore::new(self.store),
+                    beat,
+                ),
+            ),
+        }
     }
+}
 
-    // Served-capability honesty: stamps truthful status conditions on the
-    // kinds engenho advertises in discovery but does not implement
-    // (APIService, FlowSchema, PriorityLevelConfiguration). Without this
-    // the module is a well-tested vocabulary nobody emits, and an
-    // aggregated APIService registers successfully while every request to
-    // its group silently goes nowhere.
-    {
-        let c =
-            engenho_controllers::served_capability::ServedCapabilityController::new(store.clone());
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                driver_config(&["APIService", "FlowSchema", "PriorityLevelConfiguration"]),
-            )
-            .spawn(),
-        );
-    }
-
-    // NetworkPolicy: translate every policy into enforcer rules AND record
-    // whether they are actually enforced. Wired HERE, at assembly, for the
-    // same reason the event sink is: this is the only layer holding both
-    // the store and the enforcer. Without it a default-deny policy applies
-    // cleanly and restricts nothing, with no object anywhere saying so —
-    // the one gap in this codebase where silence is a SECURITY claim.
-    //
-    // The backend is `ComputedNetworkPolicyEnforcer` because engenho runs
-    // on darwin with pods in a podman VM: there is no kernel here to
-    // install a filter into. It is a deliberate, named, operator-visible
-    // state, not a stub — see `PolicyDatapath`.
-    {
-        let enforcer =
-            Arc::new(engenho_controllers::network_policy::ComputedNetworkPolicyEnforcer::new());
-        let c = engenho_controllers::network_policy_controller::NetworkPolicyController::new(
-            store.clone(),
-            enforcer,
-        )
-        .with_event_sink(events.clone());
-        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["NetworkPolicy"])).spawn());
-    }
-
-    // CSI registration: scan `<kubelet-root>/plugins_registry` and keep the
-    // driver table in sync. Without this the whole CSI plane is inert — a
-    // driver deploys, creates its sockets, and nothing ever dials them.
-    {
-        let c = engenho_kubelet::CsiRegistrarController::new(
-            &config.runtime.data_dir,
-            csi_drivers.clone(),
-        );
-        handles.push(
-            WatchDriver::new(
-                c,
-                store.clone(),
-                WatchDriverConfig {
-                    // Registration is a filesystem event, not a store one,
-                    // so this rides the FALLBACK tick alone rather than
-                    // waking on writes it can never be caused by.
-                    filter: KindFilter::Kinds(vec!["CSINode".to_string()]),
-                    debounce,
-                    fallback_interval: fallback,
-                    stuck_tick_after: STUCK_TICK_AFTER,
-                },
-            )
-            .spawn(),
-        );
-    }
-
-    // CNI status: publish which network config this node actually resolved
-    // and whether its plugin chain is executed or merely planned. On darwin
-    // the answer is `Planned` — the pod address comes from podman, not from
-    // IPAM — and nothing else in the cluster distinguishes the two.
-    {
-        let c = engenho_controllers::cni_status::CniStatusController::new(
-            store.clone(),
-            config.runtime.node_name.clone(),
-            std::path::PathBuf::from(CNI_CONFIG_DIR),
-            CNI_INSTALL,
-        );
-        handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Node"])).spawn());
-    }
-
+/// Build the ONE kubelet, with its event sink, `ServiceAccount` projection
+/// and CSI-layered volume materializer.
+fn build_kubelet(
+    config: &EngenhoConfig,
+    store: &Arc<StoreMesh>,
+    backend: &Arc<dyn ContainerRuntime>,
+    events: Arc<dyn EventSink>,
+    csi_drivers: &engenho_kubelet::DriverTable,
+) -> Arc<Kubelet> {
     // Kubelet: bound Pod → container via the backend. Watches Pods. Built
     // ONCE as an Arc<Kubelet> so the SAME instance is shared between its
     // WatchDriver (via the `Controller for Arc<C>` blanket impl) and the
@@ -3048,7 +2918,7 @@ fn spawn_drivers(
             _ => Arc::new(engenho_kubelet::NoServiceAccountProjection),
         };
 
-    let kubelet = Arc::new(
+    Arc::new(
         Kubelet::new(
             store.clone(),
             backend.clone(),
@@ -3063,10 +2933,123 @@ fn spawn_drivers(
         .with_host_path_policy(engenho_kubelet::pod_volume::HostPathPolicy::allowing(
             config.runtime.host_path_allowlist.clone(),
         )),
-    );
-    handles.push(WatchDriver::new(kubelet.clone(), store.clone(), driver_config(&["Pod"])).spawn());
+    )
+}
 
-    (handles, kubelet)
+/// The kubelet's own HTTP surface (:10250), as a catalog child.
+///
+/// ★ THIS IS WHAT MAKES THE SURFACE EXIST. `KubeletApi` and its router
+/// shipped with a trait, a route table and a test double, and nothing ever
+/// bound them — so the port was a type, not a port. Logs worked only because
+/// the kubelet happens to share a process with the apiserver; the moment
+/// there is a second node, `kubectl logs` against a pod on it has no path at
+/// all.
+///
+/// A bind failure is logged and NOT fatal: the apiserver is already serving,
+/// and killing a working control plane because one auxiliary port is taken
+/// trades a partial outage for a total one. The listener then HALTS (see
+/// [`halt`]): its heartbeat says so, and its task stays alive, parked.
+async fn serve_kubelet_http(
+    addr: String,
+    api: Arc<dyn engenho_kubelet::server::KubeletApi>,
+    beat: Arc<Heartbeat>,
+) -> std::convert::Infallible {
+    beat.begin();
+    match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => {
+            let bound = listener
+                .local_addr()
+                .map_or_else(|_| addr.clone(), |a| a.to_string());
+            info!(addr = %bound, "kubelet HTTP surface bound");
+            let app = engenho_kubelet::server::KubeletServer::new(api).routes();
+            match axum::serve(listener, app).await {
+                Ok(()) => warn!(addr = %bound, "kubelet HTTP surface stopped"),
+                Err(e) => warn!(addr = %bound, error = %e, "kubelet HTTP surface stopped"),
+            }
+        }
+        Err(e) => warn!(
+            addr = %addr,
+            error = %e,
+            "kubelet HTTP surface could not bind; container logs and exec \
+             are unreachable from off-process (the apiserver is unaffected)"
+        ),
+    }
+    halt(&beat).await
+}
+
+/// The etcd v3 façade on :2379, as a catalog child. Same failure posture as
+/// :10250: a bind failure is a WARNING and the listener halts.
+///
+/// ★ THIS IS WHAT MAKES engenho DRIVABLE BY SOFTWARE THAT HAS NEVER HEARD OF
+/// IT. `etcdctl get /registry/ --prefix --keys-only`, `snapshot save`, every
+/// backup tool and every runbook that was written against etcd. engenho runs
+/// no etcd and its apiserver never speaks it — the INTERFACE is the
+/// obligation, not the technology.
+///
+/// READ-ONLY: Kv serves Range; Put/DeleteRange/Txn are absent rather than
+/// silently dropping writes. See `etcd_facade`'s header. `MeshEtcdStore` holds
+/// a `Weak`, so the three services never keep the store alive past shutdown,
+/// and every clone is the SAME store.
+async fn serve_etcd_facade(
+    addr: String,
+    etcd_store: crate::etcd_facade::MeshEtcdStore,
+    beat: Arc<Heartbeat>,
+) -> std::convert::Infallible {
+    beat.begin();
+    match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => {
+            let bound = listener
+                .local_addr()
+                .map_or_else(|_| addr.clone(), |a| a.to_string());
+            info!(addr = %bound, "etcd v3 facade bound (read-only)");
+            let identity = engenho_etcd::server::ServerIdentity::default();
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let kv = engenho_etcd::server::ReadOnlyKv {
+                store: etcd_store.clone(),
+                identity,
+            };
+            let maintenance = engenho_etcd::server::MaintenanceSvc {
+                store: etcd_store.clone(),
+                identity,
+            };
+            let watch = engenho_etcd::server::WatchSvc::new(Arc::new(etcd_store), identity);
+            let served = tonic::transport::Server::builder()
+                .add_service(engenho_etcd::pb::etcdserverpb::kv_server::KvServer::new(kv))
+                .add_service(engenho_etcd::pb::etcdserverpb::watch_server::WatchServer::new(watch))
+                .add_service(
+                    engenho_etcd::pb::etcdserverpb::maintenance_server::MaintenanceServer::new(
+                        maintenance,
+                    ),
+                )
+                .serve_with_incoming(incoming)
+                .await;
+            match served {
+                Ok(()) => warn!(addr = %bound, "etcd v3 facade stopped"),
+                Err(e) => warn!(addr = %bound, error = %e, "etcd v3 facade stopped"),
+            }
+        }
+        Err(e) => warn!(
+            addr = %addr,
+            error = %e,
+            "etcd v3 facade could not bind; etcdctl, snapshot tooling and \
+             any --etcd-servers consumer are unreachable (the apiserver is \
+             unaffected)"
+        ),
+    }
+    halt(&beat).await
+}
+
+/// A listener whose serve has ended: record [`TickClass::Halted`] and park.
+///
+/// Its output is `Infallible`, so it cannot return; it must not panic; and
+/// rebinding is an actuator that waits for liveness to be visible (T2.7
+/// after T2.8). So it parks. The task stays in the child set as Running —
+/// it did not panic and was not aborted — and the heartbeat's `Halted` is
+/// what says it no longer serves. A liveness projection must read `Halted`
+/// as not-ok.
+async fn halt(beat: &Heartbeat) -> std::convert::Infallible {
+    beat.end(TickClass::Halted);
+    std::future::pending().await
 }
 
 /// Construct the `ServiceRouter` backend for a resolved datapath choice.
@@ -3090,7 +3073,7 @@ fn make_service_router(resolved: ResolvedDatapath) -> Arc<dyn ServiceRouter> {
 // `make_scheduling_strategy` returns `Result<Box<dyn SchedulingStrategy>,
 // SchedulerError>`; the boxed strategy is unwrapped fallibly in
 // `start_inner` (typed error for unimplemented strategies) and handed to
-// `spawn_drivers`. `Scheduler::new<S: SchedulingStrategy + 'static>`
+// `spawn_children`. `Scheduler::new<S: SchedulingStrategy + 'static>`
 // accepts the box (Box<dyn Trait> implements Trait via the blanket impl).
 
 #[cfg(test)]
@@ -3298,7 +3281,10 @@ mod tests {
     }
 
     use super::*;
+    use crate::child::{ChildHandle, ChildState};
     use engenho_config::KubeletBackendKind as CfgKind;
+    use engenho_controllers::Beat;
+    use std::collections::BTreeSet;
 
     // ── host capacity ────────────────────────────────────────────────────
 
@@ -3398,7 +3384,20 @@ mod tests {
         cfg.runtime.data_dir = std::env::temp_dir().join(unique);
         cfg.controllers.fallback_interval_seconds = 1;
         cfg.controllers.debounce_milliseconds = 20;
+        // Ephemeral ports for both listeners: parallel tests (or a real
+        // engenho on this host) holding :10250 / :2379 would otherwise halt
+        // them, and the child tests below assert that they serve.
+        cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();
+        cfg.runtime.etcd_listen_addr = "127.0.0.1:0".into();
         cfg
+    }
+
+    /// The drivers the runtime is running.
+    fn running_drivers(rt: &Runtime) -> usize {
+        rt.children()
+            .running()
+            .filter(|c| matches!(c, Child::Driver(_)))
+            .count()
     }
 
     #[tokio::test]
@@ -3424,8 +3423,92 @@ mod tests {
         // converging that kind), so the arithmetic here is the tripwire.
         // Moving it is correct ONLY alongside an intentional change to the
         // driver set — which is what added served_capability, and now
-        // volume_snapshot (19 → 20).
-        assert_eq!(rt.drivers.len(), 20);
+        // volume_snapshot (19 → 20). Every driver in the catalog is on in
+        // this config, so it is also the catalog's size.
+        assert_eq!(running_drivers(&rt), 20);
+        assert_eq!(Driver::ALL.len(), 20);
+        rt.shutdown().await.unwrap();
+    }
+
+    // ── T2.6: owned children ──────────────────────────────────────────
+    //
+    // Every task the runtime starts is a catalog `Child` in one owned set.
+    // These pin the behaviour that set exists for: each child really runs,
+    // a listener that cannot serve says so, and a stop ends every one.
+
+    /// How many ticks each driver must finish, and the deadline for all of
+    /// them together (the test config's fallback is 1 s).
+    const TICKS: u64 = 3;
+    const TICK_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Wait until `ready` holds for every child in `of`, or fail naming the
+    /// ones it never held for.
+    async fn every_child(rt: &Runtime, of: &[Child], ready: impl Fn(&Beat) -> bool) {
+        let deadline = std::time::Instant::now() + TICK_DEADLINE;
+        loop {
+            let lagging: Vec<(Child, Option<Beat>)> = of
+                .iter()
+                .map(|c| (*c, rt.children().get(*c).map(|h| h.beat().snapshot())))
+                .filter(|(_, beat)| !beat.as_ref().is_some_and(&ready))
+                .collect();
+            if lagging.is_empty() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "within {TICK_DEADLINE:?} these children never got there: {lagging:#?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_enabled_child_spawns_and_ticks_under_a_deadline() {
+        let rt = Runtime::start(ephemeral_test_config()).await.unwrap();
+
+        let spawned: BTreeSet<Child> = rt.children().iter().map(|(c, _)| c).collect();
+        let catalog: BTreeSet<Child> = Child::all().collect();
+        assert_eq!(
+            catalog.difference(&spawned).copied().collect::<Vec<_>>(),
+            [Child::NodeLease],
+            "with every switch on, only the node-lease placeholder (T1.3c) is unspawned"
+        );
+
+        let drivers: Vec<Child> = Driver::ALL.iter().map(|d| Child::Driver(*d)).collect();
+        every_child(&rt, &drivers, |b| b.ticks_finished >= TICKS).await;
+
+        let listeners: Vec<Child> = Listener::ALL.iter().map(|l| Child::Listener(*l)).collect();
+        every_child(&rt, &listeners, |b| {
+            b.in_flight() && b.last_class != Some(TickClass::Halted)
+        })
+        .await;
+
+        assert_eq!(
+            rt.children().running().count(),
+            spawned.len(),
+            "a child died during boot"
+        );
+        rt.shutdown().await.unwrap();
+    }
+
+    /// A listener that cannot bind does not end its task — its output is
+    /// `Infallible` — and does not pretend to serve: it parks, `Halted`.
+    #[tokio::test]
+    async fn a_listener_that_cannot_bind_halts_and_parks() {
+        let mut cfg = ephemeral_test_config();
+        cfg.runtime.kubelet_listen_addr = "not-an-address".into();
+        let rt = Runtime::start(cfg).await.unwrap();
+        let kubelet_http = Child::Listener(Listener::KubeletHttp);
+
+        every_child(&rt, &[kubelet_http], |b| {
+            b.last_class == Some(TickClass::Halted)
+        })
+        .await;
+        assert_eq!(
+            rt.children().get(kubelet_http).map(ChildHandle::state),
+            Some(ChildState::Running),
+            "a halted listener is parked, not dead"
+        );
         rt.shutdown().await.unwrap();
     }
 
@@ -3522,7 +3605,12 @@ mod tests {
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(rt.drivers.len(), 19);
+        assert_eq!(running_drivers(&rt), 19);
+        assert!(
+            rt.children()
+                .get(Child::Driver(Driver::ServiceRouting))
+                .is_none()
+        );
         rt.shutdown().await.unwrap();
     }
 }

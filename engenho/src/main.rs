@@ -174,11 +174,26 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // 3. Boot every subsystem over one StoreMesh. On boot the Runtime
     //    writes data_dir/kubeconfig when TLS is enabled.
-    let runtime = Runtime::start(config).await?;
+    let mut runtime = Runtime::start(config).await?;
     tracing::info!(addr = %runtime.local_addr(), "engenho up — apiserver bound");
 
-    // 4. Run until ctrl-c, then shut down gracefully.
-    tokio::signal::ctrl_c().await?;
+    // 4. Run until ctrl-c, watching the runtime's children meanwhile. A
+    //    child's task cannot finish normally, so one that ends panicked or
+    //    was aborted: the runtime marks it Dead and logs it at ERROR as it
+    //    returns here. There is no respawn — the loop goes back to watching.
+    //    The stop signal is pinned OUTSIDE the loop so a signal that lands
+    //    while a death is being recorded is not lost.
+    let stop = tokio::signal::ctrl_c();
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            signal = &mut stop => {
+                signal?;
+                break;
+            }
+            _dead = runtime.next_dead_child() => {}
+        }
+    }
     tracing::info!("shutdown signal received");
     runtime.shutdown().await?;
     tracing::info!("engenho stopped cleanly");
