@@ -43,10 +43,11 @@ use crate::command::{
 };
 use crate::pagination::{ListPage, PageAtRevision};
 use crate::patch_apply::{self, Gvk, OpenApiPatchEnv, PatchBody, PatchError, PatchSchemaEnv};
+use crate::read::{ReadConsistency, ReadPoint, ReadRefused};
 use crate::resource::{ListScope, ResourceKey, ResourceValue};
 use crate::revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 use crate::ssa;
-use crate::watch_history::{self, WatchHistory};
+use crate::watch_history::{self, WatchHistory, Window};
 
 pub use crate::watch_history::DEFAULT_HISTORY_CAPACITY;
 
@@ -1251,52 +1252,34 @@ impl ResourceCatalog {
         let (through, after) = self.history.split(rev)?;
         let floor = self.history.floor();
 
-        // Start from the present and walk backwards.
-        let mut state: BTreeMap<ResourceKey, HistoricalEntry> = self
-            .resources
-            .iter()
-            .map(|(k, (v, m))| {
-                (
-                    k.clone(),
-                    HistoricalEntry {
-                        value: v.clone(),
-                        meta: *m,
-                        fidelity: MetaFidelity::Exact,
-                    },
-                )
-            })
-            .collect();
-
-        // Undo every change strictly newer than `rev`, newest first. After
-        // undoing change C, the entry holds C's PRE-image; its metadata is
-        // whatever an older retained change to the same key says, which the
-        // second pass below supplies.
-        for c in after.rev() {
-            match &c.prior {
-                Some(prior) => {
-                    let e = state.entry(c.key.clone()).or_insert(HistoricalEntry {
-                        value: prior.clone(),
-                        meta: c.version_meta,
-                        fidelity: MetaFidelity::ModRevisionFloor,
-                    });
-                    e.value = prior.clone();
-                    // create_revision is stable across modifications, so it
-                    // survives the undo; mod_revision/version do not and are
-                    // corrected below.
-                    e.meta = VersionMeta {
-                        create_revision: c.version_meta.create_revision,
-                        mod_revision: floor,
-                        version: 1,
+        // The values: the present with every change newer than `rev`
+        // undone. A key whose entry came back through an undo keeps the
+        // undone change's create_revision (stable across modifications);
+        // its mod_revision/version are not recoverable from that change and
+        // are corrected below where an older retained change allows.
+        let mut state: BTreeMap<ResourceKey, HistoricalEntry> =
+            rewind(self.resources.iter(), after, |_| true)
+                .into_iter()
+                .map(|(key, as_of)| {
+                    let entry = match as_of {
+                        AsOf::Live(value, meta) => HistoricalEntry {
+                            value: value.clone(),
+                            meta,
+                            fidelity: MetaFidelity::Exact,
+                        },
+                        AsOf::Undone { value, by } => HistoricalEntry {
+                            value: value.clone(),
+                            meta: VersionMeta {
+                                create_revision: by.version_meta.create_revision,
+                                mod_revision: floor,
+                                version: 1,
+                            },
+                            fidelity: MetaFidelity::ModRevisionFloor,
+                        },
                     };
-                    e.fidelity = MetaFidelity::ModRevisionFloor;
-                }
-                // No pre-image ⇒ the key was CREATED by this change, so it
-                // did not exist at `rev`.
-                None => {
-                    state.remove(&c.key);
-                }
-            }
-        }
+                    (key.clone(), entry)
+                })
+                .collect();
 
         // Second pass: for every key still present, the newest retained
         // change at or before `rev` gives its exact metadata.
@@ -1463,12 +1446,9 @@ impl ResourceCatalog {
     /// continue token's `snapshot_rev` is only the envelope
     /// `resourceVersion` LABEL — it is NOT a read-isolation mechanism.
     ///
-    /// DESTINATION (deferred): revision-indexed historical reads — page
-    /// each request against the catalog AS OF the token's snapshot
-    /// revision, which requires retaining historical MVCC views (a
-    /// per-key revision history / time-travel index), not the single live
-    /// materialized map M0.1 keeps. Until then, do not claim snapshot
-    /// consistency for the page series.
+    /// A page AS OF a revision is [`Self::read_page`] at
+    /// [`ReadConsistency::Exact`] (T3.9b): it rewinds the scope through the
+    /// retained changes' pre-images, with no second index.
     #[must_use]
     #[cfg_attr(
         not(test),
@@ -1503,17 +1483,83 @@ impl ResourceCatalog {
         after: Option<&ResourceKey>,
         limit: usize,
     ) -> PageAtRevision {
-        let page = self.page(scope, after, limit);
-        PageAtRevision {
-            items: page
-                .items
-                .into_iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            revision: self.revision(),
-            next: page.next,
-            remaining: page.remaining,
+        self.page(scope, after, limit).cloned_at(self.revision())
+    }
+
+    /// One page of `scope` under `consistency` (T3.9b), judged and read
+    /// under the one borrow of this catalog, so the revision it was judged
+    /// against is the revision it is read at. See [`crate::read`] for the
+    /// table.
+    ///
+    /// * Served from the head, it is [`Self::list_page_at_revision`].
+    /// * Served from the past ([`ReadConsistency::Exact`] below the head),
+    ///   the scope is rewound to that revision by undoing the retained
+    ///   changes newer than it, and the page is cut from the rewound scope.
+    ///   The page reports that revision, so a page series that reads every
+    ///   page at the first page's revision is one snapshot: a write landing
+    ///   between two pages does not show on the second. That costs the
+    ///   scope's size plus the changes since the revision, all by reference;
+    ///   only the page's own items are cloned.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadRefused::TooLarge`] for a revision past the head,
+    /// [`ReadRefused::Expired`] for an exact revision below the compaction
+    /// floor.
+    pub fn read_page(
+        &self,
+        scope: ListScope<'_>,
+        after: Option<&ResourceKey>,
+        limit: usize,
+        consistency: ReadConsistency,
+    ) -> Result<PageAtRevision, ReadRefused> {
+        match self.read_point(consistency)? {
+            ReadPoint::Head => Ok(self.list_page_at_revision(scope, after, limit)),
+            ReadPoint::Past(rev) => {
+                let past = rewind(
+                    scope.range(&self.resources, None),
+                    self.history.since(rev)?,
+                    |key| scope.contains(key),
+                );
+                // `past` holds only the scope's keys, so the cursor needs no
+                // clamping: a start bound with an unbounded end never
+                // inverts, and a cursor past the scope reads nothing.
+                let from = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+                let run = past
+                    .range::<ResourceKey, _>((from, std::ops::Bound::Unbounded))
+                    .map(|(key, as_of)| (*key, as_of.value()));
+                Ok(page_of(run, limit).cloned_at(rev))
+            }
         }
+    }
+
+    /// One key under `consistency` (T3.9b): [`Self::read_page`] for a single
+    /// key, rewinding only that key's own changes when it reads the past.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_page`].
+    pub fn read_one(
+        &self,
+        key: &ResourceKey,
+        consistency: ReadConsistency,
+    ) -> Result<Option<ResourceValue>, ReadRefused> {
+        match self.read_point(consistency)? {
+            ReadPoint::Head => Ok(self.get(key).cloned()),
+            ReadPoint::Past(rev) => Ok(rewind(
+                self.resources.get_key_value(key).into_iter(),
+                self.history.since(rev)?,
+                |changed| changed == key,
+            )
+            .get(key)
+            .map(|as_of| as_of.value().clone())),
+        }
+    }
+
+    /// Judge `consistency` against this catalog's head and floor, read
+    /// together from its one history.
+    fn read_point(&self, consistency: ReadConsistency) -> Result<ReadPoint, ReadRefused> {
+        consistency.judge(self.history.head(), self.history.floor())
     }
 
     fn page(
@@ -1522,38 +1568,12 @@ impl ResourceCatalog {
         after: Option<&ResourceKey>,
         limit: usize,
     ) -> ListPage<'_> {
-        let mut run = scope
-            .range(&self.resources, after)
-            .map(|(k, (v, _))| (k, v));
-
-        // limit == 0 → unbounded: take all matching items after `after`.
-        if limit == 0 {
-            return ListPage {
-                items: run.collect(),
-                next: None,
-                remaining: 0,
-            };
-        }
-
-        // Collected, not `Vec::with_capacity(limit)`: `limit` is the
-        // client's number, and reserving it up front would let one request
-        // ask for any amount of memory.
-        let items: Vec<(&ResourceKey, &ResourceValue)> = run.by_ref().take(limit).collect();
-
-        // Count the rest of the scope to set `next` + `remaining`. `next` is
-        // the last EMITTED key iff at least one more item follows the page.
-        let remaining = u64::try_from(run.count()).unwrap_or(u64::MAX);
-        let next = if remaining > 0 {
-            items.last().map(|(k, _)| (*k).clone())
-        } else {
-            None
-        };
-
-        ListPage {
-            items,
-            next,
-            remaining,
-        }
+        page_of(
+            scope
+                .range(&self.resources, after)
+                .map(|(k, (v, _))| (k, v)),
+            limit,
+        )
     }
 
     /// Total resource count (across all kinds + namespaces).
@@ -1580,6 +1600,103 @@ impl ResourceCatalog {
     pub fn is_empty(&self) -> bool {
         self.resources.is_empty()
     }
+}
+
+/// Cut one page from `run`, a scope's entries in key order that sort after
+/// the cursor: up to `limit` items (`0` takes them all), the cursor for the
+/// next page, and how many remain after it. The one paging rule for the
+/// present and the past.
+fn page_of<'m>(
+    mut run: impl Iterator<Item = (&'m ResourceKey, &'m ResourceValue)>,
+    limit: usize,
+) -> ListPage<'m> {
+    // limit == 0 → unbounded: take all matching items after the cursor.
+    if limit == 0 {
+        return ListPage {
+            items: run.collect(),
+            next: None,
+            remaining: 0,
+        };
+    }
+
+    // Collected, not `Vec::with_capacity(limit)`: `limit` is the client's
+    // number, and reserving it up front would let one request ask for any
+    // amount of memory.
+    let items: Vec<(&ResourceKey, &ResourceValue)> = run.by_ref().take(limit).collect();
+
+    // Count the rest of the scope to set `next` + `remaining`. `next` is the
+    // last EMITTED key iff at least one more item follows the page.
+    let remaining = u64::try_from(run.count()).unwrap_or(u64::MAX);
+    let next = if remaining > 0 {
+        items.last().map(|(k, _)| (*k).clone())
+    } else {
+        None
+    };
+
+    ListPage {
+        items,
+        next,
+        remaining,
+    }
+}
+
+/// One entry of a selection as it was at a past revision, by reference.
+#[derive(Clone, Copy, Debug)]
+enum AsOf<'a> {
+    /// No retained change newer than the revision touched it: its value and
+    /// metadata are the live ones.
+    Live(&'a ResourceValue, VersionMeta),
+    /// Brought back by undoing `by`, the oldest change newer than the
+    /// revision that touched it: `value` is that change's pre-image.
+    Undone {
+        value: &'a ResourceValue,
+        by: &'a Change,
+    },
+}
+
+impl<'a> AsOf<'a> {
+    fn value(self) -> &'a ResourceValue {
+        match self {
+            Self::Live(value, _) | Self::Undone { value, .. } => value,
+        }
+    }
+}
+
+/// Rewind a selection to the revision `newer` was split at: start from its
+/// `present` entries and undo every change in `newer` that `selects` names,
+/// newest first. A change with a pre-image puts it back (a modification or
+/// a delete undone); a change without one created its key, so the key goes.
+///
+/// ★ NO SECOND INDEX: every retained [`Change`] carries its pre-image, so the
+/// past is the present with the newer changes undone, and the window a past
+/// read can reach is exactly the retained window. Everything is borrowed
+/// from the catalog and its ring; a caller clones only what it returns.
+///
+/// `present` must hold every live key `selects` names, and nothing else, so
+/// the rewound map is exactly the selection at that revision.
+fn rewind<'a>(
+    present: impl Iterator<Item = (&'a ResourceKey, &'a (ResourceValue, VersionMeta))>,
+    newer: Window<'a>,
+    selects: impl Fn(&ResourceKey) -> bool,
+) -> BTreeMap<&'a ResourceKey, AsOf<'a>> {
+    let mut state: BTreeMap<&'a ResourceKey, AsOf<'a>> = present
+        .map(|(key, (value, meta))| (key, AsOf::Live(value, *meta)))
+        .collect();
+    for change in newer.rev() {
+        let change: &'a Change = change;
+        if !selects(&change.key) {
+            continue;
+        }
+        match &change.prior {
+            Some(value) => {
+                state.insert(&change.key, AsOf::Undone { value, by: change });
+            }
+            None => {
+                state.remove(&change.key);
+            }
+        }
+    }
+    state
 }
 
 /// Borrow `value.spec` if present.

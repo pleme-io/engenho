@@ -13,11 +13,15 @@
 //! `snapshot_rev` is only the envelope `resourceVersion` LABEL captured
 //! by the first page — it is NOT a read-isolation mechanism.
 //!
-//! DESTINATION (deferred): revision-indexed historical reads — page each
-//! request AS OF the token's `snapshot_rev`, which requires retaining
-//! historical MVCC views (per-key revision history / time-travel index),
-//! not the single live materialized map M0.1 keeps. Do not claim
-//! snapshot consistency for the page series until that lands.
+//! That describes a page read from the PRESENT. Since T3.9b the store can
+//! also read a page AS OF a revision: [`crate::StoreMesh::list_page_consistent`]
+//! at [`crate::ReadConsistency::Exact`] of the token's `snapshot_rev` rewinds
+//! the scope by undoing the retained changes newer than it (no second index:
+//! every retained change carries its pre-image), so a series read that way
+//! is one snapshot while `snapshot_rev` is above the compaction floor, and
+//! refused as `Expired` once it is not. The apiserver's continue path does
+//! not read that way yet (T3.9b apiserver adoption), so until it does, do
+//! not claim snapshot consistency for the page series it serves.
 //!
 //! ## Relation to CAS
 //!
@@ -54,6 +58,25 @@ pub struct ListPage<'a> {
     pub items: Vec<(&'a ResourceKey, &'a ResourceValue)>,
     pub next: Option<ResourceKey>,
     pub remaining: u64,
+}
+
+impl ListPage<'_> {
+    /// This page's items cloned out, labelled with the `revision` they were
+    /// read at: what a store hands out from under its guard. Only the page's
+    /// own items are cloned.
+    #[must_use]
+    pub(crate) fn cloned_at(self, revision: Revision) -> PageAtRevision {
+        PageAtRevision {
+            items: self
+                .items
+                .into_iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            revision,
+            next: self.next,
+            remaining: self.remaining,
+        }
+    }
 }
 
 /// One page cloned out of the catalog, with the revision of the catalog it

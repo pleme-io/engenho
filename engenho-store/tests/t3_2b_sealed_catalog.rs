@@ -64,6 +64,10 @@ const DECLARED: &[(&str, &str, Bound)] = &[
     ("StoreMesh", "list", Bound::Scope),
     ("StoreMesh", "list_at_revision", Bound::Scope),
     ("StoreMesh", "list_page_at_revision", Bound::Page),
+    // T3.9b: a page read under a ReadConsistency, from the present or
+    // rewound to a retained revision; either way one scope's page, and a
+    // past read clones only the page (`t3_9b_read_consistency`).
+    ("StoreMesh", "list_page_consistent", Bound::Page),
     ("InMemoryStore", "list_at_revision", Bound::Scope),
     ("InMemoryStore", "list_page_at_revision", Bound::Page),
     ("FjallStore", "list_at_revision", Bound::Scope),

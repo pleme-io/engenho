@@ -19,6 +19,7 @@ use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
 use crate::network::{InProcessRouter, RpcRequest};
 use crate::owned_task::{OwnedTask, TaskStop};
 use crate::pagination::PageAtRevision;
+use crate::read::{ReadConsistency, ReadRefused};
 use crate::resource::{ListScope, ResourceKey, ResourceValue};
 use crate::state::ResourceCatalog;
 use crate::store::InMemoryStore;
@@ -511,10 +512,10 @@ impl StoreMesh {
     /// appear on a later page, because the next call reads the live catalog
     /// rather than reading AS OF the token's first-page revision. The
     /// `snapshot_rev` baked into the continue token is the envelope
-    /// `resourceVersion` LABEL, not a read-isolation mechanism. See the
-    /// catalog's `list_page` (crate-private since T3.2b) for the destination
-    /// (revision-indexed historical reads, deferred — needs retained
-    /// historical MVCC views).
+    /// `resourceVersion` LABEL, not a read-isolation mechanism. A series
+    /// that must be one snapshot reads each page with
+    /// [`Self::list_page_consistent`] at
+    /// [`crate::ReadConsistency::Exact`] of the first page's revision (T3.9b).
     ///
     /// Returns `(items, snapshot_rev, next, remaining)` — the fields of
     /// [`PageAtRevision`]:
@@ -553,6 +554,72 @@ impl StoreMesh {
             )
             .await;
         (items, revision, next, remaining)
+    }
+
+    // ── Reads under a ReadConsistency (T3.9b) ──────────────────────────
+    //
+    // The contract a LIST or GET's resourceVersion + resourceVersionMatch
+    // names: see [`crate::read`] for the table. Each read first waits, up to
+    // `wait`, for this replica to reach the revision the consistency needs
+    // (upstream waits `blockTimeout`, 3 s), then judges and reads under ONE
+    // guard. The wait only decides how long to be patient; the judgement
+    // under the guard decides the answer, so a rewind (a snapshot install, a
+    // restore) between the two is refused rather than served.
+
+    /// One page of `scope` read under `consistency`: items strictly after
+    /// `after`, up to `limit` (`0` = all), with the revision they are at —
+    /// the head for [`crate::ReadConsistency::Latest`] and
+    /// [`crate::ReadConsistency::NotOlderThan`], the named revision itself
+    /// for [`crate::ReadConsistency::Exact`].
+    ///
+    /// Reading every page of a series at [`crate::ReadConsistency::Exact`]
+    /// of the first page's revision makes the series one snapshot, while
+    /// that revision's history is retained.
+    ///
+    /// # Errors
+    ///
+    /// * [`crate::ReadRefused::TooLarge`] when this replica has not reached
+    ///   the revision `consistency` needs within `wait` (upstream's 504).
+    /// * [`crate::ReadRefused::Expired`] when an exact revision is below the
+    ///   compaction floor (upstream's 410).
+    pub async fn list_page_consistent(
+        &self,
+        scope: ListScope<'_>,
+        after: Option<&ResourceKey>,
+        limit: usize,
+        consistency: ReadConsistency,
+        wait: Duration,
+    ) -> Result<PageAtRevision, ReadRefused> {
+        self.catch_up(consistency, wait).await;
+        self.store
+            .read(|c| c.read_page(scope, after, limit, consistency))
+            .await
+    }
+
+    /// One resource read under `consistency`: [`Self::list_page_consistent`]
+    /// for a single key. `Ok(None)` means the key did not exist at the
+    /// revision read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::list_page_consistent`].
+    pub async fn get_consistent(
+        &self,
+        key: &ResourceKey,
+        consistency: ReadConsistency,
+        wait: Duration,
+    ) -> Result<Option<ResourceValue>, ReadRefused> {
+        self.catch_up(consistency, wait).await;
+        self.store.read(|c| c.read_one(key, consistency)).await
+    }
+
+    /// Wait, up to `wait`, for this replica to reach the revision
+    /// `consistency` needs. Whether it did is not returned: the read that
+    /// follows judges that under its own guard.
+    async fn catch_up(&self, consistency: ReadConsistency, wait: Duration) {
+        if let Some(required) = consistency.required() {
+            self.wait_for_revision(required, wait).await;
+        }
     }
 
     // ── The catalog's read surface: scalars and single-guard reads ─────
@@ -744,6 +811,39 @@ impl StoreMesh {
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(50.min(remaining.as_millis() as u64))).await;
+        }
+    }
+
+    /// Wait until this replica's catalog reaches `target`, or `within`
+    /// elapses. Returns whether it did.
+    ///
+    /// Woken by raft's metrics, not by a timer: every revision a catalog
+    /// reaches comes from applying a log entry or installing a snapshot, and
+    /// raft publishes new metrics after each. The metrics are marked seen
+    /// BEFORE the catalog is checked, so an apply that lands after the check
+    /// still wakes the wait.
+    pub async fn wait_for_revision(
+        &self,
+        target: crate::revision::Revision,
+        within: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut metrics = self.raft.metrics();
+        loop {
+            metrics.borrow_and_update();
+            if self.current_revision().await >= target {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match tokio::time::timeout(remaining, metrics.changed()).await {
+                Ok(Ok(())) => {}
+                // Raft has shut down (no more metrics will come) or the time
+                // is up: the catalog is as far as it will get in time.
+                Ok(Err(_)) | Err(_) => return self.current_revision().await >= target,
+            }
         }
     }
 

@@ -106,6 +106,7 @@ pub mod network;
 pub mod owned_task;
 pub mod pagination;
 pub mod patch_apply;
+pub mod read;
 pub mod resource;
 pub mod revision;
 pub mod ssa;
@@ -141,6 +142,7 @@ pub use patch_apply::{
     Gvk, JsonPath, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody, PatchDirective,
     PatchError, PatchSchemaEnv, apply as apply_patch_algorithm,
 };
+pub use read::{ReadConsistency, ReadRefused};
 pub use resource::{ListScope, ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 pub use ssa::{ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome, apply_ssa};
