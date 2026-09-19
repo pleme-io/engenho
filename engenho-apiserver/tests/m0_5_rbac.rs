@@ -63,7 +63,12 @@ async fn boot_rbac_server() -> (String, ApiServer) {
         .with_authenticator(Arc::new(ChainAuthenticator::bootstrap(Some(
             ADMIN_TOKEN.to_string(),
         ))))
-        .with_authorizer(authorizer);
+        .with_authorizer(authorizer)
+        // Health is derived from a liveness source; a green double stands in
+        // for the runtime's so the health probes measure authz, not health.
+        .with_liveness_source(Arc::new(
+            engenho_apiserver::health::FixedLiveness::all_alive(&["apiserver"]),
+        ));
 
     // Plaintext (no TLS material) — these tests assert authz behavior, not TLS.
     let server = ApiServer::start_with_state("127.0.0.1:0".parse().unwrap(), state, None)

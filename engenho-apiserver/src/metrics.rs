@@ -25,6 +25,17 @@
 //! existing dashboards and alerting rules already select on. A plausible
 //! rename produces metrics that scrape cleanly and match no query anyone
 //! has — the same failure mode as an invented Event reason.
+//! `controller_runtime_reconcile_total{controller,result}` is
+//! controller-runtime's name and label set for the same reason.
+//!
+//! ★ THE RUNTIME'S FAMILIES COME FROM A SOURCE, NOT A LITERAL. The store
+//! revision used to be the literal `0`: a scrape that parsed cleanly and
+//! said nothing true. `engenho_store_revision`, `engenho_panics_total`,
+//! `controller_runtime_reconcile_total` and
+//! `engenho_controller_last_tick_timestamp_seconds` are rendered from one
+//! [`MetricsSnapshot`] read through the [`MetricsSource`] the runtime
+//! installs. With no source installed they are ABSENT, which a dashboard
+//! shows as "no data" rather than charting a zero as fact.
 
 use std::fmt::Write as _;
 
@@ -134,7 +145,6 @@ fn escape(v: &str) -> String {
 pub fn apiserver_families(
     object_counts: &[(String, u64)],
     registered_resources: usize,
-    store_revision: u64,
 ) -> Vec<MetricFamily> {
     vec![
         MetricFamily {
@@ -160,17 +170,168 @@ pub fn apiserver_families(
                 value: registered_resources as f64,
             }],
         },
+    ]
+}
+
+/// What the runtime's metric families are rendered from, read once per
+/// scrape through a [`MetricsSource`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricsSnapshot {
+    /// The store's current global revision (`engenho_store_revision`).
+    pub store_revision: engenho_store::Revision,
+    /// Panics counted since the process started (`engenho_panics_total`).
+    /// `None` until a panic hook counts them: absent, not zero, because
+    /// zero would claim a count nobody took.
+    pub panics_total: Option<u64>,
+    /// `controller_runtime_reconcile_total{controller,result}`.
+    pub reconciles: Vec<ReconcileCount>,
+    /// `engenho_controller_last_tick_timestamp_seconds{controller}`.
+    pub last_ticks: Vec<LastTick>,
+}
+
+/// How one reconcile ended, in controller-runtime's `result` vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReconcileResult {
+    /// Done; nothing re-queued.
+    Success,
+    /// Returned an error.
+    Error,
+    /// Asked to be re-queued with rate limiting.
+    Requeue,
+    /// Asked to be re-queued after a fixed delay.
+    RequeueAfter,
+}
+
+impl ReconcileResult {
+    /// The `result` label, exactly as controller-runtime spells it.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Error => "error",
+            Self::Requeue => "requeue",
+            Self::RequeueAfter => "requeue_after",
+        }
+    }
+}
+
+/// One `(controller, result)` reconcile counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileCount {
+    /// The controller's name: a `&'static str`, so a label value can only
+    /// come from code, never from a request or an object.
+    pub controller: &'static str,
+    /// How the counted reconciles ended.
+    pub result: ReconcileResult,
+    /// How many.
+    pub count: u64,
+}
+
+/// When one controller last finished a tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastTick {
+    /// The controller's name.
+    pub controller: &'static str,
+    /// When its last tick finished.
+    pub at: engenho_substrate::Instant,
+}
+
+/// Where `/metrics` reads the runtime's families from. Implemented by the
+/// runtime; [`FixedMetrics`] is the test double. Installed with
+/// [`crate::router::RouterState::with_metrics_source`].
+#[async_trait::async_trait]
+pub trait MetricsSource: Send + Sync {
+    /// The current values, read once per scrape.
+    async fn snapshot(&self) -> MetricsSnapshot;
+}
+
+/// A [`MetricsSource`] that answers one fixed snapshot: the test double for
+/// the runtime's source.
+#[derive(Debug, Clone)]
+pub struct FixedMetrics(pub MetricsSnapshot);
+
+#[async_trait::async_trait]
+impl MetricsSource for FixedMetrics {
+    async fn snapshot(&self) -> MetricsSnapshot {
+        self.0.clone()
+    }
+}
+
+/// The name of the last-tick gauge. engenho-native: controller-runtime has
+/// no equivalent, and `_timestamp_seconds` is Prometheus's suffix for a
+/// Unix time.
+pub const LAST_TICK_TIMESTAMP_SECONDS: &str = "engenho_controller_last_tick_timestamp_seconds";
+
+/// The runtime's families, rendered from one snapshot.
+///
+/// Reconcile and last-tick samples are sorted by their labels, so the
+/// output does not depend on the order the source happened to report in.
+#[must_use]
+pub fn source_families(snapshot: &MetricsSnapshot) -> Vec<MetricFamily> {
+    let mut reconciles = snapshot.reconciles.clone();
+    reconciles.sort_by_key(|r| (r.controller, r.result));
+    let mut last_ticks = snapshot.last_ticks.clone();
+    last_ticks.sort_by_key(|t| t.controller);
+    vec![
         MetricFamily {
             name: "engenho_store_revision".into(),
             help: "The store's current global revision.".into(),
             kind: MetricType::Gauge,
             samples: vec![Sample {
                 labels: vec![],
-                #[allow(clippy::cast_precision_loss)]
-                value: store_revision as f64,
+                value: as_sample(snapshot.store_revision.get()),
             }],
         },
+        MetricFamily {
+            name: "engenho_panics_total".into(),
+            help: "Panics counted since the process started.".into(),
+            kind: MetricType::Counter,
+            samples: snapshot
+                .panics_total
+                .map(|n| Sample {
+                    labels: vec![],
+                    value: as_sample(n),
+                })
+                .into_iter()
+                .collect(),
+        },
+        MetricFamily {
+            name: "controller_runtime_reconcile_total".into(),
+            help: "Total number of reconciliations per controller, by result.".into(),
+            kind: MetricType::Counter,
+            samples: reconciles
+                .iter()
+                .map(|r| Sample {
+                    labels: vec![
+                        ("controller".into(), r.controller.into()),
+                        ("result".into(), r.result.label().into()),
+                    ],
+                    value: as_sample(r.count),
+                })
+                .collect(),
+        },
+        MetricFamily {
+            name: LAST_TICK_TIMESTAMP_SECONDS.into(),
+            help: "Unix time each controller last finished a reconcile tick.".into(),
+            kind: MetricType::Gauge,
+            samples: last_ticks
+                .iter()
+                .map(|t| Sample {
+                    labels: vec![("controller".into(), t.controller.into())],
+                    value: as_sample(t.at.physical_ms) / 1000.0,
+                })
+                .collect(),
+        },
     ]
+}
+
+/// A count as a Prometheus sample, which is an `f64`.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "Prometheus samples are f64; a count past 2^53 loses low bits, which every scraper accepts"
+)]
+fn as_sample(n: u64) -> f64 {
+    n as f64
 }
 
 /// The one metric family every rollout gate reports through.
@@ -217,10 +378,13 @@ pub fn log_would_reject(event: &engenho_substrate::WouldReject<'_>) {
     );
 }
 
-/// Everything `GET /metrics` serves, rendered from the router's state.
-#[must_use]
-pub fn render_state(state: &crate::router::RouterState) -> String {
-    let mut families = apiserver_families(&[], state.handler_set().len(), 0);
+/// Everything `GET /metrics` serves, rendered from the router's state and,
+/// when one is installed, its [`MetricsSource`].
+pub async fn render_state(state: &crate::router::RouterState) -> String {
+    let mut families = apiserver_families(&[], state.handler_set().len());
+    if let Some(source) = &state.metrics_source {
+        families.extend(source_families(&source.snapshot().await));
+    }
     families.push(would_reject_family(&state.would_reject.snapshot()));
     render(&families)
 }
@@ -234,7 +398,7 @@ pub async fn metrics(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        render_state(&state),
+        render_state(&state).await,
     )
 }
 
@@ -323,15 +487,18 @@ mod tests {
     fn the_metric_names_are_the_ones_existing_dashboards_select_on() {
         // A plausible rename scrapes cleanly and matches no query anyone
         // has — the same failure mode as an invented Event reason.
-        let out = render(&apiserver_families(
+        let mut families = apiserver_families(
             &[("pods".to_string(), 3), ("configmaps".to_string(), 7)],
             52,
-            41,
-        ));
+        );
+        families.extend(source_families(&snapshot(41)));
+        let out = render(&families);
         assert!(out.contains(r#"etcd_object_counts{resource="pods"} 3"#));
         assert!(out.contains(r#"etcd_object_counts{resource="configmaps"} 7"#));
         assert!(out.contains("engenho_store_revision 41"));
         assert!(out.contains("apiserver_registered_resources 52"));
+        assert!(out.contains("# TYPE controller_runtime_reconcile_total counter\n"));
+        assert!(out.contains("# TYPE engenho_panics_total counter\n"));
     }
 
     #[test]
@@ -362,15 +529,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_shadow_gate_refusal_reaches_the_scrape_and_an_enforced_one_does_not() {
+    #[tokio::test]
+    async fn a_shadow_gate_refusal_reaches_the_scrape_and_an_enforced_one_does_not() {
         let state = crate::router::RouterState::new(vec![]);
         let shadow = Gate::new("shadow_gate", Rollout::Shadow);
         let enforce = Gate::new("enforce_gate", Rollout::Enforce);
         let _ = shadow.judge(Err(Stale), &state.would_reject, &"ns/a");
         let _ = shadow.judge(Err(Stale), &state.would_reject, &"ns/b");
         let _ = enforce.judge(Err(Stale), &state.would_reject, &"ns/c");
-        let out = render_state(&state);
+        let out = render_state(&state).await;
         assert!(
             out.contains("engenho_would_reject_total{gate=\"shadow_gate\",reason=\"stale\"} 2\n"),
             "got: {out}"
@@ -378,8 +545,8 @@ mod tests {
         assert!(!out.contains("enforce_gate"), "got: {out}");
     }
 
-    #[test]
-    fn the_scrape_reads_the_ledger_the_runtime_shares() {
+    #[tokio::test]
+    async fn the_scrape_reads_the_ledger_the_runtime_shares() {
         // Gates outside the apiserver (store, scheduler) count into the
         // runtime's ledger; the scrape must read THAT one, not a private one.
         let shared = Arc::new(WouldRejectLedger::new(log_would_reject));
@@ -387,8 +554,127 @@ mod tests {
             crate::router::RouterState::new(vec![]).with_would_reject_ledger(shared.clone());
         let elsewhere = Gate::new("scheduler_filter", Rollout::Shadow);
         let _ = elsewhere.judge(Err(Stale), &shared, &"ns/pod");
-        assert!(render_state(&state).contains(
+        assert!(render_state(&state).await.contains(
             "engenho_would_reject_total{gate=\"scheduler_filter\",reason=\"stale\"} 1\n"
         ));
+    }
+
+    fn snapshot(store_revision: u64) -> MetricsSnapshot {
+        MetricsSnapshot {
+            store_revision: engenho_store::Revision(store_revision),
+            panics_total: Some(3),
+            reconciles: vec![
+                ReconcileCount {
+                    controller: "replicaset",
+                    result: ReconcileResult::Success,
+                    count: 9,
+                },
+                ReconcileCount {
+                    controller: "deployment",
+                    result: ReconcileResult::RequeueAfter,
+                    count: 2,
+                },
+                ReconcileCount {
+                    controller: "deployment",
+                    result: ReconcileResult::Error,
+                    count: 1,
+                },
+            ],
+            last_ticks: vec![
+                LastTick {
+                    controller: "replicaset",
+                    at: engenho_substrate::Instant::from_ms(1_758_000_000_250),
+                },
+                LastTick {
+                    controller: "deployment",
+                    at: engenho_substrate::Instant::from_ms(1_758_000_000_000),
+                },
+            ],
+        }
+    }
+
+    fn sourced(snapshot: MetricsSnapshot) -> crate::router::RouterState {
+        crate::router::RouterState::new(vec![])
+            .with_metrics_source(Arc::new(FixedMetrics(snapshot)))
+    }
+
+    #[tokio::test]
+    async fn the_scrape_renders_the_store_revision_the_source_reports() {
+        // Red before T2.8: `render_state` passed the literal 0.
+        let out = render_state(&sourced(snapshot(41))).await;
+        assert!(out.contains("engenho_store_revision 41\n"), "got: {out}");
+        assert!(!out.contains("engenho_store_revision 0\n"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn panics_reconciles_and_last_ticks_render_from_the_source() {
+        let out = render_state(&sourced(snapshot(41))).await;
+        assert!(out.contains("engenho_panics_total 3\n"), "got: {out}");
+        // controller-runtime's name, label order and result vocabulary,
+        // sorted by label so the source's order does not leak.
+        let reconcile_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("controller_runtime_reconcile_total{"))
+            .collect();
+        assert_eq!(
+            reconcile_lines,
+            [
+                "controller_runtime_reconcile_total{controller=\"deployment\",result=\"error\"} 1",
+                "controller_runtime_reconcile_total{controller=\"deployment\",result=\"requeue_after\"} 2",
+                "controller_runtime_reconcile_total{controller=\"replicaset\",result=\"success\"} 9",
+            ]
+        );
+        assert!(
+            out.contains(
+                "engenho_controller_last_tick_timestamp_seconds{controller=\"deployment\"} 1758000000\n"
+            ),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(
+                "engenho_controller_last_tick_timestamp_seconds{controller=\"replicaset\"} 1758000000.25\n"
+            ),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unwired_router_publishes_no_runtime_families_rather_than_zeros() {
+        let out = render_state(&crate::router::RouterState::new(vec![])).await;
+        for absent in [
+            "engenho_store_revision",
+            "engenho_panics_total",
+            "controller_runtime_reconcile_total",
+            LAST_TICK_TIMESTAMP_SECONDS,
+        ] {
+            assert!(!out.contains(absent), "{absent} must be absent; got: {out}");
+        }
+        assert!(
+            out.contains("apiserver_registered_resources 0\n"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncounted_panic_total_is_absent_not_zero() {
+        let mut snap = snapshot(7);
+        snap.panics_total = None;
+        let out = render_state(&sourced(snap)).await;
+        assert!(!out.contains("engenho_panics_total"), "got: {out}");
+        assert!(out.contains("engenho_store_revision 7\n"), "got: {out}");
+    }
+
+    #[test]
+    fn result_labels_are_controller_runtimes() {
+        let labels: Vec<&str> = [
+            ReconcileResult::Success,
+            ReconcileResult::Error,
+            ReconcileResult::Requeue,
+            ReconcileResult::RequeueAfter,
+        ]
+        .iter()
+        .map(|r| r.label())
+        .collect();
+        assert_eq!(labels, ["success", "error", "requeue", "requeue_after"]);
     }
 }

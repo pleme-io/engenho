@@ -19,6 +19,9 @@
 //!     engenho fabric can move + cache anywhere.
 //!   * [`rollout`] — one `Rollout{Shadow, Enforce}` gate type plus the
 //!     would-reject ledger every tightened check reports through
+//!   * [`freshness`] — the pure judges health is derived from:
+//!     `Freshness{NeverObserved, Fresh, Stale}` for one observation and
+//!     `Liveness{Unknown, Alive, Stalled, Dead}` for one child
 
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
@@ -36,6 +39,7 @@ pub mod drv_disk;
 pub mod error_kind;
 pub mod fake_shell;
 pub mod fingerprint;
+pub mod freshness;
 pub mod gossip_ledger;
 pub mod hash_newtype;
 pub mod hex;
@@ -83,6 +87,7 @@ pub use disposable::{Disposable, DisposableError, Transient};
 pub use drv_disk::DiskDerivationCache;
 pub use error_kind::ErrorKind;
 pub use fingerprint::{Fingerprint, fingerprint_blake3};
+pub use freshness::{Freshness, Liveness, StaleAfter, TaskState, WindowTooShort};
 pub use gossip_ledger::{
     FakeGossipTransport, GossipBroadcast, GossipBroadcaster, GossipChannel, GossipDelivery,
     GossipError, GossipLedger,

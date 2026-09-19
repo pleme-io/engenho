@@ -125,6 +125,24 @@ pub struct RouterState {
     /// ledger it shares with every other gate-owning component via
     /// [`Self::with_would_reject_ledger`], so one scrape shows every gate.
     pub would_reject: Arc<engenho_substrate::WouldRejectLedger>,
+    /// What `/livez`, `/healthz` and `/readyz` are derived from: the
+    /// runtime's supervised children, drain state and store.
+    ///
+    /// `None` ⇒ every health endpoint fails on a `liveness-source` check.
+    /// That is the honest answer for a server nothing has told about its
+    /// children, and it is deliberately NOT a default that reports ok: the
+    /// constant `"ok"` is what this field replaced. The runtime installs its
+    /// source via [`Self::with_liveness_source`].
+    pub liveness: Option<Arc<dyn crate::health::LivenessSource>>,
+    /// How long `/readyz` waits for the linearizable store read.
+    /// Defaults to [`crate::health::DEFAULT_STORE_READ_TIMEOUT`].
+    pub readyz_store_read_timeout: std::time::Duration,
+    /// What `/metrics` renders the store revision, panic count, reconcile
+    /// counts and last-tick timestamps from.
+    ///
+    /// `None` ⇒ those families are absent from the scrape (a dashboard
+    /// reads "no data"), never rendered as zeros it would chart as real.
+    pub metrics_source: Option<Arc<dyn crate::metrics::MetricsSource>>,
 }
 
 impl RouterState {
@@ -150,7 +168,35 @@ impl RouterState {
             would_reject: Arc::new(engenho_substrate::WouldRejectLedger::new(
                 crate::metrics::log_would_reject,
             )),
+            // Unwired: health is red and the source-derived metric families
+            // are absent until the runtime installs its sources.
+            liveness: None,
+            readyz_store_read_timeout: crate::health::DEFAULT_STORE_READ_TIMEOUT,
+            metrics_source: None,
         }
+    }
+
+    /// Install what the health endpoints are derived from. Builder style
+    /// mirroring [`Self::with_authorizer`]. The runtime builds the source
+    /// before starting the server and its children report into it after.
+    #[must_use]
+    pub fn with_liveness_source(mut self, source: Arc<dyn crate::health::LivenessSource>) -> Self {
+        self.liveness = Some(source);
+        self
+    }
+
+    /// Replace how long `/readyz` waits for its store read.
+    #[must_use]
+    pub fn with_readyz_store_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.readyz_store_read_timeout = timeout;
+        self
+    }
+
+    /// Install what `/metrics` reads the runtime's families from.
+    #[must_use]
+    pub fn with_metrics_source(mut self, source: Arc<dyn crate::metrics::MetricsSource>) -> Self {
+        self.metrics_source = Some(source);
+        self
     }
 
     /// Install the process-wide rollout-gate ledger. Builder style mirroring
@@ -464,8 +510,9 @@ fn route_table() -> Vec<(&'static str, axum::routing::MethodRouter<RouterState>)
             "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
             axum::routing::post(crate::authz::sar::self_subject_rules_review),
         ),
-        // ── version + health (no RouterState; kubectl/client-go probe
-        //    these before they will trust the server) ──────────────────
+        // ── version + health (pre-authz; kubectl/client-go probe these
+        //    before they will trust the server). Health reads the
+        //    RouterState's liveness source: derived, never a constant. ───
         ("/version", get(health::version)),
         ("/readyz", get(health::readyz)),
         ("/livez", get(health::livez)),
@@ -551,8 +598,8 @@ async fn authn_middleware(
 // ── authorization middleware (Brick B) ─────────────────────────────────────
 
 /// The pre-authz TIER-1 always-allow set: `/healthz`, `/livez`, `/readyz`,
-/// `/version`. These are wired in [`build_routes`] with NO `RouterState`;
-/// kubectl/client-go probe them BEFORE trusting the server, so they MUST work
+/// `/version`. These read no RBAC state (health reads only the liveness
+/// source); kubectl/client-go probe them BEFORE trusting the server, so they MUST work
 /// even with an empty/unseeded RBAC store (e.g. during boot before
 /// `seed_bootstrap_rbac` lands). This is the load-bearing reason they are a
 /// fixed allow-list HERE (in the authz middleware) and NOT a binding.
@@ -3164,8 +3211,17 @@ mod request_info_coverage {
     /// The full router over an empty handler set, judged by a [`RecordingDeny`].
     fn recorded_router() -> (Router, Arc<RecordingDeny>) {
         let recorder = Arc::new(RecordingDeny::default());
-        let state = RouterState::new(Vec::new()).with_authorizer(recorder.clone());
+        let state = green_state().with_authorizer(recorder.clone());
         (build(state), recorder)
+    }
+
+    /// A router whose health endpoints answer 200, so a status other than
+    /// 200 on them comes from the layer under test, not from the health
+    /// check itself (an unwired router is red on every health endpoint).
+    fn green_state() -> RouterState {
+        RouterState::new(Vec::new()).with_liveness_source(Arc::new(
+            crate::health::FixedLiveness::all_alive(&["test-child"]),
+        ))
     }
 
     /// A concrete request path for a route pattern: every `:param` and the
@@ -3366,13 +3422,12 @@ mod request_info_coverage {
         // of the path (and never an allow).
         let recorder = Arc::new(RecordingDeny::default());
         let authorizer: Arc<dyn crate::authz::Authorizer> = recorder.clone();
-        let authz_only =
-            build_routes(RouterState::new(Vec::new())).layer(axum::middleware::from_fn(
-                move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
-                    let authorizer = authorizer.clone();
-                    async move { authz_middleware(authorizer, req, next).await }
-                },
-            ));
+        let authz_only = build_routes(green_state()).layer(axum::middleware::from_fn(
+            move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
+                let authorizer = authorizer.clone();
+                async move { authz_middleware(authorizer, req, next).await }
+            },
+        ));
         for uri in ["/healthz", "/api/v1/namespaces/default/pods", "/api"] {
             assert_eq!(
                 send(&authz_only, "GET", uri, &[]).await,

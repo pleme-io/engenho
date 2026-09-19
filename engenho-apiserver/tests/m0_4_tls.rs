@@ -6,7 +6,8 @@
 //! chain are correct, so a real verifying client must succeed). Asserts:
 //!
 //!   * `GET /version`  → 200, `gitVersion=v1.34.0`.
-//!   * `GET /readyz` / `/livez` / `/healthz` → 200 `"ok"`.
+//!   * `GET /readyz` / `/livez` / `/healthz` → 200 `"ok"` (over a green
+//!     liveness double: health is derived, so it needs a source).
 //!   * `GET /api`      → 200 `APIVersions` (the existing discovery surface
 //!     is reachable end-to-end through the TLS handshake).
 //!   * a client trusting a DIFFERENT CA fails the handshake (proves we're
@@ -19,9 +20,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use engenho_apiserver::health::FixedLiveness;
 use engenho_apiserver::{
-    ApiServer, ResourceHandler, ServerSanInputs, StoreBackedHandler, issue_server_material,
-    load_or_generate_ca,
+    ApiServer, ResourceHandler, RouterState, ServerSanInputs, StoreBackedHandler,
+    issue_server_material, load_or_generate_ca,
 };
 use engenho_store::{InProcessRouter, StoreMesh, default_config};
 
@@ -61,13 +63,13 @@ async fn boot_tls_server() -> (String, String, ApiServer, tempfile::TempDir) {
             .expect("Namespace is cataloged"),
     );
 
-    let server = ApiServer::start(
-        "127.0.0.1:0".parse().unwrap(),
-        vec![pod, ns],
-        Some(material),
-    )
-    .await
-    .unwrap();
+    // Health is derived from a liveness source; a green double stands in
+    // for the runtime's so the health probes below measure the TLS path.
+    let state = RouterState::new(vec![pod, ns])
+        .with_liveness_source(Arc::new(FixedLiveness::all_alive(&["apiserver"])));
+    let server = ApiServer::start_with_state("127.0.0.1:0".parse().unwrap(), state, Some(material))
+        .await
+        .unwrap();
     let addr = server.local_addr();
     // Loopback URL with the bound port (127.0.0.1 is always a SAN).
     let base = format!("https://127.0.0.1:{}", addr.port());
