@@ -49,9 +49,18 @@ impl Severity {
 
 /// The upstream reason vocabulary, closed.
 ///
-/// Only reasons engenho can actually emit today are listed. A reason with
-/// no emitting site would be a promise the cluster does not keep — the same
+/// Only reasons engenho can actually emit are listed. A reason with no
+/// emitting site would be a promise the cluster does not keep — the same
 /// "advertised with zero behaviour" pattern this codebase otherwise avoids.
+/// The two exceptions, [`Reason::ProbeBlind`] and [`Reason::WouldReject`],
+/// say on their variant which emitter they are waiting for.
+///
+/// Three reasons are engenho's own, each for a state upstream does not
+/// have: [`Reason::NetworkPolicyNotEnforced`], [`Reason::ProbeBlind`] and
+/// [`Reason::WouldReject`]. Each is `Warning`. The last two share their
+/// word with what an operator searches for beside them — the kubelet's
+/// `ProbeBlind` pod condition, the `engenho_would_reject_total` metric — so
+/// each pair is found together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     // ── kubelet, pod lifecycle ──
@@ -67,6 +76,20 @@ pub enum Reason {
     Killing,
     /// A liveness/readiness/startup probe failed.
     Unhealthy,
+    /// A probe could not observe the container at all: the pod has no
+    /// address to dial, the runtime could not run the exec, or the prober
+    /// could not form the request. Nothing was asked, so nothing failed —
+    /// and a blind probe never restarts a container.
+    ///
+    /// Not upstream's: upstream's prober reports an errored probe as
+    /// `Unhealthy`, which makes "the prober cannot see" read as "the
+    /// workload is failing" to every rule that matches `Unhealthy`. Named
+    /// after the kubelet's `ProbeBlind` pod condition, raised once the
+    /// blindness is sustained.
+    ///
+    /// Emitter: the kubelet's blind report, once per blind streak, on the
+    /// pod — which at this commit still records `Unhealthy` (T1.1).
+    ProbeBlind,
     /// The container is in a crash-restart backoff.
     BackOff,
     // ── scheduler ──
@@ -117,10 +140,20 @@ pub enum Reason {
     /// rather than a missing feature, which is why it is a `Warning` and
     /// why it is surfaced where `kubectl describe` shows it.
     NetworkPolicyNotEnforced,
+    // ── rollout gates ──
+    /// A gate in Shadow allowed what Enforce would refuse. The string is
+    /// [`engenho_substrate::WouldReject::EVENT_REASON`], owned by the
+    /// rollout gate and shared with the `engenho_would_reject_total` metric,
+    /// so it is read from there rather than restated here.
+    ///
+    /// Emitter: none yet. A gate's ledger hook logs and counts; no gate
+    /// records an Event until one is handed a sink (T0.11).
+    WouldReject,
 }
 
 impl Reason {
-    /// The exact upstream string. Diffed in one place, not per call site.
+    /// The exact wire string — upstream's, or for engenho's own reasons the
+    /// one their owner defines. Diffed in one place, not per call site.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -130,6 +163,7 @@ impl Reason {
             Self::Failed => "Failed",
             Self::Killing => "Killing",
             Self::Unhealthy => "Unhealthy",
+            Self::ProbeBlind => "ProbeBlind",
             Self::BackOff => "BackOff",
             Self::Scheduled => "Scheduled",
             Self::FailedScheduling => "FailedScheduling",
@@ -144,6 +178,7 @@ impl Reason {
             Self::ProvisioningFailed => "ProvisioningFailed",
             Self::VolumeFailedDelete => "VolumeFailedDelete",
             Self::NetworkPolicyNotEnforced => "NetworkPolicyNotEnforced",
+            Self::WouldReject => engenho_substrate::WouldReject::EVENT_REASON,
         }
     }
 
@@ -152,11 +187,15 @@ impl Reason {
     /// Derived rather than passed in: a `Warning`/`Normal` argument at each
     /// call site is exactly where drift appears, and upstream's pairing is
     /// fixed per reason.
+    ///
+    /// Exhaustive, with no wildcard arm: a new reason does not compile until
+    /// it is given a severity, so it cannot fall silently into `Normal`.
     #[must_use]
     pub fn severity(self) -> Severity {
         match self {
             Self::Failed
             | Self::Unhealthy
+            | Self::ProbeBlind
             | Self::BackOff
             | Self::FailedScheduling
             | Self::ProvisioningFailed
@@ -165,8 +204,17 @@ impl Reason {
             | Self::FailedUpdate
             | Self::ReplicaSetCreateError
             | Self::FailedToUpdateEndpoint
-            | Self::NetworkPolicyNotEnforced => Severity::Warning,
-            _ => Severity::Normal,
+            | Self::NetworkPolicyNotEnforced
+            | Self::WouldReject => Severity::Warning,
+            Self::Pulled
+            | Self::Created
+            | Self::Started
+            | Self::Killing
+            | Self::Scheduled
+            | Self::ScalingReplicaSet
+            | Self::SuccessfulCreate
+            | Self::SuccessfulDelete
+            | Self::ProvisioningSucceeded => Severity::Normal,
         }
     }
 }
@@ -313,12 +361,54 @@ mod tests {
             Reason::FailedUpdate,
             Reason::ReplicaSetCreateError,
             Reason::FailedToUpdateEndpoint,
+            Reason::NetworkPolicyNotEnforced,
+            Reason::ProbeBlind,
+            Reason::WouldReject,
         ] {
             assert_eq!(r.severity(), Severity::Warning, "{} must warn", r.as_str());
         }
         for r in [Reason::Pulled, Reason::Started, Reason::Scheduled] {
             assert_eq!(r.severity(), Severity::Normal, "{}", r.as_str());
         }
+    }
+
+    #[test]
+    fn a_shadow_gates_would_reject_is_a_warning_under_the_gates_own_reason() {
+        // The rollout gate owns the string, and the event shares it with
+        // engenho_would_reject_total so one search finds both. A second
+        // spelling here would split them.
+        assert_eq!(
+            Reason::WouldReject.as_str(),
+            engenho_substrate::WouldReject::EVENT_REASON
+        );
+        assert_eq!(Reason::WouldReject.as_str(), "WouldReject");
+        // Something Enforce would refuse is going through: that is a
+        // Warning, never routine.
+        let v = rec(Reason::WouldReject).to_value();
+        assert_eq!(v["reason"], "WouldReject");
+        assert_eq!(v["type"], "Warning");
+    }
+
+    #[test]
+    fn a_blind_probe_is_a_warning_that_does_not_read_as_a_failed_one() {
+        // A probe that observed nothing did not observe a failure. Under
+        // `Unhealthy` it would count toward every rule that means "the
+        // workload is failing its probe".
+        assert_eq!(Reason::ProbeBlind.as_str(), "ProbeBlind");
+        assert_ne!(
+            Reason::ProbeBlind.as_str(),
+            Reason::Unhealthy.as_str(),
+            "blind and failed must be told apart on the wire"
+        );
+        let v = rec(Reason::ProbeBlind).to_value();
+        assert_eq!(v["reason"], "ProbeBlind");
+        assert_eq!(v["type"], "Warning");
+        // A blind event and a failure event at the same instant are two
+        // objects, not one overwriting the other.
+        assert_ne!(
+            rec(Reason::ProbeBlind).event_name(),
+            rec(Reason::Unhealthy).event_name()
+        );
     }
 
     #[test]
