@@ -15,13 +15,27 @@
 //!      saw on cid 2026-08-29: a pod with 160 restarts displaying
 //!      `Running 1/1` while restarting every three minutes.
 //!
-//! ★ THE CURVE IS UPSTREAM'S: 10s doubling to a 5-minute cap, reset after
-//! the container has stayed up for 10 minutes. Those constants are not
-//! taste — an operator reading `kubectl describe` compares the observed
+//! ★ THE CURVE IS UPSTREAM'S: 10s doubling to a 5-minute cap, reset once
+//! the container has stayed up for MORE than 10 minutes. Those constants are
+//! not taste — an operator reading `kubectl describe` compares the observed
 //! delay against the one they know, and a different curve reads as a
 //! malfunction. The reset rule is the subtle half: without it a container
 //! that recovers stays penalised forever, and a pod that crashed once at
 //! boot would take five minutes to restart a week later.
+//!
+//! ★ ONE CURVE TYPE, NOT A THIRD HAND-WRITTEN DOUBLING. The delay is read off
+//! [`engenho_controllers::curve::Curve`], the shape every retry delay in the
+//! controllers takes, so the doubling, the cap and the saturation at a huge
+//! step are written once. A curve whose cap does not exceed its base fails
+//! `cargo build` with E0080 (see `Curve::from_millis`; a post-monomorphization
+//! error, so `cargo check` alone may not see it), so [`CRASH`] cannot be
+//! edited into a flat retry that ships.
+//!
+//! ★ TWO CURVES LIVE HERE. [`CRASH`] paces container starts and restarts;
+//! [`VOLUME_PENDING`] paces how soon the kubelet asks to come back for a pod
+//! whose volumes did not resolve. That retry used to be a flat second,
+//! forever: a pod naming a `ConfigMap` that never appears kept an otherwise
+//! idle kubelet ticking once a second for as long as the pod existed.
 //!
 //! ★ PURE, AND CLOCK-INJECTED. Every decision is a function of
 //! `(restart_count, last_exit, now)`, so the whole curve is testable
@@ -31,15 +45,22 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Upstream's initial delay after the first crash.
-pub const BASE_DELAY: Duration = Duration::from_secs(10);
+use engenho_controllers::curve::{Curve, Streak};
 
-/// Upstream's ceiling. The delay doubles up to this and no further.
-pub const MAX_DELAY: Duration = Duration::from_secs(300);
-
-/// How long a container must stay up before its backoff is forgiven.
+/// Upstream's crash-loop curve: 10 s after the first crash, doubling to a
+/// 5-minute cap (`initialCrashLoopBackOff`, `MaxContainerBackOff`; kubelet
+/// v1.34 with its alpha gates off). Multiplier 2, no jitter.
 ///
-/// Without this a container that recovers stays penalised forever.
+/// Step `n` of the curve is the wait before restart `n + 1`, so the first
+/// restart, which owes nothing, is not on it: see [`delay_for`].
+pub const CRASH: Curve = Curve::from_millis::<10_000, 300_000>();
+
+/// A container that ran for LONGER than this before it exited has its
+/// backoff forgiven.
+///
+/// Strictly longer, as upstream (`FinishedAt - lastUpdate > 600s`,
+/// kubelet.go:1004-1006): a container that ran exactly 600 s is not
+/// forgiven. Without this a container that recovers stays penalised forever.
 pub const RESET_AFTER: Duration = Duration::from_secs(600);
 
 /// The waiting reason of a container held off before its next start. The
@@ -58,6 +79,15 @@ pub enum BackoffDecision {
 }
 
 impl BackoffDecision {
+    /// Hold for whatever is left of `owed` after `elapsed`, or restart once
+    /// it has been served.
+    const fn after(owed: Duration, elapsed: Duration) -> Self {
+        match still_owed(owed, elapsed) {
+            Some(remaining) => Self::Wait { remaining },
+            None => Self::Restart,
+        }
+    }
+
     /// The `status.containerStatuses[].state.waiting.reason` to publish.
     ///
     /// `None` when restarting — there is no waiting state to report.
@@ -73,21 +103,16 @@ impl BackoffDecision {
 /// The delay owed after `restart_count` prior restarts.
 ///
 /// `0` prior restarts ⇒ no delay: the FIRST restart is immediate, matching
-/// upstream. Backoff is a response to repetition, not to a single exit.
+/// upstream (no backoff entry exists yet). Backoff is a response to
+/// repetition, not to a single exit. Every later restart reads [`CRASH`]:
+/// 10 s, 20 s, 40 s … capped at 300 s, and a huge count saturates at the cap
+/// rather than wrapping to a short delay, because `Curve::delay` does.
 #[must_use]
-pub fn delay_for(restart_count: u32) -> Duration {
-    if restart_count == 0 {
-        return Duration::ZERO;
+pub const fn delay_for(restart_count: u32) -> Duration {
+    match restart_count.checked_sub(1) {
+        None => Duration::ZERO,
+        Some(step) => CRASH.delay(step),
     }
-    // 10s, 20s, 40s … capped. `checked_mul` rather than a shift so a large
-    // restart_count saturates at the cap instead of overflowing to a tiny
-    // delay — the failure mode would be a hot loop appearing only after a
-    // container had crashed ~30 times, which is exactly when it matters.
-    let factor = 1u32.checked_shl(restart_count - 1).unwrap_or(u32::MAX);
-    BASE_DELAY
-        .checked_mul(factor)
-        .unwrap_or(MAX_DELAY)
-        .min(MAX_DELAY)
 }
 
 /// Decide whether to restart now.
@@ -103,18 +128,11 @@ pub fn decide(
 ) -> BackoffDecision {
     // A container that stayed up long enough has earned a clean slate.
     // Checked BEFORE the delay so a recovered container is never penalised
-    // for an old crash.
-    if uptime_before_exit >= RESET_AFTER {
+    // for an old crash. Strictly longer than RESET_AFTER, as upstream.
+    if uptime_before_exit > RESET_AFTER {
         return BackoffDecision::Restart;
     }
-    let owed = delay_for(restart_count);
-    if since_exit >= owed {
-        BackoffDecision::Restart
-    } else {
-        BackoffDecision::Wait {
-            remaining: owed - since_exit,
-        }
-    }
+    BackoffDecision::after(delay_for(restart_count), since_exit)
 }
 
 /// The same curve, for a container that has never started at all.
@@ -137,13 +155,16 @@ pub fn decide(
 /// than infer from silence.
 #[must_use]
 pub fn decide_start(failures: u32, since_last_attempt: Duration) -> BackoffDecision {
-    let owed = delay_for(failures);
-    if since_last_attempt >= owed {
-        BackoffDecision::Restart
-    } else {
-        BackoffDecision::Wait {
-            remaining: owed - since_last_attempt,
-        }
+    BackoffDecision::after(delay_for(failures), since_last_attempt)
+}
+
+/// What is left of an `owed` wait once `elapsed` has passed, or `None` once
+/// it has been served in full. Served means `elapsed >= owed`: upstream holds
+/// only while `now - FinishedAt < backoff`, strictly.
+const fn still_owed(owed: Duration, elapsed: Duration) -> Option<Duration> {
+    match owed.checked_sub(elapsed) {
+        Some(remaining) if !remaining.is_zero() => Some(remaining),
+        _ => None,
     }
 }
 
@@ -272,6 +293,125 @@ impl StartLedger {
     }
 }
 
+// ── THE VOLUME-PENDING LEDGER: how soon to come back for an unresolved pod ──
+
+/// Upstream's volume-operation retry curve: 500 ms after the first failure,
+/// doubling to 2m2s (`initialDurationBeforeRetry`,
+/// `maxDurationBeforeRetry`; pkg/util/goroutinemap/exponentialbackoff,
+/// v1.34). It is the curve behind upstream's familiar
+/// `No retries permitted until … (durationBeforeRetry 2m2s)`.
+///
+/// The kubelet never asks to be re-ticked sooner than its 1 s requeue floor,
+/// so the first step is observed as 1 s; the curve is kept at upstream's
+/// constants so the cap, the part an operator waits on, is the one they know.
+pub const VOLUME_PENDING: Curve = Curve::from_millis::<500, 122_000>();
+
+/// Per pod, the run of volume-resolution misses and when the pod is next due.
+///
+/// ★ WHAT THIS PACES, AND WHAT IT DOES NOT. It paces the kubelet's OWN timer:
+/// the requeue it asks for when a pod's volumes did not resolve, which was a
+/// flat 1 s forever. It never refuses an attempt. The kubelet is also woken
+/// by writes to the kinds a pod's volumes read (`ConfigMap`, `Secret`,
+/// `PersistentVolumeClaim`, `PersistentVolume`), and a pod woken that way
+/// re-resolves at once: holding it until the curve allowed would make a pod
+/// whose `ConfigMap` was just created wait up to 2m2s for nothing. That is the
+/// one place this departs from upstream, which refuses every retry before
+/// its `durationBeforeRetry`.
+///
+/// So only an attempt made when the pod was DUE counts as a miss on the
+/// curve; an earlier one (a write woke the kubelet, or another pod's timer
+/// did) is [`VolumeRetry::Early`] and leaves the curve where it was. The gap
+/// between counted misses therefore grows with wall time, not with how busy
+/// the kubelet happens to be.
+///
+/// Keyed by pod. A resolution that succeeds clears the pod's entry, and a pod
+/// no longer bound here is dropped by [`VolumePendingLedger::retain_pods`].
+#[derive(Debug, Default)]
+pub struct VolumePendingLedger {
+    pods: HashMap<String, PendingPod>,
+}
+
+/// One pod's misses on [`VOLUME_PENDING`]: when the last counted miss was,
+/// and the wait it owed.
+#[derive(Clone, Copy, Debug)]
+struct PendingPod {
+    streak: Streak,
+    missed_at: Instant,
+    owed: Duration,
+}
+
+/// What an unresolved attempt cost, and when the pod should be tried again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeRetry {
+    /// The pod was due: one more miss on the curve.
+    Missed {
+        /// Consecutive counted misses, this one included.
+        consecutive: u32,
+        /// The wait the curve now owes before the pod is due again.
+        next_attempt_in: Duration,
+    },
+    /// The pod was not yet due (a write or another pod's timer woke the
+    /// kubelet): the curve is unchanged.
+    Early {
+        /// Consecutive counted misses so far.
+        consecutive: u32,
+        /// How much longer until the pod is due.
+        remaining: Duration,
+    },
+}
+
+impl VolumeRetry {
+    /// How long the kubelet should wait before trying this pod again.
+    #[must_use]
+    pub const fn next_attempt_in(self) -> Duration {
+        match self {
+            Self::Missed {
+                next_attempt_in, ..
+            } => next_attempt_in,
+            Self::Early { remaining, .. } => remaining,
+        }
+    }
+}
+
+impl VolumePendingLedger {
+    /// `pod`'s volumes did not resolve at `now`.
+    ///
+    /// Counts a miss when the pod was due (or has no entry), and otherwise
+    /// reports how long until it is.
+    pub fn unresolved(&mut self, pod: &str, now: Instant) -> VolumeRetry {
+        // A pod with no entry owes nothing yet, so its first miss counts.
+        let entry = self.pods.entry(pod.to_string()).or_insert(PendingPod {
+            streak: Streak::new(VOLUME_PENDING),
+            missed_at: now,
+            owed: Duration::ZERO,
+        });
+        let elapsed = now.saturating_duration_since(entry.missed_at);
+        if let Some(remaining) = still_owed(entry.owed, elapsed) {
+            return VolumeRetry::Early {
+                consecutive: entry.streak.misses(),
+                remaining,
+            };
+        }
+        entry.owed = entry.streak.miss();
+        entry.missed_at = now;
+        VolumeRetry::Missed {
+            consecutive: entry.streak.misses(),
+            next_attempt_in: entry.owed,
+        }
+    }
+
+    /// `pod`'s volumes resolved: its next miss, if any, starts from the base.
+    pub fn resolved(&mut self, pod: &str) {
+        self.pods.remove(pod);
+    }
+
+    /// Forget every pod `keep` rejects, so a pod that is gone takes its
+    /// streak with it and a recreated pod of the same name starts clean.
+    pub fn retain_pods(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.pods.retain(|pod, _| keep(pod));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,8 +436,16 @@ mod tests {
         assert_eq!(delay_for(4), S(80));
         assert_eq!(delay_for(5), S(160));
         // Capped at 5 minutes thereafter.
-        assert_eq!(delay_for(6), MAX_DELAY);
-        assert_eq!(delay_for(7), MAX_DELAY);
+        assert_eq!(delay_for(6), S(300));
+        assert_eq!(delay_for(7), S(300));
+    }
+
+    /// The upstream oracle row `backoff/kubelet default schedule 10s..300s`
+    /// (container-restart.json): the wait after each of eight crashes.
+    #[test]
+    fn eight_crashes_owe_upstreams_exact_schedule() {
+        let owed: Vec<u64> = (1..=8).map(|n| delay_for(n).as_secs()).collect();
+        assert_eq!(owed, [10, 20, 40, 80, 160, 300, 300, 300]);
     }
 
     #[test]
@@ -305,7 +453,7 @@ mod tests {
         // The overflow bug would appear only after ~30 crashes — exactly
         // when backoff matters most — and would present as a hot loop.
         for n in [30u32, 31, 32, 33, 1_000, u32::MAX] {
-            assert_eq!(delay_for(n), MAX_DELAY, "restart_count {n} must cap");
+            assert_eq!(delay_for(n), S(300), "restart_count {n} must cap");
         }
     }
 
@@ -332,15 +480,42 @@ mod tests {
     fn a_container_that_stayed_up_long_enough_is_forgiven() {
         // Without the reset, a pod that crashed once at boot would still be
         // waiting five minutes to restart a week later.
-        assert_eq!(
-            decide(10, Duration::ZERO, RESET_AFTER),
-            BackoffDecision::Restart
-        );
-        // One second short of the threshold is NOT forgiven.
+        assert_eq!(decide(10, Duration::ZERO, S(601)), BackoffDecision::Restart);
+        // Well short of the threshold is NOT forgiven.
         assert!(matches!(
-            decide(10, Duration::ZERO, RESET_AFTER - S(1)),
+            decide(10, Duration::ZERO, S(599)),
             BackoffDecision::Wait { .. }
         ));
+    }
+
+    /// The upstream oracle rows `backoff/kubelet reset threshold: exactly
+    /// 600s is NOT expired` and `…: 600s + 1ns is expired`
+    /// (kubelet.go:1004-1006, `> 600*time.Second`).
+    #[test]
+    fn exactly_ten_minutes_up_is_not_forgiven_and_a_nanosecond_more_is() {
+        assert_eq!(
+            decide(10, Duration::ZERO, S(600)),
+            BackoffDecision::Wait { remaining: S(300) },
+            "a container that ran exactly 600s keeps its backoff"
+        );
+        assert_eq!(
+            decide(10, Duration::ZERO, S(600) + Duration::from_nanos(1)),
+            BackoffDecision::Restart
+        );
+    }
+
+    /// The upstream oracle row `do-backoff/long idle wall-clock does NOT
+    /// reset`: a short run, a crash, and an hour of idle wall-clock is not
+    /// forgiveness. The reset keys on how long the container RAN.
+    #[test]
+    fn idle_wall_clock_after_a_short_run_is_not_forgiveness() {
+        // It is restarted (the owed wait is long past) …
+        assert_eq!(decide(5, S(3_600), S(30)), BackoffDecision::Restart);
+        // … but a short run after that still owes the next, longer step.
+        assert_eq!(
+            decide(6, Duration::ZERO, S(30)),
+            BackoffDecision::Wait { remaining: S(300) }
+        );
     }
 
     #[test]
@@ -403,9 +578,9 @@ mod tests {
 
     #[test]
     fn a_start_penalty_caps_rather_than_growing_forever() {
-        assert_eq!(delay_for(u32::MAX), MAX_DELAY);
+        assert_eq!(delay_for(u32::MAX), S(300));
         assert_eq!(
-            decide_start(u32::MAX, MAX_DELAY),
+            decide_start(u32::MAX, S(300)),
             BackoffDecision::Restart,
             "a capped penalty still expires; backoff never becomes give-up"
         );
@@ -502,5 +677,151 @@ mod tests {
         ledger.retain_pods(|pod| pod == "default/kept");
         assert!(ledger.permit("default/gone", "app", t0).is_ok());
         assert!(ledger.permit("default/kept", "app", t0).is_err());
+    }
+
+    // ── VolumePendingLedger: how soon to come back for an unresolved pod ──
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    /// Poll a pod whose volumes never resolve once a second for `seconds`,
+    /// returning the virtual second of every attempt that counted.
+    fn counted_misses_over(seconds: u64) -> Vec<u64> {
+        let t0 = Instant::now();
+        let mut ledger = VolumePendingLedger::default();
+        (0..seconds)
+            .filter(|second| {
+                matches!(
+                    ledger.unresolved("default/p", t0 + S(*second)),
+                    VolumeRetry::Missed { .. }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_volume_curve_is_upstreams_half_second_doubling_to_two_minutes_two() {
+        let t0 = Instant::now();
+        let mut ledger = VolumePendingLedger::default();
+        let mut at = t0;
+        let mut owed = Vec::new();
+        for _ in 0..10 {
+            let retry = ledger.unresolved("default/p", at);
+            owed.push(retry.next_attempt_in());
+            at += retry.next_attempt_in();
+        }
+        assert_eq!(
+            owed,
+            [
+                MS(500),
+                S(1),
+                S(2),
+                S(4),
+                S(8),
+                S(16),
+                S(32),
+                S(64),
+                S(122),
+                S(122)
+            ]
+        );
+    }
+
+    /// The measured defect, replayed: a pod whose `ConfigMap` never appears,
+    /// asked about once a second for an hour. Flat, that is 3 600 attempts
+    /// and 3 600 warnings; on the curve it is a few dozen, the gap between
+    /// them grows until the cap, and the pod is still being retried at the
+    /// end of the hour.
+    #[test]
+    fn a_pod_that_never_resolves_is_retried_on_a_growing_curve_not_every_second() {
+        let misses = counted_misses_over(3_600);
+        assert!(
+            misses.len() <= 40,
+            "at most 40 counted attempts in an hour, got {} ({misses:?})",
+            misses.len()
+        );
+        let gaps: Vec<u64> = misses.windows(2).map(|w| w[1] - w[0]).collect();
+        for pair in gaps.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "the gap between counted attempts never shrinks: {gaps:?}"
+            );
+        }
+        assert!(
+            gaps.iter().all(|gap| *gap <= 122),
+            "the cap is 2m2s: {gaps:?}"
+        );
+        assert!(
+            misses.last().is_some_and(|last| *last >= 3_600 - 122),
+            "the cap is a ceiling on the wait, never a stop: last attempt at {:?}",
+            misses.last()
+        );
+    }
+
+    #[test]
+    fn an_early_attempt_does_not_grow_the_curve() {
+        // A write, or another pod's timer, can wake the kubelet before this
+        // pod is due. That attempt still happens; it just does not count.
+        let t0 = Instant::now();
+        let mut ledger = VolumePendingLedger::default();
+        let _ = ledger.unresolved("default/p", t0);
+        let _ = ledger.unresolved("default/p", t0 + MS(500));
+        assert_eq!(
+            ledger.unresolved("default/p", t0 + MS(500) + MS(300)),
+            VolumeRetry::Early {
+                consecutive: 2,
+                remaining: MS(700),
+            }
+        );
+        // When the pod IS due, the curve takes its next step from where it
+        // was, not from where the early attempts would have pushed it.
+        assert_eq!(
+            ledger.unresolved("default/p", t0 + MS(1_500)),
+            VolumeRetry::Missed {
+                consecutive: 3,
+                next_attempt_in: S(2),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pod_whose_volumes_resolve_starts_its_next_streak_from_the_base() {
+        let t0 = Instant::now();
+        let mut ledger = VolumePendingLedger::default();
+        let mut at = t0;
+        for _ in 0..6 {
+            at += ledger.unresolved("default/p", at).next_attempt_in();
+        }
+        ledger.resolved("default/p");
+        assert_eq!(
+            ledger.unresolved("default/p", at),
+            VolumeRetry::Missed {
+                consecutive: 1,
+                next_attempt_in: MS(500),
+            },
+            "a resolved pod owes the base again, not the grown step"
+        );
+    }
+
+    #[test]
+    fn one_pods_streak_does_not_slow_another_and_a_gone_pod_takes_its_streak() {
+        let t0 = Instant::now();
+        let mut ledger = VolumePendingLedger::default();
+        let mut at = t0;
+        for _ in 0..5 {
+            at += ledger.unresolved("default/slow", at).next_attempt_in();
+        }
+        assert_eq!(
+            ledger.unresolved("default/fresh", at).next_attempt_in(),
+            MS(500)
+        );
+        ledger.retain_pods(|pod| pod == "default/fresh");
+        assert_eq!(
+            ledger.unresolved("default/slow", at),
+            VolumeRetry::Missed {
+                consecutive: 1,
+                next_attempt_in: MS(500),
+            },
+            "a recreated pod of the same name starts clean"
+        );
     }
 }

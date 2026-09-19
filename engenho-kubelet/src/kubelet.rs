@@ -663,6 +663,12 @@ pub struct Kubelet {
     /// whose replacement has not. An entry is cleared on success, and a pod
     /// no longer bound here is dropped at the top of every tick.
     start_ledger: Mutex<crate::backoff::StartLedger>,
+    /// Per pod, the run of volume-resolution misses on
+    /// [`crate::backoff::VOLUME_PENDING`]: how soon the kubelet asks to come
+    /// back for a pod whose volumes did not resolve. Cleared when they
+    /// resolve; a pod no longer bound here is dropped at the top of every
+    /// tick, beside the start ledger.
+    volume_pending: Mutex<crate::backoff::VolumePendingLedger>,
     /// Where lifecycle events go. Defaults to the null sink so emission is
     /// safe to add to a code path before the plumbing exists — the
     /// alternative being an `Option` check at every call site.
@@ -706,6 +712,7 @@ impl Kubelet {
             host_path_policy: crate::pod_volume::HostPathPolicy::deny_all(),
             clock: Arc::new(Instant::now),
             start_ledger: Mutex::new(crate::backoff::StartLedger::default()),
+            volume_pending: Mutex::new(crate::backoff::VolumePendingLedger::default()),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
             sa_projector: Arc::new(crate::pod_volume::NoServiceAccountProjection),
             last_lease_renewal: Mutex::new(None),
@@ -2551,13 +2558,17 @@ impl Controller for Kubelet {
             .collect();
         report.objects_examined = bound.len();
 
-        // A pod no longer bound here takes its start penalties with it — the
-        // one place they are dropped, and it covers a pod that never started
-        // (no local record, so the cleanup below never visits it) as well as
-        // one that did.
+        // A pod no longer bound here takes its start penalties and its
+        // volume-pending streak with it — the one place they are dropped, and
+        // it covers a pod that never started (no local record, so the cleanup
+        // below never visits it) as well as one that did.
         {
             let live: BTreeSet<String> = bound.keys().map(ResourceKey::label).collect();
             self.start_ledger
+                .lock()
+                .await
+                .retain_pods(|pod| live.contains(pod));
+            self.volume_pending
                 .lock()
                 .await
                 .retain_pods(|pod| live.contains(pod));
@@ -3041,6 +3052,16 @@ impl Kubelet {
     /// resolution error already wrote the pod Pending + armed a requeue (the
     /// caller returns without starting any container — the no-silent-wrong-
     /// answer path).
+    ///
+    /// ── ★ THE REQUEUE GROWS PER POD ─────────────────────────────────────
+    /// It was a flat 1 s, forever: a pod naming a `ConfigMap` that never
+    /// appears kept an otherwise idle kubelet ticking once a second for the
+    /// pod's whole life, each tick a warning line. The requeue is now read
+    /// off the pod's streak on [`crate::backoff::VOLUME_PENDING`] (500 ms
+    /// doubling to 2m2s, upstream's volume-retry curve), and the streak is
+    /// cleared the moment the volumes resolve. Resolution itself is never
+    /// held back: a write to a `ConfigMap`, `Secret` or claim wakes the kubelet
+    /// and the pod re-resolves at once.
     async fn resolve_or_pending(
         &self,
         key: &ResourceKey,
@@ -3054,21 +3075,47 @@ impl Kubelet {
             .resolve_pod_volume_mounts(namespace, &key.name, value)
             .await
         {
-            Ok(map) => Ok(Some(map)),
+            Ok(map) => {
+                self.volume_pending.lock().await.resolved(&key.label());
+                Ok(Some(map))
+            }
             Err(e) => {
                 let reason = e.pending_reason();
-                warn!(
-                    pod = %key.label(),
-                    error = %e,
-                    reason = reason,
-                    "volume resolution failed; pod stays Pending (no container started)"
-                );
+                let retry = self
+                    .volume_pending
+                    .lock()
+                    .await
+                    .unresolved(&key.label(), self.now());
+                match retry {
+                    // Logged at the curve's cadence, not the loop's.
+                    crate::backoff::VolumeRetry::Missed {
+                        consecutive,
+                        next_attempt_in,
+                    } => warn!(
+                        pod = %key.label(),
+                        error = %e,
+                        reason = reason,
+                        consecutive,
+                        retry_in_ms = next_attempt_in.as_millis(),
+                        "volume resolution failed; pod stays Pending (no container started)"
+                    ),
+                    crate::backoff::VolumeRetry::Early {
+                        consecutive,
+                        remaining,
+                    } => debug!(
+                        pod = %key.label(),
+                        error = %e,
+                        reason = reason,
+                        consecutive,
+                        retry_in_ms = remaining.as_millis(),
+                        "volume resolution still failing; pod stays Pending"
+                    ),
+                }
                 self.write_pod_volume_pending(key, value, container_names, reason, report)
                     .await?;
-                // Arm a requeue so the next tick re-resolves once the source
-                // appears (mirrors the probe-cadence requeue).
-                let next = soonest_requeue.map_or(MIN_PROBE_REQUEUE, |d| d.min(MIN_PROBE_REQUEUE));
-                *soonest_requeue = Some(next);
+                // Come back when the pod's streak says, so a source that
+                // appears without a write this kubelet sees is still found.
+                Self::accumulate_requeue(soonest_requeue, retry.next_attempt_in());
                 report.objects_skipped += 1;
                 Ok(None)
             }
@@ -3239,10 +3286,11 @@ impl Kubelet {
         // unsupported source class) does NOT start any container + does NOT
         // skip silently — it writes the pod Pending with EVERY container
         // `Waiting{ reason: <typed> }` (e.g. ConfigMapNotFound) + arms a
-        // requeue so a later-created source converges the pod to Running on a
-        // future tick. A no-volume pod returns an empty map (no store reads,
-        // no materialization) → every spec keeps `mounts: vec![]` → identical
-        // behavior to before this brick.
+        // requeue on the pod's volume-pending streak so a later-created
+        // source converges the pod to Running on a future tick. A no-volume
+        // pod returns an empty map (no store reads, no materialization) →
+        // every spec keeps `mounts: vec![]` → identical behavior to before
+        // this brick.
         // Project the pod's ServiceAccount credentials ONCE for the pod, the
         // way upstream's admission injects a `kube-api-access-*` volume into
         // every pod that has a service account. Without these three files an
@@ -4761,7 +4809,7 @@ impl Kubelet {
                 self.write_pod_status(key, value, &desired, report).await?;
 
                 // Arm a near requeue so the next tick advances the sequence
-                // (mirrors the probe-cadence / volume-pending requeue floor).
+                // (the probe-cadence requeue floor).
                 let next = soonest_requeue.map_or(MIN_PROBE_REQUEUE, |d| d.min(MIN_PROBE_REQUEUE));
                 *soonest_requeue = Some(next);
                 Ok(())
