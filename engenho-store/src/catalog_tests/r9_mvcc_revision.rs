@@ -169,7 +169,7 @@ proptest! {
                     ));
                     prop_assert_eq!(cat.revision().0, prev_revision);
                     prop_assert_eq!(&cat.resources, &before.resources);
-                    prop_assert_eq!(&cat.history, &before.history);
+                    prop_assert_eq!(cat.history(), before.history());
             }
         }
 
@@ -178,8 +178,8 @@ proptest! {
 
         // The history ring (when not compacted) is a dense, strictly
         // increasing 1..=real_mutations sequence with no gaps.
-        prop_assert_eq!(cat.history.len() as u64, real_mutations);
-        for (pos, change) in cat.history.iter().enumerate() {
+        prop_assert_eq!(cat.history().len() as u64, real_mutations);
+        for (pos, change) in cat.history().iter().enumerate() {
             prop_assert_eq!(change.revision.0, (pos as u64) + 1);
         }
     }
@@ -211,7 +211,7 @@ fn noop_neutrality_explicit() {
     let k = pod_key("real");
     cat.apply(&put_cmd(k.clone(), serde_json::json!({"spec": {}})), 1, 1); // rev 1
     assert_eq!(cat.revision(), Revision(1));
-    assert_eq!(cat.history.len(), 1);
+    assert_eq!(cat.history().len(), 1);
 
     // patch-missing
     let o = cat.apply(
@@ -222,14 +222,14 @@ fn noop_neutrality_explicit() {
     assert_eq!(o.op, crate::ResourceOp::NoOp);
     assert!(o.change.is_none());
     assert_eq!(cat.revision(), Revision(1));
-    assert_eq!(cat.history.len(), 1);
+    assert_eq!(cat.history().len(), 1);
 
     // delete-not-found
     let o = cat.apply(&delete_cmd(pod_key("ghost")), 1, 3);
     assert_eq!(o.op, crate::ResourceOp::NoOp);
     assert!(o.change.is_none());
     assert_eq!(cat.revision(), Revision(1));
-    assert_eq!(cat.history.len(), 1);
+    assert_eq!(cat.history().len(), 1);
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn changes_since_below_compacted_is_typed_error() {
         );
     }
     // Only revs 5,6 retained; compacted at rev 4.
-    assert_eq!(cat.history.len(), 2);
+    assert_eq!(cat.history().len(), 2);
     assert_eq!(cat.compacted_revision(), Revision(4));
 
     let err = cat

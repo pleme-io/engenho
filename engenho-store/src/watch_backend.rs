@@ -11,7 +11,7 @@
 //!     revision order ([`WatchOpts::from`]).
 //!   * **Gap-free + dup-free at the replay→live boundary** —
 //!     subscription registers UNDER THE SAME catalog lock that
-//!     `ResourceCatalog::apply` + `push_history` run under, so
+//!     `ResourceCatalog::apply` + `WatchHistory::commit` run under, so
 //!     "I captured replay up to revision R" and "I am attached to the
 //!     live tail" are one atomic act. No change committed during
 //!     subscription is missed or doubled.
@@ -84,7 +84,7 @@ pub enum WatchGone {
     /// The requested resume revision has been compacted away (the 410
     /// Gone equivalent). The consumer must re-list + resume from the
     /// fresh list revision.
-    #[error("requested revision {requested} compacted (lowest retained {compacted})")]
+    #[error("requested revision {requested} compacted (compaction floor {compacted})")]
     CompactedTooOld {
         requested: Revision,
         compacted: Revision,
@@ -493,7 +493,7 @@ impl WatcherRegistry {
 
     /// Fan one committed change to every live watcher whose
     /// `boundary < change.revision`. Called UNDER THE CATALOG LOCK by
-    /// the apply path, right after `push_history` has run.
+    /// the apply path, right after `WatchHistory::commit` has run.
     ///
     /// Builds the typed [`WatchEvent`] from the [`Change`] + the
     /// resource op (Added vs Modified is decided by whether this Put

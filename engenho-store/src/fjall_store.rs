@@ -1850,7 +1850,7 @@ mod tests {
         let cat = s2.read_catalog(ResourceCatalog::clone).await;
         assert_eq!(cat.len(), 1);
         assert!(cat.get(&key).is_some());
-        assert_eq!(cat.current_revision, Revision(1));
+        assert_eq!(cat.revision(), Revision(1));
         let (_, meta) = cat.get_with_meta(&key).unwrap();
         assert_eq!(meta, VersionMeta::created_at(Revision(1)));
         // Applied position survived → store is initialized on reopen.
@@ -1873,7 +1873,7 @@ mod tests {
                 .unwrap();
         }
         let src_cat = src.read_catalog(ResourceCatalog::clone).await;
-        let src_rev = src_cat.current_revision;
+        let src_rev = src_cat.revision();
         assert!(src_rev.get() >= 4);
 
         // Build snapshot from src.
@@ -1888,13 +1888,13 @@ mod tests {
             .await
             .unwrap();
         let dst_cat = dst.read_catalog(ResourceCatalog::clone).await;
-        assert_eq!(dst_cat.current_revision, src_rev);
+        assert_eq!(dst_cat.revision(), src_rev);
         // T3.3: the source evicted nothing, so its floor is 0 and its ring
         // backs every revision. A snapshot carries no ring, so the
         // destination's floor is the installed revision, and a watch below
         // it is a 410 rather than an empty replay.
-        assert_eq!(src_cat.compacted_revision, Revision::ZERO);
-        assert_eq!(dst_cat.compacted_revision, src_rev);
+        assert_eq!(src_cat.compacted_revision(), Revision::ZERO);
+        assert_eq!(dst_cat.compacted_revision(), src_rev);
         assert_eq!(
             dst.watch_from(WatchOpts::live_tail(Revision::ZERO, 16))
                 .await

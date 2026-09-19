@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# Both were shrunk from the W5 red runs, one per defect the seal removes:
+# the first against change-by-change eviction (a transaction kept in part at
+# the floor), the second against a load that believed a floor below its head.
+cc 9c75ba1c207263482b29a58bb2cb91b4ee7f5e801bc2cce9f255108154aaeab1 # shrinks to capacity = 1, loaded = None, ops = [Commit(2)]
+cc 576c9599ceace890bab13773faaf94dd8082c8b94d9c14500e314ef12392b738 # shrinks to capacity = 1, loaded = Some(1), ops = []

@@ -114,6 +114,10 @@ pub mod store;
 pub mod type_config;
 pub mod watch;
 pub mod watch_backend;
+/// The watch-replay ring, its compaction floor, the head revision and the
+/// ring's capacity as one sealed value (T3.3). Crate-private, like the
+/// catalog that holds it.
+mod watch_history;
 
 /// The catalog-level suites that were integration tests until T3.2b sealed
 /// the catalog: they drive `ResourceCatalog` directly, which only code

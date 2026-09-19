@@ -156,7 +156,7 @@ impl InMemoryStore {
     /// MATCHED items.
     ///
     /// ── ★ WHY THIS EXISTS RATHER THAN A CATALOG CLONE + `list(…)` ─────────
-    /// The catalog derives `Clone` and carries `history: VecDeque<Change>`
+    /// The catalog derives `Clone` and carries `history: WatchHistory`
     /// — the watch-replay ring, 8192 entries, each holding a full resource body.
     /// Cloning the catalog to serve a LIST therefore copies the entire ring, so
     /// the cost of every read scales with the cluster's AGE and write volume
