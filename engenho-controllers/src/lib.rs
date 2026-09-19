@@ -179,7 +179,7 @@ pub use pdb::PodDisruptionBudgetController;
 pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};
 pub use plantio_pipeline::{
     LedgerChoice, LedgerWrappers, NodeResolverChoice, PipelineConfig, PlantioPipeline,
-    RoceiroChoice, bootstrap_pipeline,
+    RoceiroChoice,
 };
 pub use pod_scheduling::{
     BindOutcome, Binding, DEFAULT_SCHEDULER, PodSchedulingState, Schedulable, bind_cas,

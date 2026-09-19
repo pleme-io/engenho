@@ -142,7 +142,7 @@ impl BuildBackend for FakeBuildBackend {
                     "/nix/store/{}-{name}",
                     &drv.drv_hash.to_hex()[..16]
                 )),
-                nar_hash: Some(nar.hash.clone()),
+                nar_hash: Some(nar.hash().clone()),
             });
             nars.push(nar);
         }
@@ -310,7 +310,7 @@ impl BuildResult {
             drv_hash,
             output_name: output_name.into(),
             output_path,
-            nar_hash: Some(nar.hash.clone()),
+            nar_hash: Some(nar.hash().clone()),
         };
         Self {
             realisations: vec![realisation],
@@ -381,8 +381,8 @@ mod tests {
         let b = FakeBuildBackend::new();
         let r = b.build(&sample_drv()).await.unwrap();
         for nar in &r.nars {
-            let actual = NarHash::from_bytes(&nar.bytes);
-            assert_eq!(actual, nar.hash);
+            let actual = NarHash::from_bytes(nar.bytes());
+            assert_eq!(&actual, nar.hash());
         }
     }
 
@@ -405,7 +405,7 @@ mod tests {
             b"hello-nar".to_vec(),
         );
         DrvBuildController::ingest(&cache, &result).await.unwrap();
-        let nar = cache.get_nar(&result.nars[0].hash).await.unwrap();
+        let nar = cache.get_nar(result.nars[0].hash()).await.unwrap();
         assert!(nar.is_some());
         let list = cache.list_realisations(&drv.drv_hash).await.unwrap();
         assert_eq!(list.len(), 1);
@@ -424,7 +424,7 @@ mod tests {
         assert_eq!(r.realisations[0].drv_hash, drv_hash);
         assert_eq!(r.realisations[0].output_name, "out");
         assert_eq!(r.nars.len(), 1);
-        assert_eq!(r.realisations[0].nar_hash.as_ref(), Some(&r.nars[0].hash));
+        assert_eq!(r.realisations[0].nar_hash.as_ref(), Some(r.nars[0].hash()));
     }
 
     #[test]

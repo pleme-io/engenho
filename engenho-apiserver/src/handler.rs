@@ -1191,8 +1191,9 @@ impl ResourceHandler for StoreBackedHandler {
         // so a point at or below `current` is still servable when
         // `watch_from` registers. The opposite race, a write landing in
         // between, refuses a watch that just became servable, which costs
-        // that client one relist. Checking under the store's own registration
-        // lock would close even that; the store does not offer it yet.
+        // that client one relist. The store also judges "ahead" under its own
+        // registration lock (store T3.9a-lock), so a rewind between this read
+        // and the registration is refused there, through the same mapping.
         if let Some(refusal) = WatchRefusal::ahead_of(from, current) {
             return Ok(WatchStart::Refused(refusal));
         }
@@ -1222,8 +1223,8 @@ impl ResourceHandler for StoreBackedHandler {
         // condition that is not a compaction.
         match self.store.watch_from(opts).await {
             Ok(stream) => Ok(WatchStart::Streaming(stream)),
-            Err(gone) => match Compacted::try_from(gone) {
-                Ok(compacted) => Ok(WatchStart::Refused(WatchRefusal::from(compacted))),
+            Err(gone) => match WatchRefusal::from_watch_gone(gone) {
+                Ok(refusal) => Ok(WatchStart::Refused(refusal)),
                 Err(other) => Err(ApiError::StorageError(other.to_string())),
             },
         }

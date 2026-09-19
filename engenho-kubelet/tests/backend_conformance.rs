@@ -633,7 +633,7 @@ fn evaluate_refusal(kind: KubeletBackendKind, names: &[CriGap]) -> Verdict {
         held: Vec::new(),
         broke: Violation::new(Clause::Refusal, observed),
     };
-    let Some(refused) = kind.refusal() else {
+    let Some(refused) = engenho_kubelet::config_bridge::construction_refusal(kind) else {
         let built = make_container_runtime(kind, None).map(|rt| rt.name());
         return violates(format!(
             "`{}` is no longer refused (the constructor gives {built:?}); give it a Runs row",
@@ -671,7 +671,7 @@ fn evaluate_refusal(kind: KubeletBackendKind, names: &[CriGap]) -> Verdict {
 }
 
 async fn evaluate_contract(kind: KubeletBackendKind, contract: Contract) -> Verdict {
-    if let Some(refused) = kind.refusal() {
+    if let Some(refused) = engenho_kubelet::config_bridge::construction_refusal(kind) {
         return Verdict::Violates {
             held: Vec::new(),
             broke: Violation::new(
@@ -1188,7 +1188,8 @@ fn a_violation_fails_the_matrix_whether_or_not_its_backend_is_required() {
 
 #[test]
 fn a_refusal_or_a_conforming_row_fails_nothing() {
-    let refused = KubeletBackendKind::Cri.refusal().expect("cri is refused");
+    let refused = engenho_kubelet::config_bridge::construction_refusal(KubeletBackendKind::Cri)
+        .expect("cri is refused");
     let results = [
         (KubeletBackendKind::Cri, Verdict::Refused(refused)),
         (

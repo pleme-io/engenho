@@ -150,7 +150,10 @@ impl Roceiro for BuildBackendRoceiro {
 mod tests {
     use super::*;
     use crate::drv_build::FakeBuildBackend;
-    use engenho_substrate::{FakeVerifier, MemoryDerivationCache, Verificacao, WorkloadShape};
+    use engenho_substrate::{
+        FakeOutcome, FakeVerifier, MemoryDerivationCache, Verificacao, VerificacaoKind,
+        WorkloadShape,
+    };
 
     fn n(b: u8) -> NodeId {
         NodeId::new([b; 32])
@@ -168,8 +171,10 @@ mod tests {
         Arc::new(MemoryDerivationCache::new())
     }
 
+    /// A verifier that passes every predicate kind, said out loud: an
+    /// unconfigured `FakeVerifier` refuses (T5.6).
     fn arc_verifier() -> Arc<dyn Verifier> {
-        Arc::new(FakeVerifier::new())
+        Arc::new(FakeVerifier::passing(VerificacaoKind::ALL))
     }
 
     #[tokio::test]
@@ -195,14 +200,33 @@ mod tests {
 
     #[tokio::test]
     async fn verifier_failure_surfaces_as_verification_denied() {
-        let v = Arc::new(FakeVerifier::new());
-        v.set_policy("hash_equality", false).await;
+        let v = Arc::new(FakeVerifier::passing(VerificacaoKind::ALL));
+        v.pin(VerificacaoKind::HashEquality, FakeOutcome::Deny)
+            .await;
         let mut st = stage("x");
         st.verify.push(Verificacao::HashEquality {
             expected: engenho_substrate::NarHash::from_bytes(b"x"),
         });
         let r =
             BuildBackendRoceiro::default_named(arc_build(), arc_cache(), v as Arc<dyn Verifier>);
+        let err = r.materialize(&st, n(1)).await.unwrap_err();
+        assert_eq!(err.kind(), "verification_denied");
+    }
+
+    /// ★ T5.6: a stage carrying a predicate the verifier was never told
+    /// how to answer is denied; no receipt is issued for a check that did
+    /// not run.
+    #[tokio::test]
+    async fn an_unconfigured_verifier_denies_a_stage_with_predicates() {
+        let mut st = stage("x");
+        st.verify.push(Verificacao::HashEquality {
+            expected: engenho_substrate::NarHash::from_bytes(b"x"),
+        });
+        let r = BuildBackendRoceiro::default_named(
+            arc_build(),
+            arc_cache(),
+            Arc::new(FakeVerifier::new()) as Arc<dyn Verifier>,
+        );
         let err = r.materialize(&st, n(1)).await.unwrap_err();
         assert_eq!(err.kind(), "verification_denied");
     }
@@ -231,10 +255,9 @@ mod tests {
 
     #[tokio::test]
     async fn no_verify_predicates_skips_verifier() {
-        // Verifier set to deny everything — but stage has no
+        // Verifier refuses everything (nothing pinned) — but stage has no
         // Verificacao entries, so no calls.
         let v = Arc::new(FakeVerifier::new());
-        v.set_policy("hash_equality", false).await;
         let r = BuildBackendRoceiro::default_named(
             arc_build(),
             arc_cache(),
@@ -248,7 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_verify_predicates_all_evaluated() {
-        let v = Arc::new(FakeVerifier::new());
+        let v = Arc::new(FakeVerifier::passing(VerificacaoKind::ALL));
         let mut st = stage("x");
         st.verify.push(Verificacao::HashEquality {
             expected: engenho_substrate::NarHash::from_bytes(b"a"),

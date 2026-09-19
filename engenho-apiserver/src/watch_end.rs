@@ -190,6 +190,18 @@ impl WatchProgress {
                 requested,
                 compacted,
             })),
+            WatchGone::AheadOfStore { .. } => {
+                match crate::watch_start::WatchRefusal::from_watch_gone(gone.clone()) {
+                    Ok(refusal) => AfterGone::End(WatchEnd::Refused(refusal)),
+                    // Unreachable: the store reports AheadOfStore only when
+                    // requested > current, which is exactly what makes the
+                    // mapping a refusal. Were they ever to disagree, the 429
+                    // re-watches the same point rather than inventing a 410.
+                    Err(_) => {
+                        AfterGone::End(WatchEnd::NoProgress(NoProgress { start: self.start }))
+                    }
+                }
+            }
             WatchGone::Overflow { last_seen, .. } => {
                 // Where the client resumes once the watch closes: at
                 // `last_seen` when a bookmark tells it so, otherwise at the
@@ -267,6 +279,9 @@ pub enum WatchEnd {
     /// Overflowed with nothing newer than the stream's opening revision in
     /// the buffer: `ERROR 429 TooManyRequests` with `retryAfterSeconds`.
     NoProgress(NoProgress),
+    /// A re-registration the store refused (a resume point past a store that
+    /// was rewound meanwhile): the same in-band 410 a refused start sends.
+    Refused(crate::watch_start::WatchRefusal),
 }
 
 impl WatchEnd {
@@ -284,6 +299,7 @@ impl WatchEnd {
                 .bookmark
                 .then(|| bookmark_line(progressed.resume, gvk, false)),
             Self::NoProgress(no_progress) => Some(no_progress.status_line()),
+            Self::Refused(refusal) => Some(refusal.status_line()),
         }
     }
 }
@@ -327,7 +343,7 @@ impl TryFrom<WatchGone> for Compacted {
                 requested,
                 compacted,
             }),
-            other @ WatchGone::Overflow { .. } => Err(other),
+            other @ (WatchGone::Overflow { .. } | WatchGone::AheadOfStore { .. }) => Err(other),
         }
     }
 }
@@ -507,9 +523,38 @@ mod tests {
                         AfterGone::End(WatchEnd::Compacted(c)) => {
                             panic!("an overflow is never a compaction: {c:?}")
                         }
+                        AfterGone::End(WatchEnd::Refused(r)) => {
+                            panic!("an overflow is never a refusal: {r:?}")
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// A re-registration after an overflow can meet a store that was rewound
+    /// meanwhile. The store refuses it under its lock; the watch then ends
+    /// with the same in-band 410 a refused start sends, never a 429 that would
+    /// have the client re-watch a revision the store has not reached.
+    #[test]
+    fn a_rewound_store_ends_the_watch_with_the_refusal() {
+        let progress = WatchProgress::new(Revision(10), false);
+        let gone = WatchGone::AheadOfStore {
+            requested: Revision(12),
+            current: Revision(3),
+        };
+        match progress.after(&gone) {
+            AfterGone::End(WatchEnd::Refused(refusal)) => {
+                let line = refusal.status_line();
+                let json: serde_json::Value =
+                    serde_json::from_slice(&line[..line.len() - 1]).expect("one NDJSON line");
+                assert_eq!(json["object"]["code"], 410);
+                assert_eq!(
+                    json["object"]["message"],
+                    "Too large resource version: 12, current: 3"
+                );
+            }
+            other => panic!("expected the in-band refusal, got {other:?}"),
         }
     }
 

@@ -324,9 +324,15 @@ impl EtcdWatchStore for MeshEtcdStore {
                 });
             }
         };
+        // etcd's `start_revision` ahead of the store WAITS for it. The store
+        // refuses a resume point past its revision (T3.9a-lock: right for a
+        // Kubernetes watch, whose client relists), so an ahead start registers
+        // at the store's own revision and the feed's `after` filter drops the
+        // changes before the requested start.
+        let from = after.min(current);
         let stream = store
             .watch_from(WatchOpts {
-                from: after,
+                from,
                 buffer: FEED_BUFFER,
                 // etcd sends no unsolicited progress markers; a bookmark
                 // would only be skipped on the way out.
@@ -396,6 +402,14 @@ fn watch_end(gone: &WatchGone) -> WatchEnd {
         },
         WatchGone::Overflow { last_seen, .. } => WatchEnd::Overflow {
             last_seen: wire_revision(last_seen),
+        },
+        // Reachable only when the store is rewound (a restore, a snapshot
+        // install) between the facade's read of `current` and the
+        // registration, since the facade never registers past that read. The
+        // client re-watches from the store's revision instead of waiting on
+        // a revision the store has gone back below.
+        WatchGone::AheadOfStore { current, .. } => WatchEnd::Overflow {
+            last_seen: wire_revision(current),
         },
     }
 }

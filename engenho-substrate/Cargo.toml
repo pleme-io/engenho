@@ -16,7 +16,7 @@ description = "engenho-substrate — the substrate leaf: every module a shipped 
 # The tokio-free core. Re-exported whole from lib.rs. The path + version
 # pair is what `[workspace.dependencies]` would hold; it lives here until
 # the root manifest lists the substrate family.
-engenho-substrate-core = { path = "../engenho-substrate-core", version = "0.53.118" }
+engenho-substrate-core = { workspace = true }
 async-trait        = { workspace = true }
 futures            = { workspace = true }
 thiserror          = { workspace = true }

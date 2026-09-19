@@ -61,7 +61,7 @@
 //! it can reach a stream.
 
 use bytes::Bytes;
-use engenho_store::{Revision, WatchStream};
+use engenho_store::{Revision, WatchGone, WatchStream};
 
 use crate::error::status_object;
 use crate::params::{ResumePoint, TooLargeResourceVersion, error_line};
@@ -129,6 +129,33 @@ impl WatchRefusal {
     }
 }
 
+impl WatchRefusal {
+    /// The refusal for the store's own verdict at registration, or the
+    /// verdict back when it is not a refusal.
+    ///
+    /// Two verdicts refuse a watch: history below the compaction floor, and a
+    /// resume point past the store's revision. The store judges the second
+    /// under the lock its registration holds, so a rewind (a restore, a
+    /// snapshot install) between the handler's own read and the attachment is
+    /// still refused rather than served. The ahead case goes through
+    /// [`Self::ahead_of`], the one comparison, so the store and the handler
+    /// cannot disagree about what "ahead" means. An overflow is not a refusal
+    /// and comes back unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The verdict itself, when it is not a refusal.
+    pub fn from_watch_gone(gone: WatchGone) -> Result<Self, WatchGone> {
+        match gone {
+            WatchGone::CompactedTooOld { .. } => Compacted::try_from(gone).map(Self::from),
+            WatchGone::AheadOfStore { requested, current } => {
+                Self::ahead_of(ResumePoint::At(requested), current).ok_or(gone)
+            }
+            WatchGone::Overflow { .. } => Err(gone),
+        }
+    }
+}
+
 impl From<Compacted> for WatchRefusal {
     fn from(compacted: Compacted) -> Self {
         Self(Refusal::Compacted(compacted))
@@ -145,6 +172,36 @@ mod tests {
         let bytes = refusal.status_line();
         assert_eq!(bytes.last(), Some(&b'\n'), "one NDJSON line");
         serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap()
+    }
+
+    /// The store's own ahead-of verdict, judged under its registration lock,
+    /// ends the watch exactly as the handler's pre-read does: an in-band 410
+    /// with upstream's text.
+    #[test]
+    fn the_stores_ahead_verdict_is_the_same_in_band_410() {
+        let gone = WatchGone::AheadOfStore {
+            requested: Revision(9999),
+            current: Revision(8),
+        };
+        let refusal = WatchRefusal::from_watch_gone(gone).expect("ahead of the store is a refusal");
+        let line = line_json(&refusal);
+        assert_eq!(line["type"], "ERROR");
+        assert_eq!(line["object"]["code"], 410);
+        assert_eq!(line["object"]["reason"], "Expired");
+        assert_eq!(
+            line["object"]["message"],
+            "Too large resource version: 9999, current: 8"
+        );
+    }
+
+    /// An overflow is not a refusal: it comes back for `watch_end` to decide.
+    #[test]
+    fn an_overflow_is_not_a_refusal() {
+        let gone = WatchGone::Overflow {
+            capacity: 2,
+            last_seen: Revision(5),
+        };
+        assert_eq!(WatchRefusal::from_watch_gone(gone.clone()), Err(gone));
     }
 
     #[test]

@@ -26,26 +26,39 @@
 //!
 //! ## The PipelineConfig
 //!
-//! Single typed value the operator constructs. Defaults match what
-//! the bootstrap cluster uses (FakeRoceiro + MemoryLedger + Static
-//! resolver with one node). Production overrides toggle each.
+//! Single typed value the operator constructs. The materializer is
+//! always named: `RoceiroChoice` has no default, so a pipeline that
+//! would confirm stages through `FakeRoceiro` says so at the call site
+//! (`PipelineConfig::minimal`). There is no bootstrap helper that wires
+//! a verifier nobody configured (T5.6).
 
 use std::sync::Arc;
 
 use engenho_store::StoreMesh;
 use engenho_substrate::{
-    BroadcastLedger, DerivationCacheBackend, FakeVerifier, GossipBroadcaster, GossipLedger,
-    MaterializationLedger, MemoryDerivationCache, MemoryLedger, NodeId, Verifier,
+    BroadcastLedger, DerivationCacheBackend, GossipBroadcaster, GossipLedger,
+    MaterializationLedger, MemoryLedger, NodeId, Verifier,
 };
 
 use crate::build_backend_roceiro::BuildBackendRoceiro;
-use crate::drv_build::{BuildBackend, FakeBuildBackend};
+use crate::drv_build::BuildBackend;
 use crate::plantio::{NodeResolver, PlantioController, StaticNodeResolver};
 use crate::roceiro::{FakeRoceiro, Roceiro};
 use crate::store_ledger::StoreBackedLedger;
 use crate::store_resolver::StoreBackedNodeResolver;
 
-/// Which materializer to wire.
+/// Which materializer to wire. No `Default`: a fake materializer is
+/// chosen by name or not at all.
+///
+/// ```compile_fail
+/// // T5.6: there is no default materializer to fall back on.
+/// let _ = engenho_controllers::RoceiroChoice::default();
+/// ```
+///
+/// ```compile_fail
+/// // T5.6: nor a bootstrap helper wiring a verifier nobody configured.
+/// use engenho_controllers::bootstrap_pipeline;
+/// ```
 pub enum RoceiroChoice {
     /// Deterministic fake — for tests + bootstrap.
     Fake,
@@ -62,12 +75,6 @@ pub enum RoceiroChoice {
     },
     /// Operator-supplied custom Roceiro.
     Custom(Arc<dyn Roceiro>),
-}
-
-impl Default for RoceiroChoice {
-    fn default() -> Self {
-        Self::Fake
-    }
 }
 
 /// Which ledger backend + wrappers to apply.
@@ -246,33 +253,6 @@ impl PlantioPipeline {
     }
 }
 
-/// Helper: the typical bootstrap stack — FakeBuildBackend +
-/// MemoryDerivationCache + FakeVerifier composed into a
-/// BuildBackendRoceiro, plus Broadcast wrapper. Useful for
-/// integration tests + first-boot single-node clusters.
-#[must_use]
-pub fn bootstrap_pipeline(store: Arc<StoreMesh>, nodes: Vec<NodeId>) -> PlantioPipeline {
-    let build: Arc<dyn BuildBackend> = Arc::new(FakeBuildBackend::new());
-    let cache: Arc<dyn DerivationCacheBackend> = Arc::new(MemoryDerivationCache::new());
-    let verifier: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());
-    let config = PipelineConfig {
-        store,
-        roceiro: RoceiroChoice::BuildBackend {
-            build,
-            cache,
-            verifier,
-        },
-        ledger: LedgerChoice::Memory,
-        ledger_wrappers: LedgerWrappers {
-            broadcast: true,
-            gossip: None,
-        },
-        resolver: NodeResolverChoice::Static(nodes),
-        namespace: None,
-    };
-    PlantioPipeline::build(config)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,14 +263,6 @@ mod tests {
         let w = LedgerWrappers::default();
         assert!(!w.broadcast);
         assert!(w.gossip.is_none());
-    }
-
-    #[test]
-    fn roceiro_choice_defaults_fake() {
-        match RoceiroChoice::default() {
-            RoceiroChoice::Fake => {}
-            _ => panic!("default should be Fake"),
-        }
     }
 
     #[test]
