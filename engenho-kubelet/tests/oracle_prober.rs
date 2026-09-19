@@ -68,9 +68,9 @@ use engenho_kubelet::lifecycle::Termination;
 use engenho_kubelet::{
     ContainerObservation, ContainerProbes, ContainerRuntime, ContainerStatus, ExecOutcome,
     FakeBackend, FakeExecFault, FakeNetProber, HttpProbeTarget, KubeletError, LogOptions,
-    NetProber, PodLifecycle, ProbeHandler, ProbeIoError, ProbeKind, ProbeObservation,
-    ProbeRuntime, ProbeSetupStage, ProbeSpec, ProbeTarget, ProbeUrl, Readoption, RestartPolicy,
-    TcpProbeTarget, TokioNetProber, TripKind, aggregate_container_readiness, container_started,
+    NetProber, PodLifecycle, ProbeHandler, ProbeIoError, ProbeKind, ProbeObservation, ProbeRuntime,
+    ProbeSetupStage, ProbeSpec, ProbeTarget, ProbeUrl, Readoption, RestartPolicy, TcpProbeTarget,
+    TokioNetProber, TripKind, aggregate_container_readiness, container_started,
     fold_probe_observation, http_status_observation, run_handler,
 };
 use engenho_oracle::{Answer, Case, Deviation, OutOfScope, Table, Vector, run};
@@ -470,7 +470,11 @@ async fn prober_result_handling_agrees_with_upstream() {
     assert_eq!(report.deviations, DEVIATIONS.len());
     let declared: BTreeSet<(String, String)> = PARTIAL
         .iter()
-        .flat_map(|p| p.rows.iter().map(|row| ((*row).to_owned(), p.key.to_owned())))
+        .flat_map(|p| {
+            p.rows
+                .iter()
+                .map(|row| ((*row).to_owned(), p.key.to_owned()))
+        })
         .collect();
     let undeclared: Vec<_> = unanswered.difference(&declared).collect();
     let now_answered: Vec<_> = declared.difference(&unanswered).collect();
@@ -1548,7 +1552,11 @@ async fn exec_probe(case: &Case) -> Answer {
         let (obs, attempts) = rig.run_counted(&spec).await;
         labels.push(label(obs, None));
         errors.push(is_error(obs));
-        effects.push(worker_effect(&case.expected["worker_effect"], attempts, obs));
+        effects.push(worker_effect(
+            &case.expected["worker_effect"],
+            attempts,
+            obs,
+        ));
     }
     project(
         &case.expected,
@@ -1711,7 +1719,11 @@ async fn http_probe(case: &Case) -> Answer {
         labels.push(label(obs, status));
         errors.push(is_error(obs));
         results.push(kubelet_result(obs));
-        effects.push(worker_effect(&case.expected["worker_effect"], attempts, obs));
+        effects.push(worker_effect(
+            &case.expected["worker_effect"],
+            attempts,
+            obs,
+        ));
     }
     project(
         &case.expected,
