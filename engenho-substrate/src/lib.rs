@@ -22,6 +22,8 @@
 //!   * [`freshness`] — the pure judges health is derived from:
 //!     `Freshness{NeverObserved, Fresh, Stale}` for one observation and
 //!     `Liveness{Unknown, Alive, Stalled, Dead}` for one child
+//!   * [`owned_task`] — `OwnedTask`, a spawned task one value owns and stops
+//!     by request-then-await, reporting a typed `TaskStop`
 
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
@@ -51,6 +53,7 @@ pub mod mirante;
 pub mod named;
 pub mod oci_renderer;
 pub mod orcamento;
+pub mod owned_task;
 pub mod pesquisa;
 pub mod promotion;
 pub mod provacao;
@@ -107,6 +110,7 @@ pub use mirante::{
 pub use named::Named;
 pub use oci_renderer::{OciDestReader, OciDestRef, OciImageRenderer, OciSourceRef};
 pub use orcamento::{Budget, BudgetError, BudgetSnapshot};
+pub use owned_task::{OwnedTask, StopSignal, TaskStop};
 pub use pesquisa::{
     Aptidao, Arquivo, Ensaio, EnsaioId, Evidence, FakeFitness, FakeSearchSpace, Fitness,
     FitnessError, Geracao, GeracaoId, Linhagem, NicheKey, PesquisaError, SearchEngine, SearchId,

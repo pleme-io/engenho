@@ -334,6 +334,32 @@ pub trait FaceWatchStream: Send + 'static {
     /// Returns transport errors from the underlying watch
     /// connection (network failure, decode failure, etc.).
     fn next_event(&mut self) -> Result<Option<FaceWatchEvent>, FaceError>;
+
+    /// Wait at most `within` for the next event.
+    ///
+    /// The bounded twin of [`next_event`](Self::next_event), for a consumer
+    /// that must stay stoppable: a pump that only ever calls `next_event`
+    /// cannot notice a stop request until the next event arrives, which may
+    /// be never. Required rather than defaulted, because the only default
+    /// available would ignore `within` and block anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport errors from the underlying watch connection, as
+    /// `next_event` does.
+    fn poll_event(&mut self, within: std::time::Duration) -> Result<WatchPoll, FaceError>;
+}
+
+/// What one bounded wait on a [`FaceWatchStream`] saw. Three outcomes, three
+/// variants: "nothing yet" is never reported as "the stream ended".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchPoll {
+    /// An event arrived within the bound.
+    Event(FaceWatchEvent),
+    /// The stream ended (face shutdown, subscription released by the face).
+    Ended,
+    /// Nothing arrived within the bound; the stream is still open.
+    Idle,
 }
 
 /// Single event delivered through a face watch.
@@ -552,18 +578,34 @@ impl<'de> serde::Deserialize<'de> for ResourceRef {
     }
 }
 
-/// `Sync` `mpsc::Receiver`-backed watch stream. PureRaftFace
-/// fans events to channels; this stream pulls from one channel.
-struct MpscWatchStream {
+/// The one `std::sync::mpsc::Receiver`-backed watch stream. The in-memory
+/// face store fans each event to one channel per subscriber, and the
+/// federation fan-in merges members onto one channel; both hand the reader
+/// end out as this.
+pub(crate) struct MpscWatchStream {
     rx: std::sync::mpsc::Receiver<FaceWatchEvent>,
+}
+
+impl MpscWatchStream {
+    pub(crate) fn new(rx: std::sync::mpsc::Receiver<FaceWatchEvent>) -> Self {
+        Self { rx }
+    }
 }
 
 impl FaceWatchStream for MpscWatchStream {
     fn next_event(&mut self) -> Result<Option<FaceWatchEvent>, FaceError> {
         match self.rx.recv() {
             Ok(event) => Ok(Some(event)),
-            // Sender side dropped (face shutdown / GC) — stream end.
-            Err(_) => Ok(None),
+            // Every sender dropped (face shutdown / GC) — stream end.
+            Err(std::sync::mpsc::RecvError) => Ok(None),
+        }
+    }
+
+    fn poll_event(&mut self, within: std::time::Duration) -> Result<WatchPoll, FaceError> {
+        match self.rx.recv_timeout(within) {
+            Ok(event) => Ok(WatchPoll::Event(event)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(WatchPoll::Idle),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(WatchPoll::Ended),
         }
     }
 }

@@ -38,9 +38,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::Cluster;
-use crate::face::{
-    FaceError, FaceWatchEvent, FaceWatchEventKind, FaceWatchStream, ResourceFormat, ResourceRef,
-};
+use crate::face::{FaceError, FaceWatchStream, MpscWatchStream, ResourceFormat, ResourceRef};
 
 // ─────────────────────────────────────────────────────────────────
 // RoutingPolicy — how verbs dispatch across members
@@ -387,20 +385,7 @@ impl FederatedFabric {
         {
             return Err(FederationError::Member(idx, e));
         }
-        Ok(Box::new(FederatedWatchStream { rx }))
-    }
-}
-
-struct FederatedWatchStream {
-    rx: std::sync::mpsc::Receiver<FaceWatchEvent>,
-}
-
-impl FaceWatchStream for FederatedWatchStream {
-    fn next_event(&mut self) -> Result<Option<FaceWatchEvent>, FaceError> {
-        match self.rx.recv() {
-            Ok(ev) => Ok(Some(ev)),
-            Err(_) => Ok(None),
-        }
+        Ok(Box::new(MpscWatchStream::new(rx)))
     }
 }
 
