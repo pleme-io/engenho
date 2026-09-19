@@ -772,6 +772,10 @@ struct FakeState {
     /// status at all on a total start failure shipped. A fake that can only
     /// succeed cannot prove what happens when reality refuses.
     seeded_start_failures: BTreeMap<String, String>,
+    /// Every `start` call per CONTAINER NAME, failed ones included. The
+    /// operations log records only starts that happened, so without this a
+    /// start retried in a hot loop against a seeded failure left no trace.
+    start_attempts: BTreeMap<String, usize>,
     /// Container NAMES whose every `exec` misbehaves at the RUNTIME level
     /// rather than answering with an exit code. Seeded via
     /// [`FakeBackend::seed_exec_fault`]. Takes precedence over the exec queue.
@@ -951,6 +955,18 @@ impl FakeBackend {
             .insert(container_name.to_string(), message.into());
     }
 
+    /// How many times `start` was called for `container_name`, whether it
+    /// succeeded or not.
+    pub async fn start_attempts(&self, container_name: &str) -> usize {
+        self.inner
+            .lock()
+            .await
+            .start_attempts
+            .get(container_name)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// `start` succeeds for `container_name` again — the cause of a
     /// [`FakeBackend::seed_start_failure`] was fixed.
     pub async fn clear_start_failure(&self, container_name: &str) {
@@ -1084,6 +1100,7 @@ impl ContainerRuntime for FakeBackend {
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
         let mut state = self.inner.lock().await;
+        *state.start_attempts.entry(spec.name.clone()).or_default() += 1;
         // A seeded start failure short-circuits BEFORE any state mutation, so
         // a failed start leaves no container, no id, and no log — exactly as a
         // real spawn failure does.
@@ -2474,6 +2491,10 @@ impl NetProber for FakeNetProber {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests of the runtime itself call its start directly"
+)]
 mod tests {
     use super::*;
 

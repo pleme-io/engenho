@@ -12,6 +12,11 @@
 //! skipped end-to-end test is how a runtime comes to have no end-to-end
 //! coverage at all.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "drives the native runtime directly; no kubelet in the loop"
+)]
+
 use engenho_kubelet::backend::{ContainerRuntime, ContainerSpec, LogOptions, PodIdentity};
 use engenho_kubelet::cri::{ExitDisposition, RunState};
 use engenho_kubelet::native_backend::{Isolation, NativeBackend};

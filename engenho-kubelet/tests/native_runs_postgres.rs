@@ -18,6 +18,11 @@
 //! `pg_ctl` returns 1 and `psql` reports "Unix-domain socket path ... is too
 //! long". Hence `/tmp/eng-pg-*` rather than a nested temp dir.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "drives the native runtime directly; no kubelet in the loop"
+)]
+
 use engenho_kubelet::backend::{ContainerRuntime, ContainerSpec, LogOptions, PodIdentity};
 use engenho_kubelet::native_backend::{Isolation, NativeBackend};
 use engenho_kubelet::pod_volume::{MountSource, ResolvedMount};

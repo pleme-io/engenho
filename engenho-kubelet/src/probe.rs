@@ -1638,6 +1638,10 @@ mod probe_address {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "starts a FakeBackend container to probe; no kubelet in the loop"
+)]
 mod blind {
     //! T1.1: a restart needs an OBSERVED failure. Blind runs move no counter,
     //! trip nothing, and hand back the verdict that was already latched.

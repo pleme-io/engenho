@@ -647,6 +647,10 @@ unsafe extern "C" {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests of the runtime itself call its start directly"
+)]
 mod tests {
     use super::*;
     use crate::backend::PodIdentity;

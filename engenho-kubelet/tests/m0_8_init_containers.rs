@@ -765,14 +765,18 @@ async fn a_sidecar_after_the_last_regular_init_container_lets_the_apps_start() {
 
 /// A sidecar gates the app containers until it has STARTED (KEP-753): if its
 /// start fails, no app container starts, the pod stays Pending and
-/// uninitialized, and the sidecar is retried — once it can start, the app
-/// containers follow. Starting the apps regardless, or latching init as done
-/// over a sidecar that never ran, would each strand the pod a different way.
+/// uninitialized, and the sidecar is retried on its start curve — once it can
+/// start, the app containers follow. Starting the apps regardless, or latching
+/// init as done over a sidecar that never ran, would each strand the pod a
+/// different way; retrying it on every tick is the hot loop the curve exists
+/// to stop.
 #[tokio::test]
 async fn an_app_container_never_starts_before_its_sidecar_has_started() {
     let store = boot_store().await;
     let backend = Arc::new(FakeBackend::new());
-    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    let clock = engenho_kubelet::kubelet::TestClock::new();
+    let kubelet =
+        Kubelet::new(store.clone(), backend.clone(), "node-A").with_clock(clock.as_clock());
     backend
         .seed_start_failure("default_p12_init-proxy", "image not known")
         .await;
@@ -802,8 +806,16 @@ async fn an_app_container_never_starts_before_its_sidecar_has_started() {
         Some("False")
     );
 
-    // The cause is fixed: the sidecar is retried, then the app follows.
+    assert_eq!(
+        backend.start_attempts("default_p12_init-proxy").await,
+        1,
+        "three ticks inside the 10s the failure earned attempt the sidecar once"
+    );
+
+    // The cause is fixed: once the curve allows, the sidecar is retried and
+    // the app follows.
     backend.clear_start_failure("default_p12_init-proxy").await;
+    clock.advance(std::time::Duration::from_secs(10));
     kubelet.tick().await.unwrap();
     let ev = backend.events().await;
     assert_eq!(

@@ -36,7 +36,7 @@
 //! A Pod's container is started exactly ONCE across its lifetime —
 //! membership in `local` is the guard, never `phase == Running`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -209,6 +209,28 @@ impl Polled {
     }
 }
 
+/// The logical name of `spec.<key>[i]`: its `name`, else the positional
+/// fallback every path agrees on ([`PositionalName`]), so a status name, a
+/// record key and a manifest lookup name the same container.
+fn logical_container_name(i: usize, c: &Value) -> String {
+    match c.get("name").and_then(Value::as_str) {
+        Some(name) => name.to_string(),
+        None => PositionalName(i).to_string(),
+    }
+}
+
+/// The name of an unnamed container: `main` first, `container-<i>` after.
+struct PositionalName(usize);
+
+impl std::fmt::Display for PositionalName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => f.write_str("main"),
+            i => write!(f, "container-{i}"),
+        }
+    }
+}
+
 /// What [`Kubelet::readopt`] decided for a pod with no local record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Readopted {
@@ -286,6 +308,76 @@ impl std::fmt::Display for Unseen {
             f,
             "status poll of container {} failed ({}); pod status withheld this tick",
             self.container, self.cause
+        )
+    }
+}
+
+/// A start the runtime refused, and what it cost on that container's start
+/// curve ([`crate::backoff::StartLedger`]).
+struct LaunchFailed {
+    cause: KubeletError,
+    cost: crate::backoff::StartFailed,
+}
+
+impl std::fmt::Display for LaunchFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (failed start {} in a row; next attempt in {}s)",
+            self.cause,
+            self.cost.consecutive_failures,
+            self.cost.next_attempt_in.as_secs()
+        )
+    }
+}
+
+/// What one attempt to replace a container came to ([`Kubelet::restart_container`]).
+enum Relaunch {
+    /// The replacement is up.
+    Started(crate::backend::ContainerStatus),
+    /// The container's start curve still owes a wait after a failed start.
+    /// Nothing was touched: the old container was neither stopped nor
+    /// removed, and no start was attempted.
+    Held(crate::backoff::StartHeld),
+    /// The runtime refused the replacement. The old container was already
+    /// stopped and removed to free its name.
+    Failed(LaunchFailed),
+}
+
+/// The event text for a container that could not be started.
+///
+/// The runtime's error goes in verbatim: the reason a container did not
+/// start IS the diagnostic.
+struct FailedToStart<'a> {
+    container: &'a str,
+    cause: &'a KubeletError,
+}
+
+impl std::fmt::Display for FailedToStart<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to start container {}: {}",
+            self.container, self.cause
+        )
+    }
+}
+
+/// The event text for a container held off before its next start.
+struct BackOffRestarting<'a> {
+    container: &'a str,
+    remaining: Duration,
+    prior_restarts: u32,
+}
+
+impl std::fmt::Display for BackOffRestarting<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Back-off restarting failed container {} ({}s remaining, {} prior restarts)",
+            self.container,
+            self.remaining.as_secs(),
+            self.prior_restarts
         )
     }
 }
@@ -519,12 +611,14 @@ pub struct Kubelet {
     /// deterministic probe-cadence tests via [`Kubelet::with_clock`]).
     clock: Clock,
     /// Consecutive FAILED start attempts per (pod label, container name), with
-    /// the instant of the last attempt. Feeds `backoff::decide_start`.
+    /// the instant of the last attempt: the gate every start attempt goes
+    /// through ([`Kubelet::start_permit`] then [`Kubelet::launch`]).
     ///
     /// A `ContainerRecord` only exists once a start SUCCEEDED, so it cannot
-    /// carry this: the whole point is a container that has never started. An
-    /// entry is cleared on success and when the pod goes away.
-    start_failures: Mutex<HashMap<(String, String), (u32, Instant)>>,
+    /// carry this: the whole point is a container that has never started, or
+    /// whose replacement has not. An entry is cleared on success, and a pod
+    /// no longer bound here is dropped at the top of every tick.
+    start_ledger: Mutex<crate::backoff::StartLedger>,
     /// Where lifecycle events go. Defaults to the null sink so emission is
     /// safe to add to a code path before the plumbing exists — the
     /// alternative being an `Option` check at every call site.
@@ -567,7 +661,7 @@ impl Kubelet {
             volume_materializer: Arc::new(PodmanVolumeMaterializer::new()),
             host_path_policy: crate::pod_volume::HostPathPolicy::deny_all(),
             clock: Arc::new(Instant::now),
-            start_failures: Mutex::new(HashMap::new()),
+            start_ledger: Mutex::new(crate::backoff::StartLedger::default()),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
             sa_projector: Arc::new(crate::pod_volume::NoServiceAccountProjection),
             last_lease_renewal: Mutex::new(None),
@@ -1480,17 +1574,7 @@ impl Kubelet {
             // Container logical name: spec.<key>[i].name, else a positional
             // fallback (matches the "main"/index shape so status names
             // round-trip).
-            let cname = c
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| {
-                    if i == 0 {
-                        "main".to_string()
-                    } else {
-                        format!("container-{i}")
-                    }
-                });
+            let cname = logical_container_name(i, c);
             let image = c
                 .get("image")
                 .and_then(|im| im.as_str())
@@ -1705,25 +1789,26 @@ impl Kubelet {
     /// `pod_to_container_specs` uses). Returns the raw `Value` so probe parsing
     /// reads from the same JSON-driven source as the rest of the kubelet.
     fn container_json<'a>(pod: &'a Value, cname: &str) -> Option<&'a Value> {
-        let containers = pod.get("spec")?.get("containers")?.as_array()?;
-        containers
-            .iter()
-            .enumerate()
-            .find(|(i, c)| {
-                let name = c
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| {
-                        if *i == 0 {
-                            "main".to_string()
-                        } else {
-                            format!("container-{i}")
-                        }
-                    });
-                name == cname
+        Self::container_json_in(pod, "containers", cname)
+    }
+
+    /// Whether a pod this kubelet has a record of declares an app container
+    /// the record lacks — one that has not started, or whose start failed —
+    /// and so needs the start path rather than observation alone.
+    ///
+    /// A terminal pod never does: its containers are not started again.
+    fn awaits_app_start(pod: &Value, lp: &LocalPod) -> bool {
+        if Self::pod_already_terminal(pod) {
+            return false;
+        }
+        pod.pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .is_some_and(|containers| {
+                containers
+                    .iter()
+                    .enumerate()
+                    .any(|(i, c)| !lp.containers.contains_key(&logical_container_name(i, c)))
             })
-            .map(|(_, c)| c)
     }
 
     /// Read the Pod's `spec.restartPolicy` into the typed [`RestartPolicy`].
@@ -2440,6 +2525,18 @@ impl Controller for Kubelet {
             .collect();
         report.objects_examined = bound.len();
 
+        // A pod no longer bound here takes its start penalties with it — the
+        // one place they are dropped, and it covers a pod that never started
+        // (no local record, so the cleanup below never visits it) as well as
+        // one that did.
+        {
+            let live: BTreeSet<String> = bound.keys().map(ResourceKey::label).collect();
+            self.start_ledger
+                .lock()
+                .await
+                .retain_pods(|pod| live.contains(pod));
+        }
+
         // ── (A) Delete-cleanup: local entries no longer in the bound set ──
         // A Pod we started that's absent from the freshly-listed bound set
         // was hard-deleted or its spec.nodeName moved away → orphaned on
@@ -2462,13 +2559,6 @@ impl Controller for Kubelet {
             match self.cleanup_pod_containers(&key, &lp).await {
                 Ok(()) => {
                     self.local.lock().await.remove(&key);
-                    // The pod is gone; its start penalties go with it, or
-                    // the map grows for the process's lifetime.
-                    let gone = key.label();
-                    self.start_failures
-                        .lock()
-                        .await
-                        .retain(|(pod, _), _| pod != &gone);
                     report.objects_changed += 1;
                     debug!(
                         pod = %key.label(),
@@ -2532,8 +2622,21 @@ impl Controller for Kubelet {
                     self.start_bound_pod(key, value, &mut report, &mut soonest_requeue)
                         .await?;
                 }
+                Some(lp) if Self::awaits_app_start(value, &lp) => {
+                    // ── ★ START THE MISSING, THEN OBSERVE ─────────────────
+                    // A pod with a record used to be observed only, and
+                    // observing never starts anything: a container whose
+                    // first start failed after a sibling had started was
+                    // rendered Waiting forever and never retried. The start
+                    // path starts only what the record lacks, each attempt
+                    // through that container's start curve, then observes
+                    // the whole pod the same as below.
+                    self.start_bound_pod(key, value, &mut report, &mut soonest_requeue)
+                        .await?;
+                }
                 Some(lp) => {
-                    // (C) Already started → poll + reconcile running status.
+                    // (C) Every declared container started → poll + reconcile
+                    // running status.
                     self.reconcile_running(key, value, &lp, &mut report, &mut soonest_requeue)
                         .await?;
                 }
@@ -2951,6 +3054,49 @@ impl Kubelet {
             }
         };
 
+        // ── ★ WHAT MAY START THIS TICK, DECIDED BEFORE ANY PREPARATION ──────
+        // Only a container the record lacks is started here, and only with a
+        // permit from its start curve. One whose last start failed and is
+        // still owed a wait is not attempted, and the kubelet asks to be
+        // re-ticked when the wait ends instead of hoping the next sweep lands
+        // on time. When nothing may start, the aliases, the volumes and the
+        // ServiceAccount projection below are not rebuilt just to be thrown
+        // away: the pod is observed and that is the tick.
+        let recorded: BTreeSet<String> = self
+            .local
+            .lock()
+            .await
+            .get(key)
+            .map(|lp| lp.containers.keys().cloned().collect())
+            .unwrap_or_default();
+        let mut permits: BTreeMap<String, crate::backoff::StartPermit> = BTreeMap::new();
+        for (cname, _) in &specs {
+            if recorded.contains(cname) {
+                continue;
+            }
+            match self.start_permit(key, cname).await {
+                Ok(permit) => {
+                    permits.insert(cname.clone(), permit);
+                }
+                Err(held) => {
+                    // Said out loud, at debug: a skipped attempt that logs
+                    // nothing is indistinguishable from one never reached.
+                    debug!(
+                        pod = %key.label(),
+                        container = %cname,
+                        remaining_s = held.remaining.as_secs(),
+                        consecutive_failures = held.consecutive_failures,
+                        "container start backing off; not retrying yet"
+                    );
+                    Self::accumulate_requeue(soonest_requeue, held.remaining);
+                    report.objects_skipped += 1;
+                }
+            }
+        }
+        if permits.is_empty() {
+            return self.observe_pod(key, value, report, soonest_requeue).await;
+        }
+
         // Parse the per-container probes BEFORE starting anything: a parse
         // error (no-handler / grpc / unresolved port) skips the whole pod
         // (NEVER a fake pass). Parsing here (not after start) means a bad probe
@@ -3127,18 +3273,12 @@ impl Kubelet {
         // restart, never a restart count silently reset to 0.
         let prior_runs = Self::stored_containers(value, "containerStatuses");
         for (cname, mut spec) in specs {
-            // Skip containers already started (membership guard — never a
-            // spurious restart).
-            if self
-                .local
-                .lock()
-                .await
-                .get(key)
-                .map(|lp| lp.containers.contains_key(&cname))
-                .unwrap_or(false)
-            {
+            // Only a container holding a permit starts: one already recorded
+            // never gets one (never a spurious restart), and one its curve is
+            // holding was not given one above.
+            let Some(permit) = permits.remove(&cname) else {
                 continue;
-            }
+            };
             spec.network_aliases = aliases.clone();
             spec.host_add = cluster_ip_hosts.clone();
             // (M0.7 kubelet-volumes) Map this container's `volumeMounts[]`
@@ -3188,37 +3328,10 @@ impl Kubelet {
             // loop's speed. `pitr-lab/mysql-0` declares an OCI image the
             // native backend cannot run at all, and this retried it twice a
             // second, forever, writing a log line and a status patch each
-            // time. Same curve as a crash restart — `backoff::decide_start`
-            // is the never-started half of `backoff::decide`, not a second
-            // implementation of the same 10s-doubling-to-5min shape.
-            let backoff_key = (key.label(), cname.clone());
-            let now_for_start = (self.clock)();
-            let owed = {
-                let failures = self.start_failures.lock().await;
-                match failures.get(&backoff_key) {
-                    Some((count, last)) => crate::backoff::decide_start(
-                        *count,
-                        now_for_start.saturating_duration_since(*last),
-                    ),
-                    None => crate::backoff::BackoffDecision::Restart,
-                }
-            };
-            if let crate::backoff::BackoffDecision::Wait { remaining } = owed {
-                // Said out loud, at debug: a skipped attempt that logs nothing
-                // is indistinguishable from one that was never reached.
-                debug!(
-                    pod = %key.label(),
-                    container = %cname,
-                    remaining_s = remaining.as_secs(),
-                    "container start backing off; not retrying yet"
-                );
-                report.objects_skipped += 1;
-                continue;
-            }
-
-            match self.backend.start(&spec).await {
+            // time. The permit above is the curve's say-so; `launch` records
+            // how the attempt went on the same curve.
+            match self.launch(permit, &spec).await {
                 Ok(status) => {
-                    self.start_failures.lock().await.remove(&backoff_key);
                     let started = StartedAs::of(
                         prior_runs
                             .iter()
@@ -3282,22 +3395,16 @@ impl Kubelet {
                     )
                     .await;
                 }
-                Err(e) => {
-                    let attempts = {
-                        let mut failures = self.start_failures.lock().await;
-                        let entry = failures
-                            .entry(backoff_key.clone())
-                            .or_insert((0, now_for_start));
-                        entry.0 = entry.0.saturating_add(1);
-                        entry.1 = now_for_start;
-                        entry.0
-                    };
+                Err(failed) => {
+                    // Wake when the next attempt is due, not on whatever
+                    // sweep happens to come after it.
+                    Self::accumulate_requeue(soonest_requeue, failed.cost.next_attempt_in);
                     warn!(
                         pod = %key.label(),
                         container = %cname,
-                        error = %e,
-                        consecutive_failures = attempts,
-                        next_attempt_in_s = crate::backoff::delay_for(attempts).as_secs(),
+                        error = %failed.cause,
+                        consecutive_failures = failed.cost.consecutive_failures,
+                        next_attempt_in_s = failed.cost.next_attempt_in.as_secs(),
                         "container start failed; pod remains pending"
                     );
                     // Tell the CLUSTER, not just the log.
@@ -3321,7 +3428,11 @@ impl Kubelet {
                     self.emit(
                         key,
                         engenho_controllers::event_recorder::Reason::Failed,
-                        format!("Failed to start container {cname}: {e}"),
+                        FailedToStart {
+                            container: &cname,
+                            cause: &failed.cause,
+                        }
+                        .to_string(),
                     )
                     .await;
                     report.objects_skipped += 1;
@@ -3358,6 +3469,19 @@ impl Kubelet {
                 "no container started this tick; rendering Pending/Waiting status"
             );
         }
+        self.observe_pod(key, value, report, soonest_requeue).await
+    }
+
+    /// Observe a pod after the start path: read back what is recorded now
+    /// (including what this tick started) and reconcile its status. A pod
+    /// with nothing recorded is observed as all-Waiting, i.e. `Pending`.
+    async fn observe_pod(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<(), ControllerError> {
         let lp = self
             .local
             .lock()
@@ -3366,8 +3490,7 @@ impl Kubelet {
             .cloned()
             .unwrap_or_default();
         self.reconcile_running(key, value, &lp, report, soonest_requeue)
-            .await?;
-        Ok(())
+            .await
     }
 
     /// Run the DUE probes of one running container, fold their verdicts into
@@ -3550,6 +3673,57 @@ impl Kubelet {
         });
     }
 
+    /// Leave from `cname`'s start curve to attempt a start now.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::backoff::StartHeld`] while a failed start is still owed a
+    /// wait.
+    async fn start_permit(
+        &self,
+        key: &ResourceKey,
+        cname: &str,
+    ) -> Result<crate::backoff::StartPermit, crate::backoff::StartHeld> {
+        self.start_ledger
+            .lock()
+            .await
+            .permit(&key.label(), cname, self.now())
+    }
+
+    /// ★ THE ONE PLACE A CONTAINER IS STARTED. It takes a permit, so the
+    /// curve was asked first, and it records the outcome on that same curve:
+    /// a success clears the container's penalty, a failure lengthens it.
+    ///
+    /// The first start of a pod's containers, a restart after an exit or a
+    /// probe failure, and every init container all come through here. A start
+    /// that reaches the runtime some other way skips the curve; the crate's
+    /// `clippy.toml` disallows `ContainerRuntime::start` everywhere else,
+    /// which makes such a call a lint warning, not a compile error.
+    ///
+    /// # Errors
+    ///
+    /// [`LaunchFailed`]: the runtime's error and what it cost on the curve.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one sanctioned call: it holds a permit and records the outcome"
+    )]
+    async fn launch(
+        &self,
+        permit: crate::backoff::StartPermit,
+        spec: &ContainerSpec,
+    ) -> Result<crate::backend::ContainerStatus, LaunchFailed> {
+        match self.backend.start(spec).await {
+            Ok(status) => {
+                self.start_ledger.lock().await.succeeded(permit);
+                Ok(status)
+            }
+            Err(cause) => {
+                let cost = self.start_ledger.lock().await.failed(permit);
+                Err(LaunchFailed { cause, cost })
+            }
+        }
+    }
+
     /// Restart ONE container (the existing stop→remove→start→record-update
     /// sequence used by BOTH the exit-code restart path and the liveness/
     /// startup probe restart path). Re-applies the pod-level Service aliases,
@@ -3558,8 +3732,16 @@ impl Kubelet {
     /// window), and returns the new container's status. The caller owns the
     /// `ContainerObservation` it builds from the result.
     ///
-    /// Errors from `start` are returned so the caller reports the failure +
-    /// retries next tick (never silent).
+    /// A refused start is [`Relaunch::Failed`], so the caller reports it and
+    /// retries when the container's start curve allows (never silent, never
+    /// at the sync loop's speed).
+    ///
+    /// ── ★ THE CURVE IS ASKED BEFORE THE OLD CONTAINER IS TOUCHED ─────────
+    /// A replacement whose start failed used to be retried on the very next
+    /// tick, and every tick after: the exit it replaces had long since served
+    /// its crash backoff, so nothing held the retry. Now a failed replacement
+    /// start holds the container on its start curve, and a held restart
+    /// leaves the old container exactly as it was ([`Relaunch::Held`]).
     ///
     /// ORDERING: stop THEN remove the OLD container BEFORE starting the
     /// replacement. The new container reuses the deterministic `--name`
@@ -3582,7 +3764,11 @@ impl Kubelet {
         spec: &ContainerSpec,
         old_container_id: &str,
         old_restart_count: u32,
-    ) -> Result<crate::backend::ContainerStatus, KubeletError> {
+    ) -> Relaunch {
+        let permit = match self.start_permit(key, cname).await {
+            Ok(permit) => permit,
+            Err(held) => return Relaunch::Held(held),
+        };
         let mut restart_spec = spec.clone();
         // BOTH halves — this path used to set only the aliases, which is the
         // defect `service_name_resolution` documents.
@@ -3615,7 +3801,10 @@ impl Kubelet {
         // the replacement reuse `--name`.
         let _ = self.backend.stop(old_container_id).await;
         let _ = self.backend.remove(old_container_id).await;
-        let new_status = self.backend.start(&restart_spec).await?;
+        let new_status = match self.launch(permit, &restart_spec).await {
+            Ok(status) => status,
+            Err(failed) => return Relaunch::Failed(failed),
+        };
         let new_count = old_restart_count + 1;
         let now = self.now();
         {
@@ -3632,7 +3821,7 @@ impl Kubelet {
                 rec.probes.reset(now);
             }
         }
-        Ok(new_status)
+        Relaunch::Started(new_status)
     }
 
     /// Poll one container, split into [`Polled::Running`] / [`Polled::Down`]
@@ -3758,7 +3947,7 @@ impl Kubelet {
                             )
                             .await
                         {
-                            Ok(new_status) => {
+                            Relaunch::Started(new_status) => {
                                 if let Some(ip) = &new_status.pod_ip {
                                     pod_ip.get_or_insert_with(|| ip.clone());
                                 }
@@ -3793,12 +3982,38 @@ impl Kubelet {
                                     "kubelet restarted container (probe verdict)"
                                 );
                             }
-                            Err(e) => {
+                            Relaunch::Held(held) => {
+                                // The replacement's last start failed and its
+                                // curve still owes a wait; the running
+                                // container was left alone.
+                                debug!(
+                                    pod = %key.label(),
+                                    container = %cname,
+                                    remaining_s = held.remaining.as_secs(),
+                                    "probe-driven restart backing off"
+                                );
+                                Self::accumulate_requeue(soonest_requeue, held.remaining);
+                                observations.push(ContainerObservation {
+                                    name: cname.clone(),
+                                    state: ContainerState::Running,
+                                    container_id: Some(record.container_id.clone()),
+                                    restart_count: record.restart_count,
+                                    ready: outcome.ready,
+                                    kind: crate::lifecycle::InitKind::Regular,
+                                    ever_started: true,
+                                });
+                                report.objects_skipped += 1;
+                            }
+                            Relaunch::Failed(failed) => {
+                                Self::accumulate_requeue(
+                                    soonest_requeue,
+                                    failed.cost.next_attempt_in,
+                                );
                                 warn!(
                                     pod = %key.label(),
                                     container = %cname,
-                                    error = %e,
-                                    "probe-driven restart failed; retrying next tick"
+                                    error = %failed,
+                                    "probe-driven restart failed; retrying on the start curve"
                                 );
                                 observations.push(ContainerObservation {
                                     name: cname.clone(),
@@ -3893,17 +4108,20 @@ impl Kubelet {
                         self.emit(
                             key,
                             engenho_controllers::event_recorder::Reason::BackOff,
-                            format!(
-                                "Back-off restarting failed container {cname} ({}s remaining, {} prior restarts)",
-                                remaining.as_secs(),
-                                record.restart_count
-                            ),
+                            BackOffRestarting {
+                                container: cname,
+                                remaining,
+                                prior_restarts: record.restart_count,
+                            }
+                            .to_string(),
                         )
                         .await;
                         observations.push(ContainerObservation::backing_off(
                             cname,
                             &record.container_id,
-                            backoff.waiting_reason().unwrap_or("CrashLoopBackOff"),
+                            backoff
+                                .waiting_reason()
+                                .unwrap_or(crate::backoff::CRASH_LOOP_BACK_OFF),
                             record.restart_count,
                         ));
                         continue;
@@ -3922,7 +4140,7 @@ impl Kubelet {
                             )
                             .await
                         {
-                            Ok(new_status) => {
+                            Relaunch::Started(new_status) => {
                                 if let Some(ip) = &new_status.pod_ip {
                                     pod_ip.get_or_insert_with(|| ip.clone());
                                 }
@@ -3948,14 +4166,50 @@ impl Kubelet {
                                     "kubelet restarted exited container (restartPolicy)"
                                 );
                             }
-                            Err(e) => {
+                            Relaunch::Held(held) => {
+                                // The exit has served its crash backoff, but
+                                // the replacement's last START failed and its
+                                // start curve still owes a wait. Same render
+                                // and the same event as the crash hold above.
+                                Self::accumulate_requeue(soonest_requeue, held.remaining);
+                                debug!(
+                                    pod = %key.label(),
+                                    container = %cname,
+                                    remaining_s = held.remaining.as_secs(),
+                                    consecutive_failures = held.consecutive_failures,
+                                    "replacement start backing off"
+                                );
+                                self.emit(
+                                    key,
+                                    engenho_controllers::event_recorder::Reason::BackOff,
+                                    BackOffRestarting {
+                                        container: cname,
+                                        remaining: held.remaining,
+                                        prior_restarts: record.restart_count,
+                                    }
+                                    .to_string(),
+                                )
+                                .await;
+                                observations.push(ContainerObservation::backing_off(
+                                    cname,
+                                    &record.container_id,
+                                    crate::backoff::CRASH_LOOP_BACK_OFF,
+                                    record.restart_count,
+                                ));
+                            }
+                            Relaunch::Failed(failed) => {
                                 // Restart failed — report the terminated state
-                                // this tick; next tick retries. Never silent.
+                                // this tick; the retry waits on the start
+                                // curve. Never silent.
+                                Self::accumulate_requeue(
+                                    soonest_requeue,
+                                    failed.cost.next_attempt_in,
+                                );
                                 warn!(
                                     pod = %key.label(),
                                     container = %cname,
-                                    error = %e,
-                                    "container restart failed; retrying next tick"
+                                    error = %failed,
+                                    "container restart failed; retrying on the start curve"
                                 );
                                 observations.push(ContainerObservation::terminated(
                                     cname,
@@ -4107,17 +4361,21 @@ impl Kubelet {
     /// (zero) restart count + default (empty) probe state — init containers do
     /// NOT carry probes. Returns the new container's status.
     ///
+    /// Started through [`Self::launch`], so it needs a permit from the init
+    /// container's start curve like any other start.
+    ///
     /// # Errors
     ///
-    /// Propagates a [`KubeletError::Backend`] from the runtime `start`.
+    /// [`LaunchFailed`]: the runtime refused the start.
     async fn start_init_container(
         &self,
         key: &ResourceKey,
         cname: &str,
         spec: &ContainerSpec,
         restart_count: u32,
-    ) -> Result<crate::backend::ContainerStatus, KubeletError> {
-        let status = self.backend.start(spec).await?;
+        permit: crate::backoff::StartPermit,
+    ) -> Result<crate::backend::ContainerStatus, LaunchFailed> {
+        let status = self.launch(permit, spec).await?;
         let mut local = self.local.lock().await;
         let entry = local.entry(key.clone()).or_default();
         entry.init_containers.insert(
@@ -4147,20 +4405,7 @@ impl Kubelet {
         containers
             .iter()
             .enumerate()
-            .find(|(i, c)| {
-                let name = c
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| {
-                        if *i == 0 {
-                            "main".to_string()
-                        } else {
-                            format!("container-{i}")
-                        }
-                    });
-                name == cname
-            })
+            .find(|(i, c)| logical_container_name(*i, c) == cname)
             .map(|(_, c)| c)
     }
 
@@ -4451,6 +4696,32 @@ impl Kubelet {
             .cloned()
     }
 
+    /// Leave to (re)start init container `cname` now, or `None` — said at
+    /// debug and counted as skipped — while its start curve still owes a wait.
+    /// The init sequence re-ticks every second while it is pending, so without
+    /// this a start that keeps failing is retried every second.
+    async fn init_start_permit(
+        &self,
+        key: &ResourceKey,
+        cname: &str,
+        report: &mut ReconcileReport,
+    ) -> Option<crate::backoff::StartPermit> {
+        match self.start_permit(key, cname).await {
+            Ok(permit) => Some(permit),
+            Err(held) => {
+                debug!(
+                    pod = %key.label(),
+                    container = %cname,
+                    remaining_s = held.remaining.as_secs(),
+                    consecutive_failures = held.consecutive_failures,
+                    "init container start backing off; not retrying yet"
+                );
+                report.objects_skipped += 1;
+                None
+            }
+        }
+    }
+
     /// Ensure the active init container (`index`) is started or restarted.
     ///
     ///   * Not yet recorded → start it fresh (restart_count 0).
@@ -4494,7 +4765,13 @@ impl Kubelet {
 
         match lp.init_containers.get(cname) {
             None => {
-                // Not yet started → start init[index] fresh.
+                // Not yet started → start init[index] fresh, when its start
+                // curve allows. An init container whose start keeps failing
+                // was retried on every tick, and this path re-ticks every
+                // second while init is pending.
+                let Some(permit) = self.init_start_permit(key, cname, report).await else {
+                    return Ok(None);
+                };
                 debug!(
                     pod = %key.label(),
                     container = %cname,
@@ -4502,7 +4779,10 @@ impl Kubelet {
                     image = %spec.image,
                     "kubelet starting init container"
                 );
-                match self.start_init_container(key, cname, &spec, 0).await {
+                match self
+                    .start_init_container(key, cname, &spec, 0, permit)
+                    .await
+                {
                     Ok(status) => {
                         report.objects_changed += 1;
                         Ok(status.pod_ip)
@@ -4523,12 +4803,17 @@ impl Kubelet {
                     Ok(Some(s)) if s.is_running() => Ok(s.pod_ip),
                     Ok(Some(_)) | Ok(None) => {
                         // Terminated (restartable — the sequencer said
-                        // AwaitInit for it) OR vanished → (re)start fresh.
+                        // AwaitInit for it) OR vanished → (re)start fresh,
+                        // when its start curve allows. Asked BEFORE the old
+                        // container is touched: a held restart leaves it.
+                        let Some(permit) = self.init_start_permit(key, cname, report).await else {
+                            return Ok(None);
+                        };
                         let new_count = record.restart_count + 1;
                         let _ = self.backend.stop(&record.container_id).await;
                         let _ = self.backend.remove(&record.container_id).await;
                         match self
-                            .start_init_container(key, cname, &spec, new_count)
+                            .start_init_container(key, cname, &spec, new_count, permit)
                             .await
                         {
                             Ok(status) => {
