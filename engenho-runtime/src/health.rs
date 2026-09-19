@@ -23,7 +23,7 @@
 //!
 //! | child | in flight | not in flight |
 //! |---|---|---|
-//! | tick loop (a driver) | alive until the tick is older than the stuck window, then stalled since it began | alive until the last tick ended longer ago than the idle window, then stalled since it ended |
+//! | tick loop (a driver, the node lease) | alive until the tick is older than the stuck window, then stalled since it began | alive until the last tick ended longer ago than the idle window, then stalled since it ended |
 //! | listener | serving: alive | halted, waiting to rebind: stalled since it halted |
 //!
 //! A child that has never beaten is [`Liveness::Unknown`], which no health
@@ -32,7 +32,15 @@
 //! Both windows come from ONE [`Windows`] value, built from the config and
 //! handed to the drivers too, so the tick a driver logs as BLOCKED is the
 //! tick liveness reports as stalled: the two thresholds are one value, not
-//! two constants that agree today.
+//! two constants that agree today. A driver's fallback and debounce are read
+//! off the same value, so the idle window is derived from the fallback the
+//! loop really runs on. The node lease runs on its own fallback
+//! ([`Windows::node_lease`]), and is driven and judged by that one value.
+//!
+//! One row's judgement ([`Row::liveness`]) is also what the node lease
+//! renews by: the lease is renewed only while the kubelet's row is alive
+//! (T1.3c, [`crate::node_lease`]), so `/livez` and the node's readiness
+//! cannot disagree about whether the kubelet is alive.
 //!
 //! ## The metrics
 //!
@@ -84,6 +92,7 @@ use engenho_apiserver::{
     ReconcileCount, ReconcileResult,
 };
 use engenho_config::ControllersConfig;
+use engenho_controllers::node_lease::RENEW_INTERVAL;
 use engenho_controllers::{
     Beat, Controller, ControllerError, ControllerType, Heartbeat, RESUBSCRIBE, ReconcileOutcome,
 };
@@ -103,9 +112,16 @@ use crate::panics::PanicCounter;
 /// `watch_driver::tick_observed`, which copies the kubelet's
 /// `syncLoopHealthCheck` posture.
 ///
+/// It is also T1.3c's pod-sync threshold: the node lease is renewed only
+/// while the kubelet's row is alive, so a kubelet tick in flight longer than
+/// this stops the renewals, and the node reads `NotReady` one
+/// [`engenho_controllers::node_lease::GRACE_PERIOD`] after the last one.
+/// Upstream's PLEG health check allows three minutes; this plus the grace
+/// period is about 160 s. An image pull longer than this is read as a hung
+/// tick.
+///
 /// `pending-config: controllers.stuck_tick_after_seconds` — the field
-/// belongs in engenho-config, with its bound cross-checked against the
-/// pod-sync threshold of T1.3c. Until it lands, this is the value
+/// belongs in engenho-config. Until it lands, this is the value
 /// [`Windows::of`] reads, and the only place it is written.
 pub(crate) const STUCK_TICK_AFTER: Duration = Duration::from_secs(120);
 
@@ -121,37 +137,44 @@ const SPAN_MASK: u64 = (1_u64 << SPAN) - 1;
 
 // ── windows ────────────────────────────────────────────────────────────
 
-/// The two windows a tick loop's heartbeat is judged against, built once
-/// from the config.
+/// What a tick loop runs on and is judged against, built once from the
+/// config: its fallback and debounce, and the two windows they imply.
 ///
-/// The runtime hands the same value to every driver (as its
-/// `stuck_tick_after`) and to [`Health`], so the driver's BLOCKED log and
-/// liveness's stall are one threshold.
+/// The runtime drives every tick loop from this value (its fallback,
+/// debounce and `stuck_tick_after`) and hands the same value to [`Health`],
+/// so the driver's BLOCKED log and liveness's stall are one threshold, and
+/// the idle window is derived from the fallback the loop really runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Windows {
     stuck: Duration,
-    idle: Duration,
+    fallback: Duration,
+    debounce: Duration,
 }
 
 impl Windows {
     /// The windows `controllers` implies.
-    ///
-    /// Idle: an idle driver begins its next tick at most one fallback after
-    /// its last one ended, plus the debounce, plus a re-subscribe wait
-    /// ([`RESUBSCRIBE`]'s cap) when its stream was lost. The window is twice
-    /// the fallback plus both, the way upstream's syncLoop health check
-    /// allows twice its resync interval.
     #[must_use]
     pub fn of(controllers: &ControllersConfig) -> Self {
-        let fallback = Duration::from_secs(u64::from(controllers.fallback_interval_seconds));
-        let debounce = Duration::from_millis(u64::from(controllers.debounce_milliseconds));
         Self {
             stuck: STUCK_TICK_AFTER,
-            idle: fallback
-                .saturating_mul(2)
-                .saturating_add(RESUBSCRIBE.cap())
-                .saturating_add(debounce),
+            fallback: Duration::from_secs(u64::from(controllers.fallback_interval_seconds)),
+            debounce: Duration::from_millis(u64::from(controllers.debounce_milliseconds)),
         }
+    }
+
+    /// The same windows for a loop that falls back every `fallback`.
+    #[must_use]
+    pub const fn with_fallback(self, fallback: Duration) -> Self {
+        Self { fallback, ..self }
+    }
+
+    /// The windows the node lease is driven on and judged by: its fallback
+    /// is the lease's renew interval
+    /// ([`engenho_controllers::node_lease::RENEW_INTERVAL`]), because no
+    /// store event wakes it.
+    #[must_use]
+    pub const fn node_lease(self) -> Self {
+        self.with_fallback(RENEW_INTERVAL)
     }
 
     /// How long one tick may run before it is stalled (and logged BLOCKED).
@@ -160,10 +183,31 @@ impl Windows {
         self.stuck
     }
 
+    /// How long the loop waits for an event before it ticks anyway.
+    #[must_use]
+    pub const fn fallback(self) -> Duration {
+        self.fallback
+    }
+
+    /// How long the loop coalesces a burst of events before it ticks.
+    #[must_use]
+    pub const fn debounce(self) -> Duration {
+        self.debounce
+    }
+
     /// How long an idle tick loop may go without beginning a tick.
+    ///
+    /// An idle loop begins its next tick at most one fallback after its last
+    /// one ended, plus the debounce, plus a re-subscribe wait
+    /// ([`RESUBSCRIBE`]'s cap) when its stream was lost. The window is twice
+    /// the fallback plus both, the way upstream's syncLoop health check
+    /// allows twice its resync interval.
     #[must_use]
     pub const fn idle_after(self) -> Duration {
-        self.idle
+        self.fallback
+            .saturating_mul(2)
+            .saturating_add(RESUBSCRIBE.cap())
+            .saturating_add(self.debounce)
     }
 }
 
@@ -194,10 +238,9 @@ impl Pulse {
     #[must_use]
     pub const fn of(child: Child, windows: Windows) -> Self {
         match child {
-            // The node-lease task is not spawned until T1.3c (I9) gives it a
-            // body. It is a tick loop; when it has one, its windows come from
-            // its renewal interval and it gets an arm of its own here.
-            Child::Driver(_) | Child::NodeLease => Self::Ticks(windows),
+            Child::Driver(_) => Self::Ticks(windows),
+            // A tick loop on its own fallback: the windows it is driven on.
+            Child::NodeLease => Self::Ticks(windows.node_lease()),
             Child::Listener(_) => Self::Serves,
         }
     }
@@ -217,12 +260,18 @@ impl Pulse {
         }
         let wall = |at: Option<Instant>| at.map(|at| wall_of(at, now, wall_now));
         match self {
-            Self::Ticks(windows) if beat.in_flight() => {
-                Liveness::judge(task, wall(beat.last_start), wall_now, window(windows.stuck))
-            }
-            Self::Ticks(windows) => {
-                Liveness::judge(task, wall(beat.last_end), wall_now, window(windows.idle))
-            }
+            Self::Ticks(windows) if beat.in_flight() => Liveness::judge(
+                task,
+                wall(beat.last_start),
+                wall_now,
+                window(windows.stuck_tick_after()),
+            ),
+            Self::Ticks(windows) => Liveness::judge(
+                task,
+                wall(beat.last_end),
+                wall_now,
+                window(windows.idle_after()),
+            ),
             Self::Serves if beat.in_flight() => Liveness::Alive,
             Self::Serves => match wall(beat.last_end) {
                 None => Liveness::Unknown,
@@ -501,6 +550,25 @@ impl Row {
             tally,
         }
     }
+
+    /// This child's liveness as of `now` (the heartbeat's monotonic clock),
+    /// judged against `windows` by the child's [`Pulse`].
+    ///
+    /// The one judgement of a row: `/livez` renders it, and the node lease
+    /// is renewed only while the kubelet's is [`Liveness::Alive`].
+    pub(crate) fn liveness(
+        &self,
+        windows: Windows,
+        now: Instant,
+        wall_now: WallInstant,
+    ) -> Liveness {
+        Pulse::of(self.child, windows).judge(
+            task_state(&self.task),
+            &self.beat.snapshot(),
+            now,
+            wall_now,
+        )
+    }
 }
 
 /// What the runtime's health endpoints and metric families are read from:
@@ -567,15 +635,7 @@ impl Health {
         let wall_now = WallClock.now();
         self.rows()
             .iter()
-            .map(|row| {
-                let liveness = Pulse::of(row.child, self.windows).judge(
-                    task_state(&row.task),
-                    &row.beat.snapshot(),
-                    now,
-                    wall_now,
-                );
-                (row.child, liveness)
-            })
+            .map(|row| (row.child, row.liveness(self.windows, now, wall_now)))
             .collect()
     }
 
@@ -868,9 +928,8 @@ mod tests {
             let pulse = Pulse::of(child, w);
             match child {
                 Child::Listener(_) => assert_eq!(pulse, Pulse::Serves, "{child}"),
-                Child::Driver(_) | Child::NodeLease => {
-                    assert_eq!(pulse, Pulse::Ticks(w), "{child}");
-                }
+                Child::Driver(_) => assert_eq!(pulse, Pulse::Ticks(w), "{child}"),
+                Child::NodeLease => assert_eq!(pulse, Pulse::Ticks(w.node_lease()), "{child}"),
             }
         }
     }
@@ -878,21 +937,14 @@ mod tests {
     // ── the source, over real children ───────────────────────────────
 
     async fn store() -> Arc<StoreMesh> {
-        let router = engenho_store::InProcessRouter::new();
-        let config = engenho_store::default_config("health-test").unwrap();
-        let mesh = StoreMesh::start(1, "in-process://1".into(), router, config)
-            .await
-            .unwrap();
-        mesh.initialize_singleton().await.unwrap();
-        assert!(mesh.wait_for_leadership(secs(5)).await);
-        Arc::new(mesh)
+        crate::testing::single_voter_store("health-test").await
     }
 
     /// Spawn exactly `bodies` through the catalog (every other child is
     /// left unspawned) and hand the rows to a fresh [`Health`].
     fn spawned(store: &Arc<StoreMesh>, mut bodies: Vec<(Child, ChildTask)>) -> (Children, Health) {
         let config = EngenhoConfig::prescribed_default();
-        let children = Children::spawn_catalog(&config, |child| {
+        let children = Children::spawn_catalog(&config, |child, _| {
             let at = bodies.iter().position(|(c, _)| *c == child)?;
             Some(bodies.remove(at).1)
         });

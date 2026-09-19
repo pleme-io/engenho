@@ -35,6 +35,11 @@
 //!   [`Children`] set. [`Children::next_dead`] is how `main` learns that one
 //!   ended; it is marked [`ChildState::Dead`] and logged at ERROR. There is
 //!   no respawn.
+//! * A child built before the sibling it watches: the walk hands each
+//!   child's builder the children spawned so far, and the one child that
+//!   watches another (the node lease, which watches the kubelet) is walked
+//!   after every driver. That the kubelet comes first is a test over
+//!   [`Child::all`], not a type.
 //!
 //! ## What a panic does (T2.7)
 //!
@@ -112,12 +117,10 @@ pub enum Child {
     Driver(Driver),
     /// A network listener.
     Listener(Listener),
-    /// The node-lease renewal task.
-    ///
-    /// ★ A PLACEHOLDER. It is declared so every exhaustive match over the
-    /// catalog already carries its row; T1.3c gives it a body (renew the
-    /// Lease only while the kubelet's heartbeat is young). Until then
-    /// [`Child::enabled`] is `false` for it and nothing spawns it.
+    /// The node-lease renewal task (T1.3c): renews this node's Lease every
+    /// renew interval while, and only while, the kubelet's liveness row is
+    /// alive, so a kubelet that wedges or dies stops heartbeating and the
+    /// node reads `NotReady`. Its body is the runtime's `node_lease` module.
     NodeLease,
 }
 
@@ -237,8 +240,15 @@ impl Listener {
 }
 
 impl Child {
+    /// The node lease's [`TickState`], its row in the catalog: it renews from
+    /// the kubelet's heartbeat and holds nothing across ticks, so a check
+    /// that panics is contained and re-ticked. The runtime drives the lease
+    /// with this value; [`Child::tick_state`] reports it.
+    pub const NODE_LEASE_TICK_STATE: TickState = TickState::Stateless;
+
     /// Every child, each exactly once: the drivers, then the listeners, then
-    /// the node-lease task.
+    /// the node-lease task. The lease comes last because it watches the
+    /// kubelet's row, so the kubelet is spawned before it is built.
     pub fn all() -> impl Iterator<Item = Self> {
         // The walk below names each top-level shape once. This match is the
         // reminder beside it: a new shape is E0004 here, one screen from the
@@ -274,9 +284,7 @@ impl Child {
         match self {
             Self::Driver(d) => Some(d.tick_state()),
             Self::Listener(_) => None,
-            // It renews from the store and the kubelet's heartbeat; it holds
-            // nothing across ticks.
-            Self::NodeLease => Some(TickState::Stateless),
+            Self::NodeLease => Some(Self::NODE_LEASE_TICK_STATE),
         }
     }
 
@@ -286,8 +294,9 @@ impl Child {
         match self {
             Self::Driver(d) => d.enabled(&config.controllers.enable),
             Self::Listener(l) => l.enabled(config),
-            // A placeholder until T1.3c: see the variant.
-            Self::NodeLease => false,
+            // The lease proves the kubelet alive: with no kubelet there is
+            // nothing for it to renew by.
+            Self::NodeLease => Driver::Kubelet.enabled(&config.controllers.enable),
         }
     }
 }
@@ -298,8 +307,8 @@ impl fmt::Display for Child {
     }
 }
 
-/// Which controller a driver runs, what it reads, and which events wake the
-/// driver, as the runtime wired it (T1.7, T5.11).
+/// Which controller a tick loop (a driver, or the node lease) runs, what it
+/// reads, and which events wake it, as the runtime wired it (T1.7, T5.11).
 ///
 /// The runtime builds `wakes` from `reads` and from nothing else; both are
 /// recorded so the claim "a driver wakes on every kind its controller reads"
@@ -357,7 +366,7 @@ pub(crate) struct ChildTask {
 
 impl ChildTask {
     /// A body that never returns, recording into `beat`. For a child that
-    /// is not woken by store events (a listener).
+    /// does not run a controller (a listener).
     pub(crate) fn new(
         beat: Arc<Heartbeat>,
         run: impl Future<Output = Infallible> + Send + 'static,
@@ -370,8 +379,9 @@ impl ChildTask {
         }
     }
 
-    /// A driver's body: as [`Self::new`], plus what wakes it and why, and
-    /// the tally its controller's ticks are counted in.
+    /// A tick loop's body (a driver, or the node lease): as [`Self::new`],
+    /// plus what wakes it and why, and the tally its controller's ticks are
+    /// counted in.
     pub(crate) fn driver(
         beat: Arc<Heartbeat>,
         wiring: Wiring,
@@ -450,7 +460,7 @@ impl ChildHandle {
     }
 
     /// What the child's controller reads and what wakes it; `None` for a
-    /// child no store event wakes (a listener).
+    /// child that runs no controller (a listener).
     #[must_use]
     pub fn wiring(&self) -> Option<&Wiring> {
         self.wiring.as_ref()
@@ -460,6 +470,16 @@ impl ChildHandle {
     #[must_use]
     pub const fn state(&self) -> ChildState {
         self.state
+    }
+
+    /// This entry as health reads it: clones of its handles.
+    fn row(&self, child: Child) -> Row {
+        Row::new(
+            child,
+            self.beat.clone(),
+            self.task.clone(),
+            self.tally.clone(),
+        )
     }
 }
 
@@ -477,15 +497,18 @@ pub struct Children {
 
 impl Children {
     /// Walk the catalog once, spawning every child `config` enables with the
-    /// body `build` returns for it. `build` returning `None` leaves a child
-    /// unspawned (the node-lease placeholder).
+    /// body `build` returns for it.
+    ///
+    /// `build` is handed the children spawned so far, so a child can watch
+    /// a sibling walked before it: the node lease reads the kubelet's
+    /// [`Row`]. `build` returning `None` leaves a child unspawned.
     pub(crate) fn spawn_catalog(
         config: &EngenhoConfig,
-        mut build: impl FnMut(Child) -> Option<ChildTask>,
+        mut build: impl FnMut(Child, &Self) -> Option<ChildTask>,
     ) -> Self {
         let mut children = Self::default();
         for child in Child::all().filter(|c| c.enabled(config)) {
-            if let Some(task) = build(child) {
+            if let Some(task) = build(child, &children) {
                 children.spawn(child, task);
             }
         }
@@ -513,16 +536,13 @@ impl Children {
     /// beats into, its task's handle and, for a driver, its tally. Clones
     /// of handles, so health reads them without borrowing the set.
     pub(crate) fn rows(&self) -> Vec<Row> {
-        self.iter()
-            .map(|(child, entry)| {
-                Row::new(
-                    child,
-                    entry.beat.clone(),
-                    entry.task.clone(),
-                    entry.tally.clone(),
-                )
-            })
-            .collect()
+        self.iter().map(|(child, entry)| entry.row(child)).collect()
+    }
+
+    /// `child`'s row, as [`Self::rows`] builds it; `None` if it was never
+    /// spawned.
+    pub(crate) fn row(&self, child: Child) -> Option<Row> {
+        self.get(child).map(|entry| entry.row(child))
     }
 
     /// Wait for the next child whose task ends, mark it
@@ -623,6 +643,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
+    use shikumi::TieredConfig as _;
+
     use super::*;
 
     const DEADLINE: Duration = Duration::from_secs(5);
@@ -656,6 +678,54 @@ mod tests {
             );
         }
         assert!(distinct.contains(&Child::NodeLease));
+    }
+
+    /// The node lease is built from the kubelet's row, which exists only
+    /// once the kubelet is spawned: the walk must reach the kubelet first.
+    #[test]
+    fn the_node_lease_is_walked_after_the_kubelet_it_watches() {
+        let walked: Vec<Child> = Child::all().collect();
+        let at = |c: Child| walked.iter().position(|w| *w == c);
+        let (kubelet, lease) = (at(Child::Driver(Driver::Kubelet)), at(Child::NodeLease));
+        assert!(
+            matches!((kubelet, lease), (Some(k), Some(l)) if k < l),
+            "kubelet at {kubelet:?}, node lease at {lease:?}: {walked:?}"
+        );
+    }
+
+    /// A child is built with the children spawned before it, so it can read
+    /// a sibling's row.
+    #[tokio::test]
+    async fn a_child_is_built_seeing_the_children_spawned_before_it() {
+        let config = EngenhoConfig::prescribed_default();
+        let mut seen = None;
+        let children = Children::spawn_catalog(&config, |child, before| match child {
+            Child::Driver(Driver::Kubelet) => Some(body(std::future::pending()).1),
+            Child::NodeLease => {
+                seen = Some(before.row(Child::Driver(Driver::Kubelet)).is_some());
+                Some(body(std::future::pending()).1)
+            }
+            Child::Driver(_) | Child::Listener(_) => None,
+        });
+        assert_eq!(
+            seen,
+            Some(true),
+            "the lease was built without the kubelet's row"
+        );
+        assert_eq!(
+            children.iter().map(|(c, _)| c).collect::<Vec<_>>(),
+            [Child::Driver(Driver::Kubelet), Child::NodeLease]
+        );
+    }
+
+    #[test]
+    fn the_node_lease_is_enabled_wherever_the_kubelet_runs() {
+        let config = EngenhoConfig::prescribed_default();
+        assert!(Child::Driver(Driver::Kubelet).enabled(&config));
+        assert!(
+            Child::NodeLease.enabled(&config),
+            "a node whose kubelet runs renews its lease"
+        );
     }
 
     #[test]

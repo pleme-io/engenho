@@ -40,11 +40,12 @@
 //! ## Owned children (T2.6)
 //!
 //! Every long-lived task the runtime starts — each driver, the :10250 and
-//! :2379 listeners — is a [`Child`] of one closed catalog, spawned into one
-//! [`Children`] set. A child's task cannot complete normally (its output is
-//! `Infallible`), so a task that ends has panicked or been aborted;
-//! [`Runtime::next_dead_child`] reports it, marked Dead and logged at ERROR,
-//! and `main` watches for it beside its stop signal. There is no respawn.
+//! :2379 listeners, the node lease — is a [`Child`] of one closed catalog,
+//! spawned into one [`Children`] set. A child's task cannot complete
+//! normally (its output is `Infallible`), so a task that ends has panicked
+//! or been aborted; [`Runtime::next_dead_child`] reports it, marked Dead and
+//! logged at ERROR, and `main` watches for it beside its stop signal. There
+//! is no respawn.
 //!
 //! ## Panics (T2.7)
 //!
@@ -54,6 +55,14 @@
 //! Dead. A listener whose serve ends binds again on a growing backoff. Every
 //! panic in the process, caught or not, is counted by the hook behind
 //! [`PanicCounter`], which [`Runtime::start`] installs.
+//!
+//! ## The node lease (T1.3c)
+//!
+//! [`Child::NodeLease`] renews this node's Lease every renew interval while,
+//! and only while, the kubelet's liveness row (the one `/livez` renders) is
+//! alive. A kubelet whose tick wedges past the stuck window, or whose task
+//! dies, stops heartbeating, and the node reads `NotReady` one grace period
+//! later; a long tick inside the window (an image pull) keeps it Ready.
 //!
 //! ## Health (T2.8)
 //!
@@ -105,12 +114,15 @@ mod error;
 mod health;
 #[cfg(test)]
 mod impl_census;
+mod node_lease;
 mod node_registration;
 mod panics;
 #[cfg(test)]
 mod read_census;
 mod rebind;
 mod runtime;
+#[cfg(test)]
+mod testing;
 
 pub use child::{
     Child, ChildHandle, ChildState, Children, DeadChild, DeathCause, Driver, Listener, TickState,

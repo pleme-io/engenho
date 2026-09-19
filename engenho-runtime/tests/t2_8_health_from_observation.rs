@@ -29,7 +29,8 @@ use reqwest::StatusCode;
 use shikumi::TieredConfig;
 
 /// How long a freshly booted daemon may take for every child to beat once.
-/// Each driver ticks within one fallback (1 s here) of subscribing; the rest
+/// Each driver ticks within one fallback (1 s here) of subscribing, and the
+/// node lease within one renew interval (10 s, its own fallback); the rest
 /// is boot and CI slack.
 const ALL_BEATEN: Duration = Duration::from_secs(30);
 

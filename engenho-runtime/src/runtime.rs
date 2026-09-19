@@ -46,9 +46,10 @@ use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
 use engenho_types::kind::GroupVersionKind;
 use tracing::{error, info, warn};
 
-use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, Wiring};
+use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, TickState, Wiring};
 use crate::error::{RuntimeError, ShutdownStage, StrongCounts};
-use crate::health::{Health, Tallied, Tally, Windows};
+use crate::health::{Health, Row, Tallied, Tally, Windows};
+use crate::node_lease::NodeLease;
 use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
 use crate::rebind::serve_rebinding;
@@ -2586,7 +2587,8 @@ const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall
 /// Build + spawn every child the catalog enables (T2.6) into ONE owned
 /// [`Children`] set: the drivers gated on `controllers.enable.*`, the
 /// always-on scheduler + kubelet (a single-node runtime that can't schedule
-/// or run containers is useless), and the :10250 / :2379 listeners.
+/// or run containers is useless), the :10250 / :2379 listeners, and the
+/// node lease, built from the kubelet's row (T1.3c).
 ///
 /// Returns the set PLUS an `Arc<Kubelet>` clone. The kubelet is built once
 /// and shared (via the `Controller for Arc<C>` blanket impl) between its
@@ -2601,7 +2603,7 @@ fn spawn_children(
     windows: Windows,
 ) -> (Children, Arc<Kubelet>) {
     let parts = Parts::assemble(config, store, backend, strategy, handler_sink, windows);
-    let children = Children::spawn_catalog(config, |child| parts.task(child));
+    let children = Children::spawn_catalog(config, |child, before| parts.task(child, before));
     (children, parts.kubelet)
 }
 
@@ -2685,10 +2687,9 @@ struct Parts<'a> {
     handler_sink: &'a Arc<dyn DynamicHandlerSink>,
     /// Namespace scope: `None` means all namespaces (empty in config).
     ns: Option<String>,
-    debounce: Duration,
-    fallback: Duration,
-    /// The liveness windows; each driver's stuck-tick threshold is read
-    /// from here, so it is the one liveness judges against.
+    /// The liveness windows; each driver's fallback, debounce and
+    /// stuck-tick threshold are read from here, so they are the ones
+    /// liveness judges against.
     windows: Windows,
     /// ★ ONE CSI driver table, shared by three consumers: the registrar
     /// fills it, the PV binder provisions through it, and the kubelet's
@@ -2733,8 +2734,6 @@ impl<'a> Parts<'a> {
             store,
             handler_sink,
             ns,
-            debounce: Duration::from_millis(u64::from(config.controllers.debounce_milliseconds)),
-            fallback: Duration::from_secs(u64::from(config.controllers.fallback_interval_seconds)),
             windows,
             csi_drivers,
             events,
@@ -2743,13 +2742,30 @@ impl<'a> Parts<'a> {
         }
     }
 
-    /// The body of one catalog child.
-    fn task(&self, child: Child) -> Option<ChildTask> {
+    /// The body of one catalog child. `before` is every child spawned
+    /// ahead of it in the walk.
+    fn task(&self, child: Child, before: &Children) -> Option<ChildTask> {
         match child {
             Child::Driver(driver) => Some(self.driver(driver)),
             Child::Listener(listener) => Some(self.listener(listener)),
-            // T1.3c gives it a body; `Child::enabled` keeps it out until then.
-            Child::NodeLease => None,
+            // Renewed by the kubelet's row, so built from it. The kubelet is
+            // walked first and always enabled; were it absent, the lease
+            // would have nothing to renew by, and is not spawned.
+            Child::NodeLease => {
+                let Some(kubelet) = before.row(Child::Driver(Driver::Kubelet)) else {
+                    error!(
+                        "the node lease has no kubelet to renew by and is not spawned; this \
+                         node will read NotReady"
+                    );
+                    return None;
+                };
+                Some(drive_node_lease(
+                    self.store,
+                    &self.config.runtime.node_name,
+                    kubelet,
+                    self.windows,
+                ))
+            }
         }
     }
 
@@ -2760,11 +2776,10 @@ impl<'a> Parts<'a> {
         controller: C,
     ) -> ChildTask {
         drive(
-            driver,
+            Child::Driver(driver),
+            driver.tick_state(),
             controller,
             self.store,
-            self.debounce,
-            self.fallback,
             self.windows,
         )
     }
@@ -2998,7 +3013,8 @@ impl<'a> Parts<'a> {
     }
 }
 
-/// Wrap `controller` in a `WatchDriver` as the catalog says `driver` runs.
+/// Wrap `controller` in a `WatchDriver` as the catalog says `child` (a
+/// driver, or the node lease) runs, with `tick_state` its catalog row.
 ///
 /// * Woken by exactly the kinds the controller declares it reads (T1.7).
 ///   This is the only place a driver's filter is built, and it takes nothing
@@ -3014,29 +3030,28 @@ impl<'a> Parts<'a> {
 ///   `controller_runtime_reconcile_total`, and by whether it landed a write,
 ///   for the propose-rate detector. A tick it has run longer than the
 ///   windows' stuck threshold is logged BLOCKED by the driver and reported
-///   stalled by liveness: one threshold, from `windows`.
-///
-/// [`TickState`]: crate::TickState
+///   stalled by liveness: one threshold, from `windows`. Its fallback and
+///   debounce are read from the same value, so liveness's idle window is
+///   derived from the fallback the loop runs on.
 fn drive<C: Controller + DeclaresReads + 'static>(
-    driver: Driver,
+    child: Child,
+    tick_state: TickState,
     controller: C,
     store: &Arc<StoreMesh>,
-    debounce: Duration,
-    fallback: Duration,
     windows: Windows,
 ) -> ChildTask {
     let reads = controller.reads();
     let config = WatchDriverConfig {
         filter: reads.filter(),
-        debounce,
-        fallback_interval: fallback,
+        debounce: windows.debounce(),
+        fallback_interval: windows.fallback(),
         stuck_tick_after: windows.stuck_tick_after(),
-        tick_state: driver.tick_state(),
+        tick_state,
     };
     let controller_type = controller.controller_type();
     // Named by the catalog, like its liveness row and its last-tick gauge,
-    // so every family says `controller="<driver>"` in one vocabulary.
-    let tally = Arc::new(Tally::new(driver.name()));
+    // so every family says `controller="<child>"` in one vocabulary.
+    let tally = Arc::new(Tally::new(child.name()));
     let watch = WatchDriver::new(
         Tallied::new(controller, tally.clone()),
         store.clone(),
@@ -3044,6 +3059,25 @@ fn drive<C: Controller + DeclaresReads + 'static>(
     );
     let wiring = Wiring::new(controller_type, reads, watch.wakes().clone());
     ChildTask::driver(watch.heartbeat(), wiring, tally, watch.run())
+}
+
+/// The node lease's body (T1.3c): [`NodeLease`] behind a `WatchDriver` on
+/// the lease's own windows ([`Windows::node_lease`], the ones liveness
+/// judges it by), renewing `node`'s Lease while `kubelet`'s row is alive as
+/// `windows` (the runtime's, the ones `/livez` judges the kubelet by) say.
+pub(crate) fn drive_node_lease(
+    store: &Arc<StoreMesh>,
+    node: &str,
+    kubelet: Row,
+    windows: Windows,
+) -> ChildTask {
+    drive(
+        Child::NodeLease,
+        Child::NODE_LEASE_TICK_STATE,
+        NodeLease::new(store.clone(), node, kubelet, windows),
+        store,
+        windows.node_lease(),
+    )
 }
 
 /// Build the ONE kubelet, with its event sink, `ServiceAccount` projection
@@ -3627,12 +3661,16 @@ mod tests {
         let catalog: BTreeSet<Child> = Child::all().collect();
         assert_eq!(
             catalog.difference(&spawned).copied().collect::<Vec<_>>(),
-            [Child::NodeLease],
-            "with every switch on, only the node-lease placeholder (T1.3c) is unspawned"
+            [],
+            "with every switch on, every child in the catalog is spawned"
         );
 
         let drivers: Vec<Child> = Driver::ALL.iter().map(|d| Child::Driver(*d)).collect();
         every_child(&rt, &drivers, |b| b.ticks_finished >= TICKS).await;
+
+        // The lease falls back once per renew interval: one tick is its
+        // proof of life here.
+        every_child(&rt, &[Child::NodeLease], |b| b.ticks_finished >= 1).await;
 
         let listeners: Vec<Child> = Listener::ALL.iter().map(|l| Child::Listener(*l)).collect();
         every_child(&rt, &listeners, |b| {
@@ -3681,15 +3719,14 @@ mod tests {
         let config = ephemeral_test_config();
         let store = boot_store(&config).await.unwrap();
         assert!(store.wait_for_leadership(Duration::from_secs(5)).await);
-        let children = Children::spawn_catalog(&config, |child| {
+        let children = Children::spawn_catalog(&config, |child, _| {
             (child == Child::Driver(driver)).then(|| {
                 drive(
-                    driver,
+                    child,
+                    driver.tick_state(),
                     DeclaredHere::new(PanicsEveryTick, Reads::nothing()),
                     &store,
-                    Duration::from_millis(10),
-                    PANIC_FALLBACK,
-                    Windows::of(&config.controllers),
+                    Windows::of(&config.controllers).with_fallback(PANIC_FALLBACK),
                 )
             })
         });
@@ -4132,8 +4169,8 @@ mod tests {
         // type, would pass the gate below vacuously.
         assert_eq!(
             wirings.len(),
-            Driver::ALL.len(),
-            "every driver records the controller it runs"
+            Child::all().filter(|c| c.tick_state().is_some()).count(),
+            "every tick loop (each driver, the node lease) records the controller it runs"
         );
         let unseen: Vec<&(String, String)> = spawned
             .iter()
