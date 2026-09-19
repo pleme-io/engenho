@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c94765733eb408c777a4f24798098f2fccf48cd2aa70c1f6263b1fd783cd47e6 # shrinks to keys = [ResourceKey { group: "apps", version: "v1", kind: "Po", namespace: None, name: "" }], w = Want { group: "", version: "v1", kind: "Po", namespace: None }, cursor = None
+cc eacb83a135a2904b421bfac6dac9f9cc4e47b4db5aa3bb850533892aa713dccf # shrinks to keys = [ResourceKey { group: "", version: "v1beta1", kind: "Pod\0", namespace: None, name: "" }], w = Want { group: "", version: "v1", kind: "Po", namespace: None }, limit = 1
+cc 68f8d69c439f25163e8d47966a6872277535ca4c72da9fb1c80b1b54915c266d # shrinks to keys = [ResourceKey { group: "", version: "v1beta1", kind: "Po", namespace: None, name: "" }], w = Want { group: "", version: "v1", kind: "Po", namespace: None }, cursor = ResourceKey { group: "", version: "v1", kind: "Po", namespace: None, name: "" }

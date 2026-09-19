@@ -428,14 +428,31 @@ impl FjallStore {
         Vec<(crate::resource::ResourceKey, crate::resource::ResourceValue)>,
         crate::revision::Revision,
     ) {
-        let guard = self.inner.state.lock().await;
-        let items = guard
+        self.inner
+            .state
+            .lock()
+            .await
             .catalog
-            .list(group, version, kind, namespace)
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        (items, guard.catalog.revision())
+            .list_at_revision(crate::resource::ListScope::new(
+                group, version, kind, namespace,
+            ))
+    }
+
+    /// One page + revision from ONE locked look, cloning only the page's
+    /// items. Durable sibling of
+    /// [`crate::store::InMemoryStore::list_page_at_revision`].
+    pub async fn list_page_at_revision(
+        &self,
+        scope: crate::resource::ListScope<'_>,
+        after: Option<&crate::resource::ResourceKey>,
+        limit: usize,
+    ) -> crate::pagination::PageAtRevision {
+        self.inner
+            .state
+            .lock()
+            .await
+            .catalog
+            .list_page_at_revision(scope, after, limit)
     }
 
     /// Direct catalog read by typed key (skips Raft — the local

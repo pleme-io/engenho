@@ -56,6 +56,22 @@ pub struct ListPage<'a> {
     pub remaining: u64,
 }
 
+/// One page cloned out of the catalog, with the revision of the catalog it
+/// was read from. Produced by
+/// [`crate::state::ResourceCatalog::list_page_at_revision`].
+///
+/// A store builds it under ONE guard, so `items` and `revision` describe
+/// the same instant of the catalog, and only the page's own items are
+/// cloned. The fields mean what [`ListPage`]'s do; `revision` is the label
+/// reported as the LIST envelope's `resourceVersion`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageAtRevision {
+    pub items: Vec<(ResourceKey, ResourceValue)>,
+    pub revision: Revision,
+    pub next: Option<ResourceKey>,
+    pub remaining: u64,
+}
+
 /// The opaque continue cursor a paged LIST round-trips to its client.
 ///
 ///   * `snapshot_rev` — the revision LABEL captured by the FIRST page of

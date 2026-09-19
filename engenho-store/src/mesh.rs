@@ -18,7 +18,8 @@ use crate::command::ResourceCommand;
 use crate::fjall_store::{FjallStore, Flushed};
 use crate::network::{InProcessRouter, RpcRequest};
 use crate::owned_task::{OwnedTask, TaskStop};
-use crate::resource::{ResourceKey, ResourceValue};
+use crate::pagination::PageAtRevision;
+use crate::resource::{ListScope, ResourceKey, ResourceValue};
 use crate::state::ResourceCatalog;
 use crate::store::InMemoryStore;
 use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
@@ -103,6 +104,20 @@ impl StoreBackend {
         match self {
             Self::Memory(s) => s.list_at_revision(group, version, kind, namespace).await,
             Self::Fjall(s) => s.list_at_revision(group, version, kind, namespace).await,
+        }
+    }
+
+    /// One page + revision under ONE backend guard, cloning only the page —
+    /// see [`crate::store::InMemoryStore::list_page_at_revision`].
+    async fn list_page_at_revision(
+        &self,
+        scope: ListScope<'_>,
+        after: Option<&ResourceKey>,
+        limit: usize,
+    ) -> PageAtRevision {
+        match self {
+            Self::Memory(s) => s.list_page_at_revision(scope, after, limit).await,
+            Self::Fjall(s) => s.list_page_at_revision(scope, after, limit).await,
         }
     }
 
@@ -428,13 +443,13 @@ impl StoreMesh {
     }
 
     /// List resources matching (group, version, kind), optionally
-    /// namespace-scoped, AND the snapshot [`Revision`] captured from
-    /// the SAME catalog clone — atomically.
+    /// namespace-scoped, AND the snapshot [`Revision`] read under the
+    /// SAME backend guard — atomically.
     ///
     /// This is the atomic list-then-watch primitive the apiserver
-    /// builds its `LIST` envelope on. Both the items and `rev` come from
-    /// ONE `current_catalog()` clone: within that clone `cat.list(...)`
-    /// and `cat.revision()` are a consistent snapshot of each other. A
+    /// builds its `LIST` envelope on. Both the items and `rev` are read
+    /// under ONE lock of the backend's catalog, so they are a consistent
+    /// snapshot of each other. A
     /// client that LISTs at the returned `rev` then `watch_from(rev)`
     /// resumes from exactly that snapshot boundary — gap-free + dup-free.
     ///
@@ -463,30 +478,38 @@ impl StoreMesh {
     }
 
     /// One page of resources matching (group, version, kind), optionally
-    /// namespace-scoped, AND the [`crate::revision::Revision`] read from
-    /// the SAME catalog clone — so the items + the reported revision are
+    /// namespace-scoped, AND the [`crate::revision::Revision`] read under
+    /// the SAME backend guard — so the items + the reported revision are
     /// mutually consistent FOR THIS CALL. The range-pagination sibling of
     /// [`Self::list_at_revision`].
     ///
-    /// ## Consistency: per-call clone, NOT cross-page snapshot isolation
+    /// ★ NOT `current_catalog()`. That deep-clones every resource plus the
+    /// 8192-entry watch-replay ring, and this runs once per PAGE of every
+    /// informer relist: after a restart every client relists at once, so a
+    /// per-page clone multiplies the cost that wedged Flux on rio by the
+    /// number of pages. The page is read under one guard, over the scope's
+    /// own run of keys (see [`ListScope`]), and only its items are cloned.
     ///
-    /// Each call clones the CURRENT catalog and pages it; the returned
-    /// `snapshot_rev` is the live revision at THIS call. Across a page
-    /// SERIES this is cursor-based pagination (gap/dup-free for a
-    /// quiescent key set, and a PRE-cursor late insert cannot resurface),
-    /// NOT true MVCC snapshot isolation: a POST-cursor insert committed
-    /// between page calls WILL appear on a later page, because the next
-    /// call re-clones the live catalog rather than reading AS OF the
-    /// token's first-page revision. The `snapshot_rev` baked into the
-    /// continue token is the envelope `resourceVersion` LABEL, not a
-    /// read-isolation mechanism. See [`crate::state::ResourceCatalog::list_page`]
-    /// for the destination (revision-indexed historical reads, deferred —
-    /// needs retained historical MVCC views).
+    /// ## Consistency: per-call read, NOT cross-page snapshot isolation
     ///
-    /// Returns `(items, snapshot_rev, next, remaining)`:
+    /// Each call reads the CURRENT catalog; the returned `snapshot_rev` is
+    /// the live revision at THIS call. Across a page SERIES this is
+    /// cursor-based pagination (gap/dup-free for a quiescent key set, and a
+    /// PRE-cursor late insert cannot resurface), NOT true MVCC snapshot
+    /// isolation: a POST-cursor insert committed between page calls WILL
+    /// appear on a later page, because the next call reads the live catalog
+    /// rather than reading AS OF the token's first-page revision. The
+    /// `snapshot_rev` baked into the continue token is the envelope
+    /// `resourceVersion` LABEL, not a read-isolation mechanism. See
+    /// [`crate::state::ResourceCatalog::list_page`] for the destination
+    /// (revision-indexed historical reads, deferred — needs retained
+    /// historical MVCC views).
+    ///
+    /// Returns `(items, snapshot_rev, next, remaining)` — the fields of
+    /// [`PageAtRevision`]:
     ///   * `items` — up to `limit` `(key, value)` pairs starting strictly
     ///     after `after`, in total key order.
-    ///   * `snapshot_rev` — `cat.revision()` at this call (the LABEL
+    ///   * `snapshot_rev` — the catalog revision at this call (the LABEL
     ///     reported in the LIST envelope `resourceVersion`).
     ///   * `next` — the cursor key for the following page (the last
     ///     emitted key iff more matching items remain), else `None`.
@@ -505,14 +528,20 @@ impl StoreMesh {
         Option<ResourceKey>,
         u64,
     ) {
-        let cat = self.store.current_catalog().await;
-        let page = cat.list_page(group, version, kind, namespace, after, limit);
-        let items = page
-            .items
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        (items, cat.revision(), page.next, page.remaining)
+        let PageAtRevision {
+            items,
+            revision,
+            next,
+            remaining,
+        } = self
+            .store
+            .list_page_at_revision(
+                ListScope::new(group, version, kind, namespace),
+                after,
+                limit,
+            )
+            .await;
+        (items, revision, next, remaining)
     }
 
     /// Read-only snapshot of the whole catalog.

@@ -86,12 +86,12 @@ pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
 pub use network::InProcessRouter;
 pub use owned_task::{OwnedTask, TaskStop};
-pub use pagination::{ContinueInvalid, ContinueToken, ListPage};
+pub use pagination::{ContinueInvalid, ContinueToken, ListPage, PageAtRevision};
 pub use patch_apply::{
     Gvk, JsonPath, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody, PatchDirective,
     PatchError, PatchSchemaEnv, apply as apply_patch_algorithm,
 };
-pub use resource::{ResourceKey, ResourceValue};
+pub use resource::{ListScope, ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 pub use ssa::{ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome, apply_ssa};
 pub use state::{ApplyOutcome, DEFAULT_HISTORY_CAPACITY, ResourceCatalog, check_precondition};

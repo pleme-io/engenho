@@ -26,15 +26,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
-use std::ops::Bound;
 use std::sync::Arc;
 
 use engenho_types::patch::PatchType;
 
 use crate::command::{ApplyMeta, ResourceCommand, ResourceOp, TxnCompare, TxnOp};
-use crate::pagination::ListPage;
+use crate::pagination::{ListPage, PageAtRevision};
 use crate::patch_apply::{self, Gvk, OpenApiPatchEnv, PatchBody, PatchError, PatchSchemaEnv};
-use crate::resource::{ResourceKey, ResourceValue};
+use crate::resource::{ListScope, ResourceKey, ResourceValue};
 use crate::revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 use crate::ssa;
 
@@ -1188,7 +1187,9 @@ impl ResourceCatalog {
     }
 
     /// List resources matching (group, version, kind), optionally
-    /// scoped to a namespace.
+    /// scoped to a namespace, in key order.
+    ///
+    /// Reads only the scope's own run of the map — see [`ListScope`].
     #[must_use]
     pub fn list(
         &self,
@@ -1197,25 +1198,36 @@ impl ResourceCatalog {
         kind: &str,
         namespace: Option<&str>,
     ) -> Vec<(&ResourceKey, &ResourceValue)> {
-        self.resources
-            .iter()
-            .filter(|(k, _)| k.group == group && k.version == version && k.kind == kind)
-            .filter(|(k, _)| match (namespace, k.namespace.as_deref()) {
-                (None, _) => true,
-                (Some(want), Some(have)) => want == have,
-                (Some(_), None) => false,
-            })
+        ListScope::new(group, version, kind, namespace)
+            .range(&self.resources, None)
             .map(|(k, (v, _))| (k, v))
             .collect()
+    }
+
+    /// Every item of `scope`, cloned, with this catalog's revision: what a
+    /// store hands out from under its lock. Only the listed items are
+    /// cloned, never the catalog or its watch-replay ring.
+    #[must_use]
+    pub fn list_at_revision(
+        &self,
+        scope: ListScope<'_>,
+    ) -> (Vec<(ResourceKey, ResourceValue)>, Revision) {
+        let items = scope
+            .range(&self.resources, None)
+            .map(|(k, (v, _))| (k.clone(), v.clone()))
+            .collect();
+        (items, self.current_revision)
     }
 
     /// One page of resources matching (group, version, kind), optionally
     /// namespace-scoped, in total [`ResourceKey`] order — the
     /// range-pagination primitive (etcd consistent-list semantics).
     ///
-    /// Iterates the underlying [`BTreeMap`] in key order starting
-    /// STRICTLY AFTER `after` (the continue cursor's last key), filtered
-    /// by GVK + optional namespace, taking up to `limit` matching items.
+    /// Ranges the underlying [`BTreeMap`] over the scope's own run of keys
+    /// (see [`ListScope`]), starting STRICTLY AFTER `after` (the continue
+    /// cursor's last key), taking up to `limit` items. Nothing outside the
+    /// scope is visited, so a page of one kind costs nothing for the size
+    /// of any other kind.
     ///
     ///   * `next` = the last key returned IFF more matching items remain
     ///     after it (the cursor for the following page); else `None`.
@@ -1256,49 +1268,64 @@ impl ResourceCatalog {
         after: Option<&ResourceKey>,
         limit: usize,
     ) -> ListPage<'_> {
-        // BTreeMap range starting STRICTLY after `after` (Excluded), to
-        // the end (Unbounded). When `after` is None, scan from the start.
-        let lower = match after {
-            Some(k) => Bound::Excluded(k.clone()),
-            None => Bound::Unbounded,
-        };
-        let matches = |k: &ResourceKey| {
-            k.group == group
-                && k.version == version
-                && k.kind == kind
-                && match (namespace, k.namespace.as_deref()) {
-                    (None, _) => true,
-                    (Some(want), Some(have)) => want == have,
-                    (Some(_), None) => false,
-                }
-        };
+        self.page(
+            ListScope::new(group, version, kind, namespace),
+            after,
+            limit,
+        )
+    }
 
-        let mut filtered = self
-            .resources
-            .range((lower, Bound::Unbounded))
-            .filter(|(k, _)| matches(k))
+    /// [`Self::list_page`], cloned out with this catalog's revision: what a
+    /// store hands out from under its lock. Only the page's own items are
+    /// cloned, never the catalog or its watch-replay ring.
+    #[must_use]
+    pub fn list_page_at_revision(
+        &self,
+        scope: ListScope<'_>,
+        after: Option<&ResourceKey>,
+        limit: usize,
+    ) -> PageAtRevision {
+        let page = self.page(scope, after, limit);
+        PageAtRevision {
+            items: page
+                .items
+                .into_iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            revision: self.current_revision,
+            next: page.next,
+            remaining: page.remaining,
+        }
+    }
+
+    fn page(
+        &self,
+        scope: ListScope<'_>,
+        after: Option<&ResourceKey>,
+        limit: usize,
+    ) -> ListPage<'_> {
+        let mut run = scope
+            .range(&self.resources, after)
             .map(|(k, (v, _))| (k, v));
 
         // limit == 0 → unbounded: take all matching items after `after`.
         if limit == 0 {
-            let items: Vec<(&ResourceKey, &ResourceValue)> = filtered.collect();
             return ListPage {
-                items,
+                items: run.collect(),
                 next: None,
                 remaining: 0,
             };
         }
 
-        let mut items: Vec<(&ResourceKey, &ResourceValue)> = Vec::with_capacity(limit);
-        for entry in filtered.by_ref().take(limit) {
-            items.push(entry);
-        }
+        // Collected, not `Vec::with_capacity(limit)`: `limit` is the
+        // client's number, and reserving it up front would let one request
+        // ask for any amount of memory.
+        let items: Vec<(&ResourceKey, &ResourceValue)> = run.by_ref().take(limit).collect();
 
-        // Peek the remaining matching tail to set `next` + `remaining`.
-        // `next` is the last EMITTED key iff at least one more matching
-        // item exists after the page.
-        let remaining_tail: u64 = filtered.count() as u64;
-        let next = if remaining_tail > 0 {
+        // Count the rest of the scope to set `next` + `remaining`. `next` is
+        // the last EMITTED key iff at least one more item follows the page.
+        let remaining = u64::try_from(run.count()).unwrap_or(u64::MAX);
+        let next = if remaining > 0 {
             items.last().map(|(k, _)| (*k).clone())
         } else {
             None
@@ -1307,7 +1334,7 @@ impl ResourceCatalog {
         ListPage {
             items,
             next,
-            remaining: remaining_tail,
+            remaining,
         }
     }
 

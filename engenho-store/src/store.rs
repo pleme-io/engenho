@@ -178,14 +178,30 @@ impl InMemoryStore {
         Vec<(crate::resource::ResourceKey, crate::resource::ResourceValue)>,
         crate::revision::Revision,
     ) {
-        let guard = self.inner.lock().await;
-        let items = guard
+        self.inner
+            .lock()
+            .await
             .catalog
-            .list(group, version, kind, namespace)
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        (items, guard.catalog.revision())
+            .list_at_revision(crate::resource::ListScope::new(
+                group, version, kind, namespace,
+            ))
+    }
+
+    /// One page + revision from ONE locked look at the catalog, cloning only
+    /// the page's items — the paged sibling of [`Self::list_at_revision`],
+    /// whose header carries the measurement. Every informer relist pages
+    /// through here, so a page must cost its own size, not the catalog's.
+    pub async fn list_page_at_revision(
+        &self,
+        scope: crate::resource::ListScope<'_>,
+        after: Option<&crate::resource::ResourceKey>,
+        limit: usize,
+    ) -> crate::pagination::PageAtRevision {
+        self.inner
+            .lock()
+            .await
+            .catalog
+            .list_page_at_revision(scope, after, limit)
     }
 
     /// Direct read — used by RaftStore consumers without going
