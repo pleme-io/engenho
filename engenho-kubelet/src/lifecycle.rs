@@ -603,10 +603,17 @@ pub fn reconcile_pod_phase(
 /// is restarted under `Always`/`OnFailure` and is terminal under `Never`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InitAction {
-    /// Init container at `index` is the first not-yet-succeeded init container.
-    /// The kubelet must ensure it is started (if `Waiting`) or await its exit
-    /// (if `Running` / restartable-`Terminated`). App containers must NOT start
-    /// yet. This is the only arm that keeps the pod in `Pending`/initializing.
+    /// Some init container must be started or awaited this tick.
+    ///
+    /// With `blocked_on: Some(index)`, init container `index` is the first
+    /// not-yet-succeeded regular one: the kubelet ensures it is started (if
+    /// `Waiting`) or awaits its exit (if `Running` / restartable-`Terminated`),
+    /// and app containers must NOT start yet.
+    ///
+    /// With `blocked_on: None`, every regular init container has succeeded
+    /// and only sidecars are left to (re)start. Nothing waits on them: once
+    /// each has started at least once the pod is initialized and the kubelet
+    /// proceeds to the app containers exactly as for [`InitAction::Complete`].
     AwaitInit {
         /// Every index the kubelet must ensure is running this tick: the
         /// sidecars cleared so far, plus the one container the sequence is

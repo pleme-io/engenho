@@ -4176,11 +4176,16 @@ impl Kubelet {
     ///     exit under the policy: stop+remove the old, start fresh, bump the
     ///     restart count). Status = Pending + initContainerStatuses +
     ///     Initialized=False; arm a near requeue so the next tick advances.
+    ///   * `AwaitInit{blocked_on: None}` — every regular init container has
+    ///     succeeded and only sidecars were (re)started. Once each of them has
+    ///     started at least once, initialization is over: exactly as
+    ///     `Complete`. A sidecar that has never started holds the pod in the
+    ///     Pending render above.
     ///   * `InitFailed` — phase Failed + initContainerStatuses +
     ///     Initialized=False; latch (do NOT start app containers).
-    ///   * `Complete` — set `init_complete = true`, then start the app
-    ///     containers via the normal start path (which now routes past init)
-    ///     and render the full status.
+    ///   * `Complete` — [`Self::finish_init`]: latch `init_complete`, then
+    ///     start the app containers via the normal start path (which now
+    ///     routes past init) and render the full status.
     async fn reconcile_init(
         &self,
         key: &ResourceKey,
@@ -4270,24 +4275,10 @@ impl Kubelet {
 
         match crate::lifecycle::next_init_action(restart_policy, &observations) {
             crate::lifecycle::InitAction::Complete => {
-                // Every init container Succeeded → latch init_complete, then
-                // run the app-start path (which now routes PAST init since
-                // init_complete is set) to start the app containers + render
-                // the full status (initContainerStatuses + Initialized=True).
-                {
-                    let mut local = self.local.lock().await;
-                    local.entry(key.clone()).or_default().init_complete = true;
-                }
-                report.objects_changed += 1;
-                debug!(
-                    pod = %key.label(),
-                    init_containers = init_specs.len(),
-                    "kubelet init sequence complete; starting app containers"
-                );
-                // Box the recursive call: reconcile_init → start_bound_pod →
-                // (init_complete now true) → app path. Boxing breaks the
-                // infinitely-sized async future (E0733).
-                Box::pin(self.start_bound_pod(key, value, report, soonest_requeue)).await
+                // Every regular init container Succeeded and every sidecar
+                // has started and is not down.
+                self.finish_init(key, value, init_specs.len(), report, soonest_requeue)
+                    .await
             }
             crate::lifecycle::InitAction::InitFailed { index, exit } => {
                 // Terminal init failure (an unsuccessful exit under
@@ -4322,7 +4313,7 @@ impl Kubelet {
                 // plus whichever container the sequence is gated on), and
                 // `blocked_on` says whether anything still blocks at all.
                 let mut pod_ip = None;
-                for index in start {
+                for &index in &start {
                     let (cname, base_spec) = &init_specs[index];
                     let ip = self
                         .advance_active_init(
@@ -4340,20 +4331,35 @@ impl Kubelet {
                         .await?;
                     pod_ip = pod_ip.or(ip);
                 }
+                // ── ★ NOTHING BLOCKS: INITIALIZATION ENDS HERE TOO ─────────
                 // `blocked_on: None` means every REGULAR init container has
-                // succeeded and only sidecars were (re)started — the pod is
-                // initialized and app containers may run. Re-enter the
-                // reconcile rather than writing Pending over a pod that is
-                // ready to proceed, which would be the forever-Pending hang
-                // wearing a different hat.
+                // succeeded and only sidecars were (re)started. This arm used
+                // to latch `init_complete` and return. Every later tick then
+                // took the running-pod path, which observes app containers
+                // but never starts one, so a pod whose last init container
+                // was a sidecar sat Pending forever with its app containers
+                // never started. It ends initialization the same way
+                // `Complete` does, through the one function that does it.
+                //
+                // Gated on each of those sidecars having STARTED (KEP-753):
+                // one whose start failed has no record, so it holds the pod
+                // Pending below and is retried next tick. Latching over it
+                // would report Initialized=True for a sidecar that never ran
+                // and would never retry it, since init is not revisited once
+                // latched.
                 if blocked_on.is_none() {
-                    self.local
-                        .lock()
-                        .await
-                        .entry(key.clone())
-                        .or_default()
-                        .init_complete = true;
-                    return Ok(());
+                    match self.first_never_started(key, init_specs, &start).await {
+                        None => {
+                            return self
+                                .finish_init(key, value, init_specs.len(), report, soonest_requeue)
+                                .await;
+                        }
+                        Some(cname) => debug!(
+                            pod = %key.label(),
+                            container = %cname,
+                            "sidecar has not started; app containers wait"
+                        ),
+                    }
                 }
 
                 // Re-read the (possibly just-updated) init records so the
@@ -4388,6 +4394,61 @@ impl Kubelet {
                 Ok(())
             }
         }
+    }
+
+    /// ★ THE ONE PLACE INITIALIZATION ENDS. Latch `init_complete`, then run
+    /// the start path, which now routes past init, so the app containers
+    /// start and the full status (initContainerStatuses + Initialized=True)
+    /// renders in this same tick.
+    ///
+    /// Every sequencer outcome that means "initialized" comes through here.
+    /// Latching without starting strands the pod: no later tick starts an app
+    /// container, because a pod with a record takes the running-pod path,
+    /// which observes containers and never starts one.
+    async fn finish_init(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        init_containers: usize,
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<(), ControllerError> {
+        self.local
+            .lock()
+            .await
+            .entry(key.clone())
+            .or_default()
+            .init_complete = true;
+        report.objects_changed += 1;
+        debug!(
+            pod = %key.label(),
+            init_containers,
+            "kubelet init sequence complete; starting app containers"
+        );
+        // Box the recursive call: reconcile_init → finish_init →
+        // start_bound_pod → (init_complete now true) → app path. Boxing breaks
+        // the infinitely-sized async future (E0733).
+        Box::pin(self.start_bound_pod(key, value, report, soonest_requeue)).await
+    }
+
+    /// The first of the init containers at `indices` that has never started,
+    /// or `None` when every one has run at least once. A record in
+    /// [`LocalPod::init_containers`] is written only by a start that
+    /// succeeded, so its presence is exactly "started at least once".
+    async fn first_never_started(
+        &self,
+        key: &ResourceKey,
+        init_specs: &[(String, ContainerSpec)],
+        indices: &[usize],
+    ) -> Option<String> {
+        let local = self.local.lock().await;
+        let started = local.get(key).map(|lp| &lp.init_containers);
+        indices
+            .iter()
+            .filter_map(|&index| init_specs.get(index))
+            .map(|(cname, _)| cname)
+            .find(|cname| !started.is_some_and(|records| records.contains_key(*cname)))
+            .cloned()
     }
 
     /// Ensure the active init container (`index`) is started or restarted.

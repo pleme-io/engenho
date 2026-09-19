@@ -951,6 +951,16 @@ impl FakeBackend {
             .insert(container_name.to_string(), message.into());
     }
 
+    /// `start` succeeds for `container_name` again — the cause of a
+    /// [`FakeBackend::seed_start_failure`] was fixed.
+    pub async fn clear_start_failure(&self, container_name: &str) {
+        self.inner
+            .lock()
+            .await
+            .seeded_start_failures
+            .remove(container_name);
+    }
+
     pub async fn seed_log(&self, container_name: &str, content: impl Into<String>) {
         let mut state = self.inner.lock().await;
         state
