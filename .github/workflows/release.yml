@@ -4,25 +4,55 @@ name: release
 # caller of a substrate reusable workflow — per the org's prime directive
 # (any pattern ≥2 sites → extract to substrate). Engenho ships:
 #
-#   * 2 Rust binaries  →  rust-binary-release.yml (one job per binary)
+#   * 2 Rust binaries  →  rust-binary-release.yml (one job per binary),
+#                         artifact-only: built here, published by
+#                         publish-release
 #   * 4 OCI images     →  image-push.yml (one job per binary × arch)
 #   * 2 multi-arch indexes → image-manifest (inline, below)
 #   * 1 Helm chart     →  helm-chart-release.yml
 #
-# ── PUBLISH ONLY AFTER THE GATE (improvement plan T0.3a) ──────────────────
-# Every publishing job pushes exact tags only: `:<tag>-<arch>` and `:<tag>`.
-# `:latest` moves in exactly one place, promote-latest, and only after
-# release-assets has seen every publishing job succeed AND found every asset
-# the release promises (16 GitHub Release files, 4 arch images, 2 multi-arch
-# indexes, 1 chart). Before this, `:latest` moved from three places per
-# image, with nothing checked first: image-push.yml's `additionalTags`
-# defaults to "latest", so each arch leg pushed it (the two legs raced for
-# the tag), and image-manifest tagged the index `:latest` too.
+# ── PUBLISH ONLY AFTER THE GATE (improvement plan T0.3) ───────────────────
+# Nothing becomes "the release" until every leg is green and every asset the
+# release promises exists:
+#
+#   binary-* (artifact-only) ─┐
+#   image-*  (:<tag>-<arch>) ─┤
+#   image-manifest (:<tag>)  ─┼─► release-assets ─► publish-release ─► promote-latest
+#   chart    (:<version>)    ─┘   (checks all 23)   (GitHub Release)    (:latest)
+#
+# The binary jobs run rust-binary-release.yml with `artifact-only: true`. In
+# its default mode every build leg attaches its own files to the tag's GitHub
+# Release as soon as that leg finishes; the first leg creates the release and
+# it becomes Latest with nothing checked. Receipt: run 35396851404 (v0.53.117)
+# published the release at 21:33:49 UTC, one second after the engenho-mcp
+# linux-x86_64 leg uploaded, and it ended with 12 of 16 binaries: both
+# linux-aarch64 legs, all four image pushes and the chart had failed. The
+# default mode also uploads a `linux-x86_64-binary` artifact from both binary
+# jobs of one run, and the second upload of that name conflicts.
+#
+# Now each binary job leaves one workflow artifact (its `artifact-name`
+# output). release-assets downloads both into release-files/ and
+# ci/release-contract.tlisp (verify mode) looks up every asset: the 16 files
+# there (each binary against its .sha256), the 4 arch images, the 2 indexes
+# and the chart. publish-release then creates the GitHub Release in one call,
+# with exactly the files release-assets checked, and promote-latest moves
+# :latest on exactly the images it checked.
+#
+# `package:` on the binary jobs (improvement plan T0.8). `--bin` alone builds
+# one binary but cargo still unifies features across every workspace member,
+# and sui-store asks reqwest for its default (native-tls) features, so
+# openssl-sys reached engenho-mcp's aarch64 legs (the improvement plan names
+# it as why both failed). With
+# `-p <package>` features resolve for that package alone: `cargo tree -p
+# engenho-mcp -e normal --target aarch64-unknown-linux-gnu -i openssl-sys`
+# finds no openssl-sys, while the same query over --workspace finds it.
 #
 # ci/release-contract.tlisp holds that contract. test.yml runs it on every
-# push (job release-contract), so a new `latest`, a dropped `needs` or a new
-# publishing job with no row in its catalog fails before merge; release-assets
-# runs it again in verify mode, against the real release.
+# push (job release-contract), so a binary job that leaves artifact-only or
+# drops its package, a second writer of the GitHub Release, a new `latest`, a
+# dropped `needs` or a new publishing job with no row in its catalog fails
+# before merge; release-assets runs it again in verify mode, against the real
+# release.
 #
 # `secrets: inherit` is required — reusable workflows don't
 # auto-inherit GITHUB_TOKEN unless we propagate it explicitly.
@@ -43,20 +73,31 @@ permissions:
 
 jobs:
   # ============================================================
-  #   Cross-arch Rust binaries → GitHub Release
+  #   Cross-arch Rust binaries → one workflow artifact each
+  #
+  #   artifact-only: no leg touches the GitHub Release. Each job's
+  #   `artifact-name` output names one artifact holding all four
+  #   legs' binaries and .sha256 files, flat; it is empty unless
+  #   every leg and the linux baseline passed. publish-release is
+  #   the only job that creates the release.
   # ============================================================
   binary-engenho-mcp:
-    name: binary engenho-mcp → GH Release
+    name: binary engenho-mcp → workflow artifact
     uses: pleme-io/substrate/.github/workflows/rust-binary-release.yml@main
     with:
       binary-name: engenho-mcp
+      # -p: features resolve for this package alone (see the header).
+      package: engenho-mcp
+      artifact-only: true
     secrets: inherit
 
   binary-engenho-cluster-config-render:
-    name: binary engenho-cluster-config-render → GH Release
+    name: binary engenho-cluster-config-render → workflow artifact
     uses: pleme-io/substrate/.github/workflows/rust-binary-release.yml@main
     with:
       binary-name: engenho-cluster-config-render
+      package: engenho-cluster-config-render
+      artifact-only: true
     secrets: inherit
 
   # ============================================================
@@ -93,8 +134,7 @@ jobs:
       # own system, so this resolves `packages.aarch64-linux.*` (a real
       # derivation) instead of `packages.x86_64-linux.*` on the default
       # amd64 runner, which would need a foreign aarch64-linux builder
-      # this repo has none configured for. Same runner label already
-      # proven by this workflow's own linux-arm64 binary release job.
+      # this repo has none configured for.
       runner: ubuntu-24.04-arm
     secrets: inherit
 
@@ -182,20 +222,20 @@ jobs:
     secrets: inherit
 
   # ============================================================
-  #   The gate before :latest (improvement plan T0.3a)
+  #   The gate (improvement plan T0.3)
   #
   #   release-assets needs every publishing job, so it runs only when all
   #   of them succeeded, and only for a v* tag (a branch dispatch never
-  #   promotes). A green leg is not proof of its assets: rust-binary-release
-  #   attaches nothing outside a tag push, and a partial upload is still a
-  #   green step. So ci/release-contract.tlisp (verify mode) derives every
-  #   asset the release promises from THIS file and looks each one up: the
-  #   GitHub Release files by name, the images, indexes and chart by OCI
-  #   ref. Any missing asset fails the job, and :latest stays where it was.
+  #   publishes). A green leg is not proof of its assets, so
+  #   ci/release-contract.tlisp (verify mode) derives every asset the
+  #   release promises from THIS file and looks each one up: the binary
+  #   files in release-files/ (downloaded below, each binary checked
+  #   against its .sha256), the images, indexes and chart by OCI ref. Any
+  #   missing asset or checksum mismatch fails the job; nothing has been
+  #   published to the GitHub Release and :latest stays where it was.
   #
-  #   promote-latest then moves :latest to the checked :<tag> index, one
-  #   matrix leg per image. Its image list is release-assets' output, so it
-  #   moves exactly the images that were checked.
+  #   Its two outputs are what the next jobs publish: `files` (the staged
+  #   paths it checked) and `images` (the image repos it checked).
   # ============================================================
   release-assets:
     name: every release asset exists
@@ -215,8 +255,21 @@ jobs:
       packages: read
     outputs:
       images: ${{ steps.verify.outputs.matrix }}
+      files: ${{ steps.verify.outputs.files }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download engenho-mcp's binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.binary-engenho-mcp.outputs.artifact-name }}
+          path: release-files
+
+      - name: Download engenho-cluster-config-render's binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.binary-engenho-cluster-config-render.outputs.artifact-name }}
+          path: release-files
 
       - uses: docker/login-action@v3
         with:
@@ -232,11 +285,62 @@ jobs:
         env:
           RELEASE_CONTRACT_MODE: verify
           RELEASE_TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
 
+  # ============================================================
+  #   The GitHub Release, once, from the checked files
+  #
+  #   The only job that writes a GitHub Release. It re-downloads the same
+  #   run artifacts (immutable within the run) and hands gh-release-create
+  #   exactly release-assets' `files` list. `if-exists: fail`: the default,
+  #   `skip`, reports success on an existing release without uploading a
+  #   file. `gh release create` with assets creates a draft, uploads every
+  #   file, and publishes only after the last upload; a failed upload
+  #   deletes the draft (cli/cli pkg/cmd/release/create/create.go,
+  #   draftWhileUploading + cleanupDraftRelease), so the release is never
+  #   public half-attached. That is gh's behaviour as read from its source,
+  #   not a check this repo runs.
+  # ============================================================
+  publish-release:
+    name: GitHub Release from the checked files
+    needs:
+      - release-assets
+      - binary-engenho-mcp
+      - binary-engenho-cluster-config-render
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download engenho-mcp's binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.binary-engenho-mcp.outputs.artifact-name }}
+          path: release-files
+
+      - name: Download engenho-cluster-config-render's binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.binary-engenho-cluster-config-render.outputs.artifact-name }}
+          path: release-files
+
+      - uses: pleme-io/actions/gh-release-create@main
+        with:
+          tag: ${{ github.ref_name }}
+          assets: ${{ needs.release-assets.outputs.files }}
+          if-exists: fail
+
+  # ============================================================
+  #   :latest, after the GitHub Release exists
+  #
+  #   One matrix leg per image, from release-assets' output, so it moves
+  #   exactly the images that were checked. It waits for publish-release
+  #   too: an image is never :latest for a release that has no GitHub
+  #   Release.
+  # ============================================================
   promote-latest:
     name: promote ${{ matrix.image }} to :latest
-    needs: release-assets
+    needs:
+      - release-assets
+      - publish-release
     runs-on: ubuntu-24.04
     permissions:
       packages: write

@@ -31,20 +31,22 @@ tatara similarly. Engenho follows the same shape.
 
 ### `.github/workflows/release.yml` — on `v*` tag
 
-  Ten jobs. Eight publish, and push exact tags only; two gate `:latest`:
+  Eleven jobs. Eight build and push exact tags only; three publish,
+  in order, after the gate:
 
   | Job | Uses | What |
   |---|---|---|
-  | `binary-engenho-mcp` | `rust-binary-release.yml` | Linux/macOS × x86_64/aarch64 binaries → GH Release |
-  | `binary-engenho-cluster-config-render` | `rust-binary-release.yml` | same |
+  | `binary-engenho-mcp` | `rust-binary-release.yml`, `artifact-only`, `package: engenho-mcp` | Linux/macOS × x86_64/aarch64 binaries + `.sha256` → one workflow artifact |
+  | `binary-engenho-cluster-config-render` | same, `package: engenho-cluster-config-render` | same |
   | `image-engenho-mcp-amd64` | `image-push.yml` | nix-built image → ghcr.io `:${tag}-amd64` |
   | `image-engenho-mcp-arm64` | `image-push.yml` | same, `-arm64` |
   | `image-engenho-cluster-config-render-amd64` | `image-push.yml` | same |
   | `image-engenho-cluster-config-render-arm64` | `image-push.yml` | same |
   | `chart` | `helm-chart-release.yml` | chart → ghcr.io OCI |
   | `image-manifest` | (inline — see below) | joins the per-arch tags into the `:${tag}` index |
-  | `release-assets` | `ci/release-contract.tlisp` (verify) | needs all eight; fails unless every asset exists |
-  | `promote-latest` | `pleme-io/actions/release-promote` | moves `:latest` to the checked `:${tag}`, per image |
+  | `release-assets` | `ci/release-contract.tlisp` (verify) | needs all eight; fails unless every asset exists and every binary matches its `.sha256` |
+  | `publish-release` | `pleme-io/actions/gh-release-create` | creates the GitHub Release in one call, from exactly the files `release-assets` checked |
+  | `promote-latest` | `pleme-io/actions/release-promote` | after `publish-release`: moves `:latest` to the checked `:${tag}`, per image |
 
   **`:latest` moves only after the gate** (improvement plan T0.3a).
   Every image-push call sets `additionalTags: ''`: that reusable
@@ -54,13 +56,50 @@ tatara similarly. Engenho follows the same shape.
   `release-assets` waits on every publishing job, runs only for a `v*`
   tag, and derives every asset the release promises from release.yml
   (16 GitHub Release files, 4 arch images, 2 multi-arch indexes,
-  1 chart), looking each up with `gh release view` and `docker buildx
-  imagetools inspect --raw`. One missing asset fails it, and
-  `promote-latest`, which takes its image list from `release-assets`'
-  output, does not run. `test.yml`'s `release-contract` job runs the
-  same script in check mode on every push, so a new `latest`, a dropped
-  `needs`, or a new publishing job with no row in its catalog fails
-  before merge.
+  1 chart), looking each up: the files in `release-files/`, the OCI refs
+  with `docker buildx imagetools inspect --raw`. One missing asset fails
+  it, and `promote-latest`, which takes its image list from
+  `release-assets`' output, does not run.
+
+  **The GitHub Release is created only after the gate** (improvement
+  plan T0.3c). In rust-binary-release's default mode each build leg
+  attaches its files to the tag's release as soon as that leg finishes;
+  the first leg creates the release and it becomes Latest. Run
+  35396851404 (v0.53.117) published it one second after the first upload
+  and ended with 12 of 16 binaries, with both linux-aarch64 legs, all
+  four image pushes and the chart had failed. Both binary jobs now run with
+  `artifact-only: true`: no leg touches the release, and each job leaves
+  one workflow artifact named by its `artifact-name` output. (The default
+  mode also uploaded a `linux-x86_64-binary` artifact from both jobs of
+  one run, a name conflict.) `release-assets` downloads both artifacts
+  into `release-files/`, checks the 16 files there (each binary's sha256
+  against its `.sha256`) along with the OCI refs, and outputs `files`,
+  the staged paths it checked. `publish-release` downloads the same
+  artifacts and hands exactly that list to `gh-release-create` with
+  `if-exists: fail` (its default, `skip`, reports success on an existing
+  release without uploading a file). `gh release create` with assets
+  uploads to a draft and publishes after the last upload, deleting the
+  draft if one fails; that is gh's behaviour as read from its source
+  (cli/cli `pkg/cmd/release/create/create.go`), not something this repo
+  checks. `promote-latest` needs `publish-release`, so no image becomes
+  `:latest` for a release that has no GitHub Release.
+
+  **`package:` on the binary jobs** (improvement plan T0.8). `--bin`
+  alone builds one binary, but cargo unifies features across every
+  workspace member; sui-store asks reqwest for its default (native-tls)
+  features, so openssl-sys reached engenho-mcp's aarch64 legs, which the
+  improvement plan (T0.8) names as why both failed. `-p` resolves
+  features for the one package: `cargo tree
+  -p engenho-mcp -e normal --target aarch64-unknown-linux-gnu -i
+  openssl-sys` matches no package, and the same query with `--workspace`
+  finds openssl-sys under engenho-mcp through reqwest (measured
+  2026-09-19; same for engenho-cluster-config-render).
+
+  `test.yml`'s `release-contract` job runs the same script in check
+  mode on every push, so a binary job that leaves `artifact-only` or
+  drops its `package`, a second writer of the GitHub Release, a new
+  `latest`, a dropped `needs`, or a new publishing job with no row in
+  its catalog fails before merge.
 
   The inline `image-manifest` job uses `docker buildx imagetools
   create` to assemble per-arch tags into the `:${tag}` index. It is a
@@ -155,8 +194,11 @@ push + helm chart push would fail with `unauthorized`.
     lock to it and delete the attribution rows; the check then fails
     until every row is gone, and from then on it is a plain ban.
   * `ci/release-contract.tlisp` (test.yml, job `release-contract`)
-    checks that release.yml moves `:latest` only in `promote-latest`,
-    after `release-assets`; `ci/release-contract.test.tlisp` (job
+    checks that release.yml creates the GitHub Release only in
+    `publish-release` and moves `:latest` only in `promote-latest`,
+    both after `release-assets`, and that every binary job is
+    artifact-only and names the package that declares its binary;
+    `ci/release-contract.test.tlisp` (job
     `ci-contract-tests`) shows each of its rules firing on a fixture
     with that defect.
   * `.github/workflows/mutation.yml` runs `cargo mutants` over the
@@ -175,7 +217,8 @@ push + helm chart push would fail with `unauthorized`.
 
 On every `v*` tag:
 
-  * GitHub Release with 16 files: 8 binaries plus a .sha256 each,
+  * GitHub Release with 16 files, created by `publish-release` in one
+    call once every asset is checked: 8 binaries plus a .sha256 each,
       engenho-mcp-{linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64}
       engenho-cluster-config-render-{... same legs}
   * 6 OCI refs on ghcr.io:

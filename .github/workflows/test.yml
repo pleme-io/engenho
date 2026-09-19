@@ -248,9 +248,14 @@ jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
   # Publish only after the gate, as a checked contract (improvement plan
-  # T0.3a). release.yml moves `:latest` in one job, promote-latest, after
-  # release-assets has waited on every publishing leg and found every asset.
-  # ci/release-contract.tlisp reads release.yml and fails on a job that names
+  # T0.3). release.yml creates the GitHub Release in one job,
+  # publish-release, and moves `:latest` in one job, promote-latest, both
+  # after release-assets has waited on every publishing leg and found every
+  # asset. ci/release-contract.tlisp reads release.yml and fails on a
+  # rust-binary-release call without `artifact-only: true` (its default
+  # mode attaches each leg to the release before any gate) or without a
+  # `package` that declares its binary (T0.8), a job other than
+  # publish-release that writes a GitHub Release, a job that names
   # `latest`, an image-push call that leaves `tag` or `additionalTags` at
   # their `latest` defaults, a publishing job release-assets does not wait
   # on, or a job its catalog does not know. Its tests,
