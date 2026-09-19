@@ -1,61 +1,97 @@
-;; release-contract — `:latest` moves only after every release leg is green
-;; and every asset the release promises exists.
+;; release-contract — nothing becomes "the release" until every release leg
+;; is green and every asset the release promises exists.
 ;;
-;; WHY (improvement plan T0.3a). Before this, release.yml moved `:latest`
-;; before anything was checked, and from three places per image:
-;;   * each of the four image-push.yml calls pushed `:latest` as well as its
-;;     arch tag, because that reusable's `additionalTags` defaults to
-;;     "latest". Nothing in release.yml said so; the default did it. The two
-;;     arch legs of one image raced for the same tag, so for a while
-;;     `:latest` was a single-arch image.
-;;   * image-manifest then tagged the multi-arch index `:latest` too, in the
-;;     same command that made `:<tag>`, without waiting on the binary legs or
-;;     the chart.
-;; A release whose aarch64 binaries or chart failed still moved `:latest`.
+;; WHY (improvement plan T0.3). Two things published before anything was
+;; checked:
+;;   * `:latest` (T0.3a). Each of the four image-push.yml calls pushed
+;;     `:latest` as well as its arch tag, because that reusable's
+;;     `additionalTags` defaults to "latest"; the two arch legs of one image
+;;     raced for the tag. image-manifest then tagged the multi-arch index
+;;     `:latest` too, without waiting on the binary legs or the chart.
+;;   * the GitHub Release (T0.3c). rust-binary-release.yml in its default
+;;     mode attaches each build leg's files to the tag's release as soon as
+;;     that leg finishes. The first leg creates the release and it becomes
+;;     Latest. Run 35396851404 (v0.53.117) published it one second after the
+;;     first upload and ended with 12 of 16 binaries: both linux-aarch64
+;;     legs, all four image pushes and the chart had failed.
 ;;
 ;; THE CONTRACT, for .github/workflows/release.yml:
 ;;   * every job is one row of the catalog below (binary, image, manifest,
-;;     chart, release-assets, promote-latest). A job that is none of them
-;;     fails the check, because its assets would go unverified.
-;;   * only promote-latest names the `latest` tag. Every image-push.yml call
+;;     chart, release-assets, publish-release, promote-latest). A job that is
+;;     none of them fails the check, because its assets would go unverified.
+;;   * every rust-binary-release.yml call sets `artifact-only: true`, so no
+;;     build leg writes the GitHub Release, and `package:` naming the
+;;     workspace member that declares its binary. `--bin` alone unifies
+;;     features across every member, which is how openssl-sys (native-tls,
+;;     through sui-store's default reqwest features) reached engenho-mcp's
+;;     aarch64 legs (T0.8).
+;;   * only publish-release writes a GitHub Release, and only
+;;     promote-latest names the `latest` tag. Every image-push.yml call
 ;;     declares `tag` and `additionalTags: ''` explicitly, since both
 ;;     defaults push `latest`.
 ;;   * release-assets needs every publishing job, runs only on a `v*` tag,
-;;     and runs this script in verify mode.
-;;   * promote-latest needs release-assets and takes its image list from
-;;     release-assets' output, so the images it moves are the ones that were
+;;     downloads every binary job's artifact into release-files/ before it
+;;     runs this script in verify mode, and outputs the files and images it
 ;;     checked.
+;;   * publish-release needs release-assets and every binary job, downloads
+;;     the same artifacts, and hands gh-release-create exactly release-assets'
+;;     `files`, with `if-exists: fail`.
+;;   * promote-latest needs release-assets and publish-release and takes its
+;;     image list from release-assets' output, so the images it moves are the
+;;     ones that were checked, and only once the GitHub Release exists.
 ;;
 ;; MODES (RELEASE_CONTRACT_MODE):
 ;;   check  (default) read release.yml and report contract violations. CI
 ;;          runs this on every push (test.yml, job release-contract).
-;;   verify at release time: re-check the contract, derive every asset the
-;;          release promises from release.yml, and look each one up: GitHub
-;;          Release files with `gh release view`, OCI refs (images, the
-;;          multi-arch indexes, the chart) with `docker buildx imagetools
-;;          inspect --raw`. Writes `matrix` (a JSON list of the image repos to
-;;          promote), `missing-count` and `verdict` to GITHUB_OUTPUT. Needs
-;;          RELEASE_TAG, GITHUB_REPOSITORY and GH_TOKEN.
+;;   verify at release time, before anything is published: re-check the
+;;          contract, derive every asset the release promises from
+;;          release.yml, and look each one up. Binary files in release-files/
+;;          (each binary's sha256 against its .sha256 file); OCI refs
+;;          (images, the multi-arch indexes, the chart) with `docker buildx
+;;          imagetools inspect --raw`. Writes `files` (the staged paths
+;;          checked, space-separated), `matrix` (a JSON list of the image
+;;          repos to promote), `missing-count` and `verdict` to
+;;          GITHUB_OUTPUT. Needs RELEASE_TAG.
 ;;
 ;; TIER: a CI gate plus a release-time check, not a type. The check reads the
-;; YAML the runner reads, so a removed `needs`, a new `latest`, or a new
-;; publishing job with no row is caught before merge. It cannot see inside
-;; the substrate reusables: if one starts pushing `latest` under a new input
-;; name, this does not notice. The verify mode proves each asset EXISTS at
-;; promotion time, not that it is correct.
+;; YAML the runner reads, so a binary job back in default mode, a second
+;; release writer, a removed `needs`, a new `latest`, or a new publishing job
+;; with no row is caught before merge. It cannot see inside the substrate
+;; reusables: if one starts pushing `latest` or writing a release under a new
+;; input name, this does not notice. It knows the release writers it lists
+;; (rc:RELEASE-WRITER-USES, rc:RELEASE-WRITER-RUN); a new one is not seen.
+;; A binary is found by its `[[bin]]` table, or by its package name when the
+;; member has no `[[bin]]` and a src/main.rs; an auto-discovered binary next
+;; to explicit `[[bin]]` tables is not seen, and the check then refuses. The
+;; verify mode proves each asset EXISTS at promotion time and that each
+;; staged binary matches its own .sha256, not that the binary is correct.
 ;;
-;; Exit codes: 0 clean · 1 a violation or a missing asset · 3 nothing was
-;; examined (no release.yml, no jobs, or no asset to check): the check proved
-;; nothing, which is not the same as finding nothing wrong.
+;; Exit codes: 0 clean · 1 a violation, a missing asset or a checksum
+;; mismatch · 3 nothing was examined (no release.yml, no jobs, or no asset to
+;; check): the check proved nothing, which is not the same as finding nothing
+;; wrong.
 ;;
 ;; Tests: ci/release-contract.test.tlisp (tlisp-test sets TLISP_TEST=1, which
 ;; loads these definitions and skips the main at the bottom).
 
 (define rc:WORKFLOW ".github/workflows/release.yml")
+(define rc:MANIFEST "Cargo.toml")
 (define rc:ASSETS-JOB "release-assets")
+(define rc:PUBLISH-JOB "publish-release")
 (define rc:PROMOTE-JOB "promote-latest")
 (define rc:SELF "ci/release-contract.tlisp")
 (define rc:PROMOTE-MATRIX "${{ fromJSON(needs.release-assets.outputs.images) }}")
+(define rc:FILES-OUTPUT "${{ steps.verify.outputs.files }}")
+(define rc:PUBLISH-ASSETS "${{ needs.release-assets.outputs.files }}")
+;; Where release-assets and publish-release put the binary artifacts.
+(define rc:STAGE "release-files")
+(define rc:RELEASE-CREATE "pleme-io/actions/gh-release-create@")
+
+;; Steps that write a GitHub Release, by `uses:` prefix and by `run:` text.
+(define rc:RELEASE-WRITER-USES
+  (list "softprops/action-gh-release@" "pleme-io/actions/gh-release-create@" "ncipollo/release-action@"
+        "actions/create-release@" "actions/upload-release-asset@"))
+(define rc:RELEASE-WRITER-RUN "gh\\s+release\\s+(create|upload|edit|delete)")
 
 ;; The built-in legs of substrate's rust-binary-release.yml (its matrix at
 ;; lines 175-179): gnu and musl builds use the same four suffixes. A caller
@@ -90,6 +126,13 @@
 (define (rc:steps job) (rc:as-list (rc:get job "steps")))
 (define (rc:needs job) (rc:as-list (rc:get job "needs")))
 
+;; Index of the first element satisfying pred, or -1.
+(define (rc:index-where pred xs i)
+  (cond
+    ((= (length xs) 0) -1)
+    ((pred (car xs)) i)
+    (else (rc:index-where pred (cdr xs) (+ i 1)))))
+
 ;; Every string in a parsed value, keys included.
 (define (rc:strings v)
   (cond
@@ -99,11 +142,40 @@
 
 (define (rc:names-latest? v) (any? (fn (s) (re-match? rc:LATEST-TAG s)) (rc:strings v)))
 
+(define (rc:writes-release? job)
+  (any?
+    (fn (st)
+      (or (any? (fn (p) (string-starts-with? (rc:get st "uses") p)) rc:RELEASE-WRITER-USES)
+          (re-match? rc:RELEASE-WRITER-RUN (rc:get st "run"))))
+    (rc:steps job)))
+
 (define (rc:subst-tag s tag) (re-replace rc:REF-NAME s tag))
 
 (define (rc:strip-v tag) (if (string-starts-with? tag "v") (string-join "v" (cdr (string-split tag "v"))) tag))
 
 (define (rc:strip-oci reg) (if (string-starts-with? reg "oci://") (string-replace reg "oci://" "") reg))
+
+;; ── The workspace: which package declares which binary ───────────────────
+;; toml-parse yields a table as a list of (key value) and `[[bin]]` as a list
+;; of tables.
+
+(define (rc:toml path) (if (path-exists? path) (toml-parse (read-file path)) (list)))
+
+;; (package binary) for each binary one member declares.
+(define (rc:member-bins dir)
+  (let* ((m (rc:toml (path-join dir "Cargo.toml")))
+         (pkg (rc:get (rc:get m "package") "name"))
+         (bins (filter (fn (b) (not (equal? b ""))) (map (fn (t) (rc:get t "name")) (rc:as-list (rc:get m "bin"))))))
+    (cond
+      ((or (not (string? pkg)) (equal? pkg "")) (list))
+      ((> (length bins) 0) (map (fn (b) (list pkg b)) bins))
+      ((path-exists? (path-join dir "src/main.rs")) (list (list pkg pkg)))
+      (else (list)))))
+
+(define (rc:workspace-bins)
+  (reduce (fn (acc d) (append acc (rc:member-bins d)))
+    (list)
+    (rc:as-list (rc:get (rc:get (rc:toml rc:MANIFEST) "workspace") "members"))))
 
 ;; ── The catalog: what each job publishes ─────────────────────────────────
 
@@ -112,10 +184,11 @@
 (define (rc:joins-images? job)
   (any? (fn (st) (string-contains? (rc:get st "run") "imagetools create")) (rc:steps job)))
 
-;; One of: binary image manifest chart assets promote unknown.
+;; One of: binary image manifest chart assets publish promote unknown.
 (define (rc:job-kind name job)
   (cond
     ((equal? name rc:ASSETS-JOB) "assets")
+    ((equal? name rc:PUBLISH-JOB) "publish")
     ((equal? name rc:PROMOTE-JOB) "promote")
     ((rc:uses? job "rust-binary-release.yml") "binary")
     ((rc:uses? job "image-push.yml") "image")
@@ -128,7 +201,7 @@
 (define (rc:names-of-kind wf kind) (filter (fn (n) (equal? (rc:kind-of wf n) kind)) (rc:job-names wf)))
 
 (define (rc:publishing-jobs wf)
-  (filter (fn (n) (not (member? (rc:kind-of wf n) (list "assets" "promote")))) (rc:job-names wf)))
+  (filter (fn (n) (not (member? (rc:kind-of wf n) (list "assets" "publish" "promote")))) (rc:job-names wf)))
 
 (define (rc:binary-legs job)
   (let ((inc (rc:get (rc:with job) "matrix-include")))
@@ -174,16 +247,40 @@
 
 (define (rc:asset-label a) (string-append (car a) " " (car (cdr a))))
 
+;; The GitHub Release file names among the assets, and where the gate jobs
+;; find each one.
+(define (rc:file-names assets) (map (fn (a) (car (cdr a))) (filter (fn (a) (equal? (car a) "file")) assets)))
+(define (rc:staged-files assets) (map (fn (f) (path-join rc:STAGE f)) (rc:file-names assets)))
+
 ;; ── Check mode: the contract, as a list of violation lines ───────────────
 
-(define (rc:job-violations wf name)
+(define (rc:binary-violations at w bins)
+  (let ((bin (rc:get w "binary-name")) (pkg (rc:get w "package")))
+    (append
+      (if (equal? bin "")
+        (list (string-append at "rust-binary-release.yml needs `binary-name`"))
+        (list))
+      (if (not (equal? (rc:get w "artifact-only") true))
+        (list (string-append at "rust-binary-release.yml needs `artifact-only: true`; in its default mode each build leg attaches its files to the GitHub Release as soon as it finishes, before any gate. Only " rc:PUBLISH-JOB " may create the release"))
+        (list))
+      (cond
+        ((or (not (string? pkg)) (equal? pkg ""))
+          (list (string-append at "rust-binary-release.yml needs `package:`; with --bin alone cargo unifies features across every workspace member, which is how openssl-sys reached engenho-mcp's aarch64 legs")))
+        ((not (member? (list pkg bin) bins))
+          (list (string-append at "package `" pkg "` is not a workspace member that declares the binary `" bin "`")))
+        (else (list))))))
+
+(define (rc:job-violations wf name bins)
   (let* ((job (rc:job wf name)) (w (rc:with job)) (kind (rc:job-kind name job)) (at (string-append "job `" name "`: ")))
     (append
       (if (equal? kind "unknown")
-        (list (string-append at "publishes nothing the release contract knows (binary, image, manifest, chart). Add its row to " rc:SELF " so its assets are checked before :latest moves"))
+        (list (string-append at "publishes nothing the release contract knows (binary, image, manifest, chart). Add its row to " rc:SELF " so its assets are checked before anything is published"))
         (list))
       (if (and (not (equal? kind "promote")) (rc:names-latest? job))
         (list (string-append at "names the `latest` tag; only " rc:PROMOTE-JOB " may move it, after " rc:ASSETS-JOB))
+        (list))
+      (if (and (not (equal? kind "publish")) (rc:writes-release? job))
+        (list (string-append at "writes a GitHub Release; only " rc:PUBLISH-JOB " may, after " rc:ASSETS-JOB))
         (list))
       (if (equal? kind "image")
         (append
@@ -197,9 +294,7 @@
             (list (string-append at "image-push.yml needs an explicit `imageName`, or the asset check cannot name the image"))
             (list)))
         (list))
-      (if (and (equal? kind "binary") (equal? (rc:get w "binary-name") ""))
-        (list (string-append at "rust-binary-release.yml needs `binary-name`"))
-        (list))
+      (if (equal? kind "binary") (rc:binary-violations at w bins) (list))
       (if (and (equal? kind "chart") (equal? (rc:chart-name job) ""))
         (list (string-append at "no Chart.yaml with a `name` under chart-path `" (rc:get w "chart-path") "`"))
         (list))
@@ -216,26 +311,82 @@
                 (else ""))))
           (rc:job-assets wf name rc:PROBE-TAG))))))
 
+;; The expression naming a binary job's merged artifact.
+(define (rc:artifact-ref bin-job) (string-append "${{ needs." bin-job ".outputs.artifact-name }}"))
+
+(define (rc:downloads? bin-job st)
+  (and (string-starts-with? (rc:get st "uses") "actions/download-artifact@")
+       (equal? (rc:get (rc:get st "with") "name") (rc:artifact-ref bin-job))
+       (equal? (rc:get (rc:get st "with") "path") rc:STAGE)))
+
+;; `job` must download every binary job's artifact into rc:STAGE at a step
+;; before index `before` (the step that reads the files). A negative `before`
+;; means that step is missing, which its own rule reports; then any position
+;; counts.
+(define (rc:download-violations wf at job before what)
+  (reduce
+    (fn (acc b)
+      (let ((i (rc:index-where (fn (st) (rc:downloads? b st)) (rc:steps job) 0)))
+        (if (or (< i 0) (and (>= before 0) (> i before)))
+          (append acc
+            (list (string-append at "does not download `" (rc:artifact-ref b) "` into " rc:STAGE "/ before " what)))
+          acc)))
+    (list)
+    (rc:names-of-kind wf "binary")))
+
+(define (rc:verify-step? st)
+  (and (equal? (rc:get st "id") "verify")
+       (string-starts-with? (rc:get st "uses") "pleme-io/actions/tatara-script@")
+       (equal? (rc:get (rc:get st "with") "script-file") rc:SELF)
+       (equal? (rc:get (rc:get st "env") "RELEASE_CONTRACT_MODE") "verify")))
+
 (define (rc:assets-job-violations wf)
   (let* ((job (rc:job wf rc:ASSETS-JOB)) (at (string-append "job `" rc:ASSETS-JOB "`: ")) (needs (rc:needs job)))
     (if (not (rc:has-key? (rc:get wf "jobs") rc:ASSETS-JOB))
-      (list (string-append at "missing; nothing checks that every asset exists before :latest moves"))
+      (list (string-append at "missing; nothing checks that every asset exists before anything is published"))
       (append
-        (map (fn (n) (string-append at "does not need `" n "`, so :latest can move while that leg is red or still running"))
+        (map (fn (n) (string-append at "does not need `" n "`, so the release can be published while that leg is red or still running"))
           (filter (fn (n) (not (member? n needs))) (rc:publishing-jobs wf)))
         (if (not (string-contains? (rc:get job "if") "refs/tags/v"))
-          (list (string-append at "needs `if: startsWith(github.ref, 'refs/tags/v')`; a branch dispatch must never promote"))
+          (list (string-append at "needs `if: startsWith(github.ref, 'refs/tags/v')`; a branch dispatch must never publish"))
           (list))
-        (if (not (any? (fn (st) (and (equal? (rc:get st "id") "verify")
-                                     (string-starts-with? (rc:get st "uses") "pleme-io/actions/tatara-script@")
-                                     (equal? (rc:get (rc:get st "with") "script-file") rc:SELF)
-                                     (equal? (rc:get (rc:get st "env") "RELEASE_CONTRACT_MODE") "verify")))
-                       (rc:steps job)))
+        (if (not (any? rc:verify-step? (rc:steps job)))
           (list (string-append at "needs a step `id: verify` running " rc:SELF " through pleme-io/actions/tatara-script with RELEASE_CONTRACT_MODE: verify"))
           (list))
+        (rc:download-violations wf at job (rc:index-where rc:verify-step? (rc:steps job) 0) "its verify step, so the binaries are not checked")
         (if (not (equal? (rc:get (rc:get job "outputs") "images") "${{ steps.verify.outputs.matrix }}"))
           (list (string-append at "needs `outputs: images: ${{ steps.verify.outputs.matrix }}`, the list of images it checked"))
+          (list))
+        (if (not (equal? (rc:get (rc:get job "outputs") "files") rc:FILES-OUTPUT))
+          (list (string-append at "needs `outputs: files: " rc:FILES-OUTPUT "`, the list of files it checked"))
           (list))))))
+
+(define (rc:create-step? st) (string-starts-with? (rc:get st "uses") rc:RELEASE-CREATE))
+
+(define (rc:publish-job-violations wf)
+  (let* ((job (rc:job wf rc:PUBLISH-JOB))
+         (at (string-append "job `" rc:PUBLISH-JOB "`: "))
+         (steps (rc:steps job))
+         (creates (filter rc:create-step? steps)))
+    (if (not (rc:has-key? (rc:get wf "jobs") rc:PUBLISH-JOB))
+      (list (string-append at "missing; nothing creates the GitHub Release from the checked files"))
+      (append
+        (if (not (member? rc:ASSETS-JOB (rc:needs job)))
+          (list (string-append at "does not need `" rc:ASSETS-JOB "`, so the release can be created before every asset is checked"))
+          (list))
+        (map (fn (b) (string-append at "does not need `" b "`, so it cannot read that job's artifact-name output"))
+          (filter (fn (b) (not (member? b (rc:needs job)))) (rc:names-of-kind wf "binary")))
+        (if (= (length creates) 0)
+          (list (string-append at "needs a step using " rc:RELEASE-CREATE "main"))
+          (let ((cw (rc:get (car creates) "with")))
+            (append
+              (if (not (equal? (rc:get cw "assets") rc:PUBLISH-ASSETS))
+                (list (string-append at "gh-release-create needs `assets: " rc:PUBLISH-ASSETS "`, so it publishes exactly the files " rc:ASSETS-JOB " checked"))
+                (list))
+              (if (not (equal? (rc:get cw "if-exists") "fail"))
+                (list (string-append at "gh-release-create needs `if-exists: fail`; its default, skip, reports success on an existing release without uploading a file"))
+                (list)))))
+        (rc:download-violations wf at job (rc:index-where rc:create-step? steps 0) "gh-release-create, so the checked files are not there to upload")))))
 
 (define (rc:promote-job-violations wf)
   (let* ((job (rc:job wf rc:PROMOTE-JOB)) (at (string-append "job `" rc:PROMOTE-JOB "`: ")))
@@ -245,34 +396,58 @@
         (if (not (member? rc:ASSETS-JOB (rc:needs job)))
           (list (string-append at "does not need `" rc:ASSETS-JOB "`, so :latest can move before the assets are checked"))
           (list))
+        (if (not (member? rc:PUBLISH-JOB (rc:needs job)))
+          (list (string-append at "does not need `" rc:PUBLISH-JOB "`, so an image can become :latest for a release with no GitHub Release"))
+          (list))
         (if (not (equal? (rc:get (rc:get (rc:get job "strategy") "matrix") "image") rc:PROMOTE-MATRIX))
           (list (string-append at "needs `strategy.matrix.image: " rc:PROMOTE-MATRIX "`, so it moves exactly the images that were checked"))
           (list))))))
 
-(define (rc:violations wf)
+;; `bins` is a list of (package binary) pairs, the workspace's in production.
+(define (rc:violations-in wf bins)
   (append
-    (reduce (fn (acc n) (append acc (rc:job-violations wf n))) (list) (rc:job-names wf))
+    (reduce (fn (acc n) (append acc (rc:job-violations wf n bins))) (list) (rc:job-names wf))
     (if (and (not (equal? (rc:names-of-kind wf "image") (list))) (equal? (rc:names-of-kind wf "manifest") (list)))
       (list "images are pushed per arch, but no job joins them into the `:<tag>` index that promote-latest moves")
       (list))
     (rc:assets-job-violations wf)
+    (rc:publish-job-violations wf)
     (rc:promote-job-violations wf)))
 
+(define (rc:violations wf) (rc:violations-in wf (rc:workspace-bins)))
+
 ;; ── Verify mode: look every asset up ─────────────────────────────────────
-;; The two presence checks are passed in, so the tests run this with fakes.
-;; Returns the assets that are missing.
+;; The presence and checksum lookups are passed in, so the tests run these
+;; with fakes.
+
+;; The assets that are missing.
 (define (rc:missing-assets assets file-present? oci-present?)
   (filter
     (fn (a) (not (if (equal? (car a) "file") (file-present? (car (cdr a))) (oci-present? (car (cdr a))))))
     assets))
 
-(define (rc:release-files tag repo)
-  (let ((r (exec-capture "gh" "release" "view" tag "--repo" repo "--json" "assets")))
-    (if (= (alist-get r :status 1) 0)
-      (map (fn (a) (alist-get a "name" "")) (alist-get (json-parse (alist-get r :stdout "")) "assets" (list)))
-      (begin
-        (print-line (string-append "gh release view " tag " failed: " (string-trim (alist-get r :stderr ""))))
-        (list)))))
+;; The binaries whose sha256 is empty or differs from the first field of
+;; their .sha256 file. Only files promised together with a .sha256 are
+;; checked. `sum-of` and `sidecar-of` take a release file name.
+(define (rc:bad-checksums assets sum-of sidecar-of)
+  (let ((names (rc:file-names assets)))
+    (filter
+      (fn (f)
+        (let ((got (sum-of f)))
+          (or (equal? got "") (not (equal? got (sidecar-of (string-append f ".sha256")))))))
+      (filter (fn (f) (and (not (string-ends-with? f ".sha256")) (member? (string-append f ".sha256") names))) names))))
+
+(define (rc:first-field s)
+  (let ((x (string-trim s)))
+    (if (equal? x "") "" (car (string-split x " ")))))
+
+(define (rc:staged-sha256 f)
+  (let ((r (exec-capture "sha256sum" (path-join rc:STAGE f))))
+    (if (= (alist-get r :status 1) 0) (rc:first-field (alist-get r :stdout "")) "")))
+
+(define (rc:staged-sidecar f)
+  (let ((p (path-join rc:STAGE f)))
+    (if (path-exists? p) (rc:first-field (read-file p)) "")))
 
 (define (rc:oci-exists? ref)
   (= (alist-get (exec-capture "docker" "buildx" "imagetools" "inspect" "--raw" ref) :status 1) 0))
@@ -304,13 +479,12 @@
 
 (define (rc:verify-main)
   (let* ((tag (env-get "RELEASE_TAG" ""))
-         (repo (env-get "GITHUB_REPOSITORY" ""))
          (wf (rc:load))
          (vs (rc:violations wf))
          (assets (rc:expected-assets wf tag)))
     (cond
-      ((or (equal? tag "") (equal? repo ""))
-        (print-line "FATAL: verify mode needs RELEASE_TAG and GITHUB_REPOSITORY")
+      ((equal? tag "")
+        (print-line "FATAL: verify mode needs RELEASE_TAG")
         (rc:output! "verdict=no-input")
         (exit 3))
       ((> (length vs) 0)
@@ -322,8 +496,7 @@
         (rc:output! "verdict=nothing-to-check")
         (exit 3))
       (else
-        (let* ((files (rc:release-files tag repo))
-               (missing (rc:missing-assets assets (fn (f) (member? f files)) rc:oci-exists?)))
+        (let ((missing (rc:missing-assets assets (fn (f) (path-exists? (path-join rc:STAGE f))) rc:oci-exists?)))
           (for-each
             (fn (a) (print-line (string-append (if (member? a missing) "MISSING  " "present  ") (rc:asset-label a))))
             assets)
@@ -333,10 +506,15 @@
           (rc:output! (string-append "missing-count=" (rc:n (length missing))))
           (if (> (length missing) 0)
             (begin (rc:output! "verdict=missing") (exit 1))
-            (begin
-              (rc:output! "verdict=all-present")
-              (rc:output! (string-append "matrix=" (json-stringify (rc:image-repos wf))))
-              (exit 0))))))))
+            (let ((bad (rc:bad-checksums assets rc:staged-sha256 rc:staged-sidecar)))
+              (for-each (fn (f) (print-line (string-append "CHECKSUM " f " does not match " f ".sha256"))) bad)
+              (if (> (length bad) 0)
+                (begin (rc:output! "verdict=checksum-mismatch") (exit 1))
+                (begin
+                  (rc:output! "verdict=all-present")
+                  (rc:output! (string-append "files=" (string-join " " (rc:staged-files assets))))
+                  (rc:output! (string-append "matrix=" (json-stringify (rc:image-repos wf))))
+                  (exit 0))))))))))
 
 (cond
   ((equal? (env-get "TLISP_TEST" "") "1") (print-line "TLISP_TEST=1: release-contract loaded; main skipped"))

@@ -5,19 +5,17 @@ name: test
 #
 # WHY IT EXISTS (read before "simplifying" it back into ci.yml).
 #
-# `ci.yml` runs two Nix steps: `gen confirm` (fatal; the Cargo.lock <->
-# Cargo.gen.lock tie) and a non-fatal `nix flake check`. It stopped being a
-# shim onto substrate's `cargo-ci.yml` in 4757f50; the argument below is
-# unchanged. `nix flake check` builds only `checks.<system>.*`, and
-# engenho's flake declares exactly one: `checks.<system>.typed-config` (since
-# 51e702a), an eval-time test of the Nix module trio's typed options that
-# stubs the trio's `settings` rather than building engenho. It compiles no
-# Rust, so ci.yml proves the flake and its typed module surface evaluate and
-# says nothing about the crates. On the sibling repo
-# `forge` this was proven by probe: a clean tree exited 0, a `compile_error!`
-# in a test module exited 0, and LITERAL NON-RUST GARBAGE in a function body
-# ALSO exited 0 — every run printing "(build skipped)". The crate was never
-# compiled, not merely untested.
+# `ci.yml` runs two Nix steps, both fatal: `gen confirm` (the Cargo.lock <->
+# Cargo.gen.lock tie) and `nix flake check --no-build --all-systems`. It
+# stopped being a shim onto substrate's `cargo-ci.yml` in 4757f50. The flake
+# declares five checks per system (build, gen-confirm, tests, typed-config,
+# flake-surface), but ci.yml only EVALUATES them. It compiles no Rust, so it
+# proves the flake and its check surface evaluate and says nothing about the
+# crates. How little that says was proven by probe on the sibling repo
+# `forge`, whose flake check compiled no Rust: a clean tree exited 0, a
+# `compile_error!` in a test module exited 0, and LITERAL NON-RUST GARBAGE in
+# a function body ALSO exited 0 — every run printing "(build skipped)". The
+# crate was never compiled, not merely untested.
 #
 # WHY NOT FIX IT AT THE LOAD-BEARING LAYER INSTEAD (Operating Principle #2).
 # The right fix is for the flake to expose real `checks` so `nix flake check`
@@ -26,16 +24,20 @@ name: test
 # `lockfile-builder.nix`, the engine `substrate.rust.workspace` routes to,
 # had no test runner.
 #
-# THE FIX HAS LANDED UPSTREAM; ENGENHO HAS NOT ADOPTED IT (improvement plan
-# T0.9). Substrate 83bab67 added an opt-in runner:
-# `substrate.rust.workspace { tests.cargo.runs = [ … ]; }` yields
-# `checks.<system>.tests`, `cargo test --frozen` over a vendor dir built from
-# Cargo.lock, reading this repo's [profile.*] itself. engenho's flake.lock
-# pins substrate fcd3514, which predates it. Pending: bump that input,
-# declare `tests.cargo` in flake.nix, and check that the five private git
-# dependencies vendor inside Nix. Until then THIS workflow is what stands
-# between engenho and an un-compiled merge; afterwards its cargo steps can
-# collapse into the flake. Building an in-repo `checks` by hand would be a
+# ENGENHO HAS ADOPTED THE FIX; NOTHING HAS BUILT IT YET (improvement plan
+# T0.9, integration item I36). Substrate 83bab67 added an opt-in runner, and
+# flake.lock pins substrate 1eb48fe, which carries it. flake.nix declares
+# `tests.cargo`, so `checks.<system>.tests` runs `cargo test --frozen` over a
+# vendor dir built from Cargo.lock, reading this repo's [profile.*] itself.
+# Its two runs are this workflow's selection: every target with every
+# feature, then the doctests. The live-oracle binaries stay out, read from
+# .config/nextest.toml, and so do the five engenho-kubelet tests that realise
+# a closure with a real `nix build`, because the build sandbox has no Nix
+# daemon. The vendor dir needs no credentials: Cargo.lock has no git source.
+# The check needs a ~17 GB target and has not been built anywhere yet. Once
+# it is built green on rio, this workflow's cargo legs fold into
+# `nix flake check`. Until then THIS workflow is what stands between engenho
+# and an un-compiled merge. Building an in-repo `checks` by hand would be a
 # SECOND, divergent Rust build path; Operating Principle #1 forbids that.
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,13 +45,15 @@ name: test
 # 35418242848 and 35421804575 (2026-09-19). Both used `cargo test`; the test
 # leg below now runs nextest over the same tests.
 #
-# Cargo.lock has git dependencies on five pleme-io repos (tameshi · cofre ·
-# promessa · sui · tatara), and cargo resolves the whole lock graph whatever
-# the features, so every cargo command fetches them. `git-credentials` rewrites
-# github.com URLs to carry BOT_PAT. In both runs BOT_PAT arrived non-empty (the
-# step log prints `bot-pat: ***`) and every private dependency resolved: the
-# engenho-diff compile leg was green and the test leg built and ran the whole
-# workspace.
+# Cargo.lock has no git dependency: none of its 765 sources is git (counted
+# 2026-09-19). The last 24, on nine pleme-io repos (caixa · cofre · gen ·
+# promessa · shigoto · shikumi · sui · tameshi · tatara), left in e1986fa
+# (2026-08-04). So cargo fetches from crates.io alone, and the
+# `git-credentials` steps below, which rewrite github.com URLs to carry
+# BOT_PAT, have no private dependency to carry today.
+# In both runs BOT_PAT arrived non-empty (the step log prints `bot-pat: ***`),
+# the engenho-diff compile leg was green, and the test leg built and ran the
+# whole workspace.
 #
 # Why it arrives: engenho is PUBLIC (`gh repo view` -> PUBLIC; the org posture
 # catalog, pangea-architectures workspaces/pleme-io-opensource/org.yaml,
@@ -133,8 +137,8 @@ jobs:
 
       # ── Nix on the runner: the test runner AND three tests need it ──────
       # Two consumers, so this step must stay BEFORE the nextest leg:
-      #   1. nextest itself, fetched from substrate's pin below, the same
-      #      `github:pleme-io/substrate#cargo-nextest` that substrate's
+      #   1. nextest itself: `nextest: "true"` realises
+      #      `github:pleme-io/substrate#cargo-nextest`, the build substrate's
       #      rust-auto-release test gate runs. Both gates therefore run one
       #      nextest build over one selection file, .config/nextest.toml.
       #   2. engenho-kubelet's native_runs_a_real_closure (2 tests) and
@@ -146,14 +150,16 @@ jobs:
       # third inline one. The token is only rate-limit headroom here: every
       # flake fetched is public (substrate, its pleme-io inputs skill-lint and
       # tatara-lisp, nixpkgs). The `||` fallback is the release gate's own.
-      # `nix profile install` lands the binary in ~/.nix-profile/bin, which
-      # the installer has already put on PATH, so the leg below is the same
-      # `cargo nextest run` a developer types locally.
+      # nix-setup builds nextest to an out-link under RUNNER_TEMP and puts its
+      # bin on PATH, so the leg below is the same `cargo nextest run` a
+      # developer types locally. It used to be `nix profile install`, here and
+      # three times in deep-test.yml; that wrote the runner's Nix profile.
+      # ci/nix-on-runner.tlisp now fails a step that writes a Nix profile, and
+      # a nextest step with no `nextest: "true"` nix-setup before it.
       - uses: pleme-io/actions/nix-setup@main
         with:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
-      - name: install substrate's pinned cargo-nextest
-        run: nix profile install github:pleme-io/substrate#cargo-nextest
+          nextest: "true"
 
       # ── The executing gate ──────────────────────────────────────────────
       # WHICH tests run is decided by .config/nextest.toml, not by a flag on
@@ -234,8 +240,12 @@ jobs:
   # with nix, so every job that runs tests or calls nix must install Nix
   # first, and only through pleme-io/actions/nix-setup. ci/nix-on-runner.tlisp
   # reads every workflow in .github/workflows and fails on a direct
-  # nix-installer-action or on a Nix-needing step with no nix-setup before it.
-  # It is a separate job so a red here names the contract, not a test.
+  # nix-installer-action, on a step that writes a Nix profile, on a nextest
+  # step with no `nextest: "true"` nix-setup before it, and on any other
+  # Nix-needing step with no nix-setup before it (integration item I24 added
+  # the middle two). It is a separate job so a red here names the contract,
+  # not a test. Its suite, ci/nix-on-runner.test.tlisp, runs in
+  # ci-contract-tests below.
   # ───────────────────────────────────────────────────────────────────────────
   nix-on-runner:
     name: nix on the runner (workflow contract)
@@ -245,12 +255,18 @@ jobs:
       - uses: pleme-io/actions/tatara-script@main
         with:
           script-file: ci/nix-on-runner.tlisp
+          version: v0.3.58
 
   # ───────────────────────────────────────────────────────────────────────────
   # Publish only after the gate, as a checked contract (improvement plan
-  # T0.3a). release.yml moves `:latest` in one job, promote-latest, after
-  # release-assets has waited on every publishing leg and found every asset.
-  # ci/release-contract.tlisp reads release.yml and fails on a job that names
+  # T0.3). release.yml creates the GitHub Release in one job,
+  # publish-release, and moves `:latest` in one job, promote-latest, both
+  # after release-assets has waited on every publishing leg and found every
+  # asset. ci/release-contract.tlisp reads release.yml and fails on a
+  # rust-binary-release call without `artifact-only: true` (its default
+  # mode attaches each leg to the release before any gate) or without a
+  # `package` that declares its binary (T0.8), a job other than
+  # publish-release that writes a GitHub Release, a job that names
   # `latest`, an image-push call that leaves `tag` or `additionalTags` at
   # their `latest` defaults, a publishing job release-assets does not wait
   # on, or a job its catalog does not know. Its tests,
@@ -278,10 +294,11 @@ jobs:
   # .github/workflows/mutation.yml.
   # Second step: pleme-io/actions/tlisp-test runs each ci/<name>.test.tlisp
   # against ci/<name>.tlisp. min-files is the number of suites that exist
-  # (release-contract, mutation-gate, cargo-profiles, doc-sources), so
-  # losing one is red, not a smaller green; mutation-gate's suite fails if
-  # the floor and the count disagree. The first step pins the tatara-script tlisp-test reuses
-  # from PATH.
+  # (release-contract, mutation-gate, cargo-profiles, doc-sources, no-c-tls,
+  # nix-on-runner, replay-backward), so losing one is red, not a smaller
+  # green; mutation-gate's
+  # suite fails if the floor and the count disagree. The first step pins the
+  # tatara-script tlisp-test reuses from PATH.
   # cargo-profiles has no job of its own: its suite's first test runs the
   # whole check against the real Cargo.toml, .cargo/config.toml and every
   # workflow (improvement plan T0.9). It fails if [profile.release] leaves
@@ -296,6 +313,17 @@ jobs:
   # into a crate that is not a workspace member, a `path.rs::Item` that file
   # does not declare, or an index row with no source; and if
   # engenho-machines comes back.
+  # no-c-tls has no job of its own either: its suite's first tests run the
+  # check against the real Cargo.toml, every member manifest and Cargo.lock
+  # (improvement plan T0.8). They fail if the workspace reqwest line stops
+  # turning reqwest's default features off or stops naming rustls-tls,
+  # rustls-tls-native-roots, charset, http2 and system-proxy; if a member
+  # asks reqwest for its default or native-tls features; if Cargo.lock loses
+  # reqwest, rustls or hyper-rustls; or if openssl-sys, openssl, native-tls,
+  # hyper-tls or tokio-native-tls is locked through a source the check's
+  # attribution table does not name. Today one named source remains:
+  # sui-store 0.1.153 asks reqwest for its defaults (fixed in sui 66a289f,
+  # unreleased).
   # ───────────────────────────────────────────────────────────────────────────
   ci-contract-tests:
     name: ci/*.test.tlisp + mutation-gate lists
@@ -310,4 +338,46 @@ jobs:
           MUTATION_GATE_MODE: lint
       - uses: pleme-io/actions/tlisp-test@main
         with:
-          min-files: 4
+          min-files: 7
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Backward replay (improvement plan T3.1 case 5, integration item I28). A
+  # node rolled back one release boots by replaying what the newer binary
+  # appended to its raft log. The forward half of case 5 runs in the test leg
+  # above: logs recorded by released binaries replay through this tree. This
+  # job runs the backward half, which needs the previous release's own code:
+  # ci/replay-backward.tlisp records a log from this tree with
+  # engenho-store/tests/restart_is_a_kill.rs's recorder into
+  # ENGENHO_REPLAY_FIXTURE_DIR, checks the previous release out into a git
+  # worktree, and runs THAT release's case 5 on it. The previous release is
+  # the newest `v*` tag reachable from HEAD^, which is why the checkout
+  # fetches full history. Both builds fetch the private git dependencies,
+  # hence git-credentials.
+  # Verdicts: replayed (0) · predates-harness (0, with a ::warning:: and a
+  # step-summary line saying nothing ran; it lasts only until the first
+  # release that contains the harness, v0.53.118 and older predate it) ·
+  # diverged (1: the previous release cannot replay what this tree writes;
+  # plan §6 edge 20 says how such a change ships) · harness-missing (1) ·
+  # blind (3: no previous release, a build failed, or zero tests ran).
+  # The script's decisions are tested in ci-contract-tests above
+  # (ci/replay-backward.test.tlisp), including that this job exists.
+  # ───────────────────────────────────────────────────────────────────────────
+  replay-backward:
+    name: backward replay (this tree's log through the previous release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: replay-backward
+      - uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/replay-backward.tlisp
+          version: v0.3.58

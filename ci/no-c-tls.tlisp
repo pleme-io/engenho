@@ -1,0 +1,415 @@
+;; no-c-tls — engenho asks for no C TLS stack: reqwest is rustls-only, and no
+;; OpenSSL or native-tls crate enters Cargo.lock from a source nobody named.
+;;
+;; WHY (improvement plan T0.8, buildci-5; integration row I34).
+;;   reqwest's default features include `default-tls`, which is native-tls:
+;;   OpenSSL through openssl-sys on Linux, Security.framework on darwin.
+;;   Wherever `default-tls` is on, reqwest's `TlsBackend::default()` picks
+;;   native-tls even when a rustls feature is enabled too, so a
+;;   `Client::new()` or a bare `Client::builder()` runs on it. engenho has two
+;;   of those in the daemon: the apiserver's webhook-admission client and the
+;;   kubelet's HTTPS probe client. Cargo unifies features, so ONE dependency
+;;   that asks reqwest for its defaults turns `default-tls` on for every crate
+;;   in the build, whatever the workspace line says.
+;;   * The workspace line already said `default-features = false`, but named
+;;     only json and rustls-tls. charset, http2 and system-proxy reached
+;;     engenho only because another crate asked for all of reqwest's
+;;     defaults; fixing that crate would have silently dropped HTTP/2.
+;;     The line now names them, plus rustls-tls-native-roots (the OS trust
+;;     store native-tls read), as pleme-io/sui 66a289f did.
+;;   * That other crate is sui-store 0.1.153, reached through
+;;     engenho-fonte-cli -> engenho-fonte (with-sui-eval) ->
+;;     engenho-sui-typescape -> sui-eval. It asks reqwest for its defaults.
+;;     sui fixed its workspace line in 66a289f, and no published sui release
+;;     carries that commit (the newest, 0.1.219, still asks). Cargo.gen.lock
+;;     is ONE workspace-wide resolve, and Nix builds every crate from it.
+;;     It lists `default` and `default-tls` among reqwest's features, so
+;;     every Nix-built binary that uses reqwest compiles native-tls. On
+;;     Linux that links OpenSSL. Measured 2026-09-19: the x86_64-linux
+;;     engenho-mcp derivation depends on rust_openssl-sys, which is built
+;;     against openssl-static 3.6.2. engenho-mcp does not even reach
+;;     sui-store. A per-package `cargo tree` shows none of this.
+;;   * `cargo tree -i openssl-sys --workspace` cannot see any of this on
+;;     darwin: native-tls uses Security.framework there, so the host-only
+;;     query prints nothing. It needs `--target all`. Cargo.lock is resolved
+;;     for every target at once, which is why this check reads it.
+;;
+;; RULES:
+;;   workspace   [workspace.dependencies] reqwest is a table with
+;;               `default-features = false` (the boolean), names each of
+;;               tls:WORKSPACE-WANTS, and names no feature in
+;;               tls:NATIVE-FEATURES.
+;;   members     no member manifest asks reqwest for its default or
+;;               native-tls features. Every reqwest entry, also one renamed
+;;               through `package = "reqwest"`, in [dependencies],
+;;               [dev-dependencies], [build-dependencies] or a
+;;               [target.*.…] form of them: either inherits the workspace
+;;               line (`workspace = true`) without setting
+;;               `default-features = true`, or sets `default-features =
+;;               false` itself. No entry lists a tls:NATIVE-FEATURES
+;;               feature, and no [features] entry enables one through
+;;               `reqwest/…` or `reqwest?/…`.
+;;   present     (positive control) Cargo.lock resolves each of
+;;               tls:REQUIRED. Without them the ban would pass because there
+;;               is no rustls HTTP client at all.
+;;   direct      every Cargo.lock package that depends on a tls:BANNED crate
+;;               is itself banned, or is reqwest (whose `default-tls`
+;;               feature is attributed below). Anything else pulls C TLS by
+;;               itself and fails.
+;;   attributed  while a banned crate is in Cargo.lock, every non-workspace
+;;               package that depends on a reqwest carrying a banned edge
+;;               has a tls:ATTRIBUTION row for its exact locked version, and
+;;               at least one of those rows says `asks`. A package with no
+;;               row fails: Cargo.lock does not record which dependent turned
+;;               `default-tls` on, so a dependent nobody has read is treated
+;;               as a new source.
+;;   stale       an attribution row that matches no such dependent fails.
+;;               Once no banned crate is in Cargo.lock, that is every row:
+;;               a row left behind would excuse the next regression.
+;;
+;; THE ATTRIBUTION TABLE. Each row is (package version kind why). The kind
+;; is `asks` (the package's own manifest asks reqwest for its default
+;; features: a known C TLS source, waiting on its upstream) or `clean` (the
+;; manifest was read and asks for no default and no native-tls feature). A
+;; row is a reading of one published manifest, so it names an exact version;
+;; a lock bump makes it stale and the new version unattributed, which is the
+;; prompt to read the new manifest.
+;;
+;; WHEN SUI PUBLISHES A RELEASE WITH 66a289f: move the lock to it
+;; (engenho-sui-typescape's `sui-eval = "0.1.0"` admits any 0.1.x), run
+;; `gen build`, and delete the sui-store row. If the banned crates have left
+;; Cargo.lock this check then fails on the `clean` rows; delete those too,
+;; and from then on it is a plain ban.
+;;
+;; TIER: a CI gate, not a type. It reads the TOML cargo reads: a manifest
+;; edited to ask for reqwest's defaults, a new dependency that pulls
+;; native-tls or OpenSSL, or a lock bump to an unread dependent fails before
+;; merge. It does not see per-binary feature resolution: Cargo.lock is a
+;; superset of every build, so it can fail on a crate that one binary never
+;; links. Attribution rows are hand-recorded readings of upstream manifests,
+;; not something this check can verify. It says nothing about C linked by
+;; other means (a `-sys` crate that is not TLS, or a system library a build
+;; script finds).
+;;
+;; Exit codes: 0 clean · 1 a rule is broken · 3 nothing was examined (no
+;; Cargo.lock package, or no workspace member manifest): the check proved
+;; nothing, which is not the same as finding nothing wrong.
+;;
+;; Tests: ci/no-c-tls.test.tlisp (tlisp-test sets TLISP_TEST=1, which loads
+;; these definitions and skips the main at the bottom). CI runs this check
+;; only through that suite, in test.yml's ci-contract-tests: its first test
+;; applies every rule to the real repository. Run the main locally:
+;;   tatara-script ci/no-c-tls.tlisp
+
+(define tls:MANIFEST "Cargo.toml")
+(define tls:LOCK "Cargo.lock")
+
+;; The C TLS crates. native-tls is the reqwest backend; openssl and
+;; openssl-sys are what it links on Linux; hyper-tls and tokio-native-tls are
+;; reqwest's adapters to it.
+(define tls:BANNED (list "openssl-sys" "openssl" "native-tls" "hyper-tls" "tokio-native-tls"))
+
+;; What the ban is measured against: a rustls HTTP client in the resolve.
+(define tls:REQUIRED (list "reqwest" "rustls" "hyper-rustls"))
+
+;; reqwest features that turn native-tls on. `default` is here because
+;; naming it in a feature list is the same as leaving the defaults on.
+(define tls:NATIVE-FEATURES
+  (list "default" "default-tls" "native-tls" "native-tls-alpn" "native-tls-vendored"))
+
+;; What the workspace line must name, and why, as (feature why) pairs.
+(define tls:WORKSPACE-WANTS
+  (list
+    (list "rustls-tls" "the rustls backend, with the bundled webpki roots")
+    (list "rustls-tls-native-roots" "the OS trust store native-tls read; without it a private CA stops verifying")
+    (list "charset" "one of reqwest's defaults, named back so that TLS is the only thing the line turns off")
+    (list "http2" "one of reqwest's defaults, named back so that TLS is the only thing the line turns off")
+    (list "system-proxy" "one of reqwest's defaults, named back so that TLS is the only thing the line turns off")))
+
+;; Every non-workspace reqwest dependent in Cargo.lock while a banned crate
+;; is there, as (package version kind why). See THE ATTRIBUTION TABLE above.
+(define tls:ATTRIBUTION
+  (list
+    (list "sui-store" "0.1.153" "asks"
+      "[dependencies.reqwest] features = [rustls-tls, json, stream] with default features on; fixed in pleme-io/sui 66a289f, not in any release as of 0.1.219")
+    (list "object_store" "0.13.2" "clean"
+      "[dependencies.reqwest] default-features = false, features = [rustls-tls-native-roots, http2]")
+    (list "tameshi" "0.1.3" "clean"
+      "[dependencies.reqwest] default-features = false, features = [json, rustls-tls]")))
+
+(define tls:KINDS (list "asks" "clean"))
+
+;; The dependency tables cargo reads (the underscore spellings are its older,
+;; still-accepted names).
+(define tls:DEP-TABLES
+  (list "dependencies" "dev-dependencies" "build-dependencies" "dev_dependencies" "build_dependencies"))
+
+;; ── Reading parsed TOML ──────────────────────────────────────────────────
+;; toml-parse yields a table as a list of (key value) and an array as a list.
+
+(define (tls:get al key) (if (list? al) (alist-get al key "") ""))
+
+(define (tls:has-key? al key)
+  (and (list? al) (any? (fn (e) (and (list? e) (equal? (car e) key))) al)))
+
+(define (tls:table al key) (let ((v (tls:get al key))) (if (list? v) v (list))))
+
+(define (tls:as-list v) (if (list? v) v (list)))
+
+(define (tls:in? x xs) (any? (fn (y) (equal? x y)) xs))
+
+(define (tls:n x) (string-format "{}" x))
+
+(define (tls:strings v) (filter (fn (s) (string? s)) (tls:as-list v)))
+
+;; ── One reqwest dependency entry ─────────────────────────────────────────
+
+;; An entry's `default-features` as written: true, false, another value, or
+;; "unset" when the key is absent.
+(define (tls:default-features entry)
+  (cond
+    ((tls:has-key? entry "default-features") (tls:get entry "default-features"))
+    ((tls:has-key? entry "default_features") (tls:get entry "default_features"))
+    (else "unset")))
+
+(define (tls:false? v) (and (boolean? v) (equal? v false)))
+(define (tls:true? v) (and (boolean? v) (equal? v true)))
+
+;; Is the entry `key = value` a reqwest dependency? Either the key is
+;; `reqwest` and no `package` renames it away, or `package = "reqwest"`.
+(define (tls:reqwest-entry? key value)
+  (let ((pkg (if (and (list? value) (tls:has-key? value "package")) (tls:get value "package") "")))
+    (or (equal? pkg "reqwest") (and (equal? key "reqwest") (equal? pkg "")))))
+
+;; Violations for one reqwest entry `key = entry`, found at `where`.
+(define (tls:entry-violations where key entry)
+  (let ((at (string-append where " `" key "`: ")))
+    (cond
+      ((string? entry)
+        (list (string-append at "is the bare version \"" entry "\", which takes reqwest's default features, default-tls among them; write `{ workspace = true }` or a table with `default-features = false`")))
+      ((not (list? entry))
+        (list (string-append at "is neither a version nor a table")))
+      (else
+        (let* ((df (tls:default-features entry))
+               (native (filter (fn (f) (tls:in? f tls:NATIVE-FEATURES)) (tls:strings (tls:get entry "features")))))
+          (append
+            (cond
+              ((tls:true? (tls:get entry "workspace"))
+                (if (tls:true? df)
+                  (list (string-append at "inherits the workspace line but sets `default-features = true`, which turns reqwest's defaults, default-tls among them, back on"))
+                  (list)))
+              ((tls:false? df) (list))
+              (else
+                (list (string-append at "does not set `default-features = false`, so it takes reqwest's default features, default-tls among them; inherit the workspace line with `workspace = true`"))))
+            (map (fn (f) (string-append at "names the feature `" f "`, which turns native-tls on")) native)))))))
+
+;; ── Rules over the manifests ─────────────────────────────────────────────
+
+(define (tls:workspace-violations manifest)
+  (let* ((deps (tls:table (tls:table manifest "workspace") "dependencies"))
+         (at (string-append tls:MANIFEST " [workspace.dependencies] reqwest: ")))
+    (cond
+      ((not (tls:has-key? deps "reqwest"))
+        (list (string-append at "missing; the members' `workspace = true` entries would have no line to inherit")))
+      ((not (list? (tls:get deps "reqwest")))
+        (list (string-append at "is a bare version, which takes reqwest's default features, default-tls among them")))
+      (else
+        (let* ((entry (tls:get deps "reqwest"))
+               (features (tls:strings (tls:get entry "features"))))
+          (append
+            (if (tls:false? (tls:default-features entry))
+              (list)
+              (list (string-append at "needs `default-features = false` (the boolean); reqwest's defaults include default-tls, which is native-tls")))
+            (map (fn (w) (string-append at "does not name `" (car w) "`, " (car (cdr w))))
+              (filter (fn (w) (not (tls:in? (car w) features))) tls:WORKSPACE-WANTS))
+            (map (fn (f) (string-append at "names the feature `" f "`, which turns native-tls on"))
+              (filter (fn (f) (tls:in? f tls:NATIVE-FEATURES)) features))))))))
+
+;; Every (where key entry) for a reqwest entry in one dependency table.
+(define (tls:reqwest-entries where table)
+  (map (fn (e) (list where (car e) (car (cdr e))))
+    (filter (fn (e) (and (list? e) (string? (car e)) (tls:reqwest-entry? (car e) (car (cdr e))))) (tls:as-list table))))
+
+;; Every (where key entry) for a reqwest entry anywhere in a member manifest.
+(define (tls:manifest-entries path manifest)
+  (append
+    (reduce
+      (fn (acc t) (append acc (tls:reqwest-entries (string-append path " [" t "]") (tls:table manifest t))))
+      (list) tls:DEP-TABLES)
+    (reduce
+      (fn (acc target)
+        (append acc
+          (reduce
+            (fn (acc2 t)
+              (append acc2
+                (tls:reqwest-entries (string-append path " [target." (tls:n (car target)) "." t "]")
+                  (tls:table (car (cdr target)) t))))
+            (list) tls:DEP-TABLES)))
+      (list) (tls:table manifest "target"))))
+
+;; A [features] value `reqwest/<f>` or `reqwest?/<f>` (for any key that
+;; names reqwest) enabling a native-tls feature.
+(define (tls:feature-violations path manifest keys)
+  (reduce
+    (fn (acc feature)
+      (append acc
+        (map (fn (v) (string-append path " [features] `" (tls:n (car feature)) "` enables `" v "`, which turns native-tls on"))
+          (filter
+            (fn (v)
+              (let ((parts (string-split v "/")))
+                (and (= (length parts) 2)
+                     (tls:in? (string-replace (car parts) "?" "") keys)
+                     (tls:in? (car (cdr parts)) tls:NATIVE-FEATURES))))
+            (tls:strings (car (cdr feature)))))))
+    (list)
+    (filter (fn (f) (and (list? f) (string? (car f)))) (tls:table manifest "features"))))
+
+;; `members` is a list of (path parsed-manifest).
+(define (tls:member-violations members)
+  (reduce
+    (fn (acc m)
+      (let* ((entries (tls:manifest-entries (car m) (car (cdr m))))
+             (keys (map (fn (e) (car (cdr e))) entries)))
+        (append acc
+          (reduce (fn (acc2 e) (append acc2 (tls:entry-violations (car e) (car (cdr e)) (car (cdr (cdr e)))))) (list) entries)
+          (tls:feature-violations (car m) (car (cdr m)) (if (tls:in? "reqwest" keys) keys (append keys (list "reqwest")))))))
+    (list) members))
+
+;; ── Reading Cargo.lock ───────────────────────────────────────────────────
+;; A package as (name version local? deps), each dep as (name version); a
+;; dependency written without a version ("rustls") has version "", which
+;; cargo writes only when one version of that package is locked.
+
+(define (tls:dep-of s)
+  (let ((parts (string-split s " ")))
+    (list (car parts) (if (> (length parts) 1) (car (cdr parts)) ""))))
+
+(define (tls:packages lock)
+  (map
+    (fn (p)
+      (list (tls:get p "name") (tls:get p "version") (not (tls:has-key? p "source"))
+        (map tls:dep-of (tls:strings (tls:get p "dependencies")))))
+    (filter (fn (p) (list? p)) (tls:as-list (tls:get lock "package")))))
+
+(define (tls:p-name p) (car p))
+(define (tls:p-version p) (car (cdr p)))
+(define (tls:p-local? p) (car (cdr (cdr p))))
+(define (tls:p-deps p) (car (cdr (cdr (cdr p)))))
+(define (tls:p-label p) (string-append (tls:p-name p) " " (tls:p-version p)))
+
+(define (tls:banned-deps p) (filter (fn (d) (tls:in? (car d) tls:BANNED)) (tls:p-deps p)))
+
+;; ── Rules over Cargo.lock ────────────────────────────────────────────────
+
+(define (tls:present-violations pkgs)
+  (map (fn (r) (string-append tls:LOCK ": no `" r "` package; the ban below would pass for want of a rustls HTTP client, not because of one"))
+    (filter (fn (r) (not (any? (fn (p) (equal? (tls:p-name p) r)) pkgs))) tls:REQUIRED)))
+
+(define (tls:direct-violations pkgs)
+  (reduce
+    (fn (acc p)
+      (append acc
+        (map (fn (d) (string-append tls:LOCK ": " (tls:p-label p) " depends on `" (car d) "` directly; no reqwest feature explains it"))
+          (tls:banned-deps p))))
+    (list)
+    (filter (fn (p) (and (not (tls:in? (tls:p-name p) tls:BANNED)) (not (equal? (tls:p-name p) "reqwest")))) pkgs)))
+
+;; The versions of reqwest that depend on a banned crate.
+(define (tls:tainted-reqwests pkgs)
+  (map tls:p-version
+    (filter (fn (p) (and (equal? (tls:p-name p) "reqwest") (> (length (tls:banned-deps p)) 0))) pkgs)))
+
+;; Does `p` depend on a reqwest in `tainted`? A versionless dependency names
+;; the one reqwest in the lock, tainted exactly when `tainted` is non-empty.
+(define (tls:uses-tainted? p tainted)
+  (any?
+    (fn (d)
+      (and (equal? (car d) "reqwest")
+           (if (equal? (car (cdr d)) "") (> (length tainted) 0) (tls:in? (car (cdr d)) tainted))))
+    (tls:p-deps p)))
+
+(define (tls:row-label row) (string-append (car row) " " (car (cdr row))))
+(define (tls:row-kind row) (car (cdr (cdr row))))
+
+(define (tls:row-matches? row p)
+  (and (equal? (car row) (tls:p-name p)) (equal? (car (cdr row)) (tls:p-version p))))
+
+;; Violations of `attributed` and `stale`, over the rows `rows`.
+(define (tls:attribution-violations pkgs rows)
+  (let* ((banned (filter (fn (p) (tls:in? (tls:p-name p) tls:BANNED)) pkgs))
+         (tainted (tls:tainted-reqwests pkgs))
+         (dependents (filter (fn (p) (and (not (tls:p-local? p)) (tls:uses-tainted? p tainted))) pkgs))
+         (live (filter (fn (row) (any? (fn (p) (tls:row-matches? row p)) dependents)) rows))
+         (at (string-append tls:LOCK ": ")))
+    (append
+      (map (fn (row) (string-append "tls:ATTRIBUTION row " (tls:row-label row) ": kind `" (tls:n (tls:row-kind row)) "` is neither asks nor clean"))
+        (filter (fn (row) (not (tls:in? (tls:row-kind row) tls:KINDS))) rows))
+      (if (= (length banned) 0)
+        (map (fn (row) (string-append "tls:ATTRIBUTION row " (tls:row-label row) " is stale: no C TLS crate is in " tls:LOCK "; delete it, or it would excuse the next regression"))
+          rows)
+        (append
+          (map
+            (fn (p)
+              (string-append at (tls:p-label p) " depends on a reqwest that carries native-tls, and has no tls:ATTRIBUTION row; read its reqwest line: asking for the default features makes it a new C TLS source"))
+            (filter (fn (p) (not (any? (fn (row) (tls:row-matches? row p)) rows))) dependents))
+          (map
+            (fn (row)
+              (string-append "tls:ATTRIBUTION row " (tls:row-label row) " is stale: no package at that version depends on a reqwest that carries native-tls; delete it, or read the version that is locked now"))
+            (filter (fn (row) (not (tls:in? row live))) rows))
+          (if (any? (fn (row) (equal? (tls:row-kind row) "asks")) live)
+            (list)
+            (list (string-append at "C TLS is locked (" (string-join ", " (map tls:p-label banned))
+                    ") and no attributed dependent asks reqwest for its defaults; a `clean` row is wrong, or the source is not a reqwest dependent"))))))))
+
+(define (tls:lock-violations lock rows)
+  (let ((pkgs (tls:packages lock)))
+    (append (tls:present-violations pkgs) (tls:direct-violations pkgs) (tls:attribution-violations pkgs rows))))
+
+;; ── Everything, as one list of violation lines ──────────────────────────
+
+(define (tls:violations manifest members lock rows)
+  (append
+    (tls:workspace-violations manifest)
+    (tls:member-violations members)
+    (tls:lock-violations lock rows)))
+
+;; ── Loading the real files ───────────────────────────────────────────────
+
+(define (tls:load-toml path) (if (path-exists? path) (toml-parse (read-file path)) (list)))
+
+(define (tls:load-manifest) (tls:load-toml tls:MANIFEST))
+
+(define (tls:load-lock) (tls:load-toml tls:LOCK))
+
+;; Each workspace member as (path parsed-manifest). A member whose manifest
+;; cannot be read is reported by tls:unread-members, never skipped quietly.
+(define (tls:member-paths manifest)
+  (map (fn (m) (string-append m "/Cargo.toml")) (tls:strings (tls:get (tls:table manifest "workspace") "members"))))
+
+(define (tls:load-members manifest)
+  (map (fn (p) (list p (toml-parse (read-file p)))) (filter (fn (p) (path-exists? p)) (tls:member-paths manifest))))
+
+(define (tls:unread-members manifest)
+  (map (fn (p) (string-append p ": a workspace member with no manifest here; this check reads every member's"))
+    (filter (fn (p) (not (path-exists? p))) (tls:member-paths manifest))))
+
+(define (tls:main)
+  (let* ((manifest (tls:load-manifest))
+         (members (tls:load-members manifest))
+         (lock (tls:load-lock))
+         (pkgs (tls:packages lock))
+         (vs (append (tls:unread-members manifest) (tls:violations manifest members lock tls:ATTRIBUTION)))
+         (banned (filter (fn (p) (tls:in? (tls:p-name p) tls:BANNED)) pkgs)))
+    (when (or (= (length pkgs) 0) (= (length members) 0))
+      (print-line (string-append "FATAL: no package in " tls:LOCK ", or no member manifest; the check proved nothing"))
+      (exit 3))
+    (for-each (fn (v) (print-line (string-append "FAIL " v))) vs)
+    (print-line
+      (string-append "no-c-tls: " (tls:n (length pkgs)) " locked packages · " (tls:n (length members)) " member manifests · "
+        "C TLS locked: " (if (= (length banned) 0) "none" (string-join ", " (map tls:p-label banned)))
+        " · attribution rows: " (tls:n (length tls:ATTRIBUTION)) " · violations: " (tls:n (length vs))))
+    (exit (if (> (length vs) 0) 1 0))))
+
+(cond
+  ((equal? (env-get "TLISP_TEST" "") "1") (print-line "TLISP_TEST=1: no-c-tls loaded; main skipped"))
+  (else (tls:main)))

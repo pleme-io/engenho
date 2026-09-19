@@ -1,0 +1,340 @@
+;; no-c-tls.test.tlisp — (deftest …) suite for ci/no-c-tls.tlisp.
+;; Run by pleme-io/actions/tlisp-test (test.yml, job ci-contract-tests) as
+;; stdlib + unit + this file with TLISP_TEST=1, from the repository root.
+;;
+;; The first tests read the real Cargo.toml, every member manifest and
+;; Cargo.lock, so they fail when the repository breaks a rule; two of them
+;; mutate the real workspace line, so the gate is shown to guard the line
+;; that ships and not only a fixture. The rest run the check against a small
+;; fixture workspace that keeps every rule, then against one mutation per
+;; rule, so each rule is shown to fire on the defect it names and to stay
+;; quiet on its near miss.
+
+(define (t:has? vs needle) (any? (fn (v) (string-contains? v needle)) vs))
+
+;; A fixture with one substring replaced; the replacement must happen, or the
+;; mutation test would silently check the unmutated fixture.
+(define (t:swap text from to)
+  (assert (string-contains? text from) (string-append "fixture no longer contains: " from))
+  (string-replace text from to))
+
+;; ── Fixture: a two-member workspace ──────────────────────────────────────
+
+(define t:ROOT "
+[workspace]
+members = [\"a\", \"b\"]
+
+[workspace.dependencies]
+reqwest = { version = \"0.12\", default-features = false, features = [\"json\", \"rustls-tls\", \"rustls-tls-native-roots\", \"charset\", \"http2\", \"system-proxy\"] }
+")
+
+;; a inherits the workspace line and adds a feature; b declares its own
+;; line with the defaults off, in a dev and a target table.
+(define t:A "
+[package]
+name = \"a\"
+
+[dependencies]
+reqwest = { workspace = true, features = [\"stream\"] }
+
+[features]
+wire = [\"reqwest/json\"]
+")
+
+(define t:B "
+[package]
+name = \"b\"
+
+[dev-dependencies]
+reqwest = { version = \"0.12\", default-features = false, features = [\"rustls-tls\"] }
+
+[target.'cfg(unix)'.dependencies]
+reqwest = { workspace = true }
+")
+
+;; A lock where native-tls arrives through reqwest, and reqwest's two
+;; upstream dependents are an `asks` crate and a `clean` one.
+(define t:LOCK-TAINTED "
+version = 4
+
+[[package]]
+name = \"a\"
+version = \"0.1.0\"
+dependencies = [\"reqwest\"]
+
+[[package]]
+name = \"b\"
+version = \"0.1.0\"
+dependencies = [\"reqwest\", \"up-asks\", \"up-clean\"]
+
+[[package]]
+name = \"reqwest\"
+version = \"0.12.28\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"hyper-rustls\", \"hyper-tls\", \"native-tls\", \"rustls\", \"tokio-native-tls\"]
+
+[[package]]
+name = \"rustls\"
+version = \"0.23.40\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+
+[[package]]
+name = \"hyper-rustls\"
+version = \"0.27.9\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"rustls\"]
+
+[[package]]
+name = \"hyper-tls\"
+version = \"0.6.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"native-tls\", \"tokio-native-tls\"]
+
+[[package]]
+name = \"tokio-native-tls\"
+version = \"0.3.1\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"native-tls\"]
+
+[[package]]
+name = \"native-tls\"
+version = \"0.2.18\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"openssl\", \"openssl-sys\"]
+
+[[package]]
+name = \"openssl\"
+version = \"0.10.80\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"openssl-sys\"]
+
+[[package]]
+name = \"openssl-sys\"
+version = \"0.9.116\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+
+[[package]]
+name = \"up-asks\"
+version = \"0.1.153\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"reqwest\"]
+
+[[package]]
+name = \"up-clean\"
+version = \"0.13.2\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"reqwest\"]
+")
+
+;; The same workspace once its upstream stops asking: no C TLS locked.
+(define t:LOCK-CLEAN "
+version = 4
+
+[[package]]
+name = \"a\"
+version = \"0.1.0\"
+dependencies = [\"reqwest\"]
+
+[[package]]
+name = \"reqwest\"
+version = \"0.12.28\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"hyper-rustls\", \"rustls\"]
+
+[[package]]
+name = \"rustls\"
+version = \"0.23.40\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+
+[[package]]
+name = \"hyper-rustls\"
+version = \"0.27.9\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"rustls\"]
+
+[[package]]
+name = \"up-asks\"
+version = \"0.1.220\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+dependencies = [\"reqwest\"]
+")
+
+(define t:ROWS
+  (list
+    (list "up-asks" "0.1.153" "asks" "asks reqwest for its defaults")
+    (list "up-clean" "0.13.2" "clean" "default-features = false")))
+
+(define (t:toml text) (toml-parse text))
+
+(define (t:members a b) (list (list "a/Cargo.toml" (t:toml a)) (list "b/Cargo.toml" (t:toml b))))
+
+;; Every violation for the four inputs as text, and the attribution rows.
+(define (t:vs root a b lock rows) (tls:violations (t:toml root) (t:members a b) (t:toml lock) rows))
+
+(define (t:good) (t:vs t:ROOT t:A t:B t:LOCK-TAINTED t:ROWS))
+
+(define (t:root-mutant from to) (t:vs (t:swap t:ROOT from to) t:A t:B t:LOCK-TAINTED t:ROWS))
+(define (t:a-mutant from to) (t:vs t:ROOT (t:swap t:A from to) t:B t:LOCK-TAINTED t:ROWS))
+(define (t:b-mutant from to) (t:vs t:ROOT t:A (t:swap t:B from to) t:LOCK-TAINTED t:ROWS))
+(define (t:lock-mutant from to) (t:vs t:ROOT t:A t:B (t:swap t:LOCK-TAINTED from to) t:ROWS))
+(define (t:rows-vs rows) (t:vs t:ROOT t:A t:B t:LOCK-TAINTED rows))
+
+;; ── The real repository ──────────────────────────────────────────────────
+
+(define (t:real-vs manifest-text)
+  (let ((manifest (toml-parse manifest-text)))
+    (append (tls:unread-members manifest)
+      (tls:violations manifest (tls:load-members manifest) (tls:load-lock) tls:ATTRIBUTION))))
+
+(deftest "the real Cargo.toml, member manifests and Cargo.lock keep every rule"
+  (let* ((manifest (tls:load-manifest))
+         (members (tls:load-members manifest))
+         (pkgs (tls:packages (tls:load-lock)))
+         (vs (t:real-vs (read-file tls:MANIFEST))))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (> (length members) 0) "member manifests were read")
+    (assert (> (length pkgs) 0) "Cargo.lock was read")
+    (assert (= (length vs) 0) "no violation in the repository")))
+
+(deftest "the real workspace line refuses reqwest's defaults"
+  (let ((vs (t:real-vs (t:swap (read-file tls:MANIFEST) "reqwest                = { version = \"0.12\", default-features = false, features = [" "reqwest                = { version = \"0.12\", features = ["))))
+    (assert (t:has? vs "needs `default-features = false`") "the real line without default-features = false is refused")))
+
+(deftest "the real workspace line keeps the OS trust store and the named-back defaults"
+  (let ((vs (t:real-vs (t:swap (read-file tls:MANIFEST) "  \"rustls-tls-native-roots\",\n  \"charset\",\n  \"http2\",\n" ""))))
+    (assert (t:has? vs "does not name `rustls-tls-native-roots`") "native roots dropped is refused")
+    (assert (t:has? vs "does not name `charset`") "charset dropped is refused")
+    (assert (t:has? vs "does not name `http2`") "http2 dropped is refused")))
+
+;; ── The fixture keeps every rule ─────────────────────────────────────────
+
+(deftest "the fixture workspace keeps every rule"
+  (let ((vs (t:good)))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (= (length vs) 0) "no violation in the fixture")))
+
+;; ── workspace ───────────────────────────────────────────────────────────
+
+(deftest "a workspace line that leaves reqwest's defaults on is refused"
+  (assert (t:has? (t:root-mutant "default-features = false, " "") "needs `default-features = false`") "unset is refused")
+  (assert (t:has? (t:root-mutant "default-features = false" "default-features = true") "needs `default-features = false`") "true is refused")
+  (assert (t:has? (t:root-mutant "default-features = false" "default-features = \"false\"") "needs `default-features = false`")
+    "the string \"false\" is refused; cargo would refuse the manifest"))
+
+(deftest "a workspace line that is a bare version is refused"
+  (assert (t:has? (t:root-mutant "reqwest = { version = \"0.12\", default-features = false, features = [\"json\", \"rustls-tls\", \"rustls-tls-native-roots\", \"charset\", \"http2\", \"system-proxy\"] }" "reqwest = \"0.12\"")
+            "is a bare version")
+    "reqwest = \"0.12\" is refused"))
+
+(deftest "a workspace line missing a wanted feature is refused, one message per feature"
+  (let ((vs (t:root-mutant "\"rustls-tls\", \"rustls-tls-native-roots\", " "")))
+    (assert (t:has? vs "does not name `rustls-tls`,") "rustls-tls dropped")
+    (assert (t:has? vs "does not name `rustls-tls-native-roots`") "native roots dropped")
+    (assert (= (length vs) 2) "exactly the two dropped features")))
+
+(deftest "a workspace line that names a native-tls feature is refused"
+  (assert (t:has? (t:root-mutant "\"system-proxy\"]" "\"system-proxy\", \"native-tls\"]") "names the feature `native-tls`") "native-tls")
+  (assert (t:has? (t:root-mutant "\"system-proxy\"]" "\"system-proxy\", \"default\"]") "names the feature `default`") "default"))
+
+;; ── members ─────────────────────────────────────────────────────────────
+
+(deftest "a member that inherits the workspace line is quiet; one that re-enables the defaults is refused"
+  (assert (= (length (t:a-mutant "workspace = true, features" "workspace = true, default-features = false, features")) 0)
+    "inheriting with default-features = false is quiet")
+  (assert (t:has? (t:a-mutant "workspace = true, features" "workspace = true, default-features = true, features") "sets `default-features = true`")
+    "default-features = true over the workspace line is refused"))
+
+(deftest "a member line of its own must turn the defaults off"
+  (assert (t:has? (t:b-mutant "default-features = false, " "") "does not set `default-features = false`") "unset is refused")
+  (assert (t:has? (t:b-mutant "default-features = false" "default_features = true") "does not set `default-features = false`")
+    "the underscore spelling is read too")
+  (assert (= (length (t:b-mutant "default-features = false" "default_features = false")) 0) "and its false is accepted"))
+
+(deftest "a member's bare version, in any dependency table, is refused"
+  (assert (t:has? (t:a-mutant "reqwest = { workspace = true, features = [\"stream\"] }" "reqwest = \"0.12\"") "a/Cargo.toml [dependencies] `reqwest`: is the bare version")
+    "[dependencies]")
+  (assert (t:has? (t:b-mutant "reqwest = { workspace = true }" "reqwest = \"0.12\"") "[target.cfg(unix).dependencies] `reqwest`: is the bare version")
+    "[target.'cfg(unix)'.dependencies]")
+  (assert (t:has? (t:b-mutant "[dev-dependencies]" "[build-dependencies]\nhttp = { package = \"reqwest\", version = \"0.12\" }\n\n[dev-dependencies]")
+            "[build-dependencies] `http`: does not set `default-features = false`")
+    "a renamed reqwest is read by its `package`"))
+
+(deftest "a member that names a native-tls feature is refused"
+  (assert (t:has? (t:a-mutant "features = [\"stream\"]" "features = [\"stream\", \"default-tls\"]") "names the feature `default-tls`") "default-tls")
+  (assert (t:has? (t:b-mutant "features = [\"rustls-tls\"]" "features = [\"native-tls-vendored\"]") "names the feature `native-tls-vendored`") "native-tls-vendored"))
+
+(deftest "a member feature that enables reqwest/native-tls is refused; reqwest/json is quiet"
+  (assert (t:has? (t:a-mutant "\"reqwest/json\"" "\"reqwest/native-tls\"") "enables `reqwest/native-tls`") "reqwest/native-tls")
+  (assert (t:has? (t:a-mutant "\"reqwest/json\"" "\"reqwest?/default-tls\"") "enables `reqwest?/default-tls`") "reqwest?/default-tls")
+  (assert (= (length (t:a-mutant "\"reqwest/json\"" "\"reqwest?/json\"")) 0) "reqwest?/json"))
+
+;; ── present ─────────────────────────────────────────────────────────────
+
+(deftest "a lock with no rustls HTTP client fails the positive control"
+  (let ((vs (t:vs t:ROOT t:A t:B (t:swap t:LOCK-CLEAN "name = \"rustls\"" "name = \"not-rustls\"") (list))))
+    (assert (t:has? vs "no `rustls` package") "rustls missing")
+    (assert (= (length vs) 1) "and nothing else: the ban itself holds")))
+
+;; ── direct ──────────────────────────────────────────────────────────────
+
+(deftest "a package that pulls native-tls by itself is refused, whoever depends on it"
+  (let ((vs (t:lock-mutant "name = \"up-clean\"\nversion = \"0.13.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"reqwest\"]"
+              "name = \"up-clean\"\nversion = \"0.13.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"native-tls\", \"reqwest\"]")))
+    (assert (t:has? vs "up-clean 0.13.2 depends on `native-tls` directly") "the direct edge is named"))
+  (let ((vs (t:lock-mutant "name = \"a\"\nversion = \"0.1.0\"\ndependencies = [\"reqwest\"]" "name = \"a\"\nversion = \"0.1.0\"\ndependencies = [\"openssl-sys\", \"reqwest\"]")))
+    (assert (t:has? vs "a 0.1.0 depends on `openssl-sys` directly") "a workspace member is no exception")))
+
+;; ── attributed ──────────────────────────────────────────────────────────
+
+(deftest "a reqwest dependent with no attribution row is refused while C TLS is locked"
+  (let ((vs (t:rows-vs (list (car t:ROWS)))))
+    (assert (t:has? vs "up-clean 0.13.2 depends on a reqwest that carries native-tls, and has no tls:ATTRIBUTION row") "unread dependent")
+    (assert (= (length vs) 1) "only that")))
+
+(deftest "a lock bump makes the row stale and the new version unattributed"
+  (let ((vs (t:lock-mutant "name = \"up-asks\"\nversion = \"0.1.153\"" "name = \"up-asks\"\nversion = \"0.1.154\"")))
+    (assert (t:has? vs "up-asks 0.1.154 depends on a reqwest that carries native-tls, and has no tls:ATTRIBUTION row") "new version unread")
+    (assert (t:has? vs "row up-asks 0.1.153 is stale") "old row stale")
+    (assert (t:has? vs "no attributed dependent asks reqwest for its defaults") "and nothing explains default-tls any more")))
+
+(deftest "C TLS locked with every dependent marked clean is refused: the attribution is wrong"
+  (let ((vs (t:rows-vs (list (list "up-asks" "0.1.153" "clean" "misread") (car (cdr t:ROWS))))))
+    (assert (t:has? vs "no attributed dependent asks reqwest for its defaults") "no asks row")))
+
+(deftest "a row kind other than asks or clean is refused"
+  (let ((vs (t:rows-vs (list (list "up-asks" "0.1.153" "waived" "no") (car (cdr t:ROWS))))))
+    (assert (t:has? vs "kind `waived` is neither asks nor clean") "unknown kind")))
+
+(deftest "a versionless reqwest dependency still names the tainted reqwest"
+  (let* ((pkgs (tls:packages (t:toml t:LOCK-TAINTED)))
+         (tainted (tls:tainted-reqwests pkgs))
+         (up (car (filter (fn (p) (equal? (tls:p-name p) "up-asks")) pkgs))))
+    (assert (equal? tainted (list "0.12.28")) "reqwest 0.12.28 carries the banned edges")
+    (assert (tls:uses-tainted? up tainted) "\"reqwest\" with no version resolves to it")))
+
+(deftest "a versioned reqwest dependency on an untainted reqwest needs no row"
+  (let ((vs (t:rows-vs (list (car t:ROWS)))))
+    (assert (t:has? vs "up-clean") "precondition: up-clean needs a row when it uses the tainted reqwest"))
+  (let ((vs (t:vs t:ROOT t:A t:B
+              (string-append
+                (t:swap (t:swap t:LOCK-TAINTED "dependencies = [\"reqwest\", \"up-asks\", \"up-clean\"]" "dependencies = [\"reqwest 0.12.28\", \"up-asks\", \"up-clean\"]")
+                  "name = \"up-clean\"\nversion = \"0.13.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"reqwest\"]"
+                  "name = \"up-clean\"\nversion = \"0.13.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"reqwest 0.13.4\"]")
+                "\n[[package]]\nname = \"reqwest\"\nversion = \"0.13.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"hyper-rustls\", \"rustls\"]\n")
+              (list (car t:ROWS)))))
+    (assert (not (t:has? vs "up-clean")) "a dependent of the rustls-only reqwest 0.13.4 is not a candidate source")))
+
+;; ── stale ───────────────────────────────────────────────────────────────
+
+(deftest "once no C TLS is locked, every attribution row is stale"
+  (let ((vs (t:vs t:ROOT t:A t:B t:LOCK-CLEAN t:ROWS)))
+    (assert (t:has? vs "row up-asks 0.1.153 is stale: no C TLS crate") "asks row")
+    (assert (t:has? vs "row up-clean 0.13.2 is stale: no C TLS crate") "clean row")
+    (assert (= (length vs) 2) "and nothing else"))
+  (assert (= (length (t:vs t:ROOT t:A t:B t:LOCK-CLEAN (list))) 0) "with the rows deleted it is a plain ban, and it passes"))
+
+(deftest "the plain ban fires on any C TLS crate in the lock"
+  (let ((vs (t:vs t:ROOT t:A t:B
+              (string-append t:LOCK-CLEAN "\n[[package]]\nname = \"hyper-tls\"\nversion = \"0.6.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n")
+              (list))))
+    (assert (t:has? vs "C TLS is locked (hyper-tls 0.6.0)") "a lone banned crate is refused")))
