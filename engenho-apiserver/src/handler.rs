@@ -18,6 +18,7 @@ use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor, Subresource};
 
 use crate::error::ApiError;
+use crate::field_validation::PatchFields;
 use crate::object_body::ObjectBody;
 use crate::params::{DryRun, ResumePoint, Selectors, body_precondition};
 use crate::pod_logs::{LogQuery, PodLogReader};
@@ -326,6 +327,14 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// ★ `patch` stays a raw `Value`, never an [`ObjectBody`]: in a merge
     /// patch `null` means "delete this field", so normalizing it away would
     /// turn `kubectl label x-` into a no-op (plan edge 9).
+    ///
+    /// `fields` is the request's `?fieldValidation=` context (T4.6): the
+    /// directive and what the router found in the patch's own bytes. For a
+    /// merge, strategic or JSON patch, [`StoreBackedHandler`] judges the
+    /// PATCHED object's unknown fields against it and leaves the warnings
+    /// the response carries in it. A server-side apply configuration was
+    /// judged whole at the border, so it is not judged again.
+    #[allow(clippy::too_many_arguments)]
     async fn patch(
         &self,
         namespace: Option<&str>,
@@ -335,6 +344,7 @@ pub trait ResourceHandler: Send + Sync + 'static {
         apply_opts: Option<crate::params::ApplyOptions>,
         user_info: &UserInfo,
         dry_run: DryRun,
+        fields: &mut PatchFields,
     ) -> Result<Value, ApiError>;
 
     /// DELETE a resource. Returns the response BODY as the K8s wire
@@ -1243,6 +1253,7 @@ impl ResourceHandler for StoreBackedHandler {
             WriteRequest::Create(body),
             user_info,
             dry_run,
+            &mut PatchFields::unasked(),
         )
         .await
     }
@@ -1261,6 +1272,7 @@ impl ResourceHandler for StoreBackedHandler {
             WriteRequest::Replace(body),
             user_info,
             dry_run,
+            &mut PatchFields::unasked(),
         )
         .await
     }
@@ -1274,9 +1286,10 @@ impl ResourceHandler for StoreBackedHandler {
         apply_opts: Option<crate::params::ApplyOptions>,
         user_info: &UserInfo,
         dry_run: DryRun,
+        fields: &mut PatchFields,
     ) -> Result<Value, ApiError> {
         let request = WriteRequest::patch(patch, patch_type, apply_opts)?;
-        self.write(namespace, name, request, user_info, dry_run)
+        self.write(namespace, name, request, user_info, dry_run, fields)
             .await
     }
 

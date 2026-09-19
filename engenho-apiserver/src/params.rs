@@ -428,6 +428,11 @@ pub struct ApplyParams {
     /// [`DryRun::parse`], which REFUSES any value other than `All`.
     #[serde(rename = "dryRun")]
     pub dry_run: Option<String>,
+    /// `?fieldValidation=Ignore|Warn|Strict` — interpreted by
+    /// [`crate::field_validation::Directive::parse`], which refuses any other
+    /// value as upstream does.
+    #[serde(rename = "fieldValidation")]
+    pub field_validation: Option<String>,
 }
 
 /// The validated, typed server-side-apply options threaded from the router

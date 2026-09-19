@@ -150,11 +150,13 @@ impl MetaShapeError {
     }
 }
 
-/// Upstream's `transformDecodeError` sentence, around a [`MetaShapeError`].
-struct Undecodable<'a> {
-    version: &'a str,
-    kind: &'a str,
-    error: &'a MetaShapeError,
+/// Upstream's `transformDecodeError` sentence, around why a body could not
+/// be decoded: a [`MetaShapeError`], or a strict decoding error
+/// ([`crate::field_validation`]).
+pub(crate) struct Undecodable<'a> {
+    pub(crate) version: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) error: &'a dyn fmt::Display,
 }
 
 impl fmt::Display for Undecodable<'_> {

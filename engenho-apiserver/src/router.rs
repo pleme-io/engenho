@@ -56,6 +56,9 @@ use utoipa::OpenApi;
 
 use crate::discovery;
 use crate::error::ApiError;
+use crate::field_validation::{
+    Directive, KindRef, PatchBytes, PatchFields, Warnings, WriteOptions, subresource_directive,
+};
 use crate::handler::ResourceHandler;
 use crate::health;
 use crate::object_body::ObjectBody;
@@ -980,10 +983,89 @@ fn decode_object_body(
     h: &Arc<dyn ResourceHandler>,
     headers: &HeaderMap,
     raw: &[u8],
+    border: &mut Border<'_>,
 ) -> Result<ObjectBody, ApiError> {
-    let body = decode_write_body(headers, raw)?;
-    ObjectBody::normalize(h.group(), h.kind(), body)
-        .map_err(|e| e.request_error(h.version(), h.kind()))
+    let normalize = |body| {
+        ObjectBody::normalize(h.group(), h.kind(), body)
+            .map_err(|e| e.request_error(h.version(), h.kind()))
+    };
+    // A mis-shaped body is refused before its fields are judged: upstream's
+    // decoder reports a type error instead of any strict error it collected.
+    let mut body = normalize(decode_write_body(headers, raw)?)?.into_value();
+    border.check_object(h, headers, raw, &mut body)?;
+    // Dropping a field leaves a normalized object normalized; this only
+    // re-seals it as the `ObjectBody` the pipeline takes.
+    let body = normalize(body)?;
+    border.typed_decode(h, body.as_value())?;
+    Ok(body)
+}
+
+/// A write's border, for the checks that answer to the client's
+/// `?fieldValidation=` (T4.6): the directive, the warnings the response
+/// carries, and the rollout ledger the typed decode counts into.
+struct Border<'a> {
+    directive: Directive,
+    warnings: Warnings,
+    ledger: &'a engenho_substrate::WouldRejectLedger,
+}
+
+impl<'a> Border<'a> {
+    fn new(directive: Directive, state: &'a RouterState) -> Self {
+        Self {
+            directive,
+            warnings: Warnings::default(),
+            ledger: &state.would_reject,
+        }
+    }
+
+    /// Judge a body that IS an object (POST, PUT, apply) and drop its
+    /// unknown fields. Only JSON bytes are scanned: a protobuf body cannot
+    /// name a field its message lacks, nor repeat one.
+    fn check_object(
+        &mut self,
+        h: &Arc<dyn ResourceHandler>,
+        headers: &HeaderMap,
+        raw: &[u8],
+        body: &mut serde_json::Value,
+    ) -> Result<(), ApiError> {
+        let api_version = h.api_version();
+        crate::field_validation::check_object(
+            self.directive,
+            KindRef {
+                group: h.group(),
+                version: h.version(),
+                kind: h.kind(),
+                api_version: &api_version,
+            },
+            json_bytes(headers, raw),
+            body,
+            &mut self.warnings,
+        )
+    }
+
+    /// Decode an object body into its row's generated struct, through the
+    /// shadow gate: counted, never refused while the gate is Shadow.
+    fn typed_decode(
+        &self,
+        h: &Arc<dyn ResourceHandler>,
+        body: &serde_json::Value,
+    ) -> Result<(), ApiError> {
+        crate::typed_decode::judge(h.group(), h.version(), h.kind(), body, self.ledger)
+    }
+
+    /// The response for `result`, carrying the warnings.
+    fn answer(self, result: Result<Response, ApiError>) -> Response {
+        self.warnings.attach(result)
+    }
+}
+
+/// The request's bytes when they are JSON; `None` for a protobuf body.
+fn json_bytes<'r>(headers: &HeaderMap, raw: &'r [u8]) -> Option<&'r [u8]> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    (!is_protobuf_content_type(content_type)).then_some(raw)
 }
 
 /// Decode a PATCH request body AND resolve the typed patch algorithm from the
@@ -1135,13 +1217,15 @@ async fn do_create(
     raw: &[u8],
     user_info: &UserInfo,
     dry_run: DryRun,
+    border: &mut Border<'_>,
 ) -> Result<Response, ApiError> {
-    let body = decode_object_body(h, headers, raw)?;
+    let body = decode_object_body(h, headers, raw, border)?;
     let v = h.create(ns, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &handler_gvk(h), StatusCode::CREATED, v)
 }
 
+#[allow(clippy::too_many_arguments)] // the request, its target, and its border
 async fn do_replace(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
@@ -1150,13 +1234,15 @@ async fn do_replace(
     raw: &[u8],
     user_info: &UserInfo,
     dry_run: DryRun,
+    border: &mut Border<'_>,
 ) -> Result<Response, ApiError> {
-    let body = decode_object_body(h, headers, raw)?;
+    let body = decode_object_body(h, headers, raw, border)?;
     let v = h.replace(ns, name, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &handler_gvk(h), StatusCode::OK, v)
 }
 
+#[allow(clippy::too_many_arguments)] // the request, its target, and its border
 async fn do_patch(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
@@ -1165,20 +1251,39 @@ async fn do_patch(
     raw: &[u8],
     apply_params: &crate::params::ApplyParams,
     user_info: &UserInfo,
+    border: &mut Border<'_>,
 ) -> Result<Response, ApiError> {
     let gvk = handler_gvk(h);
     // Resolve the typed patch algorithm from the Content-Type FIRST — the
     // media type is the load-bearing signal the store dispatches on. Erasing
     // it here (the old `decode_patch_body` did) made every patch a merge.
-    let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
+    let (mut patch, patch_type) = decode_patch(headers, raw, &gvk)?;
     // Server-side apply (Content-Type application/apply-patch+yaml) → validate
     // the `?fieldManager=`/`?force=` query into typed ApplyOptions. A missing
-    // fieldManager is a typed 400 here (matching upstream). For EVERY other
+    // fieldManager is a typed 400 here (matching upstream), before the body is
+    // judged: upstream validates the options first. For EVERY other
     // patch algorithm `apply_opts` is None — the non-SSA path is UNCHANGED.
     let apply_opts = if patch_type == engenho_types::patch::PatchType::Apply {
         Some(crate::params::ApplyOptions::from_params(apply_params)?)
     } else {
         None
+    };
+    // FIELD VALIDATION (T4.6). An apply configuration IS an object: judged
+    // whole here, its unknown fields dropped before the merge can record an
+    // owner for them. Any other patch is not the object: its own bytes are
+    // scanned here, and the object it would store is judged in the pipeline.
+    let json = json_bytes(headers, raw);
+    let mut fields = match (patch_type, json) {
+        (PatchType::Apply, _) => {
+            border.check_object(h, headers, raw, &mut patch)?;
+            border.typed_decode(h, &patch)?;
+            PatchFields::unasked()
+        }
+        (PatchType::Json, Some(raw)) => PatchFields::scan(border.directive, raw, PatchBytes::Json)?,
+        (PatchType::Merge | PatchType::Strategic, Some(raw)) => {
+            PatchFields::scan(border.directive, raw, PatchBytes::Merge)?
+        }
+        (_, None) => PatchFields::scan(border.directive, raw, PatchBytes::Opaque)?,
     };
     let v = h
         .patch(
@@ -1189,8 +1294,13 @@ async fn do_patch(
             apply_opts,
             user_info,
             DryRun::parse(apply_params.dry_run.as_deref())?,
+            &mut fields,
         )
-        .await?;
+        .await;
+    for warning in fields.warnings().texts() {
+        border.warnings.add(warning);
+    }
+    let v = v?;
     // An apply that CREATES the object returns 201; an apply/patch that
     // updates returns 200. The store reports Created vs Patched; the handler
     // surfaces the status via the response — here we keep 200 for parity with
@@ -2047,6 +2157,10 @@ async fn resource_get_or_list(
 pub struct WriteParams {
     #[serde(rename = "dryRun")]
     pub dry_run: Option<String>,
+    /// `?fieldValidation=Ignore|Warn|Strict` (T4.6), interpreted by
+    /// [`Directive::parse`].
+    #[serde(rename = "fieldValidation")]
+    pub field_validation: Option<String>,
 }
 
 async fn resource_create(
@@ -2058,6 +2172,7 @@ async fn resource_create(
     raw: Bytes,
 ) -> Result<Response, ApiError> {
     let dry_run = DryRun::parse(write.dry_run.as_deref())?;
+    let raw_directive = write.field_validation.as_deref();
     // POST on a subresource is not a K8s CREATE shape — status/scale/log are
     // get/patch/update shapes. `/token` is the ONE exception: it is defined as
     // a POST that mints rather than persists, so it is dispatched here rather
@@ -2071,7 +2186,9 @@ async fn resource_create(
             name,
         })) = resolve_subresource(&coords, &h)
         {
-            return do_token_request(
+            let mut warnings = Warnings::default();
+            subresource_directive(raw_directive, WriteOptions::Create, "token", &mut warnings)?;
+            let result = do_token_request(
                 &state,
                 &h,
                 coords.namespace.as_deref(),
@@ -2080,6 +2197,7 @@ async fn resource_create(
                 &raw,
             )
             .await;
+            return Ok(warnings.attach(result));
         }
         return Err(ApiError::BadRequest(format!(
             "the {sub:?} subresource does not support create (POST)"
@@ -2091,15 +2209,21 @@ async fn resource_create(
         ));
     }
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    do_create(
+    let mut border = Border::new(
+        Directive::parse(raw_directive, WriteOptions::Create)?,
+        &state,
+    );
+    let result = do_create(
         &h,
         coords.namespace.as_deref(),
         &headers,
         &raw,
         &user_info.0,
         dry_run,
+        &mut border,
     )
-    .await
+    .await;
+    Ok(border.answer(result))
 }
 
 /// PUT on a resource path. PUT is the kubectl full-object-replace verb for
@@ -2119,14 +2243,20 @@ async fn resource_put(
         ApiError::BadRequest("PUT requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    let raw_directive = write.field_validation.as_deref();
+    let mut warnings = Warnings::default();
     // The target's name IS `name` (both read `coords.name`); only the variant
     // is needed here because the main-object arm needs the name as well.
     match resolve_subresource(&coords, &h)?.map(|t| t.subresource) {
         Some(Subresource::Status) => {
-            do_put_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+            subresource_directive(raw_directive, WriteOptions::Update, "status", &mut warnings)?;
+            let result = do_put_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await;
+            Ok(warnings.attach(result))
         }
         Some(Subresource::Scale) => {
-            do_put_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+            subresource_directive(raw_directive, WriteOptions::Update, "scale", &mut warnings)?;
+            let result = do_put_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await;
+            Ok(warnings.attach(result))
         }
         // `/token` is create-only; PUT has no meaning on a thing that is
         // minted rather than stored.
@@ -2142,16 +2272,23 @@ async fn resource_put(
         // update verb. Store-backed handlers do a real optimistic-concurrency
         // replace; handlers that don't override `replace` keep the typed 400.
         None => {
-            do_replace(
+            let dry_run = DryRun::parse(write.dry_run.as_deref())?;
+            let mut border = Border::new(
+                Directive::parse(raw_directive, WriteOptions::Update)?,
+                &state,
+            );
+            let result = do_replace(
                 &h,
                 coords.namespace.as_deref(),
                 name,
                 &headers,
                 &raw,
                 &user_info.0,
-                DryRun::parse(write.dry_run.as_deref())?,
+                dry_run,
+                &mut border,
             )
-            .await
+            .await;
+            Ok(border.answer(result))
         }
     }
 }
@@ -2173,13 +2310,21 @@ async fn resource_patch(
         ApiError::BadRequest("PATCH requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    let raw_directive = apply_params.field_validation.as_deref();
+    let mut warnings = Warnings::default();
     // As in `resource_put`: the target's name is `name`, needed by every arm.
     match resolve_subresource(&coords, &h)?.map(|t| t.subresource) {
         Some(Subresource::Status) => {
-            do_patch_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+            subresource_directive(raw_directive, WriteOptions::Patch, "status", &mut warnings)?;
+            let result =
+                do_patch_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await;
+            Ok(warnings.attach(result))
         }
         Some(Subresource::Scale) => {
-            do_patch_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+            subresource_directive(raw_directive, WriteOptions::Patch, "scale", &mut warnings)?;
+            let result =
+                do_patch_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await;
+            Ok(warnings.attach(result))
         }
         // `/token` is create-only; PATCH has no meaning on a thing that is
         // minted rather than stored.
@@ -2191,7 +2336,11 @@ async fn resource_patch(
             "the log subresource is read-only (GET only)".into(),
         )),
         None => {
-            do_patch(
+            let mut border = Border::new(
+                Directive::parse(raw_directive, WriteOptions::Patch)?,
+                &state,
+            );
+            let result = do_patch(
                 &h,
                 coords.namespace.as_deref(),
                 name,
@@ -2199,8 +2348,10 @@ async fn resource_patch(
                 &raw,
                 &apply_params,
                 &user_info.0,
+                &mut border,
             )
-            .await
+            .await;
+            Ok(border.answer(result))
         }
     }
 }
@@ -2642,6 +2793,7 @@ mod tests {
             _apply_opts: Option<crate::params::ApplyOptions>,
             _user_info: &engenho_types::auth::UserInfo,
             _dry_run: crate::params::DryRun,
+            _fields: &mut crate::field_validation::PatchFields,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal(
                 "fake handler: patch not exercised".into(),

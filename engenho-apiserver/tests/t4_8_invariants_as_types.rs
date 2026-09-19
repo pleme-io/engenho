@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use engenho_apiserver::field_validation::PatchFields;
 use engenho_apiserver::params::DryRun;
 use engenho_apiserver::{
     ApiError, ApiServer, ObjectBody, ResourceHandler, StoreBackedHandler, handlers_from_catalog,
@@ -214,6 +215,7 @@ async fn patch_under_mutate_applies_the_admitted_patch() {
         None,
         &UserInfo::default(),
         DryRun::Off,
+        &mut PatchFields::unasked(),
     )
     .await
     .expect("a mutated patch succeeds");
@@ -259,6 +261,7 @@ async fn patch_under_deny_is_forbidden_and_changes_nothing() {
             None,
             &UserInfo::default(),
             DryRun::Off,
+            &mut PatchFields::unasked(),
         )
         .await
         .expect_err("a denied patch fails");

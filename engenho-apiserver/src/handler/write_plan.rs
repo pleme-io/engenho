@@ -94,6 +94,7 @@ use super::{
     stamp_namespace_create_defaults,
 };
 use crate::error::ApiError;
+use crate::field_validation::{KindRef, PatchFields};
 use crate::object_body::ObjectBody;
 use crate::params::{ApplyOptions, DryRun, body_precondition};
 use crate::schema_validation::SchemaViolation;
@@ -423,6 +424,7 @@ impl StoreBackedHandler {
         request: WriteRequest,
         user_info: &UserInfo,
         dry_run: DryRun,
+        fields: &mut PatchFields,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
         let client_expected = request.client_precondition()?;
@@ -443,6 +445,7 @@ impl StoreBackedHandler {
                     client_expected,
                     &now,
                     user_info,
+                    fields,
                 )
                 .await?
             {
@@ -489,6 +492,7 @@ impl StoreBackedHandler {
         client_expected: Option<Revision>,
         now: &str,
         user_info: &UserInfo,
+        fields: &mut PatchFields,
     ) -> Result<Planned, ApiError> {
         // ── 2. LIFECYCLE, from what the store holds. ──────────────────────
         // A POST is a create whatever the store holds: a taken name is
@@ -538,6 +542,27 @@ impl StoreBackedHandler {
             .merged()
             .clone(),
         };
+
+        // ── 4b. FIELD VALIDATION of a patched object (T4.6). ──────────────
+        // A merge, strategic or JSON patch is not an object, so its unknown
+        // fields exist only here, in what it would store. The patch answers
+        // for the ones it introduced: upstream's strict decode of the patched
+        // object. A POST, PUT or apply body was judged whole at the border.
+        let mut candidate = candidate;
+        if let (WriteRequest::Patch { algorithm, .. }, Some(prior)) = (request, lifecycle.prior()) {
+            let api_version = self.api_version();
+            fields.judge_patched(
+                KindRef {
+                    group: &self.group,
+                    version: &self.version,
+                    kind: &self.kind,
+                    api_version: &api_version,
+                },
+                prior,
+                &mut candidate,
+                *algorithm == MergeAlgorithm::Strategic,
+            )?;
+        }
 
         // ── 5. NORMALIZE the object that will be stored. ──────────────────
         // A POST or PUT body was normalized at the border already (this is
