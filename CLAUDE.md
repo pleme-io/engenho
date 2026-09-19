@@ -256,7 +256,8 @@ then `nix flake check` cannot compile any gen-pattern consumer.
 
 | Workflow | Trigger | Scope | Blocking |
 |---|---|---|---|
-| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy, + `ci/nix-on-runner.tlisp` (Nix installed only via `pleme-io/actions/nix-setup`, before any step needing it) | yes |
+| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy, + `ci/nix-on-runner.tlisp` (Nix installed only via `pleme-io/actions/nix-setup`, before any step needing it), + `ci/release-contract.tlisp` and its tests (release.yml moves `:latest` only after the gate) | yes |
+| `release.yml` | `v*` tag | 2 binaries, 4 arch images, 2 multi-arch indexes, 1 chart, exact tags only; then `release-assets` (needs every publishing job, finds all 23 assets) and `promote-latest` (moves `:latest` per image). A red leg or a missing asset leaves `:latest` where it was | — |
 | `deep-test.yml` | schedule + dispatch | breadth — macOS leg, 4k-case proptest stress, coverage artifact, `cargo audit` | no |
 | `ci.yml` | push + PR | `gen confirm` (fatal lock tie) + `nix flake check` (non-fatal; runs `checks.typed-config`, compiles no Rust) | fails only on `gen confirm` |
 

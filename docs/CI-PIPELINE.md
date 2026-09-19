@@ -31,23 +31,40 @@ tatara similarly. Engenho follows the same shape.
 
 ### `.github/workflows/release.yml` — on `v*` tag
 
-  Eight jobs, **seven of which are substrate-reusable-workflow shims**:
+  Ten jobs. Eight publish, and push exact tags only; two gate `:latest`:
 
-  | Job | Substrate workflow | What |
+  | Job | Uses | What |
   |---|---|---|
   | `binary-engenho-mcp` | `rust-binary-release.yml` | Linux/macOS × x86_64/aarch64 binaries → GH Release |
   | `binary-engenho-cluster-config-render` | `rust-binary-release.yml` | same |
-  | `image-engenho-mcp-amd64` | `image-push.yml` | nix-built image → ghcr.io |
-  | `image-engenho-mcp-arm64` | `image-push.yml` | same |
+  | `image-engenho-mcp-amd64` | `image-push.yml` | nix-built image → ghcr.io `:${tag}-amd64` |
+  | `image-engenho-mcp-arm64` | `image-push.yml` | same, `-arm64` |
   | `image-engenho-cluster-config-render-amd64` | `image-push.yml` | same |
   | `image-engenho-cluster-config-render-arm64` | `image-push.yml` | same |
   | `chart` | `helm-chart-release.yml` | chart → ghcr.io OCI |
-  | `image-manifest` | (inline — see below) | combines per-arch tags into multi-arch manifest |
+  | `image-manifest` | (inline — see below) | joins the per-arch tags into the `:${tag}` index |
+  | `release-assets` | `ci/release-contract.tlisp` (verify) | needs all eight; fails unless every asset exists |
+  | `promote-latest` | `pleme-io/actions/release-promote` | moves `:latest` to the checked `:${tag}`, per image |
 
-  The one inline job (`image-manifest`) uses `docker buildx
-  imagetools create` to assemble per-arch tags into a single
-  `:${version}` + `:latest` multi-arch manifest. This is a clear
-  candidate for extraction to a future substrate
+  **`:latest` moves only after the gate** (improvement plan T0.3a).
+  Every image-push call sets `additionalTags: ''`: that reusable
+  defaults it to `latest`, so before this each arch leg pushed
+  `:latest` (the two legs raced for it) and `image-manifest` tagged the
+  index `:latest` as well, with nothing checked first. Now
+  `release-assets` waits on every publishing job, runs only for a `v*`
+  tag, and derives every asset the release promises from release.yml
+  (16 GitHub Release files, 4 arch images, 2 multi-arch indexes,
+  1 chart), looking each up with `gh release view` and `docker buildx
+  imagetools inspect --raw`. One missing asset fails it, and
+  `promote-latest`, which takes its image list from `release-assets`'
+  output, does not run. `test.yml`'s `release-contract` job runs the
+  same script in check mode on every push, so a new `latest`, a dropped
+  `needs`, or a new publishing job with no row in its catalog fails
+  before merge.
+
+  The inline `image-manifest` job uses `docker buildx imagetools
+  create` to assemble per-arch tags into the `:${tag}` index. It is a
+  clear candidate for extraction to a future substrate
   `image-manifest.yml` reusable workflow (see "Gaps" below).
 
 ## Substrate primitives in use
@@ -99,20 +116,24 @@ push + helm chart push would fail with `unauthorized`.
     gate reads; the measured count is in CLAUDE.md § Test count.
   * `nix flake check` (non-fatal, in ci.yml) evaluates the flake and
     runs `checks.typed-config`; it compiles no Rust.
+  * `ci/release-contract.tlisp` (test.yml, job `release-contract`)
+    checks that release.yml moves `:latest` only in `promote-latest`,
+    after `release-assets`; `ci/release-contract.test.tlisp` shows each
+    of its rules firing on a fixture with that defect.
   * `nix build .#default` validates the workspace builds.
 
 ## What release produces
 
 On every `v*` tag:
 
-  * GitHub Release with 6 binary artefacts:
-      engenho-mcp-{darwin-arm64, linux-x86_64, linux-arm64}
-      engenho-cluster-config-render-{...}
-      (plus .sha256 sidecars)
-  * 6 OCI images on ghcr.io:
+  * GitHub Release with 16 files: 8 binaries plus a .sha256 each,
+      engenho-mcp-{linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64}
+      engenho-cluster-config-render-{... same legs}
+  * 6 OCI refs on ghcr.io:
       ghcr.io/pleme-io/engenho-mcp:{${tag}-amd64, ${tag}-arm64,
-                                    ${tag} (multi-arch), latest}
+                                    ${tag} (multi-arch)}
       ghcr.io/pleme-io/engenho-cluster-config-render:{... same set}
+    and `:latest` on each image once promote-latest has run.
   * 1 OCI Helm chart:
       ghcr.io/pleme-io/engenho/charts/engenho:${tag-without-v}
 

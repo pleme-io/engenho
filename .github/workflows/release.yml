@@ -1,15 +1,28 @@
 name: release
 
-# Tag-triggered (v*). EVERY job is a thin caller of a substrate
-# reusable workflow — per the org's prime directive (any pattern ≥2
-# sites → extract to substrate). Engenho ships:
+# Tag-triggered (v*). Every publishing job but image-manifest is a thin
+# caller of a substrate reusable workflow — per the org's prime directive
+# (any pattern ≥2 sites → extract to substrate). Engenho ships:
 #
 #   * 2 Rust binaries  →  rust-binary-release.yml (one job per binary)
 #   * 4 OCI images     →  image-push.yml (one job per binary × arch)
+#   * 2 multi-arch indexes → image-manifest (inline, below)
 #   * 1 Helm chart     →  helm-chart-release.yml
 #
-# Total: hand-authored composite steps = 0. All workflows are
-# reusable substrate primitives; this file is just edge config.
+# ── PUBLISH ONLY AFTER THE GATE (improvement plan T0.3a) ──────────────────
+# Every publishing job pushes exact tags only: `:<tag>-<arch>` and `:<tag>`.
+# `:latest` moves in exactly one place, promote-latest, and only after
+# release-assets has seen every publishing job succeed AND found every asset
+# the release promises (16 GitHub Release files, 4 arch images, 2 multi-arch
+# indexes, 1 chart). Before this, `:latest` moved from three places per
+# image, with nothing checked first: image-push.yml's `additionalTags`
+# defaults to "latest", so each arch leg pushed it (the two legs raced for
+# the tag), and image-manifest tagged the index `:latest` too.
+#
+# ci/release-contract.tlisp holds that contract. test.yml runs it on every
+# push (job release-contract), so a new `latest`, a dropped `needs` or a new
+# publishing job with no row in its catalog fails before merge; release-assets
+# runs it again in verify mode, against the real release.
 #
 # `secrets: inherit` is required — reusable workflows don't
 # auto-inherit GITHUB_TOKEN unless we propagate it explicitly.
@@ -61,6 +74,9 @@ jobs:
       imageAttr: engenho-mcp-image-amd64
       imageName: pleme-io/engenho-mcp
       tag: ${{ github.ref_name }}-amd64
+      # image-push.yml defaults this to "latest". Only promote-latest
+      # moves :latest (see the header).
+      additionalTags: ''
     secrets: inherit
 
   image-engenho-mcp-arm64:
@@ -70,6 +86,9 @@ jobs:
       imageAttr: engenho-mcp-image-arm64
       imageName: pleme-io/engenho-mcp
       tag: ${{ github.ref_name }}-arm64
+      # image-push.yml defaults this to "latest". Only promote-latest
+      # moves :latest (see the header).
+      additionalTags: ''
       # Native aarch64-linux runner — `nix build` targets the runner's
       # own system, so this resolves `packages.aarch64-linux.*` (a real
       # derivation) instead of `packages.x86_64-linux.*` on the default
@@ -86,6 +105,9 @@ jobs:
       imageAttr: engenho-cluster-config-render-image-amd64
       imageName: pleme-io/engenho-cluster-config-render
       tag: ${{ github.ref_name }}-amd64
+      # image-push.yml defaults this to "latest". Only promote-latest
+      # moves :latest (see the header).
+      additionalTags: ''
     secrets: inherit
 
   image-engenho-cluster-config-render-arm64:
@@ -95,6 +117,9 @@ jobs:
       imageAttr: engenho-cluster-config-render-image-arm64
       imageName: pleme-io/engenho-cluster-config-render
       tag: ${{ github.ref_name }}-arm64
+      # image-push.yml defaults this to "latest". Only promote-latest
+      # moves :latest (see the header).
+      additionalTags: ''
       # See image-engenho-mcp-arm64's comment — native aarch64-linux
       # runner so `nix build` resolves `packages.aarch64-linux.*`.
       runner: ubuntu-24.04-arm
@@ -104,7 +129,7 @@ jobs:
   #   Multi-arch manifest creation
   #
   #   Combines the per-arch tags above into a single
-  #   {tag} manifest that auto-selects the right arch on docker pull.
+  #   :{tag} index that auto-selects the right arch on docker pull.
   #   The arch-suffixed tags remain available for explicit pulls.
   #
   #   This step uses `docker buildx imagetools create` — minimal +
@@ -136,11 +161,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # `:<tag>` only. promote-latest moves `:latest` once every leg is green
+      # and every asset exists.
       - name: Combine arch tags into a single manifest
         run: |
           docker buildx imagetools create \
             --tag ghcr.io/pleme-io/${{ matrix.bin }}:${{ github.ref_name }} \
-            --tag ghcr.io/pleme-io/${{ matrix.bin }}:latest \
             ghcr.io/pleme-io/${{ matrix.bin }}:${{ github.ref_name }}-amd64 \
             ghcr.io/pleme-io/${{ matrix.bin }}:${{ github.ref_name }}-arm64
 
@@ -154,3 +180,74 @@ jobs:
       chart-path: ./charts/engenho
       oci-registry: oci://ghcr.io/pleme-io/engenho/charts
     secrets: inherit
+
+  # ============================================================
+  #   The gate before :latest (improvement plan T0.3a)
+  #
+  #   release-assets needs every publishing job, so it runs only when all
+  #   of them succeeded, and only for a v* tag (a branch dispatch never
+  #   promotes). A green leg is not proof of its assets: rust-binary-release
+  #   attaches nothing outside a tag push, and a partial upload is still a
+  #   green step. So ci/release-contract.tlisp (verify mode) derives every
+  #   asset the release promises from THIS file and looks each one up: the
+  #   GitHub Release files by name, the images, indexes and chart by OCI
+  #   ref. Any missing asset fails the job, and :latest stays where it was.
+  #
+  #   promote-latest then moves :latest to the checked :<tag> index, one
+  #   matrix leg per image. Its image list is release-assets' output, so it
+  #   moves exactly the images that were checked.
+  # ============================================================
+  release-assets:
+    name: every release asset exists
+    needs:
+      - binary-engenho-mcp
+      - binary-engenho-cluster-config-render
+      - image-engenho-mcp-amd64
+      - image-engenho-mcp-arm64
+      - image-engenho-cluster-config-render-amd64
+      - image-engenho-cluster-config-render-arm64
+      - image-manifest
+      - chart
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      images: ${{ steps.verify.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: verify
+        uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/release-contract.tlisp
+          version: v0.3.58
+        env:
+          RELEASE_CONTRACT_MODE: verify
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+
+  promote-latest:
+    name: promote ${{ matrix.image }} to :latest
+    needs: release-assets
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.release-assets.outputs.images) }}
+    steps:
+      - uses: pleme-io/actions/release-promote@main
+        with:
+          kind: image-retag
+          image: ${{ matrix.image }}
+          source-tag: ${{ github.ref_name }}
+          target-tag: latest
