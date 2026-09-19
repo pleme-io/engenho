@@ -20,6 +20,7 @@ use openraft::{
 };
 use tokio::sync::Mutex;
 
+use crate::owned_task::TaskStop;
 use crate::state::ResourceCatalog;
 use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 use crate::watch_backend::{
@@ -36,8 +37,9 @@ pub struct InMemoryStore {
     /// Store-level bookmark ticker — one per store, driving the
     /// per-watcher bookmark cadence under the catalog lock. `Arc` so
     /// every clone of the store shares (and keeps alive) the single
-    /// ticker; dropping the last store clone aborts it.
-    _bookmark_ticker: Arc<BookmarkTicker>,
+    /// ticker; dropping the last store clone aborts it, and
+    /// [`Self::quiesce_bookmarks`] aborts AND awaits it.
+    bookmark_ticker: Arc<BookmarkTicker>,
 }
 
 impl Default for InMemoryStore {
@@ -48,7 +50,7 @@ impl Default for InMemoryStore {
         let ticker = BookmarkTicker::spawn(Arc::downgrade(&inner));
         Self {
             inner,
-            _bookmark_ticker: Arc::new(ticker),
+            bookmark_ticker: Arc::new(ticker),
         }
     }
 }
@@ -86,6 +88,15 @@ impl BookmarkTickable for Mutex<Inner> {
 impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Stop this store's bookmark ticker and wait until it has ended, so it
+    /// holds no reference to the store — see [`BookmarkTicker::quiesce`].
+    ///
+    /// The ticker is shared by every clone: afterwards no clone's watchers
+    /// receive periodic bookmarks (live events still flow). One-way.
+    pub async fn quiesce_bookmarks(&self) -> TaskStop {
+        self.bookmark_ticker.quiesce().await
     }
 
     /// Open a resumable, gap-free watch from `opts.from`. See
@@ -523,5 +534,26 @@ mod tests {
         // The catalog JSON has the pod's metadata.name
         let s = std::str::from_utf8(bytes).unwrap();
         assert!(s.contains("podinfo"));
+    }
+
+    /// T2.1-store: the store's own ticker, parked mid-tick on the catalog
+    /// lock with an upgraded reference, is awaited by `quiesce_bookmarks`
+    /// rather than left holding the store.
+    #[tokio::test]
+    async fn quiesce_bookmarks_releases_a_ticker_parked_on_the_catalog_lock() {
+        let store = InMemoryStore::new();
+        let apply_in_progress = store.inner.lock().await;
+        assert!(
+            crate::watch_backend::await_strong_count(&store.inner, 2).await,
+            "precondition: the ticker upgraded its Weak and is parked on the lock"
+        );
+
+        assert_eq!(store.quiesce_bookmarks().await, TaskStop::Cancelled);
+        assert_eq!(
+            Arc::strong_count(&store.inner),
+            1,
+            "quiesce_bookmarks returned while the ticker still held the store"
+        );
+        drop(apply_in_progress);
     }
 }

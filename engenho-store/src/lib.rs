@@ -63,6 +63,7 @@ pub mod mesh;
 pub mod nats_listener;
 pub mod nats_network;
 pub mod network;
+pub mod owned_task;
 pub mod pagination;
 pub mod patch_apply;
 pub mod resource;
@@ -80,10 +81,11 @@ pub use drv_committal::{
     render_drv_resource,
 };
 pub use fjall_store::FjallStore;
-pub use mesh::{StoreError, StoreMesh, default_config};
+pub use mesh::{Quiesced, StoreError, StoreMesh, default_config};
 pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
 pub use network::InProcessRouter;
+pub use owned_task::{OwnedTask, TaskStop};
 pub use pagination::{ContinueInvalid, ContinueToken, ListPage};
 pub use patch_apply::{
     Gvk, JsonPath, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody, PatchDirective,

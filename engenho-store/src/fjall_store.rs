@@ -61,6 +61,7 @@ use openraft::{
 use tokio::sync::Mutex;
 
 use crate::mesh::StoreError;
+use crate::owned_task::TaskStop;
 use crate::state::ResourceCatalog;
 use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 use crate::watch_backend::{
@@ -138,8 +139,11 @@ pub struct FjallStore {
     /// Store-level bookmark ticker — one per store, driving the
     /// per-watcher bookmark cadence under the catalog lock. `Arc` so
     /// every clone of the store shares (and keeps alive) the single
-    /// ticker; dropping the last store clone aborts it.
-    _bookmark_ticker: Arc<BookmarkTicker>,
+    /// ticker; dropping the last store clone aborts it, and
+    /// [`Self::quiesce_bookmarks`] aborts AND awaits it. The difference
+    /// matters here more than anywhere: a tick holds an upgraded
+    /// `Arc<FjallInner>`, and `FjallInner` owns the data-directory lock.
+    bookmark_ticker: Arc<BookmarkTicker>,
 }
 
 /// The on-disk handles + the in-RAM working copy.
@@ -330,7 +334,7 @@ impl FjallStore {
         let ticker = BookmarkTicker::spawn(Arc::downgrade(&inner));
         Ok(Self {
             inner,
-            _bookmark_ticker: Arc::new(ticker),
+            bookmark_ticker: Arc::new(ticker),
         })
     }
 
@@ -353,6 +357,18 @@ impl FjallStore {
     /// the durable + watch-relevant state machine copy.
     pub async fn current_catalog(&self) -> ResourceCatalog {
         self.inner.state.lock().await.catalog.clone()
+    }
+
+    /// Stop this store's bookmark ticker and wait until it has ended, so it
+    /// holds no reference to the store — see [`BookmarkTicker::quiesce`].
+    ///
+    /// For this backend that includes the data-directory lock: after
+    /// `quiesce_bookmarks`, dropping the last store clone releases the
+    /// directory at once, even if the ticker was parked mid-tick. The
+    /// ticker is shared by every clone; afterwards no clone's watchers
+    /// receive periodic bookmarks (live events still flow). One-way.
+    pub async fn quiesce_bookmarks(&self) -> TaskStop {
+        self.bookmark_ticker.quiesce().await
     }
 
     /// The current MVCC revision, read under the lock WITHOUT cloning.
@@ -1223,5 +1239,38 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// T2.1-store: a ticker parked mid-tick holds an upgraded
+    /// `Arc<FjallInner>`, and with it the data-directory lock. After
+    /// `quiesce_bookmarks`, the store is held by its owner alone, so
+    /// dropping the store frees the directory at once and it reopens.
+    #[tokio::test]
+    async fn quiesce_bookmarks_frees_the_data_dir_even_when_the_ticker_is_mid_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = FjallStore::open(&path).unwrap();
+
+        let apply_in_progress = store.inner.state.lock().await;
+        assert!(
+            crate::watch_backend::await_strong_count(&store.inner, 2).await,
+            "precondition: the ticker upgraded its Weak and is parked on the state lock"
+        );
+
+        assert_eq!(store.quiesce_bookmarks().await, TaskStop::Cancelled);
+        assert_eq!(
+            Arc::strong_count(&store.inner),
+            1,
+            "quiesce_bookmarks returned while the ticker still held FjallInner"
+        );
+
+        drop(apply_in_progress);
+        drop(store);
+        let reopened = FjallStore::open(&path);
+        assert!(
+            reopened.is_ok(),
+            "the data dir must be free the moment the last store handle drops: {:?}",
+            reopened.err()
+        );
     }
 }

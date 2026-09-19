@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use crate::command::ResourceCommand;
 use crate::fjall_store::FjallStore;
 use crate::network::{InProcessRouter, RpcRequest};
+use crate::owned_task::{OwnedTask, TaskStop};
 use crate::resource::{ResourceKey, ResourceValue};
 use crate::state::ResourceCatalog;
 use crate::store::InMemoryStore;
@@ -129,6 +130,38 @@ impl StoreBackend {
             Self::Fjall(s) => s.is_initialized().await,
         }
     }
+
+    async fn quiesce_bookmarks(&self) -> TaskStop {
+        match self {
+            Self::Memory(s) => s.quiesce_bookmarks().await,
+            Self::Fjall(s) => s.quiesce_bookmarks().await,
+        }
+    }
+}
+
+/// How [`StoreMesh::quiesce`] left each background task the mesh owns.
+///
+/// One field per owned task. `quiesce` destructures `StoreMesh` without
+/// `..`, so a new field on the mesh does not compile (E0027) until quiesce
+/// names it — stopped here, or bound to `_` with the reason it is not a
+/// task. Choosing `_` wrongly is caught only by review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub struct Quiesced {
+    /// The raft RPC pump: the task that feeds peer RPCs from the router
+    /// into `raft`.
+    pub rpc_pump: TaskStop,
+    /// The store's bookmark ticker, which holds an upgraded store reference
+    /// for the length of each tick.
+    pub bookmark_ticker: TaskStop,
+}
+
+impl Quiesced {
+    /// `true` if either task had panicked before it was stopped — it is gone
+    /// now, but it had stopped doing its job some time before.
+    pub fn any_panicked(&self) -> bool {
+        self.rpc_pump == TaskStop::Panicked || self.bookmark_ticker == TaskStop::Panicked
+    }
 }
 
 /// Raft-replicated K8s resource store.
@@ -138,7 +171,9 @@ pub struct StoreMesh {
     node_id: RaftNodeId,
     listen_addr: String,
     router: InProcessRouter,
-    rpc_task: tokio::task::JoinHandle<()>,
+    /// Feeds peer RPCs from the router into `raft`, holding a `Raft` clone.
+    /// Owned so [`Self::quiesce`] can abort AND await it.
+    rpc_pump: OwnedTask,
 }
 
 impl StoreMesh {
@@ -243,7 +278,7 @@ impl StoreMesh {
         router.register(node_id, tx_rpc).await;
 
         let raft_for_rpc = raft.clone();
-        let rpc_task = tokio::spawn(async move {
+        let rpc_pump = OwnedTask::spawn(async move {
             while let Some(req) = rx_rpc.recv().await {
                 match req {
                     RpcRequest::AppendEntries(rpc, reply) => {
@@ -271,7 +306,7 @@ impl StoreMesh {
             node_id,
             listen_addr,
             router,
-            rpc_task,
+            rpc_pump,
         })
     }
 
@@ -556,9 +591,62 @@ impl StoreMesh {
         self.node_id
     }
 
+    /// Stop every background task the mesh owns — the raft RPC pump and
+    /// the store's bookmark ticker — aborting AND awaiting each, so that on
+    /// return neither holds anything of the store's.
+    ///
+    /// Takes `&self` so a shutdown can call it while the mesh is still
+    /// behind an `Arc`, before `Arc::try_unwrap` + [`Self::terminate`].
+    ///
+    /// Afterwards: peers can no longer reach this node (a request is refused
+    /// at the send, never accepted and then dropped), and watchers receive
+    /// no more periodic bookmarks. Raft itself keeps running until
+    /// `terminate`. One-way and idempotent: a second call reports
+    /// [`TaskStop::AlreadyStopped`] for both tasks.
+    ///
+    /// What it cannot reach: a task outside the mesh that upgrades a
+    /// `Weak<StoreMesh>` (the etcd façade does, per request). Draining those
+    /// is the caller's job; nothing here prevents a new one.
+    pub async fn quiesce(&self) -> Quiesced {
+        // Exhaustive on purpose (no `..`): every field is a decision.
+        let Self {
+            // Not a task: stopped by `terminate` (`Raft::shutdown`).
+            raft: _,
+            // Owns the bookmark ticker, stopped below.
+            store,
+            // Plain data.
+            node_id: _,
+            listen_addr: _,
+            // A registry of senders, not a task; `terminate` deregisters.
+            router: _,
+            rpc_pump,
+        } = self;
+        let rpc_pump = rpc_pump.stop().await;
+        let bookmark_ticker = store.quiesce_bookmarks().await;
+        Quiesced {
+            rpc_pump,
+            bookmark_ticker,
+        }
+    }
+
+    /// Deregister from the router, [`Self::quiesce`] (awaiting both owned
+    /// tasks), then shut raft down. A task that had panicked is logged at
+    /// ERROR rather than read as a clean stop.
+    ///
+    /// Not guaranteed on return: openraft's state-machine worker holds a
+    /// store clone and `Raft::shutdown` does not join it, so that clone is
+    /// released when that worker next runs, not necessarily before this
+    /// returns.
     pub async fn terminate(self) -> Result<(), StoreError> {
         self.router.deregister(self.node_id).await;
-        self.rpc_task.abort();
+        let quiesced = self.quiesce().await;
+        if quiesced.any_panicked() {
+            tracing::error!(
+                node_id = self.node_id,
+                ?quiesced,
+                "a store background task had panicked before terminate"
+            );
+        }
         let _ = self.raft.shutdown().await;
         Ok(())
     }

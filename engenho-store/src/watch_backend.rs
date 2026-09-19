@@ -63,6 +63,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::owned_task::{OwnedTask, TaskStop};
 use crate::revision::{Change, CompactedTooOld, Revision};
 use crate::state::ResourceCatalog;
 use crate::watch::{WatchEvent, WatchEventKind};
@@ -765,11 +766,22 @@ pub trait BookmarkTickable: Send + Sync + 'static {
     fn tick_once(&self) -> impl std::future::Future<Output = ()> + Send;
 }
 
-/// A handle to the store-level bookmark ticker task. Dropping it aborts
-/// the ticker (the watchers themselves continue to receive live
-/// events; only periodic bookmarking stops).
+/// A handle to the store-level bookmark ticker task.
+///
+/// Two ways to end it, with different guarantees:
+///
+/// * [`BookmarkTicker::quiesce`] aborts the task AND waits for it to end.
+///   Use it wherever the caller needs the ticker to hold nothing of the
+///   store afterwards (shutdown, before reopening a data directory).
+/// * Dropping the handle aborts without waiting (the watchers keep receiving
+///   live events; only periodic bookmarking stops).
+///
+/// The distinction exists because a tick holds an UPGRADED strong reference
+/// to the store across `tick_once().await`, and that await waits on the
+/// catalog lock. An abort alone leaves that reference alive until a worker
+/// next polls the task.
 pub struct BookmarkTicker {
-    handle: tokio::task::JoinHandle<()>,
+    task: OwnedTask,
 }
 
 impl BookmarkTicker {
@@ -781,7 +793,7 @@ impl BookmarkTicker {
     /// One ticker per store (not one per watcher).
     #[must_use]
     pub fn spawn<T: BookmarkTickable>(weak: std::sync::Weak<T>) -> Self {
-        let handle = tokio::spawn(async move {
+        let task = OwnedTask::spawn(async move {
             let mut tick = tokio::time::interval(BOOKMARK_TICK_GRANULARITY);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -789,18 +801,38 @@ impl BookmarkTicker {
                 let Some(strong) = weak.upgrade() else {
                     return; // store dropped — stop ticking.
                 };
+                // ★ `strong` is held across this await, which can wait on the
+                // catalog lock for as long as an apply holds it. This is the
+                // window `quiesce` exists to close.
                 strong.tick_once().await;
                 drop(strong); // don't keep the store alive across the sleep.
             }
         });
-        Self { handle }
+        Self { task }
+    }
+
+    /// Stop the ticker and wait until it has ended: on return it holds no
+    /// reference to the store, even if it was parked mid-tick.
+    ///
+    /// One-way — the ticker does not restart — and idempotent: a later call
+    /// returns [`TaskStop::AlreadyStopped`].
+    pub async fn quiesce(&self) -> TaskStop {
+        self.task.stop().await
     }
 }
 
-impl Drop for BookmarkTicker {
-    fn drop(&mut self) {
-        self.handle.abort();
+/// Test support: poll until `inner`'s strong count is exactly `count`. Used
+/// to observe a store's ticker parked mid-tick with an upgraded reference.
+/// Bounded (about two seconds): answers `false` rather than hanging.
+#[cfg(test)]
+pub(crate) async fn await_strong_count<T>(inner: &Arc<T>, count: usize) -> bool {
+    for _ in 0..200 {
+        if Arc::strong_count(inner) == count {
+            return true;
+        }
+        tokio::time::sleep(BOOKMARK_TICK_GRANULARITY / 5).await;
     }
+    false
 }
 
 #[cfg(test)]
@@ -1261,5 +1293,49 @@ mod tests {
         // WITHOUT arming a Gone → clean None.
         drop(reg);
         assert!(stream.next().await.is_none());
+    }
+
+    // ── T2.1-store: quiesce awaits a ticker parked mid-tick ────────
+
+    /// A tickable whose `tick_once` announces it has started, then waits on
+    /// a lock the test holds — the shape of a real tick waiting on the
+    /// catalog lock while an apply holds it.
+    struct ParkedTick {
+        entered: tokio::sync::Notify,
+        catalog_lock: tokio::sync::Mutex<()>,
+    }
+
+    impl BookmarkTickable for ParkedTick {
+        async fn tick_once(&self) {
+            self.entered.notify_one();
+            let _held = self.catalog_lock.lock().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn quiesce_awaits_a_ticker_parked_mid_tick_holding_the_store() {
+        let store = Arc::new(ParkedTick {
+            entered: tokio::sync::Notify::new(),
+            catalog_lock: tokio::sync::Mutex::new(()),
+        });
+        let apply_in_progress = store.catalog_lock.lock().await;
+        let ticker = BookmarkTicker::spawn(Arc::downgrade(&store));
+
+        // The ticker has upgraded its Weak and is parked on the lock.
+        store.entered.notified().await;
+        assert_eq!(
+            Arc::strong_count(&store),
+            2,
+            "precondition: the parked tick holds an upgraded reference"
+        );
+
+        assert_eq!(ticker.quiesce().await, TaskStop::Cancelled);
+        assert_eq!(
+            Arc::strong_count(&store),
+            1,
+            "quiesce returned while the aborted ticker still held the store"
+        );
+        assert_eq!(ticker.quiesce().await, TaskStop::AlreadyStopped);
+        drop(apply_in_progress);
     }
 }
