@@ -637,6 +637,9 @@ pub enum CensusError {
     /// The store could not be booted or stopped.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The OS gave no entropy to name the private copy with.
+    #[error("no OS entropy to name the private store copy: {0}")]
+    Entropy(getrandom::Error),
 }
 
 /// What a JSON body lacked.
@@ -646,6 +649,8 @@ pub enum Shape {
     NoItems,
     /// A discovery body with no `versions`, `groups` or `resources` array.
     NoDiscovery,
+    /// A discovery entry without the string that names it.
+    Unnamed(DiscoveryEntry),
 }
 
 impl fmt::Display for Shape {
@@ -653,7 +658,35 @@ impl fmt::Display for Shape {
         match self {
             Self::NoItems => f.write_str("the LIST body has no `items` array"),
             Self::NoDiscovery => f.write_str("the discovery body has none of the arrays it names"),
+            Self::Unnamed(entry) => write!(
+                f,
+                "discovery lists {entry}; a census cannot list what it cannot name"
+            ),
         }
+    }
+}
+
+/// A discovery entry the census names by one string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryEntry {
+    /// An `/api` version, which is the string itself.
+    CoreVersion,
+    /// An `/apis` group, named by `name`.
+    Group,
+    /// A group's version, named by `version`.
+    GroupVersion,
+    /// A resource, named by `name`; a listable collection also by `kind`.
+    Resource,
+}
+
+impl fmt::Display for DiscoveryEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CoreVersion => "an `/api` version that is not a string",
+            Self::Group => "a group with no `name`",
+            Self::GroupVersion => "a group version with no `version`",
+            Self::Resource => "a resource with no `name`, or a collection with no `kind`",
+        })
     }
 }
 
@@ -672,6 +705,7 @@ engenho_substrate::impl_error_kind! {
         { Copy { .. } } => "copy",
         { EmptyStore { .. } } => "empty_store",
         (Store(_)) => "store",
+        (Entropy(_)) => "entropy",
     }
 }
 

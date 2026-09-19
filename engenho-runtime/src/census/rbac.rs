@@ -33,6 +33,11 @@
 //!   all of them. An unrestricted rule granted every instance name, probed
 //!   the same way. The concrete value sent for [`Dim::Other`] is built to be
 //!   absent from every rule, so no rule can name it.
+//! * **Who asks**: each binding subject, carrying the groups the
+//!   authenticator that issues it puts on every one of its requests
+//!   ([`identity`]). A subresource the subject reaches explicitly through
+//!   one of those groups (a `pods/log` grant to `system:serviceaccounts`) was
+//!   never lost, and a probe without the group would report it anyway.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -41,8 +46,9 @@ use async_trait::async_trait;
 use engenho_apiserver::authz::{
     Attributes, Authorizer as _, GROUP_MASTERS, RbacAuthorizer, RbacStoreEnv,
 };
+use engenho_apiserver::sa_token;
 use engenho_controllers::CrdController;
-use engenho_types::auth::UserInfo;
+use engenho_types::auth::{GROUP_AUTHENTICATED, UserInfo};
 use engenho_types::generated_v1_34::catalog::{RESOURCE_CATALOG, Subresource};
 use engenho_types::generated_v1_34::rbac_v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef,
@@ -379,20 +385,78 @@ impl Sentinels {
     }
 }
 
-/// The identity a probe authenticates as: the subject alone, with no other
-/// group, so only the bindings that name it answer.
+/// The group every `ServiceAccount` token carries, whatever its namespace;
+/// its namespace group is this, `:`, the namespace. [`sa_token::groups_for`]
+/// spells both and the apiserver exports no constant for either, so this
+/// copy is pinned to that function by the census test
+/// `the_service_account_groups_are_the_authenticators`: a gate, not a type.
+pub(super) const GROUP_SERVICEACCOUNTS: &str = "system:serviceaccounts";
+
+/// The identity a probe authenticates as: the subject, carrying the groups
+/// the authenticator that issues it puts on EVERY one of its requests. No
+/// fewer: a group every request carries can grant the subresource
+/// explicitly, and a probe without it reports a loss nobody sees. No more: a
+/// group only some requests carry would hide a real one.
+///
+/// * `ServiceAccount`: its token's username and groups
+///   ([`sa_token::subject_for`], [`sa_token::groups_for`]).
+/// * `User` `system:anonymous`: the anonymous identity, which is NOT in
+///   `system:authenticated`.
+/// * any other `User`: a client certificate's, so `system:authenticated`.
+///   The certificate's Organizations are invisible to a census, so a user
+///   granted the subresource through one of them is still reported: an
+///   over-count, on the side that keeps T4.2 in Shadow.
+/// * `Group`: a member of it ([`member_of`]).
 fn identity(subject: &SubjectRef) -> Option<UserInfo> {
-    let mut user = UserInfo::default();
     match subject.kind.as_str() {
-        "User" => user.username.clone_from(&subject.name),
-        "Group" => user.groups.push(subject.name.clone()),
         "ServiceAccount" => {
             let ns = subject.namespace.as_deref().unwrap_or_default();
-            user.username = ["system:serviceaccount:", ns, ":", &subject.name].concat();
+            Some(UserInfo {
+                username: sa_token::subject_for(ns, &subject.name),
+                groups: sa_token::groups_for(ns),
+                ..UserInfo::default()
+            })
         }
-        _ => return None,
+        "User" => {
+            let anonymous = UserInfo::anonymous();
+            Some(if subject.name == anonymous.username {
+                anonymous
+            } else {
+                UserInfo::from_client_cert(&subject.name, &[])
+            })
+        }
+        "Group" => Some(member_of(&subject.name)),
+        _ => None,
     }
-    Some(user)
+}
+
+/// A member of `group`, carrying the groups every member of it carries and
+/// no username (no binding can name a member the census does not know).
+pub(super) fn member_of(group: &str) -> UserInfo {
+    let anonymous = UserInfo::anonymous();
+    if anonymous.groups.iter().any(|g| g == group) {
+        // `system:unauthenticated`: its one member is the anonymous user.
+        return anonymous;
+    }
+    let sa_namespace = group
+        .strip_prefix(GROUP_SERVICEACCOUNTS)
+        .and_then(|rest| rest.strip_prefix(':'));
+    let groups = match (group, sa_namespace) {
+        // A namespace's ServiceAccounts: their tokens' groups, exactly.
+        (_, Some(ns)) => sa_token::groups_for(ns),
+        // Every ServiceAccount: the groups no namespace changes.
+        (GROUP_SERVICEACCOUNTS, None) => vec![
+            GROUP_AUTHENTICATED.to_owned(),
+            GROUP_SERVICEACCOUNTS.to_owned(),
+        ],
+        (GROUP_AUTHENTICATED, None) => vec![GROUP_AUTHENTICATED.to_owned()],
+        // Any other group is a client certificate's Organization.
+        (other, None) => return UserInfo::from_client_cert("", &[other.to_owned()]),
+    };
+    UserInfo {
+        groups,
+        ..UserInfo::default()
+    }
 }
 
 /// A binding subject as the census names it. A `ServiceAccount` with no

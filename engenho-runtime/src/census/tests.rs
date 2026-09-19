@@ -697,6 +697,460 @@ async fn a_crd_status_subresource_is_probed_in_its_group() {
     assert_eq!(lost(&report), ["Group widget-team get widgets/status"]);
 }
 
+/// A probe carries the groups the authenticator chain puts on every request
+/// of its subject, so a subresource the subject reaches explicitly through
+/// one of them is not reported lost. Each row binds `subject` to a bare
+/// `pods` rule and grants `pods/log` explicitly to the group `grantee`; `lost`
+/// is what the census must still report.
+#[tokio::test]
+async fn a_grant_through_a_group_the_authenticator_adds_is_not_a_loss() {
+    struct Row {
+        subject: Value,
+        grantee: &'static str,
+        lost: &'static [&'static str],
+    }
+    const SA_STATUS: &[&str] = &["ServiceAccount team/bot get pods/status"];
+    const SA_BOTH: &[&str] = &[
+        "ServiceAccount team/bot get pods/log",
+        "ServiceAccount team/bot get pods/status",
+    ];
+    let sa = || json!({"kind": "ServiceAccount", "name": "bot", "namespace": "team"});
+    let user = |name: &str| json!({"kind": "User", "name": name});
+    let group = |name: &str| json!({"kind": "Group", "name": name});
+    let rows = [
+        // Every ServiceAccount token carries these three groups.
+        Row {
+            subject: sa(),
+            grantee: "system:serviceaccounts",
+            lost: SA_STATUS,
+        },
+        Row {
+            subject: sa(),
+            grantee: "system:serviceaccounts:team",
+            lost: SA_STATUS,
+        },
+        Row {
+            subject: sa(),
+            grantee: "system:authenticated",
+            lost: SA_STATUS,
+        },
+        // ...and not another namespace's group.
+        Row {
+            subject: sa(),
+            grantee: "system:serviceaccounts:other",
+            lost: SA_BOTH,
+        },
+        // A certificate user is authenticated; its Organizations are unseen.
+        Row {
+            subject: user("alice"),
+            grantee: "system:authenticated",
+            lost: &["User alice get pods/status"],
+        },
+        // The anonymous user is unauthenticated, and only that.
+        Row {
+            subject: user("system:anonymous"),
+            grantee: "system:authenticated",
+            lost: &[
+                "User system:anonymous get pods/log",
+                "User system:anonymous get pods/status",
+            ],
+        },
+        Row {
+            subject: user("system:anonymous"),
+            grantee: "system:unauthenticated",
+            lost: &["User system:anonymous get pods/status"],
+        },
+        // A group's members carry what every member of it carries.
+        Row {
+            subject: group("widget-team"),
+            grantee: "system:authenticated",
+            lost: &["Group widget-team get pods/status"],
+        },
+        Row {
+            subject: group("system:serviceaccounts:team"),
+            grantee: "system:serviceaccounts",
+            lost: &["Group system:serviceaccounts:team get pods/status"],
+        },
+        Row {
+            subject: group("system:unauthenticated"),
+            grantee: "system:authenticated",
+            lost: &[
+                "Group system:unauthenticated get pods/log",
+                "Group system:unauthenticated get pods/status",
+            ],
+        },
+    ];
+    for row in rows {
+        let source = rbac_fixture(
+            vec![
+                cluster_role(
+                    "pod-reader",
+                    &json!([{"apiGroups": [""], "resources": ["pods"], "verbs": ["get"]}]),
+                ),
+                cluster_role(
+                    "log-reader",
+                    &json!([{"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}]),
+                ),
+            ],
+            vec![
+                crb("r", "pod-reader", &json!([row.subject])),
+                crb("g", "log-reader", &json!([group(row.grantee)])),
+            ],
+        );
+        let report = census(Predicate::RbacBareParentOnly, &source).await;
+        assert_eq!(
+            lost(&report),
+            row.lost,
+            "{} with pods/log granted to {}",
+            row.subject,
+            row.grantee
+        );
+    }
+}
+
+/// The census's copy of the `ServiceAccount` group names agrees with the
+/// authenticator that issues them: every group it gives a member of a
+/// `ServiceAccount` group is one that group's tokens carry.
+#[test]
+fn the_service_account_groups_are_the_authenticators() {
+    use engenho_apiserver::sa_token::groups_for;
+
+    let token: BTreeSet<String> = groups_for("team").into_iter().collect();
+    let namespace_group = [rbac::GROUP_SERVICEACCOUNTS, ":team"].concat();
+    assert!(token.contains(rbac::GROUP_SERVICEACCOUNTS), "{token:?}");
+    assert!(token.contains(&namespace_group), "{token:?}");
+    let member = |g: &str| -> BTreeSet<String> { rbac::member_of(g).groups.into_iter().collect() };
+    assert_eq!(member(&namespace_group), token);
+    assert!(
+        member(rbac::GROUP_SERVICEACCOUNTS).is_subset(&token),
+        "a member of every ServiceAccount carries only what each token does"
+    );
+}
+
+// ── the apiserver's discovery ────────────────────────────────────────────
+
+/// An apiserver that answers `GET <path>` with the document at that path and
+/// 404 for any other.
+async fn fake_apiserver(documents: Vec<(&'static str, Value)>) -> String {
+    use axum::http::{StatusCode, Uri};
+    use axum::response::IntoResponse as _;
+
+    let documents: std::sync::Arc<BTreeMap<&'static str, Value>> =
+        std::sync::Arc::new(documents.into_iter().collect());
+    let app = axum::Router::new().fallback(move |uri: Uri| {
+        let documents = std::sync::Arc::clone(&documents);
+        async move {
+            match documents.get(uri.path()) {
+                Some(body) => (StatusCode::OK, axum::Json(body.clone())).into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a port for the fake apiserver");
+    let addr = listener.local_addr().expect("its address");
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+    ["http://", &addr.to_string()].concat()
+}
+
+async fn discover(documents: Vec<(&'static str, Value)>) -> Result<ApiSource, CensusError> {
+    let base = fake_apiserver(documents).await;
+    let conn =
+        engenho_kube_client::Connection::new(&base, engenho_types::auth::KubeAuth::Anonymous, None)
+            .expect("a connection to the fake apiserver");
+    ApiSource::connect(conn).await
+}
+
+fn resources(rows: &[(&str, &str)]) -> Value {
+    let rows: Vec<Value> = rows
+        .iter()
+        .map(|(plural, kind)| json!({"name": plural, "kind": kind, "verbs": ["list"]}))
+        .collect();
+    json!({ "resources": rows })
+}
+
+/// An apiserver serving `HorizontalPodAutoscaler` at autoscaling/v1 and v2
+/// (v2 preferred) and `Widget` at example.com/v1 and v1beta1 (v1 preferred),
+/// one object of each, readable at every version; `Gadget` only at v1beta1,
+/// which the group does not prefer.
+fn two_version_discovery() -> Vec<(&'static str, Value)> {
+    let hpa = json!({"metadata": {"name": "web", "namespace": "default"}, "spec": {}});
+    let widget = json!({"metadata": {"name": "w", "namespace": "default"}, "spec": {}});
+    vec![
+        ("/api", json!({"versions": ["v1"]})),
+        ("/api/v1", resources(&[("configmaps", "ConfigMap")])),
+        (
+            "/apis",
+            json!({"groups": [
+                // Ascending, as engenho lists them: preferredVersion decides.
+                {"name": "autoscaling",
+                 "versions": [{"version": "v1"}, {"version": "v2"}],
+                 "preferredVersion": {"version": "v2"}},
+                {"name": "example.com",
+                 "versions": [{"version": "v1"}, {"version": "v1beta1"}],
+                 "preferredVersion": {"version": "v1"}},
+                {"name": "apiextensions.k8s.io",
+                 "versions": [{"version": "v1"}],
+                 "preferredVersion": {"version": "v1"}}
+            ]}),
+        ),
+        (
+            "/apis/autoscaling/v1",
+            resources(&[("horizontalpodautoscalers", "HorizontalPodAutoscaler")]),
+        ),
+        (
+            "/apis/autoscaling/v2",
+            resources(&[("horizontalpodautoscalers", "HorizontalPodAutoscaler")]),
+        ),
+        ("/apis/example.com/v1", resources(&[("widgets", "Widget")])),
+        (
+            "/apis/example.com/v1beta1",
+            resources(&[("widgets", "Widget"), ("gadgets", "Gadget")]),
+        ),
+        (
+            "/apis/apiextensions.k8s.io/v1",
+            resources(&[("customresourcedefinitions", "CustomResourceDefinition")]),
+        ),
+        ("/api/v1/configmaps", json!({"items": []})),
+        (
+            "/apis/autoscaling/v1/horizontalpodautoscalers",
+            json!({"items": [hpa.clone()]}),
+        ),
+        (
+            "/apis/autoscaling/v2/horizontalpodautoscalers",
+            json!({"items": [hpa]}),
+        ),
+        (
+            "/apis/example.com/v1/widgets",
+            json!({"items": [widget.clone()]}),
+        ),
+        (
+            "/apis/example.com/v1beta1/widgets",
+            json!({"items": [widget]}),
+        ),
+        ("/apis/example.com/v1beta1/gadgets", json!({"items": []})),
+        (
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            json!({"items": []}),
+        ),
+    ]
+}
+
+/// A kind served at two versions is one set of objects: the census judges it
+/// once, at the group's preferred version (or, where the preferred version
+/// does not serve the kind, the next version discovery lists), so no object
+/// is counted twice. Every version still answers an explicit LIST.
+#[tokio::test]
+async fn a_kind_served_at_two_versions_is_judged_at_one() {
+    let source = discover(two_version_discovery())
+        .await
+        .expect("discovery answers");
+
+    let kinds: BTreeSet<Gvk> = source
+        .kinds()
+        .await
+        .expect("the kinds")
+        .into_iter()
+        .collect();
+    let expected: BTreeSet<Gvk> = [
+        Gvk::new("", "v1", "ConfigMap"),
+        Gvk::new("autoscaling", "v2", "HorizontalPodAutoscaler"),
+        Gvk::new("example.com", "v1", "Widget"),
+        Gvk::new("example.com", "v1beta1", "Gadget"),
+        Builtin::CustomResourceDefinition.gvk(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(kinds, expected);
+
+    let other = Gvk::new("autoscaling", "v1", "HorizontalPodAutoscaler");
+    assert_eq!(
+        source
+            .list(&other)
+            .await
+            .expect("every served version still lists")
+            .len(),
+        1
+    );
+
+    let report = run_at(Predicate::StoredWouldReject, &source, NOW)
+        .await
+        .expect("stored-would-reject answers over the fake apiserver");
+    let examined: Vec<(String, usize)> = report
+        .examined()
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(gvk, n)| (gvk.to_string(), *n))
+        .collect();
+    assert_eq!(
+        examined,
+        [
+            ("autoscaling/v2/HorizontalPodAutoscaler".to_owned(), 1),
+            ("example.com/v1/Widget".to_owned(), 1),
+        ],
+        "each object is read once"
+    );
+}
+
+/// A discovery entry without the string that names it fails the connect: a
+/// group, version or resource the census cannot name is one it cannot list,
+/// and skipping it would report fewer objects than exist.
+#[tokio::test]
+async fn an_unnamed_discovery_entry_fails_the_connect() {
+    let core = || ("/api", json!({"versions": ["v1"]}));
+    let core_v1 = || ("/api/v1", resources(&[]));
+    let rows: Vec<(DiscoveryEntry, Vec<(&'static str, Value)>)> = vec![
+        (
+            DiscoveryEntry::Group,
+            vec![
+                core(),
+                core_v1(),
+                (
+                    "/apis",
+                    json!({"groups": [{"versions": [{"version": "v1"}]}]}),
+                ),
+            ],
+        ),
+        (
+            DiscoveryEntry::GroupVersion,
+            vec![
+                core(),
+                core_v1(),
+                (
+                    "/apis",
+                    json!({"groups": [{"name": "apps", "versions": [{"groupVersion": "apps/v1"}]}]}),
+                ),
+            ],
+        ),
+        (
+            DiscoveryEntry::CoreVersion,
+            vec![
+                ("/api", json!({"versions": [1]})),
+                ("/apis", json!({"groups": []})),
+            ],
+        ),
+        (
+            DiscoveryEntry::Resource,
+            vec![
+                core(),
+                (
+                    "/api/v1",
+                    json!({"resources": [{"name": "pods", "verbs": ["list"]}]}),
+                ),
+                ("/apis", json!({"groups": []})),
+            ],
+        ),
+    ];
+    for (what, documents) in rows {
+        let Err(err) = discover(documents).await else {
+            panic!("{what}: discovery succeeded");
+        };
+        assert!(
+            matches!(err, CensusError::Shape { shape: Shape::Unnamed(entry), .. } if entry == what),
+            "{what}: {err}"
+        );
+    }
+}
+
+// ── the data directory's private copy ────────────────────────────────────
+
+/// The copy of the store (every Secret and token in it) is readable by its
+/// owner only: each directory of it is created 0700 by the call that creates
+/// it, whatever the modes of the files copied in.
+#[cfg(unix)]
+#[test]
+fn the_private_copy_is_readable_by_its_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = tmp.path().join("store");
+    std::fs::create_dir_all(store.join("part")).expect("a store with a subdirectory");
+    std::fs::write(store.join("part/secret"), b"token").expect("a world-readable file");
+    std::fs::set_permissions(
+        store.join("part/secret"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("chmod 0644");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+
+    let scratch = source::Scratch::copy_of(&store).expect("the copy");
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    for dir in [
+        scratch.root().to_path_buf(),
+        scratch.store(),
+        scratch.store().join("part"),
+    ] {
+        assert_eq!(mode(&dir), 0o700, "{} is {:o}", dir.display(), mode(&dir));
+    }
+    assert_eq!(
+        std::fs::read(scratch.store().join("part/secret")).expect("the copied file"),
+        b"token"
+    );
+}
+
+/// A private directory is never one that was already there: an existing
+/// directory, or a symlink to one the census's user owns, refuses the
+/// create and is left as it was.
+#[cfg(unix)]
+#[test]
+fn a_private_directory_is_never_adopted() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let placed = tmp.path().join("placed");
+    std::fs::create_dir(&placed).expect("a directory someone placed");
+    std::fs::set_permissions(&placed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&placed, &link).expect("a symlink to it");
+
+    for path in [&placed, &link] {
+        let err = source::create_private_dir(path).expect_err("an existing entry is refused");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "{}",
+            path.display()
+        );
+    }
+    let mode = std::fs::metadata(&placed)
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o755, "the placed directory is not taken over");
+
+    let fresh = tmp.path().join("fresh");
+    source::create_private_dir(&fresh).expect("a fresh name is created");
+    let mode = std::fs::metadata(&fresh)
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+/// Two copies made at once get two roots: the name is drawn from the OS,
+/// not derived from the process or the clock.
+#[test]
+fn every_private_copy_gets_its_own_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = tmp.path().join("store");
+    std::fs::create_dir(&store).expect("a store");
+    let (a, b) = (
+        source::Scratch::copy_of(&store).expect("one copy"),
+        source::Scratch::copy_of(&store).expect("another"),
+    );
+    assert_ne!(a.root(), b.root());
+    let (a_root, b_root) = (a.root().to_path_buf(), b.root().to_path_buf());
+    drop((a, b));
+    assert!(
+        !a_root.exists() && !b_root.exists(),
+        "each copy is deleted on drop"
+    );
+}
+
 // ── the report ───────────────────────────────────────────────────────────
 
 /// Zero matches is printed as a finding with its totals, and the header says
