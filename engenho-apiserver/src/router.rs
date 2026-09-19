@@ -44,15 +44,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
-use engenho_kube_proto::{
-    CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type, response_wants_protobuf,
-};
+use engenho_kube_proto::{CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type};
 use engenho_store::{Revision, WatchEventKind, WatchSignal, WatchStream};
 use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::Subresource;
 use engenho_types::patch::PatchType;
 use utoipa::OpenApi;
 
+use crate::accept::{self, Served};
 use crate::discovery;
 use crate::error::ApiError;
 use crate::field_validation::{
@@ -857,9 +856,9 @@ enum ResponseCodec {
 }
 
 impl ResponseCodec {
-    /// Negotiate from the request headers' `Accept`. Defaults to JSON
-    /// when `Accept` is absent or does not list protobuf.
-    /// Negotiate from the request's `Accept`.
+    /// Negotiate from the request's `Accept`: protobuf when upstream's
+    /// ranking puts a protobuf range first ([`accept::negotiate`]), JSON
+    /// otherwise and when `Accept` is absent.
     ///
     /// # Errors
     /// [`ApiError::NotAcceptable`] (HTTP 406) when `Accept` is present and
@@ -875,7 +874,8 @@ impl ResponseCodec {
         // An absent or empty Accept means "anything" — default to JSON, never
         // 406. Only an Accept that is PRESENT and names nothing servable is a
         // failed negotiation.
-        if !accept.trim().is_empty() && !accept_is_servable(accept) {
+        let negotiated = accept::negotiate(accept);
+        if !accept.trim().is_empty() && negotiated.is_none() {
             return Err(ApiError::NotAcceptable(
                 [
                     "only the following media types are acceptable: application/json, \
@@ -909,7 +909,7 @@ impl ResponseCodec {
             // response Content-Type, so this is honest negotiation rather
             // than ignoring the preference.
             Ok(ResponseCodec::PartialMetadata)
-        } else if response_wants_protobuf(accept) {
+        } else if negotiated == Some(Served::Protobuf) {
             Ok(ResponseCodec::Protobuf(JsonFallback::from_accept(accept)))
         } else {
             Ok(ResponseCodec::Json)
@@ -925,6 +925,10 @@ impl ResponseCodec {
 /// correct answer. That is what lets a kind with no vendored message (a
 /// custom resource, `batch/v1`, …) and an object whose protobuf would lose
 /// data both be served exactly, instead of a 400 or a silently smaller body.
+///
+/// Any range that takes JSON admits it, `q=0` included: upstream's
+/// negotiator uses `q` only to rank, so it answers a kind with no protobuf
+/// form in JSON even when JSON's range says `q=0` ([`accept`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JsonFallback {
     /// `Accept` also names `application/json`, `application/*` or `*/*`.
@@ -935,39 +939,12 @@ enum JsonFallback {
 
 impl JsonFallback {
     fn from_accept(accept: &str) -> Self {
-        let admits_json = accept.split(',').any(|range| {
-            let media = range.split(';').next().unwrap_or("").trim();
-            media.eq_ignore_ascii_case("application/json")
-                || media.eq_ignore_ascii_case("application/*")
-                || media == "*/*"
-        });
-        if admits_json {
+        if accept::admits(accept, Served::Json) {
             Self::Admitted
         } else {
             Self::Refused
         }
     }
-}
-
-/// Whether ANY media range in `accept` names something this server produces.
-///
-/// Per-range, because `Accept` is a list and one servable range is enough.
-/// `*/*` and `application/*` are wildcards every real client sends, and
-/// rejecting them would break kubectl before it made a single call.
-fn accept_is_servable(accept: &str) -> bool {
-    accept.split(',').any(|range| {
-        let media = range
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        media == "*/*"
-            || media == "application/*"
-            || media == "application/json"
-            || media == "application/yaml"
-            || media == CONTENT_TYPE_PROTOBUF
-    })
 }
 
 /// The GVK a handler speaks, as the K8s wire `(apiVersion, kind)` —

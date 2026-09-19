@@ -58,6 +58,11 @@
 //! The router serves JSON instead of a lossy protobuf body whenever the
 //! client's `Accept` admits JSON, which every client-go client's does.
 //!
+//! Encoding is deterministic: fields go out in field-number order and a
+//! map's entries in key order, as gogo's generated marshallers write them
+//! (`write_message`). prost-reflect's own encoder writes maps in `HashMap`
+//! order, so it is never used here.
+//!
 //! Not losses, and so not variants: `null` and an absent field are the same
 //! Go value; a JSON-number `Quantity` is sent as its decimal text, which Go
 //! parses to the same quantity; a decoded body keeps the zero values Go wrote
@@ -82,7 +87,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use chrono::DateTime;
 use engenho_kube_proto::{CONTENT_TYPE_JSON, CONTENT_TYPE_PROTOBUF, Gvk, PROTOBUF_MAGIC};
-use prost::Message as _;
+use prost::encoding::{WireType, encode_key, encode_varint};
 use prost_reflect::{
     DescriptorPool, DynamicMessage, EnumDescriptor, FieldDescriptor, Kind, MapKey,
     MessageDescriptor, ReflectMessage as _, Value as Wire,
@@ -479,9 +484,11 @@ pub enum TranscodeError {
         #[source]
         source: prost::DecodeError,
     },
-    /// The wrapper does not encode.
-    #[error("protobuf encoding failed: {0}")]
-    Encode(#[source] prost::EncodeError),
+    /// A value the encoder built does not match its field's kind, so it has
+    /// no wire form. Every value is checked against its field when it is
+    /// set, so this is a transcoder defect.
+    #[error("{field}: the encoder holds a value its field's kind cannot write")]
+    Unwritable { field: String },
     /// One field does not transcode.
     #[error("{path}: {problem}")]
     Field {
@@ -506,7 +513,7 @@ impl TranscodeError {
             | Self::InnerJson(_)
             | Self::Decode { .. }
             | Self::Field { .. } => ApiError::BadRequest(self.to_string()),
-            Self::MissingDescriptor(_) | Self::MissingField { .. } | Self::Encode(_) => {
+            Self::MissingDescriptor(_) | Self::MissingField { .. } | Self::Unwritable { .. } => {
                 ApiError::Internal(self.to_string())
             }
         }
@@ -529,7 +536,7 @@ impl TranscodeError {
             | Self::Field { .. }
             | Self::MissingDescriptor(_)
             | Self::MissingField { .. }
-            | Self::Encode(_) => ApiError::Internal(self.to_string()),
+            | Self::Unwritable { .. } => ApiError::Internal(self.to_string()),
         }
     }
 }
@@ -942,15 +949,12 @@ pub fn encode(gvk: &Gvk, value: &Value) -> Result<Encoded, TranscodeError> {
             .ok_or(TranscodeError::MissingDescriptor(UNKNOWN))?,
     );
     set_named(&mut unknown, "typeMeta", Wire::Message(type_meta))?;
-    set_named(
-        &mut unknown,
-        "raw",
-        Wire::Bytes(Bytes::from(object.encode_to_vec())),
-    )?;
+    let mut raw = Vec::new();
+    write_message(&object, &mut raw)?;
+    set_named(&mut unknown, "raw", Wire::Bytes(Bytes::from(raw)))?;
 
-    let mut out = Vec::with_capacity(PROTOBUF_MAGIC.len() + unknown.encoded_len());
-    out.extend_from_slice(&PROTOBUF_MAGIC);
-    unknown.encode(&mut out).map_err(TranscodeError::Encode)?;
+    let mut out = PROTOBUF_MAGIC.to_vec();
+    write_message(&unknown, &mut out)?;
     Ok(Encoded {
         bytes: Bytes::from(out),
         losses,
@@ -1395,6 +1399,185 @@ fn embedded_bytes(value: &Value, at: &At<'_>) -> Result<Bytes, TranscodeError> {
     serde_json::to_vec(value)
         .map(Bytes::from)
         .map_err(|e| at.problem(FieldProblem::NotJson(e)))
+}
+
+// ── the writer: one object, one byte string ─────────────────────────────────
+
+/// Append `msg` to `out` as upstream's gogo marshallers lay it out: fields in
+/// field-number order, and each map's entries sorted by key (gogo's
+/// `sortkeys`), so one object always encodes to one byte string.
+///
+/// This is prost-reflect's encoder with that one change, and the only way
+/// this module turns a message into bytes (it does not import
+/// `prost::Message`). prost-reflect's `Message::encode` writes a map in its
+/// `HashMap`'s iteration order, which is seeded per map: a `ConfigMap` with
+/// six data keys, encoded fifty more times, differed from its first encoding
+/// every time.
+fn write_message(msg: &DynamicMessage, out: &mut Vec<u8>) -> Result<(), TranscodeError> {
+    let mut fields: Vec<(FieldDescriptor, &Wire)> = msg.fields().collect();
+    fields.sort_unstable_by_key(|(field, _)| field.number());
+    for (field, value) in fields {
+        match value {
+            Wire::Map(entries) => write_map(&field, entries, out)?,
+            Wire::List(items) if field.is_packed() => write_packed(&field, items, out)?,
+            Wire::List(items) => {
+                for item in items {
+                    write_single(&field, item, out)?;
+                }
+            }
+            Wire::Bool(_)
+            | Wire::I32(_)
+            | Wire::I64(_)
+            | Wire::U32(_)
+            | Wire::U64(_)
+            | Wire::F32(_)
+            | Wire::F64(_)
+            | Wire::String(_)
+            | Wire::Bytes(_)
+            | Wire::EnumNumber(_)
+            | Wire::Message(_) => write_single(&field, value, out)?,
+        }
+    }
+    Ok(())
+}
+
+/// A map field: one length-delimited entry message per key, in key order.
+/// `MapKey`'s order is gogo's: bytewise for strings, numeric for integers.
+fn write_map(
+    field: &FieldDescriptor,
+    entries: &HashMap<MapKey, Wire>,
+    out: &mut Vec<u8>,
+) -> Result<(), TranscodeError> {
+    let kind = field.kind();
+    let entry = kind.as_message().ok_or_else(|| unwritable(field))?;
+    let key_field = entry.map_entry_key_field();
+    let value_field = entry.map_entry_value_field();
+    let mut sorted: Vec<(&MapKey, &Wire)> = entries.iter().collect();
+    sorted.sort_unstable_by_key(|&(key, _)| key);
+    let mut body = Vec::new();
+    for (key, value) in sorted {
+        body.clear();
+        write_single(&key_field, &Wire::from(key.clone()), &mut body)?;
+        write_single(&value_field, value, &mut body)?;
+        write_delimited(field.number(), &body, out);
+    }
+    Ok(())
+}
+
+/// A packed repeated scalar: one length-delimited run of bare values.
+fn write_packed(
+    field: &FieldDescriptor,
+    items: &[Wire],
+    out: &mut Vec<u8>,
+) -> Result<(), TranscodeError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let kind = field.kind();
+    let mut body = Vec::new();
+    for item in items {
+        match payload(&kind, item).ok_or_else(|| unwritable(field))? {
+            Payload::Varint(v) => encode_varint(v, &mut body),
+            Payload::Fixed32(v) => body.extend_from_slice(&v.to_le_bytes()),
+            Payload::Fixed64(v) => body.extend_from_slice(&v.to_le_bytes()),
+            // protoc refuses `packed` on a length-delimited kind.
+            Payload::Delimited(_) | Payload::Message(_) => return Err(unwritable(field)),
+        }
+    }
+    write_delimited(field.number(), &body, out);
+    Ok(())
+}
+
+/// One value of `field`, keyed. As prost-reflect does, a field with no
+/// presence is left out at its default (proto2, which every vendored message
+/// is, gives every singular field presence, so this skips nothing today).
+fn write_single(
+    field: &FieldDescriptor,
+    value: &Wire,
+    out: &mut Vec<u8>,
+) -> Result<(), TranscodeError> {
+    if !field.supports_presence() && value.is_default_for_field(field) {
+        return Ok(());
+    }
+    let number = field.number();
+    match payload(&field.kind(), value).ok_or_else(|| unwritable(field))? {
+        Payload::Varint(v) => {
+            encode_key(number, WireType::Varint, out);
+            encode_varint(v, out);
+        }
+        Payload::Fixed32(v) => {
+            encode_key(number, WireType::ThirtyTwoBit, out);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Payload::Fixed64(v) => {
+            encode_key(number, WireType::SixtyFourBit, out);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Payload::Delimited(bytes) => write_delimited(number, bytes, out),
+        Payload::Message(message) if field.is_group() => {
+            encode_key(number, WireType::StartGroup, out);
+            write_message(message, out)?;
+            encode_key(number, WireType::EndGroup, out);
+        }
+        Payload::Message(message) => {
+            let mut body = Vec::new();
+            write_message(message, &mut body)?;
+            write_delimited(number, &body, out);
+        }
+    }
+    Ok(())
+}
+
+fn write_delimited(number: u32, bytes: &[u8], out: &mut Vec<u8>) {
+    encode_key(number, WireType::LengthDelimited, out);
+    encode_varint(bytes.len() as u64, out);
+    out.extend_from_slice(bytes);
+}
+
+/// One value on the wire, without its key.
+enum Payload<'v> {
+    Varint(u64),
+    Fixed32(u32),
+    Fixed64(u64),
+    Delimited(&'v [u8]),
+    Message(&'v DynamicMessage),
+}
+
+/// How a value of `kind` travels, or `None` when the value is not of that
+/// kind. The integer encodings are protobuf's: `int32` and enums sign-extend
+/// to ten bytes when negative, `sint*` zigzag.
+fn payload<'v>(kind: &Kind, value: &'v Wire) -> Option<Payload<'v>> {
+    Some(match kind {
+        Kind::Double => Payload::Fixed64(value.as_f64()?.to_bits()),
+        Kind::Float => Payload::Fixed32(value.as_f32()?.to_bits()),
+        Kind::Int32 => Payload::Varint(i64::from(value.as_i32()?).cast_unsigned()),
+        Kind::Int64 => Payload::Varint(value.as_i64()?.cast_unsigned()),
+        Kind::Uint32 => Payload::Varint(u64::from(value.as_u32()?)),
+        Kind::Uint64 => Payload::Varint(value.as_u64()?),
+        Kind::Sint32 => {
+            let v = value.as_i32()?;
+            Payload::Varint(u64::from(((v << 1) ^ (v >> 31)).cast_unsigned()))
+        }
+        Kind::Sint64 => {
+            let v = value.as_i64()?;
+            Payload::Varint(((v << 1) ^ (v >> 63)).cast_unsigned())
+        }
+        Kind::Fixed32 => Payload::Fixed32(value.as_u32()?),
+        Kind::Fixed64 => Payload::Fixed64(value.as_u64()?),
+        Kind::Sfixed32 => Payload::Fixed32(value.as_i32()?.cast_unsigned()),
+        Kind::Sfixed64 => Payload::Fixed64(value.as_i64()?.cast_unsigned()),
+        Kind::Bool => Payload::Varint(u64::from(value.as_bool()?)),
+        Kind::Enum(_) => Payload::Varint(i64::from(value.as_enum_number()?).cast_unsigned()),
+        Kind::String => Payload::Delimited(value.as_str()?.as_bytes()),
+        Kind::Bytes => Payload::Delimited(value.as_bytes()?.as_ref()),
+        Kind::Message(_) => Payload::Message(value.as_message()?),
+    })
+}
+
+fn unwritable(field: &FieldDescriptor) -> TranscodeError {
+    TranscodeError::Unwritable {
+        field: field.full_name().to_owned(),
+    }
 }
 
 // ── descriptors and field access ────────────────────────────────────────────

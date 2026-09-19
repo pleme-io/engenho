@@ -403,8 +403,51 @@ fn token_review() -> Golden {
     }
 }
 
-/// Every golden, in both directions: one per special type, and the inline
-/// embeds a Deployment carries.
+/// `v1` ConfigMap: maps of several entries, string and bytes valued. gogo
+/// writes a map's entries sorted by key (`sortkeys.Strings`, bytewise, so
+/// `B` before `a` and `-` before `.`), and writes an empty value as an
+/// empty field. Every other golden's maps hold one entry, so this is the
+/// golden that pins the order.
+fn config_map() -> Golden {
+    Golden {
+        api_version: "v1",
+        kind: "ConfigMap",
+        object: vec![
+            msg(
+                1,
+                &[
+                    string(1, "settings"),
+                    string(3, "default"),
+                    entry(11, "app", string(2, "web")),
+                    entry(11, "tier", string(2, "frontend")),
+                    entry(12, "note", string(2, "")),
+                    entry(12, "owner", string(2, "team-a")),
+                ],
+            ),
+            entry(2, "B.conf", string(2, "upper")),
+            entry(2, "a-conf", string(2, "dash")),
+            entry(2, "a.conf", string(2, "dot")),
+            entry(2, "empty", string(2, "")),
+            entry(3, "blob", wire::bytes(2, &[0, 1, 2])),
+            entry(3, "cert", wire::bytes(2, b"pem")),
+        ],
+        json: json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "settings",
+                "namespace": "default",
+                "labels": { "tier": "frontend", "app": "web" },
+                "annotations": { "owner": "team-a", "note": "" }
+            },
+            "data": { "empty": "", "a.conf": "dot", "B.conf": "upper", "a-conf": "dash" },
+            "binaryData": { "cert": "cGVt", "blob": "AAEC" }
+        }),
+    }
+}
+
+/// Every golden, in both directions: one per special type, the inline
+/// embeds a Deployment carries, and maps of several entries.
 fn goldens() -> Vec<Golden> {
     vec![
         lease(123_456_000),
@@ -412,6 +455,7 @@ fn goldens() -> Vec<Golden> {
         service(),
         controller_revision(),
         token_review(),
+        config_map(),
     ]
 }
 
@@ -480,6 +524,61 @@ fn upstream_json_encodes_to_upstream_shaped_bytes() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// One object is one byte string, however many times it is encoded. The
+/// encoder built maps as prost-reflect `HashMap`s and let prost-reflect write
+/// them, in iteration order, which is seeded per map: the same ConfigMap
+/// came out as a different byte string on almost every encode. Both objects
+/// here hold maps of many entries; the Pod's sit inside repeated messages.
+#[test]
+fn an_object_encodes_to_the_same_bytes_every_time() {
+    let entries = |prefix: &str, n: usize| -> Value {
+        (0..n)
+            .map(|i| (format!("{prefix}-{i:02}"), json!(format!("v{i}"))))
+            .collect::<Map<String, Value>>()
+            .into()
+    };
+    let config_map = json!({
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": { "name": "many", "labels": entries("label", 8),
+            "annotations": entries("note", 8) },
+        "data": entries("key", 16)
+    });
+    let resources = json!({
+        "limits": { "cpu": "1", "memory": "1Gi", "ephemeral-storage": "2Gi", "nvidia.com/gpu": "1" },
+        "requests": { "cpu": "500m", "memory": "512Mi", "ephemeral-storage": "1Gi" }
+    });
+    let pod = json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": { "name": "many", "labels": entries("label", 8) },
+        "spec": {
+            "nodeSelector": entries("zone", 6),
+            "containers": [
+                { "name": "a", "image": "nginx", "resources": resources },
+                { "name": "b", "image": "nginx", "resources": resources }
+            ]
+        }
+    });
+    for (kind, object) in [("ConfigMap", config_map), ("Pod", pod)] {
+        let gvk = Gvk::new("v1", kind);
+        let first = proto_transcode::encode(&gvk, &object).expect("encodes");
+        assert!(first.losses.is_empty(), "{kind}: {:?}", first.losses);
+        let differing = (0..64)
+            .filter(|_| {
+                proto_transcode::encode(&gvk, &object)
+                    .expect("encodes")
+                    .bytes
+                    != first.bytes
+            })
+            .count();
+        assert_eq!(
+            differing, 0,
+            "{kind}: {differing} of 64 encodes differ from the first"
+        );
+        let decoded = proto_transcode::decode(&first.bytes).expect("decodes");
+        assert_eq!(decoded.value, object, "{kind}: the bytes are the object");
+    }
 }
 
 /// MicroTime keeps microseconds and drops the rest, as
@@ -1796,6 +1895,165 @@ async fn wildcards_admit_the_json_fallback() {
             "Accept: {accept}"
         );
     }
+}
+
+const PROTOBUF: &str = "application/vnd.kubernetes.protobuf";
+const JSON: &str = "application/json";
+const YAML: &str = "application/yaml";
+
+/// Upstream's answer to each `Accept`: `(Accept, a built-in kind, a kind with
+/// no protobuf form)`, `None` being 406. Taken by running k8s.io/apiserver
+/// v0.35.0's `negotiation.NegotiateMediaTypeOptions` (goautoneg
+/// a7dc8b61c822, the pin v1.34 carries too) over the serializers each kind
+/// offers: JSON, YAML and protobuf, and JSON and YAML. v0.34 is not in the
+/// module cache this was run from; `negotiate.go` is byte-identical from
+/// v0.35.0 to v0.36.0.
+///
+/// `q` only ranks: a `q=0` range still matches (rows 3, 14, 15), and a
+/// concrete type outranks `*/*` whatever the `q`s (row 9).
+const NEGOTIATION: [(&str, Option<&str>, Option<&str>); 15] = [
+    (
+        "application/vnd.kubernetes.protobuf,application/json",
+        Some(PROTOBUF),
+        Some(JSON),
+    ),
+    ("application/vnd.kubernetes.protobuf", Some(PROTOBUF), None),
+    (
+        "application/vnd.kubernetes.protobuf,application/json;q=0",
+        Some(PROTOBUF),
+        Some(JSON),
+    ),
+    (
+        "application/vnd.kubernetes.protobuf;q=0,application/json",
+        Some(JSON),
+        Some(JSON),
+    ),
+    (
+        "application/json,application/vnd.kubernetes.protobuf",
+        Some(JSON),
+        Some(JSON),
+    ),
+    (
+        "application/vnd.kubernetes.protobuf;q=0.5,application/json",
+        Some(JSON),
+        Some(JSON),
+    ),
+    (
+        "application/json;q=0.5,application/vnd.kubernetes.protobuf",
+        Some(PROTOBUF),
+        Some(JSON),
+    ),
+    (
+        "*/*,application/vnd.kubernetes.protobuf",
+        Some(PROTOBUF),
+        Some(JSON),
+    ),
+    (
+        "*/*;q=0.9,application/vnd.kubernetes.protobuf;q=0.1",
+        Some(PROTOBUF),
+        Some(JSON),
+    ),
+    (
+        "application/*,application/vnd.kubernetes.protobuf",
+        Some(PROTOBUF),
+        Some(JSON),
+    ),
+    (
+        "application/vnd.kubernetes.protobuf;q=1.0, application/*;q=0.5",
+        Some(PROTOBUF),
+        Some(JSON),
+    ),
+    (
+        "application/vnd.kubernetes.protobuf;q=bogus,application/json;q=0.1",
+        Some(JSON),
+        Some(JSON),
+    ),
+    (
+        "application/yaml,application/vnd.kubernetes.protobuf",
+        Some(YAML),
+        Some(YAML),
+    ),
+    ("application/json;q=0", Some(JSON), Some(JSON)),
+    (
+        "text/html,application/vnd.kubernetes.protobuf;q=0",
+        Some(PROTOBUF),
+        None,
+    ),
+];
+
+/// Rows engenho answers differently, and why. Each must still differ: a row
+/// that starts agreeing is taken off this list.
+const NEGOTIATION_DEVIATIONS: [(&str, &str); 1] = [(
+    "application/yaml,application/vnd.kubernetes.protobuf",
+    "engenho serves no YAML; a YAML range is answered in JSON",
+)];
+
+/// What engenho answered: the media type, or `None` for 406.
+async fn answered(client: &reqwest::Client, url: &str, accept: &str) -> Option<String> {
+    let resp = client
+        .get(url)
+        .header("Accept", accept)
+        .send()
+        .await
+        .unwrap();
+    if resp.status() == reqwest::StatusCode::NOT_ACCEPTABLE {
+        return None;
+    }
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "Accept: {accept}");
+    let media = content_type(&resp);
+    Some(media.split(';').next().unwrap_or("").trim().to_owned())
+}
+
+/// engenho negotiates as upstream does, row for row. Before, any protobuf
+/// range won whatever its `q` or place, so rows 4, 5, 6 and 12 were served
+/// protobuf where upstream serves JSON.
+#[tokio::test]
+async fn negotiation_follows_upstreams_ranking() {
+    let (_store, server) = boot().await;
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+    for (url, body) in [
+        (
+            format!("{base}/api/v1/namespaces/default/configmaps"),
+            json!({ "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": { "name": "plain" }, "data": { "k": "v" } }),
+        ),
+        (
+            format!("{base}/apis/networking.k8s.io/v1/ingressclasses"),
+            json!({ "apiVersion": "networking.k8s.io/v1", "kind": "IngressClass",
+                "metadata": { "name": "nginx" } }),
+        ),
+    ] {
+        let resp = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "{url}");
+    }
+    let built_in = format!("{base}/api/v1/namespaces/default/configmaps/plain");
+    let no_protobuf = format!("{base}/apis/networking.k8s.io/v1/ingressclasses/nginx");
+
+    let mut failures = Vec::new();
+    for (row, (accept, want_built_in, want_no_protobuf)) in NEGOTIATION.iter().enumerate() {
+        let got = (
+            answered(&client, &built_in, accept).await,
+            answered(&client, &no_protobuf, accept).await,
+        );
+        let want = (
+            want_built_in.map(str::to_owned),
+            want_no_protobuf.map(str::to_owned),
+        );
+        let deviation = NEGOTIATION_DEVIATIONS.iter().find(|(a, _)| a == accept);
+        match (got == want, deviation) {
+            (true, None) | (false, Some(_)) => {}
+            (false, None) => failures.push(format!(
+                "row {}: Accept {accept:?}: engenho {got:?}, upstream {want:?}",
+                row + 1
+            )),
+            (true, Some((_, why))) => failures.push(format!(
+                "row {}: Accept {accept:?} now agrees with upstream; drop the deviation ({why})",
+                row + 1
+            )),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// The oracle writer reproduces kubectl's captured bytes exactly, so the
