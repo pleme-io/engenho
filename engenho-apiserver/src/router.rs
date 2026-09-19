@@ -3,9 +3,10 @@
 //!
 //! The router supports kubectl's canonical URLs across BOTH the core
 //! group (`/api/v1/…`) and named groups (`/apis/<group>/<version>/…`)
-//! through ONE coords → dispatch path: two catch-all routes feed the
-//! [`crate::coords::ResourceCoords`] extractor (the single place URL
-//! shapes are parsed), and scope-agnostic per-method verb handlers resolve
+//! through ONE coords → dispatch path: two catch-all routes select the
+//! verb handler, the [`crate::coords::ResourceCoords`] extractor hands it the
+//! coordinates the request-info layer classified ONCE (the same value authz
+//! judged), and scope-agnostic per-method verb handlers resolve
 //! a handler via ONE resolver ([`RouterState::lookup`]) then delegate to
 //! the shared per-verb `do_*` bodies. This collapses the ~20 hand-fanned
 //! per-scope/per-verb route wrappers (5 verbs × 4 scope/group shapes) into
@@ -13,15 +14,14 @@
 //! internally on `coords.name`).
 //!
 //! Feeding routes:
-//!   * `/api/v1/*rest`               → core group (extractor synthesizes
-//!                                      `group=None, version="v1"`).
-//!   * `/apis/:group/:version/*rest` → named group (`group`/`version` from
-//!                                      the path).
+//!   * `/api/v1/*rest`               → core group.
+//!   * `/apis/:group/:version/*rest` → named group.
 //!
-//! The extractor decomposes the `*rest` tail into the six K8s resource URL
-//! shapes (namespaced/cluster × collection/instance, + an optional
-//! subresource segment); the verb handlers pick list-vs-watch +
-//! collection-vs-instance from `?watch=` + `coords.name`. A handler-map
+//! [`crate::coords::RequestInfo::parse`] decomposes the percent-decoded path
+//! into the six K8s resource URL shapes (namespaced/cluster ×
+//! collection/instance, + an optional subresource segment); the verb handlers
+//! pick list-vs-watch + collection-vs-instance from
+//! [`crate::coords::RequestInfo::is_watch`] + `coords.name`. A handler-map
 //! key is the full `(group, version, plural)` triple with `group=""`/
 //! `version="v1"` as the core sentinel, so the old `lookup_core(p)` is
 //! exactly `lookup("", "v1", p)` — the two resolvers fold into one.
@@ -114,6 +114,15 @@ pub struct RouterState {
     /// both from ONE `SaKeypair`, so a mintable token is always a verifiable
     /// one.
     pub token_issuer: Option<Arc<crate::sa_token::SaIssuer>>,
+    /// The process's rollout-gate ledger: what every gate in `Shadow` has
+    /// allowed that `Enforce` would have refused. `/metrics` renders it as
+    /// `engenho_would_reject_total{gate,reason}`.
+    ///
+    /// Defaults to a ledger private to this router that logs through
+    /// [`crate::metrics::log_would_reject`]. The runtime installs the ONE
+    /// ledger it shares with every other gate-owning component via
+    /// [`Self::with_would_reject_ledger`], so one scrape shows every gate.
+    pub would_reject: Arc<engenho_substrate::WouldRejectLedger>,
 }
 
 impl RouterState {
@@ -136,7 +145,22 @@ impl RouterState {
             // No signing key by default: `/token` answers a typed error until
             // the runtime installs the cluster's keypair. NEVER a stub token.
             token_issuer: None,
+            would_reject: Arc::new(engenho_substrate::WouldRejectLedger::new(
+                crate::metrics::log_would_reject,
+            )),
         }
+    }
+
+    /// Install the process-wide rollout-gate ledger. Builder style mirroring
+    /// [`Self::with_authorizer`]; the runtime passes the same `Arc` to every
+    /// component that owns a gate, so `/metrics` counts all of them.
+    #[must_use]
+    pub fn with_would_reject_ledger(
+        mut self,
+        ledger: Arc<engenho_substrate::WouldRejectLedger>,
+    ) -> Self {
+        self.would_reject = ledger;
+        self
     }
 
     /// Install the ServiceAccount token minter. Builder style mirroring
@@ -302,13 +326,21 @@ pub fn build(state: RouterState) -> Router {
     let authenticator = state.authenticator.clone();
     let authorizer = state.authorizer.clone();
     let router = build_routes(state);
-    // Layer order (axum: the LAST `.layer()` is OUTERMOST). The authz layer is
-    // applied FIRST so it is INNER to the authn layer — authn populates
-    // `Extension<UserInfo>` (outer), THEN authz reads it (inner). Both wrap the
-    // WHOLE route table (discovery + SAR + health), matching the authn layer's
-    // placement; the always-allow check is the first branch inside the authz
-    // middleware (health/version are pre-authz so they work with an unseeded
-    // RBAC store).
+    // Layer order (axum: the LAST `.layer()` is OUTERMOST), outside in:
+    //
+    //   1. request-info — classifies the request ONCE (method + decoded path +
+    //      `watch`) into `Extension<RequestInfo>`; upstream runs
+    //      `WithRequestInfo` before authentication too.
+    //   2. authn — populates `Extension<UserInfo>`.
+    //   3. authz — judges the stored RequestInfo as that user.
+    //
+    // All three wrap the WHOLE route table (discovery + SAR + health + the
+    // fallback), and every route comes from `route_table`, so no route can be
+    // reached without a classification. Dispatch reads the same stored value
+    // (the `ResourceCoords` / `RequestInfo` extractors), so what authz judged
+    // is what runs. The always-allow check is the first branch inside the
+    // authz middleware after the lookup (health/version are pre-authz so they
+    // work with an unseeded RBAC store).
     router
         .layer(axum::middleware::from_fn(
             move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
@@ -322,29 +354,47 @@ pub fn build(state: RouterState) -> Router {
                 async move { authn_middleware(authenticator, req, next).await }
             },
         ))
+        .layer(axum::middleware::from_fn(request_info_middleware))
 }
 
-/// The route table (without the authn layer). Split out from [`build`] so the
-/// authn middleware can wrap the WHOLE table — every route (incl. discovery /
-/// health / selfsubjectreviews) runs through authentication first.
+/// The router built from [`route_table`], without the layers. Split out from
+/// [`build`] so the layers wrap the WHOLE table — every route (incl.
+/// discovery / health / selfsubjectreviews) is classified and authenticated
+/// first.
 fn build_routes(state: RouterState) -> Router {
-    Router::new()
+    route_table()
+        .into_iter()
+        .fold(Router::new(), |router, (path, methods)| {
+            router.route(path, methods)
+        })
+        .with_state(state)
+}
+
+/// Every route this server serves, as `(path pattern, methods)`. The ONE
+/// source of routes: [`build_routes`] folds it into the router, and the
+/// route-coverage test walks it to prove each route is classified before
+/// authz. A route added anywhere else would escape both.
+fn route_table() -> Vec<(&'static str, axum::routing::MethodRouter<RouterState>)> {
+    vec![
         // ── resources: ONE coords→dispatch path, fed by two catch-alls ─
         //
         // The ~20 hand-fanned per-scope/per-verb wrappers collapse into
         // the [`ResourceCoords`] extractor + the scope-agnostic verb
         // handlers (one per HTTP method: GET handles both LIST/WATCH and
         // single-GET, branching on `coords.name`; POST/PATCH/DELETE map to
-        // create/patch/delete). Two catch-all routes feed the extractor:
+        // create/patch/delete). Two catch-all routes pick the HANDLER:
         //
-        //   * `/api/v1/*rest`               → core group (the extractor
-        //                                      synthesizes group=None,
-        //                                      version="v1").
+        //   * `/api/v1/*rest`               → core group.
         //   * `/apis/:group/:version/*rest` → named group.
         //
+        // The route params are never read. The coordinates come from the
+        // request-info layer's one classification of the DECODED path (the
+        // same value authz judged), so an encoded `/` in any segment moves
+        // authz and dispatch together or not at all.
+        //
         // Each catch-all registers EXACTLY the methods the K8s wire
-        // supports for a resource path; the extractor + `?watch=` flag
-        // pick list-vs-watch + collection-vs-instance from `coords.name`.
+        // supports for a resource path; `RequestInfo::is_watch` +
+        // `coords.name` pick list-vs-watch + collection-vs-instance.
         // An unrouted method on a matched resource path yields axum's 405
         // — the same terminal semantics the legacy MethodRouter gave (e.g.
         // PUT was never registered, so it 405'd then too). The discovery /
@@ -352,46 +402,46 @@ fn build_routes(state: RouterState) -> Router {
         // shallower param leaf) and take precedence over the catch-alls in
         // matchit (verified: `/api/v1` exact beats `/api/v1/*rest`, and
         // `/apis/:g/:v` coexists with the one-segment-deeper catch-all).
-        .route(
+        (
             "/api/v1/*rest",
             get(resource_get_or_list)
                 .post(resource_create)
                 .put(resource_put)
                 .patch(resource_patch)
                 .delete(resource_delete),
-        )
-        .route(
+        ),
+        (
             "/apis/:group/:version/*rest",
             get(resource_get_or_list)
                 .post(resource_create)
                 .put(resource_put)
                 .patch(resource_patch)
                 .delete(resource_delete),
-        )
+        ),
         // ── discovery ─────────────────────────────────────────────────
-        .route("/api", get(discovery::api_versions))
-        .route("/api/v1", get(discovery::core_resources))
-        .route("/apis", get(discovery::api_groups))
-        .route("/apis/:group/:version", get(discovery::group_resources))
+        ("/api", get(discovery::api_versions)),
+        ("/api/v1", get(discovery::core_resources)),
+        ("/apis", get(discovery::api_groups)),
+        ("/apis/:group/:version", get(discovery::group_resources)),
         // ── openapi ───────────────────────────────────────────────────
         // `/openapi.json` keeps the utoipa-derived description of engenho's
         // own REST surface (SDK/codegen consumers). `/openapi/v3` is the
         // K8s OpenAPI-v3 DISCOVERY surface kubectl `apply --validate` +
         // `explain` consume — a typed index + per-group vendored schemas,
         // scoped to exactly the cataloged groups.
-        .route("/openapi.json", get(openapi_spec))
-        .route("/openapi/v3", get(openapi_v3_index))
-        .route("/openapi/v3/api/v1", get(openapi_v3_core))
-        .route("/openapi/v3/apis/:group/:version", get(openapi_v3_group))
+        ("/openapi.json", get(openapi_spec)),
+        ("/openapi/v3", get(openapi_v3_index)),
+        ("/openapi/v3/api/v1", get(openapi_v3_core)),
+        ("/openapi/v3/apis/:group/:version", get(openapi_v3_group)),
         // ── authentication.k8s.io SelfSubjectReview (kubectl auth whoami) ──
         // A discovery-light special route (NOT a store-backed kind): it echoes
         // the authenticated identity from `Extension<UserInfo>` back as a typed
         // SelfSubjectReview. POST per the upstream API; the body is ignored
         // (the identity comes from the credential, not the body).
-        .route(
+        (
             "/apis/authentication.k8s.io/v1/selfsubjectreviews",
             axum::routing::post(self_subject_review),
-        )
+        ),
         // ── authorization.k8s.io SubjectAccessReview family (Brick B) ──────
         // Discovery-light special routes (NOT store-backed kinds), modeled on
         // the SelfSubjectReview route above. `kubectl auth can-i` POSTs to
@@ -400,29 +450,29 @@ fn build_routes(state: RouterState) -> Router {
         // (Extension<UserInfo> = the caller) and through the authz layer (a
         // SubjectAccessReview create is itself authorized — granted to
         // system:masters + via the system:basic-user policy for self-reviews).
-        .route(
+        (
             "/apis/authorization.k8s.io/v1/subjectaccessreviews",
             axum::routing::post(crate::authz::sar::subject_access_review),
-        )
-        .route(
+        ),
+        (
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
             axum::routing::post(crate::authz::sar::self_subject_access_review),
-        )
-        .route(
+        ),
+        (
             "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
             axum::routing::post(crate::authz::sar::self_subject_rules_review),
-        )
+        ),
         // ── version + health (no RouterState; kubectl/client-go probe
         //    these before they will trust the server) ──────────────────
-        .route("/version", get(health::version))
-        .route("/readyz", get(health::readyz))
-        .route("/livez", get(health::livez))
-        .route("/healthz", get(health::healthz))
+        ("/version", get(health::version)),
+        ("/readyz", get(health::readyz)),
+        ("/livez", get(health::livez)),
+        ("/healthz", get(health::healthz)),
         // Prometheus. RBAC already classified this as a non-resource URL
         // before anything served it — authz could authorize a path that
         // did not exist.
-        .route("/metrics", get(crate::metrics::metrics))
-        .with_state(state)
+        ("/metrics", get(crate::metrics::metrics)),
+    ]
 }
 
 /// The OpenAPI v3 spec — the central machine-readable description
@@ -516,14 +566,34 @@ fn is_always_allowed(path: &str) -> bool {
         || path.starts_with("/version/")
 }
 
+/// The request-info middleware — the ONE parse. Classifies the request from
+/// its method + URI ([`crate::coords::RequestInfo::parse`]: percent-decoded
+/// path, `watch` flag) and stores the result in the request extensions, where
+/// authz and dispatch both read it. A path that is not UTF-8 once decoded is a
+/// typed 400 here, before any identity is resolved.
+async fn request_info_middleware(
+    mut req: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    match crate::coords::RequestInfo::parse(req.method(), req.uri()) {
+        Ok(info) => {
+            req.extensions_mut().insert(info);
+            next.run(req).await
+        }
+        Err(e) => ApiError::from(e).into_response(),
+    }
+}
+
 /// The authz middleware — the thin axum adapter over the typed
 /// [`crate::authz::Authorizer`]. Branch order:
 ///
+///   0. Read the [`crate::coords::RequestInfo`] the request-info layer stored.
+///      None → a typed 500 ([`crate::coords::RequestInfoError::Missing`]); the
+///      path is never parsed here.
 ///   1. [`is_always_allowed`] (`/healthz`, `/livez`, `/readyz`, `/version`)
 ///      → proceed (pre-authz; works with an unseeded RBAC store).
-///   2. Build [`crate::authz::Attributes`] from `req.method()` + path (the
-///      shared [`crate::coords::RequestInfo`] parse) + the resolved
-///      [`UserInfo`] (inserted by the authn layer).
+///   2. Build [`crate::authz::Attributes`] from that `RequestInfo` + the
+///      resolved [`UserInfo`] (inserted by the authn layer).
 ///   3. `authorizer.authorize(&attrs)` →
 ///      * [`crate::authz::Decision::Allow`] → `next.run(req)`.
 ///      * `Deny` / `NoOpinion` → a typed [`ApiError::AuthzForbidden`] 403
@@ -533,32 +603,21 @@ async fn authz_middleware(
     req: axum::http::Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    let path = req.uri().path().to_string();
-
-    // TIER 1 — pre-authz always-allow (health/version). FIRST branch.
-    if is_always_allowed(&path) {
+    let attrs = match crate::coords::RequestInfo::from_extensions(req.extensions()) {
+        Err(e) => return ApiError::from(e).into_response(),
+        // TIER 1 — pre-authz always-allow (health/version).
+        Ok(info) if info.non_resource_url().is_some_and(is_always_allowed) => None,
+        Ok(info) => {
+            let user = req
+                .extensions()
+                .get::<UserInfo>()
+                .cloned()
+                .unwrap_or_else(UserInfo::anonymous);
+            Some(crate::authz::Attributes::for_request(user, info))
+        }
+    };
+    let Some(attrs) = attrs else {
         return next.run(req).await;
-    }
-
-    // Build the typed Attributes from method + path + the resolved identity.
-    let method = req.method().as_str().to_string();
-    let is_watch = req.uri().query().map(query_has_watch).unwrap_or(false);
-    let user = req
-        .extensions()
-        .get::<UserInfo>()
-        .cloned()
-        .unwrap_or_else(UserInfo::anonymous);
-    let info = crate::coords::RequestInfo::from_method_path(&method, &path, is_watch);
-    let attrs = crate::authz::Attributes {
-        user,
-        verb: info.verb,
-        group: info.group,
-        version: info.version,
-        resource: info.resource,
-        subresource: info.subresource,
-        namespace: info.namespace,
-        name: info.name,
-        non_resource_url: info.non_resource_url,
     };
 
     match authorizer.authorize(&attrs).await {
@@ -570,16 +629,6 @@ async fn authz_middleware(
             ApiError::AuthzForbidden(crate::error::forbidden_message(&attrs)).into_response()
         }
     }
-}
-
-/// `true` iff the raw query string carries `watch=true` / `watch=1` — the GET
-/// verb maps to `watch` when present. Parsed without a full decode (the values
-/// are simple flags).
-fn query_has_watch(query: &str) -> bool {
-    query.split('&').any(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        k == "watch" && (v == "true" || v == "1" || v.is_empty())
-    })
 }
 
 /// Extract the `Authorization: Bearer <token>` value, if present. Case-
@@ -1144,18 +1193,22 @@ async fn do_delete_collection(
 
 /// The shared LIST/WATCH body for both the core + grouped cases.
 ///
-///   * `p.watch == false` → the atomic-rv LIST envelope (selectors
+///   * `watch == false` → the atomic-rv LIST envelope (selectors
 ///     applied apiserver-side; rv = `current_revision`).
-///   * `p.watch == true`  → the streaming chunked NDJSON WATCH (the K8s
+///   * `watch == true`  → the streaming chunked NDJSON WATCH (the K8s
 ///     list-then-watch contract).
+///
+/// `watch` is [`crate::coords::RequestInfo::is_watch`] — the verb authz
+/// judged — never a second read of the query.
 async fn do_list_or_watch(
     h: Arc<dyn ResourceHandler>,
     namespace: Option<String>,
+    watch: bool,
     p: ListWatchParams,
     codec: ResponseCodec,
 ) -> Result<Response, ApiError> {
     let sel = p.selectors()?;
-    if p.watch {
+    if watch {
         watch_response(h, namespace, p, sel, codec).await
     } else {
         // Paged path when `limit` or `continue` is present; otherwise the
@@ -1404,10 +1457,11 @@ async fn watch_response(
 
 // ── scope-agnostic verb handlers (ONE per verb; both URL families) ─────
 //
-// Each handler takes the [`ResourceCoords`] extractor (the ONE place URL
-// shapes are parsed) + does exactly: resolve the handler via the SINGLE
-// resolver `state.lookup(coords.group_key(), coords.version_key(),
-// &coords.plural)`, then delegate to the matching shared `do_*` body. The
+// Each handler takes the [`ResourceCoords`] extractor (the request-info
+// layer's ONE classification, the value authz judged) + does exactly:
+// resolve the handler via the SINGLE resolver
+// `state.lookup(coords.group_key(), coords.version_key(), &coords.plural)`,
+// then delegate to the matching shared `do_*` body. The
 // namespaced-vs-cluster scope assertion still lives inside
 // `StoreBackedHandler::key()` (typed 400 on mismatch); coords just carries
 // `namespace: Option<String>` straight through. No subresource handler
@@ -1737,7 +1791,9 @@ async fn do_patch_scale(
 /// the branch, exactly as the legacy list-vs-get split did.
 async fn resource_get_or_list(
     State(state): State<RouterState>,
-    coords: crate::coords::ResourceCoords,
+    // The whole classification, not just the coords: list-vs-watch is
+    // `info.is_watch()`, the verb authz judged.
+    info: crate::coords::RequestInfo,
     headers: HeaderMap,
     // The `/log` subresource reads its typed `?container=&tailLines=&timestamps=`
     // knobs from this extractor. axum parses the WHOLE query string into BOTH
@@ -1746,6 +1802,7 @@ async fn resource_get_or_list(
     Query(log_query): Query<crate::pod_logs::LogQuery>,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
+    let coords = info.resource_coords()?;
     // Resolve the handler FIRST (the subresource is served by the parent
     // kind's handler), then dispatch on the typed subresource resolved from
     // the catalog.
@@ -1773,13 +1830,13 @@ async fn resource_get_or_list(
         };
     }
     match &coords.name {
-        // Collection GET → LIST or WATCH (the shared body branches on
-        // `p.watch`). `lookup` already returns an owned `Arc` (the
+        // Collection GET → LIST or WATCH (the shared body branches on the
+        // judged verb). `lookup` already returns an owned `Arc` (the
         // ArcSwap-snapshot clone) — exactly what the watch unfold stream
         // needs, no extra `.clone()`.
         None => {
             let codec = ResponseCodec::from_headers(&headers)?;
-            do_list_or_watch(h, coords.namespace, p, codec).await
+            do_list_or_watch(h, coords.namespace, info.is_watch(), p, codec).await
         }
         // Instance GET → the shared `do_get` body. Bind the owned `Arc`,
         // pass it by reference (`do_get` takes `&Arc`).
@@ -2535,5 +2592,292 @@ mod token_subresource {
             .find(|d| d.kind == "Pod" && d.group.is_empty())
             .expect("Pod is cataloged");
         assert!(!pod.subresources.contains(&Subresource::Token));
+    }
+}
+
+/// T4.1 — every route is classified ONCE, before authz, and authz judges that
+/// classification.
+#[cfg(test)]
+mod request_info_coverage {
+    use super::*;
+
+    // ── T4.1: the ONE request classification reaches every route ────────
+    //
+    // Every test below drives the REAL `build` router (all three layers) with
+    // an authorizer that records what it was asked and refuses everything, so
+    // no handler body runs and no store is needed. A route reached without a
+    // classification answers 500 (authz reads the stored RequestInfo first),
+    // so a 403 carrying the expected Attributes proves the route was
+    // classified by the request-info layer before authz judged it.
+
+    /// Records every `Attributes` it is handed and returns `NoOpinion`
+    /// (RBAC's default-deny), so the request stops at authz with a 403.
+    #[derive(Default)]
+    struct RecordingDeny {
+        seen: std::sync::Mutex<Vec<crate::authz::Attributes>>,
+    }
+
+    impl RecordingDeny {
+        fn last(&self) -> Option<crate::authz::Attributes> {
+            self.seen.lock().expect("recorder mutex").last().cloned()
+        }
+        fn count(&self) -> usize {
+            self.seen.lock().expect("recorder mutex").len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::authz::Authorizer for RecordingDeny {
+        async fn authorize(&self, attrs: &crate::authz::Attributes) -> crate::authz::Decision {
+            self.seen
+                .lock()
+                .expect("recorder mutex")
+                .push(attrs.clone());
+            crate::authz::Decision::NoOpinion
+        }
+    }
+
+    /// The full router over an empty handler set, judged by a [`RecordingDeny`].
+    fn recorded_router() -> (Router, Arc<RecordingDeny>) {
+        let recorder = Arc::new(RecordingDeny::default());
+        let state = RouterState::new(Vec::new()).with_authorizer(recorder.clone());
+        (build(state), recorder)
+    }
+
+    /// A concrete request path for a route pattern: every `:param` and the
+    /// `*rest` tail filled with a plausible resource-shaped value.
+    fn concrete_path(pattern: &str) -> String {
+        pattern
+            .replace(":group", "apps")
+            .replace(":version", "v1")
+            .replace("*rest", "namespaces/default/pods")
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt as _;
+        let mut req = axum::http::Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let req = req.body(Body::empty()).expect("test request");
+        app.clone()
+            .oneshot(req)
+            .await
+            .expect("the router is infallible")
+            .status()
+    }
+
+    /// What authz must have been handed for `method uri`: the pure
+    /// classification of the (already-decoded) path, as the anonymous user.
+    fn expected_attrs(method: &str, path: &str, is_watch: bool) -> crate::authz::Attributes {
+        crate::authz::Attributes::for_request(
+            UserInfo::anonymous(),
+            &crate::coords::RequestInfo::from_method_path(method, path, is_watch),
+        )
+    }
+
+    #[tokio::test]
+    async fn every_route_in_the_table_is_classified_before_authz() {
+        let (app, recorder) = recorded_router();
+        let table = route_table();
+        // Positive control: the walk covers the resource catch-alls, not just
+        // the static routes around them.
+        let patterns: Vec<&str> = table.iter().map(|(p, _)| *p).collect();
+        for must in ["/api/v1/*rest", "/apis/:group/:version/*rest", "/healthz"] {
+            assert!(patterns.contains(&must), "{must} is in the route table");
+        }
+
+        let (mut judged, mut pre_authz) = (0usize, 0usize);
+        for pattern in patterns {
+            let path = concrete_path(pattern);
+            let before = recorder.count();
+            let status = send(&app, "GET", &path, &[]).await;
+            let info = crate::coords::RequestInfo::from_method_path("GET", &path, false);
+            if info.non_resource_url().is_some_and(is_always_allowed) {
+                // Pre-authz health/version: authz still READ the stored
+                // classification (a missing one is a 500) and let it through.
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{pattern} ({path}) reached its handler"
+                );
+                assert_eq!(recorder.count(), before, "{pattern} skips the authorizer");
+                pre_authz += 1;
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{pattern} ({path}) was judged"
+                );
+                assert_eq!(
+                    recorder.last(),
+                    Some(expected_attrs("GET", &path, false)),
+                    "{pattern} was judged on the one classification of {path}"
+                );
+                judged += 1;
+            }
+        }
+        assert_eq!(
+            pre_authz, 4,
+            "healthz, livez, readyz and version skip authz"
+        );
+        assert_eq!(judged + pre_authz, table.len(), "every route was walked");
+    }
+
+    #[tokio::test]
+    async fn watch_requests_are_classified_as_watches_on_both_catch_alls() {
+        let (app, recorder) = recorded_router();
+        for (uri, path) in [
+            (
+                "/api/v1/namespaces/default/pods?watch=true",
+                "/api/v1/namespaces/default/pods",
+            ),
+            (
+                "/apis/apps/v1/namespaces/default/deployments?watch=1&timeoutSeconds=5",
+                "/apis/apps/v1/namespaces/default/deployments",
+            ),
+            ("/api/v1/nodes?watch=yes", "/api/v1/nodes"),
+        ] {
+            assert_eq!(send(&app, "GET", uri, &[]).await, StatusCode::FORBIDDEN);
+            let judged = recorder.last().expect("authz ran");
+            assert_eq!(judged.verb, "watch", "{uri}");
+            assert_eq!(judged, expected_attrs("GET", path, true), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrades_are_classified_before_authz() {
+        // No route serves a WebSocket today (exec/attach/portforward are not
+        // implemented), but an upgrade request must still be classified and
+        // judged like any other: the layers wrap the upgrade handshake too.
+        let (app, recorder) = recorded_router();
+        let upgrade = [
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ];
+
+        let status = send(
+            &app,
+            "GET",
+            "/api/v1/namespaces/default/pods/p1/exec?command=sh&stdin=true",
+            &upgrade,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let judged = recorder.last().expect("authz ran");
+        assert_eq!(judged.resource, "pods");
+        assert_eq!(judged.subresource.as_deref(), Some("exec"));
+        assert_eq!(judged.name.as_deref(), Some("p1"));
+        assert_eq!(judged.verb, "get");
+
+        // A watch negotiated over a WebSocket (client-go can) is a watch.
+        let status = send(
+            &app,
+            "GET",
+            "/api/v1/namespaces/default/pods?watch=true",
+            &upgrade,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(recorder.last().map(|a| a.verb).as_deref(), Some("watch"));
+    }
+
+    #[tokio::test]
+    async fn an_unrouted_path_is_classified_and_judged_too() {
+        // The fallback is wrapped by the same layers, so a path no route
+        // serves is judged as a non-resource URL rather than slipping past.
+        let (app, recorder) = recorded_router();
+        assert_eq!(
+            send(&app, "GET", "/no/such/route", &[]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            recorder.last(),
+            Some(expected_attrs("GET", "/no/such/route", false))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_encoded_separator_moves_authz_and_routing_together() {
+        // `/apis/apps%2Fv1/...` is matched by the router as group `apps/v1`,
+        // version `namespaces`. Authz and dispatch both read the DECODED
+        // classification instead: deployments in `default`.
+        let (app, recorder) = recorded_router();
+        let status = send(
+            &app,
+            "GET",
+            "/apis/apps%2Fv1/namespaces/default/deployments",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let judged = recorder.last().expect("authz ran");
+        assert_eq!(judged.group, "apps");
+        assert_eq!(judged.version, "v1");
+        assert_eq!(judged.resource, "deployments");
+        assert_eq!(judged.namespace.as_deref(), Some("default"));
+        assert_eq!(judged.verb, "list");
+    }
+
+    #[tokio::test]
+    async fn a_path_that_is_not_utf8_once_decoded_is_a_typed_400_before_authz() {
+        let (app, recorder) = recorded_router();
+        assert_eq!(
+            send(&app, "GET", "/api/v1/namespaces/default/pods/%FF", &[]).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(recorder.count(), 0, "nothing unclassifiable reaches authz");
+    }
+
+    #[tokio::test]
+    async fn without_the_request_info_layer_authz_and_dispatch_fail_closed() {
+        // Authz alone, no request-info layer: a typed 500, never a re-parse
+        // of the path (and never an allow).
+        let recorder = Arc::new(RecordingDeny::default());
+        let authorizer: Arc<dyn crate::authz::Authorizer> = recorder.clone();
+        let authz_only =
+            build_routes(RouterState::new(Vec::new())).layer(axum::middleware::from_fn(
+                move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
+                    let authorizer = authorizer.clone();
+                    async move { authz_middleware(authorizer, req, next).await }
+                },
+            ));
+        for uri in ["/healthz", "/api/v1/namespaces/default/pods", "/api"] {
+            assert_eq!(
+                send(&authz_only, "GET", uri, &[]).await,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            recorder.count(),
+            0,
+            "an unclassified request is never judged"
+        );
+
+        // Dispatch alone: the ResourceCoords / RequestInfo extractors refuse
+        // with the same typed 500 rather than reading the route params.
+        let bare = build_routes(RouterState::new(Vec::new()));
+        for (method, uri) in [
+            ("GET", "/api/v1/namespaces/default/pods"),
+            (
+                "POST",
+                "/api/v1/namespaces/default/serviceaccounts/foo/token",
+            ),
+            ("DELETE", "/apis/apps/v1/namespaces/default/deployments/web"),
+        ] {
+            assert_eq!(
+                send(&bare, method, uri, &[]).await,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {uri}"
+            );
+        }
     }
 }

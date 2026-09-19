@@ -22,7 +22,7 @@
       (group       :doc "API group (\"\" core)")
       (version     :doc "API version (not matched by RBAC)")
       (resource    :doc "resource plural; empty for non-resource")
-      (subresource :doc "status|scale; resource match key becomes resource/subresource")
+      (subresource :doc "status|scale|log|token; resource match key becomes resource/subresource; empty == absent")
       (namespace   :doc "namespace for a namespaced resource request")
       (name        :doc "instance name; matched against PolicyRule.resourceNames")
       (non-resource-url :doc "nonResourceURL (/healthz, /api, …) for a non-resource request")))
@@ -46,8 +46,8 @@
     (c resolve-roles
        :do "for each matched binding, resolve roleRef => ClusterRole (cluster) or Role (in the binding's namespace). RoleBinding may reference a ClusterRole (applied in-ns). Dangling roleRef => skip + warn (NoOpinion contribution, NOT a hard error)")
     (d match-rules
-       :resource     "verb in rule.verbs|* AND group in rule.apiGroups|* AND resource-key in rule.resources|* (resource|resource/sub|resource/* match) AND (rule.resourceNames empty OR name in rule.resourceNames) => Allow"
-       :non-resource "verb in rule.verbs|* AND path matches a rule.nonResourceURLs entry (exact | trailing /* prefix-glob) => Allow")
+       :resource     "verb in rule.verbs|* AND group in rule.apiGroups|* AND rule.resources holds * | the exact key (resource, or resource/sub) | */sub AND (rule.resourceNames empty OR name in rule.resourceNames) => Allow. A bare resource never grants its subresources; a subresource grant never grants its parent; resource/* is not a pattern. Upstream ResourceMatches, pkg/apis/rbac/v1/evaluation_helpers.go@v1.34.0"
+       :non-resource "verb in rule.verbs|* AND a rule.nonResourceURLs entry is * | the exact path | ends in * and the path starts with it minus its trailing *s => Allow. /apis/* does not grant /apis. Upstream NonResourceURLMatches, pkg/apis/rbac/v1/evaluation_helpers.go@v1.34.0")
     (e default
        :do "no rule matched => NoOpinion"))
 
@@ -72,6 +72,18 @@
     (subresource-match
       :given  (clusterrole "status-writer" :verbs (patch) :resources ("pods/status"))
       :attrs  (user (name "carol") :verb "patch" :resource "pods" :subresource "status")
+      :decision allow)
+    (subresource-grant-not-parent
+      :given  (clusterrole "status-writer" :verbs (patch) :resources ("pods/status"))
+      :attrs  (user (name "carol") :verb "patch" :resource "pods")
+      :decision no-opinion)
+    (bare-parent-not-subresource
+      :given  (role "default/sa-creator" :verbs (create) :resources (serviceaccounts))
+      :attrs  (user (name "mallory") :verb "create" :resource "serviceaccounts" :subresource "token" :namespace "default")
+      :decision no-opinion)
+    (star-subresource
+      :given  (clusterrole "scaler" :verbs (get) :api-groups (*) :resources ("*/scale"))
+      :attrs  (user (name "admin") :verb "get" :resource "deployments" :subresource "scale")
       :decision allow)
     (non-resource-url-glob
       :given  (clusterrole "system:discovery" :verbs (get) :non-resource-urls ("/api" "/apis/*"))

@@ -5,7 +5,7 @@
 //! Role(get,list pods, ns default) + a RoleBinding to `test-user`, and drives it
 //! with `reqwest` over plaintext.
 //!
-//! Proves the four live-bar items at the HTTP boundary:
+//! Proves the live-bar items at the HTTP boundary:
 //!   * BOUND ROLE WORKS — a SubjectAccessReview{user:test-user, get pods,
 //!     default} => allowed:true; {delete} => false; {secrets} => false.
 //!   * DEFAULT-DENY IS REAL — a SelfSubjectAccessReview for an ungranted verb as
@@ -15,6 +15,9 @@
 //!   * UNBOUND => 403 — an authenticated-but-unbound request to a protected
 //!     resource returns HTTP 403 with the typed K8s Status (reason Forbidden,
 //!     `forbidden: User ... cannot ...` message).
+//!   * A GRANT REACHES WHAT IT NAMES (T4.2) — `create serviceaccounts` does not
+//!     reach `serviceaccounts/token`, and `create serviceaccounts/token` does
+//!     not reach `serviceaccounts`, as upstream's `ResourceMatches`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -491,6 +494,200 @@ async fn anonymous_discovery_and_health_open() {
             "anonymous GET {path} => 200 (binding-driven discovery)"
         );
     }
+
+    server.shutdown().await.unwrap();
+}
+
+/// POST `body` to `path` as the admin (system:masters) and require 201.
+async fn admin_create(client: &reqwest::Client, base: &str, path: &str, body: serde_json::Value) {
+    let resp = client
+        .post([base, path].concat())
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&body)
+        .send()
+        .await
+        .expect("admin create");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "admin create {path}: {text}"
+    );
+}
+
+/// A Role in `default` holding one rule: `verb` on core-group `resource`.
+fn one_rule_role(name: &str, verb: &str, resource: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "Role",
+        "metadata": {"name": name, "namespace": "default"},
+        "rules": [{"verbs": [verb], "apiGroups": [""], "resources": [resource]}]
+    })
+}
+
+/// A RoleBinding in `default` binding Role `role` to one subject.
+fn bind(role: &str, subject_kind: &str, subject_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {"name": role, "namespace": "default"},
+        "roleRef": {"apiGroup": RBAC_GROUP, "kind": "Role", "name": role},
+        "subjects": [{"apiGroup": RBAC_GROUP, "kind": subject_kind, "name": subject_name}]
+    })
+}
+
+#[tokio::test]
+async fn create_serviceaccounts_does_not_grant_the_token_subresource() {
+    // (6) T4.2 — the live escalation: before it, holding `create
+    // serviceaccounts` minted a token for any ServiceAccount in the namespace
+    // through `serviceaccounts/token`.
+    let (base, server) = boot_rbac_server().await;
+    let client = reqwest::Client::new();
+    let roles = "/apis/rbac.authorization.k8s.io/v1/namespaces/default/roles";
+    let bindings = "/apis/rbac.authorization.k8s.io/v1/namespaces/default/rolebindings";
+
+    // Anonymous callers may create ServiceAccounts in `default`, nothing more.
+    admin_create(
+        &client,
+        &base,
+        roles,
+        one_rule_role("sa-creator", "create", "serviceaccounts"),
+    )
+    .await;
+    admin_create(
+        &client,
+        &base,
+        bindings,
+        bind("sa-creator", "Group", "system:unauthenticated"),
+    )
+    .await;
+
+    // Positive control: the grant is live. Without this, the 403 below could
+    // mean only that the binding was never seen.
+    let resp = client
+        .post(format!("{base}/api/v1/namespaces/default/serviceaccounts"))
+        .json(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": "foo", "namespace": "default"}
+        }))
+        .send()
+        .await
+        .expect("anonymous create ServiceAccount");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "the bare grant reaches serviceaccounts: {text}"
+    );
+
+    // The token subresource of that ServiceAccount is refused, and the
+    // refusal names what was judged.
+    let resp = client
+        .post(format!(
+            "{base}/api/v1/namespaces/default/serviceaccounts/foo/token"
+        ))
+        .json(&serde_json::json!({
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenRequest",
+            "spec": {}
+        }))
+        .send()
+        .await
+        .expect("anonymous POST serviceaccounts/foo/token");
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "create serviceaccounts must not mint a token: {v}"
+    );
+    let msg = v["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("\"serviceaccounts/token\""),
+        "the refusal names the subresource: {msg:?}"
+    );
+
+    // A SubjectAccessReview gives the same answer for the same identity.
+    let anonymous = |attrs: serde_json::Value| {
+        serde_json::json!({
+            "user": "system:anonymous",
+            "groups": ["system:unauthenticated"],
+            "resourceAttributes": attrs
+        })
+    };
+    assert!(
+        sar_allowed(
+            &client,
+            &base,
+            anonymous(serde_json::json!({
+                "verb": "create", "resource": "serviceaccounts", "namespace": "default"
+            }))
+        )
+        .await,
+        "SAR: the bare grant reaches serviceaccounts"
+    );
+    assert!(
+        !sar_allowed(
+            &client,
+            &base,
+            anonymous(serde_json::json!({
+                "verb": "create", "resource": "serviceaccounts", "subresource": "token",
+                "namespace": "default", "name": "foo"
+            }))
+        )
+        .await,
+        "SAR: the bare grant does not reach serviceaccounts/token"
+    );
+
+    // The other direction: an exact subresource grant reaches the subresource
+    // and not its parent.
+    admin_create(
+        &client,
+        &base,
+        roles,
+        one_rule_role("token-minter", "create", "serviceaccounts/token"),
+    )
+    .await;
+    admin_create(
+        &client,
+        &base,
+        bindings,
+        bind("token-minter", "User", "minter"),
+    )
+    .await;
+    let minter = |attrs: serde_json::Value| {
+        serde_json::json!({
+            "user": "minter",
+            "groups": ["system:authenticated"],
+            "resourceAttributes": attrs
+        })
+    };
+    assert!(
+        sar_allowed(
+            &client,
+            &base,
+            minter(serde_json::json!({
+                "verb": "create", "resource": "serviceaccounts", "subresource": "token",
+                "namespace": "default", "name": "foo"
+            }))
+        )
+        .await,
+        "SAR: serviceaccounts/token reaches serviceaccounts/token"
+    );
+    assert!(
+        !sar_allowed(
+            &client,
+            &base,
+            minter(serde_json::json!({
+                "verb": "create", "resource": "serviceaccounts", "namespace": "default"
+            }))
+        )
+        .await,
+        "SAR: serviceaccounts/token does not reach serviceaccounts"
+    );
 
     server.shutdown().await.unwrap();
 }
