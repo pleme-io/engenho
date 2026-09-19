@@ -62,6 +62,30 @@ impl std::fmt::Display for StageId {
     }
 }
 
+/// Parse-boundary refusal for a stage threshold `k`.
+///
+/// `k` counts nodes or receipts, so zero is not a weaker quorum — it is
+/// a policy no fold can honour. Every consumer downstream of here had
+/// independently rounded it up to one (`Placement::min_nodes`,
+/// `Plantio::compile_jobs`, the controller's `threshold_for`), which
+/// means an operator who wrote `"k": 0` got a one-node quorum and no
+/// word about it. This refuses the value where the CR is *read*,
+/// instead of repairing it at each place it is used. Wire format is
+/// unchanged: every `k` a valid CR already carries still parses.
+fn de_threshold_k<'de, D>(de: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let k = usize::deserialize(de)?;
+    if k == 0 {
+        return Err(serde::de::Error::invalid_value(
+            serde::de::Unexpected::Unsigned(0),
+            &"k: a threshold of at least 1",
+        ));
+    }
+    Ok(k)
+}
+
 /// Where a stage should be materialized.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -75,13 +99,17 @@ pub enum Placement {
     AnyOne,
     /// Any K nodes — load-spreading without agreement requirement.
     AnyK {
-        /// How many nodes (≥1).
+        /// How many nodes. `0` is refused at parse; see
+        /// [`de_threshold_k`].
+        #[serde(deserialize_with = "de_threshold_k")]
         k: usize,
     },
     /// Quorum — K nodes, BLAKE3-agreement required (typed Dissent
     /// from `QuorumTracker` if disagreement detected).
     Quorum {
-        /// Quorum threshold.
+        /// Quorum threshold. `0` is refused at parse; see
+        /// [`de_threshold_k`].
+        #[serde(deserialize_with = "de_threshold_k")]
         k: usize,
     },
     /// Every node in the cluster.
@@ -91,6 +119,11 @@ pub enum Placement {
 impl Placement {
     /// Minimum nodes required for this placement to be satisfied.
     /// `AllNodes` returns `None` (depends on dynamic cluster size).
+    ///
+    /// The `.max(1)` is the residue of the old repair-at-use design.
+    /// A parsed `Placement` can no longer carry a zero (see
+    /// [`de_threshold_k`]), so it only covers a value built in Rust;
+    /// it disappears when `k` becomes a `NonZeroUsize`.
     #[must_use]
     pub fn min_nodes(&self) -> Option<usize> {
         match self {
@@ -116,7 +149,9 @@ pub enum ConfirmacaoPolicy {
     Local,
     /// K receipts gossiped via chitchat must reach this node.
     Quorum {
-        /// Receipt threshold.
+        /// Receipt threshold. `0` is refused at parse; see
+        /// [`de_threshold_k`].
+        #[serde(deserialize_with = "de_threshold_k")]
         k: usize,
     },
     /// Every placement target must produce a receipt.
@@ -478,10 +513,94 @@ mod tests {
         assert!(!Placement::AnyK { k: 5 }.requires_agreement());
     }
 
+    /// A zero built in Rust still folds to one. This is the residual
+    /// hole, pinned so it is visible: the wire can no longer reach it
+    /// (see the parse tests below), and it closes for good when `k`
+    /// becomes a `NonZeroUsize` end to end.
     #[test]
     fn placement_zero_k_clamps_to_one_via_min_nodes() {
         assert_eq!(Placement::AnyK { k: 0 }.min_nodes(), Some(1));
         assert_eq!(Placement::Quorum { k: 0 }.min_nodes(), Some(1));
+    }
+
+    // ── k = 0 is refused where the CR is read ──────────────────
+
+    #[test]
+    fn placement_any_k_refuses_zero_at_the_parse_boundary() {
+        let err = serde_json::from_str::<Placement>(r#"{"kind":"any_k","k":0}"#)
+            .expect_err("a placement with k = 0 must not parse");
+        assert!(
+            err.to_string().contains("at least 1"),
+            "the refusal must say what was expected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn placement_quorum_refuses_zero_at_the_parse_boundary() {
+        let err = serde_json::from_str::<Placement>(r#"{"kind":"quorum","k":0}"#)
+            .expect_err("a quorum placement with k = 0 must not parse");
+        assert!(
+            err.to_string().contains("at least 1"),
+            "the refusal must say what was expected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn confirmacao_quorum_refuses_zero_at_the_parse_boundary() {
+        let err = serde_json::from_str::<ConfirmacaoPolicy>(r#"{"kind":"quorum","k":0}"#)
+            .expect_err("a confirmation policy with k = 0 must not parse");
+        assert!(
+            err.to_string().contains("at least 1"),
+            "the refusal must say what was expected, got: {err}"
+        );
+    }
+
+    /// The wire number an operator actually writes is untouched — only
+    /// zero moved from "silently means one" to "refused".
+    #[test]
+    fn every_non_zero_k_still_parses_to_the_same_number() {
+        assert_eq!(
+            serde_json::from_str::<Placement>(r#"{"kind":"any_k","k":1}"#).unwrap(),
+            Placement::AnyK { k: 1 }
+        );
+        assert_eq!(
+            serde_json::from_str::<Placement>(r#"{"kind":"quorum","k":3}"#).unwrap(),
+            Placement::Quorum { k: 3 }
+        );
+        assert_eq!(
+            serde_json::from_str::<ConfirmacaoPolicy>(r#"{"kind":"quorum","k":3}"#).unwrap(),
+            ConfirmacaoPolicy::Quorum { k: 3 }
+        );
+        let p = Placement::Quorum { k: 3 };
+        let back: Placement = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    /// The realistic path: a whole Plantio read out of a CR. A zero
+    /// anywhere in it takes the Plantio down with it rather than
+    /// quietly becoming a one-node quorum.
+    #[test]
+    fn a_plantio_carrying_a_zero_k_does_not_parse() {
+        let mut st = simple_stage("q", &[]);
+        st.placement = Placement::Quorum { k: 3 };
+        st.confirm = ConfirmacaoPolicy::Quorum { k: 3 };
+        let mut p = Plantio::new();
+        p.add_stage(st).unwrap();
+
+        let good = serde_json::to_string(&p).unwrap();
+        assert!(serde_json::from_str::<Plantio>(&good).is_ok());
+
+        let zeroed = good.replace("\"k\":3", "\"k\":0");
+        assert_ne!(
+            zeroed, good,
+            "fixture must contain the k it is about to zero"
+        );
+        let err = serde_json::from_str::<Plantio>(&zeroed)
+            .expect_err("a plantio carrying k = 0 must not parse");
+        assert!(
+            err.to_string().contains("at least 1"),
+            "the refusal must say what was expected, got: {err}"
+        );
     }
 
     #[test]
