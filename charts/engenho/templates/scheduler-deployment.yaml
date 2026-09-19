@@ -33,8 +33,6 @@ spec:
               value: {{ .Values.global.cluster.name | quote }}
             - name: ENGENHO_STORE_URL
               value: "http://{{ include "engenho.fullname" . }}-apiserver:{{ .Values.apiserver.http.port }}"
-            - name: ENGENHO_NATS_URL
-              value: {{ include "engenho.natsURL" . | quote }}
             - name: ENGENHO_SCHEDULER_STRATEGY
               value: {{ .Values.scheduler.strategy | quote }}
             - name: ENGENHO_SCHEDULER_NAMESPACE

@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "db6734c223d8768326f03f2fcb37106e9d39304467f01adcb8d38596dc62a938",
+  "cargo_lock_sha256": "1b61ea6d6089fdb44c2ab28d15e94426d5bb079b063b8a4f77155b4c73fe4402",
   "manifest_sha256": {
     "Cargo.toml": "04cf79221801b8562c19d8a3bcbf45a55f2886ba7d654cd6a523bd856736a98c",
     "engenho-apiserver/Cargo.toml": "be7d04cd80fe124f3094eb3f147cbde15e2eabe2975858e18f9ed7ab6c190ab1",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-cni/Cargo.toml": "18a964f983410b945d3e150fe0f2a33635fe63aaadb02f9425a20eac53f39908",
-    "engenho-config/Cargo.toml": "b96a79e9008ee6a636df2a80815df844ce2081fac132eeddd6e4d60e87055b88",
+    "engenho-config/Cargo.toml": "663a2eb970f314f8eea6242fce63190a45c143f25e356e8eaa566e83c3c73ac8",
     "engenho-controllers/Cargo.toml": "be0bea38707c599d4db3afbcddf9d3454695a8ead92cea2c293f28334fd00954",
     "engenho-csi/Cargo.toml": "1e80780c1c952308203895db7e3cac22d1f7e6465cacb9d698060412e56d4c97",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
@@ -29,7 +29,7 @@
     "engenho-substrate-props/Cargo.toml": "d5a75c33f45b46eddd6d7d4a7166e002f10b0787e57dc35bbbdd1521e126bec6",
     "engenho-substrate/Cargo.toml": "674f26e64fef7da9bd4004ed774c5e35d4d26780f9c337ad7ad1d4e85f288a27",
     "engenho-sui-typescape/Cargo.toml": "30fde1a3a1db010241fa2d2c10c14a4953dcbb9979d760cf0843622f3b694207",
-    "engenho-teia/Cargo.toml": "5f49fb93d3d30e02eea21bec4cb5cbe8b972bd40d3db3b8c29ce3c3f5f79c6fb",
+    "engenho-teia/Cargo.toml": "c0b840a05f7e1a944503ea3701d4f1f2a4e3656b3c334d9029e8ceb6ee8cbbcc",
     "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
     "engenho/Cargo.toml": "4a6b88432fea4ff0c2c3a8490d9b4393999440875d6a5f2010980dde7e78f13d"
   },
@@ -470,305 +470,6 @@
         ],
         "build_dependencies": [],
         "features": []
-      },
-      "async-nats-0.38.0": {
-        "runtime_dependencies": [
-          {
-            "name": "base64",
-            "package_key": "base64-0.22.1",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "bytes",
-            "package_key": "bytes-1.11.1",
-            "kind": "normal",
-            "features": [
-              "serde"
-            ],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "futures",
-            "package_key": "futures-0.3.32",
-            "kind": "normal",
-            "features": [
-              "std"
-            ],
-            "uses_default_features": false,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "memchr",
-            "package_key": "memchr-2.8.1",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "nkeys",
-            "package_key": "nkeys-0.4.5",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "nuid",
-            "package_key": "nuid-0.5.0",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "once_cell",
-            "package_key": "once_cell-1.21.4",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "pin_project",
-            "package_key": "pin-project-1.1.13",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "portable_atomic",
-            "package_key": "portable-atomic-1.13.1",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "rand",
-            "package_key": "rand-0.8.6",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "regex",
-            "package_key": "regex-1.12.3",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "ring",
-            "package_key": "ring-0.17.14",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "rustls_native_certs",
-            "package_key": "rustls-native-certs-0.7.3",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "rustls_pemfile",
-            "package_key": "rustls-pemfile-2.2.0",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "webpki",
-            "package_key": "rustls-webpki-0.102.8",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "serde",
-            "package_key": "serde-1.0.228",
-            "kind": "normal",
-            "features": [
-              "derive"
-            ],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "serde_json",
-            "package_key": "serde_json-1.0.150",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "serde_nanos",
-            "package_key": "serde_nanos-0.1.4",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "serde_repr",
-            "package_key": "serde_repr-0.1.20",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "host"
-          },
-          {
-            "name": "thiserror",
-            "package_key": "thiserror-1.0.69",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "time",
-            "package_key": "time-0.3.47",
-            "kind": "normal",
-            "features": [
-              "formatting",
-              "parsing",
-              "serde",
-              "serde-well-known"
-            ],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tokio",
-            "package_key": "tokio-1.52.3",
-            "kind": "normal",
-            "features": [
-              "fs",
-              "io-util",
-              "macros",
-              "net",
-              "rt",
-              "sync",
-              "time"
-            ],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tokio_rustls",
-            "package_key": "tokio-rustls-0.26.4",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tokio_util",
-            "package_key": "tokio-util-0.7.18",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tracing",
-            "package_key": "tracing-0.1.44",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tryhard",
-            "package_key": "tryhard-0.5.2",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "url",
-            "package_key": "url-2.5.8",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
-        "build_dependencies": [],
-        "features": [
-          "default",
-          "ring",
-          "server_2_10"
-        ]
       },
       "async-stream-0.3.6": {
         "runtime_dependencies": [
@@ -2469,24 +2170,10 @@
         ]
       },
       "bytes-1.11.1": {
-        "runtime_dependencies": [
-          {
-            "name": "serde",
-            "package_key": "serde-1.0.228",
-            "kind": "normal",
-            "features": [
-              "alloc"
-            ],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          }
-        ],
+        "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
           "default",
-          "serde",
           "std"
         ]
       },
@@ -4039,16 +3726,6 @@
             "tree": "target"
           },
           {
-            "name": "signature",
-            "package_key": "signature-2.2.0",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
             "name": "subtle",
             "package_key": "subtle-2.6.1",
             "kind": "normal",
@@ -4073,13 +3750,11 @@
         "features": [
           "alloc",
           "default",
-          "digest",
           "fast",
           "pem",
           "pkcs8",
           "rand_core",
           "serde",
-          "signature",
           "std",
           "zeroize"
         ]
@@ -7667,16 +7342,6 @@
             "tree": "target"
           },
           {
-            "name": "async_nats",
-            "package_key": "async-nats-0.38.0",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
             "name": "async_trait",
             "package_key": "async-trait-0.1.89",
             "kind": "normal",
@@ -7699,16 +7364,6 @@
           {
             "name": "engenho_types",
             "package_key": "engenho-types-0.53.118",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "futures",
-            "package_key": "futures-0.3.32",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -7747,32 +7402,12 @@
             "optional": false,
             "target": null,
             "tree": "target"
-          },
-          {
-            "name": "tokio",
-            "package_key": "tokio-1.52.3",
-            "kind": "normal",
-            "features": [
-              "full"
-            ],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tracing",
-            "package_key": "tracing-0.1.44",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
           }
         ],
         "build_dependencies": [],
-        "features": []
+        "features": [
+          "default"
+        ]
       },
       "engenho-types-0.53.118": {
         "runtime_dependencies": [
@@ -9085,7 +8720,6 @@
         ],
         "build_dependencies": [],
         "features": [
-          "custom",
           "js",
           "js-sys",
           "std",
@@ -17519,74 +17153,6 @@
         "build_dependencies": [],
         "features": []
       },
-      "nkeys-0.4.5": {
-        "runtime_dependencies": [
-          {
-            "name": "data_encoding",
-            "package_key": "data-encoding-2.11.0",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "ed25519",
-            "package_key": "ed25519-2.2.3",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "ed25519_dalek",
-            "package_key": "ed25519-dalek-2.2.0",
-            "kind": "normal",
-            "features": [
-              "digest"
-            ],
-            "uses_default_features": false,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "log",
-            "package_key": "log-0.4.30",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "rand",
-            "package_key": "rand-0.8.6",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "signatory",
-            "package_key": "signatory-0.27.1",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
-        "build_dependencies": [],
-        "features": []
-      },
       "nom-7.1.3": {
         "runtime_dependencies": [
           {
@@ -17648,22 +17214,6 @@
           "default",
           "std"
         ]
-      },
-      "nuid-0.5.0": {
-        "runtime_dependencies": [
-          {
-            "name": "rand",
-            "package_key": "rand-0.8.6",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
-        "build_dependencies": [],
-        "features": []
       },
       "num-bigint-0.4.6": {
         "runtime_dependencies": [
@@ -18820,15 +18370,6 @@
         ],
         "build_dependencies": [],
         "features": []
-      },
-      "portable-atomic-1.13.1": {
-        "runtime_dependencies": [],
-        "build_dependencies": [],
-        "features": [
-          "default",
-          "fallback",
-          "require-cas"
-        ]
       },
       "potential_utf-0.1.5": {
         "runtime_dependencies": [
@@ -22492,47 +22033,6 @@
           "web-time"
         ]
       },
-      "rustls-webpki-0.102.8": {
-        "runtime_dependencies": [
-          {
-            "name": "ring",
-            "package_key": "ring-0.17.14",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "pki_types",
-            "package_key": "rustls-pki-types-1.14.1",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "untrusted",
-            "package_key": "untrusted-0.9.0",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
-        "build_dependencies": [],
-        "features": [
-          "alloc",
-          "default",
-          "ring",
-          "std"
-        ]
-      },
       "rustls-webpki-0.103.13": {
         "runtime_dependencies": [
           {
@@ -24112,22 +23612,6 @@
           "std"
         ]
       },
-      "serde_nanos-0.1.4": {
-        "runtime_dependencies": [
-          {
-            "name": "serde",
-            "package_key": "serde-1.0.228",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
-        "build_dependencies": [],
-        "features": []
-      },
       "serde_path_to_error-0.1.20": {
         "runtime_dependencies": [
           {
@@ -24148,42 +23632,6 @@
               "alloc"
             ],
             "uses_default_features": false,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
-        "build_dependencies": [],
-        "features": []
-      },
-      "serde_repr-0.1.20": {
-        "runtime_dependencies": [
-          {
-            "name": "proc_macro2",
-            "package_key": "proc-macro2-1.0.106",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "quote",
-            "package_key": "quote-1.0.45",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "syn",
-            "package_key": "syn-2.0.117",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
             "optional": false,
             "target": null,
             "tree": "target"
@@ -24809,58 +24257,6 @@
         ],
         "build_dependencies": [],
         "features": []
-      },
-      "signatory-0.27.1": {
-        "runtime_dependencies": [
-          {
-            "name": "pkcs8",
-            "package_key": "pkcs8-0.10.2",
-            "kind": "normal",
-            "features": [
-              "alloc",
-              "pem"
-            ],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "rand_core",
-            "package_key": "rand_core-0.6.4",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "signature",
-            "package_key": "signature-2.2.0",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "zeroize",
-            "package_key": "zeroize-1.8.2",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
-        "build_dependencies": [],
-        "features": [
-          "default",
-          "std"
-        ]
       },
       "signature-2.2.0": {
         "runtime_dependencies": [
@@ -28637,7 +28033,6 @@
           "macros",
           "parsing",
           "serde",
-          "serde-well-known",
           "std"
         ]
       },
@@ -29141,155 +28536,6 @@
           "codec",
           "default",
           "io"
-        ]
-      },
-      "tokio-websockets-0.10.1": {
-        "runtime_dependencies": [
-          {
-            "name": "base64",
-            "package_key": "base64-0.22.1",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "bytes",
-            "package_key": "bytes-1.11.1",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "futures_core",
-            "package_key": "futures-core-0.3.32",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "futures_sink",
-            "package_key": "futures-sink-0.3.32",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "http",
-            "package_key": "http-1.4.1",
-            "kind": "normal",
-            "features": [
-              "std"
-            ],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "httparse",
-            "package_key": "httparse-1.10.1",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "rand",
-            "package_key": "rand-0.8.6",
-            "kind": "normal",
-            "features": [
-              "std",
-              "std_rng"
-            ],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "ring",
-            "package_key": "ring-0.17.14",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "rustls_native_certs",
-            "package_key": "rustls-native-certs-0.8.3",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "rustls_pki_types",
-            "package_key": "rustls-pki-types-1.14.1",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tokio",
-            "package_key": "tokio-1.52.3",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tokio_rustls",
-            "package_key": "tokio-rustls-0.26.4",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tokio_util",
-            "package_key": "tokio-util-0.7.18",
-            "kind": "normal",
-            "features": [
-              "codec",
-              "io"
-            ],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
-        "build_dependencies": [],
-        "features": [
-          "client",
-          "rand",
-          "ring",
-          "rustls-native-roots"
         ]
       },
       "toml-0.8.23": {
@@ -30508,38 +29754,6 @@
       },
       "try-lock-0.2.5": {
         "runtime_dependencies": [],
-        "build_dependencies": [],
-        "features": []
-      },
-      "tryhard-0.5.2": {
-        "runtime_dependencies": [
-          {
-            "name": "pin_project_lite",
-            "package_key": "pin-project-lite-0.2.17",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
-            "name": "tokio",
-            "package_key": "tokio-1.52.3",
-            "kind": "normal",
-            "features": [
-              "macros",
-              "rt",
-              "sync",
-              "test-util",
-              "time"
-            ],
-            "uses_default_features": false,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          }
-        ],
         "build_dependencies": [],
         "features": []
       },
@@ -32815,70 +32029,6 @@
               "termios"
             ]
           },
-          "rustls-native-certs-0.7.3": {
-            "runtime_dependencies": [
-              {
-                "name": "rustls_pemfile",
-                "package_key": "rustls-pemfile-2.2.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "pki_types",
-                "package_key": "rustls-pki-types-1.14.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "security_framework",
-                "package_key": "security-framework-2.11.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
-          },
-          "rustls-native-certs-0.8.3": {
-            "runtime_dependencies": [
-              {
-                "name": "pki_types",
-                "package_key": "rustls-pki-types-1.14.1",
-                "kind": "normal",
-                "features": [
-                  "std"
-                ],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "security_framework",
-                "package_key": "security-framework-3.7.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
-          },
           "rustls-platform-verifier-0.7.0": {
             "runtime_dependencies": [
               {
@@ -32946,68 +32096,6 @@
             ],
             "build_dependencies": [],
             "features": []
-          },
-          "security-framework-2.11.1": {
-            "runtime_dependencies": [
-              {
-                "name": "bitflags",
-                "package_key": "bitflags-2.11.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "core_foundation",
-                "package_key": "core-foundation-0.9.4",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "core_foundation_sys",
-                "package_key": "core-foundation-sys-0.8.7",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "libc",
-                "package_key": "libc-0.2.186",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "security_framework_sys",
-                "package_key": "security-framework-sys-2.17.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": false,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": [
-              "OSX_10_10",
-              "OSX_10_11",
-              "OSX_10_12",
-              "OSX_10_9",
-              "default"
-            ]
           },
           "security-framework-3.7.0": {
             "runtime_dependencies": [
@@ -33095,11 +32183,7 @@
             ],
             "build_dependencies": [],
             "features": [
-              "OSX_10_10",
-              "OSX_10_11",
-              "OSX_10_12",
               "OSX_10_13",
-              "OSX_10_9",
               "default"
             ]
           },
@@ -33884,11 +32968,6 @@
             "build_dependencies": [],
             "features": []
           },
-          "openssl-probe-0.1.6": {
-            "runtime_dependencies": [],
-            "build_dependencies": [],
-            "features": []
-          },
           "openssl-probe-0.2.1": {
             "runtime_dependencies": [],
             "build_dependencies": [],
@@ -34116,42 +33195,6 @@
               "system",
               "termios"
             ]
-          },
-          "rustls-native-certs-0.7.3": {
-            "runtime_dependencies": [
-              {
-                "name": "openssl_probe",
-                "package_key": "openssl-probe-0.1.6",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(all(unix, not(target_os = \"macos\")))",
-                "tree": "target"
-              },
-              {
-                "name": "rustls_pemfile",
-                "package_key": "rustls-pemfile-2.2.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "pki_types",
-                "package_key": "rustls-pki-types-1.14.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
           },
           "rustls-native-certs-0.8.3": {
             "runtime_dependencies": [
@@ -34968,11 +34011,6 @@
             "build_dependencies": [],
             "features": []
           },
-          "openssl-probe-0.1.6": {
-            "runtime_dependencies": [],
-            "build_dependencies": [],
-            "features": []
-          },
           "openssl-probe-0.2.1": {
             "runtime_dependencies": [],
             "build_dependencies": [],
@@ -35200,42 +34238,6 @@
               "system",
               "termios"
             ]
-          },
-          "rustls-native-certs-0.7.3": {
-            "runtime_dependencies": [
-              {
-                "name": "openssl_probe",
-                "package_key": "openssl-probe-0.1.6",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(all(unix, not(target_os = \"macos\")))",
-                "tree": "target"
-              },
-              {
-                "name": "rustls_pemfile",
-                "package_key": "rustls-pemfile-2.2.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "pki_types",
-                "package_key": "rustls-pki-types-1.14.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
           },
           "rustls-native-certs-0.8.3": {
             "runtime_dependencies": [
@@ -36105,70 +35107,6 @@
               "termios"
             ]
           },
-          "rustls-native-certs-0.7.3": {
-            "runtime_dependencies": [
-              {
-                "name": "rustls_pemfile",
-                "package_key": "rustls-pemfile-2.2.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "pki_types",
-                "package_key": "rustls-pki-types-1.14.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "security_framework",
-                "package_key": "security-framework-2.11.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
-          },
-          "rustls-native-certs-0.8.3": {
-            "runtime_dependencies": [
-              {
-                "name": "pki_types",
-                "package_key": "rustls-pki-types-1.14.1",
-                "kind": "normal",
-                "features": [
-                  "std"
-                ],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "security_framework",
-                "package_key": "security-framework-3.7.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
-          },
           "rustls-platform-verifier-0.7.0": {
             "runtime_dependencies": [
               {
@@ -36236,68 +35174,6 @@
             ],
             "build_dependencies": [],
             "features": []
-          },
-          "security-framework-2.11.1": {
-            "runtime_dependencies": [
-              {
-                "name": "bitflags",
-                "package_key": "bitflags-2.11.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "core_foundation",
-                "package_key": "core-foundation-0.9.4",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "core_foundation_sys",
-                "package_key": "core-foundation-sys-0.8.7",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "libc",
-                "package_key": "libc-0.2.186",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "security_framework_sys",
-                "package_key": "security-framework-sys-2.17.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": false,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": [
-              "OSX_10_10",
-              "OSX_10_11",
-              "OSX_10_12",
-              "OSX_10_9",
-              "default"
-            ]
           },
           "security-framework-3.7.0": {
             "runtime_dependencies": [
@@ -36385,11 +35261,7 @@
             ],
             "build_dependencies": [],
             "features": [
-              "OSX_10_10",
-              "OSX_10_11",
-              "OSX_10_12",
               "OSX_10_13",
-              "OSX_10_9",
               "default"
             ]
           },
@@ -37205,11 +36077,6 @@
             "build_dependencies": [],
             "features": []
           },
-          "openssl-probe-0.1.6": {
-            "runtime_dependencies": [],
-            "build_dependencies": [],
-            "features": []
-          },
           "openssl-probe-0.2.1": {
             "runtime_dependencies": [],
             "build_dependencies": [],
@@ -37417,42 +36284,6 @@
               "system",
               "termios"
             ]
-          },
-          "rustls-native-certs-0.7.3": {
-            "runtime_dependencies": [
-              {
-                "name": "openssl_probe",
-                "package_key": "openssl-probe-0.1.6",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(all(unix, not(target_os = \"macos\")))",
-                "tree": "target"
-              },
-              {
-                "name": "rustls_pemfile",
-                "package_key": "rustls-pemfile-2.2.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "pki_types",
-                "package_key": "rustls-pki-types-1.14.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
           },
           "rustls-native-certs-0.8.3": {
             "runtime_dependencies": [
@@ -38300,11 +37131,6 @@
             "build_dependencies": [],
             "features": []
           },
-          "openssl-probe-0.1.6": {
-            "runtime_dependencies": [],
-            "build_dependencies": [],
-            "features": []
-          },
           "openssl-probe-0.2.1": {
             "runtime_dependencies": [],
             "build_dependencies": [],
@@ -38513,42 +37339,6 @@
               "termios"
             ]
           },
-          "rustls-native-certs-0.7.3": {
-            "runtime_dependencies": [
-              {
-                "name": "openssl_probe",
-                "package_key": "openssl-probe-0.1.6",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(all(unix, not(target_os = \"macos\")))",
-                "tree": "target"
-              },
-              {
-                "name": "rustls_pemfile",
-                "package_key": "rustls-pemfile-2.2.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "pki_types",
-                "package_key": "rustls-pki-types-1.14.1",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
-          },
           "rustls-native-certs-0.8.3": {
             "runtime_dependencies": [
               {
@@ -38707,9 +37497,6 @@
     "asn1-rs-impl-0.2.0": {
       "edition": "2018",
       "proc_macro": true
-    },
-    "async-nats-0.38.0": {
-      "edition": "2021"
     },
     "async-stream-0.3.6": {
       "edition": "2021"
@@ -39940,15 +38727,6 @@
     "nix-nar-0.3.1": {
       "edition": "2021"
     },
-    "nkeys-0.4.5": {
-      "edition": "2021",
-      "binaries": [
-        {
-          "name": "nk",
-          "path": "src/bin/nk/main.rs"
-        }
-      ]
-    },
     "nom-7.1.3": {
       "edition": "2018"
     },
@@ -39962,9 +38740,6 @@
       "edition": "2021"
     },
     "nu-ansi-term-0.50.3": {
-      "edition": "2021"
-    },
-    "nuid-0.5.0": {
       "edition": "2021"
     },
     "num-bigint-0.4.6": {
@@ -40020,9 +38795,6 @@
     "openssl-macros-0.1.1": {
       "edition": "2018",
       "proc_macro": true
-    },
-    "openssl-probe-0.1.6": {
-      "edition": "2021"
     },
     "openssl-probe-0.2.1": {
       "edition": "2021"
@@ -40112,10 +38884,6 @@
         "name": "kazari",
         "path": "src/lib.rs"
       }
-    },
-    "portable-atomic-1.13.1": {
-      "edition": "2018",
-      "build_script": "build.rs"
     },
     "potential_utf-0.1.5": {
       "edition": "2021"
@@ -40370,9 +39138,6 @@
       "edition": "2021",
       "build_script": "build.rs"
     },
-    "rustls-native-certs-0.7.3": {
-      "edition": "2021"
-    },
     "rustls-native-certs-0.8.3": {
       "edition": "2021"
     },
@@ -40384,13 +39149,6 @@
     },
     "rustls-platform-verifier-0.7.0": {
       "edition": "2021"
-    },
-    "rustls-webpki-0.102.8": {
-      "edition": "2021",
-      "lib_target": {
-        "name": "webpki",
-        "path": "src/lib.rs"
-      }
     },
     "rustls-webpki-0.103.13": {
       "edition": "2021",
@@ -40478,9 +39236,6 @@
     "seahash-4.1.0": {
       "edition": "2015"
     },
-    "security-framework-2.11.1": {
-      "edition": "2021"
-    },
     "security-framework-3.7.0": {
       "edition": "2024"
     },
@@ -40519,15 +39274,8 @@
       "edition": "2021",
       "build_script": "build.rs"
     },
-    "serde_nanos-0.1.4": {
-      "edition": "2018"
-    },
     "serde_path_to_error-0.1.20": {
       "edition": "2021"
-    },
-    "serde_repr-0.1.20": {
-      "edition": "2021",
-      "proc_macro": true
     },
     "serde_spanned-0.6.9": {
       "edition": "2021"
@@ -40570,9 +39318,6 @@
     },
     "signal-hook-registry-1.4.8": {
       "edition": "2015"
-    },
-    "signatory-0.27.1": {
-      "edition": "2021"
     },
     "signature-2.2.0": {
       "edition": "2021"
@@ -40800,9 +39545,6 @@
     "tokio-util-0.7.18": {
       "edition": "2021"
     },
-    "tokio-websockets-0.10.1": {
-      "edition": "2021"
-    },
     "toml-0.8.23": {
       "edition": "2021"
     },
@@ -40869,9 +39611,6 @@
     },
     "try-lock-0.2.5": {
       "edition": "2015"
-    },
-    "tryhard-0.5.2": {
-      "edition": "2018"
     },
     "tungstenite-0.24.0": {
       "edition": "2018"

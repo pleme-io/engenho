@@ -137,8 +137,8 @@ impl TeiaConfig {
         self
     }
 
-    /// Validate the config. Used by [`crate::TeiaClient::connect`]
-    /// before attempting a network connection.
+    /// Validate the config. Used by `TeiaClient::connect` (under the
+    /// `teia-nats` feature) before attempting a network connection.
     ///
     /// # Errors
     ///

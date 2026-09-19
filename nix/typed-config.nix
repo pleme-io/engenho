@@ -375,25 +375,47 @@ in
         "Grace period before topology reacts to a membership change.";
     };
 
+    fabric = optional (types.enum [ "in_binary" ]) ''
+      How engenho's parts reach one another. `in_binary` is the only value and
+      engenho's own default, so leaving this unset is equivalent. There is no
+      NATS value: NATS is not engenho's fabric (docs/IMPROVEMENT-PLAN.md §5.1).
+    '';
+
+    # ── DEPRECATED, KEPT (MODULARIZE, DON'T DELETE) ─────────────────────────
+    # engenho no longer reads a `teia` section: `fabric: in_binary` replaced it
+    # (§5.1). The options stay declared because removing them would break
+    # evaluation for any consumer that still sets them. Setting any of them
+    # renders NOTHING and raises a `warnings` entry instead; see `config.warnings`
+    # below.
     teia = {
       servers = mkOption {
         type = types.listOf types.str;
         default = [ ];
         example = [ "nats://127.0.0.1:4222" ];
-        description = "NATS servers for the teia mesh. Empty keeps the default.";
+        description = ''
+          DEPRECATED and ignored: engenho does not read a `teia` section
+          (NATS is not engenho's fabric). Setting it raises a warning.
+        '';
       };
-      cluster = optional types.str ''
-        teia subject namespace.
-
-        NOTE: engenho currently defaults this to the literal `engenho-local`,
-        INDEPENDENTLY of `cluster.name` — a second hardcoded copy of the
-        cluster identity. Until that is derived upstream, set both together or
-        neither.
-      '';
-      credentialsPath = optional types.path "NATS credentials file.";
-      connectTimeoutSeconds = optional types.ints.unsigned "NATS connect timeout.";
+      cluster = optional types.str
+        "DEPRECATED and ignored (teia subject namespace). Setting it raises a warning.";
+      credentialsPath = optional types.path
+        "DEPRECATED and ignored (NATS credentials file). Setting it raises a warning.";
+      connectTimeoutSeconds = optional types.ints.unsigned
+        "DEPRECATED and ignored (NATS connect timeout). Setting it raises a warning.";
     };
   };
+
+  # A deprecated `teia` option that is set is an operator who believes it does
+  # something. It does not, so say so at eval, once, naming what replaced it.
+  # "Set" is exactly "the old render would have emitted a `teia` section":
+  # `prune` below dropped `[ ]` and `null`, so those are the unset values.
+  config.warnings =
+    let t = config.services.engenho.config.teia;
+    in lib.optional
+      (t.servers != [ ] || t.cluster != null || t.credentialsPath != null
+        || t.connectTimeoutSeconds != null)
+      "services.engenho.config.teia is deprecated and ignored: NATS is not engenho's fabric, and engenho no longer reads a `teia` section. Its replacement is `services.engenho.config.fabric = \"in_binary\"`, which is also the default. Remove the teia settings.";
 
   # ── The projection: typed options → the trio's YAML `settings` ──────────
   #
@@ -478,11 +500,8 @@ in
         min_nodes = cfg.revoada.topology.minNodes;
         grace_period_seconds = cfg.revoada.topology.gracePeriodSeconds;
       };
-      teia = {
-        servers = cfg.teia.servers;
-        cluster = cfg.teia.cluster;
-        credentials_path = cfg.teia.credentialsPath;
-        connect_timeout_seconds = cfg.teia.connectTimeoutSeconds;
-      };
+      fabric = cfg.fabric;
+      # No `teia`: engenho does not read it (§5.1). The deprecated options
+      # above warn instead of rendering.
     });
 }

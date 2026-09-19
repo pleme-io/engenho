@@ -1,11 +1,20 @@
 //! NATS fabric config — teia (the cross-cluster transport).
+//!
+//! pending-fabric: NATS is not engenho's fabric (docs/IMPROVEMENT-PLAN.md
+//! §5.1). This type is no longer a section of [`crate::EngenhoConfig`];
+//! `fabric: in_binary` replaced it, and a legacy `teia:` key is accepted as an
+//! inert [`crate::LegacyTeiaSection`]. It stays declared (MODULARIZE, DON'T
+//! DELETE) because engenho-teia converts from it under its `teia-nats`
+//! feature. It re-enters the config only as a [`crate::Fabric`] arm, never
+//! as a free-standing section again.
 
 use serde::{Deserialize, Serialize};
 use shikumi::TieredConfig;
 
 use crate::error::ConfigError;
 
-/// NATS fabric config — mirrors `engenho-teia::TeiaConfig`.
+/// NATS fabric config — mirrors `engenho-teia::TeiaConfig`. Not read by
+/// engenho's boot path (see the module doc's `pending-fabric:`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TeiaConfig {

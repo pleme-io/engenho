@@ -14,10 +14,6 @@ engenho.io/cluster: {{ .Values.global.cluster.name | quote }}
 engenho.io/region: {{ .Values.global.cluster.region | quote }}
 {{- end -}}
 
-{{- define "engenho.natsURL" -}}
-nats://{{ .Release.Name }}-nats:4222
-{{- end -}}
-
 {{- define "engenho.image" -}}
 {{- $img := index . 0 -}}
 {{- $root := index . 1 -}}

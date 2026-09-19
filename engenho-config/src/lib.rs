@@ -11,7 +11,8 @@
 //!
 //!   * [`ClusterConfig`] — cluster identity (name, region)
 //!   * [`RevoadaConfig`] — distribution layer (topology + fabric + membership)
-//!   * [`TeiaConfig`] — NATS fabric (servers, cluster, leaf-nodes)
+//!   * [`Fabric`] — how the parts reach one another: `in_binary`, the only
+//!     arm (NATS is not engenho's fabric; docs/IMPROVEMENT-PLAN.md §5.1)
 //!   * [`SchedulerConfig`] — engenho-scheduler tunables
 //!   * [`ControllersConfig`] — engenho-controllers tunables + per-controller toggles
 //!   * [`ConsistencyConfig`] — per-resource `ConsistencyTier` defaults
@@ -20,7 +21,7 @@
 //!
 //!   * `bare()` — zero-opinion floor (empty names, disabled features)
 //!   * `prescribed_default()` — what 90% of operators want on first launch
-//!     (Phalanx topology, in-process NATS, every controller enabled,
+//!     (Phalanx topology, the in-binary fabric, every controller enabled,
 //!     strong consistency)
 //!   * `extend(base)` — layered overlay (operator yaml on top of defaults)
 //!
@@ -37,9 +38,7 @@
 //!     min_nodes: 1
 //!     grace_period_seconds: 10
 //!
-//! teia:
-//!   servers: ["nats://engenho-nats:4222"]
-//!   cluster: rio
+//! fabric: in_binary
 //!
 //! scheduler:
 //!   strategy: round_robin
@@ -73,6 +72,14 @@
 //! (e.g. Solo topology + 3-node consensus quorum is incoherent;
 //! Phalanx with `min_nodes=0` makes no sense). Returns [`ConfigError`]
 //! naming the violated invariant.
+//!
+//! ## Deprecated keys
+//!
+//! A key engenho no longer reads may still be accepted for one release so a
+//! node carrying it boots. [`EngenhoConfig::deprecations`] names each one as a
+//! typed [`ConfigDeprecation`] for the boot path to log; this crate has no
+//! logger, so until the runtime does that, nothing prints them. Today the one
+//! such key is the legacy `teia:` section, superseded by `fabric: in_binary`.
 
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
@@ -98,6 +105,7 @@ mod consistency;
 mod controllers;
 mod discovery;
 mod error;
+mod fabric;
 mod networking;
 mod node_local;
 mod revoada;
@@ -111,6 +119,7 @@ pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
 pub use controllers::{ControllerEnable, ControllersConfig};
 pub use discovery::{HostnameLayer, NODE_NAME_FALLBACK};
 pub use error::ConfigError;
+pub use fabric::{ConfigDeprecation, Fabric, LegacyTeiaSection};
 pub use networking::{DatapathMode, NetworkingConfig, ResolvedDatapath, parse_ipv4_cidr};
 pub use node_local::{ListenerAddrRejection, LoopbackAddr, NodeLocalListener};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
@@ -127,8 +136,16 @@ pub struct EngenhoConfig {
     pub cluster: ClusterConfig,
     /// Distribution layer (topology + fabric + membership).
     pub revoada: RevoadaConfig,
-    /// NATS fabric.
-    pub teia: TeiaConfig,
+    /// How engenho's parts reach one another. `#[serde(default)]` so operator
+    /// YAML written before this key existed still parses; the only arm is
+    /// [`Fabric::InBinary`].
+    #[serde(default)]
+    pub fabric: Fabric,
+    /// The retired `teia:` section, accepted for one release and read by
+    /// nothing (see [`LegacyTeiaSection`]). Present only when the operator's
+    /// config still carries the key; [`Self::deprecations`] reports it.
+    #[serde(default, rename = "teia", skip_serializing_if = "Option::is_none")]
+    pub legacy_teia: Option<LegacyTeiaSection>,
     /// Scheduler tunables.
     pub scheduler: SchedulerConfig,
     /// Controller suite tunables + per-controller toggles.
@@ -151,7 +168,8 @@ impl TieredConfig for EngenhoConfig {
         Self {
             cluster: ClusterConfig::bare(),
             revoada: RevoadaConfig::bare(),
-            teia: TeiaConfig::bare(),
+            fabric: Fabric::InBinary,
+            legacy_teia: None,
             scheduler: SchedulerConfig::bare(),
             controllers: ControllersConfig::bare(),
             consistency: ConsistencyConfig::bare(),
@@ -170,7 +188,8 @@ impl TieredConfig for EngenhoConfig {
         Self {
             cluster: ClusterConfig::discovered(),
             revoada: RevoadaConfig::discovered(),
-            teia: TeiaConfig::discovered(),
+            fabric: Fabric::InBinary,
+            legacy_teia: None,
             scheduler: SchedulerConfig::discovered(),
             controllers: ControllersConfig::discovered(),
             consistency: ConsistencyConfig::discovered(),
@@ -183,7 +202,8 @@ impl TieredConfig for EngenhoConfig {
         Self {
             cluster: ClusterConfig::prescribed_default(),
             revoada: RevoadaConfig::prescribed_default(),
-            teia: TeiaConfig::prescribed_default(),
+            fabric: Fabric::InBinary,
+            legacy_teia: None,
             scheduler: SchedulerConfig::prescribed_default(),
             controllers: ControllersConfig::prescribed_default(),
             consistency: ConsistencyConfig::prescribed_default(),
@@ -196,7 +216,10 @@ impl TieredConfig for EngenhoConfig {
         Self {
             cluster: self.cluster.extend(&base.cluster),
             revoada: self.revoada.extend(&base.revoada),
-            teia: self.teia.extend(&base.teia),
+            // One arm: an overlay cannot disagree with its base yet. When a
+            // second arm lands, `fabric` needs an explicit "no opinion" tier.
+            fabric: self.fabric,
+            legacy_teia: self.legacy_teia.or_else(|| base.legacy_teia.clone()),
             scheduler: self.scheduler.extend(&base.scheduler),
             controllers: self.controllers.extend(&base.controllers),
             consistency: self.consistency.extend(&base.consistency),
@@ -227,7 +250,6 @@ impl EngenhoConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.cluster.validate()?;
         self.revoada.validate()?;
-        self.teia.validate()?;
         self.scheduler.validate()?;
         self.controllers.validate()?;
         self.consistency.validate()?;
@@ -246,6 +268,30 @@ impl EngenhoConfig {
             )));
         }
         Ok(())
+    }
+
+    /// Every key this config carries that engenho accepts but no longer reads,
+    /// in a stable order. Empty for a config that uses none. For the boot path
+    /// to log; nothing here changes behaviour.
+    #[must_use]
+    pub fn deprecations(&self) -> Vec<ConfigDeprecation> {
+        // Named field by field, no `..`: a new key cannot land without a
+        // decision here about whether it is one of these (E0027).
+        let Self {
+            legacy_teia,
+            cluster: _,
+            revoada: _,
+            fabric: _,
+            scheduler: _,
+            controllers: _,
+            consistency: _,
+            networking: _,
+            runtime: _,
+        } = self;
+        legacy_teia
+            .iter()
+            .map(|_| ConfigDeprecation::TeiaSection)
+            .collect()
     }
 
     /// Discover + load the operator config via the shikumi cascade,
@@ -771,11 +817,16 @@ runtime:
     /// Asserting they are EQUAL (rather than asserting either value) is
     /// what stops a future edit to one default from silently re-splitting
     /// them.
+    ///
+    /// `teia` is no longer a section of `EngenhoConfig` (§5.1), but
+    /// [`TeiaConfig`] is still what engenho-teia converts from under
+    /// `teia-nats`, so its default must keep agreeing with the cluster.
     #[test]
     fn teia_subject_namespace_matches_the_cluster_identity() {
         let d = EngenhoConfig::prescribed_default();
+        let teia = TeiaConfig::prescribed_default();
         assert_eq!(
-            d.teia.cluster, d.cluster.name,
+            teia.cluster, d.cluster.name,
             "teia.cluster and cluster.name must not diverge — a second \
              hardcoded copy of the cluster identity is how they last did"
         );
@@ -792,8 +843,8 @@ runtime:
         let diff = EngenhoConfig::prescribed_default().diff_against(&EngenhoConfig::bare());
         assert!(!diff.is_empty_diff());
         // Was `contains("engenho-local")` — a literal that only held while
-        // the cluster name was HARDCODED. Both `cluster.name` and
-        // `teia.cluster` now derive per node, so that string is gone and
+        // the cluster name was HARDCODED. `cluster.name` now derives per
+        // node, so that string is gone and
         // pinning today's derived value would pass on one machine only.
         // Assert what the test's name actually claims: the rendered diff
         // carries the cluster identity.
@@ -802,6 +853,151 @@ runtime:
             rendered.contains(&crate::cluster::default_cluster_name()),
             "the bare→default diff must show the derived cluster name; got:\n{rendered}"
         );
+    }
+
+    // ── fabric: in_binary; the legacy `teia:` key (T5.2, §5.1) ───────────
+
+    /// The `teia:` section as nix/typed-config.nix rendered it (every leaf
+    /// set), the partial form an operator could write because the section was
+    /// merged onto a default, and the empty mapping.
+    const LEGACY_TEIA_SECTIONS: [&str; 3] = [
+        "teia:\n  servers: [\"nats://10.0.0.1:4222\"]\n  cluster: rio\n  \
+         credentials_path: /etc/nats/engenho.creds\n  connect_timeout_seconds: 15\n",
+        "teia:\n  servers: [\"nats://10.0.0.1:4222\"]\n",
+        "teia: {}\n",
+    ];
+
+    #[test]
+    fn the_fabric_is_in_binary_and_spelled_in_binary_on_the_wire() {
+        let d = EngenhoConfig::prescribed_default();
+        assert_eq!(d.fabric, Fabric::InBinary);
+        let v: serde_yaml::Value = serde_yaml::from_str(&d.to_yaml().unwrap()).unwrap();
+        assert_eq!(v["fabric"], serde_yaml::Value::from("in_binary"));
+        let explicit = EngenhoConfig::from_yaml_with_defaults("fabric: in_binary\n").unwrap();
+        assert_eq!(explicit, d);
+    }
+
+    /// There is no arm for an external broker, so asking for one is a parse
+    /// error, not a setting that boots and is ignored.
+    #[test]
+    fn a_nats_fabric_is_refused_at_parse() {
+        for yaml in ["fabric: nats\n", "fabric: teia\n"] {
+            match EngenhoConfig::from_yaml_with_defaults(yaml) {
+                Err(ConfigError::Parse(_)) => {}
+                other => panic!("{yaml:?}: expected a parse refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_config_carries_no_teia_section_and_no_deprecation() {
+        let d = EngenhoConfig::prescribed_default();
+        let v: serde_yaml::Value = serde_yaml::from_str(&d.to_yaml().unwrap()).unwrap();
+        assert!(
+            v.get("teia").is_none(),
+            "the default config renders a teia section again:\n{}",
+            d.to_yaml().unwrap()
+        );
+        assert_eq!(d.deprecations(), Vec::new());
+        assert_eq!(EngenhoConfig::bare().deprecations(), Vec::new());
+        assert_eq!(
+            EngenhoConfig::resolve_progressive().value().deprecations(),
+            Vec::new()
+        );
+    }
+
+    /// The legacy key is accepted for one release, changes nothing else, and
+    /// is reported as a typed deprecation.
+    #[test]
+    fn a_legacy_teia_section_is_accepted_and_reported() {
+        for yaml in LEGACY_TEIA_SECTIONS {
+            let cfg = EngenhoConfig::from_yaml_with_defaults(yaml)
+                .unwrap_or_else(|e| panic!("{yaml:?}: legacy key refused: {e}"));
+            assert_eq!(
+                cfg.deprecations(),
+                vec![ConfigDeprecation::TeiaSection],
+                "{yaml:?}"
+            );
+            assert_eq!(cfg.fabric, Fabric::InBinary, "{yaml:?}");
+            let without = EngenhoConfig {
+                legacy_teia: None,
+                ..cfg
+            };
+            assert_eq!(
+                without,
+                EngenhoConfig::prescribed_default(),
+                "{yaml:?}: the legacy key changed something besides itself"
+            );
+        }
+    }
+
+    /// Nothing reads the section, so nothing validates it: an empty server
+    /// list or a dotted cluster id (both refused at boot before T5.2) no
+    /// longer stop a node.
+    #[test]
+    fn a_legacy_teia_section_is_not_validated() {
+        let yaml = "teia:\n  servers: []\n  cluster: eng.eho\n";
+        let cfg = EngenhoConfig::from_yaml_with_defaults(yaml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.deprecations(), vec![ConfigDeprecation::TeiaSection]);
+    }
+
+    /// Accepting the old key is not a licence for new typos: a sub-key the
+    /// section never had is still refused, as it was before.
+    #[test]
+    fn a_legacy_teia_section_still_refuses_unknown_sub_keys() {
+        let yaml = "teia:\n  servres: [\"nats://10.0.0.1:4222\"]\n";
+        match EngenhoConfig::from_yaml_with_defaults(yaml) {
+            Err(ConfigError::Parse(_)) => {}
+            other => panic!("expected a parse refusal for `servres`, got {other:?}"),
+        }
+    }
+
+    /// A full dump written before `fabric` existed (a `teia:` section and no
+    /// `fabric:` key) still parses strictly, with no defaults merged in.
+    #[test]
+    fn a_full_pre_fabric_dump_still_parses() {
+        let mut v = serde_yaml::to_value(EngenhoConfig::prescribed_default()).unwrap();
+        let map = v.as_mapping_mut().unwrap();
+        map.remove("fabric");
+        map.insert(
+            "teia".into(),
+            serde_yaml::from_str("{servers: [\"nats://127.0.0.1:4222\"], cluster: rio}").unwrap(),
+        );
+        let cfg: EngenhoConfig = serde_yaml::from_value(v).unwrap();
+        assert_eq!(cfg.fabric, Fabric::InBinary);
+        assert_eq!(cfg.deprecations(), vec![ConfigDeprecation::TeiaSection]);
+    }
+
+    /// The daemon boots on the progressive fold, not on
+    /// `from_yaml_with_defaults`; the legacy key must survive that path too.
+    #[test]
+    fn a_legacy_teia_section_reaches_deprecations_through_the_progressive_fold() {
+        let mut teia = Dict::new();
+        teia.insert(
+            "servers".into(),
+            figment::value::Value::from(vec!["nats://10.0.0.1:4222".to_string()]),
+        );
+        let mut root = Dict::new();
+        root.insert("teia".into(), figment::value::Value::from(teia));
+        let overlay = ProgressiveLayer::file("/etc/engenho/engenho.yaml", root);
+        let r = <EngenhoConfig as TieredConfig>::resolve_progressive_with(&[overlay]);
+        r.value().validate().unwrap();
+        assert_eq!(r.value().fabric, Fabric::InBinary);
+        assert_eq!(
+            r.value().deprecations(),
+            vec![ConfigDeprecation::TeiaSection]
+        );
+    }
+
+    #[test]
+    fn the_teia_deprecation_names_the_key_and_its_replacement() {
+        let d = ConfigDeprecation::TeiaSection;
+        let rendered = d.to_string();
+        assert!(rendered.contains("`teia`"), "{rendered}");
+        assert!(rendered.contains("`fabric: in_binary`"), "{rendered}");
+        assert_eq!(d.key(), "teia");
+        assert_eq!(d.kind(), "teia_section");
     }
 
     #[test]

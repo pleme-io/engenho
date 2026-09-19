@@ -7,12 +7,22 @@
 #   1. an unset leaf is ABSENT from the rendered YAML, not `null`
 #   2. a set leaf lands at its snake_case wire key
 #   3. a bad enum value FAILS EVAL rather than reaching the node
+#   4. the deprecated `teia` options render nothing and warn (§5.1)
 { pkgs ? import <nixpkgs> { } }:
 let
   inherit (pkgs) lib;
 
+  # Stand-in for the top-level `warnings` option that NixOS, nix-darwin and
+  # home-manager each declare; typed-config.nix writes to it.
+  warningsStub = { lib, ... }: {
+    options.warnings = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+    };
+  };
+
   # Evaluate typed-config.nix with a stub for the option the trio owns.
-  evalWith = userConfig:
+  evalConfig = userConfig:
     (lib.evalModules {
       modules = [
         ../typed-config.nix
@@ -23,10 +33,13 @@ let
             default = { };
           };
         })
+        warningsStub
         userConfig
       ];
       specialArgs = { inherit pkgs; };
-    }).config.services.engenho.settings;
+    }).config;
+  evalWith = userConfig: (evalConfig userConfig).services.engenho.settings;
+  warningsOf = userConfig: (evalConfig userConfig).warnings;
 
   # Same, but with a home-manager-shaped context: `config.home.homeDirectory`
   # exists. This is what `dataDir`'s default keys off to tell a per-user agent
@@ -43,6 +56,7 @@ let
           options.home.homeDirectory = lib.mkOption { type = lib.types.str; };
           config.home.homeDirectory = "/Users/probe";
         })
+        warningsStub
         userConfig
       ];
       specialArgs = { inherit pkgs; };
@@ -70,6 +84,18 @@ let
       teia.servers = [ "nats://10.0.0.1:4222" ];
     };
   };
+
+  # ── teia is deprecated: kept as options, never rendered (§5.1) ──────────
+  # Every teia leaf set, as a consumer that predates the deprecation would.
+  legacyTeia = {
+    services.engenho.config.teia = {
+      servers = [ "nats://10.0.0.1:4222" ];
+      cluster = "rio";
+      credentialsPath = "/etc/nats/engenho.creds";
+      connectTimeoutSeconds = 15;
+    };
+  };
+  teiaDeprecated = w: lib.any (lib.hasInfix "services.engenho.config.teia is deprecated") w;
 
   checks = [
     # An empty config renders EXACTLY ONE key, and that exception is
@@ -118,6 +144,37 @@ let
       # appear at all, or they would suppress engenho's own defaults.
       ok = !(populated ? consistency) && !(populated ? revoada);
       got = builtins.toJSON (lib.attrNames populated); }
+
+    # ── 4. teia: evaluates, renders nothing, warns ───────────────────────
+    # `populated` above sets `teia.servers` among real settings: the section
+    # must not reach the YAML, because engenho no longer reads it.
+    { name = "deprecated-teia-is-not-rendered";
+      ok = !(populated ? teia) && !((evalWith legacyTeia) ? teia);
+      got = builtins.toJSON { populated = lib.attrNames populated;
+                              legacy = evalWith legacyTeia; }; }
+
+    { name = "setting-any-teia-option-warns";
+      ok = lib.all (u: teiaDeprecated (warningsOf u)) [
+        legacyTeia
+        { services.engenho.config.teia.servers = [ "nats://10.0.0.1:4222" ]; }
+        { services.engenho.config.teia.cluster = "rio"; }
+      ];
+      got = builtins.toJSON (warningsOf legacyTeia); }
+
+    { name = "unset-teia-does-not-warn";
+      ok = warningsOf { } == [ ];
+      got = builtins.toJSON (warningsOf { }); }
+
+    { name = "fabric-in_binary-renders-at-its-wire-key";
+      ok = (evalWith { services.engenho.config.fabric = "in_binary"; }).fabric or null
+        == "in_binary";
+      got = builtins.toJSON (evalWith { services.engenho.config.fabric = "in_binary"; }); }
+
+    { name = "a-nats-fabric-is-rejected-at-eval";
+      ok = !(builtins.tryEval
+        (evalWith { services.engenho.config.fabric = "nats"; })
+      ).success;
+      got = "expected eval failure for fabric=nats"; }
 
     { name = "partial-controller-toggle-emits-only-what-was-set";
       ok = populated.controllers.enable == { gc = false; };
