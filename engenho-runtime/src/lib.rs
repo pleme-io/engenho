@@ -105,7 +105,7 @@ pub use child::{
     Wiring,
 };
 pub use dormant::{Dormant, DormantReason};
-pub use error::RuntimeError;
+pub use error::{RuntimeError, ShutdownStage};
 pub use etcd_facade::MeshEtcdStore;
 pub use node_registration::NodeRegistrationError;
 pub use panics::PanicCounter;

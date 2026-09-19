@@ -43,10 +43,10 @@ use engenho_types::generated_v1_34::rbac_v1::{
 };
 use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
 use engenho_types::kind::GroupVersionKind;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, Wiring};
-use crate::error::RuntimeError;
+use crate::error::{RuntimeError, ShutdownStage, StrongCounts};
 use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
 use crate::rebind::serve_rebinding;
@@ -431,14 +431,23 @@ impl Runtime {
         &self.config
     }
 
-    /// Graceful shutdown: abort + await every child task, shut the
-    /// apiserver down (2s grace, severs open watches), then terminate
-    /// the store.
+    /// Graceful shutdown, one [`ShutdownStage`] at a time: abort + await
+    /// every child task, stop the apiserver (2s grace), quiesce the store's
+    /// own background tasks, then take sole ownership and terminate it.
     ///
     /// `terminate` consumes [`StoreMesh`] and requires the SOLE strong
     /// `Arc` ref. The child tasks + apiserver handlers each hold a
-    /// clone; aborting + awaiting the tasks and shutting the apiserver
-    /// down drops those clones, so `Arc::try_unwrap` then succeeds.
+    /// clone; aborting + awaiting the tasks and stopping the apiserver
+    /// drops those clones, so `Arc::try_unwrap` then succeeds. The store's
+    /// strong count is read after each stage, and a failed unwrap is
+    /// charged to the first stage that owed sole ownership and did not have
+    /// it ([`ShutdownStage::owes_sole_ownership`]).
+    ///
+    /// Known residual: a client holding a WATCH open across the stop keeps
+    /// the apiserver's router alive in a connection task the apiserver does
+    /// not stop, and this returns `StoreStillShared` charged to
+    /// [`ShutdownStage::ApiserverStopped`]. Pinned by an ignored test in
+    /// `tests/shutdown_stages.rs`; the fix belongs to the apiserver.
     ///
     /// # Errors
     ///
@@ -456,15 +465,48 @@ impl Runtime {
         // (and the controller it owns) is actually dropped before we try
         // to unwrap the store.
         children.stop().await;
+        let drivers_awaited = Arc::strong_count(&store);
 
-        // Shut the apiserver down — severs open watch long-polls (each
-        // holds a StoreBackedHandler → Arc<StoreMesh> clone) within a
-        // bounded 2s grace.
+        // Stop the apiserver: every StoreBackedHandler holds an
+        // Arc<StoreMesh> clone, released with the router.
         apiserver.shutdown().await?;
+        let apiserver_stopped = Arc::strong_count(&store);
+
+        // Stop the store's own tasks (raft RPC pump, bookmark ticker) by
+        // abort-then-await while it is still behind the Arc, so neither is
+        // mid-tick on the store's inner state when `terminate` runs. They
+        // hold no Arc<StoreMesh>; this stage owes sole ownership only in
+        // the sense that nothing may take a new one meanwhile.
+        let quiesced = store.quiesce().await;
+        if quiesced.any_panicked() {
+            error!(
+                rpc_pump = ?quiesced.rpc_pump,
+                bookmark_ticker = ?quiesced.bookmark_ticker,
+                "a store background task had panicked before shutdown stopped it"
+            );
+        }
+        let counts = StrongCounts {
+            drivers_awaited,
+            apiserver_stopped,
+            store_quiesced: Arc::strong_count(&store),
+        };
 
         // Now the Runtime should hold the only strong ref. Take it.
-        let store = Arc::try_unwrap(store).map_err(|arc| RuntimeError::StoreStillShared {
-            strong_count: Arc::strong_count(&arc),
+        let store = Arc::try_unwrap(store).map_err(|shared| {
+            let strong_count = Arc::strong_count(&shared);
+            let after = counts.blame();
+            error!(
+                %after,
+                strong_count,
+                after_drivers_awaited = counts.after(ShutdownStage::DriversAwaited),
+                after_apiserver_stopped = counts.after(ShutdownStage::ApiserverStopped),
+                after_store_quiesced = counts.after(ShutdownStage::StoreQuiesced),
+                "store still shared at shutdown; strong count after each stage"
+            );
+            RuntimeError::StoreStillShared {
+                strong_count,
+                after,
+            }
         })?;
         store.terminate().await?;
         Ok(())
