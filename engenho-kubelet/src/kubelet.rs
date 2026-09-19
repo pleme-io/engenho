@@ -59,7 +59,7 @@ use crate::lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, LostPod, RestartPolicy, StartedAs,
     StoredContainer, StoredRun, Termination, reconcile_pod_phase,
 };
-use crate::lifecycle::{DownAction, RunningAction};
+use crate::lifecycle::{DownAction, DownOutcome, RunningAction};
 use crate::pod_volume::{
     MountSource, PodVolumeSource, PodmanVolumeMaterializer, VolumeMaterializer, VolumeResolveError,
     VolumeTeardown, container_mounts, pod_volumes, teardown_obligation, teardowns_of,
@@ -461,14 +461,43 @@ struct ContainerRecord {
     /// backing directories outlive the container, and re-projecting here
     /// would change that documented semantic.
     mounts: Vec<crate::pod_volume::ResolvedMount>,
-    /// When the kubelet FIRST observed this container terminated. `None`
-    /// while it is running.
+    /// What the kubelet has seen of this run being down. `None` while it
+    /// is running. See [`SeenDown`].
+    down: Option<SeenDown>,
+}
+
+/// A run the kubelet has polled down: when it first saw that, and how the
+/// run ended as far as any poll of it has said.
+#[derive(Clone, Copy, Debug)]
+struct SeenDown {
+    /// The FIRST tick that saw it down.
     ///
     /// ★ FIRST observation, not most recent: the backoff clock must run from
     /// the exit, and re-stamping it every tick would reset the wait on every
     /// poll — a hold that never elapses, which is a hang wearing a
     /// CrashLoopBackOff label.
-    terminated_at: Option<Instant>,
+    at: Instant,
+    /// How it ended, folded across every poll of this run by
+    /// [`Termination::known_after`]: an exit once observed is not turned into
+    /// an unobserved one by a later poll that can no longer say (the runtime
+    /// removed the container, or reports it UNKNOWN).
+    exit: Termination,
+}
+
+impl SeenDown {
+    /// Fold this tick's poll into what the record already knew.
+    fn fold(earlier: Option<Self>, polled: Termination, now: Instant) -> Self {
+        match earlier {
+            None => Self {
+                at: now,
+                exit: polled,
+            },
+            Some(seen) => Self {
+                at: seen.at,
+                exit: Termination::known_after(Some(seen.exit), polled),
+            },
+        }
+    }
 }
 
 /// What the kubelet remembers about a Pod it started on this node.
@@ -533,6 +562,18 @@ struct LocalPod {
     /// "reaped by the pod-dir GC" — no such GC existed, so every secret a pod
     /// ever mounted stayed on the node's disk after the pod was gone.
     volume_teardowns: BTreeSet<VolumeTeardown>,
+}
+
+impl LocalPod {
+    /// The app-container records.
+    fn apps(&mut self) -> &mut BTreeMap<String, ContainerRecord> {
+        &mut self.containers
+    }
+
+    /// The init-container records.
+    fn inits(&mut self) -> &mut BTreeMap<String, ContainerRecord> {
+        &mut self.init_containers
+    }
 }
 
 /// The volume name the kubelet materializes a pod's `ServiceAccount`
@@ -1990,12 +2031,19 @@ impl Kubelet {
     /// a process restart) is not blindly restarted. Per item-9 scope
     /// (restartPolicy:Never), terminal Pods stay terminal.
     fn pod_already_terminal(pod: &Value) -> bool {
+        use engenho_types::curated_enums::PodPhase;
         matches!(
-            pod.get("status")
-                .and_then(|s| s.get("phase"))
-                .and_then(|p| p.as_str()),
-            Some("Succeeded" | "Failed")
+            Self::published_phase(pod),
+            Some(PodPhase::Succeeded | PodPhase::Failed)
         )
+    }
+
+    /// The phase the pod's stored status shows, read by the one typed
+    /// reader. A phase outside the closed set, or none, is `None`.
+    fn published_phase(pod: &Value) -> Option<engenho_types::curated_enums::PodPhase> {
+        use serde::Deserialize;
+        pod.pointer("/status/phase")
+            .and_then(|p| engenho_types::curated_enums::PodPhase::deserialize(p).ok())
     }
 
     /// Read `status.<field>` (`containerStatuses` / `initContainerStatuses`)
@@ -2202,30 +2250,6 @@ impl Kubelet {
             .unwrap_or(false)
     }
 
-    /// Render a single [`ContainerStatusOut`] into its
-    /// `status.containerStatuses[]` JSON entry. The typed
-    /// [`ContainerState`] enum is the render surface; `json!` inside this impl
-    /// is the allowed TYPED EMISSION site (per ★★ TYPED EMISSION rule #1).
-    fn render_container_status(cs: &ContainerStatusOut) -> Value {
-        let state = match &cs.state {
-            ContainerState::Waiting { reason } => json!({ "waiting": { "reason": reason } }),
-            ContainerState::Running => json!({ "running": {} }),
-            ContainerState::Terminated(exit) => json!({
-                "terminated": { "exitCode": exit.exit_code(), "reason": exit.reason() }
-            }),
-        };
-        let mut entry = json!({
-            "name": cs.name,
-            "ready": cs.ready,
-            "state": state,
-            "restartCount": cs.restart_count,
-        });
-        if let Some(id) = &cs.container_id {
-            entry["containerID"] = Value::String(id.clone());
-        }
-        entry
-    }
-
     /// Build the desired Pod `status` from the typed
     /// `(PodPhase, Vec<ContainerStatusOut>)` fold output + the pod's IP.
     ///
@@ -2291,6 +2315,7 @@ impl Kubelet {
         has_init: bool,
     ) -> Value {
         use engenho_types::curated_enums::PodPhase;
+        let phase = crate::lifecycle::phase_to_publish(Self::published_phase(live), phase);
         let phase_str = match phase {
             PodPhase::Pending => "Pending",
             PodPhase::Running => "Running",
@@ -2308,7 +2333,7 @@ impl Kubelet {
         let ready = containers_ready;
         let status_str = |b: bool| if b { "True" } else { "False" };
         let container_statuses: Vec<Value> =
-            statuses.iter().map(Self::render_container_status).collect();
+            statuses.iter().map(ContainerStatusOut::to_wire).collect();
         // ── ★ CONDITIONS ARE MERGED BY TYPE, NOT REPLACED ────────────────
         // This array is shipped through an RFC 7396 JSON Merge Patch, whose
         // defined semantics are "arrays replace whole". So rendering a fresh
@@ -2384,7 +2409,7 @@ impl Kubelet {
         if has_init {
             let init_container_statuses: Vec<Value> = init_statuses
                 .iter()
-                .map(Self::render_container_status)
+                .map(ContainerStatusOut::to_wire)
                 .collect();
             status["initContainerStatuses"] = Value::Array(init_container_statuses);
         }
@@ -3658,7 +3683,7 @@ impl Kubelet {
                             // A first start owes nothing: the penalty starts
                             // at the first exit-driven restart.
                             crash_backoff: None,
-                            terminated_at: None,
+                            down: None,
                             // Remember what this container was started with,
                             // so a restart can be given the same mounts.
                             mounts: spec.mounts.clone(),
@@ -4024,7 +4049,7 @@ impl Kubelet {
                 rec.container_id.clone_from(&new_status.container_id);
                 rec.restart_count = new_count;
                 rec.crash_backoff = crash_backoff;
-                rec.terminated_at = None;
+                rec.down = None;
                 // Fresh startup window + zeroed probe counters on restart.
                 rec.probes.reset(now);
             }
@@ -4082,6 +4107,34 @@ impl Kubelet {
     /// is a poll that could not be made — see [`Unseen`].
     async fn poll(&self, container_id: &str) -> Result<Polled, KubeletError> {
         Ok(Polled::of(self.backend.status(container_id).await?))
+    }
+
+    /// Stamp what this tick's poll saw of a container that is down onto its
+    /// record, and return what the record now knows of the run with the
+    /// container's crash entry. `pick` chooses the records
+    /// ([`LocalPod::apps`] or [`LocalPod::inits`]). A record gone from under
+    /// the tick is answered from `snapshot`, the tick's copy of it.
+    async fn note_down(
+        &self,
+        key: &ResourceKey,
+        cname: &str,
+        pick: fn(&mut LocalPod) -> &mut BTreeMap<String, ContainerRecord>,
+        snapshot: &ContainerRecord,
+        polled: Termination,
+        now: Instant,
+    ) -> (SeenDown, Option<crate::backoff::CrashBackoff>) {
+        let mut local = self.local.lock().await;
+        match local.get_mut(key).and_then(|p| pick(p).get_mut(cname)) {
+            Some(rec) => {
+                let seen = SeenDown::fold(rec.down, polled, now);
+                rec.down = Some(seen);
+                (seen, rec.crash_backoff)
+            }
+            None => (
+                SeenDown::fold(snapshot.down, polled, now),
+                snapshot.crash_backoff,
+            ),
+        }
     }
 
     /// (C) Poll the backend for EVERY container of a started Pod, fold the
@@ -4345,7 +4398,7 @@ impl Kubelet {
                 }
                 Ok(Polled::Down {
                     pod_ip: last_ip,
-                    exit,
+                    exit: polled,
                 }) => {
                     // Terminated — or vanished, which is Terminated with an
                     // exit nobody saw. Retain the last pod_ip (K8s keeps it).
@@ -4371,18 +4424,31 @@ impl Kubelet {
                     // ★ THE PENALTY IS THE RECORD'S ENTRY, NOT ITS RESTART
                     // COUNT: see `CrashBackoff`. A Terminating pod restarts
                     // nothing (`down_action`), so it is never held either.
+                    //
+                    // ★ THE EXIT ACTED ON IS THE RUN'S, NOT THIS POLL'S: an
+                    // exit an earlier tick observed survives the runtime
+                    // losing the container (`SeenDown`).
+                    let (seen, entry) = self
+                        .note_down(key, cname, LocalPod::apps, record, polled, now)
+                        .await;
+                    let exit = seen.exit;
+                    // What is published once the decision below is carried
+                    // out: one rule for every arm (`after_down`).
+                    let after = |outcome: DownOutcome<'_>| {
+                        ContainerObservation::after_down(
+                            cname,
+                            &record.container_id,
+                            exit,
+                            record.restart_count,
+                            outcome,
+                        )
+                    };
                     let gate = match crate::lifecycle::down_action(restart_policy, lifecycle, exit)
                     {
                         DownAction::Latch => None,
-                        DownAction::Restart => Some({
-                            let mut local = self.local.lock().await;
-                            let rec = local.get_mut(key).and_then(|p| p.containers.get_mut(cname));
-                            let (entry, finished) = match rec {
-                                Some(r) => (r.crash_backoff, *r.terminated_at.get_or_insert(now)),
-                                None => (record.crash_backoff, now),
-                            };
-                            crate::backoff::crash_gate(entry, finished, now)
-                        }),
+                        DownAction::Restart => {
+                            Some(crate::backoff::crash_gate(entry, seen.at, now))
+                        }
                     };
 
                     match gate {
@@ -4414,13 +4480,11 @@ impl Kubelet {
                                 .to_string(),
                             )
                             .await;
-                            observations.push(ContainerObservation::backing_off(
-                                cname,
-                                &record.container_id,
-                                held.waiting_reason()
+                            observations.push(after(DownOutcome::Held {
+                                reason: held
+                                    .waiting_reason()
                                     .unwrap_or(crate::backoff::CRASH_LOOP_BACK_OFF),
-                                record.restart_count,
-                            ));
+                            }));
                         }
                         Some(crate::backoff::CrashGate::Go(penalty)) => {
                             match self
@@ -4440,11 +4504,9 @@ impl Kubelet {
                                     if let Some(ip) = &new_status.pod_ip {
                                         pod_ip.get_or_insert_with(|| ip.clone());
                                     }
-                                    observations.push(ContainerObservation::running(
-                                        cname,
-                                        &new_status.container_id,
-                                        record.restart_count + 1,
-                                    ));
+                                    observations.push(after(DownOutcome::Replaced {
+                                        container_id: &new_status.container_id,
+                                    }));
                                     report.objects_changed += 1;
                                     self.emit(
                                     key,
@@ -4486,12 +4548,9 @@ impl Kubelet {
                                         .to_string(),
                                     )
                                     .await;
-                                    observations.push(ContainerObservation::backing_off(
-                                        cname,
-                                        &record.container_id,
-                                        crate::backoff::CRASH_LOOP_BACK_OFF,
-                                        record.restart_count,
-                                    ));
+                                    observations.push(after(DownOutcome::Held {
+                                        reason: crate::backoff::CRASH_LOOP_BACK_OFF,
+                                    }));
                                 }
                                 Relaunch::Failed(failed) => {
                                     // Restart failed — report the terminated state
@@ -4507,12 +4566,7 @@ impl Kubelet {
                                         error = %failed,
                                         "container restart failed; retrying on the start curve"
                                     );
-                                    observations.push(ContainerObservation::terminated(
-                                        cname,
-                                        &record.container_id,
-                                        exit,
-                                        record.restart_count,
-                                    ));
+                                    observations.push(after(DownOutcome::NotReplaced));
                                     report.objects_skipped += 1;
                                 }
                                 Relaunch::OldNotCleared(cause) => {
@@ -4525,12 +4579,7 @@ impl Kubelet {
                                             MIN_PROBE_REQUEUE,
                                         );
                                     }
-                                    observations.push(ContainerObservation::terminated(
-                                        cname,
-                                        &record.container_id,
-                                        exit,
-                                        record.restart_count,
-                                    ));
+                                    observations.push(after(DownOutcome::NotReplaced));
                                     report.objects_skipped += 1;
                                 }
                             }
@@ -4540,12 +4589,7 @@ impl Kubelet {
                             // being deleted → terminal latch. Leave the local
                             // entry; later ticks keep reporting the terminal phase
                             // (idempotent-skip).
-                            observations.push(ContainerObservation::terminated(
-                                cname,
-                                &record.container_id,
-                                exit,
-                                record.restart_count,
-                            ));
+                            observations.push(after(DownOutcome::Latched));
                         }
                     }
                 }
@@ -4712,7 +4756,7 @@ impl Kubelet {
                 // the init sequence has its own ordering, and an entry it does
                 // not read would be a field nobody consults.
                 crash_backoff: None,
-                terminated_at: None,
+                down: None,
                 mounts: spec.mounts.clone(),
             },
         );
@@ -4816,11 +4860,16 @@ impl Kubelet {
                     // Exited, or lost by the backend (an Unknown exit): the
                     // sequencer restarts it under the policy or fails the pod
                     // — a lost init container is not re-run under `Never`.
-                    Ok(Polled::Down { exit, .. }) => {
+                    Ok(Polled::Down { exit: polled, .. }) => {
+                        // An init container that exited 0 and is then lost by
+                        // the runtime has still succeeded (`SeenDown`).
+                        let (seen, _) = self
+                            .note_down(key, cname, LocalPod::inits, record, polled, self.now())
+                            .await;
                         observations.push(mark(ContainerObservation::terminated(
                             cname,
                             &record.container_id,
-                            exit,
+                            seen.exit,
                             record.restart_count,
                         )));
                     }
@@ -5227,8 +5276,11 @@ impl Kubelet {
                 Some(record) => {
                     let state = match self.poll(&record.container_id).await {
                         Ok(Polled::Running(_)) => ContainerState::Running,
-                        // Exited, or vanished (an Unknown exit).
-                        Ok(Polled::Down { exit, .. }) => ContainerState::terminated(exit),
+                        // Exited, or vanished (an Unknown exit) — read with
+                        // what this run's record already observed (`SeenDown`).
+                        Ok(Polled::Down { exit, .. }) => ContainerState::terminated(
+                            Termination::known_after(record.down.map(|seen| seen.exit), exit),
+                        ),
                         Err(cause) => {
                             return Err(Unseen {
                                 container: cname.clone(),

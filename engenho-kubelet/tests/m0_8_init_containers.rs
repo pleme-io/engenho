@@ -577,6 +577,68 @@ async fn a_vanished_init_container_is_an_unobserved_exit() {
     }
 }
 
+/// ★ An init container that exited 0 has succeeded, whatever the runtime
+/// says of it afterwards. The init sequence re-polls every init container
+/// each tick, and one the runtime lost while a later one ran was read as an
+/// exit nobody observed: under `Never` the whole pod Failed during init.
+#[tokio::test]
+async fn a_completed_init_container_the_runtime_then_loses_has_still_succeeded() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_init(
+        &store,
+        "p9",
+        "node-A",
+        "Never",
+        &[("init-0", "img-0"), ("init-1", "img-1")],
+        &[("web", "img-web")],
+    )
+    .await;
+    kubelet.tick().await.unwrap();
+    let id0 = id_for_spec_name(&backend, "default_p9_init-init-0")
+        .await
+        .unwrap();
+    backend.set_exit(&id0, 0).await;
+    kubelet.tick().await.unwrap();
+    assert_eq!(
+        count_starts_named(&backend.events().await, "default_p9_init-init-1"),
+        1
+    );
+
+    use engenho_kubelet::ContainerRuntime;
+    backend.remove(&id0).await.unwrap();
+    kubelet.tick().await.unwrap();
+
+    let pod = store.get(&pod_key("p9")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Pending"), "{pod}");
+    let ics = init_container_statuses(&pod);
+    assert_eq!(ics[0]["state"]["terminated"]["exitCode"], 0, "{pod}");
+    assert_eq!(
+        ics[0]["state"]["terminated"]["reason"], "Completed",
+        "{pod}"
+    );
+    assert_eq!(
+        count_starts_named(&backend.events().await, "default_p9_init-init-0"),
+        1,
+        "not re-run"
+    );
+
+    let id1 = id_for_spec_name(&backend, "default_p9_init-init-1")
+        .await
+        .unwrap();
+    backend.set_exit(&id1, 0).await;
+    kubelet.tick().await.unwrap();
+    let pod = store.get(&pod_key("p9")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Running"), "{pod}");
+    assert_eq!(
+        count_starts_named(&backend.events().await, "default_p9_web"),
+        1
+    );
+
+    teardown(store, kubelet).await;
+}
+
 /// ★ After a kubelet restart, a `Never` pod past init — its app container up
 /// when the old kubelet went away — is Failed, not re-run from its first init
 /// container. The init container that was OBSERVED to complete keeps saying

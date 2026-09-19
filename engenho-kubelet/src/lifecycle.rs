@@ -177,6 +177,25 @@ impl Termination {
             (_, Some(code)) => Self::Observed(ExitDisposition::Code(code)),
         }
     }
+
+    /// How a run ended, as known after this poll (`polled`), when an earlier
+    /// poll of the same run had already seen it down (`earlier`).
+    ///
+    /// ── ★ AN OBSERVED EXIT IS NOT FORGOTTEN ──────────────────────────────
+    /// A container that exited 0 and is then removed from the runtime, or
+    /// that the runtime can later only report UNKNOWN, did not stop having
+    /// exited 0. Reading the second poll alone turned it into
+    /// [`Self::Unknown`], and under `Never` a `Succeeded` pod into `Failed`.
+    /// Upstream carries the previous terminated status over as-is when the
+    /// container is gone (kubelet_pods.go:2301-2304, 2336-2339). An observed
+    /// exit is kept against a later unobserved one, never the reverse.
+    #[must_use]
+    pub fn known_after(earlier: Option<Self>, polled: Self) -> Self {
+        match (earlier, polled) {
+            (Some(observed @ Self::Observed(_)), Self::Unknown) => observed,
+            (_, polled) => polled,
+        }
+    }
 }
 
 impl From<ExitDisposition> for Termination {
@@ -278,6 +297,60 @@ pub fn down_action(policy: RestartPolicy, pod: PodLifecycle, exit: Termination) 
     match pod {
         PodLifecycle::Live if policy.should_restart(exit) => DownAction::Restart,
         PodLifecycle::Live | PodLifecycle::Terminating => DownAction::Latch,
+    }
+}
+
+/// How the kubelet carried out this tick's [`DownAction`] for a container it
+/// polled down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownOutcome<'a> {
+    /// [`DownAction::Latch`]: it stays down.
+    Latched,
+    /// [`DownAction::Restart`], held: a backoff still owes a wait. `reason`
+    /// is the waiting reason published meanwhile.
+    Held {
+        /// `state.waiting.reason`.
+        reason: &'static str,
+    },
+    /// [`DownAction::Restart`], and the replacement started under this id.
+    Replaced {
+        /// The replacement's container id.
+        container_id: &'a str,
+    },
+    /// [`DownAction::Restart`] was attempted and no replacement is up this
+    /// tick: its start failed, or the old container is not cleared yet.
+    NotReplaced,
+}
+
+impl ContainerObservation {
+    /// What the kubelet publishes for a container it polled down with
+    /// `exit`, once this tick's decision has been carried out. `container_id`
+    /// and `restart_count` are the down run's.
+    ///
+    /// ── ★ A RESTART IS COUNTED WHEN ITS REPLACEMENT STARTS ────────────────
+    /// Only [`DownOutcome::Replaced`] publishes a new run, one count up. A
+    /// held or failed restart publishes the down run under its own count,
+    /// and so does a latched exit. The status is rendered AFTER the tick
+    /// has acted, so an exit restarted at once is never published as such.
+    #[must_use]
+    pub fn after_down(
+        name: impl Into<String>,
+        container_id: &str,
+        exit: Termination,
+        restart_count: u32,
+        outcome: DownOutcome<'_>,
+    ) -> Self {
+        match outcome {
+            DownOutcome::Latched | DownOutcome::NotReplaced => {
+                Self::terminated(name, container_id, exit, restart_count)
+            }
+            DownOutcome::Held { reason } => {
+                Self::backing_off(name, container_id, reason, restart_count)
+            }
+            DownOutcome::Replaced { container_id: new } => {
+                Self::running(name, new, restart_count.saturating_add(1))
+            }
+        }
     }
 }
 
@@ -546,6 +619,34 @@ pub struct ContainerStatusOut {
     pub container_id: Option<String>,
     /// `containerStatuses[].restartCount`.
     pub restart_count: u32,
+}
+
+impl ContainerStatusOut {
+    /// This entry of `status.containerStatuses[]` on the wire. The typed
+    /// [`ContainerState`] is the render surface, and `json!` inside this impl
+    /// is the allowed TYPED EMISSION site: the wire numbers of a termination
+    /// come from [`Termination::exit_code`] and [`Termination::reason`] only.
+    #[must_use]
+    pub fn to_wire(&self) -> serde_json::Value {
+        use serde_json::json;
+        let state = match &self.state {
+            ContainerState::Waiting { reason } => json!({ "waiting": { "reason": reason } }),
+            ContainerState::Running => json!({ "running": {} }),
+            ContainerState::Terminated(exit) => json!({
+                "terminated": { "exitCode": exit.exit_code(), "reason": exit.reason() }
+            }),
+        };
+        let mut entry = json!({
+            "name": self.name,
+            "ready": self.ready,
+            "state": state,
+            "restartCount": self.restart_count,
+        });
+        if let Some(id) = &self.container_id {
+            entry["containerID"] = serde_json::Value::String(id.clone());
+        }
+        entry
+    }
 }
 
 /// PURE pod-phase interpreter — the load-bearing state-machine core.
@@ -873,6 +974,24 @@ pub fn reconcile_pod_phase_with_init(
                 app_observations.iter().map(to_status).collect();
             (PodPhase::Pending, init_statuses, app_statuses, false)
         }
+    }
+}
+
+/// The phase to publish: the one this tick computed, unless the pod's stored
+/// status already shows it terminal.
+///
+/// ── ★ A TERMINAL PHASE IS NEVER LEFT ──────────────────────────────────────
+/// `Succeeded` and `Failed` are final. Upstream's `generateAPIPodStatus`
+/// forces a pod the apiserver shows terminal back to that phase whatever its
+/// containers now say (oracle row `phase/apiserver phase Succeeded is sticky
+/// even though containers render unknown with restartCount 1`). The kubelet
+/// here wrote whatever the fold computed, so a `Succeeded` pod whose
+/// containers it still held could be published `Running` or `Failed`.
+#[must_use]
+pub fn phase_to_publish(published: Option<PodPhase>, computed: PodPhase) -> PodPhase {
+    match published {
+        Some(terminal @ (PodPhase::Succeeded | PodPhase::Failed)) => terminal,
+        Some(PodPhase::Pending | PodPhase::Running | PodPhase::Unknown) | None => computed,
     }
 }
 
@@ -1815,6 +1934,136 @@ mod tests {
         assert_eq!(p_with, p_bare);
         assert!(initialized);
         assert_eq!(app_st, bare_st);
+    }
+
+    // ── What a later poll can and cannot undo ─────────────────────────────
+
+    #[test]
+    fn an_observed_exit_survives_a_poll_that_can_no_longer_say() {
+        let zero = Termination::Observed(ExitDisposition::Code(0));
+        let one = Termination::Observed(ExitDisposition::Code(1));
+        assert_eq!(
+            Termination::known_after(Some(zero), Termination::Unknown),
+            zero
+        );
+        assert_eq!(
+            Termination::known_after(Some(one), Termination::Unknown),
+            one
+        );
+        // Nothing observed yet: the poll is all there is.
+        assert_eq!(
+            Termination::known_after(None, Termination::Unknown),
+            Termination::Unknown
+        );
+        assert_eq!(
+            Termination::known_after(Some(Termination::Unknown), Termination::Unknown),
+            Termination::Unknown
+        );
+        // An observation replaces an unobserved exit, and the runtime's word
+        // on an observed one stands.
+        assert_eq!(
+            Termination::known_after(Some(Termination::Unknown), one),
+            one
+        );
+        assert_eq!(Termination::known_after(Some(zero), one), one);
+    }
+
+    #[test]
+    fn a_restart_is_counted_when_its_replacement_starts() {
+        let exit = Termination::Observed(ExitDisposition::Code(1));
+        let replaced = ContainerObservation::after_down(
+            "app",
+            "old",
+            exit,
+            3,
+            DownOutcome::Replaced {
+                container_id: "new",
+            },
+        );
+        assert_eq!(replaced, ContainerObservation::running("app", "new", 4));
+
+        let held = ContainerObservation::after_down(
+            "app",
+            "old",
+            exit,
+            3,
+            DownOutcome::Held {
+                reason: "CrashLoopBackOff",
+            },
+        );
+        assert_eq!(
+            held,
+            ContainerObservation::backing_off("app", "old", "CrashLoopBackOff", 3)
+        );
+
+        for outcome in [DownOutcome::Latched, DownOutcome::NotReplaced] {
+            assert_eq!(
+                ContainerObservation::after_down("app", "old", exit, 3, outcome),
+                ContainerObservation::terminated("app", "old", exit, 3),
+                "{outcome:?}"
+            );
+        }
+        // A count at the ceiling is not a panic.
+        let at_max = ContainerObservation::after_down(
+            "app",
+            "old",
+            exit,
+            u32::MAX,
+            DownOutcome::Replaced {
+                container_id: "new",
+            },
+        );
+        assert_eq!(at_max.restart_count, u32::MAX);
+    }
+
+    #[test]
+    fn a_terminal_phase_is_never_left() {
+        use PodPhase::{Failed, Pending, Running, Succeeded, Unknown};
+        for computed in [Pending, Running, Succeeded, Failed, Unknown] {
+            for terminal in [Succeeded, Failed] {
+                assert_eq!(phase_to_publish(Some(terminal), computed), terminal);
+            }
+            for live in [None, Some(Pending), Some(Running), Some(Unknown)] {
+                assert_eq!(phase_to_publish(live, computed), computed);
+            }
+        }
+    }
+
+    #[test]
+    fn a_status_renders_its_termination_only_through_the_termination() {
+        let lost = ContainerStatusOut {
+            name: "app".into(),
+            ready: false,
+            state: ContainerState::terminated(Termination::Unknown),
+            container_id: Some("c-1".into()),
+            restart_count: 2,
+        };
+        assert_eq!(
+            lost.to_wire(),
+            serde_json::json!({
+                "name": "app",
+                "ready": false,
+                "state": { "terminated": { "exitCode": 137, "reason": "ContainerStatusUnknown" } },
+                "restartCount": 2,
+                "containerID": "c-1",
+            })
+        );
+        let waiting = ContainerStatusOut {
+            name: "app".into(),
+            ready: false,
+            state: ContainerState::creating(),
+            container_id: None,
+            restart_count: 0,
+        };
+        assert_eq!(
+            waiting.to_wire(),
+            serde_json::json!({
+                "name": "app",
+                "ready": false,
+                "state": { "waiting": { "reason": "ContainerCreating" } },
+                "restartCount": 0,
+            })
+        );
     }
 }
 #[cfg(test)]
