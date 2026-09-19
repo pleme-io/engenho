@@ -7,8 +7,8 @@
 //! where the row is about a decision, and against a real HTTP server on
 //! 127.0.0.1 where it is about the wire (redirects, headers, timeouts). Each
 //! kind's adapter says what it drives; what is out of scope, and why, is in
-//! [`OUT_OF_SCOPE`], and where engenho differs on purpose is in
-//! [`DEVIATIONS`].
+//! [`OUT_OF_SCOPE`], the keys a checked row leaves unanswered, and why, are in
+//! [`PARTIAL`], and where engenho differs on purpose is in [`DEVIATIONS`].
 //!
 //! ## Reading upstream's vocabulary off engenho's state
 //!
@@ -57,7 +57,7 @@
     reason = "starts one FakeBackend container for exec probes to run in; no kubelet in the loop"
 )]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -66,12 +66,12 @@ use async_trait::async_trait;
 use engenho_kubelet::backend::{ContainerSpec, HostPort};
 use engenho_kubelet::lifecycle::Termination;
 use engenho_kubelet::{
-    ContainerObservation, ContainerProbes, ContainerRuntime, ExecOutcome, FakeBackend,
-    FakeExecFault, FakeNetProber, HttpProbeTarget, NetProber, PodLifecycle, ProbeHandler,
-    ProbeIoError, ProbeKind, ProbeObservation, ProbeRuntime, ProbeSetupStage, ProbeSpec,
-    ProbeTarget, ProbeUrl, RestartPolicy, TcpProbeTarget, TokioNetProber, TripKind,
-    aggregate_container_readiness, container_started, fold_probe_observation,
-    http_status_observation, run_handler,
+    ContainerObservation, ContainerProbes, ContainerRuntime, ContainerStatus, ExecOutcome,
+    FakeBackend, FakeExecFault, FakeNetProber, HttpProbeTarget, KubeletError, LogOptions,
+    NetProber, PodLifecycle, ProbeHandler, ProbeIoError, ProbeKind, ProbeObservation,
+    ProbeRuntime, ProbeSetupStage, ProbeSpec, ProbeTarget, ProbeUrl, Readoption, RestartPolicy,
+    TcpProbeTarget, TokioNetProber, TripKind, aggregate_container_readiness, container_started,
+    fold_probe_observation, http_status_observation, run_handler,
 };
 use engenho_oracle::{Answer, Case, Deviation, OutOfScope, Table, Vector, run};
 use serde_json::{Map, Value, json};
@@ -138,12 +138,6 @@ const OUT_OF_SCOPE: &[OutOfScope] = &[
     OutOfScope::kind(
         "grpc_probe",
         "grpc probes are a typed parse deferral (ProbeParseError::UnsupportedHandler)",
-    ),
-    OutOfScope::kind(
-        "update_pod_status",
-        "the kubelet's status writer decides ready and started for running and terminated \
-         containers together. The probe-decided half is checked by worker_sequence and \
-         is_container_started",
     ),
     OutOfScope::kind(
         "results_manager",
@@ -229,10 +223,221 @@ const DEVIATIONS: &[Deviation] = &[
     },
 ];
 
+/// A top-level key of upstream's `expected` that the adapter leaves
+/// unanswered on some checked rows.
+struct Partial {
+    /// The key.
+    key: &'static str,
+    /// The checked rows it is left unanswered on.
+    rows: &'static [&'static str],
+    /// Why engenho has no answer for it there.
+    why: &'static str,
+}
+
+/// Checked rows that are checked in part. The harness accepts an answer
+/// missing a key and reports only the key, per kind; the test pins this
+/// per-row list both ways, so an answer that drops a key not listed here
+/// fails, and so does a listing whose key is now answered.
+const PARTIAL: &[Partial] = &[
+    Partial {
+        key: "output",
+        rows: &[
+            "exec_exit_error_status_zero_is_success",
+            "exec_exit_status_1_is_failure",
+            "exec_nil_error_success",
+            "exec_non_exit_error_is_unknown_with_error",
+            "exec_timeout_with_gate_on_is_counted_failure",
+            "http_200_body_is_output",
+            "http_3xx_without_location_empty_body_is_warning",
+            "http_3xx_without_location_is_warning",
+            "http_500_failure_message_never_contains_body",
+            "http_body_read_error_is_discarded_not_counted",
+            "http_connection_refused_is_counted_failure",
+            "tcp_connect_error_is_counted_failure",
+            "tcp_connect_ok_success",
+        ],
+        why: "a handler's output text. engenho keeps a probe's verdict, not its output (as the \
+              cri_exec_output kind)",
+    },
+    Partial {
+        key: "output_len",
+        rows: &["exec_output_truncated_to_10240_bytes"],
+        why: "the length of a handler's output, which engenho does not keep",
+    },
+    Partial {
+        key: "output_repeat",
+        rows: &[
+            "exec_output_truncated_to_10240_bytes",
+            "http_body_over_limit_truncated_not_error",
+            "http_body_under_limit_full",
+        ],
+        why: "the content of a handler's output, which engenho does not keep",
+    },
+    Partial {
+        key: "note",
+        rows: &[
+            "http_redirects_kubelet_policy_no_nonlocal_follow",
+            "http_status_classification",
+            "seq_readiness_failure_run_must_be_consecutive",
+            "seq_readiness_success_run_carries_across_container_restart",
+            "seq_startup_errors_forever_never_started_never_restarted",
+        ],
+        why: "the table's prose about the row, not a behaviour",
+    },
+    Partial {
+        key: "manual_trigger_note",
+        rows: &["update_pod_status_ready_and_started"],
+        why: "the table's prose about the manual trigger, not a behaviour",
+    },
+    Partial {
+        key: "manual_readiness_trigger_attempted",
+        rows: &["update_pod_status_ready_and_started"],
+        why: "upstream nudges an unready container's readiness worker to probe early. engenho has \
+              no per-probe worker to nudge: the kubelet requeues the pod at its soonest \
+              next_due_in (see the worker_loop kind)",
+    },
+    Partial {
+        key: "keep_going",
+        rows: &[
+            "seq_initial_delay_liveness",
+            "seq_initial_delay_readiness",
+            "seq_initial_delay_startup",
+            "seq_probe_error_neither_counts_nor_breaks_run",
+            "seq_readiness_failure_threshold_3",
+            "seq_readiness_success_run_carries_across_container_restart",
+            "seq_readiness_success_threshold_3",
+        ],
+        why: "the lifetime of upstream's per-probe goroutine at each step. Read as worker_tick \
+              reads it (the probe may run on a later tick), it is true at every step of every \
+              sequence: none names a terminal phase, a deleted pod or restartPolicy Never. A \
+              check that cannot fail here is not asked; worker_tick checks it where it can differ",
+    },
+    Partial {
+        key: "result_container",
+        rows: &[
+            "seq_liveness_failure_holds_until_new_container",
+            "seq_startup_hold_lifted_by_new_container_then_held_again_on_success",
+        ],
+        why: "which container ID upstream's results cache holds the result under. engenho keeps \
+              probe state on the container's record and starts it afresh when the container is \
+              replaced (ContainerProbes::reset), so it is always the current container's: the \
+              answer would echo the row's own IDs. The row's result after the replacement is \
+              checked",
+    },
+    Partial {
+        key: "removed_on_step_3",
+        rows: &["seq_liveness_failure_holds_until_new_container"],
+        why: "as result_container: the replaced container's cache entry. engenho's probe state \
+              for it is overwritten on the replacement, not removed from a cache",
+    },
+    Partial {
+        key: "set_when",
+        rows: &["initial_value_per_probe_type"],
+        why: "prose on when upstream sets the initial value. engenho's probe state exists from \
+              the container's start; the module docs say how that reads as upstream's",
+    },
+    Partial {
+        key: "event",
+        rows: &[
+            "prober_handler_failure",
+            "prober_handler_unknown_with_error_is_discarded",
+        ],
+        why: "upstream's kubelet records an Unhealthy Warning on every failed or errored run. \
+              engenho's records Unhealthy when a probe goes blind and when one trips, not on \
+              every run: fewer events, no different verdict. Not driven here (the kubelet, not \
+              the prober, records events)",
+    },
+    Partial {
+        key: "error_text_prefix",
+        rows: &["prober_no_handler_is_error"],
+        why: "the deviated row: engenho refuses the pod at parse (ProbeParseError::NoHandler), so \
+              there is no run to produce upstream's error text",
+    },
+    Partial {
+        key: "result",
+        rows: &["prober_no_handler_is_error"],
+        why: "the deviated row: engenho refuses the pod at parse, so no run has a result",
+    },
+    Partial {
+        key: "runProbe_attempts",
+        rows: &["prober_no_handler_is_error"],
+        why: "the deviated row: engenho refuses the pod at parse, so no attempt is made",
+    },
+    Partial {
+        key: "User-Agent_format",
+        rows: &["http_default_request_headers"],
+        why: "prose (kube-probe/<major>.<minor>). The prefix is checked here; the whole value, \
+              built from engenho_types' KUBE_VERSION_MAJOR and KUBE_VERSION_MINOR, is pinned by \
+              backend::probe_request_tests::a_probe_sends_upstreams_default_headers",
+    },
+    Partial {
+        key: "identical_for_follow_non_local_false_and_true",
+        rows: &["http_host_header_preserved_across_redirect"],
+        why: "engenho implements followNonLocalRedirects = false only (see \
+              http_redirects_follow_nonlocal_true), so there is no second policy to compare",
+    },
+    Partial {
+        key: "proxy",
+        rows: &["http_request_url_construction"],
+        why: "TokioNetProber's client is built with no_proxy() (backend.rs). Seeing it here would \
+              take a proxy set in this process's environment, which every other test in it would \
+              then see; not driven",
+    },
+    Partial {
+        key: "tls_verification",
+        rows: &["http_request_url_construction"],
+        why: "TokioNetProber's client skips certificate verification \
+              (danger_accept_invalid_certs, backend.rs). Seeing it here would take an HTTPS \
+              server with a certificate the client cannot verify; this file has only plain HTTP. \
+              Not driven",
+    },
+    Partial {
+        key: "api_validation",
+        rows: &["unresolvable_named_port_freezes_probe_at_initial_value"],
+        why: "API validation is the apiserver's (as the probe_validation kind)",
+    },
+    Partial {
+        key: "consequence",
+        rows: &["unresolvable_named_port_freezes_probe_at_initial_value"],
+        why: "prose per kind. Each is checked where it is decided: the frozen value here \
+              (cached_result_forever), probe::upstream_prober::\
+              a_port_that_does_not_resolve_freezes_every_kind_at_its_initial_value, and \
+              m0_6's a_probe_whose_port_does_not_resolve_runs_the_pod_and_holds_the_probe",
+    },
+    Partial {
+        key: "per_tick",
+        rows: &["unresolvable_named_port_freezes_probe_at_initial_value"],
+        why: "one object compared whole, holding upstream's event text, which quotes the \
+              strconv.Atoi error engenho does not reproduce (the deviated \
+              port_resolution_unknown_name_error_is_atoi_error). That every run is blind, \
+              dials nothing and counts toward nothing is checked by the unit test named under \
+              consequence",
+    },
+    Partial {
+        key: "liveness",
+        rows: &[
+            "tick_container_waiting",
+            "tick_container_terminated_restart_never_stops_worker",
+            "tick_container_terminated_restart_always_keeps_worker",
+            "tick_pod_deletion_with_non_running_container_sets_failure_not_success",
+        ],
+        why: "a container that is not running: engenho has no liveness verdict for it. Whether \
+              it runs again is the restart policy's, which the row's readiness keep_going \
+              checks (see not_running_tick)",
+    },
+    Partial {
+        key: "startup",
+        rows: &["tick_pod_deletion_with_non_running_container_sets_failure_not_success"],
+        why: "upstream's startup worker lingers on a Terminating pod's stopped container though \
+              it can never probe again; engenho retires the probe. The only difference is a \
+              goroutine's lifetime (see not_running_tick)",
+    },
+];
+
 /// Every row that is not out of scope is checked. A row falling back to
 /// `NotChecked` fails the harness as unclaimed; this also stops the count
 /// shrinking by a row moving into [`OUT_OF_SCOPE`] unnoticed.
-const CHECKED_ROWS: usize = 73;
+const CHECKED_ROWS: usize = 74;
 
 #[tokio::test]
 async fn prober_result_handling_agrees_with_upstream() {
@@ -248,6 +453,7 @@ async fn prober_result_handling_agrees_with_upstream() {
             answer(&table, case, &mut broken_pins).await,
         );
     }
+    let unanswered = unanswered_keys(&table, &answers);
     let outcome = run(&table, OUT_OF_SCOPE, DEVIATIONS, |case| {
         answers.remove(&case.name).unwrap_or(Answer::NotChecked)
     });
@@ -262,6 +468,39 @@ async fn prober_result_handling_agrees_with_upstream() {
         "rows checked against upstream: {report:?}"
     );
     assert_eq!(report.deviations, DEVIATIONS.len());
+    let declared: BTreeSet<(String, String)> = PARTIAL
+        .iter()
+        .flat_map(|p| p.rows.iter().map(|row| ((*row).to_owned(), p.key.to_owned())))
+        .collect();
+    let undeclared: Vec<_> = unanswered.difference(&declared).collect();
+    let now_answered: Vec<_> = declared.difference(&unanswered).collect();
+    assert!(
+        undeclared.is_empty() && now_answered.is_empty(),
+        "checked rows' keys left unanswered but not in PARTIAL: {undeclared:?}\n\
+         PARTIAL entries that are answered (or name no checked row): {now_answered:?}"
+    );
+    assert!(
+        PARTIAL.iter().all(|p| !p.why.trim().is_empty()),
+        "every PARTIAL entry says why"
+    );
+}
+
+/// Every `(row, key)` where the row is checked and its `expected` has the key
+/// but the adapter's answer does not. The harness accepts such an answer and
+/// reports only the key, per kind; this is the per-row list that
+/// [`PARTIAL`] pins.
+fn unanswered_keys(table: &Table, answers: &HashMap<String, Answer>) -> BTreeSet<(String, String)> {
+    let mut unanswered = BTreeSet::new();
+    for case in &table.cases {
+        if let Some(Answer::Checked(Value::Object(got))) = answers.get(&case.name)
+            && let Value::Object(expected) = &case.expected
+        {
+            for key in expected.keys().filter(|k| !got.contains_key(*k)) {
+                unanswered.insert((case.name.clone(), key.clone()));
+            }
+        }
+    }
+    unanswered
 }
 
 async fn answer(table: &Table, case: &Case, broken_pins: &mut Vec<String>) -> Answer {
@@ -284,6 +523,7 @@ async fn answer(table: &Table, case: &Case, broken_pins: &mut Vec<String>) -> An
         "tcp_probe" => tcp_probe(case).await,
         "tcp_target" => tcp_target(case).await,
         "is_container_started" => is_container_started(case),
+        "update_pod_status" => update_pod_status(case).await,
         "probe_defaults" => probe_defaults(case),
         _ => Answer::NotChecked,
     }
@@ -367,6 +607,15 @@ fn one_label(labels: &[&str]) -> String {
     }
 }
 
+/// Several runs' values that upstream expects to agree: the shared value, or
+/// all of them when they do not.
+fn one_value(values: Vec<Value>) -> Value {
+    match values.as_slice() {
+        [first, rest @ ..] if rest.iter().all(|v| v == first) => first.clone(),
+        _ => Value::Array(values),
+    }
+}
+
 fn probe(kind: ProbeKind, json: &Value) -> ProbeSpec {
     ProbeSpec::from_k8s(kind, json, &[]).unwrap_or_else(|e| panic!("{json} parses: {e}"))
 }
@@ -444,7 +693,80 @@ impl ExecRig {
     }
 
     async fn run(&self, spec: &ProbeSpec) -> ProbeObservation {
-        run_handler(spec, &self.backend, &FakeNetProber::new(), &self.id, None).await
+        self.run_counted(spec).await.0
+    }
+
+    /// One run, and the attempts it made (the execs the runtime was asked for).
+    async fn run_counted(&self, spec: &ProbeSpec) -> (ProbeObservation, u32) {
+        let runtime = CountedExec {
+            inner: &self.backend,
+            execs: AtomicU32::new(0),
+        };
+        let obs = run_handler(spec, &runtime, &FakeNetProber::new(), &self.id, None).await;
+        (obs, runtime.execs.load(Ordering::SeqCst))
+    }
+}
+
+/// The rig's FakeBackend, counting `exec` calls: each is one attempt of a
+/// run. Every other call passes straight through.
+struct CountedExec<'a> {
+    inner: &'a FakeBackend,
+    execs: AtomicU32,
+}
+
+#[async_trait]
+impl ContainerRuntime for CountedExec<'_> {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn readoption(&self) -> Readoption {
+        self.inner.readoption()
+    }
+    async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
+        self.execs.fetch_add(1, Ordering::SeqCst);
+        self.inner.exec(container_id, argv).await
+    }
+    async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
+        self.inner.start(spec).await
+    }
+    async fn status(&self, container_id: &str) -> Result<Option<ContainerStatus>, KubeletError> {
+        self.inner.status(container_id).await
+    }
+    async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
+        self.inner.stop(container_id).await
+    }
+    async fn remove(&self, container_id: &str) -> Result<(), KubeletError> {
+        self.inner.remove(container_id).await
+    }
+    async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError> {
+        self.inner.logs(container_id, opts).await
+    }
+}
+
+/// What one run did to its probe's counters, read off engenho: the attempts
+/// it made, and whether folding it counted it and toward which threshold.
+/// Answered in the row's own words when they name the same effect (upstream's
+/// rows phrase one effect several ways, and only these exact phrases are
+/// read); otherwise in engenho's, so the row disagrees.
+fn worker_effect(expected: &Value, attempts: u32, obs: ProbeObservation) -> Value {
+    let spec = exec_probe_spec(ProbeKind::Readiness, &Value::Null);
+    let now = Instant::now();
+    let mut rt = ProbeRuntime::new(now);
+    let _ = fold_probe_observation(&spec, &mut rt, obs, now);
+    let (failures, successes) = (rt.consecutive_failures, rt.consecutive_successes);
+    let discarded = failures == 0 && successes == 0;
+    let agrees = match expected.as_str() {
+        Some("counts toward failureThreshold") => failures == 1 && successes == 0,
+        Some("discarded") => discarded,
+        Some("retried up to 3x, then discarded" | "retried up to 3x in-tick, then discarded") => {
+            discarded && attempts == 3
+        }
+        _ => false,
+    };
+    if agrees {
+        expected.clone()
+    } else {
+        json!({ "attempts": attempts, "failures": failures, "successes": successes })
     }
 }
 
@@ -513,6 +835,13 @@ impl<P> Recording<P> {
 
     fn last_tcp(&self) -> Option<TcpProbeTarget> {
         self.tcp.lock().ok().and_then(|t| t.last().cloned())
+    }
+
+    /// Every request passed on: one per attempt.
+    fn attempts(&self) -> u32 {
+        let http = self.http.lock().map_or(0, |t| t.len());
+        let tcp = self.tcp.lock().map_or(0, |t| t.len());
+        u32::try_from(http + tcp).unwrap_or(u32::MAX)
     }
 }
 
@@ -716,13 +1045,22 @@ async fn closed_port() -> u16 {
 /// 127.0.0.1 through engenho's parse, `run_handler` and the real prober.
 /// Returns the observation and the status read, if any.
 async fn probe_http(http_get: Value, timeout_seconds: u64) -> (ProbeObservation, Option<u16>) {
+    let (obs, status, _) = probe_http_counted(http_get, timeout_seconds).await;
+    (obs, status)
+}
+
+/// [`probe_http`], and the attempts the run made (the requests it sent).
+async fn probe_http_counted(
+    http_get: Value,
+    timeout_seconds: u64,
+) -> (ProbeObservation, Option<u16>, u32) {
     let spec = probe(
         ProbeKind::Readiness,
         &json!({ "httpGet": http_get, "timeoutSeconds": timeout_seconds }),
     );
     let net = Recording::new(TokioNetProber::new());
     let obs = run_handler(&spec, &FakeBackend::new(), &net, "cid", Some("127.0.0.1")).await;
-    (obs, net.last_status())
+    (obs, net.last_status(), net.attempts())
 }
 
 /// A manifest `httpHeaders` list from upstream's `{"Name": ["value", …]}`.
@@ -1096,16 +1434,13 @@ async fn prober_probe(case: &Case) -> Answer {
             let rig = ExecRig::new().await;
             rig.next(exec).await;
             let spec = exec_probe_spec(ProbeKind::Readiness, &Value::Null);
-            let obs = rig.run(&spec).await;
-            let mut rt = ProbeRuntime::new(Instant::now());
-            let _ = fold_probe_observation(&spec, &mut rt, obs, Instant::now());
-            let counted = rt.consecutive_failures + rt.consecutive_successes > 0;
+            let (obs, attempts) = rig.run_counted(&spec).await;
             project(
                 &case.expected,
                 json!({
                     "result": kubelet_result(obs),
                     "error": is_error(obs),
-                    "worker_effect": if counted { "counted" } else { "discarded" },
+                    "worker_effect": worker_effect(&case.expected["worker_effect"], attempts, obs),
                 }),
             )
         }
@@ -1207,31 +1542,51 @@ async fn exec_probe(case: &Case) -> Answer {
     let spec = exec_probe_spec(ProbeKind::Liveness, &Value::Null);
     let mut labels = Vec::new();
     let mut errors = Vec::new();
+    let mut effects = Vec::new();
     for exec in execs {
         rig.next(exec).await;
-        let obs = rig.run(&spec).await;
+        let (obs, attempts) = rig.run_counted(&spec).await;
         labels.push(label(obs, None));
         errors.push(is_error(obs));
+        effects.push(worker_effect(&case.expected["worker_effect"], attempts, obs));
     }
     project(
         &case.expected,
         json!({
             "result": one_label(&labels),
             "error": errors.iter().any(|e| *e),
+            "worker_effect": one_value(effects),
         }),
     )
 }
 
-/// `http_status_classify`: `http_status_observation` for each status.
+/// `http_status_classify`: `http_status_observation` for each status, and
+/// what the kubelet makes of each of upstream's labels. A label two statuses
+/// would map differently reads as both results.
 fn http_status_classify(case: &Case) -> Answer {
-    let results: Vec<&str> = case.input["rows"]
+    let mut results = Vec::new();
+    let mut kubelet: Map<String, Value> = Map::new();
+    for status in case.input["rows"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(u16_of)
-        .map(|status| label(http_status_observation(status), Some(status)))
-        .collect();
-    project(&case.expected, json!({ "results": results }))
+    {
+        let obs = http_status_observation(status);
+        let upstream_label = label(obs, Some(status));
+        results.push(upstream_label);
+        let result = kubelet_result(obs);
+        let entry = kubelet
+            .entry(upstream_label)
+            .or_insert_with(|| json!(result));
+        if entry.as_str() != Some(result) {
+            *entry = json!(one_label(&[entry.as_str().unwrap_or_default(), result]));
+        }
+    }
+    project(
+        &case.expected,
+        json!({ "results": results, "kubelet_result": kubelet }),
+    )
 }
 
 /// The reply the row's `server` gives a request. `redirect_code` stands in
@@ -1344,10 +1699,11 @@ async fn http_probe(case: &Case) -> Answer {
     let mut labels = Vec::new();
     let mut errors = Vec::new();
     let mut results = Vec::new();
+    let mut effects = Vec::new();
     for code in codes {
         let server = server.clone();
         let srv = serve(move |head| reply_for(&server, code, head)).await;
-        let (obs, status) = probe_http(
+        let (obs, status, attempts) = probe_http_counted(
             json!({ "path": path, "port": srv.port, "httpHeaders": headers }),
             timeout,
         )
@@ -1355,6 +1711,7 @@ async fn http_probe(case: &Case) -> Answer {
         labels.push(label(obs, status));
         errors.push(is_error(obs));
         results.push(kubelet_result(obs));
+        effects.push(worker_effect(&case.expected["worker_effect"], attempts, obs));
     }
     project(
         &case.expected,
@@ -1362,6 +1719,7 @@ async fn http_probe(case: &Case) -> Answer {
             "result": one_label(&labels),
             "error": errors.iter().any(|e| *e),
             "kubelet_result": one_label(&results),
+            "worker_effect": one_value(effects),
         }),
     )
 }
@@ -1680,6 +2038,76 @@ fn is_container_started(case: &Case) -> Answer {
         })
         .collect();
     project(&case.expected, json!({ "started": started }))
+}
+
+/// `update_pod_status`: each container's `ready` and `started` as the kubelet
+/// decides them, with each declared probe left in the row's cached state (a
+/// verdict folded once, or none). A RUNNING container goes through the
+/// kubelet's own `ContainerProbes::tick` with no probe due, so the tick runs
+/// nothing and only aggregates. One that is NOT running is read off the
+/// observation the kubelet writes for it, which carries no probe state, and
+/// `container_started`.
+///
+/// engenho writes no `containerStatuses[].started` (a gap, deferred):
+/// `started` here is the gate the kubelet runs liveness and readiness on,
+/// which is what upstream's field reports.
+async fn update_pod_status(case: &Case) -> Answer {
+    let now = Instant::now();
+    let rig = ExecRig::new().await;
+    let net = FakeNetProber::new();
+    let target = ProbeTarget {
+        runtime: &rig.backend,
+        net_prober: &net,
+        container_id: &rig.id,
+        pod_ip: None,
+    };
+    let (mut ready, mut started) = (Map::new(), Map::new());
+    for container in case.input["containers"].as_array().into_iter().flatten() {
+        let name = text(container, "name");
+        let mut probes = ContainerProbes::default();
+        for worker in container["workers"].as_array().into_iter().flatten() {
+            let kind = kind_named(worker.as_str().unwrap_or_default());
+            // Not due for an hour: the tick below reads the state, runs nothing.
+            let spec = probe(
+                kind,
+                &json!({ "exec": { "command": ["probe"] }, "initialDelaySeconds": 3600 }),
+            );
+            let mut rt = ProbeRuntime::new(now);
+            let cached = match container["cached"][kind.as_str()].as_str() {
+                Some("Success") => Some(ProbeObservation::Success),
+                Some("Failure") => Some(ProbeObservation::Failure),
+                _ => None,
+            };
+            if let Some(obs) = cached {
+                let _ = fold_probe_observation(&spec, &mut rt, obs, now);
+            }
+            let slot = match kind {
+                ProbeKind::Liveness => &mut probes.liveness,
+                ProbeKind::Readiness => &mut probes.readiness,
+                ProbeKind::Startup => &mut probes.startup,
+            };
+            *slot = Some((spec, rt));
+        }
+        let (is_ready, is_started) = if container["running"].as_bool() == Some(true) {
+            let tick = probes.tick(&target, PodLifecycle::Live, now).await;
+            assert!(tick.ran.is_empty(), "{name}: a probe ran: {:?}", tick.ran);
+            (tick.ready, probes.started(PodLifecycle::Live))
+        } else {
+            let observation =
+                ContainerObservation::terminated(name.as_str(), "cid", Termination::Unknown, 0);
+            let startup = probes.startup.as_ref().map(|(_, rt)| rt);
+            (
+                observation.ready,
+                container_started(false, startup, PodLifecycle::Live),
+            )
+        };
+        ready.insert(name.clone(), json!(is_ready));
+        started.insert(name, json!(is_started));
+    }
+    project(
+        &case.expected,
+        json!({ "ready": ready, "started": started }),
+    )
 }
 
 /// `probe_defaults`: the timing `ProbeSpec::from_k8s` applies to the row's
