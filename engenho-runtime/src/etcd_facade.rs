@@ -917,6 +917,57 @@ mod tests {
         );
     }
 
+    /// I13 (T5.4): what `serve_etcd_facade`'s doc says about ownership. The
+    /// façade and every clone of it hold no strong reference to the store; a
+    /// call leaves none behind once it returns; and a clone taken before a
+    /// write reads that write, because every clone is the one store.
+    ///
+    /// The doc used to say the façade held an `Arc<StoreMesh>`. It held a
+    /// `Weak`; this pins the `Weak`, so the doc cannot drift back.
+    #[tokio::test]
+    async fn the_facade_and_its_clones_hold_no_strong_reference_and_see_one_store() {
+        let store = boot("facade-ownership").await;
+        let baseline = Arc::strong_count(&store);
+        let facade = MeshEtcdStore::new(&store);
+        let clones = [facade.clone(), facade.clone(), facade];
+        assert_eq!(
+            Arc::strong_count(&store),
+            baseline,
+            "a façade or a clone of one holds the store strongly"
+        );
+
+        // Written after every clone was taken.
+        seed(&store).await;
+        for clone in &clones {
+            let keys: Vec<String> = EtcdReadStore::range(clone, "/registry/pods/")
+                .await
+                .expect("live")
+                .into_iter()
+                .map(|kv| String::from_utf8(kv.key).expect("utf8"))
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    "/registry/pods/default/web",
+                    "/registry/pods/kube-system/dns"
+                ],
+                "every clone reads the one store"
+            );
+        }
+        assert_eq!(
+            Arc::strong_count(&store),
+            baseline,
+            "a Range that returned still holds the store"
+        );
+
+        stop(store).await;
+        assert_eq!(
+            EtcdReadStore::range(&clones[0], "/registry/").await,
+            Err(StoreGone),
+            "a clone outliving the store says so"
+        );
+    }
+
     /// ★ T3.8. A dropped store used to answer a Range with `Ok`, no keys, at
     /// revision 0 — exactly an empty cluster, which a backup tool would
     /// save as a valid empty snapshot. Every service now answers

@@ -1,5 +1,7 @@
 //! Typed runtime errors — `thiserror`, no `anyhow` in the lib.
 
+use std::fmt;
+
 use engenho_apiserver::ServerError;
 use engenho_config::ConfigError;
 use engenho_store::StoreError;
@@ -11,7 +13,23 @@ pub enum RuntimeError {
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
 
-    /// The store mesh failed to start, initialize, or take leadership.
+    /// A config field asks for something this runtime does not do (I21):
+    /// an operator PKI, a multi-master formation, a consistency tier the
+    /// store does not serve. Refused before anything is probed or written.
+    #[error(transparent)]
+    Unhonoured(#[from] crate::Unhonoured),
+
+    /// The scheduler could not be built from `scheduler.*` (T5.8): an
+    /// unimplemented strategy or a zero tick. `validate()` refuses both
+    /// first; this is the constructor's own guard.
+    #[error(transparent)]
+    Scheduler(#[from] engenho_scheduler::SchedulerError),
+
+    /// The store mesh failed to start, initialize, or take leadership; or,
+    /// at a stop, to write its durable image
+    /// ([`engenho_store::StoreError::Persist`], from the stop's flush or
+    /// from `terminate`). A failed flush leaves every applied entry in the
+    /// log, so the next boot replays it: nothing acknowledged is lost.
     #[error("store error: {0}")]
     Store(#[from] StoreError),
 
@@ -96,15 +114,28 @@ pub enum RuntimeError {
     },
 
     /// At shutdown, the Runtime could not become the sole owner of the
-    /// store `Arc` (a driver task or apiserver handler still holds a
-    /// clone). `terminate` consumes `StoreMesh` and requires the only
-    /// strong ref; this surfaces the leak rather than hanging.
+    /// store `Arc`: something still holds a clone. `terminate` consumes
+    /// `StoreMesh` and requires the only strong ref; this surfaces the leak
+    /// rather than hanging.
+    ///
+    /// `after` names the first stage of shutdown that owed sole ownership
+    /// and did not have it (see [`ShutdownStage::owes_sole_ownership`]), so
+    /// the holder is something that outlived that stage.
+    ///
+    /// The stop has already flushed the store by then
+    /// ([`ShutdownStage::StoreFlushed`] runs before the unwrap), so the next
+    /// boot replays nothing applied before the flush even though
+    /// `terminate` never ran.
     #[error(
-        "could not acquire sole store ownership for terminate ({strong_count} strong refs remain)"
+        "could not acquire sole store ownership for terminate ({strong_count} strong refs remain \
+         after {after})"
     )]
     StoreStillShared {
         /// How many strong refs remained when `try_unwrap` failed.
         strong_count: usize,
+        /// The first stage after which the store should have had one holder
+        /// and had more.
+        after: ShutdownStage,
     },
 
     /// The kubelet is configured to drive a container runtime whose binary
@@ -154,6 +185,8 @@ pub enum RuntimeError {
 engenho_substrate::impl_error_kind! {
     RuntimeError {
         (Config(_)) => "config",
+        (Unhonoured(_)) => "unhonoured_config",
+        (Scheduler(_)) => "scheduler",
         (Store(_)) => "store",
         (Server(_)) => "server",
         (BackendRefused(_)) => "backend_refused",
@@ -166,5 +199,196 @@ engenho_substrate::impl_error_kind! {
         (Kubeconfig(_)) => "kubeconfig",
         { KubeconfigIo { .. } } => "kubeconfig_io",
         (NodeRegistration(_)) => "node_registration",
+    }
+}
+
+/// A stage of [`crate::Runtime::shutdown`], in the order the stages run.
+///
+/// The runtime reads the store's strong count after each one. A
+/// [`RuntimeError::StoreStillShared`] names the first stage that owed sole
+/// ownership and did not have it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShutdownStage {
+    /// Every child (the drivers and both listeners) has been aborted and
+    /// awaited, so each task's store clone has been dropped.
+    DriversAwaited,
+    /// The apiserver has stopped: its serve task ended, or was aborted once
+    /// the grace ran out.
+    ApiserverStopped,
+    /// The store's own background tasks (the raft RPC pump and the bookmark
+    /// ticker) have been aborted and awaited by
+    /// [`engenho_store::StoreMesh::quiesce`].
+    StoreQuiesced,
+    /// The durable image has been brought up to the applied state by
+    /// [`engenho_store::StoreMesh::flush`], while the store is still behind
+    /// the `Arc`. From here the next boot replays nothing applied before the
+    /// flush, whether or not the store can then be terminated.
+    StoreFlushed,
+}
+
+impl ShutdownStage {
+    /// Every stage, in the order shutdown runs them.
+    pub const ALL: [Self; 4] = [
+        Self::DriversAwaited,
+        Self::ApiserverStopped,
+        Self::StoreQuiesced,
+        Self::StoreFlushed,
+    ];
+
+    /// Whether the runtime must be the store's only strong holder once this
+    /// stage has run.
+    ///
+    /// Not once the drivers are awaited: every apiserver handler holds a
+    /// clone until the apiserver stops, so a count above one there is
+    /// expected and names nothing. That is why a `StoreStillShared` never
+    /// names [`Self::DriversAwaited`]. From the apiserver's stop on, nothing
+    /// the runtime started may hold the store. Quiescing releases no
+    /// `Arc<StoreMesh>` (the tasks it stops hold the store's inner state and
+    /// a raft clone), and neither does flushing, so both owe the same thing:
+    /// that nothing took a new reference in the meantime.
+    #[must_use]
+    pub const fn owes_sole_ownership(self) -> bool {
+        match self {
+            Self::DriversAwaited => false,
+            Self::ApiserverStopped | Self::StoreQuiesced | Self::StoreFlushed => true,
+        }
+    }
+}
+
+impl fmt::Display for ShutdownStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::DriversAwaited => "the drivers were awaited",
+            Self::ApiserverStopped => "the apiserver stopped",
+            Self::StoreQuiesced => "the store was quiesced",
+            Self::StoreFlushed => "the store was flushed",
+        })
+    }
+}
+
+/// The store's strong count, read after each [`ShutdownStage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StrongCounts {
+    pub(crate) drivers_awaited: usize,
+    pub(crate) apiserver_stopped: usize,
+    pub(crate) store_quiesced: usize,
+    pub(crate) store_flushed: usize,
+}
+
+impl StrongCounts {
+    /// The count read after `stage`.
+    pub(crate) const fn after(&self, stage: ShutdownStage) -> usize {
+        match stage {
+            ShutdownStage::DriversAwaited => self.drivers_awaited,
+            ShutdownStage::ApiserverStopped => self.apiserver_stopped,
+            ShutdownStage::StoreQuiesced => self.store_quiesced,
+            ShutdownStage::StoreFlushed => self.store_flushed,
+        }
+    }
+
+    /// The stage a failed `try_unwrap` is charged to: the first stage that
+    /// owed sole ownership and read more than one holder.
+    ///
+    /// When every owed reading was one, the holder took its reference after
+    /// the last reading, which is still after the store was flushed.
+    pub(crate) fn blame(&self) -> ShutdownStage {
+        ShutdownStage::ALL
+            .into_iter()
+            .find(|stage| stage.owes_sole_ownership() && self.after(*stage) > 1)
+            .unwrap_or(ShutdownStage::StoreFlushed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const fn counts(
+        drivers: usize,
+        apiserver: usize,
+        quiesced: usize,
+        flushed: usize,
+    ) -> StrongCounts {
+        StrongCounts {
+            drivers_awaited: drivers,
+            apiserver_stopped: apiserver,
+            store_quiesced: quiesced,
+            store_flushed: flushed,
+        }
+    }
+
+    /// A holder that outlived the apiserver's stop is charged to that stage,
+    /// however many the apiserver held before it.
+    #[test]
+    fn a_holder_that_outlives_the_apiserver_is_charged_to_its_stop() {
+        assert_eq!(counts(57, 2, 2, 2).blame(), ShutdownStage::ApiserverStopped);
+        assert_eq!(
+            counts(57, 57, 57, 57).blame(),
+            ShutdownStage::ApiserverStopped
+        );
+    }
+
+    /// Sole ownership after the apiserver stopped, then a second holder:
+    /// something took a new reference while the store was being quiesced.
+    #[test]
+    fn a_holder_taken_after_the_apiserver_stopped_is_charged_to_quiesce() {
+        assert_eq!(counts(57, 1, 2, 2).blame(), ShutdownStage::StoreQuiesced);
+    }
+
+    /// A reference taken while the store was being flushed, or after the
+    /// last reading, is charged to the flush: the last stage before the
+    /// unwrap.
+    #[test]
+    fn a_holder_taken_during_or_after_the_flush_is_charged_to_it() {
+        assert_eq!(counts(57, 1, 1, 2).blame(), ShutdownStage::StoreFlushed);
+        // Every owed reading was one, yet the unwrap failed: the reference
+        // was taken after the last reading.
+        assert_eq!(counts(57, 1, 1, 1).blame(), ShutdownStage::StoreFlushed);
+    }
+
+    /// The apiserver's handlers hold the store until it stops, so many
+    /// holders after the drivers are awaited is never the stage named.
+    #[test]
+    fn the_drivers_stage_is_never_charged() {
+        for drivers in [1, 2, 57] {
+            for apiserver in [1, 2] {
+                for quiesced in [1, 2] {
+                    for flushed in [1, 2] {
+                        assert_ne!(
+                            counts(drivers, apiserver, quiesced, flushed).blame(),
+                            ShutdownStage::DriversAwaited
+                        );
+                    }
+                }
+            }
+        }
+        assert!(!ShutdownStage::DriversAwaited.owes_sole_ownership());
+    }
+
+    /// The error says after which stage the store was still shared, in
+    /// words.
+    #[test]
+    fn store_still_shared_names_the_stage_in_its_message() {
+        let err = RuntimeError::StoreStillShared {
+            strong_count: 2,
+            after: ShutdownStage::ApiserverStopped,
+        };
+        assert_eq!(
+            err.to_string(),
+            "could not acquire sole store ownership for terminate (2 strong refs remain after \
+             the apiserver stopped)"
+        );
+        assert_eq!(
+            ShutdownStage::DriversAwaited.to_string(),
+            "the drivers were awaited"
+        );
+        assert_eq!(
+            ShutdownStage::StoreQuiesced.to_string(),
+            "the store was quiesced"
+        );
+        assert_eq!(
+            ShutdownStage::StoreFlushed.to_string(),
+            "the store was flushed"
+        );
     }
 }

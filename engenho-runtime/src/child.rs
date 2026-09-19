@@ -35,6 +35,11 @@
 //!   [`Children`] set. [`Children::next_dead`] is how `main` learns that one
 //!   ended; it is marked [`ChildState::Dead`] and logged at ERROR. There is
 //!   no respawn.
+//! * A child built before the sibling it watches: the walk hands each
+//!   child's builder the children spawned so far, and the one child that
+//!   watches another (the node lease, which watches the kubelet) is walked
+//!   after every driver. That the kubelet comes first is a test over
+//!   [`Child::all`], not a type.
 //!
 //! ## What a panic does (T2.7)
 //!
@@ -42,8 +47,28 @@
 //! driver: a Stateless driver contains a panicking tick, counts it and is
 //! re-ticked by the next event or the fallback, so its task never ends; a
 //! Stateful driver's panic ends its task, and the set above marks it Dead —
-//! for the kubelet, Dead is the park. A listener whose serve ends rebinds on
-//! a growing backoff. See [`engenho_controllers::contain`].
+//! for the kubelet, Dead is the park. A listener whose serve ends, or
+//! panics, rebinds on a growing backoff: an attempt holds nothing across
+//! attempts. See [`engenho_controllers::contain`].
+//!
+//! ## What every fault does (W6)
+//!
+//! [`Child::supervision`] declares, for every child and every [`Fault`] — a
+//! panic, a hang past the stuck window, an error return, a bind failure —
+//! what the supervisor does about it: a [`Supervision`]. It is derived from
+//! the rows above (a tick loop's [`TickState`], a listener's row), never
+//! written a second time. The fault-injection matrix (`fault_matrix`, a
+//! test) strikes every child in [`Child::all`] with every fault and holds
+//! the runtime to that declaration. A new child shape or fault with no row
+//! is E0004 in the declaration and in the matrix's injector; a new driver
+//! or listener joins the matrix through [`Child::all`] with no new line.
+//!
+//! A tick loop's [`TickState`] reaches its driver through
+//! [`TickLoop::tick_state`]: the runtime's one driving function takes the
+//! tick loop, not a tick state, so no call to it can drive a loop by a row
+//! other than its own. (A `WatchDriver` built by hand, outside that
+//! function, bypasses the catalog altogether — the same gap as a task
+//! spawned outside it, below.)
 //!
 //! Still only caught: a task spawned OUTSIDE this catalog (T0.4's
 //! `disallowed-methods` on every spawn path, once clippy blocks).
@@ -57,11 +82,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use engenho_config::{ControllerEnable, EngenhoConfig};
+use engenho_config::ControllerEnable;
 pub use engenho_controllers::TickState;
 use engenho_controllers::{ControllerType, Heartbeat, KindFilter, PanicMessage, Reads};
-use tokio::task::{Id, JoinSet};
+use tokio::task::{AbortHandle, Id, JoinSet};
 use tracing::error;
+
+use crate::boot_config::BootConfig;
+use crate::health::{Row, Tally};
 
 engenho_controllers::closed_enum! {
     /// Every controller loop the runtime runs, each behind a
@@ -111,12 +139,10 @@ pub enum Child {
     Driver(Driver),
     /// A network listener.
     Listener(Listener),
-    /// The node-lease renewal task.
-    ///
-    /// ★ A PLACEHOLDER. It is declared so every exhaustive match over the
-    /// catalog already carries its row; T1.3c gives it a body (renew the
-    /// Lease only while the kubelet's heartbeat is young). Until then
-    /// [`Child::enabled`] is `false` for it and nothing spawns it.
+    /// The node-lease renewal task (T1.3c): renews this node's Lease every
+    /// renew interval while, and only while, the kubelet's liveness row is
+    /// alive, so a kubelet that wedges or dies stops heartbeating and the
+    /// node reads `NotReady`. Its body is the runtime's `node_lease` module.
     NodeLease,
 }
 
@@ -187,26 +213,44 @@ impl Driver {
 
     /// Whether `controllers.enable` turns this driver on. The drivers with
     /// no switch always run.
+    ///
+    /// The one reader of `controllers.enable`, destructured with no `..`
+    /// (I21): a new switch is E0027 here until a driver answers to it.
     #[must_use]
     pub const fn enabled(self, enable: &ControllerEnable) -> bool {
+        let ControllerEnable {
+            replicaset,
+            deployment,
+            statefulset,
+            daemonset,
+            job,
+            cronjob,
+            endpoints,
+            service_routing,
+            gc,
+            crd,
+            namespace,
+            pv_binder,
+            pdb,
+        } = enable;
         match self {
-            Self::Deployment => enable.deployment,
-            Self::ReplicaSet => enable.replicaset,
-            Self::StatefulSet => enable.statefulset,
-            Self::DaemonSet => enable.daemonset,
-            Self::Job => enable.job,
-            Self::CronJob => enable.cronjob,
-            Self::PodDisruptionBudget => enable.pdb,
-            Self::Endpoints => enable.endpoints,
-            Self::ServiceRouting => enable.service_routing,
-            Self::Gc => enable.gc,
-            Self::Namespace => enable.namespace,
+            Self::Deployment => *deployment,
+            Self::ReplicaSet => *replicaset,
+            Self::StatefulSet => *statefulset,
+            Self::DaemonSet => *daemonset,
+            Self::Job => *job,
+            Self::CronJob => *cronjob,
+            Self::PodDisruptionBudget => *pdb,
+            Self::Endpoints => *endpoints,
+            Self::ServiceRouting => *service_routing,
+            Self::Gc => *gc,
+            Self::Namespace => *namespace,
             // The snapshot controller snapshots the directories the binder
             // provisions; enabling one without the other yields a controller
             // that can only ever decline. pvc-protection guards the claims the
             // binder binds, so it runs whenever the binder does.
-            Self::PvBinder | Self::VolumeSnapshot | Self::PvcProtection => enable.pv_binder,
-            Self::Crd => enable.crd,
+            Self::PvBinder | Self::VolumeSnapshot | Self::PvcProtection => *pv_binder,
+            Self::Crd => *crd,
             Self::Scheduler
             | Self::ServedCapability
             | Self::NetworkPolicy
@@ -227,20 +271,44 @@ impl Listener {
         }
     }
 
+    /// What the supervisor does when `fault` strikes this listener.
+    ///
+    /// Every listener runs one bind-and-serve attempt at a time and builds
+    /// each attempt afresh from what it was spawned with; what it serves
+    /// (the kubelet, the store) it reaches only from request tasks, which
+    /// its server spawns. So an attempt that fails, returns or panics
+    /// leaves nothing torn behind, and the listener binds again.
+    #[must_use]
+    pub const fn supervision(self, fault: Fault) -> Supervision {
+        match self {
+            Self::KubeletHttp | Self::EtcdFacade => match fault {
+                Fault::Panic | Fault::Error | Fault::BindFailure => Supervision::Rebinds,
+                Fault::Hang => Supervision::Unobserved,
+            },
+        }
+    }
+
     /// Whether the config binds this listener. An empty `etcd_listen_addr`
     /// disables the façade.
     #[must_use]
-    pub fn enabled(self, config: &EngenhoConfig) -> bool {
+    pub(crate) fn enabled(self, boot: &BootConfig) -> bool {
         match self {
             Self::KubeletHttp => true,
-            Self::EtcdFacade => !config.runtime.etcd_listen_addr.is_empty(),
+            Self::EtcdFacade => !boot.etcd_listen_addr.is_empty(),
         }
     }
 }
 
 impl Child {
+    /// The node lease's [`TickState`], its row in the catalog: it renews from
+    /// the kubelet's heartbeat and holds nothing across ticks, so a check
+    /// that panics is contained and re-ticked. The runtime drives the lease
+    /// with this value; [`Child::tick_state`] reports it.
+    pub const NODE_LEASE_TICK_STATE: TickState = TickState::Stateless;
+
     /// Every child, each exactly once: the drivers, then the listeners, then
-    /// the node-lease task.
+    /// the node-lease task. The lease comes last because it watches the
+    /// kubelet's row, so the kubelet is spawned before it is built.
     pub fn all() -> impl Iterator<Item = Self> {
         // The walk below names each top-level shape once. This match is the
         // reminder beside it: a new shape is E0004 here, one screen from the
@@ -273,23 +341,46 @@ impl Child {
     /// than ticks.
     #[must_use]
     pub const fn tick_state(self) -> Option<TickState> {
+        match self.tick_loop() {
+            Some(tick_loop) => Some(tick_loop.tick_state()),
+            None => None,
+        }
+    }
+
+    /// The child as a tick loop; `None` for a listener.
+    #[must_use]
+    pub(crate) const fn tick_loop(self) -> Option<TickLoop> {
         match self {
-            Self::Driver(d) => Some(d.tick_state()),
+            Self::Driver(d) => Some(TickLoop::Driver(d)),
+            Self::NodeLease => Some(TickLoop::NodeLease),
             Self::Listener(_) => None,
-            // It renews from the store and the kubelet's heartbeat; it holds
-            // nothing across ticks.
-            Self::NodeLease => Some(TickState::Stateless),
+        }
+    }
+
+    /// What the supervisor does when `fault` strikes this child (W6).
+    ///
+    /// Derived from the child's own rows — a tick loop's [`TickState`], a
+    /// listener's [`Listener::supervision`] — so it cannot disagree with
+    /// what the runtime drives the child by. The fault-injection matrix
+    /// holds the runtime to it.
+    #[must_use]
+    pub const fn supervision(self, fault: Fault) -> Supervision {
+        match self {
+            Self::Driver(d) => TickLoop::Driver(d).supervision(fault),
+            Self::NodeLease => TickLoop::NodeLease.supervision(fault),
+            Self::Listener(l) => l.supervision(fault),
         }
     }
 
     /// Whether this config spawns the child.
     #[must_use]
-    pub fn enabled(self, config: &EngenhoConfig) -> bool {
+    pub(crate) fn enabled(self, boot: &BootConfig) -> bool {
         match self {
-            Self::Driver(d) => d.enabled(&config.controllers.enable),
-            Self::Listener(l) => l.enabled(config),
-            // A placeholder until T1.3c: see the variant.
-            Self::NodeLease => false,
+            Self::Driver(d) => d.enabled(&boot.enable),
+            Self::Listener(l) => l.enabled(boot),
+            // The lease proves the kubelet alive: with no kubelet there is
+            // nothing for it to renew by.
+            Self::NodeLease => Driver::Kubelet.enabled(&boot.enable),
         }
     }
 }
@@ -300,8 +391,117 @@ impl fmt::Display for Child {
     }
 }
 
-/// Which controller a driver runs, what it reads, and which events wake the
-/// driver, as the runtime wired it (T1.7, T5.11).
+/// A child whose body is a tick loop behind a `WatchDriver`: a driver, or
+/// the node lease. Every child but a listener.
+///
+/// The runtime's one driving function takes this, not a [`TickState`]: the
+/// tick state a loop is driven by is read off its catalog row here, so it
+/// cannot be handed a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickLoop {
+    /// A controller loop.
+    Driver(Driver),
+    /// The node-lease renewal loop.
+    NodeLease,
+}
+
+impl TickLoop {
+    /// The catalog child this loop is.
+    #[must_use]
+    pub(crate) const fn child(self) -> Child {
+        match self {
+            Self::Driver(d) => Child::Driver(d),
+            Self::NodeLease => Child::NodeLease,
+        }
+    }
+
+    /// The loop's catalog row: what a panic in its tick does.
+    #[must_use]
+    pub(crate) const fn tick_state(self) -> TickState {
+        match self {
+            Self::Driver(d) => d.tick_state(),
+            Self::NodeLease => Child::NODE_LEASE_TICK_STATE,
+        }
+    }
+
+    /// What the supervisor does when `fault` strikes this loop.
+    const fn supervision(self, fault: Fault) -> Supervision {
+        match fault {
+            Fault::Panic => match self.tick_state() {
+                TickState::Stateless => Supervision::Contained,
+                TickState::Stateful => Supervision::Dead,
+            },
+            // The tick is never cancelled (`WatchDriverConfig::stuck_tick_after`):
+            // cancelling mid-tick strands whatever the tick already did.
+            Fault::Hang => Supervision::Stalled,
+            Fault::Error => Supervision::Retried,
+            Fault::BindFailure => Supervision::Inapplicable,
+        }
+    }
+}
+
+engenho_controllers::closed_enum! {
+    /// A fault the supervisor must answer for, in any child (W6).
+    ///
+    /// The fault-injection matrix strikes every child in [`Child::all`] with
+    /// every one of these; [`Child::supervision`] says what must happen.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Fault {
+        /// The child's unit of work panics: a tick loop's tick, a
+        /// listener's bind-and-serve attempt.
+        Panic,
+        /// The unit of work never ends: a tick in flight past the stuck-tick
+        /// window, a serve attempt that never returns.
+        Hang,
+        /// The unit of work fails and returns: a tick's Transient `Err`, a
+        /// listener's server returning.
+        Error,
+        /// The child cannot bind its port.
+        BindFailure,
+    }
+}
+
+engenho_controllers::closed_enum! {
+    /// What the supervisor does when a [`Fault`] strikes a child, as the
+    /// catalog declares it ([`Child::supervision`]). Each variant says what is
+    /// observable afterwards, because that is what the matrix checks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Supervision {
+        /// Contained: each panic is counted in the child's heartbeat, the child
+        /// keeps running, and the next event or fallback ticks it again.
+        /// Liveness reads it alive. A Stateless tick loop's panic.
+        Contained,
+        /// The child's task ends: [`Children::next_dead`] reports it panicked,
+        /// it is marked Dead after one tick, and liveness reads it Dead. It is
+        /// never re-ticked or respawned. A Stateful tick loop's panic: a tick
+        /// over the state the panic tore would act on something no longer true.
+        Dead,
+        /// The failure is classified in the child's heartbeat, the child keeps
+        /// running, and it ticks again (a Transient failure on the retry curve,
+        /// or sooner on the fallback). Liveness reads it alive: a failing
+        /// controller is still ticking, and its failures are counted in its
+        /// reconcile metrics, not in its liveness.
+        Retried,
+        /// The tick is never cancelled and no second tick starts beside it: the
+        /// child keeps running with one tick in flight, and liveness reads it
+        /// stalled since the tick began once the stuck window has passed.
+        Stalled,
+        /// The listener stops serving and says so — its heartbeat is not in
+        /// flight and liveness reads it stalled — and it binds again on the
+        /// rebind curve. Its task keeps running. A panic is counted too.
+        Rebinds,
+        /// The supervisor cannot see this fault. A listener's serve in flight is
+        /// read as serving, so a serve that never returns reads alive whether or
+        /// not it accepts anything. A named blind spot, not a verdict of health:
+        /// seeing it needs a probe of the port itself.
+        Unobserved,
+        /// The fault cannot strike this child: a tick loop binds no port.
+        Inapplicable,
+    }
+}
+
+/// Which controller a tick loop (a driver, or the node lease) runs, what it
+/// reads, and which events wake it, as the runtime wired it (T1.7, T5.11).
 ///
 /// The runtime builds `wakes` from `reads` and from nothing else; both are
 /// recorded so the claim "a driver wakes on every kind its controller reads"
@@ -349,16 +549,17 @@ impl Wiring {
 }
 
 /// A child's body, ready to spawn: the future, the heartbeat it writes and,
-/// for a driver, its [`Wiring`].
+/// for a driver, its [`Wiring`] and the [`Tally`] its ticks are counted in.
 pub(crate) struct ChildTask {
     beat: Arc<Heartbeat>,
     wiring: Option<Wiring>,
+    tally: Option<Arc<Tally>>,
     run: Pin<Box<dyn Future<Output = Infallible> + Send + 'static>>,
 }
 
 impl ChildTask {
     /// A body that never returns, recording into `beat`. For a child that
-    /// is not woken by store events (a listener).
+    /// does not run a controller (a listener).
     pub(crate) fn new(
         beat: Arc<Heartbeat>,
         run: impl Future<Output = Infallible> + Send + 'static,
@@ -366,19 +567,24 @@ impl ChildTask {
         Self {
             beat,
             wiring: None,
+            tally: None,
             run: Box::pin(run),
         }
     }
 
-    /// A driver's body: as [`Self::new`], plus what wakes it and why.
+    /// A tick loop's body (a driver, or the node lease): as [`Self::new`],
+    /// plus what wakes it and why, and the tally its controller's ticks are
+    /// counted in.
     pub(crate) fn driver(
         beat: Arc<Heartbeat>,
         wiring: Wiring,
+        tally: Arc<Tally>,
         run: impl Future<Output = Infallible> + Send + 'static,
     ) -> Self {
         Self {
             beat,
             wiring: Some(wiring),
+            tally: Some(tally),
             run: Box::pin(run),
         }
     }
@@ -432,6 +638,10 @@ pub struct DeadChild {
 pub struct ChildHandle {
     beat: Arc<Heartbeat>,
     wiring: Option<Wiring>,
+    /// The task's handle: whether it has ended is read off it directly, so
+    /// liveness sees a dead task before [`Children::next_dead`] is polled.
+    task: AbortHandle,
+    tally: Option<Arc<Tally>>,
     state: ChildState,
 }
 
@@ -443,7 +653,7 @@ impl ChildHandle {
     }
 
     /// What the child's controller reads and what wakes it; `None` for a
-    /// child no store event wakes (a listener).
+    /// child that runs no controller (a listener).
     #[must_use]
     pub fn wiring(&self) -> Option<&Wiring> {
         self.wiring.as_ref()
@@ -453,6 +663,16 @@ impl ChildHandle {
     #[must_use]
     pub const fn state(&self) -> ChildState {
         self.state
+    }
+
+    /// This entry as health reads it: clones of its handles.
+    fn row(&self, child: Child) -> Row {
+        Row::new(
+            child,
+            self.beat.clone(),
+            self.task.clone(),
+            self.tally.clone(),
+        )
     }
 }
 
@@ -469,16 +689,19 @@ pub struct Children {
 }
 
 impl Children {
-    /// Walk the catalog once, spawning every child `config` enables with the
-    /// body `build` returns for it. `build` returning `None` leaves a child
-    /// unspawned (the node-lease placeholder).
+    /// Walk the catalog once, spawning every child `boot` enables with the
+    /// body `build` returns for it.
+    ///
+    /// `build` is handed the children spawned so far, so a child can watch
+    /// a sibling walked before it: the node lease reads the kubelet's
+    /// [`Row`]. `build` returning `None` leaves a child unspawned.
     pub(crate) fn spawn_catalog(
-        config: &EngenhoConfig,
-        mut build: impl FnMut(Child) -> Option<ChildTask>,
+        boot: &BootConfig,
+        mut build: impl FnMut(Child, &Self) -> Option<ChildTask>,
     ) -> Self {
         let mut children = Self::default();
-        for child in Child::all().filter(|c| c.enabled(config)) {
-            if let Some(task) = build(child) {
+        for child in Child::all().filter(|c| c.enabled(boot)) {
+            if let Some(task) = build(child, &children) {
                 children.spawn(child, task);
             }
         }
@@ -495,9 +718,24 @@ impl Children {
             ChildHandle {
                 beat: task.beat,
                 wiring: task.wiring,
+                task: abort,
+                tally: task.tally,
                 state: ChildState::Running,
             },
         );
+    }
+
+    /// Every spawned child as health reads it, in catalog order: what it
+    /// beats into, its task's handle and, for a driver, its tally. Clones
+    /// of handles, so health reads them without borrowing the set.
+    pub(crate) fn rows(&self) -> Vec<Row> {
+        self.iter().map(|(child, entry)| entry.row(child)).collect()
+    }
+
+    /// `child`'s row, as [`Self::rows`] builds it; `None` if it was never
+    /// spawned.
+    pub(crate) fn row(&self, child: Child) -> Option<Row> {
+        self.get(child).map(|entry| entry.row(child))
     }
 
     /// Wait for the next child whose task ends, mark it
@@ -633,6 +871,54 @@ mod tests {
         assert!(distinct.contains(&Child::NodeLease));
     }
 
+    /// The node lease is built from the kubelet's row, which exists only
+    /// once the kubelet is spawned: the walk must reach the kubelet first.
+    #[test]
+    fn the_node_lease_is_walked_after_the_kubelet_it_watches() {
+        let walked: Vec<Child> = Child::all().collect();
+        let at = |c: Child| walked.iter().position(|w| *w == c);
+        let (kubelet, lease) = (at(Child::Driver(Driver::Kubelet)), at(Child::NodeLease));
+        assert!(
+            matches!((kubelet, lease), (Some(k), Some(l)) if k < l),
+            "kubelet at {kubelet:?}, node lease at {lease:?}: {walked:?}"
+        );
+    }
+
+    /// A child is built with the children spawned before it, so it can read
+    /// a sibling's row.
+    #[tokio::test]
+    async fn a_child_is_built_seeing_the_children_spawned_before_it() {
+        let mut seen = None;
+        let children =
+            Children::spawn_catalog(&BootConfig::prescribed(), |child, before| match child {
+                Child::Driver(Driver::Kubelet) => Some(body(std::future::pending()).1),
+                Child::NodeLease => {
+                    seen = Some(before.row(Child::Driver(Driver::Kubelet)).is_some());
+                    Some(body(std::future::pending()).1)
+                }
+                Child::Driver(_) | Child::Listener(_) => None,
+            });
+        assert_eq!(
+            seen,
+            Some(true),
+            "the lease was built without the kubelet's row"
+        );
+        assert_eq!(
+            children.iter().map(|(c, _)| c).collect::<Vec<_>>(),
+            [Child::Driver(Driver::Kubelet), Child::NodeLease]
+        );
+    }
+
+    #[test]
+    fn the_node_lease_is_enabled_wherever_the_kubelet_runs() {
+        let boot = BootConfig::prescribed();
+        assert!(Child::Driver(Driver::Kubelet).enabled(&boot));
+        assert!(
+            Child::NodeLease.enabled(&boot),
+            "a node whose kubelet runs renews its lease"
+        );
+    }
+
     #[test]
     fn every_child_has_a_distinct_name() {
         let names: BTreeSet<&str> = Child::all().map(Child::name).collect();
@@ -658,17 +944,24 @@ mod tests {
 
     /// Every per-child fact is an exhaustive match, so a new variant without
     /// its row is E0004 — but only while no arm is a wildcard. This keeps it
-    /// that way for this module's non-test code.
+    /// that way for this module's non-test code, and for the fault-injection
+    /// matrix, whose injector is the same kind of row (W6).
     #[test]
     fn the_child_catalog_has_no_wildcard_arm() {
-        let src = include_str!("child.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap_or(src);
-        let offenders: Vec<(usize, &str)> = code
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim_start().starts_with("//"))
-            .filter(|(_, line)| line.contains("_ =>") || line.contains("| _"))
-            .map(|(i, line)| (i + 1, line))
+        let files = [
+            ("child.rs", include_str!("child.rs")),
+            ("fault_matrix.rs", include_str!("fault_matrix.rs")),
+        ];
+        let offenders: Vec<(&str, usize, &str)> = files
+            .iter()
+            .flat_map(|(file, src)| {
+                let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+                code.lines()
+                    .enumerate()
+                    .filter(|(_, line)| !line.trim_start().starts_with("//"))
+                    .filter(|(_, line)| line.contains("_ =>") || line.contains("| _"))
+                    .map(|(i, line)| (*file, i + 1, line))
+            })
             .collect();
         assert!(
             offenders.is_empty(),

@@ -179,7 +179,9 @@ fn pump(stream: impl Read + Send + 'static, tx: mpsc::Sender<String>) -> thread:
 /// Boot a daemon, deliver `signal`, and assert the stop was CLEAN: exit
 /// status 0, the stop cause named in the log, and the clean-stop line —
 /// which is printed only after `Runtime::shutdown` returned `Ok`, i.e. every
-/// child was stopped, the apiserver drained and the store terminated.
+/// child was stopped, the apiserver drained, the store flushed and then
+/// terminated. What the flush leaves on disk is pinned by
+/// `engenho-runtime/tests/clean_stop_restart.rs`.
 fn assert_stops_cleanly_on(signal: Signal, cause: &str) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut daemon = Daemon::spawn(tmp.path());

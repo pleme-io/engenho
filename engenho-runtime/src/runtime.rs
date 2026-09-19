@@ -8,11 +8,10 @@ use engenho_apiserver::{
     ApiServer, ChainAuthenticator, ClientMaterial, RbacAuthorizer, RouterHandlerSink, RouterState,
     SanEntry, ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
     handlers_from_catalog_with_admission, issue_admin_client_material, issue_server_material,
-    load_or_generate_ca,
+    load_or_generate_ca, metrics::log_would_reject,
 };
 use engenho_config::{
-    ConfigError, EngenhoConfig, KubeconfigVisibility, KubeletBackendKind as CfgBackendKind,
-    ResolvedDatapath,
+    EngenhoConfig, KubeconfigVisibility, KubeletBackendKind as CfgBackendKind, ResolvedDatapath,
 };
 use engenho_controllers::{
     Controller, ControllerError, ControllerType, CrdController, CronJobController,
@@ -31,25 +30,30 @@ use engenho_kubelet::config_bridge::KubeletBackendKind;
 use engenho_kubelet::{
     ContainerRuntime, Kubelet, LogOptions, make_container_runtime_with_apiserver,
 };
-use engenho_scheduler::{Scheduler, make_scheduling_strategy};
+use engenho_scheduler::{ConfiguredScheduler, Scheduler};
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
     default_config,
 };
+use engenho_substrate::WouldRejectLedger;
 use engenho_types::generated_v1_34::core_v1::Namespace;
 use engenho_types::generated_v1_34::rbac_v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
 };
 use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
 use engenho_types::kind::GroupVersionKind;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, Wiring};
-use crate::error::RuntimeError;
+use crate::boot_config::{ApiserverTls, BootConfig};
+use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, TickLoop, Wiring};
+use crate::error::{RuntimeError, ShutdownStage, StrongCounts};
+use crate::health::{Health, Row, Tallied, Tally, Windows};
+use crate::node_lease::NodeLease;
 use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
 use crate::rebind::serve_rebinding;
+use crate::runtime_health::RuntimeHealthSource;
 
 /// The assembled single-node runtime. Owns the store spine, the
 /// apiserver, every child task (drivers + listeners, one owned set), and the
@@ -61,9 +65,20 @@ pub struct Runtime {
     children: Children,
     /// Every panic in the process, counted by the hook `start` installs.
     panics: PanicCounter,
-    /// Kept alive for the runtime's lifetime so the kubelet's backend
-    /// outlives every driver tick; tests pass their own clone to
-    /// [`Runtime::start_with_backend`] and inspect it.
+    /// What `/livez`, `/healthz`, `/readyz` and the runtime's `/metrics`
+    /// families are derived from (T2.8): the children's heartbeats and task
+    /// handles, the drain state, the store. See [`Runtime::health`].
+    health: Arc<Health>,
+    /// The daemon's one rollout-gate ledger (T0.11): what every gate in
+    /// `Rollout::Shadow` allowed that `Enforce` would have refused. The
+    /// apiserver's `/metrics` renders THIS ledger as
+    /// `engenho_would_reject_total{gate,reason}`, so a gate that counts
+    /// anywhere else is a gate no scrape shows. See [`Runtime::would_reject`].
+    would_reject: Arc<WouldRejectLedger>,
+    /// The backend the runtime was started with. Nothing reads it: the
+    /// kubelet holds its own clone, and that clone is what keeps the backend
+    /// alive for its ticks. A test passes its own clone to
+    /// [`Runtime::start_with_backend`] and inspects that.
     #[allow(dead_code)]
     backend: Arc<dyn ContainerRuntime>,
 }
@@ -75,14 +90,19 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// See [`RuntimeError`] — config invalid, store start / leadership
-    /// failure, apiserver bind failure, or an unparseable listen addr.
+    /// See [`RuntimeError`] — a config field this runtime does not run
+    /// ([`RuntimeError::Unhonoured`]), config invalid, store start /
+    /// leadership failure, apiserver bind failure, or an unparseable listen
+    /// addr.
     pub async fn start(config: EngenhoConfig) -> Result<Self, RuntimeError> {
+        // Every field read once, before anything is probed or written: a
+        // field this runtime cannot honour is refused here (I21).
+        let boot = BootConfig::read(&config)?;
         // Fail LOUDLY here if the configured runtime cannot be reached, rather
         // than discovering it one warn-per-tick at a time forever.
-        preflight_backend(&config)?;
-        let backend = build_backend(&config)?;
-        Self::start_inner(config, backend).await
+        preflight_backend(&boot)?;
+        let backend = build_backend(&boot)?;
+        Self::start_inner(config, boot, backend).await
     }
 
     /// Boot with an explicit pre-built [`ContainerRuntime`] (e.g.
@@ -97,11 +117,13 @@ impl Runtime {
         config: EngenhoConfig,
         backend: Arc<dyn ContainerRuntime>,
     ) -> Result<Self, RuntimeError> {
-        Self::start_inner(config, backend).await
+        let boot = BootConfig::read(&config)?;
+        Self::start_inner(config, boot, backend).await
     }
 
     async fn start_inner(
         config: EngenhoConfig,
+        boot: BootConfig,
         backend: Arc<dyn ContainerRuntime>,
     ) -> Result<Self, RuntimeError> {
         // 0. Count every panic in the process from here on (T2.7): the hook
@@ -109,28 +131,61 @@ impl Runtime {
         //    however many runtimes start.
         let panics = PanicCounter::install();
 
+        // 0b. The daemon's ONE would-reject ledger (T0.11). Built before
+        //     anything that can own a gate — the store's image tripwire
+        //     (T3.4) runs inside step 2 — so every gate-owning component is
+        //     handed this Arc and none builds its own: a second ledger is a
+        //     set of gates `/metrics` never shows. Today only the apiserver
+        //     takes it (step 5); the store's tripwire and the scheduler's
+        //     filters do not judge through a `Gate` yet.
+        let would_reject = Arc::new(WouldRejectLedger::new(log_would_reject));
+
         // 1. Validate the whole config (every section + cross-section).
+        //    Every field was already read into `boot`; what it read and does
+        //    not run is said once, here.
         config.validate()?;
+        for not_run in &boot.not_run {
+            info!(field = not_run.field(), why = %not_run, "config read, not run");
+        }
 
         // 2. Bring up the store spine. Durable = restart-safe
         //    start_or_resume; ephemeral = in-memory start +
         //    initialize_singleton (test path).
-        let store = boot_store(&config).await?;
+        let store = boot_store(&boot).await?;
 
         // 3. Wait for raft leadership — MUST precede any propose.
-        let timeout_s = config.runtime.leadership_timeout_seconds;
+        let timeout_s = boot.leadership_timeout_seconds;
         if !store
             .wait_for_leadership(Duration::from_secs(u64::from(timeout_s)))
             .await
         {
             return Err(RuntimeError::LeadershipTimeout { seconds: timeout_s });
         }
-        info!(node = %config.runtime.node_name, "store reached leadership");
+        info!(node = %boot.node_name, "store reached leadership");
+
+        // 3a. The scheduler, from every `scheduler.*` field (T5.8):
+        //     `Scheduler::from_config` is that section's one reader. It scopes
+        //     placement by `scheduler.namespace` and names the fallback its
+        //     loop runs on, `scheduler.tick_interval_seconds`, which the
+        //     windows below carry. An unimplemented strategy or a zero tick is
+        //     a typed error, never a round-robin or controllers-tick fallback
+        //     (validate() refuses both in step 1; this guard holds for any
+        //     caller that skips it).
+        let scheduler = Scheduler::from_config(store.clone(), &boot.scheduler)?;
+
+        // 3b. What health and the runtime's metrics are read from (T2.8).
+        //     Built before the apiserver binds, so the router holds it from
+        //     its first request; it reports no children (every health check
+        //     fails) until step 6 hands it the spawned set. The windows are
+        //     built ONCE and given to the drivers as well, so a tick the
+        //     driver logs BLOCKED is the tick liveness reports stalled.
+        let windows = boot.windows(scheduler.fallback_interval());
+        let health = Arc::new(Health::new(&store, windows, panics));
 
         // 4. Register THIS node so the scheduler has a target: create its
         //    Node if absent, else merge only the host-owned fields — a
         //    restart never undoes a cordon, a taint or an operator's label.
-        let node_name = &config.runtime.node_name;
+        let node_name = &boot.node_name;
         register_node(&store, node_name, &HostOwned::measured(node_name)).await?;
 
         // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +
@@ -148,7 +203,7 @@ impl Runtime {
         //    namespaces (it lives in one) and precede the apiserver bind, so
         //    the ClusterIP allocator sees .1 as held before any user Service
         //    can be created.
-        seed_kubernetes_service(&store, &config).await?;
+        seed_kubernetes_service(&store, &boot).await?;
         seed_bootstrap_rbac(&store).await?;
         //    Then the default StorageClass. It must precede the apiserver bind
         //    for the same reason the others do: a PVC created in the first
@@ -161,12 +216,10 @@ impl Runtime {
 
         // 5. Bind the apiserver, backed by the same store.
         let listen_addr: SocketAddr =
-            config
-                .runtime
-                .listen_addr
+            boot.listen_addr
                 .parse()
                 .map_err(|source| RuntimeError::ListenAddr {
-                    addr: config.runtime.listen_addr.clone(),
+                    addr: boot.listen_addr.clone(),
                     source,
                 })?;
 
@@ -183,9 +236,9 @@ impl Runtime {
         //     for the admin-cert kubeconfig.
         let mut ca_cert_pem: Option<String> = None;
         let mut admin_material: Option<ClientMaterial> = None;
-        let tls: Option<TlsMaterial> = if config.runtime.tls.enabled {
-            let ca = load_or_generate_ca(&config.runtime.data_dir)
-                .map_err(|e| RuntimeError::Server(e.into()))?;
+        let tls: Option<TlsMaterial> = if let ApiserverTls::SelfIssued { extra_sans } = &boot.tls {
+            let ca =
+                load_or_generate_ca(&boot.data_dir).map_err(|e| RuntimeError::Server(e.into()))?;
             // ── ★ A PUBLIC CA MAY NOT SERVE A REACHABLE ADDRESS ──────────
             // See `RuntimeError::PublicCaOnReachableAddress`. The danger is not
             // the CA by itself and not the address by itself; it is the pair,
@@ -193,8 +246,8 @@ impl Runtime {
             // loopback and cannot be exposed by accident.
             if ca.is_publicly_derivable() && !is_loopback_only(listen_addr) {
                 return Err(RuntimeError::PublicCaOnReachableAddress {
-                    listen_addr: config.runtime.listen_addr.clone(),
-                    pki_dir: config.runtime.data_dir.join("pki").display().to_string(),
+                    listen_addr: boot.listen_addr.clone(),
+                    pki_dir: boot.data_dir.join("pki").display().to_string(),
                 });
             }
             ca_cert_pem = Some(ca.cert_pem().to_string());
@@ -204,11 +257,11 @@ impl Runtime {
             // rather than a certificate that serves happily and verifies for
             // nobody. See `RuntimeError::ExtraSan` for why this is checked here
             // and not lazily at handshake time.
-            let extra_sans = server_sans(&config)?;
+            let extra_sans = server_sans(extra_sans, &boot.advertise_address)?;
             let material = issue_server_material(
                 &ca,
                 &ServerSanInputs {
-                    node_name: &config.runtime.node_name,
+                    node_name: &boot.node_name,
                     listen_ip,
                     extra_sans: &extra_sans,
                 },
@@ -223,7 +276,7 @@ impl Runtime {
             // kubeconfig + `kubectl auth whoami → engenho-admin`).
             let admin =
                 issue_admin_client_material(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
-            persist_admin_material(&config.runtime.data_dir, &admin)?;
+            persist_admin_material(&boot.data_dir, &admin)?;
             admin_material = Some(admin);
             Some(material)
         } else {
@@ -239,8 +292,7 @@ impl Runtime {
         // plaintext-mode operator/test gets an admin (system:masters) identity
         // to write through the authorizer. (Pre-Brick-B the plaintext floor had
         // no admin token because authorize-ALL made one unnecessary.)
-        let admin_token: Option<String> =
-            Some(load_or_generate_admin_token(&config.runtime.data_dir)?);
+        let admin_token: Option<String> = Some(load_or_generate_admin_token(&boot.data_dir)?);
         if admin_token.is_some() {
             info!("bootstrap admin bearer token available at data_dir/pki/admin.token");
         }
@@ -257,7 +309,7 @@ impl Runtime {
         // FailClosed so a misconfigured CIDR / exhausted pool denies the
         // create rather than admitting a half-built Service.
         let cluster_ip_hook: Arc<dyn AdmissionWebhook> = Arc::new(ClusterIpDefaultingWebhook::new(
-            config.networking.service_cidr.clone(),
+            boot.service_cidr.clone(),
             Arc::new(StoreServiceIpSource::new(store.clone())),
         ));
         let admission = Arc::new(AdmissionChain::new(
@@ -277,7 +329,7 @@ impl Runtime {
         // A capability that is only reachable through the call site nobody
         // audits is indistinguishable from an absent one.
         let authenticator: Arc<ChainAuthenticator> =
-            Arc::new(build_authenticator(&config.runtime.data_dir, admin_token));
+            Arc::new(build_authenticator(&boot.data_dir, admin_token));
 
         // Build the RouterState HERE (not inside ApiServer::start) so the
         // SAME table is shared with the CrdController's DynamicHandlerSink.
@@ -291,18 +343,28 @@ impl Runtime {
         let authorizer: Arc<dyn engenho_apiserver::Authorizer> =
             Arc::new(RbacAuthorizer::new(StoreRbacEnv::new(store.clone())));
 
+        // The daemon's would-reject ledger goes in with the rest, before the
+        // clones below (the CRD sink's, the log handler's, the server's): a
+        // RouterState clone copies the ledger `Arc` it holds at that moment,
+        // so a clone taken before this would keep the router's private one.
         let router_state = RouterState::new(handlers_from_catalog_with_admission(
             store.clone(),
             admission.clone(),
         ))
         .with_authenticator(authenticator)
-        .with_authorizer(authorizer);
+        .with_authorizer(authorizer)
+        .with_would_reject_ledger(Arc::clone(&would_reject))
+        // Health and the runtime's metric families, derived from observation
+        // (T2.8). Installed here with the ledger, before any clone, for the
+        // same reason.
+        .with_liveness_source(health.clone())
+        .with_metrics_source(health.clone());
         // The minting half, from the SAME key the authenticator verifies with.
         // Without it RBAC is decorative: the authorizer, the Roles and the
         // bindings all work, but nothing can present a non-admin identity to
         // be judged, so every workload needing the API has to mount a
         // kubeconfig carrying ADMIN client-key material.
-        let router_state = match build_token_issuer(&config.runtime.data_dir) {
+        let router_state = match build_token_issuer(&boot.data_dir) {
             Some(issuer) => router_state.with_token_issuer(issuer),
             None => router_state,
         };
@@ -322,7 +384,7 @@ impl Runtime {
 
         let apiserver = ApiServer::start_with_state(listen_addr, router_state, tls).await?;
         let bound_addr = apiserver.local_addr();
-        info!(addr = %bound_addr, tls = config.runtime.tls.enabled, "apiserver bound");
+        info!(addr = %bound_addr, tls = boot.tls.is_enabled(), "apiserver bound");
 
         // 5b. Boot-time kubeconfig write (TLS only — handing kubectl an
         //     anonymous-over-plaintext kubeconfig makes no sense). Uses the
@@ -335,36 +397,23 @@ impl Runtime {
         //     system:masters). Without it (shouldn't happen when TLS is on) it
         //     falls back to the anonymous-token kubeconfig.
         if let Some(ca_pem) = ca_cert_pem.as_deref() {
-            write_boot_kubeconfig(&config, bound_addr, ca_pem, admin_material.as_ref())?;
+            write_boot_kubeconfig(&boot, bound_addr, ca_pem, admin_material.as_ref())?;
         }
 
-        // 6. Construct the scheduling strategy from config. A
-        //    designed-but-unimplemented strategy (BinPack/Affinity) is a
-        //    typed error here — never a silent downgrade to round-robin.
-        //    (config.validate() already rejects these in step 1; this is
-        //    the load-bearing construction-time guard so the fallible
-        //    factory can never be bypassed.)
-        let strategy = make_scheduling_strategy(&config.scheduler).map_err(|e| match e {
-            engenho_scheduler::SchedulerError::UnsupportedStrategy { requested } => {
-                RuntimeError::Config(ConfigError::InvalidField {
-                    field: "scheduler.strategy".into(),
-                    reason: format!("unsupported scheduling strategy: {requested:?}"),
-                })
-            }
-            other => RuntimeError::Config(ConfigError::Incoherent(other.to_string())),
-        })?;
-
-        // 7. Spawn every child in the catalog (T2.6): the controller /
+        // 6. Spawn every child in the catalog (T2.6): the controller /
         //    scheduler / kubelet drivers (incl. the CrdController, which
         //    registers CR handlers into the shared router table via
         //    handler_sink) and the :10250 kubelet + :2379 etcd-façade
         //    listeners, into ONE owned set that `main` watches. Returns the
         //    Arc<Kubelet> so the Pod `/log` reader can be wired in.
         let (children, kubelet) =
-            spawn_children(&config, &store, &backend, strategy, &handler_sink);
+            spawn_children(&boot, &store, &backend, scheduler, &handler_sink, windows);
         info!(count = children.len(), "children spawned");
+        // From here the health endpoints report every spawned child, each
+        // Unknown until its first beat.
+        health.adopt(children.rows());
 
-        // 7b. Register the Pod `/log` handler — a StoreBackedHandler for the
+        // 6b. Register the Pod `/log` handler — a StoreBackedHandler for the
         //     Pod kind whose `logs` delegates to the in-process kubelet (the
         //     KubeletLogReader adapter). This REPLACES the catalog-built Pod
         //     handler (which had no log reader → /log returned NotFound) with
@@ -385,8 +434,18 @@ impl Runtime {
             apiserver,
             children,
             panics,
+            health,
+            would_reject,
             backend,
         })
+    }
+
+    /// What the health endpoints and the runtime's metric families are
+    /// derived from: every spawned child judged from its heartbeat and its
+    /// task, and every driver's reconcile tally and propose rate (T2.8).
+    #[must_use]
+    pub fn health(&self) -> &Arc<Health> {
+        &self.health
     }
 
     /// The process's panic count: every panic since the runtime started,
@@ -395,6 +454,15 @@ impl Runtime {
     #[must_use]
     pub fn panics(&self) -> PanicCounter {
         self.panics
+    }
+
+    /// The daemon's rollout-gate ledger (T0.11) — the one `/metrics`
+    /// renders as `engenho_would_reject_total{gate,reason}`, built once per
+    /// runtime. A component that judges a gate is handed this `Arc`; a
+    /// refusal a Shadow gate records here is on the next scrape.
+    #[must_use]
+    pub fn would_reject(&self) -> &Arc<WouldRejectLedger> {
+        &self.would_reject
     }
 
     /// Every child the runtime spawned, with its state and heartbeat.
@@ -431,18 +499,40 @@ impl Runtime {
         &self.config
     }
 
-    /// Graceful shutdown: abort + await every child task, shut the
-    /// apiserver down (2s grace, severs open watches), then terminate
-    /// the store.
+    /// Graceful shutdown, one [`ShutdownStage`] at a time: abort + await
+    /// every child task, stop the apiserver (2s grace), quiesce the store's
+    /// own background tasks, flush its durable image, then take sole
+    /// ownership and terminate it.
+    ///
+    /// The flush runs while the store is still behind the `Arc`, before the
+    /// unwrap: once it returns, the next boot replays nothing applied before
+    /// it, even if a leaked clone then makes the unwrap fail and `terminate`
+    /// never runs. `terminate` flushes again after `Raft::shutdown`, which
+    /// catches an entry a driver had in flight when it was aborted and that
+    /// raft applied after the first flush. Not covered: an entry openraft's
+    /// state-machine worker applies after that second flush (the worker is
+    /// not joined); it is durable in the log and replayed on the next boot.
     ///
     /// `terminate` consumes [`StoreMesh`] and requires the SOLE strong
     /// `Arc` ref. The child tasks + apiserver handlers each hold a
-    /// clone; aborting + awaiting the tasks and shutting the apiserver
-    /// down drops those clones, so `Arc::try_unwrap` then succeeds.
+    /// clone; aborting + awaiting the tasks and stopping the apiserver
+    /// drops those clones, so `Arc::try_unwrap` then succeeds. The store's
+    /// strong count is read after each stage, and a failed unwrap is
+    /// charged to the first stage that owed sole ownership and did not have
+    /// it ([`ShutdownStage::owes_sole_ownership`]).
+    ///
+    /// Known residual: a client holding a WATCH open across the stop keeps
+    /// the apiserver's router alive in a connection task the apiserver does
+    /// not stop, and this returns `StoreStillShared` charged to
+    /// [`ShutdownStage::ApiserverStopped`]. Pinned by an ignored test in
+    /// `tests/shutdown_stages.rs`; the fix belongs to the apiserver.
     ///
     /// # Errors
     ///
     /// [`RuntimeError::Server`] on apiserver shutdown failure,
+    /// [`RuntimeError::Store`] if the flush cannot write the durable image
+    /// (the stop ends there: the store is not terminated, and the log still
+    /// holds every applied entry for the next boot to replay),
     /// [`RuntimeError::StoreStillShared`] if a store clone leaked past
     /// shutdown, or [`RuntimeError::Store`] on `terminate` failure.
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
@@ -450,38 +540,76 @@ impl Runtime {
             mut children,
             apiserver,
             store,
+            health,
             ..
         } = self;
+        // Readiness fails first, so a load balancer stops routing here
+        // before anything below stops serving.
+        health.begin_drain();
         // Abort every child then await it, so its captured Arc<StoreMesh>
         // (and the controller it owns) is actually dropped before we try
         // to unwrap the store.
         children.stop().await;
+        let drivers_awaited = Arc::strong_count(&store);
 
-        // Shut the apiserver down — severs open watch long-polls (each
-        // holds a StoreBackedHandler → Arc<StoreMesh> clone) within a
-        // bounded 2s grace.
+        // Stop the apiserver: every StoreBackedHandler holds an
+        // Arc<StoreMesh> clone, released with the router.
         apiserver.shutdown().await?;
+        let apiserver_stopped = Arc::strong_count(&store);
+
+        // Stop the store's own tasks (raft RPC pump, bookmark ticker) by
+        // abort-then-await while it is still behind the Arc, so neither is
+        // mid-tick on the store's inner state when `terminate` runs. They
+        // hold no Arc<StoreMesh>; this stage owes sole ownership only in
+        // the sense that nothing may take a new one meanwhile.
+        let quiesced = store.quiesce().await;
+        if quiesced.any_panicked() {
+            error!(
+                rpc_pump = ?quiesced.rpc_pump,
+                bookmark_ticker = ?quiesced.bookmark_ticker,
+                "a store background task had panicked before shutdown stopped it"
+            );
+        }
+        let store_quiesced = Arc::strong_count(&store);
+
+        // Bring the durable image up to the applied state while the store is
+        // still behind the Arc, so the durability of this stop does not
+        // depend on the unwrap below succeeding. Nothing new is proposed any
+        // more (the drivers and the apiserver are gone, the pump is stopped);
+        // an entry already in flight may still land, and terminate's own
+        // flush catches it.
+        let flushed = store.flush().await?;
+        info!(?flushed, "store flushed at shutdown");
+        let counts = StrongCounts {
+            drivers_awaited,
+            apiserver_stopped,
+            store_quiesced,
+            store_flushed: Arc::strong_count(&store),
+        };
 
         // Now the Runtime should hold the only strong ref. Take it.
-        let store = Arc::try_unwrap(store).map_err(|arc| RuntimeError::StoreStillShared {
-            strong_count: Arc::strong_count(&arc),
+        let store = Arc::try_unwrap(store).map_err(|shared| {
+            let strong_count = Arc::strong_count(&shared);
+            let after = counts.blame();
+            error!(
+                %after,
+                strong_count,
+                after_drivers_awaited = counts.after(ShutdownStage::DriversAwaited),
+                after_apiserver_stopped = counts.after(ShutdownStage::ApiserverStopped),
+                after_store_quiesced = counts.after(ShutdownStage::StoreQuiesced),
+                after_store_flushed = counts.after(ShutdownStage::StoreFlushed),
+                "store still shared at shutdown (already flushed); strong count after each stage"
+            );
+            RuntimeError::StoreStillShared {
+                strong_count,
+                after,
+            }
         })?;
         store.terminate().await?;
         Ok(())
     }
 }
 
-/// Adapter making the in-process [`Kubelet`] satisfy the apiserver's
-/// [`engenho_apiserver::PodLogReader`] seam (single-node: the apiserver +
-/// kubelet share one process, so the Pod `/log` subresource queries the
-/// kubelet's local bookkeeping directly). Translates the apiserver's typed
-/// [`engenho_apiserver::LogQuery`] → the kubelet's [`LogOptions`] and maps
-/// `KubeletError` → `ApiError`.
-///
-/// This adapter is the layering bridge: the apiserver (below the kubelet) only
-/// knows the `PodLogReader` trait; the runtime (above both) supplies the
-/// concrete kubelet behind it. A multi-node future swaps this for a node-proxy
-/// reader with no apiserver change.
 /// The store, seen through the one capability an event sink needs.
 struct MeshEventStore {
     store: Arc<engenho_store::StoreMesh>,
@@ -511,6 +639,22 @@ impl engenho_controllers::event_recorder::EventStore for MeshEventStore {
     }
 }
 
+/// Adapter making the in-process [`Kubelet`] satisfy the apiserver's
+/// [`engenho_apiserver::PodLogReader`] seam (single-node: the apiserver +
+/// kubelet share one process, so the Pod `/log` subresource queries the
+/// kubelet's local bookkeeping directly). Translates the apiserver's typed
+/// [`engenho_apiserver::LogQuery`] → the kubelet's [`LogOptions`] and maps
+/// `KubeletError` → `ApiError`.
+///
+/// This adapter is the layering bridge: the apiserver (below the kubelet) only
+/// knows the `PodLogReader` trait; the runtime (above both) supplies the
+/// concrete kubelet behind it. A multi-node future swaps this for a node-proxy
+/// reader with no apiserver change.
+///
+/// Holds the kubelet STRONGLY, unlike the :10250 listener
+/// ([`WeakKubeletApi`]): it lives in the apiserver's router, which already
+/// holds the store through every handler, and is released with that router
+/// when the apiserver stops ([`ShutdownStage::ApiserverStopped`]).
 struct KubeletLogReader {
     kubelet: Arc<Kubelet>,
 }
@@ -711,7 +855,10 @@ fn stderr_tail(stderr: &[u8]) -> String {
 
 /// Verify at BOOT that a configured container runtime is actually usable.
 ///
-/// The `Fake` backend needs nothing. For `Podman` this runs `podman info`,
+/// A backend the kubelet refuses to construct
+/// ([`KubeletBackendKind::refusal`], T5.9) is refused here FIRST, with that
+/// refusal, before anything is probed. The `Fake` and `Native` backends need
+/// nothing. For `Podman` this runs `podman info`,
 /// which requires a working CONNECTION to the runtime — not merely a binary on
 /// disk.
 ///
@@ -727,14 +874,26 @@ fn stderr_tail(stderr: &[u8]) -> String {
 /// Deliberately at boot, once, fatal. The failure this replaces emitted one
 /// WARN per reconcile tick forever while the API showed pods with no status at
 /// all: a permanently-broken node was indistinguishable from a slow one.
-fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
+fn preflight_backend(boot: &BootConfig) -> Result<(), RuntimeError> {
+    // ★ THE REFUSAL COMES BEFORE ANY PROBE, for every backend. It is decided
+    // from the kind alone and consults nothing on the host, so a refused
+    // backend gets the same verdict on every node. Probing first let the HOST
+    // pick the error: a `cri` node without podman failed on `podman info`,
+    // naming a runtime it was configured not to use, and only a node that
+    // happened to have a working podman got as far as the refusal that says
+    // why (I38, node T5.9).
+    if let Some(refused) = engenho_kubelet::config_bridge::construction_refusal(
+        kubelet_backend_kind(boot.kubelet_backend),
+    ) {
+        return Err(RuntimeError::BackendRefused(refused));
+    }
     // Exhaustive on purpose. This used to be `if matches!(.., Fake)`, which
     // meant every NEW backend silently inherited a podman probe — and a
     // backend with no podman under it then failed to start with an error
     // naming podman, on a node deliberately configured not to use it.
     // Measured on ryn 2026-09-17: `kubelet_backend: native` in the config,
     // `backend="podman"` in the log, and a daemon that refused to come up.
-    match config.runtime.kubelet_backend {
+    match boot.kubelet_backend {
         // Runs no containers at all.
         CfgBackendKind::Fake => return Ok(()),
         // No container runtime underneath: a host process out of a Nix
@@ -742,16 +901,19 @@ fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
         // node that cannot reach podman unable to run the backend that does
         // not need it.
         CfgBackendKind::Native => return Ok(()),
-        // ★ A PRE-EXISTING DEFECT, named rather than silently changed: `Cri`
-        // dials its own endpoint (containerd/CRI-O), yet still falls through
-        // to the podman probe below. Left as-is here because rio and plo run
-        // this arm today and changing their startup check is not this
-        // change's business — but a CRI node with no podman installed cannot
-        // currently start.
-        CfgBackendKind::Cri | CfgBackendKind::PodmanApi | CfgBackendKind::Podman => {}
+        // Reached only once the kubelet ADMITS CRI, which today is never: the
+        // refusal above returns while `cri_backend::UNSUPPORTED` is
+        // non-empty. CRI dials its own endpoint (containerd / CRI-O), so there
+        // is no podman under it to probe.
+        //
+        // pending-cri: an admitted CRI still falls back to podman when no CRI
+        // socket answers (`make_container_runtime_with_apiserver`), so the
+        // probe that matches what gets built is "a CRI socket, else podman".
+        // The `a_cri_node_*` tests fail the day CRI is admitted, and say so.
+        CfgBackendKind::Cri => return Ok(()),
+        CfgBackendKind::PodmanApi | CfgBackendKind::Podman => {}
     }
-    let binary = config
-        .runtime
+    let binary = boot
         .podman_binary
         .clone()
         .unwrap_or_else(|| "podman".to_string());
@@ -799,7 +961,6 @@ fn preflight_backend(config: &EngenhoConfig) -> Result<(), RuntimeError> {
     }
 }
 
-/// Construct the container backend from the operator's config choice.
 /// The `kubernetes` Service's address, as `seed_kubernetes_service` creates it.
 ///
 /// The IP is the ClusterIP allocator's FIRST assignment (see that function's
@@ -960,11 +1121,10 @@ const PODMAN_HOST_GATEWAY: &str = "host.containers.internal";
 /// computes kube-proxy rules on darwin without installing them (see
 /// `DatapathInstall::{Computed,Installed}`), so on that platform the VIP is a
 /// bookkeeping entry and the host gateway is the truth.
-fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
+fn apiserver_reachability(boot: &BootConfig) -> ApiserverReachability {
     // The port engenho really listens on. `listen_addr` is `host:port`; a
     // shape we cannot parse is a reason to inject nothing, never to guess.
-    let Some(port) = config
-        .runtime
+    let Some(port) = boot
         .listen_addr
         .rsplit(':')
         .next()
@@ -973,7 +1133,7 @@ fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
         return ApiserverReachability::Unknown;
     };
 
-    match config.runtime.kubelet_backend {
+    match boot.kubelet_backend {
         // Pods run in podman. On darwin they are inside a VM and cannot reach
         // a host-loopback apiserver by any cluster address, and even on Linux
         // engenho installs no kube-proxy datapath for the VIP — so the
@@ -1016,14 +1176,25 @@ fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
     }
 }
 
-fn build_backend(config: &EngenhoConfig) -> Result<Arc<dyn ContainerRuntime>, RuntimeError> {
-    let kind = match config.runtime.kubelet_backend {
+/// The kubelet's name for the configured backend.
+///
+/// One mapping, read by [`preflight_backend`] for the refusal and by
+/// [`build_backend`] for construction, so the kind that is checked is the kind
+/// that is built. pending-I39: the two enums have identical arms and are to
+/// collapse into one.
+const fn kubelet_backend_kind(kind: CfgBackendKind) -> KubeletBackendKind {
+    match kind {
         CfgBackendKind::Cri => KubeletBackendKind::Cri,
         CfgBackendKind::PodmanApi => KubeletBackendKind::PodmanApi,
         CfgBackendKind::Podman => KubeletBackendKind::Podman,
         CfgBackendKind::Fake => KubeletBackendKind::Fake,
         CfgBackendKind::Native => KubeletBackendKind::Native,
-    };
+    }
+}
+
+/// Construct the container backend from the operator's config choice.
+fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, RuntimeError> {
+    let kind = kubelet_backend_kind(boot.kubelet_backend);
     // A node-level fact, set once here rather than resolved per pod — and it
     // must reach the backend, because the kubelet has THREE `backend.start`
     // call sites and stamping any one of them misses the restart path.
@@ -1031,7 +1202,7 @@ fn build_backend(config: &EngenhoConfig) -> Result<Arc<dyn ContainerRuntime>, Ru
     // What is injected is a REACHABILITY CLAIM, not a constant: see
     // `ApiserverReachability`. `None` means "tell pods nothing", which is a
     // working outcome (kubeconfig fallback), not a degraded one.
-    let reachability = apiserver_reachability(config);
+    let reachability = apiserver_reachability(boot);
     match &reachability {
         ApiserverReachability::ServiceVip { ip, port } => {
             info!(%ip, %port, "apiserver advertised to pods via the service VIP");
@@ -1045,7 +1216,7 @@ fn build_backend(config: &EngenhoConfig) -> Result<Arc<dyn ContainerRuntime>, Ru
         }
         ApiserverReachability::Unknown => {
             warn!(
-                listen_addr = %config.runtime.listen_addr,
+                listen_addr = %boot.listen_addr,
                 "cannot determine an apiserver address pods can reach; \
                  injecting no KUBERNETES_SERVICE_* env so in-cluster config \
                  fails construction and clients fall back to a kubeconfig"
@@ -1054,20 +1225,25 @@ fn build_backend(config: &EngenhoConfig) -> Result<Arc<dyn ContainerRuntime>, Ru
     }
     Ok(make_container_runtime_with_apiserver(
         kind,
-        config.runtime.podman_binary.as_deref(),
+        boot.podman_binary.as_deref(),
         reachability.injectable(),
     )?)
 }
 
+/// The directory under `data_dir` a durable node keeps its store in. The
+/// census ([`crate::census::DataDirSource`]) reads a node's store from the
+/// same place.
+pub(crate) const STORE_DIR: &str = "store";
+
 /// Bring up the store spine — durable or ephemeral per config.
-async fn boot_store(config: &EngenhoConfig) -> Result<Arc<StoreMesh>, RuntimeError> {
-    let cfg = default_config(&config.cluster.name)?;
+async fn boot_store(boot: &BootConfig) -> Result<Arc<StoreMesh>, RuntimeError> {
+    let cfg = default_config(&boot.cluster_name)?;
     let router = InProcessRouter::new();
     // Single-node self-loop address; registration happens inside start.
     let listen = "in-process://1".to_string();
 
-    if config.runtime.durable {
-        let store_path = config.runtime.data_dir.join("store");
+    if boot.durable {
+        let store_path = boot.data_dir.join(STORE_DIR);
         let (mesh, fresh) = StoreMesh::start_or_resume(1, listen, router, cfg, store_path).await?;
         info!(fresh, "durable store opened");
         Ok(Arc::new(mesh))
@@ -1342,37 +1518,32 @@ async fn seed_snapshot_crds(store: &StoreMesh) -> Result<(), RuntimeError> {
 /// Service with the first host address makes every later allocation skip it by
 /// construction rather than by a hardcoded exception — which is the difference
 /// between a rule and a special case.
-async fn seed_kubernetes_service(
-    store: &StoreMesh,
-    config: &EngenhoConfig,
-) -> Result<(), RuntimeError> {
+async fn seed_kubernetes_service(store: &StoreMesh, boot: &BootConfig) -> Result<(), RuntimeError> {
     // The CIDR may legitimately be empty (a control-plane-only node that
     // allocates no VIPs). Nothing to reserve, nothing to seed.
-    if config.networking.service_cidr.is_empty() {
+    if boot.service_cidr.is_empty() {
         return Ok(());
     }
-    let mut allocator = match engenho_controllers::cluster_ip::ClusterIpAllocator::new(
-        &config.networking.service_cidr,
-    ) {
-        Ok(a) => a,
-        Err(e) => {
-            // A malformed CIDR is the allocator's problem to report at its
-            // own boundary, not a reason to refuse to boot the whole node.
-            warn!(
-                cidr = %config.networking.service_cidr,
-                error = %e,
-                "service_cidr unparseable; skipping the kubernetes Service seed"
-            );
-            return Ok(());
-        }
-    };
+    let mut allocator =
+        match engenho_controllers::cluster_ip::ClusterIpAllocator::new(&boot.service_cidr) {
+            Ok(a) => a,
+            Err(e) => {
+                // A malformed CIDR is the allocator's problem to report at its
+                // own boundary, not a reason to refuse to boot the whole node.
+                warn!(
+                    cidr = %boot.service_cidr,
+                    error = %e,
+                    "service_cidr unparseable; skipping the kubernetes Service seed"
+                );
+                return Ok(());
+            }
+        };
     let Ok(vip) = allocator.allocate() else {
         warn!("service CIDR has no assignable address; skipping the kubernetes Service seed");
         return Ok(());
     };
 
-    let port = config
-        .runtime
+    let port = boot
         .listen_addr
         .rsplit(':')
         .next()
@@ -1892,9 +2063,12 @@ fn build_token_issuer(
 /// Only the HOST is taken: a certificate names hosts, not ports, and the
 /// advertised port is legitimately different from the bound one (a reverse
 /// proxy, a tailnet forward, a NAT).
-fn server_sans(config: &EngenhoConfig) -> Result<Vec<SanEntry>, RuntimeError> {
-    let mut sans = parse_extra_sans(&config.runtime.tls.extra_sans)?;
-    if let Some(host) = advertised_host(&config.runtime.advertise_address) {
+fn server_sans(
+    extra_sans: &[String],
+    advertise_address: &str,
+) -> Result<Vec<SanEntry>, RuntimeError> {
+    let mut sans = parse_extra_sans(extra_sans)?;
+    if let Some(host) = advertised_host(advertise_address) {
         let entry = host
             .parse::<SanEntry>()
             .map_err(|source| RuntimeError::ExtraSan { source })?;
@@ -1933,8 +2107,8 @@ fn advertised_host(advertise: &str) -> Option<&str> {
 /// The port defaults to the bound one, so an operator who only needs to name a
 /// host does not have to restate a port that is already declared — and cannot
 /// restate it wrongly.
-fn advertised_server_url(config: &EngenhoConfig, bound: SocketAddr) -> Option<String> {
-    let value = config.runtime.advertise_address.trim();
+fn advertised_server_url(advertise_address: &str, bound: SocketAddr) -> Option<String> {
+    let value = advertise_address.trim();
     if value.is_empty() {
         return None;
     }
@@ -1996,7 +2170,7 @@ fn parse_extra_sans(raw: &[String]) -> Result<Vec<SanEntry>, RuntimeError> {
 /// through the same path at the same mode rather than branching: one mode for
 /// one filename means the admin case cannot inherit the laxer one.
 fn write_boot_kubeconfig(
-    config: &EngenhoConfig,
+    boot: &BootConfig,
     bound_addr: SocketAddr,
     ca_pem: &str,
     admin: Option<&ClientMaterial>,
@@ -2005,16 +2179,16 @@ fn write_boot_kubeconfig(
     let server_url = loopback_server_url(bound_addr);
     let yaml = match admin {
         Some(admin) => emit_kubeconfig_with_admin(
-            &config.cluster.name,
+            &boot.cluster_name,
             &server_url,
             ca_pem.as_bytes(),
             admin.cert_pem.as_bytes(),
             admin.key_pem.as_bytes(),
         ),
-        None => emit_kubeconfig(&config.cluster.name, &server_url, ca_pem.as_bytes()),
+        None => emit_kubeconfig(&boot.cluster_name, &server_url, ca_pem.as_bytes()),
     }
     .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
-    let path = config.runtime.data_dir.join("kubeconfig");
+    let path = boot.data_dir.join("kubeconfig");
     // The `data_dir` copy is engenho's own bookkeeping and nothing else reads
     // it, so it stays owner-only regardless of the publish intent — widening
     // it would grant access nobody asked for.
@@ -2050,25 +2224,25 @@ fn write_boot_kubeconfig(
     // apiserver binds the host while containers live in a VM. A pod needs a
     // reachable address; it no longer needs borrowed admin credentials to be
     // ALLOWED, so prefer a ServiceAccount for new workloads.
-    if let Some(pod_publish) = resolve_publish_path(&config.runtime.pod_kubeconfig_publish_path) {
-        match apiserver_reachability(config).injectable() {
+    if let Some(pod_publish) = resolve_publish_path(&boot.pod_kubeconfig_publish_path) {
+        match apiserver_reachability(boot).injectable() {
             Some((host, port)) => {
                 let pod_server = format!("https://{host}:{port}");
                 let pod_yaml = match admin {
                     Some(admin) => emit_kubeconfig_with_admin(
-                        &config.cluster.name,
+                        &boot.cluster_name,
                         &pod_server,
                         ca_pem.as_bytes(),
                         admin.cert_pem.as_bytes(),
                         admin.key_pem.as_bytes(),
                     ),
-                    None => emit_kubeconfig(&config.cluster.name, &pod_server, ca_pem.as_bytes()),
+                    None => emit_kubeconfig(&boot.cluster_name, &pod_server, ca_pem.as_bytes()),
                 }
                 .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
                 match write_kubeconfig_file(
                     &pod_publish,
                     &pod_yaml,
-                    config.runtime.kubeconfig_publish_visibility,
+                    boot.kubeconfig_publish_visibility,
                 ) {
                     Ok(()) => info!(
                         path = %pod_publish.display(), server = %pod_server,
@@ -2104,25 +2278,23 @@ fn write_boot_kubeconfig(
     // field `server_sans` turns into a certificate SAN. One field, both
     // consumers — so a kubeconfig naming an address the cert does not is
     // unconstructible rather than merely tested for.
-    if let Some(remote_publish) =
-        resolve_publish_path(&config.runtime.remote_kubeconfig_publish_path)
-    {
-        if let Some(remote_server) = advertised_server_url(config, bound_addr) {
+    if let Some(remote_publish) = resolve_publish_path(&boot.remote_kubeconfig_publish_path) {
+        if let Some(remote_server) = advertised_server_url(&boot.advertise_address, bound_addr) {
             let remote_yaml = match admin {
                 Some(admin) => emit_kubeconfig_with_admin(
-                    &config.cluster.name,
+                    &boot.cluster_name,
                     &remote_server,
                     ca_pem.as_bytes(),
                     admin.cert_pem.as_bytes(),
                     admin.key_pem.as_bytes(),
                 ),
-                None => emit_kubeconfig(&config.cluster.name, &remote_server, ca_pem.as_bytes()),
+                None => emit_kubeconfig(&boot.cluster_name, &remote_server, ca_pem.as_bytes()),
             }
             .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
             match write_kubeconfig_file(
                 &remote_publish,
                 &remote_yaml,
-                config.runtime.kubeconfig_publish_visibility,
+                boot.kubeconfig_publish_visibility,
             ) {
                 Ok(()) => info!(
                     path = %remote_publish.display(), server = %remote_server,
@@ -2145,12 +2317,8 @@ fn write_boot_kubeconfig(
         }
     }
 
-    if let Some(publish) = resolve_publish_path(&config.runtime.kubeconfig_publish_path) {
-        match write_kubeconfig_file(
-            &publish,
-            &yaml,
-            config.runtime.kubeconfig_publish_visibility,
-        ) {
+    if let Some(publish) = resolve_publish_path(&boot.kubeconfig_publish_path) {
+        match write_kubeconfig_file(&publish, &yaml, boot.kubeconfig_publish_visibility) {
             Ok(()) => {
                 info!(path = %publish.display(), "kubeconfig published for kubectl/k9s/flux");
             }
@@ -2423,34 +2591,51 @@ const CNI_CONFIG_DIR: &str = "/etc/cni/net.d";
 /// sandbox creation, and not before.
 const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall::Planned;
 
-/// How long a single reconcile may run before the driver starts saying,
-/// once per window, that it is BLOCKED. It is never cancelled — see
-/// `watch_driver::tick_observed`, which copies the kubelet's
-/// `syncLoopHealthCheck` posture: make a stalled loop LOUD rather than abort
-/// it half-done. Measured motivation: engenho's kubelet controller was
-/// retired for 12 hours on ryn (2026-09-18) and the only evidence was the
-/// ABSENCE of its tick line among three healthy controllers.
-const STUCK_TICK_AFTER: Duration = Duration::from_secs(120);
-
 /// Build + spawn every child the catalog enables (T2.6) into ONE owned
 /// [`Children`] set: the drivers gated on `controllers.enable.*`, the
 /// always-on scheduler + kubelet (a single-node runtime that can't schedule
-/// or run containers is useless), and the :10250 / :2379 listeners.
+/// or run containers is useless), the :10250 / :2379 listeners, and the
+/// node lease, built from the kubelet's row (T1.3c).
 ///
 /// Returns the set PLUS an `Arc<Kubelet>` clone. The kubelet is built once
 /// and shared (via the `Controller for Arc<C>` blanket impl) between its
-/// driver, the :10250 listener AND the apiserver's Pod `/log` reader, so all
-/// three see the SAME local bookkeeping.
+/// driver and the apiserver's Pod `/log` reader, so both see the SAME local
+/// bookkeeping; the :10250 listener reaches it through a `Weak`
+/// ([`WeakKubeletApi`]).
 fn spawn_children(
-    config: &EngenhoConfig,
+    boot: &BootConfig,
     store: &Arc<StoreMesh>,
     backend: &Arc<dyn ContainerRuntime>,
-    strategy: Box<dyn engenho_scheduler::SchedulingStrategy>,
+    scheduler: ConfiguredScheduler,
     handler_sink: &Arc<dyn DynamicHandlerSink>,
+    windows: Windows,
 ) -> (Children, Arc<Kubelet>) {
-    let parts = Parts::assemble(config, store, backend, strategy, handler_sink);
-    let children = Children::spawn_catalog(config, |child| parts.task(child));
+    let parts = Parts::assemble(boot, store, backend, scheduler, handler_sink, windows);
+    let children = Children::spawn_catalog(boot, |child, before| parts.task(child, before));
     (children, parts.kubelet)
+}
+
+/// The scheduler as `scheduler.*` configured it (T5.8), driven as a
+/// controller: its namespace scope and strategy are inside it, and its tick
+/// is the fallback [`Windows::of_child`] gives the scheduler's loop.
+///
+/// A forwarding adapter, like [`DeclaredHere`]: its `controller_type` is the
+/// scheduler's, so the dormant-controller census sees the type that runs.
+struct ConfiguredSchedulerLoop(ConfiguredScheduler);
+
+#[async_trait::async_trait]
+impl Controller for ConfiguredSchedulerLoop {
+    fn name(&self) -> &'static str {
+        Controller::name(self.0.scheduler())
+    }
+
+    async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+        Controller::tick(self.0.scheduler()).await
+    }
+
+    fn controller_type(&self) -> ControllerType {
+        Controller::controller_type(self.0.scheduler())
+    }
 }
 
 /// A controller whose own crate does not declare what it reads yet, with
@@ -2525,16 +2710,20 @@ const SCHEDULER_READS: &[GroupVersionKind] = &[gvk("", "v1", "Pod"), gvk("", "v1
 /// The shared pieces live here rather than inside any one child's arm
 /// because more than one child reads each: the event sink (two sinks over
 /// one store would be two independent lossy buffers for one cluster's
-/// events), the CSI driver table, the scheduler (built once from the
-/// strategy the caller constructed fallibly) and the kubelet.
+/// events), the CSI driver table, the scheduler (built fallibly by the
+/// caller from `scheduler.*`) and the kubelet.
 struct Parts<'a> {
-    config: &'a EngenhoConfig,
+    boot: &'a BootConfig,
     store: &'a Arc<StoreMesh>,
     handler_sink: &'a Arc<dyn DynamicHandlerSink>,
-    /// Namespace scope: `None` means all namespaces (empty in config).
+    /// The controllers' namespace scope (`controllers.namespace`): `None`
+    /// means all namespaces. The scheduler is scoped by its own,
+    /// `scheduler.namespace`.
     ns: Option<String>,
-    debounce: Duration,
-    fallback: Duration,
+    /// The liveness windows; each driver's fallback, debounce and
+    /// stuck-tick threshold are read from here, so they are the ones
+    /// liveness judges against.
+    windows: Windows,
     /// ★ ONE CSI driver table, shared by three consumers: the registrar
     /// fills it, the PV binder provisions through it, and the kubelet's
     /// materializer publishes through it. Two tables would let a driver be
@@ -2545,40 +2734,38 @@ struct Parts<'a> {
     /// announce a parent they cannot reconcile (a template of the wrong
     /// shape) on that parent, and carry on with the rest.
     events: Arc<dyn EventSink>,
-    scheduler: Arc<Scheduler>,
+    scheduler: Arc<ConfiguredSchedulerLoop>,
     kubelet: Arc<Kubelet>,
 }
 
 impl<'a> Parts<'a> {
     fn assemble(
-        config: &'a EngenhoConfig,
+        boot: &'a BootConfig,
         store: &'a Arc<StoreMesh>,
         backend: &Arc<dyn ContainerRuntime>,
-        strategy: Box<dyn engenho_scheduler::SchedulingStrategy>,
+        scheduler: ConfiguredScheduler,
         handler_sink: &'a Arc<dyn DynamicHandlerSink>,
+        windows: Windows,
     ) -> Self {
-        let ns = Some(&config.controllers.namespace)
-            .filter(|n| !n.is_empty())
-            .cloned();
+        let ns = boot.controllers_namespace.clone();
         let csi_drivers = engenho_kubelet::DriverTable::new();
         let events: Arc<dyn EventSink> = Arc::new(
             engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
                 store: store.clone(),
             })),
         );
-        // The strategy was constructed fallibly by the caller (a typed error
-        // for unimplemented strategies — never a silent round-robin
-        // fallback). Built once here, so the scheduler child wraps a clone of
-        // the Arc rather than consuming the box.
-        let scheduler = Arc::new(Scheduler::new(store.clone(), strategy, ns.clone()));
-        let kubelet = build_kubelet(config, store, backend, events.clone(), &csi_drivers);
+        // Built fallibly by the caller from `scheduler.*` (a typed error for
+        // an unimplemented strategy or a zero tick — never a silent
+        // fallback). Held in an Arc so the scheduler child wraps a clone of
+        // it rather than consuming it.
+        let scheduler = Arc::new(ConfiguredSchedulerLoop(scheduler));
+        let kubelet = build_kubelet(boot, store, backend, events.clone(), &csi_drivers);
         Self {
-            config,
+            boot,
             store,
             handler_sink,
             ns,
-            debounce: Duration::from_millis(u64::from(config.controllers.debounce_milliseconds)),
-            fallback: Duration::from_secs(u64::from(config.controllers.fallback_interval_seconds)),
+            windows,
             csi_drivers,
             events,
             scheduler,
@@ -2586,23 +2773,58 @@ impl<'a> Parts<'a> {
         }
     }
 
-    /// The body of one catalog child.
-    fn task(&self, child: Child) -> Option<ChildTask> {
+    /// The body of one catalog child. `before` is every child spawned
+    /// ahead of it in the walk.
+    fn task(&self, child: Child, before: &Children) -> Option<ChildTask> {
         match child {
             Child::Driver(driver) => Some(self.driver(driver)),
-            Child::Listener(listener) => Some(self.listener(listener)),
-            // T1.3c gives it a body; `Child::enabled` keeps it out until then.
-            Child::NodeLease => None,
+            Child::Listener(listener) => Some(listener_task(
+                listener,
+                self.boot,
+                Arc::downgrade(&self.kubelet),
+                self.store,
+            )),
+            // Renewed by the kubelet's row, so built from it. The kubelet is
+            // walked first and always enabled; were it absent, the lease
+            // would have nothing to renew by, and is not spawned.
+            Child::NodeLease => {
+                let Some(kubelet) = before.row(Child::Driver(Driver::Kubelet)) else {
+                    error!(
+                        "the node lease has no kubelet to renew by and is not spawned; this \
+                         node will read NotReady"
+                    );
+                    return None;
+                };
+                // pending-runtime-relist: nothing relists the container
+                // runtime yet (`ContainerRuntime` has no relist method), so
+                // the lease renews by the kubelet alone and says so once.
+                // Waking it: a `Child::RuntimeRelist` driving a `Relister`
+                // over the backend, and its ledger here.
+                Some(drive_node_lease(
+                    self.store,
+                    &self.boot.node_name,
+                    kubelet,
+                    self.windows,
+                    RuntimeHealthSource::Unobserved,
+                ))
+            }
         }
     }
 
-    /// `driver`'s body: `controller` behind a `WatchDriver`. See [`drive`].
+    /// `driver`'s body: `controller` behind a `WatchDriver`, on the windows
+    /// [`Windows::of_child`] gives it (the ones liveness judges it by). See
+    /// [`drive`].
     fn watch<C: Controller + DeclaresReads + 'static>(
         &self,
         driver: Driver,
         controller: C,
     ) -> ChildTask {
-        drive(driver, controller, self.store, self.debounce, self.fallback)
+        drive(
+            TickLoop::Driver(driver),
+            controller,
+            self.store,
+            self.windows.of_child(Child::Driver(driver)),
+        )
     }
 
     #[allow(
@@ -2658,15 +2880,11 @@ impl<'a> Parts<'a> {
             // still runs + computes + observes the desired rules without ever
             // shelling to a non-existent `iptables-restore`.
             Driver::ServiceRouting => {
-                let resolved = self
-                    .config
-                    .networking
-                    .datapath_mode
-                    .resolve(cfg!(target_os = "linux"));
+                let resolved = self.boot.datapath_mode.resolve(cfg!(target_os = "linux"));
                 let backend = make_service_router(resolved);
                 info!(
                     datapath = backend.name(),
-                    mode = ?self.config.networking.datapath_mode,
+                    mode = ?self.boot.datapath_mode,
                     "service routing backend selected"
                 );
                 self.watch(
@@ -2693,8 +2911,7 @@ impl<'a> Parts<'a> {
             // (`ProvisioningFailed`), where `kubectl describe pvc` shows it.
             Driver::PvBinder => {
                 let local_path_root = self
-                    .config
-                    .runtime
+                    .boot
                     .data_dir
                     .join("local-path")
                     .to_string_lossy()
@@ -2712,8 +2929,7 @@ impl<'a> Parts<'a> {
             // provisioner — gated with the binder (see `Driver::enabled`).
             Driver::VolumeSnapshot => {
                 let snapshot_root = self
-                    .config
-                    .runtime
+                    .boot
                     .data_dir
                     .join("snapshots")
                     .to_string_lossy()
@@ -2736,7 +2952,8 @@ impl<'a> Parts<'a> {
                 driver,
                 CrdController::new(store.clone(), self.handler_sink.clone()),
             ),
-            // Scheduler: pending Pod → spec.nodeName.
+            // Scheduler: pending Pod → spec.nodeName, in `scheduler.namespace`,
+            // falling back every `scheduler.tick_interval_seconds` (T5.8).
             Driver::Scheduler => self.watch(
                 driver,
                 DeclaredHere::new(self.scheduler.clone(), Reads::of(SCHEDULER_READS)),
@@ -2784,7 +3001,7 @@ impl<'a> Parts<'a> {
                 driver,
                 DeclaredHere::new(
                     engenho_kubelet::CsiRegistrarController::new(
-                        &self.config.runtime.data_dir,
+                        &self.boot.data_dir,
                         self.csi_drivers.clone(),
                     ),
                     Reads::nothing(),
@@ -2796,7 +3013,7 @@ impl<'a> Parts<'a> {
                 driver,
                 engenho_controllers::cni_status::CniStatusController::new(
                     store.clone(),
-                    self.config.runtime.node_name.clone(),
+                    self.boot.node_name.clone(),
                     std::path::PathBuf::from(CNI_CONFIG_DIR),
                     CNI_INSTALL,
                 ),
@@ -2808,39 +3025,49 @@ impl<'a> Parts<'a> {
             ),
         }
     }
+}
 
-    /// A listener's body: bind and serve, and bind again whenever that ends
-    /// ([`serve_rebinding`], T2.7).
-    fn listener(&self, listener: Listener) -> ChildTask {
-        let beat = Arc::new(Heartbeat::new());
-        match listener {
-            Listener::KubeletHttp => {
-                let api: Arc<dyn engenho_kubelet::server::KubeletApi> = Arc::new(WeakKubeletApi {
-                    kubelet: Arc::downgrade(&self.kubelet),
-                });
-                let addr = self.config.runtime.kubelet_listen_addr.clone();
-                ChildTask::new(
-                    beat.clone(),
-                    serve_rebinding(listener, beat, move || {
-                        serve_kubelet_http(addr.clone(), api.clone())
-                    }),
-                )
-            }
-            Listener::EtcdFacade => {
-                let addr = self.config.runtime.etcd_listen_addr.clone();
-                let etcd_store = crate::etcd_facade::MeshEtcdStore::new(self.store);
-                ChildTask::new(
-                    beat.clone(),
-                    serve_rebinding(listener, beat, move || {
-                        serve_etcd_facade(addr.clone(), etcd_store.clone())
-                    }),
-                )
-            }
+/// A listener's body: bind and serve at the address `config` gives it, and
+/// bind again whenever that ends or panics ([`serve_rebinding`], T2.7).
+///
+/// The one place a listener's body is built: the runtime's walk and the
+/// fault-injection matrix (W6) both call it. `kubelet` is held weakly — a
+/// strong `Arc<Kubelet>` behind the :10250 router keeps the store alive past
+/// shutdown ([`WeakKubeletApi`]).
+pub(crate) fn listener_task(
+    listener: Listener,
+    boot: &BootConfig,
+    kubelet: std::sync::Weak<Kubelet>,
+    store: &Arc<StoreMesh>,
+) -> ChildTask {
+    let beat = Arc::new(Heartbeat::new());
+    match listener {
+        Listener::KubeletHttp => {
+            let api: Arc<dyn engenho_kubelet::server::KubeletApi> =
+                Arc::new(WeakKubeletApi { kubelet });
+            let addr = boot.kubelet_listen_addr.clone();
+            ChildTask::new(
+                beat.clone(),
+                serve_rebinding(listener, beat, move || {
+                    serve_kubelet_http(addr.clone(), api.clone())
+                }),
+            )
+        }
+        Listener::EtcdFacade => {
+            let addr = boot.etcd_listen_addr.clone();
+            let etcd_store = crate::etcd_facade::MeshEtcdStore::new(store);
+            ChildTask::new(
+                beat.clone(),
+                serve_rebinding(listener, beat, move || {
+                    serve_etcd_facade(addr.clone(), etcd_store.clone())
+                }),
+            )
         }
     }
 }
 
-/// Wrap `controller` in a `WatchDriver` as the catalog says `driver` runs.
+/// Wrap `controller` in a `WatchDriver` as the catalog says `tick_loop` (a
+/// driver, or the node lease) runs.
 ///
 /// * Woken by exactly the kinds the controller declares it reads (T1.7).
 ///   This is the only place a driver's filter is built, and it takes nothing
@@ -2849,36 +3076,69 @@ impl<'a> Parts<'a> {
 ///   The three controllers whose crates do not declare yet are declared
 ///   beside their spawn ([`DeclaredHere`]), as reads, and the read census
 ///   holds those to their sources too.
-/// * A panic in its tick is handled by the driver's catalog [`TickState`]
-///   (T2.7): contained and re-ticked for a Stateless driver, fatal to the
-///   child for a Stateful one. The catalog row is the only source of it.
-///
-/// [`TickState`]: crate::TickState
-fn drive<C: Controller + DeclaresReads + 'static>(
-    driver: Driver,
+/// * A panic in its tick is handled by the loop's catalog
+///   [`TickState`](crate::TickState) (T2.7): contained and re-ticked for a
+///   Stateless driver, fatal to the child for a Stateful one. It is read
+///   here off the tick loop's own row ([`TickLoop::tick_state`]), so no
+///   call to this function can drive a loop by another row.
+/// * Its ticks are counted ([`Tallied`], T2.8): by how each ended, for
+///   `controller_runtime_reconcile_total`, and by whether it landed a write,
+///   for the propose-rate detector. A tick it has run longer than the
+///   windows' stuck threshold is logged BLOCKED by the driver and reported
+///   stalled by liveness: one threshold, from `windows`. Its fallback and
+///   debounce are read from the same value, so liveness's idle window is
+///   derived from the fallback the loop runs on.
+pub(crate) fn drive<C: Controller + DeclaresReads + 'static>(
+    tick_loop: TickLoop,
     controller: C,
     store: &Arc<StoreMesh>,
-    debounce: Duration,
-    fallback: Duration,
+    windows: Windows,
 ) -> ChildTask {
     let reads = controller.reads();
     let config = WatchDriverConfig {
         filter: reads.filter(),
-        debounce,
-        fallback_interval: fallback,
-        stuck_tick_after: STUCK_TICK_AFTER,
-        tick_state: driver.tick_state(),
+        debounce: windows.debounce(),
+        fallback_interval: windows.fallback(),
+        stuck_tick_after: windows.stuck_tick_after(),
+        tick_state: tick_loop.tick_state(),
     };
     let controller_type = controller.controller_type();
-    let watch = WatchDriver::new(controller, store.clone(), config);
+    // Named by the catalog, like its liveness row and its last-tick gauge,
+    // so every family says `controller="<child>"` in one vocabulary.
+    let tally = Arc::new(Tally::new(tick_loop.child().name()));
+    let watch = WatchDriver::new(
+        Tallied::new(controller, tally.clone()),
+        store.clone(),
+        config,
+    );
     let wiring = Wiring::new(controller_type, reads, watch.wakes().clone());
-    ChildTask::driver(watch.heartbeat(), wiring, watch.run())
+    ChildTask::driver(watch.heartbeat(), wiring, tally, watch.run())
+}
+
+/// The node lease's body (T1.3c): [`NodeLease`] behind a `WatchDriver` on
+/// the lease's own windows ([`Windows::node_lease`], the ones liveness
+/// judges it by), renewing `node`'s Lease while `kubelet`'s row is alive as
+/// `windows` (the runtime's, the ones `/livez` judges the kubelet by) say,
+/// and `runtime` does not hold it back (W8).
+pub(crate) fn drive_node_lease(
+    store: &Arc<StoreMesh>,
+    node: &str,
+    kubelet: Row,
+    windows: Windows,
+    runtime: RuntimeHealthSource,
+) -> ChildTask {
+    drive(
+        TickLoop::NodeLease,
+        NodeLease::new(store.clone(), node, kubelet, windows, runtime),
+        store,
+        windows.of_child(Child::NodeLease),
+    )
 }
 
 /// Build the ONE kubelet, with its event sink, `ServiceAccount` projection
 /// and CSI-layered volume materializer.
 fn build_kubelet(
-    config: &EngenhoConfig,
+    boot: &BootConfig,
     store: &Arc<StoreMesh>,
     backend: &Arc<dyn ContainerRuntime>,
     events: Arc<dyn EventSink>,
@@ -2920,10 +3180,10 @@ fn build_kubelet(
             // the same one the CSI layer is being handed.
             Arc::new(
                 engenho_kubelet::PodmanVolumeMaterializer::new()
-                    .with_data_root(config.runtime.data_dir.join("volumes")),
+                    .with_data_root(boot.data_dir.join("volumes")),
             ),
             csi_drivers.clone(),
-            config.runtime.data_dir.clone(),
+            boot.data_dir.clone(),
         ));
     // The pod ServiceAccount projection. Built here because this is the only
     // layer holding both the signing key and the kubelet.
@@ -2935,10 +3195,10 @@ fn build_kubelet(
     // Both loaders are idempotent (`load_or_generate_*`), so reading them
     // here rather than threading them through costs one file read and keeps
     // the identity plumbing in the layer that uses it.
-    let sa_key = engenho_apiserver::sa_token::load_or_generate_sa_key(&config.runtime.data_dir)
+    let sa_key = engenho_apiserver::sa_token::load_or_generate_sa_key(&boot.data_dir)
         .map_err(|e| warn!(error = %e, "no SA signing key; pods get no ServiceAccount projection"))
         .ok();
-    let ca_pem_for_sa = engenho_apiserver::load_or_generate_ca(&config.runtime.data_dir)
+    let ca_pem_for_sa = engenho_apiserver::load_or_generate_ca(&boot.data_dir)
         .map(|ca| ca.cert_pem().to_string())
         .map_err(|e| warn!(error = %e, "no cluster CA; pods get no ServiceAccount projection"))
         .ok();
@@ -2964,20 +3224,16 @@ fn build_kubelet(
         };
 
     Arc::new(
-        Kubelet::new(
-            store.clone(),
-            backend.clone(),
-            config.runtime.node_name.clone(),
-        )
-        .with_event_sink(events)
-        .with_sa_projector(sa_projector)
-        .with_volume_materializer(csi_materializer)
-        // Deny-all unless this node named prefixes. Load-bearing for the
-        // native backend, whose only honourable volume shape is a hostPath
-        // mounted at its own path.
-        .with_host_path_policy(engenho_kubelet::pod_volume::HostPathPolicy::allowing(
-            config.runtime.host_path_allowlist.clone(),
-        )),
+        Kubelet::new(store.clone(), backend.clone(), boot.node_name.clone())
+            .with_event_sink(events)
+            .with_sa_projector(sa_projector)
+            .with_volume_materializer(csi_materializer)
+            // Deny-all unless this node named prefixes. Load-bearing for the
+            // native backend, whose only honourable volume shape is a hostPath
+            // mounted at its own path.
+            .with_host_path_policy(engenho_kubelet::pod_volume::HostPathPolicy::allowing(
+                boot.host_path_allowlist.clone(),
+            )),
     )
 }
 
@@ -3027,9 +3283,16 @@ async fn serve_kubelet_http(addr: String, api: Arc<dyn engenho_kubelet::server::
 /// obligation, not the technology.
 ///
 /// READ-ONLY: Kv serves Range; Put/DeleteRange/Txn are absent rather than
-/// silently dropping writes. See `etcd_facade`'s header. `MeshEtcdStore` holds
-/// a `Weak`, so the three services never keep the store alive past shutdown,
-/// and every clone is the SAME store.
+/// silently dropping writes. See `etcd_facade`'s header.
+///
+/// Ownership (I13, T5.4). `MeshEtcdStore` holds a `Weak<StoreMesh>`, not an
+/// `Arc`, and the three services (Kv, Watch, Maintenance) share clones of that
+/// one `Weak`, so they read one store. A call upgrades it for as long as the
+/// call runs and answers `StoreGone` once the store is dropped; an open watch
+/// holds the store's watch stream, not the store. So an idle connection or an
+/// open watch keeps nothing alive across a stop, and a Range or Status still
+/// in flight holds the store until it returns. Pinned by
+/// `etcd_facade::tests::the_facade_and_its_clones_hold_no_strong_reference_and_see_one_store`.
 async fn serve_etcd_facade(addr: String, etcd_store: crate::etcd_facade::MeshEtcdStore) {
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
@@ -3091,14 +3354,13 @@ fn make_service_router(resolved: ResolvedDatapath) -> Arc<dyn ServiceRouter> {
     }
 }
 
-// `make_scheduling_strategy` returns `Result<Box<dyn SchedulingStrategy>,
-// SchedulerError>`; the boxed strategy is unwrapped fallibly in
-// `start_inner` (typed error for unimplemented strategies) and handed to
-// `spawn_children`. `Scheduler::new<S: SchedulingStrategy + 'static>`
-// accepts the box (Box<dyn Trait> implements Trait via the blanket impl).
-
 #[cfg(test)]
 mod tests {
+    /// `config` as the runtime reads it.
+    fn read(config: &super::EngenhoConfig) -> super::BootConfig {
+        super::BootConfig::read(config).expect("the runtime runs this config")
+    }
+
     /// ★ A backend with no podman under it must NOT be podman-probed.
     ///
     /// Regression for a measured failure: ryn was configured
@@ -3114,7 +3376,8 @@ mod tests {
         let mut config = super::EngenhoConfig::prescribed_default();
         config.runtime.kubelet_backend = super::CfgBackendKind::Native;
         config.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
-        super::preflight_backend(&config).expect("native must skip the podman probe entirely");
+        super::preflight_backend(&read(&config))
+            .expect("native must skip the podman probe entirely");
     }
 
     /// The positive control: a podman backend with an unusable binary MUST
@@ -3124,11 +3387,46 @@ mod tests {
         let mut config = super::EngenhoConfig::prescribed_default();
         config.runtime.kubelet_backend = super::CfgBackendKind::Podman;
         config.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
+        let verdict = super::preflight_backend(&read(&config));
         assert!(
-            super::preflight_backend(&config).is_err(),
+            matches!(
+                verdict,
+                Err(super::RuntimeError::ContainerRuntimeUnavailable { .. })
+            ),
             "the probe must still catch a broken podman, or skipping it for \
-             native proves nothing"
+             native proves nothing; and the refusal check before it must not \
+             swallow an admitted backend. Got {verdict:?}"
         );
+    }
+
+    /// ★ I38 / node T5.9: a `cri` node is refused with the kubelet's own
+    /// typed refusal, BEFORE any podman probe.
+    ///
+    /// Regression: preflight probed podman for `Cri`, so a CRI node with no
+    /// podman failed with `ContainerRuntimeUnavailable { backend: "podman" }`,
+    /// an error naming a runtime it was configured not to use, and only a
+    /// node with a working podman reached the refusal. Asserted against a
+    /// podman binary that CANNOT work, so the old order fails here on every
+    /// machine, not only on one without podman.
+    #[test]
+    fn a_cri_node_is_refused_before_any_podman_probe() {
+        let mut config = super::EngenhoConfig::prescribed_default();
+        config.runtime.kubelet_backend = super::CfgBackendKind::Cri;
+        config.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
+        let expected =
+            engenho_kubelet::config_bridge::construction_refusal(super::KubeletBackendKind::Cri)
+                .expect(
+                    "CRI is refused while cri_backend::UNSUPPORTED is non-empty. Once it is \
+             admitted this premise is gone: give preflight_backend's Cri arm the \
+             probe its pending-cri note names, then rewrite this test",
+                );
+        match super::preflight_backend(&read(&config)) {
+            Err(super::RuntimeError::BackendRefused(refused)) => assert_eq!(
+                refused, expected,
+                "the node must carry the kubelet's refusal verbatim"
+            ),
+            other => panic!("a cri node must fail with the typed refusal, got {other:?}"),
+        }
     }
 
     /// ★ The invariant this exists for: pods are never told an address that
@@ -3140,7 +3438,7 @@ mod tests {
         cfg.runtime.kubelet_backend = CfgBackendKind::Podman;
         cfg.runtime.listen_addr = "127.0.0.1:6443".to_string();
 
-        let r = super::apiserver_reachability(&cfg);
+        let r = super::apiserver_reachability(&read(&cfg));
         assert_eq!(
             r,
             super::ApiserverReachability::HostGateway {
@@ -3173,7 +3471,7 @@ mod tests {
         cfg.runtime.kubelet_backend = CfgBackendKind::Podman;
         cfg.runtime.listen_addr = "not-a-socket-address".to_string();
 
-        let r = super::apiserver_reachability(&cfg);
+        let r = super::apiserver_reachability(&read(&cfg));
         assert_eq!(r, super::ApiserverReachability::Unknown);
         assert!(
             r.injectable().is_none(),
@@ -3188,7 +3486,9 @@ mod tests {
         let mut cfg = EngenhoConfig::default();
         cfg.runtime.kubelet_backend = CfgBackendKind::Podman;
         cfg.runtime.listen_addr = "127.0.0.1:16443".to_string();
-        let (_, port) = super::apiserver_reachability(&cfg).injectable().unwrap();
+        let (_, port) = super::apiserver_reachability(&read(&cfg))
+            .injectable()
+            .unwrap();
         assert_eq!(port, 16443);
     }
 
@@ -3424,12 +3724,16 @@ mod tests {
         let catalog: BTreeSet<Child> = Child::all().collect();
         assert_eq!(
             catalog.difference(&spawned).copied().collect::<Vec<_>>(),
-            [Child::NodeLease],
-            "with every switch on, only the node-lease placeholder (T1.3c) is unspawned"
+            [],
+            "with every switch on, every child in the catalog is spawned"
         );
 
         let drivers: Vec<Child> = Driver::ALL.iter().map(|d| Child::Driver(*d)).collect();
         every_child(&rt, &drivers, |b| b.ticks_finished >= TICKS).await;
+
+        // The lease falls back once per renew interval: one tick is its
+        // proof of life here.
+        every_child(&rt, &[Child::NodeLease], |b| b.ticks_finished >= 1).await;
 
         let listeners: Vec<Child> = Listener::ALL.iter().map(|l| Child::Listener(*l)).collect();
         every_child(&rt, &listeners, |b| {
@@ -3475,17 +3779,16 @@ mod tests {
     /// [`drive`] every catalog driver is built by, as the only child of a
     /// set. The store is returned so it outlives the set.
     async fn a_panicking(driver: Driver) -> (Children, Arc<StoreMesh>) {
-        let config = ephemeral_test_config();
-        let store = boot_store(&config).await.unwrap();
+        let boot = read(&ephemeral_test_config());
+        let store = boot_store(&boot).await.unwrap();
         assert!(store.wait_for_leadership(Duration::from_secs(5)).await);
-        let children = Children::spawn_catalog(&config, |child| {
+        let children = Children::spawn_catalog(&boot, |child, _| {
             (child == Child::Driver(driver)).then(|| {
                 drive(
-                    driver,
+                    TickLoop::Driver(driver),
                     DeclaredHere::new(PanicsEveryTick, Reads::nothing()),
                     &store,
-                    Duration::from_millis(10),
-                    PANIC_FALLBACK,
+                    boot.windows(PANIC_FALLBACK).with_fallback(PANIC_FALLBACK),
                 )
             })
         });
@@ -3607,7 +3910,9 @@ mod tests {
         let mut cfg = ephemeral_test_config();
         cfg.scheduler.strategy = engenho_config::SchedulerStrategyKind::BinPack;
         match Runtime::start(cfg).await {
-            Err(RuntimeError::Config(ConfigError::InvalidField { field, .. })) => {
+            Err(RuntimeError::Config(engenho_config::ConfigError::InvalidField {
+                field, ..
+            })) => {
                 assert_eq!(field, "scheduler.strategy");
             }
             Err(other) => panic!("expected Config/InvalidField, got {other:?}"),
@@ -3894,7 +4199,20 @@ mod tests {
     const FORWARDING: &[(&str, &str)] = &[
         ("engenho_controllers", "Arc"),
         ("engenho_runtime", "DeclaredHere"),
+        ("engenho_runtime", "Tallied"),
     ];
+
+    /// Concrete newtypes that only forward `Controller` to the one they hold.
+    /// The census reads an adapter off its generic bound
+    /// (`impl<C: Controller>`), which a newtype does not have, so it counts
+    /// each as a controller type of its own; each is named here instead, the
+    /// same claim `FORWARDING` makes. A name the census no longer sees fails
+    /// the gate, so the list cannot go stale.
+    ///
+    /// `pending-scheduler-into-parts`: `ConfiguredSchedulerLoop` wraps the
+    /// scheduler because `ConfiguredScheduler` does not hand its `Scheduler`
+    /// out; it goes when engenho-scheduler adds `into_parts`.
+    const FORWARDING_NEWTYPES: &[(&str, &str)] = &[("engenho_runtime", "ConfiguredSchedulerLoop")];
 
     #[tokio::test]
     async fn every_controller_type_is_spawned_or_dormant() {
@@ -3902,11 +4220,19 @@ mod tests {
             .parent()
             .expect("the runtime crate sits inside the workspace");
         let census = Implementors::of(&workspace_sources(root), "Controller");
-        let implemented: BTreeMap<(String, String), String> = census
+        let mut implemented: BTreeMap<(String, String), String> = census
             .concrete
             .iter()
             .map(|i| ((i.krate.clone(), i.ident.clone()), i.path.clone()))
             .collect();
+        for (krate, ident) in FORWARDING_NEWTYPES {
+            assert!(
+                implemented
+                    .remove(&((*krate).to_owned(), (*ident).to_owned()))
+                    .is_some(),
+                "FORWARDING_NEWTYPES names {krate}::{ident}, which the census does not see"
+            );
+        }
 
         let rt = Runtime::start(ephemeral_test_config()).await.unwrap();
         let wirings: Vec<Wiring> = rt
@@ -3928,8 +4254,8 @@ mod tests {
         // type, would pass the gate below vacuously.
         assert_eq!(
             wirings.len(),
-            Driver::ALL.len(),
-            "every driver records the controller it runs"
+            Child::all().filter(|c| c.tick_state().is_some()).count(),
+            "every tick loop (each driver, the node lease) records the controller it runs"
         );
         let unseen: Vec<&(String, String)> = spawned
             .iter()
@@ -4132,15 +4458,26 @@ mod authenticator_wiring {
 /// pair is structural; these tests exist to keep it that way.
 #[cfg(test)]
 mod advertised_address {
-    use super::{SanEntry, advertised_host, advertised_server_url, server_sans};
+    use super::{
+        ApiserverTls, BootConfig, RuntimeError, SanEntry, advertised_host, advertised_server_url,
+        server_sans,
+    };
     use engenho_config::EngenhoConfig;
     use shikumi::TieredConfig;
 
-    fn config_with(advertise: &str, extra: &[&str]) -> EngenhoConfig {
+    fn config_with(advertise: &str, extra: &[&str]) -> BootConfig {
         let mut c = EngenhoConfig::prescribed_default();
         c.runtime.advertise_address = advertise.to_string();
         c.runtime.tls.extra_sans = extra.iter().map(|s| (*s).to_string()).collect();
-        c
+        BootConfig::read(&c).expect("the runtime runs this config")
+    }
+
+    /// The SANs the serving certificate is issued with.
+    fn sans(boot: &BootConfig) -> Result<Vec<SanEntry>, RuntimeError> {
+        let ApiserverTls::SelfIssued { extra_sans } = &boot.tls else {
+            panic!("the prescribed default serves TLS");
+        };
+        server_sans(extra_sans, &boot.advertise_address)
     }
 
     fn bound() -> std::net::SocketAddr {
@@ -4149,7 +4486,7 @@ mod advertised_address {
 
     #[test]
     fn advertising_a_name_puts_it_in_the_certificate() {
-        let sans = server_sans(&config_with("plo.natal.quero.cloud", &[])).expect("sans");
+        let sans = sans(&config_with("plo.natal.quero.cloud", &[])).expect("sans");
         assert!(
             sans.contains(&SanEntry::Dns("plo.natal.quero.cloud".to_string())),
             "the advertised host MUST be a SAN — a kubeconfig naming an address \
@@ -4160,7 +4497,7 @@ mod advertised_address {
 
     #[test]
     fn advertising_an_address_puts_it_in_the_certificate_as_an_ip() {
-        let sans = server_sans(&config_with("100.64.0.7:6443", &[])).expect("sans");
+        let sans = sans(&config_with("100.64.0.7:6443", &[])).expect("sans");
         assert!(
             sans.contains(&SanEntry::Ip("100.64.0.7".parse().unwrap())),
             "got {sans:?}"
@@ -4173,7 +4510,7 @@ mod advertised_address {
         // yields either a cert with a port in a DNS SAN (matches nothing) or a
         // URL missing its port (dials 443).
         let cfg = config_with("plo.quero.cloud:16443", &[]);
-        let sans = server_sans(&cfg).expect("sans");
+        let sans = sans(&cfg).expect("sans");
         assert!(
             sans.contains(&SanEntry::Dns("plo.quero.cloud".to_string())),
             "the SAN must be the bare host; got {sans:?}"
@@ -4183,7 +4520,7 @@ mod advertised_address {
             "no SAN may carry a port; got {sans:?}"
         );
         assert_eq!(
-            advertised_server_url(&cfg, bound()).as_deref(),
+            advertised_server_url(&cfg.advertise_address, bound()).as_deref(),
             Some("https://plo.quero.cloud:16443"),
             "the URL must keep the advertised port — a proxy or forward makes it \
              legitimately different from the bound one"
@@ -4194,7 +4531,7 @@ mod advertised_address {
     fn an_advertised_host_without_a_port_inherits_the_bound_one() {
         // So an operator naming only a host cannot restate the port wrongly.
         assert_eq!(
-            advertised_server_url(&config_with("plo", &[]), bound()).as_deref(),
+            advertised_server_url(&config_with("plo", &[]).advertise_address, bound()).as_deref(),
             Some("https://plo:6443")
         );
     }
@@ -4202,9 +4539,9 @@ mod advertised_address {
     #[test]
     fn advertising_nothing_yields_no_url_and_no_extra_san() {
         let cfg = config_with("", &[]);
-        assert_eq!(advertised_server_url(&cfg, bound()), None);
+        assert_eq!(advertised_server_url(&cfg.advertise_address, bound()), None);
         assert!(
-            server_sans(&cfg).expect("sans").is_empty(),
+            sans(&cfg).expect("sans").is_empty(),
             "a node-local apiserver must gain no SANs from this path"
         );
     }
@@ -4213,8 +4550,7 @@ mod advertised_address {
     fn declaring_the_advertised_name_explicitly_does_not_duplicate_it() {
         // Listing it in extra_sans as well is the natural thing to do before
         // learning it is automatic, and must not produce a doubled SAN.
-        let sans =
-            server_sans(&config_with("plo.quero.cloud", &["plo.quero.cloud"])).expect("sans");
+        let sans = sans(&config_with("plo.quero.cloud", &["plo.quero.cloud"])).expect("sans");
         assert_eq!(
             sans.iter()
                 .filter(|s| **s == SanEntry::Dns("plo.quero.cloud".to_string()))
@@ -4229,7 +4565,7 @@ mod advertised_address {
         // Same reasoning as extra_sans: this must not become a cert that serves
         // and verifies for nobody.
         assert!(
-            server_sans(&config_with("https://plo:6443", &[])).is_err(),
+            sans(&config_with("https://plo:6443", &[])).is_err(),
             "a URL is not an address and must be refused, not encoded"
         );
     }
@@ -4239,12 +4575,12 @@ mod advertised_address {
         let cfg = config_with("fd00::1", &[]);
         assert_eq!(advertised_host("fd00::1"), Some("fd00::1"));
         assert_eq!(
-            advertised_server_url(&cfg, bound()).as_deref(),
+            advertised_server_url(&cfg.advertise_address, bound()).as_deref(),
             Some("https://[fd00::1]:6443"),
             "an unbracketed IPv6 host makes a URL that will not parse"
         );
         assert!(
-            server_sans(&cfg)
+            sans(&cfg)
                 .expect("sans")
                 .contains(&SanEntry::Ip("fd00::1".parse().unwrap())),
             "the SAN is the bare address, unbracketed"
@@ -4255,7 +4591,11 @@ mod advertised_address {
     fn a_bracketed_ipv6_with_a_port_splits_correctly() {
         assert_eq!(advertised_host("[fd00::1]:6443"), Some("fd00::1"));
         assert_eq!(
-            advertised_server_url(&config_with("[fd00::1]:6443", &[]), bound()).as_deref(),
+            advertised_server_url(
+                &config_with("[fd00::1]:6443", &[]).advertise_address,
+                bound()
+            )
+            .as_deref(),
             Some("https://[fd00::1]:6443")
         );
     }

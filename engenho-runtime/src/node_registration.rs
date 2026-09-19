@@ -10,8 +10,11 @@
 //!   * UNCORDONED the node — `kubectl cordon` writes `spec.unschedulable`,
 //!     and the literal wrote `false` over it;
 //!   * dropped every TAINT — `spec.taints` was absent from the literal;
-//!   * dropped every LABEL outside the well-known five — a `nodeSelector` on
-//!     an operator's label went from matching to Pending on a reboot;
+//!   * dropped every LABEL outside the well-known five — nothing evaluated
+//!     `nodeSelector` yet, so no pod was stranded, but once the scheduler's
+//!     `NodeSelector` filter (T5.7) did, a selector on an operator's label
+//!     would have gone from matching to Pending on a reboot. T5.7 waited for
+//!     this fix for that reason;
 //!   * reasserted `Ready=True` without a reason, on a node that had not yet
 //!     heartbeat — readiness stated, never derived.
 //!
@@ -350,9 +353,10 @@ fn refused(node: &str, refusal: Refusal) -> RuntimeError {
 /// is the difference between a label that works and a label that looks
 /// right and matches nothing — the reference pangea Postgres carries
 /// `nodeSelector: {kubernetes.io/arch: arm64}`, and against an `aarch64`
-/// label the scheduler's exact-match predicate leaves it
-/// `NodeSelectorMismatch` **forever**, with a correct-looking label
-/// visible in `kubectl get node -o yaml`.
+/// label the scheduler's `NodeSelector` filter (T5.7, an exact match)
+/// rejects the node with `NodeSelectorMismatch`. Registration re-asserts the
+/// label on every boot, so the pod stays Pending for good, with a
+/// correct-looking label visible in `kubectl get node -o yaml`.
 ///
 /// Unknown architectures pass through verbatim rather than guessing: a
 /// wrong-but-plausible label is worse than an unfamiliar one, because it
@@ -383,10 +387,15 @@ fn kube_os() -> &'static str {
 
 /// The well-known labels upstream's kubelet self-applies at registration.
 ///
-/// Without these, `metadata.labels` is ABSENT — not sparse — and
-/// `matches_node_selector` is an exact-match AND over that map, so EVERY
-/// `nodeSelector` key fails and every pod carrying one stays Pending
-/// permanently. Measured on the live node 2026-08-30: `labels: None`.
+/// Without these, `metadata.labels` is ABSENT — not sparse (measured on the
+/// live node 2026-08-30: `labels: None`). The scheduler's `NodeSelector`
+/// filter (T5.7) is an exact-match AND of `spec.nodeSelector` over that map,
+/// so a selector naming any of these keys fails on a node without them, and
+/// the pod stays Pending (`PodScheduled=False`) until a node carrying the
+/// label appears. Before T5.7 nothing shipped evaluated `nodeSelector`, so
+/// the absent map of 2026-08-30 stranded no pod: every pod was bound whatever
+/// it selected. Pinned end to end by
+/// `tests/i21_config_read.rs::a_selector_in_go_vocabulary_matches_the_registered_node`.
 ///
 /// The `beta.kubernetes.io/*` pair is deprecated upstream and still
 /// emitted, because charts in the wild continue to select on it and a
@@ -441,8 +450,9 @@ mod node_label_tests {
     }
 
     /// Every well-known key upstream's kubelet self-applies is present and
-    /// non-empty. An ABSENT labels map is what made every nodeSelector fail
-    /// permanently; a present-but-partial one fails the same way, quietly.
+    /// non-empty. Under the scheduler's `NodeSelector` filter (T5.7) an
+    /// absent key fails every selector naming it; a present-but-partial map
+    /// fails the same way, quietly.
     #[test]
     fn every_well_known_label_is_present_and_non_empty() {
         let labels = well_known_node_labels("cid");
