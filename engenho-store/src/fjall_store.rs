@@ -39,10 +39,15 @@
 //!     BEFORE calling `callback.log_io_completed(Ok(()))` — the real
 //!     durability the in-memory `append`'s synchronous no-fsync path
 //!     lacks.
-//!   * `apply` writes the materialized catalog + last_applied (+
-//!     last_membership on membership entries) and fsyncs ONCE per
-//!     batch BEFORE broadcasting any WatchEvent — a watcher never
-//!     observes an event that didn't survive to disk.
+//!   * `apply` persists the APPLIED IMAGE — the catalog blob,
+//!     `last_applied` and `last_membership` — as ONE atomic, fsynced
+//!     fjall batch, on a count/time cadence (see
+//!     `CATALOG_PERSIST_EVERY`). Watch events are fanned only after
+//!     the entry is durable in the log — a watcher never observes an
+//!     event that didn't survive to disk.
+//!   * [`FjallStore::flush`] writes the same image through the same
+//!     batch, whatever the cadence says. A clean stop calls it last, so
+//!     the next boot has nothing to replay.
 //!   * Every disk failure maps to a typed
 //!     `StorageError::IO { source: StorageIOError::… }`. NEVER panic
 //!     / unwrap on a disk error.
@@ -116,8 +121,10 @@ const CATALOG_KEY: &[u8] = b"catalog";
 /// ★ THE INVARIANT THAT MAKES THIS CORRECT: the catalog and `last_applied` are
 /// written **together or not at all**. Persisting `last_applied` while skipping
 /// the catalog would make a restart trust a catalog that is behind it — the one
-/// way to actually lose data here. Both live under the same `should_persist`
-/// branch below; do not separate them.
+/// way to actually lose data here. On the apply side there is one writer of the
+/// pair, [`FjallStore::persist_applied_image`], and it writes both (with
+/// `last_membership`) in a single atomic fjall batch — so neither can land
+/// without the other, not even across a crash between two inserts.
 const CATALOG_PERSIST_EVERY: usize = 64;
 
 /// Wall-clock bound on the same decision, so a cluster that writes rarely
@@ -127,6 +134,28 @@ const CATALOG_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 type RNodeId = RaftNodeId;
 type RMembership = StoredMembership<RaftNodeId, openraft::BasicNode>;
+
+/// What [`FjallStore::flush`] found, and what it did about it.
+///
+/// On either arm the durable image — the catalog blob, `last_applied` and
+/// `last_membership` — equals the applied state as of the call, so a boot
+/// from this directory replays nothing that was applied before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Flushed {
+    /// Nothing had been applied since the image was last written or loaded,
+    /// so it already matched; nothing was written.
+    AlreadyDurable {
+        /// The applied position the durable image stands at.
+        last_applied: Option<LogId<RNodeId>>,
+    },
+    /// The image was behind the applied state — those entries were waiting
+    /// for the next boot to replay them. It was rewritten in one fsynced batch.
+    Persisted {
+        /// The applied position the durable image now stands at.
+        last_applied: Option<LogId<RNodeId>>,
+    },
+}
 
 /// fjall-backed durable store. Same external shape as
 /// [`crate::store::InMemoryStore`] (Clone, the same four openraft
@@ -496,6 +525,80 @@ impl FjallStore {
         }
         self.persist(write_logs_err)
     }
+
+    /// Bring the durable image up to the applied state, so the next boot
+    /// replays nothing that was applied before this call.
+    ///
+    /// `apply` batches the image write (see `CATALOG_PERSIST_EVERY`), so
+    /// between writes the image lags the applied state by up to 63 apply
+    /// calls or 5 s. That is correct — the log holds those entries and a boot
+    /// replays them — but it means every stop leaves a replay behind, and a
+    /// replay is exactly what makes rolling back across a change to apply
+    /// semantics unsafe. A clean stop calls this after the writers are gone
+    /// and leaves nothing to replay.
+    ///
+    /// Writes the same triple `apply` writes, through the same single batch
+    /// (`persist_applied_image`), under the same state lock — so it
+    /// never interleaves with an apply and never splits the pair.
+    ///
+    /// Not covered: an apply that runs AFTER this returns. openraft's
+    /// state-machine worker is not joined by `Raft::shutdown`, so an entry it
+    /// applies late is batched as usual — durable through the log, replayed
+    /// on the next boot, never lost.
+    ///
+    /// # Errors
+    ///
+    /// A typed [`StorageError`] if the batch cannot be serialized, written or
+    /// fsynced. The in-RAM copy stays marked unwritten, so a retry writes
+    /// again, and the log still holds every applied entry.
+    pub async fn flush(&self) -> Result<Flushed, StorageError<RNodeId>> {
+        let mut state = self.inner.state.lock().await;
+        if state.applies_since_catalog_persist == 0 {
+            return Ok(Flushed::AlreadyDurable {
+                last_applied: state.last_applied,
+            });
+        }
+        self.persist_applied_image(&mut state)?;
+        Ok(Flushed::Persisted {
+            last_applied: state.last_applied,
+        })
+    }
+
+    /// Write the APPLIED IMAGE — the catalog blob, `last_applied` and
+    /// `last_membership`, everything `applied_state` and a reopen answer from
+    /// — as ONE atomic fjall batch fsynced with `SyncAll`, then mark the
+    /// in-RAM copy written.
+    ///
+    /// ★ The single apply-side writer of the pair. Separate inserts followed
+    /// by one fsync are not atomic: a crash between them can journal the
+    /// catalog without `last_applied`, and the next boot would replay entries
+    /// onto a catalog that already holds them. One batch makes that split
+    /// unrepresentable for `apply` and [`Self::flush`]. (The snapshot paths
+    /// still write their own keys; T3.4 moves them onto one batch.)
+    ///
+    /// The caller holds the state lock and passes the guarded state, so the
+    /// image written is exactly the applied state no apply can race.
+    fn persist_applied_image(
+        &self,
+        state: &mut MaterializedState,
+    ) -> Result<(), StorageError<RNodeId>> {
+        let catalog = serde_json::to_vec(&state.catalog).map_err(|e| write_sm_err(&e))?;
+        let last_applied = serde_json::to_vec(&state.last_applied).map_err(|e| write_sm_err(&e))?;
+        let last_membership =
+            serde_json::to_vec(&state.last_membership).map_err(|e| write_sm_err(&e))?;
+        let mut batch = self
+            .inner
+            .keyspace
+            .batch()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        batch.insert(&self.inner.catalog, CATALOG_KEY, catalog);
+        batch.insert(&self.inner.meta, META_LAST_APPLIED, last_applied);
+        batch.insert(&self.inner.meta, META_LAST_MEMBERSHIP, last_membership);
+        batch.commit().map_err(|e| write_sm_err(&e))?;
+        state.applies_since_catalog_persist = 0;
+        state.last_catalog_persist = Some(std::time::Instant::now());
+        Ok(())
+    }
 }
 
 /// Read + deserialize a JSON value from the `meta` partition.
@@ -839,7 +942,8 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         //
         // ★ The catalog and `last_applied` move TOGETHER. Advancing the
         // persisted `last_applied` past the persisted catalog is the one way
-        // to actually lose data here, so both sit inside this single branch.
+        // to actually lose data here, so the only write is
+        // `persist_applied_image`, which lands both in one atomic batch.
         // A membership change always forces a write — raft's own consistency
         // rests on it, and it is far too rare to be worth batching.
         state.applies_since_catalog_persist += 1;
@@ -848,28 +952,7 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
             .last_catalog_persist
             .is_none_or(|t| t.elapsed() >= CATALOG_PERSIST_INTERVAL);
         if membership_changed || due_by_count || due_by_time {
-            let catalog_bytes = serde_json::to_vec(&state.catalog).map_err(|e| write_sm_err(&e))?;
-            self.inner
-                .catalog
-                .insert(CATALOG_KEY, catalog_bytes)
-                .map_err(|e| write_sm_err(&e))?;
-            meta_put_json(
-                &self.inner.meta,
-                META_LAST_APPLIED,
-                &state.last_applied,
-                |e| write_sm_err(&io_to_anyerror_dyn(e)),
-            )?;
-            if membership_changed {
-                meta_put_json(
-                    &self.inner.meta,
-                    META_LAST_MEMBERSHIP,
-                    &state.last_membership,
-                    |e| write_sm_err(&io_to_anyerror_dyn(e)),
-                )?;
-            }
-            self.persist(write_sm_err)?;
-            state.applies_since_catalog_persist = 0;
-            state.last_catalog_persist = Some(std::time::Instant::now());
+            self.persist_applied_image(&mut state)?;
         }
 
         // ── fan watch events: DURABLE-BEFORE-OBSERVABLE, UNDER THE LOCK ──
@@ -947,6 +1030,10 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         state.catalog = catalog;
         state.last_applied = meta.last_log_id;
         state.last_membership = meta.last_membership.clone();
+        // The image just written IS the applied state now, so nothing is
+        // pending for `flush` or the cadence in `apply`.
+        state.applies_since_catalog_persist = 0;
+        state.last_catalog_persist = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -1168,6 +1255,143 @@ mod tests {
             cat.len()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn log_id(idx: u64) -> LogId<RNodeId> {
+        LogId {
+            leader_id: CommittedLeaderId::new(1, 0),
+            index: idx,
+        }
+    }
+
+    /// Log and apply `n` Puts at indexes `1..=n`, one apply each — the shape
+    /// of `n` writes arriving inside one persist window.
+    async fn log_and_apply(s: &mut FjallStore, n: usize) {
+        for i in 1..=n {
+            let idx = u64::try_from(i).unwrap();
+            let e = put_entry(idx, &format!("pod-{i}"));
+            s.append_entries_durable(vec![e.clone()]).unwrap();
+            s.apply(vec![e]).await.unwrap();
+        }
+    }
+
+    /// Reopen `dir` raw and report `(entries a boot would replay, objects in
+    /// the rehydrated catalog)`. A boot replays the log entries after the
+    /// persisted `last_applied` (up to `committed`, which never passes the
+    /// last entry), so the first number bounds the replay from above.
+    async fn replay_left_by(dir: &std::path::Path) -> (usize, usize) {
+        let mut s = FjallStore::open(dir).unwrap();
+        let (last_applied, _) = s.applied_state().await.unwrap();
+        let from = last_applied.map_or(0, |l| l.index + 1);
+        let pending = s.try_get_log_entries(from..).await.unwrap().len();
+        (pending, s.current_catalog().await.len())
+    }
+
+    /// T2.9-store: `flush`, then the process goes away WITHOUT `terminate`.
+    /// The reopened store has nothing to replay and every applied object.
+    #[tokio::test]
+    async fn flush_then_drop_without_terminate_leaves_nothing_to_replay() {
+        const N: usize = 6;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // ★ NEGATIVE CONTROL: the same writes, dropped with no flush, leave a
+        // replay behind. Without it, a green result below could mean the
+        // cadence happened to persist everything and `flush` did nothing.
+        let control = tmp.path().join("control");
+        {
+            let mut s = FjallStore::open(&control).unwrap();
+            log_and_apply(&mut s, N).await;
+        }
+        let (control_pending, _) = replay_left_by(&control).await;
+        assert!(
+            control_pending > 0,
+            "HARNESS PRECONDITION: without a flush the durable image must lag the log, \
+             or this test proves nothing"
+        );
+
+        let dir = tmp.path().join("flushed");
+        {
+            let mut s = FjallStore::open(&dir).unwrap();
+            log_and_apply(&mut s, N).await;
+            assert_eq!(
+                s.flush().await.unwrap(),
+                Flushed::Persisted {
+                    last_applied: Some(log_id(u64::try_from(N).unwrap())),
+                },
+                "flush must report that it wrote the image the cadence had left behind"
+            );
+            // Dropped here: no terminate.
+        }
+        let (pending, objects) = replay_left_by(&dir).await;
+        assert_eq!(
+            pending, 0,
+            "a flushed store left {pending} log entries for the next boot to replay"
+        );
+        assert_eq!(objects, N, "the flushed image is missing applied objects");
+    }
+
+    /// `flush` writes only when something was applied since the image was
+    /// last written or loaded, and always names the position the image stands
+    /// at: a fresh store, a second flush in a row and a reopened store all
+    /// answer `AlreadyDurable`.
+    #[tokio::test]
+    async fn flush_is_idempotent_and_names_the_position_it_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let mut s = FjallStore::open(&dir).unwrap();
+        assert_eq!(
+            s.flush().await.unwrap(),
+            Flushed::AlreadyDurable { last_applied: None }
+        );
+
+        log_and_apply(&mut s, 3).await;
+        let (Flushed::Persisted { last_applied } | Flushed::AlreadyDurable { last_applied }) =
+            s.flush().await.unwrap();
+        assert_eq!(last_applied, Some(log_id(3)));
+        assert_eq!(
+            s.flush().await.unwrap(),
+            Flushed::AlreadyDurable {
+                last_applied: Some(log_id(3))
+            },
+            "a second flush with no apply in between must write nothing"
+        );
+        drop(s);
+
+        let reopened = FjallStore::open(&dir).unwrap();
+        assert_eq!(
+            reopened.flush().await.unwrap(),
+            Flushed::AlreadyDurable {
+                last_applied: Some(log_id(3))
+            },
+            "a reopened store holds exactly the image it loaded"
+        );
+    }
+
+    /// An installed snapshot IS the durable image, so `flush` afterwards has
+    /// nothing to write — even when the store had unwritten applies before.
+    #[tokio::test]
+    async fn install_snapshot_leaves_nothing_for_flush_to_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = FjallStore::open(tmp.path().join("src")).unwrap();
+        log_and_apply(&mut src, 4).await;
+        let snap = src
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let mut dst = FjallStore::open(tmp.path().join("dst")).unwrap();
+        log_and_apply(&mut dst, 2).await;
+        dst.install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.flush().await.unwrap(),
+            Flushed::AlreadyDurable {
+                last_applied: snap.meta.last_log_id
+            }
+        );
     }
 
     #[tokio::test]

@@ -3,14 +3,15 @@
 //! Nothing in engenho gets to assume it was stopped politely. A process can
 //! vanish between any two instructions, and the next boot has to rebuild,
 //! from what is on disk alone, a store that tells the truth about every write
-//! it acknowledged. These five cases pin that, one way of dying each.
+//! it acknowledged. These cases pin that, one way of dying each.
 //!
 //! | case | how the process ends | what must hold on the next boot |
 //! |---|---|---|
 //! | 1 | dropped mid persist-window | every ack present, the revision unchanged, and no watch resumes into a strict subset of what happened |
 //! | 2 | dropped after a snapshot + purge past a stale catalog blob | the node boots at all, with every ack |
 //! | 3 | SIGKILL of a child process mid-propose | every ack present at the revision it was acknowledged at |
-//! | 4 | a clean stop | nothing is left to replay, the revision is continuous |
+//! | 4 | a clean stop (`StoreMesh::terminate`) | nothing is left to replay, the revision is continuous |
+//! | 4b | killed right after `StoreMesh::flush`, with no terminate | the same as case 4: the flush alone is the clean stop's durability |
 //! | 5 | — (replay compatibility) | a log recorded by a released binary replays through this tree to the same revisions and catalog bytes |
 //!
 //! ## How a "kill" is produced in-process
@@ -34,9 +35,11 @@
 //!
 //! ## Tier, stated plainly
 //!
-//! This is a gate (a test), not a type. Cases 1, 2 and 4 are red at the commit
+//! This is a gate (a test), not a type. Cases 1, 2 and 4 were red at the commit
 //! that introduced them and are `#[ignore]`d with the id of the item that turns
-//! each green; that item un-ignores it. Cases 3 and 5 are green and run always.
+//! each green; that item un-ignores it. Cases 3 and 5 are green and run always;
+//! case 4 went green with T2.9-store (`terminate` flushes last) and 4b came
+//! with it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -48,8 +51,9 @@ use std::time::{Duration, Instant};
 
 use engenho_store::command::{ApplyMeta, PatchType, TxnCompare, TxnOp};
 use engenho_store::{
-    ApplyResult, FjallStore, InMemoryStore, InProcessRouter, Reason, ResourceCommand, ResourceKey,
-    Revision, StoreError, StoreMesh, TypeConfig, WatchGone, WatchOpts, WatchSignal, default_config,
+    ApplyResult, FjallStore, Flushed, InMemoryStore, InProcessRouter, MeshFlushed, Reason,
+    ResourceCommand, ResourceKey, Revision, StoreError, StoreMesh, TypeConfig, WatchGone,
+    WatchOpts, WatchSignal, default_config,
 };
 use openraft::storage::{RaftLogStorage as _, RaftStateMachine as _};
 use openraft::{
@@ -565,19 +569,38 @@ fn propose_until_killed(dir: &Path) {
 
 // ── case 4: a clean stop ───────────────────────────────────────────────────
 
+/// How a case-4 lifetime ends after its writes.
+#[derive(Clone, Copy, Debug)]
+enum CleanStop {
+    /// `StoreMesh::terminate`, which flushes as its last step.
+    Terminate,
+    /// `StoreMesh::flush`, then the lifetime ends with no terminate: the stop
+    /// path's flush ran, and nothing after it did (a leaked `Arc` that makes
+    /// `terminate` unreachable, or a kill right after the flush).
+    FlushThenKill,
+}
+
 #[test]
-#[ignore = "red until T2.9 (the stop path): StoreMesh::terminate() persists nothing, so a clean \
-            stop leaves every write since the last batched catalog persist for the next boot \
-            to replay. T2.9 un-ignores this, substituting its clean-stop sequence for \
-            terminate() if terminate() itself does not flush"]
 fn case4_clean_stop_leaves_nothing_to_replay() {
+    clean_stop_leaves_nothing_to_replay(CleanStop::Terminate, "restart-oracle-c4");
+}
+
+#[test]
+fn case4b_flush_then_kill_leaves_nothing_to_replay() {
+    clean_stop_leaves_nothing_to_replay(CleanStop::FlushThenKill, "restart-oracle-c4b");
+}
+
+/// Three writes inside one persist window, then `stop`. The durable image
+/// must already hold all three — nothing left in the log for the next boot to
+/// replay — and the next boot continues the revision.
+fn clean_stop_leaves_nothing_to_replay(stop: CleanStop, cluster: &str) {
     let (_tmp, dir) = store_dir();
     let acks = lifetime(async {
         let (mesh, fresh) = StoreMesh::start_or_resume(
             NODE,
             ADDR.into(),
             InProcessRouter::new(),
-            default_config("restart-oracle-c4").expect("raft config"),
+            default_config(cluster).expect("raft config"),
             &dir,
         )
         .await
@@ -592,7 +615,19 @@ fn case4_clean_stop_leaves_nothing_to_replay() {
                 revision: res.revision,
             });
         }
-        mesh.terminate().await.expect("the clean stop");
+        match stop {
+            CleanStop::Terminate => mesh.terminate().await.expect("the clean stop"),
+            CleanStop::FlushThenKill => {
+                let flushed = mesh.flush().await.expect("the stop path's flush");
+                assert!(
+                    matches!(flushed, MeshFlushed::Durable(Flushed::Persisted { .. })),
+                    "HARNESS PRECONDITION: the writes must still be waiting on the persist \
+                     cadence when flush runs, or this case proves nothing about flush: \
+                     {flushed:?}"
+                );
+                // Dropped here with the runtime: no terminate.
+            }
+        }
         acks
     });
     let head = acks.last().expect("acks").revision;
@@ -619,6 +654,24 @@ fn case4_clean_stop_leaves_nothing_to_replay() {
             .await
             .expect("write after the clean restart");
         assert_eq!(next.revision, head + 1, "the revision is not continuous");
+        mesh.terminate().await.expect("terminate");
+    });
+}
+
+/// The in-memory backend has no durable image, and `flush` says so instead of
+/// reporting a write it never made.
+#[test]
+fn flush_of_an_in_memory_mesh_is_ephemeral() {
+    lifetime(async {
+        let mesh = StoreMesh::start(
+            NODE,
+            ADDR.into(),
+            InProcessRouter::new(),
+            default_config("restart-oracle-memory").expect("raft config"),
+        )
+        .await
+        .expect("start the in-memory mesh");
+        assert_eq!(mesh.flush().await.expect("flush"), MeshFlushed::Ephemeral);
         mesh.terminate().await.expect("terminate");
     });
 }

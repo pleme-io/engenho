@@ -15,7 +15,7 @@ use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
 
 use crate::command::ResourceCommand;
-use crate::fjall_store::FjallStore;
+use crate::fjall_store::{FjallStore, Flushed};
 use crate::network::{InProcessRouter, RpcRequest};
 use crate::owned_task::{OwnedTask, TaskStop};
 use crate::resource::{ResourceKey, ResourceValue};
@@ -33,6 +33,12 @@ pub enum StoreError {
     ClientWriteFailed(String),
     #[error("raft fatal: {0}")]
     Fatal(String),
+    /// The durable image could not be written by [`StoreMesh::flush`]. The
+    /// log still holds every applied entry, so nothing acknowledged is lost;
+    /// the next boot replays them. Boxed so the error stays one pointer wide
+    /// in every `Result` that carries it.
+    #[error("persist the applied image: {0}")]
+    Persist(Box<openraft::StorageError<RaftNodeId>>),
 }
 
 engenho_substrate::impl_error_kind! {
@@ -41,7 +47,19 @@ engenho_substrate::impl_error_kind! {
         (InitializeFailed(_)) => "initialize_failed",
         (ClientWriteFailed(_)) => "client_write_failed",
         (Fatal(_)) => "fatal",
+        (Persist(_)) => "persist_failed",
     }
+}
+
+/// What [`StoreMesh::flush`] did, per backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum MeshFlushed {
+    /// The in-memory backend: nothing outlives the process, so there is no
+    /// image to write and nothing a boot could replay.
+    Ephemeral,
+    /// The durable backend's answer — see [`Flushed`].
+    Durable(Flushed),
 }
 
 /// The store backend a [`StoreMesh`] is built over. Both variants
@@ -135,6 +153,17 @@ impl StoreBackend {
         match self {
             Self::Memory(s) => s.quiesce_bookmarks().await,
             Self::Fjall(s) => s.quiesce_bookmarks().await,
+        }
+    }
+
+    async fn flush(&self) -> Result<MeshFlushed, StoreError> {
+        match self {
+            Self::Memory(_) => Ok(MeshFlushed::Ephemeral),
+            Self::Fjall(s) => s
+                .flush()
+                .await
+                .map(MeshFlushed::Durable)
+                .map_err(|e| StoreError::Persist(Box::new(e))),
         }
     }
 }
@@ -629,14 +658,40 @@ impl StoreMesh {
         }
     }
 
+    /// Bring the durable image up to the applied state, so the next boot
+    /// replays nothing applied before this call — see
+    /// [`FjallStore::flush`]. The in-memory backend answers
+    /// [`MeshFlushed::Ephemeral`].
+    ///
+    /// Takes `&self` so a stop can call it while the mesh is still behind an
+    /// `Arc`, after [`Self::quiesce`] and before `Arc::try_unwrap`: if a
+    /// leaked clone then makes the unwrap fail and [`Self::terminate`] never
+    /// runs, the image is already current. `terminate` flushes again as its
+    /// last step, which answers `AlreadyDurable` unless something was applied
+    /// in between.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Persist`] if the durable batch cannot be written.
+    pub async fn flush(&self) -> Result<MeshFlushed, StoreError> {
+        self.store.flush().await
+    }
+
     /// Deregister from the router, [`Self::quiesce`] (awaiting both owned
-    /// tasks), then shut raft down. A task that had panicked is logged at
+    /// tasks), shut raft down, then [`Self::flush`] — so a clean stop leaves
+    /// the next boot nothing to replay. A task that had panicked is logged at
     /// ERROR rather than read as a clean stop.
     ///
-    /// Not guaranteed on return: openraft's state-machine worker holds a
-    /// store clone and `Raft::shutdown` does not join it, so that clone is
-    /// released when that worker next runs, not necessarily before this
-    /// returns.
+    /// The flush runs after `Raft::shutdown`, when raft no longer drives
+    /// applies. Not guaranteed on return: openraft's state-machine worker
+    /// holds a store clone and `Raft::shutdown` does not join it, so that
+    /// clone is released when that worker next runs, not necessarily before
+    /// this returns; an entry it applies after the flush is durable in the
+    /// log and replayed on the next boot.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Persist`] if the final flush cannot be written.
     pub async fn terminate(self) -> Result<(), StoreError> {
         self.router.deregister(self.node_id).await;
         let quiesced = self.quiesce().await;
@@ -648,6 +703,12 @@ impl StoreMesh {
             );
         }
         let _ = self.raft.shutdown().await;
+        let flushed = self.store.flush().await?;
+        tracing::info!(
+            node_id = self.node_id,
+            ?flushed,
+            "store flushed at terminate"
+        );
         Ok(())
     }
 }
