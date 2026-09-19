@@ -77,6 +77,7 @@ pub mod statefulset;
 pub mod status;
 pub mod store_ledger;
 pub mod store_resolver;
+pub mod sweep;
 pub mod tiered_build;
 pub mod tiered_reconciler;
 pub mod volume_snapshot;
@@ -115,7 +116,7 @@ pub use dns::{
 pub use drv::DrvController;
 pub use drv_build::{BuildBackend, BuildError, BuildResult, DrvBuildController, FakeBuildBackend};
 pub use endpoints::EndpointsController;
-pub use error::ControllerError;
+pub use error::{ControllerError, ErrorScope};
 pub use event_driven::EventDrivenController;
 pub use gc::GcController;
 pub use hpa::{
@@ -173,6 +174,7 @@ pub use status::{
 };
 pub use store_ledger::{DEFAULT_RECEIPT_NAMESPACE, StoreBackedLedger};
 pub use store_resolver::StoreBackedNodeResolver;
+pub use sweep::{ItemFailure, ObjectOutcome, Sweep, SweepAbort, SweepReport};
 pub use tiered_build::TieredBuildBackend;
 pub use tiered_reconciler::{PromotionScope, StaticPromotionScope, TieredCacheReconciler};
 pub use watch_driver::{

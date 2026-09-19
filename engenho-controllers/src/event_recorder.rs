@@ -83,6 +83,10 @@ pub enum Reason {
     SuccessfulDelete,
     /// A PersistentVolumeClaim was bound.
     ProvisioningSucceeded,
+    /// A `PersistentVolumeClaim` could not be provisioned, for a reason that
+    /// retrying will not clear (its declaration is unusable). Emitted by the
+    /// pv-binder's sweep on the claim itself.
+    ProvisioningFailed,
     // ── networking ──
     /// A NetworkPolicy was accepted and its rules computed, but no packet
     /// filter was installed — so the traffic it claims to restrict is
@@ -110,6 +114,7 @@ impl Reason {
             Self::SuccessfulCreate => "SuccessfulCreate",
             Self::SuccessfulDelete => "SuccessfulDelete",
             Self::ProvisioningSucceeded => "ProvisioningSucceeded",
+            Self::ProvisioningFailed => "ProvisioningFailed",
             Self::NetworkPolicyNotEnforced => "NetworkPolicyNotEnforced",
         }
     }
@@ -126,6 +131,7 @@ impl Reason {
             | Self::Unhealthy
             | Self::BackOff
             | Self::FailedScheduling
+            | Self::ProvisioningFailed
             | Self::NetworkPolicyNotEnforced => Severity::Warning,
             _ => Severity::Normal,
         }
@@ -240,6 +246,8 @@ mod tests {
         assert_eq!(Reason::FailedScheduling.as_str(), "FailedScheduling");
         assert_eq!(Reason::ScalingReplicaSet.as_str(), "ScalingReplicaSet");
         assert_eq!(Reason::SuccessfulCreate.as_str(), "SuccessfulCreate");
+        // k8s.io/kubernetes pkg/controller/volume/events.ProvisioningFailed.
+        assert_eq!(Reason::ProvisioningFailed.as_str(), "ProvisioningFailed");
     }
 
     #[test]
@@ -250,6 +258,7 @@ mod tests {
             Reason::Unhealthy,
             Reason::BackOff,
             Reason::FailedScheduling,
+            Reason::ProvisioningFailed,
         ] {
             assert_eq!(r.severity(), Severity::Warning, "{} must warn", r.as_str());
         }

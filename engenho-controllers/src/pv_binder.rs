@@ -58,9 +58,11 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 use tracing::debug;
 
-use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::controller::{Controller, ReconcileOutcome};
 use crate::csi_provisioner::{CsiCreateRequest, CsiProvisioner, NoCsiProvisioner, parse_quantity};
 use crate::error::ControllerError;
+use crate::event_recorder::{EventSink, Reason as EventReason};
+use crate::sweep::{ObjectOutcome, Sweep};
 
 /// The local-path provisioner identifier. A StorageClass whose
 /// `provisioner` is this string (the rancher.io/local-path de-facto
@@ -71,6 +73,36 @@ pub const ENGENHO_LOCAL_PATH_PROVISIONER: &str = "engenho.io/local-path";
 
 /// The annotation marking a StorageClass as the cluster default.
 const DEFAULT_SC_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
+
+/// Upstream's `source.component` for the PV controller, which signs the
+/// binder's Events.
+const COMPONENT: &str = "persistentvolume-controller";
+
+/// Why a local-path claim with no usable size cannot be provisioned.
+///
+/// Upstream's apiserver refuses such a claim at create time; engenho's does
+/// not, and the binder used to provision it anyway — a local-path PV whose
+/// `capacity.storage` was `null` or the unparseable string, bound as if it
+/// were real. Now it is an Item failure on the claim: the claim stays
+/// Pending and a `ProvisioningFailed` Event on it says why.
+const UNUSABLE_REQUEST: &str = "spec.resources.requests.storage is missing or is not a quantity, \
+     so the local-path provisioner has no size to give the volume; the claim stays Pending \
+     until it names one";
+
+/// The report note for a claim that restores from a snapshot not yet ready.
+const SNAPSHOT_NOT_READY: &str = "PVC names a VolumeSnapshot dataSource that is not ready; left \
+     Pending rather than provisioned empty";
+
+/// The report note for a `WaitForFirstConsumer` claim.
+const WAIT_FOR_FIRST_CONSUMER: &str = "WaitForFirstConsumer PVC left Pending (deferred)";
+
+/// Everything a sweep reads once and matches each claim against.
+struct TickView {
+    pvs: Vec<(ResourceKey, Value)>,
+    storage_classes: Vec<(ResourceKey, Value)>,
+    snapshots: Vec<(ResourceKey, Value)>,
+    snapshot_contents: Vec<(ResourceKey, Value)>,
+}
 
 /// The host-effect seam — the side-effecting half of the provisioner behind
 /// a trait so binding + provisioning is unit-testable WITHOUT a real
@@ -139,6 +171,8 @@ pub struct PvBinderController {
     /// this branch existed — so wiring it is opt-in and its absence is not
     /// a behaviour change.
     csi: Arc<dyn CsiProvisioner>,
+    /// Per-claim isolation: one claim's failure costs only that claim.
+    sweep: Sweep,
 }
 
 impl PvBinderController {
@@ -156,6 +190,7 @@ impl PvBinderController {
             local_path_root: local_path_root.into(),
             env: Arc::new(HostProvisionerEnv),
             csi: Arc::new(NoCsiProvisioner),
+            sweep: Sweep::new(COMPONENT, EventReason::ProvisioningFailed),
         }
     }
 
@@ -174,6 +209,7 @@ impl PvBinderController {
             local_path_root: local_path_root.into(),
             env,
             csi: Arc::new(NoCsiProvisioner),
+            sweep: Sweep::new(COMPONENT, EventReason::ProvisioningFailed),
         }
     }
 
@@ -181,6 +217,14 @@ impl PvBinderController {
     #[must_use]
     pub fn with_csi(mut self, csi: Arc<dyn CsiProvisioner>) -> Self {
         self.csi = csi;
+        self
+    }
+
+    /// Builder: wire the event sink a claim that cannot be provisioned is
+    /// reported through (`ProvisioningFailed`, on the claim).
+    #[must_use]
+    pub fn with_event_sink(mut self, events: Arc<dyn EventSink>) -> Self {
+        self.sweep = self.sweep.with_event_sink(events);
         self
     }
 
@@ -514,7 +558,7 @@ impl PvBinderController {
         pvc_name: &str,
         sc: &Value,
         provisioner: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), ControllerError> {
         let pv_name = format!("pvc-{pvc_ns}-{pvc_name}");
         let requested = pvc
             .get("spec")
@@ -545,6 +589,9 @@ impl PvBinderController {
             .filter_map(Value::as_str)
             .any(|m| m == "ReadWriteMany" || m == "ReadOnlyMany");
 
+        // A driver's refusal is this claim's alone: Item scope, retried on
+        // the claim's own curve. Never a fake Bound — a claim bound to a
+        // volume that was never created is worse than one honestly Pending.
         let created = self
             .csi
             .create_volume(&CsiCreateRequest {
@@ -554,7 +601,12 @@ impl PvBinderController {
                 parameters,
                 multi_node,
             })
-            .await?;
+            .await
+            .map_err(|e| {
+                ControllerError::Internal(
+                    ["CSI CreateVolume through ", provisioner, " failed: ", &e].concat(),
+                )
+            })?;
 
         let sc_name = sc
             .get("metadata")
@@ -608,10 +660,12 @@ impl PvBinderController {
             "status": { "phase": "Bound" }
         });
 
+        // Store writes keep their own error, so they keep its Sweep scope.
+        // They used to be flattened to a String with the driver's refusal,
+        // which made a store that could not commit look like one claim's
+        // problem and let the sweep carry on writing into it.
         let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
-        self.put(pv_key, pv)
-            .await
-            .map_err(|e| format!("writing PV {pv_name}: {e}"))?;
+        self.put(pv_key, pv).await?;
 
         let mut bound_pvc = pvc.clone();
         if let Some(spec) = bound_pvc.get_mut("spec").and_then(Value::as_object_mut) {
@@ -619,9 +673,7 @@ impl PvBinderController {
         }
         set_phase(&mut bound_pvc, "Bound");
         let pvc_key = ResourceKey::namespaced("", "v1", "PersistentVolumeClaim", pvc_ns, pvc_name);
-        self.put(pvc_key, bound_pvc)
-            .await
-            .map_err(|e| format!("binding PVC {pvc_ns}/{pvc_name}: {e}"))?;
+        self.put(pvc_key, bound_pvc).await?;
 
         Ok(())
     }
@@ -668,6 +720,155 @@ fn sc_is_local_path(sc: &Value) -> bool {
     )
 }
 
+impl PvBinderController {
+    /// Reconcile ONE claim. `?` in here leaves this claim only; whether the
+    /// error then ends the sweep is decided by its scope in
+    /// [`ObjectOutcome::settle`], never here.
+    ///
+    /// `claimed_this_tick` is shared across the sweep so two Pending claims
+    /// do not bind the same available PV in one pass.
+    async fn reconcile_claim(
+        &self,
+        pvc_key: &ResourceKey,
+        pvc: &Value,
+        view: &TickView,
+        claimed_this_tick: &tokio::sync::Mutex<Vec<String>>,
+    ) -> Result<ObjectOutcome, ControllerError> {
+        // Held for this claim's whole reconcile. Claims are reconciled one
+        // at a time, so this never waits; it is how the one list is shared
+        // by per-claim futures that each outlive a single borrow.
+        let mut claimed_this_tick = claimed_this_tick.lock().await;
+        // Only Pending (or status-less) PVCs need binding. Already-Bound
+        // PVCs are converged: idempotent no-ops.
+        if Self::pvc_phase(pvc) != "Pending" {
+            return Ok(ObjectOutcome::Unchanged);
+        }
+        let pvc_ns = pvc_key.namespace.as_deref().unwrap_or("default");
+        let pvc_name = &pvc_key.name;
+
+        // 1. STATIC BIND. Candidate set: every Available PV not already
+        //    claimed this tick. A pre-bound PVC (spec.volumeName) narrows
+        //    to exactly that PV.
+        let pre_bound = Self::pre_bound_volume(pvc);
+        let candidate = view.pvs.iter().find(|(pv_key, pv)| {
+            if claimed_this_tick.contains(&pv_key.name) {
+                return false;
+            }
+            if Self::pv_phase(pv) != "Available" {
+                return false;
+            }
+            // Pre-bind: the candidate MUST be the named PV.
+            if let Some(name) = pre_bound {
+                if pv_key.name != name {
+                    return false;
+                }
+            }
+            Self::pv_matches_pvc(pv, pvc, pvc_ns, pvc_name)
+        });
+
+        if let Some((pv_key, pv)) = candidate {
+            let pv_name = pv_key.name.clone();
+            let bound_pvc = Self::bind_pvc(pvc.clone(), &pv_name);
+            let bound_pv = Self::bind_pv(pv.clone(), pvc, pvc_ns, pvc_name);
+            self.put(pvc_key.clone(), bound_pvc).await?;
+            self.put(pv_key.clone(), bound_pv).await?;
+            debug!(pvc = %pvc_key.label(), pv = %pv_name, "bound PVC to existing PV");
+            claimed_this_tick.push(pv_name);
+            return Ok(ObjectOutcome::Changed);
+        }
+
+        // A pre-bound PVC whose named PV isn't available this pass waits;
+        // we never dynamically provision over an explicit volumeName.
+        if pre_bound.is_some() {
+            return Ok(ObjectOutcome::SKIPPED);
+        }
+
+        // 2. DYNAMIC PROVISION via the local-path provisioner / default SC.
+        let Some(sc) = Self::effective_storage_class(pvc, &view.storage_classes) else {
+            // No class + no default SC → stay Pending (no provisioner).
+            return Ok(ObjectOutcome::SKIPPED);
+        };
+        if !sc_is_local_path(sc) {
+            // 2b. CSI DYNAMIC PROVISION. The class names some other
+            // provisioner; if a registered CSI driver answers to that
+            // name, engenho provisions through it.
+            let provisioner = sc
+                .get("provisioner")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // Asked BEFORE creating: an absent driver must leave the PVC
+            // Pending ("waiting for your driver"), not fail a provision
+            // ("your storage is broken"). Also what keeps a cluster with
+            // an external provisioner working unchanged.
+            if provisioner.is_empty() || !self.csi.can_provision(provisioner).await {
+                return Ok(ObjectOutcome::SKIPPED);
+            }
+            if Self::is_wait_for_first_consumer(Some(sc)) {
+                return Ok(ObjectOutcome::SKIPPED);
+            }
+            self.provision_csi(pvc, pvc_ns, pvc_name, sc, provisioner)
+                .await?;
+            return Ok(ObjectOutcome::Changed);
+        }
+        if Self::is_wait_for_first_consumer(Some(sc)) {
+            // WaitForFirstConsumer: leave Pending until a Pod references the
+            // PVC. TYPED-DEFERRED (named follow-up) — never provision early.
+            return Ok(ObjectOutcome::skipped_because(WAIT_FOR_FIRST_CONSUMER));
+        }
+
+        // Immediate binding mode: provision now. The local-path PV copies
+        // the claim's request as its capacity, so a claim with no usable
+        // size has nothing to provision. That is its declaration being
+        // unusable, not the world being unready: Declarative, reported on
+        // the claim. (A CSI claim with no size is different: the driver
+        // picks one and the PV records the driver's answer.)
+        if Self::pvc_request_bytes(pvc).is_none() {
+            return Err(ControllerError::InvalidResource(
+                UNUSABLE_REQUEST.to_string(),
+            ));
+        }
+        let (pv_name, host_path, dyn_pv) = self.build_dynamic_pv(pvc, pvc_ns, pvc_name, sc);
+        // The ONE host effect — create the backing dir before the PV is
+        // visible so the kubelet can bind-mount it. A failure is this
+        // claim's alone: the claims after it in the list still bind.
+        self.env
+            .ensure_dir(&host_path)
+            .map_err(|e| ControllerError::Internal(["provision local-path dir: ", &e].concat()))?;
+        // ── RESTORE-FROM-SNAPSHOT ────────────────────────────────────
+        // A PVC whose `spec.dataSource` names a VolumeSnapshot is a
+        // RESTORE, and this is the PITR drill's whole restore vector. The
+        // hydrate happens AFTER the dir exists and BEFORE the PV is
+        // visible, so a pod can never observe a half-filled volume.
+        //
+        // A named-but-unresolvable snapshot leaves the claim Pending
+        // rather than provisioning an empty volume: presenting an empty
+        // restore as a successful one is exactly the "clean receipt, no
+        // data underneath" failure a drill exists to catch.
+        if let Some(snap_name) = Self::snapshot_data_source(pvc) {
+            let Some(src) = self.resolve_snapshot_path(
+                pvc_ns,
+                &snap_name,
+                &view.snapshots,
+                &view.snapshot_contents,
+            ) else {
+                return Ok(ObjectOutcome::skipped_because(SNAPSHOT_NOT_READY));
+            };
+            self.env
+                .restore_tree(&src, &host_path)
+                .map_err(|e| ControllerError::Internal(["restore from snapshot: ", &e].concat()))?;
+            debug!(pvc = %pvc_key.label(), snapshot = %snap_name, "restored PV data from snapshot");
+        }
+        let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
+        self.put(pv_key, dyn_pv).await?;
+        // Bind the PVC to the freshly-provisioned PV.
+        let bound_pvc = Self::bind_pvc(pvc.clone(), &pv_name);
+        self.put(pvc_key.clone(), bound_pvc).await?;
+        debug!(pvc = %pvc_key.label(), pv = %pv_name, "dynamically provisioned + bound local-path PV");
+        claimed_this_tick.push(pv_name);
+        Ok(ObjectOutcome::Changed)
+    }
+}
+
 #[async_trait]
 impl Controller for PvBinderController {
     fn name(&self) -> &'static str {
@@ -680,187 +881,46 @@ impl Controller for PvBinderController {
             .store
             .list("", "v1", "PersistentVolumeClaim", self.namespace.as_deref())
             .await;
-        let pvs = self.store.list("", "v1", "PersistentVolume", None).await;
-        let storage_classes = self
-            .store
-            .list("storage.k8s.io", "v1", "StorageClass", None)
-            .await;
-        // Snapshot kinds, for `spec.dataSource` restores. Listing them
-        // unconditionally costs one store read per tick and keeps the restore
-        // path from needing a second controller.
-        let snapshots = self
-            .store
-            .list(
-                crate::volume_snapshot::SNAPSHOT_GROUP,
-                crate::volume_snapshot::SNAPSHOT_VERSION,
-                "VolumeSnapshot",
-                None,
-            )
-            .await;
-        let snapshot_contents = self
-            .store
-            .list(
-                crate::volume_snapshot::SNAPSHOT_GROUP,
-                crate::volume_snapshot::SNAPSHOT_VERSION,
-                "VolumeSnapshotContent",
-                None,
-            )
-            .await;
-
-        let mut report = ReconcileReport::default();
-        report.objects_examined = pvcs.len();
+        let view = TickView {
+            pvs: self.store.list("", "v1", "PersistentVolume", None).await,
+            storage_classes: self
+                .store
+                .list("storage.k8s.io", "v1", "StorageClass", None)
+                .await,
+            // Snapshot kinds, for `spec.dataSource` restores. Listing them
+            // unconditionally costs one store read per tick and keeps the
+            // restore path from needing a second controller.
+            snapshots: self
+                .store
+                .list(
+                    crate::volume_snapshot::SNAPSHOT_GROUP,
+                    crate::volume_snapshot::SNAPSHOT_VERSION,
+                    "VolumeSnapshot",
+                    None,
+                )
+                .await,
+            snapshot_contents: self
+                .store
+                .list(
+                    crate::volume_snapshot::SNAPSHOT_GROUP,
+                    crate::volume_snapshot::SNAPSHOT_VERSION,
+                    "VolumeSnapshotContent",
+                    None,
+                )
+                .await,
+        };
 
         // Track PVs claimed THIS tick so two Pending PVCs don't bind the same
         // available PV in one pass.
-        let mut claimed_this_tick: Vec<String> = Vec::new();
+        let claimed_this_tick = tokio::sync::Mutex::new(Vec::new());
 
-        for (pvc_key, pvc) in &pvcs {
-            // Only Pending (or status-less) PVCs need binding. Already-Bound
-            // PVCs are idempotent no-ops.
-            if Self::pvc_phase(pvc) != "Pending" {
-                report.objects_skipped += 1;
-                continue;
-            }
-            let pvc_ns = pvc_key.namespace.as_deref().unwrap_or("default");
-            let pvc_name = &pvc_key.name;
-
-            // 1. STATIC BIND. Candidate set: every Available PV not already
-            //    claimed this tick. A pre-bound PVC (spec.volumeName) narrows
-            //    to exactly that PV.
-            let pre_bound = Self::pre_bound_volume(pvc);
-            let candidate = pvs.iter().find(|(pv_key, pv)| {
-                if claimed_this_tick.contains(&pv_key.name) {
-                    return false;
-                }
-                if Self::pv_phase(pv) != "Available" {
-                    return false;
-                }
-                // Pre-bind: the candidate MUST be the named PV.
-                if let Some(name) = pre_bound {
-                    if pv_key.name != name {
-                        return false;
-                    }
-                }
-                Self::pv_matches_pvc(pv, pvc, pvc_ns, pvc_name)
-            });
-
-            if let Some((pv_key, pv)) = candidate {
-                let pv_name = pv_key.name.clone();
-                let bound_pvc = Self::bind_pvc(pvc.clone(), &pv_name);
-                let bound_pv = Self::bind_pv(pv.clone(), pvc, pvc_ns, pvc_name);
-                self.put(pvc_key.clone(), bound_pvc).await?;
-                self.put(pv_key.clone(), bound_pv).await?;
-                claimed_this_tick.push(pv_name.clone());
-                report.objects_changed += 1;
-                debug!(pvc = %pvc_key.label(), pv = %pv_name, "bound PVC to existing PV");
-                continue;
-            }
-
-            // A pre-bound PVC whose named PV isn't available this pass waits;
-            // we never dynamically provision over an explicit volumeName.
-            if pre_bound.is_some() {
-                report.objects_skipped += 1;
-                continue;
-            }
-
-            // 2. DYNAMIC PROVISION via the local-path provisioner / default SC.
-            let Some(sc) = Self::effective_storage_class(pvc, &storage_classes) else {
-                // No class + no default SC → stay Pending (no provisioner).
-                report.objects_skipped += 1;
-                continue;
-            };
-            if !sc_is_local_path(sc) {
-                // 2b. CSI DYNAMIC PROVISION. The class names some other
-                // provisioner; if a registered CSI driver answers to that
-                // name, engenho provisions through it.
-                let provisioner = sc
-                    .get("provisioner")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                // Asked BEFORE creating: an absent driver must leave the PVC
-                // Pending ("waiting for your driver"), not fail a provision
-                // ("your storage is broken"). Also what keeps a cluster with
-                // an external provisioner working unchanged.
-                if provisioner.is_empty() || !self.csi.can_provision(&provisioner).await {
-                    report.objects_skipped += 1;
-                    continue;
-                }
-                if Self::is_wait_for_first_consumer(Some(sc)) {
-                    report.objects_skipped += 1;
-                    continue;
-                }
-                match self
-                    .provision_csi(pvc, pvc_ns, pvc_name, sc, &provisioner)
-                    .await
-                {
-                    Ok(()) => report.objects_changed += 1,
-                    Err(e) => {
-                        // Retried next tick. Never a fake Bound: a PVC bound
-                        // to a volume that was never created is worse than
-                        // one that is honestly still Pending.
-                        tracing::warn!(
-                            pvc = %format!("{pvc_ns}/{pvc_name}"),
-                            provisioner = %provisioner,
-                            error = %e,
-                            "CSI provisioning failed; the claim stays Pending"
-                        );
-                        report.objects_skipped += 1;
-                    }
-                }
-                continue;
-            }
-            if Self::is_wait_for_first_consumer(Some(sc)) {
-                // WaitForFirstConsumer: leave Pending until a Pod references the
-                // PVC. TYPED-DEFERRED (named follow-up) — never provision early.
-                report.objects_skipped += 1;
-                report.note = Some("WaitForFirstConsumer PVC left Pending (deferred)".to_string());
-                continue;
-            }
-
-            // Immediate binding mode: provision now.
-            let (pv_name, host_path, dyn_pv) = self.build_dynamic_pv(pvc, pvc_ns, pvc_name, sc);
-            // The ONE host effect — create the backing dir before the PV is
-            // visible so the kubelet can bind-mount it.
-            self.env
-                .ensure_dir(&host_path)
-                .map_err(|e| ControllerError::Internal(format!("provision local-path dir: {e}")))?;
-            // ── RESTORE-FROM-SNAPSHOT ────────────────────────────────────
-            // A PVC whose `spec.dataSource` names a VolumeSnapshot is a
-            // RESTORE, and this is the PITR drill's whole restore vector. The
-            // hydrate happens AFTER the dir exists and BEFORE the PV is
-            // visible, so a pod can never observe a half-filled volume.
-            //
-            // A named-but-unresolvable snapshot leaves the claim Pending
-            // rather than provisioning an empty volume: presenting an empty
-            // restore as a successful one is exactly the "clean receipt, no
-            // data underneath" failure a drill exists to catch.
-            if let Some(snap_name) = Self::snapshot_data_source(pvc) {
-                let Some(src) =
-                    self.resolve_snapshot_path(pvc_ns, &snap_name, &snapshots, &snapshot_contents)
-                else {
-                    report.objects_skipped += 1;
-                    report.note = Some(
-                        "PVC names a VolumeSnapshot dataSource that is not ready; left Pending                          rather than provisioned empty"
-                            .to_string(),
-                    );
-                    continue;
-                };
-                self.env.restore_tree(&src, &host_path).map_err(|e| {
-                    ControllerError::Internal(format!("restore from snapshot: {e}"))
-                })?;
-                debug!(pvc = %pvc_key.label(), snapshot = %snap_name, "restored PV data from snapshot");
-            }
-            let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
-            self.put(pv_key, dyn_pv).await?;
-            // Bind the PVC to the freshly-provisioned PV.
-            let bound_pvc = Self::bind_pvc(pvc.clone(), &pv_name);
-            self.put(pvc_key.clone(), bound_pvc).await?;
-            claimed_this_tick.push(pv_name.clone());
-            report.objects_changed += 1;
-            debug!(pvc = %pvc_key.label(), pv = %pv_name, "dynamically provisioned + bound local-path PV");
-        }
-
+        let (this, view, claimed) = (self, &view, &claimed_this_tick);
+        let report = self
+            .sweep
+            .run(&pvcs, |pvc_key, pvc| async move {
+                ObjectOutcome::settle(this.reconcile_claim(pvc_key, pvc, view, claimed).await)
+            })
+            .await?;
         Ok(report.into())
     }
 }
@@ -1312,6 +1372,207 @@ mod tests {
             }
         }
         assert_eq!(bound_count, 1, "exactly one PVC binds the single PV");
+    }
+
+    // ── per-claim isolation (T2.3) ───────────────────────────────────
+
+    /// A host seam whose directory creation fails for exactly one claim.
+    struct PoisonedEnv {
+        poisoned_dir: &'static str,
+    }
+
+    impl ProvisionerEnv for PoisonedEnv {
+        fn ensure_dir(&self, path: &str) -> Result<(), String> {
+            if path.ends_with(self.poisoned_dir) {
+                Err("mkdir: permission denied".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn restore_tree(&self, _src: &str, _dst: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    async fn default_local_path_class(store: &StoreMesh) {
+        put_op(
+            store,
+            sc_key("local-path"),
+            json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
+                   "metadata": {"name": "local-path",
+                                "annotations": {"storageclass.kubernetes.io/is-default-class": "true"}},
+                   "provisioner": "rancher.io/local-path",
+                   "volumeBindingMode": "Immediate"}),
+        )
+        .await;
+    }
+
+    async fn put_claim(store: &StoreMesh, name: &str, spec: Value) {
+        put_op(
+            store,
+            pvc_key("ns1", name),
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                   "metadata": {"name": name, "namespace": "ns1", "uid": (["uid-", name].concat())},
+                   "spec": spec}),
+        )
+        .await;
+    }
+
+    fn sized() -> Value {
+        json!({"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}})
+    }
+
+    async fn phase(store: &StoreMesh, name: &str) -> Value {
+        store.get(&pvc_key("ns1", name)).await.unwrap()["status"]["phase"].clone()
+    }
+
+    /// The claim listed FIRST cannot get its directory. Before T2.3 its
+    /// `?` ended the tick, so the two healthy claims after it were never
+    /// reached — on that tick or any later one while the directory failed.
+    #[tokio::test]
+    async fn one_poisoned_claim_does_not_stop_the_others() {
+        let store = live_store().await;
+        default_local_path_class(&store).await;
+        for name in ["aaa-poisoned", "bbb", "ccc"] {
+            put_claim(&store, name, sized()).await;
+        }
+        let listed = store.list("", "v1", "PersistentVolumeClaim", None).await;
+        assert_eq!(
+            listed[0].0.name, "aaa-poisoned",
+            "precondition: listed first"
+        );
+
+        let c = PvBinderController::with_env(
+            store.clone(),
+            None,
+            "/data/local-path",
+            Arc::new(PoisonedEnv {
+                poisoned_dir: "ns1-aaa-poisoned",
+            }),
+        );
+        let outcome = c
+            .tick()
+            .await
+            .expect("one claim's directory is not the whole sweep's failure");
+
+        for name in ["bbb", "ccc"] {
+            assert_eq!(phase(&store, name).await, "Bound", "{name} was reconciled");
+        }
+        assert_ne!(phase(&store, "aaa-poisoned").await, "Bound");
+        assert!(
+            store.get(&pv_key("pvc-ns1-aaa-poisoned")).await.is_none(),
+            "no PV is written for a claim whose directory does not exist"
+        );
+        let sweep = outcome.sweep.expect("the binder reports through its sweep");
+        assert_eq!((sweep.changed(), sweep.failed()), (2, 1));
+        // A mkdir failure is Transient: isolated, but still retried on the
+        // claim's own curve rather than left to the fallback timer.
+        assert_eq!(
+            outcome.result,
+            crate::ReconcileResult::Requeue(crate::TRANSIENT_RETRY.base())
+        );
+    }
+
+    /// examined = changed + unchanged + skipped + failed, on a real tick
+    /// that produces every outcome.
+    #[tokio::test]
+    async fn the_report_identity_holds_on_a_real_sweep() {
+        let store = live_store().await;
+        default_local_path_class(&store).await;
+        // Changed: provisioned.
+        put_claim(&store, "fresh", sized()).await;
+        // Unchanged: already Bound.
+        put_op(
+            &store,
+            pvc_key("ns1", "settled"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                   "metadata": {"name": "settled", "namespace": "ns1"},
+                   "spec": {"volumeName": "elsewhere"}, "status": {"phase": "Bound"}}),
+        )
+        .await;
+        // Skipped: pre-bound to a PV that is not there.
+        put_claim(
+            &store,
+            "waiting",
+            json!({"accessModes": ["ReadWriteOnce"], "volumeName": "absent",
+                   "resources": {"requests": {"storage": "1Gi"}}}),
+        )
+        .await;
+        // Failed, Transient: its directory cannot be made.
+        put_claim(&store, "poisoned", sized()).await;
+        // Failed, Declarative: no size to provision.
+        put_claim(
+            &store,
+            "sizeless",
+            json!({"accessModes": ["ReadWriteOnce"]}),
+        )
+        .await;
+
+        let c = PvBinderController::with_env(
+            store.clone(),
+            None,
+            "/data/local-path",
+            Arc::new(PoisonedEnv {
+                poisoned_dir: "ns1-poisoned",
+            }),
+        );
+        let outcome = c.tick().await.unwrap();
+        let sweep = outcome.sweep.unwrap();
+        assert_eq!(
+            (
+                sweep.changed(),
+                sweep.unchanged(),
+                sweep.skipped(),
+                sweep.failed()
+            ),
+            (1, 1, 1, 2)
+        );
+        assert_eq!(sweep.examined(), 5, "every listed claim was examined");
+        assert_eq!(outcome.objects_examined, 5);
+        assert_eq!(outcome.objects_changed, 1);
+        assert_eq!(outcome.objects_skipped, 1);
+    }
+
+    /// A claim with no usable size is a broken declaration: it stays
+    /// Pending, gets no PV, and says why on itself — once, not once per
+    /// sweep. The claim beside it still provisions.
+    #[tokio::test]
+    async fn a_sizeless_claim_fails_on_itself_with_one_event() {
+        let store = live_store().await;
+        default_local_path_class(&store).await;
+        put_claim(
+            &store,
+            "sizeless",
+            json!({"accessModes": ["ReadWriteOnce"]}),
+        )
+        .await;
+        put_claim(&store, "sized", sized()).await;
+
+        let events = Arc::new(crate::event_recorder::CollectingEventSink::new());
+        let c = binder(store.clone()).with_event_sink(events.clone());
+        let outcome = c.tick().await.unwrap();
+        c.tick().await.unwrap();
+
+        assert_eq!(phase(&store, "sized").await, "Bound");
+        assert_ne!(phase(&store, "sizeless").await, "Bound");
+        assert!(
+            store.get(&pv_key("pvc-ns1-sizeless")).await.is_none(),
+            "no PV with a null or unparseable capacity"
+        );
+        let recorded = events.drain();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "one Event across two sweeps: {recorded:?}"
+        );
+        let e = &recorded[0];
+        assert_eq!(e.reason, crate::event_recorder::Reason::ProvisioningFailed);
+        assert_eq!(e.involved.kind, "PersistentVolumeClaim");
+        assert_eq!(e.involved.name, "sizeless");
+        assert_eq!(e.involved.uid.as_deref(), Some("uid-sizeless"));
+        assert_eq!(e.component, "persistentvolume-controller");
+        // Declarative: no targeted retry; the Event is the answer.
+        assert_eq!(outcome.result, crate::ReconcileResult::Done);
     }
 }
 

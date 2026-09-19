@@ -59,6 +59,67 @@ impl ControllerError {
     }
 }
 
+/// Where an error's damage stops, inside one sweep over many objects.
+///
+/// A sweep reconciles every object of a kind in one tick. Before this type
+/// the only exit was `?`, which ended the WHOLE sweep: one PVC whose
+/// backing directory could not be created kept every later PVC in the list
+/// Pending, tick after tick, for as long as that one directory failed. The
+/// scope says which failures are allowed to do that.
+///
+///   * `Item` — the failure belongs to one object: its declaration is
+///     unusable, or a host effect made on its behalf failed. The next
+///     object is unaffected, so the sweep records the failure against
+///     this object and carries on.
+///   * `Sweep` — the failure belongs to what every object shares: the
+///     store. The next object's write would meet the same refusal, and a
+///     sweep whose write did not land is acting on a view that is now
+///     stale, so the sweep stops and the tick fails.
+///
+/// Read through [`ControllerError::scope`]; acted on by
+/// [`crate::sweep::Sweep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorScope {
+    Item,
+    Sweep,
+}
+
+impl ControllerError {
+    /// How far this error's damage reaches inside a sweep.
+    ///
+    /// Decided by the VARIANT, like [`Self::classify`], and by an
+    /// exhaustive match with no wildcard, so a new variant does not compile
+    /// (E0004) until someone says whether it may stop a sweep.
+    ///
+    ///   * `Store` — Sweep, for every [`StoreError`]; see [`store_scope`].
+    ///   * `InvalidResource` — Item. One object's declaration is malformed;
+    ///     its neighbours' are not.
+    ///   * `Internal` — Item. It wraps a controller's own work on one
+    ///     object (a directory it provisions, a tree it copies).
+    #[must_use]
+    pub const fn scope(&self) -> ErrorScope {
+        match self {
+            Self::Store(e) => store_scope(e),
+            Self::InvalidResource(_) | Self::Internal(_) => ErrorScope::Item,
+        }
+    }
+}
+
+/// The sweep scope of a store error: always [`ErrorScope::Sweep`].
+///
+/// Every variant is the store failing as a whole — a proposal that did not
+/// commit, a store built wrong, a Raft core that stopped — never one key
+/// being refused. Spelled out per variant rather than as `Store(_)` so a
+/// per-key variant, if the store ever grows one, has to be placed.
+const fn store_scope(e: &StoreError) -> ErrorScope {
+    match e {
+        StoreError::ClientWriteFailed(_)
+        | StoreError::ConfigInvalid(_)
+        | StoreError::InitializeFailed(_)
+        | StoreError::Fatal(_) => ErrorScope::Sweep,
+    }
+}
+
 /// The retry class of a store error.
 ///
 ///   * `ClientWriteFailed` — Transient. A proposal that did not commit
@@ -126,6 +187,37 @@ mod tests {
             row(ControllerError::InvalidResource(m())),
             row(ControllerError::Internal(m())),
         ]
+    }
+
+    /// One row per variant, in declaration order, with the scope it must
+    /// have. Built by an exhaustive match for the same reason as
+    /// `every_variant`: a new variant stops this compiling until it has a
+    /// row.
+    fn every_scope() -> Vec<(ControllerError, ErrorScope)> {
+        fn row(e: ControllerError) -> (ControllerError, ErrorScope) {
+            let want = match &e {
+                ControllerError::Store(s) => match s {
+                    StoreError::ClientWriteFailed(_)
+                    | StoreError::ConfigInvalid(_)
+                    | StoreError::InitializeFailed(_)
+                    | StoreError::Fatal(_) => ErrorScope::Sweep,
+                },
+                ControllerError::InvalidResource(_) | ControllerError::Internal(_) => {
+                    ErrorScope::Item
+                }
+            };
+            (e, want)
+        }
+        every_variant().into_iter().map(|(e, _)| row(e)).collect()
+    }
+
+    #[test]
+    fn store_errors_stop_a_sweep_and_nothing_else_does() {
+        let rows = every_scope();
+        assert_eq!(rows.len(), 6, "one row per variant");
+        for (e, want) in rows {
+            assert_eq!(e.scope(), want, "{e:?}");
+        }
     }
 
     #[test]

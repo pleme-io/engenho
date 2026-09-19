@@ -2774,6 +2774,16 @@ fn spawn_drivers(
         handles.push(WatchDriver::new(c, store.clone(), driver_config(&["Namespace"])).spawn());
     }
 
+    // The event sink, built once and shared by every producer below. It
+    // lives here rather than inside the kubelet block because the pv-binder
+    // and the NetworkPolicy controller need it too, and two sinks over one
+    // store would be two independent lossy buffers for one cluster's events.
+    let events: Arc<dyn engenho_controllers::event_recorder::EventSink> = Arc::new(
+        engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
+            store: store.clone(),
+        })),
+    );
+
     // PV/PVC binder: binds Pending PersistentVolumeClaims to matching
     // Available PersistentVolumes (capacity ≥ request, accessModes ⊇ requested,
     // storageClassName equal, volumeName pre-bind) and dynamically provisions a
@@ -2797,10 +2807,14 @@ fn spawn_drivers(
         // fills it), the provisioner (CreateVolume) and the materializer
         // (NodePublishVolume). Two tables would let a driver be
         // provisionable but not mountable, or the reverse.
-        let c =
-            PvBinderController::new(store.clone(), ns.clone(), local_path_root).with_csi(Arc::new(
-                engenho_kubelet::DriverCsiProvisioner::new(csi_drivers.clone()),
-            ));
+        // The event sink: a claim that cannot be provisioned says why on
+        // the claim (`ProvisioningFailed`), where `kubectl describe pvc`
+        // shows it.
+        let c = PvBinderController::new(store.clone(), ns.clone(), local_path_root)
+            .with_csi(Arc::new(engenho_kubelet::DriverCsiProvisioner::new(
+                csi_drivers.clone(),
+            )))
+            .with_event_sink(events.clone());
         handles.push(
             WatchDriver::new(
                 c,
@@ -2885,16 +2899,6 @@ fn spawn_drivers(
             .spawn(),
         );
     }
-
-    // The event sink, built once and shared by every producer below. It
-    // lives here rather than inside the kubelet block because the
-    // NetworkPolicy controller needs it too, and two sinks over one store
-    // would be two independent lossy buffers for one cluster's events.
-    let events: Arc<dyn engenho_controllers::event_recorder::EventSink> = Arc::new(
-        engenho_controllers::event_recorder::StoreEventSink::new(Arc::new(MeshEventStore {
-            store: store.clone(),
-        })),
-    );
 
     // NetworkPolicy: translate every policy into enforcer rules AND record
     // whether they are actually enforced. Wired HERE, at assembly, for the

@@ -25,6 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::ControllerError;
+use crate::sweep::SweepReport;
 
 /// One controller — implements the standard reconcile-loop shape.
 #[async_trait]
@@ -112,27 +113,36 @@ impl ReconcileResult {
 pub struct ReconcileOutcome {
     pub report: ReconcileReport,
     pub result: ReconcileResult,
+    /// The per-object tally, when the tick ran through a
+    /// [`crate::sweep::Sweep`]. `report` is derived from it; this keeps the
+    /// counts `ReconcileReport` has no field for (unchanged, failed).
+    pub sweep: Option<SweepReport>,
 }
 
 impl ReconcileOutcome {
     /// Build an outcome from a report + an explicit requeue decision.
     #[must_use]
     pub fn new(report: ReconcileReport, result: ReconcileResult) -> Self {
-        Self { report, result }
+        Self {
+            report,
+            result,
+            sweep: None,
+        }
     }
 
-    /// Log the embedded report (delegates to [`ReconcileReport::log`]).
+    /// Log the tick: the sweep's tally when there is one (it can say that
+    /// objects failed), else the embedded report.
     pub fn log(&self, controller_name: &str) {
-        self.report.log(controller_name);
+        match &self.sweep {
+            Some(sweep) => sweep.log(controller_name),
+            None => self.report.log(controller_name),
+        }
     }
 }
 
 impl From<ReconcileReport> for ReconcileOutcome {
     fn from(report: ReconcileReport) -> Self {
-        Self {
-            report,
-            result: ReconcileResult::Done,
-        }
+        Self::new(report, ReconcileResult::Done)
     }
 }
 
