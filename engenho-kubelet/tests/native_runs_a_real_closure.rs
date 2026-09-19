@@ -77,9 +77,11 @@ async fn a_nix_closure_runs_as_a_native_process_and_its_output_is_readable() {
     );
     // ★ CORRECTED 2026-09-18. This asserted `pod_ip.is_none()`, reasoning that
     // "inventing a pod IP would be worse than reporting none". The incident
-    // said otherwise: `probe.rs` maps an http/tcp probe with no pod IP to
-    // `ProbeObservation::Failure` unconditionally, so `None` does not mean
-    // "no opinion" — it means EVERY network probe fails forever.
+    // said otherwise: `probe.rs` mapped an http/tcp probe with no pod IP to
+    // `ProbeObservation::Failure` unconditionally, so `None` did not mean
+    // "no opinion" — it meant EVERY network probe failed forever. (Since T1.1
+    // it is `Blind(NoTargetAddress)`, which no longer restarts the pod, but a
+    // probe with nothing to dial still never passes, so this still matters.)
     //
     // Measured on ryn: pangea-operator's startupProbe (30 x 5s = 150s) could
     // never pass, so the kubelet killed a healthy operator every 2.5 minutes

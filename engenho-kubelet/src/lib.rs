@@ -71,8 +71,9 @@ pub mod server;
 pub mod volume;
 
 pub use backend::{
-    ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeNetProber, HttpProbeTarget,
-    LogOptions, NetProber, PodmanBackend, ProbeIoError, PullPolicy, TcpProbeTarget, TokioNetProber,
+    ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeExecFault, FakeNetProber,
+    HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage,
+    PullPolicy, TcpProbeTarget, TokioNetProber,
 };
 pub use config_bridge::{make_container_runtime, make_container_runtime_with_apiserver};
 pub use csi_materializer::{
@@ -90,9 +91,9 @@ pub use pod_volume::{
     VolumeMaterializer, VolumeResolveError, resolve_pod_volumes,
 };
 pub use probe::{
-    HttpScheme, ProbeHandler, ProbeKind, ProbeObservation, ProbeParseError, ProbePort,
-    ProbeRuntime, ProbeSpec, ProbeTiming, ProbeVerdict, aggregate_container_readiness,
-    fold_probe_observation, run_handler,
+    BlindCause, BlindNotice, BlindStreak, HttpScheme, ProbeHandler, ProbeKind, ProbeObservation,
+    ProbeParseError, ProbePort, ProbeRuntime, ProbeSpec, ProbeTiming, ProbeTrip, ProbeVerdict,
+    TripKind, aggregate_container_readiness, fold_probe_observation, run_handler,
 };
 pub use volume::{
     AccessMode, FakeVolumeBackend, FakeVolumeEvent, HostPathVolumeBackend, MountedVolume,

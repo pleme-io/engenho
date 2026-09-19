@@ -56,9 +56,37 @@ use crate::pod_volume::{
     container_mounts, pod_volumes,
 };
 use crate::probe::{
-    ProbeKind, ProbeRuntime, ProbeSpec, aggregate_container_readiness, fold_probe_observation,
-    run_handler,
+    BlindCause, BlindNotice, ProbeKind, ProbeRuntime, ProbeSpec, ProbeTrip,
+    aggregate_container_readiness, fold_probe_observation, run_handler,
 };
+
+/// The pod condition the kubelet raises while a probe has been BLIND — unable
+/// to observe the workload at all — for as many consecutive runs as it would
+/// have taken a failing probe to trip. Upstream has no equivalent because
+/// upstream never has a pod IP to lack; engenho's native backend did, and the
+/// result was a healthy operator restarted every 150s with nothing on the pod
+/// to say why.
+///
+/// Not in [`KUBELET_OWNED_CONDITIONS`]: the status builder preserves it like a
+/// foreign condition, so render paths that ran no probes (Pending, init)
+/// leave it as last observed rather than clearing a fact they did not check.
+/// Only [`Kubelet::render_probe_blind_condition`], on the path that ran the
+/// probes, sets or resolves it.
+const PROBE_BLIND_CONDITION: &str = "ProbeBlind";
+
+/// The pod conditions the kubelet renders from scratch on every status write —
+/// upstream's own list, `kubetypes.PodConditionsByKubelet`. Everything else in
+/// `status.conditions` is preserved in its existing order.
+const KUBELET_OWNED_CONDITIONS: [&str; 4] =
+    ["PodScheduled", "Initialized", "Ready", "ContainersReady"];
+
+/// A probe that has been blind long enough to say so on the pod.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProbeBlindCondition {
+    container: String,
+    kind: ProbeKind,
+    cause: BlindCause,
+}
 
 /// The lowest period the kubelet will requeue at — a 1s floor so a
 /// `periodSeconds: 1` probe does not spin the loop faster than the runtime can
@@ -99,16 +127,33 @@ impl ContainerProbeState {
             *rt = ProbeRuntime::new(now);
         }
     }
+
+    /// The first probe (startup, readiness, liveness — a fixed order, so the
+    /// condition it feeds renders the same on every tick) that has been blind
+    /// for at least its own `failureThreshold` runs.
+    fn sustained_blindness(&self) -> Option<(ProbeKind, BlindCause)> {
+        [&self.startup, &self.readiness, &self.liveness]
+            .into_iter()
+            .flatten()
+            .find_map(|(spec, rt)| rt.sustained_blindness(spec).map(|c| (spec.kind, c)))
+    }
 }
 
 /// The aggregated probe decision for one running container this tick: its
-/// effective readiness + whether a liveness/startup verdict requests a restart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// effective readiness, whether a liveness/startup verdict requests a restart,
+/// and what the probes could not see.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ProbeOutcome {
     /// The container's effective `ready` (→ `containerStatuses[].ready`).
     ready: bool,
-    /// `true` iff a liveness/startup verdict (post-gating) requests a restart.
-    needs_restart: bool,
+    /// `Some` iff a liveness/startup probe OBSERVED failures past its
+    /// threshold (post-gating). A blind probe cannot produce one: see
+    /// [`ProbeTrip`].
+    trip: Option<ProbeTrip>,
+    /// Probes that went blind THIS tick — one Warning each.
+    entered_blind: Vec<(ProbeKind, BlindCause)>,
+    /// A probe blind for at least its `failureThreshold` runs, if any.
+    sustained_blind: Option<(ProbeKind, BlindCause)>,
 }
 
 /// What the kubelet remembers about ONE container of a Pod it started.
@@ -1847,9 +1892,8 @@ impl Kubelet {
         // every tick — waking every Pod-subscribed controller forever. Computed
         // FROM `live`, equality holds by construction.
         //
-        // Upstream's own list, `kubetypes.PodConditionsByKubelet`.
-        const KUBELET_OWNED: [&str; 4] =
-            ["PodScheduled", "Initialized", "Ready", "ContainersReady"];
+        // Upstream's own list, `kubetypes.PodConditionsByKubelet`
+        // (KUBELET_OWNED_CONDITIONS).
         // (a) Everything we do NOT own, in its existing order — readiness
         // gates, DisruptionTarget, anything a future controller adds.
         let mut conditions: Vec<Value> = live
@@ -1860,7 +1904,7 @@ impl Kubelet {
                     .filter(|c| {
                         !c.get("type")
                             .and_then(Value::as_str)
-                            .is_some_and(|t| KUBELET_OWNED.contains(&t))
+                            .is_some_and(|t| KUBELET_OWNED_CONDITIONS.contains(&t))
                     })
                     .cloned()
                     .collect()
@@ -1929,6 +1973,66 @@ impl Kubelet {
             .map_or_else(engenho_types::time::now_rfc3339_utc, str::to_string);
         status["startTime"] = Value::String(start_time);
         status
+    }
+
+    /// Set or resolve the [`PROBE_BLIND_CONDITION`] on a rendered `status`.
+    ///
+    /// Called only on the render path that ran the probes this tick, AFTER
+    /// the builder copied `live`'s conditions into `status`:
+    ///
+    ///   * `Some` → `ProbeBlind=True` with the cause as `reason` and a
+    ///     [`BlindNotice`] as `message` — neither carries a count, so the
+    ///     condition is byte-identical on every tick the cause holds and the
+    ///     status write stays `NoChange`.
+    ///   * `None` and the pod carries the condition → `ProbeBlind=False`. It
+    ///     resolves rather than vanishing, so `kubectl describe` shows the
+    ///     blindness cleared instead of silently forgetting it happened.
+    ///   * `None` and no condition → nothing: a pod that never went blind
+    ///     renders exactly as before.
+    ///
+    /// A new condition is inserted where the NEXT render will put it: the
+    /// builder keeps every condition it does not own ahead of its own, in
+    /// live order. Appending instead would reorder the array on the next
+    /// tick, and a status that differs on every tick writes on every tick.
+    fn render_probe_blind_condition(status: &mut Value, blind: Option<&ProbeBlindCondition>) {
+        let Some(conditions) = status.get_mut("conditions").and_then(Value::as_array_mut) else {
+            return;
+        };
+        let is_type = |c: &Value, ty: &str| c.get("type").and_then(Value::as_str) == Some(ty);
+        let existing = conditions
+            .iter()
+            .position(|c| is_type(c, PROBE_BLIND_CONDITION));
+        let rendered = match (blind, existing) {
+            (Some(b), _) => json!({
+                "type": PROBE_BLIND_CONDITION,
+                "status": "True",
+                "reason": b.cause.reason(),
+                "message": BlindNotice {
+                    container: &b.container,
+                    kind: b.kind,
+                    cause: b.cause,
+                }
+                .to_string(),
+            }),
+            (None, Some(_)) => json!({
+                "type": PROBE_BLIND_CONDITION,
+                "status": "False",
+            }),
+            (None, None) => return,
+        };
+        if let Some(i) = existing {
+            conditions[i] = rendered;
+        } else {
+            let at = conditions
+                .iter()
+                .position(|c| {
+                    KUBELET_OWNED_CONDITIONS
+                        .iter()
+                        .any(|owned| is_type(c, owned))
+                })
+                .unwrap_or(conditions.len());
+            conditions.insert(at, rendered);
+        }
     }
 }
 
@@ -2877,13 +2981,13 @@ impl Kubelet {
 
     /// Run the DUE probes of one running container, fold their verdicts into
     /// the per-container [`ProbeRuntime`]s (persisted back into `self.local`),
-    /// and return the aggregated `(ready, needs_restart)` decision via
-    /// [`ProbeOutcome`]. Also folds the container's soonest next-probe-due into
-    /// `soonest_requeue`.
+    /// and return the aggregated decision via [`ProbeOutcome`]: readiness,
+    /// the restart witness (if any), and what the probes could not see. Also
+    /// folds the container's soonest next-probe-due into `soonest_requeue`.
     ///
     /// A container with NO probes short-circuits: `ready = is_running` (true,
-    /// since this is only called on a running container), `needs_restart =
-    /// false`, no requeue contributed — the behavior-preserving common case.
+    /// since this is only called on a running container), no trip, nothing
+    /// blind, no requeue contributed — the behavior-preserving common case.
     async fn run_container_probes(
         &self,
         record: &ContainerRecord,
@@ -2897,13 +3001,14 @@ impl Kubelet {
         if record.probes.is_empty() {
             return ProbeOutcome {
                 ready: true,
-                needs_restart: false,
+                ..ProbeOutcome::default()
             };
         }
 
         // Work on a clone of the probe state so we drive the I/O without
         // holding the lock, then persist the advanced runtimes back.
         let mut probes = record.probes.clone();
+        let mut entered_blind: Vec<(ProbeKind, BlindCause)> = Vec::new();
 
         // Helper: for one probe slot, if due, run + fold; always fold the
         // probe's next-due into soonest_requeue.
@@ -2911,7 +3016,7 @@ impl Kubelet {
         // readiness + liveness. The verdicts are aggregated below.
         let mut startup_done = true;
         let mut has_startup = false;
-        let mut startup_needs_restart = false;
+        let mut startup_trip: Option<ProbeTrip> = None;
 
         if let Some((spec, rt)) = probes.startup.as_mut() {
             has_startup = true;
@@ -2925,7 +3030,8 @@ impl Kubelet {
                 )
                 .await;
                 let verdict = fold_probe_observation(spec, rt, obs, now);
-                startup_needs_restart = verdict.needs_restart;
+                startup_trip = verdict.trip;
+                entered_blind.extend(verdict.entered_blind.map(|c| (spec.kind, c)));
             }
             startup_done = rt.gate_satisfied;
             Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
@@ -2944,13 +3050,14 @@ impl Kubelet {
                     pod_ip,
                 )
                 .await;
-                let _ = fold_probe_observation(spec, rt, obs, now);
+                let verdict = fold_probe_observation(spec, rt, obs, now);
+                entered_blind.extend(verdict.entered_blind.map(|c| (spec.kind, c)));
             }
             readiness_ready = rt.gate_satisfied;
             Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
         }
 
-        let mut liveness_needs_restart = false;
+        let mut liveness_trip: Option<ProbeTrip> = None;
         if let Some((spec, rt)) = probes.liveness.as_mut() {
             if rt.is_due(spec, now) {
                 let obs = run_handler(
@@ -2962,7 +3069,8 @@ impl Kubelet {
                 )
                 .await;
                 let verdict = fold_probe_observation(spec, rt, obs, now);
-                liveness_needs_restart = verdict.needs_restart;
+                liveness_trip = verdict.trip;
+                entered_blind.extend(verdict.entered_blind.map(|c| (spec.kind, c)));
             }
             Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
         }
@@ -2980,7 +3088,8 @@ impl Kubelet {
         // A startup probe that itself failed past threshold ALWAYS restarts (a
         // container that never boots IS restarted), regardless of the gate.
         // Liveness restart only fires once the startup window has passed.
-        let needs_restart = startup_needs_restart || (may_run_liveness && liveness_needs_restart);
+        let trip = startup_trip.or(liveness_trip.filter(|_| may_run_liveness));
+        let sustained_blind = probes.sustained_blindness();
 
         // Persist the advanced probe runtimes back into the local record.
         {
@@ -3003,7 +3112,42 @@ impl Kubelet {
 
         ProbeOutcome {
             ready: effective_ready,
-            needs_restart,
+            trip,
+            entered_blind,
+            sustained_blind,
+        }
+    }
+
+    /// A probe that cannot see the workload says so, and restarts nothing —
+    /// only a [`ProbeTrip`] does. One `Unhealthy` Warning per probe that went
+    /// blind this tick (once per streak, not once per period), and the first
+    /// sustained blindness (manifest order) is kept for the pod condition.
+    async fn report_blindness(
+        &self,
+        key: &ResourceKey,
+        cname: &str,
+        outcome: &ProbeOutcome,
+        pod_blind: &mut Option<ProbeBlindCondition>,
+    ) {
+        for &(kind, cause) in &outcome.entered_blind {
+            let notice = BlindNotice {
+                container: cname,
+                kind,
+                cause,
+            };
+            self.emit(
+                key,
+                engenho_controllers::event_recorder::Reason::Unhealthy,
+                notice.to_string(),
+            )
+            .await;
+        }
+        if let Some((kind, cause)) = outcome.sustained_blind {
+            pod_blind.get_or_insert_with(|| ProbeBlindCondition {
+                container: cname.to_string(),
+                kind,
+                cause,
+            });
         }
     }
 
@@ -3158,6 +3302,9 @@ impl Kubelet {
         let mut observations: Vec<ContainerObservation> = Vec::with_capacity(specs.len());
         let mut pod_ip: Option<String> = None;
         let mut vanished = false;
+        // The first container (manifest order) whose probe has been blind long
+        // enough to raise ProbeBlind on the pod.
+        let mut pod_blind: Option<ProbeBlindCondition> = None;
         // Per-container poll. Collect the typed observations + handle restart.
         for (cname, spec) in &specs {
             let record = lp.containers.get(cname);
@@ -3188,10 +3335,17 @@ impl Kubelet {
                         )
                         .await;
 
-                    if outcome.needs_restart && restart_policy != RestartPolicy::Never {
-                        // Liveness/startup failed past threshold → restart THIS
-                        // container via the existing restart machinery
-                        // (restartPolicy:Never suppresses it — K8s semantics).
+                    self.report_blindness(key, cname, &outcome, &mut pod_blind)
+                        .await;
+
+                    if let Some(trip) = outcome.trip
+                        && restart_policy != RestartPolicy::Never
+                    {
+                        // Liveness/startup OBSERVED failures past threshold →
+                        // restart THIS container via the existing restart
+                        // machinery (restartPolicy:Never suppresses it — K8s
+                        // semantics).
+                        debug!(pod = %key.label(), container = %cname, %trip, "probe tripped");
                         match self
                             .restart_container(
                                 key,
@@ -3457,7 +3611,7 @@ impl Kubelet {
         // and CAS-write. The pure reconcile_pod_phase is the interpreter; this
         // is the I/O shell.
         let (phase, statuses) = reconcile_pod_phase(restart_policy, &observations);
-        let desired = if has_init {
+        let mut desired = if has_init {
             // init_complete pod (we only reach here past the init route once
             // init_complete): render initContainerStatuses (every init
             // container Terminated exit 0) + Initialized=True alongside the app
@@ -3477,6 +3631,9 @@ impl Kubelet {
         } else {
             Self::build_pod_status(value, phase, &statuses, pod_ip.as_deref())
         };
+        // This is the render path that ran the probes, so it is the one that
+        // may set or resolve ProbeBlind.
+        Self::render_probe_blind_condition(&mut desired, pod_blind.as_ref());
         self.write_pod_status(key, value, &desired, report).await
     }
 
@@ -4780,6 +4937,111 @@ mod tests {
             .filter(|c| c["type"] == "PodScheduled")
             .count();
         assert_eq!(n, 1, "no duplicate PodScheduled: {status}");
+    }
+
+    // ── ProbeBlind: a probe that cannot see says so on the pod ──────────
+
+    fn blind_on_c() -> ProbeBlindCondition {
+        ProbeBlindCondition {
+            container: "c".into(),
+            kind: ProbeKind::Startup,
+            cause: BlindCause::NoTargetAddress,
+        }
+    }
+
+    /// The render the probe path produces for `live` — builder, then the
+    /// `ProbeBlind` step — and the pod as it stands after that write lands.
+    fn probe_path_render(live: &Value, blind: Option<&ProbeBlindCondition>) -> (Value, Value) {
+        use engenho_types::curated_enums::PodPhase;
+        let mut status =
+            Kubelet::build_pod_status(live, PodPhase::Running, &one_running_status(), None);
+        Kubelet::render_probe_blind_condition(&mut status, blind);
+        let next_live = json!({ "status": status.clone() });
+        (status, next_live)
+    }
+
+    #[test]
+    fn a_pod_that_never_went_blind_renders_exactly_as_before() {
+        use engenho_types::curated_enums::PodPhase;
+        let live = json!({"status": {"conditions": [
+            {"type": "DisruptionTarget", "status": "True"}
+        ]}});
+        let before =
+            Kubelet::build_pod_status(&live, PodPhase::Running, &one_running_status(), None);
+        let (after, _) = probe_path_render(&live, None);
+        assert_eq!(after, before, "no ProbeBlind unless a probe went blind");
+    }
+
+    #[test]
+    fn a_sustained_blind_probe_raises_probe_blind_and_the_render_is_stable() {
+        let (first, live) = probe_path_render(&json!({}), Some(&blind_on_c()));
+        let cond = type_of(&first, PROBE_BLIND_CONDITION).expect("raised");
+        assert_eq!(cond["status"], "True");
+        assert_eq!(cond["reason"], "NoTargetAddress");
+        assert!(
+            cond["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("startup probe of container c")),
+            "the message names the probe and container: {cond}"
+        );
+
+        // The next tick, same cause: byte-identical, so the CAS write is
+        // NoChange rather than a write (and a watch event) every period.
+        let (second, _) = probe_path_render(&live, Some(&blind_on_c()));
+        assert_eq!(second, first, "a steady blind pod must not rewrite status");
+    }
+
+    #[test]
+    fn probe_blind_resolves_to_false_instead_of_vanishing() {
+        let (_, live) = probe_path_render(&json!({}), Some(&blind_on_c()));
+
+        let (resolved, live) = probe_path_render(&live, None);
+        let cond = type_of(&resolved, PROBE_BLIND_CONDITION).expect("kept, not deleted");
+        assert_eq!(cond["status"], "False");
+
+        let (steady, _) = probe_path_render(&live, None);
+        assert_eq!(steady, resolved, "the resolved condition is stable too");
+    }
+
+    #[test]
+    fn probe_blind_sits_with_the_foreign_conditions_so_the_order_holds() {
+        // A readiness gate the kubelet does not own. The builder keeps foreign
+        // conditions ahead of its own; ProbeBlind must land where the NEXT
+        // render will put it, or the array reorders — and rewrites — forever.
+        let live = json!({"status": {"conditions": [
+            {"type": "example.com/gate", "status": "True"}
+        ]}});
+        let (first, live) = probe_path_render(&live, Some(&blind_on_c()));
+        let types: Vec<&str> = first["conditions"]
+            .as_array()
+            .map(|cs| cs.iter().filter_map(|c| c["type"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            types,
+            [
+                "example.com/gate",
+                PROBE_BLIND_CONDITION,
+                "ContainersReady",
+                "Ready",
+                "PodScheduled"
+            ]
+        );
+        let (second, _) = probe_path_render(&live, Some(&blind_on_c()));
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn render_paths_that_ran_no_probes_leave_probe_blind_as_observed() {
+        use engenho_types::curated_enums::PodPhase;
+        // The Pending / init renders call only the builder. A blindness they
+        // did not re-check is preserved, never cleared on their say-so.
+        let (_, live) = probe_path_render(&json!({}), Some(&blind_on_c()));
+        let pending =
+            Kubelet::build_pod_status(&live, PodPhase::Pending, &one_running_status(), None);
+        assert_eq!(
+            type_of(&pending, PROBE_BLIND_CONDITION).map(|c| &c["status"]),
+            Some(&json!("True"))
+        );
     }
 
     #[test]

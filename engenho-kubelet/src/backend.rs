@@ -712,6 +712,24 @@ struct FakeState {
     /// status at all on a total start failure shipped. A fake that can only
     /// succeed cannot prove what happens when reality refuses.
     seeded_start_failures: BTreeMap<String, String>,
+    /// Container NAMES whose every `exec` misbehaves at the RUNTIME level
+    /// rather than answering with an exit code. Seeded via
+    /// [`FakeBackend::seed_exec_fault`]. Takes precedence over the exec queue.
+    exec_faults: BTreeMap<String, FakeExecFault>,
+}
+
+/// How a [`FakeBackend`] exec fails without the command ever answering.
+///
+/// The two cases a prober must tell apart from a non-zero exit: the runtime
+/// returned an error (the command never ran — a probe is Blind), and the
+/// runtime never returned at all (the probe times out — a Failure).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FakeExecFault {
+    /// `exec` returns `Err(KubeletError::Backend(message))`, as a podman
+    /// socket that refuses the connection would.
+    Unavailable(String),
+    /// `exec` never completes.
+    Hang,
 }
 
 /// Operation log entry for `FakeBackend`. Tests assert this shape
@@ -850,6 +868,23 @@ impl FakeBackend {
     pub async fn set_default_exec(&self, outcome: ExecOutcome) {
         self.inner.lock().await.default_exec = Some(outcome);
     }
+
+    /// Test hook: make every `exec` against the container of name
+    /// `container_name` fail in the RUNTIME with `fault` instead of answering
+    /// with an exit code. Applies until [`FakeBackend::clear_exec_fault`].
+    pub async fn seed_exec_fault(&self, container_name: &str, fault: FakeExecFault) {
+        self.inner
+            .lock()
+            .await
+            .exec_faults
+            .insert(container_name.to_string(), fault);
+    }
+
+    /// Test hook: the runtime recovers — `exec` against `container_name`
+    /// answers with exit codes again (the seeded queue, then the default).
+    pub async fn clear_exec_fault(&self, container_name: &str) {
+        self.inner.lock().await.exec_faults.remove(container_name);
+    }
 }
 
 #[async_trait]
@@ -873,6 +908,22 @@ impl ContainerRuntime for FakeBackend {
         // Resolve the spec NAME this id was started under, then pop the front
         // of its seeded queue; fall back to the configured default (success).
         let name = state.id_to_name.get(container_id).cloned();
+        match name
+            .as_deref()
+            .and_then(|n| state.exec_faults.get(n))
+            .cloned()
+        {
+            Some(FakeExecFault::Unavailable(message)) => {
+                return Err(KubeletError::Backend(message));
+            }
+            Some(FakeExecFault::Hang) => {
+                // Release the lock first: a hung exec must not also wedge
+                // every other call into the fake.
+                drop(state);
+                return std::future::pending().await;
+            }
+            None => {}
+        }
         let popped = name
             .as_deref()
             .and_then(|n| state.seeded_exec_by_name.get_mut(n))
@@ -1965,9 +2016,11 @@ pub struct TcpProbeTarget {
     pub timeout: Duration,
 }
 
-/// Typed I/O failure for a network probe. The prober's `run_handler` maps ANY
-/// of these to a probe `Failure` (never aborts the tick) — so this error never
-/// escapes the prober, but it's typed for diagnostics + the mock contract.
+/// Typed I/O failure for a network probe. It never escapes the prober and never
+/// aborts the tick; `run_handler` classifies each variant exhaustively. A
+/// request that went out and was answered badly is a probe `Failure`
+/// (`Connect`, `Timeout`, `Io`). A request that was never sent (`Setup`) is
+/// `Blind`: it says nothing about the workload and can never restart it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProbeIoError {
     /// The connection was refused / reset / unreachable.
@@ -1984,9 +2037,39 @@ pub enum ProbeIoError {
         /// `ip:port` label.
         target: String,
     },
-    /// Any other I/O error (DNS, TLS, malformed response).
+    /// Any other I/O error on a SENT request (DNS, TLS, malformed response).
     #[error("probe io error: {0}")]
     Io(String),
+    /// The prober could not form the request, so nothing was sent.
+    #[error("probe could not be set up ({stage}): {reason}")]
+    Setup {
+        /// Which step of forming the request failed.
+        stage: ProbeSetupStage,
+        /// Underlying reason.
+        reason: String,
+    },
+}
+
+/// Which step of forming a network probe request failed — before anything
+/// reached the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSetupStage {
+    /// The probe URL did not parse.
+    Url,
+    /// The HTTP client could not be built.
+    Client,
+    /// The request could not be assembled (for example an invalid header).
+    Request,
+}
+
+impl std::fmt::Display for ProbeSetupStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ProbeSetupStage::Url => "url",
+            ProbeSetupStage::Client => "client",
+            ProbeSetupStage::Request => "request",
+        })
+    }
 }
 
 /// The network-probe seam: httpGet + tcpSocket against the routable pod IP.
@@ -2039,13 +2122,19 @@ impl NetProber for TokioNetProber {
             format!("/{}", target.path)
         };
         let url = reqwest::Url::parse(&format!("{}://{authority}{path}", target.scheme.as_str()))
-            .map_err(|e| ProbeIoError::Io(format!("bad probe url: {e}")))?;
+            .map_err(|e| ProbeIoError::Setup {
+            stage: ProbeSetupStage::Url,
+            reason: e.to_string(),
+        })?;
         let client = reqwest::Client::builder()
             .timeout(target.timeout)
             // Probes accept self-signed certs (K8s does not verify probe TLS).
             .danger_accept_invalid_certs(true)
             .build()
-            .map_err(|e| ProbeIoError::Io(format!("http client build: {e}")))?;
+            .map_err(|e| ProbeIoError::Setup {
+                stage: ProbeSetupStage::Client,
+                reason: e.to_string(),
+            })?;
         let mut req = client.get(url);
         // Host override → Host header; custom headers appended.
         if let Some(host) = &target.host {
@@ -2056,6 +2145,12 @@ impl NetProber for TokioNetProber {
         }
         match req.send().await {
             Ok(resp) => Ok(resp.status().as_u16()),
+            // reqwest defers an invalid header to `send`; it never reached the
+            // wire, so it is a setup error, not an answer from the workload.
+            Err(e) if e.is_builder() => Err(ProbeIoError::Setup {
+                stage: ProbeSetupStage::Request,
+                reason: e.to_string(),
+            }),
             Err(e) if e.is_timeout() => Err(ProbeIoError::Timeout { target: authority }),
             Err(e) if e.is_connect() => Err(ProbeIoError::Connect {
                 target: authority,
@@ -3279,6 +3374,62 @@ mod kubernetes_service_env_tests {
         inject_kubernetes_service_env(&mut env, "10.0.0.5", 6443);
         assert!(env.contains_key("KUBERNETES_PORT_6443_TCP"));
         assert!(!env.contains_key("KUBERNETES_PORT_443_TCP"));
+    }
+}
+
+#[cfg(test)]
+mod probe_setup_tests {
+    //! A request the prober could not FORM never reached the workload, so it
+    //! must come back as `ProbeIoError::Setup` — which the prober reads as
+    //! Blind — and never as a transport error, which it reads as Failure.
+    //! These run the real `TokioNetProber`; neither case opens a socket.
+    use super::*;
+
+    fn target(ip: &str, headers: Vec<(String, String)>) -> HttpProbeTarget {
+        HttpProbeTarget {
+            ip: ip.to_string(),
+            port: 8080,
+            path: "/healthz".to_string(),
+            scheme: HttpScheme::Http,
+            host: None,
+            headers,
+            timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_that_cannot_be_encoded_is_a_setup_error() {
+        let bad = vec![("bad header\n".to_string(), "v".to_string())];
+        let got = TokioNetProber::new()
+            .http_get(&target("127.0.0.1", bad))
+            .await;
+        assert!(
+            matches!(
+                got,
+                Err(ProbeIoError::Setup {
+                    stage: ProbeSetupStage::Request,
+                    ..
+                })
+            ),
+            "an unencodable header is a setup error, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_that_cannot_form_a_url_is_a_setup_error() {
+        let got = TokioNetProber::new()
+            .http_get(&target("not an address", Vec::new()))
+            .await;
+        assert!(
+            matches!(
+                got,
+                Err(ProbeIoError::Setup {
+                    stage: ProbeSetupStage::Url,
+                    ..
+                })
+            ),
+            "an unparsable URL is a setup error, got {got:?}"
+        );
     }
 }
 

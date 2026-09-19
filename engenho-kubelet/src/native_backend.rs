@@ -233,10 +233,15 @@ pub struct NativeBackend {
 /// per-pod IP — and this used to report `None` on that basis, with a comment
 /// arguing that "inventing one would be worse than reporting none."
 ///
-/// ★ `None` is not the neutral answer. `probe.rs` reads it as
+/// ★ `None` is not the neutral answer. `probe.rs` read it as
 /// `ProbeObservation::Failure` unconditionally (`let Some(ip) = pod_ip else
 /// { return Failure }`), so EVERY httpGet and tcpSocket probe against a
-/// native pod fails forever, whatever the workload is doing.
+/// native pod failed forever, whatever the workload was doing.
+///
+/// Since T1.1 it reads as `Blind(NoTargetAddress)`: no restart, a Warning and
+/// a `ProbeBlind` pod condition instead. That stops the kill loop below but
+/// not the cause — a probe with nothing to dial still never PASSES, so the
+/// pod stays unready. Reporting the real address is still the fix.
 ///
 /// Measured on ryn 2026-09-18: pangea-operator's `startupProbe`
 /// (failureThreshold 30 x periodSeconds 5 = 150s) could never pass, so the
