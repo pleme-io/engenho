@@ -49,9 +49,11 @@ use engenho_types::generated_v1_34::rbac_v1::{
 /// resolves to a [`UserInfo`] carrying this group.
 pub const GROUP_MASTERS: &str = "system:masters";
 
-/// A request reduced to the inputs RBAC authorizes on. Built from the HTTP
-/// method + URL path (the shared [`crate::coords::parse_request_info`] helper)
-/// + the resolved [`UserInfo`] (request extensions). One of `resource` /
+/// A request reduced to the inputs RBAC authorizes on. For an HTTP request it
+/// is built by [`Attributes::for_request`] from the ONE
+/// [`crate::coords::RequestInfo`] the request-info layer stored + the resolved
+/// [`UserInfo`] (request extensions); the `SubjectAccessReview` routes build it
+/// from a review spec instead. One of `resource` /
 /// `non_resource_url` is the discriminant: a resource request carries
 /// `resource` (+ optional `subresource` / `namespace` / `name`); a non-resource
 /// request (`/healthz`, `/metrics`, `/openapi/v3`) carries `non_resource_url`.
@@ -86,6 +88,41 @@ pub struct Attributes {
 }
 
 impl Attributes {
+    /// The authz inputs for an HTTP request: `info` (the request-info layer's
+    /// one classification) reduced to what RBAC matches on, as `user`.
+    ///
+    /// Dispatch reads the same `info` (the [`crate::coords::ResourceCoords`]
+    /// extractor, [`crate::coords::RequestInfo::is_watch`]), so the resource,
+    /// subresource, name and verb judged here are the ones acted on.
+    #[must_use]
+    pub fn for_request(user: UserInfo, info: &crate::coords::RequestInfo) -> Self {
+        let verb = info.verb().to_string();
+        match info.target() {
+            crate::coords::RequestTarget::Resource(c) => Self {
+                user,
+                verb,
+                group: c.group_key().to_string(),
+                version: c.version_key().to_string(),
+                resource: c.plural.clone(),
+                subresource: c.subresource.clone(),
+                namespace: c.namespace.clone(),
+                name: c.name.clone(),
+                non_resource_url: None,
+            },
+            crate::coords::RequestTarget::NonResource(path) => Self {
+                user,
+                verb,
+                group: String::new(),
+                version: String::new(),
+                resource: String::new(),
+                subresource: None,
+                namespace: None,
+                name: None,
+                non_resource_url: Some(path.clone()),
+            },
+        }
+    }
+
     /// `true` iff this is a non-resource request (a `nonResourceURL` path, not
     /// a `/api`/`/apis` resource shape).
     #[must_use]

@@ -32,9 +32,11 @@ use crate::error::ApiError;
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ListWatchParams {
-    /// `?watch=true` / `?watch=1` → stream; anything else → list.
-    #[serde(deserialize_with = "de_bool")]
-    pub watch: bool,
+    // No `watch` field. Whether a GET streams is decided ONCE, by
+    // `crate::coords::RequestInfo` in the request-info layer, and the
+    // dispatcher reads `RequestInfo::is_watch` — the verb authz judged. A
+    // second read here is how a list-only grant used to open a stream
+    // (`?watch=yes`: authz saw `list`, this struct saw `true`).
     /// `resourceVersion=` — string per K8s ("" / absent / "0" / "N").
     #[serde(rename = "resourceVersion")]
     pub resource_version: Option<String>,
@@ -760,10 +762,20 @@ fn encode_ndjson<T: Serialize>(value: &T) -> Bytes {
 
 // ── deserialize helpers ────────────────────────────────────────────
 
+/// The ONE truth table for a boolean query flag: `true`, `1` or `yes` (the
+/// value already percent-decoded) is set; anything else, including an empty
+/// value, is not. Shared by every flag here and by the `watch` read in
+/// [`crate::coords::RequestInfo::parse`], so a flag cannot mean one thing to
+/// authz and another to dispatch.
+#[must_use]
+pub(crate) fn query_flag(value: &str) -> bool {
+    matches!(value, "true" | "1" | "yes")
+}
+
 /// `?flag=true|1|yes` → true; absent → false (serde `default`).
 fn de_bool<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
     let s = String::deserialize(de)?;
-    Ok(matches!(s.as_str(), "true" | "1" | "yes"))
+    Ok(query_flag(&s))
 }
 
 /// Same, but absent / empty defaults to `true` (allowWatchBookmarks
@@ -1210,15 +1222,22 @@ mod tests {
     }
 
     #[test]
-    fn watch_flag_parses() {
-        let p: ListWatchParams = serde_urlencoded::from_str("watch=true").unwrap();
-        assert!(p.watch);
-        let p: ListWatchParams = serde_urlencoded::from_str("watch=1").unwrap();
-        assert!(p.watch);
-        let p: ListWatchParams = serde_urlencoded::from_str("watch=false").unwrap();
-        assert!(!p.watch);
-        let p: ListWatchParams = serde_urlencoded::from_str("").unwrap();
-        assert!(!p.watch);
+    fn query_flag_truth_table() {
+        for set in ["true", "1", "yes"] {
+            assert!(query_flag(set), "{set:?} sets a flag");
+        }
+        for unset in ["false", "0", "no", "", "TRUE", "on"] {
+            assert!(!query_flag(unset), "{unset:?} does not set a flag");
+        }
+    }
+
+    #[test]
+    fn list_watch_params_ignore_the_watch_key() {
+        // `watch` is read once, by RequestInfo; the list/watch params accept
+        // the key (every watch request carries it) without holding a copy.
+        let p: ListWatchParams =
+            serde_urlencoded::from_str("watch=true&labelSelector=app%3Dweb").unwrap();
+        assert_eq!(p.label_selector.as_deref(), Some("app=web"));
     }
 
     #[test]

@@ -61,7 +61,10 @@ pub use authz::{
     AllowAllAuthorizer, Attributes, Authorizer, Decision, EffectiveRules, RbacAuthorizer,
     RbacStoreEnv, into_dyn_authorizer, store_env::StoreRbacEnv,
 };
-pub use coords::{RequestInfo, ResourceCoords, parse_resource_path, resource_verb};
+pub use coords::{
+    RequestInfo, RequestInfoError, RequestTarget, ResourceCoords, parse_resource_path,
+    resource_verb,
+};
 pub use discovery::{
     APIGroup, APIGroupList, APIResource, APIResourceList, APIVersions, GroupVersionForDiscovery,
     ServerAddressByClientCIDR,
