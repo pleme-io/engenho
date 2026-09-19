@@ -65,7 +65,7 @@ is the one everything else in that domain hangs off.
 | `ClusterState` / `ClusterEvent` | `kikai/src/state.rs` | 14-state lifecycle FSM (SM ①) |
 | `Role` | `topology.rs` | `Master · Worker · Bootstrap · Observer`; `is_voting()` |
 | `NodeState` | `topology.rs` | `Joining · Standby · Active(Role) · Demoting · Departing · Failed` |
-| `RoleAssignment` | `topology.rs` | committed `Vec<(NodeId, NodeState)>`; `has_majority()` |
+| `RoleAssignment` | `topology.rs` | committed `Vec<(NodeId, NodeState)>`; `has_majority()` — true whenever any voter exists, so not yet a majority check; no caller |
 | `Transition` | `topology.rs` | `Admit · Promote · Demote · Reassign · Evict` |
 | `RoleAssignment` (cmd) | `engenho-revoada/src/consensus/role_assignment.rs` | `Promote · Demote · Quarantine · Restore` + `Reason` |
 | `RoleAttestationBlock` | revoada/attestation | `{prev_hash, assignment, raft_term, raft_log_index, leader_sig, witness_sigs}` |

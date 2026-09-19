@@ -8,7 +8,7 @@
 //! A [`FederatedFabric`] is N such clusters composed with a typed
 //! [`RoutingPolicy`]. The operator-facing handle exposes the same
 //! 5-verb contract every Face honors — but **routed across
-//! members** by namespace, prefix, round-robin, or affinity.
+//! members** to the first member or by namespace.
 //!
 //! This is the "many engenho nodes form one living fabric"
 //! primitive the architectural framing called for. Cross-cluster
@@ -57,17 +57,20 @@ use crate::face::{
 /// **Write verbs** (`apply` / `delete`) MUST route to a single
 /// member — divergent writes across members defeat consistency.
 /// The policy must yield exactly one member for each write.
+///
+/// There is deliberately no load-spreading variant. A `RoundRobin`
+/// variant promised a rotating cursor while its routing arm answered
+/// member 0 for every call — `First` under a name that said otherwise.
+/// It was deleted rather than implemented: revoada is a fenced typed
+/// draft (docs/IMPROVEMENT-PLAN.md §5.3) and nothing routes through a
+/// federation yet. A spreading policy comes back with its cursor and a
+/// row in the routing-matrix test that sees two writes land on two
+/// members.
 #[derive(Clone, Debug)]
 pub enum RoutingPolicy {
     /// Always pick the first member. The simplest policy; useful
     /// for testing + single-active multi-standby deployments.
     First,
-
-    /// Round-robin across members. State is internal to the
-    /// [`FederatedFabric`] (Mutex-protected counter). Useful for
-    /// load-spreading reads; **apply/delete still routes to one
-    /// member** (the round-robin pick at write time).
-    RoundRobin,
 
     /// Map resource namespace → member index. The HashMap key is
     /// the namespace string; missing entries fall through to
@@ -89,7 +92,6 @@ impl RoutingPolicy {
     fn pick_for_ref(&self, reference: &ResourceRef, member_count: usize) -> Option<usize> {
         match self {
             Self::First => (member_count > 0).then_some(0),
-            Self::RoundRobin => (member_count > 0).then_some(0),
             Self::NamespacePrefix {
                 map,
                 default_member,
@@ -112,7 +114,7 @@ impl RoutingPolicy {
         _member_count: usize,
     ) -> Option<usize> {
         match self {
-            Self::First | Self::RoundRobin => None,
+            Self::First => None,
             Self::NamespacePrefix {
                 map,
                 default_member,
@@ -513,6 +515,76 @@ mod tests {
             env
         );
         assert!(fab.members()[1].get(&r, ResourceFormat::Native).is_err());
+    }
+
+    // ── Routing matrix: every policy places writes as its name says ──
+
+    /// Where each write must land, as the policy's NAME promises, on
+    /// the two-member fabric the matrix test builds.
+    ///
+    /// The `match` has no wildcard arm, so a new [`RoutingPolicy`]
+    /// variant does not compile until it has a row here, and every row
+    /// is checked against where [`FederatedFabric::apply`] actually puts
+    /// the object. The deleted `RoundRobin` could not have had an
+    /// honest row: its name promised rotation and its arm answered
+    /// member 0 for every call. Tier: a compile gate in test code, not
+    /// a property of the enum itself.
+    fn promised_placement(policy: &RoutingPolicy) -> Vec<(ResourceRef, usize)> {
+        match policy {
+            // Every write, whatever its namespace, on member 0.
+            RoutingPolicy::First => vec![
+                (pod_ref("p1", "team-a"), 0),
+                (pod_ref("p2", "team-b"), 0),
+                (pod_ref("p3", "unmapped"), 0),
+            ],
+            // Mapped namespaces on their member; the rest on the
+            // default. Matches the map `routing_matrix` builds.
+            RoutingPolicy::NamespacePrefix { .. } => vec![
+                (pod_ref("p1", "team-a"), 0),
+                (pod_ref("p2", "team-b"), 1),
+                (pod_ref("p3", "unmapped"), 1),
+            ],
+        }
+    }
+
+    /// One policy per [`RoutingPolicy`] variant.
+    fn routing_matrix() -> Vec<RoutingPolicy> {
+        let mut map = HashMap::new();
+        map.insert("team-a".to_string(), 0);
+        map.insert("team-b".to_string(), 1);
+        vec![
+            RoutingPolicy::First,
+            RoutingPolicy::NamespacePrefix {
+                map,
+                default_member: Some(1),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_routing_policy_places_writes_where_its_name_promises() {
+        for policy in routing_matrix() {
+            let promised = promised_placement(&policy);
+            assert!(!promised.is_empty(), "{policy:?} has an empty row");
+            let fab = FederatedFabric::new(vec![cluster("m0"), cluster("m1")], policy.clone())
+                .expect("matrix fabric");
+            for (reference, want) in &promised {
+                fab.apply(
+                    reference,
+                    ResourceFormat::Native,
+                    &envelope(reference, b"x"),
+                )
+                .expect("routed apply");
+                for (idx, member) in fab.members().iter().enumerate() {
+                    let held = member.get(reference, ResourceFormat::Native).is_ok();
+                    assert_eq!(
+                        held,
+                        idx == *want,
+                        "{policy:?}: {reference:?} must be on member {want} only; member {idx} holds it = {held}"
+                    );
+                }
+            }
+        }
     }
 
     // ── NamespacePrefix policy ──────────────────────────────────

@@ -293,8 +293,12 @@ points, not limits.
    match in the reactor.
 
 2. **Single-source-of-truth** — `RoleAssignment` lives in
-   engenho-revoada's Raft state machine; reads are linearizable;
-   writes go through quorum.
+   engenho-revoada's Raft state machine, and writes go through
+   openraft's quorum commit. Reads are served from the local state
+   machine without a read-index round, so they are not
+   linearizable. The log and vote are in memory, so none of this
+   survives a restart yet (DISTRIBUTED.md, "Why this composition
+   wins").
 
 3. **Formation by configuration** — operators don't write
    procedural code to handle losses; they pick a strategy +

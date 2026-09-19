@@ -201,9 +201,13 @@ impl RoleAssignment {
             .count()
     }
 
-    /// True if the assignment satisfies Raft majority (voting > 1
-    /// implies > N/2 voters present). Used by
-    /// [`TopologyStrategy::has_quorum`].
+    /// **Not a majority check yet.** A voting node is always
+    /// `Active`, and every `Active` node is eligible, so the
+    /// eligible-voting count always equals the voting count and this
+    /// returns `true` whenever at least one voter exists. Nothing
+    /// calls it. A real check needs the configured voter set to count
+    /// against; revoada's split-brain safety waits on it
+    /// (docs/IMPROVEMENT-PLAN.md §5.3).
     #[must_use]
     pub fn has_majority(&self) -> bool {
         let voting = self.voting_count();
@@ -795,7 +799,8 @@ impl TopologyReactor {
 
     /// Apply a committed transition to the local view. Called by
     /// the Raft state-machine apply path after the transition has
-    /// been durably committed.
+    /// been committed — to an in-memory log today, so the commit does
+    /// not survive a restart.
     pub fn apply_transition(&self, t: &Transition) {
         let mut current = self.current.lock().unwrap();
         match t.clone() {

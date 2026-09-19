@@ -106,17 +106,26 @@ from memory; disk is read only on restart for replay.
 
 Each transport has a sweet spot. Per-write, engenho chooses one:
 
-### Transport 1 — openraft (STRONG, in-process today, NATS R10)
+### Transport 1 — openraft (STRONG writes, local reads; in-process today, NATS R10)
 
   **Use for:** resource CRUD (pods, services, etc.), role
   assignments, anything kubectl-apply-shaped.
 
-  **Semantics:** linearizable. Every commit goes through quorum;
-  every read on the leader sees the latest committed state.
+  **Semantics:** writes are committed through openraft —
+  `client_write` returns once a quorum of voters holds the entry
+  and the leader has applied it. Reads are **not** linearizable.
+  `StoreMesh::get` and `StoreMesh::list_at_revision` answer from
+  the local replica's catalog with no read-index round and no
+  leader lease (openraft's `ensure_linearizable` is not called).
+  With more than one voter, a follower — or a leader deposed by a
+  partition it has not yet noticed — can return stale data. On
+  today's single-voter nodes the one node is the whole quorum, so a
+  read issued after a write returns sees that write. That is
+  read-your-writes on one node, not linearizability across nodes.
 
   **Latency:** ~5-20ms for commits depending on network +
-  follower count. Reads on the leader are free (state machine
-  is local).
+  follower count. Reads are free because they are local — the same
+  fact that makes them non-linearizable.
 
   **Where:** `engenho-store::StoreMesh::propose` +
   `engenho-revoada::consensus::RaftMesh::propose`.
