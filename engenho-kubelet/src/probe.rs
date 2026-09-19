@@ -45,10 +45,25 @@
 //!
 //! ## No silent wrong answers
 //!
-//! Every parse rejection is a typed error. Every unimplemented surface (grpc,
-//! an unresolvable named port) is a typed error at parse time — never a fake
-//! `Success`. There is no `todo!()` / `panic!()` / placeholder `Ok` in any
-//! production path.
+//! Every parse rejection is a typed error, and every unimplemented surface
+//! (grpc) is one — never a fake `Success`. There is no `todo!()` /
+//! `panic!()` / placeholder `Ok` in any production path.
+//!
+//! A port that does not resolve is NOT a parse rejection. Upstream's API
+//! validation checks only a port name's syntax, so a pod naming a port its
+//! container does not declare is admitted and run; its prober then fails to
+//! resolve the port on every run and throws the run away, freezing the probe
+//! at its initial value (liveness never restarts, readiness never Ready,
+//! startup never started). Here the unresolved port is kept on the handler
+//! as an [`UnresolvablePort`] and every run of it is
+//! [`BlindCause::UnresolvablePort`], which folds to the same frozen state.
+//!
+//! ## One run is up to three attempts
+//!
+//! [`run_handler`] retries an attempt that observed nothing, up to three
+//! attempts in one run, as upstream's `runProbeWithRetries` does
+//! (`maxProbeRetries = 3`). An answer — pass or fail — is never retried: a
+//! failure retried until it passed would be a pass the workload never gave.
 //!
 //! ## Typed border derives
 //!
@@ -62,8 +77,9 @@
 //! authoring surface for probes, when it lands, mirrors the lifecycle border
 //! the same way.
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -97,6 +113,14 @@ pub enum ProbeKind {
 }
 
 impl ProbeKind {
+    /// Every kind, in the order the kubelet runs them: startup first, since
+    /// it gates the other two.
+    pub const ALL: [ProbeKind; 3] = [
+        ProbeKind::Startup,
+        ProbeKind::Readiness,
+        ProbeKind::Liveness,
+    ];
+
     /// The lower-case name upstream uses in its probe events (`liveness`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -106,6 +130,41 @@ impl ProbeKind {
             ProbeKind::Startup => "startup",
         }
     }
+
+    /// The container field this probe is declared under (`livenessProbe`).
+    #[must_use]
+    pub fn field(self) -> &'static str {
+        match self {
+            ProbeKind::Liveness => "livenessProbe",
+            ProbeKind::Readiness => "readinessProbe",
+            ProbeKind::Startup => "startupProbe",
+        }
+    }
+
+    /// Whether a probe of this kind runs on a RUNNING container whose
+    /// started state is `started` (see [`container_started`]).
+    ///
+    /// Upstream's worker (worker.go:283-294): liveness and readiness are
+    /// skipped until the container has started, and startup is skipped once
+    /// it has. So a startup probe that already passed can never restart the
+    /// container later, and a liveness probe cannot bank failures during the
+    /// startup window that would trip it on its first run after it.
+    #[must_use]
+    pub fn may_run(self, started: bool) -> bool {
+        match self {
+            ProbeKind::Startup => !started,
+            ProbeKind::Liveness | ProbeKind::Readiness => started,
+        }
+    }
+}
+
+/// Whether a container counts as STARTED (upstream `isContainerStarted`,
+/// prober_manager.go:270-287): it is running, and it either has no startup
+/// probe or that probe has passed. A startup probe that has not run, is below
+/// its threshold, or tripped all leave the container not started.
+#[must_use]
+pub fn container_started(is_running: bool, startup: Option<&ProbeRuntime>) -> bool {
+    is_running && startup.is_none_or(|rt| rt.gate_satisfied)
 }
 
 impl fmt::Display for ProbeKind {
@@ -147,14 +206,56 @@ impl HttpScheme {
     }
 }
 
-/// A resolved probe port. K8s `port` is an `IntOrString` (an integer or a
-/// named container port); the parser resolves a name against
-/// `spec.containers[i].ports[].name` at parse time, so by the time a
-/// [`ProbeHandler`] exists the port is ALWAYS a concrete `u16`. An
-/// unresolvable name is a parse-time [`ProbeParseError::UnresolvedPort`],
-/// never a silent skip.
+/// A resolved probe port: `1..=65535`. K8s `port` is an `IntOrString` (an
+/// integer or a named container port); the parser resolves a name against
+/// `spec.containers[i].ports[].name` at parse time. Port 0 has no value of
+/// this type (upstream: `port > 0 && port < 65536`, probe/util.go:43).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProbePort(pub u16);
+pub struct ProbePort(NonZeroU16);
+
+impl ProbePort {
+    /// `None` for port 0, the one `u16` that is not a port.
+    #[must_use]
+    pub fn new(port: u16) -> Option<Self> {
+        NonZeroU16::new(port).map(Self)
+    }
+
+    /// The port number.
+    #[must_use]
+    pub fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+/// Why a network probe's `port` names no port to dial.
+///
+/// Not a parse error: the pod is admitted and runs, and every run of the
+/// probe is [`BlindCause::UnresolvablePort`] — upstream resolves the port on
+/// each run, fails, and throws the run away (probe/util.go:27-47,
+/// worker.go:297-301). A container's ports cannot change while it exists, so
+/// resolving once at parse time gives the answer every run would.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum UnresolvablePort {
+    /// A name the container's `ports[].name` does not declare.
+    #[error("the container declares no port named {name:?}")]
+    NoSuchName {
+        /// The name the probe asked for.
+        name: String,
+    },
+    /// A number, given or looked up, outside `1..=65535`. The text is
+    /// upstream's (probe/util.go:46).
+    #[error("invalid port number: {number}")]
+    OutOfRange {
+        /// The number.
+        number: i64,
+    },
+    /// The handler has no `port` at all.
+    #[error("the probe declares no port")]
+    Missing,
+    /// A `port` that is neither an integer nor a string.
+    #[error("the probe's port is neither an integer nor a string")]
+    NotIntOrString,
+}
 
 /// A probe's action. Closed enum — exactly one handler per probe. A K8s
 /// `Probe` with NO action is a [`ProbeParseError::NoHandler`]; a `grpc`
@@ -163,47 +264,52 @@ pub struct ProbePort(pub u16);
 pub enum ProbeHandler {
     /// `exec` — run an argv inside the container; exit 0 = success.
     Exec {
-        /// The argv to exec (no shell). Empty argv is a parse-time error.
+        /// The argv to exec (no shell), `$(VAR)` references already expanded
+        /// (see [`ProbeSpec::from_container`]). Empty argv is a parse-time
+        /// error.
         command: Vec<String>,
     },
-    /// `httpGet` — issue an HTTP GET against the pod IP; a 2xx/3xx status =
-    /// success.
+    /// `httpGet` — issue an HTTP GET against `host`, else the pod IP; a
+    /// status in `200..400` = success.
     HttpGet {
         /// Request path (defaults to `/` when absent in the manifest).
         path: String,
-        /// Target port (resolved at parse time).
-        port: ProbePort,
+        /// Target port, resolved at parse time. `Err` makes every run Blind.
+        port: Result<ProbePort, UnresolvablePort>,
         /// URL scheme.
         scheme: HttpScheme,
-        /// Optional `Host` override (defaults to the pod IP).
+        /// The host to dial instead of the pod IP (`httpGet.host`). It is the
+        /// URL's host, not a header: a `Host` HEADER comes from `headers`.
         host: Option<String>,
-        /// Custom request headers (`httpHeaders`).
+        /// Custom request headers (`httpHeaders`), in manifest order.
         headers: Vec<(String, String)>,
     },
-    /// `tcpSocket` — open a TCP connection to the pod IP:port; connect-ok =
-    /// success.
+    /// `tcpSocket` — open a TCP connection to `host`, else the pod IP;
+    /// connect-ok = success.
     TcpSocket {
-        /// Target port (resolved at parse time).
-        port: ProbePort,
-        /// Optional host override (defaults to the pod IP).
+        /// Target port, resolved at parse time. `Err` makes every run Blind.
+        port: Result<ProbePort, UnresolvablePort>,
+        /// The host to dial instead of the pod IP (`tcpSocket.host`).
         host: Option<String>,
     },
 }
 
-/// Probe timing knobs, with K8s defaults applied + min-clamped at parse.
+/// Probe timing knobs, with K8s defaults applied at parse. A zero (or
+/// negative) value is UNSET and takes the default, as upstream's
+/// `SetDefaults_Probe` does (pkg/apis/core/v1/defaults.go:236-249).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeTiming {
     /// `initialDelaySeconds` — wait this long after container start before the
     /// FIRST probe run. Default 0.
     pub initial_delay: Duration,
-    /// `periodSeconds` — how often to probe. Default 10s, min-clamped 1s.
+    /// `periodSeconds` — how often to probe. Default 10s.
     pub period: Duration,
-    /// `timeoutSeconds` — per-run I/O timeout. Default 1s, min-clamped 1s.
+    /// `timeoutSeconds` — per-run I/O timeout. Default 1s.
     pub timeout: Duration,
     /// `successThreshold` — consecutive successes to flip the gate. Default 1;
-    /// FORCED to 1 for liveness/startup (K8s rule). Min 1.
+    /// FORCED to 1 for liveness/startup (K8s rule).
     pub success_threshold: u32,
-    /// `failureThreshold` — consecutive failures to trip. Default 3. Min 1.
+    /// `failureThreshold` — consecutive failures to trip. Default 3.
     pub failure_threshold: u32,
 }
 
@@ -241,6 +347,10 @@ pub struct ProbeSpec {
 
 /// Typed probe-parse failures. Every one is surfaced (the kubelet skips the
 /// pod + bumps `objects_skipped`), NEVER a fake pass.
+///
+/// Upstream's API validation rejects the first two before any kubelet sees
+/// them; engenho's kubelet refuses the pod instead. A port that does not
+/// resolve is deliberately NOT here: see [`UnresolvablePort`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProbeParseError {
     /// The `Probe` declared no action (no exec/httpGet/tcpSocket/grpc).
@@ -256,36 +366,64 @@ pub enum ProbeParseError {
         /// The handler kind string (e.g. `"grpc"`).
         kind: &'static str,
     },
-    /// A named port that does not resolve against the container's
-    /// `ports[].name`.
-    #[error("probe port {name:?} does not resolve to a container port")]
-    UnresolvedPort {
-        /// The unresolvable port name.
-        name: String,
-    },
-    /// The `port` value was neither an integer in `1..=65535` nor a string.
-    #[error("probe port value is invalid: {reason}")]
-    InvalidPort {
-        /// Why the port is invalid.
-        reason: String,
-    },
 }
 
 impl ProbeSpec {
-    /// Parse a raw-JSON `Probe` object (the kubelet reads pods as
-    /// [`serde_json::Value`] end to end) of `kind` into the typed border,
-    /// applying K8s defaults + min-clamps + the liveness/startup
-    /// `successThreshold==1` rule, resolving the port against `container_ports`
-    /// (`spec.containers[i].ports[]`), and rejecting no-handler / grpc /
-    /// unresolved-port with typed errors.
+    /// Parse the probe of `kind` declared on one `spec.containers[i]` JSON
+    /// object. `Ok(None)` when the container declares no such probe (absent
+    /// or `null`).
     ///
-    /// `container_ports` is the slice of `(name, number)` pairs from the
-    /// container's `ports[]` — used only to resolve a NAMED probe port.
+    /// This is the whole of what the kubelet parses, in one place: the
+    /// named-port table and the environment come from the same container, so
+    /// no caller can pair a probe with another container's ports.
+    ///
+    /// An exec probe's argv has its `$(VAR)` references expanded the way
+    /// upstream's prober does (`ExpandContainerCommandOnlyStatic`,
+    /// prober.go:154): against each env entry's LITERAL `value` — an entry
+    /// set by `valueFrom` reads as the empty string, and a value is not
+    /// itself expanded first. A reference to an undeclared variable stays as
+    /// written.
     ///
     /// # Errors
     ///
-    /// [`ProbeParseError`] on no-handler, empty-exec, grpc, or unresolvable /
-    /// invalid port. Never a silent skip.
+    /// [`ProbeParseError`] on no-handler, empty-exec or grpc.
+    pub fn from_container(
+        kind: ProbeKind,
+        container: &Value,
+    ) -> Result<Option<Self>, ProbeParseError> {
+        let probe = match container.get(kind.field()) {
+            None | Some(Value::Null) => return Ok(None),
+            Some(probe) => probe,
+        };
+        let mut spec = Self::from_k8s(kind, probe, &container_ports(container))?;
+        if let ProbeHandler::Exec { command } = &mut spec.handler {
+            let env = literal_env(container);
+            for arg in command.iter_mut() {
+                *arg = crate::env_ref::expand_env_refs(arg, &env);
+            }
+        }
+        Ok(Some(spec))
+    }
+
+    /// Parse a raw-JSON `Probe` object (the kubelet reads pods as
+    /// [`serde_json::Value`] end to end) of `kind` into the typed border,
+    /// applying K8s defaults and the liveness/startup `successThreshold==1`
+    /// rule, resolving the port against `container_ports`
+    /// (`spec.containers[i].ports[]`), and rejecting no-handler / grpc with
+    /// typed errors.
+    ///
+    /// `container_ports` is the slice of `(name, number)` pairs from the
+    /// container's `ports[]` — used only to resolve a NAMED probe port. A
+    /// port that does not resolve is kept on the handler as an
+    /// [`UnresolvablePort`], never a parse error.
+    ///
+    /// The exec argv is taken verbatim; [`ProbeSpec::from_container`] is the
+    /// path that also expands its `$(VAR)` references.
+    ///
+    /// # Errors
+    ///
+    /// [`ProbeParseError`] on no-handler, empty-exec or grpc. Never a silent
+    /// skip.
     pub fn from_k8s(
         kind: ProbeKind,
         probe: &Value,
@@ -309,7 +447,7 @@ impl ProbeSpec {
             }
             ProbeHandler::Exec { command }
         } else if let Some(http) = probe.get("httpGet") {
-            let port = resolve_port(http.get("port"), container_ports)?;
+            let port = resolve_port(http.get("port"), container_ports);
             let path = http
                 .get("path")
                 .and_then(|p| p.as_str())
@@ -342,7 +480,7 @@ impl ProbeSpec {
                 headers,
             }
         } else if let Some(tcp) = probe.get("tcpSocket") {
-            let port = resolve_port(tcp.get("port"), container_ports)?;
+            let port = resolve_port(tcp.get("port"), container_ports);
             let host = tcp
                 .get("host")
                 .and_then(|h| h.as_str())
@@ -362,32 +500,39 @@ impl ProbeSpec {
         })
     }
 
-    /// Fold the raw-JSON timing fields into a [`ProbeTiming`], applying K8s
-    /// defaults, min-clamps (period/timeout ≥ 1s, thresholds ≥ 1), and the
-    /// liveness/startup `successThreshold == 1` rule.
+    /// Fold the raw-JSON timing fields into a [`ProbeTiming`]: a field that is
+    /// absent, zero or negative takes its K8s default, and liveness/startup
+    /// force `successThreshold` to 1.
+    ///
+    /// Zero is UNSET, not a floor to clamp to: upstream defaults the zero
+    /// value (`SetDefaults_Probe`, defaults.go:236-249), so an explicit
+    /// `periodSeconds: 0` probes every 10s and `failureThreshold: 0` trips on
+    /// the third failure — not every second and on the first. A negative
+    /// value is rejected by upstream's validation and never reaches a
+    /// kubelet; here it reads as unset too.
     fn parse_timing(kind: ProbeKind, probe: &Value) -> ProbeTiming {
-        let mut t = ProbeTiming::k8s_defaults();
-        // i64 reads tolerate either JSON integer width; negatives clamp to the
-        // floor below.
-        let secs =
-            |key: &str| -> Option<i64> { probe.get(key).and_then(serde_json::Value::as_i64) };
-
-        if let Some(d) = secs("initialDelaySeconds") {
-            // initialDelay floor is 0 (a 0 / negative value = run from start).
-            t.initial_delay = Duration::from_secs(u64::try_from(d.max(0)).unwrap_or(0));
-        }
-        if let Some(p) = secs("periodSeconds") {
-            t.period = Duration::from_secs(u64::try_from(p.max(1)).unwrap_or(10));
-        }
-        if let Some(to) = secs("timeoutSeconds") {
-            t.timeout = Duration::from_secs(u64::try_from(to.max(1)).unwrap_or(1));
-        }
-        if let Some(st) = secs("successThreshold") {
-            t.success_threshold = u32::try_from(st.max(1)).unwrap_or(1);
-        }
-        if let Some(ft) = secs("failureThreshold") {
-            t.failure_threshold = u32::try_from(ft.max(1)).unwrap_or(3);
-        }
+        let defaults = ProbeTiming::k8s_defaults();
+        // A positive integer, or None for absent / zero / negative / not an int.
+        let set = |key: &str| -> Option<u64> {
+            probe
+                .get(key)
+                .and_then(Value::as_i64)
+                .and_then(|v| u64::try_from(v).ok())
+                .filter(|&v| v > 0)
+        };
+        let secs = |key: &str, default: Duration| set(key).map_or(default, Duration::from_secs);
+        let count = |key: &str, default: u32| {
+            set(key)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(default)
+        };
+        let mut t = ProbeTiming {
+            initial_delay: secs("initialDelaySeconds", defaults.initial_delay),
+            period: secs("periodSeconds", defaults.period),
+            timeout: secs("timeoutSeconds", defaults.timeout),
+            success_threshold: count("successThreshold", defaults.success_threshold),
+            failure_threshold: count("failureThreshold", defaults.failure_threshold),
+        };
         // K8s rule: successThreshold MUST be 1 for liveness + startup.
         if matches!(kind, ProbeKind::Liveness | ProbeKind::Startup) {
             t.success_threshold = 1;
@@ -396,50 +541,67 @@ impl ProbeSpec {
     }
 }
 
-/// Resolve a raw-JSON `port` value (integer or named string) against the
-/// container's `ports[]` (`(name, number)` pairs). Returns a typed error for
-/// an unresolvable name or an out-of-range / non-int-non-string value.
+/// The container's named ports as `(name, number)` pairs. An entry without a
+/// name cannot be referred to by one, and a number outside `u16` is not a
+/// port; both are left out, so a probe naming them resolves to
+/// [`UnresolvablePort`] rather than to a wrong port.
+fn container_ports(container: &Value) -> Vec<(String, u16)> {
+    container
+        .get("ports")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let name = p.get("name").and_then(Value::as_str)?.to_string();
+                    let number = p.get("containerPort").and_then(Value::as_i64)?;
+                    u16::try_from(number).ok().map(|n| (name, n))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Upstream's `EnvVarsToMap`: each env entry's literal `value` by name, the
+/// empty string for an entry set by `valueFrom`, a later entry winning.
+fn literal_env(container: &Value) -> BTreeMap<String, String> {
+    container
+        .get("env")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    let name = e.get("name").and_then(Value::as_str)?.to_string();
+                    let value = e.get("value").and_then(Value::as_str).unwrap_or_default();
+                    Some((name, value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve a raw-JSON `port` (integer or string) against the container's
+/// `ports[]`, in upstream's order (probe/util.go:27-47): a string is looked
+/// up as a port NAME first, then read as a number written as a string
+/// (`"8080"`); the number must then be in `1..=65535`.
 fn resolve_port(
     port: Option<&Value>,
     container_ports: &[(String, u16)],
-) -> Result<ProbePort, ProbeParseError> {
-    let Some(port) = port else {
-        return Err(ProbeParseError::InvalidPort {
-            reason: "missing port".to_string(),
-        });
+) -> Result<ProbePort, UnresolvablePort> {
+    let number = match port {
+        None | Some(Value::Null) => return Err(UnresolvablePort::Missing),
+        Some(Value::String(name)) => match container_ports.iter().find(|(n, _)| n == name) {
+            Some((_, number)) => i64::from(*number),
+            None => name
+                .parse::<i64>()
+                .map_err(|_| UnresolvablePort::NoSuchName { name: name.clone() })?,
+        },
+        Some(other) => other.as_i64().ok_or(UnresolvablePort::NotIntOrString)?,
     };
-    // Integer port: must be 1..=65535.
-    if let Some(n) = port.as_i64() {
-        if let Ok(p) = u16::try_from(n)
-            .map_err(|_| ())
-            .and_then(|p| if p >= 1 { Ok(p) } else { Err(()) })
-        {
-            return Ok(ProbePort(p));
-        }
-        return Err(ProbeParseError::InvalidPort {
-            reason: format!("integer port {n} out of range 1..=65535"),
-        });
-    }
-    // Named port: look up against the container's ports[].name.
-    if let Some(name) = port.as_str() {
-        // A numeric string ("8080") is also a valid integer port.
-        if let Ok(p) = name
-            .parse::<u16>()
-            .map_err(|_| ())
-            .and_then(|p| if p >= 1 { Ok(p) } else { Err(()) })
-        {
-            return Ok(ProbePort(p));
-        }
-        if let Some((_, number)) = container_ports.iter().find(|(n, _)| n == name) {
-            return Ok(ProbePort(*number));
-        }
-        return Err(ProbeParseError::UnresolvedPort {
-            name: name.to_string(),
-        });
-    }
-    Err(ProbeParseError::InvalidPort {
-        reason: "port is neither an integer nor a string".to_string(),
-    })
+    u16::try_from(number)
+        .ok()
+        .and_then(ProbePort::new)
+        .ok_or(UnresolvablePort::OutOfRange { number })
 }
 
 // =====================================================================
@@ -565,6 +727,10 @@ pub enum BlindCause {
     /// The prober could not form the request (an unparsable URL, a client it
     /// could not build, a header it could not encode). Nothing was sent.
     ProberSetup,
+    /// The probe's `port` names no port to dial (see [`UnresolvablePort`]).
+    /// It cannot change while the container exists, so every run is blind
+    /// and the probe stays at its initial value, as upstream's does.
+    UnresolvablePort,
 }
 
 impl BlindCause {
@@ -575,6 +741,7 @@ impl BlindCause {
             BlindCause::NoTargetAddress => "NoTargetAddress",
             BlindCause::RuntimeUnavailable => "RuntimeUnavailable",
             BlindCause::ProberSetup => "ProberSetup",
+            BlindCause::UnresolvablePort => "UnresolvablePort",
         }
     }
 }
@@ -585,6 +752,9 @@ impl fmt::Display for BlindCause {
             BlindCause::NoTargetAddress => "the pod reports no address to dial",
             BlindCause::RuntimeUnavailable => "the container runtime could not run the probe",
             BlindCause::ProberSetup => "the prober could not form the request",
+            BlindCause::UnresolvablePort => {
+                "the probe's port does not resolve to a port of the container"
+            }
         })
     }
 }
@@ -897,23 +1067,69 @@ pub fn aggregate_container_readiness(
 // I/O shell — the SOLE place that touches a Fake (runtime exec + NetProber)
 // =====================================================================
 
-/// Run ONE probe handler against the live runtime + net seams, reducing the
-/// result to a [`ProbeObservation`]. The SOLE place that touches the runtime
-/// `exec` or the [`NetProber`] — so the fold tests never need real exec /
-/// http / tcp. Every handler is bounded by `spec.timing.timeout`. Nothing here
-/// aborts the tick: a failing or blind probe is a normal, expected signal.
+/// Attempts one probe run may make. Upstream's `maxProbeRetries`
+/// (prober.go:41, 134-147): an attempt that ERRORS is tried again inside the
+/// same run, up to three attempts in all; an answer ends the run.
+const PROBE_ATTEMPTS: u32 = 3;
+
+/// Run ONE probe against the live runtime + net seams, reducing the result to
+/// a [`ProbeObservation`]. The SOLE place that touches the runtime `exec` or
+/// the [`NetProber`] — so the fold tests never need real exec / http / tcp.
+/// Every attempt is bounded by `spec.timing.timeout`. Nothing here aborts the
+/// tick: a failing or blind probe is a normal, expected signal.
+///
+/// One run is up to three attempts (`PROBE_ATTEMPTS`). An attempt that observed
+/// nothing ([`ProbeObservation::Blind`]) is tried again at once, so a
+/// transient runtime error followed by a pass is a pass in one run, not a
+/// discarded run and a wait of a whole period. `Success` and `Failure` are
+/// never retried: they are the workload's answer, and retrying a failure
+/// until it passed would record a pass the workload never gave. Three blind
+/// attempts return the last one's cause.
 ///
 /// The split between Failure and Blind is "did the workload answer?":
 ///
 /// | handler | Failure (the workload said no) | Blind (nothing was asked) |
 /// |---|---|---|
 /// | exec | non-zero exit, 127 included; timeout | the runtime or its transport returned an error |
-/// | httpGet | status outside 200..400; refused, reset, TLS, malformed; timeout | no pod IP; the request could not be formed |
-/// | tcpSocket | refused; timeout | no pod IP |
+/// | httpGet | status outside 200..400; refused, reset, TLS, malformed; timeout | no address; unresolvable port; the request could not be formed |
+/// | tcpSocket | refused; timeout | no address; unresolvable port |
 ///
 /// `container_id` is the exec target (container-scoped); `pod_ip` is the
-/// http/tcp target (network-scoped).
+/// http/tcp target (network-scoped) unless the probe names its own `host`.
 pub async fn run_handler(
+    spec: &ProbeSpec,
+    runtime: &dyn ContainerRuntime,
+    net_prober: &dyn NetProber,
+    container_id: &str,
+    pod_ip: Option<&str>,
+) -> ProbeObservation {
+    let mut attempt = 1;
+    loop {
+        match run_attempt(spec, runtime, net_prober, container_id, pod_ip).await {
+            ProbeObservation::Blind(cause) if attempt < PROBE_ATTEMPTS => {
+                tracing::debug!(container_id, attempt, %cause, "probe attempt observed nothing; retrying");
+                attempt += 1;
+            }
+            observed_or_last => return observed_or_last,
+        }
+    }
+}
+
+/// How the status an httpGet probe was answered with is judged: `200..400`
+/// passes, anything else fails (upstream probe/http/http.go:111-122; a 3xx
+/// that reaches this point is upstream's "warning", which the kubelet counts
+/// as a pass).
+#[must_use]
+pub fn http_status_observation(status: u16) -> ProbeObservation {
+    if (200..400).contains(&status) {
+        ProbeObservation::Success
+    } else {
+        ProbeObservation::Failure
+    }
+}
+
+/// One attempt of [`run_handler`].
+async fn run_attempt(
     spec: &ProbeSpec,
     runtime: &dyn ContainerRuntime,
     net_prober: &dyn NetProber,
@@ -946,35 +1162,37 @@ pub async fn run_handler(
             host,
             headers,
         } => {
+            let Ok(port) = port else {
+                return ProbeObservation::Blind(BlindCause::UnresolvablePort);
+            };
             // No address is not a failed check — nothing could be dialled.
-            let Some(ip) = pod_ip else {
+            let Some(dial) = host.as_deref().or(pod_ip) else {
                 return ProbeObservation::Blind(BlindCause::NoTargetAddress);
             };
             let target = HttpProbeTarget {
-                ip: ip.to_string(),
-                port: port.0,
+                host: dial.to_string(),
+                port: port.get(),
                 path: path.clone(),
                 scheme: *scheme,
-                host: host.clone(),
                 headers: headers.clone(),
                 timeout,
             };
             match tokio::time::timeout(timeout, net_prober.http_get(&target)).await {
-                // K8s: 2xx/3xx is healthy.
-                Ok(Ok(status)) if (200..400).contains(&status) => ProbeObservation::Success,
-                Ok(Ok(_)) => ProbeObservation::Failure,
+                Ok(Ok(status)) => http_status_observation(status),
                 Ok(Err(e)) => net_error_observation(&e),
                 Err(_elapsed) => ProbeObservation::Failure,
             }
         }
         ProbeHandler::TcpSocket { port, host } => {
-            let Some(ip) = pod_ip else {
+            let Ok(port) = port else {
+                return ProbeObservation::Blind(BlindCause::UnresolvablePort);
+            };
+            let Some(dial) = host.as_deref().or(pod_ip) else {
                 return ProbeObservation::Blind(BlindCause::NoTargetAddress);
             };
             let target = TcpProbeTarget {
-                ip: ip.to_string(),
-                port: port.0,
-                host: host.clone(),
+                host: dial.to_string(),
+                port: port.get(),
                 timeout,
             };
             match tokio::time::timeout(timeout, net_prober.tcp_connect(&target)).await {
@@ -1002,6 +1220,12 @@ fn net_error_observation(e: &ProbeIoError) -> ProbeObservation {
             ProbeObservation::Blind(BlindCause::ProberSetup)
         }
     }
+}
+
+/// A non-zero port for a test fixture.
+#[cfg(test)]
+fn port_n(n: u16) -> ProbePort {
+    ProbePort::new(n).unwrap_or_else(|| panic!("port {n} is zero"))
 }
 
 #[cfg(test)]
@@ -1243,18 +1467,31 @@ mod tests {
         assert_eq!(spec.timing.success_threshold, 4);
     }
 
+    /// Zero is UNSET, not a floor. This test used to pin `periodSeconds: 0`
+    /// to a 1s period and `failureThreshold: 0` to a restart on the FIRST
+    /// failure; upstream defaults the zero value (`SetDefaults_Probe`,
+    /// defaults.go:236-249), so both take their defaults. Negative values
+    /// (rejected by upstream validation) read as unset too.
     #[test]
-    fn from_k8s_min_clamps() {
-        let probe = json!({
-            "exec": { "command": ["true"] },
-            "periodSeconds": 0,
-            "timeoutSeconds": 0,
-            "failureThreshold": 0
-        });
-        let spec = ProbeSpec::from_k8s(ProbeKind::Readiness, &probe, &[]).unwrap();
-        assert_eq!(spec.timing.period, Duration::from_secs(1));
-        assert_eq!(spec.timing.timeout, Duration::from_secs(1));
-        assert_eq!(spec.timing.failure_threshold, 1);
+    fn from_k8s_zero_or_negative_fields_take_the_defaults() {
+        for v in [0, -5] {
+            let probe = json!({
+                "exec": { "command": ["true"] },
+                "initialDelaySeconds": v,
+                "periodSeconds": v,
+                "timeoutSeconds": v,
+                "successThreshold": v,
+                "failureThreshold": v
+            });
+            let spec = ProbeSpec::from_k8s(ProbeKind::Readiness, &probe, &[]).unwrap();
+            assert_eq!(
+                spec.timing,
+                ProbeTiming::k8s_defaults(),
+                "fields set to {v}"
+            );
+            assert_eq!(spec.timing.period, Duration::from_secs(10));
+            assert_eq!(spec.timing.failure_threshold, 3);
+        }
     }
 
     #[test]
@@ -1292,7 +1529,7 @@ mod tests {
             ProbeHandler::HttpGet {
                 port, path, scheme, ..
             } => {
-                assert_eq!(port, ProbePort(8080));
+                assert_eq!(port, Ok(port_n(8080)));
                 assert_eq!(path, "/healthz");
                 assert_eq!(scheme, HttpScheme::Http);
             }
@@ -1306,18 +1543,26 @@ mod tests {
         let ports = vec![("http".to_string(), 8080u16), ("metrics".to_string(), 9090)];
         let spec = ProbeSpec::from_k8s(ProbeKind::Readiness, &probe, &ports).unwrap();
         match spec.handler {
-            ProbeHandler::HttpGet { port, .. } => assert_eq!(port, ProbePort(8080)),
+            ProbeHandler::HttpGet { port, .. } => assert_eq!(port, Ok(port_n(8080))),
             other => panic!("expected HttpGet, got {other:?}"),
         }
     }
 
+    /// A port the container does not declare is NOT a parse error: this test
+    /// used to pin it as one, which made the kubelet refuse the whole pod.
+    /// Upstream admits and runs it; the probe keeps the reason, and every run
+    /// of it is blind (see `unresolvable_port` below).
     #[test]
-    fn from_k8s_unresolved_named_port_is_typed_error() {
+    fn from_k8s_unresolved_named_port_is_kept_with_its_reason() {
         let probe = json!({ "tcpSocket": { "port": "nope" } });
+        let spec = ProbeSpec::from_k8s(ProbeKind::Readiness, &probe, &[]).unwrap();
         assert_eq!(
-            ProbeSpec::from_k8s(ProbeKind::Readiness, &probe, &[]).unwrap_err(),
-            ProbeParseError::UnresolvedPort {
-                name: "nope".to_string()
+            spec.handler,
+            ProbeHandler::TcpSocket {
+                port: Err(UnresolvablePort::NoSuchName {
+                    name: "nope".to_string()
+                }),
+                host: None,
             }
         );
     }
@@ -1339,9 +1584,9 @@ mod tests {
         assert!(matches!(
             spec.handler,
             ProbeHandler::TcpSocket {
-                port: ProbePort(6379),
+                port: Ok(p),
                 ..
-            }
+            } if p.get() == 6379
         ));
     }
 
@@ -1576,7 +1821,7 @@ mod probe_address {
             kind: ProbeKind::Startup,
             handler: ProbeHandler::HttpGet {
                 path: "/healthz".into(),
-                port: ProbePort(8080),
+                port: Ok(port_n(8080)),
                 scheme: HttpScheme::Http,
                 host: None,
                 headers: Vec::new(),
@@ -1623,7 +1868,7 @@ mod probe_address {
     async fn a_tcp_probe_with_no_address_is_blind_too() {
         let spec = ProbeSpec {
             handler: ProbeHandler::TcpSocket {
-                port: ProbePort(8080),
+                port: Ok(port_n(8080)),
                 host: None,
             },
             ..http_spec()
@@ -1846,7 +2091,7 @@ mod blind {
         ProbeSpec {
             handler: ProbeHandler::HttpGet {
                 path: "/healthz".into(),
-                port: ProbePort(8080),
+                port: Ok(port_n(8080)),
                 scheme: HttpScheme::Http,
                 host: None,
                 headers: Vec::new(),
@@ -2037,5 +2282,335 @@ mod blind {
         let got = run_handler(&spec, &backend, &FakeNetProber::new(), &id, None).await;
 
         assert_eq!(got, ProbeObservation::Failure);
+    }
+}
+
+#[cfg(test)]
+mod upstream_prober {
+    //! The prober's run semantics against upstream v1.34 (pkg/kubelet/prober,
+    //! pkg/probe): a blind attempt is retried inside its run, a port that
+    //! never resolves freezes the probe, port resolution's order and range,
+    //! the started gate, zero-means-unset, exec `$(VAR)` expansion, and a
+    //! probe that names its own host. The table-driven check against the
+    //! upstream rows is `tests/oracle_prober.rs`; these pin each rule where it
+    //! lives.
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::backend::{FakeBackend, FakeNetProber, ProbeSetupStage};
+
+    /// A net prober that answers from a script, front first, then with its
+    /// default — and counts every call, so a test can see each attempt.
+    struct Script {
+        answers: Mutex<VecDeque<Result<u16, ProbeIoError>>>,
+        default: Result<u16, ProbeIoError>,
+        calls: AtomicU32,
+    }
+
+    impl Script {
+        fn new(answers: impl IntoIterator<Item = Result<u16, ProbeIoError>>) -> Self {
+            Self {
+                answers: Mutex::new(answers.into_iter().collect()),
+                default: Ok(200),
+                calls: AtomicU32::new(0),
+            }
+        }
+
+        fn calls(&self) -> u32 {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn next(&self) -> Result<u16, ProbeIoError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let front = self.answers.lock().map(|mut q| q.pop_front());
+            front.ok().flatten().unwrap_or_else(|| self.default.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NetProber for Script {
+        async fn http_get(&self, _: &HttpProbeTarget) -> Result<u16, ProbeIoError> {
+            self.next()
+        }
+        async fn tcp_connect(&self, _: &TcpProbeTarget) -> Result<(), ProbeIoError> {
+            self.next().map(|_| ())
+        }
+    }
+
+    /// An attempt that never reached the workload.
+    fn unsent() -> Result<u16, ProbeIoError> {
+        Err(ProbeIoError::Setup {
+            stage: ProbeSetupStage::Request,
+            reason: "could not form the request".into(),
+        })
+    }
+
+    fn http_spec(kind: ProbeKind) -> ProbeSpec {
+        ProbeSpec {
+            kind,
+            handler: ProbeHandler::HttpGet {
+                path: "/healthz".into(),
+                port: Ok(port_n(8080)),
+                scheme: HttpScheme::Http,
+                host: None,
+                headers: Vec::new(),
+            },
+            timing: ProbeTiming::k8s_defaults(),
+        }
+    }
+
+    async fn run(spec: &ProbeSpec, net: &dyn NetProber) -> ProbeObservation {
+        run_handler(spec, &FakeBackend::new(), net, "cid", Some("10.0.0.1")).await
+    }
+
+    // ── one run is up to three attempts ─────────────────────────────────
+
+    #[tokio::test]
+    async fn a_blind_attempt_is_retried_in_the_same_run_and_the_answer_after_it_counts() {
+        let net = Script::new([unsent(), unsent(), Ok(200)]);
+        assert_eq!(
+            run(&http_spec(ProbeKind::Liveness), &net).await,
+            ProbeObservation::Success
+        );
+        assert_eq!(net.calls(), 3, "error, error, success is ONE run");
+    }
+
+    #[tokio::test]
+    async fn three_blind_attempts_are_one_blind_run_and_no_fourth_is_made() {
+        let net = Script::new([unsent(), unsent(), unsent(), Ok(200)]);
+        assert_eq!(
+            run(&http_spec(ProbeKind::Liveness), &net).await,
+            ProbeObservation::Blind(BlindCause::ProberSetup)
+        );
+        assert_eq!(net.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_never_retried() {
+        for (first, then, expected) in [
+            (Ok(500), Ok(200), ProbeObservation::Failure),
+            (Ok(200), Ok(500), ProbeObservation::Success),
+        ] {
+            let net = Script::new([first, then]);
+            assert_eq!(run(&http_spec(ProbeKind::Liveness), &net).await, expected);
+            assert_eq!(net.calls(), 1, "{expected:?} is the workload's answer");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_a_blind_attempt_is_a_counted_failure() {
+        let net = Script::new([unsent(), Ok(500), Ok(200)]);
+        assert_eq!(
+            run(&http_spec(ProbeKind::Liveness), &net).await,
+            ProbeObservation::Failure
+        );
+        assert_eq!(net.calls(), 2);
+    }
+
+    // ── a port that never resolves ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_port_that_does_not_resolve_freezes_every_kind_at_its_initial_value() {
+        let now = Instant::now();
+        for handler in [
+            json!({ "httpGet": { "port": "http" } }),
+            json!({ "tcpSocket": { "port": "http" } }),
+        ] {
+            for kind in ProbeKind::ALL {
+                let mut container = serde_json::Map::new();
+                container.insert("name".into(), json!("main"));
+                container.insert(kind.field().into(), handler.clone());
+                let spec = ProbeSpec::from_container(kind, &Value::Object(container))
+                    .unwrap()
+                    .unwrap();
+                // The workload behind the port would answer 200 if asked.
+                let net = Script::new([]);
+                let mut rt = ProbeRuntime::new(now);
+                for _ in 0..100 {
+                    let obs = run(&spec, &net).await;
+                    assert_eq!(obs, ProbeObservation::Blind(BlindCause::UnresolvablePort));
+                    let v = fold_probe_observation(&spec, &mut rt, obs, now);
+                    assert_eq!(v.trip, None, "{kind} {handler}: restarted on nothing");
+                }
+                assert_eq!(net.calls(), 0, "{kind} {handler}: nothing is dialled");
+                assert!(
+                    !rt.gate_satisfied,
+                    "{kind} {handler}: never Ready / started"
+                );
+                assert_eq!(rt.consecutive_failures, 0);
+                assert_eq!(rt.consecutive_successes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn port_resolution_takes_a_name_first_then_a_number_and_only_1_to_65535() {
+        let ports = [("found".to_string(), 93u16), ("zero".to_string(), 0)];
+        let resolved = |port: Value| resolve_port(Some(&port), &ports).map(ProbePort::get);
+        let out_of_range = |number| Err(UnresolvablePort::OutOfRange { number });
+        let no_such = |name: &str| {
+            Err(UnresolvablePort::NoSuchName {
+                name: name.to_string(),
+            })
+        };
+        assert_eq!(resolved(json!("found")), Ok(93));
+        assert_eq!(resolved(json!(76)), Ok(76));
+        assert_eq!(resolved(json!("118")), Ok(118));
+        assert_eq!(resolved(json!(65535)), Ok(65535));
+        assert_eq!(resolved(json!("65535")), Ok(65535));
+        assert_eq!(resolved(json!(1)), Ok(1));
+        assert_eq!(resolved(json!(0)), out_of_range(0));
+        assert_eq!(resolved(json!(-1)), out_of_range(-1));
+        assert_eq!(resolved(json!("-1")), out_of_range(-1));
+        assert_eq!(resolved(json!(65536)), out_of_range(65536));
+        assert_eq!(resolved(json!("65536")), out_of_range(65536));
+        // A NAMED port whose number is 0 is no port either.
+        assert_eq!(resolved(json!("zero")), out_of_range(0));
+        assert_eq!(resolved(json!("not-found")), no_such("not-found"));
+        assert_eq!(resolved(json!("")), no_such(""));
+        assert_eq!(resolved(json!(true)), Err(UnresolvablePort::NotIntOrString));
+        assert_eq!(resolved(Value::Null), Err(UnresolvablePort::Missing));
+        assert_eq!(
+            resolve_port(None, &ports).map(ProbePort::get),
+            Err(UnresolvablePort::Missing)
+        );
+    }
+
+    #[test]
+    fn port_zero_has_no_probe_port() {
+        assert_eq!(ProbePort::new(0), None);
+        assert_eq!(ProbePort::new(1).map(ProbePort::get), Some(1));
+        assert_eq!(ProbePort::new(u16::MAX).map(ProbePort::get), Some(65535));
+    }
+
+    #[test]
+    fn the_out_of_range_reason_reads_as_upstreams() {
+        assert_eq!(
+            UnresolvablePort::OutOfRange { number: 0 }.to_string(),
+            "invalid port number: 0"
+        );
+    }
+
+    // ── the started gate ────────────────────────────────────────────────
+
+    #[test]
+    fn liveness_and_readiness_run_only_once_started_and_startup_only_before() {
+        for (kind, before, after) in [
+            (ProbeKind::Liveness, false, true),
+            (ProbeKind::Readiness, false, true),
+            (ProbeKind::Startup, true, false),
+        ] {
+            assert_eq!(kind.may_run(false), before, "{kind} before started");
+            assert_eq!(kind.may_run(true), after, "{kind} once started");
+        }
+    }
+
+    #[test]
+    fn a_container_is_started_once_running_with_its_startup_probe_passed() {
+        let now = Instant::now();
+        let mut spec = http_spec(ProbeKind::Startup);
+        spec.timing.failure_threshold = 1;
+        let fresh = ProbeRuntime::new(now);
+        let mut tripped = ProbeRuntime::new(now);
+        let _ = fold_probe_observation(&spec, &mut tripped, ProbeObservation::Failure, now);
+        let mut passed = ProbeRuntime::new(now);
+        let _ = fold_probe_observation(&spec, &mut passed, ProbeObservation::Success, now);
+
+        assert!(container_started(true, None), "no startup probe");
+        assert!(!container_started(true, Some(&fresh)), "not yet run");
+        assert!(!container_started(true, Some(&tripped)), "tripped");
+        assert!(container_started(true, Some(&passed)), "passed");
+        assert!(!container_started(false, Some(&passed)), "not running");
+        assert!(!container_started(false, None), "not running");
+    }
+
+    // ── exec `$(VAR)` expansion and parsing from the container ──────────
+
+    #[test]
+    fn an_exec_probe_expands_references_to_literal_env_values_only() {
+        let container = json!({
+            "name": "main",
+            "env": [
+                { "name": "A", "value": "script" },
+                { "name": "B", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } },
+                { "name": "C", "value": "$(A)" }
+            ],
+            "livenessProbe": {
+                "exec": { "command": ["/bin/bash", "-c", "some $(A) [$(B)] $(C) $(D) $$(A)"] }
+            }
+        });
+        let spec = ProbeSpec::from_container(ProbeKind::Liveness, &container)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            spec.handler,
+            ProbeHandler::Exec {
+                command: vec![
+                    "/bin/bash".into(),
+                    "-c".into(),
+                    // B is valueFrom: the empty string. C's value is not
+                    // itself expanded. D is undeclared and stays. $$ escapes.
+                    "some script [] $(A) $(D) $(A)".into(),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn from_container_reads_its_own_kind_and_ports_and_null_is_absent() {
+        let container = json!({
+            "name": "main",
+            "ports": [{ "name": "db", "containerPort": 5432 }],
+            "livenessProbe": { "tcpSocket": { "port": "db" } },
+            "readinessProbe": null
+        });
+        let liveness = ProbeSpec::from_container(ProbeKind::Liveness, &container).unwrap();
+        assert!(matches!(
+            liveness.map(|s| s.handler),
+            Some(ProbeHandler::TcpSocket { port: Ok(p), host: None }) if p.get() == 5432
+        ));
+        assert_eq!(
+            ProbeSpec::from_container(ProbeKind::Readiness, &container),
+            Ok(None)
+        );
+        assert_eq!(
+            ProbeSpec::from_container(ProbeKind::Startup, &container),
+            Ok(None)
+        );
+    }
+
+    // ── a probe that names its own host ─────────────────────────────────
+
+    #[tokio::test]
+    async fn a_probe_naming_a_host_dials_it_even_when_the_pod_has_no_address() {
+        let net = FakeNetProber::new();
+        net.seed_http("example.internal", 8080, "/healthz", [200])
+            .await;
+        net.seed_tcp("db.internal", 8080, [true]).await;
+        let http = ProbeSpec {
+            handler: ProbeHandler::HttpGet {
+                path: "/healthz".into(),
+                port: Ok(port_n(8080)),
+                scheme: HttpScheme::Http,
+                host: Some("example.internal".into()),
+                headers: Vec::new(),
+            },
+            ..http_spec(ProbeKind::Readiness)
+        };
+        let tcp = ProbeSpec {
+            handler: ProbeHandler::TcpSocket {
+                port: Ok(port_n(8080)),
+                host: Some("db.internal".into()),
+            },
+            ..http_spec(ProbeKind::Readiness)
+        };
+        for spec in [http, tcp] {
+            let got = run_handler(&spec, &FakeBackend::new(), &net, "cid", None).await;
+            assert_eq!(got, ProbeObservation::Success, "{:?}", spec.handler);
+        }
     }
 }

@@ -708,3 +708,221 @@ async fn a_liveness_probe_the_runtime_cannot_run_never_restarts_and_says_so() {
 
     teardown(store, kubelet).await;
 }
+
+// ── 12 — a port that does not resolve runs the pod; the probe stays put ──
+//
+// Upstream admits a probe naming a port the container does not declare
+// (validation checks only the name's syntax) and runs the pod; its prober
+// fails to resolve the port on every run and throws the run away, so the probe
+// stays at its initial value: liveness never restarts, readiness never Ready.
+// engenho used to refuse the whole pod at parse — it never started.
+
+#[tokio::test]
+async fn a_probe_whose_port_does_not_resolve_runs_the_pod_and_holds_the_probe() {
+    use engenho_controllers::event_recorder::{CollectingEventSink, Reason as EventReason};
+
+    let store = boot_store("probes-unresolvable-port").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    // The workload would pass if it were asked: nothing here may be a Failure.
+    net.set_default_http(200).await;
+    net.set_default_tcp(true).await;
+    let clock = TestClock::new();
+    let events = Arc::new(CollectingEventSink::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock())
+        .with_event_sink(events.clone());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "ports": [{ "name": "metrics", "containerPort": 9090 }],
+        "readinessProbe": {
+            "httpGet": { "path": "/healthz", "port": "http" },
+            "periodSeconds": 1,
+            "failureThreshold": 3
+        },
+        "livenessProbe": {
+            "tcpSocket": { "port": "http" },
+            "periodSeconds": 1,
+            "failureThreshold": 1
+        }
+    });
+    put_pod_container(&store, "p1", container, "Always").await;
+
+    kubelet.tick().await.unwrap();
+    for _ in 0..10 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "the pod runs, and a liveness probe that never resolved never restarts it"
+    );
+    assert_eq!(restart_count(&pod, 0), Some(0));
+    assert_eq!(pod["status"]["phase"], "Running", "{pod}");
+    assert_eq!(
+        container_ready(&pod, 0),
+        Some(false),
+        "readiness stays at its initial value: not ready"
+    );
+    let blind = pod["status"]["conditions"]
+        .as_array()
+        .and_then(|cs| cs.iter().find(|c| c["type"] == "ProbeBlind"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(blind["status"], "True", "{pod}");
+    assert_eq!(blind["reason"], "UnresolvablePort", "{pod}");
+    let warnings: Vec<String> = events
+        .drain()
+        .into_iter()
+        .filter(|e| e.reason == EventReason::Unhealthy)
+        .map(|e| e.message)
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "one Warning per probe, not one per period: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|w| w.contains("does not resolve to a port of the container")),
+        "{warnings:?}"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── 13 — a startup probe that passed is never run again ───────────────────
+//
+// Upstream skips the startup probe once the container has started
+// (worker.go:283-294, and the worker holds after its first verdict). engenho
+// kept running it, so an endpoint that later failed `failureThreshold` times
+// restarted a container that had started long ago.
+
+/// Tick until the pod reports `Ready=True` or `ticks` run out.
+async fn tick_until_ready(
+    kubelet: &Kubelet,
+    store: &StoreMesh,
+    clock: &TestClock,
+    ticks: usize,
+) -> bool {
+    for _ in 0..ticks {
+        kubelet.tick().await.unwrap();
+        let pod = store.get(&pod_key("p1")).await.unwrap();
+        if condition_status(&pod, "Ready").as_deref() == Some("True") {
+            return true;
+        }
+        clock.advance(Duration::from_millis(1100));
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_startup_probe_that_passed_is_never_run_again() {
+    let store = boot_store("probes-startup-once").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "startupProbe": {
+            "httpGet": { "path": "/started", "port": 8080 },
+            "periodSeconds": 1,
+            "failureThreshold": 2
+        }
+    });
+    put_pod_container(&store, "p1", container, "Always").await;
+    // Passes once, then the endpoint fails for good (the fake's default 503).
+    net.seed_http("10.42.0.1", 8080, "/started", [200]).await;
+
+    assert!(
+        tick_until_ready(&kubelet, &store, &clock, 6).await,
+        "the startup probe passes, so the container starts and is Ready"
+    );
+    for _ in 0..6 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "a started container is not restarted by its startup probe: {pod}"
+    );
+    assert_eq!(restart_count(&pod, 0), Some(0));
+    assert_eq!(condition_status(&pod, "Ready").as_deref(), Some("True"));
+
+    teardown(store, kubelet).await;
+}
+
+// ── 14 — liveness banks no failures during the startup window ────────────
+//
+// Upstream does not run liveness until the container has started. engenho ran
+// it and only filtered the restart, so failures counted during the window
+// tripped liveness on its first run after it — before `failureThreshold`
+// failures of a STARTED container had been observed.
+
+#[tokio::test]
+async fn liveness_banks_no_failures_during_the_startup_window() {
+    let store = boot_store("probes-startup-bank").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "startupProbe": {
+            "httpGet": { "path": "/started", "port": 8080 },
+            "periodSeconds": 1,
+            "failureThreshold": 10
+        },
+        "livenessProbe": {
+            "exec": { "command": ["sh", "-c", "test -f /tmp/alive"] },
+            "periodSeconds": 1,
+            "failureThreshold": 3
+        }
+    });
+    put_pod_container(&store, "p1", container, "Always").await;
+    // Startup fails three times, then passes. Liveness fails throughout.
+    net.seed_http("10.42.0.1", 8080, "/started", [503, 503, 503, 200])
+        .await;
+    backend.set_default_exec(ExecOutcome::failure(1)).await;
+
+    let started = tick_until_ready(&kubelet, &store, &clock, 8).await;
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert!(started, "the startup probe passes on its fourth run: {pod}");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "one liveness failure after start is below failureThreshold 3: {pod}"
+    );
+
+    // Control: three failures observed AFTER start do restart it.
+    for _ in 0..2 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "the third post-start liveness failure restarts the container"
+    );
+
+    teardown(store, kubelet).await;
+}

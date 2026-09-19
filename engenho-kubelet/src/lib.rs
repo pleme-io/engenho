@@ -46,6 +46,7 @@ pub mod config_bridge;
 pub mod cri;
 pub mod cri_backend;
 pub mod csi_materializer;
+mod env_ref;
 pub mod error;
 pub mod exec_channel;
 pub mod exec_session;
@@ -76,7 +77,7 @@ pub mod volume;
 
 pub use backend::{
     ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeExecFault, FakeNetProber,
-    HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage,
+    HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage, ProbeUrl,
     PullPolicy, Readoption, TcpProbeTarget, TerminationGrace, TokioNetProber,
 };
 pub use config_bridge::{
@@ -100,7 +101,8 @@ pub use pod_volume::{
 pub use probe::{
     BlindCause, BlindNotice, BlindStreak, HttpScheme, ProbeHandler, ProbeKind, ProbeObservation,
     ProbeParseError, ProbePort, ProbeRuntime, ProbeSpec, ProbeTiming, ProbeTrip, ProbeVerdict,
-    TripKind, aggregate_container_readiness, fold_probe_observation, run_handler,
+    TripKind, UnresolvablePort, aggregate_container_readiness, container_started,
+    fold_probe_observation, http_status_observation, run_handler,
 };
 pub use volume::{
     AccessMode, FakeVolumeBackend, FakeVolumeEvent, HostPathVolumeBackend, MountedVolume,

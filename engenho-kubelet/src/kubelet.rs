@@ -64,8 +64,8 @@ use crate::pod_volume::{
     VolumeTeardown, container_mounts, pod_volumes, teardown_obligation, teardowns_of,
 };
 use crate::probe::{
-    BlindCause, BlindNotice, ProbeKind, ProbeRuntime, ProbeSpec, ProbeTrip,
-    aggregate_container_readiness, fold_probe_observation, run_handler,
+    BlindCause, BlindNotice, ProbeHandler, ProbeKind, ProbeRuntime, ProbeSpec, ProbeTrip,
+    aggregate_container_readiness, container_started, fold_probe_observation, run_handler,
 };
 
 /// The pod condition the kubelet raises while a probe has been BLIND — unable
@@ -1262,71 +1262,6 @@ impl Kubelet {
     /// credentials. A pod that cannot get its environment must not reach
     /// Running, because "started successfully, silently misconfigured" is
     /// the single hardest state to debug from outside.
-    /// Expand `$(VAR)` references in an env value or an argv element, using
-    /// the variables already defined for this container.
-    ///
-    /// **Kubernetes does this and every workload assumes it.** A manifest
-    /// writes `value: "source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local."`
-    /// and expects a hostname; without expansion the container receives the
-    /// literal text and fails at whatever it hands the string to — far from
-    /// the kubelet, with nothing naming it. Measured on rio 2026-09-15: Flux's
-    /// kustomize-controller logged
-    /// `Get "http://source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local./…"`
-    /// and could not fetch a single artifact, so nothing was ever applied.
-    ///
-    /// Upstream's three rules, all load-bearing:
-    ///   * only variables defined EARLIER in the list are visible — the caller
-    ///     passes the map accumulated so far, so order is the semantics;
-    ///   * `$$` escapes to a single literal `$`;
-    ///   * an UNRESOLVABLE `$(VAR)` is left exactly as written, never blanked.
-    ///     Blanking would turn a typo into a silently-empty hostname, which is
-    ///     strictly harder to debug than the unexpanded text.
-    #[must_use]
-    fn expand_env_refs(raw: &str, defined: &BTreeMap<String, String>) -> String {
-        let bytes = raw.as_bytes();
-        let mut out = String::with_capacity(raw.len());
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] != b'$' {
-                // Push the whole UTF-8 character, not the byte: indexing by
-                // byte and emitting bytes would split a multi-byte codepoint.
-                let ch = raw[i..].chars().next().unwrap_or('$');
-                out.push(ch);
-                i += ch.len_utf8();
-                continue;
-            }
-            match bytes.get(i + 1) {
-                Some(b'$') => {
-                    out.push('$');
-                    i += 2;
-                }
-                Some(b'(') => {
-                    if let Some(close) = raw[i + 2..].find(')') {
-                        let name = &raw[i + 2..i + 2 + close];
-                        if let Some(v) = defined.get(name) {
-                            out.push_str(v);
-                        } else {
-                            // Unresolvable: emit verbatim, including the
-                            // delimiters, so the operator sees what was asked
-                            // for rather than an empty string.
-                            out.push_str(&raw[i..i + 3 + close]);
-                        }
-                        i += 3 + close;
-                    } else {
-                        // No closing paren — not a reference at all.
-                        out.push('$');
-                        i += 1;
-                    }
-                }
-                _ => {
-                    out.push('$');
-                    i += 1;
-                }
-            }
-        }
-        out
-    }
-
     fn resolve_env_entry(
         namespace: &str,
         pod_name: &str,
@@ -1685,7 +1620,7 @@ impl Kubelet {
                         // container's environment, which is a different and
                         // much larger promise than the one Kubernetes makes.
                         let v = if entry.get("value").is_some() {
-                            Self::expand_env_refs(&v, &map)
+                            crate::env_ref::expand_env_refs(&v, &map)
                         } else {
                             v
                         };
@@ -1710,7 +1645,7 @@ impl Kubelet {
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|x| x.as_str())
-                            .map(|x| Self::expand_env_refs(x, &env))
+                            .map(|x| crate::env_ref::expand_env_refs(x, &env))
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default()
@@ -1815,56 +1750,55 @@ impl Kubelet {
 
     /// Parse the three probes (`livenessProbe`/`readinessProbe`/
     /// `startupProbe`) of a single `spec.containers[i]` JSON object into a
-    /// [`ContainerProbeState`], resolving named ports against the container's
-    /// own `ports[]`. The probe specs are parsed; their [`ProbeRuntime`]
-    /// counters are stamped from `now` (the container's start instant).
+    /// [`ContainerProbeState`] through [`ProbeSpec::from_container`] (which
+    /// resolves named ports against the container's own `ports[]` and
+    /// expands an exec probe's `$(VAR)` references). The probe specs are
+    /// parsed; their [`ProbeRuntime`] counters are stamped from `now` (the
+    /// container's start instant).
+    ///
+    /// A port that does not resolve is NOT an error here: the container runs
+    /// and the probe stays at its initial value, blind on every run (see
+    /// [`crate::probe::UnresolvablePort`]). It is logged once, at parse, with
+    /// the name it could not find.
     ///
     /// # Errors
     ///
     /// Propagates a [`ProbeParseError`](crate::probe::ProbeParseError) (mapped
-    /// to a typed [`KubeletError::InvalidPod`]) for a no-handler / grpc /
-    /// unresolved-port probe — the pod is skipped, NEVER a fake pass.
+    /// to a typed [`KubeletError::InvalidPod`]) for a no-handler / empty-exec
+    /// / grpc probe — the pod is skipped, NEVER a fake pass.
     fn parse_container_probes(
         container: &Value,
         pod_label: &str,
         now: Instant,
     ) -> Result<ContainerProbeState, KubeletError> {
-        // Resolve the container's named ports once for port resolution.
-        let ports: Vec<(String, u16)> = container
-            .get("ports")
-            .and_then(|p| p.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| {
-                        let name = p.get("name").and_then(|n| n.as_str())?.to_string();
-                        let number = p.get("containerPort").and_then(serde_json::Value::as_i64)?;
-                        u16::try_from(number).ok().map(|n| (name, n))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let parse_one = |field: &str,
-                         kind: ProbeKind|
-         -> Result<Option<(ProbeSpec, ProbeRuntime)>, KubeletError> {
-            match container.get(field) {
-                None => Ok(None),
-                Some(probe) => {
-                    let spec = ProbeSpec::from_k8s(kind, probe, &ports).map_err(|e| {
-                        KubeletError::InvalidPod {
-                            pod: pod_label.to_string(),
-                            reason: format!("{field}: {e}"),
-                        }
-                    })?;
-                    Ok(Some((spec, ProbeRuntime::new(now))))
+        let parse_one =
+            |kind: ProbeKind| -> Result<Option<(ProbeSpec, ProbeRuntime)>, KubeletError> {
+                let Some(spec) = ProbeSpec::from_container(kind, container).map_err(|e| {
+                    KubeletError::InvalidPod {
+                        pod: pod_label.to_string(),
+                        reason: format!("{}: {e}", kind.field()),
+                    }
+                })?
+                else {
+                    return Ok(None);
+                };
+                if let ProbeHandler::HttpGet { port: Err(why), .. }
+                | ProbeHandler::TcpSocket { port: Err(why), .. } = &spec.handler
+                {
+                    warn!(
+                        pod = %pod_label,
+                        probe = %kind,
+                        reason = %why,
+                        "probe port does not resolve; the probe stays at its initial value"
+                    );
                 }
-            }
-        };
+                Ok(Some((spec, ProbeRuntime::new(now))))
+            };
 
         Ok(ContainerProbeState {
-            liveness: parse_one("livenessProbe", ProbeKind::Liveness)?,
-            readiness: parse_one("readinessProbe", ProbeKind::Readiness)?,
-            startup: parse_one("startupProbe", ProbeKind::Startup)?,
+            liveness: parse_one(ProbeKind::Liveness)?,
+            readiness: parse_one(ProbeKind::Readiness)?,
+            startup: parse_one(ProbeKind::Startup)?,
         })
     }
 
@@ -3479,8 +3413,10 @@ impl Kubelet {
         }
 
         // Parse the per-container probes BEFORE starting anything: a parse
-        // error (no-handler / grpc / unresolved port) skips the whole pod
-        // (NEVER a fake pass). Parsing here (not after start) means a bad probe
+        // error (no-handler / empty exec / grpc) skips the whole pod (NEVER a
+        // fake pass); a port that does not resolve is not one — that pod runs
+        // with the probe frozen, as upstream's does. Parsing here (not after
+        // start) means a bad probe
         // never even starts a container. The ProbeRuntimes are stamped at the
         // container's start instant below, but the spec parse is what can fail.
         let now = self.now();
@@ -3898,70 +3834,53 @@ impl Kubelet {
         let mut probes = record.probes.clone();
         let mut entered_blind: Vec<(ProbeKind, BlindCause)> = Vec::new();
 
-        // Helper: for one probe slot, if due, run + fold; always fold the
-        // probe's next-due into soonest_requeue.
-        // We run them sequentially: startup first (it gates the others), then
-        // readiness + liveness. The verdicts are aggregated below.
-        let mut startup_done = true;
-        let mut has_startup = false;
-        let mut startup_trip: Option<ProbeTrip> = None;
-
-        if let Some((spec, rt)) = probes.startup.as_mut() {
-            has_startup = true;
-            if rt.is_due(spec, now) {
-                let obs = run_handler(
-                    spec,
-                    &*self.backend,
-                    &*self.net_prober,
-                    container_id,
-                    pod_ip,
-                )
-                .await;
-                let verdict = fold_probe_observation(spec, rt, obs, now);
-                startup_trip = verdict.trip;
-                entered_blind.extend(verdict.entered_blind.map(|c| (spec.kind, c)));
-            }
-            startup_done = rt.gate_satisfied;
-            Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
+        // Startup first: it decides whether the other two may run. Upstream
+        // runs liveness and readiness only once the container has STARTED and
+        // startup only until it has (worker.go:283-294), so a startup probe
+        // that passed is never run again on this container — it cannot
+        // restart it later — and liveness cannot bank failures during the
+        // startup window. `started` is re-read after the startup run, so a
+        // startup probe that passes this tick lets the other two run in it.
+        let started = container_started(true, probes.startup.as_ref().map(|(_, rt)| rt));
+        let startup_trip = match probes.startup.as_mut() {
+            Some(slot) => self
+                .run_probe_slot(slot, started, container_id, pod_ip, now, soonest_requeue)
+                .await
+                .and_then(|v| {
+                    entered_blind.extend(v.entered_blind.map(|c| (ProbeKind::Startup, c)));
+                    v.trip
+                }),
+            None => None,
+        };
+        let started = container_started(true, probes.startup.as_ref().map(|(_, rt)| rt));
+        if let Some(slot) = probes.readiness.as_mut()
+            && let Some(v) = self
+                .run_probe_slot(slot, started, container_id, pod_ip, now, soonest_requeue)
+                .await
+        {
+            entered_blind.extend(v.entered_blind.map(|c| (ProbeKind::Readiness, c)));
         }
+        let liveness_trip = match probes.liveness.as_mut() {
+            Some(slot) => self
+                .run_probe_slot(slot, started, container_id, pod_ip, now, soonest_requeue)
+                .await
+                .and_then(|v| {
+                    entered_blind.extend(v.entered_blind.map(|c| (ProbeKind::Liveness, c)));
+                    v.trip
+                }),
+            None => None,
+        };
 
-        let mut readiness_ready = false;
-        let mut has_readiness = false;
-        if let Some((spec, rt)) = probes.readiness.as_mut() {
-            has_readiness = true;
-            if rt.is_due(spec, now) {
-                let obs = run_handler(
-                    spec,
-                    &*self.backend,
-                    &*self.net_prober,
-                    container_id,
-                    pod_ip,
-                )
-                .await;
-                let verdict = fold_probe_observation(spec, rt, obs, now);
-                entered_blind.extend(verdict.entered_blind.map(|c| (spec.kind, c)));
-            }
-            readiness_ready = rt.gate_satisfied;
-            Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
-        }
-
-        let mut liveness_trip: Option<ProbeTrip> = None;
-        if let Some((spec, rt)) = probes.liveness.as_mut() {
-            if rt.is_due(spec, now) {
-                let obs = run_handler(
-                    spec,
-                    &*self.backend,
-                    &*self.net_prober,
-                    container_id,
-                    pod_ip,
-                )
-                .await;
-                let verdict = fold_probe_observation(spec, rt, obs, now);
-                liveness_trip = verdict.trip;
-                entered_blind.extend(verdict.entered_blind.map(|c| (spec.kind, c)));
-            }
-            Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
-        }
+        let startup_done = probes
+            .startup
+            .as_ref()
+            .is_none_or(|(_, rt)| rt.gate_satisfied);
+        let readiness_ready = probes
+            .readiness
+            .as_ref()
+            .is_some_and(|(_, rt)| rt.gate_satisfied);
+        let has_startup = probes.startup.is_some();
+        let has_readiness = probes.readiness.is_some();
 
         // Aggregate the per-kind gates into effective readiness + whether
         // liveness restart may fire (startup window suppresses it).
@@ -3973,9 +3892,11 @@ impl Kubelet {
             /* is_running */ true,
         );
 
-        // A startup probe that itself failed past threshold ALWAYS restarts (a
-        // container that never boots IS restarted), regardless of the gate.
-        // Liveness restart only fires once the startup window has passed.
+        // A startup probe that failed past its threshold restarts the
+        // container (one that never boots IS restarted); it only runs before
+        // the container has started, so it cannot trip after. Liveness only
+        // runs once it has — the filter restates that gate, it does not add
+        // one.
         let trip = startup_trip.or(liveness_trip.filter(|_| may_run_liveness));
         let sustained_blind = probes.sustained_blindness();
 
@@ -4004,6 +3925,41 @@ impl Kubelet {
             entered_blind,
             sustained_blind,
         }
+    }
+
+    /// One probe slot of a running container this tick: run it if its kind
+    /// may run given `started` ([`ProbeKind::may_run`]) and it is due, fold
+    /// the observation, and fold its next due time into `soonest_requeue`.
+    /// `None` when it did not run. A probe that may not run contributes no
+    /// requeue: it has nothing to be due for until `started` changes, and
+    /// the probe that changes it (startup) keeps its own cadence.
+    async fn run_probe_slot(
+        &self,
+        (spec, rt): &mut (ProbeSpec, ProbeRuntime),
+        started: bool,
+        container_id: &str,
+        pod_ip: Option<&str>,
+        now: Instant,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Option<crate::probe::ProbeVerdict> {
+        if !spec.kind.may_run(started) {
+            return None;
+        }
+        let verdict = if rt.is_due(spec, now) {
+            let obs = run_handler(
+                spec,
+                &*self.backend,
+                &*self.net_prober,
+                container_id,
+                pod_ip,
+            )
+            .await;
+            Some(fold_probe_observation(spec, rt, obs, now))
+        } else {
+            None
+        };
+        Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
+        verdict
     }
 
     /// A probe that cannot see the workload says so, and restarts nothing —
@@ -5455,7 +5411,7 @@ mod env_resolution_tests {
         let mut defined = BTreeMap::new();
         defined.insert("RUNTIME_NAMESPACE".to_string(), "flux-system".to_string());
         assert_eq!(
-            Kubelet::expand_env_refs(
+            crate::env_ref::expand_env_refs(
                 "http://source-controller.$(RUNTIME_NAMESPACE).svc.cluster.local.",
                 &defined
             ),
@@ -5469,11 +5425,11 @@ mod env_resolution_tests {
     fn a_doubled_dollar_is_an_escape_not_a_reference() {
         let defined = BTreeMap::new();
         assert_eq!(
-            Kubelet::expand_env_refs("cost is $$5", &defined),
+            crate::env_ref::expand_env_refs("cost is $$5", &defined),
             "cost is $5"
         );
         assert_eq!(
-            Kubelet::expand_env_refs("$$(NOT_A_REF)", &defined),
+            crate::env_ref::expand_env_refs("$$(NOT_A_REF)", &defined),
             "$(NOT_A_REF)"
         );
     }
@@ -5485,7 +5441,7 @@ mod env_resolution_tests {
     fn an_unresolvable_reference_is_left_verbatim_never_blanked() {
         let defined = BTreeMap::new();
         assert_eq!(
-            Kubelet::expand_env_refs("host.$(MISSING).local", &defined),
+            crate::env_ref::expand_env_refs("host.$(MISSING).local", &defined),
             "host.$(MISSING).local"
         );
     }
@@ -5494,12 +5450,12 @@ mod env_resolution_tests {
     #[test]
     fn a_bare_dollar_is_not_a_reference() {
         let defined = BTreeMap::new();
-        assert_eq!(Kubelet::expand_env_refs("100$", &defined), "100$");
+        assert_eq!(crate::env_ref::expand_env_refs("100$", &defined), "100$");
         assert_eq!(
-            Kubelet::expand_env_refs("$(unclosed", &defined),
+            crate::env_ref::expand_env_refs("$(unclosed", &defined),
             "$(unclosed"
         );
-        assert_eq!(Kubelet::expand_env_refs("a $ b", &defined), "a $ b");
+        assert_eq!(crate::env_ref::expand_env_refs("a $ b", &defined), "a $ b");
     }
 
     /// Multi-byte text must survive byte-wise scanning — emitting bytes rather
@@ -5509,7 +5465,7 @@ mod env_resolution_tests {
         let mut defined = BTreeMap::new();
         defined.insert("NS".to_string(), "café".to_string());
         assert_eq!(
-            Kubelet::expand_env_refs("日本語-$(NS)-日本語", &defined),
+            crate::env_ref::expand_env_refs("日本語-$(NS)-日本語", &defined),
             "日本語-café-日本語"
         );
     }
@@ -5522,9 +5478,9 @@ mod env_resolution_tests {
         let mut defined = BTreeMap::new();
         defined.insert("A".to_string(), "$(B)".to_string());
         defined.insert("B".to_string(), "final".to_string());
-        assert_eq!(Kubelet::expand_env_refs("$(A)", &defined), "$(B)");
+        assert_eq!(crate::env_ref::expand_env_refs("$(A)", &defined), "$(B)");
         assert_eq!(
-            Kubelet::expand_env_refs("$(A)/$(B)", &defined),
+            crate::env_ref::expand_env_refs("$(A)/$(B)", &defined),
             "$(B)/final"
         );
     }

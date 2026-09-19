@@ -2291,36 +2291,77 @@ impl ContainerRuntime for PodmanBackend {
 // minimal AND keeps http/tcp unit-testable without a real socket (the trait IS
 // the testability contract — FakeNetProber seeds verdicts).
 
-/// Target for an `httpGet` probe — the pod IP + the resolved port/path/scheme.
+/// Target for an `httpGet` probe — where to dial and what to ask.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpProbeTarget {
-    /// The pod IP to connect to (the kubelet owns it from the status poll).
-    pub ip: String,
+    /// The host dialled: the probe's `httpGet.host` when it sets one, else the
+    /// pod IP (upstream probe/http/request.go:46-49). A hostname or an IP
+    /// literal, IPv6 included.
+    pub host: String,
     /// The resolved TCP port.
     pub port: u16,
     /// The request path.
     pub path: String,
     /// HTTP/HTTPS.
     pub scheme: HttpScheme,
-    /// Optional `Host` header override (defaults to the IP when `None`).
-    pub host: Option<String>,
-    /// Custom request headers.
+    /// `httpHeaders`, in manifest order. A `Host` entry sets the Host header;
+    /// a `User-Agent` or `Accept` entry replaces that default, and an empty
+    /// one removes it (upstream request.go:63-92).
     pub headers: Vec<(String, String)>,
     /// The per-run timeout (`timeoutSeconds`).
     pub timeout: Duration,
 }
 
-/// Target for a `tcpSocket` probe — the pod IP + resolved port.
+/// Target for a `tcpSocket` probe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpProbeTarget {
-    /// The pod IP to connect to.
-    pub ip: String,
+    /// The host dialled: the probe's `tcpSocket.host` when it sets one, else
+    /// the pod IP (upstream prober.go:180-183).
+    pub host: String,
     /// The resolved TCP port.
     pub port: u16,
-    /// Optional host override (defaults to the IP when `None`).
-    pub host: Option<String>,
     /// The per-run timeout (`timeoutSeconds`).
     pub timeout: Duration,
+}
+
+/// `host:port`, with an IPv6 literal bracketed — upstream's
+/// `net.JoinHostPort`. The one rendering of a probe's authority, used for the
+/// URL, the dial, and the error label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostPort<'a> {
+    /// A hostname or an IP literal.
+    pub host: &'a str,
+    /// The port.
+    pub port: u16,
+}
+
+impl std::fmt::Display for HostPort<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// The URL an `httpGet` probe requests — upstream's `formatURL`
+/// (probe/http/request.go:95-109): the lower-case scheme, the dialled host
+/// joined with the port, then the path, with a `/` put in front of a path
+/// that lacks one. The port is always written, `:80` included.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeUrl<'a>(pub &'a HttpProbeTarget);
+
+impl std::fmt::Display for ProbeUrl<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let t = self.0;
+        let authority = HostPort {
+            host: &t.host,
+            port: t.port,
+        };
+        let slash = if t.path.starts_with('/') { "" } else { "/" };
+        write!(f, "{}://{authority}{slash}{}", t.scheme.as_str(), t.path)
+    }
 }
 
 /// Typed I/O failure for a network probe. It never escapes the prober and never
@@ -2403,9 +2444,18 @@ pub trait NetProber: Send + Sync {
 }
 
 /// Real network prober. `tcpSocket` uses [`tokio::net::TcpStream::connect`];
-/// `httpGet` uses a minimal `reqwest` client. URLs are composed via a typed
-/// builder (never a `format!()` of URL syntax beyond the host:port authority,
-/// which `reqwest` re-parses) — per TYPED EMISSION.
+/// `httpGet` uses a `reqwest` client configured the way upstream's prober
+/// configures its `http.Client` (probe/http/http.go:41-60, prober.go:60):
+///
+/// * the URL is [`ProbeUrl`] — a typed rendering, never a `format!()` of URL
+///   syntax;
+/// * a redirect to another HOSTNAME is not followed: its 3xx is the answer,
+///   which passes. A redirect to the same hostname is followed, whatever its
+///   port, up to ten requests;
+/// * no proxy, whatever the environment says, and TLS certificates are not
+///   verified;
+/// * `User-Agent: kube-probe/<major>.<minor>` and `Accept: */*` unless the
+///   probe's `httpHeaders` set them, `Connection: close`.
 #[derive(Default)]
 pub struct TokioNetProber;
 
@@ -2417,40 +2467,118 @@ impl TokioNetProber {
     }
 }
 
+/// The most requests one probe makes following redirects (upstream's
+/// `RedirectChecker`: `len(via) >= 10` stops the chain).
+const MAX_PROBE_REQUESTS: usize = 10;
+
+/// A redirect chain that reached [`MAX_PROBE_REQUESTS`]. The workload was
+/// asked and kept redirecting, so it is a failure, not a blind run.
+#[derive(Debug, thiserror::Error)]
+#[error("stopped after 10 redirects")]
+struct RedirectLimit;
+
+/// Upstream's probe redirect rule with `followNonLocalRedirects = false`
+/// (probe/http/http.go:126-141): a redirect whose HOSTNAME differs from the
+/// first request's is not followed (the port is not part of the comparison),
+/// so the 3xx itself is the response; a same-host chain errors once it has
+/// made [`MAX_PROBE_REQUESTS`] requests.
+fn local_redirects_only() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let first_host = attempt.previous().first().map(reqwest::Url::host_str);
+        let same_host = first_host.is_none_or(|first| first == attempt.url().host_str());
+        let exhausted = attempt.previous().len() >= MAX_PROBE_REQUESTS;
+        if !same_host {
+            attempt.stop()
+        } else if exhausted {
+            attempt.error(RedirectLimit)
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// The request headers of one probe: the probe's own `httpHeaders` (each
+/// appended, so a repeated name keeps every value), then upstream's defaults
+/// (probe/http/request.go:63-92) — `User-Agent: kube-probe/<major>.<minor>`
+/// and `Accept: */*` when the probe does not set them, neither when it sets
+/// them EMPTY — and `Connection: close` (upstream disables keep-alives).
+///
+/// One gap on the wire, not in this map: reqwest adds `Accept: */*` to any
+/// request without an Accept, so an emptied Accept still reaches the workload
+/// as `*/*` where upstream sends none. The two mean the same (RFC 9110
+/// 12.5.1: no Accept is any media type); `tests/oracle_prober.rs` declares it.
+///
+/// # Errors
+///
+/// [`ProbeIoError::Setup`] at [`ProbeSetupStage::Request`] for a name or
+/// value that cannot be a header. Nothing is sent.
+fn probe_request_headers(
+    user: &[(String, String)],
+) -> Result<reqwest::header::HeaderMap, ProbeIoError> {
+    use reqwest::header::{ACCEPT, CONNECTION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
+    let setup = |reason: String| ProbeIoError::Setup {
+        stage: ProbeSetupStage::Request,
+        reason,
+    };
+    let mut headers = HeaderMap::new();
+    for (name, value) in user {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| setup(e.to_string()))?;
+        let value = HeaderValue::from_str(value).map_err(|e| setup(e.to_string()))?;
+        headers.append(name, value);
+    }
+    let user_agent = [
+        "kube-probe/",
+        engenho_types::KUBE_VERSION_MAJOR,
+        ".",
+        engenho_types::KUBE_VERSION_MINOR,
+    ]
+    .concat();
+    for (name, default) in [
+        (USER_AGENT, HeaderValue::from_str(&user_agent)),
+        (ACCEPT, Ok(HeaderValue::from_static("*/*"))),
+    ] {
+        match headers.get(&name).map(HeaderValue::is_empty) {
+            None => {
+                headers.insert(name, default.map_err(|e| setup(e.to_string()))?);
+            }
+            Some(true) => {
+                headers.remove(&name);
+            }
+            Some(false) => {}
+        }
+    }
+    headers.insert(CONNECTION, HeaderValue::from_static("close"));
+    Ok(headers)
+}
+
 #[async_trait]
 impl NetProber for TokioNetProber {
     async fn http_get(&self, target: &HttpProbeTarget) -> Result<u16, ProbeIoError> {
-        // Compose the URL via reqwest's typed URL parser (host authority +
-        // path). The path is taken verbatim from the probe spec.
-        let authority = format!("{}:{}", target.ip, target.port);
-        let path = if target.path.starts_with('/') {
-            target.path.clone()
-        } else {
-            format!("/{}", target.path)
+        let authority = HostPort {
+            host: &target.host,
+            port: target.port,
         };
-        let url = reqwest::Url::parse(&format!("{}://{authority}{path}", target.scheme.as_str()))
-            .map_err(|e| ProbeIoError::Setup {
-            stage: ProbeSetupStage::Url,
-            reason: e.to_string(),
+        let url = reqwest::Url::parse(&ProbeUrl(target).to_string()).map_err(|e| {
+            ProbeIoError::Setup {
+                stage: ProbeSetupStage::Url,
+                reason: e.to_string(),
+            }
         })?;
+        let headers = probe_request_headers(&target.headers)?;
         let client = reqwest::Client::builder()
             .timeout(target.timeout)
             // Probes accept self-signed certs (K8s does not verify probe TLS).
             .danger_accept_invalid_certs(true)
+            .redirect(local_redirects_only())
+            // Upstream's probe transport sets `Proxy: http.ProxyURL(nil)`: a
+            // probe asks the workload, never a proxy in front of it.
+            .no_proxy()
             .build()
             .map_err(|e| ProbeIoError::Setup {
                 stage: ProbeSetupStage::Client,
                 reason: e.to_string(),
             })?;
-        let mut req = client.get(url);
-        // Host override → Host header; custom headers appended.
-        if let Some(host) = &target.host {
-            req = req.header("Host", host);
-        }
-        for (k, v) in &target.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        match req.send().await {
+        match client.get(url).headers(headers).send().await {
             Ok(resp) => Ok(resp.status().as_u16()),
             // reqwest defers an invalid header to `send`; it never reached the
             // wire, so it is a setup error, not an answer from the workload.
@@ -2458,9 +2586,11 @@ impl NetProber for TokioNetProber {
                 stage: ProbeSetupStage::Request,
                 reason: e.to_string(),
             }),
-            Err(e) if e.is_timeout() => Err(ProbeIoError::Timeout { target: authority }),
+            Err(e) if e.is_timeout() => Err(ProbeIoError::Timeout {
+                target: authority.to_string(),
+            }),
             Err(e) if e.is_connect() => Err(ProbeIoError::Connect {
-                target: authority,
+                target: authority.to_string(),
                 reason: e.to_string(),
             }),
             Err(e) => Err(ProbeIoError::Io(e.to_string())),
@@ -2468,20 +2598,25 @@ impl NetProber for TokioNetProber {
     }
 
     async fn tcp_connect(&self, target: &TcpProbeTarget) -> Result<(), ProbeIoError> {
-        let authority = format!("{}:{}", target.ip, target.port);
-        let connect = tokio::net::TcpStream::connect(&authority);
+        let authority = HostPort {
+            host: &target.host,
+            port: target.port,
+        };
+        let connect = tokio::net::TcpStream::connect((target.host.as_str(), target.port));
         match tokio::time::timeout(target.timeout, connect).await {
             Ok(Ok(_stream)) => Ok(()), // drop closes the stream immediately
             Ok(Err(e)) => Err(ProbeIoError::Connect {
-                target: authority,
+                target: authority.to_string(),
                 reason: e.to_string(),
             }),
-            Err(_elapsed) => Err(ProbeIoError::Timeout { target: authority }),
+            Err(_elapsed) => Err(ProbeIoError::Timeout {
+                target: authority.to_string(),
+            }),
         }
     }
 }
 
-/// Mock network prober for tests — seeds per-`(ip,port,path)` verdicts so
+/// Mock network prober for tests — seeds per-`(host,port,path)` verdicts so
 /// http/tcp probe logic is unit-testable WITHOUT a real socket. The trait IS
 /// the testability contract.
 #[derive(Default, Clone)]
@@ -2491,10 +2626,11 @@ pub struct FakeNetProber {
 
 #[derive(Default)]
 struct FakeNetState {
-    /// Programmed HTTP status codes keyed by `(ip, port, path)`, popped FRONT
+    /// Programmed HTTP status codes keyed by `(host, port, path)` — the host
+    /// dialled, which is the pod IP unless the probe names one — popped FRONT
     /// first; an absent / drained queue falls back to `default_http`.
     http: BTreeMap<(String, u16, String), VecDeque<u16>>,
-    /// Programmed TCP connect verdicts keyed by `(ip, port)`, popped FRONT
+    /// Programmed TCP connect verdicts keyed by `(host, port)`, popped FRONT
     /// first (`true` = connect ok); falls back to `default_tcp`.
     tcp: BTreeMap<(String, u16), VecDeque<bool>>,
     /// Default HTTP status when no queue applies (defaults to 503 = fail, so a
@@ -2561,7 +2697,7 @@ impl FakeNetProber {
 impl NetProber for FakeNetProber {
     async fn http_get(&self, target: &HttpProbeTarget) -> Result<u16, ProbeIoError> {
         let mut state = self.inner.lock().await;
-        let key = (target.ip.clone(), target.port, target.path.clone());
+        let key = (target.host.clone(), target.port, target.path.clone());
         let status = state
             .http
             .get_mut(&key)
@@ -2572,7 +2708,7 @@ impl NetProber for FakeNetProber {
 
     async fn tcp_connect(&self, target: &TcpProbeTarget) -> Result<(), ProbeIoError> {
         let mut state = self.inner.lock().await;
-        let key = (target.ip.clone(), target.port);
+        let key = (target.host.clone(), target.port);
         let ok = state
             .tcp
             .get_mut(&key)
@@ -2582,7 +2718,11 @@ impl NetProber for FakeNetProber {
             Ok(())
         } else {
             Err(ProbeIoError::Connect {
-                target: format!("{}:{}", target.ip, target.port),
+                target: HostPort {
+                    host: &target.host,
+                    port: target.port,
+                }
+                .to_string(),
                 reason: "fake refused".to_string(),
             })
         }
@@ -3718,13 +3858,12 @@ mod probe_setup_tests {
     //! These run the real `TokioNetProber`; neither case opens a socket.
     use super::*;
 
-    fn target(ip: &str, headers: Vec<(String, String)>) -> HttpProbeTarget {
+    fn target(host: &str, headers: Vec<(String, String)>) -> HttpProbeTarget {
         HttpProbeTarget {
-            ip: ip.to_string(),
+            host: host.to_string(),
             port: 8080,
             path: "/healthz".to_string(),
             scheme: HttpScheme::Http,
-            host: None,
             headers,
             timeout: Duration::from_secs(1),
         }
@@ -3762,6 +3901,112 @@ mod probe_setup_tests {
                 })
             ),
             "an unparsable URL is a setup error, got {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_request_tests {
+    //! What the real prober asks for, against upstream's request builder
+    //! (probe/http/request.go). Pure: no socket. The same rules over the
+    //! wire, redirects included, are rows of `tests/oracle_prober.rs`.
+    use super::*;
+    use reqwest::header::{ACCEPT, CONNECTION, HeaderMap, USER_AGENT};
+
+    fn url(host: &str, port: u16, path: &str, scheme: HttpScheme) -> String {
+        ProbeUrl(&HttpProbeTarget {
+            host: host.to_string(),
+            port,
+            path: path.to_string(),
+            scheme,
+            headers: Vec::new(),
+            timeout: Duration::from_secs(1),
+        })
+        .to_string()
+    }
+
+    fn headers(user: &[(&str, &str)]) -> HeaderMap {
+        let user: Vec<(String, String)> = user
+            .iter()
+            .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+            .collect();
+        probe_request_headers(&user).unwrap_or_else(|e| panic!("headers: {e}"))
+    }
+
+    fn values(h: &HeaderMap, name: &reqwest::header::HeaderName) -> Vec<String> {
+        h.get_all(name)
+            .iter()
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_url_joins_host_and_port_and_brackets_an_ipv6_literal() {
+        assert_eq!(
+            url("10.0.0.5", 8080, "/healthz", HttpScheme::Http),
+            "http://10.0.0.5:8080/healthz"
+        );
+        assert_eq!(
+            url("10.0.0.5", 8443, "/ready", HttpScheme::Https),
+            "https://10.0.0.5:8443/ready"
+        );
+        assert_eq!(
+            url("fd00::5", 8080, "/healthz", HttpScheme::Http),
+            "http://[fd00::5]:8080/healthz"
+        );
+        // A path without its slash gets one; the default port is still written.
+        assert_eq!(
+            url("example.internal", 80, "path", HttpScheme::Http),
+            "http://example.internal:80/path"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_pod_address_forms_a_url_the_client_accepts() {
+        let text = url("fd00::5", 8080, "/healthz?x=1", HttpScheme::Http);
+        let parsed = reqwest::Url::parse(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+        assert_eq!(parsed.host_str(), Some("[fd00::5]"));
+        assert_eq!(parsed.port(), Some(8080));
+        assert_eq!(parsed.query(), Some("x=1"));
+    }
+
+    #[test]
+    fn a_probe_sends_upstreams_default_headers() {
+        let h = headers(&[]);
+        let agent = [
+            "kube-probe/",
+            engenho_types::KUBE_VERSION_MAJOR,
+            ".",
+            engenho_types::KUBE_VERSION_MINOR,
+        ]
+        .concat();
+        assert_eq!(values(&h, &USER_AGENT), [agent]);
+        assert_eq!(values(&h, &ACCEPT), ["*/*"]);
+        assert_eq!(values(&h, &CONNECTION), ["close"]);
+        assert_eq!(h.len(), 3, "nothing else: {h:?}");
+    }
+
+    #[test]
+    fn a_probe_header_replaces_a_default_and_an_empty_one_removes_it() {
+        let h = headers(&[("user-agent", "foo/1.0"), ("Accept", "text/html")]);
+        assert_eq!(values(&h, &USER_AGENT), ["foo/1.0"]);
+        assert_eq!(values(&h, &ACCEPT), ["text/html"]);
+
+        let h = headers(&[("User-Agent", ""), ("Accept", "")]);
+        assert!(!h.contains_key(USER_AGENT), "{h:?}");
+        assert!(!h.contains_key(ACCEPT), "{h:?}");
+
+        // An empty header that has no default is sent as written.
+        let h = headers(&[("Accept-Encoding", "")]);
+        assert_eq!(values(&h, &reqwest::header::ACCEPT_ENCODING), [""]);
+    }
+
+    #[test]
+    fn a_repeated_probe_header_keeps_every_value() {
+        let h = headers(&[("X-Probe", "a"), ("X-Probe", "b")]);
+        assert_eq!(
+            values(&h, &reqwest::header::HeaderName::from_static("x-probe")),
+            ["a", "b"]
         );
     }
 }

@@ -1668,6 +1668,7 @@ dependencies = [
  "engenho-config",
  "engenho-controllers",
  "engenho-csi",
+ "engenho-oracle",
  "engenho-store",
  "engenho-substrate",
  "engenho-types",
