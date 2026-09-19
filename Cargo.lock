@@ -1392,6 +1392,7 @@ dependencies = [
  "ed25519-dalek",
  "engenho-controllers",
  "engenho-kube-proto",
+ "engenho-oracle",
  "engenho-store",
  "engenho-substrate",
  "engenho-types",

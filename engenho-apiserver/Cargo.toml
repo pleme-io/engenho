@@ -58,6 +58,7 @@ engenho-substrate  = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+engenho-oracle = { path = "../engenho-oracle" }
 engenho-kube-proto = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 serde_urlencoded = "0.7"

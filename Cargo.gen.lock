@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "cbfa7430bc50eae1ef7378bd6300cf13f35adedc2131da65c4281f41f4057d3a",
+  "cargo_lock_sha256": "19f1675d8b20084a028862384bf0ba455056044c6ef9f15b70e86779ec50ebcd",
   "manifest_sha256": {
     "Cargo.toml": "24cdbc582b37d5f4d3426ff34aa27b414acc38cef6239eafd14f2cdda855d90a",
-    "engenho-apiserver/Cargo.toml": "dd8ed22200247d6e30cbd121f61cf79de3c9bc3f83946ddd4519d6626b03ac33",
+    "engenho-apiserver/Cargo.toml": "be7d04cd80fe124f3094eb3f147cbde15e2eabe2975858e18f9ed7ab6c190ab1",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-cni/Cargo.toml": "18a964f983410b945d3e150fe0f2a33635fe63aaadb02f9425a20eac53f39908",
