@@ -37,11 +37,23 @@
 //! convention. That the Blind arm never calls it is pinned by tests, which is
 //! a gate, not a type.
 //!
-//! The kubelet's `reconcile_running` ([`crate::kubelet`]) is the I/O shell: it
-//! decides which probes are *due* (period + initialDelay), runs each handler
-//! through the [`run_handler`] wrapper (the SOLE place that touches a Fake),
-//! folds the observation, then aggregates the per-container effective
-//! readiness + restart decision.
+//! The kubelet's `reconcile_running` ([`crate::kubelet`]) is the I/O shell. It
+//! hands each running container's [`ContainerProbes`] to
+//! [`ContainerProbes::tick`], which decides which probes may run (the started
+//! gate, and a pod being deleted) and are *due* (period + initialDelay), runs
+//! each through the [`run_handler`] wrapper (the SOLE place that touches a
+//! Fake), folds the observation, then aggregates the container's effective
+//! readiness + restart decision. The kubelet persists the advanced state and
+//! acts on the result.
+//!
+//! ## A pod being deleted is not restarted by a probe
+//!
+//! Once a pod carries `metadata.deletionTimestamp` ([`PodLifecycle`]), its
+//! running containers' liveness and startup probes stop and hold at Success,
+//! as upstream's do: nothing restarts a pod on its way out, and a container
+//! still in its startup window reads as started. Readiness keeps probing.
+//! The kubelet does not yet stop a Terminating pod's containers itself (no
+//! graceful deletion); this is only the prober's half of it.
 //!
 //! ## No silent wrong answers
 //!
@@ -141,19 +153,70 @@ impl ProbeKind {
         }
     }
 
+    /// Whether this kind is done for good on a pod in `pod`'s lifecycle:
+    /// liveness and startup once the pod is [`PodLifecycle::Terminating`].
+    ///
+    /// Upstream's worker (worker.go:265-276): once a pod has a
+    /// deletionTimestamp, a running container's liveness and startup probes
+    /// are set to Success and stop, "to ensure quiet shutdown". A pod on its
+    /// way out is never restarted by a probe, and a container that had not
+    /// passed its startup probe reads as started. Readiness keeps probing, so
+    /// the container can still go unready while it drains. A retired probe
+    /// runs on no later tick of the pod, on this container or on one that
+    /// replaces it; a Terminating pod does not become Live again.
+    #[must_use]
+    pub fn retired(self, pod: PodLifecycle) -> bool {
+        matches!(
+            (self, pod),
+            (
+                ProbeKind::Liveness | ProbeKind::Startup,
+                PodLifecycle::Terminating
+            )
+        )
+    }
+
     /// Whether a probe of this kind runs on a RUNNING container whose
-    /// started state is `started` (see [`container_started`]).
+    /// started state is `started` (see [`container_started`]), in a pod in
+    /// `pod`'s lifecycle.
     ///
     /// Upstream's worker (worker.go:283-294): liveness and readiness are
     /// skipped until the container has started, and startup is skipped once
     /// it has. So a startup probe that already passed can never restart the
     /// container later, and a liveness probe cannot bank failures during the
-    /// startup window that would trip it on its first run after it.
+    /// startup window that would trip it on its first run after it. A
+    /// [`retired`](Self::retired) kind never runs.
     #[must_use]
-    pub fn may_run(self, started: bool) -> bool {
-        match self {
-            ProbeKind::Startup => !started,
-            ProbeKind::Liveness | ProbeKind::Readiness => started,
+    pub fn may_run(self, started: bool, pod: PodLifecycle) -> bool {
+        !self.retired(pod)
+            && match self {
+                ProbeKind::Startup => !started,
+                ProbeKind::Liveness | ProbeKind::Readiness => started,
+            }
+    }
+}
+
+/// Whether a pod has been asked to go away: its `metadata.deletionTimestamp`
+/// is set. Upstream's graceful deletion stamps it and leaves the pod running
+/// until the kubelet has stopped it; engenho's store stamps it on a pod that
+/// still carries finalizers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PodLifecycle {
+    /// No deletion requested.
+    #[default]
+    Live,
+    /// `metadata.deletionTimestamp` is set. An object that carries one never
+    /// loses it, so this lasts until the pod is gone.
+    Terminating,
+}
+
+impl PodLifecycle {
+    /// Read a pod manifest's `metadata.deletionTimestamp`: present and not
+    /// `null` is [`Self::Terminating`].
+    #[must_use]
+    pub fn of(pod: &Value) -> Self {
+        match pod.pointer("/metadata/deletionTimestamp") {
+            None | Some(Value::Null) => Self::Live,
+            Some(_) => Self::Terminating,
         }
     }
 }
@@ -161,10 +224,16 @@ impl ProbeKind {
 /// Whether a container counts as STARTED (upstream `isContainerStarted`,
 /// prober_manager.go:270-287): it is running, and it either has no startup
 /// probe or that probe has passed. A startup probe that has not run, is below
-/// its threshold, or tripped all leave the container not started.
+/// its threshold, or tripped all leave the container not started — unless it
+/// is [retired](ProbeKind::retired): upstream sets a running container's
+/// startup result to Success when its pod is being deleted.
 #[must_use]
-pub fn container_started(is_running: bool, startup: Option<&ProbeRuntime>) -> bool {
-    is_running && startup.is_none_or(|rt| rt.gate_satisfied)
+pub fn container_started(
+    is_running: bool,
+    startup: Option<&ProbeRuntime>,
+    pod: PodLifecycle,
+) -> bool {
+    is_running && (ProbeKind::Startup.retired(pod) || startup.is_none_or(|rt| rt.gate_satisfied))
 }
 
 impl fmt::Display for ProbeKind {
@@ -1025,6 +1094,10 @@ pub fn fold_probe_observation(
 ///   * **Startup gates**: while a startup probe exists and is NOT done,
 ///     readiness is FORCED false AND liveness restart is suppressed
 ///     (`may_run_restart_probes = false`) — the startup window.
+///   * **Not running** ⇒ not ready, whatever a readiness probe last latched
+///     (upstream `UpdatePodStatus` in `prober_manager.go`: a container with
+///     no running state is not ready, decided before the readiness result is
+///     read).
 ///   * **No readiness probe** ⇒ `effective_ready = is_running` (the
 ///     behavior-preserving common case — ready immediately once Running).
 ///   * **No startup probe** ⇒ liveness + readiness active from initialDelay
@@ -1052,14 +1125,11 @@ pub fn aggregate_container_readiness(
     if has_startup && !startup_done {
         return (false, false);
     }
-    // Past the startup gate (or no startup probe): readiness sources from the
-    // readiness gate, else from is_running (behavior-preserving). Liveness may
-    // run.
-    let effective_ready = if has_readiness {
-        readiness_ready
-    } else {
-        is_running
-    };
+    // Past the startup gate (or no startup probe): a running container's
+    // readiness sources from the readiness gate, else from is_running
+    // (behavior-preserving). A container that is not running is never ready,
+    // however the gate was last latched. Liveness may run.
+    let effective_ready = is_running && (!has_readiness || readiness_ready);
     (effective_ready, true)
 }
 
@@ -1220,6 +1290,197 @@ fn net_error_observation(e: &ProbeIoError) -> ProbeObservation {
             ProbeObservation::Blind(BlindCause::ProberSetup)
         }
     }
+}
+
+// =====================================================================
+// One container's probes, one tick
+// =====================================================================
+
+/// The probes one container declares, each paired with its [`ProbeRuntime`].
+/// `None` for a probe the container does not declare.
+///
+/// The kubelet keeps one on each container's record so the counters persist
+/// across ticks, and [resets](Self::reset) it when the container restarts. An
+/// all-`None` value is the common case: no probe, and
+/// [`tick`](Self::tick) reports the container ready because it runs.
+#[derive(Clone, Debug, Default)]
+pub struct ContainerProbes {
+    /// `livenessProbe`.
+    pub liveness: Option<(ProbeSpec, ProbeRuntime)>,
+    /// `readinessProbe`.
+    pub readiness: Option<(ProbeSpec, ProbeRuntime)>,
+    /// `startupProbe`.
+    pub startup: Option<(ProbeSpec, ProbeRuntime)>,
+}
+
+/// Where one container's probes are put: the runtime an exec runs in, the
+/// prober an httpGet or tcpSocket goes through, and the addresses each aims
+/// at.
+#[derive(Clone, Copy)]
+pub struct ProbeTarget<'a> {
+    /// Runs exec probes.
+    pub runtime: &'a dyn ContainerRuntime,
+    /// Sends httpGet and tcpSocket probes.
+    pub net_prober: &'a dyn NetProber,
+    /// The container an exec runs in.
+    pub container_id: &'a str,
+    /// The address an httpGet or tcpSocket dials, unless the probe names its
+    /// own `host`.
+    pub pod_ip: Option<&'a str>,
+}
+
+/// What one [`ContainerProbes::tick`] of a running container decided.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProbeTick {
+    /// The container's effective `ready` (→ `containerStatuses[].ready`).
+    pub ready: bool,
+    /// `Some` iff a liveness or startup probe OBSERVED failures past its
+    /// threshold on this tick. A blind probe cannot produce one: see
+    /// [`ProbeTrip`].
+    pub trip: Option<ProbeTrip>,
+    /// The probes that ran on this tick, in the order they ran.
+    pub ran: Vec<ProbeKind>,
+    /// Probes that went blind on this tick: one Warning each.
+    pub entered_blind: Vec<(ProbeKind, BlindCause)>,
+    /// The first probe (startup, readiness, liveness) blind for at least its
+    /// own `failureThreshold` runs.
+    pub sustained_blind: Option<(ProbeKind, BlindCause)>,
+    /// How soon a probe that may run is next due. `None` when none may run
+    /// until something else changes.
+    pub next_due_in: Option<Duration>,
+}
+
+impl ContainerProbes {
+    /// `true` when the container declares no probe.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.liveness.is_none() && self.readiness.is_none() && self.startup.is_none()
+    }
+
+    /// Start every probe afresh, for a container that (re)started `now`: the
+    /// startup gate re-arms and the counters zero. The parsed specs stay.
+    pub fn reset(&mut self, now: Instant) {
+        for (_, rt) in [&mut self.liveness, &mut self.readiness, &mut self.startup]
+            .into_iter()
+            .flatten()
+        {
+            *rt = ProbeRuntime::new(now);
+        }
+    }
+
+    /// The first probe (startup, readiness, liveness — a fixed order, so the
+    /// condition it feeds renders the same on every tick) that has been blind
+    /// for at least its own `failureThreshold` runs.
+    #[must_use]
+    pub fn sustained_blindness(&self) -> Option<(ProbeKind, BlindCause)> {
+        [&self.startup, &self.readiness, &self.liveness]
+            .into_iter()
+            .flatten()
+            .find_map(|(spec, rt)| rt.sustained_blindness(spec).map(|c| (spec.kind, c)))
+    }
+
+    /// Whether this container, running, counts as started (see
+    /// [`container_started`]).
+    #[must_use]
+    pub fn started(&self, pod: PodLifecycle) -> bool {
+        container_started(true, self.startup.as_ref().map(|(_, rt)| rt), pod)
+    }
+
+    /// Run a RUNNING container's due probes once, in upstream's order, fold
+    /// each result, and aggregate the container's readiness and restart
+    /// request.
+    ///
+    /// Startup runs first because it decides whether the other two may run:
+    /// liveness and readiness run only once the container has started, and
+    /// startup only until it has ([`ProbeKind::may_run`]). `started` is read
+    /// again after startup ran, so a startup probe that passes on this tick
+    /// lets the other two run in it. On a [`PodLifecycle::Terminating`] pod,
+    /// liveness and startup do not run at all ([`ProbeKind::retired`]) and the
+    /// container reads as started, so readiness keeps probing.
+    ///
+    /// A probe runs when it may and is due ([`ProbeRuntime::is_due`]); one
+    /// that may not run adds nothing to `next_due_in`, since it has nothing to
+    /// be due for until `started` changes.
+    pub async fn tick(
+        &mut self,
+        target: &ProbeTarget<'_>,
+        pod: PodLifecycle,
+        now: Instant,
+    ) -> ProbeTick {
+        let mut tick = ProbeTick::default();
+        if self.is_empty() {
+            tick.ready = true;
+            return tick;
+        }
+
+        let started = self.started(pod);
+        let startup_trip = run_slot(&mut self.startup, started, pod, target, now, &mut tick)
+            .await
+            .and_then(|v| v.trip);
+        let started = self.started(pod);
+        let _ = run_slot(&mut self.readiness, started, pod, target, now, &mut tick).await;
+        let liveness_trip = run_slot(&mut self.liveness, started, pod, target, now, &mut tick)
+            .await
+            .and_then(|v| v.trip);
+
+        let readiness_ready = self
+            .readiness
+            .as_ref()
+            .is_some_and(|(_, rt)| rt.gate_satisfied);
+        let (ready, may_restart_on_liveness) = aggregate_container_readiness(
+            self.started(pod),
+            readiness_ready,
+            self.startup.is_some(),
+            self.readiness.is_some(),
+            true,
+        );
+        tick.ready = ready;
+        // A startup probe that failed past its threshold restarts the
+        // container (one that never boots IS restarted); it only runs before
+        // the container has started, so it cannot trip after. Liveness only
+        // runs once it has: the filter restates that gate, it adds none.
+        tick.trip = startup_trip.or(liveness_trip.filter(|_| may_restart_on_liveness));
+        tick.sustained_blind = self.sustained_blindness();
+        tick
+    }
+}
+
+/// One probe slot of [`ContainerProbes::tick`]: run it if its kind may run
+/// and it is due, fold the observation, and record what happened on `tick`.
+/// `None` when it did not run.
+async fn run_slot(
+    slot: &mut Option<(ProbeSpec, ProbeRuntime)>,
+    started: bool,
+    pod: PodLifecycle,
+    target: &ProbeTarget<'_>,
+    now: Instant,
+    tick: &mut ProbeTick,
+) -> Option<ProbeVerdict> {
+    let (spec, rt) = slot.as_mut()?;
+    if !spec.kind.may_run(started, pod) {
+        return None;
+    }
+    let verdict = if rt.is_due(spec, now) {
+        let obs = run_handler(
+            spec,
+            target.runtime,
+            target.net_prober,
+            target.container_id,
+            target.pod_ip,
+        )
+        .await;
+        let verdict = fold_probe_observation(spec, rt, obs, now);
+        tick.ran.push(spec.kind);
+        if let Some(cause) = verdict.entered_blind {
+            tick.entered_blind.push((spec.kind, cause));
+        }
+        Some(verdict)
+    } else {
+        None
+    };
+    let due = rt.next_due_in(spec, now);
+    tick.next_due_in = Some(tick.next_due_in.map_or(due, |soonest| soonest.min(due)));
+    verdict
 }
 
 /// A non-zero port for a test fixture.
@@ -1398,6 +1659,21 @@ mod tests {
 
         let (ready_down, _) = aggregate_container_readiness(true, false, false, false, false);
         assert!(!ready_down, "not running → not ready");
+    }
+
+    #[test]
+    fn aggregate_not_running_is_not_ready_whatever_readiness_last_latched() {
+        // The readiness gate latched Ready while the container ran; it has
+        // since stopped. Upstream reads `ready = false` off the stopped state
+        // before it reads the readiness result.
+        for (startup_done, has_startup) in [(true, false), (true, true)] {
+            let (ready, _) =
+                aggregate_container_readiness(startup_done, true, has_startup, true, false);
+            assert!(
+                !ready,
+                "startup_done={startup_done} has_startup={has_startup}"
+            );
+        }
     }
 
     #[test]
@@ -2504,9 +2780,49 @@ mod upstream_prober {
             (ProbeKind::Readiness, false, true),
             (ProbeKind::Startup, true, false),
         ] {
-            assert_eq!(kind.may_run(false), before, "{kind} before started");
-            assert_eq!(kind.may_run(true), after, "{kind} once started");
+            let live = PodLifecycle::Live;
+            assert_eq!(kind.may_run(false, live), before, "{kind} before started");
+            assert_eq!(kind.may_run(true, live), after, "{kind} once started");
         }
+    }
+
+    #[test]
+    fn a_terminating_pod_retires_liveness_and_startup_and_keeps_readiness() {
+        let gone = PodLifecycle::Terminating;
+        for started in [false, true] {
+            assert!(
+                !ProbeKind::Liveness.may_run(started, gone),
+                "liveness, started={started}"
+            );
+            assert!(
+                !ProbeKind::Startup.may_run(started, gone),
+                "startup, started={started}"
+            );
+        }
+        assert!(ProbeKind::Readiness.may_run(true, gone));
+        assert!(!ProbeKind::Readiness.may_run(false, gone));
+        assert!(ProbeKind::Liveness.retired(gone) && ProbeKind::Startup.retired(gone));
+        assert!(!ProbeKind::Readiness.retired(gone));
+        assert!(
+            ProbeKind::ALL
+                .iter()
+                .all(|k| !k.retired(PodLifecycle::Live))
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_is_read_off_the_deletion_timestamp() {
+        assert_eq!(PodLifecycle::of(&json!({})), PodLifecycle::Live);
+        assert_eq!(
+            PodLifecycle::of(&json!({ "metadata": { "deletionTimestamp": null } })),
+            PodLifecycle::Live
+        );
+        assert_eq!(
+            PodLifecycle::of(
+                &json!({ "metadata": { "deletionTimestamp": "2026-09-19T00:00:00Z" } })
+            ),
+            PodLifecycle::Terminating
+        );
     }
 
     #[test]
@@ -2520,12 +2836,32 @@ mod upstream_prober {
         let mut passed = ProbeRuntime::new(now);
         let _ = fold_probe_observation(&spec, &mut passed, ProbeObservation::Success, now);
 
-        assert!(container_started(true, None), "no startup probe");
-        assert!(!container_started(true, Some(&fresh)), "not yet run");
-        assert!(!container_started(true, Some(&tripped)), "tripped");
-        assert!(container_started(true, Some(&passed)), "passed");
-        assert!(!container_started(false, Some(&passed)), "not running");
-        assert!(!container_started(false, None), "not running");
+        let live = PodLifecycle::Live;
+        assert!(container_started(true, None, live), "no startup probe");
+        assert!(!container_started(true, Some(&fresh), live), "not yet run");
+        assert!(!container_started(true, Some(&tripped), live), "tripped");
+        assert!(container_started(true, Some(&passed), live), "passed");
+        assert!(
+            !container_started(false, Some(&passed), live),
+            "not running"
+        );
+        assert!(!container_started(false, None, live), "not running");
+
+        // A pod being deleted sets a running container's startup result to
+        // Success; a container that is not running is still not started.
+        let gone = PodLifecycle::Terminating;
+        assert!(
+            container_started(true, Some(&fresh), gone),
+            "not yet run, deleting"
+        );
+        assert!(
+            container_started(true, Some(&tripped), gone),
+            "tripped, deleting"
+        );
+        assert!(
+            !container_started(false, Some(&fresh), gone),
+            "not running, deleting"
+        );
     }
 
     // ── exec `$(VAR)` expansion and parsing from the container ──────────

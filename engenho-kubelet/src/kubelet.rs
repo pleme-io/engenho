@@ -64,8 +64,8 @@ use crate::pod_volume::{
     VolumeTeardown, container_mounts, pod_volumes, teardown_obligation, teardowns_of,
 };
 use crate::probe::{
-    BlindCause, BlindNotice, ProbeHandler, ProbeKind, ProbeRuntime, ProbeSpec, ProbeTrip,
-    aggregate_container_readiness, container_started, fold_probe_observation, run_handler,
+    BlindCause, BlindNotice, ContainerProbes, PodLifecycle, ProbeHandler, ProbeKind, ProbeRuntime,
+    ProbeSpec, ProbeTarget, ProbeTick,
 };
 
 /// The pod condition the kubelet raises while a probe has been BLIND — unable
@@ -105,69 +105,6 @@ const MIN_PROBE_REQUEUE: Duration = Duration::from_secs(1);
 /// `source.component`), shared by [`Kubelet::emit`] and the per-pod
 /// [`Sweep`] so a pod's events never come from two spellings of one source.
 const KUBELET_COMPONENT: &str = "kubelet";
-
-/// The three probes (liveness/readiness/startup) a container may carry, each
-/// paired with its persistent [`ProbeRuntime`] counters. Lives on the
-/// per-container [`ContainerRecord`] so the counters persist across ticks (like
-/// `restart_count`) + reset on a container restart (fresh startup window).
-///
-/// `None` for a probe the container doesn't declare. An all-`None`
-/// `ContainerProbeState` is the behavior-preserving common case: no probe ⇒
-/// `aggregate_container_readiness` returns `ready = is_running`, byte-identical
-/// to the pre-probe kubelet.
-#[derive(Clone, Debug, Default)]
-struct ContainerProbeState {
-    liveness: Option<(ProbeSpec, ProbeRuntime)>,
-    readiness: Option<(ProbeSpec, ProbeRuntime)>,
-    startup: Option<(ProbeSpec, ProbeRuntime)>,
-}
-
-impl ContainerProbeState {
-    /// `true` iff the container declares NO probes (the behavior-preserving
-    /// common case — no requeue armed, ready mirrors is_running).
-    fn is_empty(&self) -> bool {
-        self.liveness.is_none() && self.readiness.is_none() && self.startup.is_none()
-    }
-
-    /// Reset all probe runtimes to a fresh window (called on a container
-    /// restart so the startup gate re-arms + counters zero). Preserves the
-    /// parsed specs.
-    fn reset(&mut self, now: Instant) {
-        for (_, rt) in [&mut self.liveness, &mut self.readiness, &mut self.startup]
-            .into_iter()
-            .flatten()
-        {
-            *rt = ProbeRuntime::new(now);
-        }
-    }
-
-    /// The first probe (startup, readiness, liveness — a fixed order, so the
-    /// condition it feeds renders the same on every tick) that has been blind
-    /// for at least its own `failureThreshold` runs.
-    fn sustained_blindness(&self) -> Option<(ProbeKind, BlindCause)> {
-        [&self.startup, &self.readiness, &self.liveness]
-            .into_iter()
-            .flatten()
-            .find_map(|(spec, rt)| rt.sustained_blindness(spec).map(|c| (spec.kind, c)))
-    }
-}
-
-/// The aggregated probe decision for one running container this tick: its
-/// effective readiness, whether a liveness/startup verdict requests a restart,
-/// and what the probes could not see.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ProbeOutcome {
-    /// The container's effective `ready` (→ `containerStatuses[].ready`).
-    ready: bool,
-    /// `Some` iff a liveness/startup probe OBSERVED failures past its
-    /// threshold (post-gating). A blind probe cannot produce one: see
-    /// [`ProbeTrip`].
-    trip: Option<ProbeTrip>,
-    /// Probes that went blind THIS tick — one Warning each.
-    entered_blind: Vec<(ProbeKind, BlindCause)>,
-    /// A probe blind for at least its `failureThreshold` runs, if any.
-    sustained_blind: Option<(ProbeKind, BlindCause)>,
-}
 
 /// One status poll of a container the kubelet started, split the only two
 /// ways the kubelet acts on it.
@@ -475,7 +412,7 @@ struct ContainerRecord {
     restart_count: u32,
     /// Per-container probe specs + runtime counters (liveness/readiness/
     /// startup). Default = all-None = no probes = behavior-preserving.
-    probes: ContainerProbeState,
+    probes: ContainerProbes,
     /// When this container was (re)started. Feeds `uptime_before_exit`, which
     /// is what lets a container that stayed up long enough earn a clean slate
     /// instead of inheriting an old crash's penalty.
@@ -554,9 +491,10 @@ struct LocalPod {
     /// then the next once the prior Succeeds). Empty for a pod with no init
     /// containers (the common case) — that pod's `init_complete` is true from
     /// the first reconcile and the app-start path runs identically to before
-    /// the init-container brick. Init containers do NOT carry probes (K8s does
-    /// not run liveness/readiness/startup on init containers), so each
-    /// [`ContainerRecord::probes`] stays default (all-None).
+    /// the init-container brick. Init containers carry no probes here, so
+    /// each [`ContainerRecord::probes`] stays default (all-None). Upstream
+    /// runs none on a classic init container, but does probe a native sidecar
+    /// (`restartPolicy: Always`); engenho does not yet — a gap, not a design.
     init_containers: BTreeMap<String, ContainerRecord>,
     /// `true` once every init container has Succeeded (or the pod declares no
     /// init containers). Latched: once the init sequence is `Complete`, app
@@ -1750,7 +1688,7 @@ impl Kubelet {
 
     /// Parse the three probes (`livenessProbe`/`readinessProbe`/
     /// `startupProbe`) of a single `spec.containers[i]` JSON object into a
-    /// [`ContainerProbeState`] through [`ProbeSpec::from_container`] (which
+    /// [`ContainerProbes`] through [`ProbeSpec::from_container`] (which
     /// resolves named ports against the container's own `ports[]` and
     /// expands an exec probe's `$(VAR)` references). The probe specs are
     /// parsed; their [`ProbeRuntime`] counters are stamped from `now` (the
@@ -1763,20 +1701,21 @@ impl Kubelet {
     ///
     /// # Errors
     ///
-    /// Propagates a [`ProbeParseError`](crate::probe::ProbeParseError) (mapped
-    /// to a typed [`KubeletError::InvalidPod`]) for a no-handler / empty-exec
-    /// / grpc probe — the pod is skipped, NEVER a fake pass.
+    /// [`KubeletError::InvalidProbe`], carrying the
+    /// [`ProbeParseError`](crate::probe::ProbeParseError), for a no-handler /
+    /// empty-exec / grpc probe — the pod is skipped, NEVER a fake pass.
     fn parse_container_probes(
         container: &Value,
         pod_label: &str,
         now: Instant,
-    ) -> Result<ContainerProbeState, KubeletError> {
+    ) -> Result<ContainerProbes, KubeletError> {
         let parse_one =
             |kind: ProbeKind| -> Result<Option<(ProbeSpec, ProbeRuntime)>, KubeletError> {
-                let Some(spec) = ProbeSpec::from_container(kind, container).map_err(|e| {
-                    KubeletError::InvalidPod {
+                let Some(spec) = ProbeSpec::from_container(kind, container).map_err(|source| {
+                    KubeletError::InvalidProbe {
                         pod: pod_label.to_string(),
-                        reason: format!("{}: {e}", kind.field()),
+                        kind,
+                        source,
                     }
                 })?
                 else {
@@ -1795,7 +1734,7 @@ impl Kubelet {
                 Ok(Some((spec, ProbeRuntime::new(now))))
             };
 
-        Ok(ContainerProbeState {
+        Ok(ContainerProbes {
             liveness: parse_one(ProbeKind::Liveness)?,
             readiness: parse_one(ProbeKind::Readiness)?,
             startup: parse_one(ProbeKind::Startup)?,
@@ -3421,7 +3360,7 @@ impl Kubelet {
         // container's start instant below, but the spec parse is what can fail.
         let now = self.now();
         let pod_label = key.label().to_string();
-        let mut probe_state_by_cname: BTreeMap<String, ContainerProbeState> = BTreeMap::new();
+        let mut probe_state_by_cname: BTreeMap<String, ContainerProbes> = BTreeMap::new();
         for (cname, _spec) in &specs {
             let Some(cjson) = Self::container_json(value, cname) else {
                 continue;
@@ -3803,163 +3742,58 @@ impl Kubelet {
             .await
     }
 
-    /// Run the DUE probes of one running container, fold their verdicts into
-    /// the per-container [`ProbeRuntime`]s (persisted back into `self.local`),
-    /// and return the aggregated decision via [`ProbeOutcome`]: readiness,
-    /// the restart witness (if any), and what the probes could not see. Also
-    /// folds the container's soonest next-probe-due into `soonest_requeue`.
+    /// Run the DUE probes of one running container through
+    /// [`ContainerProbes::tick`], persist the advanced runtimes back into
+    /// `self.local`, and fold the soonest next-probe-due into
+    /// `soonest_requeue`. `pod` is the pod's lifecycle: on a Terminating pod
+    /// liveness and startup no longer run ([`ProbeKind::retired`]).
     ///
-    /// A container with NO probes short-circuits: `ready = is_running` (true,
-    /// since this is only called on a running container), no trip, nothing
-    /// blind, no requeue contributed — the behavior-preserving common case.
+    /// A container with NO probes short-circuits inside `tick`: ready (it is
+    /// running), no trip, nothing blind, no requeue contributed — the
+    /// behavior-preserving common case.
     async fn run_container_probes(
         &self,
         record: &ContainerRecord,
-        _spec: &ContainerSpec,
-        container_id: &str,
         pod_ip: Option<&str>,
+        pod: PodLifecycle,
         now: Instant,
         soonest_requeue: &mut Option<Duration>,
-    ) -> ProbeOutcome {
-        // Fast path: no probes → behavior-preserving (ready = is_running).
-        if record.probes.is_empty() {
-            return ProbeOutcome {
-                ready: true,
-                ..ProbeOutcome::default()
-            };
-        }
-
+    ) -> ProbeTick {
         // Work on a clone of the probe state so we drive the I/O without
         // holding the lock, then persist the advanced runtimes back.
         let mut probes = record.probes.clone();
-        let mut entered_blind: Vec<(ProbeKind, BlindCause)> = Vec::new();
-
-        // Startup first: it decides whether the other two may run. Upstream
-        // runs liveness and readiness only once the container has STARTED and
-        // startup only until it has (worker.go:283-294), so a startup probe
-        // that passed is never run again on this container — it cannot
-        // restart it later — and liveness cannot bank failures during the
-        // startup window. `started` is re-read after the startup run, so a
-        // startup probe that passes this tick lets the other two run in it.
-        let started = container_started(true, probes.startup.as_ref().map(|(_, rt)| rt));
-        let startup_trip = match probes.startup.as_mut() {
-            Some(slot) => self
-                .run_probe_slot(slot, started, container_id, pod_ip, now, soonest_requeue)
-                .await
-                .and_then(|v| {
-                    entered_blind.extend(v.entered_blind.map(|c| (ProbeKind::Startup, c)));
-                    v.trip
-                }),
-            None => None,
+        let target = ProbeTarget {
+            runtime: &*self.backend,
+            net_prober: &*self.net_prober,
+            container_id: &record.container_id,
+            pod_ip,
         };
-        let started = container_started(true, probes.startup.as_ref().map(|(_, rt)| rt));
-        if let Some(slot) = probes.readiness.as_mut()
-            && let Some(v) = self
-                .run_probe_slot(slot, started, container_id, pod_ip, now, soonest_requeue)
-                .await
-        {
-            entered_blind.extend(v.entered_blind.map(|c| (ProbeKind::Readiness, c)));
+        let tick = probes.tick(&target, pod, now).await;
+        if probes.is_empty() {
+            // Nothing ran and nothing advanced: no requeue, nothing to keep.
+            return tick;
         }
-        let liveness_trip = match probes.liveness.as_mut() {
-            Some(slot) => self
-                .run_probe_slot(slot, started, container_id, pod_ip, now, soonest_requeue)
-                .await
-                .and_then(|v| {
-                    entered_blind.extend(v.entered_blind.map(|c| (ProbeKind::Liveness, c)));
-                    v.trip
-                }),
-            None => None,
-        };
+        if let Some(due) = tick.next_due_in {
+            Self::accumulate_requeue(soonest_requeue, due);
+        }
 
-        let startup_done = probes
-            .startup
-            .as_ref()
-            .is_none_or(|(_, rt)| rt.gate_satisfied);
-        let readiness_ready = probes
-            .readiness
-            .as_ref()
-            .is_some_and(|(_, rt)| rt.gate_satisfied);
-        let has_startup = probes.startup.is_some();
-        let has_readiness = probes.readiness.is_some();
-
-        // Aggregate the per-kind gates into effective readiness + whether
-        // liveness restart may fire (startup window suppresses it).
-        let (effective_ready, may_run_liveness) = aggregate_container_readiness(
-            startup_done,
-            readiness_ready,
-            has_startup,
-            has_readiness,
-            /* is_running */ true,
-        );
-
-        // A startup probe that failed past its threshold restarts the
-        // container (one that never boots IS restarted); it only runs before
-        // the container has started, so it cannot trip after. Liveness only
-        // runs once it has — the filter restates that gate, it does not add
-        // one.
-        let trip = startup_trip.or(liveness_trip.filter(|_| may_run_liveness));
-        let sustained_blind = probes.sustained_blindness();
-
-        // Persist the advanced probe runtimes back into the local record.
+        // Persist the advanced probe runtimes back into the local record,
+        // found by container_id (stable for this tick; the cname is not
+        // threaded here).
         {
-            let key_probes = &mut probes;
             let mut local = self.local.lock().await;
-            // Find the record by container_id (the cname isn't threaded here,
-            // but container_id is stable for this tick). Iterate the pod's
-            // containers to locate it.
             for pod in local.values_mut() {
                 if let Some(rec) = pod
                     .containers
                     .values_mut()
-                    .find(|r| r.container_id == container_id)
+                    .find(|r| r.container_id == record.container_id)
                 {
-                    rec.probes = key_probes.clone();
+                    rec.probes = probes;
                     break;
                 }
             }
         }
-
-        ProbeOutcome {
-            ready: effective_ready,
-            trip,
-            entered_blind,
-            sustained_blind,
-        }
-    }
-
-    /// One probe slot of a running container this tick: run it if its kind
-    /// may run given `started` ([`ProbeKind::may_run`]) and it is due, fold
-    /// the observation, and fold its next due time into `soonest_requeue`.
-    /// `None` when it did not run. A probe that may not run contributes no
-    /// requeue: it has nothing to be due for until `started` changes, and
-    /// the probe that changes it (startup) keeps its own cadence.
-    async fn run_probe_slot(
-        &self,
-        (spec, rt): &mut (ProbeSpec, ProbeRuntime),
-        started: bool,
-        container_id: &str,
-        pod_ip: Option<&str>,
-        now: Instant,
-        soonest_requeue: &mut Option<Duration>,
-    ) -> Option<crate::probe::ProbeVerdict> {
-        if !spec.kind.may_run(started) {
-            return None;
-        }
-        let verdict = if rt.is_due(spec, now) {
-            let obs = run_handler(
-                spec,
-                &*self.backend,
-                &*self.net_prober,
-                container_id,
-                pod_ip,
-            )
-            .await;
-            Some(fold_probe_observation(spec, rt, obs, now))
-        } else {
-            None
-        };
-        Self::accumulate_requeue(soonest_requeue, rt.next_due_in(spec, now));
-        verdict
+        tick
     }
 
     /// A probe that cannot see the workload says so, and restarts nothing —
@@ -3970,7 +3804,7 @@ impl Kubelet {
         &self,
         key: &ResourceKey,
         cname: &str,
-        outcome: &ProbeOutcome,
+        outcome: &ProbeTick,
         pod_blind: &mut Option<ProbeBlindCondition>,
     ) {
         for &(kind, cause) in &outcome.entered_blind {
@@ -4220,6 +4054,9 @@ impl Kubelet {
         };
 
         let now = self.now();
+        // Read once per tick: a pod being deleted keeps its readiness probe
+        // and loses liveness and startup (see `ProbeKind::retired`).
+        let lifecycle = PodLifecycle::of(value);
         let mut observations: Vec<ContainerObservation> = Vec::with_capacity(specs.len());
         let mut pod_ip: Option<String> = None;
         // The first container this tick could not poll. Anything in it
@@ -4250,9 +4087,8 @@ impl Kubelet {
                     let outcome = self
                         .run_container_probes(
                             record,
-                            spec,
-                            &record.container_id,
                             s.pod_ip.as_deref().or(pod_ip.as_deref()),
+                            lifecycle,
                             now,
                             soonest_requeue,
                         )
@@ -4727,8 +4563,9 @@ impl Kubelet {
 
     /// Start ONE init container (the spec already carries its name/aliases/
     /// mounts) and record it under [`LocalPod::init_containers`] with a fresh
-    /// (zero) restart count + default (empty) probe state — init containers do
-    /// NOT carry probes. Returns the new container's status.
+    /// (zero) restart count + default (empty) probe state — no init container
+    /// carries probes here, sidecars included (see [`LocalPod`]). Returns the
+    /// new container's status.
     ///
     /// Started through [`Self::launch`], so it needs a permit from the init
     /// container's start curve like any other start.
@@ -4756,9 +4593,9 @@ impl Kubelet {
             ContainerRecord {
                 container_id: status.container_id.clone(),
                 restart_count,
-                // Init containers never carry probes (K8s does not run
-                // liveness/readiness/startup on init containers).
-                probes: ContainerProbeState::default(),
+                // No init container carries probes here. Upstream probes a
+                // native sidecar; engenho does not yet (see `LocalPod`).
+                probes: ContainerProbes::default(),
                 // Init containers are not subject to CrashLoopBackOff here:
                 // the init sequence has its own ordering, and stamping a
                 // start it does not read would be a field nobody consults.
@@ -4783,8 +4620,9 @@ impl Kubelet {
     }
 
     /// INIT reconcile — the I/O driver over the pure
-    /// [`crate::lifecycle::next_init_action`] sequencer. NO probes (K8s does
-    /// not run them on init containers). Polls each init container's recorded
+    /// [`crate::lifecycle::next_init_action`] sequencer. NO probes (none on a
+    /// classic init container upstream either; a native sidecar's are a gap
+    /// here, see [`LocalPod`]). Polls each init container's recorded
     /// state, builds the ORDERED `Vec<ContainerObservation>` (Waiting if not
     /// yet recorded, Running if up, Terminated{exit} if exited), asks the pure
     /// sequencer for the next [`InitAction`], and acts:

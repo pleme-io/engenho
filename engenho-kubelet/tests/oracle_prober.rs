@@ -30,6 +30,27 @@
 //! probe does not run once the container has started. The adapter reads that
 //! as upstream's hold, with a run length of zero: the next run starts from
 //! nothing either way.
+//!
+//! ## One tick of the worker
+//!
+//! Upstream's `doProbe` reports, per probe, whether it Set a result
+//! (`result_set`) and whether its goroutine lives on (`keep_going`). engenho
+//! has no per-probe goroutine; the kubelet runs a running container's probes
+//! through `ContainerProbes::tick`. The `worker_tick` adapter reads:
+//!
+//! - `keep_going` as "engenho may run this probe on a later tick of this
+//!   pod": the container runs, or will run again (not yet started, or
+//!   restarted under its policy), and the kind is not retired by the pod's
+//!   deletion (`ProbeKind::retired`).
+//! - `result_set` (upstream: the results cache holds a value for the
+//!   container) as "engenho holds a result for this probe of this container".
+//!   It always does once the kubelet has started the container: the probe's
+//!   `ProbeRuntime` exists from the start, which is the initial value upstream
+//!   Sets on a new container ID. So the key is true on every row answered;
+//!   the rows where upstream has none yet are the out-of-scope ones.
+//!
+//! The rows about the goroutine alone (no pod status, a terminal phase, no
+//! container ID yet) are declared out of scope one by one.
 
 #![allow(
     clippy::disallowed_methods,
@@ -43,10 +64,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use engenho_kubelet::backend::{ContainerSpec, HostPort};
+use engenho_kubelet::lifecycle::Termination;
 use engenho_kubelet::{
-    ContainerRuntime, ExecOutcome, FakeBackend, FakeExecFault, FakeNetProber, HttpProbeTarget,
-    NetProber, ProbeHandler, ProbeIoError, ProbeKind, ProbeObservation, ProbeRuntime,
-    ProbeSetupStage, ProbeSpec, ProbeUrl, TcpProbeTarget, TokioNetProber,
+    ContainerObservation, ContainerProbes, ContainerRuntime, ExecOutcome, FakeBackend,
+    FakeExecFault, FakeNetProber, HttpProbeTarget, NetProber, PodLifecycle, ProbeHandler,
+    ProbeIoError, ProbeKind, ProbeObservation, ProbeRuntime, ProbeSetupStage, ProbeSpec,
+    ProbeTarget, ProbeUrl, RestartPolicy, TcpProbeTarget, TokioNetProber, TripKind,
     aggregate_container_readiness, container_started, fold_probe_observation,
     http_status_observation, run_handler,
 };
@@ -62,13 +85,41 @@ const OUT_OF_SCOPE: &[OutOfScope] = &[
         "Go's integer encoding of results.Result. engenho keeps no cached result per probe; \
          each kind's result is read off the probe's state (see the module docs)",
     ),
-    OutOfScope::kind(
-        "worker_tick",
-        "each row is a gate of upstream's per-probe worker goroutine (pod phase, deletion \
-         timestamp, container status present, restartPolicy Never ending the worker) and \
-         reports keep_going, that goroutine's lifetime. engenho has no per-probe worker: the \
-         kubelet's pod reconcile decides these for the whole pod. The started gate these rows \
-         also carry is checked by the worker_sequence rows",
+    OutOfScope::case(
+        "tick_no_pod_status",
+        "upstream's worker reads the pod from the kubelet's status cache and idles while it has \
+         none; keep_going is that goroutine's lifetime. engenho has no per-probe worker and no \
+         status cache: probes run inside the kubelet's reconcile of the pod object itself, so \
+         there is no tick without a pod",
+    ),
+    OutOfScope::case(
+        "tick_pod_phase_failed_stops_worker_without_setting",
+        "keep_going: false is the end of upstream's per-probe goroutine on a terminal phase. \
+         engenho has no per-probe worker: probes run inside the kubelet's pod reconcile, only on \
+         containers it polls Running, and the phase is what that reconcile derives from those \
+         containers, not a gate it reads before probing",
+    ),
+    OutOfScope::case(
+        "tick_pod_phase_succeeded_stops_worker",
+        "as tick_pod_phase_failed_stops_worker_without_setting: the end of upstream's \
+         per-probe goroutine on a terminal phase, which engenho has no counterpart for",
+    ),
+    OutOfScope::case(
+        "tick_container_status_missing",
+        "upstream's worker idles until the status cache shows the container. engenho's kubelet \
+         keeps its own record of each container it started; one it has no record of is \
+         Waiting and is never probed, and a container's probe state exists only from its start",
+    ),
+    OutOfScope::case(
+        "tick_container_status_with_empty_container_id",
+        "as tick_container_status_missing: upstream idles until the cached status carries a \
+         container ID; engenho probes only containers it started and holds the ID of",
+    ),
+    OutOfScope::case(
+        "tick_container_found_only_in_init_container_statuses",
+        "a readiness probe on a restartable init container (a native sidecar). engenho's kubelet \
+         parses and runs no probe on any init container, sidecars included. That is a gap, not \
+         a design: upstream probes sidecars",
     ),
     OutOfScope::kind(
         "feature_gate_default",
@@ -181,7 +232,7 @@ const DEVIATIONS: &[Deviation] = &[
 /// Every row that is not out of scope is checked. A row falling back to
 /// `NotChecked` fails the harness as unclaimed; this also stops the count
 /// shrinking by a row moving into [`OUT_OF_SCOPE`] unnoticed.
-const CHECKED_ROWS: usize = 66;
+const CHECKED_ROWS: usize = 73;
 
 #[tokio::test]
 async fn prober_result_handling_agrees_with_upstream() {
@@ -217,6 +268,7 @@ async fn answer(table: &Table, case: &Case, broken_pins: &mut Vec<String>) -> An
     match table.kind_of(case).as_str() {
         "worker_initial_value" => worker_initial_value(case),
         "worker_sequence" => worker_sequence(case).await,
+        "worker_tick" => worker_tick(case).await,
         "worker_tick_predicate" => worker_tick_predicate(case),
         "prober_probe" => prober_probe(case).await,
         "prober_exec_command" => prober_exec_command(case),
@@ -747,12 +799,15 @@ async fn worker_sequence(case: &Case) -> Answer {
         // the row gives: engenho derives it from the container's startup
         // probe, which is not this row's. A startup probe's own state IS.
         let started = match kind {
-            ProbeKind::Startup => container_started(true, Some(&rt)),
+            ProbeKind::Startup => container_started(true, Some(&rt), PodLifecycle::Live),
             ProbeKind::Liveness | ProbeKind::Readiness => {
                 step["started"].as_bool().unwrap_or(false)
             }
         };
-        let runs = running && !tripped && kind.may_run(started) && rt.is_due(&spec, now);
+        let runs = running
+            && !tripped
+            && kind.may_run(started, PodLifecycle::Live)
+            && rt.is_due(&spec, now);
         if runs {
             rig.next_letter(&text(step, "probe")).await;
             let obs = rig.run(&spec).await;
@@ -762,7 +817,10 @@ async fn worker_sequence(case: &Case) -> Answer {
         }
         let held = tripped
             || (kind == ProbeKind::Startup
-                && !ProbeKind::Startup.may_run(container_started(true, Some(&rt))));
+                && !ProbeKind::Startup.may_run(
+                    container_started(true, Some(&rt), PodLifecycle::Live),
+                    PodLifecycle::Live,
+                ));
         result.push(match (running, kind) {
             (true, _) => cached_result(kind, &rt, tripped),
             // Not running: engenho does not report the container ready.
@@ -784,9 +842,193 @@ async fn worker_sequence(case: &Case) -> Answer {
             "result_run": result_run,
             "on_hold": on_hold,
             "prober_invoked": invoked,
-            "container_started": container_started(true, Some(&rt)),
+            "container_started": container_started(true, Some(&rt), PodLifecycle::Live),
         }),
     )
+}
+
+/// `worker_tick`: one tick of a container declaring all three probes, in the
+/// row's situation, read per kind as the module docs say. Each kind's answer
+/// is cut to the keys upstream's row has for it; a kind the adapter does not
+/// answer is left out whole, and the harness lists it.
+async fn worker_tick(case: &Case) -> Answer {
+    let input = &case.input;
+    // Rows with no app container this kubelet started and holds the ID of,
+    // or a pod already terminal: each is in OUT_OF_SCOPE by name, and the
+    // harness fails if this test and that list ever disagree.
+    let unanswered = input.get("pod_status").is_some_and(Value::is_null)
+        || matches!(text(input, "pod_phase").as_str(), "Failed" | "Succeeded")
+        || input["container_status_present"].as_bool() == Some(false)
+        || input["container_id"].as_str() == Some("")
+        || input["container_in"].as_str() == Some("InitContainerStatuses");
+    if unanswered {
+        return Answer::NotChecked;
+    }
+    let pod = if input["deletion_timestamp_set"].as_bool() == Some(true) {
+        PodLifecycle::Terminating
+    } else {
+        PodLifecycle::Live
+    };
+    let per_kind = if input["container"]["running"].as_bool() == Some(true) {
+        running_tick(input, pod).await
+    } else {
+        not_running_tick(input, pod)
+    };
+    let mut out = Map::new();
+    for (kind, want) in case.expected.as_object().into_iter().flatten() {
+        if let Some(got) = per_kind.get(kind)
+            && let Answer::Checked(v) = project(want, got.clone())
+        {
+            out.insert(kind.clone(), v);
+        }
+    }
+    Answer::Checked(Value::Object(out))
+}
+
+/// A RUNNING container through the kubelet's own `ContainerProbes::tick`:
+/// every probe an exec answering `prober_would_return`, with the thresholds
+/// of upstream's `TestDoProbe` fixture (all 1, common_test.go), which the
+/// row's note names for startup. Whether liveness and readiness may run is
+/// engenho's to decide, from the startup probe and the pod's lifecycle, and
+/// is what the row checks.
+async fn running_tick(input: &Value, pod: PodLifecycle) -> Map<String, Value> {
+    let rig = ExecRig::new().await;
+    let answer = match text(input, "prober_would_return").as_str() {
+        "S" => ExecOutcome::success(),
+        _ => ExecOutcome::failure(1),
+    };
+    rig.backend.set_default_exec(answer).await;
+    let now = Instant::now();
+    let slot = |kind| {
+        let spec = probe(
+            kind,
+            &json!({
+                "exec": { "command": ["probe"] },
+                "timeoutSeconds": 1,
+                "periodSeconds": 1,
+                "successThreshold": 1,
+                "failureThreshold": 1,
+            }),
+        );
+        Some((spec, ProbeRuntime::new(now)))
+    };
+    let mut probes = ContainerProbes {
+        liveness: slot(ProbeKind::Liveness),
+        readiness: slot(ProbeKind::Readiness),
+        startup: slot(ProbeKind::Startup),
+    };
+    let net = FakeNetProber::new();
+    let target = ProbeTarget {
+        runtime: &rig.backend,
+        net_prober: &net,
+        container_id: &rig.id,
+        pod_ip: None,
+    };
+    let tick = probes.tick(&target, pod, now).await;
+    let tripped = |k: TripKind| tick.trip.is_some_and(|t| t.kind() == k);
+
+    let mut out = Map::new();
+    for (kind, declared) in [
+        (ProbeKind::Liveness, &probes.liveness),
+        (ProbeKind::Readiness, &probes.readiness),
+        (ProbeKind::Startup, &probes.startup),
+    ] {
+        let Some((spec, _)) = declared else { continue };
+        let ran = tick.ran.contains(&kind);
+        let result = match kind {
+            ProbeKind::Liveness if tripped(TripKind::Liveness) => "Failure",
+            ProbeKind::Liveness => "Success",
+            ProbeKind::Readiness if tick.ready => "Success",
+            ProbeKind::Readiness => "Failure",
+            ProbeKind::Startup if probes.started(pod) => "Success",
+            ProbeKind::Startup if tripped(TripKind::Startup) => "Failure",
+            ProbeKind::Startup => "Unknown",
+        };
+        out.insert(
+            kind.as_str().into(),
+            json!({
+                "keep_going": !kind.retired(pod),
+                // Declared on a started container: engenho holds its state.
+                "result_set": true,
+                "result": result,
+                "prober_invoked": ran,
+                "note": format!("FailureThreshold {}", spec.timing.failure_threshold),
+            }),
+        );
+    }
+    out
+}
+
+/// A container that is NOT running. The kubelet runs probes only on
+/// containers it polls Running, so none runs; what it decides for the
+/// container is read instead:
+///
+/// - `result_set` true: the kubelet holds the container's record, and its
+///   probes' state, from the container's first start;
+/// - readiness off the observation the kubelet writes for it
+///   (`ContainerObservation::backing_off` while it waits, `terminated` once it
+///   has ended), which carries no probe state: not ready, whatever the probe
+///   last latched;
+/// - startup off `container_started`, given a startup probe that had PASSED:
+///   a container that is not running is not started;
+/// - `keep_going` off whether the container runs again: one that has not
+///   ended is started once its hold passes, one that has is restarted only if
+///   `RestartPolicy::should_restart` says so. The row names no exit, and
+///   Always and Never do not read one; it is asked with the exit nobody
+///   observed (`Termination::Unknown`).
+///
+/// Liveness is not answered: engenho has no liveness verdict for a container
+/// that is down — whether it comes back is the restart policy's, which
+/// `keep_going` already reads. Startup is not answered on a Terminating pod:
+/// upstream's startup worker lingers there (it reaches the non-running gate
+/// before the deletion gate) though it can never probe again, and engenho
+/// retires the probe, so the only difference is a goroutine's lifetime.
+fn not_running_tick(input: &Value, pod: PodLifecycle) -> Map<String, Value> {
+    let terminated = input["container"]["terminated"].as_bool() == Some(true);
+    let policy = RestartPolicy::from_spec_str(input["restart_policy"].as_str());
+    let (observation, runs_again) = if terminated {
+        (
+            ContainerObservation::terminated("main", "cid", Termination::Unknown, 0),
+            policy.should_restart(Termination::Unknown),
+        )
+    } else {
+        (
+            ContainerObservation::backing_off("main", "cid", "CrashLoopBackOff", 0),
+            true,
+        )
+    };
+    let now = Instant::now();
+    let startup = probe(
+        ProbeKind::Startup,
+        &json!({ "exec": { "command": ["probe"] } }),
+    );
+    let mut passed = ProbeRuntime::new(now);
+    let _ = fold_probe_observation(&startup, &mut passed, ProbeObservation::Success, now);
+
+    let mut out = Map::new();
+    out.insert(
+        "readiness".into(),
+        json!({
+            "keep_going": runs_again && !ProbeKind::Readiness.retired(pod),
+            "result_set": true,
+            "result": if observation.ready { "Success" } else { "Failure" },
+        }),
+    );
+    if !ProbeKind::Startup.retired(pod) {
+        out.insert(
+            "startup".into(),
+            json!({
+                "keep_going": runs_again,
+                "result_set": true,
+                "result": if container_started(false, Some(&passed), pod) {
+                    "Success"
+                } else {
+                    "Failure"
+                },
+            }),
+        );
+    }
+    out
 }
 
 /// `worker_tick_predicate`: the initial-delay test, `ProbeRuntime::past_initial_delay`.
@@ -1433,6 +1675,7 @@ fn is_container_started(case: &Case) -> Answer {
             container_started(
                 row["running"].as_bool().unwrap_or(false),
                 startup.then_some(&rt),
+                PodLifecycle::Live,
             )
         })
         .collect();

@@ -99,10 +99,11 @@ pub use pod_volume::{
     resolve_pod_volumes, teardown_obligation,
 };
 pub use probe::{
-    BlindCause, BlindNotice, BlindStreak, HttpScheme, ProbeHandler, ProbeKind, ProbeObservation,
-    ProbeParseError, ProbePort, ProbeRuntime, ProbeSpec, ProbeTiming, ProbeTrip, ProbeVerdict,
-    TripKind, UnresolvablePort, aggregate_container_readiness, container_started,
-    fold_probe_observation, http_status_observation, run_handler,
+    BlindCause, BlindNotice, BlindStreak, ContainerProbes, HttpScheme, PodLifecycle, ProbeHandler,
+    ProbeKind, ProbeObservation, ProbeParseError, ProbePort, ProbeRuntime, ProbeSpec, ProbeTarget,
+    ProbeTick, ProbeTiming, ProbeTrip, ProbeVerdict, TripKind, UnresolvablePort,
+    aggregate_container_readiness, container_started, fold_probe_observation,
+    http_status_observation, run_handler,
 };
 pub use volume::{
     AccessMode, FakeVolumeBackend, FakeVolumeEvent, HostPathVolumeBackend, MountedVolume,

@@ -926,3 +926,156 @@ async fn liveness_banks_no_failures_during_the_startup_window() {
 
     teardown(store, kubelet).await;
 }
+
+// ── 15 — a pod being deleted is not restarted by its liveness probe ──────
+//
+// Upstream's worker (worker.go:265-276): once the pod has a
+// deletionTimestamp, liveness and startup are set to Success and stop, so a
+// pod on its way out is never restarted by a probe. engenho read no
+// deletionTimestamp at all, so a finalizer-held Terminating pod could be
+// liveness-restarted while it waited to go.
+
+/// Put a single-container pod that a finalizer holds once it is deleted.
+async fn put_held_pod(store: &StoreMesh, name: &str, container: Value) {
+    let value = json!({
+        "kind": "Pod",
+        "apiVersion": "v1",
+        "metadata": { "name": name, "finalizers": ["example.com/hold"] },
+        "spec": {
+            "nodeName": "node-A",
+            "restartPolicy": "Always",
+            "containers": [container]
+        }
+    });
+    store
+        .propose(ResourceCommand::Put {
+            key: pod_key(name),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await
+        .unwrap();
+}
+
+/// Delete a pod through the store's own delete, which stamps
+/// `metadata.deletionTimestamp` on a finalizer-held pod and leaves it.
+async fn delete_held_pod(store: &StoreMesh, name: &str) {
+    store
+        .propose(ResourceCommand::delete(pod_key(name), Reason::Operator))
+        .await
+        .unwrap();
+    let pod = store.get(&pod_key(name)).await.unwrap();
+    assert!(
+        pod.pointer("/metadata/deletionTimestamp").is_some(),
+        "the finalizer holds the pod Terminating: {pod}"
+    );
+}
+
+#[tokio::test]
+async fn a_pod_being_deleted_is_not_restarted_by_its_liveness_probe() {
+    let store = boot_store("probes-deleting-liveness").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "livenessProbe": {
+            "exec": { "command": ["sh", "-c", "test -f /tmp/alive"] },
+            "periodSeconds": 1,
+            "failureThreshold": 2
+        }
+    });
+    // Two identical pods; only `gone` is deleted. `kept` is the control: the
+    // same failing probe does restart a pod that is not being deleted.
+    put_held_pod(&store, "gone", container.clone()).await;
+    put_held_pod(&store, "kept", container).await;
+    backend.set_default_exec(ExecOutcome::failure(1)).await;
+
+    // Start both, and bank one failure each (threshold 2).
+    kubelet.tick().await.unwrap();
+    delete_held_pod(&store, "gone").await;
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+
+    let gone = store.get(&pod_key("gone")).await.unwrap();
+    let kept = store.get(&pod_key("kept")).await.unwrap();
+    assert_eq!(
+        restart_count(&gone, 0),
+        Some(0),
+        "a Terminating pod is not restarted by its liveness probe: {gone}"
+    );
+    assert!(
+        restart_count(&kept, 0).unwrap_or(0) >= 1,
+        "control: the same probe restarts a pod that is not being deleted: {kept}"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+// ── 16 — a pod being deleted reads as started; readiness keeps deciding ──
+//
+// Upstream sets a Terminating pod's startup result to Success, so a container
+// still in its startup window counts as started and its readiness probe runs.
+
+#[tokio::test]
+async fn a_pod_being_deleted_reads_as_started_and_readiness_keeps_probing() {
+    let store = boot_store("probes-deleting-startup").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        // Never passes: the fake answers 503 by default.
+        "startupProbe": {
+            "httpGet": { "path": "/started", "port": 8080 },
+            "periodSeconds": 1,
+            "failureThreshold": 30
+        },
+        "readinessProbe": {
+            "exec": { "command": ["sh", "-c", "true"] },
+            "periodSeconds": 1
+        }
+    });
+    put_held_pod(&store, "p1", container).await;
+    backend.set_default_exec(ExecOutcome::success()).await;
+
+    kubelet.tick().await.unwrap();
+    clock.advance(Duration::from_millis(1100));
+    kubelet.tick().await.unwrap();
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        container_ready(&pod, 0),
+        Some(false),
+        "before the delete, the startup window holds readiness off: {pod}"
+    );
+
+    delete_held_pod(&store, "p1").await;
+    clock.advance(Duration::from_millis(1100));
+    kubelet.tick().await.unwrap();
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        container_ready(&pod, 0),
+        Some(true),
+        "once deleting, the container reads as started and readiness runs: {pod}"
+    );
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "nothing restarted"
+    );
+
+    teardown(store, kubelet).await;
+}
