@@ -1,0 +1,4 @@
+engenho-kubelet/src/native_backend.rs:398:9: replace <impl ContainerRuntime for NativeBackend>::name -> &'static str with "xyzzy"
+engenho-kubelet/src/native_backend.rs:569:52: delete - in <impl ContainerRuntime for NativeBackend>::exec
+engenho-kubelet/src/native_backend.rs:398:9: replace <impl ContainerRuntime for NativeBackend>::name -> &'static str with ""
+engenho-kubelet/src/native_backend.rs:526:20: delete ! in <impl ContainerRuntime for NativeBackend>::logs

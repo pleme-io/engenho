@@ -258,10 +258,8 @@ jobs:
   # ci/release-contract.tlisp reads release.yml and fails on a job that names
   # `latest`, an image-push call that leaves `tag` or `additionalTags` at
   # their `latest` defaults, a publishing job release-assets does not wait
-  # on, or a job its catalog does not know. The tlisp-test step runs
-  # ci/release-contract.test.tlisp, which shows each rule firing on a fixture
-  # with that defect. The first step pins the tatara-script both steps use:
-  # tlisp-test reuses the binary already on PATH.
+  # on, or a job its catalog does not know. Its tests,
+  # ci/release-contract.test.tlisp, run in ci-contract-tests below.
   # ───────────────────────────────────────────────────────────────────────────
   release-contract:
     name: release publishes after the gate (workflow contract)
@@ -272,6 +270,33 @@ jobs:
         with:
           script-file: ci/release-contract.tlisp
           version: v0.3.58
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The mutation gate's lists, and every ci/*.test.tlisp (improvement plan
+  # T0.6). The release-contract suite used to run in the job above; it runs
+  # here now, beside mutation-gate's.
+  # First step: ci/mutation-gate.tlisp in lint mode. ci/seam-files.txt must
+  # name repo-relative .rs files that exist, each once; every row of
+  # ci/mutants-allowlist.txt needs a `# why:` reason and a seam's path. A seam
+  # renamed without updating the list fails here, on every push, instead of
+  # leaving that file silently unmutated. The mutation runs themselves are
+  # .github/workflows/mutation.yml.
+  # Second step: pleme-io/actions/tlisp-test runs each ci/<name>.test.tlisp
+  # against ci/<name>.tlisp. min-files is the number of suites that exist
+  # (release-contract, mutation-gate), so losing one is red, not a smaller
+  # green. The first step pins the tatara-script tlisp-test reuses from PATH.
+  # ───────────────────────────────────────────────────────────────────────────
+  ci-contract-tests:
+    name: ci/*.test.tlisp + mutation-gate lists
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/mutation-gate.tlisp
+          version: v0.3.58
+        env:
+          MUTATION_GATE_MODE: lint
       - uses: pleme-io/actions/tlisp-test@main
         with:
-          min-files: 1
+          min-files: 2

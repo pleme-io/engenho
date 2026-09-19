@@ -118,8 +118,19 @@ push + helm chart push would fail with `unauthorized`.
     runs `checks.typed-config`; it compiles no Rust.
   * `ci/release-contract.tlisp` (test.yml, job `release-contract`)
     checks that release.yml moves `:latest` only in `promote-latest`,
-    after `release-assets`; `ci/release-contract.test.tlisp` shows each
-    of its rules firing on a fixture with that defect.
+    after `release-assets`; `ci/release-contract.test.tlisp` (job
+    `ci-contract-tests`) shows each of its rules firing on a fixture
+    with that defect.
+  * `.github/workflows/mutation.yml` runs `cargo mutants` over the
+    files in `ci/seam-files.txt`: every mutant nightly, the changed
+    lines on a push or PR that touches a seam. A surviving mutant fails
+    the leg unless `ci/mutants-allowlist.txt` has a row saying why; the
+    judge is `ci/mutation-gate.tlisp`. It is hand-authored, like
+    test.yml: substrate has no reusable for it, and
+    `pleme-io/actions/mutation-test` cannot gate (it ignores
+    cargo-mutants' exit status and reads survivors from the summary
+    text). test.yml's `ci-contract-tests` job lints the two lists on
+    every push.
   * `nix build .#default` validates the workspace builds.
 
 ## What release produces

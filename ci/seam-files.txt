@@ -1,0 +1,30 @@
+# seam-files.txt — the source files under the mutation gate (improvement
+# plan T0.6). One repo-relative path per line; `#` starts a comment.
+#
+# A SEAM is a file where engenho decides what an observation MEANS: whether a
+# probe failed, whether an owner is gone, whether a watch ended, how long to
+# wait before a restart, whether a native process is alive. The four defects
+# of 2026-09-18 lived in the first four files below, in code that had tests,
+# and a mutation run over those four found 25 of 99 viable mutants surviving
+# (docs/IMPROVEMENT-PLAN.md §2). A line count says code is covered; a killed
+# mutant says a test would notice the code changing.
+#
+# WHAT THE GATE DOES WITH THIS LIST (.github/workflows/mutation.yml, logic in
+# ci/mutation-gate.tlisp):
+#   * nightly, and on dispatch: `cargo mutants --file <path>` for every path
+#     below, one job per path;
+#   * on a push or PR to main: the same, restricted with `--in-diff` to the
+#     lines the change touched, for each path below the change touched;
+#   * a surviving (missed) mutant fails the job unless ci/mutants-allowlist.txt
+#     has a row for it saying why.
+# It is the only list. The workflow reads it; nothing else names these files.
+#
+# ADDING A SEAM: add the path here in the commit that creates the seam. The
+# gate refuses a path that does not exist, so a renamed or deleted seam must
+# be updated here in the same commit or every run goes red naming it.
+
+engenho-controllers/src/gc.rs
+engenho-controllers/src/watch_driver.rs
+engenho-kubelet/src/probe.rs
+engenho-kubelet/src/backoff.rs
+engenho-kubelet/src/native_backend.rs

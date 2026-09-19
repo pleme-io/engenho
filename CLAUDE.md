@@ -256,9 +256,10 @@ then `nix flake check` cannot compile any gen-pattern consumer.
 
 | Workflow | Trigger | Scope | Blocking |
 |---|---|---|---|
-| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy, + `ci/nix-on-runner.tlisp` (Nix installed only via `pleme-io/actions/nix-setup`, before any step needing it), + `ci/release-contract.tlisp` and its tests (release.yml moves `:latest` only after the gate) | yes |
+| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy, + `ci/nix-on-runner.tlisp` (Nix installed only via `pleme-io/actions/nix-setup`, before any step needing it), + `ci/release-contract.tlisp` (release.yml moves `:latest` only after the gate), + `ci-contract-tests`: every `ci/*.test.tlisp` and a lint of the mutation gate's two lists | yes |
 | `release.yml` | `v*` tag | 2 binaries, 4 arch images, 2 multi-arch indexes, 1 chart, exact tags only; then `release-assets` (needs every publishing job, finds all 23 assets) and `promote-latest` (moves `:latest` per image). A red leg or a missing asset leaves `:latest` where it was | — |
 | `deep-test.yml` | schedule + dispatch | breadth — macOS leg, 4k-case proptest stress, coverage artifact, `cargo audit` | no |
+| `mutation.yml` | schedule + dispatch; push + PR touching a seam | `cargo mutants` over `ci/seam-files.txt`: every mutant nightly, the changed lines on a push. A surviving mutant fails unless `ci/mutants-allowlist.txt` says why (`ci/mutation-gate.tlisp`) | yes, on a push that touches a seam |
 | `ci.yml` | push + PR | `gen confirm` (fatal lock tie) + `nix flake check` (non-fatal; runs `checks.typed-config`, compiles no Rust) | fails only on `gen confirm` |
 
 `deep-test.yml` deliberately has **no** `push`/`pull_request` trigger:
@@ -297,6 +298,37 @@ StoreStillShared failures are a code defect (improvement plan T2.1).
 Local builds do **not** reproduce credential problems: `~/.cargo/git`
 holds credentialed checkouts, so a workstation can be green while CI is
 red.
+
+### Mutation gate — tests that pin behaviour (plan T0.6)
+
+`ci/seam-files.txt` lists the files where engenho decides what an
+observation means (gc, watch_driver, probe, backoff, native_backend).
+On 2026-09-19, 25 of 99 viable mutants in the first four survived: the
+tests executed that code and would not have noticed it change.
+`mutation.yml` runs `cargo mutants` over each seam nightly, and over the
+changed lines of any push or PR that touches one. A surviving mutant
+fails the leg unless `ci/mutants-allowlist.txt` has a row
+(`<path>: <mutant description> # why: <reason>`). A full run also fails
+on an allowlist row that no longer matches a survivor. The judge reads
+every outcome in `outcomes.json`: a mutant whose test run ended on a
+signal (`Failure`) appears in no `.txt` file and in none of the totals,
+so a gate built on either would miss it. A failed baseline, missing
+tools, an unfinished run or files that disagree make the leg **blind**
+(exit 3), never green. Listing a new seam, or removing a mutant's row
+once a test kills it, goes in the same commit as the code change.
+
+**Standing rule:** a commit that touches a seam ends with a mutation
+pass over what it touched, from the repository root:
+
+```bash
+MUTATION_GATE_MODE=run MUTATION_GATE_FILE=engenho-kubelet/src/probe.rs \
+  MUTATION_GATE_BASE=HEAD~1 tatara-script ci/mutation-gate.tlisp
+```
+
+Leave out `MUTATION_GATE_BASE` for every mutant in the file. Outside
+GitHub Actions cargo-mutants builds in a copy of the tree. The gate is
+only as green as `test.yml`: a package whose own tests are red makes
+every leg over it blind.
 
 ## Substrate integration (no escape hatches)
 

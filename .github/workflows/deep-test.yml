@@ -13,6 +13,9 @@ name: deep-test
 # macOS leg, a 4x proptest case count, a coverage artifact, and a RustSec
 # advisory scan. None of those belong on the PR critical path; all of them
 # rot silently if nobody ever runs them.
+# Mutation testing is scheduled too, but it is not here: it also gates pushes
+# that touch a seam file, so it has its own workflow (mutation.yml), and none
+# of its jobs depend on this file's.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # THIS WORKFLOW HAS NEVER ONCE BEEN GREEN. That is why it was rewritten.

@@ -1,0 +1,148 @@
+name: mutation
+
+# skip-workflow-shim: substrate catalogues no mutation-testing reusable, and pleme-io/actions/mutation-test cannot gate (it ignores cargo-mutants' exit status and parses survivors from summary text); see docs/CI-PIPELINE.md
+# ─────────────────────────────────────────────────────────────────────────────
+# THE MUTATION GATE (improvement plan T0.6). A mutant that survives in a seam
+# file fails this workflow, unless ci/mutants-allowlist.txt has a row for it
+# saying why it may.
+#
+# WHY. The four defects of 2026-09-18 lived in code that had tests
+# (controllers: 615, kubelet: 438). cargo-mutants over the four files found
+# 25 of 99 viable mutants surviving: those tests executed the code and would
+# not have noticed it change. This gate keeps that number from growing and
+# makes it visible until the plan's T1/T2 tests bring it to zero.
+#
+# WHAT RUNS. ci/seam-files.txt is the one list of files. `plan` reads it and
+# chooses:
+#   * schedule (nightly) and workflow_dispatch: every seam, every mutant, one
+#     `mutants` leg per seam (`cargo mutants --file <seam>`);
+#   * push / pull_request to main: each seam the change touched, restricted
+#     to the changed lines (`cargo mutants --in-diff`). A change that touches
+#     no seam runs `plan` only. When the base commit is unknown (a new
+#     branch, a history that was not fetched), it falls back to every seam.
+# Each `mutants` leg runs ci/mutation-gate.tlisp in run mode, which lists the
+# mutants first (the denominator), runs them with nextest (so
+# .config/nextest.toml selects tests, as in every other gate), and judges
+# every outcome in outcomes.json. The judge's rules, and what exit 3 (blind)
+# means, are in that file's header. A leg is red on a survivor with no
+# allowlist row, on a stale allowlist row in a full run, and on a blind run.
+#
+# WHY ITS OWN WORKFLOW, NOT A deep-test.yml JOB. deep-test.yml is breadth
+# that reports and never blocks, and it has never been green. This gate runs
+# on pushes too, and a red here must name mutation, not a stale deep-test
+# leg. No job here `needs:` anything outside this file.
+#
+# TIER: a CI gate, not a type. See ci/mutation-gate.tlisp for what it proves
+# and what it cannot see (code outside the list, other crates' tests).
+# Plan edge 19 applies: every mutant is judged against a baseline, and a
+# baseline red on the package's own tests makes the leg blind (exit 3), so
+# this gate is only as green as test.yml.
+#
+# RUNNING IT LOCALLY (the standing rule: a commit that touches a seam ends
+# with a mutation pass over what it touched), from the repository root:
+#   MUTATION_GATE_MODE=run MUTATION_GATE_FILE=<seam> MUTATION_GATE_BASE=HEAD~1 \
+#     tatara-script ci/mutation-gate.tlisp
+# Drop MUTATION_GATE_BASE for every mutant in the file. Outside GitHub
+# Actions cargo-mutants works in a copy of the tree, not in place.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 5 * * *'  # 05:00 UTC daily: every seam, every mutant
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Load-bearing, as in test.yml: cargo must shell out to git so the
+  # git-credentials url rewrite reaches the private git dependencies.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Every mutant is a fresh dev build of one package. Debuginfo is not read by
+  # any test and roughly doubles the target directory.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Lint the two lists and choose the legs. Full history, so `git diff BASE
+  # HEAD` can see the base commit.
+  # ───────────────────────────────────────────────────────────────────────────
+  plan:
+    name: plan (which seams to mutate)
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      base: ${{ steps.plan.outputs.base-ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: plan
+        uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/mutation-gate.tlisp
+          version: v0.3.58
+        env:
+          MUTATION_GATE_MODE: plan
+          MUTATION_GATE_EVENT: ${{ github.event_name }}
+          # push: the commit before the push. pull_request: the PR's base.
+          # schedule / dispatch: empty, which means every seam.
+          MUTATION_GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # One leg per seam the plan chose. Skipped when the change touched none.
+  # ───────────────────────────────────────────────────────────────────────────
+  mutants:
+    name: mutants (${{ matrix.seam.file }})
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    # probe.rs alone was ~50 mutants at ~60 s each on ryn (2026-09-19).
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        seam: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      # The gate mutates this checkout in place in Actions, so this cache is
+      # the target every mutant builds in.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants
+      # cargo-mutants and nextest come from `nix shell` inside the gate, and
+      # engenho-kubelet's native tests realise closures with `nix build`.
+      - uses: pleme-io/actions/nix-setup@main
+        with:
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+      - id: gate
+        uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/mutation-gate.tlisp
+          version: v0.3.58
+        env:
+          MUTATION_GATE_MODE: run
+          MUTATION_GATE_FILE: ${{ matrix.seam.file }}
+          MUTATION_GATE_BASE: ${{ needs.plan.outputs.base }}
+      # mutants.out holds each mutant's diff and test log: what a survivor
+      # changed, and what the tests printed with it in place.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-${{ matrix.seam.slug }}
+          path: ${{ runner.temp }}/mutation-gate/${{ matrix.seam.slug }}/mutants.out
+          if-no-files-found: ignore
