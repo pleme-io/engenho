@@ -1404,6 +1404,35 @@ fn is_name_conflict(stderr: &str) -> bool {
         || stderr.contains("container already exists")
 }
 
+/// Does this `podman inspect` stderr mean no container has this id or name?
+///
+/// ★ `podman inspect` IS NOT `podman container inspect`. [`PodmanBackend::inspect_argv`]
+/// runs the untyped form, which looks the name up as a container, then an
+/// image, a volume, a network, a pod and an artifact, and only when every one
+/// misses does it fail — with the generic word, not the container one. From
+/// podman 5.7.0's source (`cmd/podman/inspect/inspect.go:254`, printed by
+/// `formatError` in `cmd/podman/root.go`):
+///
+/// ```text
+/// Error: no such object: "ns_pod_container"
+/// ```
+///
+/// This predicate used to test only `no such container` and `not found`, so a
+/// container the runtime no longer had came back as `Err("podman inspect
+/// failed")` rather than `None`: the trait's "not tracked" answer turned into
+/// a broken runtime, and the kubelet withholds a pod's status write on a
+/// failed poll. The backend conformance matrix's `unknown id is absent` and
+/// `remove` clauses are where that shows.
+///
+/// A podman that cannot answer at all is NOT an absent container, and must
+/// stay an error — see the negative cases in its test.
+#[must_use]
+fn is_no_such_container(stderr: &str) -> bool {
+    stderr.contains("no such object")
+        || stderr.contains("no such container")
+        || stderr.contains("not found")
+}
+
 /// `--pull` policy passed to `podman run`. Typed so the backend has ONE
 /// extensible knob for image-pull behavior instead of a hard-coded flag.
 ///
@@ -2217,7 +2246,7 @@ impl ContainerRuntime for PodmanBackend {
         if !out.status.success() {
             // Not found is a normal case; return None.
             let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.contains("no such container") || stderr.contains("not found") {
+            if is_no_such_container(&stderr) {
                 return Ok(None);
             }
             return Err(KubeletError::Backend(format!(
@@ -3547,6 +3576,40 @@ mod tests {
         assert!(!is_name_conflict(
             "Error: getting container from store \"cea832b7\": container not known"
         ));
+    }
+
+    /// ★ What `podman inspect` prints for a name nothing has, read from podman
+    /// 5.7.0's SOURCE (`cmd/podman/inspect/inspect.go:254`,
+    /// `fmt.Errorf("no such object: %q", name)`, rendered `Error: %v` by
+    /// `cmd/podman/root.go` `formatError`) — not captured from a live podman,
+    /// which this was written without. A container the runtime no longer has
+    /// is `None`, never a failed poll.
+    #[test]
+    fn a_container_podman_no_longer_has_is_absent_not_a_failed_inspect() {
+        let untyped_inspect =
+            "Error: no such object: \"engenho-conformance_conformance-1_podman-long\"";
+        assert!(
+            is_no_such_container(untyped_inspect),
+            "`podman inspect` of a missing container must read as absent"
+        );
+        // The forms the predicate already accepted stay accepted.
+        assert!(is_no_such_container(
+            "Error: no such container engenho-conformance_x"
+        ));
+        assert!(is_no_such_container("Error: container not found"));
+
+        // ★ A podman that cannot answer is not a container that is gone.
+        // Captured 2026-09-19 from podman 5.7.0 on a macOS host with no
+        // machine running (home directory replaced): reading it as absent
+        // would publish every pod on the node as never started.
+        let unreachable = "Cannot connect to Podman. Please verify your connection to the Linux \
+            system using `podman system connection list`, or try `podman machine init` and \
+            `podman machine start` to manage a new Linux VM\nError: unable to connect to Podman \
+            socket: failed to read identity \
+            \"/Users/op/.local/share/containers/podman/machine/machine\": open \
+            /Users/op/.local/share/containers/podman/machine/machine: no such file or \
+            directory";
+        assert!(!is_no_such_container(unreachable));
     }
 
     #[test]
