@@ -1483,6 +1483,7 @@ dependencies = [
  "engenho-store",
  "engenho-substrate",
  "engenho-types",
+ "openraft",
  "proptest",
  "serde",
  "serde_json",

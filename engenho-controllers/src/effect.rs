@@ -138,7 +138,10 @@ impl Effect {
             | ResourceOp::Patched
             | ResourceOp::Deleted
             | ResourceOp::DeletionPending => Self::Written(Landed(())),
-            ResourceOp::NoOp => Self::Unchanged,
+            // T3.5: an identical Put or Patch consumed no revision and fired
+            // no event, so it is not a change. Counting it as one is the
+            // "changed=1 on every tick" churn T1.8 exists to end.
+            ResourceOp::NoOp | ResourceOp::Unchanged => Self::Unchanged,
             ResourceOp::Conflict => Self::Rejected(Refusal::Conflict),
             ResourceOp::PatchRejected => Self::Rejected(Refusal::PatchRejected),
             ResourceOp::ApplyConflict => Self::Rejected(Refusal::ApplyConflict),

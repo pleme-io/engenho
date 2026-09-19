@@ -127,7 +127,8 @@ const fn store_scope(e: &StoreError) -> ErrorScope {
         StoreError::ClientWriteFailed(_)
         | StoreError::ConfigInvalid(_)
         | StoreError::InitializeFailed(_)
-        | StoreError::Fatal(_) => ErrorScope::Sweep,
+        | StoreError::Fatal(_)
+        | StoreError::Persist(_) => ErrorScope::Sweep,
     }
 }
 
@@ -140,9 +141,14 @@ const fn store_scope(e: &StoreError) -> ErrorScope {
 ///     store was built wrong or the Raft core has stopped; no reconcile
 ///     retry repairs that, and hammering it only buries the one log line
 ///     that says so.
+///   * `Persist` — Transient. Only `StoreMesh::flush` returns it: the durable
+///     image was not written, but the log still holds every applied entry,
+///     so nothing is lost and a later flush can succeed (disk freed). No
+///     controller calls flush today; the arm exists so the class is decided
+///     rather than defaulted if one ever does.
 const fn store_class(e: &StoreError) -> FailureKind {
     match e {
-        StoreError::ClientWriteFailed(_) => FailureKind::Transient,
+        StoreError::ClientWriteFailed(_) | StoreError::Persist(_) => FailureKind::Transient,
         StoreError::ConfigInvalid(_) | StoreError::InitializeFailed(_) | StoreError::Fatal(_) => {
             FailureKind::Declarative
         }
@@ -152,6 +158,13 @@ const fn store_class(e: &StoreError) -> FailureKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `StoreError::Persist`, built the way `FjallStore` builds one.
+    fn persist() -> StoreError {
+        StoreError::Persist(Box::new(openraft::StorageError::IO {
+            source: openraft::StorageIOError::write(&openraft::AnyError::error("disk full")),
+        }))
+    }
 
     fn shape_error() -> ShapeError {
         let mut v = serde_json::json!({"metadata": "x"});
@@ -185,7 +198,9 @@ mod tests {
         fn row(e: ControllerError) -> (ControllerError, FailureKind) {
             let want = match &e {
                 ControllerError::Store(s) => match s {
-                    StoreError::ClientWriteFailed(_) => FailureKind::Transient,
+                    StoreError::ClientWriteFailed(_) | StoreError::Persist(_) => {
+                        FailureKind::Transient
+                    }
                     StoreError::ConfigInvalid(_)
                     | StoreError::InitializeFailed(_)
                     | StoreError::Fatal(_) => FailureKind::Declarative,
@@ -203,6 +218,7 @@ mod tests {
             row(ControllerError::Store(StoreError::InitializeFailed(m()))),
             row(ControllerError::Store(StoreError::ClientWriteFailed(m()))),
             row(ControllerError::Store(StoreError::Fatal(m()))),
+            row(ControllerError::Store(persist())),
             row(ControllerError::InvalidResource(m())),
             row(ControllerError::Shape(shape_error())),
             row(ControllerError::Internal(m())),
@@ -220,7 +236,8 @@ mod tests {
                     StoreError::ClientWriteFailed(_)
                     | StoreError::ConfigInvalid(_)
                     | StoreError::InitializeFailed(_)
-                    | StoreError::Fatal(_) => ErrorScope::Sweep,
+                    | StoreError::Fatal(_)
+                    | StoreError::Persist(_) => ErrorScope::Sweep,
                 },
                 ControllerError::InvalidResource(_)
                 | ControllerError::Shape(_)
@@ -234,7 +251,7 @@ mod tests {
     #[test]
     fn store_errors_stop_a_sweep_and_nothing_else_does() {
         let rows = every_scope();
-        assert_eq!(rows.len(), 7, "one row per variant");
+        assert_eq!(rows.len(), 8, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.scope(), want, "{e:?}");
         }
@@ -243,7 +260,7 @@ mod tests {
     #[test]
     fn every_error_variant_maps_to_its_retry_class() {
         let rows = every_variant();
-        assert_eq!(rows.len(), 7, "one row per variant");
+        assert_eq!(rows.len(), 8, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.classify(), want, "{e:?}");
         }

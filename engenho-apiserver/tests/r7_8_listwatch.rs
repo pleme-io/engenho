@@ -241,14 +241,14 @@ async fn list_returns_snapshot_resource_version() {
 
     // The rv is current_revision, NOT last_applied_index. Assert it
     // equals the store's current_revision at list time directly.
-    let current = store.current_catalog().await.revision().get();
+    let current = store.current_revision().await.get();
     assert_eq!(rv, current, "LIST rv == current_revision (dense MVCC)");
     assert_eq!(rv, 3, "3 real mutations → revision 3");
 
     // Regression: last_applied_index has advanced PAST current_revision
     // (the openraft init blank entry consumes a log index but no
     // revision), so the old broken envelope would NOT equal 3.
-    let last_applied = store.current_catalog().await.last_applied_index;
+    let last_applied = store.last_applied_index().await;
     assert!(
         last_applied >= rv,
         "last_applied_index ({last_applied}) >= current_revision ({rv}) — they differ, \
@@ -562,7 +562,7 @@ async fn bookmark_passthrough_and_optout() {
     // can't set cadence directly, so drive the store's watch_from with a
     // short bookmark_every) → a BOOKMARK signal arrives on a quiescent
     // store.
-    let from = store.current_catalog().await.revision();
+    let from = store.current_revision().await;
     let mut bm_stream = store
         .watch_from(engenho_store::WatchOpts {
             from,
@@ -756,7 +756,7 @@ async fn handler_list_at_returns_items_and_current_revision() {
         .await
         .unwrap();
     assert_eq!(items.len(), 2);
-    assert_eq!(rv, store.current_catalog().await.revision());
+    assert_eq!(rv, store.current_revision().await);
     assert_eq!(rv, Revision(2));
 
     drop(h);

@@ -107,10 +107,10 @@ async fn a_policy_reaches_the_enforcer_and_says_it_is_not_enforced() {
     assert!(ev.message.contains("NOT restricted"), "{}", ev.message);
 
     // N4 — a second tick must not rewrite the object or re-emit the event.
-    let before = store.current_catalog().await.revision();
+    let before = store.current_revision().await;
     c.tick().await.unwrap();
     assert_eq!(
-        store.current_catalog().await.revision(),
+        store.current_revision().await,
         before,
         "an unchanged rewrite every tick is the revision hot-loop class"
     );

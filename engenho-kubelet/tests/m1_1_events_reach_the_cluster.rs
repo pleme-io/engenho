@@ -347,14 +347,14 @@ async fn l4_the_lease_renews_on_its_interval_not_on_every_tick() {
         .get(&lease_key("node-A"))
         .await
         .expect("the first tick always renews");
-    let rev_after_first = store.current_catalog().await.revision();
+    let rev_after_first = store.current_revision().await;
 
     // Five more ticks INSIDE the interval must write nothing at all.
     for _ in 0..5 {
         kubelet.tick().await.unwrap();
     }
     assert_eq!(
-        store.current_catalog().await.revision(),
+        store.current_revision().await,
         rev_after_first,
         "ticks inside RENEW_INTERVAL advance no revision — this is the \
          idempotent-skip invariant the first version broke"
@@ -371,7 +371,7 @@ async fn l4_the_lease_renews_on_its_interval_not_on_every_tick() {
     clock.advance(RENEW_INTERVAL + StdDuration::from_secs(1));
     kubelet.tick().await.unwrap();
     assert!(
-        store.current_catalog().await.revision() > rev_after_first,
+        store.current_revision().await > rev_after_first,
         "past the interval the heartbeat actually beats"
     );
     assert!(

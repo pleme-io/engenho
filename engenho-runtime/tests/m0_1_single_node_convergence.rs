@@ -459,10 +459,10 @@ async fn deployment_status_converges_then_reconcile_is_bounded() {
     let store = rt.store();
     // Let any final in-flight status writes settle.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let rev_a = store.current_catalog().await.revision();
+    let rev_a = store.current_revision().await;
     // Idle window > 2 fallback intervals (fallback = 1s) with no mutation.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let rev_b = store.current_catalog().await.revision();
+    let rev_b = store.current_revision().await;
     assert_eq!(
         rev_a, rev_b,
         "post-convergence idle reconcile must NOT advance the revision \

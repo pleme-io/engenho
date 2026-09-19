@@ -19,6 +19,11 @@ pub enum RuntimeError {
     #[error("apiserver error: {0}")]
     Server(#[from] ServerError),
 
+    /// The configured kubelet backend is refused at construction (T5.9): CRI
+    /// until it sets mounts, pod IPs and confinement.
+    #[error(transparent)]
+    BackendRefused(#[from] engenho_kubelet::BackendRefused),
+
     /// Raft leadership wasn't reached within the configured timeout.
     /// The store started but never elected a leader, so no `propose`
     /// (Node registration, apiserver writes) could ever succeed.
@@ -147,6 +152,7 @@ engenho_substrate::impl_error_kind! {
         (Config(_)) => "config",
         (Store(_)) => "store",
         (Server(_)) => "server",
+        (BackendRefused(_)) => "backend_refused",
         { LeadershipTimeout { .. } } => "leadership_timeout",
         { ListenAddr { .. } } => "listen_addr",
         { ExtraSan { .. } } => "extra_san",

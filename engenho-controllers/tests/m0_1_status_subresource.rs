@@ -186,9 +186,9 @@ async fn replicaset_status_write_is_idempotent_at_fixpoint() {
     rc.tick().await.unwrap(); // create + first status
     // Reach the fixpoint: a tick that changes nothing.
     let _ = rc.tick().await.unwrap();
-    let rev_before = store.current_catalog().await.revision();
+    let rev_before = store.current_revision().await;
     let report = rc.tick().await.unwrap();
-    let rev_after = store.current_catalog().await.revision();
+    let rev_after = store.current_revision().await;
     assert_eq!(report.objects_changed, 0, "fixpoint tick proposes nothing");
     assert_eq!(
         rev_before, rev_after,
@@ -472,11 +472,11 @@ async fn status_write_succeeds_with_current_rv_then_noop_on_reissue() {
     // Re-read the (now status-bearing) object + re-issue the SAME status →
     // NoChange, and the catalog revision must not advance.
     let parent2 = store.get(&rs_key).await.unwrap();
-    let rev_before = store.current_catalog().await.revision();
+    let rev_before = store.current_revision().await;
     let outcome2 = write_status_cas(&store, &rs_key, &parent2, &desired)
         .await
         .unwrap();
-    let rev_after = store.current_catalog().await.revision();
+    let rev_after = store.current_revision().await;
     assert_eq!(outcome2, StatusWriteOutcome::NoChange);
     assert_eq!(
         rev_before, rev_after,

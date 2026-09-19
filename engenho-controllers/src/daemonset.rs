@@ -543,12 +543,12 @@ mod tests {
 
         let c = DaemonSetController::new(store.clone(), None);
         c.tick().await.unwrap();
-        let rev_a = store.current_catalog().await.revision();
+        let rev_a = store.current_revision().await;
         // Several idle ticks: at the fixpoint nothing is proposed.
         for _ in 0..3 {
             c.tick().await.unwrap();
         }
-        let rev_b = store.current_catalog().await.revision();
+        let rev_b = store.current_revision().await;
         assert_eq!(rev_a, rev_b, "converged DaemonSet must not thrash");
     }
 

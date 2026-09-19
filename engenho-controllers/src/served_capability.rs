@@ -490,10 +490,10 @@ mod producer_tests {
         assert_eq!(avail["reason"], "AggregationNotImplemented");
 
         // And a second tick changes nothing.
-        let before = store.current_catalog().await.revision();
+        let before = store.current_revision().await;
         c.tick().await.unwrap();
         assert_eq!(
-            store.current_catalog().await.revision(),
+            store.current_revision().await,
             before,
             "stamping is idempotent — a rewrite every tick is a hot loop"
         );

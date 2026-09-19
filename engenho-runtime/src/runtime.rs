@@ -76,7 +76,7 @@ impl Runtime {
         // Fail LOUDLY here if the configured runtime cannot be reached, rather
         // than discovering it one warn-per-tick at a time forever.
         preflight_backend(&config)?;
-        let backend = build_backend(&config);
+        let backend = build_backend(&config)?;
         Self::start_inner(config, backend).await
     }
 
@@ -995,7 +995,7 @@ fn apiserver_reachability(config: &EngenhoConfig) -> ApiserverReachability {
     }
 }
 
-fn build_backend(config: &EngenhoConfig) -> Arc<dyn ContainerRuntime> {
+fn build_backend(config: &EngenhoConfig) -> Result<Arc<dyn ContainerRuntime>, RuntimeError> {
     let kind = match config.runtime.kubelet_backend {
         CfgBackendKind::Cri => KubeletBackendKind::Cri,
         CfgBackendKind::PodmanApi => KubeletBackendKind::PodmanApi,
@@ -1031,11 +1031,11 @@ fn build_backend(config: &EngenhoConfig) -> Arc<dyn ContainerRuntime> {
             );
         }
     }
-    make_container_runtime_with_apiserver(
+    Ok(make_container_runtime_with_apiserver(
         kind,
         config.runtime.podman_binary.as_deref(),
         reachability.injectable(),
-    )
+    )?)
 }
 
 /// Bring up the store spine — durable or ephemeral per config.

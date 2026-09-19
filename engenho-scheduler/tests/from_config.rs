@@ -237,7 +237,9 @@ async fn the_driver_ticks_on_the_configured_interval() {
         fallback_interval: Duration::from_secs(3600),
         ..WatchDriverConfig::default()
     };
-    let handle = configured.into_watch_driver(base).spawn();
+    // T2.6: a driver is a future that never returns (`run -> Infallible`);
+    // the caller owns the task.
+    let handle = tokio::spawn(configured.into_watch_driver(base).run());
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut landed = None;

@@ -742,11 +742,11 @@ mod tests {
         let _uid = seed_sts(&store, "default", "vm", 2).await;
         let c = StatefulSetController::new(store.clone(), None);
         c.tick().await.unwrap();
-        let rev_a = store.current_catalog().await.revision();
+        let rev_a = store.current_revision().await;
         for _ in 0..3 {
             c.tick().await.unwrap();
         }
-        let rev_b = store.current_catalog().await.revision();
+        let rev_b = store.current_revision().await;
         assert_eq!(rev_a, rev_b, "converged StatefulSet must not thrash");
     }
 }
