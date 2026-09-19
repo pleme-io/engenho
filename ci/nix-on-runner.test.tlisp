@@ -1,0 +1,127 @@
+;; nix-on-runner.test.tlisp — (deftest …) suite for ci/nix-on-runner.tlisp.
+;; Run by pleme-io/actions/tlisp-test (test.yml, job ci-contract-tests) as
+;; stdlib + unit + this file with TLISP_TEST=1, from the repository root.
+;;
+;; The first tests read the real .github/workflows, so they fail when the
+;; repository breaks a rule. The rest run the check against a small fixture
+;; job that keeps every rule, then against one mutation per rule, so each
+;; rule is shown to fire on the defect it names and to stay quiet on its near
+;; miss. One mutation is the shape test.yml and deep-test.yml had before
+;; integration item I24: nix-setup, then `nix profile install` of nextest.
+
+(define (t:has? found needle) (any? (fn (f) (string-contains? f needle)) found))
+
+;; A fixture with one substring replaced; the replacement must happen, or the
+;; mutation test would silently check the unmutated fixture.
+(define (t:swap text from to)
+  (assert (string-contains? text from) (string-append "fixture no longer contains: " from))
+  (string-replace text from to))
+
+;; (findings consumers) for one workflow text.
+(define (t:check text) (nor:check-all (list (list "fixture.yml" (yaml-parse text)))))
+(define (t:found text) (car (t:check text)))
+
+;; ── The real workflows ───────────────────────────────────────────────────
+
+(deftest "every real workflow keeps every rule"
+  (let ((r (nor:check-all (nor:workflows))))
+    (for-each (fn (f) (print-line (string-append "  " f))) (car r))
+    (assert (= (length (car r)) 0) "no findings in .github/workflows")
+    (assert (> (car (cdr r)) 0) "and the scan examined at least one step that needs Nix")))
+
+(deftest "the real nextest steps exist, so the nextest rule is not vacuous over them"
+  ;; test.yml's leg and deep-test.yml's cross-os, property-stress and
+  ;; coverage. A floor, not a count: a fifth nextest job is not a failure.
+  ;; `append`, not `flatten`: a step is itself an alist, which flatten would
+  ;; take apart.
+  (let ((steps (reduce
+                 (fn (acc p)
+                   (reduce (fn (acc2 entry) (append acc2 (alist-get (car (cdr entry)) "steps" (list))))
+                     acc
+                     (alist-get (car (cdr p)) "jobs" (list))))
+                 (list)
+                 (nor:workflows))))
+    (assert (>= (length (filter (fn (st) (nor:runs-nextest? (alist-get st "run" ""))) steps)) 4)
+      "at least four steps run nextest")))
+
+;; ── Fixture: one job that keeps every rule ───────────────────────────────
+
+(define t:WORKFLOW "
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compile only
+        run: cargo test -p engenho-diff --all-targets --no-run
+      - uses: pleme-io/actions/nix-setup@main
+        with:
+          github-token: x
+          nextest: \"true\"
+      - name: the gate
+        run: >-
+          cargo nextest run --workspace --all-targets --locked
+      - name: doctests
+        run: cargo test --workspace --doc
+      - name: read the store
+        run: nix path-info --json .#default
+")
+
+(deftest "the fixture keeps every rule"
+  (let ((r (t:check t:WORKFLOW)))
+    (assert (= (length (car r)) 0) "no findings")
+    (assert (= (car (cdr r)) 3) "three steps need Nix: the nextest run, the doctests, nix path-info")))
+
+;; ── profile: the shape I24 replaced ──────────────────────────────────────
+
+(deftest "the old shape, nix-setup then `nix profile install` of nextest, fails twice"
+  (let ((found (t:found
+                 (t:swap t:WORKFLOW
+                   "          nextest: \"true\"\n"
+                   "      - name: install substrate's pinned cargo-nextest\n        run: nix profile install github:pleme-io/substrate#cargo-nextest\n"))))
+    (assert (t:has? found "install substrate's pinned cargo-nextest` writes a Nix profile") "the install step")
+    (assert (t:has? found "the gate` runs nextest but no") "and the nextest step, whose nix-setup no longer carries it")
+    (assert (= (length found) 2) "nothing else")))
+
+(deftest "each profile-writing command is caught, and a read-only one is not"
+  (assert (nor:writes-profile? "nix profile add nixpkgs#hello") "nix profile add (newer Nix)")
+  (assert (nor:writes-profile? "nix profile upgrade --all") "nix profile upgrade")
+  (assert (nor:writes-profile? "nix-env -f '<nixpkgs>' -iA hello") "nix-env -iA")
+  (assert (nor:writes-profile? "nix-env --install hello") "nix-env --install")
+  (assert (not (nor:writes-profile? "nix profile list")) "listing writes nothing")
+  (assert (not (nor:writes-profile? "nix-env -q")) "a nix-env query writes nothing")
+  (assert (not (nor:writes-profile? "nix build --out-link x .#y")) "an out-link is not a profile"))
+
+;; ── nextest ──────────────────────────────────────────────────────────────
+
+(deftest "a nextest step after a nix-setup without nextest fails"
+  (let ((found (t:found (t:swap t:WORKFLOW "          nextest: \"true\"\n" ""))))
+    (assert (= (length found) 1) "one finding")
+    (assert (t:has? found "the gate` runs nextest but no pleme-io/actions/nix-setup@ step with `nextest: \"true\"`")
+      "names the step and the missing input")))
+
+(deftest "nextest \"false\" is no nextest; an unquoted true is"
+  (assert (t:has? (t:found (t:swap t:WORKFLOW "nextest: \"true\"" "nextest: \"false\"")) "runs nextest but no")
+    "\"false\"")
+  (assert (= (length (t:found (t:swap t:WORKFLOW "nextest: \"true\"" "nextest: true"))) 0)
+    "YAML true: GitHub passes the action the string \"true\""))
+
+(deftest "cargo llvm-cov nextest is a nextest step"
+  (assert (t:has? (t:found (t:swap (t:swap t:WORKFLOW "          nextest: \"true\"\n" "")
+                             "cargo nextest run --workspace" "cargo llvm-cov nextest --workspace"))
+            "runs nextest but no")
+    "coverage's shape"))
+
+;; ── order and seam ───────────────────────────────────────────────────────
+
+(deftest "a test run before nix-setup fails; a compile-only run does not"
+  (let ((found (t:found (t:swap t:WORKFLOW "--all-targets --no-run" "--all-targets"))))
+    (assert (= (length found) 1) "one finding")
+    (assert (t:has? found "compile only` needs Nix but no") "the executing cargo test")))
+
+(deftest "a direct installer fails, and leaves the nextest step without its nix-setup"
+  (let ((found (t:found (t:swap t:WORKFLOW "pleme-io/actions/nix-setup@main" "DeterminateSystems/nix-installer-action@main"))))
+    (assert (t:has? found "installs Nix directly") "the installer step")
+    (assert (t:has? found "the gate` runs nextest but no") "the nextest step")
+    (assert (t:has? found "doctests` needs Nix but no") "the doctest step")))

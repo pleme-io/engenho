@@ -9,116 +9,171 @@
 ;; job, each with its own nix.conf. Both are the same class: Nix reaching a
 ;; job by accident rather than through one declared step.
 ;;
+;; The same class, for nextest (integration item I24). test.yml and three
+;; deep-test.yml jobs each followed nix-setup with `nix profile install
+;; github:pleme-io/substrate#cargo-nextest`: one tool fetched four times, into
+;; the runner user's Nix profile. pleme-io/actions/nix-setup's
+;; `nextest: "true"` now realises that build to an out-link under RUNNER_TEMP
+;; and puts it on PATH, so a nextest step's tool comes from the same declared
+;; step as its Nix.
+;;
 ;; RULES, per job of every .github/workflows/*.yml:
-;;   seam   no step uses DeterminateSystems/nix-installer-action directly.
-;;          Nix is installed only by pleme-io/actions/nix-setup, which owns
-;;          the installer pin and the nix.conf (sandbox = relaxed, tokens).
-;;   order  a step that calls `nix`, or that EXECUTES tests (`cargo nextest`,
-;;          `cargo llvm-cov nextest`, or `cargo test` without `--no-run`),
-;;          comes after a nix-setup step in the same job. A test leg runs the
-;;          three tests that call nix, and nextest is itself fetched with nix.
+;;   seam     no step uses DeterminateSystems/nix-installer-action directly.
+;;            Nix is installed only by pleme-io/actions/nix-setup, which owns
+;;            the installer pin and the nix.conf (sandbox = relaxed, tokens).
+;;   profile  no step writes a Nix profile (`nix profile install|add|upgrade|
+;;            remove`, `nix-env -i`/`--install`). Tools come from nix-setup.
+;;   nextest  a step that runs nextest (`cargo nextest`, `cargo llvm-cov
+;;            nextest`) comes after a nix-setup step with `nextest: "true"`
+;;            in the same job.
+;;   order    any other step that calls `nix`, or that EXECUTES tests
+;;            (`cargo test` without `--no-run`), comes after a nix-setup step
+;;            in the same job: a test leg runs the three tests that call nix.
+;; One step gets at most one finding, checked in that order.
 ;;
 ;; TIER: a CI gate, not a type. It reads the YAML the runner reads, so it
 ;; catches a removed or misordered step. It matches commands by text, so a
-;; test run hidden behind a script or an alias is invisible to it.
+;; test run or a profile write hidden behind a script or an alias is
+;; invisible to it.
 ;;
 ;; Exit codes: 0 clean · 1 a rule is broken · 3 the scan examined nothing
 ;; (no workflow, or no step that needs Nix): the gate proved nothing, which is
 ;; not the same as finding nothing wrong.
+;;
+;; Tests: ci/nix-on-runner.test.tlisp (tlisp-test sets TLISP_TEST=1, which
+;; loads these definitions and skips the main at the bottom). The main runs in
+;; test.yml's nix-on-runner job; the suite runs in ci-contract-tests, and its
+;; first test applies every rule to the real workflows.
 
-(define SEAM-PREFIX "pleme-io/actions/nix-setup@")
-(define BARE-INSTALLER "DeterminateSystems/nix-installer-action")
+(define nor:SEAM-PREFIX "pleme-io/actions/nix-setup@")
+(define nor:BARE-INSTALLER "DeterminateSystems/nix-installer-action")
 ;; Each pattern is searched in the step's `run` text with a space appended,
 ;; so a command at the very end of the text still ends in whitespace.
-(define CALLS-NIX "(^|\\s)nix\\s")
-(define RUNS-NEXTEST "(^|\\s)cargo\\s+(llvm-cov\\s+)?nextest\\s")
-(define RUNS-CARGO-TEST "(^|\\s)cargo\\s+test\\s")
-(define COMPILE-ONLY "\\s--no-run\\s")
+(define nor:CALLS-NIX "(^|\\s)nix\\s")
+(define nor:RUNS-NEXTEST "(^|\\s)cargo\\s+(llvm-cov\\s+)?nextest\\s")
+(define nor:RUNS-CARGO-TEST "(^|\\s)cargo\\s+test\\s")
+(define nor:COMPILE-ONLY "\\s--no-run\\s")
+(define nor:WRITES-PROFILE
+  "(^|\\s)nix\\s+profile\\s+(install|add|upgrade|remove)\\s|(^|\\s)nix-env\\s(.*\\s)?(-[A-Za-z]*i[A-Za-z]*|--install)\\s")
 
-(define (needs-nix? run)
-  (let ((text (string-append run " ")))
-    (or (re-match? CALLS-NIX text)
-        (re-match? RUNS-NEXTEST text)
-        (and (re-match? RUNS-CARGO-TEST text)
-             (not (re-match? COMPILE-ONLY text))))))
+(define (nor:padded run) (string-append run " "))
 
-(define (fail-line wf job msg)
-  (print-line (string-append "FAIL " wf " job `" job "`: " msg)))
+(define (nor:runs-nextest? run) (re-match? nor:RUNS-NEXTEST (nor:padded run)))
 
-(define (step-label st)
+(define (nor:writes-profile? run) (re-match? nor:WRITES-PROFILE (nor:padded run)))
+
+(define (nor:needs-nix? run)
+  (let ((text (nor:padded run)))
+    (or (re-match? nor:CALLS-NIX text)
+        (nor:runs-nextest? run)
+        (and (re-match? nor:RUNS-CARGO-TEST text)
+             (not (re-match? nor:COMPILE-ONLY text))))))
+
+(define (nor:seam? st) (string-starts-with? (alist-get st "uses" "") nor:SEAM-PREFIX))
+
+;; `with: nextest: "true"` parses as a string; an unquoted `true` as a boolean.
+;; GitHub hands the action the string "true" for both.
+(define (nor:seam-with-nextest? st)
+  (and (nor:seam? st)
+       (let ((v (alist-get (alist-get st "with" (list)) "nextest" "")))
+         (or (equal? v "true") (equal? v true)))))
+
+(define (nor:step-label st)
   (let ((name (alist-get st "name" "")))
     (if (equal? name "")
       (string-append "step `" (alist-get st "uses" (alist-get st "run" "?")) "`")
       (string-append "step `" name "`"))))
 
-;; Fold one job's steps in order. State: (seen-seam failures consumers).
-(define (check-job wf job steps)
+(define (nor:finding wf job st msg)
+  (string-append wf " job `" job "`: " (nor:step-label st) " " msg))
+
+;; Fold one job's steps in order. State: (seen-seam seen-nextest findings
+;; consumers). Returns (findings consumers).
+(define (nor:check-job wf job steps)
   (let ((final
           (reduce
             (fn (state st)
               (let ((seen (car state))
-                    (fails (car (cdr state)))
-                    (consumers (car (cdr (cdr state))))
-                    (uses (alist-get st "uses" ""))
+                    (seen-nextest (car (cdr state)))
+                    (found (car (cdr (cdr state))))
+                    (consumers (car (cdr (cdr (cdr state)))))
                     (run (alist-get st "run" "")))
                 (cond
-                  ((string-starts-with? uses BARE-INSTALLER)
-                    (fail-line wf job
-                      (string-append (step-label st)
-                        " installs Nix directly; use " SEAM-PREFIX "main"))
-                    (list seen (+ fails 1) consumers))
-                  ((string-starts-with? uses SEAM-PREFIX)
-                    (list true fails consumers))
-                  ((needs-nix? run)
-                    (if seen
-                      (list seen fails (+ consumers 1))
-                      (begin
-                        (fail-line wf job
-                          (string-append (step-label st)
-                            " needs Nix but no " SEAM-PREFIX " step precedes it"))
-                        (list seen (+ fails 1) (+ consumers 1)))))
+                  ((string-starts-with? (alist-get st "uses" "") nor:BARE-INSTALLER)
+                    (list seen seen-nextest
+                      (append found (list (nor:finding wf job st
+                        (string-append "installs Nix directly; use " nor:SEAM-PREFIX "main"))))
+                      consumers))
+                  ((nor:seam? st)
+                    (list true (or seen-nextest (nor:seam-with-nextest? st)) found consumers))
+                  ((nor:writes-profile? run)
+                    (list seen seen-nextest
+                      (append found (list (nor:finding wf job st
+                        (string-append "writes a Nix profile; tools come from " nor:SEAM-PREFIX
+                          " (nextest: \"true\" for nextest)"))))
+                      (+ consumers 1)))
+                  ((nor:runs-nextest? run)
+                    (list seen seen-nextest
+                      (if seen-nextest
+                        found
+                        (append found (list (nor:finding wf job st
+                          (string-append "runs nextest but no " nor:SEAM-PREFIX
+                            " step with `nextest: \"true\"` precedes it")))))
+                      (+ consumers 1)))
+                  ((nor:needs-nix? run)
+                    (list seen seen-nextest
+                      (if seen
+                        found
+                        (append found (list (nor:finding wf job st
+                          (string-append "needs Nix but no " nor:SEAM-PREFIX " step precedes it")))))
+                      (+ consumers 1)))
                   (else state))))
-            (list false 0 0)
+            (list false false (list) 0)
             steps)))
-    (list (car (cdr final)) (car (cdr (cdr final))))))
+    (list (car (cdr (cdr final))) (car (cdr (cdr (cdr final)))))))
 
-;; Returns (failures consumers) summed over the workflow's jobs. A job that
-;; calls a reusable workflow has no `steps` and contributes nothing. yaml-parse
-;; yields each mapping entry as a two-element list (key value), not a dotted
-;; pair, so the value is (car (cdr entry)).
-(define (check-workflow wf)
-  (let ((jobs (alist-get (yaml-parse (read-file wf)) "jobs" (list))))
-    (reduce
-      (fn (acc entry)
-        (let ((r (check-job wf (car entry)
-                   (alist-get (car (cdr entry)) "steps" (list)))))
-          (list (+ (car acc) (car r)) (+ (car (cdr acc)) (car (cdr r))))))
-      (list 0 0)
-      jobs)))
-
-(define workflows
-  (append (glob ".github/workflows/*.yml") (glob ".github/workflows/*.yaml")))
-
-(define totals
+;; (findings consumers) for one parsed workflow. A job that calls a reusable
+;; workflow has no `steps` and contributes nothing. yaml-parse yields each
+;; mapping entry as a two-element list (key value), not a dotted pair, so the
+;; value is (car (cdr entry)).
+(define (nor:check-workflow wf doc)
   (reduce
-    (fn (acc wf)
-      (let ((r (check-workflow wf)))
-        (list (+ (car acc) (car r)) (+ (car (cdr acc)) (car (cdr r))))))
-    (list 0 0)
-    workflows))
+    (fn (acc entry)
+      (let ((r (nor:check-job wf (car entry) (alist-get (car (cdr entry)) "steps" (list)))))
+        (list (append (car acc) (car r)) (+ (car (cdr acc)) (car (cdr r))))))
+    (list (list) 0)
+    (alist-get doc "jobs" (list))))
 
-(define failures (car totals))
-(define consumers (car (cdr totals)))
+;; (findings consumers) summed over (path parsed-doc) pairs.
+(define (nor:check-all pairs)
+  (reduce
+    (fn (acc p)
+      (let ((r (nor:check-workflow (car p) (car (cdr p)))))
+        (list (append (car acc) (car r)) (+ (car (cdr acc)) (car (cdr r))))))
+    (list (list) 0)
+    pairs))
 
-(print-line
-  (string-append
-    "workflows examined: " (string-format "{}" (length workflows))
-    " · steps needing Nix: " (string-format "{}" consumers)
-    " · failures: " (string-format "{}" failures)))
+(define (nor:workflows)
+  (map (fn (wf) (list wf (yaml-parse (read-file wf))))
+    (append (glob ".github/workflows/*.yml") (glob ".github/workflows/*.yaml"))))
 
-(when (or (= (length workflows) 0) (= consumers 0))
-  (print-line
-    "FATAL: nothing to check -- no workflow, or no step that needs Nix; the scan proved nothing")
-  (exit 3))
+(define (nor:main)
+  (let* ((pairs (nor:workflows))
+         (r (nor:check-all pairs))
+         (found (car r))
+         (consumers (car (cdr r))))
+    (for-each (fn (f) (print-line (string-append "FAIL " f))) found)
+    (print-line
+      (string-append
+        "workflows examined: " (string-format "{}" (length pairs))
+        " · steps needing Nix: " (string-format "{}" consumers)
+        " · failures: " (string-format "{}" (length found))))
+    (when (or (= (length pairs) 0) (= consumers 0))
+      (print-line
+        "FATAL: nothing to check -- no workflow, or no step that needs Nix; the scan proved nothing")
+      (exit 3))
+    (exit (if (> (length found) 0) 1 0))))
 
-(exit (if (> failures 0) 1 0))
+(cond
+  ((equal? (env-get "TLISP_TEST" "") "1") (print-line "TLISP_TEST=1: nix-on-runner loaded; main skipped"))
+  (else (nor:main)))

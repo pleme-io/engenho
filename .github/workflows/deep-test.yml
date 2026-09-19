@@ -88,7 +88,8 @@ jobs:
   # Which tests run is decided by .config/nextest.toml, the same file test.yml
   # and substrate's release gate read: its default-filter skips engenho-diff's
   # four live-oracle binaries, which are still compiled below. Every job in
-  # this file fetches nextest from substrate's pin, as test.yml does.
+  # this file gets nextest from substrate's pin through nix-setup's
+  # `nextest: "true"`, as test.yml does.
   cross-os:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -109,8 +110,7 @@ jobs:
       - uses: pleme-io/actions/nix-setup@main
         with:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
-      - name: install substrate's pinned cargo-nextest
-        run: nix profile install github:pleme-io/substrate#cargo-nextest
+          nextest: "true"
       - name: compile engenho-diff (live-oracle crate — compiled, not run)
         run: cargo test -p engenho-diff --all-targets --all-features --locked --no-run
       - name: cargo nextest run --workspace --all-targets --all-features
@@ -162,8 +162,7 @@ jobs:
       - uses: pleme-io/actions/nix-setup@main
         with:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
-      - name: install substrate's pinned cargo-nextest
-        run: nix profile install github:pleme-io/substrate#cargo-nextest
+          nextest: "true"
       - name: proptest stress
         run: >-
           cargo nextest run --workspace --all-targets --all-features --locked
@@ -191,8 +190,7 @@ jobs:
       - uses: pleme-io/actions/nix-setup@main
         with:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
-      - name: install substrate's pinned cargo-nextest
-        run: nix profile install github:pleme-io/substrate#cargo-nextest
+          nextest: "true"
       # `cargo llvm-cov nextest`, not plain `cargo llvm-cov`: the plain form
       # runs cargo test, which cannot read .config/nextest.toml and would need
       # its own exclusion flag, a second selection contract. fail-fast comes

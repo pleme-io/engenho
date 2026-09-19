@@ -133,8 +133,8 @@ jobs:
 
       # ── Nix on the runner: the test runner AND three tests need it ──────
       # Two consumers, so this step must stay BEFORE the nextest leg:
-      #   1. nextest itself, fetched from substrate's pin below, the same
-      #      `github:pleme-io/substrate#cargo-nextest` that substrate's
+      #   1. nextest itself: `nextest: "true"` realises
+      #      `github:pleme-io/substrate#cargo-nextest`, the build substrate's
       #      rust-auto-release test gate runs. Both gates therefore run one
       #      nextest build over one selection file, .config/nextest.toml.
       #   2. engenho-kubelet's native_runs_a_real_closure (2 tests) and
@@ -146,14 +146,16 @@ jobs:
       # third inline one. The token is only rate-limit headroom here: every
       # flake fetched is public (substrate, its pleme-io inputs skill-lint and
       # tatara-lisp, nixpkgs). The `||` fallback is the release gate's own.
-      # `nix profile install` lands the binary in ~/.nix-profile/bin, which
-      # the installer has already put on PATH, so the leg below is the same
-      # `cargo nextest run` a developer types locally.
+      # nix-setup builds nextest to an out-link under RUNNER_TEMP and puts its
+      # bin on PATH, so the leg below is the same `cargo nextest run` a
+      # developer types locally. It used to be `nix profile install`, here and
+      # three times in deep-test.yml; that wrote the runner's Nix profile.
+      # ci/nix-on-runner.tlisp now fails a step that writes a Nix profile, and
+      # a nextest step with no `nextest: "true"` nix-setup before it.
       - uses: pleme-io/actions/nix-setup@main
         with:
           github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
-      - name: install substrate's pinned cargo-nextest
-        run: nix profile install github:pleme-io/substrate#cargo-nextest
+          nextest: "true"
 
       # ── The executing gate ──────────────────────────────────────────────
       # WHICH tests run is decided by .config/nextest.toml, not by a flag on
@@ -234,8 +236,12 @@ jobs:
   # with nix, so every job that runs tests or calls nix must install Nix
   # first, and only through pleme-io/actions/nix-setup. ci/nix-on-runner.tlisp
   # reads every workflow in .github/workflows and fails on a direct
-  # nix-installer-action or on a Nix-needing step with no nix-setup before it.
-  # It is a separate job so a red here names the contract, not a test.
+  # nix-installer-action, on a step that writes a Nix profile, on a nextest
+  # step with no `nextest: "true"` nix-setup before it, and on any other
+  # Nix-needing step with no nix-setup before it (integration item I24 added
+  # the middle two). It is a separate job so a red here names the contract,
+  # not a test. Its suite, ci/nix-on-runner.test.tlisp, runs in
+  # ci-contract-tests below.
   # ───────────────────────────────────────────────────────────────────────────
   nix-on-runner:
     name: nix on the runner (workflow contract)
@@ -245,6 +251,7 @@ jobs:
       - uses: pleme-io/actions/tatara-script@main
         with:
           script-file: ci/nix-on-runner.tlisp
+          version: v0.3.58
 
   # ───────────────────────────────────────────────────────────────────────────
   # Publish only after the gate, as a checked contract (improvement plan
@@ -283,8 +290,8 @@ jobs:
   # .github/workflows/mutation.yml.
   # Second step: pleme-io/actions/tlisp-test runs each ci/<name>.test.tlisp
   # against ci/<name>.tlisp. min-files is the number of suites that exist
-  # (release-contract, mutation-gate, cargo-profiles, doc-sources,
-  # no-c-tls), so losing one is red, not a smaller green; mutation-gate's
+  # (release-contract, mutation-gate, cargo-profiles, doc-sources, no-c-tls,
+  # nix-on-runner), so losing one is red, not a smaller green; mutation-gate's
   # suite fails if the floor and the count disagree. The first step pins the
   # tatara-script tlisp-test reuses from PATH.
   # cargo-profiles has no job of its own: its suite's first test runs the
@@ -326,4 +333,4 @@ jobs:
           MUTATION_GATE_MODE: lint
       - uses: pleme-io/actions/tlisp-test@main
         with:
-          min-files: 5
+          min-files: 6
