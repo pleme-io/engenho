@@ -8,7 +8,7 @@ use engenho_apiserver::{
     ApiServer, ChainAuthenticator, ClientMaterial, RbacAuthorizer, RouterHandlerSink, RouterState,
     SanEntry, ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
     handlers_from_catalog_with_admission, issue_admin_client_material, issue_server_material,
-    load_or_generate_ca,
+    load_or_generate_ca, metrics::log_would_reject,
 };
 use engenho_config::{
     ConfigError, EngenhoConfig, KubeconfigVisibility, KubeletBackendKind as CfgBackendKind,
@@ -37,6 +37,7 @@ use engenho_store::{
     command::{Reason, ResourceCommand},
     default_config,
 };
+use engenho_substrate::WouldRejectLedger;
 use engenho_types::generated_v1_34::core_v1::Namespace;
 use engenho_types::generated_v1_34::rbac_v1::{
     ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject,
@@ -61,6 +62,12 @@ pub struct Runtime {
     children: Children,
     /// Every panic in the process, counted by the hook `start` installs.
     panics: PanicCounter,
+    /// The daemon's one rollout-gate ledger (T0.11): what every gate in
+    /// `Rollout::Shadow` allowed that `Enforce` would have refused. The
+    /// apiserver's `/metrics` renders THIS ledger as
+    /// `engenho_would_reject_total{gate,reason}`, so a gate that counts
+    /// anywhere else is a gate no scrape shows. See [`Runtime::would_reject`].
+    would_reject: Arc<WouldRejectLedger>,
     /// Kept alive for the runtime's lifetime so the kubelet's backend
     /// outlives every driver tick; tests pass their own clone to
     /// [`Runtime::start_with_backend`] and inspect it.
@@ -108,6 +115,15 @@ impl Runtime {
         //    chains to whatever was installed before it, and installs once
         //    however many runtimes start.
         let panics = PanicCounter::install();
+
+        // 0b. The daemon's ONE would-reject ledger (T0.11). Built before
+        //     anything that can own a gate — the store's image tripwire
+        //     (T3.4) runs inside step 2 — so every gate-owning component is
+        //     handed this Arc and none builds its own: a second ledger is a
+        //     set of gates `/metrics` never shows. Today only the apiserver
+        //     takes it (step 5); the store's tripwire and the scheduler's
+        //     filters do not judge through a `Gate` yet.
+        let would_reject = Arc::new(WouldRejectLedger::new(log_would_reject));
 
         // 1. Validate the whole config (every section + cross-section).
         config.validate()?;
@@ -291,12 +307,17 @@ impl Runtime {
         let authorizer: Arc<dyn engenho_apiserver::Authorizer> =
             Arc::new(RbacAuthorizer::new(StoreRbacEnv::new(store.clone())));
 
+        // The daemon's would-reject ledger goes in with the rest, before the
+        // clones below (the CRD sink's, the log handler's, the server's): a
+        // RouterState clone copies the ledger `Arc` it holds at that moment,
+        // so a clone taken before this would keep the router's private one.
         let router_state = RouterState::new(handlers_from_catalog_with_admission(
             store.clone(),
             admission.clone(),
         ))
         .with_authenticator(authenticator)
-        .with_authorizer(authorizer);
+        .with_authorizer(authorizer)
+        .with_would_reject_ledger(Arc::clone(&would_reject));
         // The minting half, from the SAME key the authenticator verifies with.
         // Without it RBAC is decorative: the authorizer, the Roles and the
         // bindings all work, but nothing can present a non-admin identity to
@@ -385,6 +406,7 @@ impl Runtime {
             apiserver,
             children,
             panics,
+            would_reject,
             backend,
         })
     }
@@ -395,6 +417,15 @@ impl Runtime {
     #[must_use]
     pub fn panics(&self) -> PanicCounter {
         self.panics
+    }
+
+    /// The daemon's rollout-gate ledger (T0.11) — the one `/metrics`
+    /// renders as `engenho_would_reject_total{gate,reason}`, built once per
+    /// runtime. A component that judges a gate is handed this `Arc`; a
+    /// refusal a Shadow gate records here is on the next scrape.
+    #[must_use]
+    pub fn would_reject(&self) -> &Arc<WouldRejectLedger> {
+        &self.would_reject
     }
 
     /// Every child the runtime spawned, with its state and heartbeat.
