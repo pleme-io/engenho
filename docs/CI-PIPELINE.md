@@ -123,7 +123,9 @@ push + helm chart push would fail with `unauthorized`.
     opt-level 3 with debug assertions and overflow checks on; every
     step that raises `PROPTEST_CASES` selects it and never `--release`.
     deep-test.yml's `property-stress` job is that step, over the whole
-    workspace.
+    workspace. Values are compared by TOML type, as cargo reads them:
+    `opt-level = "3"`, `opt-level = 3.0` and `debug-assertions = "true"`
+    fail the check, as cargo refuses each of them.
   * `ci/release-contract.tlisp` (test.yml, job `release-contract`)
     checks that release.yml moves `:latest` only in `promote-latest`,
     after `release-assets`; `ci/release-contract.test.tlisp` (job

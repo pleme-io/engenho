@@ -26,6 +26,9 @@
 ;;            opt-level 3, debug-assertions true, overflow-checks true, and
 ;;            strip false (the lane sets RUST_BACKTRACE=1; a stripped binary
 ;;            prints a backtrace with no function names).
+;;            Both rules compare by TOML type as well as value, as cargo
+;;            reads them: the string "3" or the float 3.0 is not opt-level 3,
+;;            and the string "true" is not true. cargo refuses all three.
 ;;   lane     every workflow step that runs cargo tests with PROPTEST_CASES
 ;;            raised above proptest's default (256), at workflow, job or step
 ;;            level, selects the stress profile: `--cargo-profile stress`
@@ -99,8 +102,50 @@
 
 (define (prof:n x) (string-format "{}" x))
 
-;; `3` and `"3"` are the same opt-level to cargo; compare by rendering.
-(define (prof:same? a b) (equal? (prof:n a) (prof:n b)))
+;; ── Comparing values by TOML type ────────────────────────────────────────
+;; cargo reads each profile key by its TOML type, so this check does too.
+;; string-format prints 3, "3" and 3.0 alike, and this check once compared
+;; that text: it passed opt-level = "3", opt-level = 3.0 and
+;; debug-assertions = "true", three manifests cargo refuses (exit 101, before
+;; any build):
+;;   must be `0`, `1`, `2`, `3`, `s` or `z`, but found the string: "3"
+;;   invalid type: floating point `3.0`, expected an optimization level
+;;   invalid type: string "true", expected a boolean
+
+;; The TOML type of a parsed value. toml-parse yields an integer for 3 and a
+;; non-integer number for 3.0.
+(define (prof:kind v)
+  (cond
+    ((string? v) "string")
+    ((integer? v) "integer")
+    ((number? v) "float")
+    ((boolean? v) "boolean")
+    ((list? v) "table")
+    (else "value")))
+
+;; The same TOML type and the same value.
+(define (prof:same? a b) (and (equal? (prof:kind a) (prof:kind b)) (equal? a b)))
+
+;; A value as Cargo.toml spells it, so "3", 3 and 3.0 read differently: a
+;; string in quotes, a whole float with its `.0`.
+(define (prof:spelled v)
+  (cond
+    ((string? v) (string-append "\"" v "\""))
+    ((and (equal? (prof:kind v) "float") (re-match? "^-?[0-9]+$" (prof:n v))) (string-append (prof:n v) ".0"))
+    (else (prof:n v))))
+
+(define (prof:a kind) (string-append (if (re-match? "^[aeiou]" kind) "an " "a ") kind))
+
+;; "`key` is `got`, not `want`", naming both types when they differ.
+(define (prof:differs key got want)
+  (string-append "`" key "` is `" (prof:spelled got) "`"
+    (if (equal? (prof:kind got) (prof:kind want))
+      (string-append ", not `" (prof:spelled want) "`")
+      (string-append ", " (prof:a (prof:kind got)) ", not the " (prof:kind want) " `" (prof:spelled want) "`"))))
+
+;; What cargo parses as an opt-level (its TomlOptLevel): an integer, or the
+;; string "s" or "z". Anything else fails the manifest.
+(define (prof:cargo-opt-level? v) (or (integer? v) (equal? v "s") (equal? v "z")))
 
 ;; A number from an env value: 4096, "4096". Anything else is 0.
 (define (prof:int v)
@@ -120,8 +165,12 @@
       ((not (prof:has-key? release "opt-level"))
         (list (string-append at "declares no opt-level; declare " (prof:n prof:DAEMON-OPT-LEVEL) ", the level the Nix-built daemon is compiled at")))
       ((not (prof:same? (prof:get release "opt-level") prof:DAEMON-OPT-LEVEL))
-        (list (string-append at "opt-level is `" (prof:n (prof:get release "opt-level")) "`; the Nix-built daemon is compiled at "
-                (prof:n prof:DAEMON-OPT-LEVEL) " (buildRustCrate), so the cargo-built release binaries would be a different build of the same code")))
+        (let ((got (prof:get release "opt-level")))
+          (list (string-append at (prof:differs "opt-level" got prof:DAEMON-OPT-LEVEL)
+                  (if (prof:cargo-opt-level? got)
+                    (string-append "; the Nix-built daemon is compiled at " (prof:n prof:DAEMON-OPT-LEVEL)
+                      " (buildRustCrate), so the cargo-built release binaries would be a different build of the same code")
+                    "; cargo takes an integer or \"s\" or \"z\" there, so it refuses the manifest and no cargo command runs")))))
       (else (list)))))
 
 (define (prof:stress-violations manifest)
@@ -140,9 +189,9 @@
               (let ((key (car pair)) (want (car (cdr pair))))
                 (cond
                   ((not (prof:has-key? stress key))
-                    (string-append at "declares no `" key "`; declare `" key " = " (prof:n want) "` here rather than inherit it"))
+                    (string-append at "declares no `" key "`; declare `" key " = " (prof:spelled want) "` here rather than inherit it"))
                   ((not (prof:same? (prof:get stress key) want))
-                    (string-append at "`" key "` is `" (prof:n (prof:get stress key)) "`, not `" (prof:n want) "`"))
+                    (string-append at (prof:differs key (prof:get stress key) want)))
                   (else ""))))
             prof:STRESS-DECLARES))))))
 

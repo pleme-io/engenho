@@ -119,13 +119,25 @@ jobs:
 
 (deftest "release at opt-level z is refused"
   (let ((vs (t:manifest-mutant "codegen-units = 1\nlto = true\nopt-level = 3" "codegen-units = 1\nlto = true\nopt-level = \"z\"")))
-    (assert (t:has? vs "[profile.release]: opt-level is `z`") "names the value")))
+    (assert (t:has? vs "[profile.release]: `opt-level` is `\"z\"`, a string, not the integer `3`") "names the value and its type")
+    (assert (t:has? vs "a different build of the same code") "\"z\" is an opt-level cargo reads, so the reason is the build")
+    (assert (not (t:has? vs "refuses the manifest")) "and not a manifest cargo refuses")))
 
 (deftest "release at any level but 3 is refused, not just z"
   (let ((vs (t:manifest-mutant "codegen-units = 1\nlto = true\nopt-level = 3" "codegen-units = 1\nlto = true\nopt-level = 2")))
-    (assert (t:has? vs "[profile.release]: opt-level is `2`") "2 is refused too"))
+    (assert (t:has? vs "[profile.release]: `opt-level` is `2`, not `3`") "2 is refused too")))
+
+;; cargo reads opt-level by TOML type. Real cargo on each of these exits 101
+;; before any build:
+;;   opt-level = "3"   must be `0`, `1`, `2`, `3`, `s` or `z`, but found the string: "3"
+;;   opt-level = 3.0   invalid type: floating point `3.0`, expected an optimization level
+(deftest "release at the string \"3\" or the float 3.0 is refused: cargo reads opt-level by type"
   (let ((vs (t:manifest-mutant "codegen-units = 1\nlto = true\nopt-level = 3" "codegen-units = 1\nlto = true\nopt-level = \"3\"")))
-    (assert (not (t:has? vs "[profile.release]")) "\"3\" is the same level to cargo")))
+    (assert (t:has? vs "[profile.release]: `opt-level` is `\"3\"`, a string, not the integer `3`") "the quoted 3 is a string, not level 3")
+    (assert (t:has? vs "cargo takes an integer or \"s\" or \"z\" there, so it refuses the manifest") "and a manifest cargo will not read"))
+  (let ((vs (t:manifest-mutant "codegen-units = 1\nlto = true\nopt-level = 3" "codegen-units = 1\nlto = true\nopt-level = 3.0")))
+    (assert (t:has? vs "[profile.release]: `opt-level` is `3.0`, a float, not the integer `3`") "3.0 is a float, not level 3")
+    (assert (t:has? vs "so it refuses the manifest") "which cargo refuses too")))
 
 (deftest "release that leaves opt-level to cargo's default is refused"
   (let ((vs (t:manifest-mutant "codegen-units = 1\nlto = true\nopt-level = 3\n" "codegen-units = 1\nlto = true\n")))
@@ -150,6 +162,16 @@ jobs:
     (assert (t:has? vs "[profile.stress]: `strip` is `true`, not `false`") "a stripped backtrace names nothing"))
   (let ((vs (t:manifest-mutant "inherits = \"release\"\nopt-level = 3" "inherits = \"release\"\nopt-level = 1")))
     (assert (t:has? vs "[profile.stress]: `opt-level` is `1`, not `3`") "unoptimised stress would not finish")))
+
+;; The same type rule for the stress keys. cargo on debug-assertions = "true":
+;; `invalid type: string "true", expected a boolean` (exit 101).
+(deftest "a stress profile that spells a value in the wrong TOML type is refused"
+  (let ((vs (t:manifest-mutant "inherits = \"release\"\nopt-level = 3" "inherits = \"release\"\nopt-level = \"3\"")))
+    (assert (t:has? vs "[profile.stress]: `opt-level` is `\"3\"`, a string, not the integer `3`") "a quoted opt-level"))
+  (let ((vs (t:manifest-mutant "debug-assertions = true" "debug-assertions = \"true\"")))
+    (assert (t:has? vs "[profile.stress]: `debug-assertions` is `\"true\"`, a string, not the boolean `true`") "a quoted boolean"))
+  (let ((vs (t:manifest-mutant "overflow-checks = true" "overflow-checks = 1")))
+    (assert (t:has? vs "[profile.stress]: `overflow-checks` is `1`, an integer, not the boolean `true`") "1 is not true")))
 
 ;; ── lane ─────────────────────────────────────────────────────────────────
 
