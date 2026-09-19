@@ -13,7 +13,9 @@
 //!   * Backends:
 //!       * [`backend::FakeBackend`] — in-memory, deterministic, for tests
 //!       * [`backend::PodmanBackend`] — shell-out to `podman` for local Mac/Linux
-//!       * (future R10.5) CriBackend, RunwasiBackend
+//!       * [`cri_backend::CriBackend`] — CRI over gRPC; refused at
+//!         construction while [`cri_backend::UNSUPPORTED`] is non-empty
+//!       * (future) `RunwasiBackend`
 //!
 //! ## Reconcile loop
 //!
@@ -75,7 +77,9 @@ pub use backend::{
     HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage,
     PullPolicy, Readoption, TcpProbeTarget, TerminationGrace, TokioNetProber,
 };
-pub use config_bridge::{make_container_runtime, make_container_runtime_with_apiserver};
+pub use config_bridge::{
+    BackendRefused, make_container_runtime, make_container_runtime_with_apiserver,
+};
 pub use csi_materializer::{
     CsiRegistrarController, CsiVolumeMaterializer, DriverCsiProvisioner, DriverTable,
     RegisteredDriver,

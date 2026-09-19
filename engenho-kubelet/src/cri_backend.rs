@@ -52,6 +52,95 @@ use crate::error::KubeletError;
 /// with an empty body rather than an error.
 pub const POD_LOG_ROOT: &str = "/var/log/pods";
 
+/// A capability every Pod depends on that this backend does not provide yet.
+///
+/// ★ EACH ONE IS A SILENT DROP. The container starts and runs; what the Pod
+/// declared is simply not there, and nothing on the Pod says so. That is why
+/// [`crate::config_bridge`] refuses to construct this backend while any entry
+/// of [`UNSUPPORTED`] remains, rather than let a node run pods on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CriGap {
+    /// `ContainerSpec::mounts` is never lowered onto `ContainerConfig.mounts`:
+    /// every configMap, secret and emptyDir, and the service-account token,
+    /// is absent inside the container.
+    Mounts,
+    /// No pod IP is ever read back — it lives on the sandbox
+    /// (`PodSandboxStatus`), which nothing here reads — so `status.podIP`
+    /// stays empty and no Endpoints object ever lists the Pod.
+    PodIp,
+    /// `ContainerSpec::confinement` is never lowered onto the container's
+    /// `LinuxContainerSecurityContext`: `runAsUser`, dropped capabilities and
+    /// a read-only root filesystem are replaced by the runtime's defaults.
+    Confinement,
+}
+
+impl std::fmt::Display for CriGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Mounts => "drops every volume mount",
+            Self::PodIp => "never reports a pod IP",
+            Self::Confinement => "drops the pod's securityContext",
+        })
+    }
+}
+
+/// The gaps this backend has at this commit.
+///
+/// Closing one is: implement it, delete its entry here, and once the list is
+/// empty the construction refusal lifts with no other change. The
+/// `*_gap_is_declared_iff_*` tests hold this list to the code in both
+/// directions — an entry cannot outlive its gap, nor go before the gap
+/// closes. That is a CI-caught gate, not a type.
+///
+/// Not claimed exhaustive: these are the drops that change what a Pod
+/// declared. `network_aliases` and `host_add` are podman-network concepts
+/// CRI has no field for.
+pub const UNSUPPORTED: &[CriGap] = &[CriGap::Mounts, CriGap::PodIp, CriGap::Confinement];
+
+/// A NON-EMPTY set of [`CriGap`]s — what a construction refusal carries.
+///
+/// The field is private and [`Self::outstanding`] is the only public
+/// constructor, so a refusal that names no reason cannot be built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CriGaps(&'static [CriGap]);
+
+impl CriGaps {
+    /// The gaps in [`UNSUPPORTED`], or `None` once every one is closed.
+    #[must_use]
+    pub fn outstanding() -> Option<Self> {
+        Self::nonempty(UNSUPPORTED)
+    }
+
+    fn nonempty(gaps: &'static [CriGap]) -> Option<Self> {
+        (!gaps.is_empty()).then_some(Self(gaps))
+    }
+
+    /// Whether `gap` is among these.
+    #[must_use]
+    pub fn contains(self, gap: CriGap) -> bool {
+        self.0.contains(&gap)
+    }
+
+    /// Every gap, in declaration order.
+    #[must_use]
+    pub fn as_slice(self) -> &'static [CriGap] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CriGaps {
+    /// One clause per gap, `"; "`-separated.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, gap) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str("; ")?;
+            }
+            std::fmt::Display::fmt(gap, f)?;
+        }
+        Ok(())
+    }
+}
+
 /// The key a sandbox is tracked under. `uid` is included because it is what
 /// distinguishes a Pod from its own replacement after a delete/recreate — two
 /// Pods with the same namespace/name are a normal occurrence, and keying
@@ -92,10 +181,9 @@ pub struct CriBackend {
     endpoint: Endpoint,
     /// Dialed on first use, not in the constructor.
     ///
-    /// ★ [`crate::config_bridge::make_container_runtime`] is SYNCHRONOUS and
-    /// returns `Arc<dyn ContainerRuntime>`; a gRPC dial is async. Connecting
-    /// lazily keeps that signature (so every existing caller is untouched) and
-    /// mirrors `PodmanApiBackend::discover`, which likewise decides the
+    /// ★ [`crate::config_bridge::make_container_runtime`] is SYNCHRONOUS; a
+    /// gRPC dial is async. Connecting lazily keeps construction free of I/O
+    /// and mirrors `PodmanApiBackend::discover`, which likewise decides the
     /// endpoint synchronously by stat-ing it and does its I/O later.
     channel: OnceCell<Channel>,
     sandboxes: Mutex<BTreeMap<PodKey, String>>,
@@ -119,8 +207,12 @@ impl CriBackend {
     /// happens on first use and its failure is a typed error there, because a
     /// runtime that is installed but not yet up at kubelet start is a normal
     /// boot ordering, not a reason to refuse to run.
+    ///
+    /// `pub(crate)` because it is this type's only constructor: outside this
+    /// crate the one way to a CRI runtime is [`crate::config_bridge`], which
+    /// refuses it while [`UNSUPPORTED`] is non-empty (T5.9).
     #[must_use]
-    pub fn discover(endpoint: Option<&str>) -> Option<Self> {
+    pub(crate) fn discover(endpoint: Option<&str>) -> Option<Self> {
         let candidates: Vec<String> = match endpoint {
             Some(e) => vec![e.to_string()],
             None => crate::cri::DEFAULT_ENDPOINTS
@@ -340,6 +432,76 @@ impl CriBackend {
             }
         }
     }
+
+    /// The `ContainerConfig` that `CreateContainer` is sent for `spec`.
+    ///
+    /// Pure — no RPC — so what this backend asks the runtime for is readable
+    /// in a test. The [`CriGap`] truth tests read it.
+    fn container_config(&self, spec: &ContainerSpec, image_ref: String) -> v1::ContainerConfig {
+        let mut envs: Vec<v1::KeyValue> = spec
+            .env
+            .iter()
+            .map(|(k, v)| v1::KeyValue {
+                key: k.clone(),
+                // CRI declares `bytes value = 2` — an env value is not required
+                // to be UTF-8 on the wire even though ours always is.
+                value: v.clone().into_bytes(),
+            })
+            .collect();
+        if let Some((host, port)) = &self.kubernetes_service {
+            let mut merged = spec.env.clone();
+            crate::backend::inject_kubernetes_service_env(&mut merged, host, *port);
+            envs = merged
+                .into_iter()
+                .map(|(key, value)| v1::KeyValue {
+                    key,
+                    value: value.into_bytes(),
+                })
+                .collect();
+        }
+
+        let cname = spec.pod.container_name.clone();
+        let mut log_path = cname.clone();
+        log_path.push_str("/0.log");
+
+        v1::ContainerConfig {
+            metadata: Some(v1::ContainerMetadata {
+                name: cname,
+                attempt: 0,
+            }),
+            image: Some(v1::ImageSpec {
+                image: image_ref,
+                user_specified_image: spec.image.clone(),
+                ..Default::default()
+            }),
+            command: spec.command.clone(),
+            envs,
+            // Relative to the sandbox's log_directory — the contract that makes
+            // `logs()` able to find anything at all.
+            log_path,
+            linux: Some(v1::LinuxContainerConfig {
+                resources: linux_resources(&spec.resources),
+                // `spec.confinement` is not lowered: CriGap::Confinement.
+                security_context: None,
+            }),
+            // `mounts` is left empty whatever `spec.mounts` holds:
+            // CriGap::Mounts.
+            ..Default::default()
+        }
+    }
+}
+
+/// Lower CRI's `ContainerStatus` onto the trait's.
+///
+/// `pod_ip` is always `None`: a pod IP lives on the SANDBOX
+/// (`PodSandboxStatus.network.ip`), which nothing here reads — see
+/// [`CriGap::PodIp`].
+fn lower_status(st: v1::ContainerStatus) -> ContainerStatus {
+    ContainerStatus {
+        container_id: st.id,
+        state: RunState::from_cri(st.state, st.exit_code),
+        pod_ip: None,
+    }
 }
 
 /// Lower typed resources onto CRI's `LinuxContainerResources`.
@@ -406,54 +568,7 @@ impl ContainerRuntime for CriBackend {
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
         let (key, sandbox_id) = self.sandbox_for(spec).await?;
         let image_ref = self.ensure_image(spec).await?;
-
-        let mut envs: Vec<v1::KeyValue> = spec
-            .env
-            .iter()
-            .map(|(k, v)| v1::KeyValue {
-                key: k.clone(),
-                // CRI declares `bytes value = 2` — an env value is not required
-                // to be UTF-8 on the wire even though ours always is.
-                value: v.clone().into_bytes(),
-            })
-            .collect();
-        if let Some((host, port)) = &self.kubernetes_service {
-            let mut merged = spec.env.clone();
-            crate::backend::inject_kubernetes_service_env(&mut merged, host, *port);
-            envs = merged
-                .into_iter()
-                .map(|(key, value)| v1::KeyValue {
-                    key,
-                    value: value.into_bytes(),
-                })
-                .collect();
-        }
-
-        let cname = spec.pod.container_name.clone();
-        let mut log_path = cname.clone();
-        log_path.push_str("/0.log");
-
-        let cfg = v1::ContainerConfig {
-            metadata: Some(v1::ContainerMetadata {
-                name: cname,
-                attempt: 0,
-            }),
-            image: Some(v1::ImageSpec {
-                image: image_ref,
-                user_specified_image: spec.image.clone(),
-                ..Default::default()
-            }),
-            command: spec.command.clone(),
-            envs,
-            // Relative to the sandbox's log_directory — the contract that makes
-            // `logs()` able to find anything at all.
-            log_path,
-            linux: Some(v1::LinuxContainerConfig {
-                resources: linux_resources(&spec.resources),
-                security_context: None,
-            }),
-            ..Default::default()
-        };
+        let cfg = self.container_config(spec, image_ref);
 
         let mut rt = self.runtime().await?;
         let created = rt
@@ -499,11 +614,7 @@ impl ContainerRuntime for CriBackend {
         let Some(st) = resp.status else {
             return Ok(None);
         };
-        Ok(Some(ContainerStatus {
-            container_id: st.id,
-            state: RunState::from_cri(st.state, st.exit_code),
-            pod_ip: None,
-        }))
+        Ok(Some(lower_status(st)))
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
@@ -607,17 +718,111 @@ mod tests {
         assert!(linux_resources(&crate::backend::Resources::default()).is_none());
     }
 
-    #[tokio::test]
-    async fn a_spec_without_pod_identity_is_refused_not_guessed() {
-        // The alternative — inventing an identity — keys a sandbox on "" and
-        // silently puts unrelated containers into one pod.
-        let b = CriBackend {
+    /// A backend that has never dialled, for the pure paths.
+    fn unconnected() -> CriBackend {
+        CriBackend {
             endpoint: Endpoint("/nonexistent.sock".into()),
             channel: OnceCell::new(),
             sandboxes: Mutex::new(BTreeMap::new()),
             container_pod: Mutex::new(BTreeMap::new()),
             kubernetes_service: None,
-        };
+        }
+    }
+
+    /// A Pod container that declares what every [`CriGap`] is about: a volume
+    /// mount and a non-default securityContext.
+    fn declaring_spec() -> ContainerSpec {
+        use crate::backend::Confinement;
+        use crate::pod_volume::{MountSource, ResolvedMount};
+        ContainerSpec {
+            name: "ns_p_c".into(),
+            image: "i".into(),
+            pod: ident(),
+            mounts: vec![ResolvedMount {
+                source: MountSource::EmptyDirHostDir("/var/lib/engenho/ed/data".into()),
+                mount_path: "/data".into(),
+                read_only: false,
+                sub_path: None,
+            }],
+            confinement: Confinement {
+                read_only_root_fs: true,
+                cap_drop: vec!["ALL".into()],
+                run_as_user: Some(1000),
+                ..Confinement::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    // ── T5.9: the declared gaps are the real ones ─────────────────────────
+    // Each test below compares what this backend actually sends or reports
+    // with whether UNSUPPORTED lists the gap. It fails if a gap is closed
+    // while still listed (the refusal would outlive its reason) and if an
+    // entry is deleted while the gap is open (the refusal would lift while
+    // pods still lose part of their spec).
+
+    #[test]
+    fn the_mounts_gap_is_declared_iff_mounts_are_dropped() {
+        let sent = unconnected().container_config(&declaring_spec(), "sha256:i".into());
+        assert_eq!(
+            sent.mounts.is_empty(),
+            UNSUPPORTED.contains(&CriGap::Mounts),
+            "the pod declares one mount and CreateContainer carries {}; \
+             UNSUPPORTED must list CriGap::Mounts exactly when none is carried",
+            sent.mounts.len()
+        );
+    }
+
+    #[test]
+    fn the_confinement_gap_is_declared_iff_the_security_context_is_dropped() {
+        let sent = unconnected().container_config(&declaring_spec(), "sha256:i".into());
+        let lowered = sent
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .is_some();
+        assert_eq!(
+            !lowered,
+            UNSUPPORTED.contains(&CriGap::Confinement),
+            "the pod declares runAsUser/capDrop/readOnlyRootFilesystem; \
+             UNSUPPORTED must list CriGap::Confinement exactly when none of it is sent"
+        );
+    }
+
+    #[test]
+    fn the_pod_ip_gap_is_declared_iff_no_pod_ip_is_reported() {
+        // Pins one direction honestly: deleting the PodIp entry while status
+        // still reports no IP fails here. Closing the gap will change how a
+        // status is built (the IP comes from the sandbox), and this test with
+        // it.
+        let st = lower_status(v1::ContainerStatus {
+            id: "c1".into(),
+            state: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            st.pod_ip.is_none(),
+            UNSUPPORTED.contains(&CriGap::PodIp),
+            "a running container reported pod_ip {:?}",
+            st.pod_ip
+        );
+    }
+
+    #[test]
+    fn an_empty_gap_set_is_no_refusal() {
+        // Once every gap closes there is nothing to refuse with, so the
+        // refusal lifts rather than carrying an empty reason.
+        assert_eq!(CriGaps::nonempty(&[]), None);
+        let one = CriGaps::nonempty(&[CriGap::PodIp]).expect("one gap is a refusal");
+        assert!(one.contains(CriGap::PodIp));
+        assert!(!one.contains(CriGap::Mounts));
+    }
+
+    #[tokio::test]
+    async fn a_spec_without_pod_identity_is_refused_not_guessed() {
+        // The alternative — inventing an identity — keys a sandbox on "" and
+        // silently puts unrelated containers into one pod.
+        let b = unconnected();
         let spec = ContainerSpec {
             name: "ns_p_c".into(),
             image: "i".into(),
