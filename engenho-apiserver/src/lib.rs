@@ -51,6 +51,7 @@ pub mod schema_validation;
 pub mod server;
 pub mod table;
 pub mod validation;
+pub mod watch_start;
 pub mod webhook_admission;
 
 pub use authn::{
@@ -71,8 +72,8 @@ pub use discovery::{
 };
 pub use error::{ApiError, ErrorKind, forbidden_message, status_object};
 pub use handler::{
-    ResourceHandler, RouterHandlerSink, StoreBackedHandler, gone_to_api_error,
-    handlers_from_catalog, handlers_from_catalog_with_admission,
+    ResourceHandler, RouterHandlerSink, StoreBackedHandler, handlers_from_catalog,
+    handlers_from_catalog_with_admission,
 };
 pub use health::VersionInfo;
 pub use openapi::ApiDoc;
@@ -91,6 +92,7 @@ pub use scale::{
     Scale, ScaleMeta, ScaleSpec, ScaleStatus, label_selector_to_string, project_scale,
 };
 pub use server::{ApiServer, ServerError};
+pub use watch_start::{WatchRefusal, WatchStart};
 pub use webhook_admission::{
     ReqwestWebhookCaller, StoreWebhookConfigSource, catalog_pluralizer, mutating_webhook_plugin,
 };

@@ -9,7 +9,7 @@ use engenho_controllers::admission::{
     AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionRequest,
 };
 use engenho_store::{
-    ContinueToken, Revision, StoreMesh, WatchGone, WatchOpts, WatchStream,
+    ContinueToken, Revision, StoreMesh, WatchOpts,
     command::{ApplyMeta, Reason, ResourceCommand, ResourceOp},
     resource::ResourceKey,
     watch_backend::WATCH_CHANNEL_CAPACITY,
@@ -21,33 +21,11 @@ use crate::error::ApiError;
 use crate::params::{DryRun, ResumePoint, Selectors, body_precondition};
 use crate::pod_logs::{LogQuery, PodLogReader};
 use crate::scale::{Scale, project_scale};
+use crate::watch_start::{WatchRefusal, WatchStart};
 
 /// Bookmark cadence handed to `watch_from` when the client opted into
 /// bookmarks (`allowWatchBookmarks=true`). Mirrors the store default.
 const WATCH_BOOKMARK_EVERY: Duration = Duration::from_secs(5);
-
-/// Map a [`WatchGone`] surfaced at WATCH REGISTRATION to an
-/// [`ApiError::Gone`] (HTTP 410 / Expired). Both variants become 410:
-/// the client re-LISTs + re-WATCHes from a fresh list revision.
-///
-/// `CompactedTooOld` is the common at-registration case (`from` below
-/// the compaction watermark). `Overflow` cannot occur at registration
-/// (the channel is empty) but is mapped for completeness — never a
-/// silent wrong answer.
-#[must_use]
-pub fn gone_to_api_error(gone: WatchGone) -> ApiError {
-    match gone {
-        WatchGone::CompactedTooOld {
-            requested,
-            compacted,
-        } => ApiError::Gone(format!(
-            "too old resource version: {requested} ({compacted})"
-        )),
-        WatchGone::Overflow { last_seen, .. } => ApiError::Gone(format!(
-            "watch buffer overflowed at registration; resume from {last_seen}"
-        )),
-    }
-}
 
 /// Typed K8s-resource CRUD trait. Each registered kind implements
 /// this; the router dispatches REST routes to the trait methods.
@@ -250,23 +228,27 @@ pub trait ResourceHandler: Send + Sync + 'static {
         continue_token: Option<ContinueToken>,
     ) -> Result<(Vec<Value>, Revision, Option<String>, Option<u64>), ApiError>;
 
-    /// Open a streaming WATCH from `from`. The returned [`WatchStream`]
-    /// is cluster-wide (the store fans every kind through one registry);
-    /// the router filters each event down to this handler's GVK +
+    /// Open a streaming WATCH from `from`. A [`WatchStart::Streaming`]
+    /// stream is cluster-wide (the store fans every kind through one
+    /// registry); the router filters each event down to this handler's GVK +
     /// requested namespace + selectors.
     ///
     /// `allow_bookmarks` toggles the bookmark cadence (`5s` vs disabled).
     ///
+    /// A resume point the store cannot serve is [`WatchStart::Refused`], not
+    /// an error: ahead of the store's current revision, or below its
+    /// compaction floor. The router ends a refused watch in-band with a 410
+    /// (see [`crate::watch_start`] for why never an HTTP status).
+    ///
     /// # Errors
     ///
-    /// [`ApiError::Gone`] when `from` is below the compaction watermark
-    /// at registration (`WatchGone::CompactedTooOld`).
+    /// An [`ApiError`] only when the handler cannot open a watch at all.
     async fn watch_stream(
         &self,
         namespace: Option<&str>,
         from: ResumePoint,
         allow_bookmarks: bool,
-    ) -> Result<WatchStream, ApiError>;
+    ) -> Result<WatchStart, ApiError>;
 
     /// CREATE a resource. `user_info` is the authenticated identity (threaded
     /// from the request's `Extension<UserInfo>`); it travels into the
@@ -1193,9 +1175,10 @@ impl ResourceHandler for StoreBackedHandler {
         _namespace: Option<&str>,
         from: ResumePoint,
         allow_bookmarks: bool,
-    ) -> Result<WatchStream, ApiError> {
-        // Resolve the resume revision. MostRecent ("0"/absent) means
-        // "from now, no replay" → read the current revision and start there.
+    ) -> Result<WatchStart, ApiError> {
+        // One read of the current revision serves both resume points.
+        // MostRecent ("0"/absent) means "from now, no replay" and starts
+        // there; an explicit `At(rev)` must not be past it.
         //
         // ★ `current_revision()`, NOT `current_catalog().revision()`. The
         // latter reads this one `u64` by deep-cloning the entire catalog —
@@ -1206,9 +1189,23 @@ impl ResourceHandler for StoreBackedHandler {
         // watches) was reconciling: writes went from ~40ms to 27-51s with the
         // daemon burning ~2 cores in memcpy. MostRecent is the COMMON case —
         // every "watch from now" takes this branch.
+        let current = self.store.current_revision().await;
+        // A resume point the store has not reached is refused, never served
+        // from `current`: that answer would leave the client's cache silently
+        // stale after a restore or a replay that renumbered history (T3.9a).
+        //
+        // Revisions only grow between this read and the registration below,
+        // so a point at or below `current` is still servable when
+        // `watch_from` registers. The opposite race, a write landing in
+        // between, refuses a watch that just became servable, which costs
+        // that client one relist. Checking under the store's own registration
+        // lock would close even that; the store does not offer it yet.
+        if let Some(refusal) = WatchRefusal::ahead_of(from, current) {
+            return Ok(WatchStart::Refused(refusal));
+        }
         let from_rev = match from {
             ResumePoint::At(rev) => rev,
-            ResumePoint::MostRecent => self.store.current_revision().await,
+            ResumePoint::MostRecent => current,
         };
         let opts = WatchOpts {
             from: from_rev,
@@ -1219,10 +1216,13 @@ impl ResourceHandler for StoreBackedHandler {
                 Duration::ZERO
             },
         };
-        // CompactedTooOld at registration → a real HTTP 410 Gone. The
-        // client re-LISTs + re-WATCHes from the fresh list rv. Overflow
-        // cannot occur at registration (the channel is empty).
-        self.store.watch_from(opts).await.map_err(gone_to_api_error)
+        // CompactedTooOld at registration is refused like a point ahead of
+        // the store: an in-band 410, after which the client re-LISTs and
+        // re-WATCHes from the fresh list rv.
+        match self.store.watch_from(opts).await {
+            Ok(stream) => Ok(WatchStart::Streaming(stream)),
+            Err(gone) => Ok(WatchStart::Refused(WatchRefusal::from(gone))),
+        }
     }
 
     async fn create(
@@ -2425,40 +2425,6 @@ mod tests {
             Some(&Value::String("x".into()))
         );
         assert_eq!(out.pointer("/data/k"), Some(&Value::String("v".into())));
-    }
-
-    #[test]
-    fn compacted_too_old_maps_to_gone_410() {
-        // The translation arm: WatchGone::CompactedTooOld => ApiError::Gone,
-        // which renders HTTP 410 / Expired (proven in error::tests).
-        let gone = WatchGone::CompactedTooOld {
-            requested: Revision(2),
-            compacted: Revision(5),
-        };
-        let err = gone_to_api_error(gone);
-        assert!(matches!(err, ApiError::Gone(_)));
-        let msg = err.to_string();
-        assert!(
-            msg.contains('2') && msg.contains('5'),
-            "carries req + compacted: {msg}"
-        );
-        // Renders HTTP 410.
-        use axum::response::IntoResponse;
-        assert_eq!(
-            err.into_response().status(),
-            axum::http::StatusCode::GONE,
-            "CompactedTooOld → ApiError::Gone → HTTP 410"
-        );
-    }
-
-    #[test]
-    fn overflow_at_registration_also_maps_to_gone() {
-        let gone = WatchGone::Overflow {
-            capacity: 4,
-            last_seen: Revision(7),
-        };
-        let err = gone_to_api_error(gone);
-        assert!(matches!(err, ApiError::Gone(_)));
     }
 
     // ── metadata.namespace stamp (K8s namespaced-object invariant) ────────

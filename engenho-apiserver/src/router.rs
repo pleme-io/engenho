@@ -63,6 +63,7 @@ use crate::params::{
     DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, event_line,
     gvk_ns_matches, status_410_line,
 };
+use crate::watch_start::{WatchRefusal, WatchStart};
 
 /// The dispatch key for a registered handler: `(group, version, plural)`.
 /// `group` is `""` for the core group. Keying on the full triple (not the
@@ -1309,7 +1310,8 @@ async fn watch_response(
     // Measured on rio 2026-09-15 — Flux's controllers logged it every ~25s
     // while their LIST (already projected) succeeded.
     let partial = matches!(codec, ResponseCodec::PartialMetadata);
-    let mut from: ResumePoint = p.resume_point()?;
+    let requested: ResumePoint = p.resume_point()?;
+    let mut from = requested;
 
     // ── streaming lists (K8s 1.27 `sendInitialEvents`) ──
     //
@@ -1322,6 +1324,13 @@ async fn watch_response(
     let mut prelude: Vec<Bytes> = Vec::new();
     if p.send_initial_events {
         let (items, rv) = h.list_at(namespace.as_deref(), &sel).await?;
+        // The snapshot answers "state not older than resourceVersion". A
+        // resourceVersion the snapshot has not reached would get older state
+        // than the client demanded, so the watch is refused in-band instead,
+        // checked against the snapshot's own revision.
+        if let Some(refusal) = WatchRefusal::ahead_of(requested, rv) {
+            return refused_watch_response(&refusal);
+        }
         let api_version = h.api_version();
         let gvk = WatchGvk {
             api_version: &api_version,
@@ -1342,12 +1351,18 @@ async fn watch_response(
         from = ResumePoint::At(rv);
     }
 
-    // CompactedTooOld AT REGISTRATION → a real HTTP 410 (the client
-    // re-LISTs). Once we have a stream, the response is 200 and any
-    // later loss is in-band.
-    let stream = h
+    // A resume point the store cannot serve (ahead of it, or compacted) is
+    // refused in-band: HTTP 200 and one ERROR 410 line, never an HTTP
+    // status, which kube-rs would retry at the same revision forever
+    // (crate::watch_start). Once there is a stream, any later loss is
+    // in-band too.
+    let stream = match h
         .watch_stream(namespace.as_deref(), from, p.allow_watch_bookmarks)
-        .await?;
+        .await?
+    {
+        WatchStart::Streaming(stream) => stream,
+        WatchStart::Refused(refusal) => return refused_watch_response(&refusal),
+    };
 
     let init = WatchStreamState {
         stream,
@@ -1441,18 +1456,29 @@ async fn watch_response(
         futures::stream::iter(prelude.into_iter().map(Ok::<Bytes, Infallible>)),
         live,
     ));
+    watch_ok_response(body)
+}
 
-    // 200 the instant the response starts. The body is an unbounded
-    // stream with no Content-Length, so hyper frames it as HTTP/1.1
-    // chunked transfer-encoding automatically — we MUST NOT set
-    // `Transfer-Encoding: chunked` by hand (a manual header double-frames
-    // the body and the client never sees a complete chunk).
-    let resp = Response::builder()
+/// The whole response to a watch that cannot start at its resume point: the
+/// refusal's single in-band `ERROR` 410 line, then the end of the body.
+fn refused_watch_response(refusal: &WatchRefusal) -> Result<Response, ApiError> {
+    let line: Result<Bytes, Infallible> = Ok(refusal.status_line());
+    watch_ok_response(Body::from_stream(futures::stream::iter([line])))
+}
+
+/// Every watch response is HTTP 200 the instant it starts; how it ends is
+/// carried in-band.
+///
+/// The body is a stream with no Content-Length, so hyper frames it as
+/// HTTP/1.1 chunked transfer-encoding automatically — we MUST NOT set
+/// `Transfer-Encoding: chunked` by hand (a manual header double-frames the
+/// body and the client never sees a complete chunk).
+fn watch_ok_response(body: Body) -> Result<Response, ApiError> {
+    Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(body)
-        .map_err(|e| ApiError::Internal(format!("failed to build watch response: {e}")))?;
-    Ok(resp)
+        .map_err(|e| ApiError::Internal(format!("failed to build watch response: {e}")))
 }
 
 // ── scope-agnostic verb handlers (ONE per verb; both URL families) ─────
@@ -2317,7 +2343,7 @@ mod tests {
             _ns: Option<&str>,
             _from: crate::params::ResumePoint,
             _allow_bookmarks: bool,
-        ) -> Result<engenho_store::WatchStream, ApiError> {
+        ) -> Result<crate::watch_start::WatchStart, ApiError> {
             Err(ApiError::Internal(
                 "fake handler: watch_stream not exercised".into(),
             ))

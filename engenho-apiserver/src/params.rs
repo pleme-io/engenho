@@ -65,7 +65,10 @@ pub struct ListWatchParams {
     pub send_initial_events: bool,
     /// `resourceVersionMatch=NotOlderThan` — required by K8s alongside
     /// `sendInitialEvents`. Accepted and recorded; engenho always serves the
-    /// most recent revision, which satisfies `NotOlderThan` by construction.
+    /// most recent revision. That satisfies `NotOlderThan` whenever the store
+    /// has reached `resourceVersion`; a `resourceVersion` ahead of the
+    /// snapshot is refused in-band with a 410 instead
+    /// ([`crate::watch_start::WatchRefusal`]).
     #[serde(rename = "resourceVersionMatch")]
     pub resource_version_match: Option<String>,
     /// Accepted + parsed, no-op at M0.1 (informer long-poll timeout).
@@ -403,7 +406,9 @@ pub enum ResumePoint {
     /// revision forward, NO historical replay.
     MostRecent,
     /// `resourceVersion="N"` (N > 0) — replay `changes_since(N)` then
-    /// live.
+    /// live. A WATCH at an `N` the store has not reached, or has compacted
+    /// away, is refused in-band with a 410
+    /// ([`crate::watch_start::WatchRefusal`]).
     At(Revision),
 }
 
@@ -736,19 +741,25 @@ pub fn status_410_line(rev: Revision) -> Bytes {
         410,
         "Expired",
     );
-    // The Status object goes out as a watch line of type ERROR — the
-    // shape kube-apiserver uses for in-band terminal status.
+    error_line(&status)
+}
+
+/// Encode a `Status` object as a watch line of type `ERROR`, the shape
+/// kube-apiserver uses for an in-band terminal status. Every in-band end of a
+/// watch goes through here: the mid-stream 410 above and a refused start,
+/// [`crate::watch_start::WatchRefusal::status_line`].
+#[must_use]
+pub(crate) fn error_line(status: &serde_json::Value) -> Bytes {
     #[derive(Serialize)]
     struct StatusLine<'a> {
         #[serde(rename = "type")]
         kind: &'static str,
         object: &'a serde_json::Value,
     }
-    let line = StatusLine {
+    encode_ndjson(&StatusLine {
         kind: "ERROR",
-        object: &status,
-    };
-    encode_ndjson(&line)
+        object: status,
+    })
 }
 
 /// Serialize a value as one NDJSON line (`<json>\n`). Falls back to an

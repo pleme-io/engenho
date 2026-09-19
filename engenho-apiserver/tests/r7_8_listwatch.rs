@@ -7,13 +7,14 @@
 //!      `last_applied_index`).
 //!   2. WATCH from that rv is gap+dup-free (replay tail then live tail
 //!      one contiguous ordered range).
-//!   3. CompactedTooOld → 410 (the `WatchGone::CompactedTooOld =>
-//!      ApiError::Gone` mapping + a handler-seam 410, plus the in-band
-//!      410 line shape).
+//!   3. CompactedTooOld → an in-band 410 (the `WatchGone::CompactedTooOld
+//!      => WatchRefusal` mapping and the in-band 410 line shape).
 //!   4. GVK/namespace filter excludes other resources.
 //!   5. labelSelector filter (LIST + WATCH).
 //!   6. Bookmark passthrough (+ opt-out + resume-from-bookmark).
 //!   7. rv=0/absent = most recent, no replay.
+//!   8. A WATCH ahead of the store → an in-band 410, never served from the
+//!      current revision (T3.9a); a WATCH at the store's revision is served.
 //!
 //! Two harness levels: (1) HTTP via reqwest over the real ApiServer
 //! (chunked NDJSON read incrementally with a per-line timeout so a hang
@@ -24,8 +25,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use engenho_apiserver::{ApiServer, ResourceHandler, ResumePoint, Selectors, StoreBackedHandler};
-use engenho_store::{InProcessRouter, Revision, StoreMesh, WatchSignal, default_config};
+use engenho_apiserver::{
+    ApiServer, ResourceHandler, ResumePoint, Selectors, StoreBackedHandler, WatchRefusal,
+    WatchStart,
+};
+use engenho_store::{
+    InProcessRouter, Revision, StoreMesh, WatchGone, WatchSignal, WatchStream, default_config,
+};
 
 // ── boot helpers ──────────────────────────────────────────────────
 
@@ -151,6 +157,28 @@ impl NdjsonReader {
             }
         }
     }
+}
+
+/// The stream of a watch the handler opened, or a test failure naming the
+/// refusal.
+fn streaming(start: WatchStart) -> WatchStream {
+    match start {
+        WatchStart::Streaming(stream) => stream,
+        WatchStart::Refused(refusal) => panic!("watch refused: {refusal}"),
+    }
+}
+
+/// Assert `line` is the in-band end of a refused watch: an `ERROR` event
+/// carrying `Status{code: 410, reason: "Expired"}`, with every field kube-rs's
+/// `ErrorResponse` needs to decode it (kube-rs relists only on this shape).
+fn assert_in_band_410(line: &serde_json::Value) {
+    assert_eq!(line["type"], "ERROR", "in-band terminal status: {line}");
+    let status = &line["object"];
+    assert_eq!(status["kind"], "Status", "{line}");
+    assert_eq!(status["status"], "Failure", "{line}");
+    assert_eq!(status["code"], 410, "{line}");
+    assert_eq!(status["reason"], "Expired", "{line}");
+    assert!(status["message"].is_string(), "{line}");
 }
 
 /// The `resourceVersion` of a watch event's object, as u64.
@@ -361,55 +389,25 @@ async fn watch_replay_tail_then_live_tail_one_contiguous_range() {
 }
 
 // =================================================================
-// 3. WATCH from a compacted rv => 410
+// 3. WATCH from a compacted rv => an in-band 410
 // =================================================================
 
-#[tokio::test]
-async fn compacted_too_old_maps_to_gone_410() {
+#[test]
+fn compacted_too_old_is_refused_with_an_in_band_410() {
     // DEFAULT_HISTORY_CAPACITY isn't reachable through the public mesh
     // boot, so per the test strategy we assert the translation arm
-    // directly: WatchGone::CompactedTooOld => ApiError::Gone => HTTP 410
-    // Expired. A registry-backed integration in engenho-store already
-    // proves watch_from(below-watermark) => CompactedTooOld; this proves
-    // the apiserver translates it to a real 410.
-    use axum::response::IntoResponse;
-    let err = engenho_apiserver::gone_to_api_error(engenho_store::WatchGone::CompactedTooOld {
+    // directly: WatchGone::CompactedTooOld => WatchRefusal => the in-band
+    // 410 Expired line the router ends a refused watch with. A
+    // registry-backed integration in engenho-store already proves
+    // watch_from(below-watermark) => CompactedTooOld. The router's rendering
+    // of a refusal is proven end to end over HTTP in section 8.
+    let refusal = WatchRefusal::from(WatchGone::CompactedTooOld {
         requested: Revision(1),
         compacted: Revision(5),
     });
-    let resp = err.into_response();
-    assert_eq!(
-        resp.status(),
-        axum::http::StatusCode::GONE,
-        "CompactedTooOld at registration → HTTP 410"
-    );
-
-    // Sanity at the handler seam: a normal MostRecent watch never 410s,
-    // and an rv ahead of the server is tolerated as MostRecent at M0.1
-    // (documented) — it must NOT 410.
-    let store = boot_store().await;
-    let h =
-        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).expect("Pod is cataloged");
-    assert!(
-        h.watch_stream(Some("default"), ResumePoint::MostRecent, true)
-            .await
-            .is_ok(),
-        "MostRecent watch never Gone"
-    );
-    assert!(
-        h.watch_stream(Some("default"), ResumePoint::At(Revision(9_999)), true)
-            .await
-            .is_ok(),
-        "an rv ahead of the server is tolerated (MostRecent), not 410, at M0.1"
-    );
-
-    drop(h);
-    Arc::try_unwrap(store)
-        .ok()
-        .unwrap()
-        .terminate()
-        .await
-        .unwrap();
+    let bytes = refusal.status_line();
+    let line: serde_json::Value = serde_json::from_slice(bytes.trim_ascii_end()).unwrap();
+    assert_in_band_410(&line);
 }
 
 // =================================================================
@@ -625,10 +623,11 @@ async fn watch_stream_disables_bookmarks_when_not_requested() {
     let store = boot_store().await;
     let h =
         StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).expect("Pod is cataloged");
-    let mut stream = h
-        .watch_stream(Some("default"), ResumePoint::MostRecent, false)
-        .await
-        .unwrap();
+    let mut stream = streaming(
+        h.watch_stream(Some("default"), ResumePoint::MostRecent, false)
+            .await
+            .unwrap(),
+    );
     let none = tokio::time::timeout(Duration::from_millis(120), stream.next()).await;
     assert!(none.is_err(), "no bookmark with allow_bookmarks=false");
     drop(stream);
@@ -858,4 +857,218 @@ async fn watch_without_timeout_seconds_stays_open() {
         "watch without timeoutSeconds must stay open; it ended on its own, \
          which would make the timeoutSeconds test vacuous"
     );
+}
+
+// =================================================================
+// 8. A WATCH ahead of the store => an in-band 410 (T3.9a)
+// =================================================================
+//
+// A resourceVersion the store has not reached comes from a history it no
+// longer holds: a restore, or a replay that renumbered revisions. Serving
+// such a watch from the current revision leaves the client's cache silently
+// stale. The watch is refused instead, in-band, because kube-rs retries an
+// HTTP error at the same resourceVersion forever and relists only on an
+// in-band 410.
+
+#[tokio::test]
+async fn handler_seam_refuses_a_resume_point_ahead_of_the_store() {
+    let store = boot_store().await;
+    let h =
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).expect("Pod is cataloged");
+    let current = store.current_revision().await;
+
+    assert!(
+        matches!(
+            h.watch_stream(Some("default"), ResumePoint::MostRecent, true)
+                .await,
+            Ok(WatchStart::Streaming(_))
+        ),
+        "MostRecent is never refused"
+    );
+    assert!(
+        matches!(
+            h.watch_stream(Some("default"), ResumePoint::At(current), true)
+                .await,
+            Ok(WatchStart::Streaming(_))
+        ),
+        "a resume point at the store's revision is served"
+    );
+    let ahead = Revision(current.0 + 9_999);
+    match h
+        .watch_stream(Some("default"), ResumePoint::At(ahead), true)
+        .await
+    {
+        Ok(WatchStart::Refused(refusal)) => {
+            let message = refusal.to_string();
+            assert!(
+                message.contains(&ahead.to_string()) && message.contains(&current.to_string()),
+                "the refusal names the requested and the current revision: {message}"
+            );
+        }
+        Ok(WatchStart::Streaming(_)) => {
+            panic!("a resume point ahead of the store was served, not refused")
+        }
+        Err(e) => panic!("a resume point ahead of the store is a refusal, not an error: {e}"),
+    }
+
+    drop(h);
+    Arc::try_unwrap(store)
+        .ok()
+        .unwrap()
+        .terminate()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn watch_ahead_of_the_store_ends_in_band_with_410() {
+    let (store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    post_pod(&client, addr, "default", &pod_body("before")).await;
+    let current = store.current_revision().await.0;
+    let ahead = current + 100;
+
+    // HTTP 200: the refusal is in-band, never an HTTP status.
+    let mut watch = open_watch(
+        &client,
+        addr,
+        &format!("/api/v1/namespaces/default/pods?watch=true&resourceVersion={ahead}"),
+    )
+    .await;
+    // A write after the watch opened. A watch served from the current
+    // revision would deliver it as the first line.
+    post_pod(&client, addr, "default", &pod_body("after")).await;
+
+    let first = watch
+        .next_line()
+        .await
+        .expect("a refused watch sends one line");
+    assert_in_band_410(&first);
+    let message = first["object"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&ahead.to_string()) && message.contains(&current.to_string()),
+        "the 410 names the requested and the current revision: {message}"
+    );
+    assert!(
+        watch.next_line().await.is_none(),
+        "the 410 is the last line: the watch ends so the client relists"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn watch_at_the_store_revision_is_served() {
+    let (store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    post_pod(&client, addr, "default", &pod_body("before")).await;
+    let current = store.current_revision().await.0;
+
+    let mut watch = open_watch(
+        &client,
+        addr,
+        &format!("/api/v1/namespaces/default/pods?watch=true&resourceVersion={current}"),
+    )
+    .await;
+    post_pod(&client, addr, "default", &pod_body("after")).await;
+
+    let ev = watch.next_event().await;
+    assert_eq!(ev["type"], "ADDED", "{ev}");
+    assert_eq!(ev["object"]["metadata"]["name"], "after");
+    assert!(
+        ev_rv(&ev) > current,
+        "only what came after the resume point"
+    );
+
+    drop(watch);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn streaming_list_ahead_of_the_store_ends_in_band_with_410() {
+    let (store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    post_pod(&client, addr, "default", &pod_body("existing")).await;
+    let ahead = store.current_revision().await.0 + 100;
+
+    // sendInitialEvents asks for state "not older than" resourceVersion. A
+    // snapshot at the store's revision is older than that, so the client
+    // gets the refusal, not the snapshot.
+    let mut watch = open_watch(
+        &client,
+        addr,
+        &format!(
+            "/api/v1/namespaces/default/pods?watch=true&sendInitialEvents=true\
+             &resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true\
+             &resourceVersion={ahead}"
+        ),
+    )
+    .await;
+
+    let first = watch
+        .next_line()
+        .await
+        .expect("a refused watch sends one line");
+    assert_in_band_410(&first);
+    assert!(
+        watch.next_line().await.is_none(),
+        "the 410 is the last line: no snapshot follows it"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn streaming_list_the_store_has_reached_is_served() {
+    let (store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+
+    for n in ["s1", "s2"] {
+        post_pod(&client, addr, "default", &pod_body(n)).await;
+    }
+    let current = store.current_revision().await.0;
+
+    let mut watch = open_watch(
+        &client,
+        addr,
+        &format!(
+            "/api/v1/namespaces/default/pods?watch=true&sendInitialEvents=true\
+             &resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true\
+             &resourceVersion={current}"
+        ),
+    )
+    .await;
+
+    let mut names = Vec::new();
+    for _ in 0..2 {
+        let ev = watch.next_line().await.expect("an initial event");
+        assert_eq!(ev["type"], "ADDED", "{ev}");
+        names.push(
+            ev["object"]["metadata"]["name"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    names.sort();
+    assert_eq!(names, ["s1", "s2"]);
+    let end = watch
+        .next_line()
+        .await
+        .expect("the initial-events bookmark");
+    assert_eq!(end["type"], "BOOKMARK", "{end}");
+    assert_eq!(
+        end["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"],
+        "true"
+    );
+
+    drop(watch);
+    server.shutdown().await.unwrap();
 }

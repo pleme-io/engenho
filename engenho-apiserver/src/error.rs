@@ -71,10 +71,13 @@ pub enum ApiError {
     /// wire is built by serde, never `format!()`).
     #[error("{0}")]
     AuthzForbidden(String),
-    /// The requested `resourceVersion` resume point has been compacted
-    /// away — the K8s 410 Gone / Expired equivalent. The client must
-    /// re-LIST + re-WATCH from the fresh list revision. Carries the
-    /// human-readable message rendered into the `Status` body.
+    /// A LIST `continue` token that no longer decodes or verifies — the K8s
+    /// 410 Gone / Expired equivalent. The client must restart the LIST.
+    /// Carries the human-readable message rendered into the `Status` body.
+    ///
+    /// Never a WATCH's answer: a watch the store cannot serve from its
+    /// `resourceVersion` ends in-band ([`crate::watch_start::WatchRefusal`]),
+    /// because kube-rs retries an HTTP error at the same revision forever.
     #[error("{0}")]
     Gone(String),
     /// A server-side apply hit field-ownership conflicts `force` did not
@@ -462,8 +465,9 @@ mod tests {
 
     #[test]
     fn gone_renders_410_expired_status() {
-        // CompactedTooOld → ApiError::Gone → HTTP 410 + reason "Expired".
-        let err = ApiError::Gone("too old resource version: 2 (5)".into());
+        // An expired continue token → ApiError::Gone → HTTP 410 + reason
+        // "Expired".
+        let err = ApiError::Gone("invalid or expired continue token".into());
         assert_eq!(err.status_code(), StatusCode::GONE);
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::GONE);
