@@ -77,7 +77,7 @@ pub enum ReconcileResult {
     /// Like `Requeue` but signalling "I made progress, more work is
     /// left." Lets a future requeue scheduler prioritize this resource
     /// over idle ones. The drivers treat it the same as `Requeue` for
-    /// now (a one-shot re-tick at `delay`).
+    /// now (the driver's one requeue slot, armed for `delay`).
     RequeueWithProgress(Duration),
 }
 
@@ -89,8 +89,10 @@ impl Default for ReconcileResult {
 
 impl ReconcileResult {
     /// The follow-up delay this result asks for, if any. `Done` →
-    /// `None`; both requeue variants → `Some(delay)`. Drivers arm a
-    /// one-shot re-tick when this is `Some`.
+    /// `None`; both requeue variants → `Some(delay)`. Read through
+    /// [`crate::next_wake`], which arms the driver's one requeue slot
+    /// when this is `Some` — a slot, never a spawned task, so repeated
+    /// requeues replace each other instead of accumulating.
     #[must_use]
     pub fn requeue_after(&self) -> Option<Duration> {
         match self {

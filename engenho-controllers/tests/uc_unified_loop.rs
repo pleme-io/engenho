@@ -5,9 +5,9 @@
 //! Three properties:
 //!   1. A controller that doesn't opt into requeue returns
 //!      `ReconcileOutcome.result == Done` (drivers behave as before).
-//!   2. A controller that requests `Requeue{after}` gets a one-shot
-//!      re-tick fired at `after` — NOT a silent warn-and-wait. The
-//!      WatchDriver's `arm_requeue` schedules the extra tick.
+//!   2. A controller that requests `Requeue{after}` is re-ticked at
+//!      `after` — NOT a silent warn-and-wait. The WatchDriver arms its
+//!      one requeue slot, and the wait wakes on it.
 //!   3. A controller that returns a Transient `ControllerError::Store`
 //!      is RETRIED (the loop schedules a re-tick), while a Declarative
 //!      error is surfaced + NOT targeted-retried — proven via the typed
@@ -84,7 +84,7 @@ async fn owned_children_tick_defaults_result_to_done() {
 // ──────────────────────────────────────────────────────────────────────
 // (2) A Requeue{after} is propagated by the driver into ONE extra tick,
 //     not swallowed. The controller returns Requeue on its first tick
-//     and Done after; the WatchDriver's arm_requeue fires the re-tick.
+//     and Done after; the WatchDriver's requeue slot fires the re-tick.
 // ──────────────────────────────────────────────────────────────────────
 
 /// Controller that requeues itself once: tick #1 returns
@@ -127,7 +127,7 @@ impl Controller for RequeueOnceRef {
 }
 
 #[tokio::test]
-async fn requeue_result_arms_one_shot_re_tick_not_swallowed() {
+async fn requeue_result_arms_the_requeue_slot_not_swallowed() {
     let store = boot().await;
     let ctrl = Arc::new(RequeueOnce::default());
 

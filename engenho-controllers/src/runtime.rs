@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use crate::controller::Controller;
+use crate::watch_driver::{log_tick, next_wake};
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -90,45 +91,17 @@ impl ControllerRuntime {
         for (controller, interval) in self.controllers {
             let handle = tokio::spawn(async move {
                 loop {
-                    // The interval-only fallback path now consumes the typed
-                    // ReconcileOutcome the same way the WatchDriver does: on
-                    // a requeue request, re-tick at `after` (capped at the
-                    // configured interval — never wait LONGER than the
-                    // fallback would); on a Declarative error, surface +
-                    // wait the normal interval (no faster blind retry); on
-                    // a Transient error, retry at the derived delay.
-                    let next_delay = match controller.tick().await {
-                        Ok(outcome) => {
-                            outcome.log(controller.name());
-                            match outcome.result.requeue_after() {
-                                Some(after) => after.min(interval),
-                                None => interval,
-                            }
-                        }
-                        Err(e) => {
-                            if e.classify() == shigoto_types::failure::FailureKind::Declarative {
-                                tracing::error!(
-                                    controller = controller.name(),
-                                    error = %e,
-                                    "reconcile failed (declarative — surfacing; waiting normal interval)"
-                                );
-                                interval
-                            } else {
-                                // Transient (+ future class): retry at the
-                                // derived delay, capped at the interval.
-                                let after = e
-                                    .retry_after()
-                                    .unwrap_or(Duration::from_secs(1))
-                                    .min(interval);
-                                tracing::warn!(
-                                    controller = controller.name(),
-                                    error = %e,
-                                    "reconcile failed (transient — retrying)"
-                                );
-                                after
-                            }
-                        }
-                    };
+                    // The interval-only path consumes the typed outcome
+                    // through the SAME decision as the WatchDriver
+                    // (`next_wake`): a requeue or a Transient error re-ticks
+                    // at its delay, capped at the interval (never wait
+                    // LONGER than the fallback would); `Done` and a
+                    // Declarative error wait the normal interval. One
+                    // sequential sleep is this loop's one requeue slot.
+                    let result = controller.tick().await;
+                    let wake = next_wake(&result);
+                    log_tick(controller.name(), &result, wake);
+                    let next_delay = wake.map_or(interval, |after| after.min(interval));
                     tokio::time::sleep(next_delay).await;
                 }
             });

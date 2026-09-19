@@ -173,4 +173,4 @@ pub use store_ledger::{DEFAULT_RECEIPT_NAMESPACE, StoreBackedLedger};
 pub use store_resolver::StoreBackedNodeResolver;
 pub use tiered_build::TieredBuildBackend;
 pub use tiered_reconciler::{PromotionScope, StaticPromotionScope, TieredCacheReconciler};
-pub use watch_driver::{KindFilter, WatchDriver, WatchDriverConfig};
+pub use watch_driver::{KindFilter, WatchDriver, WatchDriverConfig, next_wake};
