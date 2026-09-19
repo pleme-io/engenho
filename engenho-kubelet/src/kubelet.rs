@@ -42,7 +42,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use engenho_controllers::{
-    Controller, ControllerError, ReconcileOutcome, ReconcileReport, ReconcileResult,
+    Controller, ControllerError, Effect, ObjectOutcome, ReconcileOutcome, ReconcileReport,
+    ReconcileResult, Sweep,
     dns::DEFAULT_CLUSTER_DOMAIN,
     selector::{matches_labels, service_selector},
     status::{resource_version_of, write_status_cas},
@@ -99,6 +100,11 @@ struct ProbeBlindCondition {
 /// `periodSeconds: 1` probe does not spin the loop faster than the runtime can
 /// service it. Mirrors the K8s min period.
 const MIN_PROBE_REQUEUE: Duration = Duration::from_secs(1);
+
+/// The name this kubelet signs its Events with (upstream's
+/// `source.component`), shared by [`Kubelet::emit`] and the per-pod
+/// [`Sweep`] so a pod's events never come from two spellings of one source.
+const KUBELET_COMPONENT: &str = "kubelet";
 
 /// The three probes (liveness/readiness/startup) a container may carry, each
 /// paired with its persistent [`ProbeRuntime`] counters. Lives on the
@@ -575,6 +581,60 @@ struct LocalPod {
 /// teardown, so the three cannot disagree about which directory is whose.
 const SA_PROJECTION_VOLUME: &str = "kube-api-access";
 
+/// Why a pod could not be given its `ServiceAccount` credentials.
+///
+/// The pod is held `Pending` with every container `Waiting` on
+/// [`pending_reason`](Self::pending_reason), and the Display is the Warning
+/// Event on the pod — worded as upstream words the same failure of its
+/// projected `kube-api-access-*` volume, since that is the volume this is.
+#[derive(Debug)]
+enum SaProjectionFailed {
+    /// The projector could not mint the token.
+    Mint {
+        service_account: String,
+        cause: String,
+    },
+    /// The minted credentials could not be written where the pod mounts
+    /// them.
+    Write {
+        service_account: String,
+        cause: VolumeResolveError,
+    },
+}
+
+impl SaProjectionFailed {
+    /// The `waiting.reason` every container of the held pod carries.
+    fn pending_reason(&self) -> &'static str {
+        match self {
+            Self::Mint { .. } => "ServiceAccountTokenUnavailable",
+            Self::Write { cause, .. } => cause.pending_reason(),
+        }
+    }
+}
+
+impl std::fmt::Display for SaProjectionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mint {
+                service_account,
+                cause,
+            } => write!(
+                f,
+                "MountVolume.SetUp failed for volume \"{SA_PROJECTION_VOLUME}\" : failed to \
+                 fetch token for ServiceAccount \"{service_account}\": {cause}"
+            ),
+            Self::Write {
+                service_account,
+                cause,
+            } => write!(
+                f,
+                "MountVolume.SetUp failed for volume \"{SA_PROJECTION_VOLUME}\" : could not \
+                 write the credentials of ServiceAccount \"{service_account}\": {cause}"
+            ),
+        }
+    }
+}
+
 /// The kubelet's clock — a `now()` source. Defaults to [`Instant::now`];
 /// tests inject a controllable clock so probe `period` / `initialDelay`
 /// cadence is exercised deterministically without sleeping (the Environment
@@ -673,6 +733,10 @@ pub struct Kubelet {
     /// safe to add to a code path before the plumbing exists — the
     /// alternative being an `Option` check at every call site.
     events: Arc<dyn engenho_controllers::event_recorder::EventSink>,
+    /// Runs the per-pod start/observe pass so one pod's failure costs only
+    /// that pod (see [`Kubelet::reconcile_pod`]). Announces through the same
+    /// sink as `events`.
+    sweep: Sweep,
     /// When this kubelet last wrote its node lease.
     ///
     /// ★ THE CADENCE IS LOAD-BEARING, not a nicety. A heartbeat written on
@@ -714,6 +778,10 @@ impl Kubelet {
             start_ledger: Mutex::new(crate::backoff::StartLedger::default()),
             volume_pending: Mutex::new(crate::backoff::VolumePendingLedger::default()),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
+            sweep: Sweep::new(
+                KUBELET_COMPONENT,
+                engenho_controllers::event_recorder::Reason::Failed,
+            ),
             sa_projector: Arc::new(crate::pod_volume::NoServiceAccountProjection),
             last_lease_renewal: Mutex::new(None),
             last_sa_refresh: Mutex::new(None),
@@ -767,6 +835,7 @@ impl Kubelet {
         mut self,
         events: Arc<dyn engenho_controllers::event_recorder::EventSink>,
     ) -> Self {
+        self.sweep = self.sweep.with_event_sink(events.clone());
         self.events = events;
         self
     }
@@ -800,7 +869,7 @@ impl Kubelet {
             None,
             reason,
             message,
-            "kubelet",
+            KUBELET_COMPONENT,
             &engenho_types::time::now_rfc3339_utc(),
         )
         .await;
@@ -904,28 +973,10 @@ impl Kubelet {
                 .unwrap_or_default();
 
             match self
-                .sa_projector
-                .project(namespace, sa_name, &key.name, pod_uid)
+                .project_service_account(namespace, sa_name, &key.name, pod_uid)
                 .await
             {
-                Ok(Some(files)) => {
-                    match self
-                        .volume_materializer
-                        .materialize_files(namespace, &key.name, SA_PROJECTION_VOLUME, &files)
-                        .await
-                    {
-                        Ok(_) => report.refreshed += 1,
-                        Err(e) => {
-                            report.failed += 1;
-                            warn!(
-                                pod = %key.label(),
-                                error = %e,
-                                "ServiceAccount token refresh could not be written; the pod \
-                                 keeps its current token until that token expires"
-                            );
-                        }
-                    }
-                }
+                Ok(Some(_)) => report.refreshed += 1,
                 // Nothing to project for this pod — not a failure.
                 Ok(None) => {}
                 Err(e) => {
@@ -933,8 +984,8 @@ impl Kubelet {
                     warn!(
                         pod = %key.label(),
                         error = %e,
-                        "ServiceAccount token refresh could not be minted; the pod keeps its \
-                         current token until that token expires"
+                        "ServiceAccount token refresh failed; the pod keeps its current token \
+                         until that token expires"
                     );
                 }
             }
@@ -2526,7 +2577,7 @@ impl Kubelet {
 #[async_trait]
 impl Controller for Kubelet {
     fn name(&self) -> &'static str {
-        "kubelet"
+        KUBELET_COMPONENT
     }
 
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
@@ -2603,46 +2654,54 @@ impl Controller for Kubelet {
         // one-shot Requeue) rather than only on Pod-watch events / the coarse
         // fallback. None = no probes anywhere = no Requeue = today's wake
         // behavior (the behavior-preserving guarantee for no-probe pods).
-        for (key, value) in &bound {
-            // Membership decides start (B) vs poll (C); compute it under a
-            // short lock to avoid holding it across the backend await.
-            let local_entry = self.local.lock().await.get(key).cloned();
-
-            match local_entry {
-                None => {
-                    // (B) Not started locally. Skip if already terminal
-                    // (don't restart a Succeeded/Failed pod we've
-                    // forgotten — restartPolicy:Never, item-9 scope).
-                    if Self::pod_already_terminal(value) {
-                        continue;
-                    }
-                    // ── ★ NO RECORD IS NOT "NEVER STARTED" — see `readopt`.
-                    match self.readopt(key, value, &mut report).await? {
-                        Readopted::Start => {}
-                        Readopted::Settled | Readopted::Held => continue,
-                    }
-                    self.start_bound_pod(key, value, &mut report, &mut soonest_requeue)
-                        .await?;
+        //
+        // ── ★ ONE POD'S FAILURE COSTS ONLY THAT POD ──────────────────────
+        // This was a hand loop whose every step ended in `?`, so one pod's
+        // error left the whole tick: every pod after it in key order was
+        // neither started nor observed, on that tick and every tick after,
+        // for as long as the one pod kept failing. The sweep settles each
+        // pod's result by the error's SCOPE: an Item error is that pod's
+        // failure (logged, retried on its own curve, or announced on it as
+        // an Event) and the sweep moves on; only a store error, which the
+        // next pod's write would meet too, still ends the tick.
+        //
+        // The tick's report and requeue are shared across pods through a
+        // lock held for one pod's pass. Pods are reconciled one at a time
+        // (`Sweep::run` awaits each before the next), so it is never
+        // contended; it exists because each pod's future must own its
+        // borrows.
+        let pods: Vec<(ResourceKey, Value)> = bound.into_iter().collect();
+        let tally = Mutex::new(TickTally {
+            report,
+            soonest_requeue,
+        });
+        let swept = self
+            .sweep
+            .run(&pods, |key, value| {
+                let tally = &tally;
+                async move {
+                    let mut tally = tally.lock().await;
+                    let TickTally {
+                        report,
+                        soonest_requeue,
+                    } = &mut *tally;
+                    ObjectOutcome::settle(
+                        self.reconcile_pod(key, value, report, soonest_requeue)
+                            .await,
+                    )
                 }
-                Some(lp) if Self::awaits_app_start(value, &lp) => {
-                    // ── ★ START THE MISSING, THEN OBSERVE ─────────────────
-                    // A pod with a record used to be observed only, and
-                    // observing never starts anything: a container whose
-                    // first start failed after a sibling had started was
-                    // rendered Waiting forever and never retried. The start
-                    // path starts only what the record lacks, each attempt
-                    // through that container's start curve, then observes
-                    // the whole pod the same as below.
-                    self.start_bound_pod(key, value, &mut report, &mut soonest_requeue)
-                        .await?;
-                }
-                Some(lp) => {
-                    // (C) Every declared container started → poll + reconcile
-                    // running status.
-                    self.reconcile_running(key, value, &lp, &mut report, &mut soonest_requeue)
-                        .await?;
-                }
-            }
+            })
+            .await?;
+        let TickTally {
+            report,
+            mut soonest_requeue,
+        } = tally.into_inner();
+        // A pod whose failure was Transient is owed a retry on its own
+        // curve; fold it into the one requeue the tick asks for, so an
+        // isolated failure is come back to as soon as the curve says rather
+        // than on the coarse fallback.
+        if let Some(after) = swept.retry_after() {
+            Self::accumulate_requeue(&mut soonest_requeue, after);
         }
 
         if report.objects_changed > 0 {
@@ -2661,11 +2720,116 @@ impl Controller for Kubelet {
             Some(after) => ReconcileResult::Requeue(after.max(MIN_PROBE_REQUEUE)),
             None => ReconcileResult::Done,
         };
-        Ok(ReconcileOutcome::new(report, result))
+        let mut outcome = ReconcileOutcome::new(report, result);
+        // The per-pod tally, beside the per-write counts: it is the one
+        // that can say a pod FAILED while the rest were reconciled.
+        outcome.sweep = Some(swept);
+        Ok(outcome)
+    }
+}
+
+/// What the per-pod pass accumulates across one tick: the legacy per-write
+/// counts and the soonest wake any pod asked for. See the sweep in
+/// [`Kubelet::tick`](Controller::tick).
+struct TickTally {
+    report: ReconcileReport,
+    soonest_requeue: Option<Duration>,
+}
+
+/// How the sweep counts one pod's pass, read off what the pass counted.
+///
+/// A pass that counted a landed write is `Changed`; one that only held
+/// something back (a start on its curve, a volume not resolved, an invalid
+/// manifest) is `Skipped`; one that did neither is `Unchanged`.
+///
+/// Tier-honest: `landed` is derived from the legacy `objects_changed`
+/// counter, whose every kubelet increment follows a store answer
+/// (`write_status_cas(..).changed()`) or a runtime `Ok`. That the counter
+/// is bumped ONLY there is CI-caught (T1.8's `NOT_YET_MIGRATED` ceiling),
+/// not a type; when those sites move to `Effect`, this reads the `Effect`.
+fn pod_outcome(landed: bool, held: bool) -> ObjectOutcome {
+    if landed {
+        ObjectOutcome::from(Effect::answered(true))
+    } else if held {
+        ObjectOutcome::SKIPPED
+    } else {
+        ObjectOutcome::Unchanged
     }
 }
 
 impl Kubelet {
+    /// One bound pod's start/observe pass, as the tick's sweep runs it.
+    ///
+    /// Errors are written with ordinary `?` and leave only this pod: the
+    /// sweep settles them by scope ([`ObjectOutcome::settle`]), so a pod
+    /// cannot end the tick for the pods after it unless the store itself
+    /// failed. The outcome is read off what the pass counted
+    /// ([`pod_outcome`]).
+    async fn reconcile_pod(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<ObjectOutcome, ControllerError> {
+        let (changed, skipped) = (report.objects_changed, report.objects_skipped);
+        self.drive_pod(key, value, report, soonest_requeue).await?;
+        Ok(pod_outcome(
+            report.objects_changed > changed,
+            report.objects_skipped > skipped,
+        ))
+    }
+
+    /// (B) start or (C) observe one bound pod, by whether this kubelet
+    /// holds a record of it.
+    async fn drive_pod(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<(), ControllerError> {
+        // Membership decides start (B) vs poll (C); compute it under a
+        // short lock to avoid holding it across the backend await.
+        let local_entry = self.local.lock().await.get(key).cloned();
+
+        match local_entry {
+            None => {
+                // (B) Not started locally. Skip if already terminal
+                // (don't restart a Succeeded/Failed pod we've
+                // forgotten — restartPolicy:Never, item-9 scope).
+                if Self::pod_already_terminal(value) {
+                    return Ok(());
+                }
+                // ── ★ NO RECORD IS NOT "NEVER STARTED" — see `readopt`.
+                match self.readopt(key, value, report).await? {
+                    Readopted::Start => {}
+                    Readopted::Settled | Readopted::Held => return Ok(()),
+                }
+                self.start_bound_pod(key, value, report, soonest_requeue)
+                    .await
+            }
+            Some(lp) if Self::awaits_app_start(value, &lp) => {
+                // ── ★ START THE MISSING, THEN OBSERVE ─────────────────────
+                // A pod with a record used to be observed only, and
+                // observing never starts anything: a container whose first
+                // start failed after a sibling had started was rendered
+                // Waiting forever and never retried. The start path starts
+                // only what the record lacks, each attempt through that
+                // container's start curve, then observes the whole pod the
+                // same as below.
+                self.start_bound_pod(key, value, report, soonest_requeue)
+                    .await
+            }
+            Some(lp) => {
+                // (C) Every declared container started → poll + reconcile
+                // running status.
+                self.reconcile_running(key, value, &lp, report, soonest_requeue)
+                    .await
+            }
+        }
+    }
+
     /// (A) Delete-cleanup: local entries no longer in the bound set.
     ///
     /// A Pod we started that's absent from the freshly-listed bound set was
@@ -3080,46 +3244,121 @@ impl Kubelet {
                 Ok(Some(map))
             }
             Err(e) => {
-                let reason = e.pending_reason();
-                let retry = self
-                    .volume_pending
-                    .lock()
-                    .await
-                    .unresolved(&key.label(), self.now());
-                match retry {
-                    // Logged at the curve's cadence, not the loop's.
-                    crate::backoff::VolumeRetry::Missed {
-                        consecutive,
-                        next_attempt_in,
-                    } => warn!(
-                        pod = %key.label(),
-                        error = %e,
-                        reason = reason,
-                        consecutive,
-                        retry_in_ms = next_attempt_in.as_millis(),
-                        "volume resolution failed; pod stays Pending (no container started)"
-                    ),
-                    crate::backoff::VolumeRetry::Early {
-                        consecutive,
-                        remaining,
-                    } => debug!(
-                        pod = %key.label(),
-                        error = %e,
-                        reason = reason,
-                        consecutive,
-                        retry_in_ms = remaining.as_millis(),
-                        "volume resolution still failing; pod stays Pending"
-                    ),
-                }
-                self.write_pod_volume_pending(key, value, container_names, reason, report)
-                    .await?;
-                // Come back when the pod's streak says, so a source that
-                // appears without a write this kubelet sees is still found.
-                Self::accumulate_requeue(soonest_requeue, retry.next_attempt_in());
-                report.objects_skipped += 1;
+                self.hold_unmounted(
+                    key,
+                    value,
+                    container_names,
+                    e.pending_reason(),
+                    &e,
+                    report,
+                    soonest_requeue,
+                )
+                .await?;
                 Ok(None)
             }
         }
+    }
+
+    /// Hold a pod whose volumes — its `ServiceAccount` projection among them —
+    /// could not all be set up: every container `Waiting{reason}`, the pod
+    /// `Pending`, nothing started, and a requeue at the pod's next due miss
+    /// on [`crate::backoff::VOLUME_PENDING`].
+    ///
+    /// Returns the retry, so a caller that announces the failure does it on
+    /// a counted miss — at the curve's cadence, not the loop's.
+    #[allow(clippy::too_many_arguments)]
+    async fn hold_unmounted(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        container_names: &[String],
+        reason: &'static str,
+        cause: &(dyn std::fmt::Display + Sync),
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) -> Result<crate::backoff::VolumeRetry, ControllerError> {
+        let retry = self
+            .volume_pending
+            .lock()
+            .await
+            .unresolved(&key.label(), self.now());
+        match retry {
+            // Logged at the curve's cadence, not the loop's.
+            crate::backoff::VolumeRetry::Missed {
+                consecutive,
+                next_attempt_in,
+            } => warn!(
+                pod = %key.label(),
+                error = %cause,
+                reason = reason,
+                consecutive,
+                retry_in_ms = next_attempt_in.as_millis(),
+                "pod volumes could not be set up; pod stays Pending (no container started)"
+            ),
+            crate::backoff::VolumeRetry::Early {
+                consecutive,
+                remaining,
+            } => debug!(
+                pod = %key.label(),
+                error = %cause,
+                reason = reason,
+                consecutive,
+                retry_in_ms = remaining.as_millis(),
+                "pod volumes still cannot be set up; pod stays Pending"
+            ),
+        }
+        self.write_pod_volume_pending(key, value, container_names, reason, report)
+            .await?;
+        // Come back when the pod's streak says, so a source that appears
+        // without a write this kubelet sees is still found.
+        Self::accumulate_requeue(soonest_requeue, retry.next_attempt_in());
+        report.objects_skipped += 1;
+        Ok(retry)
+    }
+
+    /// Mint `pod`'s `ServiceAccount` credentials and write them where its
+    /// containers mount them. `Ok(None)` when the projector mints nothing.
+    ///
+    /// One path for the start and the refresh, so the two cannot disagree
+    /// about which directory a token lives in or what a failure is.
+    async fn project_service_account(
+        &self,
+        namespace: &str,
+        service_account: &str,
+        pod: &str,
+        pod_uid: &str,
+    ) -> Result<Option<crate::pod_volume::ResolvedMount>, SaProjectionFailed> {
+        let files = match self
+            .sa_projector
+            .project(namespace, service_account, pod, pod_uid)
+            .await
+        {
+            Ok(Some(files)) => files,
+            Ok(None) => return Ok(None),
+            Err(cause) => {
+                return Err(SaProjectionFailed::Mint {
+                    service_account: service_account.to_string(),
+                    cause,
+                });
+            }
+        };
+        let source = self
+            .volume_materializer
+            .materialize_files(namespace, pod, SA_PROJECTION_VOLUME, &files)
+            .await
+            .map_err(|cause| SaProjectionFailed::Write {
+                service_account: service_account.to_string(),
+                cause,
+            })?;
+        Ok(Some(crate::pod_volume::ResolvedMount {
+            source,
+            mount_path: crate::pod_volume::SA_MOUNT_PATH.to_string(),
+            // Read-only, as upstream projects it. A writable credential
+            // directory lets a compromised container rewrite its own
+            // identity.
+            read_only: true,
+            sub_path: None,
+        }))
     }
 
     /// (B) Start a bound Pod's containers (one per `spec.containers[i]`) +
@@ -3353,50 +3592,52 @@ impl Kubelet {
             .pointer("/metadata/uid")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let cnames: Vec<String> = specs.iter().map(|(c, _)| c.clone()).collect();
         let sa_mount = if !automount {
             // No projection, no materialization, no mount. The pod asked for
             // no credential and gets none.
             None
         } else {
             match self
-                .sa_projector
-                .project(namespace, sa_name, &key.name, pod_uid)
+                .project_service_account(namespace, sa_name, &key.name, pod_uid)
                 .await
             {
-                Ok(Some(files)) => {
-                    let src = self
-                        .volume_materializer
-                        .materialize_files(namespace, &key.name, SA_PROJECTION_VOLUME, &files)
-                        .await
-                        .map_err(|e| {
-                            ControllerError::Internal(format!(
-                                "materialize ServiceAccount projection: {e}"
-                            ))
-                        })?;
-                    Some(crate::pod_volume::ResolvedMount {
-                        source: src,
-                        mount_path: crate::pod_volume::SA_MOUNT_PATH.to_string(),
-                        // Read-only, as upstream projects it. A writable
-                        // credential directory lets a compromised container
-                        // rewrite its own identity.
-                        read_only: true,
-                        sub_path: None,
-                    })
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    warn!(
-                        pod = %key.label(),
-                        error = %e,
-                        "ServiceAccount projection failed; pod stays Pending"
-                    );
-                    report.objects_skipped += 1;
+                Ok(mount) => mount,
+                // ── ★ HELD, SAID, AND SKIPPED — NEVER THE TICK'S ERROR ────
+                // A write failure here was `?`-ed as `Internal`, which ended
+                // the whole tick: every pod after this one went unstarted
+                // and unobserved for as long as this one directory failed.
+                // A mint failure was the opposite and as bad — a skip with
+                // no status and no Event, so the pod showed a nodeName and
+                // nothing else. Both are now what a volume that cannot be
+                // set up is: the pod Pending with the reason on every
+                // container, a Warning on the pod at the retry curve's
+                // cadence, and a requeue on that curve.
+                Err(failed) => {
+                    let retry = self
+                        .hold_unmounted(
+                            key,
+                            value,
+                            &cnames,
+                            failed.pending_reason(),
+                            &failed,
+                            report,
+                            soonest_requeue,
+                        )
+                        .await?;
+                    if matches!(retry, crate::backoff::VolumeRetry::Missed { .. }) {
+                        self.emit(
+                            key,
+                            engenho_controllers::event_recorder::Reason::Failed,
+                            failed.to_string(),
+                        )
+                        .await;
+                    }
                     return Ok(());
                 }
             }
         };
 
-        let cnames: Vec<String> = specs.iter().map(|(c, _)| c.clone()).collect();
         let Some(resolved) = self
             .resolve_or_pending(key, value, namespace, &cnames, report, soonest_requeue)
             .await?
