@@ -77,7 +77,9 @@ pub use handler::{
     handlers_from_catalog_with_admission,
 };
 pub use health::{ChildLiveness, DrainState, LivenessSource, VersionInfo};
-pub use metrics::{LastTick, MetricsSnapshot, MetricsSource, ReconcileCount, ReconcileResult};
+pub use metrics::{
+    LastTick, MetricsSnapshot, MetricsSource, ObjectCount, ReconcileCount, ReconcileResult,
+};
 pub use openapi::ApiDoc;
 pub use params::{
     ListWatchParams, ResumePoint, Selectors, body_precondition, bookmark_line, gvk_ns_matches,

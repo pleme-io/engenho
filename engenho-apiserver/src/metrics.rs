@@ -20,20 +20,39 @@
 //! [`MetricFamily`] rather than assembling strings at call sites, and why
 //! the tests assert ORDER and not merely presence.
 //!
-//! ★ NAMES ARE UPSTREAM'S. `apiserver_request_total`,
-//! `apiserver_current_inflight_requests` and `etcd_object_counts` are what
-//! existing dashboards and alerting rules already select on. A plausible
-//! rename produces metrics that scrape cleanly and match no query anyone
-//! has — the same failure mode as an invented Event reason.
-//! `controller_runtime_reconcile_total{controller,result}` is
-//! controller-runtime's name and label set for the same reason.
+//! ★ THE FAMILIES. This is every family the endpoint can render, and
+//! `tests/t5_10_metrics_doc_truth.rs` holds this header to the scrape in
+//! both directions. A family named in backticks anywhere in this header
+//! that the scrape lacks fails it; a label set given in braces that the
+//! scrape's samples do not carry, in that order, fails it; and a family
+//! the scrape renders that this header does not name fails it. So: a
+//! family is named in backticks, a Rust item is linked as [`Item`] (which
+//! the check skips), and a name this module does not emit is not written
+//! here at all.
+//!
+//! | family | rendered from |
+//! |---|---|
+//! | `apiserver_registered_resources` | the router's handler set |
+//! | `etcd_object_counts{resource}` | the [`MetricsSource`] |
+//! | `engenho_store_revision` | the [`MetricsSource`] |
+//! | `engenho_panics_total` | the [`MetricsSource`], once a panic hook counts |
+//! | `controller_runtime_reconcile_total{controller,result}` | the [`MetricsSource`] |
+//! | `engenho_controller_last_tick_timestamp_seconds{controller}` | the [`MetricsSource`] |
+//! | `engenho_would_reject_total{gate,reason}` | the rollout-gate ledger |
+//!
+//! ★ NAMES ARE UPSTREAM'S WHERE UPSTREAM HAS ONE. `etcd_object_counts` is
+//! the name kube-apiserver published this gauge under, and
+//! `controller_runtime_reconcile_total` with its label set is
+//! controller-runtime's. Existing dashboards and alerting rules select on
+//! those names, and a plausible rename produces metrics that scrape cleanly
+//! and match no query anyone has — the same failure mode as an invented
+//! Event reason. The `engenho_` families have no upstream equivalent.
 //!
 //! ★ THE RUNTIME'S FAMILIES COME FROM A SOURCE, NOT A LITERAL. The store
-//! revision used to be the literal `0`: a scrape that parsed cleanly and
-//! said nothing true. `engenho_store_revision`, `engenho_panics_total`,
-//! `controller_runtime_reconcile_total` and
-//! `engenho_controller_last_tick_timestamp_seconds` are rendered from one
-//! [`MetricsSnapshot`] read through the [`MetricsSource`] the runtime
+//! revision used to be the literal `0` and the object counts a literal
+//! empty slice: a scrape that parsed cleanly and said nothing true. Every
+//! family the table marks as rendered from the [`MetricsSource`] comes from
+//! one [`MetricsSnapshot`] read per scrape through the source the runtime
 //! installs. With no source installed they are ABSENT, which a dashboard
 //! shows as "no data" rather than charting a zero as fact.
 
@@ -130,53 +149,52 @@ fn escape(v: &str) -> String {
     out
 }
 
-/// Build the apiserver's metric families.
+/// Build the families the router answers from its own state.
 ///
-/// `object_counts` is `(resource, count)` — upstream's `etcd_object_counts`
-/// keyed by resource, which is what capacity dashboards chart.
-///
-/// ★ COUNTS ARE PASSED IN, NOT GATHERED HERE, and that is deliberate: a
-/// scrape must not become a full keyspace walk. Prometheus polls every
-/// 15–30s and a handler that listed every kind per scrape would turn
-/// monitoring into load. The caller supplies whatever it can produce
-/// cheaply; an empty slice omits the family entirely rather than
-/// publishing zeros that a dashboard would chart as "everything vanished".
+/// Object counts are not among them: they come from the
+/// [`MetricsSource`] (see [`MetricsSnapshot::object_counts`]), because the
+/// router has no cheap way to count and a literal in their place is a
+/// scrape that parses cleanly and says nothing true.
 #[must_use]
-pub fn apiserver_families(
-    object_counts: &[(String, u64)],
-    registered_resources: usize,
-) -> Vec<MetricFamily> {
-    vec![
-        MetricFamily {
-            name: "etcd_object_counts".into(),
-            help: "Number of stored objects, by resource.".into(),
-            kind: MetricType::Gauge,
-            samples: object_counts
-                .iter()
-                .map(|(resource, n)| Sample {
-                    labels: vec![("resource".into(), resource.clone())],
-                    #[allow(clippy::cast_precision_loss)]
-                    value: *n as f64,
-                })
-                .collect(),
-        },
-        MetricFamily {
-            name: "apiserver_registered_resources".into(),
-            help: "Number of API resources this server serves.".into(),
-            kind: MetricType::Gauge,
-            samples: vec![Sample {
-                labels: vec![],
-                #[allow(clippy::cast_precision_loss)]
-                value: registered_resources as f64,
-            }],
-        },
-    ]
+pub fn apiserver_families(registered_resources: usize) -> Vec<MetricFamily> {
+    vec![MetricFamily {
+        name: "apiserver_registered_resources".into(),
+        help: "Number of API resources this server serves.".into(),
+        kind: MetricType::Gauge,
+        samples: vec![Sample {
+            labels: vec![],
+            #[allow(clippy::cast_precision_loss)]
+            value: registered_resources as f64,
+        }],
+    }]
+}
+
+/// How many objects of one resource the store holds: one
+/// `etcd_object_counts{resource}` sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectCount {
+    /// The resource's plural name (`pods`, `configmaps`, a CRD's plural).
+    /// Owned, not `&'static` like the controller label: CRD plurals are
+    /// data, so this label's values grow with the resources served.
+    pub resource: String,
+    /// How many are stored.
+    pub count: u64,
 }
 
 /// What the runtime's metric families are rendered from, read once per
 /// scrape through a [`MetricsSource`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricsSnapshot {
+    /// `etcd_object_counts{resource}`, keyed by resource, which is what
+    /// capacity dashboards chart.
+    ///
+    /// ★ COUNTS ARE SUPPLIED, NOT GATHERED AT SCRAPE TIME, and that is
+    /// deliberate: a scrape must not become a full keyspace walk.
+    /// Prometheus polls every 15–30s and a handler that listed every kind
+    /// per scrape would turn monitoring into load. The source reports what
+    /// it can produce cheaply; an empty `Vec` omits the family rather than
+    /// publishing zeros a dashboard would chart as "everything vanished".
+    pub object_counts: Vec<ObjectCount>,
     /// The store's current global revision (`engenho_store_revision`).
     pub store_revision: engenho_store::Revision,
     /// Panics counted since the process started (`engenho_panics_total`).
@@ -264,15 +282,30 @@ pub const LAST_TICK_TIMESTAMP_SECONDS: &str = "engenho_controller_last_tick_time
 
 /// The runtime's families, rendered from one snapshot.
 ///
-/// Reconcile and last-tick samples are sorted by their labels, so the
-/// output does not depend on the order the source happened to report in.
+/// Object-count, reconcile and last-tick samples are sorted by their
+/// labels, so the output does not depend on the order the source happened
+/// to report in.
 #[must_use]
 pub fn source_families(snapshot: &MetricsSnapshot) -> Vec<MetricFamily> {
+    let mut object_counts: Vec<&ObjectCount> = snapshot.object_counts.iter().collect();
+    object_counts.sort_by(|a, b| a.resource.cmp(&b.resource));
     let mut reconciles = snapshot.reconciles.clone();
     reconciles.sort_by_key(|r| (r.controller, r.result));
     let mut last_ticks = snapshot.last_ticks.clone();
     last_ticks.sort_by_key(|t| t.controller);
     vec![
+        MetricFamily {
+            name: "etcd_object_counts".into(),
+            help: "Number of stored objects, by resource.".into(),
+            kind: MetricType::Gauge,
+            samples: object_counts
+                .iter()
+                .map(|c| Sample {
+                    labels: vec![("resource".into(), c.resource.clone())],
+                    value: as_sample(c.count),
+                })
+                .collect(),
+        },
         MetricFamily {
             name: "engenho_store_revision".into(),
             help: "The store's current global revision.".into(),
@@ -381,7 +414,7 @@ pub fn log_would_reject(event: &engenho_substrate::WouldReject<'_>) {
 /// Everything `GET /metrics` serves, rendered from the router's state and,
 /// when one is installed, its [`MetricsSource`].
 pub async fn render_state(state: &crate::router::RouterState) -> String {
-    let mut families = apiserver_families(&[], state.handler_set().len());
+    let mut families = apiserver_families(state.handler_set().len());
     if let Some(source) = &state.metrics_source {
         families.extend(source_families(&source.snapshot().await));
     }
@@ -487,10 +520,7 @@ mod tests {
     fn the_metric_names_are_the_ones_existing_dashboards_select_on() {
         // A plausible rename scrapes cleanly and matches no query anyone
         // has — the same failure mode as an invented Event reason.
-        let mut families = apiserver_families(
-            &[("pods".to_string(), 3), ("configmaps".to_string(), 7)],
-            52,
-        );
+        let mut families = apiserver_families(52);
         families.extend(source_families(&snapshot(41)));
         let out = render(&families);
         assert!(out.contains(r#"etcd_object_counts{resource="pods"} 3"#));
@@ -561,6 +591,16 @@ mod tests {
 
     fn snapshot(store_revision: u64) -> MetricsSnapshot {
         MetricsSnapshot {
+            object_counts: vec![
+                ObjectCount {
+                    resource: "pods".into(),
+                    count: 3,
+                },
+                ObjectCount {
+                    resource: "configmaps".into(),
+                    count: 7,
+                },
+            ],
             store_revision: engenho_store::Revision(store_revision),
             panics_total: Some(3),
             reconciles: vec![
@@ -639,9 +679,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_counts_render_from_the_source_sorted_by_resource() {
+        // Red before T5.10: `render_state` fed `etcd_object_counts` the
+        // literal `&[]`, so the family was never served whatever the
+        // store held.
+        let out = render_state(&sourced(snapshot(41))).await;
+        let count_lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("etcd_object_counts{"))
+            .collect();
+        assert_eq!(
+            count_lines,
+            [
+                "etcd_object_counts{resource=\"configmaps\"} 7",
+                "etcd_object_counts{resource=\"pods\"} 3",
+            ],
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_object_counts_from_the_source_omit_the_family_rather_than_zero_it() {
+        let mut snap = snapshot(41);
+        snap.object_counts.clear();
+        let out = render_state(&sourced(snap)).await;
+        assert!(!out.contains("etcd_object_counts"), "got: {out}");
+        assert!(out.contains("engenho_store_revision 41\n"), "got: {out}");
+    }
+
+    #[tokio::test]
     async fn an_unwired_router_publishes_no_runtime_families_rather_than_zeros() {
         let out = render_state(&crate::router::RouterState::new(vec![])).await;
         for absent in [
+            "etcd_object_counts",
             "engenho_store_revision",
             "engenho_panics_total",
             "controller_runtime_reconcile_total",
