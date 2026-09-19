@@ -51,42 +51,171 @@ use engenho_types::generated_v1_34::{
     EmptyDirVolumeSource, KeyToPath, SecretVolumeSource, Volume, VolumeMount,
 };
 
-/// Where a [`ResolvedMount`] sources its bytes from on the host. The two
-/// arms map to the two podman `-v` shapes:
+/// Where a [`ResolvedMount`] sources its bytes from on the host.
 ///
-///   * [`MountSource::HostDir`] → `-v <abs host path>:<mountPath>[:ro]`
-///     (configMap / secret materialized as files under the $HOME data
-///     root; the podman machine shares $HOME so the bind resolves).
-///   * [`MountSource::NamedVolume`] → `-v <volume name>:<mountPath>`
-///     (emptyDir as a podman named volume, shared read-write across every
-///     container in the pod that references it).
+/// Each arm says two things: what the runtime binds ([`Self::bind_source`])
+/// and what tearing the pod down owes ([`teardown_obligation`]). Both are
+/// exhaustive matches, so a new arm cannot land without deciding either.
+///
+/// ── ★ WHO OWNS THE DIRECTORY IS PART OF THE TYPE ─────────────────────────
+/// This used to be one `HostDir(PathBuf)` arm for both a directory the
+/// kubelet WROTE (configMap / secret / projected / `ServiceAccount` files) and
+/// a directory the POD named (`hostPath`). The two need opposite teardowns —
+/// the first must be removed with the pod or every secret it ever held
+/// stays on disk; the second must never be removed, because it is the
+/// user's data — and one arm could not say which it held. So neither was
+/// ever removed.
+///
+///   * [`MountSource::Materialized`] — written by a [`VolumeMaterializer`];
+///     only this module can build a [`MaterializedDir`], and it is removed
+///     on teardown.
+///   * [`MountSource::UserHostPath`] — named by the pod; never removed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MountSource {
-    /// An absolute host-filesystem directory (or file) to bind-mount.
-    /// configMap / secret sources — default read-only (K8s semantics).
-    HostDir(PathBuf),
+    /// A host directory a pod's `hostPath` volume named, admitted by the
+    /// node's [`HostPathPolicy`]. The kubelet does not own it and NEVER
+    /// removes it. Read-write by default, as upstream mounts `hostPath`.
+    UserHostPath(PathBuf),
+    /// A host directory a [`VolumeMaterializer`] wrote the pod's files into
+    /// (configMap / secret / projected, and the `ServiceAccount` projection).
+    /// Default read-only (K8s semantics). Removed when the pod is torn down.
+    ///
+    /// Never deserialized: a `MaterializedDir` read back from bytes would be
+    /// a path nobody materialized, and teardown removes it.
+    #[serde(skip_deserializing)]
+    Materialized(MaterializedDir),
     /// An absolute host-filesystem directory bind-mounted from a podman
     /// named volume's Mountpoint. emptyDir sourced via the volume-inspect
-    /// path (see `ensure_empty_dir`) — default read-write. Semantically
-    /// distinct from `HostDir` (configMap/secret) so the RO default doesn't
-    /// spill onto workload emptyDir mounts.
+    /// path (see `ensure_empty_dir`) — default read-write. Distinct from
+    /// `Materialized` so the RO default doesn't spill onto workload emptyDir
+    /// mounts.
     EmptyDirHostDir(PathBuf),
     /// A named podman volume (created via `podman volume create`).
     /// emptyDir sources — default read-write, shared across the pod.
     NamedVolume(String),
     /// A bound-PVC backing directory bind-mounted from the PV's node-local
-    /// `hostPath`/`local` source — `-v <pv path>:<mountPath>`. Distinct from
-    /// [`MountSource::HostDir`] only in its DEFAULT read-write semantics
-    /// (a PVC is read-write unless the volume/volumeMount forces read-only),
-    /// where configMap/secret default read-only. `read_only` carries the
-    /// `persistentVolumeClaim.readOnly` flag (forces RO regardless of the
-    /// volumeMount).
+    /// `hostPath`/`local` source, or from the target a CSI driver published
+    /// — `-v <pv path>:<mountPath>`. Read-write by default (a PVC is
+    /// read-write unless the volume/volumeMount forces read-only);
+    /// `read_only` carries the `persistentVolumeClaim.readOnly` flag (forces
+    /// RO regardless of the volumeMount).
     PvcHostDir {
         /// Absolute host path of the bound PV's `hostPath`/`local` source dir.
         path: PathBuf,
         /// `persistentVolumeClaim.readOnly` — forces the mount read-only.
         read_only: bool,
     },
+}
+
+pub use materialized::MaterializedDir;
+
+/// The one place a [`MaterializedDir`] can be built.
+///
+/// A private module with a `pub(super)` constructor: only `pod_volume` — the
+/// module the materializers live in — can call it, and the compiler says so
+/// (`E0624`) anywhere else. Teardown removes a `MaterializedDir` outright, so
+/// a path that could be wrapped by anyone would be a path anyone could have
+/// deleted.
+mod materialized {
+    use serde::Serialize;
+    use std::path::{Path, PathBuf};
+
+    /// A directory a [`super::VolumeMaterializer`] wrote a pod's files into,
+    /// and so a directory the kubelet owns and removes on teardown.
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+    pub struct MaterializedDir(PathBuf);
+
+    impl MaterializedDir {
+        /// Wrap a directory a materializer in this module just wrote.
+        pub(super) fn written_at(dir: PathBuf) -> Self {
+            Self(dir)
+        }
+
+        /// Where it is on the host.
+        #[must_use]
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+}
+
+/// What a container runtime binds for a [`MountSource`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindSource<'a> {
+    /// A host path, bind-mounted.
+    Path(&'a Path),
+    /// A runtime-managed named volume.
+    Volume(&'a str),
+}
+
+impl MountSource {
+    /// What the runtime binds for this source. The ONE mapping every backend
+    /// reads, so a new arm is decided here once rather than at each backend.
+    #[must_use]
+    pub fn bind_source(&self) -> BindSource<'_> {
+        match self {
+            Self::UserHostPath(p) | Self::EmptyDirHostDir(p) => BindSource::Path(p),
+            Self::Materialized(dir) => BindSource::Path(dir.path()),
+            Self::PvcHostDir { path, .. } => BindSource::Path(path),
+            Self::NamedVolume(name) => BindSource::Volume(name),
+        }
+    }
+}
+
+/// What tearing down one of a pod's volumes owes, once every container that
+/// mounted it is gone. Recorded on the kubelet's pod record at start and
+/// discharged by its delete cleanup.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VolumeTeardown {
+    /// Remove a directory a materializer wrote.
+    RemoveMaterialized(MaterializedDir),
+    /// Remove the storage backing the emptyDir `volume`
+    /// ([`VolumeMaterializer::remove_empty_dir`]).
+    RemoveEmptyDir {
+        /// The pod's logical volume name (`spec.volumes[i].name`).
+        volume: String,
+    },
+    /// Release whatever was published for the claim mounted as `volume`
+    /// ([`VolumeMaterializer::unpublish_csi`]). A node-local PV was never
+    /// published, so this is a no-op for it; the PV's own reclaim owns its
+    /// directory.
+    ReleaseClaim {
+        /// The pod's logical volume name (`spec.volumes[i].name`).
+        volume: String,
+    },
+}
+
+/// The teardown the volume `volume`, resolved to `source`, owes.
+///
+/// Exhaustive over [`MountSource`] with no wildcard, so a new source kind is
+/// a compile error (`E0004`) here until someone decides what removing it
+/// means. `None` is a decision, not a default: a `hostPath` belongs to the
+/// user.
+#[must_use]
+pub fn teardown_obligation(volume: &str, source: &MountSource) -> Option<VolumeTeardown> {
+    match source {
+        MountSource::UserHostPath(_) => None,
+        MountSource::Materialized(dir) => Some(VolumeTeardown::RemoveMaterialized(dir.clone())),
+        MountSource::EmptyDirHostDir(_) | MountSource::NamedVolume(_) => {
+            Some(VolumeTeardown::RemoveEmptyDir {
+                volume: volume.to_string(),
+            })
+        }
+        MountSource::PvcHostDir { .. } => Some(VolumeTeardown::ReleaseClaim {
+            volume: volume.to_string(),
+        }),
+    }
+}
+
+/// Every teardown a resolved `volName → MountSource` map owes.
+#[must_use]
+pub fn teardowns_of(
+    resolved: &BTreeMap<String, MountSource>,
+) -> std::collections::BTreeSet<VolumeTeardown> {
+    resolved
+        .iter()
+        .filter_map(|(volume, source)| teardown_obligation(volume, source))
+        .collect()
 }
 
 /// One fully-resolved mount: the materialized source + the container's
@@ -105,7 +234,7 @@ pub struct ResolvedMount {
     /// read-only (K8s semantics); emptyDir is read-write.
     pub read_only: bool,
     /// `volumeMount.subPath` — the single-element subdir/file the container
-    /// sees. Folded into [`MountSource::HostDir`] at materialize time when
+    /// sees. Folded into the host source path at materialize time when
     /// easy; carried here for diagnostics + future complex-subPath handling.
     pub sub_path: Option<String>,
 }
@@ -127,7 +256,7 @@ pub struct ResolvedMount {
 ///
 /// The [`PodVolumeSource::Pvc`] arm is LIVE: it resolves the PVC's bound PV
 /// (via the `fetch` seam) to the PV's node-local `hostPath`/`local` source
-/// path and produces a [`MountSource::HostDir`]. An unbound PVC keeps the
+/// path and produces a [`MountSource::PvcHostDir`]. An unbound PVC keeps the
 /// pod Pending (`"PvcNotBound"`); a PVC bound to a PV with an unsupported
 /// source class (CSI/nfs/…) keeps it Pending (`"PvcSourceUnsupported"`) —
 /// never a fake mount. See [`crate::volume`] for the CSI-style storage trait
@@ -177,7 +306,7 @@ pub enum PodVolumeSource {
         sources: Vec<engenho_types::generated_v1_34::types::VolumeProjection>,
     },
     /// `persistentVolumeClaim` — resolved to the bound PV's node-local
-    /// `hostPath`/`local` source dir (a [`MountSource::HostDir`]). An unbound
+    /// `hostPath`/`local` source dir (a [`MountSource::PvcHostDir`]). An unbound
     /// PVC / unsupported-source PV stay Pending (never a fake mount).
     Pvc {
         /// Referenced `PersistentVolumeClaim` name (`persistentVolumeClaim.claimName`),
@@ -372,6 +501,16 @@ pub enum VolumeResolveError {
     /// volume create`) failed. Pending reason `"VolumeMaterializeError"`.
     #[error("materialize: {0}")]
     Materialize(String),
+    /// Removing a directory a materializer wrote failed for a reason other
+    /// than it already being gone. Raised only by teardown, which runs for a
+    /// pod that is being deleted, never for one waiting to start.
+    #[error("remove materialized directory {}: {detail}", path.display())]
+    RemoveMaterialized {
+        /// The directory that could not be removed.
+        path: PathBuf,
+        /// What the host said.
+        detail: String,
+    },
 }
 
 impl VolumeResolveError {
@@ -392,6 +531,7 @@ impl VolumeResolveError {
             VolumeResolveError::PvcSourceUnsupported { .. } => "PvcSourceUnsupported",
             VolumeResolveError::CsiUnavailable { .. } => "CsiUnavailable",
             VolumeResolveError::Materialize(_) => "VolumeMaterializeError",
+            VolumeResolveError::RemoveMaterialized { .. } => "VolumeTeardownError",
         }
     }
 }
@@ -408,6 +548,7 @@ engenho_substrate::impl_error_kind! {
         { PvcSourceUnsupported { .. } } => "pvc_source_unsupported",
         { CsiUnavailable { .. } } => "csi_unavailable",
         (Materialize(_)) => "materialize",
+        { RemoveMaterialized { .. } } => "remove_materialized",
     }
 }
 
@@ -421,7 +562,7 @@ engenho_substrate::impl_error_kind! {
 ///
 ///   * [`materialize_files`](VolumeMaterializer::materialize_files) — write
 ///     a `(filename → bytes)` set into a per-pod-per-volume host dir, return
-///     the [`MountSource::HostDir`] to bind-mount. configMap + secret share
+///     the [`MountSource::Materialized`] to bind-mount. configMap + secret share
 ///     this (secret decodes before calling; the materializer sees raw bytes).
 ///   * [`ensure_empty_dir`](VolumeMaterializer::ensure_empty_dir) —
 ///     idempotently create a per-pod-volume named volume, return the
@@ -603,6 +744,21 @@ pub trait VolumeMaterializer: Send + Sync {
         pod: &str,
         volume: &str,
     ) -> Result<(), VolumeResolveError>;
+
+    /// Remove a directory [`materialize_files`](VolumeMaterializer::materialize_files)
+    /// wrote — the pod-delete counterpart, run once every container that
+    /// mounted it is gone. Already absent is SUCCESS: teardown re-runs after a
+    /// partial failure.
+    ///
+    /// Required, not defaulted: a materializer that delegates
+    /// `materialize_files` must delegate this too, and a default would let it
+    /// forget silently — every secret it ever wrote would stay on disk.
+    ///
+    /// # Errors
+    ///
+    /// [`VolumeResolveError::RemoveMaterialized`] on a removal that failed
+    /// for any reason other than the directory already being gone.
+    async fn remove_materialized(&self, dir: &MaterializedDir) -> Result<(), VolumeResolveError>;
 }
 
 /// Read the typed `Vec<Volume>` from a Pod's raw `spec.volumes` JSON. Absent
@@ -1017,7 +1173,8 @@ where
             },
             PodVolumeSource::HostPath { path } => {
                 if host_path_policy.permits(Path::new(&path)) {
-                    MountSource::HostDir(PathBuf::from(path))
+                    // The POD's directory, not ours: never removed.
+                    MountSource::UserHostPath(PathBuf::from(path))
                 } else {
                     // Denied, and Pending — never a fake mount, and never a
                     // quiet substitution of some other directory.
@@ -1344,13 +1501,15 @@ pub fn container_mounts(
                 vol: vm.name.clone(),
             });
         };
-        // configMap/secret are HostDir + default read-only; emptyDir is a
-        // NamedVolume OR EmptyDirHostDir + default read-write; a bound-PVC
-        // (PvcHostDir) defaults read-write but the PVC-source `readOnly` flag
-        // forces read-only. An explicit volumeMount.readOnly:true forces
-        // read-only in every case.
+        // configMap/secret are Materialized + default read-only; emptyDir
+        // is a NamedVolume OR EmptyDirHostDir + default read-write; a
+        // hostPath (UserHostPath) is read-write as upstream mounts it; a
+        // bound-PVC (PvcHostDir) defaults read-write but the PVC-source
+        // `readOnly` flag forces read-only. An explicit
+        // volumeMount.readOnly:true forces read-only in every case.
         let (source_ro, source_default_ro) = match source {
-            MountSource::HostDir(_) => (false, true),
+            MountSource::Materialized(_) => (false, true),
+            MountSource::UserHostPath(_) => (false, false),
             MountSource::EmptyDirHostDir(_) => (false, false),
             MountSource::NamedVolume(_) => (false, false),
             MountSource::PvcHostDir { read_only, .. } => (*read_only, false),
@@ -1722,7 +1881,7 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
                 VolumeResolveError::Materialize(format!("write {}: {e}", path.display()))
             })?;
         }
-        Ok(MountSource::HostDir(dir))
+        Ok(MountSource::Materialized(MaterializedDir::written_at(dir)))
     }
 
     async fn ensure_empty_dir(
@@ -1752,14 +1911,14 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
             }
         }
         // Resolve the named volume to its on-disk mountpoint and emit a
-        // HostDir bind mount rather than a NamedVolume. Measured 2026-09-10:
+        // host-path bind (`EmptyDirHostDir`) rather than a NamedVolume. Measured 2026-09-10:
         // libpod's container-create API, given `Type: volume, Source: <name>`
         // and no `Name` field, records `Type: bind, Source: <name>` in the
         // container's Mounts, and crun then fails to start the container with
         // `mount <name>: No such device` — because there is no host device at
         // a path called <name>. `podman run -v <name>:<dest>` (CLI) resolves
         // to the same Mountpoint below and mounts as a bind, which works.
-        // Emitting a HostDir of the Mountpoint here reuses the bind path and
+        // Emitting a bind of the Mountpoint here reuses the bind path and
         // sidesteps the API mismatch entirely.
         let out = tokio::process::Command::new(&self.binary)
             .args([
@@ -1825,6 +1984,53 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
         }
         Ok(())
     }
+
+    async fn remove_materialized(&self, dir: &MaterializedDir) -> Result<(), VolumeResolveError> {
+        remove_materialized_dir(dir.path())?;
+        // `<data_root>/<ns>_<pod>/<volume>`: once the pod's last volume is
+        // gone its `<ns>_<pod>` directory is empty, and leaving it would
+        // leave one empty directory per pod this node ever ran. Removed only
+        // when empty and only inside the data root — never a directory this
+        // materializer did not lay out.
+        if let Some(pod_dir) = dir.path().parent()
+            && pod_dir.parent() == Some(self.data_root.as_path())
+        {
+            remove_if_empty(pod_dir)?;
+        }
+        Ok(())
+    }
+}
+
+/// Remove a materialized directory; already gone is success.
+fn remove_materialized_dir(dir: &Path) -> Result<(), VolumeResolveError> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(VolumeResolveError::RemoveMaterialized {
+            path: dir.to_path_buf(),
+            detail: e.to_string(),
+        }),
+    }
+}
+
+/// Remove `dir` if it is empty. Not empty (another volume of the pod is still
+/// there) or already gone is success.
+fn remove_if_empty(dir: &Path) -> Result<(), VolumeResolveError> {
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(VolumeResolveError::RemoveMaterialized {
+            path: dir.to_path_buf(),
+            detail: e.to_string(),
+        }),
+    }
 }
 
 // =================================================================
@@ -1834,7 +2040,7 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
 /// Deterministic mock [`VolumeMaterializer`] — records every
 /// `(volName → filename → bytes)` it was asked to materialize + every
 /// emptyDir it was asked to ensure, and returns deterministic
-/// [`MountSource`]s (`HostDir("/fake/<vol>")` / `NamedVolume("fake-<vol>")`).
+/// [`MountSource`]s (`Materialized("/fake/<vol>")` / `NamedVolume("fake-<vol>")`).
 /// The trait IS the testability contract: resolution is fully exercised with
 /// ZERO real podman + ZERO host filesystem.
 #[derive(Default)]
@@ -1850,6 +2056,9 @@ struct FakeMatState {
     empty_dirs: Vec<String>,
     /// emptyDir volumes the materializer was asked to remove (delete path).
     removed_empty_dirs: Vec<String>,
+    /// Materialized directories the materializer was asked to remove
+    /// (delete path).
+    removed_materialized: Vec<PathBuf>,
 }
 
 impl FakeVolumeMaterializer {
@@ -1875,6 +2084,13 @@ impl FakeVolumeMaterializer {
     pub async fn removed_empty_dirs(&self) -> Vec<String> {
         self.inner.lock().await.removed_empty_dirs.clone()
     }
+
+    /// The materialized directories the mock was asked to remove (in call
+    /// order) — the pod-delete cleanup surface for configMap / secret /
+    /// projected / `ServiceAccount` files.
+    pub async fn removed_materialized(&self) -> Vec<PathBuf> {
+        self.inner.lock().await.removed_materialized.clone()
+    }
 }
 
 #[async_trait]
@@ -1895,9 +2111,9 @@ impl VolumeMaterializer for FakeVolumeMaterializer {
             .await
             .files
             .insert(volume.to_string(), files.clone());
-        Ok(MountSource::HostDir(PathBuf::from(format!(
-            "/fake/{volume}"
-        ))))
+        Ok(MountSource::Materialized(MaterializedDir::written_at(
+            PathBuf::from(format!("/fake/{volume}")),
+        )))
     }
 
     async fn ensure_empty_dir(
@@ -1921,6 +2137,15 @@ impl VolumeMaterializer for FakeVolumeMaterializer {
             .await
             .removed_empty_dirs
             .push(volume.to_string());
+        Ok(())
+    }
+
+    async fn remove_materialized(&self, dir: &MaterializedDir) -> Result<(), VolumeResolveError> {
+        self.inner
+            .lock()
+            .await
+            .removed_materialized
+            .push(dir.path().to_path_buf());
         Ok(())
     }
 }
@@ -2042,7 +2267,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             map.get("cfg"),
-            Some(&MountSource::HostDir(PathBuf::from("/fake/cfg")))
+            Some(&MountSource::Materialized(MaterializedDir::written_at(
+                PathBuf::from("/fake/cfg")
+            )))
         );
         let files = mat.files_for("cfg").await.unwrap();
         assert_eq!(files.get("greeting"), Some(&b"hello".to_vec()));
@@ -2151,7 +2378,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             map.get("cfg"),
-            Some(&MountSource::HostDir(PathBuf::from("/fake/cfg")))
+            Some(&MountSource::Materialized(MaterializedDir::written_at(
+                PathBuf::from("/fake/cfg")
+            )))
         );
         // Materialized with NO files (empty volume).
         assert_eq!(mat.files_for("cfg").await.unwrap().len(), 0);
@@ -2173,7 +2402,7 @@ mod tests {
         let mut resolved = BTreeMap::new();
         resolved.insert(
             "cfg".to_string(),
-            MountSource::HostDir(PathBuf::from("/fake/cfg")),
+            MountSource::Materialized(MaterializedDir::written_at(PathBuf::from("/fake/cfg"))),
         );
         resolved.insert(
             "scratch".to_string(),
@@ -2188,7 +2417,7 @@ mod tests {
         });
         let mounts = container_mounts(&container, &resolved).unwrap();
         assert_eq!(mounts.len(), 2);
-        // configMap (HostDir) defaults read-only.
+        // configMap (Materialized) defaults read-only.
         let cfg = mounts.iter().find(|m| m.mount_path == "/etc/cfg").unwrap();
         assert!(cfg.read_only);
         // emptyDir (NamedVolume) defaults read-write.
@@ -2825,5 +3054,142 @@ mod projected_volumes {
             PodVolumeSource::Projected { sources } => assert_eq!(sources.len(), 2),
             other => panic!("expected Projected, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// ★ T2.10: each source's teardown is DECIDED, and the two host-path
+    /// kinds that used to share one arm get opposite answers: the kubelet's
+    /// own files go, the user's directory stays.
+    #[test]
+    fn each_source_owes_its_own_teardown_and_a_host_path_owes_none() {
+        assert_eq!(
+            teardown_obligation("data", &MountSource::UserHostPath("/srv/data".into())),
+            None,
+            "a hostPath is the user's directory and is never removed"
+        );
+        let dir = MaterializedDir::written_at(PathBuf::from("/root/ns_p/cfg"));
+        assert_eq!(
+            teardown_obligation("cfg", &MountSource::Materialized(dir.clone())),
+            Some(VolumeTeardown::RemoveMaterialized(dir))
+        );
+        for source in [
+            MountSource::NamedVolume("engenho-empty-ns_p_scratch".into()),
+            MountSource::EmptyDirHostDir("/var/lib/x/_data".into()),
+        ] {
+            assert_eq!(
+                teardown_obligation("scratch", &source),
+                Some(VolumeTeardown::RemoveEmptyDir {
+                    volume: "scratch".into()
+                })
+            );
+        }
+        assert_eq!(
+            teardown_obligation(
+                "pv",
+                &MountSource::PvcHostDir {
+                    path: "/mnt/pv".into(),
+                    read_only: false
+                }
+            ),
+            Some(VolumeTeardown::ReleaseClaim {
+                volume: "pv".into()
+            })
+        );
+    }
+
+    /// A `Materialized` source cannot be read back from bytes: teardown
+    /// removes it outright, so a deserialized one would be a path nobody
+    /// materialized, queued for deletion.
+    #[test]
+    fn a_materialized_source_cannot_be_deserialized() {
+        let forged = json!({ "Materialized": "/" });
+        assert!(
+            serde_json::from_value::<MountSource>(forged).is_err(),
+            "deserializing a Materialized source must be refused"
+        );
+        // Control: the user's own kind round-trips.
+        let user = MountSource::UserHostPath("/srv/data".into());
+        let back: MountSource =
+            serde_json::from_value(serde_json::to_value(&user).expect("serialize"))
+                .expect("a hostPath source deserializes");
+        assert_eq!(back, user);
+    }
+
+    /// A hostPath mounts read-write by default, as upstream mounts it; the
+    /// kubelet's materialized files stay read-only by default.
+    #[test]
+    fn a_host_path_defaults_read_write_and_materialized_files_read_only() {
+        let resolved: BTreeMap<String, MountSource> = [
+            (
+                "data".to_string(),
+                MountSource::UserHostPath("/srv/data".into()),
+            ),
+            (
+                "cfg".to_string(),
+                MountSource::Materialized(MaterializedDir::written_at("/root/ns_p/cfg".into())),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let container = json!({
+            "name": "main",
+            "volumeMounts": [
+                { "name": "data", "mountPath": "/data" },
+                { "name": "cfg", "mountPath": "/etc/cfg" }
+            ]
+        });
+        let mounts = container_mounts(&container, &resolved).expect("mounts");
+        assert!(!mounts[0].read_only, "hostPath is read-write by default");
+        assert!(mounts[1].read_only, "configMap/secret files are read-only");
+    }
+
+    /// ★ T2.10, against the real filesystem: the production materializer
+    /// removes what it wrote, then the pod's directory once it is empty —
+    /// and a re-run (teardown retried after a partial failure) is success.
+    #[tokio::test]
+    async fn the_podman_materializer_removes_what_it_wrote_and_nothing_else() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let m = PodmanVolumeMaterializer::new().with_data_root(root.path());
+        let files: BTreeMap<String, Vec<u8>> = [("token".to_string(), b"s3cret".to_vec())]
+            .into_iter()
+            .collect();
+
+        let MountSource::Materialized(secret) = m
+            .materialize_files("ns", "p", "secret-vol", &files)
+            .await
+            .expect("materialize")
+        else {
+            panic!("materialize_files must produce a Materialized source");
+        };
+        let MountSource::Materialized(cfg) = m
+            .materialize_files("ns", "p", "cfg-vol", &files)
+            .await
+            .expect("materialize")
+        else {
+            panic!("materialize_files must produce a Materialized source");
+        };
+        let pod_dir = root.path().join("ns_p");
+        assert!(secret.path().join("token").exists(), "control: written");
+
+        m.remove_materialized(&secret).await.expect("remove");
+        assert!(!secret.path().exists(), "the secret directory is gone");
+        assert!(cfg.path().exists(), "a sibling volume is untouched");
+        assert!(pod_dir.exists(), "the pod dir stays while it is not empty");
+
+        m.remove_materialized(&cfg).await.expect("remove");
+        assert!(!pod_dir.exists(), "the empty pod directory goes with it");
+        assert!(
+            root.path().exists(),
+            "the data root itself is never removed"
+        );
+
+        m.remove_materialized(&cfg)
+            .await
+            .expect("removing what is already gone is success");
     }
 }

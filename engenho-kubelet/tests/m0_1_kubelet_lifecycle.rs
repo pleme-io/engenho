@@ -1302,3 +1302,131 @@ async fn total_start_failure_still_writes_pending_status() {
         "an un-started container is not ready"
     );
 }
+
+// ── T2.10 — a restart reads its stop and remove results ─────────────────
+//
+// `restart_container` discarded both with `let _`, then started the
+// replacement regardless: beside an old container the runtime had refused to
+// stop, or — on the native backend — beside a process still inside its grace
+// period. Each is two copies of one workload.
+
+/// A replacement is never started beside an old container the runtime
+/// refused to stop. Once the runtime stops it, the restart goes ahead.
+#[tokio::test]
+async fn a_restart_never_starts_a_replacement_beside_a_container_that_would_not_stop() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("OnFailure")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    backend.set_exit(&cid, 1).await;
+    backend
+        .seed_stop_fault(&cid, "podman stop: timed out")
+        .await;
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "no replacement beside a container the runtime would not stop"
+    );
+    assert!(
+        backend.status(&cid).await.unwrap().is_some(),
+        "the old container was not removed out from under its failed stop"
+    );
+
+    backend.clear_stop_fault(&cid).await;
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "control: once it stops, the restart goes ahead"
+    );
+    assert_eq!(backend.status(&cid).await.unwrap(), None, "old one removed");
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(container_statuses(&pod)[0]["restartCount"], 1);
+
+    teardown(store, kubelet).await;
+}
+
+/// A restart waits for the old process to be REAPED — the native backend
+/// refuses to drop it while it is inside its grace period — and asks to be
+/// re-ticked soon rather than on the next sweep.
+///
+/// `Always`, because the fake's `stop` rewrites the container's exit to 0;
+/// the restart path under test is the same one every policy takes.
+#[tokio::test]
+async fn a_restart_waits_for_the_old_process_to_be_reaped() {
+    use engenho_controllers::ReconcileResult;
+
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("Always")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    backend.set_exit(&cid, 1).await;
+    backend.hold_unreaped(&cid).await;
+    let outcome = kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "no replacement while the old process is unreaped"
+    );
+    assert!(
+        matches!(
+            outcome.result,
+            ReconcileResult::Requeue(_) | ReconcileResult::RequeueWithProgress(_)
+        ),
+        "the kubelet must come back soon, got {:?}",
+        outcome.result
+    );
+
+    backend.reap(&cid).await;
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&backend.events().await),
+        2,
+        "restarted once reaped"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// The pod's `terminationGracePeriodSeconds` reaches the runtime with the
+/// container it governs — the native backend escalates on exactly this value.
+#[tokio::test]
+async fn the_pods_termination_grace_reaches_the_runtime() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    store
+        .propose(ResourceCommand::Put {
+            key: pod_key("pg"),
+            value: json!({
+                "kind": "Pod", "apiVersion": "v1",
+                "metadata": { "name": "pg" },
+                "spec": {
+                    "nodeName": "node-A",
+                    "terminationGracePeriodSeconds": 90,
+                    "containers": [{ "name": "main", "image": "img" }]
+                }
+            }),
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await
+        .unwrap();
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+    let spec = backend.spec_of(&cid).await.expect("started");
+    assert_eq!(spec.termination_grace.duration(), Duration::from_secs(90));
+
+    teardown(store, kubelet).await;
+}

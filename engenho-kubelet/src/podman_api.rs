@@ -501,18 +501,17 @@ pub fn pull_policy_value(policy: PullPolicy) -> &'static str {
 /// Translate one resolved mount into libpod's shape.
 ///
 /// Mirrors [`crate::backend::PodmanBackend`]'s argv rendering exactly —
-/// `HostDir` and `PvcHostDir` are bind mounts of a host path, `NamedVolume` is
-/// a podman volume — because the two backends must place the same bytes at the
+/// every host-path source is a bind mount, `NamedVolume` is a podman volume —
+/// read through the one [`MountSource::bind_source`](crate::pod_volume::MountSource::bind_source)
+/// mapping — because the two backends must place the same bytes at the
 /// same container path. A mount that differs between backends is a workload
 /// that behaves differently depending on how the kubelet was configured, which
 /// is the worst kind of difference: invisible until something reads a file.
 fn to_libpod_mount(m: &crate::pod_volume::ResolvedMount) -> Mount {
-    use crate::pod_volume::MountSource;
-    let (source, mount_type) = match &m.source {
-        MountSource::HostDir(p) => (p.display().to_string(), "bind"),
-        MountSource::EmptyDirHostDir(p) => (p.display().to_string(), "bind"),
-        MountSource::PvcHostDir { path, .. } => (path.display().to_string(), "bind"),
-        MountSource::NamedVolume(n) => (n.clone(), "volume"),
+    use crate::pod_volume::BindSource;
+    let (source, mount_type) = match m.source.bind_source() {
+        BindSource::Path(p) => (p.display().to_string(), "bind"),
+        BindSource::Volume(n) => (n.to_string(), "volume"),
     };
     // subPath: bind the *specific file or subdirectory* inside the resolved
     // source, not the whole volume. Without this, a `volumeMount.subPath:
@@ -1631,6 +1630,7 @@ mod tests {
             resources: crate::backend::Resources::default(),
             pod: crate::backend::PodIdentity::default(),
             init_kind: crate::lifecycle::InitKind::Regular,
+            termination_grace: crate::backend::TerminationGrace::default(),
         };
         let req = create_request(&spec, Some("engenho-net"));
 
@@ -1869,7 +1869,7 @@ mod tests {
             name: "c".to_string(),
             image: "img".to_string(),
             mounts: vec![crate::pod_volume::ResolvedMount {
-                source: crate::pod_volume::MountSource::HostDir("/host/cm".into()),
+                source: crate::pod_volume::MountSource::UserHostPath("/host/cm".into()),
                 mount_path: "/etc/config".to_string(),
                 read_only: true,
                 sub_path: None,
@@ -1939,7 +1939,7 @@ mod tests {
         // defect. A per-field assertion on mounts[0] passes happily while
         // mounts 1..n are dropped.
         let mk = |n: u8| crate::pod_volume::ResolvedMount {
-            source: crate::pod_volume::MountSource::HostDir(format!("/h/{n}").into()),
+            source: crate::pod_volume::MountSource::UserHostPath(format!("/h/{n}").into()),
             mount_path: format!("/c/{n}"),
             read_only: false,
             sub_path: None,

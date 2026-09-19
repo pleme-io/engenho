@@ -161,7 +161,10 @@ async fn configmap_volume_materializes_files_and_mounts_read_only() {
         spec.mounts[0].read_only,
         "configMap mount defaults read-only"
     );
-    assert!(matches!(spec.mounts[0].source, MountSource::HostDir(_)));
+    assert!(matches!(
+        spec.mounts[0].source,
+        MountSource::Materialized(_)
+    ));
 
     teardown(store, kubelet).await;
 }
@@ -293,8 +296,9 @@ async fn empty_dir_named_volume_reaped_on_pod_delete() {
                 "nodeName": "node-A",
                 "volumes": [
                     { "name": "scratch", "emptyDir": {} },
-                    // A configMap-less optional vol to prove configMap/secret
-                    // HostDir sources are NOT reaped as named volumes.
+                    // A configMap-less optional vol: its (empty) materialized
+                    // directory is removed as a directory, never reaped as a
+                    // named volume.
                     { "name": "cfg-vol", "configMap": { "name": "absent", "optional": true } }
                 ],
                 "containers": [ {
@@ -318,9 +322,14 @@ async fn empty_dir_named_volume_reaped_on_pod_delete() {
     );
     assert_eq!(count_starts(&backend.events().await), 1);
 
-    // Hard-delete the pod → next tick reaps the orphan's containers AND its
-    // emptyDir named volume (the configMap HostDir is NOT a named volume → not
-    // reaped here).
+    assert!(
+        mat.removed_materialized().await.is_empty(),
+        "no materialized directory removed before delete"
+    );
+
+    // Hard-delete the pod → next tick reaps the orphan's containers, its
+    // emptyDir named volume, AND the directory the configMap was materialized
+    // into — each through its own teardown, never one mistaken for the other.
     delete_pod(&store, "p1").await;
     kubelet.tick().await.unwrap();
 
@@ -328,6 +337,13 @@ async fn empty_dir_named_volume_reaped_on_pod_delete() {
         mat.removed_empty_dirs().await,
         vec!["scratch".to_string()],
         "exactly the emptyDir volume is reaped on pod delete"
+    );
+    // ★ T2.10: this directory was never removed before. The LocalPod comment
+    // promised a "pod-dir GC" that did not exist.
+    assert_eq!(
+        mat.removed_materialized().await,
+        vec![std::path::PathBuf::from("/fake/cfg-vol")],
+        "the materialized configMap directory is removed on pod delete"
     );
 
     teardown(store, kubelet).await;
@@ -452,7 +468,7 @@ fn run_argv_emits_volume_flags_in_order() {
         image: "busybox".into(),
         mounts: vec![
             ResolvedMount {
-                source: MountSource::HostDir("/home/u/vols/cfg".into()),
+                source: MountSource::UserHostPath("/home/u/vols/cfg".into()),
                 mount_path: "/etc/cfg".into(),
                 read_only: true,
                 sub_path: None,
@@ -469,7 +485,7 @@ fn run_argv_emits_volume_flags_in_order() {
     let argv = backend.run_argv(&spec);
 
     // The two `-v` pairs appear in spec.mounts order, AFTER `--name <name>`
-    // and BEFORE the image. HostDir read-only → `:ro`; NamedVolume rw → none.
+    // and BEFORE the image. A read-only host path → `:ro`; NamedVolume rw → none.
     let name_idx = argv.iter().position(|a| a == "default_p1_main").unwrap();
     let cfg_idx = argv
         .iter()
@@ -488,4 +504,180 @@ fn run_argv_emits_volume_flags_in_order() {
     assert!(name_idx < cfg_idx, "mounts come after --name");
     assert!(cfg_idx < scratch_idx, "mounts preserve spec.mounts order");
     assert!(scratch_idx < image_idx, "mounts come before the image");
+}
+
+// ── T2.10: cleanup obligations are values ───────────────────────────────────
+
+/// ★ T2.10, against the real filesystem: deleting a pod removes the
+/// directory its secret was materialized into, and leaves the directory its
+/// `hostPath` named exactly as it was.
+///
+/// Before T2.10 both were one `MountSource::HostDir` arm, and neither was
+/// ever removed: every secret a pod had mounted stayed on the node's disk
+/// after the pod was gone, behind a comment promising a "pod-dir GC" that did
+/// not exist. Removing "every HostDir" instead would have deleted the
+/// user's data — which is why the fix is a type, not a loop.
+#[tokio::test]
+async fn deleting_a_pod_removes_its_materialized_secret_and_never_its_host_path() {
+    let store = boot_store("vol-teardown-real").await;
+    let backend = Arc::new(FakeBackend::new());
+    let data_root = tempfile::tempdir().expect("tempdir");
+    let user_root = tempfile::tempdir().expect("tempdir");
+    let user_dir = user_root.path().join("pgdata");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("PG_VERSION"), b"16").unwrap();
+
+    let mat =
+        Arc::new(engenho_kubelet::PodmanVolumeMaterializer::new().with_data_root(data_root.path()));
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_volume_materializer(mat as Arc<dyn VolumeMaterializer>)
+        .with_host_path_policy(engenho_kubelet::pod_volume::HostPathPolicy::allowing([
+            user_root.path(),
+        ]));
+
+    put(
+        &store,
+        ResourceKey::namespaced("", "v1", "Secret", "default", "creds"),
+        json!({
+            "kind": "Secret", "apiVersion": "v1",
+            "metadata": { "name": "creds", "namespace": "default" },
+            "data": { "password": b64("hunter2") }
+        }),
+    )
+    .await;
+    put(
+        &store,
+        pod_key("db"),
+        json!({
+            "kind": "Pod", "apiVersion": "v1",
+            "metadata": { "name": "db", "namespace": "default" },
+            "spec": {
+                "nodeName": "node-A",
+                "volumes": [
+                    { "name": "creds", "secret": { "secretName": "creds" } },
+                    { "name": "data", "hostPath": { "path": user_dir.to_string_lossy() } }
+                ],
+                "containers": [ {
+                    "name": "main", "image": "busybox",
+                    "volumeMounts": [
+                        { "name": "creds", "mountPath": "/etc/creds" },
+                        { "name": "data", "mountPath": "/var/lib/data" }
+                    ]
+                } ]
+            }
+        }),
+    )
+    .await;
+
+    kubelet.tick().await.unwrap();
+    assert_eq!(count_starts(&backend.events().await), 1, "control: started");
+    let secret_dir = data_root.path().join("default_db").join("creds");
+    assert_eq!(
+        std::fs::read(secret_dir.join("password")).unwrap(),
+        b"hunter2",
+        "control: the secret was materialized"
+    );
+
+    delete_pod(&store, "db").await;
+    kubelet.tick().await.unwrap();
+
+    assert!(
+        !secret_dir.exists(),
+        "the materialized secret must not outlive its pod"
+    );
+    assert!(
+        !data_root.path().join("default_db").exists(),
+        "nor the pod's now-empty directory"
+    );
+    assert!(
+        user_dir.join("PG_VERSION").exists(),
+        "a hostPath is the user's data and is never removed"
+    );
+    assert_eq!(
+        std::fs::read(user_dir.join("PG_VERSION")).unwrap(),
+        b"16",
+        "nor rewritten"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// A container whose stop is still in flight (the native backend's answer
+/// while its process is inside the grace period) holds the pod's teardown:
+/// no volume is removed from under a process that may still be using it,
+/// the kubelet asks to come back soon rather than waiting for a sweep, and
+/// once the process is reaped everything is discharged.
+#[tokio::test]
+async fn volumes_wait_for_a_container_still_inside_its_grace_period() {
+    use engenho_controllers::ReconcileResult;
+    use engenho_kubelet::ContainerRuntime;
+
+    let store = boot_store("vol-teardown-unreaped").await;
+    let backend = Arc::new(FakeBackend::new());
+    let mat = Arc::new(FakeVolumeMaterializer::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_volume_materializer(mat.clone() as Arc<dyn VolumeMaterializer>);
+
+    put(
+        &store,
+        pod_key("p1"),
+        json!({
+            "kind": "Pod", "apiVersion": "v1",
+            "metadata": { "name": "p1" },
+            "spec": {
+                "nodeName": "node-A",
+                "volumes": [
+                    { "name": "scratch", "emptyDir": {} },
+                    { "name": "cfg-vol", "configMap": { "name": "absent", "optional": true } }
+                ],
+                "containers": [ {
+                    "name": "main", "image": "busybox",
+                    "volumeMounts": [
+                        { "name": "scratch", "mountPath": "/data" },
+                        { "name": "cfg-vol", "mountPath": "/etc/cfg" }
+                    ]
+                } ]
+            }
+        }),
+    )
+    .await;
+    kubelet.tick().await.unwrap();
+    let (cid, _) = backend.containers().await.remove(0);
+
+    backend.hold_unreaped(&cid).await;
+    delete_pod(&store, "p1").await;
+    let outcome = kubelet.tick().await.unwrap();
+
+    assert!(
+        backend.status(&cid).await.unwrap().is_some(),
+        "an unreaped container's record stays"
+    );
+    assert!(
+        mat.removed_empty_dirs().await.is_empty() && mat.removed_materialized().await.is_empty(),
+        "no volume is torn down while a container that mounts it is still stopping"
+    );
+    assert!(
+        matches!(
+            outcome.result,
+            ReconcileResult::Requeue(_) | ReconcileResult::RequeueWithProgress(_)
+        ),
+        "the kubelet must come back soon to finish, got {:?}",
+        outcome.result
+    );
+
+    backend.reap(&cid).await;
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        backend.status(&cid).await.unwrap(),
+        None,
+        "removed once reaped"
+    );
+    assert_eq!(mat.removed_empty_dirs().await, vec!["scratch".to_string()]);
+    assert_eq!(
+        mat.removed_materialized().await,
+        vec![std::path::PathBuf::from("/fake/cfg-vol")]
+    );
+
+    teardown(store, kubelet).await;
 }

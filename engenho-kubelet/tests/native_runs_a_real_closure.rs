@@ -255,3 +255,148 @@ async fn the_image_ryn_runs_today_is_refused_by_the_real_backend() {
     assert!(msg.contains("no Linux runtime"), "{msg}");
     assert!(msg.contains("nix:/nix/store/"), "{msg}");
 }
+
+/// Is `pid` still in the process table — running OR a zombie? `ps` lists
+/// zombies too, so `false` means the process was reaped. Explicit columns:
+/// macOS `ps` refuses its default format (the TIME column) under a sandbox.
+fn in_process_table(pid: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "pid=", "-p", pid])
+        .output()
+        .expect("run ps");
+    out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+}
+
+/// The process group `pid` is in, as `ps` reports it.
+fn pgid_of(pid: &str) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", pid])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// ★ T2.10, end to end through the real backend: a workload that ignores
+/// SIGTERM is SIGKILLed once the POD's grace period has passed, and reaped.
+///
+/// Before T2.10 `stop` sent SIGTERM and returned, and `remove` dropped the
+/// record whatever the process was doing. This workload would have run on
+/// with no record left to find it by — and a restart under the same id would
+/// have started a second copy beside it.
+///
+/// Pinned along the way, each a behaviour the kubelet relies on:
+///   * `stop` returns at once — the grace period is waited out in the
+///     container's termination task, never in the kubelet's tick;
+///   * while the process is inside its grace period it still reads as
+///     running, `remove` refuses to drop it, and a second start under its id
+///     is refused — one process per workload;
+///   * the workload stays in the daemon's process group (no
+///     `process_group(0)`): launchd killing the job's group is what keeps a
+///     daemon restart from leaving a second copy running (plan edge 12).
+#[tokio::test]
+async fn a_workload_ignoring_sigterm_is_sigkilled_after_the_pods_grace_and_reaped() {
+    use engenho_kubelet::KubeletError;
+    use engenho_kubelet::backend::TerminationGrace;
+    use std::time::{Duration, Instant};
+
+    // `^out`: bash has several outputs and the first one printed is its man
+    // pages, which hold no `bin/bash`.
+    let bash = closure("nixpkgs#bash^out");
+    let coreutils = closure("nixpkgs#coreutils");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-grace"),
+    );
+    let mut image = String::from("nix:");
+    image.push_str(&bash);
+    // `exec` keeps the pid and the ignored SIGTERM: the process the backend
+    // signals IS the one that ignores it, with no child of its own.
+    let script = format!("trap '' TERM; echo $$; echo ready; exec {coreutils}/bin/sleep 30");
+    let mut s = spec(&image, &["bash", "-c", &script], &[]);
+    s.termination_grace = TerminationGrace::from_seconds(2);
+    let grace = s.termination_grace.duration();
+
+    let started = backend.start(&s).await.expect("start");
+    let id = started.container_id.clone();
+
+    // Signal only once the trap is set.
+    let mut log = String::new();
+    for _ in 0..250 {
+        log = backend
+            .logs(&id, &LogOptions::default())
+            .await
+            .expect("logs");
+        if log.contains("ready") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        log.contains("ready"),
+        "the workload never got ready: {log:?}"
+    );
+    let pid = log.lines().next().expect("the pid line").trim().to_string();
+    assert!(in_process_table(&pid), "control: the workload is running");
+    assert_eq!(
+        pgid_of(&pid),
+        pgid_of(&std::process::id().to_string()),
+        "a native workload must stay in the daemon's process group"
+    );
+
+    let stopped_at = Instant::now();
+    backend.stop(&id).await.expect("stop");
+    assert!(
+        stopped_at.elapsed() < Duration::from_millis(500),
+        "stop must hand the grace period to a task, not wait it out inline: {:?}",
+        stopped_at.elapsed()
+    );
+
+    // Inside the grace period: SIGTERM was ignored, so it is still up.
+    assert!(
+        backend
+            .status(&id)
+            .await
+            .expect("status")
+            .expect("tracked")
+            .is_running(),
+        "a process inside its grace period is still running"
+    );
+    match backend.remove(&id).await {
+        Err(KubeletError::NotReaped { container_id }) => assert_eq!(container_id, id),
+        other => panic!("remove must refuse an unreaped process, got {other:?}"),
+    }
+    match backend.start(&s).await {
+        Err(KubeletError::NotReaped { .. }) => {}
+        other => panic!("a second copy must not start beside an unreaped one, got {other:?}"),
+    }
+
+    let mut ended = None;
+    while stopped_at.elapsed() < grace + Duration::from_secs(5) {
+        let st = backend.status(&id).await.expect("status").expect("tracked");
+        if !st.is_running() {
+            ended = Some((st.state, stopped_at.elapsed()));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (state, took) = ended.expect("the workload must end within its grace period + 5s");
+    assert_eq!(
+        state,
+        RunState::Exited(ExitDisposition::Signal(9)),
+        "SIGTERM was ignored, so SIGKILL ended it"
+    );
+    assert!(
+        took >= grace,
+        "SIGKILL came before the pod's grace period ran out: {took:?} < {grace:?}"
+    );
+    assert!(
+        !in_process_table(&pid),
+        "the process must be reaped, not left a zombie"
+    );
+
+    backend
+        .remove(&id)
+        .await
+        .expect("a reaped process's record may go");
+    assert!(backend.status(&id).await.expect("status").is_none());
+}

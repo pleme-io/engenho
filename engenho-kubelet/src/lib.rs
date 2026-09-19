@@ -73,7 +73,7 @@ pub mod volume;
 pub use backend::{
     ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeExecFault, FakeNetProber,
     HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage,
-    PullPolicy, Readoption, TcpProbeTarget, TokioNetProber,
+    PullPolicy, Readoption, TcpProbeTarget, TerminationGrace, TokioNetProber,
 };
 pub use config_bridge::{make_container_runtime, make_container_runtime_with_apiserver};
 pub use csi_materializer::{
@@ -86,9 +86,10 @@ pub use lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
 };
 pub use pod_volume::{
-    FakeVolumeMaterializer, MountSource, NoServiceAccountProjection, PodVolumeSource,
-    PodmanVolumeMaterializer, ResolvedMount, SA_MOUNT_PATH, ServiceAccountProjector,
-    VolumeMaterializer, VolumeResolveError, resolve_pod_volumes,
+    BindSource, FakeVolumeMaterializer, MaterializedDir, MountSource, NoServiceAccountProjection,
+    PodVolumeSource, PodmanVolumeMaterializer, ResolvedMount, SA_MOUNT_PATH,
+    ServiceAccountProjector, VolumeMaterializer, VolumeResolveError, VolumeTeardown,
+    resolve_pod_volumes, teardown_obligation,
 };
 pub use probe::{
     BlindCause, BlindNotice, BlindStreak, HttpScheme, ProbeHandler, ProbeKind, ProbeObservation,

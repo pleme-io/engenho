@@ -35,10 +35,12 @@ use crate::backend::{
 use crate::cri::{ExitDisposition, RunState};
 use crate::error::KubeletError;
 use crate::image_source::ImageSource;
-use crate::pod_volume::MountSource;
+use crate::pod_volume::BindSource;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 /// What the native backend refused, and why.
 ///
@@ -90,6 +92,26 @@ pub enum NativeError {
     ExecNoCommand,
     /// A tracked program has no closure root to resolve an exec against.
     NoClosureRoot { program: PathBuf },
+    /// Asking the kernel whether a container's process exited failed.
+    Wait {
+        /// The container asked about.
+        id: String,
+        /// What the kernel said.
+        detail: String,
+    },
+    /// The container's process has not been reaped, so its record cannot be
+    /// dropped and its id cannot be reused.
+    NotReaped {
+        /// The container still owed a wait.
+        id: String,
+    },
+    /// The task terminating a container ended without saying how the process
+    /// did. Its calls cannot panic, so this is a runtime shutting down under
+    /// it; the process may still be alive, and nothing escalated.
+    TerminationLost {
+        /// The container whose termination was lost.
+        id: String,
+    },
 }
 
 impl std::fmt::Display for NativeError {
@@ -159,6 +181,19 @@ impl std::fmt::Display for NativeError {
                  against",
                 program.display()
             ),
+            Self::Wait { id, detail } => {
+                write!(f, "cannot read the exit of container {id}: {detail}")
+            }
+            Self::NotReaped { id } => write!(
+                f,
+                "container {id} has not been reaped; its record stays until \
+                 its process is waited on"
+            ),
+            Self::TerminationLost { id } => write!(
+                f,
+                "the task terminating container {id} ended without reaping \
+                 it; the process may still be running"
+            ),
         }
     }
 }
@@ -167,8 +202,12 @@ impl std::error::Error for NativeError {}
 
 impl From<NativeError> for KubeletError {
     /// The ONE place a native-backend failure becomes a string, and it goes
-    /// through `Display`.
+    /// through `Display`. A process still owed a wait keeps its type: the
+    /// kubelet retries it quietly rather than reporting a broken runtime.
     fn from(e: NativeError) -> Self {
+        if let NativeError::NotReaped { id } = e {
+            return Self::NotReaped { container_id: id };
+        }
         let mut rendered = String::from("native backend: ");
         std::fmt::Write::write_fmt(&mut rendered, format_args!("{e}"))
             .expect("writing to a String cannot fail");
@@ -210,16 +249,182 @@ impl std::fmt::Display for ContainerId<'_> {
 /// A container this backend started.
 #[derive(Debug)]
 struct NativeContainer {
-    pid: Option<u32>,
     log_path: PathBuf,
-    /// The live handle. Kept rather than dropped so the process is REAPED and
-    /// its real exit code is readable: a dropped `Child` leaves a zombie and
-    /// makes every exit look like `None`, which a kubelet reads as "still
-    /// running" forever.
-    child: tokio::process::Child,
     /// Kept so `status` can report the closure a container came from without
     /// re-parsing the spec.
     program: PathBuf,
+    /// The pod's `SIGTERM` → `SIGKILL` window, from the spec it started with.
+    grace: Duration,
+    /// Where the process is in its life, and who holds it.
+    process: Process,
+}
+
+/// ★ WHO HOLDS THE PROCESS IS A VALUE, NOT A HOPE.
+///
+/// `stop` used to send `SIGTERM` to a pid and return, and `remove` dropped
+/// the record whatever the process was doing. A workload that ignored
+/// `SIGTERM` kept running with no record left to find it by, and the next
+/// start under the same id ran a second copy beside it. Every stage is an arm
+/// now, and only [`Process::Reaped`] lets a record go.
+#[derive(Debug)]
+enum Process {
+    /// Running, or exited and not yet waited on. The backend holds the only
+    /// handle. Kept rather than dropped so the process is REAPED and its real
+    /// exit is readable: a dropped `Child` leaves a zombie and makes every
+    /// exit look like `None`, which a kubelet reads as "still running"
+    /// forever.
+    Live(tokio::process::Child),
+    /// Handed to its termination task, which holds the `Child` until it has
+    /// reaped it. Still alive as far as anyone may assume.
+    Terminating(Termination),
+    /// Waited on: the pid is released and nothing of the process remains.
+    Reaped(Reaped),
+}
+
+/// A process being stopped: `SIGTERM`, then `SIGKILL` once the grace period
+/// runs out, then reaped — in a task of its own, so no caller waits out a
+/// grace period inline.
+#[derive(Debug)]
+struct Termination {
+    /// The task's verdict, sent exactly once, when the process is reaped.
+    verdict: oneshot::Receiver<Reaped>,
+    /// The task. Held so the record owns it; never aborted — dropping the
+    /// handle detaches the task, which still escalates and reaps, so a
+    /// backend going away mid-stop does not strand a process that ignored
+    /// `SIGTERM`.
+    _task: tokio::task::JoinHandle<()>,
+}
+
+/// How a reaped process ended.
+#[derive(Debug, Clone, Copy)]
+enum Reaped {
+    /// The kernel's wait status.
+    Status(std::process::ExitStatus),
+    /// The wait itself failed, which leaves nothing to wait on: the pid is no
+    /// longer this process's child to reap. Gone, and how is not known.
+    Unobservable,
+}
+
+impl Reaped {
+    fn run_state(self) -> RunState {
+        match self {
+            Self::Status(status) => run_state_of(Some(status)),
+            Self::Unobservable => RunState::Unknown,
+        }
+    }
+}
+
+impl Termination {
+    /// Hand `child` to a new termination task.
+    ///
+    /// ── ★ THE PID, NEVER ITS PROCESS GROUP ─────────────────────────────────
+    /// Signals go to exactly the child's pid, and the workload is spawned
+    /// WITHOUT `process_group(0)`: it stays in the daemon's process group. On
+    /// ryn that group is launchd's job, and when launchd stops the job it
+    /// kills the group — today's only guard against a daemon restart leaving
+    /// a second copy of every native workload running, since a new process
+    /// cannot re-adopt the old one's children (plan edge 12). The cost is
+    /// stated rather than hidden: a workload's own children are not
+    /// signalled here. A `SIGKILL`ed shell's children are orphaned and reaped
+    /// by launchd, not by this backend.
+    fn spawn(child: tokio::process::Child, grace: Duration) -> Self {
+        let (tx, verdict) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let reaped = terminate(child, grace).await;
+            if tx.send(reaped).is_err() {
+                // The record, and the backend with it, went away first;
+                // there is nobody left to tell. The process is reaped anyway.
+                tracing::debug!("native container reaped after its record was dropped");
+            }
+        });
+        Self {
+            verdict,
+            _task: task,
+        }
+    }
+}
+
+/// Stop `child`: `SIGTERM`, `SIGKILL` once `grace` has passed, then reap.
+async fn terminate(mut child: tokio::process::Child, grace: Duration) -> Reaped {
+    // `id()` is `Some` exactly while the child is unreaped, so the pid cannot
+    // have been recycled to a stranger.
+    if let Some(pid) = child.id()
+        && !signal_process(pid, SIGTERM)
+    {
+        tracing::debug!(
+            pid,
+            "SIGTERM not delivered; the grace period still bounds the wait"
+        );
+    }
+    let waited = match tokio::time::timeout(grace, child.wait()).await {
+        Ok(waited) => waited,
+        Err(_grace_elapsed) => {
+            // The workload ignored SIGTERM, or is still shutting down with
+            // the grace spent. SIGKILL cannot be ignored.
+            if let Err(e) = child.start_kill() {
+                tracing::warn!(error = %e, "SIGKILL after the grace period failed");
+            }
+            child.wait().await
+        }
+    };
+    match waited {
+        Ok(status) => Reaped::Status(status),
+        Err(e) => {
+            tracing::warn!(error = %e, "waiting on a stopped native container failed");
+            Reaped::Unobservable
+        }
+    }
+}
+
+impl NativeContainer {
+    /// Advance the record to what the kernel says now: a live process that
+    /// has exited is reaped, and a termination that has finished is read.
+    fn settle(&mut self, id: &str) -> Result<(), NativeError> {
+        let reaped = match &mut self.process {
+            Process::Live(child) => child
+                .try_wait()
+                .map_err(|e| NativeError::Wait {
+                    id: id.to_string(),
+                    detail: e.to_string(),
+                })?
+                .map(Reaped::Status),
+            Process::Terminating(t) => match t.verdict.try_recv() {
+                Ok(reaped) => Some(reaped),
+                Err(oneshot::error::TryRecvError::Empty) => None,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    return Err(NativeError::TerminationLost { id: id.to_string() });
+                }
+            },
+            Process::Reaped(_) => None,
+        };
+        if let Some(reaped) = reaped {
+            self.process = Process::Reaped(reaped);
+        }
+        Ok(())
+    }
+
+    /// What the process is doing, as last settled. A process being
+    /// terminated is still running: nothing has reaped it.
+    fn run_state(&self) -> RunState {
+        match &self.process {
+            Process::Live(_) | Process::Terminating(_) => RunState::Running,
+            Process::Reaped(reaped) => reaped.run_state(),
+        }
+    }
+
+    const fn is_reaped(&self) -> bool {
+        matches!(self.process, Process::Reaped(_))
+    }
+
+    /// Begin stopping: a live process goes to its termination task. One
+    /// already terminating or reaped is left as it is — stop is idempotent.
+    fn stopping(self) -> Self {
+        let process = match self.process {
+            Process::Live(child) => Process::Terminating(Termination::spawn(child, self.grace)),
+            other => other,
+        };
+        Self { process, ..self }
+    }
 }
 
 /// Runs containers as native host processes out of Nix closures.
@@ -361,12 +566,11 @@ impl NativeBackend {
     /// come up empty, and report success either way.
     fn verify_mounts(spec: &ContainerSpec) -> Result<(), NativeError> {
         for m in &spec.mounts {
-            let host = match &m.source {
-                MountSource::HostDir(p) | MountSource::EmptyDirHostDir(p) => p.clone(),
-                MountSource::PvcHostDir { path, .. } => path.clone(),
-                MountSource::NamedVolume(name) => {
+            let host = match m.source.bind_source() {
+                BindSource::Path(p) => p.to_path_buf(),
+                BindSource::Volume(name) => {
                     return Err(NativeError::NamedVolume {
-                        volume: name.clone(),
+                        volume: name.to_string(),
                     });
                 }
             };
@@ -419,6 +623,19 @@ impl ContainerRuntime for NativeBackend {
         Self::verify_mounts(spec)?;
 
         let id = Self::container_id(spec);
+        // ── ★ ONE PROCESS PER ID ───────────────────────────────────────────
+        // Held from the check to the insert, so nothing can slip a second
+        // start in between. A previous run under this id that has not been
+        // reaped is still — as far as anyone may assume — running, and a
+        // start beside it is two copies of the workload. Checked before the
+        // log is opened, because opening it truncates that run's log.
+        let mut state = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
+        if let Some(previous) = state.get_mut(&id) {
+            previous.settle(&id)?;
+            if !previous.is_reaped() {
+                return Err(NativeError::NotReaped { id }.into());
+            }
+        }
         std::fs::create_dir_all(&self.log_dir).map_err(|e| NativeError::VolumePath {
             path: self.log_dir.clone(),
             detail: e.to_string(),
@@ -452,18 +669,16 @@ impl ContainerRuntime for NativeBackend {
         })?;
         let pid = child.id();
 
-        self.state
-            .lock()
-            .map_err(|_| NativeError::StatePoisoned)?
-            .insert(
-                id.clone(),
-                NativeContainer {
-                    pid,
-                    log_path,
-                    child,
-                    program,
-                },
-            );
+        state.insert(
+            id.clone(),
+            NativeContainer {
+                log_path,
+                program,
+                grace: spec.termination_grace.duration(),
+                process: Process::Live(child),
+            },
+        );
+        drop(state);
 
         Ok(ContainerStatus {
             container_id: id,
@@ -486,35 +701,48 @@ impl ContainerRuntime for NativeBackend {
         // try_wait REAPS an exited child and yields its real status. Asking the
         // kernel beats trusting a cached flag: a container that died a second
         // ago must not still read as running.
-        let exited = c.child.try_wait().map_err(|e| NativeError::Spawn {
-            program: c.program.clone(),
-            detail: e.to_string(),
-        })?;
+        c.settle(container_id)?;
         Ok(Some(ContainerStatus {
             container_id: container_id.to_string(),
-            state: run_state_of(exited),
+            state: c.run_state(),
             pod_ip: Some(HOST_NETWORK_POD_IP.to_string()),
         }))
     }
 
+    /// `SIGTERM` now; `SIGKILL` once the pod's grace period has passed; then
+    /// reap — all in the container's termination task, so this returns at
+    /// once and the kubelet's tick never waits out a grace period.
+    ///
+    /// SIGTERM first, so a workload that handles it gets to shut down
+    /// cleanly. Postgres in particular treats SIGTERM as "smart shutdown" and
+    /// SIGKILL as a crash it must recover from on next start — which is why
+    /// the grace period is the pod's own, not a constant.
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
         let mut guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
-        let Some(c) = guard.get_mut(container_id) else {
+        let Some(c) = guard.remove(container_id) else {
             // Not tracked. A typed no-op beats an error: stopping something
             // already gone is the normal end of a pod, not a failure.
             return Ok(());
         };
-        // SIGTERM first, so a workload that handles it gets to shut down
-        // cleanly. Postgres in particular treats SIGTERM as "smart shutdown"
-        // and SIGKILL as a crash it must recover from on next start.
-        if let Some(pid) = c.pid {
-            signal_process(pid, SIGTERM);
-        }
+        guard.insert(container_id.to_string(), c.stopping());
         Ok(())
     }
 
+    /// Drop the record — only once its process has been reaped. Before that
+    /// the refusal is [`KubeletError::NotReaped`], and the record (with its
+    /// id) stays, so no replacement can be started beside a live process.
     async fn remove(&self, container_id: &str) -> Result<(), KubeletError> {
         let mut guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
+        let Some(c) = guard.get_mut(container_id) else {
+            return Ok(());
+        };
+        c.settle(container_id)?;
+        if !c.is_reaped() {
+            return Err(NativeError::NotReaped {
+                id: container_id.to_string(),
+            }
+            .into());
+        }
         guard.remove(container_id);
         Ok(())
     }
@@ -801,7 +1029,7 @@ mod tests {
     fn a_volume_that_cannot_be_remapped_is_refused_naming_both_paths() {
         let mut s = spec("nix:/nix/store/a-pkg", &["postgres"]);
         s.mounts = vec![crate::pod_volume::ResolvedMount {
-            source: MountSource::HostDir("/Users/luis.d/pgdata".into()),
+            source: crate::pod_volume::MountSource::UserHostPath("/Users/luis.d/pgdata".into()),
             mount_path: "/var/lib/postgresql/data".to_string(),
             read_only: false,
             sub_path: None,
@@ -829,7 +1057,7 @@ mod tests {
         let dir = std::env::temp_dir().join("engenho-native-mount-ok");
         let mut s = spec("nix:/nix/store/a-pkg", &["postgres"]);
         s.mounts = vec![crate::pod_volume::ResolvedMount {
-            source: MountSource::HostDir(dir.clone()),
+            source: crate::pod_volume::MountSource::UserHostPath(dir.clone()),
             mount_path: dir.to_string_lossy().into_owned(),
             read_only: false,
             sub_path: None,
@@ -844,7 +1072,7 @@ mod tests {
     fn a_named_volume_is_refused_because_it_has_no_host_path() {
         let mut s = spec("nix:/nix/store/a-pkg", &["postgres"]);
         s.mounts = vec![crate::pod_volume::ResolvedMount {
-            source: MountSource::NamedVolume("pgdata".to_string()),
+            source: crate::pod_volume::MountSource::NamedVolume("pgdata".to_string()),
             mount_path: "/var/lib/postgresql/data".to_string(),
             read_only: false,
             sub_path: None,
@@ -900,6 +1128,88 @@ mod tests {
             !state.exit().is_some_and(ExitDisposition::is_success),
             "a killed process must never read as a success"
         );
+    }
+
+    /// Spawn `/bin/sh` running `script` with stdout piped, and wait until it
+    /// prints `ready` — so a test signals it only after its traps are set.
+    async fn shell_ready(script: &str) -> tokio::process::Child {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/sh");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let first = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the script reports ready within 5s")
+            .expect("read stdout");
+        assert_eq!(first.as_deref(), Some("ready"));
+        child
+    }
+
+    /// ★ T2.10: a workload that ignores SIGTERM is killed with SIGKILL once its grace
+    /// period has passed — not before — and REAPED: nothing of it remains,
+    /// not even a zombie (which `kill(pid, 0)` would still find).
+    ///
+    /// The stop this replaced sent SIGTERM and returned; a workload that
+    /// ignored it ran on with nothing left to find it by.
+    #[tokio::test]
+    async fn a_process_ignoring_sigterm_is_sigkilled_after_its_grace_and_reaped() {
+        let child = shell_ready("trap '' TERM; echo ready; exec sleep 30").await;
+        let pid = child.id().expect("running");
+        let grace = Duration::from_millis(400);
+
+        let begun = std::time::Instant::now();
+        let reaped = terminate(child, grace).await;
+        let took = begun.elapsed();
+
+        let Reaped::Status(status) = reaped else {
+            panic!("the wait must succeed: {reaped:?}");
+        };
+        assert_eq!(
+            run_state_of(Some(status)),
+            RunState::Exited(ExitDisposition::Signal(9)),
+            "SIGTERM was ignored, so only SIGKILL could end it"
+        );
+        assert!(
+            took >= grace,
+            "SIGKILL came before the grace period ran out: {took:?} < {grace:?}"
+        );
+        assert!(
+            took < grace + Duration::from_secs(3),
+            "the escalation must follow the grace period promptly: {took:?}"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "the process must be reaped, not left a zombie"
+        );
+    }
+
+    /// The positive control for the escalation: a workload that honours
+    /// SIGTERM ends on SIGTERM, well inside its grace period. A stop that
+    /// sent SIGKILL first would pass the test above and fail this one.
+    #[tokio::test]
+    async fn a_process_honouring_sigterm_ends_on_sigterm_inside_its_grace() {
+        let child = shell_ready("echo ready; exec sleep 30").await;
+        let pid = child.id().expect("running");
+
+        let begun = std::time::Instant::now();
+        let reaped = terminate(child, Duration::from_secs(20)).await;
+
+        let Reaped::Status(status) = reaped else {
+            panic!("the wait must succeed: {reaped:?}");
+        };
+        assert_eq!(
+            run_state_of(Some(status)),
+            RunState::Exited(ExitDisposition::Signal(15))
+        );
+        assert!(
+            begun.elapsed() < Duration::from_secs(5),
+            "a SIGTERM-honouring process must not wait out its grace period"
+        );
+        assert!(!process_is_alive(pid), "reaped");
     }
 
     #[test]

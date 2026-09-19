@@ -60,7 +60,7 @@ use crate::lifecycle::{
 };
 use crate::pod_volume::{
     MountSource, PodVolumeSource, PodmanVolumeMaterializer, VolumeMaterializer, VolumeResolveError,
-    container_mounts, pod_volumes,
+    VolumeTeardown, container_mounts, pod_volumes, teardown_obligation, teardowns_of,
 };
 use crate::probe::{
     BlindCause, BlindNotice, ProbeKind, ProbeRuntime, ProbeSpec, ProbeTrip,
@@ -342,6 +342,42 @@ enum Relaunch {
     /// The runtime refused the replacement. The old container was already
     /// stopped and removed to free its name.
     Failed(LaunchFailed),
+    /// The old container is not out of the way yet: its stop or remove was
+    /// refused, or — [`KubeletError::NotReaped`] — its process is still
+    /// inside its grace period. No replacement was started, because one
+    /// started now would run beside it (native) or collide with its name
+    /// (podman). The permit went unused, so the start curve is not charged.
+    OldNotCleared(KubeletError),
+}
+
+impl Relaunch {
+    /// Stop THEN remove the container a restart replaces, reading both
+    /// results. Either refusal is the reason no replacement starts.
+    async fn clear_old(backend: &dyn ContainerRuntime, old: &str) -> Result<(), KubeletError> {
+        backend.stop(old).await?;
+        backend.remove(old).await
+    }
+}
+
+/// How a restart that could not clear its old container is logged: a stop
+/// still in flight is progress (debug), anything else is a runtime failing
+/// (warn). One place, so the two restart paths cannot drift.
+fn log_old_not_cleared(pod: &ResourceKey, container: &str, cause: &KubeletError) {
+    if matches!(cause, KubeletError::NotReaped { .. }) {
+        debug!(
+            pod = %pod.label(),
+            container,
+            error = %cause,
+            "restart waiting on the old container's stop"
+        );
+    } else {
+        warn!(
+            pod = %pod.label(),
+            container,
+            error = %cause,
+            "old container could not be cleared; replacement not started"
+        );
+    }
 }
 
 /// The event text for a container that could not be started.
@@ -521,15 +557,23 @@ struct LocalPod {
     /// containers may start + the pod proceeds to the app reconcile. A pod with
     /// no init containers reaches `init_complete = true` on its first start.
     init_complete: bool,
-    /// emptyDir volume NAMES (`spec.volumes[i].name`, NOT the backing podman
-    /// volume name) this pod created. Recorded at start so delete-cleanup can
-    /// reap each one via `volume_materializer.remove_empty_dir(ns, pod, name)`
-    /// — emptyDir is pod-lifetime scratch, so its named volume dies with the
-    /// pod (alongside the container stop+remove). configMap/secret HostDir
-    /// sources are NOT recorded here — they're plain files under the data root,
-    /// reaped by the pod-dir GC, not a podman named volume.
-    empty_dir_volumes: Vec<String>,
+    /// What tearing this pod's volumes down owes, as VALUES: recorded when a
+    /// container that mounts them starts, discharged by
+    /// [`Kubelet::cleanup_pod_containers`] once every container is gone.
+    ///
+    /// Filled only through [`teardown_obligation`], which is exhaustive over
+    /// [`MountSource`], so a new volume source cannot be mounted without
+    /// deciding what removing it means. This replaced a list of emptyDir
+    /// names beside a comment promising that configMap/secret files were
+    /// "reaped by the pod-dir GC" — no such GC existed, so every secret a pod
+    /// ever mounted stayed on the node's disk after the pod was gone.
+    volume_teardowns: BTreeSet<VolumeTeardown>,
 }
+
+/// The volume name the kubelet materializes a pod's `ServiceAccount`
+/// projection under — one name at the start path, the token refresh and the
+/// teardown, so the three cannot disagree about which directory is whose.
+const SA_PROJECTION_VOLUME: &str = "kube-api-access";
 
 /// The kubelet's clock — a `now()` source. Defaults to [`Instant::now`];
 /// tests inject a controllable clock so probe `period` / `initialDelay`
@@ -860,7 +904,7 @@ impl Kubelet {
                 Ok(Some(files)) => {
                     match self
                         .volume_materializer
-                        .materialize_files(namespace, &key.name, "kube-api-access", &files)
+                        .materialize_files(namespace, &key.name, SA_PROJECTION_VOLUME, &files)
                         .await
                     {
                         Ok(_) => report.refreshed += 1,
@@ -1681,6 +1725,9 @@ impl Kubelet {
                     // requests`. The scheduler did arithmetic about a bound the
                     // node declined to enforce.
                     resources: crate::backend::Resources::from_container_json(c),
+                    // Pod-level, carried per container so a stop can honour
+                    // it without looking the pod up again.
+                    termination_grace: crate::backend::TerminationGrace::of_pod(pod),
                     // ★ The identity, carried rather than fused. The four
                     // components are all in scope right here and were being
                     // thrown away into `backend_name`'s lossy join — which the
@@ -2538,46 +2585,12 @@ impl Controller for Kubelet {
         }
 
         // ── (A) Delete-cleanup: local entries no longer in the bound set ──
-        // A Pod we started that's absent from the freshly-listed bound set
-        // was hard-deleted or its spec.nodeName moved away → orphaned on
-        // this node. stop THEN remove, then drop the local entry. The
-        // store key is already gone for a delete; nothing to patch.
-        let orphaned: Vec<(ResourceKey, LocalPod)> = {
-            let local = self.local.lock().await;
-            let live: BTreeSet<&ResourceKey> = bound.keys().collect();
-            local
-                .iter()
-                .filter(|(key, _)| !live.contains(key))
-                .map(|(key, lp)| (key.clone(), lp.clone()))
-                .collect()
-        };
-        for (key, lp) in orphaned {
-            // MULTI-CONTAINER: stop THEN remove EVERY container of the pod.
-            // All-or-nothing: only drop the local entry if every container
-            // cleaned up; otherwise retain it so the next tick retries the
-            // stragglers (no silent leak).
-            match self.cleanup_pod_containers(&key, &lp).await {
-                Ok(()) => {
-                    self.local.lock().await.remove(&key);
-                    report.objects_changed += 1;
-                    debug!(
-                        pod = %key.label(),
-                        containers = lp.containers.len(),
-                        "kubelet cleaned up orphaned pod containers"
-                    );
-                }
-                Err(e) => {
-                    // Leave the local entry so the next tick retries — no
-                    // silent leak.
-                    warn!(
-                        pod = %key.label(),
-                        error = %e,
-                        "kubelet cleanup failed; will retry next tick"
-                    );
-                    report.objects_skipped += 1;
-                }
-            }
-        }
+        // The soonest this tick asks to be re-run. Declared before the
+        // cleanup, which can ask too: a container whose stop is in flight is
+        // come back to soon, not on the next coarse sweep.
+        let mut soonest_requeue: Option<Duration> = None;
+        self.cleanup_orphans(&bound, &mut report, &mut soonest_requeue)
+            .await;
 
         // ── PROJECTED-TOKEN REFRESH. After cleanup so a pod on its way out
         // is not re-minted, and before the start/status work so a long-lived
@@ -2600,7 +2613,6 @@ impl Controller for Kubelet {
         // one-shot Requeue) rather than only on Pod-watch events / the coarse
         // fallback. None = no probes anywhere = no Requeue = today's wake
         // behavior (the behavior-preserving guarantee for no-probe pods).
-        let mut soonest_requeue: Option<Duration> = None;
         for (key, value) in &bound {
             // Membership decides start (B) vs poll (C); compute it under a
             // short lock to avoid holding it across the backend await.
@@ -2664,6 +2676,69 @@ impl Controller for Kubelet {
 }
 
 impl Kubelet {
+    /// (A) Delete-cleanup: local entries no longer in the bound set.
+    ///
+    /// A Pod we started that's absent from the freshly-listed bound set was
+    /// hard-deleted or its spec.nodeName moved away → orphaned on this node.
+    /// stop THEN remove, then drop the local entry. The store key is already
+    /// gone for a delete; nothing to patch.
+    async fn cleanup_orphans(
+        &self,
+        bound: &BTreeMap<ResourceKey, Value>,
+        report: &mut ReconcileReport,
+        soonest_requeue: &mut Option<Duration>,
+    ) {
+        let orphaned: Vec<(ResourceKey, LocalPod)> = {
+            let local = self.local.lock().await;
+            let live: BTreeSet<&ResourceKey> = bound.keys().collect();
+            local
+                .iter()
+                .filter(|(key, _)| !live.contains(key))
+                .map(|(key, lp)| (key.clone(), lp.clone()))
+                .collect()
+        };
+        for (key, lp) in orphaned {
+            // MULTI-CONTAINER: stop THEN remove EVERY container of the pod.
+            // All-or-nothing: only drop the local entry if every container
+            // cleaned up; otherwise retain it so the next tick retries the
+            // stragglers (no silent leak).
+            match self.cleanup_pod_containers(&key, &lp).await {
+                Ok(()) => {
+                    self.local.lock().await.remove(&key);
+                    report.objects_changed += 1;
+                    debug!(
+                        pod = %key.label(),
+                        containers = lp.containers.len(),
+                        "kubelet cleaned up orphaned pod containers"
+                    );
+                }
+                Err(KubeletError::NotReaped { container_id }) => {
+                    // A stop still in flight — the process is inside its
+                    // grace period. Not a failure: the entry stays, nothing
+                    // after the container is torn down yet, and the kubelet
+                    // comes back soon to finish.
+                    debug!(
+                        pod = %key.label(),
+                        container_id = %container_id,
+                        "kubelet cleanup waiting on a container's stop"
+                    );
+                    Self::accumulate_requeue(soonest_requeue, MIN_PROBE_REQUEUE);
+                    report.objects_skipped += 1;
+                }
+                Err(e) => {
+                    // Leave the local entry so the next tick retries — no
+                    // silent leak.
+                    warn!(
+                        pod = %key.label(),
+                        error = %e,
+                        "kubelet cleanup failed; will retry next tick"
+                    );
+                    report.objects_skipped += 1;
+                }
+            }
+        }
+    }
+
     /// stop THEN remove a container; idempotent on the backend (already
     /// stopped / not found are success). Stop-before-remove ordering is
     /// the invariant.
@@ -2674,14 +2749,15 @@ impl Kubelet {
     }
 
     /// MULTI-CONTAINER cleanup: stop THEN remove EVERY container of the pod,
-    /// THEN reap each emptyDir named volume the pod created. Returns `Ok(())`
-    /// only if all containers AND all emptyDir volumes cleaned up; the FIRST
-    /// failure is surfaced (so the caller retains the local entry + retries).
-    /// Each container's stop-before-remove ordering is preserved; volume
-    /// removal happens AFTER all containers are gone (a volume still in use by
-    /// a live container can't be removed). emptyDir-volume removal is
-    /// idempotent (already-absent is success), so a retry after a partial
-    /// failure converges.
+    /// THEN discharge every volume teardown the pod owes. Returns `Ok(())`
+    /// only when all of it is done; otherwise the FIRST failure, and the
+    /// caller keeps the local entry and retries. Every step is idempotent
+    /// (already stopped / already gone / already removed is success), so a
+    /// retry after a partial pass converges.
+    ///
+    /// Volumes go last: a volume a live container still mounts cannot be
+    /// taken out from under it. A container whose stop is still in flight
+    /// ([`KubeletError::NotReaped`]) holds everything after it.
     async fn cleanup_pod_containers(
         &self,
         key: &ResourceKey,
@@ -2697,9 +2773,7 @@ impl Kubelet {
         //
         // Upstream's rule (KEP-753 R8): stop the regular app containers, and
         // only once they are gone stop the sidecars.
-        for record in lp.containers.values() {
-            self.cleanup_container(&record.container_id).await?;
-        }
+        self.cleanup_group(lp.containers.values()).await?;
         // Then the init containers. A pod deleted mid-init, or after a
         // completed init sequence, still has them recorded — an exited init
         // container retains its podman name until removed. stop is a no-op on
@@ -2715,21 +2789,63 @@ impl Kubelet {
         // means making the map ordered, which is a wider change than this one;
         // recorded rather than approximated, because an ordering that is wrong
         // in a way tests can pass is worse than one that is openly absent.
-        for record in lp.init_containers.values() {
-            self.cleanup_container(&record.container_id).await?;
-        }
-        // emptyDir is pod-lifetime scratch → reap its backing podman named
-        // volume now that every container is stopped+removed. The volume name
-        // recorded on the LocalPod is the logical `spec.volumes[i].name`; the
-        // materializer maps it to the deterministic backing volume.
+        self.cleanup_group(lp.init_containers.values()).await?;
+        // Every container is stopped and removed: discharge what the pod's
+        // volumes owe.
         let namespace = key.namespace.as_deref().unwrap_or("default");
-        for vol in &lp.empty_dir_volumes {
-            self.volume_materializer
-                .remove_empty_dir(namespace, &key.name, vol)
+        for teardown in &lp.volume_teardowns {
+            self.discharge(namespace, &key.name, teardown)
                 .await
-                .map_err(|e| KubeletError::Backend(format!("remove emptyDir {vol}: {e}")))?;
+                .map_err(KubeletError::VolumeTeardown)?;
         }
         Ok(())
+    }
+
+    /// Stop EVERY container in `records`, then remove every one.
+    ///
+    /// All stops go out before any remove, so containers whose runtime stops
+    /// them asynchronously (the native backend's `SIGTERM` → grace →
+    /// `SIGKILL`) spend their grace periods side by side rather than one
+    /// after another. A remove that is refused does not skip the rest; the
+    /// first failure is returned once every container has been tried.
+    async fn cleanup_group<'a>(
+        &self,
+        records: impl Iterator<Item = &'a ContainerRecord> + Clone,
+    ) -> Result<(), KubeletError> {
+        for record in records.clone() {
+            self.backend.stop(&record.container_id).await?;
+        }
+        let mut first_failure = None;
+        for record in records {
+            if let Err(e) = self.backend.remove(&record.container_id).await {
+                first_failure.get_or_insert(e);
+            }
+        }
+        first_failure.map_or(Ok(()), Err)
+    }
+
+    /// Discharge one volume teardown through the materializer that owns it.
+    async fn discharge(
+        &self,
+        namespace: &str,
+        pod: &str,
+        teardown: &VolumeTeardown,
+    ) -> Result<(), VolumeResolveError> {
+        match teardown {
+            VolumeTeardown::RemoveMaterialized(dir) => {
+                self.volume_materializer.remove_materialized(dir).await
+            }
+            VolumeTeardown::RemoveEmptyDir { volume } => {
+                self.volume_materializer
+                    .remove_empty_dir(namespace, pod, volume)
+                    .await
+            }
+            VolumeTeardown::ReleaseClaim { volume } => {
+                self.volume_materializer
+                    .unpublish_csi(namespace, pod, volume)
+                    .await
+            }
+        }
     }
 
     /// Pre-fetch every `Secret` / `ConfigMap` referenced by `env[].valueFrom`
@@ -3223,7 +3339,7 @@ impl Kubelet {
                 Ok(Some(files)) => {
                     let src = self
                         .volume_materializer
-                        .materialize_files(namespace, &key.name, "kube-api-access", &files)
+                        .materialize_files(namespace, &key.name, SA_PROJECTION_VOLUME, &files)
                         .await
                         .map_err(|e| {
                             ControllerError::Internal(format!(
@@ -3262,6 +3378,14 @@ impl Kubelet {
             // requeue; nothing else to do this tick.
             return Ok(());
         };
+        // What removing these volumes will owe — the resolved ones and the
+        // ServiceAccount projection, which is materialized outside `resolved`.
+        let mut teardowns = teardowns_of(&resolved);
+        teardowns.extend(
+            sa_mount
+                .as_ref()
+                .and_then(|m| teardown_obligation(SA_PROJECTION_VOLUME, &m.source)),
+        );
 
         // Ensure a fresh local record exists, then start each container not
         // yet recorded. (On a partial prior start the record already holds
@@ -3342,28 +3466,10 @@ impl Kubelet {
                     );
                     let mut local = self.local.lock().await;
                     let entry = local.entry(key.clone()).or_default();
-                    // Record this pod's emptyDir volume names ONCE so
-                    // delete-cleanup can reap the backing podman named volumes.
-                    // emptyDir sources resolve to MountSource::NamedVolume
-                    // (legacy) OR MountSource::EmptyDirHostDir (current, since
-                    // a563f42 resolved the named volume to its host mountpoint
-                    // to sidestep a libpod-API/crun mismatch). configMap/secret
-                    // (HostDir files) are NOT recorded — they aren't podman
-                    // named volumes. Idempotent: only set on the first
-                    // container start (when the list is still empty).
-                    if entry.empty_dir_volumes.is_empty() {
-                        entry.empty_dir_volumes = resolved
-                            .iter()
-                            .filter(|(_, src)| {
-                                matches!(
-                                    src,
-                                    crate::pod_volume::MountSource::NamedVolume(_)
-                                        | crate::pod_volume::MountSource::EmptyDirHostDir(_)
-                                )
-                            })
-                            .map(|(name, _)| name.clone())
-                            .collect();
-                    }
+                    // A started container mounts these, so the pod now owes
+                    // their removal. A set: a later start re-resolving the
+                    // same volumes owes nothing twice.
+                    entry.volume_teardowns.extend(teardowns.iter().cloned());
                     entry.containers.insert(
                         cname.clone(),
                         ContainerRecord {
@@ -3796,11 +3902,15 @@ impl Kubelet {
                 .map(|rec| rec.mounts.clone())
                 .unwrap_or_default()
         };
-        // Free the deterministic name first: stop THEN remove the old container
-        // (best-effort — an exited container is already stopped). Only then can
-        // the replacement reuse `--name`.
-        let _ = self.backend.stop(old_container_id).await;
-        let _ = self.backend.remove(old_container_id).await;
+        // Free the deterministic name first: stop THEN remove the old
+        // container. Both results are read — they were `let _` until T2.10,
+        // which started a replacement beside an old container the runtime
+        // had refused to stop (and, on the native backend, beside a process
+        // still inside its grace period). An exited container's stop is a
+        // no-op, so the common exit-restart clears at once.
+        if let Err(cause) = Relaunch::clear_old(self.backend.as_ref(), old_container_id).await {
+            return Relaunch::OldNotCleared(cause);
+        }
         let new_status = match self.launch(permit, &restart_spec).await {
             Ok(status) => status,
             Err(failed) => return Relaunch::Failed(failed),
@@ -4026,6 +4136,26 @@ impl Kubelet {
                                 });
                                 report.objects_skipped += 1;
                             }
+                            Relaunch::OldNotCleared(cause) => {
+                                log_old_not_cleared(key, cname, &cause);
+                                if matches!(cause, KubeletError::NotReaped { .. }) {
+                                    // Its stop is in flight; the replacement
+                                    // follows as soon as it is reaped.
+                                    Self::accumulate_requeue(soonest_requeue, MIN_PROBE_REQUEUE);
+                                }
+                                // Still up, and being stopped for the probe it
+                                // failed: not ready.
+                                observations.push(ContainerObservation {
+                                    name: cname.clone(),
+                                    state: ContainerState::Running,
+                                    container_id: Some(record.container_id.clone()),
+                                    restart_count: record.restart_count,
+                                    ready: false,
+                                    kind: crate::lifecycle::InitKind::Regular,
+                                    ever_started: true,
+                                });
+                                report.objects_skipped += 1;
+                            }
                         }
                     } else {
                         // No restart this tick → readiness sources from the
@@ -4219,6 +4349,21 @@ impl Kubelet {
                                 ));
                                 report.objects_skipped += 1;
                             }
+                            Relaunch::OldNotCleared(cause) => {
+                                // The exit stands as observed; the restart
+                                // waits until the old container is gone.
+                                log_old_not_cleared(key, cname, &cause);
+                                if matches!(cause, KubeletError::NotReaped { .. }) {
+                                    Self::accumulate_requeue(soonest_requeue, MIN_PROBE_REQUEUE);
+                                }
+                                observations.push(ContainerObservation::terminated(
+                                    cname,
+                                    &record.container_id,
+                                    exit,
+                                    record.restart_count,
+                                ));
+                                report.objects_skipped += 1;
+                            }
                         }
                     } else {
                         // restartPolicy:Never (or OnFailure+zero) → terminal
@@ -4374,10 +4519,14 @@ impl Kubelet {
         spec: &ContainerSpec,
         restart_count: u32,
         permit: crate::backoff::StartPermit,
+        resolved: &BTreeMap<String, MountSource>,
     ) -> Result<crate::backend::ContainerStatus, LaunchFailed> {
         let status = self.launch(permit, spec).await?;
         let mut local = self.local.lock().await;
         let entry = local.entry(key.clone()).or_default();
+        // The pod's volumes were materialized for this container too; a pod
+        // deleted mid-init owes their removal as much as a running one.
+        entry.volume_teardowns.extend(teardowns_of(resolved));
         entry.init_containers.insert(
             cname.to_string(),
             ContainerRecord {
@@ -4780,7 +4929,7 @@ impl Kubelet {
                     "kubelet starting init container"
                 );
                 match self
-                    .start_init_container(key, cname, &spec, 0, permit)
+                    .start_init_container(key, cname, &spec, 0, permit, resolved)
                     .await
                 {
                     Ok(status) => {
@@ -4810,10 +4959,17 @@ impl Kubelet {
                             return Ok(None);
                         };
                         let new_count = record.restart_count + 1;
-                        let _ = self.backend.stop(&record.container_id).await;
-                        let _ = self.backend.remove(&record.container_id).await;
+                        // Read, not discarded: a replacement must not start
+                        // beside an old container that is not gone.
+                        if let Err(cause) =
+                            Relaunch::clear_old(self.backend.as_ref(), &record.container_id).await
+                        {
+                            log_old_not_cleared(key, cname, &cause);
+                            report.objects_skipped += 1;
+                            return Ok(None);
+                        }
                         match self
-                            .start_init_container(key, cname, &spec, new_count, permit)
+                            .start_init_container(key, cname, &spec, new_count, permit, resolved)
                             .await
                         {
                             Ok(status) => {

@@ -99,7 +99,7 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
         // already expects — which is the only shape a native process can
         // honour, and which `verify_mounts` enforces.
         mounts: vec![ResolvedMount {
-            source: MountSource::HostDir(data.clone()),
+            source: MountSource::UserHostPath(data.clone()),
             mount_path: data.to_string_lossy().into_owned(),
             read_only: false,
             sub_path: None,

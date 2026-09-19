@@ -507,15 +507,23 @@ impl ContainerRuntime for CriBackend {
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
-        self.runtime()
+        match self
+            .runtime()
             .await?
             .stop_container(v1::StopContainerRequest {
                 container_id: container_id.to_string(),
                 timeout: 30,
             })
             .await
-            .map_err(|e| KubeletError::Backend(format!("StopContainer: {e}")))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            // A container the runtime no longer has is already stopped — the
+            // trait's contract, and the same reading `status` gives NotFound.
+            // Without it the kubelet, which reads every stop's result, could
+            // never restart a container that vanished.
+            Err(s) if s.code() == tonic::Code::NotFound => Ok(()),
+            Err(e) => Err(KubeletError::Backend(format!("StopContainer: {e}"))),
+        }
     }
 
     async fn remove(&self, container_id: &str) -> Result<(), KubeletError> {

@@ -6,7 +6,7 @@
 //! receive a typed `ContainerSpec` + return a typed
 //! `ContainerStatus`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -347,6 +347,60 @@ impl Resources {
     }
 }
 
+/// How long a container gets between `SIGTERM` and `SIGKILL` when it is
+/// stopped — the pod's `spec.terminationGracePeriodSeconds`.
+///
+/// ── ★ READ FROM THE POD, FLOORED THE WAY UPSTREAM FLOORS IT ─────────────
+/// Upstream defaults an absent field to 30 s
+/// (`DefaultTerminationGracePeriodSeconds`) and its kubelet never gives a
+/// container less than 2 s (`minimumGracePeriodInSeconds` in
+/// `kuberuntime_container.go`, "always give containers a minimal shutdown
+/// window to avoid unnecessary SIGKILLs"). A negative value is clamped the
+/// same way: since v1.27 upstream reads it as 1 s, which the floor lifts to 2.
+///
+/// The only constructors apply that floor, so a zero-length window — a stop
+/// that is really a `SIGKILL` — cannot be built. A value that is not an
+/// integer is read as the default: the longer window is the conservative
+/// guess for a field whose job is to protect a shutdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminationGrace(Duration);
+
+impl TerminationGrace {
+    /// Upstream's default for a pod that declares none.
+    pub const DEFAULT: Self = Self(Duration::from_secs(30));
+    /// Upstream kubelet's floor: no container gets less.
+    pub const MINIMUM: Duration = Duration::from_secs(2);
+
+    /// A grace of `seconds`, floored at [`Self::MINIMUM`]. Negative seconds
+    /// floor too.
+    #[must_use]
+    pub fn from_seconds(seconds: i64) -> Self {
+        let declared = Duration::from_secs(u64::try_from(seconds).unwrap_or(0));
+        Self(declared.max(Self::MINIMUM))
+    }
+
+    /// The grace a Pod declares in `spec.terminationGracePeriodSeconds`, or
+    /// [`Self::DEFAULT`] when it declares none.
+    #[must_use]
+    pub fn of_pod(pod: &serde_json::Value) -> Self {
+        pod.pointer("/spec/terminationGracePeriodSeconds")
+            .and_then(serde_json::Value::as_i64)
+            .map_or(Self::DEFAULT, Self::from_seconds)
+    }
+
+    /// The window itself.
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for TerminationGrace {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Which Pod this container belongs to, as separate typed fields.
 ///
 /// ── ★ THE JOIN IS LOSSY AND THE CODE SAYS SO ──────────────────────────────
@@ -486,6 +540,11 @@ pub struct ContainerSpec {
     /// this field existed. See [`Resources`] for why an unparseable bound is a
     /// distinct state rather than an absent one.
     pub resources: Resources,
+    /// The pod's `SIGTERM` → `SIGKILL` window, carried to the runtime at
+    /// start so a stop can honour it without a second lookup. A backend that
+    /// stops with its own fixed timeout ignores it today; the native backend
+    /// escalates on it.
+    pub termination_grace: TerminationGrace,
 }
 
 /// Status the backend reports back.
@@ -679,16 +738,30 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Stop a running container.
     ///
+    /// Idempotent: stopping a container that already exited, or one the
+    /// runtime no longer has, is success. The kubelet reads every stop's
+    /// result, so a runtime that reported "already gone" as an error would
+    /// wedge the restart of a container that vanished.
+    ///
+    /// A stop may return before the process is gone: the native backend
+    /// hands the process to a termination task (`SIGTERM`, then `SIGKILL`
+    /// after [`ContainerSpec::termination_grace`], then reap) so the caller's
+    /// tick never waits out a grace period.
+    ///
     /// # Errors
     ///
     /// Returns [`KubeletError::Backend`] if the backend cannot stop.
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError>;
 
-    /// Drop the container's record; equivalent to `docker rm`.
+    /// Drop the container's record; equivalent to `docker rm`. Removing a
+    /// container the runtime no longer has is success.
     ///
     /// # Errors
     ///
-    /// Returns [`KubeletError::Backend`] on failure.
+    /// [`KubeletError::NotReaped`] while the container's process has not been
+    /// reaped — its stop is still in flight. The record stays, and so does
+    /// the name, so a replacement cannot be started beside it.
+    /// [`KubeletError::Backend`] on any other failure.
     async fn remove(&self, container_id: &str) -> Result<(), KubeletError>;
 
     /// Stream a container's stdout/stderr log. The `kubectl logs <pod>
@@ -790,6 +863,11 @@ struct FakeState {
     /// the container as it was. Seeded via [`FakeBackend::seed_stop_fault`].
     /// A teardown that did not happen must not be reported as one that did.
     stop_faults: BTreeMap<String, String>,
+    /// Container IDs whose `remove` is refused as
+    /// [`KubeletError::NotReaped`], leaving the record — the native backend's
+    /// answer while a stopped process is inside its grace period. Seeded via
+    /// [`FakeBackend::hold_unreaped`].
+    unreaped: BTreeSet<String>,
 }
 
 /// How a [`FakeBackend`] exec fails without the command ever answering.
@@ -875,6 +953,22 @@ impl FakeBackend {
     /// The runtime stops `container_id` again.
     pub async fn clear_stop_fault(&self, container_id: &str) {
         self.inner.lock().await.stop_faults.remove(container_id);
+    }
+
+    /// Refuse every `remove` of `container_id` as
+    /// [`KubeletError::NotReaped`] until [`FakeBackend::reap`] — a stop whose
+    /// process is still inside its grace period.
+    pub async fn hold_unreaped(&self, container_id: &str) {
+        self.inner
+            .lock()
+            .await
+            .unreaped
+            .insert(container_id.to_string());
+    }
+
+    /// The held process has been reaped; `remove` succeeds again.
+    pub async fn reap(&self, container_id: &str) {
+        self.inner.lock().await.unreaped.remove(container_id);
     }
 
     /// Snapshot of all containers currently tracked.
@@ -1184,6 +1278,11 @@ impl ContainerRuntime for FakeBackend {
 
     async fn remove(&self, container_id: &str) -> Result<(), KubeletError> {
         let mut state = self.inner.lock().await;
+        if state.unreaped.contains(container_id) {
+            return Err(KubeletError::NotReaped {
+                container_id: container_id.to_string(),
+            });
+        }
         state.containers.remove(container_id);
         state.specs.remove(container_id);
         state.logs.remove(container_id);
@@ -1621,19 +1720,15 @@ impl PodmanBackend {
         // (M0.7 kubelet-volumes) Already-resolved volume mounts → `-v` pairs,
         // emitted AFTER `--name` and BEFORE the `-e` env pairs (deterministic,
         // unit-assertable position; preserved in `spec.mounts` order). A
-        // HostDir source uses the absolute host path; a NamedVolume uses the
+        // host-path source uses the absolute host path; a NamedVolume uses the
         // volume name. `:ro` is appended when the mount is read-only
         // (configMap/secret default; emptyDir read-write). Empty `spec.mounts`
         // (a pod with no volumes) emits nothing → byte-identical argv to before
         // this brick.
         for m in &spec.mounts {
-            let src = match &m.source {
-                crate::pod_volume::MountSource::HostDir(p) => p.display().to_string(),
-                crate::pod_volume::MountSource::EmptyDirHostDir(p) => p.display().to_string(),
-                crate::pod_volume::MountSource::NamedVolume(n) => n.clone(),
-                crate::pod_volume::MountSource::PvcHostDir { path, .. } => {
-                    path.display().to_string()
-                }
+            let src = match m.source.bind_source() {
+                crate::pod_volume::BindSource::Path(p) => p.display().to_string(),
+                crate::pod_volume::BindSource::Volume(n) => n.to_string(),
             };
             let spec_str = if m.read_only {
                 format!("{src}:{}:ro", m.mount_path)
@@ -1804,7 +1899,11 @@ impl PodmanBackend {
     /// `podman stop` argv for `id`.
     #[must_use]
     pub fn stop_argv(id: &str) -> Vec<String> {
-        vec!["stop".to_string(), id.to_string()]
+        // `--ignore`: a container podman no longer has is already stopped.
+        // Without it `podman stop` exits non-zero on a missing container, and
+        // the kubelet — which reads every stop's result — could never restart
+        // a container that vanished.
+        vec!["stop".to_string(), "--ignore".to_string(), id.to_string()]
     }
 
     /// `podman rm -f` argv for `id`. `-f` force-stops then removes;
@@ -2757,6 +2856,8 @@ mod tests {
             // same argv it did before the field existed, which is exactly what
             // these tests pin.
             resources: Resources::default(),
+            // Stop-time only; no argv carries it.
+            termination_grace: TerminationGrace::default(),
             // No Pod identity: these argv tests construct a spec directly, not
             // through the Pod path, and a backend that needs identity must
             // check `is_present()` rather than assume it.
@@ -3252,7 +3353,10 @@ mod tests {
 
     #[test]
     fn stop_argv_maps_id() {
-        assert_eq!(PodmanBackend::stop_argv("abc123"), vec!["stop", "abc123"]);
+        assert_eq!(
+            PodmanBackend::stop_argv("abc123"),
+            vec!["stop", "--ignore", "abc123"]
+        );
     }
 
     #[test]
@@ -3705,5 +3809,43 @@ mod name_conflict_tests {
         ] {
             assert!(!is_name_conflict(msg), "must NOT reclaim on: {msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod termination_grace_tests {
+    use super::TerminationGrace;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn of(spec: &serde_json::Value) -> Duration {
+        TerminationGrace::of_pod(&json!({ "spec": spec })).duration()
+    }
+
+    /// The pod's own grace is honoured, and the two upstream rules around
+    /// it hold: absent means 30 s, and nothing gets less than 2 s — a
+    /// zero-length window would make every stop a SIGKILL.
+    #[test]
+    fn the_pods_grace_is_read_defaulted_and_floored_as_upstream_does() {
+        assert_eq!(
+            of(&json!({ "terminationGracePeriodSeconds": 45 })),
+            Duration::from_secs(45)
+        );
+        assert_eq!(of(&json!({})), Duration::from_secs(30), "absent → 30 s");
+        assert_eq!(
+            of(&json!({ "terminationGracePeriodSeconds": 0 })),
+            Duration::from_secs(2),
+            "0 → the 2 s floor, never an immediate SIGKILL"
+        );
+        assert_eq!(
+            of(&json!({ "terminationGracePeriodSeconds": -5 })),
+            Duration::from_secs(2),
+            "negative → the floor"
+        );
+        assert_eq!(
+            of(&json!({ "terminationGracePeriodSeconds": "soon" })),
+            Duration::from_secs(30),
+            "not an integer → the default, the longer window"
+        );
     }
 }
