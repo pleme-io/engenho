@@ -79,6 +79,13 @@ pub const DEFAULT_BOOKMARK_EVERY: Duration = Duration::from_secs(5);
 /// `broadcast::RecvError::Lagged`). A consumer that receives a
 /// [`WatchGone`] re-establishes the watch from the carried resume
 /// point — it never silently misses events.
+///
+/// Two of the reasons are refusals at registration: the resume point lies
+/// outside the history the store holds, below its compaction floor
+/// ([`Self::CompactedTooOld`]) or past its current revision
+/// ([`Self::AheadOfStore`]). Both are judged in [`WatcherRegistry::register`]
+/// under the catalog lock the registration itself holds, so neither can go
+/// stale between the judgement and the attachment.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WatchGone {
     /// The requested resume revision has been compacted away (the 410
@@ -88,6 +95,22 @@ pub enum WatchGone {
     CompactedTooOld {
         requested: Revision,
         compacted: Revision,
+    },
+    /// The requested resume revision is past the store's current
+    /// revision (T3.9a): the client's resourceVersion came from a history
+    /// this store does not hold, typically one a restore or a snapshot
+    /// install has since rewound. Attaching at `current` would serve that
+    /// client a different history under revisions it believes it has seen,
+    /// so its cache would be silently stale. The consumer must re-list +
+    /// resume from the fresh list revision.
+    ///
+    /// Judged against `current` under the SAME catalog lock the
+    /// registration takes, so a rewind cannot land between a caller's own
+    /// read of the revision and the attachment.
+    #[error("requested revision {requested} is ahead of the store (current revision {current})")]
+    AheadOfStore {
+        requested: Revision,
+        current: Revision,
     },
     /// The watcher overflowed its per-watcher buffer. `last_seen` is
     /// the highest revision actually delivered — the consumer resumes
@@ -104,6 +127,7 @@ pub enum WatchGone {
 engenho_substrate::impl_error_kind! {
     WatchGone {
         { CompactedTooOld { .. } } => "compacted_too_old",
+        { AheadOfStore { .. } } => "ahead_of_store",
         { Overflow { .. } } => "overflow",
     }
 }
@@ -198,6 +222,13 @@ impl GoneSlot {
 pub struct WatchOpts {
     /// Resume point. `Revision::ZERO` means "from the beginning of
     /// retained history" (i.e. every change still in the ring).
+    ///
+    /// Must lie inside the history the store holds when the watch
+    /// registers: at or above its compaction floor
+    /// ([`WatchGone::CompactedTooOld`] otherwise) and at or below its
+    /// current revision ([`WatchGone::AheadOfStore`] otherwise). A caller
+    /// with etcd's "wait for a future revision" semantics clamps `from` to
+    /// a revision it read and filters the events up to its own start.
     pub from: Revision,
     /// Per-watcher bounded-channel capacity. The ONLY place loss is
     /// possible — and there it is a typed [`WatchGone::Overflow`].
@@ -384,14 +415,18 @@ impl WatcherRegistry {
     ///     and runs under the SAME lock,
     ///   * nothing in between — no gap, no dup, no reorder.
     ///
-    /// A rejected watch (`from` below compaction) allocates NO channel
-    /// — it returns `Err(WatchGone::CompactedTooOld)` before any sender
-    /// is registered.
+    /// A rejected watch (`from` below compaction, or past the current
+    /// revision) allocates NO channel — it returns the refusal before any
+    /// sender is registered.
     ///
     /// # Errors
     ///
-    /// [`WatchGone::CompactedTooOld`] when `opts.from` is below the
-    /// catalog's compaction watermark.
+    /// * [`WatchGone::AheadOfStore`] when `opts.from` is past the
+    ///   catalog's current revision (T3.9a).
+    /// * [`WatchGone::CompactedTooOld`] when `opts.from` is below the
+    ///   catalog's compaction watermark.
+    ///
+    /// The two are disjoint: the floor never passes the current revision.
     ///
     /// `pub(crate)`: it reads a catalog, which is sealed (T3.2b). Outside
     /// the crate, [`Self::register_captured`] takes an already-captured
@@ -401,13 +436,42 @@ impl WatcherRegistry {
         catalog: &ResourceCatalog,
         opts: &WatchOpts,
     ) -> Result<WatchStream, WatchGone> {
-        // (a) Capture replay + boundary BEFORE allocating anything. A
-        // rejected watch costs nothing. Both reads happen here so the
-        // caller can do them under the catalog lock atomically with the
-        // sender registration in `register_captured`.
+        // (a) Judge the resume point, then capture replay + boundary,
+        // BEFORE allocating anything. A rejected watch costs nothing. Every
+        // read is of the one `catalog` the caller holds under its lock, so
+        // the judgement, the replay and the attachment in
+        // `register_captured` see ONE revision: a rewind (a restore, a
+        // snapshot install) cannot land between a caller's earlier read of
+        // the revision and the attachment and be served silently (T3.9a).
+        let current = catalog.revision();
+        if opts.from > current {
+            return Err(WatchGone::AheadOfStore {
+                requested: opts.from,
+                current,
+            });
+        }
         let replay = catalog.changes_since(opts.from).map_err(WatchGone::from)?;
-        let boundary = catalog.revision();
-        Ok(self.register_captured(replay, boundary, opts))
+        Ok(self.register_captured(replay, current, opts))
+    }
+
+    /// Register a LIVE-TAIL watcher (no replay, no bookmarks) starting at
+    /// the catalog's current revision, read under the caller's catalog
+    /// lock.
+    ///
+    /// Infallible, because the start is read from the same `catalog` the
+    /// attachment uses: it is the current revision, so it is never ahead of
+    /// it, and the floor never passes it. A caller that read the revision
+    /// under one guard and registered under another could be refused
+    /// ([`WatchGone::AheadOfStore`]) by a rewind landing in between.
+    pub(crate) fn register_live_tail(
+        &mut self,
+        catalog: &ResourceCatalog,
+        buffer: usize,
+    ) -> WatchStream {
+        let current = catalog.revision();
+        // Nothing is retained past the current revision, so the replay
+        // from it is empty.
+        self.register_captured(Vec::new(), current, &WatchOpts::live_tail(current, buffer))
     }
 
     /// Register a watcher from an ALREADY-CAPTURED replay + boundary,
@@ -837,6 +901,43 @@ pub(crate) async fn await_strong_count<T>(inner: &Arc<T>, count: usize) -> bool 
         tokio::time::sleep(BOOKMARK_TICK_GRANULARITY / 5).await;
     }
     false
+}
+
+/// Test support: force `first` to take the catalog lock `held` guards, and
+/// `second` to take it right after, by queueing them on it in that order
+/// while it is held, then releasing it. Returns both outputs.
+///
+/// tokio's mutex grants the lock in the order `lock()` was called, and on the
+/// current-thread runtime (`#[tokio::test]`'s default) `yield_now` runs a
+/// freshly spawned task until it waits on the held lock. So anything `first`
+/// queues on the lock AGAIN, after its first hold, waits behind `second`:
+/// the interleaving a split read-then-register would race into, forced
+/// instead of raced.
+#[cfg(test)]
+pub(crate) async fn run_queued_behind<G, A, B>(
+    held: G,
+    first: A,
+    second: B,
+) -> (A::Output, B::Output)
+where
+    A: std::future::Future + Send + 'static,
+    A::Output: Send + 'static,
+    B: std::future::Future + Send + 'static,
+    B::Output: Send + 'static,
+{
+    let first = tokio::spawn(first);
+    tokio::task::yield_now().await;
+    let second = tokio::spawn(second);
+    tokio::task::yield_now().await;
+    drop(held);
+    (
+        first
+            .await
+            .expect("the first queued task ran to completion"),
+        second
+            .await
+            .expect("the second queued task ran to completion"),
+    )
 }
 
 #[cfg(test)]
@@ -1456,5 +1557,132 @@ mod tests {
             replayed.push(ev.resource_version);
         }
         assert_eq!(replayed, vec![4, 5]);
+    }
+
+    // ── T3.9a: a resume point ahead of the catalog ─────────────────
+
+    /// A catalog at revision `head` with a history ring of `capacity`
+    /// changes, one Put per revision.
+    fn catalog_at(head: u64, capacity: usize) -> ResourceCatalog {
+        let mut cat = ResourceCatalog::with_history_capacity(capacity);
+        for i in 1..=head {
+            cat.apply(
+                &crate::command::ResourceCommand::Put {
+                    key: pod_key(&format!("p{i}")),
+                    value: serde_json::json!({"i": i}),
+                    expected: None,
+                    reason: crate::command::Reason::Operator,
+                },
+                1,
+                i,
+            );
+        }
+        cat
+    }
+
+    /// A resume point past the catalog's revision is refused with the
+    /// revision the catalog is actually at, and allocates no watcher. Before
+    /// T3.9a it was attached at the current revision and served, so a client
+    /// holding a revision from a rewound history read the new history as
+    /// the continuation of the one it had seen.
+    #[tokio::test]
+    async fn a_resume_point_ahead_of_the_catalog_is_refused_before_any_channel() {
+        let cat = catalog_at(3, 16);
+        let mut reg = WatcherRegistry::new();
+        for requested in [4, 5, 1_000] {
+            let err = reg
+                .register(&cat, &WatchOpts::from_revision(Revision(requested)))
+                .err();
+            assert_eq!(
+                err,
+                Some(WatchGone::AheadOfStore {
+                    requested: Revision(requested),
+                    current: Revision(3),
+                }),
+                "a watch from {requested} over a catalog at 3 must be refused, not attached at 3"
+            );
+            assert_eq!(reg.len(), 0, "a refused watch allocates no watcher");
+        }
+        assert_eq!(
+            WatchGone::AheadOfStore {
+                requested: Revision(4),
+                current: Revision(3),
+            }
+            .kind(),
+            "ahead_of_store"
+        );
+
+        // Exactly the current revision is inside the window: it replays
+        // nothing and receives the next change.
+        let mut stream = reg
+            .register(&cat, &WatchOpts::from_revision(Revision(3)))
+            .expect("a watch from the current revision is honoured");
+        assert!(stream.try_next().is_none(), "nothing after 3 to replay");
+        reg.fan_change(&change_at(4, "p4", ChangeKind::Put));
+        assert!(
+            matches!(stream.try_next(), Some(Ok(WatchSignal::Event(ev))) if ev.resource_version == 4),
+            "the next change reaches a watch opened at the current revision"
+        );
+    }
+
+    /// Every resume point lands in exactly one of three places: below the
+    /// floor (compacted), the retained window `floor..=head` (served, with
+    /// exactly the revisions after it), or past the head (ahead). No
+    /// revision outside the window is served.
+    #[tokio::test]
+    async fn every_resume_point_is_compacted_served_or_ahead() {
+        // Capacity 2 over five revisions: the ring holds 4 and 5, floor 3.
+        let cat = catalog_at(5, 2);
+        assert_eq!(
+            (cat.compacted_revision(), cat.revision()),
+            (Revision(3), Revision(5))
+        );
+        for from in 0..=9u64 {
+            let mut reg = WatcherRegistry::new();
+            let got = reg.register(&cat, &WatchOpts::from_revision(Revision(from)));
+            match from {
+                0..=2 => assert_eq!(
+                    got.err(),
+                    Some(WatchGone::CompactedTooOld {
+                        requested: Revision(from),
+                        compacted: Revision(3),
+                    }),
+                    "{from} is below the floor"
+                ),
+                3..=5 => {
+                    let mut stream = got.expect("inside the window is served");
+                    let mut replayed = Vec::new();
+                    while let Some(Ok(WatchSignal::Event(ev))) = stream.try_next() {
+                        replayed.push(ev.resource_version);
+                    }
+                    assert_eq!(replayed, (from + 1..=5).collect::<Vec<_>>(), "from {from}");
+                }
+                _ => assert_eq!(
+                    got.err(),
+                    Some(WatchGone::AheadOfStore {
+                        requested: Revision(from),
+                        current: Revision(5),
+                    }),
+                    "{from} is past the head"
+                ),
+            }
+        }
+    }
+
+    /// The live tail starts at the revision of the catalog it registers
+    /// against, so it can never be refused: it replays nothing and receives
+    /// every later change.
+    #[tokio::test]
+    async fn a_live_tail_starts_at_the_catalog_it_registers_against() {
+        let cat = catalog_at(5, 2);
+        let mut reg = WatcherRegistry::new();
+        let mut stream = reg.register_live_tail(&cat, 8);
+        assert_eq!(reg.len(), 1);
+        assert!(stream.try_next().is_none(), "a live tail replays nothing");
+        reg.fan_change(&change_at(6, "p6", ChangeKind::Put));
+        assert!(
+            matches!(stream.try_next(), Some(Ok(WatchSignal::Event(ev))) if ev.resource_version == 6),
+            "the live tail receives the next change"
+        );
     }
 }

@@ -672,8 +672,13 @@ impl StoreMesh {
     ///
     /// # Errors
     ///
-    /// [`crate::watch_backend::WatchGone::CompactedTooOld`] when
-    /// `opts.from` is below the compaction watermark.
+    /// * [`crate::watch_backend::WatchGone::AheadOfStore`] when
+    ///   `opts.from` is past the current revision. It is judged under the
+    ///   registration's own catalog lock, so a caller's earlier read of
+    ///   [`Self::current_revision`] followed by a rewind (a restore, a
+    ///   snapshot install) is caught here rather than served (T3.9a).
+    /// * [`crate::watch_backend::WatchGone::CompactedTooOld`] when
+    ///   `opts.from` is below the compaction watermark.
     pub async fn watch_from(
         &self,
         opts: crate::watch_backend::WatchOpts,
@@ -690,8 +695,8 @@ impl StoreMesh {
     ///
     /// # Errors
     ///
-    /// Never errors in practice (live-tail resumes from current
-    /// revision); the `Result` matches `watch_from`.
+    /// Never: the live tail starts at the current revision, read under the
+    /// registration's own lock. The `Result` matches `watch_from`.
     pub async fn watch(
         &self,
     ) -> Result<crate::watch_backend::WatchStream, crate::watch_backend::WatchGone> {

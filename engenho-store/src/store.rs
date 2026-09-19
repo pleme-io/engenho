@@ -108,8 +108,12 @@ impl InMemoryStore {
     ///
     /// # Errors
     ///
-    /// [`WatchGone::CompactedTooOld`] when `opts.from` is below the
-    /// catalog's compaction watermark (no channel is allocated).
+    /// No channel is allocated for either refusal:
+    ///
+    /// * [`WatchGone::AheadOfStore`] when `opts.from` is past the catalog's
+    ///   current revision, judged under this lock (T3.9a).
+    /// * [`WatchGone::CompactedTooOld`] when `opts.from` is below the
+    ///   catalog's compaction watermark.
     pub async fn watch_from(&self, opts: WatchOpts) -> Result<WatchStream, WatchGone> {
         // ── under the catalog lock ─────────────────────────────────
         let mut guard = self.inner.lock().await;
@@ -227,15 +231,21 @@ impl InMemoryStore {
     ///
     /// For resumable, gap-free watches use [`Self::watch_from`].
     ///
+    /// The start is read under the SAME guard the registration holds, so a
+    /// rewind (a snapshot install) cannot land between the two and leave a
+    /// start ahead of the store.
+    ///
     /// # Errors
     ///
-    /// Never errors in practice — live-tail resumes from the current
-    /// revision, which is never below the compaction watermark. The
+    /// Never: the live tail starts at the current revision, which is never
+    /// ahead of the catalog nor below its compaction watermark. The
     /// `Result` matches `watch_from`'s signature.
     pub async fn watch_subscribe(&self) -> Result<WatchStream, WatchGone> {
-        let from = self.inner.lock().await.catalog.revision();
-        self.watch_from(WatchOpts::live_tail(from, WATCH_CHANNEL_CAPACITY))
-            .await
+        let mut guard = self.inner.lock().await;
+        let inner = &mut *guard;
+        Ok(inner
+            .watchers
+            .register_live_tail(&inner.catalog, WATCH_CHANNEL_CAPACITY))
     }
 
     /// Active watch subscriber count (live registry size). Useful for
@@ -556,6 +566,55 @@ mod tests {
         // The catalog JSON has the pod's metadata.name
         let s = std::str::from_utf8(bytes).unwrap();
         assert!(s.contains("podinfo"));
+    }
+
+    /// Apply `n` Puts at indexes `1..=n`, one revision each.
+    async fn apply_puts(s: &mut InMemoryStore, n: u64) {
+        for i in 1..=n {
+            s.apply(vec![put_entry(i, &format!("pod-{i}"))])
+                .await
+                .unwrap();
+        }
+    }
+
+    /// T3.9a: the live tail reads its start under the guard its registration
+    /// holds. A rewind (a snapshot install) queued on the catalog lock right
+    /// behind the subscriber lands after the whole subscription, never
+    /// between reading the start and attaching at it, where the start would
+    /// be ahead of the rewound catalog and the live tail refused.
+    #[tokio::test]
+    async fn a_rewind_queued_behind_a_live_tail_cannot_split_it() {
+        let mut store = InMemoryStore::new();
+        apply_puts(&mut store, 5).await;
+        let mut src = InMemoryStore::new();
+        apply_puts(&mut src, 2).await;
+        let snap = src
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let held = store.inner.lock().await;
+        let for_tail = store.clone();
+        let mut for_rewind = store.clone();
+        let (tail, install) = crate::watch_backend::run_queued_behind(
+            held,
+            async move { for_tail.watch_subscribe().await },
+            async move { for_rewind.install_snapshot(&snap.meta, snap.snapshot).await },
+        )
+        .await;
+        install.unwrap();
+        assert_eq!(
+            store.current_revision().await,
+            crate::revision::Revision(2),
+            "precondition: the install rewound the store"
+        );
+        assert!(
+            tail.is_ok(),
+            "a live tail is never refused, whatever queues behind it: {:?}",
+            tail.err()
+        );
     }
 
     /// T2.1-store: the store's own ticker, parked mid-tick on the catalog
