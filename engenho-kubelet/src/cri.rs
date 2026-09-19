@@ -91,6 +91,54 @@ impl Endpoint {
     }
 }
 
+/// How a process that has stopped ended.
+///
+/// ★ A SIGNAL IS NOT AN EXIT CODE, AND NEITHER IS "NO CODE". A process killed
+/// by a signal has no exit code at all: `ExitStatus::code()` is `None`. Until
+/// T1.2 every backend reduced this to `exit_code: Option<i32>` and the kubelet
+/// read `None` through `unwrap_or(0)` — so a `SIGKILL`ed `restartPolicy: Never`
+/// pod was published as `Succeeded`, and a Job counted it as a completion.
+/// The two arms make the kill a value the kubelet has to handle, and
+/// [`Self::is_success`] names the only success there is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExitDisposition {
+    /// The process exited on its own with this code.
+    Code(i32),
+    /// The process was terminated by this signal number.
+    Signal(i32),
+}
+
+impl ExitDisposition {
+    /// Did the process succeed? True ONLY for `Code(0)` — a signal is never a
+    /// success, whichever signal it was.
+    #[must_use]
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Code(0))
+    }
+
+    /// The `exitCode` upstream reports for this disposition.
+    ///
+    /// A code is itself. A signal is `128 + n`, the convention containerd and
+    /// every shell use, so a SIGKILL reads as the familiar 137 rather than as
+    /// a bare 9 that looks like an application's own exit code.
+    #[must_use]
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Code(code) => code,
+            Self::Signal(signal) => 128_i32.saturating_add(signal),
+        }
+    }
+}
+
+impl std::fmt::Display for ExitDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(code) => write!(f, "code {code}"),
+            Self::Signal(signal) => write!(f, "signal {signal}"),
+        }
+    }
+}
+
 /// Translate a CRI container state to the kubelet's running/exited view.
 ///
 /// ★ `UNKNOWN` IS NOT `EXITED`. A runtime reporting UNKNOWN has lost track
@@ -98,23 +146,41 @@ impl Endpoint {
 /// make the kubelet start a SECOND copy of a container that is already up,
 /// which for anything holding a lock or a port is worse than the outage it
 /// was trying to fix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ★ `EXITED` CARRIES HOW. An exited container without its
+/// [`ExitDisposition`] is not representable, so no reader can default the
+/// missing half to success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RunState {
+    /// Created, never started.
     Created,
+    /// Up right now.
     Running,
-    Exited,
+    /// Stopped, and the runtime said how.
+    Exited(ExitDisposition),
     /// The runtime does not know. Explicitly distinct from `Exited`.
+    ///
+    /// The kubelet reads it as an exit nobody observed
+    /// (`lifecycle::Termination::Unknown`), never as a success. When the
+    /// policy restarts it, the restart path stops and removes the old
+    /// container before starting the new one — upstream's kill-before-restart
+    /// — best-effort, since a runtime that lost the container may not be able
+    /// to stop it either.
     Unknown,
 }
 
 impl RunState {
-    /// Decode the CRI `ContainerState` enum value.
+    /// Decode the CRI `ContainerState` enum value, with the `exit_code` the
+    /// same `ContainerStatus` message carries (read only for `EXITED`).
+    ///
+    /// CRI has no signal field: the runtime has already folded a signal into
+    /// `128 + n`, so a CRI exit is always a [`ExitDisposition::Code`].
     #[must_use]
-    pub fn from_cri(state: i32) -> Self {
+    pub fn from_cri(state: i32, exit_code: i32) -> Self {
         match state {
             0 => Self::Created,
             1 => Self::Running,
-            2 => Self::Exited,
+            2 => Self::Exited(ExitDisposition::Code(exit_code)),
             _ => Self::Unknown,
         }
     }
@@ -134,7 +200,16 @@ impl RunState {
     /// `Unknown` yields `false` — see the type doc.
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Exited)
+        matches!(self, Self::Exited(_))
+    }
+
+    /// How the container ended, when the runtime observed it end.
+    #[must_use]
+    pub fn exit(self) -> Option<ExitDisposition> {
+        match self {
+            Self::Exited(disposition) => Some(disposition),
+            Self::Created | Self::Running | Self::Unknown => None,
+        }
     }
 }
 
@@ -204,19 +279,55 @@ mod tests {
         // Treating UNKNOWN as exited makes the kubelet start a SECOND copy
         // of a container that may still be running — worse than the outage
         // it was trying to fix, for anything holding a lock or a port.
-        assert_eq!(RunState::from_cri(3), RunState::Unknown);
+        assert_eq!(RunState::from_cri(3, 0), RunState::Unknown);
         assert!(!RunState::Unknown.is_terminal());
         assert!(!RunState::Unknown.is_running());
-        assert!(RunState::Exited.is_terminal());
+        assert_eq!(RunState::Unknown.exit(), None);
+        assert!(RunState::Exited(ExitDisposition::Code(0)).is_terminal());
     }
 
     #[test]
     fn created_is_not_running() {
         // Reporting it as up would make a pod Ready before its process
         // exists.
-        assert_eq!(RunState::from_cri(0), RunState::Created);
+        assert_eq!(RunState::from_cri(0, 0), RunState::Created);
         assert!(!RunState::Created.is_running());
-        assert!(RunState::from_cri(1).is_running());
+        assert!(RunState::from_cri(1, 0).is_running());
+    }
+
+    #[test]
+    fn a_cri_exit_carries_its_code_and_only_an_exited_state_reads_it() {
+        // CONTAINER_EXITED with the code the runtime reported.
+        assert_eq!(
+            RunState::from_cri(2, 137),
+            RunState::Exited(ExitDisposition::Code(137))
+        );
+        // A RUNNING container's exit_code field is proto3's zero default, not
+        // an observation. Reading it would report a clean exit for a live
+        // container.
+        assert_eq!(RunState::from_cri(1, 0).exit(), None);
+        assert_eq!(RunState::from_cri(0, 0).exit(), None);
+    }
+
+    #[test]
+    fn only_code_zero_is_success() {
+        assert!(ExitDisposition::Code(0).is_success());
+        assert!(!ExitDisposition::Code(1).is_success());
+        // ★ The defect this type exists for: a SIGKILL has no exit code, and
+        // reading "no code" as 0 published a killed Never pod as Succeeded.
+        assert!(!ExitDisposition::Signal(9).is_success());
+        // Signal 0 is not a delivered signal, but if a decoder ever produced
+        // it, it must still not read as success.
+        assert!(!ExitDisposition::Signal(0).is_success());
+    }
+
+    #[test]
+    fn a_signal_reports_upstreams_128_plus_n_exit_code() {
+        assert_eq!(ExitDisposition::Signal(9).exit_code(), 137);
+        assert_eq!(ExitDisposition::Signal(15).exit_code(), 143);
+        assert_eq!(ExitDisposition::Code(3).exit_code(), 3);
+        // No overflow panic on a hostile value.
+        assert_eq!(ExitDisposition::Signal(i32::MAX).exit_code(), i32::MAX);
     }
 
     #[test]

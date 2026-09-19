@@ -119,7 +119,7 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
     };
 
     let started = backend.start(&spec).await.expect("postgres must start");
-    assert!(started.running);
+    assert!(started.is_running());
 
     // Wait for it to accept connections, bounded — never an unbounded wait, and
     // never a fixed sleep that passes on a fast machine and flakes on a slow one.
@@ -171,7 +171,7 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
         .expect("status")
         .expect("tracked");
     assert!(
-        live.running,
+        live.is_running(),
         "postgres must still be running while it serves"
     );
 
@@ -184,7 +184,7 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
             .await
             .expect("status")
             .expect("tracked");
-        if !s.running {
+        if !s.is_running() {
             stopped = true;
             break;
         }

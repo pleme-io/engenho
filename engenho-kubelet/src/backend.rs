@@ -493,12 +493,19 @@ pub struct ContainerSpec {
 pub struct ContainerStatus {
     /// Opaque backend handle identifying the running container.
     pub container_id: String,
-    /// Whether the container is currently up.
-    pub running: bool,
+    /// What the runtime says the container's process is doing.
+    ///
+    /// ── ★ ONE FIELD, NOT `running: bool` + `exit_code: Option<i32>` ────────
+    /// The pair admitted `running: false, exit_code: None` — stopped, with no
+    /// word on how — and every reader resolved that with `unwrap_or(0)`, i.e.
+    /// as a clean exit. A container killed by `SIGKILL` has exactly that shape (a
+    /// signal has no exit code), so it was published as `Succeeded`. In
+    /// [`RunState`] a stopped container either carries its
+    /// [`ExitDisposition`](crate::cri::ExitDisposition) or is explicitly
+    /// `Unknown`; there is no third, defaultable spelling.
+    pub state: crate::cri::RunState,
     /// Pod-network IP assigned to the container (None until network setup).
     pub pod_ip: Option<String>,
-    /// Optional exit code if the container has terminated.
-    pub exit_code: Option<i32>,
 }
 
 impl ContainerStatus {
@@ -507,10 +514,15 @@ impl ContainerStatus {
     pub fn running(container_id: impl Into<String>, pod_ip: impl Into<String>) -> Self {
         Self {
             container_id: container_id.into(),
-            running: true,
+            state: crate::cri::RunState::Running,
             pod_ip: Some(pod_ip.into()),
-            exit_code: None,
         }
+    }
+
+    /// Whether the container is up right now.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.state.is_running()
     }
 }
 
@@ -773,27 +785,39 @@ impl FakeBackend {
             .await
             .containers
             .values()
-            .filter(|s| s.running)
+            .filter(|s| s.is_running())
             .count()
     }
 
     /// Test hook: simulate a container exiting ON ITS OWN with
     /// `exit_code` (distinct from an operator-initiated [`stop`]). Flips
-    /// the tracked container to `running == false` + records the exit
-    /// code, WITHOUT emitting a [`FakeEvent::Stop`] — modeling a process
-    /// that terminated by itself rather than being told to. The kubelet's
-    /// running-status poll then observes the terminated container on its
-    /// next tick.
+    /// the tracked container to [`RunState::Exited`](crate::cri::RunState)
+    /// with that code, WITHOUT emitting a [`FakeEvent::Stop`] — modeling a
+    /// process that terminated by itself rather than being told to. The
+    /// kubelet's running-status poll then observes the terminated container
+    /// on its next tick.
     ///
     /// No-op (silently) if `container_id` isn't tracked — mirrors a
     /// best-effort host observation.
     ///
     /// [`stop`]: ContainerRuntime::stop
     pub async fn set_exit(&self, container_id: &str, exit_code: i32) {
+        self.set_run_state(
+            container_id,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(exit_code)),
+        )
+        .await;
+    }
+
+    /// Test hook: set what the runtime reports for `container_id` to any
+    /// [`RunState`](crate::cri::RunState) — a signal death
+    /// (`Exited(Signal(9))`), or a container the runtime has lost track of
+    /// (`Unknown`), which [`Self::set_exit`] cannot express. Same no-op rule
+    /// for an untracked id, and likewise emits no [`FakeEvent`].
+    pub async fn set_run_state(&self, container_id: &str, run_state: crate::cri::RunState) {
         let mut state = self.inner.lock().await;
         if let Some(s) = state.containers.get_mut(container_id) {
-            s.running = false;
-            s.exit_code = Some(exit_code);
+            s.state = run_state;
         }
     }
 
@@ -982,8 +1006,7 @@ impl ContainerRuntime for FakeBackend {
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
         let mut state = self.inner.lock().await;
         if let Some(s) = state.containers.get_mut(container_id) {
-            s.running = false;
-            s.exit_code = Some(0);
+            s.state = crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(0));
         }
         state.events.push(FakeEvent::Stop(container_id.to_string()));
         Ok(())
@@ -1660,8 +1683,18 @@ impl PodmanBackend {
                 "podman inspect output unexpected shape: {text}"
             )));
         }
-        let running = parts[0] == "true";
-        let exit_code = parts[1].parse::<i32>().ok();
+        let state = if parts[0] == "true" {
+            crate::cri::RunState::Running
+        } else {
+            // Stopped. An unreadable code is NOT a zero: it is a stop nobody
+            // observed the cause of, and it stays `Unknown` so the kubelet
+            // cannot report it as a clean exit.
+            parts[1]
+                .parse::<i32>()
+                .map_or(crate::cri::RunState::Unknown, |code| {
+                    crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(code))
+                })
+        };
         let pod_ip = if parts[2].is_empty() {
             None
         } else {
@@ -1669,9 +1702,8 @@ impl PodmanBackend {
         };
         Ok(ContainerStatus {
             container_id: container_id.to_string(),
-            running,
+            state,
             pod_ip,
-            exit_code,
         })
     }
 
@@ -1883,19 +1915,18 @@ impl ContainerRuntime for PodmanBackend {
         // per-network `pod_ip` instead of always `None`, closing the
         // one-tick empty-Endpoints window. The IP is usually assigned by
         // the time `run` returns the container id; if it isn't yet (rare
-        // race) we fall back to `running: true, pod_ip: None` — the
+        // race) we fall back to `RunState::Running, pod_ip: None` — the
         // kubelet's reconcile_running poll converges it on the next tick,
         // so this is a latency optimization, not a correctness dependency.
         // An inspect error here is non-fatal for the same reason: the
         // container DID start (run succeeded); we just couldn't read its IP
         // yet, so we return the started status and let the poll path retry.
         match self.status(&container_id).await {
-            Ok(Some(observed)) if observed.running => Ok(observed),
+            Ok(Some(observed)) if observed.is_running() => Ok(observed),
             _ => Ok(ContainerStatus {
                 container_id,
-                running: true,
+                state: crate::cri::RunState::Running,
                 pod_ip: None, // not yet readable; status() poll converges it
-                exit_code: None,
             }),
         }
     }
@@ -2297,7 +2328,7 @@ mod tests {
             ..Default::default()
         };
         let status = backend.start(&spec).await.unwrap();
-        assert!(status.running);
+        assert!(status.is_running());
         assert!(status.pod_ip.is_some());
         assert!(status.container_id.starts_with("fake-"));
         assert_eq!(backend.running_count().await, 1);
@@ -2316,8 +2347,10 @@ mod tests {
         let s = backend.start(&spec).await.unwrap();
         backend.stop(&s.container_id).await.unwrap();
         let after = backend.status(&s.container_id).await.unwrap().unwrap();
-        assert!(!after.running);
-        assert_eq!(after.exit_code, Some(0));
+        assert_eq!(
+            after.state,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(0))
+        );
     }
 
     #[tokio::test]
@@ -2368,8 +2401,10 @@ mod tests {
         let s = backend.start(&spec).await.unwrap();
         backend.set_exit(&s.container_id, 137).await;
         let after = backend.status(&s.container_id).await.unwrap().unwrap();
-        assert!(!after.running);
-        assert_eq!(after.exit_code, Some(137));
+        assert_eq!(
+            after.state,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(137))
+        );
         // set_exit models a self-exit, NOT an operator stop — only the
         // Start event was recorded.
         let events = backend.events().await;
@@ -2391,7 +2426,10 @@ mod tests {
         backend.set_exit(&s.container_id, 0).await;
         assert_eq!(backend.running_count().await, 0);
         let after = backend.status(&s.container_id).await.unwrap().unwrap();
-        assert_eq!(after.exit_code, Some(0));
+        assert_eq!(
+            after.state,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(0))
+        );
     }
 
     #[test]
@@ -3228,8 +3266,9 @@ mod tests {
     #[test]
     fn parse_inspect_running_with_ip() {
         let s = PodmanBackend::parse_inspect("cid", "true|0|10.88.0.4").unwrap();
-        assert!(s.running);
-        assert_eq!(s.exit_code, Some(0));
+        // podman prints ExitCode 0 for a running container; it is not an
+        // exit and must not be read as one.
+        assert_eq!(s.state, crate::cri::RunState::Running);
         assert_eq!(s.pod_ip.as_deref(), Some("10.88.0.4"));
         assert_eq!(s.container_id, "cid");
     }
@@ -3237,15 +3276,25 @@ mod tests {
     #[test]
     fn parse_inspect_terminated_no_ip() {
         let s = PodmanBackend::parse_inspect("cid", "false|137|").unwrap();
-        assert!(!s.running);
-        assert_eq!(s.exit_code, Some(137));
+        assert_eq!(
+            s.state,
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(137))
+        );
         assert!(s.pod_ip.is_none());
+    }
+
+    #[test]
+    fn parse_inspect_unreadable_exit_code_is_unknown_not_zero() {
+        // A stopped container whose code cannot be read was a clean exit
+        // under `unwrap_or(0)`. It is a stop nobody observed the cause of.
+        let s = PodmanBackend::parse_inspect("cid", "false|<no value>|").unwrap();
+        assert_eq!(s.state, crate::cri::RunState::Unknown);
     }
 
     #[test]
     fn parse_inspect_trims_trailing_newline() {
         let s = PodmanBackend::parse_inspect("cid", "true|0|10.88.0.4\n").unwrap();
-        assert!(s.running);
+        assert!(s.is_running());
         assert_eq!(s.pod_ip.as_deref(), Some("10.88.0.4"));
     }
 
@@ -3267,8 +3316,7 @@ mod tests {
     fn parse_inspect_per_network_ip_is_surfaced() {
         // The fixed behavior: a non-empty per-network IP → pod_ip Some.
         let s = PodmanBackend::parse_inspect("cid", "true|0|10.89.0.4").unwrap();
-        assert!(s.running);
-        assert_eq!(s.exit_code, Some(0));
+        assert_eq!(s.state, crate::cri::RunState::Running);
         assert_eq!(s.pod_ip.as_deref(), Some("10.89.0.4"));
     }
 
@@ -3281,7 +3329,7 @@ mod tests {
         // above); this proves an empty third field still maps to None so
         // an unbound / not-yet-networked container is honestly reported.
         let s = PodmanBackend::parse_inspect("cid", "true|0|").unwrap();
-        assert!(s.running);
+        assert!(s.is_running());
         assert!(
             s.pod_ip.is_none(),
             "empty per-network IP must yield pod_ip None"

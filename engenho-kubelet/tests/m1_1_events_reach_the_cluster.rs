@@ -136,7 +136,7 @@ async fn e1_e2_e3_lifecycle_events_land_in_the_store() {
             .containers()
             .await
             .into_iter()
-            .find(|(_, s)| s.running)
+            .find(|(_, s)| s.is_running())
             .map(|(id, _)| id)
             .expect("a running container");
         backend.set_exit(&id, 1).await;

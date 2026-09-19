@@ -492,11 +492,9 @@ impl ContainerRuntime for CriBackend {
         let Some(st) = resp.status else {
             return Ok(None);
         };
-        let run = RunState::from_cri(st.state);
         Ok(Some(ContainerStatus {
             container_id: st.id,
-            running: run.is_running(),
-            exit_code: run.is_terminal().then_some(st.exit_code),
+            state: RunState::from_cri(st.state, st.exit_code),
             pod_ip: None,
         }))
     }

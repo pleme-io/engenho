@@ -427,6 +427,43 @@ impl InspectResponse {
             Some(settings.ip_address.clone())
         }
     }
+
+    /// The kubelet's view of this container: its id, run state and address.
+    ///
+    /// One conversion for both the post-start read-back and the status poll,
+    /// so the two cannot disagree about what a stopped container means.
+    #[must_use]
+    pub fn into_container_status(self) -> crate::backend::ContainerStatus {
+        let pod_ip = self.pod_ip();
+        crate::backend::ContainerStatus {
+            container_id: self.id,
+            state: self.state.run_state(),
+            pod_ip,
+        }
+    }
+}
+
+impl InspectState {
+    /// The run state this block describes.
+    ///
+    /// An exit code is only meaningful once the container is terminal.
+    /// Reporting 0 for a RUNNING container is how a healthy workload gets read
+    /// as a clean exit and restarted, so a running container carries none.
+    ///
+    /// libpod's `ExitCode` has already folded a signal into `128 + n`, so a
+    /// stopped container is always an [`ExitDisposition::Code`]. Decoding
+    /// `Status` (`created` is not `exited`) is T1.2 commit 2; until then this
+    /// keys on `Running` exactly as before.
+    ///
+    /// [`ExitDisposition::Code`]: crate::cri::ExitDisposition::Code
+    #[must_use]
+    pub fn run_state(&self) -> crate::cri::RunState {
+        if self.running {
+            crate::cri::RunState::Running
+        } else {
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(self.exit_code))
+        }
+    }
 }
 
 /// Map engenho's [`PullPolicy`] onto libpod's `pull_policy` string.
@@ -1334,9 +1371,8 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
                 );
                 return Ok(crate::backend::ContainerStatus {
                     container_id: existing.id,
-                    running: true,
+                    state: crate::cri::RunState::Running,
                     pod_ip,
-                    exit_code: None,
                 });
             }
             // Present but not running: a dead predecessor holding the name.
@@ -1360,28 +1396,15 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         // does not have.
         let status = self.api.inspect(&created.id).await?;
         Ok(match status {
-            Some(i) => {
-                let pod_ip = i.pod_ip();
-                crate::backend::ContainerStatus {
-                    container_id: i.id,
-                    running: i.state.running,
-                    pod_ip,
-                    exit_code: if i.state.running {
-                        None
-                    } else {
-                        Some(i.state.exit_code)
-                    },
-                }
-            }
+            Some(i) => i.into_container_status(),
             // Created and started, then gone before the read: a container that
-            // exits instantly. Report it as not-running with no exit code
-            // rather than inventing one — the reconciler's next tick will see
-            // the real terminal state.
+            // exits instantly. Report it as `Unknown` — stopped, cause never
+            // observed — rather than inventing an exit code; the reconciler's
+            // next tick will see the real terminal state.
             None => crate::backend::ContainerStatus {
                 container_id: created.id,
-                running: false,
+                state: crate::cri::RunState::Unknown,
                 pod_ip: None,
-                exit_code: None,
             },
         })
     }
@@ -1390,22 +1413,11 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         &self,
         container_id: &str,
     ) -> Result<Option<crate::backend::ContainerStatus>, KubeletError> {
-        Ok(self.api.inspect(container_id).await?.map(|i| {
-            let pod_ip = i.pod_ip();
-            crate::backend::ContainerStatus {
-                container_id: i.id,
-                running: i.state.running,
-                pod_ip,
-                // An exit code is only meaningful once the container is
-                // terminal. Reporting 0 for a RUNNING container is how a
-                // healthy workload gets read as a clean exit and restarted.
-                exit_code: if i.state.running {
-                    None
-                } else {
-                    Some(i.state.exit_code)
-                },
-            }
-        }))
+        Ok(self
+            .api
+            .inspect(container_id)
+            .await?
+            .map(InspectResponse::into_container_status))
     }
 
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
@@ -2002,5 +2014,32 @@ mod tests {
         assert_eq!(r.id, "deadbeef");
         assert!(r.state.running);
         assert_eq!(r.pod_ip().as_deref(), Some("10.89.1.9"));
+    }
+
+    #[test]
+    fn a_running_container_carries_no_exit_and_a_stopped_one_carries_its_code() {
+        // libpod reports ExitCode 0 for a RUNNING container. Surfacing it
+        // would read a healthy workload as a clean exit.
+        let running = InspectState {
+            status: "running".to_string(),
+            running: true,
+            exit_code: 0,
+        };
+        assert_eq!(running.run_state(), crate::cri::RunState::Running);
+        let killed = InspectState {
+            status: "exited".to_string(),
+            running: false,
+            exit_code: 137,
+        };
+        assert_eq!(
+            killed.run_state(),
+            crate::cri::RunState::Exited(crate::cri::ExitDisposition::Code(137))
+        );
+        assert!(
+            !killed
+                .run_state()
+                .exit()
+                .is_some_and(crate::cri::ExitDisposition::is_success)
+        );
     }
 }

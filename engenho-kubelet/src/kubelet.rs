@@ -19,7 +19,8 @@
 //!     a container started + an initial `Running` status written via CAS.
 //!   * **Running-status reconciliation** — a bound Pod already in `local`
 //!     is polled via `backend.status`; still-running stays `Running`,
-//!     terminated maps `exit_code → Succeeded | Failed`. A vanished
+//!     terminated maps its [`Termination`] → `Succeeded | Failed` (only an
+//!     observed exit 0 succeeds; a signal or an unobserved exit fails). A vanished
 //!     container (no backend record) clears the local entry so the next
 //!     tick re-creates it (a managed bound Pod converges back to running).
 //!
@@ -49,7 +50,8 @@ use tracing::{debug, info, warn};
 use crate::backend::{ContainerRuntime, ContainerSpec, LogOptions, NetProber, TokioNetProber};
 use crate::error::KubeletError;
 use crate::lifecycle::{
-    ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
+    ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, Termination,
+    reconcile_pod_phase,
 };
 use crate::pod_volume::{
     MountSource, PodVolumeSource, PodmanVolumeMaterializer, VolumeMaterializer, VolumeResolveError,
@@ -154,6 +156,31 @@ struct ProbeOutcome {
     entered_blind: Vec<(ProbeKind, BlindCause)>,
     /// A probe blind for at least its `failureThreshold` runs, if any.
     sustained_blind: Option<(ProbeKind, BlindCause)>,
+}
+
+/// One status poll of a container the kubelet started, split the only two
+/// ways the kubelet acts on it.
+///
+/// ── ★ `Down` ALWAYS CARRIES HOW ───────────────────────────────────────────
+/// Every poll site used to test `s.running` and then read the exit as
+/// `s.exit_code.unwrap_or(0)` — three sites, one default, and the default
+/// was success. Here the split and the [`Termination`] come from ONE
+/// [`Termination::from_run_state`], so a stopped container cannot reach a
+/// caller without its exit, and there is no `Option` left to default.
+enum Polled {
+    /// Up right now.
+    Running(crate::backend::ContainerStatus),
+    /// Down; the status as polled plus how it ended.
+    Down(crate::backend::ContainerStatus, Termination),
+}
+
+impl Polled {
+    fn of(status: crate::backend::ContainerStatus) -> Self {
+        match Termination::from_run_state(status.state) {
+            None => Self::Running(status),
+            Some(exit) => Self::Down(status, exit),
+        }
+    }
 }
 
 /// What the kubelet remembers about ONE container of a Pod it started.
@@ -1775,8 +1802,8 @@ impl Kubelet {
         let state = match &cs.state {
             ContainerState::Waiting { reason } => json!({ "waiting": { "reason": reason } }),
             ContainerState::Running => json!({ "running": {} }),
-            ContainerState::Terminated { exit_code, reason } => json!({
-                "terminated": { "exitCode": exit_code, "reason": reason }
+            ContainerState::Terminated(exit) => json!({
+                "terminated": { "exitCode": exit.exit_code(), "reason": exit.reason() }
             }),
         };
         let mut entry = json!({
@@ -3244,6 +3271,12 @@ impl Kubelet {
         Ok(new_status)
     }
 
+    /// Poll one container, split into [`Polled::Running`] / [`Polled::Down`].
+    /// `Ok(None)` is a container the backend no longer knows.
+    async fn poll(&self, container_id: &str) -> Result<Option<Polled>, KubeletError> {
+        Ok(self.backend.status(container_id).await?.map(Polled::of))
+    }
+
     /// (C) Poll the backend for EVERY container of a started Pod, fold the
     /// observed states into the pod phase via [`reconcile_pod_phase`], apply
     /// restartPolicy + probe verdicts (restart an exited / liveness-failing /
@@ -3314,8 +3347,8 @@ impl Kubelet {
                 observations.push(ContainerObservation::waiting(cname));
                 continue;
             };
-            match self.backend.status(&record.container_id).await {
-                Ok(Some(s)) if s.running => {
+            match self.poll(&record.container_id).await {
+                Ok(Some(Polled::Running(s))) => {
                     if let Some(ip) = &s.pod_ip {
                         pod_ip.get_or_insert_with(|| ip.clone());
                     }
@@ -3427,14 +3460,14 @@ impl Kubelet {
                         });
                     }
                 }
-                Ok(Some(s)) => {
+                Ok(Some(Polled::Down(s, exit))) => {
                     // Terminated. Retain the last pod_ip (K8s keeps it).
                     if let Some(ip) = &s.pod_ip {
                         pod_ip.get_or_insert_with(|| ip.clone());
                     }
-                    let exit = s.exit_code.unwrap_or(0);
                     // restartPolicy: restart THIS one container if the policy
-                    // says so (Always, or OnFailure+nonzero). The pod stays
+                    // says so (Always, or OnFailure + anything but an observed
+                    // exit 0 — a signal or an unobserved exit included). The pod stays
                     // Running across the restart (reconcile_pod_phase folds a
                     // restartable-terminated container to Running). Uses the
                     // shared restart_container helper (same stop→remove→start→
@@ -3447,7 +3480,7 @@ impl Kubelet {
                     // The stamp is taken here, on the FIRST tick that sees
                     // the exit, so the delay is measured from the exit and
                     // not from whenever the operator happened to look.
-                    let backoff = if restart_policy.should_restart(s.exit_code) {
+                    let backoff = if restart_policy.should_restart(exit) {
                         let (since_exit, uptime) = {
                             let mut local = self.local.lock().await;
                             let rec = local.get_mut(key).and_then(|p| p.containers.get_mut(cname));
@@ -3505,7 +3538,7 @@ impl Kubelet {
                         continue;
                     }
 
-                    if restart_policy.should_restart(s.exit_code) {
+                    if restart_policy.should_restart(exit) {
                         match self
                             .restart_container(
                                 key,
@@ -3657,7 +3690,10 @@ impl Kubelet {
                 ContainerStatusOut {
                     name: cname.clone(),
                     ready: false,
-                    state: ContainerState::terminated(0),
+                    // `init_complete` is latched only after every init
+                    // container was OBSERVED to exit 0, so this is that
+                    // observation replayed, not a default.
+                    state: ContainerState::terminated(crate::cri::ExitDisposition::Code(0)),
                     container_id: rec.map(|r| r.container_id.clone()),
                     restart_count: rec.map(|r| r.restart_count).unwrap_or(0),
                 }
@@ -3828,20 +3864,22 @@ impl Kubelet {
             };
             match lp.init_containers.get(cname) {
                 None => observations.push(mark(ContainerObservation::waiting(cname))),
-                Some(record) => match self.backend.status(&record.container_id).await {
-                    Ok(Some(s)) if s.running => {
+                Some(record) => match self.poll(&record.container_id).await {
+                    Ok(Some(Polled::Running(_))) => {
                         observations.push(mark(ContainerObservation::running(
                             cname,
                             &record.container_id,
                             record.restart_count,
-                        )))
+                        )));
                     }
-                    Ok(Some(s)) => observations.push(mark(ContainerObservation::terminated(
-                        cname,
-                        &record.container_id,
-                        s.exit_code.unwrap_or(0),
-                        record.restart_count,
-                    ))),
+                    Ok(Some(Polled::Down(_, exit))) => {
+                        observations.push(mark(ContainerObservation::terminated(
+                            cname,
+                            &record.container_id,
+                            exit,
+                            record.restart_count,
+                        )));
+                    }
                     Ok(None) => {
                         // Backend lost this init container out-of-band → treat
                         // as Waiting so it re-starts on the AwaitInit path.
@@ -3882,15 +3920,16 @@ impl Kubelet {
                 // infinitely-sized async future (E0733).
                 Box::pin(self.start_bound_pod(key, value, report, soonest_requeue)).await
             }
-            crate::lifecycle::InitAction::InitFailed { index, exit_code } => {
-                // Terminal init failure (non-zero exit under restartPolicy:Never)
-                // → pod Failed; app containers never start. Render the init
-                // statuses (the failed one Terminated non-zero) + Initialized
-                // False. Latch (no app start, init_complete stays false).
+            crate::lifecycle::InitAction::InitFailed { index, exit } => {
+                // Terminal init failure (an unsuccessful exit under
+                // restartPolicy:Never) → pod Failed; app containers never
+                // start. Render the init statuses (the failed one Terminated
+                // with its exit) + Initialized False. Latch (no app start,
+                // init_complete stays false).
                 warn!(
                     pod = %key.label(),
                     index,
-                    exit_code,
+                    %exit,
                     "init container failed terminally; pod Failed (app never starts)"
                 );
                 let init_statuses = self.init_statuses_observed(&observations);
@@ -4041,7 +4080,7 @@ impl Kubelet {
                 // container is restarted (stop+remove old, start fresh, bump
                 // count); a Running one is awaited (no-op).
                 match self.backend.status(&record.container_id).await {
-                    Ok(Some(s)) if s.running => Ok(s.pod_ip),
+                    Ok(Some(s)) if s.is_running() => Ok(s.pod_ip),
                     Ok(Some(_)) | Ok(None) => {
                         // Terminated (restartable — the sequencer said
                         // AwaitInit for it) OR vanished → (re)start fresh.
@@ -4127,9 +4166,9 @@ impl Kubelet {
                     restart_count: 0,
                 },
                 Some(record) => {
-                    let state = match self.backend.status(&record.container_id).await {
-                        Ok(Some(s)) if s.running => ContainerState::Running,
-                        Ok(Some(s)) => ContainerState::terminated(s.exit_code.unwrap_or(0)),
+                    let state = match self.poll(&record.container_id).await {
+                        Ok(Some(Polled::Running(_))) => ContainerState::Running,
+                        Ok(Some(Polled::Down(_, exit))) => ContainerState::terminated(exit),
                         // Vanished / poll error → Waiting (will re-start).
                         _ => ContainerState::creating(),
                     };
@@ -5118,7 +5157,7 @@ mod tests {
         let statuses = vec![ContainerStatusOut {
             name: "web".into(),
             ready: false,
-            state: ContainerState::terminated(0),
+            state: ContainerState::terminated(crate::cri::ExitDisposition::Code(0)),
             container_id: Some("fake-2".into()),
             restart_count: 0,
         }];
@@ -5148,7 +5187,7 @@ mod tests {
         let statuses = vec![ContainerStatusOut {
             name: "web".into(),
             ready: false,
-            state: ContainerState::terminated(137),
+            state: ContainerState::terminated(crate::cri::ExitDisposition::Code(137)),
             container_id: Some("fake-3".into()),
             restart_count: 0,
         }];
@@ -5158,6 +5197,37 @@ mod tests {
         assert_eq!(term["exitCode"], 137);
         assert_eq!(term["reason"], "Error");
         assert!(status.get("podIP").is_none());
+    }
+
+    /// ★ T1.2 wire shape: a signal death and an unobserved exit each render
+    /// the way upstream publishes them — 128+n / `Error`, and 137 /
+    /// `ContainerStatusUnknown` — while staying distinct internally.
+    #[test]
+    fn a_signal_death_and_an_unobserved_exit_render_upstreams_wire_shape() {
+        use engenho_types::curated_enums::PodPhase;
+        let statuses = vec![
+            ContainerStatusOut {
+                name: "killed".into(),
+                ready: false,
+                state: ContainerState::terminated(crate::cri::ExitDisposition::Signal(9)),
+                container_id: Some("fake-4".into()),
+                restart_count: 0,
+            },
+            ContainerStatusOut {
+                name: "lost".into(),
+                ready: false,
+                state: ContainerState::terminated(Termination::Unknown),
+                container_id: Some("fake-5".into()),
+                restart_count: 0,
+            },
+        ];
+        let status = Kubelet::build_pod_status(&json!({}), PodPhase::Failed, &statuses, None);
+        let killed = &status["containerStatuses"][0]["state"]["terminated"];
+        assert_eq!(killed["exitCode"], 137);
+        assert_eq!(killed["reason"], "Error");
+        let lost = &status["containerStatuses"][1]["state"]["terminated"];
+        assert_eq!(lost["exitCode"], 137);
+        assert_eq!(lost["reason"], "ContainerStatusUnknown");
     }
 
     #[test]

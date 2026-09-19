@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_controllers::Controller;
+use engenho_kubelet::cri::{ExitDisposition, RunState};
 use engenho_kubelet::{ContainerRuntime, FakeBackend, Kubelet, LogOptions};
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
@@ -332,6 +333,7 @@ async fn exit_zero_drives_succeeded() {
     );
     let term = &pod["status"]["containerStatuses"][0]["state"]["terminated"];
     assert_eq!(term["exitCode"], 0);
+    assert_eq!(term["reason"], "Completed");
 
     // No new Start: exactly one Start across the lifetime.
     assert_eq!(count_starts(&backend.events().await), 1);
@@ -380,6 +382,107 @@ async fn exit_nonzero_drives_failed() {
     assert_eq!(backend.running_count().await, 0);
 
     teardown(store, kubelet).await;
+}
+
+// ── T1.2 — how a container ended, carried to the Pod phase ───────────────
+
+/// ★ Live on ryn before T1.2: a `SIGKILL`ed `restartPolicy: Never` container
+/// has no exit code, the kubelet read the absence as 0, and the pod was
+/// published `Succeeded` — which JobController then counted as a completion.
+#[tokio::test]
+async fn a_sigkilled_never_pod_is_failed_not_succeeded() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_pod(&store, "p1", "img", Some("node-A")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    backend
+        .set_run_state(&cid, RunState::Exited(ExitDisposition::Signal(9)))
+        .await;
+    kubelet.tick().await.unwrap();
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(
+        pod_phase(&pod).as_deref(),
+        Some("Failed"),
+        "a killed container is not a successful one"
+    );
+    let term = &pod["status"]["containerStatuses"][0]["state"]["terminated"];
+    assert_eq!(term["exitCode"], 137, "SIGKILL renders as 128+9");
+    assert_eq!(term["reason"], "Error");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "Never: no restart"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// An exit nobody observed: upstream renders it terminated / 137 /
+/// `ContainerStatusUnknown`, and under `Never` the pod is Failed.
+#[tokio::test]
+async fn an_unobserved_exit_under_never_is_failed_as_container_status_unknown() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    put_pod(&store, "p1", "img", Some("node-A")).await;
+    kubelet.tick().await.unwrap();
+    let cid = first_container_id(&backend).await;
+
+    backend.set_run_state(&cid, RunState::Unknown).await;
+    kubelet.tick().await.unwrap();
+
+    let pod = store.get(&pod_key("p1")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Failed"));
+    let term = &pod["status"]["containerStatuses"][0]["state"]["terminated"];
+    assert_eq!(term["exitCode"], 137);
+    assert_eq!(term["reason"], "ContainerStatusUnknown");
+    assert_eq!(
+        count_starts(&backend.events().await),
+        1,
+        "Never: no restart"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+/// Under `OnFailure` an unobserved exit and a signal death are failures, so
+/// both are restarted rather than latched `Succeeded`.
+#[tokio::test]
+async fn under_on_failure_a_signal_or_unobserved_exit_is_restarted() {
+    for run_state in [
+        RunState::Exited(ExitDisposition::Signal(9)),
+        RunState::Unknown,
+    ] {
+        let store = boot_store().await;
+        let backend = Arc::new(FakeBackend::new());
+        let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+        put_pod_with_policy(&store, "p1", "img", Some("node-A"), Some("OnFailure")).await;
+        kubelet.tick().await.unwrap();
+        let cid = first_container_id(&backend).await;
+
+        backend.set_run_state(&cid, run_state).await;
+        kubelet.tick().await.unwrap();
+
+        assert_eq!(
+            count_starts(&backend.events().await),
+            2,
+            "{run_state:?} under OnFailure must be restarted"
+        );
+        assert_eq!(
+            pod_phase(&store.get(&pod_key("p1")).await.unwrap()).as_deref(),
+            Some("Running"),
+            "{run_state:?}"
+        );
+
+        teardown(store, kubelet).await;
+    }
 }
 
 // ── Test 5 — still-running stays running, no spurious restart ─────────────

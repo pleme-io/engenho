@@ -13,6 +13,7 @@
 //! coverage at all.
 
 use engenho_kubelet::backend::{ContainerRuntime, ContainerSpec, LogOptions, PodIdentity};
+use engenho_kubelet::cri::{ExitDisposition, RunState};
 use engenho_kubelet::native_backend::{Isolation, NativeBackend};
 use std::collections::BTreeMap;
 
@@ -72,7 +73,7 @@ async fn a_nix_closure_runs_as_a_native_process_and_its_output_is_readable() {
         .expect("a realised closure must start");
     assert_eq!(started.container_id, "default_native-probe_probe");
     assert!(
-        started.running,
+        started.is_running(),
         "a freshly spawned process must report running"
     );
     // ★ CORRECTED 2026-09-18. This asserted `pod_ip.is_none()`, reasoning that
@@ -106,7 +107,7 @@ async fn a_nix_closure_runs_as_a_native_process_and_its_output_is_readable() {
             .await
             .expect("status")
             .expect("the container is tracked");
-        if !s.running {
+        if !s.is_running() {
             status = Some(s);
             break;
         }
@@ -114,8 +115,8 @@ async fn a_nix_closure_runs_as_a_native_process_and_its_output_is_readable() {
     }
     let status = status.expect("echo must exit well within two seconds");
     assert_eq!(
-        status.exit_code,
-        Some(0),
+        status.state,
+        RunState::Exited(ExitDisposition::Code(0)),
         "the real exit code must be readable — a dropped Child would leave a \
          zombie and report None forever, which a kubelet reads as running"
     );
@@ -139,6 +140,49 @@ async fn a_nix_closure_runs_as_a_native_process_and_its_output_is_readable() {
             .is_none(),
         "a removed container must stop being tracked"
     );
+}
+
+/// ★ T1.2, end to end through the real backend: a container ended by a
+/// signal reports the SIGNAL. The backend used to report `code()`, which is
+/// `None` for a killed process, and the kubelet read that absence as exit 0 —
+/// a killed `restartPolicy: Never` pod published as `Succeeded`.
+#[tokio::test]
+async fn a_signalled_container_reports_its_signal_not_a_clean_exit() {
+    let coreutils = closure("nixpkgs#coreutils");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-signal"),
+    );
+    let mut image = String::from("nix:");
+    image.push_str(&coreutils);
+    let started = backend
+        .start(&spec(&image, &["sleep", "30"], &[]))
+        .await
+        .expect("start");
+    assert!(started.is_running());
+
+    // The backend's own stop: SIGTERM, which `sleep` does not handle.
+    backend.stop(&started.container_id).await.expect("stop");
+    let mut ended = None;
+    for _ in 0..100 {
+        let s = backend
+            .status(&started.container_id)
+            .await
+            .expect("status")
+            .expect("tracked");
+        if !s.is_running() {
+            ended = Some(s.state);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let ended = ended.expect("a SIGTERMed sleep must exit well within two seconds");
+    assert_eq!(ended, RunState::Exited(ExitDisposition::Signal(15)));
+    assert!(
+        !ended.exit().is_some_and(ExitDisposition::is_success),
+        "a signal death must never read as a success"
+    );
+    backend.remove(&started.container_id).await.expect("remove");
 }
 
 /// The environment a container gets is the one its spec DECLARES — nothing
@@ -166,7 +210,7 @@ async fn a_container_sees_only_its_declared_environment() {
             .await
             .unwrap()
             .unwrap();
-        if !s.running {
+        if !s.is_running() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

@@ -30,6 +30,7 @@
 //! this crate keeps finding.
 
 use crate::backend::{ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions};
+use crate::cri::{ExitDisposition, RunState};
 use crate::error::KubeletError;
 use crate::image_source::ImageSource;
 use crate::pod_volume::MountSource;
@@ -457,9 +458,14 @@ impl ContainerRuntime for NativeBackend {
 
         Ok(ContainerStatus {
             container_id: id,
-            running: pid.is_some(),
+            // No pid means the child was already reaped — gone, cause not
+            // seen here. The next `status` poll owns the answer.
+            state: if pid.is_some() {
+                RunState::Running
+            } else {
+                RunState::Unknown
+            },
             pod_ip: Some(HOST_NETWORK_POD_IP.to_string()),
-            exit_code: None,
         })
     }
 
@@ -475,12 +481,10 @@ impl ContainerRuntime for NativeBackend {
             program: c.program.clone(),
             detail: e.to_string(),
         })?;
-        let exit_code = exited.and_then(|s| s.code());
         Ok(Some(ContainerStatus {
             container_id: container_id.to_string(),
-            running: exited.is_none(),
+            state: run_state_of(exited),
             pod_ip: Some(HOST_NETWORK_POD_IP.to_string()),
-            exit_code,
         }))
     }
 
@@ -579,6 +583,29 @@ impl ContainerRuntime for NativeBackend {
 }
 
 const SIGTERM: i32 = 15;
+
+/// What a `try_wait` result says about a native container.
+///
+/// ★ THE KERNEL'S TWO ANSWERS, KEPT APART. A process either exits with a code
+/// or is killed by a signal, and a killed process has NO code:
+/// `ExitStatus::code()` is `None`. This backend used to report exactly
+/// `code()`, so every SIGKILL — the OOM killer, `kill -9`, a node agent
+/// reaping it — reached the kubelet as "no exit code", which read it as 0 and
+/// published a `restartPolicy: Never` pod as `Succeeded`.
+///
+/// A status that is neither (a stopped or continued process, which `wait`
+/// without `WUNTRACED` does not report) is `Unknown`, never a guess.
+fn run_state_of(exited: Option<std::process::ExitStatus>) -> RunState {
+    use std::os::unix::process::ExitStatusExt;
+    let Some(status) = exited else {
+        return RunState::Running;
+    };
+    match (status.code(), status.signal()) {
+        (Some(code), _) => RunState::Exited(ExitDisposition::Code(code)),
+        (None, Some(signal)) => RunState::Exited(ExitDisposition::Signal(signal)),
+        (None, None) => RunState::Unknown,
+    }
+}
 
 /// Is `pid` still alive? `kill(pid, 0)` performs the permission/existence
 /// check without delivering anything.
@@ -839,6 +866,53 @@ mod tests {
             HOST_NETWORK_POD_IP, "127.0.0.1",
             "a host process is reachable at the host's loopback; reporting no \
              address at all makes every network probe fail forever"
+        );
+    }
+
+    /// ★ The T1.2 defect, against a REAL kernel wait status: a `SIGKILL`ed
+    /// process has no exit code, and this backend reported exactly that
+    /// absence — which the kubelet read as a clean exit.
+    #[test]
+    fn a_sigkilled_process_is_signal_9_and_never_success() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        // std's `Child::kill` delivers SIGKILL on unix.
+        child.kill().expect("deliver SIGKILL");
+        let status = child.wait().expect("reap");
+        let state = run_state_of(Some(status));
+        assert_eq!(state, RunState::Exited(ExitDisposition::Signal(9)));
+        assert!(
+            !state.exit().is_some_and(ExitDisposition::is_success),
+            "a killed process must never read as a success"
+        );
+    }
+
+    #[test]
+    fn the_wait_status_decodes_into_code_signal_running_or_unknown() {
+        use std::os::unix::process::ExitStatusExt;
+        // Not reaped yet: still up.
+        assert_eq!(run_state_of(None), RunState::Running);
+        // exit(0) and exit(3): raw status carries the code in bits 8..16.
+        assert_eq!(
+            run_state_of(Some(std::process::ExitStatus::from_raw(0))),
+            RunState::Exited(ExitDisposition::Code(0))
+        );
+        assert_eq!(
+            run_state_of(Some(std::process::ExitStatus::from_raw(3 << 8))),
+            RunState::Exited(ExitDisposition::Code(3))
+        );
+        // Terminated by SIGTERM: the signal lives in the low 7 bits.
+        assert_eq!(
+            run_state_of(Some(std::process::ExitStatus::from_raw(15))),
+            RunState::Exited(ExitDisposition::Signal(15))
+        );
+        // A STOPPED status (0x7f low byte) is neither an exit nor a kill.
+        // It must not be guessed into either.
+        assert_eq!(
+            run_state_of(Some(std::process::ExitStatus::from_raw((19 << 8) | 0x7f))),
+            RunState::Unknown
         );
     }
 }

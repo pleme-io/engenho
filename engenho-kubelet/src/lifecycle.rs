@@ -31,6 +31,7 @@
 //! container is observed `Running` again on the next tick. There is no
 //! `todo!()` / `panic!()` / placeholder `Ok`.
 
+use crate::cri::{ExitDisposition, RunState};
 use engenho_types::curated_enums::PodPhase;
 use serde::{Deserialize, Serialize};
 
@@ -72,23 +73,105 @@ impl RestartPolicy {
         }
     }
 
-    /// `true` iff a container that has terminated with `exit_code` should be
-    /// restarted under this policy. The kubelet uses this to decide whether
-    /// to re-`start` the one exited container.
+    /// `true` iff a container that terminated with `exit` should be restarted
+    /// under this policy. The kubelet uses this to decide whether to
+    /// re-`start` the one exited container.
     ///
     ///   * `Always`    → always restart.
-    ///   * `OnFailure` → restart iff the exit code is non-zero.
-    ///   * `Never`     → never restart.
+    ///   * `OnFailure` → restart unless the exit [`Termination::is_success`] —
+    ///     so a signal death and an [`Termination::Unknown`] exit restart.
+    ///   * `Never`     → never restart; the fold then latches the pod, and an
+    ///     Unknown exit latches it `Failed`, never `Succeeded`.
     ///
-    /// A terminated container with NO recorded exit code is treated as a
-    /// non-zero/abnormal exit (defensively unhealthy) — so `OnFailure`
-    /// restarts it.
+    /// Unknown follows upstream: an exit nobody observed is treated as a
+    /// failure, never as the success a missing code used to default to.
     #[must_use]
-    pub fn should_restart(self, exit_code: Option<i32>) -> bool {
+    pub fn should_restart(self, exit: Termination) -> bool {
         match self {
             RestartPolicy::Always => true,
             RestartPolicy::Never => false,
-            RestartPolicy::OnFailure => exit_code != Some(0),
+            RestartPolicy::OnFailure => !exit.is_success(),
+        }
+    }
+}
+
+/// How a terminated container ended, as far as this kubelet observed.
+///
+/// ── ★ UNKNOWN IS A STATE, NOT A DEFAULT ───────────────────────────────────
+/// The runtime can report a container down without saying how: CRI
+/// `CONTAINER_UNKNOWN`, a container that is `Created` but was started, a
+/// podman read-back that found nothing. Before T1.2 all of those arrived as
+/// `exit_code: None` and three call sites in the kubelet resolved it with
+/// `unwrap_or(0)` — a clean exit. An unobserved exit is now its own arm, it is
+/// never a success, and it is only turned into numbers at the wire
+/// ([`Self::exit_code`], [`Self::reason`]) the way upstream renders it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Termination {
+    /// The runtime reported how the process ended.
+    Observed(ExitDisposition),
+    /// The container is down, and how it ended was never observed.
+    Unknown,
+}
+
+impl Termination {
+    /// The `exitCode` upstream publishes for a container whose status could
+    /// not be determined.
+    pub const UNKNOWN_EXIT_CODE: i32 = 137;
+    /// The `reason` upstream publishes alongside [`Self::UNKNOWN_EXIT_CODE`].
+    pub const UNKNOWN_REASON: &'static str = "ContainerStatusUnknown";
+
+    /// What a runtime [`RunState`] says about a container that is not
+    /// running. `None` exactly when it is running.
+    ///
+    /// `Created` and `Unknown` both yield [`Termination::Unknown`]: the kubelet
+    /// only polls containers it started, so either one is a container that is
+    /// not up and whose end nobody saw. Upstream likewise restarts both.
+    #[must_use]
+    pub fn from_run_state(state: RunState) -> Option<Self> {
+        match state {
+            RunState::Running => None,
+            RunState::Exited(disposition) => Some(Self::Observed(disposition)),
+            RunState::Created | RunState::Unknown => Some(Self::Unknown),
+        }
+    }
+
+    /// Did the container succeed? Only an observed `Code(0)` does.
+    #[must_use]
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Observed(d) if d.is_success())
+    }
+
+    /// `state.terminated.exitCode` on the wire.
+    #[must_use]
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Observed(d) => d.exit_code(),
+            Self::Unknown => Self::UNKNOWN_EXIT_CODE,
+        }
+    }
+
+    /// `state.terminated.reason` on the wire.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Observed(d) if d.is_success() => "Completed",
+            Self::Observed(_) => "Error",
+            Self::Unknown => Self::UNKNOWN_REASON,
+        }
+    }
+}
+
+impl From<ExitDisposition> for Termination {
+    fn from(disposition: ExitDisposition) -> Self {
+        Self::Observed(disposition)
+    }
+}
+
+impl std::fmt::Display for Termination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Observed(d) => d.fmt(f),
+            Self::Unknown => f.write_str("unobserved"),
         }
     }
 }
@@ -107,14 +190,12 @@ pub enum ContainerState {
     },
     /// The container is up. Renders `state: { running: {} }`.
     Running,
-    /// The container has terminated. Renders
-    /// `state: { terminated: { exitCode, reason } }`.
-    Terminated {
-        /// Process exit code (`0` = clean).
-        exit_code: i32,
-        /// Short reason string (`"Completed"` for exit 0, else `"Error"`).
-        reason: String,
-    },
+    /// The container has terminated, and this is how. Renders
+    /// `state: { terminated: { exitCode, reason } }` from
+    /// [`Termination::exit_code`] and [`Termination::reason`] — the wire
+    /// numbers are derived, so an Unknown exit cannot be confused with a
+    /// genuine exit 137 anywhere but on the wire.
+    Terminated(Termination),
 }
 
 impl ContainerState {
@@ -127,26 +208,22 @@ impl ContainerState {
     /// `true` iff this container has terminated.
     #[must_use]
     pub fn is_terminated(&self) -> bool {
-        matches!(self, ContainerState::Terminated { .. })
+        matches!(self, ContainerState::Terminated(_))
     }
 
-    /// The exit code if terminated, else `None`.
+    /// How the container ended if terminated, else `None`.
     #[must_use]
-    pub fn exit_code(&self) -> Option<i32> {
+    pub fn termination(&self) -> Option<Termination> {
         match self {
-            ContainerState::Terminated { exit_code, .. } => Some(*exit_code),
-            _ => None,
+            ContainerState::Terminated(exit) => Some(*exit),
+            ContainerState::Waiting { .. } | ContainerState::Running => None,
         }
     }
 
-    /// Build the canonical `Terminated` state from an exit code, deriving the
-    /// reason (`"Completed"` for 0, `"Error"` otherwise).
+    /// Build the `Terminated` state for `exit`.
     #[must_use]
-    pub fn terminated(exit_code: i32) -> Self {
-        ContainerState::Terminated {
-            exit_code,
-            reason: if exit_code == 0 { "Completed" } else { "Error" }.to_string(),
-        }
+    pub fn terminated(exit: impl Into<Termination>) -> Self {
+        ContainerState::Terminated(exit.into())
     }
 
     /// Build the canonical not-yet-started `Waiting` state.
@@ -270,12 +347,12 @@ impl ContainerObservation {
     pub fn terminated(
         name: impl Into<String>,
         container_id: impl Into<String>,
-        exit_code: i32,
+        exit: impl Into<Termination>,
         restart_count: u32,
     ) -> Self {
         Self {
             name: name.into(),
-            state: ContainerState::terminated(exit_code),
+            state: ContainerState::terminated(exit),
             container_id: Some(container_id.into()),
             restart_count,
             ready: false,
@@ -462,9 +539,8 @@ pub fn reconcile_pod_phase(
     // also covers the all-terminated-under-Always window.
     let any_restartable = observations.iter().any(|o| {
         o.state
-            .exit_code()
-            .map(|code| restart_policy.should_restart(Some(code)))
-            .unwrap_or(false)
+            .termination()
+            .is_some_and(|exit| restart_policy.should_restart(exit))
     });
     if any_restartable {
         return (PodPhase::Running, statuses);
@@ -479,9 +555,12 @@ pub fn reconcile_pod_phase(
     }
 
     // All containers terminated, none restartable → terminal phase. Worst-case
-    // fold: Succeeded iff every container exited 0, else Failed.
-    let all_zero = observations.iter().all(|o| o.state.exit_code() == Some(0));
-    let phase = if all_zero {
+    // fold: Succeeded iff every container exited 0, else Failed. A signal death
+    // or an Unknown exit is never a success, so either one makes it Failed.
+    let all_succeeded = observations
+        .iter()
+        .all(|o| o.state.termination().is_some_and(Termination::is_success));
+    let phase = if all_succeeded {
         PodPhase::Succeeded
     } else {
         PodPhase::Failed
@@ -514,14 +593,14 @@ pub enum InitAction {
         /// and only sidecars are still coming up.
         blocked_on: Option<usize>,
     },
-    /// Init container `index` terminated non-restartably with `exit_code` (a
-    /// non-zero exit under `restartPolicy: Never`) → the whole pod has **Failed**
-    /// during init; app containers never start.
+    /// Init container `index` terminated non-restartably with `exit` (an
+    /// unsuccessful exit under `restartPolicy: Never`) → the whole pod has
+    /// **Failed** during init; app containers never start.
     InitFailed {
         /// 0-based index into `spec.initContainers`.
         index: usize,
-        /// The non-zero exit code that latched the failure.
-        exit_code: i32,
+        /// The unsuccessful exit that latched the failure.
+        exit: Termination,
     },
     /// Every init container has Succeeded (exit 0), or there are no init
     /// containers. App containers may start; the pod is `Initialized`.
@@ -581,7 +660,7 @@ pub fn next_init_action(
                 // listeners will blackhole the app's first connections.
                 continue;
             }
-            if matches!(o.state, ContainerState::Terminated { .. }) {
+            if o.state.is_terminated() {
                 // ★ RESTARTED UNCONDITIONALLY — the pod-level restartPolicy is
                 // NOT consulted. Upstream restarts a sidecar regardless of the
                 // pod policy, including `Never` and including a non-zero exit,
@@ -594,20 +673,18 @@ pub fn next_init_action(
         }
         match &o.state {
             // Succeeded → move on to the next init container.
-            ContainerState::Terminated { exit_code, .. } if *exit_code == 0 => continue,
-            // Failed init container: restart per policy, else terminal failure.
-            ContainerState::Terminated { exit_code, .. } => {
-                return if restart_policy.should_restart(Some(*exit_code)) {
+            ContainerState::Terminated(exit) if exit.is_success() => continue,
+            // Failed init container (a non-zero code, a signal, or an exit
+            // nobody observed): restart per policy, else terminal failure.
+            ContainerState::Terminated(exit) => {
+                return if restart_policy.should_restart(*exit) {
                     start.push(index);
                     InitAction::AwaitInit {
                         start,
                         blocked_on: Some(index),
                     }
                 } else {
-                    InitAction::InitFailed {
-                        index,
-                        exit_code: *exit_code,
-                    }
+                    InitAction::InitFailed { index, exit: *exit }
                 };
             }
             // In flight or not yet started → this is the active init container.
@@ -689,7 +766,13 @@ mod tests {
         ContainerObservation::running(name, id, 0)
     }
     fn terminated(name: &str, id: &str, code: i32) -> ContainerObservation {
-        ContainerObservation::terminated(name, id, code, 0)
+        ContainerObservation::terminated(name, id, ExitDisposition::Code(code), 0)
+    }
+    fn killed(name: &str, id: &str, signal: i32) -> ContainerObservation {
+        ContainerObservation::terminated(name, id, ExitDisposition::Signal(signal), 0)
+    }
+    fn unobserved(name: &str, id: &str) -> ContainerObservation {
+        ContainerObservation::terminated(name, id, Termination::Unknown, 0)
     }
     fn waiting(name: &str) -> ContainerObservation {
         ContainerObservation::waiting(name)
@@ -726,17 +809,119 @@ mod tests {
 
     #[test]
     fn should_restart_matrix() {
-        // Always → always.
-        assert!(RestartPolicy::Always.should_restart(Some(0)));
-        assert!(RestartPolicy::Always.should_restart(Some(1)));
-        assert!(RestartPolicy::Always.should_restart(None));
-        // Never → never.
-        assert!(!RestartPolicy::Never.should_restart(Some(0)));
-        assert!(!RestartPolicy::Never.should_restart(Some(1)));
-        // OnFailure → only non-zero (or unknown).
-        assert!(!RestartPolicy::OnFailure.should_restart(Some(0)));
-        assert!(RestartPolicy::OnFailure.should_restart(Some(1)));
-        assert!(RestartPolicy::OnFailure.should_restart(None));
+        let clean: Termination = ExitDisposition::Code(0).into();
+        let failed: Termination = ExitDisposition::Code(1).into();
+        let sigkill: Termination = ExitDisposition::Signal(9).into();
+        let unknown = Termination::Unknown;
+        // Always → always, however it ended.
+        for exit in [clean, failed, sigkill, unknown] {
+            assert!(RestartPolicy::Always.should_restart(exit), "{exit}");
+        }
+        // Never → never, however it ended.
+        for exit in [clean, failed, sigkill, unknown] {
+            assert!(!RestartPolicy::Never.should_restart(exit), "{exit}");
+        }
+        // OnFailure → everything but an observed clean exit. A signal and an
+        // unobserved exit are failures (upstream's Unknown rule).
+        assert!(!RestartPolicy::OnFailure.should_restart(clean));
+        assert!(RestartPolicy::OnFailure.should_restart(failed));
+        assert!(RestartPolicy::OnFailure.should_restart(sigkill));
+        assert!(RestartPolicy::OnFailure.should_restart(unknown));
+    }
+
+    // ── Termination: the T1.2 exit disposition ──────────────────────────
+
+    #[test]
+    fn a_sigkilled_never_pod_is_failed_not_succeeded() {
+        // ★ The live defect on ryn: a SIGKILL has no exit code, the kubelet
+        // read "no code" as 0, and a killed Never pod was published
+        // Succeeded — which a Job then counted as a completion.
+        let (phase, st) = reconcile_pod_phase(RestartPolicy::Never, &[killed("a", "id-a", 9)]);
+        assert_eq!(phase, PodPhase::Failed);
+        assert_eq!(
+            st[0].state,
+            ContainerState::Terminated(Termination::Observed(ExitDisposition::Signal(9)))
+        );
+        // The same kill beside a clean sibling still fails the pod.
+        let (phase, _) = reconcile_pod_phase(
+            RestartPolicy::Never,
+            &[terminated("a", "id-a", 0), killed("b", "id-b", 9)],
+        );
+        assert_eq!(phase, PodPhase::Failed);
+    }
+
+    #[test]
+    fn an_unobserved_exit_restarts_under_always_and_onfailure_and_fails_under_never() {
+        // Upstream's rule for a container whose end nobody saw.
+        let obs = [unobserved("a", "id-a")];
+        assert_eq!(
+            reconcile_pod_phase(RestartPolicy::Always, &obs).0,
+            PodPhase::Running,
+            "Always: restarted, so the pod stays Running"
+        );
+        assert_eq!(
+            reconcile_pod_phase(RestartPolicy::OnFailure, &obs).0,
+            PodPhase::Running,
+            "OnFailure: an unobserved exit is a failure, so it is restarted"
+        );
+        assert_eq!(
+            reconcile_pod_phase(RestartPolicy::Never, &obs).0,
+            PodPhase::Failed,
+            "Never: latched Failed — never the Succeeded a default 0 produced"
+        );
+    }
+
+    #[test]
+    fn an_unobserved_exit_renders_as_upstreams_137_container_status_unknown() {
+        // Internally it stays Unknown; only the wire gets the numbers.
+        assert_eq!(Termination::Unknown.exit_code(), 137);
+        assert_eq!(Termination::Unknown.reason(), "ContainerStatusUnknown");
+        assert!(!Termination::Unknown.is_success());
+        // Distinct from a genuine exit 137 everywhere except the wire code.
+        let real_137: Termination = ExitDisposition::Code(137).into();
+        assert_ne!(real_137, Termination::Unknown);
+        assert_eq!(real_137.reason(), "Error");
+        // A signal renders 128+n with upstream's generic reason.
+        let sigkill: Termination = ExitDisposition::Signal(9).into();
+        assert_eq!(sigkill.exit_code(), 137);
+        assert_eq!(sigkill.reason(), "Error");
+        // And the one success.
+        let clean: Termination = ExitDisposition::Code(0).into();
+        assert_eq!((clean.exit_code(), clean.reason()), (0, "Completed"));
+        assert!(clean.is_success());
+    }
+
+    #[test]
+    fn a_run_state_maps_to_a_termination_only_when_not_running() {
+        assert_eq!(Termination::from_run_state(RunState::Running), None);
+        assert_eq!(
+            Termination::from_run_state(RunState::Exited(ExitDisposition::Signal(9))),
+            Some(Termination::Observed(ExitDisposition::Signal(9)))
+        );
+        // The runtime lost it, or it is Created though we started it: down,
+        // cause unseen. Never a clean exit.
+        assert_eq!(
+            Termination::from_run_state(RunState::Unknown),
+            Some(Termination::Unknown)
+        );
+        assert_eq!(
+            Termination::from_run_state(RunState::Created),
+            Some(Termination::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_killed_init_container_fails_the_pod_under_never() {
+        let obs = vec![killed("init-0", "id0", 9)];
+        assert_eq!(
+            next_init_action(RestartPolicy::Never, &obs),
+            InitAction::InitFailed {
+                index: 0,
+                exit: ExitDisposition::Signal(9).into()
+            }
+        );
+        // And is restarted, not advanced past, under OnFailure.
+        assert!(!next_init_action(RestartPolicy::OnFailure, &obs).is_complete());
     }
 
     // ── reconcile_pod_phase: single-container ───────────────────────────
@@ -770,7 +955,10 @@ mod tests {
     fn single_terminated_zero_never_is_succeeded() {
         let (phase, st) = reconcile_pod_phase(RestartPolicy::Never, &[terminated("a", "id-a", 0)]);
         assert_eq!(phase, PodPhase::Succeeded);
-        assert_eq!(st[0].state.exit_code(), Some(0));
+        assert_eq!(
+            st[0].state.termination(),
+            Some(Termination::Observed(ExitDisposition::Code(0)))
+        );
     }
 
     #[test]
@@ -946,7 +1134,7 @@ mod tests {
             next_init_action(RestartPolicy::Never, &obs_regular),
             InitAction::InitFailed {
                 index: 0,
-                exit_code: 7
+                exit: ExitDisposition::Code(7).into()
             }
         );
     }
@@ -1062,7 +1250,7 @@ mod tests {
             next_init_action(RestartPolicy::Never, &obs),
             InitAction::InitFailed {
                 index: 0,
-                exit_code: 7
+                exit: ExitDisposition::Code(7).into()
             }
         );
     }
@@ -1155,17 +1343,24 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Every way a container can end: a small code range (0 included), a
+    /// signal, or an exit nobody observed.
+    fn termination_strategy() -> impl Strategy<Value = Termination> {
+        prop_oneof![
+            (-5i32..5).prop_map(|c| Termination::Observed(ExitDisposition::Code(c))),
+            (1i32..32).prop_map(|s| Termination::Observed(ExitDisposition::Signal(s))),
+            Just(Termination::Unknown),
+        ]
+    }
+
     /// Strategy for a single container observation (Running / Terminated /
-    /// Waiting with a small exit-code range).
+    /// Waiting).
     fn obs_strategy() -> impl Strategy<Value = ContainerObservation> {
         prop_oneof![
             (any::<u32>()).prop_map(|rc| ContainerObservation::running("c", "id", rc % 10)),
-            (-5i32..5, any::<u32>()).prop_map(|(code, rc)| ContainerObservation::terminated(
-                "c",
-                "id",
-                code,
-                rc % 10
-            )),
+            (termination_strategy(), any::<u32>()).prop_map(|(exit, rc)| {
+                ContainerObservation::terminated("c", "id", exit, rc % 10)
+            }),
             Just(ContainerObservation::waiting("c")),
         ]
     }
@@ -1198,8 +1393,8 @@ mod proptests {
             obs in prop::collection::vec(
                 prop_oneof![
                     (any::<u32>()).prop_map(|rc| ContainerObservation::running("c", "id", rc % 10)),
-                    (-5i32..5, any::<u32>())
-                        .prop_map(|(code, rc)| ContainerObservation::terminated("c", "id", code, rc % 10)),
+                    (termination_strategy(), any::<u32>())
+                        .prop_map(|(exit, rc)| ContainerObservation::terminated("c", "id", exit, rc % 10)),
                 ],
                 1..6,
             ),
@@ -1216,20 +1411,23 @@ mod proptests {
         /// Never terminal-latch invariant.
         #[test]
         fn never_all_terminated_is_terminal(
-            codes in prop::collection::vec(-5i32..5, 1..6),
+            exits in prop::collection::vec(termination_strategy(), 1..6),
         ) {
-            let obs: Vec<ContainerObservation> = codes
+            let obs: Vec<ContainerObservation> = exits
                 .iter()
                 .enumerate()
-                .map(|(i, c)| ContainerObservation::terminated(format!("c{i}"), format!("id{i}"), *c, 0))
+                .map(|(i, e)| ContainerObservation::terminated(format!("c{i}"), format!("id{i}"), *e, 0))
                 .collect();
             let (phase, _) = reconcile_pod_phase(RestartPolicy::Never, &obs);
             prop_assert!(
                 matches!(phase, PodPhase::Succeeded | PodPhase::Failed),
                 "Never + all-terminated must be terminal, got {phase:?}"
             );
-            // Succeeded iff every code is 0.
-            let all_zero = codes.iter().all(|c| *c == 0);
+            // Succeeded iff every container was OBSERVED to exit with code 0 —
+            // a signal or an unobserved exit anywhere makes it Failed.
+            let all_zero = exits
+                .iter()
+                .all(|e| *e == Termination::Observed(ExitDisposition::Code(0)));
             if all_zero {
                 prop_assert_eq!(phase, PodPhase::Succeeded);
             } else {
