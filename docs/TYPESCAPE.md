@@ -65,9 +65,9 @@ is the one everything else in that domain hangs off.
 | `ClusterState` / `ClusterEvent` | `kikai/src/state.rs` | 14-state lifecycle FSM (SM ①) |
 | `Role` | `topology.rs` | `Master · Worker · Bootstrap · Observer`; `is_voting()` |
 | `NodeState` | `topology.rs` | `Joining · Standby · Active(Role) · Demoting · Departing · Failed` |
-| `RoleAssignment` | `topology.rs` | committed `Vec<(NodeId, NodeState)>`; `has_majority()` |
+| `RoleAssignment` | `topology.rs` | committed `Vec<(NodeId, NodeState)>`; `has_majority()` — true whenever any voter exists, so not yet a majority check; no caller |
 | `Transition` | `topology.rs` | `Admit · Promote · Demote · Reassign · Evict` |
-| `RoleAssignment` (cmd) | `consensus/role_assignment.rs` | `Promote · Demote · Quarantine · Restore` + `Reason` |
+| `RoleAssignment` (cmd) | `engenho-revoada/src/consensus/role_assignment.rs` | `Promote · Demote · Quarantine · Restore` + `Reason` |
 | `RoleAttestationBlock` | revoada/attestation | `{prev_hash, assignment, raft_term, raft_log_index, leader_sig, witness_sigs}` |
 
 ### 3. Resource / kind (the faces)
@@ -145,7 +145,7 @@ paths collapse into the keyword.
 | Tier | Typescape coverage |
 |---|---|
 | Foundational scalars/collections | ✅ in `engenho-sui-typescape::ext` |
-| Substrate state enums + shapes | scaffolded in [`engenho-machines`](../engenho-machines/) (substrate-first) |
+| Substrate state enums + shapes | none today. `WorkloadShape` and two state enums had `Typescape` impls in `engenho-machines`, which was deleted as a model that contradicted the code (improvement plan T5.3) |
 | Resource catalog (`KubeResource` kinds) | via serde today; `Typescape` derive arrives with kube-forge (M0.0.3+) |
 | caixa / pangea / magma / viggy-promessa | gain `Typescape` so a `(defsistema)` references them by name without losing type-safety |
 

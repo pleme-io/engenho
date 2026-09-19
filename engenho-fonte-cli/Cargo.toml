@@ -10,11 +10,23 @@ readme.workspace = true
 categories.workspace = true
 keywords.workspace = true
 authors.workspace = true
-description = "engenho-fonte-cli — operator-facing daemon. Watches a (defsistema …) tlisp file via shikumi-notify, evaluates it via sui, materializes through a revoada FabricFace, BLAKE3-chains every transition, routes anomalies through the typed RemediationPolicy. One binary that wires the entire Viggy convergence loop."
+description = "engenho-fonte-cli — the fonte convergence loop run as a process over a MOCK universe: a real shikumi file watch and sui eval feed in-process stand-ins (mock reconcilers or an in-memory PureRaftFace, mock attester, mock publisher). Built only with `--features mock-universe`; it resolves and logs the Universe of every slot at startup and never reports a mock tick as a convergence."
 
+# The fence. Every role after the watch and the eval is an in-process
+# stand-in, so cargo builds this binary only when the caller asks for a
+# mock universe by name: `cargo build -p engenho-fonte-cli --features
+# mock-universe`. Without it, `--bin engenho-fonte` is refused and a
+# workspace build skips the target. main.rs carries a matching
+# compile_error! in case this line is ever dropped.
 [[bin]]
 name = "engenho-fonte"
 path = "src/main.rs"
+required-features = ["mock-universe"]
+
+[features]
+# Opt in to a binary whose attester, publisher, proposer and remediation
+# are mocks. Never add this to `default`: that would turn the fence off.
+mock-universe = []
 
 [dependencies]
 async-trait    = { workspace = true }
@@ -22,7 +34,13 @@ clap           = { version = "4", features = ["derive"] }
 tokio          = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time", "signal"] }
 tracing        = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-# All three real-substrate features enabled — this binary is the
-# integration point for the full Viggy convergence loop.
+# with-shikumi and with-sui-eval make the watch and the eval real;
+# with-revoada supplies the in-memory PureRaftFace behind --with-revoada.
 engenho-fonte  = { workspace = true, features = ["with-shikumi", "with-sui-eval", "with-revoada"] }
 engenho-revoada = { workspace = true }
+thiserror      = { workspace = true }
+
+[dev-dependencies]
+tempfile       = "3"
+# tests/mock_universe_fence.rs reads this manifest.
+toml           = "0.8"

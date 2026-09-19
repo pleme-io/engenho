@@ -1,0 +1,290 @@
+;; mutation-gate.test.tlisp — (deftest …) suite for ci/mutation-gate.tlisp.
+;; Run by pleme-io/actions/tlisp-test (test.yml, job ci-contract-tests) as
+;; stdlib + unit + this file with TLISP_TEST=1, from the repository root.
+;;
+;; The first tests read the real ci/seam-files.txt, ci/mutants-allowlist.txt
+;; and .github/workflows/mutation.yml. The judge tests read
+;; ci/fixtures/mutation-gate/native_backend/: the native_backend.rs slice of a
+;; real cargo-mutants 25.3.1 run on ryn (2026-09-19; 32 mutants: 22 caught,
+;; 4 missed, 5 unviable, 1 Failure), with only the argv, duration, log and
+;; diff fields removed. Each rule is shown firing on a copy of that fixture
+;; with one defect written in.
+
+(define t:FILE "engenho-kubelet/src/native_backend.rs")
+(define t:FIXTURE "ci/fixtures/mutation-gate/native_backend/")
+(define t:OUTCOMES (read-file (string-append t:FIXTURE "outcomes.json")))
+(define t:MISSED (read-file (string-append t:FIXTURE "missed.txt")))
+(define t:N 32)
+
+(define t:PLAN-SEAMS
+  (list "engenho-controllers/src/gc.rs" "engenho-controllers/src/watch_driver.rs"
+        "engenho-kubelet/src/probe.rs" "engenho-kubelet/src/backoff.rs" t:FILE))
+
+;; The four survivors of the fixture, as allowlist keys.
+(define t:K-XYZZY "engenho-kubelet/src/native_backend.rs: replace <impl ContainerRuntime for NativeBackend>::name -> &'static str with \"xyzzy\"")
+(define t:K-EMPTY "engenho-kubelet/src/native_backend.rs: replace <impl ContainerRuntime for NativeBackend>::name -> &'static str with \"\"")
+(define t:K-EXEC "engenho-kubelet/src/native_backend.rs: delete - in <impl ContainerRuntime for NativeBackend>::exec")
+(define t:K-LOGS "engenho-kubelet/src/native_backend.rs: delete ! in <impl ContainerRuntime for NativeBackend>::logs")
+
+(define (t:has? lines needle) (any? (fn (l) (string-contains? l needle)) lines))
+
+;; yaml-parse yields a mapping as a list of (key value) lists.
+(define (t:has-key? al key) (and (list? al) (any? (fn (e) (and (list? e) (equal? (car e) key))) al)))
+
+;; Position of the first element satisfying pred, or -1. State: (found next).
+(define (t:index-of pred xs)
+  (car
+    (reduce
+      (fn (acc x)
+        (let ((found (car acc)) (i (car (cdr acc))))
+          (list (if (and (< found 0) (pred x)) i found) (+ i 1))))
+      (list -1 0)
+      xs)))
+
+(define (t:rows keys)
+  (let ((parsed (mg:parse-allowlist
+                  (string-join "\n" (map (fn (k) (string-append k " # why: fixture reason")) keys))
+                  t:PLAN-SEAMS)))
+    (assert (= (length (car (cdr parsed))) 0) "fixture rows parse")
+    (car parsed)))
+
+;; The text with exactly one occurrence of `from` replaced; asserting the
+;; count keeps a mutation test from silently checking the unmutated fixture.
+(define (t:once text from to)
+  (assert (= (length (string-split text from)) 2) (string-append "fixture contains exactly once: " from))
+  (string-replace text from to))
+
+(define (t:judge mode expected outcomes-text missed-text rows)
+  (mg:judge t:FILE mode expected (json-parse outcomes-text) missed-text rows))
+
+(define (t:verdict r) (mg:get r "verdict"))
+(define (t:exit r) (mg:get r "exit"))
+(define (t:lines r) (mg:get r "lines"))
+
+;; ── The real lists and workflow ──────────────────────────────────────────
+
+(deftest "the real seam list names the plan's five seams, and each exists"
+  (let* ((parsed (mg:parse-seams (read-file mg:SEAMS))) (seams (car parsed)))
+    (for-each (fn (e) (print-line e)) (car (cdr parsed)))
+    (assert (= (length (car (cdr parsed))) 0) "ci/seam-files.txt parses clean")
+    (for-each (fn (s) (assert (member? s seams) (string-append "seam listed: " s))) t:PLAN-SEAMS)
+    (assert (= (length (mg:missing-seams seams path-exists?)) 0) "every listed seam exists")))
+
+(deftest "the real allowlist parses clean against the real seam list"
+  (let* ((seams (car (mg:parse-seams (read-file mg:SEAMS))))
+         (parsed (mg:parse-allowlist (read-file mg:ALLOWLIST) seams)))
+    (for-each (fn (e) (print-line e)) (car (cdr parsed)))
+    (assert (= (length (car (cdr parsed))) 0) "ci/mutants-allowlist.txt has no malformed row")))
+
+(deftest "mutation.yml plans from the seam list and gates each leg after nix-setup"
+  (let* ((wf (yaml-parse (read-file ".github/workflows/mutation.yml")))
+         (on (mg:get wf "on"))
+         (jobs (mg:get wf "jobs"))
+         (plan (mg:get jobs "plan"))
+         (mutants (mg:get jobs "mutants"))
+         (plan-step (car (filter (fn (s) (equal? (mg:get s "id") "plan")) (mg:get plan "steps"))))
+         (steps (mg:get mutants "steps"))
+         (nix-at (t:index-of (fn (s) (string-starts-with? (mg:get s "uses") "pleme-io/actions/nix-setup@")) steps))
+         (gate-at (t:index-of (fn (s) (equal? (mg:get (mg:get s "env") "MUTATION_GATE_MODE") "run")) steps)))
+    (for-each (fn (t) (assert (t:has-key? on t) (string-append "triggered on " t)))
+      (list "schedule" "push" "pull_request" "workflow_dispatch"))
+    (assert (equal? (mg:get (mg:get plan-step "with") "script-file") "ci/mutation-gate.tlisp") "plan runs the gate script")
+    (assert (equal? (mg:get (mg:get plan-step "env") "MUTATION_GATE_MODE") "plan") "in plan mode")
+    (assert (equal? (mg:get mutants "needs") "plan") "each leg waits for the plan and nothing else")
+    (assert (string-contains? (mg:n (mg:get (mg:get mutants "strategy") "matrix")) "needs.plan.outputs.matrix")
+      "legs come from the plan, not a hand list")
+    (assert (>= nix-at 0) "a leg installs Nix through nix-setup")
+    (assert (> gate-at nix-at) "and only then runs the gate")))
+
+;; The suites tlisp-test discovers: its `find` walks the repository and skips
+;; .git, target and node_modules.
+(define (t:suites)
+  (filter (fn (p) (not (re-match? "(^|/)(\\.git|target|node_modules)/" p))) (glob "**/*.test.tlisp")))
+
+(deftest "test.yml lints the lists and runs every *.test.tlisp, with a floor equal to their count"
+  (let* ((wf (yaml-parse (read-file ".github/workflows/test.yml")))
+         (steps (mg:get (mg:get (mg:get wf "jobs") "ci-contract-tests") "steps"))
+         (floor (mg:n (length (t:suites)))))
+    (assert (>= (length (t:suites)) 3) "the suites were found: mutation-gate, release-contract, cargo-profiles")
+    (assert (any? (fn (s) (equal? (mg:get (mg:get s "env") "MUTATION_GATE_MODE") "lint")) steps) "lint on every push")
+    (assert (any? (fn (s) (and (string-starts-with? (mg:get s "uses") "pleme-io/actions/tlisp-test@")
+                               (equal? (mg:n (mg:get (mg:get s "with") "min-files")) floor)))
+                  steps)
+      (string-append "tlisp-test with min-files equal to the " floor " suites that exist, so losing one is red"))))
+
+;; ── The lists' rules ─────────────────────────────────────────────────────
+
+(deftest "a malformed seam list names each problem"
+  (let ((errs (car (cdr (mg:parse-seams
+                          "# comment\n/abs/x.rs\n../up/x.rs\nnot/rust.toml\nok/a.rs\nok/a.rs\nhas space.rs\n")))))
+    (assert (= (length errs) 5) "five problems")
+    (assert (t:has? errs "`/abs/x.rs` is absolute") "absolute")
+    (assert (t:has? errs "`../up/x.rs` leaves the repository") "parent")
+    (assert (t:has? errs "`not/rust.toml` is not a Rust source file") "not .rs")
+    (assert (t:has? errs "`ok/a.rs` is listed twice") "duplicate")
+    (assert (t:has? errs "`has space.rs` contains whitespace") "whitespace")))
+
+(deftest "a seam that no longer exists is refused"
+  (let ((missing (mg:missing-seams (list "a/kept.rs" "a/renamed.rs") (fn (p) (equal? p "a/kept.rs")))))
+    (assert (= (length missing) 1) "one missing")
+    (assert (t:has? missing "`a/renamed.rs` does not exist") "names it")))
+
+(deftest "an allowlist row needs a reason, a seam, and a key of its own"
+  (let* ((text (string-join "\n"
+                 (list "# a comment is not a row"
+                       (string-append t:K-EXEC " # why: equivalent: exit codes are never negative")
+                       t:K-LOGS
+                       (string-append t:K-XYZZY " # why:   ")
+                       "engenho-kubelet/src/other.rs: delete ! in f # why: not a seam"
+                       "no path here # why: malformed key"
+                       (string-append t:K-EXEC " # why: listed again"))))
+         (parsed (mg:parse-allowlist text t:PLAN-SEAMS))
+         (rows (car parsed))
+         (errs (car (cdr parsed))))
+    (assert (= (length rows) 1) "one good row")
+    (assert (equal? (car (car rows)) t:K-EXEC) "keyed by path and description")
+    (assert (equal? (car (cdr (cdr (car rows)))) "equivalent: exit codes are never negative") "reason kept")
+    (assert (= (length errs) 5) "five bad rows")
+    (assert (t:has? errs "has no `# why:` reason") "missing reason")
+    (assert (t:has? errs "has an empty reason") "empty reason")
+    (assert (t:has? errs "names a file that is not in ci/seam-files.txt") "not a seam")
+    (assert (t:has? errs "does not start `<path>.rs: <mutant description>`") "malformed key")
+    (assert (t:has? errs "repeats a key") "duplicate key")))
+
+;; ── The judge, over the real run ─────────────────────────────────────────
+
+(deftest "the real native_backend.rs run: its four survivors fail the gate"
+  (let ((r (t:judge "full" t:N t:OUTCOMES t:MISSED (list))))
+    (for-each (fn (l) (print-line l)) (t:lines r))
+    (assert (equal? (t:verdict r) "survivors") "verdict survivors")
+    (assert (= (t:exit r) 1) "exit 1")
+    (assert (= (mg:count r "caught") 22) "22 caught")
+    (assert (= (mg:count r "missed") 4) "4 missed")
+    (assert (= (mg:count r "unviable") 5) "5 unviable")
+    (for-each (fn (k) (assert (t:has? (t:lines r) (string-append "SURVIVED " k ":")) k))
+      (list t:K-XYZZY t:K-EMPTY t:K-EXEC t:K-LOGS))))
+
+(deftest "the Signalled mutant is named as unclassified, never counted as caught"
+  (let ((r (t:judge "full" t:N t:OUTCOMES t:MISSED (list))))
+    (assert (= (mg:count r "unclassified") 1) "one unclassified")
+    (assert (= (+ (mg:count r "caught") (mg:count r "missed") (mg:count r "unviable") (mg:count r "unclassified")) t:N)
+      "every listed mutant is in exactly one count")
+    (assert (t:has? (t:lines r)
+              "UNCLASSIFIED engenho-kubelet/src/native_backend.rs:590:12: BinaryOperator -> `>` in signal_process: its test phase ended Signalled 15")
+      "named with how its test phase ended")))
+
+(deftest "allowlisted survivors pass the gate"
+  (let ((r (t:judge "full" t:N t:OUTCOMES t:MISSED (t:rows (list t:K-XYZZY t:K-EMPTY t:K-EXEC t:K-LOGS)))))
+    (for-each (fn (l) (print-line l)) (t:lines r))
+    (assert (equal? (t:verdict r) "clean") "verdict clean")
+    (assert (= (t:exit r) 0) "exit 0")
+    (assert (= (mg:count r "allowed") 4) "four allowed")
+    (assert (t:has? (t:lines r) (string-append "allowed  " t:K-EXEC)) "an allowed survivor is still listed"))
+  (let ((r (t:judge "full" t:N t:OUTCOMES t:MISSED (t:rows (list t:K-XYZZY t:K-EMPTY t:K-EXEC)))))
+    (assert (equal? (t:verdict r) "survivors") "three rows do not cover four survivors")
+    (assert (t:has? (t:lines r) (string-append "SURVIVED " t:K-LOGS ":")) "the uncovered one is named")))
+
+(deftest "a stale row fails a full run of its seam, and nothing else"
+  (let* ((stale (string-append t:FILE ": replace a with b in gone"))
+         (other "engenho-kubelet/src/probe.rs: delete ! in ProbeSpec::from_k8s")
+         (rows (t:rows (list t:K-XYZZY t:K-EMPTY t:K-EXEC t:K-LOGS stale other)))
+         (full (t:judge "full" t:N t:OUTCOMES t:MISSED rows))
+         (diff (t:judge "diff" t:N t:OUTCOMES t:MISSED rows)))
+    (assert (equal? (t:verdict full) "survivors") "a full run fails")
+    (assert (t:has? (t:lines full) (string-append "STALE allowlist row `" stale "`")) "and names the row")
+    (assert (not (t:has? (t:lines full) (string-append "STALE allowlist row `" other "`")))
+      "a row for another seam is not judged by this seam's run")
+    (assert (equal? (t:verdict diff) "clean") "a diff run tests a subset and does not judge staleness")))
+
+(deftest "a timeout counts as killed and is named"
+  (let ((r (t:judge "full" t:N (t:once t:OUTCOMES "\"summary\":\"Failure\"" "\"summary\":\"Timeout\"") t:MISSED
+             (t:rows (list t:K-XYZZY t:K-EMPTY t:K-EXEC t:K-LOGS)))))
+    (assert (equal? (t:verdict r) "clean") "not a survivor")
+    (assert (= (mg:count r "timeout") 1) "counted as a timeout")
+    (assert (t:has? (t:lines r) "TIMEOUT  engenho-kubelet/src/native_backend.rs:590:12") "named")))
+
+;; ── The judge is blind rather than wrong ─────────────────────────────────
+
+(deftest "a failed baseline makes the gate blind"
+  (let ((r (t:judge "full" t:N
+             (t:once t:OUTCOMES "{\"scenario\":\"Baseline\",\"summary\":\"Success\""
+                                "{\"scenario\":\"Baseline\",\"summary\":\"Failure\"")
+             t:MISSED (list))))
+    (assert (equal? (t:verdict r) "blind") "blind")
+    (assert (= (t:exit r) 3) "exit 3")
+    (assert (t:has? (t:lines r) "the unmutated tree did not pass its own tests") "says why")))
+
+(deftest "a run that did not test every listed mutant is blind"
+  (let ((r (t:judge "full" (+ t:N 1) t:OUTCOMES t:MISSED (list))))
+    (assert (equal? (t:verdict r) "blind") "blind")
+    (assert (t:has? (t:lines r) "outcomes.json records 32 mutants but the listing found 33") "says why")))
+
+(deftest "an outcome the gate does not know is never counted as caught"
+  (let ((r (t:judge "full" t:N (t:once t:OUTCOMES "\"summary\":\"Failure\"" "\"summary\":\"Crashed\"") t:MISSED (list))))
+    (assert (equal? (t:verdict r) "blind") "blind")
+    (assert (t:has? (t:lines r) "unknown outcome `Crashed`") "names the outcome")))
+
+(deftest "missed.txt and outcomes.json must agree"
+  (let* ((lines (mg:nonblank-lines t:MISSED))
+         (three (string-join "\n" (cdr lines)))
+         (r (t:judge "full" t:N t:OUTCOMES three (list))))
+    (assert (equal? (t:verdict r) "blind") "a dropped survivor line is blind, not a pass")
+    (assert (t:has? (t:lines r) "missed.txt lists 3 survivors but outcomes.json records 4") "says why"))
+  (let ((r (t:judge "full" t:N t:OUTCOMES (string-append t:MISSED "garbage without a position\n") (list))))
+    (assert (t:has? (t:lines r) "is not in the `path:line:col: description` form") "a malformed line is blind")))
+
+(deftest "outcomes for another file are blind"
+  (let ((r (mg:judge "engenho-kubelet/src/probe.rs" "full" t:N (json-parse t:OUTCOMES) t:MISSED (list))))
+    (assert (equal? (t:verdict r) "blind") "blind")
+    (assert (t:has? (t:lines r) "which is not the seam under test (engenho-kubelet/src/probe.rs)") "says why")))
+
+(deftest "no mutant: empty for a diff run, blind for a full run"
+  (let ((d (t:judge "diff" 0 "{}" "" (list))) (f (t:judge "full" 0 "{}" "" (list))))
+    (assert (equal? (t:verdict d) "empty") "diff: empty")
+    (assert (= (t:exit d) 0) "diff: exit 0")
+    (assert (equal? (t:verdict f) "blind") "full: blind")
+    (assert (= (t:exit f) 3) "full: exit 3")))
+
+;; ── Choosing what to mutate ──────────────────────────────────────────────
+
+(deftest "nightly and dispatch mutate every seam"
+  (for-each
+    (fn (ev)
+      (let ((s (mg:select t:PLAN-SEAMS ev "abc123" true (list t:FILE))))
+        (assert (equal? (mg:get s "mode") "full") ev)
+        (assert (equal? (mg:get s "files") t:PLAN-SEAMS) (string-append ev ": all five"))
+        (assert (equal? (mg:get s "base") "") (string-append ev ": no diff restriction"))))
+    (list "schedule" "workflow_dispatch")))
+
+(deftest "a push mutates only the seams it touched, on the lines it touched"
+  (let ((s (mg:select t:PLAN-SEAMS "push" "abc123" true
+             (list "README.md" "engenho-kubelet/src/probe.rs" "engenho-controllers/src/gc.rs"))))
+    (assert (equal? (mg:get s "mode") "diff") "diff mode")
+    (assert (equal? (mg:get s "files") (list "engenho-controllers/src/gc.rs" "engenho-kubelet/src/probe.rs"))
+      "the two touched seams, in list order")
+    (assert (equal? (mg:get s "base") "abc123") "restricted to the change"))
+  (let ((s (mg:select t:PLAN-SEAMS "pull_request" "abc123" true (list "README.md"))))
+    (assert (equal? (mg:get s "mode") "none") "a change touching no seam mutates nothing")
+    (assert (= (length (mg:get s "files")) 0) "no leg")))
+
+(deftest "a push whose base is missing, null or unknown mutates every seam"
+  (for-each
+    (fn (c)
+      (let ((s (mg:select t:PLAN-SEAMS "push" (car c) (car (cdr c)) (list))))
+        (assert (equal? (mg:get s "mode") "full") (car (cdr (cdr c))))
+        (assert (= (length (mg:get s "files")) 5) (car (cdr (cdr c))))))
+    (list (list "" false "no base")
+          (list mg:NULL-SHA false "null sha")
+          (list "abc123" false "base not fetched"))))
+
+(deftest "each leg carries a slug usable as a job and artifact name"
+  (assert (equal? (json-stringify (mg:legs (list "engenho-kubelet/src/probe.rs")))
+                  "[{\"file\":\"engenho-kubelet/src/probe.rs\",\"slug\":\"engenho-kubelet-src-probe-rs\"}]")
+    "file and slug"))
+
+(deftest "the listing's count: blank and [] are zero, anything else must be a JSON list"
+  (assert (= (mg:listed-count "") 0) "cargo-mutants 25.3.1 prints nothing for an --in-diff with no mutant")
+  (assert (= (mg:listed-count "[]\n") 0) "and [] without --in-diff")
+  (assert (= (mg:listed-count "[{\"file\":\"a.rs\"},{\"file\":\"a.rs\"}]") 2) "a list counts its entries")
+  (assert (= (mg:listed-count "{\"file\":\"a.rs\"}") -1) "an object is not a listing")
+  (assert (= (mg:listed-count "error: no such flag") -1) "text is not a listing"))

@@ -5,10 +5,15 @@ name: test
 #
 # WHY IT EXISTS (read before "simplifying" it back into ci.yml).
 #
-# `ci.yml` is a shim onto substrate's `cargo-ci.yml`, whose entire body is
-# `nix flake check`. `nix flake check` builds only `checks.<system>.*`, and
-# engenho's flake declares NONE (it is `substrate.rust.workspace` + image
-# grafts — see flake.nix). So ci.yml compiles nothing. On the sibling repo
+# `ci.yml` runs two Nix steps: `gen confirm` (fatal; the Cargo.lock <->
+# Cargo.gen.lock tie) and a non-fatal `nix flake check`. It stopped being a
+# shim onto substrate's `cargo-ci.yml` in 4757f50; the argument below is
+# unchanged. `nix flake check` builds only `checks.<system>.*`, and
+# engenho's flake declares exactly one: `checks.<system>.typed-config` (since
+# 51e702a), an eval-time test of the Nix module trio's typed options that
+# stubs the trio's `settings` rather than building engenho. It compiles no
+# Rust, so ci.yml proves the flake and its typed module surface evaluate and
+# says nothing about the crates. On the sibling repo
 # `forge` this was proven by probe: a clean tree exited 0, a `compile_error!`
 # in a test module exited 0, and LITERAL NON-RUST GARBAGE in a function body
 # ALSO exited 0 — every run printing "(build skipped)". The crate was never
@@ -16,54 +21,59 @@ name: test
 #
 # WHY NOT FIX IT AT THE LOAD-BEARING LAYER INSTEAD (Operating Principle #2).
 # The right fix is for the flake to expose real `checks` so `nix flake check`
-# compiles + tests hermetically. That is BLOCKED OUTSIDE SUBSTRATE, and the
-# block was verified here rather than assumed:
-#   * `runTests` is a crate2nix-generated-Cargo.nix concept. nixpkgs'
-#     `buildRustCrate` has no such argument.
-#   * `substrate/lib/build/rust/lockfile-builder.nix` — the engine engenho
-#     actually uses — has ZERO occurrences of `runTests`. (The single fleet
-#     occurrence is `crate2nix-builders.nix:240`, and it reads `= false`.)
-#   * engenho's flake.nix calls `substrate.rust.workspace`, which routes
-#     `mk-rust-workspace.nix` -> `lockfile-builder.nix`. Confirmed, not
-#     inferred. There is no committed `Cargo.nix` under the gen delta-only
-#     doctrine, so the crate2nix path is not available either.
-# Building an in-repo `checks` would mean a SECOND, divergent Rust build path
-# next to the gen/lockfile-builder one. Operating Principle #1 forbids that.
+# compiles + tests hermetically. Until 2026-09-19 that was blocked in
+# substrate: nixpkgs' `buildRustCrate` has no `runTests`, and
+# `lockfile-builder.nix`, the engine `substrate.rust.workspace` routes to,
+# had no test runner.
 #
-# THE SUBSTRATE FOLLOW-UP, RECORDED HERE RATHER THAN ROUTED AROUND SILENTLY:
-#   substrate/lib/build/rust/lockfile-builder.nix should grow a `runTests`
-#   (or a sibling `mkWorkspaceChecks`) so `substrate.rust.workspace` can
-#   expose `checks.<system>.test`. Until it does, `nix flake check` remains
-#   structurally incapable of compiling any gen-pattern consumer, and THIS
-#   workflow is what stands between engenho and an un-compiled merge.
-#   When that lands, this workflow's cargo steps can collapse into the flake.
+# THE FIX HAS LANDED UPSTREAM; ENGENHO HAS NOT ADOPTED IT (improvement plan
+# T0.9). Substrate 83bab67 added an opt-in runner:
+# `substrate.rust.workspace { tests.cargo.runs = [ … ]; }` yields
+# `checks.<system>.tests`, `cargo test --frozen` over a vendor dir built from
+# Cargo.lock, reading this repo's [profile.*] itself. engenho's flake.lock
+# pins substrate fcd3514, which predates it. Pending: bump that input,
+# declare `tests.cargo` in flake.nix, and check that the five private git
+# dependencies vendor inside Nix. Until then THIS workflow is what stands
+# between engenho and an un-compiled merge; afterwards its cargo steps can
+# collapse into the flake. Building an in-repo `checks` by hand would be a
+# SECOND, divergent Rust build path; Operating Principle #1 forbids that.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚠ KNOWN BLOCKER — THIS GATE CANNOT GO GREEN UNTIL AN OPERATOR ACTS.
+# PRIVATE DEPENDENCIES AND WHAT IS STILL RED — measured on main in runs
+# 35418242848 and 35421804575 (2026-09-19). Both used `cargo test`; the test
+# leg below now runs nextest over the same tests.
 #
-# engenho's Cargo.lock has git dependencies on FIVE PRIVATE pleme-io repos:
-#   tameshi · cofre · promessa · sui · tatara      (verified via `gh repo view`)
-# Cargo resolves the WHOLE lock graph regardless of which features are on, so
-# EVERY cargo command — even `cargo test -p engenho-types` — must fetch them.
+# Cargo.lock has git dependencies on five pleme-io repos (tameshi · cofre ·
+# promessa · sui · tatara), and cargo resolves the whole lock graph whatever
+# the features, so every cargo command fetches them. `git-credentials` rewrites
+# github.com URLs to carry BOT_PAT. In both runs BOT_PAT arrived non-empty (the
+# step log prints `bot-pat: ***`) and every private dependency resolved: the
+# engenho-diff compile leg was green and the test leg built and ran the whole
+# workspace.
 #
-# `pleme-io` is on the GitHub FREE plan (`gh api orgs/pleme-io` -> plan: free,
-# 747 private repos). On Free, an ORG secret reaches PUBLIC repos only.
-# engenho is PRIVATE and has NO repo-level secrets (`gh secret list` -> empty).
-# Therefore `secrets.BOT_PAT` arrives EMPTY here, `git-credentials` falls back
-# to the repo-scoped GITHUB_TOKEN, and GITHUB_TOKEN cannot read a sibling
-# private repo. Result:
+# Why it arrives: engenho is PUBLIC (`gh repo view` -> PUBLIC; the org posture
+# catalog, pangea-architectures workspaces/pleme-io-opensource/org.yaml,
+# declares `visibility: public`), and on the GitHub Free plan an org secret
+# reaches public repos. No repo-level secret is needed, and the catalog
+# declares none (`actions_secrets: []`). If engenho is ever made private, the
+# fix is an `actions_secrets` row in that catalog, never `gh secret set` (★★
+# PLATFORM-MEDIATED INFRASTRUCTURE).
 #
-#   fatal: could not read Username for 'https://github.com'
-#   error: failed to get `tameshi` as a dependency of package `engenho-fonte`
-#
-# THE FIX IS ONE OPERATOR ACTION, NOT A CODE CHANGE:
-#   gh secret set BOT_PAT --repo pleme-io/engenho --body '<org PAT>'
-# This is the same repo-level-BOT_PAT workaround pangea-operator already
-# carries for exactly this reason. The wiring below is already correct and
-# needs NO edit once that secret exists.
-#
-# This is wired red-but-correct ON PURPOSE. A gate that is honest about being
-# blocked beats a shim that prints green over an un-compiled crate.
+# The test leg's reds, identical in both runs: 7 tests in 4 binaries.
+#   * 3 need a `nix` binary the runner did not have. Each panicked with
+#     `could not run nix ...: No such file or directory`:
+#       engenho-kubelet --test native_runs_a_real_closure   (2 tests)
+#       engenho-kubelet --test native_runs_postgres         (1 test)
+#     They fail rather than skip on purpose: they are the only tests that run
+#     a real native process. Nix is now installed before the test leg, through
+#     pleme-io/actions/nix-setup (below).
+#   * 4 fail graceful shutdown with `StoreStillShared { strong_count: 2 }`:
+#       engenho-runtime --test m0_1_single_node_convergence (1 test)
+#       engenho-runtime --test m0_6_namespaced_reconcile    (3 tests)
+#     A second holder of the store outlives shutdown. That is a code defect
+#     (improvement plan T2.1), not a CI problem.
+# Expected next run: red only on those two engenho-runtime binaries. Any other
+# red is a new finding, to be recorded rather than skipped.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -110,37 +120,73 @@ jobs:
           shared-key: test-ubuntu
 
       # ── Compile-only leg for the live-oracle crate ──────────────────────
-      # engenho-diff's four tests all drive a REAL k3s cluster to diff against
-      # (see ci/live-oracle-tests.txt). No oracle exists on a runner, so they
-      # are excluded from EXECUTION below — but their code must still compile
-      # on every PR. This step is what makes that true, and it is deliberately
-      # FIRST: it is the exact check that catches a crate silently falling out
-      # of every build path and rotting, which is the failure shape this repo
-      # already had (see CLAUDE.md § CI + gating).
+      # engenho-diff's four integration binaries each drive a REAL Kubernetes
+      # oracle cluster to diff against. No oracle exists on a runner, so
+      # .config/nextest.toml keeps them out of EXECUTION below, but their code
+      # must still compile on every PR. The nextest leg builds them too; this
+      # step stays deliberately FIRST so a compile break in the crate fails
+      # fast and by name. It is the check that catches a crate silently falling
+      # out of every build path and rotting, which this repo already had (see
+      # CLAUDE.md § CI + gating).
       - name: compile engenho-diff (live-oracle crate — compiled, not run)
         run: cargo test -p engenho-diff --all-targets --all-features --locked --no-run
 
+      # ── Nix on the runner: the test runner AND three tests need it ──────
+      # Two consumers, so this step must stay BEFORE the nextest leg:
+      #   1. nextest itself, fetched from substrate's pin below, the same
+      #      `github:pleme-io/substrate#cargo-nextest` that substrate's
+      #      rust-auto-release test gate runs. Both gates therefore run one
+      #      nextest build over one selection file, .config/nextest.toml.
+      #   2. engenho-kubelet's native_runs_a_real_closure (2 tests) and
+      #      native_runs_postgres (1 test), which realise their closures with
+      #      a real `nix build`. Without Nix they fail with `could not run nix
+      #      ...: No such file or directory` (run 35418242848).
+      # The install is pleme-io/actions/nix-setup, the shared copy of this
+      # step (pinned installer, `sandbox = relaxed`, access-tokens), not a
+      # third inline one. The token is only rate-limit headroom here: every
+      # flake fetched is public (substrate, its pleme-io inputs skill-lint and
+      # tatara-lisp, nixpkgs). The `||` fallback is the release gate's own.
+      # `nix profile install` lands the binary in ~/.nix-profile/bin, which
+      # the installer has already put on PATH, so the leg below is the same
+      # `cargo nextest run` a developer types locally.
+      - uses: pleme-io/actions/nix-setup@main
+        with:
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+      - name: install substrate's pinned cargo-nextest
+        run: nix profile install github:pleme-io/substrate#cargo-nextest
+
       # ── The executing gate ──────────────────────────────────────────────
+      # WHICH tests run is decided by .config/nextest.toml, not by a flag on
+      # this line: its default-filter skips the four named live-oracle
+      # binaries and runs everything else, engenho-diff's mocked unit tests
+      # included. The release gate reads the same file without being told to,
+      # so the two gates can no longer disagree about WHICH tests are in scope
+      # (they still differ in features: the release gate runs defaults). This
+      # leg is also the regression test of that file: if the filter is lost,
+      # the oracle binaries run on a runner with no oracle and fail here.
       # --all-features is LOAD-BEARING here, not decoration. engenho gates real
       # code behind with-tameshi / with-sui-eval / with-shikumi / with-revoada /
       # with-engenho-kube-client / openapi-roundtrip / bit-repro / mock. Default
       # features leave all of it uncompiled and unrun.
       # --locked ensures a drifted Cargo.lock fails loudly instead of being
       # silently re-resolved.
-      # --no-fail-fast is REQUIRED for an honest count: without it cargo stops
-      # at the first failing BINARY. Measured here: the run aborted at
-      # `engenho-diff` (alphabetical) reporting 881 tests; the true figure with
-      # --no-fail-fast is 3,169.
-      - name: cargo test --workspace --all-targets --all-features
-        run: |
-          cargo test --workspace --exclude engenho-diff \
-            --all-targets --all-features --locked --no-fail-fast
+      # --no-fail-fast is REQUIRED for an honest count. The config also sets
+      # `fail-fast = false`; the flag stays so this line reads true without
+      # the file. Under cargo test the run once aborted at `engenho-diff`
+      # reporting 881 tests; the true figure with --no-fail-fast was 3,169.
+      # --no-tests=fail is the release gate's anti-vacuity assertion: a run
+      # that selects zero tests is red, never a vacuous green.
+      - name: cargo nextest run --workspace --all-targets --all-features
+        run: >-
+          cargo nextest run --workspace --all-targets --all-features
+          --locked --no-fail-fast --no-tests=fail
 
       # ── Doctests — a SEPARATE leg, on purpose ───────────────────────────
-      # `--all-targets` EXCLUDES doctests. A gate built only on the line above
-      # ships green over a broken doctest; the sibling repo iac-forge had
-      # exactly one real failure this week and the doctest leg alone caught it
-      # (an inverted assert_ne! in a module example).
+      # nextest does not run doctests at all, and `--all-targets` excludes them
+      # under cargo test as well, so they stay on cargo. A gate built only on
+      # the leg above ships green over a broken doctest; the sibling repo
+      # iac-forge had exactly one real failure this week and the doctest leg
+      # alone caught it (an inverted assert_ne! in a module example).
       # HONEST SCOPE, engenho as measured: 42 doctests, of which 41 are
       # ```ignore``` and exactly 1 executes. This leg is therefore close to a
       # vacuous guard TODAY — it is wired anyway so the next real doctest lands
@@ -181,3 +227,87 @@ jobs:
           shared-key: clippy-ubuntu
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
         continue-on-error: true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Nix on the runner, as a checked contract (improvement plan T0.1). Three
+  # tests realise closures with a real `nix build`, and nextest is fetched
+  # with nix, so every job that runs tests or calls nix must install Nix
+  # first, and only through pleme-io/actions/nix-setup. ci/nix-on-runner.tlisp
+  # reads every workflow in .github/workflows and fails on a direct
+  # nix-installer-action or on a Nix-needing step with no nix-setup before it.
+  # It is a separate job so a red here names the contract, not a test.
+  # ───────────────────────────────────────────────────────────────────────────
+  nix-on-runner:
+    name: nix on the runner (workflow contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/nix-on-runner.tlisp
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Publish only after the gate, as a checked contract (improvement plan
+  # T0.3a). release.yml moves `:latest` in one job, promote-latest, after
+  # release-assets has waited on every publishing leg and found every asset.
+  # ci/release-contract.tlisp reads release.yml and fails on a job that names
+  # `latest`, an image-push call that leaves `tag` or `additionalTags` at
+  # their `latest` defaults, a publishing job release-assets does not wait
+  # on, or a job its catalog does not know. Its tests,
+  # ci/release-contract.test.tlisp, run in ci-contract-tests below.
+  # ───────────────────────────────────────────────────────────────────────────
+  release-contract:
+    name: release publishes after the gate (workflow contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/release-contract.tlisp
+          version: v0.3.58
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The mutation gate's lists, and every ci/*.test.tlisp (improvement plan
+  # T0.6). The release-contract suite used to run in the job above; it runs
+  # here now, beside mutation-gate's.
+  # First step: ci/mutation-gate.tlisp in lint mode. ci/seam-files.txt must
+  # name repo-relative .rs files that exist, each once; every row of
+  # ci/mutants-allowlist.txt needs a `# why:` reason and a seam's path. A seam
+  # renamed without updating the list fails here, on every push, instead of
+  # leaving that file silently unmutated. The mutation runs themselves are
+  # .github/workflows/mutation.yml.
+  # Second step: pleme-io/actions/tlisp-test runs each ci/<name>.test.tlisp
+  # against ci/<name>.tlisp. min-files is the number of suites that exist
+  # (release-contract, mutation-gate, cargo-profiles, doc-sources), so
+  # losing one is red, not a smaller green; mutation-gate's suite fails if
+  # the floor and the count disagree. The first step pins the tatara-script tlisp-test reuses
+  # from PATH.
+  # cargo-profiles has no job of its own: its suite's first test runs the
+  # whole check against the real Cargo.toml, .cargo/config.toml and every
+  # workflow (improvement plan T0.9). It fails if [profile.release] leaves
+  # opt-level 3, the level the Nix-built daemon is compiled at; if
+  # [profile.stress] stops declaring opt-level 3 with debug assertions and
+  # overflow checks on; if a step that raises PROPTEST_CASES builds with
+  # `--release` or without the stress profile; or if a workflow env or a
+  # cargo config overrides either profile from outside Cargo.toml.
+  # doc-sources has no job of its own either: its suite's first tests run the
+  # check against docs/STATE-MACHINES.md and docs/TYPESCAPE.md (improvement
+  # plan T5.3). They fail if either names a path that does not exist, a path
+  # into a crate that is not a workspace member, a `path.rs::Item` that file
+  # does not declare, or an index row with no source; and if
+  # engenho-machines comes back.
+  # ───────────────────────────────────────────────────────────────────────────
+  ci-contract-tests:
+    name: ci/*.test.tlisp + mutation-gate lists
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/mutation-gate.tlisp
+          version: v0.3.58
+        env:
+          MUTATION_GATE_MODE: lint
+      - uses: pleme-io/actions/tlisp-test@main
+        with:
+          min-files: 4

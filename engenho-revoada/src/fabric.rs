@@ -18,24 +18,34 @@
 //! face-agnostic; each [`FabricFace`] is just a Reader+Writer pair
 //! against the same underlying typed state machine.
 //!
-//! # The two guarantees ([`FabricStrategy`] enforces by construction)
+//! # What a [`FabricStrategy`] value guarantees — and what it does not
 //!
-//! 1. **Never split-brain.** [`ConsensusKind`] variants are all quorum-
-//!    based by design — there is no "no consensus" variant. Picking a
-//!    strategy = picking a split-brain-free algorithm. The invariant
-//!    is enforced at the type level: `ConsensusKind` cannot represent
-//!    an algorithm that allows divided writes.
-//! 2. **Always eventually resolves.** [`ReconciliationCadence`] forces
-//!    a non-zero tick interval. [`FabricStrategy::prove_liveness`] runs
-//!    a cross-field check that membership-failure-detection-timeout <
-//!    reconciliation-tick (so a partition heals before the next
-//!    convergence round). Strategies that can't prove liveness fail
-//!    construction.
+//! Both checks below are facts about the CONFIGURATION value. Neither
+//! is a property of a running fabric.
 //!
-//! These properties are not assertions the documentation makes — they
-//! are theorems the type system + a small set of compile-time and
-//! runtime checks enforce. Operators write the strategy; the fabric
-//! refuses configurations that would violate either property.
+//! 1. **It can only name a quorum algorithm.** [`ConsensusKind`] has no
+//!    leaderless or "no consensus" variant, so a strategy cannot select
+//!    an algorithm that permits divided writes. Split-brain freedom is a
+//!    property of the implementation behind that name, and revoada's is
+//!    not there yet:
+//!    - the Raft vote and log live in memory
+//!      ([`crate::consensus`]'s store), so a restarted node forgets the
+//!      vote it cast and the entries it acknowledged;
+//!    - [`RoleAssignment::has_majority`](crate::topology::RoleAssignment::has_majority)
+//!      is true whenever any voter exists;
+//!    - [`TopologyReactor`](crate::topology::TopologyReactor) proposes a
+//!      promotion from its own gossip view, with no quorum check.
+//!
+//!    revoada is a fenced typed draft, outside the shipped `engenho`
+//!    binary (docs/IMPROVEMENT-PLAN.md §5.3).
+//! 2. **Its timings are cross-checked.** [`ReconciliationCadence`]
+//!    cannot be zero, and [`FabricStrategy::prove_liveness`] rejects a
+//!    strategy whose failure-detector timeout is not below its
+//!    reconciliation tick, or whose quorum is even or below 3.
+//!    [`ClusterDeclaration::new`](crate::ClusterDeclaration::new)
+//!    runs that check, so such a strategy fails construction. It is a
+//!    consistency check between numbers; it does not prove that a
+//!    partition heals.
 
 use std::time::Duration;
 
@@ -72,10 +82,11 @@ pub struct FabricStrategy {
 
 /// Consensus layer configuration.
 ///
-/// Every variant is quorum-based by design — there is no "leaderless"
-/// or "anti-entropy-only" variant. Picking a [`ConsensusKind`] is
-/// picking a split-brain-free algorithm; the type system makes the
-/// guarantee structural.
+/// Every variant names a quorum-based algorithm — there is no
+/// "leaderless" or "anti-entropy-only" variant, so a configuration
+/// cannot select one. Whether the running fabric is split-brain free
+/// depends on the implementation behind the name, which the type does
+/// not reach; see the module header for what is still missing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusConfig {
     pub kind: ConsensusKind,

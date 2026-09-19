@@ -23,33 +23,48 @@ tatara similarly. Engenho follows the same shape.
 
 ### `.github/workflows/ci.yml` — every commit
 
-  Delegates to: `pleme-io/substrate/.github/workflows/cargo-ci.yml@main`
-
-  Which runs `nix flake check` — that evaluates substrate's
-  `rust-workspace-release-flake` helper, builds via crate2nix,
-  and runs whatever `checks.<system>.*` the flake exposes.
-
-  Total engenho file size: 21 lines (95% header + the `uses:` clause).
+  No longer a substrate shim (4757f50). After `pleme-io/actions/nix-setup`
+  it runs `nix run github:pleme-io/gen -- confirm` (fatal: the
+  `Cargo.lock` ↔ `Cargo.gen.lock` tie) and a non-fatal `nix flake
+  check`, whose only check is the eval-time `checks.typed-config`. It
+  compiles no Rust; `test.yml` is the gate that does.
 
 ### `.github/workflows/release.yml` — on `v*` tag
 
-  Eight jobs, **seven of which are substrate-reusable-workflow shims**:
+  Ten jobs. Eight publish, and push exact tags only; two gate `:latest`:
 
-  | Job | Substrate workflow | What |
+  | Job | Uses | What |
   |---|---|---|
   | `binary-engenho-mcp` | `rust-binary-release.yml` | Linux/macOS × x86_64/aarch64 binaries → GH Release |
   | `binary-engenho-cluster-config-render` | `rust-binary-release.yml` | same |
-  | `image-engenho-mcp-amd64` | `image-push.yml` | nix-built image → ghcr.io |
-  | `image-engenho-mcp-arm64` | `image-push.yml` | same |
+  | `image-engenho-mcp-amd64` | `image-push.yml` | nix-built image → ghcr.io `:${tag}-amd64` |
+  | `image-engenho-mcp-arm64` | `image-push.yml` | same, `-arm64` |
   | `image-engenho-cluster-config-render-amd64` | `image-push.yml` | same |
   | `image-engenho-cluster-config-render-arm64` | `image-push.yml` | same |
   | `chart` | `helm-chart-release.yml` | chart → ghcr.io OCI |
-  | `image-manifest` | (inline — see below) | combines per-arch tags into multi-arch manifest |
+  | `image-manifest` | (inline — see below) | joins the per-arch tags into the `:${tag}` index |
+  | `release-assets` | `ci/release-contract.tlisp` (verify) | needs all eight; fails unless every asset exists |
+  | `promote-latest` | `pleme-io/actions/release-promote` | moves `:latest` to the checked `:${tag}`, per image |
 
-  The one inline job (`image-manifest`) uses `docker buildx
-  imagetools create` to assemble per-arch tags into a single
-  `:${version}` + `:latest` multi-arch manifest. This is a clear
-  candidate for extraction to a future substrate
+  **`:latest` moves only after the gate** (improvement plan T0.3a).
+  Every image-push call sets `additionalTags: ''`: that reusable
+  defaults it to `latest`, so before this each arch leg pushed
+  `:latest` (the two legs raced for it) and `image-manifest` tagged the
+  index `:latest` as well, with nothing checked first. Now
+  `release-assets` waits on every publishing job, runs only for a `v*`
+  tag, and derives every asset the release promises from release.yml
+  (16 GitHub Release files, 4 arch images, 2 multi-arch indexes,
+  1 chart), looking each up with `gh release view` and `docker buildx
+  imagetools inspect --raw`. One missing asset fails it, and
+  `promote-latest`, which takes its image list from `release-assets`'
+  output, does not run. `test.yml`'s `release-contract` job runs the
+  same script in check mode on every push, so a new `latest`, a dropped
+  `needs`, or a new publishing job with no row in its catalog fails
+  before merge.
+
+  The inline `image-manifest` job uses `docker buildx imagetools
+  create` to assemble per-arch tags into the `:${tag}` index. It is a
+  clear candidate for extraction to a future substrate
   `image-manifest.yml` reusable workflow (see "Gaps" below).
 
 ## Substrate primitives in use
@@ -95,25 +110,59 @@ push + helm chart push would fail with `unauthorized`.
 
 ## What CI exercises
 
-  * `cargo test --workspace` runs all 274 unit + integration tests
-    across the 7 workspace crates (types, mcp, revoada, store,
-    apiserver, teia, scheduler).
-  * `nix flake check` validates the flake outputs (apps, packages,
-    overlays).
+  * `test.yml` runs `cargo nextest run --workspace --all-targets
+    --all-features` with substrate's pinned nextest. Which tests run
+    is set by `.config/nextest.toml`, the same file substrate's release
+    gate reads; the measured count is in CLAUDE.md § Test count.
+  * `nix flake check` (non-fatal, in ci.yml) evaluates the flake and
+    runs `checks.typed-config`; it compiles no Rust.
+  * `ci/cargo-profiles.test.tlisp` (test.yml, job `ci-contract-tests`)
+    runs `ci/cargo-profiles.tlisp` against the real `Cargo.toml` and
+    workflows: `[profile.release]` stays at opt-level 3, the level the
+    Nix-built daemon is compiled at; `[profile.stress]` declares
+    opt-level 3 with debug assertions and overflow checks on; every
+    step that raises `PROPTEST_CASES` selects it and never `--release`.
+    deep-test.yml's `property-stress` job is that step, over the whole
+    workspace. Values are compared by TOML type, as cargo reads them:
+    `opt-level = "3"`, `opt-level = 3.0` and `debug-assertions = "true"`
+    fail the check, as cargo refuses each of them.
+  * `ci/doc-sources.test.tlisp` (test.yml, job `ci-contract-tests`)
+    runs `ci/doc-sources.tlisp` against `docs/STATE-MACHINES.md` and
+    `docs/TYPESCAPE.md`: every repository path they name exists, none
+    starts at a crate directory outside the workspace, every
+    `path.rs::Item` names an item that file declares, and every row of a
+    table with a `Source` column names a path. Declarations are matched
+    by text, so an item declared through a macro is not seen. The suite
+    also fails if `engenho-machines` comes back (improvement plan T5.3).
+  * `ci/release-contract.tlisp` (test.yml, job `release-contract`)
+    checks that release.yml moves `:latest` only in `promote-latest`,
+    after `release-assets`; `ci/release-contract.test.tlisp` (job
+    `ci-contract-tests`) shows each of its rules firing on a fixture
+    with that defect.
+  * `.github/workflows/mutation.yml` runs `cargo mutants` over the
+    files in `ci/seam-files.txt`: every mutant nightly, the changed
+    lines on a push or PR that touches a seam. A surviving mutant fails
+    the leg unless `ci/mutants-allowlist.txt` has a row saying why; the
+    judge is `ci/mutation-gate.tlisp`. It is hand-authored, like
+    test.yml: substrate has no reusable for it, and
+    `pleme-io/actions/mutation-test` cannot gate (it ignores
+    cargo-mutants' exit status and reads survivors from the summary
+    text). test.yml's `ci-contract-tests` job lints the two lists on
+    every push.
   * `nix build .#default` validates the workspace builds.
 
 ## What release produces
 
 On every `v*` tag:
 
-  * GitHub Release with 6 binary artefacts:
-      engenho-mcp-{darwin-arm64, linux-x86_64, linux-arm64}
-      engenho-cluster-config-render-{...}
-      (plus .sha256 sidecars)
-  * 6 OCI images on ghcr.io:
+  * GitHub Release with 16 files: 8 binaries plus a .sha256 each,
+      engenho-mcp-{linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64}
+      engenho-cluster-config-render-{... same legs}
+  * 6 OCI refs on ghcr.io:
       ghcr.io/pleme-io/engenho-mcp:{${tag}-amd64, ${tag}-arm64,
-                                    ${tag} (multi-arch), latest}
+                                    ${tag} (multi-arch)}
       ghcr.io/pleme-io/engenho-cluster-config-render:{... same set}
+    and `:latest` on each image once promote-latest has run.
   * 1 OCI Helm chart:
       ghcr.io/pleme-io/engenho/charts/engenho:${tag-without-v}
 

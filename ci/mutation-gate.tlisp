@@ -1,0 +1,466 @@
+;; mutation-gate — a mutant that survives in a seam file fails CI, unless a
+;; row in ci/mutants-allowlist.txt says why it may.
+;;
+;; WHY (improvement plan T0.6). The four defects of 2026-09-18 lived in
+;; controllers (615 tests) and the kubelet (438 tests), in code that had tests.
+;; cargo-mutants over the four files involved found 25 of 99 viable mutants
+;; surviving: the tests ran that code and would not have noticed it change.
+;; Coverage said the code was tested. Mutation says whether a test pins it.
+;;
+;; INPUTS. ci/seam-files.txt names the files (the only list; the workflow
+;; reads it through `plan`). ci/mutants-allowlist.txt names accepted
+;; survivors, each with a reason. Both formats are described in those files.
+;;
+;; MODES (MUTATION_GATE_MODE):
+;;   lint  check the two lists: every seam path is a repo-relative .rs file
+;;         that exists, listed once; every allowlist row has a non-empty
+;;         reason, a key of the form `<seam>.rs: <description>` whose file is
+;;         a seam, and no repeated key. test.yml runs this on every push.
+;;   plan  lint, then choose what to mutate (MUTATION_GATE_EVENT, the GitHub
+;;         event name; MUTATION_GATE_BASE, the commit to diff against):
+;;           schedule / workflow_dispatch, no base, the null sha, or a base
+;;           that is not in the fetched history -> `full`: every seam, every
+;;           mutant;
+;;           otherwise -> `diff`: each seam that `git diff --name-only BASE
+;;           HEAD` names, restricted later to the changed lines; `none` when
+;;           the change touches no seam.
+;;         Writes matrix (JSON list of {file, slug}), count, base-ref (the
+;;         base for `diff`, else ""), verdict (full | diff | none) and reason
+;;         to GITHUB_OUTPUT.
+;;   run   mutate ONE seam (MUTATION_GATE_FILE) and judge the result. With
+;;         MUTATION_GATE_BASE set, only mutants on lines `git diff BASE HEAD
+;;         -- <file>` touched (`cargo mutants --in-diff`). Steps:
+;;           1. `cargo mutants --list --json` fixes the denominator N.
+;;           2. `cargo mutants --file <seam> --test-tool nextest` (so
+;;              .config/nextest.toml selects the tests, as in every other
+;;              gate), --all-features, --cargo-arg=--locked, --no-shuffle.
+;;              In GitHub Actions it mutates the checkout in place, so the
+;;              rust-cache target is reused; elsewhere cargo-mutants works in
+;;              a copy and leaves your tree alone.
+;;           3. judge mutants.out/outcomes.json and missed.txt (below).
+;;         Tools come from `nix shell`: cargo-mutants from nixpkgs as pinned by
+;;         this repo's flake.lock (`--inputs-from .`), nextest from
+;;         github:pleme-io/substrate#cargo-nextest, the build test.yml runs.
+;;         Writes verdict, mutants-killed and mutants-survived to GITHUB_OUTPUT.
+;;
+;; THE JUDGE reads every outcome, not the summary counts. Receipt: the
+;; 2026-09-19 run on ryn had a mutant in native_backend.rs's signal_process
+;; (`pid <= 0` -> `pid > 0`) whose test run ended `Signalled 15`, because the
+;; mutant signalled the test's own process group. cargo-mutants filed it as
+;; `Failure`: it is in no .txt file, and outcomes.json's totals leave it out
+;; (120 mutants; 25 + 74 + 20 = 119). A gate that read missed.txt or the
+;; totals would never see it.
+;;   CaughtMutant   killed: a test failed.
+;;   MissedMutant   SURVIVED: every test passed with the mutant in place.
+;;                  Fails the run unless allowlisted.
+;;   Timeout        counted as killed: the tests did not pass within the
+;;                  limit. Listed by name.
+;;   Unviable       did not build; counted, not judged.
+;;   Failure        UNCLASSIFIED: the test phase ended some other way (a
+;;                  signal). Not a survivor, since the tests did not pass, and
+;;                  not counted as caught, since no test failed on it. Listed
+;;                  by name with how the test phase ended.
+;;   anything else  the gate is BLIND: an outcome it does not know is never
+;;                  counted as caught.
+;; A full run also fails on a STALE allowlist row: a row for this seam that
+;; matches no surviving mutant must be deleted, so the list cannot outlive the
+;; gaps it names. A diff run tests a subset, so it does not judge staleness.
+;;
+;; TIER: a CI gate, not a type. It proves that each listed seam's tests kill
+;; every mutant cargo-mutants generates there, or that a row says why not. It
+;; says nothing about code outside the list, about mutations cargo-mutants
+;; does not generate, or about tests in other crates: cargo-mutants runs only
+;; the mutated package's tests, so a mutant killed only by, say, an
+;; engenho-runtime integration test reports as missed. Whether a test pins the
+;; RIGHT behaviour is T0.7's question, not this gate's.
+;;
+;; Exit codes: 0 clean (or nothing to mutate in a diff run) · 1 a survivor, a
+;; stale row, or a malformed list · 3 the gate is blind: baseline failed, the
+;; tools are missing, a full run found no mutant, the run did not finish, or
+;; the result files disagree. 3 proved nothing, which is not the same as
+;; finding nothing wrong.
+;;
+;; Tests: ci/mutation-gate.test.tlisp (tlisp-test sets TLISP_TEST=1, which
+;; loads these definitions and skips the main at the bottom).
+
+(define mg:SEAMS (env-get "MUTATION_GATE_SEAMS" "ci/seam-files.txt"))
+(define mg:ALLOWLIST (env-get "MUTATION_GATE_ALLOWLIST" "ci/mutants-allowlist.txt"))
+;; The row separator. Reasons are trimmed, so `x # why:` has an empty one.
+(define mg:WHY " # why:")
+(define mg:NULL-SHA "0000000000000000000000000000000000000000")
+(define mg:FULL-EVENTS (list "schedule" "workflow_dispatch"))
+;; `path:line:col: description`, cargo-mutants' missed.txt line. Paths hold no
+;; colon, so the first three fields are unambiguous.
+(define mg:MISSED-LINE "^([^:]+):([0-9]+):([0-9]+): (.+)$")
+;; An allowlist key: `path.rs: description`.
+(define mg:KEY "^([^:\\s]+\\.rs): (.+)$")
+(define mg:SUMMARIES (list "CaughtMutant" "MissedMutant" "Timeout" "Unviable" "Failure"))
+;; Tools. `nixpkgs` resolves through `--inputs-from .` to this repo's locked
+;; nixpkgs (cargo-mutants 25.3.1 at the time of writing, the version whose
+;; outcomes.json the fixtures in ci/fixtures/mutation-gate/ come from).
+(define mg:MUTANTS-REF "nixpkgs#cargo-mutants")
+(define mg:NEXTEST-REF "github:pleme-io/substrate#cargo-nextest")
+;; cargo-mutants' own exit codes: 0 all caught, 2 a mutant missed, 3 a
+;; timeout, 4 the baseline failed. Anything else is an error, not a verdict.
+(define mg:VERDICT-STATUSES (list 0 2 3 4))
+
+(define (mg:n x) (string-format "{}" x))
+
+(define (mg:get al key) (if (list? al) (alist-get al key "") ""))
+
+(define (mg:list-of v) (if (list? v) v (list)))
+
+;; Non-blank lines, trimmed, `#` comment lines dropped.
+(define (mg:content-lines text)
+  (filter
+    (fn (l) (and (not (equal? l "")) (not (string-starts-with? l "#"))))
+    (map string-trim (string-split text "\n"))))
+
+;; Non-blank lines, trimmed. For tool output, where `#` is data.
+(define (mg:nonblank-lines text)
+  (filter (fn (l) (not (equal? l ""))) (map string-trim (string-split text "\n"))))
+
+(define (mg:slug path) (string-replace (string-replace path "/" "-") "." "-"))
+
+;; ── The two lists ────────────────────────────────────────────────────────
+
+(define (mg:seam-problem line)
+  (cond
+    ((string-starts-with? line "/") "is absolute; paths are relative to the repository root")
+    ((string-contains? line "..") "leaves the repository (`..`)")
+    ((re-match? "\\s" line) "contains whitespace")
+    ((not (string-ends-with? line ".rs")) "is not a Rust source file")
+    (else "")))
+
+;; -> (paths errors)
+(define (mg:parse-seams text)
+  (reduce
+    (fn (acc line)
+      (let ((paths (car acc)) (errs (car (cdr acc))) (why (mg:seam-problem line)))
+        (cond
+          ((not (equal? why ""))
+            (list paths (append errs (list (string-append "seam `" line "` " why)))))
+          ((member? line paths)
+            (list paths (append errs (list (string-append "seam `" line "` is listed twice")))))
+          (else (list (append paths (list line)) errs)))))
+    (list (list) (list))
+    (mg:content-lines text)))
+
+;; -> (rows errors); a row is (key path reason).
+(define (mg:parse-allowlist text seams)
+  (reduce
+    (fn (acc line)
+      (let* ((rows (car acc))
+             (errs (car (cdr acc)))
+             (parts (string-split line mg:WHY))
+             (key (string-trim (car parts)))
+             (reason (if (> (length parts) 1) (string-trim (string-join mg:WHY (cdr parts))) ""))
+             (path (if (re-match? mg:KEY key) (nth 1 (re-captures mg:KEY key)) ""))
+             (bad (fn (msg) (list rows (append errs (list (string-append "allowlist row `" line "` " msg)))))))
+        (cond
+          ((= (length parts) 1) (bad "has no `# why:` reason"))
+          ((equal? reason "") (bad "has an empty reason after `# why:`"))
+          ((equal? path "") (bad "does not start `<path>.rs: <mutant description>`"))
+          ((not (member? path seams)) (bad "names a file that is not in ci/seam-files.txt"))
+          ((any? (fn (r) (equal? (car r) key)) rows) (bad "repeats a key listed above it"))
+          (else (list (append rows (list (list key path reason))) errs)))))
+    (list (list) (list))
+    (mg:content-lines text)))
+
+(define (mg:missing-seams seams exists?)
+  (map (fn (s) (string-append "seam `" s "` does not exist; a renamed or deleted seam must be updated in ci/seam-files.txt in the same commit"))
+       (filter (fn (s) (not (exists? s))) seams)))
+
+;; ── Choosing what to mutate ──────────────────────────────────────────────
+
+;; -> alist: mode (full | diff | none), files, base, reason.
+(define (mg:select seams event base base-known? changed)
+  (let ((full (fn (why) (list (list "mode" "full") (list "files" seams) (list "base" "") (list "reason" why)))))
+    (cond
+      ((member? event mg:FULL-EVENTS) (full (string-append event ": every seam, every mutant")))
+      ((equal? base "") (full "no base commit was given, so every seam, every mutant"))
+      ((equal? base mg:NULL-SHA) (full "the push has no previous commit (a new branch), so every seam, every mutant"))
+      ((not base-known?) (full (string-append "base " base " is not in the fetched history, so every seam, every mutant")))
+      (else
+        (let ((touched (filter (fn (s) (member? s changed)) seams)))
+          (if (null? touched)
+            (list (list "mode" "none") (list "files" (list)) (list "base" base)
+                  (list "reason" (string-append "the change since " base " touches no seam")))
+            (list (list "mode" "diff") (list "files" touched) (list "base" base)
+                  (list "reason" (string-append "lines changed since " base " in " (mg:n (length touched)) " seam(s)")))))))))
+
+(define (mg:legs files)
+  (map (fn (f) (list (list "file" f) (list "slug" (mg:slug f)))) files))
+
+;; ── Judging one run ──────────────────────────────────────────────────────
+
+(define (mg:mutant o) (mg:get (mg:get o "scenario") "Mutant"))
+
+(define (mg:baseline? o) (equal? (mg:get o "scenario") "Baseline"))
+
+(define (mg:summary o) (mg:get o "summary"))
+
+;; `file:line:col: <genre> -> `<replacement>` in <function>`, from
+;; outcomes.json alone. Used for outcomes that no .txt file names.
+(define (mg:label o)
+  (let* ((m (mg:mutant o))
+         (start (mg:get (mg:get m "span") "start"))
+         (fnm (mg:get (mg:get m "function") "function_name")))
+    (string-append (mg:get m "file") ":" (mg:n (mg:get start "line")) ":" (mg:n (mg:get start "column"))
+      ": " (mg:get m "genre") " -> `" (mg:get m "replacement") "`"
+      (if (equal? fnm "") "" (string-append " in " fnm)))))
+
+;; process_status is "Success" or a one-entry object such as {"Signalled": 15}.
+(define (mg:status-text st)
+  (if (list? st)
+    (string-join ", " (map (fn (e) (string-append (mg:n (car e)) " " (mg:n (car (cdr e))))) st))
+    (mg:n st)))
+
+(define (mg:ending o)
+  (let ((tests (filter (fn (p) (equal? (mg:get p "phase") "Test")) (mg:list-of (mg:get o "phase_results")))))
+    (if (null? tests)
+      "no test phase ran"
+      (string-append "its test phase ended " (mg:status-text (mg:get (car tests) "process_status"))))))
+
+;; missed.txt line -> allowlist key, or "" when the line is not in form.
+(define (mg:missed-key line)
+  (if (re-match? mg:MISSED-LINE line)
+    (let ((c (re-captures mg:MISSED-LINE line))) (string-append (nth 1 c) ": " (nth 4 c)))
+    ""))
+
+(define (mg:result verdict code lines counts)
+  (list (list "verdict" verdict) (list "exit" code) (list "lines" lines) (list "counts" counts)))
+
+(define (mg:blind why) (mg:result "blind" 3 (list (string-append "BLIND: " why)) (list)))
+
+;; The first reason the result files cannot be judged, or "".
+(define (mg:blindness file expected outs muts keys missed-lines)
+  (let* ((base (filter mg:baseline? outs))
+         (foreign (filter (fn (o) (not (equal? (mg:get (mg:mutant o) "file") file))) muts))
+         (unknown (filter (fn (o) (not (member? (mg:summary o) mg:SUMMARIES))) muts))
+         (malformed (filter (fn (l) (equal? (mg:missed-key l) "")) missed-lines))
+         (missed (filter (fn (o) (equal? (mg:summary o) "MissedMutant")) muts))
+         (off-seam (filter (fn (k) (not (string-starts-with? k (string-append file ": ")))) keys)))
+    (cond
+      ((null? base) "outcomes.json has no Baseline outcome: the unmutated tree was never tested")
+      ((not (equal? (mg:summary (car base)) "Success"))
+        (string-append "the unmutated tree did not pass its own tests (" (mg:summary (car base)) "; "
+          (mg:ending (car base)) "), so no mutant result means anything"))
+      ((not (= (length muts) expected))
+        (string-append "outcomes.json records " (mg:n (length muts)) " mutants but the listing found "
+          (mg:n expected) ": the run did not finish"))
+      ((not (null? foreign))
+        (string-append "outcome for " (mg:label (car foreign)) ", which is not the seam under test (" file ")"))
+      ((not (null? unknown))
+        (string-append "unknown outcome `" (mg:n (mg:summary (car unknown))) "` for " (mg:label (car unknown))
+          "; an outcome this gate does not know is never counted as caught"))
+      ((not (null? malformed))
+        (string-append "missed.txt line `" (car malformed) "` is not in the `path:line:col: description` form"))
+      ((not (= (length missed-lines) (length missed)))
+        (string-append "missed.txt lists " (mg:n (length missed-lines)) " survivors but outcomes.json records "
+          (mg:n (length missed)) "; the gate cannot tell which survived"))
+      ((not (null? off-seam))
+        (string-append "missed.txt names `" (car off-seam) "`, which is not in the seam under test (" file ")"))
+      (else ""))))
+
+;; file: the seam. mode: "full" | "diff". expected: mutants the listing found.
+;; doc: parsed outcomes.json (ignored when expected is 0). missed-text: the
+;; content of missed.txt. rows: parsed allowlist rows.
+;; -> alist: verdict (clean | survivors | empty | blind), exit, lines, counts.
+(define (mg:judge file mode expected doc missed-text rows)
+  (cond
+    ((and (= expected 0) (equal? mode "diff"))
+      (mg:result "empty" 0
+        (list (string-append "EMPTY: the change touched no line of " file " that carries a mutant"))
+        (list)))
+    ((= expected 0)
+      (mg:blind (string-append "cargo-mutants lists no mutant in " file "; a full run over it proves nothing")))
+    (else
+      (let* ((outs (mg:list-of (mg:get doc "outcomes")))
+             (muts (filter (fn (o) (list? (mg:mutant o))) outs))
+             (missed-lines (mg:nonblank-lines missed-text))
+             (keys (map mg:missed-key missed-lines))
+             (blind (mg:blindness file expected outs muts keys missed-lines)))
+        (if (not (equal? blind ""))
+          (mg:blind blind)
+          (let* ((of (fn (s) (filter (fn (o) (equal? (mg:summary o) s)) muts)))
+                 (row-keys (map car rows))
+                 (survivors (filter (fn (k) (not (member? k row-keys))) keys))
+                 (allowed (filter (fn (k) (member? k row-keys)) keys))
+                 (stale (if (equal? mode "full")
+                          (filter (fn (r) (and (equal? (car (cdr r)) file) (not (member? (car r) keys)))) rows)
+                          (list)))
+                 (counts (list (list "caught" (length (of "CaughtMutant")))
+                               (list "missed" (length (of "MissedMutant")))
+                               (list "timeout" (length (of "Timeout")))
+                               (list "unviable" (length (of "Unviable")))
+                               (list "unclassified" (length (of "Failure")))
+                               (list "allowed" (length allowed))))
+                 (lines
+                   (append
+                     (map (fn (k) (string-append "SURVIVED " k
+                                    ": every test passed with this mutant in place; add a test that kills it, or a row to ci/mutants-allowlist.txt saying why it may live"))
+                          survivors)
+                     (map (fn (r) (string-append "STALE allowlist row `" (car r)
+                                    "`: a full run found no surviving mutant it matches; delete the row"))
+                          stale)
+                     (map (fn (k) (string-append "allowed  " k)) allowed)
+                     (map (fn (o) (string-append "TIMEOUT  " (mg:label o) ": counted as killed (the tests did not pass within the limit)"))
+                          (of "Timeout"))
+                     (map (fn (o) (string-append "UNCLASSIFIED " (mg:label o) ": " (mg:ending o)
+                                    "; not a survivor (the tests did not pass) and not counted as caught (no test failed)"))
+                          (of "Failure"))))
+                 (bad (+ (length survivors) (length stale))))
+            (mg:result (if (> bad 0) "survivors" "clean") (if (> bad 0) 1 0) lines counts)))))))
+
+(define (mg:count result key) (mg:get (mg:get result "counts") key))
+
+;; `cargo mutants --list --json` stdout -> how many mutants, or -1 when it is
+;; not a JSON array of mutants (each names its `file`; json-parse gives an
+;; object as a list too, so `list?` alone cannot tell the two apart). Blank
+;; counts as 0: with `--in-diff` and no mutant on a
+;; changed line, cargo-mutants 25.3.1 prints nothing at all (not `[]`), exits
+;; 0 and says "No mutants to filter" on stderr (measured on a doc-comment-only
+;; change). Without `--in-diff` the same case prints `[]`. Either way 0 is
+;; judged by mg:judge: `empty` for a diff run, blind for a full one.
+(define (mg:listed-count stdout)
+  (let ((text (string-trim stdout)))
+    (if (equal? text "")
+      0
+      (try
+        (let ((v (json-parse text)))
+          (if (and (list? v) (every? (fn (m) (not (equal? (mg:get m "file") ""))) v)) (length v) -1))
+        (catch (e) -1)))))
+
+;; ── Effects ──────────────────────────────────────────────────────────────
+
+(define (mg:output! line)
+  (let ((path (env-get "GITHUB_OUTPUT" "")))
+    (when (not (equal? path ""))
+      (write-file path (string-append (if (path-exists? path) (read-file path) "") line "\n")))))
+
+(define (mg:read-or-empty path) (if (path-exists? path) (read-file path) ""))
+
+;; -> (seams rows errors)
+(define (mg:load-lists)
+  (let* ((seam-text (mg:read-or-empty mg:SEAMS))
+         (parsed (mg:parse-seams seam-text))
+         (seams (car parsed))
+         (allow (mg:parse-allowlist (mg:read-or-empty mg:ALLOWLIST) seams)))
+    (list seams (car allow)
+      (append (car (cdr parsed)) (mg:missing-seams seams path-exists?) (car (cdr allow))))))
+
+;; Lint, print, and exit on a broken list. Returns (seams rows) when clean.
+(define (mg:lint!)
+  (let* ((loaded (mg:load-lists)) (seams (car loaded)) (rows (car (cdr loaded))) (errs (car (cdr (cdr loaded)))))
+    (for-each (fn (e) (print-line (string-append "FAIL " e))) errs)
+    (print-line (string-append "mutation gate lists: " (mg:n (length seams)) " seam(s) in " mg:SEAMS
+      " · " (mg:n (length rows)) " allowlist row(s) in " mg:ALLOWLIST " · problems: " (mg:n (length errs))))
+    (cond
+      ((> (length errs) 0) (exit 1))
+      ((null? seams)
+        (print-line (string-append "FATAL: " mg:SEAMS " names no seam; the gate would mutate nothing"))
+        (exit 3))
+      (else (list seams rows)))))
+
+(define (mg:git args) (apply exec-capture (append (list "git") args)))
+
+(define (mg:plan-main)
+  (let* ((lists (mg:lint!))
+         (seams (car lists))
+         (event (env-get "MUTATION_GATE_EVENT" ""))
+         (base (string-trim (env-get "MUTATION_GATE_BASE" "")))
+         (usable? (and (not (equal? base "")) (not (equal? base mg:NULL-SHA))))
+         (known? (and usable? (= (status-of (mg:git (list "cat-file" "-e" (string-append base "^{commit}")))) 0)))
+         (diff (if known? (mg:git (list "diff" "--name-only" base "HEAD")) (list)))
+         (changed (if (and known? (= (status-of diff) 0)) (mg:nonblank-lines (stdout-of diff)) (list)))
+         (sel (mg:select seams event base (and known? (= (status-of diff) 0)) changed))
+         (files (mg:get sel "files")))
+    (print-line (string-append "plan: " (mg:get sel "mode") " -- " (mg:get sel "reason")))
+    (for-each (fn (f) (print-line (string-append "  mutate " f))) files)
+    (mg:output! (string-append "matrix=" (json-stringify (mg:legs files))))
+    (mg:output! (string-append "count=" (mg:n (length files))))
+    (mg:output! (string-append "base-ref=" (mg:get sel "base")))
+    (mg:output! (string-append "verdict=" (mg:get sel "mode")))
+    (mg:output! (string-append "reason=" (mg:get sel "reason")))
+    (exit 0)))
+
+(define (mg:nix-present?)
+  (try (= (status-of (exec-capture "nix" "--version")) 0) (catch (e) false)))
+
+(define (mg:mutants-argv tail)
+  (append (list "nix" "shell" "--inputs-from" "." mg:MUTANTS-REF mg:NEXTEST-REF "--command" "cargo" "mutants") tail))
+
+(define (mg:report! file result)
+  (for-each print-line (mg:get result "lines"))
+  (print-line
+    (string-append "mutation gate " file ": " (mg:get result "verdict")
+      (if (null? (mg:get result "counts"))
+        ""
+        (string-append " · caught " (mg:n (mg:count result "caught")) " · missed " (mg:n (mg:count result "missed"))
+          " (allowed " (mg:n (mg:count result "allowed")) ") · timeout " (mg:n (mg:count result "timeout"))
+          " · unclassified " (mg:n (mg:count result "unclassified")) " · unviable " (mg:n (mg:count result "unviable"))))))
+  (mg:output! (string-append "verdict=" (mg:get result "verdict")))
+  (mg:output! (string-append "mutants-killed=" (mg:n (if (null? (mg:get result "counts")) 0 (mg:count result "caught")))))
+  (mg:output! (string-append "mutants-survived=" (mg:n (if (null? (mg:get result "counts")) 0 (mg:count result "missed")))))
+  (exit (mg:get result "exit")))
+
+(define (mg:blind! file why) (mg:report! file (mg:blind why)))
+
+(define (mg:run-main)
+  (let* ((lists (mg:lint!))
+         (seams (car lists))
+         (rows (car (cdr lists)))
+         (file (string-trim (env-get "MUTATION_GATE_FILE" "")))
+         (base (string-trim (env-get "MUTATION_GATE_BASE" "")))
+         (mode (if (equal? base "") "full" "diff"))
+         (out (path-join (env-get "RUNNER_TEMP" "target") (string-append "mutation-gate/" (mg:slug file))))
+         (diff-path (path-join out "seam.diff")))
+    (when (not (member? file seams))
+      (print-line (string-append "FAIL MUTATION_GATE_FILE `" file "` is not listed in " mg:SEAMS))
+      (exit 1))
+    (when (not (mg:nix-present?))
+      (mg:blind! file "`nix` is not on PATH; the tools come from `nix shell` (install it with pleme-io/actions/nix-setup)"))
+    (rm-rf out)
+    (mkdir-p out)
+    (when (equal? mode "diff")
+      (let ((d (mg:git (list "diff" base "HEAD" "--" file))))
+        (when (not (= (status-of d) 0))
+          (mg:blind! file (string-append "`git diff " base " HEAD` failed: " (string-trim (stderr-of d)))))
+        (write-file diff-path (stdout-of d))))
+    (let* ((scope (append (list "--file" file) (if (equal? mode "diff") (list "--in-diff" diff-path) (list))))
+           (listing (apply exec-capture (mg:mutants-argv (append (list "--list" "--json") scope)))))
+      (when (not (= (status-of listing) 0))
+        (print-line (stderr-of listing))
+        (mg:blind! file (string-append "`cargo mutants --list` exited " (mg:n (status-of listing)))))
+      (let ((expected (mg:listed-count (stdout-of listing))))
+        (when (< expected 0)
+          (mg:blind! file "`cargo mutants --list --json` printed something that is not a JSON list"))
+        (print-line (string-append "mutation gate " file ": " mode " run, " (mg:n expected) " mutant(s) listed"))
+        (when (= expected 0)
+          (mg:report! file (mg:judge file mode 0 (list) "" rows)))
+        (let* ((in-place (if (equal? (env-get "GITHUB_ACTIONS" "") "true") (list "--in-place") (list)))
+               (status
+                 (apply exec-check
+                   (mg:mutants-argv
+                     (append scope in-place
+                       (list "--test-tool" "nextest" "--all-features" "--cargo-arg=--locked" "--no-shuffle" "--output" out)))))
+               (outcomes-path (path-join out "mutants.out/outcomes.json"))
+               (missed-path (path-join out "mutants.out/missed.txt")))
+          (cond
+            ((not (member? status mg:VERDICT-STATUSES))
+              (mg:blind! file (string-append "cargo mutants exited " (mg:n status) ", an error rather than a verdict")))
+            ((not (path-exists? outcomes-path))
+              (mg:blind! file (string-append "cargo mutants exited " (mg:n status) " and wrote no " outcomes-path)))
+            (else
+              (mg:report! file
+                (mg:judge file mode expected (json-parse (read-file outcomes-path)) (mg:read-or-empty missed-path) rows)))))))))
+
+(cond
+  ((equal? (env-get "TLISP_TEST" "") "1") (print-line "TLISP_TEST=1: mutation-gate loaded; main skipped"))
+  ((equal? (env-get "MUTATION_GATE_MODE" "lint") "plan") (mg:plan-main))
+  ((equal? (env-get "MUTATION_GATE_MODE" "lint") "run") (mg:run-main))
+  ((equal? (env-get "MUTATION_GATE_MODE" "lint") "lint") (mg:lint!) (exit 0))
+  (else
+    (print-line (string-append "FAIL unknown MUTATION_GATE_MODE `" (env-get "MUTATION_GATE_MODE" "") "`; one of lint, plan, run"))
+    (exit 1)))

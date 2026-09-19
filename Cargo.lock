@@ -1595,7 +1595,10 @@ dependencies = [
  "clap",
  "engenho-fonte",
  "engenho-revoada",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1685,17 +1688,6 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "tracing",
-]
-
-[[package]]
-name = "engenho-machines"
-version = "0.53.118"
-dependencies = [
- "engenho-substrate",
- "engenho-sui-typescape",
- "proptest",
- "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]

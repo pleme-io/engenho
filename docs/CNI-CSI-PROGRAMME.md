@@ -262,8 +262,9 @@ Reasons, in order:
 ## Verification
 
 Unchanged from the contract programme: local gate
-(`cargo test --workspace --exclude engenho-diff --all-targets --all-features
---locked --no-fail-fast`, `fmt --check`, `clippy -D warnings`), `gen build` after
+(`cargo nextest run --workspace --all-targets --all-features --locked
+--no-fail-fast --no-tests=fail`, which selects tests through
+`.config/nextest.toml`; `fmt --check`, `clippy -D warnings`), `gen build` after
 any workspace-member change, and every new gate red-run once against a
 deliberately-broken input before it is trusted.
 

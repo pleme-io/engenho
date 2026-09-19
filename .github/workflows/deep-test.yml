@@ -10,9 +10,12 @@ name: deep-test
 #   deep-test  — "has the WORLD moved under us?"       Slow, cross-OS, stress,
 #                coverage, advisories. Time-triggered, NON-blocking by trigger.
 # Concretely deep-test owns four things test.yml deliberately does not: a
-# macOS leg, a 4x proptest case count, a coverage artifact, and a RustSec
+# macOS leg, a 4,096-case proptest run, a coverage artifact, and a RustSec
 # advisory scan. None of those belong on the PR critical path; all of them
 # rot silently if nobody ever runs them.
+# Mutation testing is scheduled too, but it is not here: it also gates pushes
+# that touch a seam file, so it has its own workflow (mutation.yml), and none
+# of its jobs depend on this file's.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # THIS WORKFLOW HAS NEVER ONCE BEEN GREEN. That is why it was rewritten.
@@ -33,18 +36,20 @@ name: deep-test
 #     Already fixed in-tree — it is a git dep now, and a repo-wide grep for
 #     `path = "../../` returns 0 hits. Recorded so it is not reintroduced.
 #
-#   RC-2 (2026-07-17 -> now) — private git deps, no credential. THE LIVE ONE.
-#     See test.yml's header for the full diagnosis and the one-line operator
-#     fix (a REPO-level BOT_PAT). Both workflows are blocked on that same
-#     secret; both are wired correctly to work the moment it exists.
+#   RC-2 (2026-07-17 -> resolved) — private git deps, no credential.
+#     No longer live: engenho is public, so the org-level BOT_PAT reaches it,
+#     and in runs 35418242848 and 35421804575 (2026-09-19) every private dep
+#     resolved. What is still red is in test.yml's header.
 #
 # THREE FALSE CLAIMS IN THE PREVIOUS VERSION OF THIS FILE, ALL REMOVED:
 #
-#   1. "free public-repo tier ... fan-out is free". engenho is PRIVATE
-#      (`gh repo view pleme-io/engenho` -> PRIVATE). Its Actions minutes are
-#      BILLABLE, and the macOS half of the old 30-job matrix billed at the
-#      10x macOS multiplier. The fan-out was not free; it was the most
-#      expensive possible way to produce no signal.
+#   1. "free public-repo tier ... fan-out is free". engenho was PRIVATE
+#      then (`gh repo view pleme-io/engenho` -> PRIVATE). Its Actions minutes
+#      were BILLABLE, and the macOS half of the old 30-job matrix billed at
+#      the 10x macOS multiplier. The fan-out was not free; it was the most
+#      expensive possible way to produce no signal. (engenho is PUBLIC as of
+#      2026-09-19, so minutes no longer bill; the matrix stays cut because it
+#      produced no signal.)
 #   2. The hardcoded 15-crate matrix claimed to be "one job per workspace
 #      crate". The workspace has 24 members. NINE were in no test path at
 #      all — including `engenho`, the main binary, and `engenho-fonte`, the
@@ -80,8 +85,10 @@ jobs:
   # ── Cross-OS: the one axis test.yml genuinely does not cover ─────────────
   # Whole workspace per OS, NOT a hand-listed per-crate matrix. `--workspace`
   # cannot drift out of date; a literal crate list demonstrably did.
-  # engenho-diff is excluded for the live-k3s-oracle reason documented in
-  # ci/live-oracle-tests.txt, and is still compiled below.
+  # Which tests run is decided by .config/nextest.toml, the same file test.yml
+  # and substrate's release gate read: its default-filter skips engenho-diff's
+  # four live-oracle binaries, which are still compiled below. Every job in
+  # this file fetches nextest from substrate's pin, as test.yml does.
   cross-os:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -99,19 +106,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: deep-${{ matrix.os }}
+      - uses: pleme-io/actions/nix-setup@main
+        with:
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+      - name: install substrate's pinned cargo-nextest
+        run: nix profile install github:pleme-io/substrate#cargo-nextest
       - name: compile engenho-diff (live-oracle crate — compiled, not run)
         run: cargo test -p engenho-diff --all-targets --all-features --locked --no-run
-      - name: cargo test --workspace --all-targets --all-features
-        run: |
-          cargo test --workspace --exclude engenho-diff \
-            --all-targets --all-features --locked --no-fail-fast
-      # `--all-targets` excludes doctests; kept as its own leg for the same
-      # reason as in test.yml.
+      - name: cargo nextest run --workspace --all-targets --all-features
+        run: >-
+          cargo nextest run --workspace --all-targets --all-features
+          --locked --no-fail-fast --no-tests=fail
+      # nextest does not run doctests; kept on cargo as its own leg for the
+      # same reason as in test.yml.
       - name: cargo test --doc
         run: cargo test --workspace --all-features --locked --doc --no-fail-fast
 
-  # ── Property-test stress: 4x the default case count ─────────────────────
-  # Distinct scope from test.yml, which runs proptest at its default budget.
+  # ── Property-test stress: 4,096 cases per property ──────────────────────
+  # Distinct scope from test.yml, which runs each property at its default
+  # budget (256, or 128 in three engenho-substrate-props suites).
+  #
+  # PROFILE. Built with Cargo.toml's [profile.stress], not `--release`.
+  # `--release` turns debug assertions and overflow checks off, so this lane
+  # used to check LESS per case than the default run. [profile.stress] is
+  # opt-level 3 with both checks on. nextest's own `--profile` names a nextest
+  # profile; the cargo profile is `--cargo-profile`. ci/cargo-profiles.tlisp
+  # (test.yml) fails a step that raises PROPTEST_CASES without selecting it.
+  #
+  # SELECTION. The whole workspace, filtered only by .config/nextest.toml. The
+  # lane used to pass `proptest`, a substring filter on test NAMES. Only tests
+  # named that way matched: engenho-kubelet's two `mod proptests` and two
+  # `proptest_*` functions in engenho-revoada's cross_face_verbs.rs. The
+  # `proptest!` blocks in the other ~55 files (every engenho-substrate-props
+  # suite, engenho-store's r9_mvcc_revision, engenho-types'
+  # determinism_proptest) are named for what they prove, so the 4,096-case
+  # lane never ran them. Tests with no property run once more under the
+  # optimised profile. --no-tests=fail keeps an empty selection red; cargo
+  # test exits 0 on that shape (measured by substrate 2026-08-06; see the
+  # cargo-nextest package in its flake.nix).
   property-stress:
     name: proptest stress (4k cases)
     runs-on: ubuntu-latest
@@ -127,10 +159,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: proptest-stress
+      - uses: pleme-io/actions/nix-setup@main
+        with:
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+      - name: install substrate's pinned cargo-nextest
+        run: nix profile install github:pleme-io/substrate#cargo-nextest
       - name: proptest stress
-        run: |
-          cargo test --workspace --exclude engenho-diff \
-            --all-features --locked --release --no-fail-fast -- proptest
+        run: >-
+          cargo nextest run --workspace --all-targets --all-features --locked
+          --cargo-profile stress --no-fail-fast --no-tests=fail
 
   # ── Coverage artifact ───────────────────────────────────────────────────
   coverage:
@@ -151,10 +188,19 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+      - uses: pleme-io/actions/nix-setup@main
+        with:
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+      - name: install substrate's pinned cargo-nextest
+        run: nix profile install github:pleme-io/substrate#cargo-nextest
+      # `cargo llvm-cov nextest`, not plain `cargo llvm-cov`: the plain form
+      # runs cargo test, which cannot read .config/nextest.toml and would need
+      # its own exclusion flag, a second selection contract. fail-fast comes
+      # from the config's `fail-fast = false`.
       - name: coverage
-        run: |
-          cargo llvm-cov --workspace --exclude engenho-diff \
-            --all-features --locked --lcov --output-path lcov.info
+        run: >-
+          cargo llvm-cov nextest --workspace --all-features --locked
+          --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov

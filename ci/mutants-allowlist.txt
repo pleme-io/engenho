@@ -1,0 +1,35 @@
+# mutants-allowlist.txt — surviving mutants the mutation gate accepts, each
+# with the reason it is acceptable (improvement plan T0.6).
+#
+# ROW FORMAT, one per line; `#` at the start of a line is a comment:
+#
+#   <seam path>: <mutant description> # why: <reason>
+#
+# `<seam path>: <mutant description>` is a line of cargo-mutants' missed.txt
+# with its `:line:col` removed. For the missed.txt line
+#
+#   engenho-kubelet/src/probe.rs:470:24: replace < with <= in ProbeRuntime::next_due_in
+#
+# the row starts `engenho-kubelet/src/probe.rs: replace < with <= in
+# ProbeRuntime::next_due_in`. Line and column are left out so that editing
+# code above a mutant does not break its row.
+#
+# RULES the gate enforces (ci/mutation-gate.tlisp):
+#   * the reason after `# why:` is required and may not be empty;
+#   * the path must be listed in ci/seam-files.txt;
+#   * no two rows have the same key;
+#   * in a full run of a seam, a row for that seam that matches no surviving
+#     mutant is STALE and fails the run. When a test starts killing a mutant,
+#     its row is deleted in that commit.
+#
+# LIMIT: a row matches every surviving mutant in that file with the same
+# description. cargo-mutants names two `delete !` mutants in one function
+# identically (probe.rs:283:29 and :310:29 in ProbeSpec::from_k8s, run of
+# 2026-09-19), so one row would accept both. Kill such mutants rather than
+# listing them.
+#
+# A reason says why no test can or should kill the mutant: an equivalent
+# mutant (the change cannot be observed), or a value the program never reads.
+# "Pre-existing" and "no time" are not reasons. The list starts empty: the 25
+# survivors measured on 2026-09-19 are test gaps, and the plan's T1/T2 items
+# add the tests that kill them.

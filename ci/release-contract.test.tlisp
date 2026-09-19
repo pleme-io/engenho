@@ -1,0 +1,192 @@
+;; release-contract.test.tlisp — (deftest …) suite for ci/release-contract.tlisp.
+;; Run by pleme-io/actions/tlisp-test (test.yml, job ci-contract-tests) as
+;; stdlib + unit + this file with TLISP_TEST=1, from the repository root.
+;;
+;; The first two tests read the real .github/workflows/release.yml, so they
+;; fail when release.yml breaks the contract. The rest run the check against
+;; a small fixture that keeps the contract, then against one mutation per
+;; rule, so each rule is shown to fire on the defect it names.
+
+(define (t:has? vs needle) (any? (fn (v) (string-contains? v needle)) vs))
+
+(define (t:asset? assets kind name) (member? (list kind name) assets))
+
+(define t:GOOD "
+on:
+  push:
+    tags: ['v*']
+jobs:
+  binary-tool:
+    uses: pleme-io/substrate/.github/workflows/rust-binary-release.yml@main
+    with:
+      binary-name: tool
+    secrets: inherit
+  image-tool-amd64:
+    uses: pleme-io/substrate/.github/workflows/image-push.yml@main
+    with:
+      imageAttr: tool-image-amd64
+      imageName: pleme-io/tool
+      tag: ${{ github.ref_name }}-amd64
+      additionalTags: ''
+    secrets: inherit
+  image-manifest:
+    needs: [image-tool-amd64]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          docker buildx imagetools create \\
+            --tag ghcr.io/pleme-io/tool:${{ github.ref_name }} \\
+            ghcr.io/pleme-io/tool:${{ github.ref_name }}-amd64
+  chart:
+    uses: pleme-io/substrate/.github/workflows/helm-chart-release.yml@main
+    with:
+      chart-path: ./charts/engenho
+      oci-registry: oci://ghcr.io/pleme-io/engenho/charts
+    secrets: inherit
+  release-assets:
+    needs: [binary-tool, image-tool-amd64, image-manifest, chart]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    outputs:
+      images: ${{ steps.verify.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: verify
+        uses: pleme-io/actions/tatara-script@main
+        with:
+          script-file: ci/release-contract.tlisp
+        env:
+          RELEASE_CONTRACT_MODE: verify
+          RELEASE_TAG: ${{ github.ref_name }}
+  promote-latest:
+    needs: release-assets
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        image: ${{ fromJSON(needs.release-assets.outputs.images) }}
+    steps:
+      - uses: pleme-io/actions/release-promote@main
+        with:
+          image: ${{ matrix.image }}
+          source-tag: ${{ github.ref_name }}
+          target-tag: latest
+")
+
+(define (t:wf text) (yaml-parse text))
+
+;; The fixture with one substring replaced; the replacement must happen, or
+;; the mutation test would silently check the unmutated fixture.
+(define (t:mutant from to)
+  (assert (string-contains? t:GOOD from) (string-append "fixture no longer contains: " from))
+  (t:wf (string-replace t:GOOD from to)))
+
+(deftest "the real release.yml keeps the contract"
+  (let ((vs (rc:violations (rc:load))))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (> (length (rc:job-names (rc:load))) 0) "release.yml was read and has jobs")
+    (assert (= (length vs) 0) "no violation in .github/workflows/release.yml")))
+
+(deftest "the real release.yml promises every leg's assets, and never :latest"
+  (let* ((assets (rc:expected-assets (rc:load) "v1.2.3"))
+         (files (filter (fn (a) (equal? (car a) "file")) assets)))
+    (for-each
+      (fn (bin)
+        (for-each
+          (fn (leg)
+            (assert (t:asset? assets "file" (string-append bin "-" leg)) (string-append bin "-" leg))
+            (assert (t:asset? assets "file" (string-append bin "-" leg ".sha256")) (string-append bin "-" leg ".sha256")))
+          (list "linux-x86_64" "linux-aarch64" "macos-x86_64" "macos-aarch64")))
+      (list "engenho-mcp" "engenho-cluster-config-render"))
+    (assert (= (length files) 16) "2 binaries x 4 legs x (binary, .sha256)")
+    (for-each
+      (fn (bin)
+        (assert (t:asset? assets "oci" (string-append "ghcr.io/pleme-io/" bin ":v1.2.3-amd64")) (string-append bin " amd64"))
+        (assert (t:asset? assets "oci" (string-append "ghcr.io/pleme-io/" bin ":v1.2.3-arm64")) (string-append bin " arm64"))
+        (assert (t:asset? assets "oci" (string-append "ghcr.io/pleme-io/" bin ":v1.2.3")) (string-append bin " multi-arch index")))
+      (list "engenho-mcp" "engenho-cluster-config-render"))
+    (assert (t:asset? assets "oci" "ghcr.io/pleme-io/engenho/charts/engenho:1.2.3") "chart at the tag's version, v stripped")
+    (assert (not (any? (fn (a) (string-contains? (car (cdr a)) "latest")) assets)) "no asset is a latest tag")
+    (assert (equal? (rc:image-repos (rc:load)) (list "ghcr.io/pleme-io/engenho-mcp" "ghcr.io/pleme-io/engenho-cluster-config-render"))
+      "promote-latest moves both images")))
+
+(deftest "the fixture keeps the contract, and a runner label is not a latest tag"
+  (let ((vs (rc:violations (t:wf t:GOOD))))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (= (length vs) 0) "clean fixture has no violation, though it says ubuntu-latest")))
+
+(deftest "an image-push call without additionalTags pushes latest by default"
+  (let ((vs (rc:violations (t:mutant "      additionalTags: ''\n" ""))))
+    (assert (t:has? vs "job `image-tool-amd64`") "names the image job")
+    (assert (t:has? vs "additionalTags") "says which input")))
+
+(deftest "an image-push call with no tag pushes latest by default"
+  (let ((vs (rc:violations (t:mutant "      tag: ${{ github.ref_name }}-amd64\n" ""))))
+    (assert (t:has? vs "job `image-tool-amd64`: image-push.yml needs `tag:`") "tag must be declared")))
+
+(deftest "an additional latest tag on an arch leg is refused"
+  (let ((vs (rc:violations (t:mutant "additionalTags: ''" "additionalTags: latest"))))
+    (assert (t:has? vs "job `image-tool-amd64`: names the `latest` tag") "latest named outside promote-latest")))
+
+(deftest "the manifest job may not tag the index latest"
+  (let ((vs (rc:violations
+              (t:mutant "--tag ghcr.io/pleme-io/tool:${{ github.ref_name }} \\\n"
+                        "--tag ghcr.io/pleme-io/tool:${{ github.ref_name }} \\\n            --tag ghcr.io/pleme-io/tool:latest \\\n"))))
+    (assert (t:has? vs "job `image-manifest`: names the `latest` tag") "manifest latest refused")))
+
+(deftest "release-assets must wait for every publishing job"
+  (let ((vs (rc:violations (t:mutant "needs: [binary-tool, image-tool-amd64, image-manifest, chart]"
+                                     "needs: [binary-tool, image-tool-amd64, image-manifest]"))))
+    (assert (t:has? vs "job `release-assets`: does not need `chart`") "the dropped leg is named")))
+
+(deftest "release-assets runs only on a v* tag"
+  (let ((vs (rc:violations (t:mutant "    if: startsWith(github.ref, 'refs/tags/v')\n" ""))))
+    (assert (t:has? vs "job `release-assets`: needs `if:") "tag guard required")))
+
+(deftest "release-assets must run the verify step"
+  (let ((vs (rc:violations (t:mutant "RELEASE_CONTRACT_MODE: verify" "RELEASE_CONTRACT_MODE: check"))))
+    (assert (t:has? vs "job `release-assets`: needs a step `id: verify`") "verify mode required")))
+
+(deftest "promote-latest must wait for release-assets and move only what it checked"
+  (let ((vs (rc:violations (t:mutant "    needs: release-assets\n" "    needs: chart\n"))))
+    (assert (t:has? vs "job `promote-latest`: does not need `release-assets`") "promote waits for the check"))
+  (let ((vs (rc:violations (t:mutant "${{ fromJSON(needs.release-assets.outputs.images) }}" "[ghcr.io/pleme-io/tool]"))))
+    (assert (t:has? vs "job `promote-latest`: needs `strategy.matrix.image") "image list comes from the check")))
+
+(deftest "a workflow without the gate jobs is refused"
+  (let ((vs (rc:violations (t:mutant "  release-assets:\n" "  release-assets-renamed:\n"))))
+    (assert (t:has? vs "job `release-assets`: missing") "missing gate named")
+    (assert (t:has? vs "job `release-assets-renamed`: publishes nothing the release contract knows")
+      "an uncatalogued job is refused")))
+
+(deftest "a new publishing job with no catalog row is refused"
+  (let ((vs (rc:violations
+              (t:mutant "  release-assets:\n"
+                        "  npm-publish:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n  release-assets:\n"))))
+    (assert (t:has? vs "job `npm-publish`: publishes nothing the release contract knows") "unknown kind refused")
+    (assert (t:has? vs "job `release-assets`: does not need `npm-publish`") "and it is not waited on")))
+
+(deftest "per-arch images with no job joining them into :<tag> are refused"
+  (let ((vs (rc:violations (t:mutant "docker buildx imagetools create" "docker buildx imagetools inspect"))))
+    (assert (t:has? vs "no job joins them into the `:<tag>` index") "the index promote-latest moves must exist")))
+
+(deftest "verify reports exactly the assets that are missing"
+  (let* ((assets (rc:expected-assets (t:wf t:GOOD) "v2.0.0"))
+         (present-files (list "tool-linux-x86_64" "tool-linux-x86_64.sha256" "tool-macos-x86_64"
+                              "tool-macos-x86_64.sha256" "tool-macos-aarch64" "tool-macos-aarch64.sha256"
+                              "tool-linux-aarch64"))
+         (present-refs (list "ghcr.io/pleme-io/tool:v2.0.0-amd64" "ghcr.io/pleme-io/tool:v2.0.0"))
+         (missing (rc:missing-assets assets (fn (f) (member? f present-files)) (fn (r) (member? r present-refs)))))
+    (assert (= (length assets) 11) "8 binary files, 1 arch image, 1 index, 1 chart")
+    (assert (= (length missing) 2) "two missing")
+    (assert (t:asset? missing "file" "tool-linux-aarch64.sha256") "the missing sidecar")
+    (assert (t:asset? missing "oci" "ghcr.io/pleme-io/engenho/charts/engenho:2.0.0") "the missing chart"))
+  (let ((assets (rc:expected-assets (t:wf t:GOOD) "v2.0.0")))
+    (assert (= (length (rc:missing-assets assets (fn (f) true) (fn (r) true))) 0) "all present: nothing missing")
+    (assert (= (length (rc:missing-assets assets (fn (f) false) (fn (r) false))) (length assets)) "none present: all missing")))
+
+(deftest "matrix-include legs replace the built-in ones"
+  (let* ((wf (t:mutant "      binary-name: tool\n"
+                       "      binary-name: tool\n      matrix-include: '[{\"os\":\"ubuntu-latest\",\"target\":\"x86_64-unknown-linux-musl\",\"suffix\":\"linux-x86_64\"}]'\n"))
+         (files (filter (fn (a) (equal? (car a) "file")) (rc:expected-assets wf "v1.0.0"))))
+    (assert (= (length files) 2) "one leg: binary + sha256")
+    (assert (t:asset? files "file" "tool-linux-x86_64.sha256") "the declared leg")))

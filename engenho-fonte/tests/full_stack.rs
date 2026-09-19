@@ -216,17 +216,25 @@ async fn full_stack_convergence_loop_typed_end_to_end() {
     )
     .unwrap();
 
-    // Wait for the notify watcher + conduit to drain.
+    // Tick until the edited declaration has been applied. The watcher
+    // re-reads the file on every event, and on macOS FSEvents it can
+    // deliver step 1's own write after the watch starts. So the first
+    // tick after the edit may still carry the old declaration: measured
+    // 2026-09-19, revision 1 applied podinfo alone and revision 2 added
+    // lilitu. The loop promises convergence on the file's current
+    // content, not that the next tick is the edit.
     let second = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(Some(o)) = conduit.tick().await {
+            if let Ok(Some(o)) = conduit.tick().await
+                && apps.emitted().iter().any(|d| d.metadata.name == "lilitu")
+            {
                 return o;
             }
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("modify notify within 5s");
+    .expect("the edited declaration is applied within 5s");
     assert!(second.revision > initial.revision);
 
     // ── 5. Assert convergence to the new Sistema ─────────────────

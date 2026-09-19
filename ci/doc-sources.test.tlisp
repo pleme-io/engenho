@@ -1,0 +1,203 @@
+;; doc-sources.test.tlisp — (deftest …) suite for ci/doc-sources.tlisp.
+;; Run by pleme-io/actions/tlisp-test (test.yml, job ci-contract-tests) as
+;; stdlib + unit + this file with TLISP_TEST=1, from the repository root.
+;;
+;; The first tests read the real repository: the documents in src:DOCS keep
+;; every rule, STATE-MACHINES.md's SM ③ and SM ⑥ rows name the code that
+;; implements them, and engenho-machines is gone. The rest run the check
+;; against a small fixture repository that keeps every rule, then against
+;; one mutation per rule, so each rule is shown to fire on the defect it
+;; names and to stay quiet on its near miss.
+
+(define (t:has? vs needle) (any? (fn (v) (string-contains? v needle)) vs))
+
+;; ── The real repository ──────────────────────────────────────────────────
+
+(deftest "the real documents name only code that exists"
+  (let* ((docs (src:load-docs))
+         (vs (src:violations docs (src:real-fs) (src:load-members))))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (= (length (filter src:doc-present? docs)) (length src:DOCS)) "every listed document was read")
+    (assert (> (src:ref-count docs) 0) "path references were found")
+    (assert (= (length vs) 0) "no violation in the repository")))
+
+;; The index row for one machine, found by its number (③, ⑥).
+(define (t:index-row text marker)
+  (let ((rows (filter (fn (l) (string-starts-with? l (string-append "| " marker " |"))) (string-split text "\n"))))
+    (if (= (length rows) 0) "" (car rows))))
+
+(define (t:row-names-its-code marker)
+  (let* ((doc "docs/STATE-MACHINES.md")
+         (row (t:index-row (read-file doc) marker))
+         (refs (src:line-refs doc 0 row))
+         (items (filter (fn (r) (not (equal? (car (cdr (cdr (cdr r)))) ""))) refs))
+         (vs (reduce (fn (acc r) (append acc (src:ref-violations doc (src:real-fs) (src:load-members) r))) (list) refs)))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (not (equal? row "")) (string-append "STATE-MACHINES.md has an index row " marker))
+    (assert (> (length items) 0) (string-append "row " marker " names at least one `path.rs::Item`"))
+    (assert (= (length vs) 0) (string-append "every source row " marker " names resolves"))))
+
+(deftest "STATE-MACHINES.md's SM ③ row names the topology code that implements it"
+  (t:row-names-its-code "③"))
+
+(deftest "STATE-MACHINES.md's SM ⑥ row names the quorum code that implements it"
+  (t:row-names-its-code "⑥"))
+
+(deftest "engenho-machines is deleted: no workspace member, no directory"
+  (let ((members (src:load-members)))
+    (assert (> (length members) 0) "Cargo.toml's members were read")
+    (assert (not (any? (fn (m) (equal? m "engenho-machines")) members)) "engenho-machines is not a workspace member")
+    (assert (not (path-exists? "engenho-machines")) "engenho-machines has no directory")))
+
+;; ── A fixture repository ─────────────────────────────────────────────────
+;; A filesystem built from (path text) pairs: a path exists when it is a
+;; file or a directory holding one.
+
+(define (t:under? f p) (string-starts-with? (car f) (string-append p "/")))
+
+(define (t:fs files)
+  (list
+    (fn (p) (any? (fn (f) (or (equal? (car f) p) (t:under? f p))) files))
+    (fn (p) (any? (fn (f) (t:under? f p)) files))
+    (fn (p) (let ((hit (filter (fn (f) (equal? (car f) p)) files)))
+              (if (= (length hit) 0) "" (car (cdr (car hit))))))))
+
+(define t:LIB "pub struct Tracker;
+impl Tracker {
+    pub fn ingest(&self) {}
+}
+pub enum Outcome {
+    Pending,
+    Reached { n: usize },
+}
+")
+
+(define t:FILES
+  (list
+    (list "engenho-a/Cargo.toml" "[package]")
+    (list "engenho-a/src/lib.rs" t:LIB)
+    (list "engenho-a/src/quorum.rs" "pub fn fold() {}")
+    (list "engenho-a/src/sub/mod.rs" "")
+    (list "engenho-orphan/Cargo.toml" "[package]")
+    (list "engenho-orphan/src/lib.rs" "pub struct Orphan;")
+    (list "docs/OTHER.md" "")))
+
+(define t:MEMBERS (list "engenho-a"))
+
+(define t:DOC "# Catalog
+
+| # | Machine | Source |
+|---|---|---|
+| 1 | Tracker | `engenho-a/src/lib.rs::Tracker` |
+| 2 | Both | `engenho-a/src/{lib,quorum}.rs` |
+| 3 | Dir | `engenho-a/src/sub/` |
+| 4 | External | `kikai/src/state.rs` |
+
+| Term | Meaning |
+|---|---|
+| fold | no source column here |
+
+See [the other doc](OTHER.md), [the crate](../engenho-a/), [upstream](https://example.com/x/y.rs)
+and [a sibling repository](../../theory/THEORY.md).
+Members: `engenho-a/src/lib.rs::Tracker::ingest` and `engenho-a/src/lib.rs::Outcome::Reached`.
+Prose with slashes: `start/status/stop/remove`.
+
+```
+engenho-gone/src/lib.rs::Nothing in a fence is not read: `engenho-gone/src/lib.rs`
+```
+")
+
+(define (t:check-with doc members)
+  (src:violations (list (list "docs/CATALOG.md" true doc)) (t:fs t:FILES) members))
+
+(define (t:check doc) (t:check-with doc t:MEMBERS))
+
+;; The fixture with one substring replaced; the replacement must happen, or
+;; the mutation test would silently check the unmutated fixture.
+(define (t:swap text from to)
+  (assert (string-contains? text from) (string-append "fixture no longer contains: " from))
+  (string-replace text from to))
+
+(define (t:mutant from to) (t:check (t:swap t:DOC from to)))
+
+;; ── Every rule quiet on the fixture ──────────────────────────────────────
+
+(deftest "the fixture keeps every rule, and every kind of reference in it is read"
+  (let ((vs (t:check t:DOC))
+        (refs (src:refs "docs/CATALOG.md" t:DOC)))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (= (length vs) 0) "no violation")
+    ;; four table rows, two links (the http one and the one leaving the
+    ;; repository are not read), two member references
+    (assert (= (length refs) 8) (string-append "eight references read, got " (src:n (length refs))))))
+
+;; ── root ─────────────────────────────────────────────────────────────────
+
+(deftest "root: a path starting at a directory that does not exist is refused"
+  (let ((vs (t:mutant "`engenho-a/src/lib.rs::Tracker`" "`engenho-gone/src/lib.rs::Tracker`")))
+    (assert (t:has? vs "docs/CATALOG.md:5: starts at `engenho-gone/`, which is not a directory")
+      "the deleted crate is named, with its line")))
+
+(deftest "root: a relative link to a directory that does not exist is refused"
+  (let ((vs (t:mutant "[the crate](../engenho-a/)" "[the crate](../engenho-machines/)")))
+    (assert (t:has? vs "starts at `engenho-machines/`") "the link's target is refused")))
+
+(deftest "root: a declared external repository is not read"
+  (assert (= (length (t:mutant "`kikai/src/state.rs`" "`kikai/src/not-here-either.rs`")) 0)
+    "kikai is another repository; its paths are not checked"))
+
+;; ── crate ────────────────────────────────────────────────────────────────
+
+(deftest "crate: a path into a crate that is not a workspace member is refused"
+  (let ((doc (t:swap t:DOC "`engenho-a/src/{lib,quorum}.rs`" "`engenho-orphan/src/lib.rs::Orphan`")))
+    (assert (t:has? (t:check doc) "docs/CATALOG.md:6: starts at `engenho-orphan/`, a crate that is not a workspace member")
+      "the orphan crate is refused, with its line")
+    (assert (= (length (t:check-with doc (list "engenho-a" "engenho-orphan"))) 0)
+      "the same path is fine once the crate is a member")))
+
+;; ── exists ───────────────────────────────────────────────────────────────
+
+(deftest "exists: every alternative of a brace group must exist"
+  (let ((vs (t:mutant "{lib,quorum}" "{lib,gone}")))
+    (assert (= (length vs) 1) "one violation")
+    (assert (t:has? vs "`engenho-a/src/gone.rs` does not exist") "it names the missing alternative")))
+
+(deftest "exists: a path ending in / must be a directory"
+  (let ((vs (t:mutant "`engenho-a/src/sub/`" "`engenho-a/src/lib.rs/`")))
+    (assert (t:has? vs "`engenho-a/src/lib.rs/` is not a directory") "a file is not a directory")))
+
+;; ── item ─────────────────────────────────────────────────────────────────
+
+(deftest "item: a named item the file does not declare is refused"
+  (let ((vs (t:mutant "lib.rs::Tracker`" "lib.rs::Tracer`")))
+    (assert (t:has? vs "`engenho-a/src/lib.rs` declares no item `Tracer`") "the misspelt item is named")))
+
+(deftest "item: a member must be a fn or a variant in that file"
+  (assert (t:has? (t:mutant "Tracker::ingest" "Tracker::ingest_all") "declares no fn or variant `ingest_all`")
+    "a missing fn is refused")
+  (assert (t:has? (t:mutant "Outcome::Reached" "Outcome::Dissent") "declares no fn or variant `Dissent`")
+    "a missing variant is refused"))
+
+;; ── source ───────────────────────────────────────────────────────────────
+
+(deftest "source: a row whose Source cell names no path is refused"
+  (let ((vs (t:mutant "| 3 | Dir | `engenho-a/src/sub/` |" "| 3 | Dir | the sub module |")))
+    (assert (t:has? vs "docs/CATALOG.md:7: the row `3` names no source path") "the row is named, with its line")))
+
+(deftest "source: a table with no Source column is not held to it"
+  (assert (= (length (t:mutant "| fold | no source column here |" "| fold | still no path |")) 0)
+    "only a Source column must name a path"))
+
+;; ── what counts as a path ────────────────────────────────────────────────
+
+(deftest "a path inside a fenced block is not read; the same path outside it is"
+  (let ((vs (t:mutant "```\nengenho-gone" "\nengenho-gone")))
+    (assert (t:has? vs "starts at `engenho-gone/`") "outside the fence, the path is checked")))
+
+(deftest "prose with slashes, URLs and links that leave the repository are not paths"
+  (assert (= (length (src:line-refs "docs/CATALOG.md" 1 "`start/status/stop/remove` `a/b` `~/x/y.rs` `/etc/z.toml`")) 0)
+    "no path in prose, a bare a/b, a home path or an absolute path")
+  (assert (equal? (src:resolve-link "docs/CATALOG.md" "../../theory/THEORY.md") "")
+    "a link that climbs out of the repository resolves to nothing")
+  (assert (equal? (src:resolve-link "docs/CATALOG.md" "../engenho-a/src/") "engenho-a/src/")
+    "a link into the repository resolves from the document's directory"))

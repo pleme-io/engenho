@@ -8,11 +8,21 @@
 > [`engenho-substrate::maquina::StateMachine`](../engenho-substrate/src/maquina.rs)
 > — a pure `step(&state, &event) -> Result<(state, effect), err>` with a
 > `MachineRunner` that records a typed `TransitionRecord` history and is
-> itself `mirante::Observable`. The **formalization target**: every SM
-> below lifts into a `StateMachine` impl (see
-> [`engenho-machines`](../engenho-machines/) — substrate-first). The one
-> already-perfect exemplar (exhaustive proptest: deterministic,
-> all-states-reachable, no spurious self-loops) is **SM ①, kikai**.
+> itself `mirante::Observable`.
+>
+> **A machine here is the code its Source column names, never a model
+> kept beside it.** A model may exist only as the implementation itself,
+> or with a differential test against the implementation over every
+> (state, event) pair (improvement plan §5.2). The `engenho-machines`
+> crate held unchecked models of SM ③ and SM ⑥ that contradicted both
+> implementations; it was deleted (T5.3). The one already-perfect
+> exemplar (exhaustive proptest: deterministic, all-states-reachable, no
+> spurious self-loops) is **SM ①, kikai**.
+>
+> `ci/doc-sources.tlisp` checks this file on every push: each repository
+> path it names exists, no path starts at a crate directory outside the
+> workspace, each `path.rs::Item` names an item that file declares, and
+> each row of the index names its source.
 >
 > Companions: [`STRATEGY.md`](STRATEGY.md) · [`TYPESCAPE.md`](TYPESCAPE.md)
 > · [`RESILIENCE.md`](RESILIENCE.md) · [`DISTRIBUTED.md`](DISTRIBUTED.md).
@@ -23,10 +33,10 @@
 |---|---|---|---|---|
 | ① | Cluster lifecycle (kikai) | lifecycle backend | `kikai/src/state.rs` | ✅ exhaustively tested |
 | ② | Node membership (phi-accrual) | revoada A | `engenho-revoada/src/membership/` | ✅ shipped |
-| ③ | Topology / formation node-state | revoada policy | `engenho-revoada/src/topology.rs` | ✅ typed (reactor; not yet a `maquina` FSM) |
+| ③ | Topology / formation node-state | revoada policy | `engenho-revoada/src/topology.rs::TopologyReactor` · `engenho-revoada/src/policy/formation.rs::FormationPolicy` | 🟡 typed; transitions unguarded; in no binary |
 | ④ | Raft consensus (per group) | revoada B / store | `engenho-revoada/src/consensus/`, `engenho-store/` | ✅ openraft (in-process transport) |
 | ⑤ | Store write path | store | `engenho-store/src/{mesh,state,watch}.rs` | ✅ in-memory; disk pending C4 |
-| ⑥ | Derivation / materialization | substrate | `engenho-substrate/src/{derivation,shape,quorum,roca}.rs` | ✅ primitives; lifecycle FSM in `engenho-machines` |
+| ⑥ | Derivation / materialization | substrate | `engenho-substrate/src/quorum.rs::QuorumTracker` · `engenho-substrate/src/{receipt,derivation,shape,ledger,roca}.rs` | 🟡 quorum fold only; no lifecycle FSM; no running path drives it |
 | ⑦ | Pod lifecycle (kubelet) | control | `engenho-kubelet/src/kubelet.rs` | 🟡 start path; stop/probes pending |
 | ⑧ | Scheduler placement | control | `engenho-scheduler/src/scheduler.rs` | 🟡 RoundRobin |
 | ⑨ | Controller reconcile | control | `engenho-controllers/src/controller.rs` | ✅ generic trait + core set |
@@ -90,30 +100,58 @@ counter rejects stale gossip).
 
 ## ③ Topology / formation node-state (`engenho-revoada/src/topology.rs`)
 
-The "lose-planes-shift-formation" machine. Typed; driven by a
-`TopologyReactor` (pure, Raft-decoupled) rather than a `maquina` FSM
-today — **the prime candidate to formalize** in `engenho-machines`.
+The "lose-planes-shift-formation" machine. There is no separate model:
+the machine is this code.
 
-**States (`NodeState`):** `Joining · Standby · Active(Role) · Demoting ·
-Departing · Failed`, where `Role = Master | Worker | Bootstrap | Observer`.
-**Transitions (`Transition`):** `Admit(id) · Promote(id,role) · Demote(id)
-· Reassign(id,role) · Evict(id)`.
+**Implemented by:**
+- `engenho-revoada/src/topology.rs::NodeState` — the states: `Joining ·
+  Standby · Active(Role) · Demoting · Departing · Failed`, where
+  `Role = Master | Worker | Bootstrap | Observer`.
+- `engenho-revoada/src/topology.rs::Transition` — the events: `Admit(id)
+  · Promote(id,role) · Demote(id) · Reassign(id,role) · Evict(id)`.
+- `engenho-revoada/src/topology.rs::TopologyReactor::observe_membership`
+  — decides the transitions for one membership snapshot: `Admit` each
+  new eligible node; `Promote` the strategy's initial shape when no
+  Master exists yet; then the strategy's `react_to_loss`, plus an
+  `Evict` for every failed node the strategy did not evict.
+- `engenho-revoada/src/topology.rs::TopologyReactor::apply_transition`
+  (and `apply_transitions`) — the transition function.
+- `engenho-revoada/src/policy/formation.rs::FormationPolicy` — turns the
+  reactor's transitions into consensus `RoleAssignment` proposals.
 
-```
-            phi-accrual flags ↘
- Joining ─admit▶ Standby ─promote▶ Active(Role) ─demote/reassign▶ Demoting ─▶ Standby
-                                          │                          │
-                                          └──── depart ───▶ Departing ─▶ evicted
-                                                  Failed ◀─ phi-accrual ─┘
-```
+**The transition function, as `apply_transition` implements it.** The
+next state depends on the event alone. The prior state is never read,
+and no transition is refused:
 
-Every edge is a Raft `Transition` log entry — **no out-of-band
-promotion**, even self-promotion at bootstrap goes through a
-quorum-of-1 commit. Six pre-packed strategies (`Solo · Pair · Quorum3M ·
-Cluster3MNW · MeshAllPeers · Phalanx`) each define `assign` (ideal shape),
-`react_to_loss` (the shift), and `validate` (the invariant). Never-stuck:
-below `min_nodes` the cluster goes read-only, never freezes; every
-strategy provably yields ≥1 voter.
+| Event | Next state |
+|---|---|
+| `Admit` | `Standby` |
+| `Promote(role)` | `Active(role)` |
+| `Demote` | `Demoting` |
+| `Reassign(role)` | `Active(role)` |
+| `Evict` | `Failed`; the node stays in the assignment |
+
+**What the code does not do.** These are design intent; nothing
+implements them:
+- No transition returns `Demoting` to `Standby`, and none produces
+  `Departing`. Neither the reactor nor any strategy emits `Demote`;
+  `FormationPolicy` only consumes it.
+- Nothing commits a `Transition` to Raft. Only tests call
+  `apply_transition`, and only tests construct a `FormationPolicy`:
+  revoada is in no binary (improvement plan §5.3). `FormationPolicy`
+  proposes only master-class promotions, demotions, reassignments and
+  the demotion of an evicted node's roles; it drops `Admit` and every
+  Worker or Observer promotion.
+- Below `min_nodes`, `TopologyStrategy::assign` returns
+  `TopologyError::InsufficientNodes`. The read-only mode the design names
+  for that case does not exist.
+
+**What is tested.** Six pre-packed strategies (`Solo · Pair · Quorum3M ·
+Cluster3MNW · MeshAllPeers · Phalanx`) each define `assign` (ideal
+shape), `react_to_loss` (the shift) and `validate` (the invariant).
+`engenho-revoada/tests/topology_invariants.rs` proptests them, among
+other properties that `assign` yields at least one voter and that a lost
+node is never promoted.
 
 ---
 
@@ -150,15 +188,69 @@ exist behind the API, wired at C4 (snapshot every 10k entries).
 
 ## ⑥ Derivation / materialization — the substrate→ether path (`engenho-substrate/`)
 
-The "shift the right bits to the right form across the ether" machine.
-Composed from real types: `Drv`/`DrvHash`/`Realisation`
-([`derivation.rs`](../engenho-substrate/src/derivation.rs)),
-`WorkloadShape` ([`shape.rs`](../engenho-substrate/src/shape.rs):
-`OciImage · NixClosure · Qcow2 · Wasm · StaticBinary{triple} · HelmChart ·
-Custom{name}`), `MaterializationReceipt` + `QuorumOutcome`
-([`quorum.rs`](../engenho-substrate/src/quorum.rs): `Pending · Reached ·
-Dissent`), and the `roca` materialization-job staging. Formalized as a
-`maquina::StateMachine` in [`engenho-machines`](../engenho-machines/).
+The "shift the right bits to the right form across the ether" path.
+What is implemented is the **quorum fold**. There is no lifecycle state
+machine: the `Defined → … → Terminal` chain at the end of this section is
+design, and no code steps through it.
+
+**Implemented by:**
+- `engenho-substrate/src/quorum.rs::QuorumTracker` — the quorum fold for
+  one `(kind, subject)`. `engenho-substrate/src/quorum.rs::QuorumTracker::ingest`
+  is its transition function, and
+  `engenho-substrate/src/quorum.rs::QuorumOutcome` (`Pending · Reached ·
+  Dissent`) its state.
+- `engenho-substrate/src/receipt.rs::MaterializationReceipt` — the event
+  the fold consumes: kind, subject, emitter and `evidence_hash`.
+- `engenho-substrate/src/derivation.rs::Drv` and
+  `engenho-substrate/src/derivation.rs::Realisation` (with `DrvHash`) —
+  what a receipt is about. Types only; nothing steps them through a
+  lifecycle.
+- `engenho-substrate/src/shape.rs::WorkloadShape` — `OciImage · NixClosure
+  · Qcow2 · Wasm · StaticBinary{triple} · HelmChart · Custom{name}`.
+- `engenho-substrate/src/roca.rs` — the materialization-job staging.
+- Two mirrors that re-derive the verdict outside the fold:
+  `engenho-substrate/src/ledger.rs::MemoryLedger` and
+  `engenho-controllers/src/store_ledger.rs::StoreBackedLedger`. In wave 3
+  of the improvement plan (T5.3), `QuorumTracker` becomes the only fold
+  and both mirrors are deleted.
+
+**The fold, as `QuorumTracker` implements it.** It counts distinct
+emitters; a second receipt from the same emitter replaces that emitter's
+evidence. For a threshold K (a K of 0 is raised to 1):
+
+| Distinct emitters | Distinct evidence hashes | Outcome |
+|---|---|---|
+| fewer than K | any | `Pending` |
+| K or more | 1 | `Reached` |
+| K or more | 2 or more | `Dissent` |
+
+No outcome is terminal. A dissenting emitter that re-emits agreeing
+evidence moves `Dissent` back to `Reached`, and `reset` forgets every
+confirmation.
+
+The mirrors do not agree with that table. `MemoryLedger`'s `outcome`
+never reads the threshold: one agreeing receipt with K = 3 reads as
+`Reached`, and two disagreeing receipts below K read as `Dissent`.
+
+**Reach.** `engenho-substrate` and `engenho-controllers` are compiled
+into the shipped binary, but no running path ingests a receipt. The
+only non-test driver of a ledger is
+`engenho-controllers/src/plantio.rs::PlantioController`. Only
+`engenho-controllers/src/plantio_pipeline.rs::PlantioPipeline::build`
+constructs one, and nothing outside the two plantio modules calls it
+(improvement plan T5.6 and T5.11).
+
+**Content-addressing:** BLAKE3 over canonical drv ATerm (`DrvHash`),
+over NAR bytes (`NarHash`), over rendered artifact bytes (`evidence_hash`).
+**Closures:** `input_drvs: BTreeMap<DrvHash, Vec<String>>`. **Trust:**
+two nodes rendering the same `Drv` must produce the same `evidence_hash`
+(verified in `oci_renderer` tests); disagreement among K or more
+emitters is `Dissent`. The
+`engenho-substrate/src/oci_renderer.rs::OciImageRenderer` is the
+concrete bridge (Drv → `docker-archive:` → skopeo copy → `oci-archive:`
+→ registry-servable bytes).
+
+**Design, not implemented.** The lifecycle the fold was meant to sit in:
 
 ```
 Defined ─hash▶ Hashed ─build▶ Built ─nar▶ Realised ─put_realisation▶ StoreCommitted
@@ -167,14 +259,6 @@ Defined ─hash▶ Hashed ─build▶ Built ─nar▶ Realised ─put_realisatio
        │        ─ledger.broadcast/gossip▶ Distributed ─▶ Terminal(available)
        └─(K confirmed, >1 evidence variant)▶ QuorumDissent   ← hard fault (re-derive / evict)
 ```
-
-**Content-addressing:** BLAKE3 over canonical drv ATerm (`DrvHash`),
-over NAR bytes (`NarHash`), over rendered artifact bytes (`evidence_hash`).
-**Closures:** `input_drvs: BTreeMap<DrvHash, Vec<String>>`. **Trust:**
-two nodes rendering the same `Drv` must produce the same `evidence_hash`
-(verified in `oci_renderer` tests); disagreement ⇒ `Dissent`. The
-`OciImageRenderer` is the concrete bridge (Drv → `docker-archive:` →
-skopeo copy → `oci-archive:` → registry-servable bytes).
 
 ---
 
@@ -234,7 +318,10 @@ topology, promessas}`; `PromessaKind = Compliance | CostBudget |
 CustomerKpi | Sla | Security`. **Maturity:** mock-universe is the
 always-on default; real role impls are feature-gated M1.1–M1.5
 (`with-shikumi/-sui-eval/-revoada/-tameshi/-mirante`). `ProvacaoConduit`
-wraps the conduit for deterministic fault injection.
+wraps the conduit for deterministic fault injection. The one binary that
+runs this loop, `engenho-fonte` (`engenho-fonte-cli`), is a mock-universe
+harness: cargo builds it only with `--features mock-universe`, and it logs
+the `Universe` it resolved for each slot at startup (T5.5).
 
 ---
 

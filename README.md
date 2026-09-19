@@ -80,7 +80,10 @@ engenho-local   Ready    control-plane,master   2m    v1.34.5+k3s1
 
 ```bash
 cargo build --workspace
-cargo test  --workspace      # 12 unit + 5 manifest + 3 proptests (768 cases)
+# The gate, as test.yml runs it. Which tests run is set by .config/nextest.toml;
+# the measured count lives in CLAUDE.md § Test count.
+cargo nextest run --workspace --all-targets --all-features --locked
+cargo test --workspace --all-features --locked --doc   # nextest skips doctests
 
 nix build                    # hermetic release build via substrate's
                              # rust-workspace-release-flake.nix
@@ -129,7 +132,7 @@ the `M0.0` line this replaces.
 | API machinery | server-side apply (+`managedFields`), WATCH, label selectors, resourceVersion, API **defaulting** and **validation** (core kinds), field selectors incl. `spec.nodeName`/`status.phase` — all working |
 | controller chain | Deployment → ReplicaSet → Pod reconciles end to end |
 | endpoints serving | `/healthz` `/readyz` `/livez` `/version` (`v1.34.0`) `/api` `/apis` `/openapi/v3` |
-| crates | 24 workspace members; `engenho-datastore`, `-cni`, `-kubeproxy`, `-dns`, `-localpath`, `-ca`, `-caixa`, `-mesh`, `-gateway`, `-attest`, `-cli` are TARGET names above and do **not** exist yet |
+| crates | 26 workspace members (Cargo.toml `members`, counted 2026-09-19 after `engenho-machines` was deleted); `engenho-datastore`, `-kubeproxy`, `-dns`, `-localpath`, `-ca`, `-caixa`, `-mesh`, `-gateway`, `-attest`, `-cli` are TARGET names above and do **not** exist yet |
 
 ## The load-bearing insight: interfaces are the contract, technology is not
 

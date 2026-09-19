@@ -191,7 +191,7 @@ post-incident analysis, compliance attestation, debugging.
 |---|---|
 | **Dynamic role shifts** | Layer B's joint consensus = atomic membership changes |
 | **Survives N node failures** | Raft tolerates ⌊(N-1)/2⌋ failures in the control-plane set; the mesh elects replacements via Layer A+B |
-| **Eventual consistency in partitions** | Layer A keeps every partition's node state observable locally; Layer B blocks role changes during partition (Raft requires quorum) so split-brain is impossible |
+| **Eventual consistency in partitions** | Layer A keeps every partition's node state observable locally. Layer B is *designed* to block role changes during a partition, because a Raft commit needs a quorum. That is not yet a safety property of revoada, and split-brain freedom cannot be claimed until three missing pieces exist: (1) a durable vote and log — both live in memory today (`consensus/store.rs`), so a restarted node forgets the vote it cast and the entries it acknowledged; (2) a real majority check — `RoleAssignment::has_majority` returns true whenever any voter exists; (3) a quorum check on promotion — `TopologyReactor` proposes promotions from its own gossip view. revoada is a fenced typed draft outside the shipped `engenho` binary (IMPROVEMENT-PLAN.md §5.3). |
 | **kubectl wire compatibility** | The K8s apiserver (engenho-apiserver at M0.1) is unchanged; revoada just decides WHICH NODES run it |
 | **No single point of failure** | Layer C distributes workload data P2P; if all control planes fail simultaneously, workers can continue serving cached pod state until the consensus reforms |
 | **Attestable** | Layer D writes every role transition to a BLAKE3 chain (same shape as tameshi's other chains — compounding the attestation primitive) |
