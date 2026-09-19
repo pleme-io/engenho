@@ -144,9 +144,11 @@ A build-time tool is not a violation: `engenho-kube-codegen` and
 
 ```bash
 cargo build --workspace                    # debug build
-# THE gate command — mirrors .github/workflows/test.yml exactly:
-cargo test --workspace --exclude engenho-diff \
-  --all-targets --all-features --locked --no-fail-fast
+# THE gate command — mirrors .github/workflows/test.yml exactly. The tool is
+# substrate's pinned nextest (`nix run github:pleme-io/substrate#cargo-nextest
+# -- nextest run …` if you have none; .config/nextest.toml requires >= 0.9.114):
+cargo nextest run --workspace --all-targets --all-features \
+  --locked --no-fail-fast --no-tests=fail
 cargo test --workspace --all-features --locked --doc   # doctests (see below)
 cargo fmt --all -- --check                 # formatting gate
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -162,7 +164,8 @@ Every flag above is load-bearing:
   `with-engenho-kube-client`, `openapi-roundtrip`, `bit-repro`, `mock`.
   Default features leave all of it uncompiled and unrun.
 - **`--all-targets`** — includes `tests/`, `examples/`, `benches/`.
-  **It EXCLUDES doctests**, which is why `--doc` is a separate line.
+  **It EXCLUDES doctests**, and nextest never runs them, which is why
+  `--doc` is a separate `cargo test` line.
 - **`--no-fail-fast`** — without it cargo stops at the first failing
   *binary*. Measured: a plain run aborted at `engenho-diff`
   (alphabetically first to fail) and reported **881** tests; the same
@@ -170,7 +173,13 @@ Every flag above is load-bearing:
   this flag is not a count of the suite.
 - **`--locked`** — a drifted `Cargo.lock` fails loudly instead of being
   silently re-resolved.
-- **`--exclude engenho-diff`** — see § Live-oracle tests.
+- **`--no-tests=fail`** — the release gate's anti-vacuity assertion. A
+  run that selects zero tests is red; `cargo test` exits 0 on it.
+- **No exclusion flag, on purpose.** Which tests run is decided by
+  [`.config/nextest.toml`](./.config/nextest.toml), which nextest reads
+  on its own. That is what makes test.yml, `deep-test.yml`, substrate's
+  release gate and a local run select the same tests. See § Live-oracle
+  tests.
 
 ### Test count (measured 2026-07-27, not estimated)
 
@@ -189,23 +198,37 @@ not being run; this one had not been reproducible for months.
 Source attributes in-tree: 2,306 `#[test]` + 824 `#[tokio::test]` =
 3,130 (exclude `target/` when counting, or the number inflates).
 
+The table was taken under the old `cargo test --exclude engenho-diff`
+gate. The gate now runs nextest over `.config/nextest.toml`, which skips
+only the four oracle binaries, so engenho-diff's **34** mocked library
+unit tests now run in the gate (measured 2026-09-19 with nextest 0.9.136,
+`-p engenho-diff --all-features`: 34 run, 34 pass, 4 binaries skipped).
+The whole workspace has not been re-counted under nextest yet.
+
 The doctest leg is **41 of 42 `ignore`d** — close to a vacuous guard
 today. It is wired anyway so the next real doctest lands guarded, and
 so the 41 are visible as debt rather than counted as coverage.
 
 ### Live-oracle tests
 
-`engenho-diff`'s four tests are a *differential* suite: each drives the
-same operation against engenho-in-process **and a real k3s cluster**,
-then diffs the responses. They resolve
-`$HOME/.kube/engenho-local-tunnel.yaml` and are written to **fail loud,
-never silently skip**. No such cluster exists on a CI runner, so CI
-excludes them **from execution only** — `test.yml` still runs
-`cargo test -p engenho-diff --no-run`, so the crate must compile on
-every PR. Enumerated with rationale in
-[`ci/live-oracle-tests.txt`](./ci/live-oracle-tests.txt). Not
-`#[ignore]`d (that would hide them from the operator, where the oracle
-*does* exist and they are the entire point).
+`engenho-diff`'s four integration binaries are a *differential* suite:
+each drives the same operation against engenho-in-process **and a live
+Kubernetes oracle cluster**, then diffs the responses. They resolve
+`ENGENHO_ORACLE_KUBECONFIG`, falling back to
+`$HOME/.kube/engenho-local-tunnel.yaml`, and are written to **fail
+loud, never silently skip**. No oracle exists on a CI runner, so they
+are kept out **of execution only**, by name, in
+[`.config/nextest.toml`](./.config/nextest.toml) — the one
+test-selection contract, with the full rationale as its header. The
+crate still compiles on every PR (`test.yml` runs
+`cargo test -p engenho-diff --no-run` first), and its mocked library
+unit tests run in the gate like any other.
+
+Where an oracle exists:
+`ENGENHO_ORACLE_KUBECONFIG=<kubeconfig> cargo nextest run --profile oracle`.
+The `live-oracle` test group runs them one at a time, because they share
+one cluster. Not `#[ignore]`d (that would hide them from the operator,
+where the oracle *does* exist and they are the entire point).
 
 ## CI + gating
 
@@ -230,7 +253,7 @@ then `nix flake check` cannot compile any gen-pattern consumer.
 
 | Workflow | Trigger | Scope | Blocking |
 |---|---|---|---|
-| `test.yml` | push + PR | **the real gate** — whole workspace, all-features, all-targets, + doctests, + `engenho-diff` compile-only, + fmt + clippy | yes |
+| `test.yml` | push + PR | **the real gate** — whole workspace under substrate's nextest (selection from `.config/nextest.toml`), all-features, all-targets, + doctests on cargo, + `engenho-diff` compile-only, + fmt + clippy | yes |
 | `deep-test.yml` | schedule + dispatch | breadth — macOS leg, 4k-case proptest stress, coverage artifact, `cargo audit` | no |
 | `ci.yml` | push + PR | `nix flake check` (compiles nothing today — kept so the flake still evaluates) | — |
 

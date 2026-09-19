@@ -80,7 +80,10 @@ engenho-local   Ready    control-plane,master   2m    v1.34.5+k3s1
 
 ```bash
 cargo build --workspace
-cargo test  --workspace      # 12 unit + 5 manifest + 3 proptests (768 cases)
+# The gate, as test.yml runs it. Which tests run is set by .config/nextest.toml;
+# the measured count lives in CLAUDE.md § Test count.
+cargo nextest run --workspace --all-targets --all-features --locked
+cargo test --workspace --all-features --locked --doc   # nextest skips doctests
 
 nix build                    # hermetic release build via substrate's
                              # rust-workspace-release-flake.nix

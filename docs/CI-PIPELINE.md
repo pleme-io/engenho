@@ -95,9 +95,10 @@ push + helm chart push would fail with `unauthorized`.
 
 ## What CI exercises
 
-  * `cargo test --workspace` runs all 274 unit + integration tests
-    across the 7 workspace crates (types, mcp, revoada, store,
-    apiserver, teia, scheduler).
+  * `test.yml` runs `cargo nextest run --workspace --all-targets
+    --all-features` with substrate's pinned nextest. Which tests run
+    is set by `.config/nextest.toml`, the same file substrate's release
+    gate reads; the measured count is in CLAUDE.md § Test count.
   * `nix flake check` validates the flake outputs (apps, packages,
     overlays).
   * `nix build .#default` validates the workspace builds.

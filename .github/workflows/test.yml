@@ -110,37 +110,65 @@ jobs:
           shared-key: test-ubuntu
 
       # ── Compile-only leg for the live-oracle crate ──────────────────────
-      # engenho-diff's four tests all drive a REAL k3s cluster to diff against
-      # (see ci/live-oracle-tests.txt). No oracle exists on a runner, so they
-      # are excluded from EXECUTION below — but their code must still compile
-      # on every PR. This step is what makes that true, and it is deliberately
-      # FIRST: it is the exact check that catches a crate silently falling out
-      # of every build path and rotting, which is the failure shape this repo
-      # already had (see CLAUDE.md § CI + gating).
+      # engenho-diff's four integration binaries each drive a REAL Kubernetes
+      # oracle cluster to diff against. No oracle exists on a runner, so
+      # .config/nextest.toml keeps them out of EXECUTION below, but their code
+      # must still compile on every PR. The nextest leg builds them too; this
+      # step stays deliberately FIRST so a compile break in the crate fails
+      # fast and by name. It is the check that catches a crate silently falling
+      # out of every build path and rotting, which this repo already had (see
+      # CLAUDE.md § CI + gating).
       - name: compile engenho-diff (live-oracle crate — compiled, not run)
         run: cargo test -p engenho-diff --all-targets --all-features --locked --no-run
 
+      # ── The test runner: substrate's nextest, the release gate's own ────
+      # Nix is installed here ONLY to fetch nextest from substrate's pin, the
+      # same `github:pleme-io/substrate#cargo-nextest` that substrate's
+      # rust-auto-release test gate runs. Both gates therefore run one nextest
+      # build over one selection file, .config/nextest.toml. The installer's
+      # github-token is rate-limit headroom for a public fetch; the `||`
+      # fallback is the release gate's own, for the reason written there.
+      # `nix profile install` lands the binary in ~/.nix-profile/bin, which
+      # the installer has already put on PATH, so the leg below is the same
+      # `cargo nextest run` a developer types locally.
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+      - name: install substrate's pinned cargo-nextest
+        run: nix profile install github:pleme-io/substrate#cargo-nextest
+
       # ── The executing gate ──────────────────────────────────────────────
+      # WHICH tests run is decided by .config/nextest.toml, not by a flag on
+      # this line: its default-filter skips the four named live-oracle
+      # binaries and runs everything else, engenho-diff's mocked unit tests
+      # included. The release gate reads the same file without being told to,
+      # so the two gates can no longer disagree about WHICH tests are in scope
+      # (they still differ in features: the release gate runs defaults). This
+      # leg is also the regression test of that file: if the filter is lost,
+      # the oracle binaries run on a runner with no oracle and fail here.
       # --all-features is LOAD-BEARING here, not decoration. engenho gates real
       # code behind with-tameshi / with-sui-eval / with-shikumi / with-revoada /
       # with-engenho-kube-client / openapi-roundtrip / bit-repro / mock. Default
       # features leave all of it uncompiled and unrun.
       # --locked ensures a drifted Cargo.lock fails loudly instead of being
       # silently re-resolved.
-      # --no-fail-fast is REQUIRED for an honest count: without it cargo stops
-      # at the first failing BINARY. Measured here: the run aborted at
-      # `engenho-diff` (alphabetical) reporting 881 tests; the true figure with
-      # --no-fail-fast is 3,169.
-      - name: cargo test --workspace --all-targets --all-features
-        run: |
-          cargo test --workspace --exclude engenho-diff \
-            --all-targets --all-features --locked --no-fail-fast
+      # --no-fail-fast is REQUIRED for an honest count. The config also sets
+      # `fail-fast = false`; the flag stays so this line reads true without
+      # the file. Under cargo test the run once aborted at `engenho-diff`
+      # reporting 881 tests; the true figure with --no-fail-fast was 3,169.
+      # --no-tests=fail is the release gate's anti-vacuity assertion: a run
+      # that selects zero tests is red, never a vacuous green.
+      - name: cargo nextest run --workspace --all-targets --all-features
+        run: >-
+          cargo nextest run --workspace --all-targets --all-features
+          --locked --no-fail-fast --no-tests=fail
 
       # ── Doctests — a SEPARATE leg, on purpose ───────────────────────────
-      # `--all-targets` EXCLUDES doctests. A gate built only on the line above
-      # ships green over a broken doctest; the sibling repo iac-forge had
-      # exactly one real failure this week and the doctest leg alone caught it
-      # (an inverted assert_ne! in a module example).
+      # nextest does not run doctests at all, and `--all-targets` excludes them
+      # under cargo test as well, so they stay on cargo. A gate built only on
+      # the leg above ships green over a broken doctest; the sibling repo
+      # iac-forge had exactly one real failure this week and the doctest leg
+      # alone caught it (an inverted assert_ne! in a module example).
       # HONEST SCOPE, engenho as measured: 42 doctests, of which 41 are
       # ```ignore``` and exactly 1 executes. This leg is therefore close to a
       # vacuous guard TODAY — it is wired anyway so the next real doctest lands

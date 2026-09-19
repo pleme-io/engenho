@@ -80,8 +80,10 @@ jobs:
   # ── Cross-OS: the one axis test.yml genuinely does not cover ─────────────
   # Whole workspace per OS, NOT a hand-listed per-crate matrix. `--workspace`
   # cannot drift out of date; a literal crate list demonstrably did.
-  # engenho-diff is excluded for the live-k3s-oracle reason documented in
-  # ci/live-oracle-tests.txt, and is still compiled below.
+  # Which tests run is decided by .config/nextest.toml, the same file test.yml
+  # and substrate's release gate read: its default-filter skips engenho-diff's
+  # four live-oracle binaries, which are still compiled below. Every job in
+  # this file fetches nextest from substrate's pin, as test.yml does.
   cross-os:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -99,14 +101,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: deep-${{ matrix.os }}
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+      - name: install substrate's pinned cargo-nextest
+        run: nix profile install github:pleme-io/substrate#cargo-nextest
       - name: compile engenho-diff (live-oracle crate — compiled, not run)
         run: cargo test -p engenho-diff --all-targets --all-features --locked --no-run
-      - name: cargo test --workspace --all-targets --all-features
-        run: |
-          cargo test --workspace --exclude engenho-diff \
-            --all-targets --all-features --locked --no-fail-fast
-      # `--all-targets` excludes doctests; kept as its own leg for the same
-      # reason as in test.yml.
+      - name: cargo nextest run --workspace --all-targets --all-features
+        run: >-
+          cargo nextest run --workspace --all-targets --all-features
+          --locked --no-fail-fast --no-tests=fail
+      # nextest does not run doctests; kept on cargo as its own leg for the
+      # same reason as in test.yml.
       - name: cargo test --doc
         run: cargo test --workspace --all-features --locked --doc --no-fail-fast
 
@@ -127,10 +134,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: proptest-stress
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+      - name: install substrate's pinned cargo-nextest
+        run: nix profile install github:pleme-io/substrate#cargo-nextest
+      # `proptest` is a test-name substring filter, intersected with the
+      # config's default-filter. --no-tests=fail turns a filter that matches
+      # nothing into a red run. cargo test exits 0 on that shape (measured by
+      # substrate 2026-08-06; see the cargo-nextest package in its flake.nix).
       - name: proptest stress
-        run: |
-          cargo test --workspace --exclude engenho-diff \
-            --all-features --locked --release --no-fail-fast -- proptest
+        run: >-
+          cargo nextest run --workspace --all-features --locked --release
+          --no-fail-fast --no-tests=fail proptest
 
   # ── Coverage artifact ───────────────────────────────────────────────────
   coverage:
@@ -151,10 +167,19 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          github-token: ${{ secrets.BOT_PAT || secrets.GITHUB_TOKEN }}
+      - name: install substrate's pinned cargo-nextest
+        run: nix profile install github:pleme-io/substrate#cargo-nextest
+      # `cargo llvm-cov nextest`, not plain `cargo llvm-cov`: the plain form
+      # runs cargo test, which cannot read .config/nextest.toml and would need
+      # its own exclusion flag, a second selection contract. fail-fast comes
+      # from the config's `fail-fast = false`.
       - name: coverage
-        run: |
-          cargo llvm-cov --workspace --exclude engenho-diff \
-            --all-features --locked --lcov --output-path lcov.info
+        run: >-
+          cargo llvm-cov nextest --workspace --all-features --locked
+          --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov

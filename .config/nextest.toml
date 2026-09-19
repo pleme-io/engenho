@@ -1,0 +1,116 @@
+# .config/nextest.toml — engenho's ONE test-selection contract.
+#
+# nextest discovers this file on its own, from the workspace root. So every
+# runner that says `cargo nextest run` in this repository selects the same
+# tests, and none of them needs a flag to do it:
+#
+#   * test.yml, the PR gate. It runs nextest from substrate's pin.
+#   * deep-test.yml, the scheduled breadth run: cross-OS, proptest stress
+#     and coverage.
+#   * substrate's rust-auto-release test gate. It runs
+#     `nextest run --no-tests=fail --workspace --no-fail-fast` and was never
+#     told about engenho-diff, so before this file it executed the live-oracle
+#     binaries and panicked at m0_core_crud_parity.rs:154.
+#   * a local `cargo nextest run`.
+#
+# This replaces two contracts that disagreed: test.yml's
+# `--exclude engenho-diff` flag, and the rationale file ci/live-oracle-tests.txt
+# that explained it. The release gate followed neither.
+#
+# ── WHAT IS EXCLUDED, AND WHY ────────────────────────────────────────────────
+# engenho-diff is a differential suite. Each of its integration binaries sends
+# one operation to an in-process engenho AND to a live Kubernetes "oracle"
+# cluster, then diffs the two responses. On a CI runner there is no oracle, so
+# these binaries cannot run there. They are not stale, not broken, and not
+# skipped to buy green.
+#
+# `default-filter` below names them one binary at a time:
+#   m0_core_crud_parity · patch_parity · selector_parity ·
+#   status_subresource_parity
+#
+# ── WHY NAMES, NOT THE WHOLE CRATE ───────────────────────────────────────────
+# The exclusion is exact, so everything else still runs and can still fail:
+#   * engenho-diff's own library unit tests use MockKubeClient and need no
+#     cluster, so they run. `--exclude engenho-diff` used to hide them too.
+#   * A NEW integration binary in engenho-diff runs by default. If it is a
+#     mocked test, it simply runs. If it needs an oracle, it fails on the
+#     first CI run, and the fix is to add its name here, where a reviewer can
+#     see it. A crate-level exclusion would hide either kind without a word.
+#   * A name that no longer matches a binary, because the file was renamed or
+#     deleted, is not a silent no-op. nextest refuses the whole file at parse
+#     time ("operator didn't match any binary names", exit 96), in every gate
+#     at once. The same holds for the package name. Measured 2026-09-19 with
+#     nextest 0.9.136.
+#
+# ── WHY NOT `#[ignore]`, AND WHY NOT `continue-on-error` ─────────────────────
+# `#[ignore]` would hide these tests from the OPERATOR as well. Where an
+# oracle does exist, these tests are the whole point. `continue-on-error`
+# would turn the job green and swallow genuinely new failures with it.
+#
+# ── THE CRATE IS STILL COMPILED ON EVERY PR ──────────────────────────────────
+# test.yml runs `cargo test -p engenho-diff --all-targets --no-run` as its own
+# first step, and nextest builds every target before it filters. Only the
+# EXECUTION of the named binaries is deferred. Compiling them catches the
+# failure this repository actually had: a crate that quietly fell out of every
+# build path and rotted (CLAUDE.md § CI + gating).
+#
+# ── RUNNING THEM WHERE AN ORACLE EXISTS ──────────────────────────────────────
+#   ENGENHO_ORACLE_KUBECONFIG=<kubeconfig> cargo nextest run --profile oracle
+#
+# If ENGENHO_ORACLE_KUBECONFIG is unset or empty, the binaries fall back to
+# $HOME/.kube/engenho-local-tunnel.yaml (engenho-diff/tests/common/mod.rs ::
+# oracle_kubeconfig). That file pointed at a hand-built k3s VM that no longer
+# exists. Any conformant apiserver works, and a disposable `kind` cluster
+# pinned to the target Kubernetes version is the reproducible choice.
+#
+# The binaries share ONE oracle cluster and are not safe to run in parallel.
+# Measured 2026-08-09: run concurrently, one of them fails with a spurious
+# `MissingResource`. The `live-oracle` test group below runs them one at a
+# time under EVERY profile, including a run with `--ignore-default-filter`.
+# The cargo path, `cargo test -p engenho-diff`, does not read this file.
+#
+# ── WHY THE THREE SETS CANNOT DRIFT APART ────────────────────────────────────
+# The four names appear once, in `profile.default.default-filter`, and
+# that expression ANDs them with `package(=engenho-diff) & kind(=test)`. The
+# oracle profile and the serial test group both select exactly
+# `package(=engenho-diff) & kind(=test)`. So every binary the default run
+# skips is, by construction, one the oracle profile runs, one at a time. No
+# binary can be dropped from both.
+#
+# ── VERSION ──────────────────────────────────────────────────────────────────
+# `recommended` is substrate's pin: `github:pleme-io/substrate#cargo-nextest`,
+# 0.9.136 as of 2026-09-19. test.yml and the release gate both run that build.
+# `required` is the oldest version measured to honour `default-filter` and to
+# skip the named binaries: 0.9.114, 2026-09-19. It is not a claim about the
+# oldest version that could.
+
+nextest-version = { required = "0.9.114", recommended = "0.9.136" }
+
+[test-groups]
+live-oracle = { max-threads = 1 }
+
+[profile.default]
+# The CLAUDE.md rule, now the default: without it, the run stops at the first
+# failing test and the count it reports is not a count of the suite.
+fail-fast = false
+default-filter = '''
+not (
+    package(=engenho-diff) & kind(=test) & (
+          binary(=m0_core_crud_parity)
+        | binary(=patch_parity)
+        | binary(=selector_parity)
+        | binary(=status_subresource_parity)
+    )
+)
+'''
+
+# Defined on the default profile, so every other profile inherits it after its
+# own overrides.
+[[profile.default.overrides]]
+filter = 'package(=engenho-diff) & kind(=test)'
+test-group = 'live-oracle'
+
+[profile.oracle]
+# Every integration binary in engenho-diff, a superset of the four names that
+# the default profile skips. See "WHY THE THREE SETS CANNOT DRIFT APART".
+default-filter = 'package(=engenho-diff) & kind(=test)'
