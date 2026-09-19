@@ -45,11 +45,21 @@
 //! A controller asks to be ticked again by returning
 //! `ReconcileResult::Requeue(after)`; a Transient error asks the same
 //! thing implicitly. Both become ONE deadline in a `RequeueSlot` owned
-//! by the loop — never a task. [`next_wake`] is the single pure decision
+//! by the loop — never a task. [`next_wake`] is the single decision
 //! (outcome → delay); the slot is cleared when any tick starts, because a
 //! tick is a full sweep and satisfies whatever was pending, then re-armed
 //! from that tick's outcome. `wait_for_relevant_event` sleeps until the
 //! earlier of the fallback and the slot's deadline.
+//!
+//! ## Retries grow
+//!
+//! A Transient failure's targeted retry is read off [`TRANSIENT_RETRY`]
+//! (1 s doubling to 60 s) at the driver's count of consecutive failed
+//! ticks, which any `Ok` resets — upstream's per-item rate limiter,
+//! per driver. A re-subscribe after the stream ends is read off
+//! [`RESUBSCRIBE`] (100 ms doubling to 30 s), reset by a delivered event.
+//! Both are one [`Curve`]; neither is a flat retry, because a flat retry
+//! against a store that is down is a hot loop for as long as it is down.
 //!
 //! So a driver has at most one pending re-tick and at most one tick in
 //! flight, whatever the controller returns. The previous shape spawned a
@@ -67,7 +77,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use shigoto_types::failure::FailureKind;
+
 use crate::controller::{Controller, ReconcileOutcome};
+use crate::curve::{Curve, Streak};
 use crate::error::ControllerError;
 
 /// Filter: which resource kinds wake this driver's controller?
@@ -172,13 +185,23 @@ impl<C: Controller + 'static> WatchDriver<C> {
     }
 }
 
-/// Bounds on how fast the driver re-subscribes after the stream ends.
+/// How fast the driver re-subscribes after the stream ends: 100 ms
+/// doubling to 30 s, reset when a subscription delivers an event.
 ///
 /// Upstream's reflector wraps `ListAndWatch` in `wait.BackoffUntil`, so a
 /// store that keeps ending the subscription is retried forever but never
 /// hot-looped. Same shape, same reason.
-const RESUBSCRIBE_BACKOFF_MIN: Duration = Duration::from_millis(100);
-const RESUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+pub const RESUBSCRIBE: Curve = Curve::from_millis::<100, 30_000>();
+
+/// The targeted retry after a Transient failure: 1 s doubling to 60 s,
+/// indexed by the driver's [`ConsecutiveFailures`] and reset by any `Ok`.
+///
+/// Upstream's controller workqueue does the same per item (5 ms doubling
+/// to 1000 s); this is per driver, because a driver's tick is a full sweep
+/// and its failure is the sweep's. The cap sits above the default 30 s
+/// fallback on purpose: a driver that has failed for a minute is re-ticked
+/// by its events and its fallback, not by a retry of its own.
+pub const TRANSIENT_RETRY: Curve = Curve::from_millis::<1_000, 60_000>();
 
 /// Where the loop gets its live-tail subscription.
 ///
@@ -225,13 +248,14 @@ async fn subscribe<S: WatchSource + ?Sized>(
     }
 }
 
-/// Grow the re-subscribe delay geometrically, capped.
-fn grow(delay: Duration) -> Duration {
-    if delay.is_zero() {
-        RESUBSCRIBE_BACKOFF_MIN
-    } else {
-        (delay * 2).min(RESUBSCRIBE_BACKOFF_MAX)
-    }
+/// Re-subscribe after the stream ended or was refused, waiting the delay
+/// the next miss on `attempts` owes first.
+async fn resubscribe<S: WatchSource + ?Sized>(
+    source: &S,
+    controller: &'static str,
+    attempts: &mut Streak,
+) -> Option<WatchStream> {
+    subscribe(source, controller, attempts.miss()).await
 }
 
 async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
@@ -241,13 +265,20 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
 ) {
     let name = controller.name();
     let mut rx = subscribe(store.as_ref(), name, Duration::ZERO).await;
-    // Reset to zero whenever a subscription actually delivers an event —
-    // upstream resets its backoff on a watch that made progress.
-    let mut backoff = Duration::ZERO;
-    // The ONE pending re-tick this driver may have. Every tick below goes
-    // through `tick_into_slot`, which clears it and re-arms it; nothing
-    // else can schedule a tick, so there is no second one to pile up.
-    let mut slot = RequeueSlot::default();
+    // Re-subscribes since the last delivered event: reset whenever a
+    // subscription actually delivers one — upstream resets its backoff on
+    // a watch that made progress.
+    let mut resubscribes = Streak::new(RESUBSCRIBE);
+    // The ONE pending re-tick this driver may have, and its failed ticks
+    // in a row. Every tick below goes through `ticker.tick()`, which
+    // clears the slot and re-arms it; nothing else can schedule a tick, so
+    // there is no second one to pile up.
+    let mut ticker = Ticker {
+        controller,
+        stuck_after: config.stuck_tick_after,
+        slot: RequeueSlot::default(),
+        failures: ConsecutiveFailures::default(),
+    };
 
     info!(
         controller = name,
@@ -278,9 +309,9 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
     // the way a closed `ResultChan` sends upstream's reflector back
     // through `ListAndWatch`.
     loop {
-        match wait_for_relevant_event(rx.as_mut(), &config, slot).await {
+        match wait_for_relevant_event(rx.as_mut(), &config, ticker.slot).await {
             EventOrTimer::Event => {
-                backoff = Duration::ZERO;
+                resubscribes.reset();
                 // Coalesce the burst, then tick once.
                 tokio::time::sleep(config.debounce).await;
                 // A terminal can surface mid-drain. It is returned, never
@@ -289,15 +320,14 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
                 let gone = rx
                     .as_mut()
                     .and_then(|stream| drain_pending(stream, name, &config));
-                tick_into_slot(&controller, config.stuck_tick_after, &mut slot).await;
+                ticker.tick().await;
                 if let Some(gone) = gone {
                     warn!(
                         controller = name,
                         gone = %gone,
                         "watch stream gone while coalescing; re-subscribing"
                     );
-                    backoff = grow(backoff);
-                    rx = subscribe(store.as_ref(), name, backoff).await;
+                    rx = resubscribe(store.as_ref(), name, &mut resubscribes).await;
                 }
             }
             EventOrTimer::Gone(gone) => {
@@ -306,9 +336,8 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
                     gone = %gone,
                     "watch stream gone; ticking + re-subscribing"
                 );
-                tick_into_slot(&controller, config.stuck_tick_after, &mut slot).await;
-                backoff = grow(backoff);
-                rx = subscribe(store.as_ref(), name, backoff).await;
+                ticker.tick().await;
+                rx = resubscribe(store.as_ref(), name, &mut resubscribes).await;
             }
             EventOrTimer::StreamEnded => {
                 // NOT a shutdown. The subscription is over — the terminal
@@ -318,42 +347,90 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
                     controller = name,
                     "watch stream ended; ticking + re-subscribing (not a shutdown)"
                 );
-                tick_into_slot(&controller, config.stuck_tick_after, &mut slot).await;
-                backoff = grow(backoff);
-                rx = subscribe(store.as_ref(), name, backoff).await;
+                ticker.tick().await;
+                rx = resubscribe(store.as_ref(), name, &mut resubscribes).await;
             }
             wake @ (EventOrTimer::Requeue | EventOrTimer::FallbackTimer) => {
                 debug!(controller = name, ?wake, "timer wake");
-                tick_into_slot(&controller, config.stuck_tick_after, &mut slot).await;
+                ticker.tick().await;
                 // Either timer is the retry point for a refused
                 // subscription. Both must be: with a requeue due every
                 // second, the fallback (restarted on every wait) never
                 // fires, and a driver that re-subscribed only on the
                 // fallback would stay stream-less forever.
                 if rx.is_none() {
-                    backoff = grow(backoff);
-                    rx = subscribe(store.as_ref(), name, backoff).await;
+                    rx = resubscribe(store.as_ref(), name, &mut resubscribes).await;
                 }
             }
         }
     }
 }
 
+/// A driver's run of failed ticks in a row, read against
+/// [`TRANSIENT_RETRY`]. One per driver loop, owned by it; [`next_wake`]
+/// is the only thing that advances or resets it.
+///
+/// The curve is fixed by construction — there is no way to build one on a
+/// different curve — so every driver retries on the same schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsecutiveFailures(Streak);
+
+impl Default for ConsecutiveFailures {
+    fn default() -> Self {
+        Self(Streak::new(TRANSIENT_RETRY))
+    }
+}
+
+impl ConsecutiveFailures {
+    /// Failed ticks since the last `Ok`.
+    #[must_use]
+    pub const fn count(&self) -> u32 {
+        self.0.misses()
+    }
+}
+
 /// When the driver should tick again ON ITS OWN, given how the last tick
-/// ended. The one decision every self-scheduled re-tick goes through, in
-/// both drivers ([`WatchDriver`] and [`crate::ControllerRuntime`]).
+/// ended — and fold that tick into the driver's `failures`. The one
+/// decision every self-scheduled re-tick goes through, in both drivers
+/// ([`WatchDriver`] and [`crate::ControllerRuntime`]).
 ///
 ///   * `Ok` + `Done` → `None`: the next event or the fallback wakes it.
 ///   * `Ok` + `Requeue(d)` / `RequeueWithProgress(d)` → `Some(d)`.
 ///   * `Err`, Declarative → `None`: a broken declaration does not fix
 ///     itself by being retried. It is surfaced, and the next event or
 ///     the fallback still re-ticks it coarsely.
-///   * `Err`, Transient → a targeted retry (1 s, flat, for now).
+///   * `Err`, Transient → a targeted retry at [`TRANSIENT_RETRY`]'s next
+///     step: 1 s after the first failure in a row, doubling to 60 s.
+///
+/// Every `Ok` resets `failures`; every `Err`, of either class, extends it,
+/// so a Transient failure after a run of Declarative ones is retried as
+/// the Nth failure in a row, which it is.
 #[must_use]
-pub fn next_wake(result: &Result<ReconcileOutcome, ControllerError>) -> Option<Duration> {
+pub fn next_wake(
+    result: &Result<ReconcileOutcome, ControllerError>,
+    failures: &mut ConsecutiveFailures,
+) -> Option<Duration> {
     match result {
-        Ok(outcome) => outcome.result.requeue_after(),
-        Err(e) => e.retry_after(),
+        Ok(outcome) => {
+            failures.0.reset();
+            outcome.result.requeue_after()
+        }
+        Err(e) => {
+            let owed = failures.0.miss();
+            match e.classify() {
+                FailureKind::Declarative => None,
+                FailureKind::Transient => Some(owed),
+                // `FailureKind` is `#[non_exhaustive]`, so a class shigoto
+                // adds later lands here. It is retried on the same growing
+                // curve — kept trying, never faster than a Transient — and
+                // never at a flat delay.
+                #[allow(
+                    clippy::match_same_arms,
+                    reason = "the known class and the unknown ones are separate decisions that happen to agree today"
+                )]
+                _ => Some(owed),
+            }
+        }
     }
 }
 
@@ -398,7 +475,7 @@ fn millis(d: Duration) -> u64 {
 /// The driver's ONE pending re-tick: a deadline held by the loop, never
 /// a task.
 ///
-/// Owned by `run`: only `tick_into_slot` writes it, and
+/// Owned by `run`'s [`Ticker`]: only [`Ticker::tick`] writes it, and
 /// `wait_for_relevant_event` gets a copy to sleep on. There is no
 /// second holder of a pending re-tick, so there is nothing to pile up.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -427,22 +504,30 @@ impl RequeueSlot {
     }
 }
 
-/// Tick through the slot: clear it, tick, log, re-arm from the outcome.
-///
-/// The ONLY way `run` ticks. A requeue far enough out that the deadline
-/// does not fit in an `Instant` is left unarmed — it is further away than
-/// the fallback anyway.
-async fn tick_into_slot<C: Controller + ?Sized + 'static>(
-    controller: &Arc<C>,
+/// What `run` ticks through: the controller, the one requeue slot, and the
+/// driver's failed ticks in a row. `tick` is the ONLY way `run` ticks.
+struct Ticker<C: Controller + ?Sized + 'static> {
+    controller: Arc<C>,
     stuck_after: Duration,
-    slot: &mut RequeueSlot,
-) {
-    slot.clear();
-    let result = tick_observed(controller, stuck_after).await;
-    let wake = next_wake(&result);
-    log_tick(controller.name(), &result, wake);
-    if let Some(deadline) = wake.and_then(|after| Instant::now().checked_add(after)) {
-        slot.arm(deadline);
+    slot: RequeueSlot,
+    failures: ConsecutiveFailures,
+}
+
+impl<C: Controller + ?Sized + 'static> Ticker<C> {
+    /// Tick through the slot: clear it, tick, log, re-arm from the outcome
+    /// (which also advances or resets the failure streak).
+    ///
+    /// A requeue far enough out that the deadline does not fit in an
+    /// `Instant` is left unarmed — it is further away than the fallback
+    /// anyway.
+    async fn tick(&mut self) {
+        self.slot.clear();
+        let result = tick_observed(&self.controller, self.stuck_after).await;
+        let wake = next_wake(&result, &mut self.failures);
+        log_tick(self.controller.name(), &result, wake);
+        if let Some(deadline) = wake.and_then(|after| Instant::now().checked_add(after)) {
+            self.slot.arm(deadline);
+        }
     }
 }
 
@@ -704,20 +789,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resubscribe_backoff_grows_from_zero_and_caps() {
-        let mut d = Duration::ZERO;
-        d = grow(d);
-        assert_eq!(d, RESUBSCRIBE_BACKOFF_MIN, "first retry is the floor");
-        for _ in 0..20 {
-            d = grow(d);
-        }
-        assert_eq!(
-            d, RESUBSCRIBE_BACKOFF_MAX,
-            "a failing store must not hot-loop"
-        );
-    }
-
     // ── T2.1: one requeue slot per driver ──────────────────────────────
     //
     // The shape this replaces spawned a detached sleep-then-tick task for
@@ -755,6 +826,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum Answer {
+        Done,
         Requeue(Duration),
         Transient,
         Declarative,
@@ -763,6 +835,10 @@ mod tests {
     impl Answer {
         fn result(self) -> Result<ReconcileOutcome, ControllerError> {
             match self {
+                Self::Done => Ok(ReconcileOutcome::new(
+                    ReconcileReport::default(),
+                    ReconcileResult::Done,
+                )),
                 Self::Requeue(after) => Ok(ReconcileOutcome::new(
                     ReconcileReport::default(),
                     ReconcileResult::Requeue(after),
@@ -791,20 +867,39 @@ mod tests {
     /// was driven.
     struct Probe {
         answer: Answer,
+        /// How long one tick takes.
+        takes: Duration,
         stats: Mutex<Stats>,
+        /// When each tick started, in order.
+        starts: Mutex<Vec<Instant>>,
     }
 
     impl Probe {
         fn new(answer: Answer) -> Arc<Self> {
+            Self::taking(answer, TICK_TAKES)
+        }
+
+        fn taking(answer: Answer, takes: Duration) -> Arc<Self> {
             Arc::new(Self {
                 answer,
+                takes,
                 stats: Mutex::new(Stats::default()),
+                starts: Mutex::new(Vec::new()),
             })
         }
 
         fn stats(&self) -> Stats {
             *self.stats.lock().unwrap()
         }
+
+        /// The gaps between consecutive tick starts.
+        fn gaps(&self) -> Vec<Duration> {
+            gaps(&self.starts.lock().unwrap())
+        }
+    }
+
+    fn gaps(at: &[Instant]) -> Vec<Duration> {
+        at.windows(2).map(|w| w[1] - w[0]).collect()
     }
 
     #[async_trait::async_trait]
@@ -824,19 +919,26 @@ mod tests {
                 s.ticks += 1;
                 s.in_flight += 1;
                 s.max_in_flight = s.max_in_flight.max(s.in_flight);
+                self.starts.lock().unwrap().push(now);
             }
-            tokio::time::sleep(TICK_TAKES).await;
+            tokio::time::sleep(self.takes).await;
             self.stats.lock().unwrap().in_flight -= 1;
             self.answer.result()
         }
     }
 
     /// The store's live tail reduced to what the loop reads: a registry
-    /// the test fans changes into, which can refuse subscriptions.
+    /// the test fans changes into, which can refuse subscriptions or end
+    /// every one it grants.
     struct Feed {
         state: Mutex<(WatcherRegistry, Revision)>,
         refuse_next: AtomicUsize,
         accepted: AtomicUsize,
+        /// Grant each subscription from a registry that is dropped at
+        /// once, so the stream ends as soon as it is read.
+        end_every_stream: bool,
+        /// When each subscription was asked for, in order.
+        asked: Mutex<Vec<Instant>>,
     }
 
     impl Feed {
@@ -849,6 +951,18 @@ mod tests {
                 state: Mutex::new((WatcherRegistry::new(), Revision::ZERO)),
                 refuse_next: AtomicUsize::new(n),
                 accepted: AtomicUsize::new(0),
+                end_every_stream: false,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn ending_every_stream() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new((WatcherRegistry::new(), Revision::ZERO)),
+                refuse_next: AtomicUsize::new(0),
+                accepted: AtomicUsize::new(0),
+                end_every_stream: true,
+                asked: Mutex::new(Vec::new()),
             })
         }
 
@@ -863,6 +977,7 @@ mod tests {
     #[async_trait::async_trait]
     impl WatchSource for Feed {
         async fn watch(&self) -> Result<WatchStream, WatchGone> {
+            self.asked.lock().unwrap().push(Instant::now());
             let refused = self
                 .refuse_next
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -874,42 +989,62 @@ mod tests {
                 });
             }
             self.accepted.fetch_add(1, Ordering::SeqCst);
+            let opts = |from| WatchOpts {
+                from,
+                buffer: 1024,
+                bookmark_every: Duration::ZERO,
+            };
+            if self.end_every_stream {
+                // The registry, and with it the stream's sender, is
+                // dropped on return: the stream reads as ended.
+                return Ok(WatcherRegistry::new().register_captured(
+                    Vec::new(),
+                    Revision::ZERO,
+                    &opts(Revision::ZERO),
+                ));
+            }
             let mut state = self.state.lock().unwrap();
             let (reg, rev) = &mut *state;
-            Ok(reg.register_captured(
-                Vec::new(),
-                *rev,
-                &WatchOpts {
-                    from: *rev,
-                    buffer: 1024,
-                    bookmark_every: Duration::ZERO,
-                },
-            ))
+            Ok(reg.register_captured(Vec::new(), *rev, &opts(*rev)))
         }
     }
 
     /// Drive the real loop for one virtual hour: an event every 5 s and a
     /// 30 s fallback.
     async fn an_hour_of(probe: &Arc<Probe>, feed: &Arc<Feed>) -> Stats {
+        drive(probe, feed, FALLBACK, Some(EVENT_EVERY), HOUR).await
+    }
+
+    /// Drive the real loop for `run_for` of virtual time, with the given
+    /// fallback, emitting an event every `event_every` if set.
+    async fn drive(
+        probe: &Arc<Probe>,
+        feed: &Arc<Feed>,
+        fallback: Duration,
+        event_every: Option<Duration>,
+        run_for: Duration,
+    ) -> Stats {
         let config = WatchDriverConfig {
-            fallback_interval: FALLBACK,
+            fallback_interval: fallback,
             ..WatchDriverConfig::default()
         };
         let driver = tokio::spawn(run(probe.clone(), feed.clone(), config));
-        let events = tokio::spawn({
+        let events = event_every.map(|every| {
             let feed = feed.clone();
-            async move {
+            tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(EVENT_EVERY).await;
+                    tokio::time::sleep(every).await;
                     feed.emit();
                 }
-            }
+            })
         });
-        tokio::time::sleep(HOUR).await;
+        tokio::time::sleep(run_for).await;
         driver.abort();
-        events.abort();
         let _ = driver.await;
-        let _ = events.await;
+        if let Some(events) = events {
+            events.abort();
+            let _ = events.await;
+        }
         probe.stats()
     }
 
@@ -946,7 +1081,11 @@ mod tests {
     async fn a_controller_that_always_fails_transiently_gets_one_slot_not_a_chain() {
         let probe = Probe::new(Answer::Transient);
         assert!(
-            next_wake(&Answer::Transient.result()).is_some(),
+            next_wake(
+                &Answer::Transient.result(),
+                &mut ConsecutiveFailures::default()
+            )
+            .is_some(),
             "precondition: a Transient error is retried"
         );
         let s = an_hour_of(&probe, &Feed::new()).await;
@@ -999,23 +1138,143 @@ mod tests {
 
     #[test]
     fn next_wake_on_a_declarative_error_is_none() {
-        assert_eq!(next_wake(&Answer::Declarative.result()), None);
+        let mut failures = ConsecutiveFailures::default();
+        for _ in 0..3 {
+            assert_eq!(
+                next_wake(&Answer::Declarative.result(), &mut failures),
+                None
+            );
+        }
     }
 
     #[test]
     fn next_wake_follows_the_outcome() {
         let d = Duration::from_millis(250);
         let ok = |result| Ok(ReconcileOutcome::new(ReconcileReport::default(), result));
-        assert_eq!(next_wake(&ok(ReconcileResult::Done)), None);
-        assert_eq!(next_wake(&ok(ReconcileResult::Requeue(d))), Some(d));
+        let mut failures = ConsecutiveFailures::default();
+        assert_eq!(next_wake(&ok(ReconcileResult::Done), &mut failures), None);
         assert_eq!(
-            next_wake(&ok(ReconcileResult::RequeueWithProgress(d))),
+            next_wake(&ok(ReconcileResult::Requeue(d)), &mut failures),
             Some(d)
         );
-        // Flat 1 s until T2.2 replaces it with a growing curve.
         assert_eq!(
-            next_wake(&Answer::Transient.result()),
+            next_wake(&ok(ReconcileResult::RequeueWithProgress(d)), &mut failures),
+            Some(d)
+        );
+        // The first Transient failure in a row is retried at the base.
+        assert_eq!(
+            next_wake(&Answer::Transient.result(), &mut failures),
             Some(Duration::from_secs(1))
+        );
+    }
+
+    // ── T2.2: retries grow ─────────────────────────────────────────────
+    //
+    // A Transient failure used to be retried at a flat 1 s for as long as
+    // it lasted: a store that was down for an hour cost every driver 3,600
+    // failed sweeps, each a log line and a round-trip. The retry now grows
+    // on one curve, and forgets on success.
+
+    /// Measured on the real loop, with no events. The fallback fires the
+    /// first tick and is longer than the cap, so it never fires again once
+    /// the retries start: every later tick is a targeted retry. Each gap is
+    /// at least 1.8x the one before until the cap, and then holds at it.
+    #[tokio::test(start_paused = true)]
+    async fn transient_retry_gaps_grow_until_the_cap() {
+        const KICK: Duration = Duration::from_secs(90);
+        const _: () = assert!(KICK.as_millis() > TRANSIENT_RETRY.cap().as_millis() + 100);
+        let probe = Probe::new(Answer::Transient);
+        let _ = drive(&probe, &Feed::new(), KICK, None, Duration::from_secs(600)).await;
+        let gaps = probe.gaps();
+        let cap = TRANSIENT_RETRY.cap() + TICK_TAKES;
+
+        assert_eq!(
+            gaps.first().copied(),
+            Some(TRANSIENT_RETRY.base() + TICK_TAKES),
+            "the first retry is at the base: {gaps:?}"
+        );
+        assert_grows_then_holds(&gaps, cap);
+        assert!(
+            gaps.iter().filter(|g| **g == cap).count() >= 3,
+            "ten minutes of failure never reached the {cap:?} cap: {gaps:?}"
+        );
+    }
+
+    /// Every gap is at least 1.8x the one before it until one reaches
+    /// `cap`; from there every gap is exactly `cap`.
+    fn assert_grows_then_holds(gaps: &[Duration], cap: Duration) {
+        assert!(gaps.len() >= 3, "too few retries to see a curve: {gaps:?}");
+        for pair in gaps.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(b <= cap, "a {b:?} gap is past the {cap:?} cap: {gaps:?}");
+            if a < cap {
+                assert!(
+                    b == cap || b.as_micros() * 10 >= a.as_micros() * 18,
+                    "{a:?} then {b:?}: the retry gap did not grow 1.8x toward the cap: {gaps:?}"
+                );
+            } else {
+                assert_eq!(b, cap, "past the cap the gap holds: {gaps:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_success_resets_the_retry_curve() {
+        let mut failures = ConsecutiveFailures::default();
+        let owed: Vec<_> = (0..4)
+            .map(|_| next_wake(&Answer::Transient.result(), &mut failures))
+            .collect();
+        assert_eq!(
+            owed,
+            [1, 2, 4, 8].map(|s| Some(Duration::from_secs(s))),
+            "consecutive failures walk the curve"
+        );
+        assert_eq!(failures.count(), 4);
+
+        let _ = next_wake(&Answer::Done.result(), &mut failures);
+        assert_eq!(failures.count(), 0, "an Ok ends the streak");
+        assert_eq!(
+            next_wake(&Answer::Transient.result(), &mut failures),
+            Some(TRANSIENT_RETRY.base()),
+            "the first failure after a success is retried at the base again"
+        );
+    }
+
+    /// A Declarative failure is not retried, but it is a failure in a row:
+    /// a Transient one after it is retried further out, not at the base.
+    #[test]
+    fn a_declarative_failure_extends_the_streak_without_a_retry() {
+        let mut failures = ConsecutiveFailures::default();
+        assert_eq!(
+            next_wake(&Answer::Declarative.result(), &mut failures),
+            None
+        );
+        assert_eq!(failures.count(), 1);
+        assert_eq!(
+            next_wake(&Answer::Transient.result(), &mut failures),
+            Some(TRANSIENT_RETRY.delay(1))
+        );
+    }
+
+    /// The re-subscribe path on the same curve family: a store that ends
+    /// every stream it grants is asked again at gaps growing 1.8x per
+    /// attempt up to the 30 s cap — never hot-looped, never abandoned.
+    #[tokio::test(start_paused = true)]
+    async fn resubscribe_gaps_grow_until_the_cap() {
+        let probe = Probe::taking(Answer::Done, Duration::ZERO);
+        let feed = Feed::ending_every_stream();
+        let _ = drive(&probe, &feed, HOUR, None, Duration::from_secs(300)).await;
+        let gaps = gaps(&feed.asked.lock().unwrap());
+
+        assert_eq!(
+            gaps.first().copied(),
+            Some(RESUBSCRIBE.base()),
+            "the first re-subscribe waits the base: {gaps:?}"
+        );
+        assert_grows_then_holds(&gaps, RESUBSCRIBE.cap());
+        assert!(
+            gaps.iter().filter(|g| **g == RESUBSCRIBE.cap()).count() >= 3,
+            "five minutes of ended streams never reached the cap: {gaps:?}"
         );
     }
 

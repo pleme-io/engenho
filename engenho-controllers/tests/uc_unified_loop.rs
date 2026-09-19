@@ -9,17 +9,19 @@
 //!      `after` — NOT a silent warn-and-wait. The WatchDriver arms its
 //!      one requeue slot, and the wait wakes on it.
 //!   3. A controller that returns a Transient `ControllerError::Store`
-//!      is RETRIED (the loop schedules a re-tick), while a Declarative
-//!      error is surfaced + NOT targeted-retried — proven via the typed
-//!      classifier on `ControllerError`.
+//!      is RETRIED on a growing curve (the loop schedules a re-tick),
+//!      while a Declarative error is surfaced + NOT targeted-retried —
+//!      proven via `next_wake`, the decision the loop consults. The
+//!      variant decides the class, never the message text.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use engenho_controllers::{
-    Controller, ControllerError, KindFilter, ReconcileOutcome, ReconcileReport, ReconcileResult,
-    ReplicaSetController, WatchDriver, WatchDriverConfig,
+    ConsecutiveFailures, Controller, ControllerError, KindFilter, ReconcileOutcome,
+    ReconcileReport, ReconcileResult, ReplicaSetController, WatchDriver, WatchDriverConfig,
+    next_wake,
 };
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
@@ -27,6 +29,7 @@ use engenho_store::{
     default_config,
 };
 use serde_json::json;
+use shigoto_types::failure::FailureKind;
 
 async fn boot() -> Arc<StoreMesh> {
     let router = InProcessRouter::new();
@@ -178,45 +181,73 @@ async fn requeue_result_arms_the_requeue_slot_not_swallowed() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// (3) Typed error classification: Transient is retried; Declarative is
-//     surfaced + NOT targeted-retried. Asserted directly on the typed
-//     ControllerError classifier the loop consults (so the test is
-//     deterministic + needs no real failing store).
+// (3) Typed error classification: Transient is retried on a growing
+//     curve; Declarative is surfaced + NOT targeted-retried. The class is
+//     the VARIANT's, never the message's. Asserted on `next_wake`, the
+//     decision the loop consults (deterministic; no real failing store).
 // ──────────────────────────────────────────────────────────────────────
 
+fn targeted_retry(e: ControllerError, failures: &mut ConsecutiveFailures) -> Option<Duration> {
+    next_wake(&Err(e), failures)
+}
+
 #[test]
-fn store_error_classifies_transient_and_retries() {
-    // A store/transport failure is Transient by the fleet classifier →
-    // the loop schedules a targeted retry at ~1s instead of waiting the
-    // flat 30s fallback.
-    let e = ControllerError::Store(engenho_store::StoreError::ClientWriteFailed(
-        "connection refused".into(),
-    ));
-    assert_eq!(e.classify(), shigoto_types::failure::FailureKind::Transient);
-    assert_eq!(e.retry_after(), Some(Duration::from_secs(1)));
+fn store_error_classifies_transient_and_retries_on_a_growing_curve() {
+    // A proposal that did not commit is Transient → a targeted retry at
+    // 1 s, then 2 s, 4 s … — never a flat retry for as long as the store
+    // is down.
+    let e = || {
+        ControllerError::Store(engenho_store::StoreError::ClientWriteFailed(
+            "connection refused".into(),
+        ))
+    };
+    assert_eq!(e().classify(), FailureKind::Transient);
+    let mut failures = ConsecutiveFailures::default();
+    assert_eq!(
+        targeted_retry(e(), &mut failures),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        targeted_retry(e(), &mut failures),
+        Some(Duration::from_secs(2))
+    );
+    assert_eq!(
+        targeted_retry(e(), &mut failures),
+        Some(Duration::from_secs(4))
+    );
 }
 
 #[test]
 fn invalid_resource_classifies_declarative_and_does_not_retry() {
     // A malformed declaration is Declarative → surfaced, NO targeted
-    // retry (retry_after == None). The prior loop retried this forever.
+    // retry. The prior loop retried this forever.
     let e = ControllerError::InvalidResource("missing the attribute `template`".into());
-    assert_eq!(
-        e.classify(),
-        shigoto_types::failure::FailureKind::Declarative
-    );
-    assert_eq!(e.retry_after(), None);
+    assert_eq!(e.classify(), FailureKind::Declarative);
+    assert_eq!(targeted_retry(e, &mut ConsecutiveFailures::default()), None);
 }
 
 #[test]
-fn internal_error_with_declarative_signature_is_surfaced() {
-    // An Internal error whose message carries a documented Declarative
-    // signature is classified Declarative (consumes the fleet classifier,
-    // not a fork) → surfaced, not blind-retried.
-    let e = ControllerError::Internal("schema validation failed: unknown attribute".into());
+fn the_message_text_does_not_decide_the_retry() {
+    // This replaces a test that asserted the opposite: that an `Internal`
+    // error whose text contained a Declarative signature was surfaced and
+    // not retried. The class was read off the wording, so a `raft fatal`
+    // store error was retried forever and an I/O failure that mentioned
+    // "does not exist" was dropped. The variant now decides.
+    let declarative_words = "schema validation failed: unknown attribute";
+    let internal = ControllerError::Internal(declarative_words.into());
+    assert_eq!(internal.classify(), FailureKind::Transient);
     assert_eq!(
-        e.classify(),
-        shigoto_types::failure::FailureKind::Declarative
+        targeted_retry(internal, &mut ConsecutiveFailures::default()),
+        Some(Duration::from_secs(1)),
+        "an Internal error is retried whatever it says"
     );
-    assert_eq!(e.retry_after(), None);
+
+    let transient_words = "connection refused";
+    let fatal = ControllerError::Store(engenho_store::StoreError::Fatal(transient_words.into()));
+    assert_eq!(fatal.classify(), FailureKind::Declarative);
+    assert_eq!(
+        targeted_retry(fatal, &mut ConsecutiveFailures::default()),
+        None,
+        "a stopped Raft core is surfaced whatever it says"
+    );
 }

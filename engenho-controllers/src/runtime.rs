@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use crate::controller::Controller;
-use crate::watch_driver::{log_tick, next_wake};
+use crate::watch_driver::{ConsecutiveFailures, log_tick, next_wake};
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -90,6 +90,9 @@ impl ControllerRuntime {
         let mut handles = Vec::new();
         for (controller, interval) in self.controllers {
             let handle = tokio::spawn(async move {
+                // This controller's failed ticks in a row: its Transient
+                // retries grow on the same curve as a WatchDriver's.
+                let mut failures = ConsecutiveFailures::default();
                 loop {
                     // The interval-only path consumes the typed outcome
                     // through the SAME decision as the WatchDriver
@@ -99,7 +102,7 @@ impl ControllerRuntime {
                     // Declarative error wait the normal interval. One
                     // sequential sleep is this loop's one requeue slot.
                     let result = controller.tick().await;
-                    let wake = next_wake(&result);
+                    let wake = next_wake(&result, &mut failures);
                     log_tick(controller.name(), &result, wake);
                     let next_delay = wake.map_or(interval, |after| after.min(interval));
                     tokio::time::sleep(next_delay).await;
@@ -145,6 +148,62 @@ mod tests {
             }
             .into())
         }
+    }
+
+    /// A controller that always fails Transiently, recording when each
+    /// tick started.
+    struct AlwaysTransient {
+        starts: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    #[async_trait]
+    impl Controller for AlwaysTransient {
+        fn name(&self) -> &'static str {
+            "always_transient"
+        }
+        async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+            self.starts
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
+            Err(ControllerError::Store(
+                engenho_store::StoreError::ClientWriteFailed("no leader".into()),
+            ))
+        }
+    }
+
+    /// The interval-only loop owns a failure streak too: its Transient
+    /// retries grow on the same curve as a `WatchDriver`'s, capped at the
+    /// interval, instead of re-ticking at a flat second.
+    #[tokio::test(start_paused = true)]
+    async fn runtime_transient_retries_grow_up_to_the_interval() {
+        let interval = Duration::from_secs(30);
+        let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut rt = ControllerRuntime::new(RuntimeConfig {
+            default_interval: interval,
+        });
+        rt.register(AlwaysTransient {
+            starts: starts.clone(),
+        });
+        let handles = rt.spawn();
+        tokio::time::sleep(Duration::from_secs(180)).await;
+        for h in handles {
+            h.abort();
+        }
+        let at = starts.lock().unwrap().clone();
+        let gaps: Vec<u64> = at
+            .windows(2)
+            .map(|w| u64::try_from((w[1] - w[0]).as_millis()).unwrap())
+            .collect();
+        assert_eq!(
+            gaps.get(..6),
+            Some(&[1_000, 2_000, 4_000, 8_000, 16_000, 30_000][..]),
+            "retry gaps must double from 1 s and stop at the interval: {gaps:?}"
+        );
+        assert!(
+            gaps[5..].iter().all(|g| *g == 30_000),
+            "past the cap the interval holds: {gaps:?}"
+        );
     }
 
     #[test]

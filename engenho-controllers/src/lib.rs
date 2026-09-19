@@ -41,6 +41,7 @@ pub mod crd_validator;
 pub mod create_stamp;
 pub mod cron;
 pub mod csi_provisioner;
+pub mod curve;
 pub mod daemonset;
 pub mod deployment;
 pub mod dns;
@@ -136,6 +137,7 @@ pub use engenho_substrate::FrozenClock;
     note = "use engenho_substrate::FrozenClock directly (ms precision)"
 )]
 pub type FixedClock = engenho_substrate::FrozenClock;
+pub use curve::{Curve, Streak};
 pub use meta::ObjectMeta;
 pub use namespace::{NamespaceController, namespaced_kinds};
 pub use network_policy::{
@@ -173,4 +175,7 @@ pub use store_ledger::{DEFAULT_RECEIPT_NAMESPACE, StoreBackedLedger};
 pub use store_resolver::StoreBackedNodeResolver;
 pub use tiered_build::TieredBuildBackend;
 pub use tiered_reconciler::{PromotionScope, StaticPromotionScope, TieredCacheReconciler};
-pub use watch_driver::{KindFilter, WatchDriver, WatchDriverConfig, next_wake};
+pub use watch_driver::{
+    ConsecutiveFailures, KindFilter, RESUBSCRIBE, TRANSIENT_RETRY, WatchDriver, WatchDriverConfig,
+    next_wake,
+};
