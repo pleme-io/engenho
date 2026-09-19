@@ -23,10 +23,15 @@
 //!
 //! ## Aggregation
 //!
-//! `outcome()` walks all receipts matching a `LedgerKey`,
-//! reconstructs a `QuorumTracker`, returns the current outcome.
+//! `outcome()` walks all receipts matching a `LedgerKey`, folds them
+//! into a `QuorumTracker` built with the stored threshold, and returns
+//! the tracker's own verdict. It never computes a verdict itself: the
+//! verdict is sealed, so there is no second copy of the fold here.
+//! A receipt whose stored threshold is missing or zero is skipped like
+//! an undecodable one.
 //! `forget_stage` deletes every receipt resource for the stage.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,8 +41,8 @@ use engenho_store::{
     resource::ResourceKey,
 };
 use engenho_substrate::{
-    LedgerError, LedgerKey, MaterializationLedger, MaterializationReceipt, QuorumOutcome,
-    QuorumTracker, ReceiptKind, StageId,
+    LedgerError, LedgerKey, MaterializationLedger, MaterializationReceipt, QuorumTracker,
+    QuorumVerdict, ReceiptKind, StageId,
 };
 use serde_json::json;
 
@@ -111,9 +116,9 @@ impl MaterializationLedger for StoreBackedLedger {
     async fn ingest(
         &self,
         stage_id: &StageId,
-        threshold: usize,
+        threshold: NonZeroUsize,
         receipt: &MaterializationReceipt,
-    ) -> Result<QuorumOutcome, LedgerError> {
+    ) -> Result<QuorumVerdict, LedgerError> {
         // Commit the receipt as a typed resource.
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| LedgerError::Backend(format!("encode receipt: {e}")))?;
@@ -127,7 +132,7 @@ impl MaterializationLedger for StoreBackedLedger {
             },
             "spec": {
                 "stage_id": stage_id.as_str(),
-                "threshold": threshold,
+                "threshold": threshold.get(),
                 "receipt": receipt_json,
             },
         });
@@ -148,15 +153,16 @@ impl MaterializationLedger for StoreBackedLedger {
             subject: receipt.subject,
         };
         match self.outcome(&ledger_key).await? {
-            Some(o) => Ok(o),
-            None => Ok(QuorumOutcome::Pending {
-                confirmed: 0,
-                threshold: threshold.max(1),
-            }),
+            Some(verdict) => Ok(verdict),
+            // The list did not show the receipt just committed: report
+            // the empty fold (pending, nothing counted) rather than guess.
+            None => {
+                Ok(QuorumTracker::new(receipt.kind.clone(), receipt.subject, threshold).verdict())
+            }
         }
     }
 
-    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumOutcome>, LedgerError> {
+    async fn outcome(&self, key: &LedgerKey) -> Result<Option<QuorumVerdict>, LedgerError> {
         let all = self
             .store
             .list(
@@ -167,7 +173,6 @@ impl MaterializationLedger for StoreBackedLedger {
             )
             .await;
         let mut tracker: Option<QuorumTracker> = None;
-        let mut threshold_seen: Option<usize> = None;
         for (_, v) in all {
             let spec = match v.get("spec") {
                 Some(s) => s,
@@ -191,43 +196,23 @@ impl MaterializationLedger for StoreBackedLedger {
             if receipt.kind != key.kind || receipt.subject != key.subject {
                 continue;
             }
-            // Track threshold from any committed receipt (operators
+            // The first committed receipt fixes the threshold (operators
             // shouldn't disagree on threshold for the same key).
-            let t = spec
+            let Some(threshold) = spec
                 .get("threshold")
-                .and_then(|n| n.as_u64())
-                .map(|n| n as usize)
-                .unwrap_or(1);
-            threshold_seen.get_or_insert(t);
-            let trk = tracker.get_or_insert_with(|| {
-                QuorumTracker::new(receipt.kind.clone(), receipt.subject, t.max(1))
-            });
-            trk.ingest(&receipt);
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .and_then(NonZeroUsize::new)
+            else {
+                continue;
+            };
+            tracker
+                .get_or_insert_with(|| {
+                    QuorumTracker::new(receipt.kind.clone(), receipt.subject, threshold)
+                })
+                .ingest(&receipt);
         }
-        Ok(tracker.map(|t| {
-            // The last ingest's outcome IS the current state.
-            // We don't have it cached — re-run the math via the
-            // tracker's public accessors.
-            let confirmed = t.confirmed_count();
-            let variants = t.evidence_variants();
-            let threshold = threshold_seen.unwrap_or(1);
-            if variants > 1 && confirmed >= threshold {
-                QuorumOutcome::Dissent {
-                    confirmed,
-                    evidence_variants: variants,
-                }
-            } else if confirmed >= threshold {
-                QuorumOutcome::Reached {
-                    confirmed,
-                    threshold,
-                }
-            } else {
-                QuorumOutcome::Pending {
-                    confirmed,
-                    threshold,
-                }
-            }
-        }))
+        Ok(tracker.map(|t| t.verdict()))
     }
 
     async fn forget_stage(&self, stage_id: &StageId) -> Result<(), LedgerError> {
@@ -299,6 +284,98 @@ mod tests {
 
     fn stage() -> StageId {
         StageId::new("build-image")
+    }
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("test thresholds are non-zero")
+    }
+
+    async fn test_store(name: &str) -> Arc<StoreMesh> {
+        use engenho_store::{InProcessRouter, default_config};
+        let router = InProcessRouter::new();
+        let cfg = default_config(name).unwrap();
+        let store = Arc::new(
+            StoreMesh::start(1, "in-process://1".into(), router, cfg)
+                .await
+                .unwrap(),
+        );
+        store.initialize_singleton().await.unwrap();
+        assert!(
+            store
+                .wait_for_leadership(std::time::Duration::from_secs(3))
+                .await
+        );
+        store
+    }
+
+    fn drv_key() -> LedgerKey {
+        LedgerKey {
+            stage_id: stage(),
+            kind: ReceiptKind::Drv,
+            subject: [7u8; 32],
+        }
+    }
+
+    // ── outcome: the tracker's verdict, not a second fold ──────
+
+    #[tokio::test]
+    async fn outcome_is_the_trackers_verdict_against_the_stored_threshold() {
+        let ledger = StoreBackedLedger::new(test_store("store-ledger-threshold").await);
+        let first = ledger
+            .ingest(&stage(), nz(3), &rcpt_drv(1, 5))
+            .await
+            .unwrap();
+        let read = ledger
+            .outcome(&drv_key())
+            .await
+            .unwrap()
+            .expect("slot exists");
+        assert_eq!(read.state(), engenho_substrate::QuorumState::Pending);
+        assert_eq!((read.confirmed(), read.threshold()), (1, nz(3)));
+        assert_eq!(read, first);
+        ledger
+            .ingest(&stage(), nz(3), &rcpt_drv(2, 5))
+            .await
+            .unwrap();
+        let last = ledger
+            .ingest(&stage(), nz(3), &rcpt_drv(3, 5))
+            .await
+            .unwrap();
+        assert!(last.is_reached());
+        assert_eq!(ledger.outcome(&drv_key()).await.unwrap(), Some(last));
+    }
+
+    #[tokio::test]
+    async fn a_receipt_with_a_zero_threshold_is_not_counted() {
+        let store = test_store("store-ledger-zero").await;
+        let ledger = StoreBackedLedger::new(store.clone());
+        let receipt = rcpt_drv(1, 5);
+        let name = StoreBackedLedger::receipt_name(&stage(), &receipt);
+        store
+            .propose(ResourceCommand::Put {
+                key: ResourceKey::namespaced(
+                    "engenho.io",
+                    "v1",
+                    "MaterializationReceipt",
+                    DEFAULT_RECEIPT_NAMESPACE,
+                    &name,
+                ),
+                value: json!({
+                    "apiVersion": "engenho.io/v1",
+                    "kind": "MaterializationReceipt",
+                    "metadata": {"name": name, "namespace": DEFAULT_RECEIPT_NAMESPACE},
+                    "spec": {
+                        "stage_id": stage().as_str(),
+                        "threshold": 0,
+                        "receipt": serde_json::to_value(&receipt).unwrap(),
+                    },
+                }),
+                expected: None,
+                reason: Reason::Controller,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ledger.outcome(&drv_key()).await.unwrap(), None);
     }
 
     // ── receipt_name ──────────────────────────────────────────

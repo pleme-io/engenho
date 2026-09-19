@@ -65,7 +65,7 @@ is the one everything else in that domain hangs off.
 | `ClusterState` / `ClusterEvent` | `kikai/src/state.rs` | 14-state lifecycle FSM (SM ①) |
 | `Role` | `topology.rs` | `Master · Worker · Bootstrap · Observer`; `is_voting()` |
 | `NodeState` | `topology.rs` | `Joining · Standby · Active(Role) · Demoting · Departing · Failed` |
-| `RoleAssignment` | `topology.rs` | committed `Vec<(NodeId, NodeState)>`; `has_majority()` — true whenever any voter exists, so not yet a majority check; no caller |
+| `RoleAssignment` | `topology.rs` | committed `Vec<(NodeId, NodeState)>`; `has_majority(reachable)` — a strict majority of the configured voters, counted through the quorum fold (`Tally`); no caller on the promotion path |
 | `Transition` | `topology.rs` | `Admit · Promote · Demote · Reassign · Evict` |
 | `RoleAssignment` (cmd) | `engenho-revoada/src/consensus/role_assignment.rs` | `Promote · Demote · Quarantine · Restore` + `Reason` |
 | `RoleAttestationBlock` | revoada/attestation | `{prev_hash, assignment, raft_term, raft_log_index, leader_sig, witness_sigs}` |
@@ -101,7 +101,7 @@ is the one everything else in that domain hangs off.
 | `Realisation` | derivation.rs | `{drv_hash, output_name, output_path, nar_hash}` |
 | `WorkloadShape` | `shape.rs` | `OciImage · NixClosure · Qcow2 · Wasm · StaticBinary{triple} · HelmChart · Custom{name}` |
 | `MaterializationReceipt` / `ReceiptKind` | `receipt.rs` | signed evidence of materialization |
-| `QuorumOutcome` | `quorum.rs` | `Pending · Reached · Dissent` (K-of-N independent rebuilds) |
+| `QuorumVerdict` | `quorum.rs` | sealed: private fields, built only by `Tally::verdict`; `state()` is `QuorumState{Pending · Reached · Dissent}` (K-of-N independent rebuilds over a `NonZeroUsize` threshold) |
 | `LineageGraph` / `LineageProof` | `linhagem_aberta.rs` | causality DAG, BLAKE3 fingerprints |
 | `Budget` (orçamento) · `Provacao` · `Clock`/`HlcClock` (relógio) | resp. files | token-bucket · deterministic fault inject · logical clock |
 | `StateMachine` / `MachineRunner` / `TransitionRecord` | `maquina.rs` | the FSM substrate every SM lifts into |

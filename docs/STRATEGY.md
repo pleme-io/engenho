@@ -46,7 +46,7 @@ The three axes the design is built around are **one** claim:
 3. **Content-address everything; attest every transition.** Bits are
    BLAKE3-addressed `Drv` / `WorkloadShape` outputs. Role shifts and
    materializations write signed, hash-linked chain blocks (tameshi).
-   **Trust = K-of-N independent rebuild agreement** (`QuorumOutcome`),
+   **Trust = K-of-N independent rebuild agreement** (`QuorumVerdict`),
    not authority.
 4. **Formation by configuration, not procedure.** Operators pick a
    `TopologyStrategy`; the substrate handles every loss case the
@@ -92,7 +92,7 @@ OpenSSL.
 - **Membership** (gossip): `start · subscribe · update_local_state ·
   wait_for_members · peers · shutdown`.
 - **Substrate** (`engenho-substrate`): `put_drv/get_drv · build ·
-  render(shape) · ingest(receipt)→QuorumOutcome · verify ·
+  render(shape) · ingest(receipt)→QuorumVerdict · verify ·
   ledger.broadcast/gossip · cache.{get,promote}`.
 - **Reconcile** (`controllers` / `scheduler` / `kubelet` / `fonte`):
   `tick → {ReconcileReport | Binding | ContainerStatus | Outcome}`.
@@ -146,7 +146,7 @@ real cluster** until engenho-native lands (M0.4).
 
 Each typed primitive unlocks the next layer for free: a `Drv` that
 content-addresses unlocks the ledger that distributes it; a
-`QuorumOutcome` over independent rebuilds unlocks trust without
+`QuorumVerdict` over independent rebuilds unlocks trust without
 authority; a `Face` that translates unlocks every CLI without forking
 the store; a `TopologyStrategy` that declares a shape unlocks
 self-healing without procedural failure code; a `Typescape` impl

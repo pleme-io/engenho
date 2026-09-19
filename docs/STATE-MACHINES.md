@@ -197,8 +197,12 @@ design, and no code steps through it.
 - `engenho-substrate/src/quorum.rs::QuorumTracker` — the quorum fold for
   one `(kind, subject)`. `engenho-substrate/src/quorum.rs::QuorumTracker::ingest`
   is its transition function, and
-  `engenho-substrate/src/quorum.rs::QuorumOutcome` (`Pending · Reached ·
-  Dissent`) its state.
+  `engenho-substrate/src/quorum.rs::QuorumVerdict` its state
+  (`QuorumState`: `Pending · Reached · Dissent`). The arithmetic lives in
+  `engenho-substrate/src/quorum.rs::Tally::verdict`, the only constructor
+  of a `QuorumVerdict` (its fields are private, so a copy elsewhere is
+  E0451). revoada's `RoleAssignment::has_majority` and
+  `TopologyReactor`'s bootstrap gate count through the same `Tally`.
 - `engenho-substrate/src/receipt.rs::MaterializationReceipt` — the event
   the fold consumes: kind, subject, emitter and `evidence_hash`.
 - `engenho-substrate/src/derivation.rs::Drv` and
@@ -208,15 +212,14 @@ design, and no code steps through it.
 - `engenho-substrate/src/shape.rs::WorkloadShape` — `OciImage · NixClosure
   · Qcow2 · Wasm · StaticBinary{triple} · HelmChart · Custom{name}`.
 - `engenho-substrate/src/roca.rs` — the materialization-job staging.
-- Two mirrors that re-derive the verdict outside the fold:
+- The ledgers, which hold trackers and return their verdicts:
   `engenho-substrate/src/ledger.rs::MemoryLedger` and
-  `engenho-controllers/src/store_ledger.rs::StoreBackedLedger`. In wave 3
-  of the improvement plan (T5.3), `QuorumTracker` becomes the only fold
-  and both mirrors are deleted.
+  `engenho-controllers/src/store_ledger.rs::StoreBackedLedger`. Neither
+  computes a verdict of its own (improvement plan T5.3, W10).
 
 **The fold, as `QuorumTracker` implements it.** It counts distinct
 emitters; a second receipt from the same emitter replaces that emitter's
-evidence. For a threshold K (a K of 0 is raised to 1):
+evidence. For a threshold K (a `NonZeroUsize`, so K = 0 has no value):
 
 | Distinct emitters | Distinct evidence hashes | Outcome |
 |---|---|---|
@@ -228,9 +231,11 @@ No outcome is terminal. A dissenting emitter that re-emits agreeing
 evidence moves `Dissent` back to `Reached`, and `reset` forgets every
 confirmation.
 
-The mirrors do not agree with that table. `MemoryLedger`'s `outcome`
-never reads the threshold: one agreeing receipt with K = 3 reads as
-`Reached`, and two disagreeing receipts below K read as `Dissent`.
+A ledger's read path returns the verdict the tracker computed against
+the slot's own threshold, so a read agrees with the ingest before it.
+`MemoryLedger`'s read path used to re-derive the verdict without the
+threshold (one agreeing receipt with K = 3 read as `Reached`); the seal
+makes that re-derivation a compile error.
 
 **Reach.** `engenho-substrate` and `engenho-controllers` are compiled
 into the shipped binary, but no running path ingests a receipt. The

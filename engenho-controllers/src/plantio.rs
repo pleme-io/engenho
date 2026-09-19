@@ -25,6 +25,7 @@
 //! missing from the ledger. Re-tick with no state change is a no-op.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,7 +34,7 @@ use engenho_store::{
     command::{Reason, ResourceCommand},
 };
 use engenho_substrate::{
-    JobTarget, MaterializationLedger, NodeId, Plantio, QuorumOutcome, StageId,
+    JobTarget, MaterializationLedger, NodeId, Plantio, QuorumState, QuorumVerdict, StageId,
 };
 use serde_json::{Value, json};
 use tracing::debug;
@@ -127,20 +128,20 @@ impl PlantioController {
     }
 
     /// Confirmation threshold for a stage. Maps the typed
-    /// ConfirmacaoPolicy + Placement into a `usize` the ledger
-    /// understands.
+    /// ConfirmacaoPolicy + Placement into the non-zero threshold the
+    /// ledger counts against. A `k` of 0 still parses (the policy
+    /// carries a `usize`) and means one.
     #[must_use]
-    pub fn threshold_for(stage: &engenho_substrate::Stage) -> usize {
+    pub fn threshold_for(stage: &engenho_substrate::Stage) -> NonZeroUsize {
         use engenho_substrate::ConfirmacaoPolicy as C;
         use engenho_substrate::Placement as P;
-        match (&stage.confirm, &stage.placement) {
-            (C::Local, _) => 1,
-            (C::Quorum { k }, _) => (*k).max(1),
-            (C::All, P::Pinned { .. } | P::AnyOne) => 1,
-            (C::All, P::AnyK { k } | P::Quorum { k }) => (*k).max(1),
-            (C::All, P::AllNodes) => 1, // resolved at runtime by resolver count
-            (C::RaftCommitted, _) => 1,
-        }
+        let k = match (&stage.confirm, &stage.placement) {
+            (C::Quorum { k }, _) | (C::All, P::AnyK { k } | P::Quorum { k }) => *k,
+            // AllNodes is resolved at runtime by the resolver count.
+            (C::Local | C::RaftCommitted, _)
+            | (C::All, P::Pinned { .. } | P::AnyOne | P::AllNodes) => 1,
+        };
+        NonZeroUsize::new(k).unwrap_or(NonZeroUsize::MIN)
     }
 
     /// Compute the set of StageIds whose deps are all Confirmed.
@@ -227,7 +228,7 @@ impl Controller for PlantioController {
                     };
                     let nodes = self.resolver.resolve(&target).await?;
                     let threshold = Self::threshold_for(stage);
-                    let mut quorum_outcome: Option<QuorumOutcome> = None;
+                    let mut quorum_outcome: Option<QuorumVerdict> = None;
                     for node in nodes {
                         match self.roceiro.materialize(stage, node).await {
                             Ok(receipt) => {
@@ -244,16 +245,16 @@ impl Controller for PlantioController {
                             }
                         }
                     }
-                    match quorum_outcome {
-                        Some(QuorumOutcome::Reached { .. }) => {
+                    match quorum_outcome.map(|v| v.state()) {
+                        Some(QuorumState::Reached) => {
                             confirmed.insert(stage_id.clone());
                             stage_phases.insert(stage_id, "Confirmed".into());
                             made_progress = true;
                         }
-                        Some(QuorumOutcome::Dissent { .. }) => {
+                        Some(QuorumState::Dissent) => {
                             stage_phases.insert(stage_id, "Dissent".into());
                         }
-                        Some(QuorumOutcome::Pending { .. }) => {
+                        Some(QuorumState::Pending) => {
                             stage_phases
                                 .entry(stage_id)
                                 .or_insert("Materializing".into());
@@ -388,21 +389,21 @@ mod tests {
     fn threshold_for_local_is_one() {
         let stage = pinned_stage("x", n(1));
         // confirm defaults to Local
-        assert_eq!(PlantioController::threshold_for(&stage), 1);
+        assert_eq!(PlantioController::threshold_for(&stage).get(), 1);
     }
 
     #[test]
     fn threshold_for_quorum_uses_k() {
         let mut stage = pinned_stage("x", n(1));
         stage.confirm = ConfirmacaoPolicy::Quorum { k: 5 };
-        assert_eq!(PlantioController::threshold_for(&stage), 5);
+        assert_eq!(PlantioController::threshold_for(&stage).get(), 5);
     }
 
     #[test]
     fn threshold_for_quorum_clamps_zero_to_one() {
         let mut stage = pinned_stage("x", n(1));
         stage.confirm = ConfirmacaoPolicy::Quorum { k: 0 };
-        assert_eq!(PlantioController::threshold_for(&stage), 1);
+        assert_eq!(PlantioController::threshold_for(&stage).get(), 1);
     }
 
     #[test]
@@ -410,14 +411,14 @@ mod tests {
         let mut stage = pinned_stage("x", n(1));
         stage.confirm = ConfirmacaoPolicy::All;
         stage.placement = Placement::AnyK { k: 3 };
-        assert_eq!(PlantioController::threshold_for(&stage), 3);
+        assert_eq!(PlantioController::threshold_for(&stage).get(), 3);
     }
 
     #[test]
     fn threshold_for_raft_committed_is_one() {
         let mut stage = pinned_stage("x", n(1));
         stage.confirm = ConfirmacaoPolicy::RaftCommitted;
-        assert_eq!(PlantioController::threshold_for(&stage), 1);
+        assert_eq!(PlantioController::threshold_for(&stage).get(), 1);
     }
 
     // ── ready_stages ──────────────────────────────────────────
@@ -505,9 +506,6 @@ mod tests {
             outcomes.push(ledger.ingest(&stage.id, threshold, &r).await.unwrap());
         }
         // Third receipt should be Reached.
-        assert!(matches!(
-            outcomes.last(),
-            Some(QuorumOutcome::Reached { .. })
-        ));
+        assert!(outcomes.last().is_some_and(QuorumVerdict::is_reached));
     }
 }
