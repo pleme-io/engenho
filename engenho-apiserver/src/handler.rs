@@ -1744,20 +1744,6 @@ impl ResourceHandler for StoreBackedHandler {
         // through `ApplyResult` is a larger store-layer change deferred to
         // a later brick.
         let prior = self.store.get(&key).await;
-        // DETERMINISM: freeze ONE boundary clock read into the replicated
-        // command IFF the live object bears finalizers (only then does the
-        // store's finalizer gate stamp `metadata.deletionTimestamp`). The
-        // timestamp is captured here, at the apiserver boundary, via the
-        // typed RFC3339 render (`engenho_types::time`) — the one
-        // non-deterministic input — so every Raft replica replays the
-        // identical bytes. A no-finalizer object threads `None` (the gate
-        // removes it immediately, BEHAVIOR-PRESERVATION).
-        let deletion_timestamp = prior
-            .as_ref()
-            .filter(|v| object_has_finalizers(v))
-            .map(|_| engenho_types::time::now_rfc3339_utc());
-        // Keep a clone for the DeletionPending re-read (the original is
-        // moved into the proposed command).
         // DRY-RUN GATE. THE dangerous one: before this existed a
         // `kubectl delete --dry-run=server` really deleted. The pre-delete
         // image is exactly what a real delete returns, so the dry response is
@@ -1768,14 +1754,26 @@ impl ResourceHandler for StoreBackedHandler {
                 None => crate::error::delete_status_success(name, &self.kind),
             });
         }
+        // Keep a clone for the DeletionPending re-read (the original is
+        // moved into the proposed command).
         let key_for_reread = key.clone();
+        // ★ EVERY DELETE CARRIES ITS CLOCK (T3.6). Whether the object is
+        // removed or goes Terminating is decided by the store at APPLY time,
+        // from the object as it stands then — never from `prior`, which was
+        // read at a different moment. A finalizer that landed between that
+        // read and this proposal used to reach the store with no timestamp,
+        // and the store kept the object live while this DELETE answered
+        // success. The clock is read ONCE here, at the boundary, through the
+        // typed RFC3339 render (the one non-deterministic input), and frozen
+        // into the replicated command so every replica stamps the same bytes.
+        // A finalizer-free object ignores it and is removed immediately.
         let result = self
             .store
             .propose(ResourceCommand::delete_at(
                 key,
                 expected,
                 Reason::Operator,
-                deletion_timestamp,
+                Some(engenho_types::time::now_rfc3339_utc()),
             ))
             .await
             .map_err(|e| ApiError::StorageError(e.to_string()))?;
@@ -2192,18 +2190,6 @@ fn inject_type_meta(v: &Value, api_version: String, kind: &str) -> Value {
             .or_insert_with(|| Value::String(api_version));
     }
     out
-}
-
-/// `true` iff the object carries a NON-EMPTY `metadata.finalizers` array —
-/// the apiserver-side gate that decides whether to freeze a boundary
-/// `deletionTimestamp` into the Delete command (mirrors the store-side
-/// `has_finalizers`; the two agree because both read the same opaque body).
-fn object_has_finalizers(value: &Value) -> bool {
-    value
-        .get("metadata")
-        .and_then(|m| m.get("finalizers"))
-        .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
 }
 
 /// Inject `metadata.creationTimestamp` (if absent) from the typed RFC3339
