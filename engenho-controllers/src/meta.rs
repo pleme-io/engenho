@@ -85,6 +85,15 @@ pub trait ObjectMeta {
     /// `metadata.namespace` — the object's namespace scope. `None`
     /// for cluster-scoped objects or before the field is set.
     fn namespace(&self) -> Option<&str>;
+
+    /// `metadata.deletionTimestamp` — present once a delete was accepted
+    /// for an object that finalizers still hold (Terminating). `None` when
+    /// absent, `null` or empty: an empty stamp is no stamp.
+    fn deletion_timestamp(&self) -> Option<&str>;
+
+    /// Whether `metadata.finalizers` names `finalizer`. An absent, `null`
+    /// or non-list field names none.
+    fn has_finalizer(&self, finalizer: &str) -> bool;
 }
 
 impl ObjectMeta for Value {
@@ -104,6 +113,20 @@ impl ObjectMeta for Value {
         self.get("metadata")
             .and_then(|m| m.get("namespace"))
             .and_then(|n| n.as_str())
+    }
+
+    fn deletion_timestamp(&self) -> Option<&str> {
+        self.get("metadata")
+            .and_then(|m| m.get("deletionTimestamp"))
+            .and_then(Value::as_str)
+            .filter(|ts| !ts.is_empty())
+    }
+
+    fn has_finalizer(&self, finalizer: &str) -> bool {
+        self.get("metadata")
+            .and_then(|m| m.get("finalizers"))
+            .and_then(Value::as_array)
+            .is_some_and(|all| all.iter().any(|f| f.as_str() == Some(finalizer)))
     }
 }
 
@@ -568,6 +591,38 @@ mod tests {
     fn namespace_none_when_absent() {
         let obj = json!({"metadata": {"name": "x"}});
         assert_eq!(obj.namespace(), None);
+    }
+
+    #[test]
+    fn deletion_timestamp_reads_a_stamp_and_nothing_else() {
+        let ts = "2026-01-01T00:00:00Z";
+        assert_eq!(
+            json!({"metadata": {"deletionTimestamp": ts}}).deletion_timestamp(),
+            Some(ts)
+        );
+        for unstamped in [
+            json!({"metadata": {}}),
+            json!({"metadata": {"deletionTimestamp": null}}),
+            json!({"metadata": {"deletionTimestamp": ""}}),
+            json!({}),
+        ] {
+            assert_eq!(unstamped.deletion_timestamp(), None, "{unstamped}");
+        }
+    }
+
+    #[test]
+    fn has_finalizer_matches_a_named_entry_only() {
+        let obj = json!({"metadata": {"finalizers": ["orphan", "foregroundDeletion"]}});
+        assert!(obj.has_finalizer("foregroundDeletion"));
+        assert!(obj.has_finalizer("orphan"));
+        assert!(!obj.has_finalizer("kubernetes"));
+        for none in [
+            json!({"metadata": {}}),
+            json!({"metadata": {"finalizers": null}}),
+            json!({"metadata": {"finalizers": "foregroundDeletion"}}),
+        ] {
+            assert!(!none.has_finalizer("foregroundDeletion"), "{none}");
+        }
     }
 
     #[test]

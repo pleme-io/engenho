@@ -41,6 +41,9 @@ base64             = "0.22"
 chrono             = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
+# Upstream behaviour tables (I19): tests/oracle_gc.rs checks gc owner
+# resolution against Kubernetes v1.34.0 row by row. Dev-only, no new crates.
+engenho-oracle = { path = "../engenho-oracle" }
 openraft = { workspace = true }
 proptest = "1"
 # `tokio::time::pause`: the WatchDriver requeue tests run a virtual hour of
