@@ -28,6 +28,9 @@ futures            = { workspace = true }
 arc-swap           = { workspace = true }
 bytes              = "1"
 base64             = "0.22"
+# The path decoder axum's `Path` extractor uses; RequestInfo decodes with the
+# same function so authz and dispatch cannot disagree on a path.
+percent-encoding   = "2"
 rcgen              = { workspace = true }
 rustls             = { workspace = true }
 rustls-pemfile     = { workspace = true }

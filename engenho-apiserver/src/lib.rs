@@ -93,7 +93,8 @@ pub use pki::{
 pub use pod_logs::{LogQuery, PodLogReader};
 pub use router::{RouterState, build};
 pub use scale::{
-    Scale, ScaleMeta, ScaleSpec, ScaleStatus, label_selector_to_string, project_scale,
+    Scale, ScaleMeta, ScaleSpec, ScaleStatus, UnprojectableScale, label_selector_to_string,
+    project_scale,
 };
 pub use server::{ApiServer, ServerError};
 pub use watch_end::{

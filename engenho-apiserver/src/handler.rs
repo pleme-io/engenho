@@ -900,8 +900,9 @@ impl ResourceHandler for StoreBackedHandler {
             .await
             .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
         // Project the parent into its autoscaling/v1 Scale view. Serde →
-        // Value (typed emission; no format! of the wire).
-        let scale = project_scale(&live);
+        // Value (typed emission; no format! of the wire). A count the parent
+        // declares but that is not an integer is a 500, never the default.
+        let scale = project_scale(&live)?;
         serde_json::to_value(&scale)
             .map_err(|e| ApiError::Internal(format!("scale projection serialize: {e}")))
     }
@@ -918,6 +919,10 @@ impl ResourceHandler for StoreBackedHandler {
             .get(&key)
             .await
             .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
+        // The parent must be projectable BEFORE anything is written, as
+        // upstream converts the old object to a Scale first: otherwise the
+        // write lands and the re-projection below answers 500 for it.
+        project_scale(&live)?;
         // Deserialize the incoming autoscaling/v1 Scale + take spec.replicas.
         let scale: Scale = serde_json::from_value(incoming)
             .map_err(|e| ApiError::BadRequest(format!("invalid Scale body: {e}")))?;
@@ -948,9 +953,13 @@ impl ResourceHandler for StoreBackedHandler {
         _patch_type: engenho_types::patch::PatchType,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
-        if self.store.get(&key).await.is_none() {
-            return Err(ApiError::NotFound(format!("{}/{}", self.kind, name)));
-        }
+        let live = self
+            .store
+            .get(&key)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
+        // Projectable before anything is written (see `put_scale`).
+        project_scale(&live)?;
         // Translate the Scale-shaped patch's spec.replicas into a scoped
         // `{"spec":{"replicas":N}}` merge patch on the parent. A scale patch
         // that doesn't carry spec.replicas is a no-op replica change → leave

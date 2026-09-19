@@ -12,6 +12,9 @@
 //!   7. Discovery advertises `deployments/scale` + `deployments/status`
 //!      under apps/v1, `pods/status` (but NOT `pods/scale`) under /api/v1.
 //!   8. POST/DELETE on a subresource → typed 4xx (no stub Ok).
+//!   9. A parent whose replica count is not an integer has no Scale: GET,
+//!      PUT and PATCH `/scale` answer 500 naming the field, never a Scale of
+//!      the default, and the writes land nothing (T1.6).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -456,6 +459,122 @@ async fn post_and_delete_on_subresource_are_typed_rejections() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.shutdown().await.unwrap();
+}
+
+/// Merge-patch `url` with `body`; the response status.
+async fn merge_patch(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> reqwest::StatusCode {
+    client
+        .patch(url)
+        .header("Content-Type", "application/merge-patch+json")
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Assert `resp` is the 500 Status for an unprojectable Scale naming `field`.
+/// The code, not the reason: upstream's nearest path (a custom resource's
+/// scale, whose replica accessor fails) returns a bare error, which renders
+/// as a 500 with no reason of its own.
+async fn assert_unprojectable(resp: reqwest::Response, field: &str) {
+    assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let status: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status.get("kind").unwrap(), "Status");
+    assert_eq!(status.get("code").unwrap(), 500);
+    let message = status.get("message").and_then(|m| m.as_str()).unwrap();
+    assert!(message.contains(field), "{message}");
+}
+
+#[tokio::test]
+async fn scale_of_a_parent_whose_spec_replicas_is_not_an_integer_is_a_500() {
+    let (_store, server) = boot().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+    let base = create_web(addr, &client).await;
+    let parent_url = format!("{base}/web");
+    let scale_url = format!("{parent_url}/scale");
+
+    // A PATCH on the parent is not validated today, so this is storable.
+    let bad = serde_json::json!({ "spec": { "replicas": "3" } });
+    assert_eq!(
+        merge_patch(&client, &parent_url, &bad).await,
+        reqwest::StatusCode::OK
+    );
+
+    // GET: before T1.6 this was a 200 Scale of 1, the absent default, for a
+    // parent that declared something else entirely.
+    let resp = client.get(&scale_url).send().await.unwrap();
+    assert_unprojectable(resp, "spec.replicas").await;
+
+    // PUT and PATCH refuse before writing: the parent still says "3".
+    let put = serde_json::json!({
+        "apiVersion": "autoscaling/v1",
+        "kind": "Scale",
+        "metadata": { "name": "web", "namespace": "default" },
+        "spec": { "replicas": 5 }
+    });
+    let resp = client.put(&scale_url).json(&put).send().await.unwrap();
+    assert_unprojectable(resp, "spec.replicas").await;
+    let resp = client
+        .patch(&scale_url)
+        .header("Content-Type", "application/merge-patch+json")
+        .json(&serde_json::json!({ "spec": { "replicas": 7 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_unprojectable(resp, "spec.replicas").await;
+
+    let parent = get_json(&client, &parent_url).await;
+    assert_eq!(
+        parent.get("spec").unwrap().get("replicas").unwrap(),
+        "3",
+        "a refused /scale write changed the parent"
+    );
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn scale_write_on_a_parent_whose_status_replicas_is_not_an_integer_lands_nothing() {
+    let (_store, server) = boot().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+    let base = create_web(addr, &client).await;
+    let parent_url = format!("{base}/web");
+    let scale_url = format!("{parent_url}/scale");
+
+    let bad = serde_json::json!({ "status": { "replicas": "2" } });
+    assert_eq!(
+        merge_patch(&client, &format!("{parent_url}/status"), &bad).await,
+        reqwest::StatusCode::OK
+    );
+
+    let resp = client.get(&scale_url).send().await.unwrap();
+    assert_unprojectable(resp, "status.replicas").await;
+
+    // A PUT that wrote first and projected after would land replicas=5 and
+    // still answer 500. It must answer 500 with the parent untouched.
+    let put = serde_json::json!({
+        "apiVersion": "autoscaling/v1",
+        "kind": "Scale",
+        "metadata": { "name": "web", "namespace": "default" },
+        "spec": { "replicas": 5 }
+    });
+    let resp = client.put(&scale_url).json(&put).send().await.unwrap();
+    assert_unprojectable(resp, "status.replicas").await;
+    let parent = get_json(&client, &parent_url).await;
+    assert_eq!(
+        replicas(&parent),
+        3,
+        "a refused /scale PUT wrote the parent"
+    );
 
     server.shutdown().await.unwrap();
 }

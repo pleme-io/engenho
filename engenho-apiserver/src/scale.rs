@@ -16,16 +16,41 @@
 //!     `spec.replicas` via a scoped `{"spec":{"replicas":N}}` merge patch,
 //!     then re-projects the now-updated parent for the response.
 //!
+//! ## A replica count has three states (T1.6)
+//!
+//! Both counts are read through [`engenho_controllers::int_at`], which is
+//! [`engenho_types::SpecInt`] underneath: absent (or `null`), an integer,
+//! or something else. The old reader folded the third into the first, so a
+//! parent declaring `spec.replicas: "3"` projected as a Scale of `1` — an
+//! answer about an object nobody declared. Now:
+//!
+//!   * absent → the field's API default. `spec.replicas` takes
+//!     [`engenho_controllers::REPLICAS`], the one default every workload
+//!     controller also reads, so the Scale and the controller acting on it
+//!     cannot disagree about what an absent count means;
+//!   * not an integer → [`UnprojectableScale`], a 500 naming the field.
+//!     Upstream never stores such a parent (decoding into `int32` refuses
+//!     it); where it can project from an untyped object — a custom
+//!     resource's scale subresource — an accessor error there is a 500
+//!     too.
+//!
+//! Tier-honest: the three states are a type, and this module cannot build a
+//! [`Scale`] from a count it could not read. That no OTHER reader in the
+//! crate calls `as_i64` directly is review, not a type.
+//!
 //! Typed serde end-to-end — no `format!()` of the wire (★★ TYPED EMISSION).
 //! The selector string is built by the typed [`label_selector_to_string`]
 //! helper (sorted, deterministic), never `format!`-concatenated ad hoc.
 
+use engenho_controllers::{DefaultedInt, REPLICAS, ShapeError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::error::ApiError;
+
 /// The `autoscaling/v1` `Scale` object — the projected replica view served
-/// at `<plural>/<name>/scale` for scalable kinds (Deployment / ReplicaSet /
-/// StatefulSet). GVK-tagged `autoscaling/v1`/`Scale` regardless of the
+/// at `<plural>/<name>/scale` for scalable kinds (`Deployment` /
+/// `ReplicaSet` / `StatefulSet`). GVK-tagged `autoscaling/v1`/`Scale` regardless of the
 /// parent's group (the upstream contract).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scale {
@@ -40,7 +65,7 @@ pub struct Scale {
     pub status: ScaleStatus,
 }
 
-/// The ObjectMeta subset a `Scale` carries — projected from the parent so
+/// The `ObjectMeta` subset a `Scale` carries — projected from the parent so
 /// the Scale's `resourceVersion` IS the parent's rv (kubectl's
 /// `scale --resource-version` CAS works, and a subsequent `PUT /scale`
 /// threads the projected rv back as the CAS `expected`).
@@ -90,14 +115,33 @@ impl Scale {
     pub const KIND: &'static str = "Scale";
 }
 
-/// Read an `i64` off a JSON path `obj.<a>.<b>`, defaulting to `default`
-/// when the path is absent or not an integer. K8s replica counts are
-/// int32 on the wire but parse cleanly as `i64`.
-fn read_i64(obj: &Value, a: &str, b: &str, default: i64) -> i64 {
-    obj.get(a)
-        .and_then(|v| v.get(b))
-        .and_then(Value::as_i64)
-        .unwrap_or(default)
+/// `status.replicas` of a scalable parent: absent means no replica has been
+/// observed yet, so `0` (upstream's `int32` status count, omitted when
+/// zero).
+const STATUS_REPLICAS: DefaultedInt = DefaultedInt::new(&["status", "replicas"], 0);
+
+/// A parent whose replica counts cannot be read, so no [`Scale`] can be
+/// projected from it. The [`ShapeError`] names the field and what stands
+/// there.
+///
+/// Answered as a 500: the client sent nothing wrong, the server holds an
+/// object it cannot project. Never answered with the field's default.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("no Scale can be projected from this object: {0}")]
+pub struct UnprojectableScale(ShapeError);
+
+impl UnprojectableScale {
+    /// The field that could not be read, and what stands there.
+    #[must_use]
+    pub fn shape(&self) -> &ShapeError {
+        &self.0
+    }
+}
+
+impl From<UnprojectableScale> for ApiError {
+    fn from(e: UnprojectableScale) -> Self {
+        ApiError::Internal(e.to_string())
+    }
 }
 
 /// Read an optional string off a JSON path `obj.<a>.<b>`.
@@ -108,19 +152,26 @@ fn read_str(obj: &Value, a: &str, b: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Project a parent object (a Deployment / ReplicaSet / StatefulSet) into
+/// Project a parent object (a `Deployment` / `ReplicaSet` / `StatefulSet`) into
 /// its `autoscaling/v1` Scale view:
 ///
-///   * `spec.replicas`    ← parent `.spec.replicas`   (default `1`).
-///   * `status.replicas`  ← parent `.status.replicas` (default `0`).
+///   * `spec.replicas`    ← parent `.spec.replicas`; absent or `null` is
+///     [`REPLICAS`]' API default (`1`).
+///   * `status.replicas`  ← parent `.status.replicas`; absent or `null` is
+///     `0`.
 ///   * `status.selector`  ← serialized parent `.spec.selector.matchLabels`
 ///     (e.g. `"app=web"`); `None` when there is no selector.
 ///   * `metadata`         ← parent's name / namespace / uid / rv /
 ///     creationTimestamp (so the Scale's rv is the PARENT's rv).
-#[must_use]
-pub fn project_scale(parent: &Value) -> Scale {
-    let spec_replicas = read_i64(parent, "spec", "replicas", 1);
-    let status_replicas = read_i64(parent, "status", "replicas", 0);
+///
+/// # Errors
+///
+/// [`UnprojectableScale`] when either count — or a step above it that is
+/// not an object — holds something other than an integer (`"3"`, `2.5`,
+/// `true`). No default is substituted for a value the parent declared.
+pub fn project_scale(parent: &Value) -> Result<Scale, UnprojectableScale> {
+    let spec_replicas = REPLICAS.read(parent).map_err(UnprojectableScale)?;
+    let status_replicas = STATUS_REPLICAS.read(parent).map_err(UnprojectableScale)?;
 
     // selector ← .spec.selector.matchLabels serialized as a label string.
     let selector = parent
@@ -137,7 +188,7 @@ pub fn project_scale(parent: &Value) -> Scale {
         creation_timestamp: read_str(parent, "metadata", "creationTimestamp"),
     };
 
-    Scale {
+    Ok(Scale {
         api_version: Scale::API_VERSION.to_string(),
         kind: Scale::KIND.to_string(),
         metadata,
@@ -148,7 +199,7 @@ pub fn project_scale(parent: &Value) -> Scale {
             replicas: status_replicas,
             selector,
         },
-    }
+    })
 }
 
 /// Serialize a `matchLabels` JSON object into the K8s label-selector string
@@ -191,6 +242,7 @@ pub fn label_selector_to_string(match_labels: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engenho_controllers::JsonKind;
     use serde_json::json;
 
     fn parent() -> Value {
@@ -214,7 +266,7 @@ mod tests {
 
     #[test]
     fn project_reads_spec_status_selector_and_meta() {
-        let s = project_scale(&parent());
+        let s = project_scale(&parent()).expect("projectable");
         assert_eq!(s.api_version, "autoscaling/v1");
         assert_eq!(s.kind, "Scale");
         assert_eq!(s.spec.replicas, 5);
@@ -235,10 +287,86 @@ mod tests {
     fn project_defaults_replicas_when_absent() {
         // No spec.replicas → default 1; no status.replicas → default 0.
         let p = json!({ "metadata": { "name": "x" }, "spec": {}, "status": {} });
-        let s = project_scale(&p);
+        let s = project_scale(&p).expect("projectable");
         assert_eq!(s.spec.replicas, 1, "absent spec.replicas defaults to 1");
         assert_eq!(s.status.replicas, 0, "absent status.replicas defaults to 0");
         assert_eq!(s.status.selector, None, "no selector → None");
+    }
+
+    #[test]
+    fn project_reads_null_replicas_as_absent() {
+        // `null` decodes to a nil pointer upstream and is defaulted like a
+        // missing key: the same answer, not a leniency.
+        let p = json!({ "spec": { "replicas": null }, "status": { "replicas": null } });
+        let s = project_scale(&p).expect("projectable");
+        assert_eq!(s.spec.replicas, 1);
+        assert_eq!(s.status.replicas, 0);
+    }
+
+    #[test]
+    fn project_reads_zero_replicas_as_zero_not_as_the_default() {
+        // A declared 0 is a scale-to-zero, never the absent default of 1.
+        let p = json!({ "spec": { "replicas": 0 }, "status": { "replicas": 0 } });
+        let s = project_scale(&p).expect("projectable");
+        assert_eq!(s.spec.replicas, 0);
+        assert_eq!(s.status.replicas, 0);
+    }
+
+    /// The field an [`UnprojectableScale`] names, dotted, and the JSON type
+    /// it found — read through the typed error, not its message.
+    fn refused(p: &Value) -> (String, JsonKind) {
+        match project_scale(p) {
+            Err(e) => match e.shape() {
+                ShapeError::NotAnInteger { path, found } => (path.to_string(), *found),
+                other @ ShapeError::Wrong { .. } => panic!("expected NotAnInteger, got {other:?}"),
+            },
+            Ok(s) => panic!("projected {s:?} from a count it cannot read"),
+        }
+    }
+
+    #[test]
+    fn project_refuses_a_spec_replicas_that_is_not_an_integer() {
+        // The defect: `"3"` read as absent and projected as a Scale of 1.
+        let mut p = parent();
+        p["spec"]["replicas"] = json!("3");
+        assert_eq!(refused(&p), ("spec.replicas".to_string(), JsonKind::String));
+        for bad in [json!(2.5), json!(true), json!([3]), json!({ "n": 3 })] {
+            let mut p = parent();
+            p["spec"]["replicas"] = bad.clone();
+            assert_eq!(refused(&p).0, "spec.replicas", "{bad}");
+        }
+    }
+
+    #[test]
+    fn project_refuses_a_status_replicas_that_is_not_an_integer() {
+        let mut p = parent();
+        p["status"]["replicas"] = json!("2");
+        assert_eq!(
+            refused(&p),
+            ("status.replicas".to_string(), JsonKind::String)
+        );
+    }
+
+    #[test]
+    fn project_refuses_a_spec_that_is_not_an_object() {
+        // `spec: "oops"` declared something; reading it as absent would
+        // hand back the default for an object that said otherwise.
+        let p = json!({ "metadata": { "name": "x" }, "spec": "oops" });
+        assert_eq!(refused(&p), ("spec.replicas".to_string(), JsonKind::String));
+    }
+
+    #[test]
+    fn unprojectable_scale_is_a_500_naming_the_field() {
+        let mut p = parent();
+        p["spec"]["replicas"] = json!("3");
+        let err = project_scale(&p).expect_err("unprojectable");
+        match ApiError::from(err) {
+            ApiError::Internal(msg) => assert!(
+                msg.contains("spec.replicas") && msg.contains("a string"),
+                "{msg}"
+            ),
+            other => panic!("expected a 500, got {other:?}"),
+        }
     }
 
     #[test]
@@ -265,7 +393,7 @@ mod tests {
 
     #[test]
     fn scale_serializes_with_autoscaling_v1_gvk() {
-        let s = project_scale(&parent());
+        let s = project_scale(&parent()).expect("projectable");
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v.get("apiVersion").unwrap(), "autoscaling/v1");
         assert_eq!(v.get("kind").unwrap(), "Scale");
@@ -277,7 +405,7 @@ mod tests {
     #[test]
     fn scale_round_trips_through_serde() {
         // The incoming PUT /scale body deserializes to the same Scale.
-        let s = project_scale(&parent());
+        let s = project_scale(&parent()).expect("projectable");
         let wire = serde_json::to_string(&s).unwrap();
         let back: Scale = serde_json::from_str(&wire).unwrap();
         assert_eq!(back.spec.replicas, 5);
