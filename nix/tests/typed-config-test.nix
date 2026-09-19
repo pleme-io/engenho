@@ -190,6 +190,15 @@ let
       ).success;
       got = "expected eval failure for kubeletBackend=docker"; }
 
+    # engenho refuses `kubelet_backend: cri` when its config is parsed (T5.9),
+    # so the typed surface refuses it at eval: a node must never be handed a
+    # config its daemon will not start on.
+    { name = "refused-cri-backend-is-rejected-at-eval";
+      ok = !(builtins.tryEval
+        (evalWith { services.engenho.config.runtime.kubeletBackend = "cri"; })
+      ).success;
+      got = "expected eval failure for kubeletBackend=cri"; }
+
     { name = "bad-scheduler-strategy-is-rejected";
       ok = !(builtins.tryEval
         (evalWith { services.engenho.config.scheduler.strategy = "random"; })

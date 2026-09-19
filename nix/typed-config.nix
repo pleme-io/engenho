@@ -221,13 +221,18 @@ in
         `/Users/x/data-evil`, and a path containing `..` is refused.
       '';
 
-      kubeletBackend = optional (types.enum [ "podman_api" "podman" "cri" "fake" "native" ]) ''
+      # `cri` is deliberately NOT offered. engenho refuses it when its config is
+      # parsed (T5.9, pending-cri: the CRI backend still drops part of every
+      # Pod), so offering it here would let a green eval render a config the
+      # daemon will not start on. It returns to this list when engenho lifts
+      # that refusal (engenho-config `KubeletBackendKind::selection_refusal`).
+      kubeletBackend = optional (types.enum [ "podman_api" "podman" "fake" "native" ]) ''
         Container runtime the kubelet drives.
 
         `native` runs each container as a NATIVE HOST PROCESS out of a realised
         Nix closure, with no container runtime underneath it at all. It is the
-        only backend that runs a workload on darwin without a Linux VM -- the
-        other three all end at a Linux runtime, which on macOS means
+        only backend that runs a workload on darwin without a Linux VM -- both
+        podman arms end at a Linux runtime, which on macOS means
         podman-machine. It accepts `nix:/nix/store/...` images and REFUSES OCI
         references rather than falling back, so a node set to `native` cannot
         silently end up running its pods in a VM.
@@ -253,6 +258,9 @@ in
 
         `fake` runs NOTHING — the mock backend, correct for a
         control-plane-only node and wrong anywhere pods must actually run.
+
+        `cri` is not offered: engenho refuses it when its config is parsed,
+        because its CRI backend still drops part of every Pod (pending-cri).
 
         ★ Both podman arms drive the SAME container store; the difference is
         entirely client-side. Switching between them does not migrate, restart

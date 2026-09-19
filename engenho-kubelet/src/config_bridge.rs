@@ -6,48 +6,37 @@ use std::sync::Arc;
 use crate::backend::{ContainerRuntime, FakeBackend, PodmanBackend};
 use crate::cri_backend::CriGaps;
 
-/// Operator-facing kubelet backend choice. Mirrors
-/// `engenho_config::KubeletBackendKind` (lives in this crate to
-/// avoid a forward declaration in engenho-config).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KubeletBackendKind {
-    /// A CRI runtime over gRPC (containerd / CRI-O / youki) — what upstream's
-    /// kubelet speaks, and the only backend that makes the runtime
-    /// substitutable.
-    ///
-    /// REFUSED at construction while [`crate::cri_backend::UNSUPPORTED`] is
-    /// non-empty: see [`KubeletBackendKind::refusal`].
-    Cri,
-    /// podman over its libpod REST API — no subprocess. The default.
-    PodmanApi,
-    /// Real podman shell-out. Retained because it is the only backend that
-    /// currently serves `exec` and `logs`.
-    Podman,
-    /// In-memory deterministic fake (tests + dev environments).
-    Fake,
-    /// Native host processes out of Nix closures — NO runtime underneath.
-    ///
-    /// The only backend that does not end at a Linux runtime, and therefore
-    /// the only one that runs a workload on macOS without a VM. It runs
-    /// `nix:` closure images and REFUSES OCI references, so it is selected
-    /// deliberately, never inherited.
-    Native,
-}
+/// The operator's backend choice: [`engenho_config::KubeletBackendKind`].
+///
+/// Re-exported, not mirrored (I39). This crate used to declare its own enum
+/// with the same five arms, and the runtime converted a parsed config into it
+/// arm by arm. Two lists of one fact is where a new backend lands in one and
+/// not the other; with one type a parsed config's choice reaches
+/// [`make_container_runtime`] as-is. The path `config_bridge::KubeletBackendKind`
+/// still resolves.
+pub use engenho_config::KubeletBackendKind;
 
-impl KubeletBackendKind {
-    /// Why this backend may not be constructed, or `None` when it may.
-    ///
-    /// Decided from the kind alone — no socket is probed — so a node's config
-    /// can be checked before anything boots, and a host that happens to run
-    /// containerd is refused exactly like one that does not.
-    #[must_use]
-    pub fn refusal(self) -> Option<BackendRefused> {
-        match self {
-            Self::Cri => {
-                CriGaps::outstanding().map(|missing| BackendRefused::CriIncomplete { missing })
-            }
-            Self::PodmanApi | Self::Podman | Self::Fake | Self::Native => None,
+/// Why `kind` may not be constructed, or `None` when it may.
+///
+/// Decided from the kind alone — no socket is probed — so a node's config
+/// can be checked before anything boots, and a host that happens to run
+/// containerd is refused exactly like one that does not.
+///
+/// This is the refusal from EVIDENCE: `cri` is refused while
+/// [`CriGaps::outstanding`] names a gap. The config refuses the same kinds by
+/// policy, when it is parsed ([`KubeletBackendKind::selection_refusal`]),
+/// because `engenho-config` cannot see the gap list; a test here holds the
+/// two answers equal for every kind.
+#[must_use]
+pub fn construction_refusal(kind: KubeletBackendKind) -> Option<BackendRefused> {
+    match kind {
+        KubeletBackendKind::Cri => {
+            CriGaps::outstanding().map(|missing| BackendRefused::CriIncomplete { missing })
         }
+        KubeletBackendKind::PodmanApi
+        | KubeletBackendKind::Podman
+        | KubeletBackendKind::Fake
+        | KubeletBackendKind::Native => None,
     }
 }
 
@@ -97,8 +86,7 @@ fn dirs_home() -> std::path::PathBuf {
 /// Construct the runtime trait object from the operator's choice.
 ///
 /// # Errors
-/// [`BackendRefused`] when `kind` is refused — see
-/// [`KubeletBackendKind::refusal`].
+/// [`BackendRefused`] when `kind` is refused — see [`construction_refusal`].
 pub fn make_container_runtime(
     kind: KubeletBackendKind,
     podman_binary: Option<&str>,
@@ -116,15 +104,14 @@ pub fn make_container_runtime(
 /// pangea-operator hit.
 ///
 /// # Errors
-/// [`BackendRefused`] when `kind` is refused — see
-/// [`KubeletBackendKind::refusal`]. Checked before anything is probed or
-/// built.
+/// [`BackendRefused`] when `kind` is refused — see [`construction_refusal`].
+/// Checked before anything is probed or built.
 pub fn make_container_runtime_with_apiserver(
     kind: KubeletBackendKind,
     podman_binary: Option<&str>,
     apiserver: Option<(String, u16)>,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
-    if let Some(refused) = kind.refusal() {
+    if let Some(refused) = construction_refusal(kind) {
         return Err(refused);
     }
     let runtime: Arc<dyn ContainerRuntime> = match kind {
@@ -180,7 +167,7 @@ pub fn make_container_runtime_with_apiserver(
         }
         KubeletBackendKind::Cri => {
             // Reached only once `cri_backend::UNSUPPORTED` is empty; until
-            // then `refusal` returned above.
+            // then `construction_refusal` returned above.
             //
             // ── A MISSING SOCKET FALLS BACK, LOUDLY — same rule as PodmanApi.
             // An operator who selected `cri` on a node whose containerd has not
@@ -298,7 +285,7 @@ mod tests {
     fn the_refusal_is_decided_before_anything_is_probed() {
         // Pure: a config can be checked before boot, and the answer does not
         // depend on whether this host runs containerd.
-        let refused = KubeletBackendKind::Cri.refusal().expect("cri is refused");
+        let refused = construction_refusal(KubeletBackendKind::Cri).expect("cri is refused");
         let BackendRefused::CriIncomplete { missing } = refused;
         assert_eq!(missing.as_slice(), crate::cri_backend::UNSUPPORTED);
     }
@@ -313,13 +300,17 @@ mod tests {
             KubeletBackendKind::Fake,
             KubeletBackendKind::Native,
         ] {
-            assert_eq!(kind.refusal(), None, "{kind:?} must not be refused");
+            assert_eq!(
+                construction_refusal(kind),
+                None,
+                "{kind:?} must not be refused"
+            );
         }
     }
 
     #[test]
     fn the_refusal_tells_the_operator_every_gap_and_what_to_select() {
-        let refused = KubeletBackendKind::Cri.refusal().expect("cri is refused");
+        let refused = construction_refusal(KubeletBackendKind::Cri).expect("cri is refused");
         let BackendRefused::CriIncomplete { missing } = refused;
         let shown = refused.to_string();
         assert!(shown.contains("`cri`"), "names the backend: {shown}");
@@ -330,5 +321,73 @@ mod tests {
             shown.contains("podman_api"),
             "names a backend that works: {shown}"
         );
+    }
+
+    // ── I38/I39: one backend type, refused at parse and at construction ──
+
+    /// Every kind, for the tests that must cover all of them.
+    ///
+    /// The `match` has no wildcard, so a new variant does not compile here
+    /// until it is placed; the list beside it is then the one to extend. That
+    /// keeps the list honest by review, not by type.
+    fn every_kind() -> [KubeletBackendKind; 5] {
+        let every = [
+            KubeletBackendKind::Cri,
+            KubeletBackendKind::PodmanApi,
+            KubeletBackendKind::Podman,
+            KubeletBackendKind::Fake,
+            KubeletBackendKind::Native,
+        ];
+        for kind in every {
+            match kind {
+                KubeletBackendKind::Cri
+                | KubeletBackendKind::PodmanApi
+                | KubeletBackendKind::Podman
+                | KubeletBackendKind::Fake
+                | KubeletBackendKind::Native => {}
+            }
+        }
+        every
+    }
+
+    #[test]
+    fn the_config_refuses_exactly_the_backends_the_kubelet_refuses() {
+        // The config refuses by policy because it cannot see the gap list;
+        // this holds the policy to the evidence. Closing the last CRI gap turns
+        // it red until the config's refusal lifts too, and a config that lifted
+        // it early turns it red the other way.
+        for kind in every_kind() {
+            assert_eq!(
+                kind.selection_refusal().is_some(),
+                construction_refusal(kind).is_some(),
+                "{kind:?}: the config (selection_refusal) and the kubelet \
+                 (construction_refusal) disagree on whether it may be used"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parsed_config_selects_the_runtime_with_no_conversion() {
+        // One type end to end: the value the config parsed is the value the
+        // kubelet constructs from.
+        let cfg = engenho_config::EngenhoConfig::from_yaml_with_defaults(
+            "runtime:\n  kubelet_backend: fake\n",
+        )
+        .expect("`fake` parses");
+        let rt =
+            make_container_runtime(cfg.runtime.kubelet_backend, None).expect("fake is not refused");
+        assert_eq!(rt.name(), "fake");
+    }
+
+    #[test]
+    fn a_config_selecting_cri_never_reaches_the_kubelet() {
+        // The parse boundary refuses first; the construction refusal above is
+        // the second line, for a config built in code that skipped validate.
+        match engenho_config::EngenhoConfig::from_yaml_with_defaults(
+            "runtime:\n  kubelet_backend: cri\n",
+        ) {
+            Err(engenho_config::ConfigError::KubeletBackendRefused(_)) => {}
+            other => panic!("`cri` must be refused when the config is parsed, got {other:?}"),
+        }
     }
 }
