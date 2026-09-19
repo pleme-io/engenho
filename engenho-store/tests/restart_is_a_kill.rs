@@ -40,7 +40,8 @@
 //! each green; that item un-ignores it. Cases 3 and 5 are green and run always;
 //! case 4 went green with T2.9-store (`terminate` flushes last) and 4b came
 //! with it; case 1 went green with T3.3 (the floor on load is the current
-//! revision).
+//! revision); case 2 went green with T3.4 (the durable image is never older
+//! than a snapshot). No case is ignored any more.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -356,9 +357,11 @@ const C2_ENTRIES_PER_APPLY: usize = 5;
 /// behind under a burst).
 const C2_KEEP: usize = 50;
 
+/// Red before T3.4: `build_snapshot` wrote the snapshot but left the blob and
+/// `last_applied` where the first apply put them, so the reopen failed in
+/// `Raft::new` with "Failed to get log entries, expected index": the replay
+/// from the stale `last_applied` ran into the purge.
 #[test]
-#[ignore = "red until T3.4 (the durable image is never older than a snapshot): the reopen fails \
-            in Raft::new with 'Failed to get log entries, expected index'"]
 fn case2_snapshot_and_purge_past_a_stale_blob_still_boots() {
     let (_tmp, dir) = store_dir();
     let acks = lifetime(commit_to_durable_log(
@@ -402,6 +405,13 @@ fn case2_snapshot_and_purge_past_a_stale_blob_still_boots() {
             .await
             .expect("the rebooted node takes a write");
         assert_eq!(next.revision, head + 1, "the revision is not continuous");
+        // An image this tree wrote agrees with itself: the boot check must not
+        // trip on it (a false hit would read as a pre-T3.4 image on the node).
+        assert_eq!(
+            mesh.image_tripwire().await.map(|t| t.total()),
+            Some(0),
+            "the image this tree wrote tripped the boot check"
+        );
         mesh.terminate().await.expect("terminate");
     });
 }

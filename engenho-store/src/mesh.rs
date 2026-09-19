@@ -15,7 +15,7 @@ use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
 
 use crate::command::ResourceCommand;
-use crate::fjall_store::{FjallStore, Flushed};
+use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
 use crate::network::{InProcessRouter, RpcRequest};
 use crate::owned_task::{OwnedTask, TaskStop};
 use crate::pagination::PageAtRevision;
@@ -704,6 +704,16 @@ impl StoreMesh {
     /// [`StoreError::Persist`] if the durable batch cannot be written.
     pub async fn flush(&self) -> Result<MeshFlushed, StoreError> {
         self.store.flush().await
+    }
+
+    /// The durable-image tripwire counts (T3.4) — see
+    /// [`FjallStore::image_tripwire`]. `None` for the in-memory backend,
+    /// which has no durable image to disagree with itself.
+    pub async fn image_tripwire(&self) -> Option<ImageTripwire> {
+        match &self.store {
+            StoreBackend::Memory(_) => None,
+            StoreBackend::Fjall(s) => Some(s.image_tripwire().await),
+        }
     }
 
     /// Deregister from the router, [`Self::quiesce`] (awaiting both owned

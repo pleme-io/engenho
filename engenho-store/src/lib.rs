@@ -80,7 +80,7 @@ pub use drv_committal::{
     DRV_GROUP, DRV_KIND, DRV_VERSION, delete_drv_command, drv_resource_key, put_drv_command,
     render_drv_resource,
 };
-pub use fjall_store::{FjallStore, Flushed};
+pub use fjall_store::{FjallStore, Flushed, IMAGE_GATE, ImageInconsistency, ImageTripwire};
 pub use mesh::{MeshFlushed, Quiesced, StoreError, StoreMesh, default_config};
 pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
