@@ -62,7 +62,7 @@ fn pvc_key() -> ResourceKey {
 }
 
 fn pv_key() -> ResourceKey {
-    ResourceKey::cluster_scoped("", "v1", "PersistentVolume", "pvc-ns-claim")
+    ResourceKey::cluster_scoped("", "v1", "PersistentVolume", "pvc-u-1")
 }
 
 async fn seed(store: &StoreMesh, provisioner: &str, size: &str) {
@@ -130,7 +130,7 @@ async fn a_csi_storage_class_provisions_binds_and_yields_a_publishable_pv() {
     // P1 — the claim is Bound to a real volume.
     let pvc = store.get(&pvc_key()).await.expect("pvc");
     assert_eq!(pvc["status"]["phase"], "Bound");
-    assert_eq!(pvc["spec"]["volumeName"], "pvc-ns-claim");
+    assert_eq!(pvc["spec"]["volumeName"], "pvc-u-1");
 
     // P2 — and the PV carries a `csi` source the node path consumes. This
     // is where the two halves of the CSI work meet: publish reads exactly
@@ -156,7 +156,7 @@ async fn a_csi_storage_class_provisions_binds_and_yields_a_publishable_pv() {
     assert_eq!(creates.len(), 1, "{creates:?}");
     assert_eq!(
         creates[0],
-        DriverCall::CreateVolume("pvc-ns-claim".into(), 1_073_741_824)
+        DriverCall::CreateVolume("pvc-u-1".into(), 1_073_741_824)
     );
 
     // P4 — a second tick must not provision a second disk. The claim is

@@ -966,7 +966,9 @@ impl Kubelet {
         let key = crate::node_lease::lease_key(&self.node_name);
         let value = crate::node_lease::lease_value(
             &self.node_name,
-            &engenho_types::time::now_rfc3339_utc(),
+            // MicroTime, as upstream: a renewal is a distinct write even
+            // when two land inside one second.
+            &engenho_types::time::now_micro_time_utc(),
             0,
         );
         if let Err(e) = self

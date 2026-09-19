@@ -39,6 +39,24 @@ pub fn to_rfc3339_utc(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// Render a [`DateTime<Utc>`] to the Kubernetes `MicroTime` wire form:
+/// microsecond precision, Zulu suffix, e.g. `2026-06-08T12:34:56.123456Z`.
+///
+/// Upstream's `metav1.MicroTime`, the type of `Lease.spec.renewTime` and
+/// `acquireTime` and of `Event.eventTime`. Second precision there is wrong,
+/// and since T3.5 it is visible: two renewals inside one second render the
+/// same bytes, and the store correctly answers `Unchanged` to the second.
+#[must_use]
+pub fn to_micro_time_utc(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// Read the wall clock and render it as a [`to_micro_time_utc`] stamp.
+#[must_use]
+pub fn now_micro_time_utc() -> String {
+    to_micro_time_utc(Utc::now())
+}
+
 /// Read the wall clock and render it to the Kubernetes-wire RFC3339
 /// form — the apiserver-boundary timestamp stamp.
 ///
@@ -69,6 +87,17 @@ pub fn epoch_to_rfc3339_utc(secs: i64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// MicroTime carries six fractional digits and a Zulu suffix, and parses
+    /// back through the same reader the lease staleness check uses.
+    #[test]
+    fn micro_time_is_microsecond_rfc3339() {
+        let t = DateTime::parse_from_rfc3339("2026-06-08T12:34:56.123456Z")
+            .map(|d| d.with_timezone(&Utc))
+            .expect("fixture parses");
+        assert_eq!(super::to_micro_time_utc(t), "2026-06-08T12:34:56.123456Z");
+        assert!(super::age_since_rfc3339(&super::now_micro_time_utc()).is_some());
+    }
+
     use super::*;
     use chrono::TimeZone;
 

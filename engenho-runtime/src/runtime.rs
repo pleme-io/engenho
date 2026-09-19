@@ -3561,8 +3561,12 @@ mod tests {
     /// `Infallible` — and does not pretend to serve: it parks, `Halted`.
     #[tokio::test]
     async fn a_listener_that_cannot_bind_halts_and_parks() {
+        // A loopback address that passes config validation (T4.9 keeps node
+        // listeners on loopback and rejects a non-literal before start) but
+        // cannot be bound, because this test already holds the port.
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
         let mut cfg = ephemeral_test_config();
-        cfg.runtime.kubelet_listen_addr = "not-an-address".into();
+        cfg.runtime.kubelet_listen_addr = occupied.local_addr().expect("local addr").to_string();
         let rt = Runtime::start(cfg).await.unwrap();
         let kubelet_http = Child::Listener(Listener::KubeletHttp);
 
@@ -3813,10 +3817,22 @@ mod tests {
         assert!(seen(Driver::DaemonSet).contains("Node"));
         let binder = seen(Driver::PvBinder);
         assert!(binder.contains("VolumeSnapshot") && binder.contains("VolumeSnapshotContent"));
-        let kubelet = seen(Driver::Kubelet);
+        let kubelet = Census::of(&controller_sources(Driver::Kubelet));
+        // Node is read, but since T1.3b through node_readiness::publish_ready,
+        // which takes the key as an argument: the census counts that read as
+        // computed and cannot name it. The declaration is what the wake filter
+        // is built from, so it is checked directly instead.
+        assert!(
+            kubelet.computed >= 1,
+            "the helper's Node read is still seen as a read"
+        );
+        assert!(
+            KUBELET_READS.iter().any(|g| g.kind == "Node"),
+            "the kubelet declares the Node it reads through node_readiness"
+        );
+        let kubelet = kubelet.kinds;
         for kind in [
             "Pod",
-            "Node",
             "Service",
             "ConfigMap",
             "Secret",

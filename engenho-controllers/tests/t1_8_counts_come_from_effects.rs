@@ -81,10 +81,13 @@ fn orphan_pod(name: &str, finalizers: &[&str]) -> Value {
     pod
 }
 
-/// E1. gc deletes orphans with no clock. For an orphan that carries a
-/// finalizer the store has no deletionTimestamp to stamp, so it leaves the
-/// object exactly as it was and answers `NoOp`. That delete used to count
-/// as a change, on every tick, for as long as the finalizer stayed.
+/// E1. A delete the store answers `NoOp` is not a change.
+///
+/// Since store T3.6 every delete carries a clock, so gc's first delete of a
+/// finalizer-bearing orphan stamps `deletionTimestamp` (Terminating): a real
+/// change, counted once. Every later delete of that object, for as long as
+/// the finalizer holds, is the store's `NoOp`. That repeat used to count as a
+/// change on every tick.
 #[tokio::test]
 async fn a_write_the_store_answered_noop_is_not_a_change() {
     let store = boot("t1-8-gc-noop").await;
@@ -92,7 +95,6 @@ async fn a_write_the_store_answered_noop_is_not_a_change() {
     let free = ResourceKey::namespaced("", "v1", "Pod", "ns", "free");
     put(&store, &held, orphan_pod("held", &["example.com/hold"])).await;
     put(&store, &free, orphan_pod("free", &[])).await;
-    let held_before = store.get(&held).await.expect("held");
 
     let gc = GcController::new(store.clone(), None);
     let outcome = gc.tick().await.expect("gc tick");
@@ -102,18 +104,20 @@ async fn a_write_the_store_answered_noop_is_not_a_change() {
         store.get(&free).await.is_none(),
         "positive control: the finalizer-free orphan was deleted"
     );
-    assert_eq!(
-        store.get(&held).await.expect("held survives"),
-        held_before,
-        "the store changed nothing on the finalizer-bearing orphan"
+    let terminating = store.get(&held).await.expect("held survives its finalizer");
+    assert!(
+        terminating["metadata"]["deletionTimestamp"].is_string(),
+        "the finalizer-bearing orphan is Terminating, not gone: {terminating}"
     );
     assert_eq!(
-        outcome.report.objects_changed, 1,
-        "only the delete that landed is a change; the NoOp is not"
+        outcome.report.objects_changed, 2,
+        "both deletes landed: one removal, one Terminating stamp"
     );
 
-    // And the next tick, with only the held orphan left, reports nothing.
+    // The next tick deletes the Terminating orphan again. The store answers
+    // NoOp and leaves it exactly as it was, so nothing is counted.
     let again = gc.tick().await.expect("gc tick");
+    assert_eq!(store.get(&held).await.expect("held"), terminating);
     assert_eq!(
         again.report.objects_changed, 0,
         "a NoOp repeated every tick is not a change every tick"
