@@ -412,3 +412,31 @@ async fn with_a_live_node_available_the_pod_never_lands_on_the_wedged_one() {
     assert_eq!(landed.as_deref(), Some("b-live"), "{report:?}");
     teardown(store).await;
 }
+
+#[tokio::test]
+async fn the_runtime_reads_the_same_counts_the_scheduler_kept() {
+    // Through the `Controller` trait, the path the WatchDriver ticks: a
+    // bind is a change and carries a note; once nothing is pending the
+    // tick changes nothing and says nothing.
+    use engenho_controllers::Controller;
+
+    let store = boot_store().await;
+    put_node(&store, "node-1").await;
+    put_pending_pod(&store, "pending-pod").await;
+    let sched = Scheduler::new(store.clone(), RoundRobinStrategy::new(), None);
+
+    let first = Controller::tick(&sched).await.unwrap();
+    assert_eq!(first.objects_examined, 1);
+    assert_eq!(first.objects_changed, 1, "the bind is the one change");
+    assert_eq!(first.objects_skipped, 0);
+    assert!(first.note.is_some(), "a pending pod is noted");
+
+    let second = Controller::tick(&sched).await.unwrap();
+    assert_eq!(second.objects_examined, 1);
+    assert_eq!(second.objects_changed, 0, "a bound pod is not rewritten");
+    assert_eq!(second.objects_skipped, 0);
+    assert_eq!(second.note, None, "nothing pending, nothing noted");
+
+    drop(sched);
+    teardown(store).await;
+}

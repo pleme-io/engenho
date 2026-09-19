@@ -502,6 +502,88 @@ async fn probe_pod_arms_a_requeue() {
     teardown(store, kubelet).await;
 }
 
+// ── 6b — The requeue IS the kubelet's probe clock (I26) ───────────────────
+//
+// The kubelet schedules no timer of its own: a tick returns
+// `Requeue(soonest due)`, clamped to the 1 s floor, and the WatchDriver's
+// one requeue slot re-ticks it then. These two pin what that return value
+// is, which is the whole of the kubelet's side of the contract.
+
+/// A readiness exec probe on `period` seconds.
+fn probed(period: u64) -> Value {
+    json!({
+        "name": "main",
+        "image": "busybox",
+        "readinessProbe": {
+            "exec": { "command": ["true"] },
+            "periodSeconds": period
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_probe_due_sooner_than_the_floor_requeues_at_the_floor() {
+    let store = boot_store("probes-requeue-floor").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+    put_pod_container(&store, "p1", probed(5), "Always").await;
+    backend.set_default_exec(ExecOutcome::success()).await;
+
+    // The probe runs on the first tick, so it is next due a full period on.
+    let first = kubelet.tick().await.unwrap();
+    assert_eq!(
+        first.result,
+        ReconcileResult::Requeue(Duration::from_secs(5))
+    );
+
+    // 4.5 s later the probe is due in 0.5 s: the kubelet asks for the 1 s
+    // floor, never less.
+    clock.advance(Duration::from_millis(4500));
+    let second = kubelet.tick().await.unwrap();
+    assert_eq!(
+        second.result,
+        ReconcileResult::Requeue(Duration::from_secs(1)),
+        "a probe due in 0.5 s is requeued at the 1 s floor"
+    );
+
+    teardown(store, kubelet).await;
+}
+
+#[tokio::test]
+async fn the_requeue_is_the_soonest_probe_due_across_pods() {
+    let store = boot_store("probes-requeue-soonest").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+    put_pod_container(&store, "slow", probed(10), "Always").await;
+    put_pod_container(&store, "fast", probed(3), "Always").await;
+    backend.set_default_exec(ExecOutcome::success()).await;
+
+    let first = kubelet.tick().await.unwrap();
+    assert_eq!(
+        first.result,
+        ReconcileResult::Requeue(Duration::from_secs(3)),
+        "one requeue, at the sooner of a 3 s and a 10 s probe"
+    );
+
+    // 1.5 s on: the 3 s probe is due in 1.5 s, the 10 s one in 8.5 s.
+    clock.advance(Duration::from_millis(1500));
+    let second = kubelet.tick().await.unwrap();
+    assert_eq!(
+        second.result,
+        ReconcileResult::Requeue(Duration::from_millis(1500))
+    );
+
+    teardown(store, kubelet).await;
+}
+
 // ── 7 — tcpSocket readiness via FakeNetProber (refused→ok flips ready) ─────
 
 #[tokio::test]

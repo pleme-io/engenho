@@ -2571,11 +2571,15 @@ impl Controller for Kubelet {
         }
 
         // ── (B)+(C) Start + running-status reconciliation over bound set ──
-        // `soonest_requeue` accumulates the smallest next-probe-due across all
-        // bound containers, so the kubelet wakes on its OWN probe clock (a
-        // one-shot Requeue) rather than only on Pod-watch events / the coarse
-        // fallback. None = no probes anywhere = no Requeue = today's wake
-        // behavior (the behavior-preserving guarantee for no-probe pods).
+        // `soonest_requeue` accumulates the soonest thing this tick found
+        // coming due: a probe's next period, the end of a start or
+        // crash-loop hold, a volume or init retry, an orphan's stop still
+        // inside its grace period. The tick returns it as
+        // `Requeue(soonest)`, and the WatchDriver's one requeue slot
+        // re-ticks the kubelet then, so probes run on their own clock rather
+        // than only on Pod-watch events or the coarse fallback. The kubelet
+        // arms no timer of its own. None = nothing due = `Done`: a node with
+        // no probes wakes on events and the fallback alone.
         //
         // ── ★ ONE POD'S FAILURE COSTS ONLY THAT POD ──────────────────────
         // This was a hand loop whose every step ended in `?`, so one pod's
@@ -2634,10 +2638,15 @@ impl Controller for Kubelet {
                 "kubelet tick"
             );
         }
-        // Arm a one-shot re-tick at the soonest next-probe-due (clamped to the
-        // 1s floor) so probes run on `periodSeconds`. A pod with NO probes
-        // contributes nothing → soonest_requeue stays None → ReconcileResult
-        // Done → same wake behavior as the pre-probe kubelet.
+        // Return `Requeue(soonest due)`, clamped to the 1 s floor, and the
+        // WatchDriver's one requeue slot re-ticks the kubelet then, so probes
+        // run on `periodSeconds`. The kubelet schedules nothing itself: the
+        // driver clears its slot when any tick starts and re-arms it from
+        // that tick's outcome, so there is one pending re-tick per driver,
+        // never a chain. Nothing due (no probe, no hold, no retry) → `Done`,
+        // and the next Pod-watch event or the fallback wakes it. Pinned by
+        // m0_6_kubelet_probes: `a_probe_due_sooner_than_the_floor_requeues_at_the_floor`
+        // and `the_requeue_is_the_soonest_probe_due_across_pods`.
         let result = match soonest_requeue {
             Some(after) => ReconcileResult::Requeue(after.max(MIN_PROBE_REQUEUE)),
             None => ReconcileResult::Done,
@@ -4143,7 +4152,8 @@ impl Kubelet {
     /// startup-failing container under the policy; source each container's
     /// readiness from the readiness-probe verdict), and write the
     /// multi-container status. The `soonest_requeue` accumulator collects the
-    /// smallest next-probe-due so `tick` can arm a one-shot re-tick.
+    /// smallest next-probe-due (and the end of any restart hold), which
+    /// `tick` returns as `Requeue` for the `WatchDriver`'s one requeue slot.
     async fn reconcile_running(
         &self,
         key: &ResourceKey,
