@@ -1,6 +1,5 @@
 //! The reconcile loop.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,7 +13,8 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::error::SchedulerError;
-use crate::fit::{NodeResources, fits, node_allocatable, pod_requests};
+use crate::fit::pod_requests;
+use crate::ledger::{NodeLedger, node_name_of};
 use crate::strategy::SchedulingStrategy;
 
 /// The scheduler.
@@ -42,15 +42,15 @@ impl Scheduler {
     /// One reconcile tick.
     ///
     /// 1. List all Pods (matching namespace filter) + all Nodes.
-    /// 2. Seed each Node's running **free** capacity =
-    ///    `allocatable − Σ requests of pods already bound there`
-    ///    (the resource-fit **Filter** stage's accumulator).
+    /// 2. Open a [`NodeLedger`]: each Node's allocatable minus the
+    ///    effective requests of every pod bound there that still holds
+    ///    capacity (the resource-fit **Filter** stage's accumulator).
     /// 3. For each pending Pod (empty/missing `spec.nodeName`): compute
-    ///    its summed resource requests; filter Nodes to those that
+    ///    its effective requests ([`pod_requests`]); filter Nodes to those that
     ///    currently FIT the request; ask the strategy to pick from the
     ///    fitting subset only; on a pick, patch `spec.nodeName` AND
-    ///    decrement that Node's running free so a later Pod in the SAME
-    ///    tick can't overcommit it; on NO fitting node, leave the Pod
+    ///    debit the ledger so a later Pod in the SAME tick can't
+    ///    overcommit that Node; on NO fitting node, leave the Pod
     ///    unbound + write a typed `PodScheduled=False /
     ///    reason=Unschedulable` status.
     ///
@@ -75,25 +75,11 @@ impl Scheduler {
 
         let node_values: Vec<Value> = nodes.iter().map(|(_, v)| v.clone()).collect();
 
-        // Seed per-node running free capacity = allocatable − Σ requests
-        // of pods already bound to it. We scan EVERY pod (cluster-wide,
-        // not just the namespace-scoped pending set) so a pod bound in
-        // another namespace still counts against the node's capacity.
+        // Open the books over EVERY pod (cluster-wide, not just the
+        // namespace-scoped pending set): a pod bound in another namespace
+        // still occupies its node.
         let all_pods = self.store.list("", "v1", "Pod", None).await;
-        let mut free: HashMap<String, NodeResources> = node_values
-            .iter()
-            .filter_map(|n| node_name_of(n).map(|name| (name, node_allocatable(n))))
-            .collect();
-        for (_, pod) in &all_pods {
-            let Some(node) = bound_node(pod) else {
-                continue;
-            };
-            if let Some(f) = free.get_mut(&node) {
-                let req = pod_requests(pod);
-                f.cpu_milli = (f.cpu_milli - req.cpu_milli).max(0);
-                f.mem_milli = (f.mem_milli - req.mem_milli).max(0);
-            }
-        }
+        let mut ledger = NodeLedger::seed(&node_values, all_pods.iter().map(|(_, v)| v));
 
         for (pod_key, pod_value) in &pods {
             if !is_pending(pod_value) {
@@ -102,15 +88,11 @@ impl Scheduler {
             report.pending_pods += 1;
 
             // Resource-fit Filter: restrict candidates to nodes that fit
-            // THIS pod's request given current running free capacity.
+            // THIS pod's request given the ledger's current balances.
             let req = pod_requests(pod_value);
             let fitting: Vec<Value> = node_values
                 .iter()
-                .filter(|n| {
-                    node_name_of(n)
-                        .and_then(|name| free.get(&name).copied())
-                        .is_some_and(|f| fits(&f, &req))
-                })
+                .filter(|n| node_name_of(n).is_some_and(|name| ledger.fits(name, &req)))
                 .cloned()
                 .collect();
 
@@ -149,13 +131,10 @@ impl Scheduler {
                 ))
                 .await?;
 
-            // Decrement the chosen node's running free so a later pending
-            // pod in THIS SAME tick can't also "fit" capacity that is now
-            // spoken for (within-tick overcommit defense).
-            if let Some(f) = free.get_mut(&node_name) {
-                f.cpu_milli = (f.cpu_milli - req.cpu_milli).max(0);
-                f.mem_milli = (f.mem_milli - req.mem_milli).max(0);
-            }
+            // Charge the chosen node so a later pending pod in THIS SAME
+            // tick can't also "fit" capacity that is now spoken for
+            // (within-tick overcommit defense).
+            ledger.debit(&node_name, &req);
 
             report.bound.push(Binding {
                 pod_key: pod_key.clone(),
@@ -292,24 +271,6 @@ pub fn is_pending(pod: &Value) -> bool {
         .and_then(|n| n.as_str())
         .map(str::is_empty)
         .unwrap_or(true)
-}
-
-/// A node's `metadata.name`, if present.
-fn node_name_of(node: &Value) -> Option<String> {
-    node.get("metadata")
-        .and_then(|m| m.get("name"))
-        .and_then(|n| n.as_str())
-        .map(String::from)
-}
-
-/// The node a pod is already bound to (non-empty `spec.nodeName`), or
-/// `None` if the pod is still pending.
-fn bound_node(pod: &Value) -> Option<String> {
-    pod.get("spec")
-        .and_then(|s| s.get("nodeName"))
-        .and_then(|n| n.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from)
 }
 
 #[cfg(test)]

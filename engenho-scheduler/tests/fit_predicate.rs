@@ -273,3 +273,125 @@ async fn no_within_tick_overcommit_of_a_single_node() {
 
     teardown(store, sched).await;
 }
+
+/// Put a pod bound to `node` requesting `cpu`/`memory`, whose last written
+/// `status.phase` is `phase`.
+async fn put_bound_pod_in_phase(
+    store: &StoreMesh,
+    name: &str,
+    node: &str,
+    cpu: &str,
+    memory: &str,
+    phase: &str,
+) {
+    store
+        .propose(ResourceCommand::Put {
+            key: ResourceKey::namespaced("", "v1", "Pod", "default", name),
+            value: json!({
+                "kind": "Pod",
+                "apiVersion": "v1",
+                "metadata": { "name": name },
+                "spec": {
+                    "nodeName": node,
+                    "containers": [{
+                        "name": "main",
+                        "image": "podinfo:6",
+                        "resources": { "requests": { "cpu": cpu, "memory": memory } }
+                    }]
+                },
+                "status": { "phase": phase }
+            }),
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn terminal_bound_pods_release_their_node_capacity() {
+    // One 1-core node, full of finished work: a Succeeded pod and a Failed
+    // pod, each requesting the whole core. Neither will run again, so a
+    // newcomer needing the core must bind there.
+    let store = boot_store().await;
+    put_sized_node(&store, "node-1", "1", "2Gi").await;
+    put_bound_pod_in_phase(&store, "done", "node-1", "1", "512Mi", "Succeeded").await;
+    put_bound_pod_in_phase(&store, "crashed", "node-1", "1", "512Mi", "Failed").await;
+    put_requesting_pod(&store, "newcomer", "1", "256Mi").await;
+
+    let sched = Scheduler::new(store.clone(), RoundRobinStrategy::new(), None);
+    let report = sched.tick().await.unwrap();
+
+    assert_eq!(report.unschedulable_no_fit, 0, "terminal pods hold nothing");
+    assert_eq!(report.bound.len(), 1);
+    assert_eq!(report.bound[0].node_name, "node-1");
+
+    teardown(store, sched).await;
+}
+
+#[tokio::test]
+async fn a_bound_pod_whose_phase_is_not_terminal_keeps_its_capacity() {
+    // `Unknown`, and a phase string that is not a pod phase, are not an
+    // observed finish: the occupant still holds the core.
+    for phase in ["Unknown", "Completed"] {
+        let store = boot_store().await;
+        put_sized_node(&store, "node-1", "1", "2Gi").await;
+        put_bound_pod_in_phase(&store, "occupant", "node-1", "1", "512Mi", phase).await;
+        put_requesting_pod(&store, "newcomer", "1", "256Mi").await;
+
+        let sched = Scheduler::new(store.clone(), RoundRobinStrategy::new(), None);
+        let report = sched.tick().await.unwrap();
+
+        assert_eq!(report.bound.len(), 0, "phase {phase} must hold the core");
+        assert_eq!(report.unschedulable_no_fit, 1);
+
+        teardown(store, sched).await;
+    }
+}
+
+#[tokio::test]
+async fn a_pending_pods_init_container_peak_must_fit_the_node() {
+    // The app asks for 100m, but a plain init container needs 2 cores
+    // first, and the pod holds that while it initializes. A 1-core node
+    // cannot run it; a 4-core node can.
+    for (cores, binds) in [("1", false), ("4", true)] {
+        let store = boot_store().await;
+        put_sized_node(&store, "node-1", cores, "8Gi").await;
+        store
+            .propose(ResourceCommand::Put {
+                key: ResourceKey::namespaced("", "v1", "Pod", "default", "migrator"),
+                value: json!({
+                    "kind": "Pod",
+                    "apiVersion": "v1",
+                    "metadata": { "name": "migrator" },
+                    "spec": {
+                        "initContainers": [{
+                            "name": "migrate",
+                            "image": "migrate:1",
+                            "resources": { "requests": { "cpu": "2", "memory": "64Mi" } }
+                        }],
+                        "containers": [{
+                            "name": "main",
+                            "image": "podinfo:6",
+                            "resources": { "requests": { "cpu": "100m", "memory": "64Mi" } }
+                        }]
+                    }
+                }),
+                expected: None,
+                reason: Reason::Operator,
+            })
+            .await
+            .unwrap();
+
+        let sched = Scheduler::new(store.clone(), RoundRobinStrategy::new(), None);
+        let report = sched.tick().await.unwrap();
+        assert_eq!(
+            report.bound.len(),
+            usize::from(binds),
+            "{cores}-core node: the init container's 2 cores decide the fit"
+        );
+        assert_eq!(report.unschedulable_no_fit, usize::from(!binds));
+
+        teardown(store, sched).await;
+    }
+}
