@@ -17,6 +17,11 @@
 //!     `DerivationCacheBackend` pluggable trait. Sui-as-substrate:
 //!     derivations become a location-independent typed value the
 //!     engenho fabric can move + cache anywhere.
+//!   * [`rollout`] — one `Rollout{Shadow, Enforce}` gate type plus the
+//!     would-reject ledger every tightened check reports through
+//!   * [`freshness`] — the pure judges health is derived from:
+//!     `Freshness{NeverObserved, Fresh, Stale}` for one observation and
+//!     `Liveness{Unknown, Alive, Stalled, Dead}` for one child
 
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
@@ -34,6 +39,7 @@ pub mod drv_disk;
 pub mod error_kind;
 pub mod fake_shell;
 pub mod fingerprint;
+pub mod freshness;
 pub mod gossip_ledger;
 pub mod hash_newtype;
 pub mod hex;
@@ -55,6 +61,7 @@ pub mod replay;
 pub mod retrying_cache;
 pub mod risca;
 pub mod roca;
+pub mod rollout;
 pub mod selo;
 pub mod shape;
 pub mod shape_renderers;
@@ -80,6 +87,7 @@ pub use disposable::{Disposable, DisposableError, Transient};
 pub use drv_disk::DiskDerivationCache;
 pub use error_kind::ErrorKind;
 pub use fingerprint::{Fingerprint, fingerprint_blake3};
+pub use freshness::{Freshness, Liveness, StaleAfter, TaskState, WindowTooShort};
 pub use gossip_ledger::{
     FakeGossipTransport, GossipBroadcast, GossipBroadcaster, GossipChannel, GossipDelivery,
     GossipError, GossipLedger,
@@ -115,6 +123,10 @@ pub use risca::{REDACTED, Redact, Risca, redact_credit_card, redact_email, redac
 pub use roca::{
     ConfirmacaoPolicy, JobTarget, MaterializationJob, Placement, Plantio, PlantioError, Stage,
     StageId,
+};
+pub use rollout::{
+    Gate, Proceed, Refused, RejectReason, Rollout, WouldReject, WouldRejectCount, WouldRejectHook,
+    WouldRejectLedger,
 };
 pub use selo::{Selo, SeloError, SeloIssuer};
 pub use shape::{RenderedArtifact, ShapeError, ShapeRenderer, WorkloadShape};

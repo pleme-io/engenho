@@ -23,6 +23,7 @@ use engenho_store::watch::WatchEvent;
 use engenho_store::{ContinueToken, Revision, WatchEventKind};
 
 use crate::error::ApiError;
+use crate::watch_end::Compacted;
 
 /// Raw list/watch query string params, K8s-shaped.
 ///
@@ -32,9 +33,11 @@ use crate::error::ApiError;
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ListWatchParams {
-    /// `?watch=true` / `?watch=1` → stream; anything else → list.
-    #[serde(deserialize_with = "de_bool")]
-    pub watch: bool,
+    // No `watch` field. Whether a GET streams is decided ONCE, by
+    // `crate::coords::RequestInfo` in the request-info layer, and the
+    // dispatcher reads `RequestInfo::is_watch` — the verb authz judged. A
+    // second read here is how a list-only grant used to open a stream
+    // (`?watch=yes`: authz saw `list`, this struct saw `true`).
     /// `resourceVersion=` — string per K8s ("" / absent / "0" / "N").
     #[serde(rename = "resourceVersion")]
     pub resource_version: Option<String>,
@@ -63,7 +66,10 @@ pub struct ListWatchParams {
     pub send_initial_events: bool,
     /// `resourceVersionMatch=NotOlderThan` — required by K8s alongside
     /// `sendInitialEvents`. Accepted and recorded; engenho always serves the
-    /// most recent revision, which satisfies `NotOlderThan` by construction.
+    /// most recent revision. That satisfies `NotOlderThan` whenever the store
+    /// has reached `resourceVersion`; a `resourceVersion` ahead of the
+    /// snapshot is refused in-band with a 410 instead
+    /// ([`crate::watch_start::WatchRefusal`]).
     #[serde(rename = "resourceVersionMatch")]
     pub resource_version_match: Option<String>,
     /// Accepted + parsed, no-op at M0.1 (informer long-poll timeout).
@@ -401,7 +407,9 @@ pub enum ResumePoint {
     /// revision forward, NO historical replay.
     MostRecent,
     /// `resourceVersion="N"` (N > 0) — replay `changes_since(N)` then
-    /// live.
+    /// live. A WATCH at an `N` the store has not reached, or has compacted
+    /// away, is refused in-band with a 410
+    /// ([`crate::watch_start::WatchRefusal`]).
     At(Revision),
 }
 
@@ -723,30 +731,42 @@ pub fn bookmark_line(rev: Revision, gvk: WatchGvk<'_>, initial_events_end: bool)
     encode_ndjson(&line)
 }
 
-/// Encode an in-band 410 `Status` line carrying `rev` as the safe
-/// resume point. Used mid-stream (the response is already HTTP 200) when
-/// compaction / overflow is discovered — clients (informers) drop their
-/// cache + re-LIST from a revision >= `rev`.
+/// Encode the in-band `ERROR` line that ends a watch whose history was
+/// compacted mid-stream: `Status{code: 410, reason: "Expired"}` with
+/// kube-apiserver's `too old resource version: <requested> (<compacted>)`.
+/// The response is already HTTP 200, so the end is carried in-band; the
+/// client drops its cache and re-LISTs.
+///
+/// Takes a [`Compacted`], which only `WatchGone::CompactedTooOld` builds: an
+/// overflow is not a compaction, and ends another way
+/// ([`crate::watch_end`]).
 #[must_use]
-pub fn status_410_line(rev: Revision) -> Bytes {
-    let status = crate::error::status_object(
-        format!("too old resource version: resume from {rev}"),
+pub fn status_410_line(compacted: Compacted) -> Bytes {
+    error_line(&crate::error::status_object(
+        compacted.to_string(),
         410,
         "Expired",
-    );
-    // The Status object goes out as a watch line of type ERROR — the
-    // shape kube-apiserver uses for in-band terminal status.
+    ))
+}
+
+/// Encode a `Status` object as a watch line of type `ERROR`, the shape
+/// kube-apiserver uses for an in-band terminal status. Every in-band end of a
+/// watch goes through here: the mid-stream 410 above, the no-progress 429
+/// ([`crate::watch_end::NoProgress::status_line`]), a refused start or
+/// resume ([`crate::watch_start::WatchRefusal::status_line`]) and an error
+/// met while a watch resumes.
+#[must_use]
+pub(crate) fn error_line(status: &serde_json::Value) -> Bytes {
     #[derive(Serialize)]
     struct StatusLine<'a> {
         #[serde(rename = "type")]
         kind: &'static str,
         object: &'a serde_json::Value,
     }
-    let line = StatusLine {
+    encode_ndjson(&StatusLine {
         kind: "ERROR",
-        object: &status,
-    };
-    encode_ndjson(&line)
+        object: status,
+    })
 }
 
 /// Serialize a value as one NDJSON line (`<json>\n`). Falls back to an
@@ -760,10 +780,20 @@ fn encode_ndjson<T: Serialize>(value: &T) -> Bytes {
 
 // ── deserialize helpers ────────────────────────────────────────────
 
+/// The ONE truth table for a boolean query flag: `true`, `1` or `yes` (the
+/// value already percent-decoded) is set; anything else, including an empty
+/// value, is not. Shared by every flag here and by the `watch` read in
+/// [`crate::coords::RequestInfo::parse`], so a flag cannot mean one thing to
+/// authz and another to dispatch.
+#[must_use]
+pub(crate) fn query_flag(value: &str) -> bool {
+    matches!(value, "true" | "1" | "yes")
+}
+
 /// `?flag=true|1|yes` → true; absent → false (serde `default`).
 fn de_bool<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
     let s = String::deserialize(de)?;
-    Ok(matches!(s.as_str(), "true" | "1" | "yes"))
+    Ok(query_flag(&s))
 }
 
 /// Same, but absent / empty defaults to `true` (allowWatchBookmarks
@@ -1210,15 +1240,22 @@ mod tests {
     }
 
     #[test]
-    fn watch_flag_parses() {
-        let p: ListWatchParams = serde_urlencoded::from_str("watch=true").unwrap();
-        assert!(p.watch);
-        let p: ListWatchParams = serde_urlencoded::from_str("watch=1").unwrap();
-        assert!(p.watch);
-        let p: ListWatchParams = serde_urlencoded::from_str("watch=false").unwrap();
-        assert!(!p.watch);
-        let p: ListWatchParams = serde_urlencoded::from_str("").unwrap();
-        assert!(!p.watch);
+    fn query_flag_truth_table() {
+        for set in ["true", "1", "yes"] {
+            assert!(query_flag(set), "{set:?} sets a flag");
+        }
+        for unset in ["false", "0", "no", "", "TRUE", "on"] {
+            assert!(!query_flag(unset), "{unset:?} does not set a flag");
+        }
+    }
+
+    #[test]
+    fn list_watch_params_ignore_the_watch_key() {
+        // `watch` is read once, by RequestInfo; the list/watch params accept
+        // the key (every watch request carries it) without holding a copy.
+        let p: ListWatchParams =
+            serde_urlencoded::from_str("watch=true&labelSelector=app%3Dweb").unwrap();
+        assert_eq!(p.label_selector.as_deref(), Some("app=web"));
     }
 
     #[test]
@@ -1522,7 +1559,12 @@ mod tests {
 
     #[test]
     fn status_410_line_shape() {
-        let bytes = status_410_line(Revision(3));
+        let compacted = Compacted::try_from(engenho_store::WatchGone::CompactedTooOld {
+            requested: Revision(3),
+            compacted: Revision(6),
+        })
+        .unwrap();
+        let bytes = status_410_line(compacted);
         let s = std::str::from_utf8(&bytes).unwrap();
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(v.get("type").unwrap(), "ERROR");
@@ -1530,5 +1572,9 @@ mod tests {
         assert_eq!(obj.get("kind").unwrap(), "Status");
         assert_eq!(obj.get("code").unwrap(), 410);
         assert_eq!(obj.get("reason").unwrap(), "Expired");
+        assert_eq!(
+            obj.get("message").unwrap(),
+            "too old resource version: 3 (6)"
+        );
     }
 }

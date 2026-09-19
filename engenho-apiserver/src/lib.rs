@@ -51,6 +51,8 @@ pub mod schema_validation;
 pub mod server;
 pub mod table;
 pub mod validation;
+pub mod watch_end;
+pub mod watch_start;
 pub mod webhook_admission;
 
 pub use authn::{
@@ -61,17 +63,23 @@ pub use authz::{
     AllowAllAuthorizer, Attributes, Authorizer, Decision, EffectiveRules, RbacAuthorizer,
     RbacStoreEnv, into_dyn_authorizer, store_env::StoreRbacEnv,
 };
-pub use coords::{RequestInfo, ResourceCoords, parse_resource_path, resource_verb};
+pub use coords::{
+    RequestInfo, RequestInfoError, RequestTarget, ResourceCoords, parse_resource_path,
+    resource_verb,
+};
 pub use discovery::{
     APIGroup, APIGroupList, APIResource, APIResourceList, APIVersions, GroupVersionForDiscovery,
     ServerAddressByClientCIDR,
 };
 pub use error::{ApiError, ErrorKind, forbidden_message, status_object};
 pub use handler::{
-    ResourceHandler, RouterHandlerSink, StoreBackedHandler, gone_to_api_error,
-    handlers_from_catalog, handlers_from_catalog_with_admission,
+    ResourceHandler, RouterHandlerSink, StoreBackedHandler, handlers_from_catalog,
+    handlers_from_catalog_with_admission,
 };
-pub use health::VersionInfo;
+pub use health::{ChildLiveness, DrainState, LivenessSource, VersionInfo};
+pub use metrics::{
+    LastTick, MetricsSnapshot, MetricsSource, ObjectCount, ReconcileCount, ReconcileResult,
+};
 pub use openapi::ApiDoc;
 pub use params::{
     ListWatchParams, ResumePoint, Selectors, body_precondition, bookmark_line, gvk_ns_matches,
@@ -88,6 +96,11 @@ pub use scale::{
     Scale, ScaleMeta, ScaleSpec, ScaleStatus, label_selector_to_string, project_scale,
 };
 pub use server::{ApiServer, ServerError};
+pub use watch_end::{
+    AfterGone, Compacted, NO_PROGRESS_RETRY_AFTER_SECONDS, NoProgress, Progressed, Resume,
+    WatchEnd, WatchProgress,
+};
+pub use watch_start::{WatchRefusal, WatchStart};
 pub use webhook_admission::{
     ReqwestWebhookCaller, StoreWebhookConfigSource, catalog_pluralizer, mutating_webhook_plugin,
 };

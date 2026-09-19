@@ -71,10 +71,13 @@ pub enum ApiError {
     /// wire is built by serde, never `format!()`).
     #[error("{0}")]
     AuthzForbidden(String),
-    /// The requested `resourceVersion` resume point has been compacted
-    /// away — the K8s 410 Gone / Expired equivalent. The client must
-    /// re-LIST + re-WATCH from the fresh list revision. Carries the
-    /// human-readable message rendered into the `Status` body.
+    /// A LIST `continue` token that no longer decodes or verifies — the K8s
+    /// 410 Gone / Expired equivalent. The client must restart the LIST.
+    /// Carries the human-readable message rendered into the `Status` body.
+    ///
+    /// Never a WATCH's answer: a watch the store cannot serve from its
+    /// `resourceVersion` ends in-band ([`crate::watch_start::WatchRefusal`]),
+    /// because kube-rs retries an HTTP error at the same revision forever.
     #[error("{0}")]
     Gone(String),
     /// A server-side apply hit field-ownership conflicts `force` did not
@@ -151,12 +154,18 @@ impl ApiError {
     }
 }
 
-/// A typed K8s `Status` object. The single render surface for every
-/// failure body — both the [`IntoResponse`] path (a real HTTP error)
-/// and the in-band watch-stream 410 line (`params::status_410_line`)
-/// build their JSON through this struct, never `format!()` of JSON.
+/// A typed K8s `Status` FAILURE object. The single render surface for
+/// every failure body: the [`IntoResponse`] path (a real HTTP error), the
+/// in-band watch-stream ends (`params::status_410_line`, the 429 of
+/// `watch_end::NoProgress`, an [`ApiError`] met while a watch resumes) and
+/// the apply-conflict 409 all build their JSON
+/// through this struct, never `format!()` of JSON.
+///
+/// `D` is the `details` block: [`NoDetails`] for the plain shape (the block
+/// is then absent, and cannot be present), [`StatusCauseDetails`] for an
+/// apply conflict, [`RetryAfterDetails`] for a 429.
 #[derive(Serialize)]
-struct K8sStatus {
+struct K8sStatus<D> {
     kind: &'static str,
     #[serde(rename = "apiVersion")]
     api_version: &'static str,
@@ -164,6 +173,41 @@ struct K8sStatus {
     code: u16,
     reason: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<D>,
+}
+
+impl<D: Serialize> K8sStatus<D> {
+    fn failure(code: u16, reason: &str, message: String, details: Option<D>) -> Self {
+        Self {
+            kind: "Status",
+            api_version: "v1",
+            status: "Failure",
+            code,
+            reason: reason.to_string(),
+            message,
+            details,
+        }
+    }
+
+    /// As a JSON value. Infallible for these concrete shapes.
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// The `details` of a plain failure `Status`: none. Uninhabited, so a plain
+/// Status can never carry a details block.
+#[derive(Serialize)]
+enum NoDetails {}
+
+/// The `metav1.StatusDetails` of a 429: how long the client should wait
+/// before it retries. client-go reads it through
+/// `apierrors.SuggestsClientDelay`.
+#[derive(Serialize)]
+struct RetryAfterDetails {
+    #[serde(rename = "retryAfterSeconds")]
+    retry_after_seconds: u32,
 }
 
 /// A typed K8s `Status` SUCCESS object — the `metav1.Status{status:"Success"}`
@@ -189,28 +233,13 @@ struct StatusDetails {
     kind: String,
 }
 
-/// A typed K8s `Status` FAILURE object carrying a `details.causes` array —
-/// the shape server-side apply returns on a field-ownership conflict
-/// (`Apply failed with N conflict(s)`, reason "Conflict", code 409, one
-/// `FieldManagerConflict` cause per conflicting field). DISTINCT from
-/// [`K8sStatus`] (which has no `details`). The `causes` array is the typed
-/// `serde_json::Value` built store-side by
+/// The `metav1.StatusDetails` block carrying `causes` — the shape
+/// server-side apply returns on a field-ownership conflict (`Apply failed
+/// with N conflict(s)`, reason "Conflict", code 409, one
+/// `FieldManagerConflict` cause per conflicting field). The `causes` array
+/// is the typed `serde_json::Value` built store-side by
 /// `engenho_store::ssa::ApplyConflicts::to_causes` — serde all the way
 /// (TYPED EMISSION; never `format!()` of the wire object).
-#[derive(Serialize)]
-struct K8sStatusWithCauses {
-    kind: &'static str,
-    #[serde(rename = "apiVersion")]
-    api_version: &'static str,
-    status: &'static str,
-    code: u16,
-    reason: String,
-    message: String,
-    details: StatusCauseDetails,
-}
-
-/// The `metav1.StatusDetails` block carrying `causes` — used by the
-/// apply-conflict 409.
 #[derive(Serialize)]
 struct StatusCauseDetails {
     causes: serde_json::Value,
@@ -252,16 +281,27 @@ pub fn delete_status_success(name: &str, kind: &str) -> serde_json::Value {
 /// kube-apiserver's long-poll watch behavior.
 #[must_use]
 pub fn status_object(message: String, code: u16, reason: &str) -> serde_json::Value {
-    let status = K8sStatus {
-        kind: "Status",
-        api_version: "v1",
-        status: "Failure",
-        code,
-        reason: reason.to_string(),
+    K8sStatus::<NoDetails>::failure(code, reason, message, None).to_value()
+}
+
+/// Build `Status{code: 429, reason: "TooManyRequests",
+/// details.retryAfterSeconds}`, the shape of upstream's
+/// `errors.NewTooManyRequests`. Crate-private: the one in-band watch 429 is
+/// `watch_end::NoProgress::status_line`.
+#[must_use]
+pub(crate) fn too_many_requests_object(
+    message: String,
+    retry_after_seconds: u32,
+) -> serde_json::Value {
+    K8sStatus::failure(
+        429,
+        "TooManyRequests",
         message,
-    };
-    // Infallible for this concrete struct.
-    serde_json::to_value(status).unwrap_or(serde_json::Value::Null)
+        Some(RetryAfterDetails {
+            retry_after_seconds,
+        }),
+    )
+    .to_value()
 }
 
 /// A protobuf-codec failure at the HTTP boundary becomes an
@@ -308,61 +348,67 @@ pub fn forbidden_message(attrs: &crate::authz::Attributes) -> String {
     )
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let code = self.status_code();
-        // The apply-conflict path renders a Status WITH `details.causes` —
-        // a distinct body shape from every other error (which has no
-        // details). Handle it first; the message names the conflict count.
-        if let ApiError::ApplyConflict(causes) = &self {
+impl ApiError {
+    /// The `Status.reason` this error carries on the wire.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "NotFound",
+            Self::Conflict(_, _) => "AlreadyExists",
+            // Optimistic-concurrency failure uses reason "Conflict" (K8s uses
+            // `.details` for these), distinct from the create-already-exists
+            // "AlreadyExists" above. An apply conflict shares the reason and
+            // adds `details.causes` (see `status`).
+            Self::ResourceVersionConflict(_) | Self::ApplyConflict(_) => "Conflict",
+            Self::BadRequest(_) => "BadRequest",
+            Self::Invalid(_) => "Invalid",
+            Self::NotAcceptable(_) => "NotAcceptable",
+            Self::Unauthorized(_) => "Unauthorized",
+            Self::UnsupportedMediaType(_) => "UnsupportedMediaType",
+            Self::Forbidden(_) | Self::AuthzForbidden(_) => "Forbidden",
+            Self::Gone(_) => "Expired",
+            Self::Internal(_) => "InternalError",
+            Self::StorageError(_) => "ServiceUnavailable",
+        }
+    }
+
+    /// This error as a K8s failure `Status`: the one body both an HTTP error
+    /// response and an in-band watch `ERROR` line carry.
+    fn status(&self) -> K8sStatus<StatusCauseDetails> {
+        let code = self.status_code().as_u16();
+        // The apply-conflict path renders a Status WITH `details.causes`, a
+        // distinct body shape from every other error (which has no details).
+        // The message names the conflict count.
+        if let Self::ApplyConflict(causes) = self {
             let n = causes.as_array().map_or(0, Vec::len);
             let message = if n == 1 {
                 "Apply failed with 1 conflict".to_string()
             } else {
                 format!("Apply failed with {n} conflicts")
             };
-            let payload = K8sStatusWithCauses {
-                kind: "Status",
-                api_version: "v1",
-                status: "Failure",
-                code: code.as_u16(),
-                reason: "Conflict".to_string(),
+            return K8sStatus::failure(
+                code,
+                self.reason(),
                 message,
-                details: StatusCauseDetails {
+                Some(StatusCauseDetails {
                     causes: causes.clone(),
-                },
-            };
-            return (code, Json(payload)).into_response();
+                }),
+            );
         }
-        let reason = match self {
-            ApiError::NotFound(_) => "NotFound",
-            ApiError::Conflict(_, _) => "AlreadyExists",
-            // Optimistic-concurrency failure uses reason "Conflict"
-            // (K8s uses `.details` for these) — distinct from the
-            // create-already-exists "AlreadyExists" above. `ApplyConflict`
-            // is rendered by the early-return above (with `details.causes`)
-            // so its arm here is unreachable; it shares the "Conflict"
-            // reason for exhaustiveness.
-            ApiError::ResourceVersionConflict(_) | ApiError::ApplyConflict(_) => "Conflict",
-            ApiError::BadRequest(_) => "BadRequest",
-            ApiError::Invalid(_) => "Invalid",
-            ApiError::NotAcceptable(_) => "NotAcceptable",
-            ApiError::Unauthorized(_) => "Unauthorized",
-            ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
-            ApiError::Forbidden(_) | ApiError::AuthzForbidden(_) => "Forbidden",
-            ApiError::Gone(_) => "Expired",
-            ApiError::Internal(_) => "InternalError",
-            ApiError::StorageError(_) => "ServiceUnavailable",
-        };
-        let payload = K8sStatus {
-            kind: "Status",
-            api_version: "v1",
-            status: "Failure",
-            code: code.as_u16(),
-            reason: reason.to_string(),
-            message: self.to_string(),
-        };
-        (code, Json(payload)).into_response()
+        K8sStatus::failure(code, self.reason(), self.to_string(), None)
+    }
+
+    /// This error as the object of an in-band watch `ERROR` line, for a
+    /// failure met after the watch's HTTP 200 has gone out: the same `Status`
+    /// its HTTP response would carry.
+    #[must_use]
+    pub(crate) fn to_status_object(&self) -> serde_json::Value {
+        self.status().to_value()
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status_code(), Json(self.status())).into_response()
     }
 }
 
@@ -462,8 +508,9 @@ mod tests {
 
     #[test]
     fn gone_renders_410_expired_status() {
-        // CompactedTooOld → ApiError::Gone → HTTP 410 + reason "Expired".
-        let err = ApiError::Gone("too old resource version: 2 (5)".into());
+        // An expired continue token → ApiError::Gone → HTTP 410 + reason
+        // "Expired".
+        let err = ApiError::Gone("invalid or expired continue token".into());
         assert_eq!(err.status_code(), StatusCode::GONE);
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::GONE);

@@ -3,9 +3,10 @@
 //!
 //! The router supports kubectl's canonical URLs across BOTH the core
 //! group (`/api/v1/…`) and named groups (`/apis/<group>/<version>/…`)
-//! through ONE coords → dispatch path: two catch-all routes feed the
-//! [`crate::coords::ResourceCoords`] extractor (the single place URL
-//! shapes are parsed), and scope-agnostic per-method verb handlers resolve
+//! through ONE coords → dispatch path: two catch-all routes select the
+//! verb handler, the [`crate::coords::ResourceCoords`] extractor hands it the
+//! coordinates the request-info layer classified ONCE (the same value authz
+//! judged), and scope-agnostic per-method verb handlers resolve
 //! a handler via ONE resolver ([`RouterState::lookup`]) then delegate to
 //! the shared per-verb `do_*` bodies. This collapses the ~20 hand-fanned
 //! per-scope/per-verb route wrappers (5 verbs × 4 scope/group shapes) into
@@ -13,15 +14,14 @@
 //! internally on `coords.name`).
 //!
 //! Feeding routes:
-//!   * `/api/v1/*rest`               → core group (extractor synthesizes
-//!                                      `group=None, version="v1"`).
-//!   * `/apis/:group/:version/*rest` → named group (`group`/`version` from
-//!                                      the path).
+//!   * `/api/v1/*rest`               → core group.
+//!   * `/apis/:group/:version/*rest` → named group.
 //!
-//! The extractor decomposes the `*rest` tail into the six K8s resource URL
-//! shapes (namespaced/cluster × collection/instance, + an optional
-//! subresource segment); the verb handlers pick list-vs-watch +
-//! collection-vs-instance from `?watch=` + `coords.name`. A handler-map
+//! [`crate::coords::RequestInfo::parse`] decomposes the percent-decoded path
+//! into the six K8s resource URL shapes (namespaced/cluster ×
+//! collection/instance, + an optional subresource segment); the verb handlers
+//! pick list-vs-watch + collection-vs-instance from
+//! [`crate::coords::RequestInfo::is_watch`] + `coords.name`. A handler-map
 //! key is the full `(group, version, plural)` triple with `group=""`/
 //! `version="v1"` as the core sentinel, so the old `lookup_core(p)` is
 //! exactly `lookup("", "v1", p)` — the two resolvers fold into one.
@@ -48,7 +48,7 @@ use engenho_kube_proto::{
     self as kube_proto, CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type,
     response_wants_protobuf,
 };
-use engenho_store::{WatchEventKind, WatchGone, WatchSignal, WatchStream};
+use engenho_store::{Revision, WatchEventKind, WatchSignal, WatchStream};
 use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::Subresource;
 use engenho_types::patch::PatchType;
@@ -60,9 +60,11 @@ use crate::handler::ResourceHandler;
 use crate::health;
 use crate::openapi::ApiDoc;
 use crate::params::{
-    DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, event_line,
-    gvk_ns_matches, status_410_line,
+    DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, error_line,
+    event_line, gvk_ns_matches,
 };
+use crate::watch_end::{AfterGone, WatchProgress};
+use crate::watch_start::{WatchRefusal, WatchStart};
 
 /// The dispatch key for a registered handler: `(group, version, plural)`.
 /// `group` is `""` for the core group. Keying on the full triple (not the
@@ -114,6 +116,33 @@ pub struct RouterState {
     /// both from ONE `SaKeypair`, so a mintable token is always a verifiable
     /// one.
     pub token_issuer: Option<Arc<crate::sa_token::SaIssuer>>,
+    /// The process's rollout-gate ledger: what every gate in `Shadow` has
+    /// allowed that `Enforce` would have refused. `/metrics` renders it as
+    /// `engenho_would_reject_total{gate,reason}`.
+    ///
+    /// Defaults to a ledger private to this router that logs through
+    /// [`crate::metrics::log_would_reject`]. The runtime installs the ONE
+    /// ledger it shares with every other gate-owning component via
+    /// [`Self::with_would_reject_ledger`], so one scrape shows every gate.
+    pub would_reject: Arc<engenho_substrate::WouldRejectLedger>,
+    /// What `/livez`, `/healthz` and `/readyz` are derived from: the
+    /// runtime's supervised children, drain state and store.
+    ///
+    /// `None` ⇒ every health endpoint fails on a `liveness-source` check.
+    /// That is the honest answer for a server nothing has told about its
+    /// children, and it is deliberately NOT a default that reports ok: the
+    /// constant `"ok"` is what this field replaced. The runtime installs its
+    /// source via [`Self::with_liveness_source`].
+    pub liveness: Option<Arc<dyn crate::health::LivenessSource>>,
+    /// How long `/readyz` waits for the linearizable store read.
+    /// Defaults to [`crate::health::DEFAULT_STORE_READ_TIMEOUT`].
+    pub readyz_store_read_timeout: std::time::Duration,
+    /// What `/metrics` renders the store revision, panic count, reconcile
+    /// counts and last-tick timestamps from.
+    ///
+    /// `None` ⇒ those families are absent from the scrape (a dashboard
+    /// reads "no data"), never rendered as zeros it would chart as real.
+    pub metrics_source: Option<Arc<dyn crate::metrics::MetricsSource>>,
 }
 
 impl RouterState {
@@ -136,7 +165,50 @@ impl RouterState {
             // No signing key by default: `/token` answers a typed error until
             // the runtime installs the cluster's keypair. NEVER a stub token.
             token_issuer: None,
+            would_reject: Arc::new(engenho_substrate::WouldRejectLedger::new(
+                crate::metrics::log_would_reject,
+            )),
+            // Unwired: health is red and the source-derived metric families
+            // are absent until the runtime installs its sources.
+            liveness: None,
+            readyz_store_read_timeout: crate::health::DEFAULT_STORE_READ_TIMEOUT,
+            metrics_source: None,
         }
+    }
+
+    /// Install what the health endpoints are derived from. Builder style
+    /// mirroring [`Self::with_authorizer`]. The runtime builds the source
+    /// before starting the server and its children report into it after.
+    #[must_use]
+    pub fn with_liveness_source(mut self, source: Arc<dyn crate::health::LivenessSource>) -> Self {
+        self.liveness = Some(source);
+        self
+    }
+
+    /// Replace how long `/readyz` waits for its store read.
+    #[must_use]
+    pub fn with_readyz_store_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.readyz_store_read_timeout = timeout;
+        self
+    }
+
+    /// Install what `/metrics` reads the runtime's families from.
+    #[must_use]
+    pub fn with_metrics_source(mut self, source: Arc<dyn crate::metrics::MetricsSource>) -> Self {
+        self.metrics_source = Some(source);
+        self
+    }
+
+    /// Install the process-wide rollout-gate ledger. Builder style mirroring
+    /// [`Self::with_authorizer`]; the runtime passes the same `Arc` to every
+    /// component that owns a gate, so `/metrics` counts all of them.
+    #[must_use]
+    pub fn with_would_reject_ledger(
+        mut self,
+        ledger: Arc<engenho_substrate::WouldRejectLedger>,
+    ) -> Self {
+        self.would_reject = ledger;
+        self
     }
 
     /// Install the ServiceAccount token minter. Builder style mirroring
@@ -302,13 +374,21 @@ pub fn build(state: RouterState) -> Router {
     let authenticator = state.authenticator.clone();
     let authorizer = state.authorizer.clone();
     let router = build_routes(state);
-    // Layer order (axum: the LAST `.layer()` is OUTERMOST). The authz layer is
-    // applied FIRST so it is INNER to the authn layer — authn populates
-    // `Extension<UserInfo>` (outer), THEN authz reads it (inner). Both wrap the
-    // WHOLE route table (discovery + SAR + health), matching the authn layer's
-    // placement; the always-allow check is the first branch inside the authz
-    // middleware (health/version are pre-authz so they work with an unseeded
-    // RBAC store).
+    // Layer order (axum: the LAST `.layer()` is OUTERMOST), outside in:
+    //
+    //   1. request-info — classifies the request ONCE (method + decoded path +
+    //      `watch`) into `Extension<RequestInfo>`; upstream runs
+    //      `WithRequestInfo` before authentication too.
+    //   2. authn — populates `Extension<UserInfo>`.
+    //   3. authz — judges the stored RequestInfo as that user.
+    //
+    // All three wrap the WHOLE route table (discovery + SAR + health + the
+    // fallback), and every route comes from `route_table`, so no route can be
+    // reached without a classification. Dispatch reads the same stored value
+    // (the `ResourceCoords` / `RequestInfo` extractors), so what authz judged
+    // is what runs. The always-allow check is the first branch inside the
+    // authz middleware after the lookup (health/version are pre-authz so they
+    // work with an unseeded RBAC store).
     router
         .layer(axum::middleware::from_fn(
             move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
@@ -322,29 +402,47 @@ pub fn build(state: RouterState) -> Router {
                 async move { authn_middleware(authenticator, req, next).await }
             },
         ))
+        .layer(axum::middleware::from_fn(request_info_middleware))
 }
 
-/// The route table (without the authn layer). Split out from [`build`] so the
-/// authn middleware can wrap the WHOLE table — every route (incl. discovery /
-/// health / selfsubjectreviews) runs through authentication first.
+/// The router built from [`route_table`], without the layers. Split out from
+/// [`build`] so the layers wrap the WHOLE table — every route (incl.
+/// discovery / health / selfsubjectreviews) is classified and authenticated
+/// first.
 fn build_routes(state: RouterState) -> Router {
-    Router::new()
+    route_table()
+        .into_iter()
+        .fold(Router::new(), |router, (path, methods)| {
+            router.route(path, methods)
+        })
+        .with_state(state)
+}
+
+/// Every route this server serves, as `(path pattern, methods)`. The ONE
+/// source of routes: [`build_routes`] folds it into the router, and the
+/// route-coverage test walks it to prove each route is classified before
+/// authz. A route added anywhere else would escape both.
+fn route_table() -> Vec<(&'static str, axum::routing::MethodRouter<RouterState>)> {
+    vec![
         // ── resources: ONE coords→dispatch path, fed by two catch-alls ─
         //
         // The ~20 hand-fanned per-scope/per-verb wrappers collapse into
         // the [`ResourceCoords`] extractor + the scope-agnostic verb
         // handlers (one per HTTP method: GET handles both LIST/WATCH and
         // single-GET, branching on `coords.name`; POST/PATCH/DELETE map to
-        // create/patch/delete). Two catch-all routes feed the extractor:
+        // create/patch/delete). Two catch-all routes pick the HANDLER:
         //
-        //   * `/api/v1/*rest`               → core group (the extractor
-        //                                      synthesizes group=None,
-        //                                      version="v1").
+        //   * `/api/v1/*rest`               → core group.
         //   * `/apis/:group/:version/*rest` → named group.
         //
+        // The route params are never read. The coordinates come from the
+        // request-info layer's one classification of the DECODED path (the
+        // same value authz judged), so an encoded `/` in any segment moves
+        // authz and dispatch together or not at all.
+        //
         // Each catch-all registers EXACTLY the methods the K8s wire
-        // supports for a resource path; the extractor + `?watch=` flag
-        // pick list-vs-watch + collection-vs-instance from `coords.name`.
+        // supports for a resource path; `RequestInfo::is_watch` +
+        // `coords.name` pick list-vs-watch + collection-vs-instance.
         // An unrouted method on a matched resource path yields axum's 405
         // — the same terminal semantics the legacy MethodRouter gave (e.g.
         // PUT was never registered, so it 405'd then too). The discovery /
@@ -352,46 +450,46 @@ fn build_routes(state: RouterState) -> Router {
         // shallower param leaf) and take precedence over the catch-alls in
         // matchit (verified: `/api/v1` exact beats `/api/v1/*rest`, and
         // `/apis/:g/:v` coexists with the one-segment-deeper catch-all).
-        .route(
+        (
             "/api/v1/*rest",
             get(resource_get_or_list)
                 .post(resource_create)
                 .put(resource_put)
                 .patch(resource_patch)
                 .delete(resource_delete),
-        )
-        .route(
+        ),
+        (
             "/apis/:group/:version/*rest",
             get(resource_get_or_list)
                 .post(resource_create)
                 .put(resource_put)
                 .patch(resource_patch)
                 .delete(resource_delete),
-        )
+        ),
         // ── discovery ─────────────────────────────────────────────────
-        .route("/api", get(discovery::api_versions))
-        .route("/api/v1", get(discovery::core_resources))
-        .route("/apis", get(discovery::api_groups))
-        .route("/apis/:group/:version", get(discovery::group_resources))
+        ("/api", get(discovery::api_versions)),
+        ("/api/v1", get(discovery::core_resources)),
+        ("/apis", get(discovery::api_groups)),
+        ("/apis/:group/:version", get(discovery::group_resources)),
         // ── openapi ───────────────────────────────────────────────────
         // `/openapi.json` keeps the utoipa-derived description of engenho's
         // own REST surface (SDK/codegen consumers). `/openapi/v3` is the
         // K8s OpenAPI-v3 DISCOVERY surface kubectl `apply --validate` +
         // `explain` consume — a typed index + per-group vendored schemas,
         // scoped to exactly the cataloged groups.
-        .route("/openapi.json", get(openapi_spec))
-        .route("/openapi/v3", get(openapi_v3_index))
-        .route("/openapi/v3/api/v1", get(openapi_v3_core))
-        .route("/openapi/v3/apis/:group/:version", get(openapi_v3_group))
+        ("/openapi.json", get(openapi_spec)),
+        ("/openapi/v3", get(openapi_v3_index)),
+        ("/openapi/v3/api/v1", get(openapi_v3_core)),
+        ("/openapi/v3/apis/:group/:version", get(openapi_v3_group)),
         // ── authentication.k8s.io SelfSubjectReview (kubectl auth whoami) ──
         // A discovery-light special route (NOT a store-backed kind): it echoes
         // the authenticated identity from `Extension<UserInfo>` back as a typed
         // SelfSubjectReview. POST per the upstream API; the body is ignored
         // (the identity comes from the credential, not the body).
-        .route(
+        (
             "/apis/authentication.k8s.io/v1/selfsubjectreviews",
             axum::routing::post(self_subject_review),
-        )
+        ),
         // ── authorization.k8s.io SubjectAccessReview family (Brick B) ──────
         // Discovery-light special routes (NOT store-backed kinds), modeled on
         // the SelfSubjectReview route above. `kubectl auth can-i` POSTs to
@@ -400,29 +498,30 @@ fn build_routes(state: RouterState) -> Router {
         // (Extension<UserInfo> = the caller) and through the authz layer (a
         // SubjectAccessReview create is itself authorized — granted to
         // system:masters + via the system:basic-user policy for self-reviews).
-        .route(
+        (
             "/apis/authorization.k8s.io/v1/subjectaccessreviews",
             axum::routing::post(crate::authz::sar::subject_access_review),
-        )
-        .route(
+        ),
+        (
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
             axum::routing::post(crate::authz::sar::self_subject_access_review),
-        )
-        .route(
+        ),
+        (
             "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
             axum::routing::post(crate::authz::sar::self_subject_rules_review),
-        )
-        // ── version + health (no RouterState; kubectl/client-go probe
-        //    these before they will trust the server) ──────────────────
-        .route("/version", get(health::version))
-        .route("/readyz", get(health::readyz))
-        .route("/livez", get(health::livez))
-        .route("/healthz", get(health::healthz))
+        ),
+        // ── version + health (pre-authz; kubectl/client-go probe these
+        //    before they will trust the server). Health reads the
+        //    RouterState's liveness source: derived, never a constant. ───
+        ("/version", get(health::version)),
+        ("/readyz", get(health::readyz)),
+        ("/livez", get(health::livez)),
+        ("/healthz", get(health::healthz)),
         // Prometheus. RBAC already classified this as a non-resource URL
         // before anything served it — authz could authorize a path that
         // did not exist.
-        .route("/metrics", get(crate::metrics::metrics))
-        .with_state(state)
+        ("/metrics", get(crate::metrics::metrics)),
+    ]
 }
 
 /// The OpenAPI v3 spec — the central machine-readable description
@@ -499,8 +598,8 @@ async fn authn_middleware(
 // ── authorization middleware (Brick B) ─────────────────────────────────────
 
 /// The pre-authz TIER-1 always-allow set: `/healthz`, `/livez`, `/readyz`,
-/// `/version`. These are wired in [`build_routes`] with NO `RouterState`;
-/// kubectl/client-go probe them BEFORE trusting the server, so they MUST work
+/// `/version`. These read no RBAC state (health reads only the liveness
+/// source); kubectl/client-go probe them BEFORE trusting the server, so they MUST work
 /// even with an empty/unseeded RBAC store (e.g. during boot before
 /// `seed_bootstrap_rbac` lands). This is the load-bearing reason they are a
 /// fixed allow-list HERE (in the authz middleware) and NOT a binding.
@@ -516,14 +615,34 @@ fn is_always_allowed(path: &str) -> bool {
         || path.starts_with("/version/")
 }
 
+/// The request-info middleware — the ONE parse. Classifies the request from
+/// its method + URI ([`crate::coords::RequestInfo::parse`]: percent-decoded
+/// path, `watch` flag) and stores the result in the request extensions, where
+/// authz and dispatch both read it. A path that is not UTF-8 once decoded is a
+/// typed 400 here, before any identity is resolved.
+async fn request_info_middleware(
+    mut req: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    match crate::coords::RequestInfo::parse(req.method(), req.uri()) {
+        Ok(info) => {
+            req.extensions_mut().insert(info);
+            next.run(req).await
+        }
+        Err(e) => ApiError::from(e).into_response(),
+    }
+}
+
 /// The authz middleware — the thin axum adapter over the typed
 /// [`crate::authz::Authorizer`]. Branch order:
 ///
+///   0. Read the [`crate::coords::RequestInfo`] the request-info layer stored.
+///      None → a typed 500 ([`crate::coords::RequestInfoError::Missing`]); the
+///      path is never parsed here.
 ///   1. [`is_always_allowed`] (`/healthz`, `/livez`, `/readyz`, `/version`)
 ///      → proceed (pre-authz; works with an unseeded RBAC store).
-///   2. Build [`crate::authz::Attributes`] from `req.method()` + path (the
-///      shared [`crate::coords::RequestInfo`] parse) + the resolved
-///      [`UserInfo`] (inserted by the authn layer).
+///   2. Build [`crate::authz::Attributes`] from that `RequestInfo` + the
+///      resolved [`UserInfo`] (inserted by the authn layer).
 ///   3. `authorizer.authorize(&attrs)` →
 ///      * [`crate::authz::Decision::Allow`] → `next.run(req)`.
 ///      * `Deny` / `NoOpinion` → a typed [`ApiError::AuthzForbidden`] 403
@@ -533,32 +652,21 @@ async fn authz_middleware(
     req: axum::http::Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    let path = req.uri().path().to_string();
-
-    // TIER 1 — pre-authz always-allow (health/version). FIRST branch.
-    if is_always_allowed(&path) {
+    let attrs = match crate::coords::RequestInfo::from_extensions(req.extensions()) {
+        Err(e) => return ApiError::from(e).into_response(),
+        // TIER 1 — pre-authz always-allow (health/version).
+        Ok(info) if info.non_resource_url().is_some_and(is_always_allowed) => None,
+        Ok(info) => {
+            let user = req
+                .extensions()
+                .get::<UserInfo>()
+                .cloned()
+                .unwrap_or_else(UserInfo::anonymous);
+            Some(crate::authz::Attributes::for_request(user, info))
+        }
+    };
+    let Some(attrs) = attrs else {
         return next.run(req).await;
-    }
-
-    // Build the typed Attributes from method + path + the resolved identity.
-    let method = req.method().as_str().to_string();
-    let is_watch = req.uri().query().map(query_has_watch).unwrap_or(false);
-    let user = req
-        .extensions()
-        .get::<UserInfo>()
-        .cloned()
-        .unwrap_or_else(UserInfo::anonymous);
-    let info = crate::coords::RequestInfo::from_method_path(&method, &path, is_watch);
-    let attrs = crate::authz::Attributes {
-        user,
-        verb: info.verb,
-        group: info.group,
-        version: info.version,
-        resource: info.resource,
-        subresource: info.subresource,
-        namespace: info.namespace,
-        name: info.name,
-        non_resource_url: info.non_resource_url,
     };
 
     match authorizer.authorize(&attrs).await {
@@ -570,16 +678,6 @@ async fn authz_middleware(
             ApiError::AuthzForbidden(crate::error::forbidden_message(&attrs)).into_response()
         }
     }
-}
-
-/// `true` iff the raw query string carries `watch=true` / `watch=1` — the GET
-/// verb maps to `watch` when present. Parsed without a full decode (the values
-/// are simple flags).
-fn query_has_watch(query: &str) -> bool {
-    query.split('&').any(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        k == "watch" && (v == "true" || v == "1" || v.is_empty())
-    })
 }
 
 /// Extract the `Authorization: Bearer <token>` value, if present. Case-
@@ -1144,18 +1242,22 @@ async fn do_delete_collection(
 
 /// The shared LIST/WATCH body for both the core + grouped cases.
 ///
-///   * `p.watch == false` → the atomic-rv LIST envelope (selectors
+///   * `watch == false` → the atomic-rv LIST envelope (selectors
 ///     applied apiserver-side; rv = `current_revision`).
-///   * `p.watch == true`  → the streaming chunked NDJSON WATCH (the K8s
+///   * `watch == true`  → the streaming chunked NDJSON WATCH (the K8s
 ///     list-then-watch contract).
+///
+/// `watch` is [`crate::coords::RequestInfo::is_watch`] — the verb authz
+/// judged — never a second read of the query.
 async fn do_list_or_watch(
     h: Arc<dyn ResourceHandler>,
     namespace: Option<String>,
+    watch: bool,
     p: ListWatchParams,
     codec: ResponseCodec,
 ) -> Result<Response, ApiError> {
     let sel = p.selectors()?;
-    if p.watch {
+    if watch {
         watch_response(h, namespace, p, sel, codec).await
     } else {
         // Paged path when `limit` or `continue` is present; otherwise the
@@ -1190,7 +1292,10 @@ struct WatchStreamState {
     handler: Arc<dyn ResourceHandler>,
     namespace: Option<String>,
     selectors: Selectors,
-    allow_bookmarks: bool,
+    /// What the client has been sent, whether it asked for bookmarks, and
+    /// where the store stream opened: decides whether the watch ends or
+    /// resumes when the store stops serving it ([`crate::watch_end`]).
+    progress: WatchProgress,
     /// Server-side deadline from `?timeoutSeconds=N`. `None` = stream
     /// until the client goes away.
     ///
@@ -1256,7 +1361,8 @@ async fn watch_response(
     // Measured on rio 2026-09-15 — Flux's controllers logged it every ~25s
     // while their LIST (already projected) succeeded.
     let partial = matches!(codec, ResponseCodec::PartialMetadata);
-    let mut from: ResumePoint = p.resume_point()?;
+    let requested: ResumePoint = p.resume_point()?;
+    let mut from = requested;
 
     // ── streaming lists (K8s 1.27 `sendInitialEvents`) ──
     //
@@ -1269,6 +1375,13 @@ async fn watch_response(
     let mut prelude: Vec<Bytes> = Vec::new();
     if p.send_initial_events {
         let (items, rv) = h.list_at(namespace.as_deref(), &sel).await?;
+        // The snapshot answers "state not older than resourceVersion". A
+        // resourceVersion the snapshot has not reached would get older state
+        // than the client demanded, so the watch is refused in-band instead,
+        // checked against the snapshot's own revision.
+        if let Some(refusal) = WatchRefusal::ahead_of(requested, rv) {
+            return refused_watch_response(&refusal);
+        }
         let api_version = h.api_version();
         let gvk = WatchGvk {
             api_version: &api_version,
@@ -1289,19 +1402,29 @@ async fn watch_response(
         from = ResumePoint::At(rv);
     }
 
-    // CompactedTooOld AT REGISTRATION → a real HTTP 410 (the client
-    // re-LISTs). Once we have a stream, the response is 200 and any
-    // later loss is in-band.
-    let stream = h
+    // A resume point the store cannot serve (ahead of it, or compacted) is
+    // refused in-band: HTTP 200 and one ERROR 410 line, never an HTTP
+    // status, which kube-rs would retry at the same revision forever
+    // (crate::watch_start). Once there is a stream, every end is in-band
+    // too (crate::watch_end).
+    let stream = match h
         .watch_stream(namespace.as_deref(), from, p.allow_watch_bookmarks)
-        .await?;
+        .await?
+    {
+        WatchStart::Streaming(stream) => stream,
+        WatchStart::Refused(refusal) => return refused_watch_response(&refusal),
+    };
 
+    // Nothing has been read from the stream yet, so its `last_seen` is the
+    // revision it opened at: `from`, or the store's revision for a watch
+    // "from now".
+    let progress = WatchProgress::new(stream.last_seen(), p.allow_watch_bookmarks);
     let init = WatchStreamState {
         stream,
         handler: h,
         namespace,
         selectors: sel,
-        allow_bookmarks: p.allow_watch_bookmarks,
+        progress,
         deadline: p.timeout()?.map(|d| tokio::time::Instant::now() + d),
         partial,
     };
@@ -1346,34 +1469,76 @@ async fn watch_response(
                     );
                     let line =
                         event_line(ev.kind, &project_watch_object(&ev.object, st.partial), gvk);
+                    st.progress.delivered(Revision(ev.resource_version));
                     return Some((Ok::<Bytes, Infallible>(line), st));
                 }
                 Some(Ok(WatchSignal::Bookmark(rev))) => {
-                    if st.allow_bookmarks {
+                    if st.progress.bookmarks() {
                         let api_version = st.handler.api_version();
                         let gvk = WatchGvk {
                             api_version: &api_version,
                             kind: st.handler.kind(),
                         };
-                        return Some((Ok(bookmark_line(rev, gvk, false)), st));
+                        let line = bookmark_line(rev, gvk, false);
+                        st.progress.delivered(rev);
+                        return Some((Ok(line), st));
                     }
                     // Bookmarks not requested → drop + keep streaming.
                     continue;
                 }
-                Some(Err(WatchGone::CompactedTooOld { compacted, .. })) => {
-                    // Mid-stream compaction: emit an in-band 410 Status
-                    // carrying the safe resume point, then end. The next
-                    // unfold poll sees None (the WatchStream surfaces its
-                    // single terminal Err exactly once, then None) — the
-                    // 410 line is the final line of the stream.
-                    let line = status_410_line(compacted);
-                    return Some((Ok(line), st));
-                }
-                Some(Err(WatchGone::Overflow { last_seen, .. })) => {
-                    // Mid-stream loss: emit an in-band 410 Status carrying
-                    // last_seen as the safe resume point, then end. The
-                    // client re-LISTs.
-                    let line = status_410_line(last_seen);
+                Some(Err(gone)) => {
+                    // The store stopped serving this watch. What happens
+                    // depends on why, and on what the client has been sent
+                    // (crate::watch_end): a 410 for a compaction, a bookmark
+                    // and a clean close for an overflow the client can resume
+                    // past, a resume of the store watch for an overflow of
+                    // filtered history nothing can tell the client about,
+                    // and a 429 for an overflow with nothing to move past.
+                    //
+                    // The old WatchStream surfaces its terminal Err once and
+                    // then None, so a line returned here is the last one, and
+                    // with no line the body ends now.
+                    let end = match st.progress.after(&gone) {
+                        AfterGone::End(end) => end,
+                        AfterGone::Resume(resume) => {
+                            let reopened = st
+                                .handler
+                                .watch_stream(
+                                    st.namespace.as_deref(),
+                                    ResumePoint::At(resume.at()),
+                                    st.progress.bookmarks(),
+                                )
+                                .await;
+                            match reopened {
+                                Ok(WatchStart::Streaming(stream)) => {
+                                    st.stream = stream;
+                                    st.progress.resumed(&resume);
+                                    // A chain of resumes over filtered
+                                    // history sends nothing and may never
+                                    // wait on the store; give the worker
+                                    // back between links.
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                }
+                                // The store compacted past the resume
+                                // point: the 410 a re-watch would get.
+                                Ok(WatchStart::Refused(refusal)) => {
+                                    return Some((Ok(refusal.status_line()), st));
+                                }
+                                // The store could not open a watch at all.
+                                // Said in-band, as the error it is.
+                                Err(err) => {
+                                    return Some((Ok(error_line(&err.to_status_object())), st));
+                                }
+                            }
+                        }
+                    };
+                    let api_version = st.handler.api_version();
+                    let gvk = WatchGvk {
+                        api_version: &api_version,
+                        kind: st.handler.kind(),
+                    };
+                    let line = end.final_line(gvk)?;
                     return Some((Ok(line), st));
                 }
                 None => return None, // store dropped / clean close → end.
@@ -1388,31 +1553,59 @@ async fn watch_response(
         futures::stream::iter(prelude.into_iter().map(Ok::<Bytes, Infallible>)),
         live,
     ));
+    watch_ok_response(body)
+}
 
-    // 200 the instant the response starts. The body is an unbounded
-    // stream with no Content-Length, so hyper frames it as HTTP/1.1
-    // chunked transfer-encoding automatically — we MUST NOT set
-    // `Transfer-Encoding: chunked` by hand (a manual header double-frames
-    // the body and the client never sees a complete chunk).
-    let resp = Response::builder()
+/// The whole response to a watch that cannot start at its resume point: the
+/// refusal's single in-band `ERROR` 410 line, then the end of the body.
+fn refused_watch_response(refusal: &WatchRefusal) -> Result<Response, ApiError> {
+    let line: Result<Bytes, Infallible> = Ok(refusal.status_line());
+    watch_ok_response(Body::from_stream(futures::stream::iter([line])))
+}
+
+/// Every watch response is HTTP 200 the instant it starts; how it ends is
+/// carried in-band.
+///
+/// The body is a stream with no Content-Length, so hyper frames it as
+/// HTTP/1.1 chunked transfer-encoding automatically — we MUST NOT set
+/// `Transfer-Encoding: chunked` by hand (a manual header double-frames the
+/// body and the client never sees a complete chunk).
+fn watch_ok_response(body: Body) -> Result<Response, ApiError> {
+    Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(body)
-        .map_err(|e| ApiError::Internal(format!("failed to build watch response: {e}")))?;
-    Ok(resp)
+        .map_err(|e| ApiError::Internal(format!("failed to build watch response: {e}")))
 }
 
 // ── scope-agnostic verb handlers (ONE per verb; both URL families) ─────
 //
-// Each handler takes the [`ResourceCoords`] extractor (the ONE place URL
-// shapes are parsed) + does exactly: resolve the handler via the SINGLE
-// resolver `state.lookup(coords.group_key(), coords.version_key(),
-// &coords.plural)`, then delegate to the matching shared `do_*` body. The
+// Each handler takes the [`ResourceCoords`] extractor (the request-info
+// layer's ONE classification, the value authz judged) + does exactly:
+// resolve the handler via the SINGLE resolver
+// `state.lookup(coords.group_key(), coords.version_key(), &coords.plural)`,
+// then delegate to the matching shared `do_*` body. The
 // namespaced-vs-cluster scope assertion still lives inside
 // `StoreBackedHandler::key()` (typed 400 on mismatch); coords just carries
 // `namespace: Option<String>` straight through. No subresource handler
 // exists today — a `Some(subresource)` returns a typed `NotFound` (no stub
 // Ok), reserved for the status/scale follow-up.
+
+/// A subresource resolved against its kind's catalog, carried TOGETHER with
+/// the instance name it addresses. A subresource always targets one object,
+/// so the name is part of the resolved value rather than a separate
+/// `Option` on [`crate::coords::ResourceCoords`] that every dispatch arm
+/// would have to re-check. `name` is a `&str`, not an `Option`, so a target
+/// without a name cannot be represented. The type is private to this module
+/// and [`resolve_subresource`] is the one place that builds it; that part is
+/// convention inside the module, not something the compiler enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubresourceTarget<'a> {
+    /// Which catalog-declared subresource the request addresses.
+    subresource: Subresource,
+    /// The object the subresource belongs to.
+    name: &'a str,
+}
 
 /// Resolve `coords.subresource` against the resolved handler's catalog-
 /// declared subresource set. The router NEVER special-cases a kind by name:
@@ -1421,27 +1614,29 @@ async fn watch_response(
 ///
 ///   * `None`               → `Ok(None)` (the base-object verb path).
 ///   * `Some("status")` + the kind declares `Subresource::Status`
-///                          → `Ok(Some(Subresource::Status))`.
+///                          → `Ok(Some(target))` with `Subresource::Status`.
 ///   * `Some("scale")`  + the kind declares `Subresource::Scale`
-///                          → `Ok(Some(Subresource::Scale))`.
+///                          → `Ok(Some(target))` with `Subresource::Scale`.
 ///   * anything else, or a declared-absent subresource
 ///                          → a typed K8s `Status` 404 (no stub Ok, no panic).
 ///
 /// `name` is required for a subresource (a subresource always targets an
-/// instance) — a collection-path subresource is a typed `BadRequest`.
-fn resolve_subresource(
-    coords: &crate::coords::ResourceCoords,
+/// instance) — a collection-path subresource is a typed `BadRequest`. The
+/// name is returned inside the [`SubresourceTarget`], so a caller holding a
+/// resolved subresource holds its name too.
+fn resolve_subresource<'a>(
+    coords: &'a crate::coords::ResourceCoords,
     h: &Arc<dyn ResourceHandler>,
-) -> Result<Option<Subresource>, ApiError> {
+) -> Result<Option<SubresourceTarget<'a>>, ApiError> {
     let Some(sub) = coords.subresource.as_deref() else {
         return Ok(None);
     };
-    if coords.name.is_none() {
+    let Some(name) = coords.name.as_deref() else {
         return Err(ApiError::BadRequest(format!(
             "subresource {sub:?} requires a resource name (instance path)"
         )));
-    }
-    let parsed = match sub {
+    };
+    let subresource = match sub {
         "status" if h.subresources().contains(&Subresource::Status) => Subresource::Status,
         "scale" if h.subresources().contains(&Subresource::Scale) => Subresource::Scale,
         "log" if h.subresources().contains(&Subresource::Log) => Subresource::Log,
@@ -1453,7 +1648,7 @@ fn resolve_subresource(
             )));
         }
     };
-    Ok(Some(parsed))
+    Ok(Some(SubresourceTarget { subresource, name }))
 }
 
 /// Default token lifetime when a `TokenRequest` names none — one hour, the
@@ -1495,19 +1690,19 @@ fn clamp_token_lifetime(requested: i64) -> i64 {
 ///
 /// It also made RBAC decorative. The authorizer, the Roles and the bindings
 /// all worked; nothing could ever present a non-admin identity to be judged.
+///
+/// `name` is the service account the resolved [`SubresourceTarget`] addresses —
+/// taken from the target rather than re-read from the coordinates, so there
+/// is no "token request that names no service account" branch to write.
 async fn do_token_request(
     state: &RouterState,
     h: &Arc<dyn ResourceHandler>,
-    coords: &crate::coords::ResourceCoords,
+    namespace: Option<&str>,
+    name: &str,
     headers: &HeaderMap,
     raw: &Bytes,
 ) -> Result<Response, ApiError> {
-    let Some(name) = coords.name.as_deref() else {
-        return Err(ApiError::BadRequest(
-            "the token subresource requires a ServiceAccount name".into(),
-        ));
-    };
-    let Some(namespace) = coords.namespace.as_deref() else {
+    let Some(namespace) = namespace else {
         return Err(ApiError::BadRequest(
             "the token subresource is namespaced; no namespace in the request path".into(),
         ));
@@ -1737,7 +1932,9 @@ async fn do_patch_scale(
 /// the branch, exactly as the legacy list-vs-get split did.
 async fn resource_get_or_list(
     State(state): State<RouterState>,
-    coords: crate::coords::ResourceCoords,
+    // The whole classification, not just the coords: list-vs-watch is
+    // `info.is_watch()`, the verb authz judged.
+    info: crate::coords::RequestInfo,
     headers: HeaderMap,
     // The `/log` subresource reads its typed `?container=&tailLines=&timestamps=`
     // knobs from this extractor. axum parses the WHOLE query string into BOTH
@@ -1746,16 +1943,16 @@ async fn resource_get_or_list(
     Query(log_query): Query<crate::pod_logs::LogQuery>,
     Query(p): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
+    let coords = info.resource_coords()?;
     // Resolve the handler FIRST (the subresource is served by the parent
     // kind's handler), then dispatch on the typed subresource resolved from
     // the catalog.
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    if let Some(sub) = resolve_subresource(&coords, &h)? {
-        // A subresource always targets an instance — `name` is present
-        // (resolve_subresource enforces it).
-        let name = coords.name.as_deref().expect("subresource requires a name");
+    if let Some(SubresourceTarget { subresource, name }) = resolve_subresource(&coords, &h)? {
+        // A subresource always targets an instance — the resolved target
+        // carries that instance's name.
         let codec = ResponseCodec::from_headers(&headers)?;
-        return match sub {
+        return match subresource {
             Subresource::Status => {
                 do_get_status(&h, coords.namespace.as_deref(), name, codec).await
             }
@@ -1773,13 +1970,13 @@ async fn resource_get_or_list(
         };
     }
     match &coords.name {
-        // Collection GET → LIST or WATCH (the shared body branches on
-        // `p.watch`). `lookup` already returns an owned `Arc` (the
+        // Collection GET → LIST or WATCH (the shared body branches on the
+        // judged verb). `lookup` already returns an owned `Arc` (the
         // ArcSwap-snapshot clone) — exactly what the watch unfold stream
         // needs, no extra `.clone()`.
         None => {
             let codec = ResponseCodec::from_headers(&headers)?;
-            do_list_or_watch(h, coords.namespace, p, codec).await
+            do_list_or_watch(h, coords.namespace, info.is_watch(), p, codec).await
         }
         // Instance GET → the shared `do_get` body. Bind the owned `Arc`,
         // pass it by reference (`do_get` takes `&Arc`).
@@ -1827,11 +2024,20 @@ async fn resource_create(
     // the typed BadRequest below.
     if let Some(sub) = &coords.subresource {
         let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-        if matches!(
-            resolve_subresource(&coords, &h),
-            Ok(Some(Subresource::Token))
-        ) {
-            return do_token_request(&state, &h, &coords, &headers, &raw).await;
+        if let Ok(Some(SubresourceTarget {
+            subresource: Subresource::Token,
+            name,
+        })) = resolve_subresource(&coords, &h)
+        {
+            return do_token_request(
+                &state,
+                &h,
+                coords.namespace.as_deref(),
+                name,
+                &headers,
+                &raw,
+            )
+            .await;
         }
         return Err(ApiError::BadRequest(format!(
             "the {sub:?} subresource does not support create (POST)"
@@ -1871,7 +2077,9 @@ async fn resource_put(
         ApiError::BadRequest("PUT requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    match resolve_subresource(&coords, &h)? {
+    // The target's name IS `name` (both read `coords.name`); only the variant
+    // is needed here because the main-object arm needs the name as well.
+    match resolve_subresource(&coords, &h)?.map(|t| t.subresource) {
         Some(Subresource::Status) => {
             do_put_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
         }
@@ -1923,7 +2131,8 @@ async fn resource_patch(
         ApiError::BadRequest("PATCH requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    match resolve_subresource(&coords, &h)? {
+    // As in `resource_put`: the target's name is `name`, needed by every arm.
+    match resolve_subresource(&coords, &h)?.map(|t| t.subresource) {
         Some(Subresource::Status) => {
             do_patch_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
         }
@@ -2125,6 +2334,99 @@ mod tests {
         namespaced: bool,
         short_names: Vec<&'static str>,
         singular: &'static str,
+        /// What `watch_stream` serves, for the tests that drive a watch.
+        watch: std::sync::Mutex<FakeWatch>,
+    }
+
+    /// What a [`FakeHandler`]'s `watch_stream` serves.
+    enum FakeWatch {
+        /// Nothing: the typed not-exercised error.
+        Unused,
+        /// One pre-built stream, handed out once.
+        Once(Option<WatchStream>),
+        /// A store history, opened afresh at every resume point.
+        History(FakeHistory),
+    }
+
+    /// A store history a watch can open, and re-open, at any revision.
+    ///
+    /// Each open registers a real store `WatchStream` over the changes past
+    /// its resume point, `buffer` slots deep, as the store's own
+    /// `register_captured` does. The registry is dropped at once, so a
+    /// stream whose replay fits closes cleanly after it: "caught up".
+    struct FakeHistory {
+        changes: Vec<engenho_store::Change>,
+        buffer: usize,
+        /// What every open after the first meets.
+        reopen: Reopen,
+        /// Every resume point the watch was opened at, in order.
+        opened: Vec<ResumePoint>,
+    }
+
+    /// What a [`FakeHistory`] does with every open after the first.
+    #[derive(Clone, Copy)]
+    enum Reopen {
+        /// Serves it like the first.
+        Serve,
+        /// History below this revision was compacted after the first open.
+        CompactedBelow(Revision),
+        /// The store stopped: the handler cannot open a watch at all.
+        Fail,
+    }
+
+    impl FakeHistory {
+        /// More opens than any test's history can need: a watch that
+        /// re-opens this often is re-opening in a loop.
+        const MAX_OPENS: usize = 32;
+
+        fn open(&mut self, from: ResumePoint) -> Result<WatchStart, ApiError> {
+            if self.opened.len() >= Self::MAX_OPENS {
+                return Err(ApiError::Internal(
+                    "fake store: the watch re-opened in a loop".into(),
+                ));
+            }
+            let first = self.opened.is_empty();
+            self.opened.push(from);
+            let head = self.changes.last().map_or(Revision(10), |c| c.revision);
+            let at = match from {
+                ResumePoint::At(rev) => rev,
+                ResumePoint::MostRecent => head,
+            };
+            match self.reopen {
+                Reopen::Fail if !first => {
+                    return Err(ApiError::StorageError("fake store stopped".into()));
+                }
+                Reopen::CompactedBelow(floor) if !first && at < floor => {
+                    let compacted = crate::watch_end::Compacted::try_from(
+                        engenho_store::WatchGone::CompactedTooOld {
+                            requested: at,
+                            compacted: floor,
+                        },
+                    )
+                    .expect("a compaction converts");
+                    return Ok(WatchStart::Refused(WatchRefusal::from(compacted)));
+                }
+                Reopen::Serve | Reopen::CompactedBelow(_) | Reopen::Fail => {}
+            }
+            let replay = self
+                .changes
+                .iter()
+                .filter(|c| c.revision > at)
+                .cloned()
+                .collect();
+            let opts = engenho_store::WatchOpts {
+                from: at,
+                buffer: self.buffer,
+                bookmark_every: std::time::Duration::ZERO,
+            };
+            Ok(WatchStart::Streaming(
+                engenho_store::watch_backend::WatcherRegistry::new().register_captured(
+                    replay,
+                    head.max(at),
+                    &opts,
+                ),
+            ))
+        }
     }
 
     impl FakeHandler {
@@ -2143,7 +2445,31 @@ mod tests {
                 namespaced,
                 short_names: Vec::new(),
                 singular: "",
+                watch: std::sync::Mutex::new(FakeWatch::Unused),
             })
+        }
+
+        /// A core-group, namespaced handler whose `watch_stream` serves
+        /// `watch`.
+        fn watching(kind: &str, plural: &str, watch: FakeWatch) -> Arc<Self> {
+            Arc::new(Self {
+                group: String::new(),
+                version: "v1".into(),
+                kind: kind.into(),
+                plural: plural.into(),
+                namespaced: true,
+                short_names: Vec::new(),
+                singular: "",
+                watch: std::sync::Mutex::new(watch),
+            })
+        }
+
+        /// Every resume point the watch was opened at, in order.
+        fn opened(&self) -> Vec<ResumePoint> {
+            match &*self.watch.lock().expect("fake watch lock") {
+                FakeWatch::History(history) => history.opened.clone(),
+                FakeWatch::Unused | FakeWatch::Once(_) => Vec::new(),
+            }
         }
 
         fn arc_with_meta(
@@ -2163,6 +2489,7 @@ mod tests {
                 namespaced,
                 short_names,
                 singular,
+                watch: std::sync::Mutex::new(FakeWatch::Unused),
             })
         }
     }
@@ -2229,12 +2556,20 @@ mod tests {
         async fn watch_stream(
             &self,
             _ns: Option<&str>,
-            _from: crate::params::ResumePoint,
+            from: crate::params::ResumePoint,
             _allow_bookmarks: bool,
-        ) -> Result<engenho_store::WatchStream, ApiError> {
-            Err(ApiError::Internal(
-                "fake handler: watch_stream not exercised".into(),
-            ))
+        ) -> Result<crate::watch_start::WatchStart, ApiError> {
+            let not_exercised =
+                || ApiError::Internal("fake handler: watch_stream not exercised".into());
+            let mut watch = self.watch.lock().map_err(|_| not_exercised())?;
+            match &mut *watch {
+                FakeWatch::Unused => Err(not_exercised()),
+                FakeWatch::Once(stream) => stream
+                    .take()
+                    .map(WatchStart::Streaming)
+                    .ok_or_else(not_exercised),
+                FakeWatch::History(history) => history.open(from),
+            }
         }
         async fn create(
             &self,
@@ -2284,6 +2619,299 @@ mod tests {
                 "fake handler: delete_with_precondition not exercised".into(),
             ))
         }
+    }
+
+    // ── how a streaming watch ends, or resumes (T3.7) ────────────────────
+    //
+    // Each test drives `watch_response` over a real store `WatchStream`
+    // whose replay overflows a tiny buffer, and reads the whole body. The
+    // watch opens at revision 10; the replay is revisions 11.. and the
+    // buffer holds two, so the store delivers 11 and 12 and then reports
+    // `Overflow { last_seen: 12 }`.
+
+    /// A create of `kind` `name` at `rev`, as the store's history holds it.
+    fn created(kind: &str, name: &str, rev: u64) -> engenho_store::Change {
+        engenho_store::Change {
+            revision: Revision(rev),
+            key: engenho_store::ResourceKey::namespaced("", "v1", kind, "default", name),
+            kind: engenho_store::ChangeKind::Put,
+            value: serde_json::json!({
+                "metadata": {"name": name, "namespace": "default", "resourceVersion": rev.to_string()}
+            }),
+            prior: None,
+            version_meta: engenho_store::VersionMeta::created_at(Revision(rev)),
+        }
+    }
+
+    /// A stream opened at revision 10 over `replay`, with room for two
+    /// signals: it overflows at the third.
+    fn overflowing(replay: Vec<engenho_store::Change>) -> WatchStream {
+        let opts = engenho_store::WatchOpts {
+            from: Revision(10),
+            buffer: 2,
+            bookmark_every: std::time::Duration::ZERO,
+        };
+        let boundary = replay.last().map_or(Revision(10), |c| c.revision);
+        engenho_store::watch_backend::WatcherRegistry::new()
+            .register_captured(replay, boundary, &opts)
+    }
+
+    /// A Pod handler over `changes`, opened afresh with a two-slot buffer at
+    /// every resume point.
+    fn pod_history(changes: Vec<engenho_store::Change>, reopen: Reopen) -> Arc<FakeHandler> {
+        FakeHandler::watching(
+            "Pod",
+            "pods",
+            FakeWatch::History(FakeHistory {
+                changes,
+                buffer: 2,
+                reopen,
+                opened: Vec::new(),
+            }),
+        )
+    }
+
+    /// Every line a Pod watch from revision 10 sends before its body ends.
+    async fn pod_watch_lines(stream: WatchStream, bookmarks: bool) -> Vec<serde_json::Value> {
+        let h = FakeHandler::watching("Pod", "pods", FakeWatch::Once(Some(stream)));
+        watch_lines(h, 10, bookmarks).await
+    }
+
+    /// Every line a watch from revision `from` over `h` sends before its
+    /// body ends.
+    async fn watch_lines(
+        h: Arc<FakeHandler>,
+        from: u64,
+        bookmarks: bool,
+    ) -> Vec<serde_json::Value> {
+        let p = ListWatchParams {
+            resource_version: Some(from.to_string()),
+            allow_watch_bookmarks: bookmarks,
+            ..ListWatchParams::default()
+        };
+        let resp = watch_response(h, None, p, Selectors::default(), ResponseCodec::Json)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "every watch end is in-band");
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the watch body ended")
+        .unwrap();
+        body.split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
+
+    fn line_types(lines: &[serde_json::Value]) -> Vec<&str> {
+        lines.iter().map(|l| l["type"].as_str().unwrap()).collect()
+    }
+
+    fn line_rv(line: &serde_json::Value) -> &str {
+        line["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap()
+    }
+
+    /// Upstream's cacher ends a watcher that fell behind with a bookmark at
+    /// the last revision it dispatched and a clean close; the client resumes
+    /// from there. The `ConfigMap` at 12 was filtered out of this Pod watch,
+    /// and the bookmark still moves the client past it.
+    #[tokio::test]
+    async fn an_overflow_after_progress_ends_with_a_bookmark_at_last_seen_and_a_clean_close() {
+        let stream = overflowing(vec![
+            created("Pod", "p", 11),
+            created("ConfigMap", "c", 12),
+            created("Pod", "q", 13),
+        ]);
+        let lines = pod_watch_lines(stream, true).await;
+        assert_eq!(line_types(&lines), ["ADDED", "BOOKMARK"], "{lines:?}");
+        assert_eq!(line_rv(&lines[0]), "11");
+        assert_eq!(
+            line_rv(&lines[1]),
+            "12",
+            "the bookmark is at the store's last_seen"
+        );
+        assert_eq!(lines[1]["object"]["kind"], "Pod");
+        assert_eq!(lines[1]["object"]["apiVersion"], "v1");
+    }
+
+    /// A client that did not ask for bookmarks resumes from the last event
+    /// it was sent, so the watch just closes after it.
+    #[tokio::test]
+    async fn an_overflow_after_progress_without_bookmarks_is_a_clean_close() {
+        let stream = overflowing(vec![
+            created("Pod", "p", 11),
+            created("Pod", "q", 12),
+            created("Pod", "r", 13),
+        ]);
+        let lines = pod_watch_lines(stream, false).await;
+        assert_eq!(line_types(&lines), ["ADDED", "ADDED"], "{lines:?}");
+        assert_eq!(line_rv(&lines[1]), "12");
+    }
+
+    /// Every revision the store delivered was filtered out, and the client
+    /// asked for no bookmarks, so nothing on the wire can move it past them.
+    /// Ending the watch would send it back to 10, into the same replay and
+    /// the same overflow. The router resumes the store watch at each
+    /// overflow's `last_seen` instead, each time strictly further on, and
+    /// the client gets the Pod past all of it without a break.
+    #[tokio::test]
+    async fn an_overflow_of_filtered_history_resumes_the_store_watch_and_reaches_past_it() {
+        let mut changes: Vec<_> = (11..=17)
+            .map(|rev| created("ConfigMap", "c", rev))
+            .collect();
+        changes.push(created("Pod", "p", 18));
+        let h = pod_history(changes, Reopen::Serve);
+        let lines = watch_lines(h.clone(), 10, false).await;
+        assert_eq!(line_types(&lines), ["ADDED"], "{lines:?}");
+        assert_eq!(line_rv(&lines[0]), "18");
+        assert_eq!(
+            h.opened(),
+            [10, 12, 14, 16].map(|rev| ResumePoint::At(Revision(rev))),
+            "one open, then a resume at every overflow's last_seen"
+        );
+    }
+
+    /// The client's resume point after a watch: the newest revision a line
+    /// carried, or where it started when none did.
+    fn resume_after(from: u64, lines: &[serde_json::Value]) -> u64 {
+        lines
+            .iter()
+            .filter(|l| l["type"] != "ERROR")
+            .map(|l| line_rv(l).parse::<u64>().unwrap())
+            .max()
+            .unwrap_or(from)
+    }
+
+    /// The loop a no-progress 429 made: the store's replay is decided by
+    /// history alone, so a client that retries from where the watch left it
+    /// meets the same end. Watch the same history twice, the second time
+    /// from where the first left the client: the client has moved, and the
+    /// second watch does not end the way the first did.
+    #[tokio::test]
+    async fn retrying_from_where_a_watch_left_the_client_never_meets_the_same_end() {
+        let history = || {
+            vec![
+                created("ConfigMap", "a", 11),
+                created("ConfigMap", "b", 12),
+                created("ConfigMap", "c", 13),
+                created("Pod", "p", 14),
+            ]
+        };
+        for bookmarks in [false, true] {
+            let first = watch_lines(pod_history(history(), Reopen::Serve), 10, bookmarks).await;
+            let resume = resume_after(10, &first);
+            let second =
+                watch_lines(pod_history(history(), Reopen::Serve), resume, bookmarks).await;
+            assert_ne!(first, second, "bookmarks={bookmarks}: the same end twice");
+            assert!(
+                resume > 10,
+                "bookmarks={bookmarks}: the client is left where it started: {first:?}"
+            );
+            assert!(
+                resume_after(resume, &second) >= resume,
+                "bookmarks={bookmarks}: {second:?}"
+            );
+        }
+    }
+
+    /// A resume point the store compacted away while the watch was
+    /// filtering its way forward ends the watch with the 410 a re-watch
+    /// from there would get.
+    #[tokio::test]
+    async fn a_resume_below_the_compaction_floor_ends_with_the_410_a_rewatch_would_get() {
+        let h = pod_history(
+            vec![
+                created("ConfigMap", "a", 11),
+                created("ConfigMap", "b", 12),
+                created("ConfigMap", "c", 13),
+                created("Pod", "p", 14),
+            ],
+            Reopen::CompactedBelow(Revision(13)),
+        );
+        let lines = watch_lines(h.clone(), 10, false).await;
+        assert_eq!(line_types(&lines), ["ERROR"], "{lines:?}");
+        let status = &lines[0]["object"];
+        assert_eq!(status["code"], 410, "{status}");
+        assert_eq!(status["reason"], "Expired");
+        assert_eq!(status["message"], "too old resource version: 12 (13)");
+        assert_eq!(
+            h.opened(),
+            [10, 12].map(|rev| ResumePoint::At(Revision(rev)))
+        );
+    }
+
+    /// A store that cannot open the resumed watch at all: the watch says so
+    /// in-band, with the Status the same error carries over HTTP.
+    #[tokio::test]
+    async fn a_resume_the_store_cannot_open_ends_with_its_error_in_band() {
+        let h = pod_history(
+            vec![
+                created("ConfigMap", "a", 11),
+                created("ConfigMap", "b", 12),
+                created("ConfigMap", "c", 13),
+            ],
+            Reopen::Fail,
+        );
+        let lines = watch_lines(h, 10, false).await;
+        assert_eq!(line_types(&lines), ["ERROR"], "{lines:?}");
+        let status = &lines[0]["object"];
+        assert_eq!(status["kind"], "Status");
+        assert_eq!(status["code"], 500, "{status}");
+        assert_eq!(status["reason"], "ServiceUnavailable");
+        assert_eq!(status["message"], "storage error: fake store stopped");
+    }
+
+    /// The one overflow a retry can change: the buffer filled with nothing
+    /// newer than the stream's opening revision, so timing decided it, not
+    /// history. A one-slot buffer holding the bookmark at 10 does that when
+    /// the change at 11 arrives. The watch forwards the bookmark and ends
+    /// with the 429.
+    #[tokio::test]
+    async fn an_overflow_with_nothing_past_the_opening_revision_ends_with_an_in_band_429() {
+        let mut registry = engenho_store::watch_backend::WatcherRegistry::new();
+        let opts = engenho_store::WatchOpts {
+            from: Revision(10),
+            buffer: 1,
+            bookmark_every: std::time::Duration::from_millis(1),
+        };
+        let stream = registry.register_captured(Vec::new(), Revision(10), &opts);
+        registry.tick_bookmarks(
+            Revision(10),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        registry.fan_change(&created("Pod", "p", 11));
+        drop(registry);
+
+        let lines = pod_watch_lines(stream, true).await;
+        assert_eq!(line_types(&lines), ["BOOKMARK", "ERROR"], "{lines:?}");
+        assert_eq!(line_rv(&lines[0]), "10");
+        let status = &lines[1]["object"];
+        assert_eq!(status["kind"], "Status");
+        assert_eq!(status["code"], 429, "{status}");
+        assert_eq!(status["reason"], "TooManyRequests");
+        assert_eq!(
+            status["details"]["retryAfterSeconds"],
+            crate::watch_end::NO_PROGRESS_RETRY_AFTER_SECONDS
+        );
+    }
+
+    /// The same filtered history with bookmarks requested is progress: the
+    /// bookmark at the store's `last_seen` carries the client past it.
+    #[tokio::test]
+    async fn with_bookmarks_filtered_history_ends_with_a_bookmark_not_a_429() {
+        let stream = overflowing(vec![
+            created("ConfigMap", "a", 11),
+            created("ConfigMap", "b", 12),
+            created("ConfigMap", "c", 13),
+        ]);
+        let lines = pod_watch_lines(stream, true).await;
+        assert_eq!(line_types(&lines), ["BOOKMARK"], "{lines:?}");
+        assert_eq!(line_rv(&lines[0]), "12");
     }
 
     #[test]
@@ -2535,5 +3163,400 @@ mod token_subresource {
             .find(|d| d.kind == "Pod" && d.group.is_empty())
             .expect("Pod is cataloged");
         assert!(!pod.subresources.contains(&Subresource::Token));
+    }
+}
+
+/// T4.1 — every route is classified ONCE, before authz, and authz judges that
+/// classification.
+#[cfg(test)]
+mod request_info_coverage {
+    use super::*;
+
+    // ── T4.1: the ONE request classification reaches every route ────────
+    //
+    // Every test below drives the REAL `build` router (all three layers) with
+    // an authorizer that records what it was asked and refuses everything, so
+    // no handler body runs and no store is needed. A route reached without a
+    // classification answers 500 (authz reads the stored RequestInfo first),
+    // so a 403 carrying the expected Attributes proves the route was
+    // classified by the request-info layer before authz judged it.
+
+    /// Records every `Attributes` it is handed and returns `NoOpinion`
+    /// (RBAC's default-deny), so the request stops at authz with a 403.
+    #[derive(Default)]
+    struct RecordingDeny {
+        seen: std::sync::Mutex<Vec<crate::authz::Attributes>>,
+    }
+
+    impl RecordingDeny {
+        fn last(&self) -> Option<crate::authz::Attributes> {
+            self.seen.lock().expect("recorder mutex").last().cloned()
+        }
+        fn count(&self) -> usize {
+            self.seen.lock().expect("recorder mutex").len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::authz::Authorizer for RecordingDeny {
+        async fn authorize(&self, attrs: &crate::authz::Attributes) -> crate::authz::Decision {
+            self.seen
+                .lock()
+                .expect("recorder mutex")
+                .push(attrs.clone());
+            crate::authz::Decision::NoOpinion
+        }
+    }
+
+    /// The full router over an empty handler set, judged by a [`RecordingDeny`].
+    fn recorded_router() -> (Router, Arc<RecordingDeny>) {
+        let recorder = Arc::new(RecordingDeny::default());
+        let state = green_state().with_authorizer(recorder.clone());
+        (build(state), recorder)
+    }
+
+    /// A router whose health endpoints answer 200, so a status other than
+    /// 200 on them comes from the layer under test, not from the health
+    /// check itself (an unwired router is red on every health endpoint).
+    fn green_state() -> RouterState {
+        RouterState::new(Vec::new()).with_liveness_source(Arc::new(
+            crate::health::FixedLiveness::all_alive(&["test-child"]),
+        ))
+    }
+
+    /// A concrete request path for a route pattern: every `:param` and the
+    /// `*rest` tail filled with a plausible resource-shaped value.
+    fn concrete_path(pattern: &str) -> String {
+        pattern
+            .replace(":group", "apps")
+            .replace(":version", "v1")
+            .replace("*rest", "namespaces/default/pods")
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt as _;
+        let mut req = axum::http::Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let req = req.body(Body::empty()).expect("test request");
+        app.clone()
+            .oneshot(req)
+            .await
+            .expect("the router is infallible")
+            .status()
+    }
+
+    /// What authz must have been handed for `method uri`: the pure
+    /// classification of the (already-decoded) path, as the anonymous user.
+    fn expected_attrs(method: &str, path: &str, is_watch: bool) -> crate::authz::Attributes {
+        crate::authz::Attributes::for_request(
+            UserInfo::anonymous(),
+            &crate::coords::RequestInfo::from_method_path(method, path, is_watch),
+        )
+    }
+
+    #[tokio::test]
+    async fn every_route_in_the_table_is_classified_before_authz() {
+        let (app, recorder) = recorded_router();
+        let table = route_table();
+        // Positive control: the walk covers the resource catch-alls, not just
+        // the static routes around them.
+        let patterns: Vec<&str> = table.iter().map(|(p, _)| *p).collect();
+        for must in ["/api/v1/*rest", "/apis/:group/:version/*rest", "/healthz"] {
+            assert!(patterns.contains(&must), "{must} is in the route table");
+        }
+
+        let (mut judged, mut pre_authz) = (0usize, 0usize);
+        for pattern in patterns {
+            let path = concrete_path(pattern);
+            let before = recorder.count();
+            let status = send(&app, "GET", &path, &[]).await;
+            let info = crate::coords::RequestInfo::from_method_path("GET", &path, false);
+            if info.non_resource_url().is_some_and(is_always_allowed) {
+                // Pre-authz health/version: authz still READ the stored
+                // classification (a missing one is a 500) and let it through.
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{pattern} ({path}) reached its handler"
+                );
+                assert_eq!(recorder.count(), before, "{pattern} skips the authorizer");
+                pre_authz += 1;
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{pattern} ({path}) was judged"
+                );
+                assert_eq!(
+                    recorder.last(),
+                    Some(expected_attrs("GET", &path, false)),
+                    "{pattern} was judged on the one classification of {path}"
+                );
+                judged += 1;
+            }
+        }
+        assert_eq!(
+            pre_authz, 4,
+            "healthz, livez, readyz and version skip authz"
+        );
+        assert_eq!(judged + pre_authz, table.len(), "every route was walked");
+    }
+
+    #[tokio::test]
+    async fn watch_requests_are_classified_as_watches_on_both_catch_alls() {
+        let (app, recorder) = recorded_router();
+        for (uri, path) in [
+            (
+                "/api/v1/namespaces/default/pods?watch=true",
+                "/api/v1/namespaces/default/pods",
+            ),
+            (
+                "/apis/apps/v1/namespaces/default/deployments?watch=1&timeoutSeconds=5",
+                "/apis/apps/v1/namespaces/default/deployments",
+            ),
+            ("/api/v1/nodes?watch=yes", "/api/v1/nodes"),
+        ] {
+            assert_eq!(send(&app, "GET", uri, &[]).await, StatusCode::FORBIDDEN);
+            let judged = recorder.last().expect("authz ran");
+            assert_eq!(judged.verb, "watch", "{uri}");
+            assert_eq!(judged, expected_attrs("GET", path, true), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrades_are_classified_before_authz() {
+        // No route serves a WebSocket today (exec/attach/portforward are not
+        // implemented), but an upgrade request must still be classified and
+        // judged like any other: the layers wrap the upgrade handshake too.
+        let (app, recorder) = recorded_router();
+        let upgrade = [
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ];
+
+        let status = send(
+            &app,
+            "GET",
+            "/api/v1/namespaces/default/pods/p1/exec?command=sh&stdin=true",
+            &upgrade,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let judged = recorder.last().expect("authz ran");
+        assert_eq!(judged.resource, "pods");
+        assert_eq!(judged.subresource.as_deref(), Some("exec"));
+        assert_eq!(judged.name.as_deref(), Some("p1"));
+        assert_eq!(judged.verb, "get");
+
+        // A watch negotiated over a WebSocket (client-go can) is a watch.
+        let status = send(
+            &app,
+            "GET",
+            "/api/v1/namespaces/default/pods?watch=true",
+            &upgrade,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(recorder.last().map(|a| a.verb).as_deref(), Some("watch"));
+    }
+
+    #[tokio::test]
+    async fn an_unrouted_path_is_classified_and_judged_too() {
+        // The fallback is wrapped by the same layers, so a path no route
+        // serves is judged as a non-resource URL rather than slipping past.
+        let (app, recorder) = recorded_router();
+        assert_eq!(
+            send(&app, "GET", "/no/such/route", &[]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            recorder.last(),
+            Some(expected_attrs("GET", "/no/such/route", false))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_encoded_separator_moves_authz_and_routing_together() {
+        // `/apis/apps%2Fv1/...` is matched by the router as group `apps/v1`,
+        // version `namespaces`. Authz and dispatch both read the DECODED
+        // classification instead: deployments in `default`.
+        let (app, recorder) = recorded_router();
+        let status = send(
+            &app,
+            "GET",
+            "/apis/apps%2Fv1/namespaces/default/deployments",
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let judged = recorder.last().expect("authz ran");
+        assert_eq!(judged.group, "apps");
+        assert_eq!(judged.version, "v1");
+        assert_eq!(judged.resource, "deployments");
+        assert_eq!(judged.namespace.as_deref(), Some("default"));
+        assert_eq!(judged.verb, "list");
+    }
+
+    #[tokio::test]
+    async fn a_path_that_is_not_utf8_once_decoded_is_a_typed_400_before_authz() {
+        let (app, recorder) = recorded_router();
+        assert_eq!(
+            send(&app, "GET", "/api/v1/namespaces/default/pods/%FF", &[]).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(recorder.count(), 0, "nothing unclassifiable reaches authz");
+    }
+
+    #[tokio::test]
+    async fn without_the_request_info_layer_authz_and_dispatch_fail_closed() {
+        // Authz alone, no request-info layer: a typed 500, never a re-parse
+        // of the path (and never an allow).
+        let recorder = Arc::new(RecordingDeny::default());
+        let authorizer: Arc<dyn crate::authz::Authorizer> = recorder.clone();
+        let authz_only = build_routes(green_state()).layer(axum::middleware::from_fn(
+            move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
+                let authorizer = authorizer.clone();
+                async move { authz_middleware(authorizer, req, next).await }
+            },
+        ));
+        for uri in ["/healthz", "/api/v1/namespaces/default/pods", "/api"] {
+            assert_eq!(
+                send(&authz_only, "GET", uri, &[]).await,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            recorder.count(),
+            0,
+            "an unclassified request is never judged"
+        );
+
+        // Dispatch alone: the ResourceCoords / RequestInfo extractors refuse
+        // with the same typed 500 rather than reading the route params.
+        let bare = build_routes(RouterState::new(Vec::new()));
+        for (method, uri) in [
+            ("GET", "/api/v1/namespaces/default/pods"),
+            (
+                "POST",
+                "/api/v1/namespaces/default/serviceaccounts/foo/token",
+            ),
+            ("DELETE", "/apis/apps/v1/namespaces/default/deployments/web"),
+        ] {
+            assert_eq!(
+                send(&bare, method, uri, &[]).await,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {uri}"
+            );
+        }
+    }
+}
+
+/// T4.8 — a resolved subresource carries the instance name it targets, so no
+/// dispatch arm re-reads `coords.name` and asserts it is present.
+#[cfg(test)]
+mod subresource_target {
+    use super::*;
+    use crate::coords::ResourceCoords;
+
+    /// The cataloged Pod handler (declares `status` + `log`, not `token`).
+    /// `resolve_subresource` reads only the descriptor, so the store is never
+    /// touched — it exists because a handler cannot be built without one.
+    async fn pod_handler() -> Arc<dyn ResourceHandler> {
+        let cfg = engenho_store::default_config("router-subresource-target").expect("store config");
+        let store = engenho_store::StoreMesh::start(
+            1,
+            "in-process://1".into(),
+            engenho_store::InProcessRouter::new(),
+            cfg,
+        )
+        .await
+        .expect("store starts");
+        Arc::new(
+            crate::handler::StoreBackedHandler::for_kind(Arc::new(store), "Pod")
+                .expect("Pod is cataloged"),
+        )
+    }
+
+    fn pod_coords(name: Option<&str>, subresource: Option<&str>) -> ResourceCoords {
+        ResourceCoords {
+            group: None,
+            version: Some("v1".into()),
+            namespace: Some("default".into()),
+            plural: "pods".into(),
+            name: name.map(Into::into),
+            subresource: subresource.map(Into::into),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_subresource_resolves_together_with_its_instance_name() {
+        let h = pod_handler().await;
+        let coords = pod_coords(Some("web-0"), Some("status"));
+        match resolve_subresource(&coords, &h) {
+            Ok(Some(target)) => assert_eq!(
+                target,
+                SubresourceTarget {
+                    subresource: Subresource::Status,
+                    name: "web-0",
+                }
+            ),
+            Ok(None) => panic!("pods/web-0/status resolved to the base object"),
+            Err(e) => panic!("pods/web-0/status is served: {e:?}"),
+        }
+        let coords = pod_coords(Some("web-1"), Some("log"));
+        assert!(matches!(
+            resolve_subresource(&coords, &h),
+            Ok(Some(SubresourceTarget {
+                subresource: Subresource::Log,
+                name: "web-1",
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_subresource_is_the_base_object_path() {
+        let h = pod_handler().await;
+        assert!(matches!(
+            resolve_subresource(&pod_coords(Some("web-0"), None), &h),
+            Ok(None)
+        ));
+        assert!(matches!(
+            resolve_subresource(&pod_coords(None, None), &h),
+            Ok(None)
+        ));
+    }
+
+    /// A subresource with no instance name never becomes a target — this is
+    /// the state the GET dispatch's old `expect` assumed away.
+    #[tokio::test]
+    async fn a_subresource_without_an_instance_name_is_a_bad_request() {
+        let h = pod_handler().await;
+        let coords = pod_coords(None, Some("status"));
+        let resolved = resolve_subresource(&coords, &h);
+        assert!(
+            matches!(resolved, Err(ApiError::BadRequest(_))),
+            "a collection-path subresource is a typed 400: {resolved:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subresource_the_kind_does_not_declare_is_not_found() {
+        let h = pod_handler().await;
+        let coords = pod_coords(Some("web-0"), Some("token"));
+        let resolved = resolve_subresource(&coords, &h);
+        assert!(
+            matches!(resolved, Err(ApiError::NotFound(_))),
+            "Pod does not serve /token: {resolved:?}"
+        );
     }
 }

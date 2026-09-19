@@ -99,6 +99,7 @@ mod controllers;
 mod discovery;
 mod error;
 mod networking;
+mod node_local;
 mod revoada;
 mod runtime;
 mod scheduler;
@@ -111,6 +112,7 @@ pub use controllers::{ControllerEnable, ControllersConfig};
 pub use discovery::{HostnameLayer, NODE_NAME_FALLBACK};
 pub use error::ConfigError;
 pub use networking::{DatapathMode, NetworkingConfig, ResolvedDatapath, parse_ipv4_cidr};
+pub use node_local::{ListenerAddrRejection, LoopbackAddr, NodeLocalListener};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
 pub use runtime::{KubeconfigVisibility, KubeletBackendKind, RuntimeConfig};
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
@@ -506,6 +508,54 @@ cluster:
         let default = EngenhoConfig::prescribed_default();
         assert_eq!(cfg.scheduler, default.scheduler);
         assert_eq!(cfg.controllers, default.controllers);
+    }
+
+    /// T4.9 at the parse boundary: operator YAML that widens a node-local
+    /// listener off loopback is refused by the parse itself, not left for a
+    /// bind to discover.
+    #[test]
+    fn yaml_that_widens_a_node_local_listener_is_refused() {
+        let cases = [
+            (
+                "runtime:\n  kubelet_listen_addr: 0.0.0.0:10250\n",
+                NodeLocalListener::Kubelet,
+            ),
+            (
+                "runtime:\n  etcd_listen_addr: \"[::]:2379\"\n",
+                NodeLocalListener::EtcdFacade,
+            ),
+        ];
+        for (yaml, want) in cases {
+            match EngenhoConfig::from_yaml_with_defaults(yaml) {
+                Err(ConfigError::NodeLocalListener {
+                    listener,
+                    rejection: ListenerAddrRejection::NotLoopback(_),
+                }) => assert_eq!(listener, want),
+                other => panic!("{yaml:?}: expected a NotLoopback refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_that_moves_a_node_local_listener_within_loopback_parses() {
+        let yaml = "\
+runtime:
+  kubelet_listen_addr: \"[::1]:10251\"
+  etcd_listen_addr: 127.0.0.1:12379
+";
+        let cfg = EngenhoConfig::from_yaml_with_defaults(yaml).unwrap();
+        let kubelet = cfg
+            .runtime
+            .node_local_addr(NodeLocalListener::Kubelet)
+            .unwrap()
+            .map(LoopbackAddr::socket_addr);
+        let etcd = cfg
+            .runtime
+            .node_local_addr(NodeLocalListener::EtcdFacade)
+            .unwrap()
+            .map(LoopbackAddr::socket_addr);
+        assert_eq!(kubelet, Some("[::1]:10251".parse().unwrap()));
+        assert_eq!(etcd, Some("127.0.0.1:12379".parse().unwrap()));
     }
 
     #[test]

@@ -61,7 +61,9 @@ async fn admission_mutate_injects_label_into_stored_object() {
     let chain = Arc::new(AdmissionChain::new(vec![hook], AdmissionMode::FailClosed));
 
     let handler: Arc<dyn ResourceHandler> = Arc::new(
-        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain),
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true)
+            .expect("Pod is cataloged")
+            .with_admission(chain),
     );
     let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![handler], None)
         .await
@@ -106,7 +108,9 @@ async fn admission_deny_returns_403_and_commits_nothing() {
     let chain = Arc::new(AdmissionChain::new(vec![hook], AdmissionMode::FailClosed));
 
     let handler: Arc<dyn ResourceHandler> = Arc::new(
-        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain),
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true)
+            .expect("Pod is cataloged")
+            .with_admission(chain),
     );
     let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![handler], None)
         .await

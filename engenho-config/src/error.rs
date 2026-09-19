@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::node_local::{ListenerAddrRejection, NodeLocalListener};
+
 /// Errors a config can return at parse/validate time.
 #[derive(Debug, Clone, Error)]
 pub enum ConfigError {
@@ -21,6 +23,20 @@ pub enum ConfigError {
         /// Why it failed.
         reason: String,
     },
+
+    /// A node-local listener was given an address it may not bind. It cannot
+    /// authenticate its callers yet, so it binds loopback only (T4.9).
+    #[error(
+        "invalid field {}: {rejection}; {listener} has no {} yet, so it binds loopback only",
+        .listener.field(),
+        .listener.missing_gate()
+    )]
+    NodeLocalListener {
+        /// Which listener.
+        listener: NodeLocalListener,
+        /// Why its address was refused.
+        rejection: ListenerAddrRejection,
+    },
 }
 
 impl ConfigError {
@@ -31,6 +47,7 @@ impl ConfigError {
             Self::Parse(_) => "parse",
             Self::Incoherent(_) => "incoherent",
             Self::InvalidField { .. } => "invalid_field",
+            Self::NodeLocalListener { .. } => "node_local_listener",
         }
     }
 }
@@ -50,6 +67,14 @@ mod tests {
             }
             .kind(),
             "invalid_field"
+        );
+        assert_eq!(
+            ConfigError::NodeLocalListener {
+                listener: NodeLocalListener::Kubelet,
+                rejection: ListenerAddrRejection::NotALiteral("x".into()),
+            }
+            .kind(),
+            "node_local_listener"
         );
     }
 }
