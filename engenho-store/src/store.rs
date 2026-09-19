@@ -20,6 +20,7 @@ use openraft::{
 };
 use tokio::sync::Mutex;
 
+use crate::owned_task::TaskStop;
 use crate::state::ResourceCatalog;
 use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 use crate::watch_backend::{
@@ -36,8 +37,9 @@ pub struct InMemoryStore {
     /// Store-level bookmark ticker — one per store, driving the
     /// per-watcher bookmark cadence under the catalog lock. `Arc` so
     /// every clone of the store shares (and keeps alive) the single
-    /// ticker; dropping the last store clone aborts it.
-    _bookmark_ticker: Arc<BookmarkTicker>,
+    /// ticker; dropping the last store clone aborts it, and
+    /// [`Self::quiesce_bookmarks`] aborts AND awaits it.
+    bookmark_ticker: Arc<BookmarkTicker>,
 }
 
 impl Default for InMemoryStore {
@@ -48,7 +50,7 @@ impl Default for InMemoryStore {
         let ticker = BookmarkTicker::spawn(Arc::downgrade(&inner));
         Self {
             inner,
-            _bookmark_ticker: Arc::new(ticker),
+            bookmark_ticker: Arc::new(ticker),
         }
     }
 }
@@ -88,6 +90,15 @@ impl InMemoryStore {
         Self::default()
     }
 
+    /// Stop this store's bookmark ticker and wait until it has ended, so it
+    /// holds no reference to the store — see [`BookmarkTicker::quiesce`].
+    ///
+    /// The ticker is shared by every clone: afterwards no clone's watchers
+    /// receive periodic bookmarks (live events still flow). One-way.
+    pub async fn quiesce_bookmarks(&self) -> TaskStop {
+        self.bookmark_ticker.quiesce().await
+    }
+
     /// Open a resumable, gap-free watch from `opts.from`. See
     /// [`crate::watch_backend`] for the full contract.
     ///
@@ -102,31 +113,36 @@ impl InMemoryStore {
     pub async fn watch_from(&self, opts: WatchOpts) -> Result<WatchStream, WatchGone> {
         // ── under the catalog lock ─────────────────────────────────
         let mut guard = self.inner.lock().await;
-        // Read replay + boundary from the catalog (immutable), then
-        // register the sender on the registry (mutable). `register_captured`
-        // enqueues the entire replay into the channel IN REVISION ORDER
-        // before the handle is reachable by `fan_change` — all under THIS
-        // lock, so the replay→live handoff is atomic AND structurally
-        // ordered (no feeder task, no second producer racing apply).
-        // Borrows are sequential (no split-borrow of the MutexGuard's
-        // Deref) and the catalog ring is NOT cloned.
-        let replay = guard
-            .catalog
-            .changes_since(opts.from)
-            .map_err(WatchGone::from)?;
-        let boundary = guard.catalog.revision();
-        Ok(guard.watchers.register_captured(replay, boundary, &opts))
+        // Reborrow the guard once so the catalog (shared) and the registry
+        // (mutable) split as two fields of one `&mut Inner`. `register`
+        // reads replay + boundary from the catalog, then enqueues the entire
+        // replay into the channel IN REVISION ORDER before the handle is
+        // reachable by `fan_change` — all under THIS lock, so the
+        // replay→live handoff is atomic AND structurally ordered (no feeder
+        // task, no second producer racing apply). The ring is NOT cloned;
+        // only the replayed changes are.
+        let inner = &mut *guard;
+        inner.watchers.register(&inner.catalog, &opts)
     }
 
-    pub async fn current_catalog(&self) -> ResourceCatalog {
-        self.inner.lock().await.catalog.clone()
+    /// Run `read` over the catalog under ONE guard and return what it
+    /// returns. The only way code outside this file gets a reference to the
+    /// catalog.
+    ///
+    /// `pub(crate)`, and it cannot be otherwise: the catalog is sealed
+    /// (T3.2b), so a public signature naming it does not compile. Whatever
+    /// `read` clones is all that is cloned; it runs under the lock `apply`
+    /// takes, so it should filter and clone, and leave rendering to the
+    /// caller after the guard drops.
+    pub(crate) async fn read_catalog<R>(&self, read: impl FnOnce(&ResourceCatalog) -> R) -> R {
+        read(&self.inner.lock().await.catalog)
     }
 
     /// The current MVCC revision, read under the lock WITHOUT cloning.
     ///
     /// ── ★ WHY A SCALAR NEEDS ITS OWN METHOD ──────────────────────────────
-    /// `current_catalog().revision()` reads one `u64` by deep-cloning the
-    /// entire [`ResourceCatalog`] first — every resource AND the 8192-entry
+    /// The removed `current_catalog().revision()` read one `u64` by
+    /// deep-cloning the entire catalog first — every resource AND the 8192-entry
     /// watch-replay ring, whose entries each carry a full post-image and a
     /// full pre-image. Measured on rio: that made establishing a single watch
     /// cost hundreds of megabytes of memcpy, and since a watch is established
@@ -139,8 +155,8 @@ impl InMemoryStore {
     /// List + revision from ONE locked look at the catalog, cloning only the
     /// MATCHED items.
     ///
-    /// ── ★ WHY THIS EXISTS RATHER THAN `current_catalog().list(…)` ─────────
-    /// `ResourceCatalog` derives `Clone` and carries `history: VecDeque<Change>`
+    /// ── ★ WHY THIS EXISTS RATHER THAN A CATALOG CLONE + `list(…)` ─────────
+    /// The catalog derives `Clone` and carries `history: VecDeque<Change>`
     /// — the watch-replay ring, 8192 entries, each holding a full resource body.
     /// Cloning the catalog to serve a LIST therefore copies the entire ring, so
     /// the cost of every read scales with the cluster's AGE and write volume
@@ -167,14 +183,30 @@ impl InMemoryStore {
         Vec<(crate::resource::ResourceKey, crate::resource::ResourceValue)>,
         crate::revision::Revision,
     ) {
-        let guard = self.inner.lock().await;
-        let items = guard
+        self.inner
+            .lock()
+            .await
             .catalog
-            .list(group, version, kind, namespace)
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        (items, guard.catalog.revision())
+            .list_at_revision(crate::resource::ListScope::new(
+                group, version, kind, namespace,
+            ))
+    }
+
+    /// One page + revision from ONE locked look at the catalog, cloning only
+    /// the page's items — the paged sibling of [`Self::list_at_revision`],
+    /// whose header carries the measurement. Every informer relist pages
+    /// through here, so a page must cost its own size, not the catalog's.
+    pub async fn list_page_at_revision(
+        &self,
+        scope: crate::resource::ListScope<'_>,
+        after: Option<&crate::resource::ResourceKey>,
+        limit: usize,
+    ) -> crate::pagination::PageAtRevision {
+        self.inner
+            .lock()
+            .await
+            .catalog
+            .list_page_at_revision(scope, after, limit)
     }
 
     /// Direct read — used by RaftStore consumers without going
@@ -385,10 +417,11 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
             let log_id = entry.log_id;
             let (op, patch_error) = match entry.payload {
                 EntryPayload::Blank => (crate::command::ResourceOp::NoOp, None),
-                EntryPayload::Normal(ref cmd) => {
-                    let outcome = guard
-                        .catalog
-                        .apply(cmd, log_id.leader_id.term, log_id.index);
+                EntryPayload::Normal(ref logged) => {
+                    let outcome =
+                        guard
+                            .catalog
+                            .apply_logged(logged, log_id.leader_id.term, log_id.index);
                     // Fan the committed change to live watchers WHILE
                     // STILL HOLDING the catalog lock — this closes the
                     // replay→live race window entirely (the legacy
@@ -480,7 +513,7 @@ mod tests {
                 leader_id: CommittedLeaderId::new(1, 0),
                 index: idx,
             },
-            payload: EntryPayload::Normal(cmd),
+            payload: EntryPayload::Normal(crate::command::LoggedCommand::proposed(cmd)),
         }
     }
 
@@ -498,10 +531,10 @@ mod tests {
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].applied_index, 1);
         assert_eq!(res[0].op, crate::command::ResourceOp::Created);
-        let catalog = s.current_catalog().await;
-        assert_eq!(catalog.len(), 1);
         let key = ResourceKey::namespaced("", "v1", "Pod", "default", "podinfo");
-        assert!(catalog.get(&key).is_some());
+        let (len, held) = s.read_catalog(|c| (c.len(), c.get(&key).is_some())).await;
+        assert_eq!(len, 1);
+        assert!(held);
     }
 
     #[tokio::test]
@@ -523,5 +556,26 @@ mod tests {
         // The catalog JSON has the pod's metadata.name
         let s = std::str::from_utf8(bytes).unwrap();
         assert!(s.contains("podinfo"));
+    }
+
+    /// T2.1-store: the store's own ticker, parked mid-tick on the catalog
+    /// lock with an upgraded reference, is awaited by `quiesce_bookmarks`
+    /// rather than left holding the store.
+    #[tokio::test]
+    async fn quiesce_bookmarks_releases_a_ticker_parked_on_the_catalog_lock() {
+        let store = InMemoryStore::new();
+        let apply_in_progress = store.inner.lock().await;
+        assert!(
+            crate::watch_backend::await_strong_count(&store.inner, 2).await,
+            "precondition: the ticker upgraded its Weak and is parked on the lock"
+        );
+
+        assert_eq!(store.quiesce_bookmarks().await, TaskStop::Cancelled);
+        assert_eq!(
+            Arc::strong_count(&store.inner),
+            1,
+            "quiesce_bookmarks returned while the ticker still held the store"
+        );
+        drop(apply_in_progress);
     }
 }

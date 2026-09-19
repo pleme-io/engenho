@@ -22,9 +22,10 @@
 //!     so a watcher resuming from before the Txn sees ALL of it, never a
 //!     torn half.
 
-use engenho_store::command::{Reason, ResourceCommand, TxnCompare, TxnOp};
-use engenho_store::revision::Revision;
-use engenho_store::{ResourceCatalog, ResourceKey, ResourceValue};
+use crate::command::{Reason, ResourceCommand, TxnCompare, TxnOp};
+use crate::revision::Revision;
+use crate::state::ResourceCatalog;
+use crate::{ResourceKey, ResourceValue};
 
 fn pod_key(name: &str) -> ResourceKey {
     ResourceKey::namespaced("", "v1", "Pod", "default", name)
@@ -59,7 +60,7 @@ fn apply(
     cat: &mut ResourceCatalog,
     cmd: &ResourceCommand,
     index: u64,
-) -> engenho_store::state::ApplyOutcome {
+) -> crate::state::ApplyOutcome {
     cat.apply(cmd, 1, index)
 }
 
@@ -93,7 +94,7 @@ fn t2_one_transaction_is_one_revision_across_every_key() {
     }
 
     // T5: all three changes are reported, and all at the same revision.
-    let all: Vec<&engenho_store::revision::Change> =
+    let all: Vec<&crate::revision::Change> =
         out.change.iter().chain(out.extra_changes.iter()).collect();
     assert_eq!(all.len(), 3, "every mutated key must be reported");
     assert!(all.iter().all(|c| c.revision == rev));

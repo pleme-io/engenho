@@ -33,6 +33,42 @@
 //! wrapper that translates K8s API REST calls into `ResourceCommand`
 //! Raft proposals. Workers and CLI clients see a stock K8s API;
 //! the underlying store is the distributed substrate.
+//!
+//! ## The catalog is sealed (T3.2b)
+//!
+//! The state machine's catalog is crate-private, and this crate denies
+//! `private_interfaces`, so no public signature can return or take it.
+//! Reading one integer used to clone every resource plus the 8192-entry
+//! watch-replay ring; now a reader outside the crate gets a scalar, one
+//! key, a scoped list or page, or a visitor under one guard — see
+//! [`StoreMesh`]'s read surface.
+//!
+//! The type cannot be named from outside:
+//!
+//! ```compile_fail,E0603
+//! let _ = engenho_store::state::ResourceCatalog::default();
+//! ```
+//!
+//! and the method that handed it out is gone:
+//!
+//! ```compile_fail,E0599
+//! async fn read(mesh: &engenho_store::StoreMesh) {
+//!     let _ = mesh.current_catalog().await;
+//! }
+//! ```
+//!
+//! while its replacements are reachable. This is the positive control for
+//! both blocks above — the same shapes, compiling — and it is what keeps them
+//! from being vacuous: stable rustdoc does not check a `compile_fail` block's
+//! error code (only nightly does), so on stable a block proves only that it
+//! fails to compile, not why.
+//!
+//! ```
+//! async fn read(mesh: &engenho_store::StoreMesh) -> (engenho_store::Revision, u64) {
+//!     (mesh.current_revision().await, mesh.last_applied_index().await)
+//! }
+//! let _ = engenho_store::state::DEFAULT_HISTORY_CAPACITY;
+//! ```
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
@@ -54,6 +90,10 @@
 // timeout value. Both predate item-2 and are out of its scope.
 #![allow(clippy::unused_async)]
 #![allow(clippy::cast_possible_truncation)]
+// ★ T3.2b: the catalog seal. `state::ResourceCatalog` is `pub(crate)`; with
+// this denied, a `pub fn` that returns or takes it is a compile error rather
+// than a quiet way to hand the whole catalog and its replay ring back out.
+#![deny(private_interfaces)]
 
 pub mod command;
 pub mod data_dir_lock;
@@ -63,6 +103,7 @@ pub mod mesh;
 pub mod nats_listener;
 pub mod nats_network;
 pub mod network;
+pub mod owned_task;
 pub mod pagination;
 pub mod patch_apply;
 pub mod resource;
@@ -74,25 +115,32 @@ pub mod type_config;
 pub mod watch;
 pub mod watch_backend;
 
-pub use command::{Reason, ResourceCommand, ResourceOp};
+/// The catalog-level suites that were integration tests until T3.2b sealed
+/// the catalog: they drive `ResourceCatalog` directly, which only code
+/// inside the crate can name.
+#[cfg(test)]
+mod catalog_tests;
+
+pub use command::{ApplySemantics, LoggedCommand, Reason, ResourceCommand, ResourceOp};
 pub use drv_committal::{
     DRV_GROUP, DRV_KIND, DRV_VERSION, delete_drv_command, drv_resource_key, put_drv_command,
     render_drv_resource,
 };
-pub use fjall_store::FjallStore;
-pub use mesh::{StoreError, StoreMesh, default_config};
+pub use fjall_store::{FjallStore, Flushed, IMAGE_GATE, ImageInconsistency, ImageTripwire};
+pub use mesh::{MeshFlushed, Quiesced, StoreError, StoreMesh, default_config};
 pub use nats_listener::NatsListener;
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
 pub use network::InProcessRouter;
-pub use pagination::{ContinueInvalid, ContinueToken, ListPage};
+pub use owned_task::{OwnedTask, TaskStop};
+pub use pagination::{ContinueInvalid, ContinueToken, ListPage, PageAtRevision};
 pub use patch_apply::{
     Gvk, JsonPath, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody, PatchDirective,
     PatchError, PatchSchemaEnv, apply as apply_patch_algorithm,
 };
-pub use resource::{ResourceKey, ResourceValue};
+pub use resource::{ListScope, ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 pub use ssa::{ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome, apply_ssa};
-pub use state::{ApplyOutcome, DEFAULT_HISTORY_CAPACITY, ResourceCatalog, check_precondition};
+pub use state::{ApplyOutcome, DEFAULT_HISTORY_CAPACITY, check_precondition, unchanged};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
 pub use watch::{WatchEvent, WatchEventKind};

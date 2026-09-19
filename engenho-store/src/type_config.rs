@@ -5,7 +5,7 @@
 
 use openraft::BasicNode;
 
-use crate::command::ResourceCommand;
+use crate::command::LoggedCommand;
 use crate::command::ResourceOp;
 
 pub type RaftNodeId = u64;
@@ -17,9 +17,13 @@ pub struct ApplyResult {
     pub applied_term: u64,
     /// What the catalog did with this command.
     pub op: ResourceOp,
-    /// The global MVCC revision stamped onto this mutation's
-    /// `metadata.resourceVersion`. `0` for a no-op (no revision was
-    /// consumed). Decoupled from `applied_index` (the Raft log
+    /// The catalog's global MVCC revision once this command was applied.
+    /// For a committed change it is the revision stamped onto the
+    /// mutation's `metadata.resourceVersion`. For an outcome that consumed
+    /// none (a no-op, a refusal, or [`ResourceOp::Unchanged`]) it is the
+    /// revision the catalog already stood at — NOT the object's own
+    /// resourceVersion, which an unchanged write leaves where it was; read
+    /// the object for that. Decoupled from `applied_index` (the Raft log
     /// index) — see [`crate::revision`]. Consumers use this for
     /// list-then-watch resume + optimistic concurrency.
     pub revision: u64,
@@ -34,7 +38,8 @@ pub struct ApplyResult {
 openraft::declare_raft_types!(
     /// engenho-store's openraft type configuration.
     pub TypeConfig:
-        D            = ResourceCommand,
+        // A command plus the apply rules it was proposed under (T3.5).
+        D            = LoggedCommand,
         R            = ApplyResult,
         NodeId       = RaftNodeId,
         Node         = BasicNode,

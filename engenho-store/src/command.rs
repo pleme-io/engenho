@@ -124,18 +124,25 @@ pub enum ResourceCommand {
     /// `Preconditions.resourceVersion`, surfaced as `?resourceVersion=`
     /// on DELETE) — see [`ResourceCommand::Put`].
     ///
-    /// `deletion_timestamp` is the FROZEN RFC3339-UTC instant the
-    /// apiserver boundary captured for this delete (a CLOCK read, the one
-    /// non-deterministic input — see `engenho_types::time`). It is part of
-    /// the REPLICATED command so the finalizer delete-gate in
-    /// `state::apply_delete` stamps `metadata.deletionTimestamp` from this
-    /// replicated scalar (NOT a per-node clock), keeping every Raft
-    /// replica byte-identical. `None` ⇒ no timestamp threaded (the
-    /// boundary judged the object finalizer-free, OR a pre-field log entry
-    /// is being replayed): apply_delete removes immediately as before. The
-    /// gate decision (finalizers present ⇒ Terminating, else remove) is
-    /// made deterministically inside apply_delete; this scalar only
-    /// supplies the timestamp it would stamp.
+    /// `deletion_timestamp` is the FROZEN RFC3339-UTC instant the proposer
+    /// captured for this delete (a CLOCK read, the one non-deterministic
+    /// input — see `engenho_types::time`). It is part of the REPLICATED
+    /// command so the finalizer delete-gate in `state::apply_delete` stamps
+    /// `metadata.deletionTimestamp` from this replicated scalar (NOT a
+    /// per-node clock), keeping every Raft replica byte-identical. The gate
+    /// decision (finalizers present ⇒ Terminating, else remove) is made
+    /// deterministically inside apply_delete; this scalar only supplies the
+    /// timestamp it would stamp.
+    ///
+    /// ★ A DELETE CARRIES ITS CLOCK (T3.6). [`Self::delete`] always stamps
+    /// one, so a controller or GC delete of a finalizer-bearing object goes
+    /// Terminating the way upstream does. The field stays `Option` on the
+    /// wire because the log already holds `None` entries — written before
+    /// the field existed, or by the clockless `delete()` before T3.6 — and
+    /// those must replay exactly as they did: a finalizer-free object is
+    /// removed, a finalizer-bearing one is left untouched (`NoOp`). `None`
+    /// is still reachable from [`Self::delete_at`] and a struct literal; it
+    /// is no longer reachable from the default constructor.
     Delete {
         key: ResourceKey,
         expected: Option<Revision>,
@@ -264,28 +271,35 @@ impl ResourceCommand {
         }
     }
 
-    /// Construct an UNCONDITIONAL `Delete` (no CAS precondition, no frozen
-    /// timestamp). The common controller/GC shape — these don't read a
-    /// boundary clock; the finalizer gate falls back to "no timestamp to
-    /// stamp" which is correct for a no-finalizer object (immediate
-    /// remove) and for a finalizer-bearing one stamps nothing this pass
-    /// (the next pass with a threaded timestamp, or a `Put`-carried
-    /// timestamp, supplies it). Equivalent to the struct literal with
-    /// `expected: None, deletion_timestamp: None`.
+    /// Construct an UNCONDITIONAL `Delete` (no CAS precondition) that
+    /// CARRIES ITS CLOCK — the common controller/GC shape.
+    ///
+    /// The wall clock is read HERE, once, on the proposing node
+    /// (`engenho_types::time::now_rfc3339_utc`), and frozen into the
+    /// replicated command, so every replica stamps the same bytes. A
+    /// finalizer-free object is removed immediately; a finalizer-bearing one
+    /// goes Terminating with this `deletionTimestamp` instead of the silent
+    /// `NoOp` a clockless delete gets (see the variant docs). Equivalent to
+    /// [`Self::delete_at`] with `expected: None` and `Some(now)`.
     #[must_use]
     pub fn delete(key: ResourceKey, reason: Reason) -> Self {
-        Self::Delete {
+        Self::delete_at(
             key,
-            expected: None,
+            None,
             reason,
-            deletion_timestamp: None,
-        }
+            Some(engenho_types::time::now_rfc3339_utc()),
+        )
     }
 
     /// Construct a `Delete` carrying a FROZEN boundary `deletion_timestamp`
     /// (and optional CAS precondition). The apiserver delete path uses
     /// this so the finalizer gate stamps `metadata.deletionTimestamp` from
     /// the replicated scalar — deterministic across replicas.
+    ///
+    /// Passing `None` builds the clockless shape the log still holds from
+    /// before T3.6; a finalizer-bearing object then stays untouched. The
+    /// plan's destination is a required `String` here — that signature
+    /// change lands with its callers in other crates.
     #[must_use]
     pub fn delete_at(
         key: ResourceKey,
@@ -299,6 +313,89 @@ impl ResourceCommand {
             reason,
             deletion_timestamp,
         }
+    }
+}
+
+/// Which apply rules a logged command is replayed under.
+///
+/// ★ A LOG ENTRY IS REPLAYED BY WHATEVER BINARY OPENS THE LOG, not by the
+/// one that wrote it. Changing what `apply` does with an old entry would
+/// renumber every revision after it, so a change to the rules is a new
+/// version here, and each entry names the version it was proposed under.
+///
+/// ★ ABSENCE MEANS V0. Every entry written before the marker existed
+/// deserializes as [`Self::V0`] and replays exactly as it did then — the
+/// same optional-field pattern `patch_type` and `apply` use on
+/// [`ResourceCommand::Patch`]. An older binary ignores the field and reads
+/// every entry as V0, which is why a rollback across a version starts only
+/// from a clean stop (nothing left to replay).
+///
+/// Only `Put` and `Patch` (server-side apply included) read it; `Delete`
+/// and `Txn` apply the same way under every version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplySemantics {
+    /// Before T3.5: a `Put` or `Patch` that passes its precondition consumes
+    /// a revision even when the stored object comes out identical.
+    V0,
+    /// T3.5 — a revision means a change. A `Put` or `Patch` whose result
+    /// equals the stored object (see [`crate::state::unchanged`]) returns
+    /// [`ResourceOp::Unchanged`]: no revision, no history, no watch event.
+    V1,
+}
+
+impl ApplySemantics {
+    /// The rules this binary proposes under.
+    pub const CURRENT: Self = Self::V1;
+
+    /// The rules an entry written before the marker existed was applied
+    /// under (the `#[serde(default)]` for [`LoggedCommand`]).
+    const fn unmarked() -> Self {
+        Self::V0
+    }
+}
+
+/// A [`ResourceCommand`] as the Raft log carries it: the command plus the
+/// [`ApplySemantics`] it was proposed under.
+///
+/// The marker is flattened into the command's own JSON object, so a logged
+/// `Put` is `{"kind":"put", …, "semantics":"v1"}`: an older binary decodes it
+/// as a plain `ResourceCommand` (the extra field is ignored), and an entry
+/// written before the marker decodes here as [`ApplySemantics::V0`].
+///
+/// The fields are private and [`Self::proposed`] is the only constructor, so
+/// this binary cannot write an entry under old rules; V0 exists only as
+/// decoded history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggedCommand {
+    #[serde(flatten)]
+    command: ResourceCommand,
+    #[serde(default = "ApplySemantics::unmarked")]
+    semantics: ApplySemantics,
+}
+
+impl LoggedCommand {
+    /// Log `command` under the rules this binary proposes under
+    /// ([`ApplySemantics::CURRENT`]).
+    #[must_use]
+    pub fn proposed(command: ResourceCommand) -> Self {
+        Self {
+            command,
+            semantics: ApplySemantics::CURRENT,
+        }
+    }
+
+    /// The rules this entry replays under.
+    #[must_use]
+    pub fn semantics(&self) -> ApplySemantics {
+        self.semantics
+    }
+
+    /// The logged command. Crate-private: applying it without its
+    /// [`Self::semantics`] is the one way to replay an entry wrongly, so the
+    /// only consumer is [`crate::state::ResourceCatalog::apply_logged`].
+    pub(crate) fn command(&self) -> &ResourceCommand {
+        &self.command
     }
 }
 
@@ -368,6 +465,19 @@ pub enum ResourceOp {
     /// 409 `Status` (reason "Conflict" + per-field causes) — NEVER a silent
     /// overwrite.
     ApplyConflict,
+    /// A `Put` or `Patch` (server-side apply included) whose result equals
+    /// the stored object — T3.5, a revision means a change. Nothing is
+    /// written: no revision consumed, no history entry, no watch event, and
+    /// the stored `resourceVersion` stays what it was. Distinct from
+    /// [`Self::NoOp`], which names a write that had nothing to act on (a
+    /// patch or delete of a missing key); this one acted and found nothing
+    /// to change. The apiserver answers it like a successful write, with
+    /// the stored object read back.
+    ///
+    /// A response, never a log entry: `ResourceOp` is what `apply` returns,
+    /// so adding it changes no replayed bytes. Only entries under
+    /// [`ApplySemantics::V1`] can produce it.
+    Unchanged,
     /// Idempotent no-op (delete-not-found, etc.).
     #[default]
     NoOp,
@@ -495,6 +605,62 @@ mod tests {
         }
     }
 
+    fn cm_put() -> ResourceCommand {
+        ResourceCommand::put(
+            ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm"),
+            serde_json::json!({"data": {"k": "v"}}),
+            Reason::Operator,
+        )
+    }
+
+    #[test]
+    fn a_log_entry_written_before_the_marker_replays_under_v0() {
+        // The exact shape every pre-T3.5 log entry has: a bare command.
+        let legacy = serde_json::to_value(cm_put()).unwrap();
+        assert!(legacy.get("semantics").is_none());
+        let entry: LoggedCommand = serde_json::from_value(legacy).unwrap();
+        assert_eq!(entry.semantics(), ApplySemantics::V0);
+        assert_eq!(entry.command(), &cm_put());
+    }
+
+    #[test]
+    fn this_binary_proposes_under_v1_and_the_marker_round_trips() {
+        assert_eq!(ApplySemantics::CURRENT, ApplySemantics::V1);
+        let entry = LoggedCommand::proposed(cm_put());
+        assert_eq!(entry.semantics(), ApplySemantics::V1);
+        let wire = serde_json::to_value(&entry).unwrap();
+        // Flat: the marker sits beside the command's own fields.
+        assert_eq!(wire["kind"], "put");
+        assert_eq!(wire["semantics"], "v1");
+        let back: LoggedCommand = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn an_older_binary_still_decodes_a_marked_entry_as_its_command() {
+        // What a pre-T3.5 binary does with a V1 entry: decode it as a plain
+        // ResourceCommand, ignoring the marker. Rollback relies on the entry
+        // at least decoding.
+        for cmd in [
+            cm_put(),
+            ResourceCommand::apply_ssa(
+                ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm"),
+                serde_json::json!({"data": {"a": "1"}}),
+                ApplyMeta {
+                    manager: "kubectl".into(),
+                    force: false,
+                    time: "2026-09-19T00:00:00Z".into(),
+                },
+                Some(crate::revision::Revision(7)),
+                Reason::Operator,
+            ),
+        ] {
+            let wire = serde_json::to_string(&LoggedCommand::proposed(cmd.clone())).unwrap();
+            let old: ResourceCommand = serde_json::from_str(&wire).unwrap();
+            assert_eq!(old, cmd);
+        }
+    }
+
     #[test]
     fn delete_at_threads_the_frozen_timestamp() {
         let cmd = ResourceCommand::delete_at(
@@ -507,6 +673,34 @@ mod tests {
             ResourceCommand::Delete {
                 deletion_timestamp, ..
             } => assert_eq!(deletion_timestamp.as_deref(), Some("2026-06-08T00:00:00Z")),
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    /// T3.6: the default delete carries the proposer's clock, read once at
+    /// construction, and stays unconditional.
+    #[test]
+    fn delete_always_carries_the_proposers_clock() {
+        let before = engenho_types::time::now_rfc3339_utc();
+        let cmd = ResourceCommand::delete(
+            ResourceKey::namespaced("", "v1", "Pod", "default", "gc"),
+            Reason::GarbageCollector,
+        );
+        let after = engenho_types::time::now_rfc3339_utc();
+        match cmd {
+            ResourceCommand::Delete {
+                deletion_timestamp,
+                expected,
+                ..
+            } => {
+                let ts = deletion_timestamp.expect("delete() carries a clock");
+                // Fixed-width RFC3339 Zulu strings order chronologically.
+                assert!(
+                    before <= ts && ts <= after,
+                    "the instant read at construction: {before} <= {ts} <= {after}"
+                );
+                assert_eq!(expected, None, "delete() stays unconditional");
+            }
             other => panic!("expected Delete, got {other:?}"),
         }
     }

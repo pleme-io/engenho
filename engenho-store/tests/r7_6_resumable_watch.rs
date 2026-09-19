@@ -19,11 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_store::{
-    InProcessRouter, ResourceCatalog, ResourceKey, Revision, StoreMesh, WatchEventKind, WatchGone,
-    WatchOpts, WatchSignal,
+    InProcessRouter, ResourceKey, Revision, StoreMesh, WatchEventKind, WatchGone, WatchOpts,
+    WatchSignal,
     command::{Reason, ResourceCommand},
     default_config,
-    watch_backend::WatcherRegistry,
 };
 use serde_json::json;
 
@@ -149,7 +148,7 @@ async fn resumability_fjall() {
 
 async fn gap_freedom_iteration(mesh: &Arc<StoreMesh>, n: u64) {
     // rv0 = the revision JUST before we subscribe.
-    let rv0 = mesh.current_catalog().await.revision();
+    let rv0 = mesh.current_revision().await;
 
     // Start the watch (mid-storm in the spirit of the spec: subscribe,
     // then immediately hammer writes).
@@ -247,7 +246,7 @@ async fn gap_freedom_fjall() {
 async fn nonempty_replay_boundary_iteration(mesh: &Arc<StoreMesh>, backlog: u64, live: u64) {
     // (1) Build a NON-EMPTY backlog: put `backlog` revisions, then pick
     // a resume point `from` partway through so the replay is non-empty.
-    let base = mesh.current_catalog().await.revision().get();
+    let base = mesh.current_revision().await.get();
     for i in 1..=backlog {
         put(&mesh, &format!("bk{base}_{i}"), i).await;
     }
@@ -338,64 +337,6 @@ async fn nonempty_replay_boundary_ordering_fjall() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Registry-level mirror driving the primitive directly (no Raft, no
-/// store): register from rev2 → replay {3,4,5}; IMMEDIATELY fan_change
-/// rev6 (before the first poll); assert delivery is exactly 3,4,5,6.
-/// This is the tightest reproduction of the [6,3,4,5] defect — it
-/// FAILS with the old spawned-feeder path and PASSES with the replay
-/// fed under the lock inside `register_captured`.
-#[tokio::test]
-async fn registry_nonempty_replay_then_immediate_live_is_ordered() {
-    let mut cat = ResourceCatalog::default();
-    for i in 1..=5u64 {
-        cat.apply(
-            &ResourceCommand::Put {
-                key: pod_key(&format!("p{i}")),
-                value: json!({"i": i}),
-                expected: None,
-                reason: Reason::Operator,
-            },
-            1,
-            i,
-        );
-    }
-    let mut reg = WatcherRegistry::new();
-    // Register from rev2 → replay {3,4,5} enqueued under this call.
-    let mut stream = reg
-        .register(&cat, &WatchOpts::from_revision(Revision(2)))
-        .unwrap();
-    // Live rev6 fanned BEFORE any poll (boundary == 5, so 6 > boundary).
-    cat.apply(
-        &ResourceCommand::Put {
-            key: pod_key("p6"),
-            value: json!({"i": 6}),
-            expected: None,
-            reason: Reason::Operator,
-        },
-        1,
-        6,
-    );
-    let change6 = cat.changes_since(Revision(5)).unwrap().pop().unwrap();
-    assert_eq!(change6.revision, Revision(6));
-    reg.fan_change(&change6);
-
-    let mut got = Vec::new();
-    for _ in 0..4 {
-        match tokio::time::timeout(Duration::from_secs(3), stream.next())
-            .await
-            .expect("signal before timeout")
-        {
-            Some(Ok(WatchSignal::Event(ev))) => got.push(ev.resource_version),
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-    assert_eq!(
-        got,
-        vec![3, 4, 5, 6],
-        "replay {{3,4,5}} must precede the immediate live event 6 — no reorder"
-    );
-}
-
 /// Headline variant: race a fresh watch_from(rv0) against the single
 /// propose whose revision == rv0+1, asserting that event is delivered
 /// exactly once regardless of interleaving.
@@ -403,7 +344,7 @@ async fn registry_nonempty_replay_then_immediate_live_is_ordered() {
 async fn boundary_single_event_delivered_exactly_once_memory() {
     let mesh = boot_memory().await;
     for _ in 0..50 {
-        let rv0 = mesh.current_catalog().await.revision();
+        let rv0 = mesh.current_revision().await;
         let mut w = mesh
             .watch_from(WatchOpts::from_revision(rv0))
             .await
@@ -430,58 +371,13 @@ async fn boundary_single_event_delivered_exactly_once_memory() {
 }
 
 // =================================================================
-// 3. Gone on compaction (registry-level, no Raft)
+// 3. Gone on compaction
 // =================================================================
-
-#[tokio::test]
-async fn gone_on_compaction_registry() {
-    // Tiny history capacity forces compaction. Build the catalog
-    // directly (per the test strategy: a direct ResourceCatalog +
-    // registry unit test where no Raft is needed).
-    let mut cat = ResourceCatalog::with_history_capacity(2);
-    for i in 1..=5u64 {
-        cat.apply(
-            &ResourceCommand::Put {
-                key: pod_key(&format!("p{i}")),
-                value: json!({"i": i}),
-                expected: None,
-                reason: Reason::Operator,
-            },
-            1,
-            i,
-        );
-    }
-    // Only revs 4,5 retained → compacted at rev 3.
-    assert_eq!(cat.compacted_revision(), Revision(3));
-
-    let mut reg = WatcherRegistry::new();
-    // watch_from below the watermark → immediate typed Gone, NO channel.
-    let err = reg
-        .register(&cat, &WatchOpts::from_revision(Revision(1)))
-        .unwrap_err();
-    assert_eq!(
-        err,
-        WatchGone::CompactedTooOld {
-            requested: Revision(1),
-            compacted: Revision(3),
-        }
-    );
-    assert_eq!(err.kind(), "compacted_too_old");
-    assert_eq!(reg.len(), 0, "rejected watch allocates no channel");
-
-    // From exactly the watermark succeeds (watermark honored); the
-    // replay (revs 4,5) is enqueued into the stream — drain it to prove
-    // exactly 2 events landed.
-    let mut stream = reg
-        .register(&cat, &WatchOpts::from_revision(Revision(3)))
-        .unwrap();
-    assert_eq!(reg.len(), 1);
-    let mut replayed = Vec::new();
-    while let Some(Ok(WatchSignal::Event(ev))) = stream.try_next() {
-        replayed.push(ev.resource_version);
-    }
-    assert_eq!(replayed, vec![4, 5]);
-}
+//
+// Registry-level: `gone_on_compaction_registry` and
+// `registry_nonempty_replay_then_immediate_live_is_ordered` drive a
+// catalog directly, so since T3.2b sealed it they live in the crate, in
+// `watch_backend`'s own tests. The mesh-level path is below.
 
 // =================================================================
 // 4. Bookmark advance
@@ -491,7 +387,7 @@ async fn bookmark_case(mesh: Arc<StoreMesh>) {
     // Quiescent store, fast bookmark cadence.
     let mut w = mesh
         .watch_from(WatchOpts {
-            from: mesh.current_catalog().await.revision(),
+            from: mesh.current_revision().await,
             buffer: 64,
             bookmark_every: Duration::from_millis(50),
         })
@@ -499,7 +395,7 @@ async fn bookmark_case(mesh: Arc<StoreMesh>) {
         .unwrap();
 
     // At least one Bookmark arrives at the current revision.
-    let rev_before = mesh.current_catalog().await.revision();
+    let rev_before = mesh.current_revision().await;
     let first_bm = wait_for_bookmark(&mut w).await;
     assert_eq!(first_bm, rev_before, "bookmark marks the current revision");
 
@@ -574,10 +470,7 @@ async fn overflow_case(mesh: Arc<StoreMesh>) {
     // A SECOND watcher opened before the storm with an adequate buffer,
     // actively drained → must receive ALL events.
     let fast = mesh
-        .watch_from(WatchOpts::live_tail(
-            mesh.current_catalog().await.revision(),
-            1024,
-        ))
+        .watch_from(WatchOpts::live_tail(mesh.current_revision().await, 1024))
         .await
         .unwrap();
     let fast = Arc::new(tokio::sync::Mutex::new(fast));
@@ -606,10 +499,7 @@ async fn overflow_case(mesh: Arc<StoreMesh>) {
 
     // Slow watcher: buffer 4, NOT polled during the storm.
     let mut slow = mesh
-        .watch_from(WatchOpts::live_tail(
-            mesh.current_catalog().await.revision(),
-            4,
-        ))
+        .watch_from(WatchOpts::live_tail(mesh.current_revision().await, 4))
         .await
         .unwrap();
 
@@ -714,10 +604,7 @@ async fn lock_held_send_bound_case(mesh: Arc<StoreMesh>) {
     // still return promptly — try_send is non-blocking, so the in-lock
     // fan-out never awaits the slow consumer.
     let _stalled = mesh
-        .watch_from(WatchOpts::live_tail(
-            mesh.current_catalog().await.revision(),
-            1,
-        ))
+        .watch_from(WatchOpts::live_tail(mesh.current_revision().await, 1))
         .await
         .unwrap();
 

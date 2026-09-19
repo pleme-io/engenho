@@ -63,6 +63,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::owned_task::{OwnedTask, TaskStop};
 use crate::revision::{Change, CompactedTooOld, Revision};
 use crate::state::ResourceCatalog;
 use crate::watch::{WatchEvent, WatchEventKind};
@@ -391,7 +392,11 @@ impl WatcherRegistry {
     ///
     /// [`WatchGone::CompactedTooOld`] when `opts.from` is below the
     /// catalog's compaction watermark.
-    pub fn register(
+    ///
+    /// `pub(crate)`: it reads a catalog, which is sealed (T3.2b). Outside
+    /// the crate, [`Self::register_captured`] takes an already-captured
+    /// replay instead.
+    pub(crate) fn register(
         &mut self,
         catalog: &ResourceCatalog,
         opts: &WatchOpts,
@@ -765,11 +770,22 @@ pub trait BookmarkTickable: Send + Sync + 'static {
     fn tick_once(&self) -> impl std::future::Future<Output = ()> + Send;
 }
 
-/// A handle to the store-level bookmark ticker task. Dropping it aborts
-/// the ticker (the watchers themselves continue to receive live
-/// events; only periodic bookmarking stops).
+/// A handle to the store-level bookmark ticker task.
+///
+/// Two ways to end it, with different guarantees:
+///
+/// * [`BookmarkTicker::quiesce`] aborts the task AND waits for it to end.
+///   Use it wherever the caller needs the ticker to hold nothing of the
+///   store afterwards (shutdown, before reopening a data directory).
+/// * Dropping the handle aborts without waiting (the watchers keep receiving
+///   live events; only periodic bookmarking stops).
+///
+/// The distinction exists because a tick holds an UPGRADED strong reference
+/// to the store across `tick_once().await`, and that await waits on the
+/// catalog lock. An abort alone leaves that reference alive until a worker
+/// next polls the task.
 pub struct BookmarkTicker {
-    handle: tokio::task::JoinHandle<()>,
+    task: OwnedTask,
 }
 
 impl BookmarkTicker {
@@ -781,7 +797,7 @@ impl BookmarkTicker {
     /// One ticker per store (not one per watcher).
     #[must_use]
     pub fn spawn<T: BookmarkTickable>(weak: std::sync::Weak<T>) -> Self {
-        let handle = tokio::spawn(async move {
+        let task = OwnedTask::spawn(async move {
             let mut tick = tokio::time::interval(BOOKMARK_TICK_GRANULARITY);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -789,18 +805,38 @@ impl BookmarkTicker {
                 let Some(strong) = weak.upgrade() else {
                     return; // store dropped — stop ticking.
                 };
+                // ★ `strong` is held across this await, which can wait on the
+                // catalog lock for as long as an apply holds it. This is the
+                // window `quiesce` exists to close.
                 strong.tick_once().await;
                 drop(strong); // don't keep the store alive across the sleep.
             }
         });
-        Self { handle }
+        Self { task }
+    }
+
+    /// Stop the ticker and wait until it has ended: on return it holds no
+    /// reference to the store, even if it was parked mid-tick.
+    ///
+    /// One-way — the ticker does not restart — and idempotent: a later call
+    /// returns [`TaskStop::AlreadyStopped`].
+    pub async fn quiesce(&self) -> TaskStop {
+        self.task.stop().await
     }
 }
 
-impl Drop for BookmarkTicker {
-    fn drop(&mut self) {
-        self.handle.abort();
+/// Test support: poll until `inner`'s strong count is exactly `count`. Used
+/// to observe a store's ticker parked mid-tick with an upgraded reference.
+/// Bounded (about two seconds): answers `false` rather than hanging.
+#[cfg(test)]
+pub(crate) async fn await_strong_count<T>(inner: &Arc<T>, count: usize) -> bool {
+    for _ in 0..200 {
+        if Arc::strong_count(inner) == count {
+            return true;
+        }
+        tokio::time::sleep(BOOKMARK_TICK_GRANULARITY / 5).await;
     }
+    false
 }
 
 #[cfg(test)]
@@ -1261,5 +1297,164 @@ mod tests {
         // WITHOUT arming a Gone → clean None.
         drop(reg);
         assert!(stream.next().await.is_none());
+    }
+
+    // ── T2.1-store: quiesce awaits a ticker parked mid-tick ────────
+
+    /// A tickable whose `tick_once` announces it has started, then waits on
+    /// a lock the test holds — the shape of a real tick waiting on the
+    /// catalog lock while an apply holds it.
+    struct ParkedTick {
+        entered: tokio::sync::Notify,
+        catalog_lock: tokio::sync::Mutex<()>,
+    }
+
+    impl BookmarkTickable for ParkedTick {
+        async fn tick_once(&self) {
+            self.entered.notify_one();
+            let _held = self.catalog_lock.lock().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn quiesce_awaits_a_ticker_parked_mid_tick_holding_the_store() {
+        let store = Arc::new(ParkedTick {
+            entered: tokio::sync::Notify::new(),
+            catalog_lock: tokio::sync::Mutex::new(()),
+        });
+        let apply_in_progress = store.catalog_lock.lock().await;
+        let ticker = BookmarkTicker::spawn(Arc::downgrade(&store));
+
+        // The ticker has upgraded its Weak and is parked on the lock.
+        store.entered.notified().await;
+        assert_eq!(
+            Arc::strong_count(&store),
+            2,
+            "precondition: the parked tick holds an upgraded reference"
+        );
+
+        assert_eq!(ticker.quiesce().await, TaskStop::Cancelled);
+        assert_eq!(
+            Arc::strong_count(&store),
+            1,
+            "quiesce returned while the aborted ticker still held the store"
+        );
+        assert_eq!(ticker.quiesce().await, TaskStop::AlreadyStopped);
+        drop(apply_in_progress);
+    }
+
+    // ── Moved from tests/r7_6_resumable_watch.rs (T3.2b) ──────────────
+    // Both drive a `ResourceCatalog` directly, which only the crate can name
+    // since the catalog was sealed.
+
+    use crate::command::{Reason, ResourceCommand};
+    use serde_json::json;
+
+    /// Registry-level mirror driving the primitive directly (no Raft, no
+    /// store): register from rev2 → replay {3,4,5}; IMMEDIATELY fan_change
+    /// rev6 (before the first poll); assert delivery is exactly 3,4,5,6.
+    /// This is the tightest reproduction of the [6,3,4,5] defect — it
+    /// FAILS with the old spawned-feeder path and PASSES with the replay
+    /// fed under the lock inside `register_captured`.
+    #[tokio::test]
+    async fn registry_nonempty_replay_then_immediate_live_is_ordered() {
+        let mut cat = ResourceCatalog::default();
+        for i in 1..=5u64 {
+            cat.apply(
+                &ResourceCommand::Put {
+                    key: pod_key(&format!("p{i}")),
+                    value: json!({"i": i}),
+                    expected: None,
+                    reason: Reason::Operator,
+                },
+                1,
+                i,
+            );
+        }
+        let mut reg = WatcherRegistry::new();
+        // Register from rev2 → replay {3,4,5} enqueued under this call.
+        let mut stream = reg
+            .register(&cat, &WatchOpts::from_revision(Revision(2)))
+            .unwrap();
+        // Live rev6 fanned BEFORE any poll (boundary == 5, so 6 > boundary).
+        cat.apply(
+            &ResourceCommand::Put {
+                key: pod_key("p6"),
+                value: json!({"i": 6}),
+                expected: None,
+                reason: Reason::Operator,
+            },
+            1,
+            6,
+        );
+        let change6 = cat.changes_since(Revision(5)).unwrap().pop().unwrap();
+        assert_eq!(change6.revision, Revision(6));
+        reg.fan_change(&change6);
+
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_secs(3), stream.next())
+                .await
+                .expect("signal before timeout")
+            {
+                Some(Ok(WatchSignal::Event(ev))) => got.push(ev.resource_version),
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(
+            got,
+            vec![3, 4, 5, 6],
+            "replay {{3,4,5}} must precede the immediate live event 6 — no reorder"
+        );
+    }
+
+    #[tokio::test]
+    async fn gone_on_compaction_registry() {
+        // Tiny history capacity forces compaction. Build the catalog
+        // directly (per the test strategy: a direct ResourceCatalog +
+        // registry unit test where no Raft is needed).
+        let mut cat = ResourceCatalog::with_history_capacity(2);
+        for i in 1..=5u64 {
+            cat.apply(
+                &ResourceCommand::Put {
+                    key: pod_key(&format!("p{i}")),
+                    value: json!({"i": i}),
+                    expected: None,
+                    reason: Reason::Operator,
+                },
+                1,
+                i,
+            );
+        }
+        // Only revs 4,5 retained → compacted at rev 3.
+        assert_eq!(cat.compacted_revision(), Revision(3));
+
+        let mut reg = WatcherRegistry::new();
+        // watch_from below the watermark → immediate typed Gone, NO channel.
+        let err = reg
+            .register(&cat, &WatchOpts::from_revision(Revision(1)))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            WatchGone::CompactedTooOld {
+                requested: Revision(1),
+                compacted: Revision(3),
+            }
+        );
+        assert_eq!(err.kind(), "compacted_too_old");
+        assert_eq!(reg.len(), 0, "rejected watch allocates no channel");
+
+        // From exactly the watermark succeeds (watermark honored); the
+        // replay (revs 4,5) is enqueued into the stream — drain it to prove
+        // exactly 2 events landed.
+        let mut stream = reg
+            .register(&cat, &WatchOpts::from_revision(Revision(3)))
+            .unwrap();
+        assert_eq!(reg.len(), 1);
+        let mut replayed = Vec::new();
+        while let Some(Ok(WatchSignal::Event(ev))) = stream.try_next() {
+            replayed.push(ev.resource_version);
+        }
+        assert_eq!(replayed, vec![4, 5]);
     }
 }

@@ -14,10 +14,12 @@ use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
 
-use crate::command::ResourceCommand;
-use crate::fjall_store::FjallStore;
+use crate::command::{LoggedCommand, ResourceCommand};
+use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
 use crate::network::{InProcessRouter, RpcRequest};
-use crate::resource::{ResourceKey, ResourceValue};
+use crate::owned_task::{OwnedTask, TaskStop};
+use crate::pagination::PageAtRevision;
+use crate::resource::{ListScope, ResourceKey, ResourceValue};
 use crate::state::ResourceCatalog;
 use crate::store::InMemoryStore;
 use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
@@ -32,6 +34,12 @@ pub enum StoreError {
     ClientWriteFailed(String),
     #[error("raft fatal: {0}")]
     Fatal(String),
+    /// The durable image could not be written by [`StoreMesh::flush`]. The
+    /// log still holds every applied entry, so nothing acknowledged is lost;
+    /// the next boot replays them. Boxed so the error stays one pointer wide
+    /// in every `Result` that carries it.
+    #[error("persist the applied image: {0}")]
+    Persist(Box<openraft::StorageError<RaftNodeId>>),
 }
 
 engenho_substrate::impl_error_kind! {
@@ -40,7 +48,19 @@ engenho_substrate::impl_error_kind! {
         (InitializeFailed(_)) => "initialize_failed",
         (ClientWriteFailed(_)) => "client_write_failed",
         (Fatal(_)) => "fatal",
+        (Persist(_)) => "persist_failed",
     }
+}
+
+/// What [`StoreMesh::flush`] did, per backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum MeshFlushed {
+    /// The in-memory backend: nothing outlives the process, so there is no
+    /// image to write and nothing a boot could replay.
+    Ephemeral,
+    /// The durable backend's answer — see [`Flushed`].
+    Durable(Flushed),
 }
 
 /// The store backend a [`StoreMesh`] is built over. Both variants
@@ -87,10 +107,28 @@ impl StoreBackend {
         }
     }
 
-    async fn current_catalog(&self) -> ResourceCatalog {
+    /// One page + revision under ONE backend guard, cloning only the page —
+    /// see [`crate::store::InMemoryStore::list_page_at_revision`].
+    async fn list_page_at_revision(
+        &self,
+        scope: ListScope<'_>,
+        after: Option<&ResourceKey>,
+        limit: usize,
+    ) -> PageAtRevision {
         match self {
-            Self::Memory(s) => s.current_catalog().await,
-            Self::Fjall(s) => s.current_catalog().await,
+            Self::Memory(s) => s.list_page_at_revision(scope, after, limit).await,
+            Self::Fjall(s) => s.list_page_at_revision(scope, after, limit).await,
+        }
+    }
+
+    /// Run `read` over the backend's catalog under ONE guard — see
+    /// [`InMemoryStore::read_catalog`]. Every catalog read on
+    /// [`StoreMesh`] that is not one of the older per-backend pairs above
+    /// goes through here, so a new accessor is written once, not twice.
+    async fn read<R>(&self, read: impl FnOnce(&ResourceCatalog) -> R) -> R {
+        match self {
+            Self::Memory(s) => s.read_catalog(read).await,
+            Self::Fjall(s) => s.read_catalog(read).await,
         }
     }
 
@@ -129,6 +167,49 @@ impl StoreBackend {
             Self::Fjall(s) => s.is_initialized().await,
         }
     }
+
+    async fn quiesce_bookmarks(&self) -> TaskStop {
+        match self {
+            Self::Memory(s) => s.quiesce_bookmarks().await,
+            Self::Fjall(s) => s.quiesce_bookmarks().await,
+        }
+    }
+
+    async fn flush(&self) -> Result<MeshFlushed, StoreError> {
+        match self {
+            Self::Memory(_) => Ok(MeshFlushed::Ephemeral),
+            Self::Fjall(s) => s
+                .flush()
+                .await
+                .map(MeshFlushed::Durable)
+                .map_err(|e| StoreError::Persist(Box::new(e))),
+        }
+    }
+}
+
+/// How [`StoreMesh::quiesce`] left each background task the mesh owns.
+///
+/// One field per owned task. `quiesce` destructures `StoreMesh` without
+/// `..`, so a new field on the mesh does not compile (E0027) until quiesce
+/// names it — stopped here, or bound to `_` with the reason it is not a
+/// task. Choosing `_` wrongly is caught only by review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub struct Quiesced {
+    /// The raft RPC pump: the task that feeds peer RPCs from the router
+    /// into `raft`.
+    pub rpc_pump: TaskStop,
+    /// The store's bookmark ticker, which holds an upgraded store reference
+    /// for the length of each tick.
+    pub bookmark_ticker: TaskStop,
+}
+
+impl Quiesced {
+    /// `true` if either task had panicked before it was stopped — it is gone
+    /// now, but it had stopped doing its job some time before.
+    pub fn any_panicked(&self) -> bool {
+        self.rpc_pump == TaskStop::Panicked || self.bookmark_ticker == TaskStop::Panicked
+    }
 }
 
 /// Raft-replicated K8s resource store.
@@ -138,7 +219,9 @@ pub struct StoreMesh {
     node_id: RaftNodeId,
     listen_addr: String,
     router: InProcessRouter,
-    rpc_task: tokio::task::JoinHandle<()>,
+    /// Feeds peer RPCs from the router into `raft`, holding a `Raft` clone.
+    /// Owned so [`Self::quiesce`] can abort AND await it.
+    rpc_pump: OwnedTask,
 }
 
 impl StoreMesh {
@@ -243,7 +326,7 @@ impl StoreMesh {
         router.register(node_id, tx_rpc).await;
 
         let raft_for_rpc = raft.clone();
-        let rpc_task = tokio::spawn(async move {
+        let rpc_pump = OwnedTask::spawn(async move {
             while let Some(req) = rx_rpc.recv().await {
                 match req {
                     RpcRequest::AppendEntries(rpc, reply) => {
@@ -271,7 +354,7 @@ impl StoreMesh {
             node_id,
             listen_addr,
             router,
-            rpc_task,
+            rpc_pump,
         })
     }
 
@@ -328,10 +411,15 @@ impl StoreMesh {
         Ok(())
     }
 
+    /// Replicate `cmd` and return what the state machine did with it.
+    ///
+    /// Every proposal is logged under [`crate::command::ApplySemantics::CURRENT`]:
+    /// an identical `Put` or `Patch` comes back
+    /// [`crate::ResourceOp::Unchanged`] with the revision untouched.
     pub async fn propose(&self, cmd: ResourceCommand) -> Result<ApplyResult, StoreError> {
         let resp: ClientWriteResponse<TypeConfig> = self
             .raft
-            .client_write(cmd)
+            .client_write(LoggedCommand::proposed(cmd))
             .await
             .map_err(|e| StoreError::ClientWriteFailed(e.to_string()))?;
         Ok(resp.data)
@@ -364,13 +452,13 @@ impl StoreMesh {
     }
 
     /// List resources matching (group, version, kind), optionally
-    /// namespace-scoped, AND the snapshot [`Revision`] captured from
-    /// the SAME catalog clone — atomically.
+    /// namespace-scoped, AND the snapshot [`Revision`] read under the
+    /// SAME backend guard — atomically.
     ///
     /// This is the atomic list-then-watch primitive the apiserver
-    /// builds its `LIST` envelope on. Both the items and `rev` come from
-    /// ONE `current_catalog()` clone: within that clone `cat.list(...)`
-    /// and `cat.revision()` are a consistent snapshot of each other. A
+    /// builds its `LIST` envelope on. Both the items and `rev` are read
+    /// under ONE lock of the backend's catalog, so they are a consistent
+    /// snapshot of each other. A
     /// client that LISTs at the returned `rev` then `watch_from(rev)`
     /// resumes from exactly that snapshot boundary — gap-free + dup-free.
     ///
@@ -384,8 +472,9 @@ impl StoreMesh {
         kind: &str,
         namespace: Option<&str>,
     ) -> (Vec<(ResourceKey, ResourceValue)>, crate::revision::Revision) {
-        // ★ NOT `current_catalog()`. That clones the whole ResourceCatalog —
-        // including its 8192-entry watch-replay history ring — so serving a
+        // ★ NOT a catalog clone (the removed `current_catalog()`). That
+        // copied the whole catalog — including its 8192-entry watch-replay
+        // history ring — so serving a
         // LIST cost time proportional to the cluster's AGE rather than to the
         // number of objects listed. Measured 2026-09-14: 4.4ms → 31.8ms as the
         // ring filled while ONE object existed, plateauing exactly at the cap;
@@ -399,30 +488,39 @@ impl StoreMesh {
     }
 
     /// One page of resources matching (group, version, kind), optionally
-    /// namespace-scoped, AND the [`crate::revision::Revision`] read from
-    /// the SAME catalog clone — so the items + the reported revision are
+    /// namespace-scoped, AND the [`crate::revision::Revision`] read under
+    /// the SAME backend guard — so the items + the reported revision are
     /// mutually consistent FOR THIS CALL. The range-pagination sibling of
     /// [`Self::list_at_revision`].
     ///
-    /// ## Consistency: per-call clone, NOT cross-page snapshot isolation
+    /// ★ NOT a catalog clone (the removed `current_catalog()`). That
+    /// deep-cloned every resource plus the 8192-entry watch-replay ring,
+    /// and this runs once per PAGE of every
+    /// informer relist: after a restart every client relists at once, so a
+    /// per-page clone multiplies the cost that wedged Flux on rio by the
+    /// number of pages. The page is read under one guard, over the scope's
+    /// own run of keys (see [`ListScope`]), and only its items are cloned.
     ///
-    /// Each call clones the CURRENT catalog and pages it; the returned
-    /// `snapshot_rev` is the live revision at THIS call. Across a page
-    /// SERIES this is cursor-based pagination (gap/dup-free for a
-    /// quiescent key set, and a PRE-cursor late insert cannot resurface),
-    /// NOT true MVCC snapshot isolation: a POST-cursor insert committed
-    /// between page calls WILL appear on a later page, because the next
-    /// call re-clones the live catalog rather than reading AS OF the
-    /// token's first-page revision. The `snapshot_rev` baked into the
-    /// continue token is the envelope `resourceVersion` LABEL, not a
-    /// read-isolation mechanism. See [`crate::state::ResourceCatalog::list_page`]
-    /// for the destination (revision-indexed historical reads, deferred —
-    /// needs retained historical MVCC views).
+    /// ## Consistency: per-call read, NOT cross-page snapshot isolation
     ///
-    /// Returns `(items, snapshot_rev, next, remaining)`:
+    /// Each call reads the CURRENT catalog; the returned `snapshot_rev` is
+    /// the live revision at THIS call. Across a page SERIES this is
+    /// cursor-based pagination (gap/dup-free for a quiescent key set, and a
+    /// PRE-cursor late insert cannot resurface), NOT true MVCC snapshot
+    /// isolation: a POST-cursor insert committed between page calls WILL
+    /// appear on a later page, because the next call reads the live catalog
+    /// rather than reading AS OF the token's first-page revision. The
+    /// `snapshot_rev` baked into the continue token is the envelope
+    /// `resourceVersion` LABEL, not a read-isolation mechanism. See the
+    /// catalog's `list_page` (crate-private since T3.2b) for the destination
+    /// (revision-indexed historical reads, deferred — needs retained
+    /// historical MVCC views).
+    ///
+    /// Returns `(items, snapshot_rev, next, remaining)` — the fields of
+    /// [`PageAtRevision`]:
     ///   * `items` — up to `limit` `(key, value)` pairs starting strictly
     ///     after `after`, in total key order.
-    ///   * `snapshot_rev` — `cat.revision()` at this call (the LABEL
+    ///   * `snapshot_rev` — the catalog revision at this call (the LABEL
     ///     reported in the LIST envelope `resourceVersion`).
     ///   * `next` — the cursor key for the following page (the last
     ///     emitted key iff more matching items remain), else `None`.
@@ -441,31 +539,124 @@ impl StoreMesh {
         Option<ResourceKey>,
         u64,
     ) {
-        let cat = self.store.current_catalog().await;
-        let page = cat.list_page(group, version, kind, namespace, after, limit);
-        let items = page
-            .items
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        (items, cat.revision(), page.next, page.remaining)
+        let PageAtRevision {
+            items,
+            revision,
+            next,
+            remaining,
+        } = self
+            .store
+            .list_page_at_revision(
+                ListScope::new(group, version, kind, namespace),
+                after,
+                limit,
+            )
+            .await;
+        (items, revision, next, remaining)
     }
 
-    /// Read-only snapshot of the whole catalog.
-    pub async fn current_catalog(&self) -> ResourceCatalog {
-        self.store.current_catalog().await
-    }
+    // ── The catalog's read surface: scalars and single-guard reads ─────
+    //
+    // ★ THERE IS NO WHOLE-CATALOG READ, AND THERE CANNOT BE ONE (T3.2b).
+    // `current_catalog()` used to hand the catalog out by value, so reading
+    // one integer — `.revision()`, `.last_applied_index` — deep-cloned every
+    // resource plus the 8192-entry watch-replay ring (two full resource
+    // bodies per entry) under the lock `apply` needs. Measured on rio: each
+    // watch establishment cost hundreds of MB of memcpy, stalling writes for
+    // tens of seconds at ~2 cores while FluxCD held dozens of watches.
+    //
+    // The catalog is now crate-private and the crate denies
+    // `private_interfaces`, so a `pub fn` returning it does not compile.
+    // What remains is the shape below: a scalar, one key, or a visitor that
+    // runs under ONE guard and clones only what the caller keeps.
 
     /// The current MVCC revision, read WITHOUT cloning the catalog.
-    ///
-    /// ★ Reach for this instead of `current_catalog().revision()`. That reads
-    /// one `u64` by deep-cloning every resource plus the 8192-entry
-    /// watch-replay ring (two full resource bodies per entry). Measured on
-    /// rio: it made each watch establishment cost hundreds of MB of memcpy
-    /// under the same lock `apply` needs, stalling writes for tens of seconds
-    /// at ~2 cores of CPU while FluxCD held dozens of watches.
     pub async fn current_revision(&self) -> crate::revision::Revision {
         self.store.current_revision().await
+    }
+
+    /// The Raft log index of the last entry applied to the catalog — the
+    /// read-after-write position [`Self::wait_for_applied`] waits on, and
+    /// what etcd's `Status` reports as `raftAppliedIndex`.
+    pub async fn last_applied_index(&self) -> u64 {
+        self.store.read(|c| c.last_applied_index).await
+    }
+
+    /// The compaction watermark: every change above it is still retained
+    /// for replay; a resume point below it is refused with
+    /// [`crate::revision::CompactedTooOld`]. A store that has just loaded
+    /// from disk or a snapshot starts with it equal to
+    /// [`Self::current_revision`] (T3.3).
+    pub async fn compacted_revision(&self) -> crate::revision::Revision {
+        self.store.read(ResourceCatalog::compacted_revision).await
+    }
+
+    /// One resource with its MVCC version metadata — [`Self::get`] plus the
+    /// `(create_revision, mod_revision, version)` triple etcd reports.
+    pub async fn get_with_meta(
+        &self,
+        key: &ResourceKey,
+    ) -> Option<(ResourceValue, crate::revision::VersionMeta)> {
+        self.store
+            .read(|c| c.get_with_meta(key).map(|(v, m)| (v.clone(), m)))
+            .await
+    }
+
+    /// Visit every stored resource, in key order, under ONE guard.
+    ///
+    /// For a reader whose selection is not a [`ListScope`] — the etcd
+    /// façade's `/registry` prefix, or its size of everything served.
+    /// Nothing is cloned for it: `visit` sees each resource by reference and
+    /// keeps what it needs.
+    ///
+    /// ★ `visit` RUNS UNDER THE LOCK `apply` TAKES. Filter and clone in it;
+    /// render after this returns. A visitor that serializes every object
+    /// holds every write for the length of that work.
+    ///
+    /// ★ RETURNS THE REVISION THE VISITED OBJECTS ARE AT, read under the same
+    /// guard. A reader that reports the objects with a revision must use this
+    /// one. A revision from a second call can be newer than the objects, and
+    /// a client that lists at it and then watches from the revision after it
+    /// never sees the writes that landed in between.
+    pub async fn for_each_resource(
+        &self,
+        mut visit: impl FnMut(&ResourceKey, &ResourceValue, crate::revision::VersionMeta),
+    ) -> crate::revision::Revision {
+        self.store
+            .read(|c| {
+                for (key, (value, meta)) in &c.resources {
+                    visit(key, value, *meta);
+                }
+                c.revision()
+            })
+            .await
+    }
+
+    /// Visit every retained change with `revision > from`, in revision
+    /// order, under ONE guard — the watch replay's own window, without
+    /// cloning the ring to read it.
+    ///
+    /// ★ `visit` RUNS UNDER THE LOCK `apply` TAKES; see
+    /// [`Self::for_each_resource`].
+    ///
+    /// # Errors
+    ///
+    /// [`crate::revision::CompactedTooOld`] when `from` is below
+    /// [`Self::compacted_revision`]; `visit` is then never called, so a
+    /// caller cannot mistake a partial window for the whole one.
+    pub async fn for_each_change_since(
+        &self,
+        from: crate::revision::Revision,
+        mut visit: impl FnMut(&crate::revision::Change),
+    ) -> Result<(), crate::revision::CompactedTooOld> {
+        self.store
+            .read(|c| {
+                for change in c.changes_after(from)? {
+                    visit(change);
+                }
+                Ok(())
+            })
+            .await
     }
 
     /// Open a RESUMABLE, gap-free watch from `opts.from`. The
@@ -540,8 +731,7 @@ impl StoreMesh {
     pub async fn wait_for_applied(&self, target: u64, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let catalog = self.current_catalog().await;
-            if catalog.last_applied_index >= target {
+            if self.last_applied_index().await >= target {
                 return true;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -556,10 +746,105 @@ impl StoreMesh {
         self.node_id
     }
 
+    /// Stop every background task the mesh owns — the raft RPC pump and
+    /// the store's bookmark ticker — aborting AND awaiting each, so that on
+    /// return neither holds anything of the store's.
+    ///
+    /// Takes `&self` so a shutdown can call it while the mesh is still
+    /// behind an `Arc`, before `Arc::try_unwrap` + [`Self::terminate`].
+    ///
+    /// Afterwards: peers can no longer reach this node (a request is refused
+    /// at the send, never accepted and then dropped), and watchers receive
+    /// no more periodic bookmarks. Raft itself keeps running until
+    /// `terminate`. One-way and idempotent: a second call reports
+    /// [`TaskStop::AlreadyStopped`] for both tasks.
+    ///
+    /// What it cannot reach: a task outside the mesh that upgrades a
+    /// `Weak<StoreMesh>` (the etcd façade does, per request). Draining those
+    /// is the caller's job; nothing here prevents a new one.
+    pub async fn quiesce(&self) -> Quiesced {
+        // Exhaustive on purpose (no `..`): every field is a decision.
+        let Self {
+            // Not a task: stopped by `terminate` (`Raft::shutdown`).
+            raft: _,
+            // Owns the bookmark ticker, stopped below.
+            store,
+            // Plain data.
+            node_id: _,
+            listen_addr: _,
+            // A registry of senders, not a task; `terminate` deregisters.
+            router: _,
+            rpc_pump,
+        } = self;
+        let rpc_pump = rpc_pump.stop().await;
+        let bookmark_ticker = store.quiesce_bookmarks().await;
+        Quiesced {
+            rpc_pump,
+            bookmark_ticker,
+        }
+    }
+
+    /// Bring the durable image up to the applied state, so the next boot
+    /// replays nothing applied before this call — see
+    /// [`FjallStore::flush`]. The in-memory backend answers
+    /// [`MeshFlushed::Ephemeral`].
+    ///
+    /// Takes `&self` so a stop can call it while the mesh is still behind an
+    /// `Arc`, after [`Self::quiesce`] and before `Arc::try_unwrap`: if a
+    /// leaked clone then makes the unwrap fail and [`Self::terminate`] never
+    /// runs, the image is already current. `terminate` flushes again as its
+    /// last step, which answers `AlreadyDurable` unless something was applied
+    /// in between.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Persist`] if the durable batch cannot be written.
+    pub async fn flush(&self) -> Result<MeshFlushed, StoreError> {
+        self.store.flush().await
+    }
+
+    /// The durable-image tripwire counts (T3.4) — see
+    /// [`FjallStore::image_tripwire`]. `None` for the in-memory backend,
+    /// which has no durable image to disagree with itself.
+    pub async fn image_tripwire(&self) -> Option<ImageTripwire> {
+        match &self.store {
+            StoreBackend::Memory(_) => None,
+            StoreBackend::Fjall(s) => Some(s.image_tripwire().await),
+        }
+    }
+
+    /// Deregister from the router, [`Self::quiesce`] (awaiting both owned
+    /// tasks), shut raft down, then [`Self::flush`] — so a clean stop leaves
+    /// the next boot nothing to replay. A task that had panicked is logged at
+    /// ERROR rather than read as a clean stop.
+    ///
+    /// The flush runs after `Raft::shutdown`, when raft no longer drives
+    /// applies. Not guaranteed on return: openraft's state-machine worker
+    /// holds a store clone and `Raft::shutdown` does not join it, so that
+    /// clone is released when that worker next runs, not necessarily before
+    /// this returns; an entry it applies after the flush is durable in the
+    /// log and replayed on the next boot.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Persist`] if the final flush cannot be written.
     pub async fn terminate(self) -> Result<(), StoreError> {
         self.router.deregister(self.node_id).await;
-        self.rpc_task.abort();
+        let quiesced = self.quiesce().await;
+        if quiesced.any_panicked() {
+            tracing::error!(
+                node_id = self.node_id,
+                ?quiesced,
+                "a store background task had panicked before terminate"
+            );
+        }
         let _ = self.raft.shutdown().await;
+        let flushed = self.store.flush().await?;
+        tracing::info!(
+            node_id = self.node_id,
+            ?flushed,
+            "store flushed at terminate"
+        );
         Ok(())
     }
 }

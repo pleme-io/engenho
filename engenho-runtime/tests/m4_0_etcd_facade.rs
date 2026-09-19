@@ -11,8 +11,11 @@
 //! * **F3** a prefix Range returns byte-ordered results
 //! * **F4** `keys_only` strips values; `count` is the TOTAL, not the page
 //! * **F5** Maintenance reports the live revision and applied index
-//! * **F6** a compacted watch start is REFUSED with the watermark
+//! * **F6** a compacted watch start is REFUSED with the watermark; history
+//!   is replayed through the one atomic `watch_from`
 //! * **F7** an unknown kind has no path rather than a guessed one
+//! * **F8** the façade does not keep the store alive, and a dropped store
+//!   answers `StoreGone` — never an empty or zero answer
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +23,8 @@ use std::time::Duration;
 use serde_json::json;
 
 use engenho_etcd::server::{
-    EtcdReadStore, EtcdStatusStore, EtcdWatchStore, ReadOnlyKv, ServerIdentity,
+    EtcdReadStore, EtcdRevision, EtcdStatusStore, EtcdWatchStore, ReadOnlyKv, ServerIdentity,
+    StoreGone, WatchEnd, WatchFeed, WatchStart, WatchStep,
 };
 use engenho_runtime::MeshEtcdStore;
 use engenho_runtime::etcd_facade::registry_path;
@@ -71,7 +75,9 @@ async fn an_object_written_to_the_store_is_readable_by_its_registry_path() {
     put(&store, key.clone(), value.clone()).await;
 
     let facade = MeshEtcdStore::new(&store);
-    let kvs = EtcdReadStore::range(&facade, "/registry/pods/").await;
+    let kvs = EtcdReadStore::range(&facade, "/registry/pods/")
+        .await
+        .expect("live");
     assert_eq!(kvs.len(), 1, "{kvs:?}");
 
     // F1 — upstream's path exactly. A wrong key does not error; it returns
@@ -109,7 +115,9 @@ async fn an_object_written_to_the_store_is_readable_by_its_registry_path() {
         json!({ "apiVersion": "v1", "kind": "Pod", "x": 1 }),
     )
     .await;
-    let kvs2 = EtcdReadStore::range(&facade, "/registry/pods/").await;
+    let kvs2 = EtcdReadStore::range(&facade, "/registry/pods/")
+        .await
+        .expect("live");
     assert_eq!(kvs2[0].create_revision, kvs[0].create_revision);
     assert!(kvs2[0].mod_revision > kvs[0].mod_revision);
     assert_eq!(kvs2[0].version, 2);
@@ -137,7 +145,9 @@ async fn a_prefix_range_is_returned_in_byte_order() {
     }
 
     let facade = MeshEtcdStore::new(&store);
-    let kvs = EtcdReadStore::range(&facade, "/registry/pods/").await;
+    let kvs = EtcdReadStore::range(&facade, "/registry/pods/")
+        .await
+        .expect("live");
     let paths: Vec<String> = kvs
         .iter()
         .map(|kv| String::from_utf8(kv.key.clone()).unwrap())
@@ -218,8 +228,8 @@ async fn maintenance_reports_the_live_revision_and_applied_index() {
     put(&store, k, v).await;
 
     let facade = MeshEtcdStore::new(&store);
-    assert!(EtcdStatusStore::revision(&facade).await > 0);
-    assert!(EtcdStatusStore::applied_index(&facade).await > 0);
+    assert!(EtcdRevision::revision(&facade).await.expect("live") > 0);
+    assert!(EtcdStatusStore::applied_index(&facade).await.expect("live") > 0);
     // ★ NOT ZERO, AND NOT `None`. Real etcdctl divides by this field to
     // render "DB SIZE IN USE" and panics with an integer-divide-by-zero
     // when it is 0 — measured 2026-08-30 against this very façade. The
@@ -227,6 +237,7 @@ async fn maintenance_reports_the_live_revision_and_applied_index() {
     // value is MEASURED: the serialized size of everything served.
     let size = EtcdStatusStore::db_size(&facade)
         .await
+        .expect("live")
         .expect("a measured size, because zero crashes etcdctl");
     assert!(size > 0, "got {size}");
 
@@ -250,34 +261,46 @@ async fn a_watch_below_the_compaction_watermark_is_refused_with_the_watermark() 
     let store = boot("etcd-compact").await;
     let facade = MeshEtcdStore::new(&store);
 
-    // Nothing compacted yet: revision 0 is servable.
+    // Nothing compacted yet: the first revision is servable.
+    let first = WatchStart::from_wire(1);
     assert!(
-        EtcdWatchStore::changes_since(&facade, "/registry/", 0)
+        EtcdWatchStore::watch_from(&facade, "/registry/", first)
             .await
             .is_ok()
     );
 
-    // The negative direction, which is the one that matters. A revision
-    // below the watermark comes back AS the watermark, not as silence:
-    // a client resuming below it has to be told where it may safely
-    // restart, or it believes it is tracking a cluster it has already lost
-    // sync with. With no compaction the watermark is 0, so -1 is the probe.
-    let watermark = EtcdWatchStore::changes_since(&facade, "/registry/", -1)
+    // The negative direction, which is the one that matters. A start below
+    // the watermark comes back AS the watermark, not as silence: a client
+    // resuming below it has to be told where it may safely restart, or it
+    // believes it is tracking a cluster it has already lost sync with.
+    // With no compaction the watermark is 0, so a negative start is the
+    // probe.
+    let refused = EtcdWatchStore::watch_from(&facade, "/registry/", WatchStart::from_wire(-1))
         .await
-        .expect_err("a revision below the watermark must be refused");
+        .expect_err("a start below the watermark must be refused");
     assert_eq!(
-        watermark, 0,
+        refused,
+        WatchEnd::Compacted {
+            compact_revision: 0
+        },
         "the resume point the client must restart from"
     );
 
-    // And live history is readable.
+    // And history is replayed through the same atomic watch.
     let (k, v) = pod("default", "web");
     put(&store, k, v).await;
-    let events = EtcdWatchStore::changes_since(&facade, "/registry/pods/", 0)
+    let mut feed = EtcdWatchStore::watch_from(&facade, "/registry/pods/", first)
         .await
-        .expect("history is servable");
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0].r#type, 0, "PUT");
+        .expect("history is servable")
+        .feed;
+    let step = tokio::time::timeout(Duration::from_secs(5), feed.next())
+        .await
+        .expect("the replayed PUT is ready at once");
+    let WatchStep::Event(event) = step else {
+        panic!("expected the replayed PUT, got {step:?}");
+    };
+    assert_eq!(event.r#type, 0, "PUT");
+    drop(feed);
 
     drop(facade);
     Arc::try_unwrap(store)
@@ -311,7 +334,7 @@ fn a_kind_outside_the_catalog_has_no_registry_path() {
     );
 }
 
-/// F8 — the façade must not keep the store alive, and must degrade when it
+/// F8 — the façade must not keep the store alive, and must say so when it
 /// is gone.
 ///
 /// ★ THIS IS A REGRESSION TEST FOR A LEAK I SHIPPED. The first version held
@@ -323,14 +346,17 @@ fn a_kind_outside_the_catalog_has_no_registry_path() {
 /// first, for the :10250 listener), which is why it now has a test rather
 /// than a comment.
 #[tokio::test]
-async fn the_facade_does_not_keep_the_store_alive_and_degrades_when_it_is_gone() {
+async fn the_facade_does_not_keep_the_store_alive_and_answers_store_gone_after() {
     let store = boot("etcd-weak").await;
     let (k, v) = pod("default", "web");
     put(&store, k, v).await;
 
     let facade = MeshEtcdStore::new(&store);
     assert_eq!(
-        EtcdReadStore::range(&facade, "/registry/pods/").await.len(),
+        EtcdReadStore::range(&facade, "/registry/pods/")
+            .await
+            .expect("live")
+            .len(),
         1,
         "live while the store is live"
     );
@@ -344,19 +370,23 @@ async fn the_facade_does_not_keep_the_store_alive_and_degrades_when_it_is_gone()
         .await
         .unwrap();
 
-    // And now it answers empty rather than panicking: the listener task is
-    // being torn down in the same breath, and taking the shutdown path down
-    // with a panic would turn a clean stop into a crash.
-    assert!(
-        EtcdReadStore::range(&facade, "/registry/pods/")
-            .await
-            .is_empty()
+    // And now it answers `StoreGone` — neither panicking nor empty. A panic
+    // would take the shutdown path down with it; an empty Range at revision
+    // 0 is exactly an empty cluster, which a backup tool would save as a
+    // valid, empty snapshot (T3.8).
+    assert_eq!(
+        EtcdReadStore::range(&facade, "/registry/pods/").await,
+        Err(StoreGone)
     );
-    assert_eq!(EtcdReadStore::revision(&facade).await, 0);
-    assert_eq!(EtcdStatusStore::applied_index(&facade).await, 0);
-    assert!(
-        EtcdWatchStore::changes_since(&facade, "/registry/", 0)
+    assert_eq!(EtcdRevision::revision(&facade).await, Err(StoreGone));
+    assert_eq!(
+        EtcdStatusStore::applied_index(&facade).await,
+        Err(StoreGone)
+    );
+    assert_eq!(
+        EtcdWatchStore::watch_from(&facade, "/registry/", WatchStart::Now)
             .await
-            .is_ok()
+            .err(),
+        Some(WatchEnd::StoreGone(StoreGone))
     );
 }

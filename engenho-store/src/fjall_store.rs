@@ -29,9 +29,11 @@
 //!     revision state, single key `catalog` → `serde_json::to_vec(
 //!     &ResourceCatalog)`. The catalog's hand-written Serialize
 //!     already carries resources (value + VersionMeta),
-//!     last_applied_term/index, current_revision + compacted_revision
-//!     (history is rebuilt by replay). One value = all of item-1's
-//!     durable revision state.
+//!     last_applied_term/index, current_revision + compacted_revision.
+//!     The history ring is not persisted, so on load the compaction
+//!     floor is set to current_revision and the stored floor is
+//!     ignored (T3.3); the ring refills from the replay above it. One
+//!     value = all of item-1's durable revision state.
 //!
 //! ## Durability discipline
 //!
@@ -39,10 +41,27 @@
 //!     BEFORE calling `callback.log_io_completed(Ok(()))` — the real
 //!     durability the in-memory `append`'s synchronous no-fsync path
 //!     lacks.
-//!   * `apply` writes the materialized catalog + last_applied (+
-//!     last_membership on membership entries) and fsyncs ONCE per
-//!     batch BEFORE broadcasting any WatchEvent — a watcher never
-//!     observes an event that didn't survive to disk.
+//!   * `apply` persists the APPLIED IMAGE — the catalog blob,
+//!     `last_applied` and `last_membership` — as ONE atomic, fsynced
+//!     fjall batch, on a count/time cadence (see
+//!     `CATALOG_PERSIST_EVERY`). Watch events are fanned only after
+//!     the entry is durable in the log — a watcher never observes an
+//!     event that didn't survive to disk.
+//!   * [`FjallStore::flush`] writes the same image through the same
+//!     batch, whatever the cadence says. A clean stop calls it last, so
+//!     the next boot has nothing to replay.
+//!   * Both snapshot paths — `build_snapshot` and `install_snapshot` —
+//!     write the snapshot AND the applied image in that same one batch,
+//!     from the same catalog bytes, so the durable image is never older
+//!     than the snapshot (T3.4). A purge removes log entries only up to a
+//!     snapshot, so an image older than one could be left with a replay
+//!     that no longer exists.
+//!   * `open` checks the image it reads and loads the snapshot when it is
+//!     newer than the blob, which only an image written before T3.4 can
+//!     be. Every disagreement it finds is logged and counted in the
+//!     store's [`ImageTripwire`] — Shadow: none of them refuses a boot.
+//!   * `apply` skips an entry the image already holds, so a replay that
+//!     re-offers one never applies it twice.
 //!   * Every disk failure maps to a typed
 //!     `StorageError::IO { source: StorageIOError::… }`. NEVER panic
 //!     / unwrap on a disk error.
@@ -61,6 +80,7 @@ use openraft::{
 use tokio::sync::Mutex;
 
 use crate::mesh::StoreError;
+use crate::owned_task::TaskStop;
 use crate::state::ResourceCatalog;
 use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 use crate::watch_backend::{
@@ -112,11 +132,28 @@ const CATALOG_KEY: &[u8] = b"catalog";
 /// `leader election lost` and exits by design, so kustomize-controller and
 /// helm-controller crash-looped and nothing reconciled.
 ///
-/// ★ THE INVARIANT THAT MAKES THIS CORRECT: the catalog and `last_applied` are
-/// written **together or not at all**. Persisting `last_applied` while skipping
-/// the catalog would make a restart trust a catalog that is behind it — the one
-/// way to actually lose data here. Both live under the same `should_persist`
-/// branch below; do not separate them.
+/// ★ THE INVARIANTS THAT MAKE THIS CORRECT.
+///
+/// 1. The catalog and `last_applied` are written **together or not at all**.
+///    Persisting `last_applied` while skipping the catalog would make a
+///    restart trust a catalog that is behind it; persisting the catalog
+///    without `last_applied` would make the replay apply entries twice.
+/// 2. The image is **never older than the snapshot**. A purge removes log
+///    entries up to a snapshot, so the replay from an image older than the
+///    snapshot can be purged away and the node cannot boot (T3.1 case 2).
+///
+/// Both hold because every path that writes the pair — `apply` and
+/// [`FjallStore::flush`] through `persist_applied_image`, and both snapshot
+/// paths — writes it through ONE function, `FjallStore::write_image`, as one
+/// atomic fjall batch. A snapshot write lands its snapshot keys in that same
+/// batch, from the same catalog bytes, with the image's `last_applied` and
+/// `last_membership` taken from the snapshot's own meta. No crash between two
+/// inserts can split either invariant.
+///
+/// Before T3.4 neither held for snapshots: `build_snapshot` wrote the snapshot
+/// without the blob or `last_applied`, and `install_snapshot` wrote the pair as
+/// separate inserts. Images written then are why `open` still checks both
+/// (see [`ImageInconsistency`]).
 const CATALOG_PERSIST_EVERY: usize = 64;
 
 /// Wall-clock bound on the same decision, so a cluster that writes rarely
@@ -126,6 +163,172 @@ const CATALOG_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 type RNodeId = RaftNodeId;
 type RMembership = StoredMembership<RaftNodeId, openraft::BasicNode>;
+type RSnapshotMeta = SnapshotMeta<RaftNodeId, openraft::BasicNode>;
+
+/// The `gate` label the durable-image tripwire reports under: every log line
+/// it writes carries it, and it is the label T0.11's
+/// `engenho_would_reject_total{gate,reason}` will count it under.
+pub const IMAGE_GATE: &str = "store_image";
+
+/// One way a durable image was found disagreeing with itself (T3.4).
+///
+/// ★ SHADOW, NOT FATAL. Each hit is logged at WARN under [`IMAGE_GATE`] and
+/// counted in the store's [`ImageTripwire`]; none refuses a boot. A node that
+/// booted yesterday must still boot, so the check ships watching.
+/// [`Self::ReplayGap`] is the only state neither the snapshot nor the log can
+/// rebuild — the one a later release may make fatal, once a release has run
+/// with zero hits on every node.
+///
+/// This release cannot WRITE any of them: every writer lands the image and
+/// the snapshot through one batch (see [`CATALOG_PERSIST_EVERY`]). A hit means
+/// an image an earlier release wrote, or a disk that lost part of a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ImageInconsistency {
+    /// The persisted snapshot is ahead of the catalog blob — what a
+    /// `build_snapshot` before T3.4 left, since it wrote neither the blob nor
+    /// `last_applied`. `open` boots from the snapshot instead of the blob.
+    SnapshotNewerThanBlob,
+    /// The snapshot's meta could not be read, or it is ahead of the blob and
+    /// its data could not be read or decoded. `open` boots from the blob, as
+    /// the previous release did.
+    SnapshotUnreadable,
+    /// The blob holds commands past the persisted `last_applied` — a split
+    /// write (the catalog landed, `last_applied` did not) from the separate
+    /// inserts used before one batch. The boot replay re-offers those
+    /// commands; `apply` skips them.
+    BlobAheadOfLastApplied,
+    /// Log entries after the image's applied position were purged, so the
+    /// boot replay cannot reach them and no snapshot covers them.
+    ReplayGap,
+    /// `apply` was handed entries the image already holds, and skipped them
+    /// rather than apply them twice. One hit per entry.
+    AlreadyApplied,
+}
+
+impl ImageInconsistency {
+    /// The `reason` label a hit is logged, and will be counted, under.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::SnapshotNewerThanBlob => "snapshot_newer_than_blob",
+            Self::SnapshotUnreadable => "snapshot_unreadable",
+            Self::BlobAheadOfLastApplied => "blob_ahead_of_last_applied",
+            Self::ReplayGap => "replay_gap",
+            Self::AlreadyApplied => "already_applied",
+        }
+    }
+}
+
+impl std::fmt::Display for ImageInconsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// How many times each [`ImageInconsistency`] was hit since the store opened.
+///
+/// A count, not a verdict: in Shadow the store boots and serves whatever it
+/// counts. Read it with [`FjallStore::image_tripwire`], for example against a
+/// copy of a node's data directory (T0.10).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageTripwire {
+    hits: std::collections::BTreeMap<ImageInconsistency, u64>,
+}
+
+impl ImageTripwire {
+    /// Hits of one kind.
+    #[must_use]
+    pub fn count(&self, kind: ImageInconsistency) -> u64 {
+        self.hits.get(&kind).copied().unwrap_or(0)
+    }
+
+    /// Hits of every kind together. Zero means the image agreed with itself.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.hits.values().sum()
+    }
+
+    fn hit(&mut self, kind: ImageInconsistency, times: u64) {
+        let count = self.hits.entry(kind).or_default();
+        *count = count.saturating_add(times);
+    }
+}
+
+/// Count `$times` hits of `$kind` on `$tripwire` and log them at WARN under
+/// the gate's labels, with the call site's own fields and message. Shadow:
+/// this counts and logs, and never returns an error.
+macro_rules! trip {
+    ($tripwire:expr, $kind:expr, $times:expr, $($fields:tt)+) => {{
+        let kind: ImageInconsistency = $kind;
+        let times: u64 = $times;
+        $tripwire.hit(kind, times);
+        tracing::warn!(
+            gate = IMAGE_GATE,
+            reason = kind.reason(),
+            rollout = "shadow",
+            times,
+            $($fields)+
+        );
+    }};
+}
+
+/// What one fsynced batch lands. Every variant carries the applied image —
+/// the catalog blob, `last_applied` and `last_membership` — so no writer can
+/// land one of the pair without the other.
+enum ImageWrite<'a> {
+    /// The applied state the guarded [`MaterializedState`] holds: `apply`
+    /// and [`FjallStore::flush`].
+    Applied,
+    /// A snapshot and the image it IS: `catalog` is written as both the blob
+    /// and the snapshot's data, and the image's `last_applied` and
+    /// `last_membership` are the snapshot meta's own — so the image cannot be
+    /// older than the snapshot, nor disagree with it.
+    Snapshot {
+        catalog: &'a [u8],
+        meta: &'a RSnapshotMeta,
+        /// The snapshot counter to persist when this write mints a snapshot
+        /// (`build_snapshot`); `None` when it installs one received from the
+        /// leader, which mints nothing.
+        minted: Option<u64>,
+    },
+}
+
+/// Why `open` could not use a snapshot newer than the blob. Diagnostic only:
+/// it is logged with an [`ImageInconsistency::SnapshotUnreadable`] hit, and
+/// the boot goes on from the blob.
+#[derive(Debug, thiserror::Error)]
+enum SnapshotUnreadable {
+    #[error("read the snapshot meta: {0}")]
+    Meta(StoreError),
+    #[error("the snapshot meta is ahead of the blob but its data is absent")]
+    DataAbsent,
+    #[error("read the snapshot data: {0}")]
+    Read(#[from] fjall::Error),
+    #[error("decode the snapshot data: {0}")]
+    Decode(#[from] serde_json::Error),
+}
+
+/// What [`FjallStore::flush`] found, and what it did about it.
+///
+/// On either arm the durable image — the catalog blob, `last_applied` and
+/// `last_membership` — equals the applied state as of the call, so a boot
+/// from this directory replays nothing that was applied before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Flushed {
+    /// Nothing had been applied since the image was last written or loaded,
+    /// so it already matched; nothing was written.
+    AlreadyDurable {
+        /// The applied position the durable image stands at.
+        last_applied: Option<LogId<RNodeId>>,
+    },
+    /// The image was behind the applied state — those entries were waiting
+    /// for the next boot to replay them. It was rewritten in one fsynced batch.
+    Persisted {
+        /// The applied position the durable image now stands at.
+        last_applied: Option<LogId<RNodeId>>,
+    },
+}
 
 /// fjall-backed durable store. Same external shape as
 /// [`crate::store::InMemoryStore`] (Clone, the same four openraft
@@ -138,8 +341,11 @@ pub struct FjallStore {
     /// Store-level bookmark ticker — one per store, driving the
     /// per-watcher bookmark cadence under the catalog lock. `Arc` so
     /// every clone of the store shares (and keeps alive) the single
-    /// ticker; dropping the last store clone aborts it.
-    _bookmark_ticker: Arc<BookmarkTicker>,
+    /// ticker; dropping the last store clone aborts it, and
+    /// [`Self::quiesce_bookmarks`] aborts AND awaits it. The difference
+    /// matters here more than anywhere: a tick holds an upgraded
+    /// `Arc<FjallInner>`, and `FjallInner` owns the data-directory lock.
+    bookmark_ticker: Arc<BookmarkTicker>,
 }
 
 /// The on-disk handles + the in-RAM working copy.
@@ -202,6 +408,128 @@ struct MaterializedState {
     /// which forces the first apply to persist — so a node that takes one
     /// write and then idles still lands its state.
     last_catalog_persist: Option<std::time::Instant>,
+    /// Every way the durable image was found disagreeing with itself — at
+    /// `open`, and by `apply` skipping entries the image already held.
+    tripwire: ImageTripwire,
+}
+
+impl MaterializedState {
+    /// Whether `entry`'s effect is already in this image, so applying it
+    /// again would apply it twice (T3.4).
+    ///
+    /// Two positions say so, and everything at or below either is held:
+    /// entries apply strictly in log order. `last_applied` covers every entry
+    /// kind. The catalog's own `last_applied_index` covers commands even when
+    /// the persisted `last_applied` lags the blob it was written with, the
+    /// split write [`ImageInconsistency::BlobAheadOfLastApplied`] names. It
+    /// moves only on a command, and no command has index 0 (openraft's first
+    /// entry is the initial membership), so 0 there means "none".
+    fn holds(&self, entry: &Entry<TypeConfig>) -> bool {
+        let index = entry.log_id.index;
+        self.last_applied
+            .is_some_and(|applied| index <= applied.index)
+            || (matches!(entry.payload, EntryPayload::Normal(_))
+                && (1..=self.catalog.last_applied_index).contains(&index))
+    }
+
+    /// The durable image now equals this state: nothing is pending for
+    /// [`FjallStore::flush`] or the cadence in `apply`.
+    fn mark_image_written(&mut self) {
+        self.applies_since_catalog_persist = 0;
+        self.last_catalog_persist = Some(std::time::Instant::now());
+    }
+
+    /// T3.4: if the persisted snapshot is ahead of the image the blob and
+    /// `last_applied` describe, hydrate from the snapshot instead.
+    ///
+    /// The snapshot's data is the whole catalog at its position, and its meta
+    /// names that position and the membership there, so loading it is
+    /// exactly having applied up to it. The boot replay goes on from there,
+    /// over entries a purge never removed: openraft purges only up to a
+    /// snapshot. The blob on disk is then behind this state, so the image is
+    /// marked unwritten and the next `apply` or [`FjallStore::flush`] lands it.
+    ///
+    /// Read leniently. A snapshot `open` cannot use is a counted hit, and the
+    /// boot goes on from the blob, as the previous release's did.
+    fn adopt_newer_snapshot(&mut self, meta: &fjall::PartitionHandle) {
+        match read_snapshot_newer_than(meta, self.last_applied) {
+            Ok(None) => {}
+            Ok(Some((snapshot, catalog))) => {
+                trip!(
+                    self.tripwire,
+                    ImageInconsistency::SnapshotNewerThanBlob,
+                    1,
+                    image = ?self.last_applied,
+                    snapshot = ?snapshot.last_log_id,
+                    "the snapshot is newer than the catalog blob; booting from the snapshot"
+                );
+                self.catalog = catalog;
+                self.last_applied = snapshot.last_log_id;
+                self.last_membership = snapshot.last_membership;
+                self.applies_since_catalog_persist = 1;
+            }
+            Err(error) => trip!(
+                self.tripwire,
+                ImageInconsistency::SnapshotUnreadable,
+                1,
+                %error,
+                image = ?self.last_applied,
+                "the snapshot cannot be used; booting from the catalog blob"
+            ),
+        }
+    }
+
+    /// T3.4: count the two ways the image `open` settled on can still
+    /// disagree with the log. Neither refuses the boot (Shadow).
+    fn check_replay(&mut self) {
+        let applied = self.last_applied.map(|l| l.index);
+        let in_catalog = self.catalog.last_applied_index;
+        if in_catalog > 0 && applied.is_none_or(|a| in_catalog > a) {
+            trip!(
+                self.tripwire,
+                ImageInconsistency::BlobAheadOfLastApplied,
+                1,
+                last_applied = ?applied,
+                catalog_applied = in_catalog,
+                "the catalog blob holds commands past the persisted last_applied; \
+                 the replay will skip them"
+            );
+        }
+        if let Some(purged) = self.last_purged
+            && applied.is_none_or(|a| purged.index > a)
+        {
+            trip!(
+                self.tripwire,
+                ImageInconsistency::ReplayGap,
+                1,
+                last_applied = ?applied,
+                last_purged = purged.index,
+                "log entries after the image were purged and no snapshot covers them; \
+                 the replay cannot rebuild this state"
+            );
+        }
+    }
+}
+
+/// The persisted snapshot and its decoded catalog, when it is ahead of
+/// `image_at`. `Ok(None)` when there is no snapshot, or it is not ahead.
+fn read_snapshot_newer_than(
+    meta: &fjall::PartitionHandle,
+    image_at: Option<LogId<RNodeId>>,
+) -> Result<Option<(RSnapshotMeta, ResourceCatalog)>, SnapshotUnreadable> {
+    let Some(snapshot) = meta_get_json::<RSnapshotMeta>(meta, META_SNAPSHOT_META)
+        .map_err(SnapshotUnreadable::Meta)?
+    else {
+        return Ok(None);
+    };
+    if snapshot.last_log_id <= image_at {
+        return Ok(None);
+    }
+    let data = meta
+        .get(META_SNAPSHOT_DATA)?
+        .ok_or(SnapshotUnreadable::DataAbsent)?;
+    let catalog = serde_json::from_slice(&data)?;
+    Ok(Some((snapshot, catalog)))
 }
 
 // ── error mapping helpers ─────────────────────────────────────────
@@ -316,6 +644,12 @@ impl FjallStore {
             state.last_membership = m;
         }
         state.snapshot_index = meta_get_json(&meta, META_SNAPSHOT_INDEX)?.unwrap_or(0);
+        // ── T3.4: the image must not be older than the snapshot ──────
+        // Only an image written before T3.4 can be; boot it from the
+        // snapshot, then count whatever still disagrees. Nothing here adds a
+        // way for `open` to fail.
+        state.adopt_newer_snapshot(&meta);
+        state.check_replay();
 
         let inner = Arc::new(FjallInner {
             _dir_lock: dir_lock,
@@ -330,7 +664,7 @@ impl FjallStore {
         let ticker = BookmarkTicker::spawn(Arc::downgrade(&inner));
         Ok(Self {
             inner,
-            _bookmark_ticker: Arc::new(ticker),
+            bookmark_ticker: Arc::new(ticker),
         })
     }
 
@@ -349,19 +683,39 @@ impl FjallStore {
         s.vote.is_some() || s.last_applied.is_some()
     }
 
-    /// Read-only snapshot of the current materialized catalog —
-    /// the durable + watch-relevant state machine copy.
-    pub async fn current_catalog(&self) -> ResourceCatalog {
-        self.inner.state.lock().await.catalog.clone()
+    /// How many times each [`ImageInconsistency`] was hit since this store
+    /// opened — at `open`, and by `apply` skipping entries the image already
+    /// held. Zero in total means the image agreed with itself.
+    pub async fn image_tripwire(&self) -> ImageTripwire {
+        self.inner.state.lock().await.tripwire.clone()
+    }
+
+    /// Run `read` over the materialized catalog under ONE guard. Durable
+    /// sibling of [`crate::store::InMemoryStore::read_catalog`], whose
+    /// header says why it is `pub(crate)` and what `read` should do.
+    pub(crate) async fn read_catalog<R>(&self, read: impl FnOnce(&ResourceCatalog) -> R) -> R {
+        read(&self.inner.state.lock().await.catalog)
+    }
+
+    /// Stop this store's bookmark ticker and wait until it has ended, so it
+    /// holds no reference to the store — see [`BookmarkTicker::quiesce`].
+    ///
+    /// For this backend that includes the data-directory lock: after
+    /// `quiesce_bookmarks`, dropping the last store clone releases the
+    /// directory at once, even if the ticker was parked mid-tick. The
+    /// ticker is shared by every clone; afterwards no clone's watchers
+    /// receive periodic bookmarks (live events still flow). One-way.
+    pub async fn quiesce_bookmarks(&self) -> TaskStop {
+        self.bookmark_ticker.quiesce().await
     }
 
     /// The current MVCC revision, read under the lock WITHOUT cloning.
     ///
     /// Durable sibling of [`crate::store::InMemoryStore::current_revision`];
     /// that method's header carries the measurement. Short version: reading
-    /// this scalar via `current_catalog()` deep-clones the whole catalog and
-    /// its 8192-entry replay ring, which is what made establishing a watch
-    /// stall every concurrent write.
+    /// this scalar through the removed `current_catalog()` deep-cloned the
+    /// whole catalog and its 8192-entry replay ring, which is what made
+    /// establishing a watch stall every concurrent write.
     pub async fn current_revision(&self) -> crate::revision::Revision {
         self.inner.state.lock().await.catalog.revision()
     }
@@ -370,7 +724,7 @@ impl FjallStore {
     ///
     /// The durable sibling of [`crate::store::InMemoryStore::list_at_revision`];
     /// that method's header carries the measurement and the reasoning. Short
-    /// version: cloning the whole [`ResourceCatalog`] to serve a LIST also
+    /// version: cloning the whole catalog to serve a LIST also
     /// clones its 8192-entry watch-replay ring, making every read cost scale
     /// with cluster age instead of object count.
     pub async fn list_at_revision(
@@ -383,14 +737,31 @@ impl FjallStore {
         Vec<(crate::resource::ResourceKey, crate::resource::ResourceValue)>,
         crate::revision::Revision,
     ) {
-        let guard = self.inner.state.lock().await;
-        let items = guard
+        self.inner
+            .state
+            .lock()
+            .await
             .catalog
-            .list(group, version, kind, namespace)
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        (items, guard.catalog.revision())
+            .list_at_revision(crate::resource::ListScope::new(
+                group, version, kind, namespace,
+            ))
+    }
+
+    /// One page + revision from ONE locked look, cloning only the page's
+    /// items. Durable sibling of
+    /// [`crate::store::InMemoryStore::list_page_at_revision`].
+    pub async fn list_page_at_revision(
+        &self,
+        scope: crate::resource::ListScope<'_>,
+        after: Option<&crate::resource::ResourceKey>,
+        limit: usize,
+    ) -> crate::pagination::PageAtRevision {
+        self.inner
+            .state
+            .lock()
+            .await
+            .catalog
+            .list_page_at_revision(scope, after, limit)
     }
 
     /// Direct catalog read by typed key (skips Raft — the local
@@ -419,13 +790,9 @@ impl FjallStore {
         // handle is reachable by `fan_change` — all under THIS lock, so
         // the replay→live handoff is atomic AND structurally ordered (no
         // feeder task, no second producer racing apply).
-        let mut state = self.inner.state.lock().await;
-        let replay = state
-            .catalog
-            .changes_since(opts.from)
-            .map_err(WatchGone::from)?;
-        let boundary = state.catalog.revision();
-        Ok(state.watchers.register_captured(replay, boundary, &opts))
+        let mut guard = self.inner.state.lock().await;
+        let state = &mut *guard;
+        state.watchers.register(&state.catalog, &opts)
     }
 
     /// Subscribe to the LIVE-TAIL watch stream (compatibility shim over
@@ -479,6 +846,134 @@ impl FjallStore {
                 .map_err(|e| write_logs_err(&e))?;
         }
         self.persist(write_logs_err)
+    }
+
+    /// Bring the durable image up to the applied state, so the next boot
+    /// replays nothing that was applied before this call.
+    ///
+    /// `apply` batches the image write (see `CATALOG_PERSIST_EVERY`), so
+    /// between writes the image lags the applied state by up to 63 apply
+    /// calls or 5 s. That is correct — the log holds those entries and a boot
+    /// replays them — but it means every stop leaves a replay behind, and a
+    /// replay is exactly what makes rolling back across a change to apply
+    /// semantics unsafe. A clean stop calls this after the writers are gone
+    /// and leaves nothing to replay.
+    ///
+    /// Writes the same triple `apply` writes, through the same single batch
+    /// (`persist_applied_image`), under the same state lock — so it
+    /// never interleaves with an apply and never splits the pair.
+    ///
+    /// Not covered: an apply that runs AFTER this returns. openraft's
+    /// state-machine worker is not joined by `Raft::shutdown`, so an entry it
+    /// applies late is batched as usual — durable through the log, replayed
+    /// on the next boot, never lost.
+    ///
+    /// # Errors
+    ///
+    /// A typed [`StorageError`] if the batch cannot be serialized, written or
+    /// fsynced. The in-RAM copy stays marked unwritten, so a retry writes
+    /// again, and the log still holds every applied entry.
+    pub async fn flush(&self) -> Result<Flushed, StorageError<RNodeId>> {
+        let mut state = self.inner.state.lock().await;
+        if state.applies_since_catalog_persist == 0 {
+            return Ok(Flushed::AlreadyDurable {
+                last_applied: state.last_applied,
+            });
+        }
+        self.persist_applied_image(&mut state)?;
+        Ok(Flushed::Persisted {
+            last_applied: state.last_applied,
+        })
+    }
+
+    /// Write the APPLIED IMAGE — the catalog blob, `last_applied` and
+    /// `last_membership`, everything `applied_state` and a reopen answer from
+    /// — as ONE atomic fjall batch fsynced with `SyncAll`, then mark the
+    /// in-RAM copy written.
+    ///
+    /// The apply side of [`Self::write_image`]: `apply` and [`Self::flush`].
+    ///
+    /// The caller holds the state lock and passes the guarded state, so the
+    /// image written is exactly the applied state no apply can race.
+    fn persist_applied_image(
+        &self,
+        state: &mut MaterializedState,
+    ) -> Result<(), StorageError<RNodeId>> {
+        self.write_image(state, &ImageWrite::Applied, |e| {
+            write_sm_err(&io_to_anyerror_dyn(e))
+        })
+    }
+
+    /// ★ THE ONE WRITER OF THE DURABLE IMAGE — `apply`, [`Self::flush`],
+    /// `build_snapshot` and `install_snapshot` all land it here, as ONE
+    /// atomic fjall batch fsynced with `SyncAll`, then mark the in-RAM copy
+    /// written.
+    ///
+    /// Separate inserts followed by one fsync are not atomic: a crash between
+    /// them can journal the catalog without `last_applied` (the next boot
+    /// replays entries onto a catalog that already holds them) or the
+    /// snapshot without the image (the next boot trusts an image older than
+    /// a snapshot the log was purged to). One batch per write, and every
+    /// [`ImageWrite`] carrying the whole image, make both splits
+    /// unrepresentable for every writer in this file.
+    ///
+    /// The caller holds the state lock across this call, so no apply and no
+    /// flush interleaves with it. For [`ImageWrite::Snapshot`] the caller
+    /// updates the in-RAM catalog after it returns, if the snapshot is not
+    /// already the in-RAM state.
+    fn write_image(
+        &self,
+        state: &mut MaterializedState,
+        write: &ImageWrite<'_>,
+        map: impl Fn(&dyn std::error::Error) -> StorageError<RNodeId>,
+    ) -> Result<(), StorageError<RNodeId>> {
+        let applied_catalog;
+        let (catalog, last_applied, last_membership) = match write {
+            ImageWrite::Applied => {
+                applied_catalog = serde_json::to_vec(&state.catalog).map_err(|e| map(&e))?;
+                (
+                    applied_catalog.as_slice(),
+                    serde_json::to_vec(&state.last_applied).map_err(|e| map(&e))?,
+                    serde_json::to_vec(&state.last_membership).map_err(|e| map(&e))?,
+                )
+            }
+            ImageWrite::Snapshot { catalog, meta, .. } => (
+                *catalog,
+                serde_json::to_vec(&meta.last_log_id).map_err(|e| map(&e))?,
+                serde_json::to_vec(&meta.last_membership).map_err(|e| map(&e))?,
+            ),
+        };
+        let mut batch = self
+            .inner
+            .keyspace
+            .batch()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        batch.insert(&self.inner.catalog, CATALOG_KEY, catalog);
+        batch.insert(&self.inner.meta, META_LAST_APPLIED, last_applied);
+        batch.insert(&self.inner.meta, META_LAST_MEMBERSHIP, last_membership);
+        if let ImageWrite::Snapshot {
+            catalog,
+            meta,
+            minted,
+        } = write
+        {
+            batch.insert(&self.inner.meta, META_SNAPSHOT_DATA, *catalog);
+            batch.insert(
+                &self.inner.meta,
+                META_SNAPSHOT_META,
+                serde_json::to_vec(meta).map_err(|e| map(&e))?,
+            );
+            if let Some(index) = minted {
+                batch.insert(
+                    &self.inner.meta,
+                    META_SNAPSHOT_INDEX,
+                    serde_json::to_vec(index).map_err(|e| map(&e))?,
+                );
+            }
+        }
+        batch.commit().map_err(|e| map(&e))?;
+        state.mark_image_written();
+        Ok(())
     }
 }
 
@@ -713,39 +1208,35 @@ pub struct FjallSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for FjallSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<RNodeId>> {
+        // Held across the write: the snapshot is exactly the applied state,
+        // and no apply or flush lands between reading it and writing it.
         let mut state = self.store.inner.state.lock().await;
-        let last_applied = state.last_applied;
-        let last_membership = state.last_membership.clone();
         // Byte-identical to InMemorySnapshotBuilder: serde_json over
         // the materialized catalog (carries the full revision state).
         let catalog_bytes =
             serde_json::to_vec(&state.catalog).map_err(|e| write_snapshot_err(None, &e))?;
-        state.snapshot_index += 1;
-        let snapshot_index = state.snapshot_index;
+        let snapshot_index = state.snapshot_index + 1;
         let snapshot_id = format!("snap-{snapshot_index}");
-
-        // Persist snapshot bytes + meta + bumped index so
-        // get_current_snapshot can serve it after a restart.
         let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership,
+            last_log_id: state.last_applied,
+            last_membership: state.last_membership.clone(),
             snapshot_id,
         };
-        meta_put_json(
-            &self.store.inner.meta,
-            META_SNAPSHOT_INDEX,
-            &snapshot_index,
-            |e| write_snapshot_err(None, &io_to_anyerror_dyn(e)),
+
+        // T3.4: the snapshot, its bumped counter AND the applied image it is,
+        // in one batch — so get_current_snapshot serves it after a restart,
+        // and the image a restart boots from is never older than it.
+        let signature = meta.signature();
+        self.store.write_image(
+            &mut state,
+            &ImageWrite::Snapshot {
+                catalog: &catalog_bytes,
+                meta: &meta,
+                minted: Some(snapshot_index),
+            },
+            |e| write_snapshot_err(Some(signature.clone()), &io_to_anyerror_dyn(e)),
         )?;
-        meta_put_json(&self.store.inner.meta, META_SNAPSHOT_META, &meta, |e| {
-            write_snapshot_err(None, &io_to_anyerror_dyn(e))
-        })?;
-        self.store
-            .inner
-            .meta
-            .insert(META_SNAPSHOT_DATA, catalog_bytes.clone())
-            .map_err(|e| write_snapshot_err(None, &e))?;
-        self.store.persist(|e| write_snapshot_err(None, e))?;
+        state.snapshot_index = snapshot_index;
 
         Ok(Snapshot {
             meta,
@@ -781,15 +1272,38 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         let mut committed: Vec<crate::revision::Change> = Vec::new();
         // Track whether last_membership changed so we persist it.
         let mut membership_changed = false;
+        // Indexes skipped because the image already held them (T3.4).
+        let mut skipped: Vec<u64> = Vec::new();
 
         for entry in entries {
             let log_id = entry.log_id;
+            // ★ A REPLAY IS IDEMPOTENT. An entry the image already holds is
+            // never applied again: a second apply of a Put renumbers the
+            // object's resourceVersion, and every later revision with it.
+            // openraft never offers one in steady state; a boot replay does
+            // when the persisted `last_applied` lags the blob it was written
+            // with (see `MaterializedState::holds`). No revision is consumed
+            // and no event is fanned; the position still advances, since the
+            // entry IS applied.
+            if state.holds(&entry) {
+                skipped.push(log_id.index);
+                state.last_applied = state.last_applied.max(Some(log_id));
+                results.push(ApplyResult {
+                    applied_index: log_id.index,
+                    applied_term: log_id.leader_id.term,
+                    op: crate::command::ResourceOp::NoOp,
+                    revision: state.catalog.revision().get(),
+                    patch_error: None,
+                });
+                continue;
+            }
             let (op, patch_error) = match entry.payload {
                 EntryPayload::Blank => (crate::command::ResourceOp::NoOp, None),
-                EntryPayload::Normal(ref cmd) => {
-                    let outcome = state
-                        .catalog
-                        .apply(cmd, log_id.leader_id.term, log_id.index);
+                EntryPayload::Normal(ref logged) => {
+                    let outcome =
+                        state
+                            .catalog
+                            .apply_logged(logged, log_id.leader_id.term, log_id.index);
                     let op = outcome.op;
                     let patch_error = outcome.patch_error.clone();
                     if let Some(change) = outcome.change {
@@ -812,6 +1326,16 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
                 patch_error,
             });
         }
+        if let (Some(&first), Some(&last)) = (skipped.first(), skipped.last()) {
+            trip!(
+                state.tripwire,
+                ImageInconsistency::AlreadyApplied,
+                u64::try_from(skipped.len()).unwrap_or(u64::MAX),
+                first,
+                last,
+                "apply was handed entries the image already holds; skipped them"
+            );
+        }
 
         // ── durable write ──────────────────────────────────────────
         // The catalog blob is a CACHE of applied state, not the durability
@@ -823,7 +1347,8 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         //
         // ★ The catalog and `last_applied` move TOGETHER. Advancing the
         // persisted `last_applied` past the persisted catalog is the one way
-        // to actually lose data here, so both sit inside this single branch.
+        // to actually lose data here, so the only write is
+        // `persist_applied_image`, which lands both in one atomic batch.
         // A membership change always forces a write — raft's own consistency
         // rests on it, and it is far too rare to be worth batching.
         state.applies_since_catalog_persist += 1;
@@ -832,28 +1357,7 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
             .last_catalog_persist
             .is_none_or(|t| t.elapsed() >= CATALOG_PERSIST_INTERVAL);
         if membership_changed || due_by_count || due_by_time {
-            let catalog_bytes = serde_json::to_vec(&state.catalog).map_err(|e| write_sm_err(&e))?;
-            self.inner
-                .catalog
-                .insert(CATALOG_KEY, catalog_bytes)
-                .map_err(|e| write_sm_err(&e))?;
-            meta_put_json(
-                &self.inner.meta,
-                META_LAST_APPLIED,
-                &state.last_applied,
-                |e| write_sm_err(&io_to_anyerror_dyn(e)),
-            )?;
-            if membership_changed {
-                meta_put_json(
-                    &self.inner.meta,
-                    META_LAST_MEMBERSHIP,
-                    &state.last_membership,
-                    |e| write_sm_err(&io_to_anyerror_dyn(e)),
-                )?;
-            }
-            self.persist(write_sm_err)?;
-            state.applies_since_catalog_persist = 0;
-            state.last_catalog_persist = Some(std::time::Instant::now());
+            self.persist_applied_image(&mut state)?;
         }
 
         // ── fan watch events: DURABLE-BEFORE-OBSERVABLE, UNDER THE LOCK ──
@@ -899,35 +1403,25 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         let catalog: ResourceCatalog = serde_json::from_slice(&bytes)
             .map_err(|e| read_snapshot_err(Some(meta.signature()), &e))?;
 
-        // Overwrite catalog partition + in-RAM copy + applied/membership.
-        self.inner
-            .catalog
-            .insert(CATALOG_KEY, bytes.clone())
-            .map_err(|e| write_snapshot_err(Some(meta.signature()), &e))?;
-        meta_put_json(
-            &self.inner.meta,
-            META_LAST_APPLIED,
-            &meta.last_log_id,
-            |e| write_snapshot_err(Some(meta.signature()), &io_to_anyerror_dyn(e)),
-        )?;
-        meta_put_json(
-            &self.inner.meta,
-            META_LAST_MEMBERSHIP,
-            &meta.last_membership,
-            |e| write_snapshot_err(Some(meta.signature()), &io_to_anyerror_dyn(e)),
-        )?;
-        // Keep the snapshot bytes + meta so get_current_snapshot
-        // serves it after restart.
-        self.inner
-            .meta
-            .insert(META_SNAPSHOT_DATA, bytes)
-            .map_err(|e| write_snapshot_err(Some(meta.signature()), &e))?;
-        meta_put_json(&self.inner.meta, META_SNAPSHOT_META, meta, |e| {
-            write_snapshot_err(Some(meta.signature()), &io_to_anyerror_dyn(e))
-        })?;
-        self.persist(|e| write_snapshot_err(Some(meta.signature()), e))?;
-
+        // ★ The lock BEFORE the write, held until the in-RAM copy matches it.
+        // A flush that took the lock between a lock-free write and the in-RAM
+        // update would see the old state as unwritten and land it over the
+        // snapshot: an image older than the snapshot beside it.
         let mut state = self.inner.state.lock().await;
+        // T3.4: the snapshot keys and the image they are — the received bytes
+        // as the blob, `last_applied` and `last_membership` from the meta — in
+        // one batch, so get_current_snapshot serves it after a restart and
+        // the image is never older than it. The received bytes are kept
+        // byte for byte; installing mints no snapshot counter.
+        self.write_image(
+            &mut state,
+            &ImageWrite::Snapshot {
+                catalog: &bytes,
+                meta,
+                minted: None,
+            },
+            |e| write_snapshot_err(Some(meta.signature()), &io_to_anyerror_dyn(e)),
+        )?;
         state.catalog = catalog;
         state.last_applied = meta.last_log_id;
         state.last_membership = meta.last_membership.clone();
@@ -982,7 +1476,7 @@ mod tests {
                 leader_id: CommittedLeaderId::new(1, 0),
                 index: idx,
             },
-            payload: EntryPayload::Normal(cmd),
+            payload: EntryPayload::Normal(crate::command::LoggedCommand::proposed(cmd)),
         }
     }
 
@@ -1132,7 +1626,7 @@ mod tests {
             }
         }
         let s2 = FjallStore::open(&dir).unwrap();
-        let cat = s2.current_catalog().await;
+        let cat = s2.read_catalog(ResourceCatalog::clone).await;
         let persisted_applied = s2.inner.state.lock().await.last_applied;
 
         assert_eq!(
@@ -1154,6 +1648,192 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn log_id(idx: u64) -> LogId<RNodeId> {
+        LogId {
+            leader_id: CommittedLeaderId::new(1, 0),
+            index: idx,
+        }
+    }
+
+    /// Log and apply `n` Puts at indexes `1..=n`, one apply each — the shape
+    /// of `n` writes arriving inside one persist window.
+    async fn log_and_apply(s: &mut FjallStore, n: usize) {
+        for i in 1..=n {
+            let idx = u64::try_from(i).unwrap();
+            let e = put_entry(idx, &format!("pod-{i}"));
+            s.append_entries_durable(vec![e.clone()]).unwrap();
+            s.apply(vec![e]).await.unwrap();
+        }
+    }
+
+    /// Reopen `dir` raw and report `(entries a boot would replay, objects in
+    /// the rehydrated catalog)`. A boot replays the log entries after the
+    /// persisted `last_applied` (up to `committed`, which never passes the
+    /// last entry), so the first number bounds the replay from above.
+    async fn replay_left_by(dir: &std::path::Path) -> (usize, usize) {
+        let mut s = FjallStore::open(dir).unwrap();
+        let (last_applied, _) = s.applied_state().await.unwrap();
+        let from = last_applied.map_or(0, |l| l.index + 1);
+        let pending = s.try_get_log_entries(from..).await.unwrap().len();
+        (pending, s.read_catalog(ResourceCatalog::len).await)
+    }
+
+    /// T2.9-store: `flush`, then the process goes away WITHOUT `terminate`.
+    /// The reopened store has nothing to replay and every applied object.
+    #[tokio::test]
+    async fn flush_then_drop_without_terminate_leaves_nothing_to_replay() {
+        const N: usize = 6;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // ★ NEGATIVE CONTROL: the same writes, dropped with no flush, leave a
+        // replay behind. Without it, a green result below could mean the
+        // cadence happened to persist everything and `flush` did nothing.
+        let control = tmp.path().join("control");
+        {
+            let mut s = FjallStore::open(&control).unwrap();
+            log_and_apply(&mut s, N).await;
+        }
+        let (control_pending, _) = replay_left_by(&control).await;
+        assert!(
+            control_pending > 0,
+            "HARNESS PRECONDITION: without a flush the durable image must lag the log, \
+             or this test proves nothing"
+        );
+
+        let dir = tmp.path().join("flushed");
+        {
+            let mut s = FjallStore::open(&dir).unwrap();
+            log_and_apply(&mut s, N).await;
+            assert_eq!(
+                s.flush().await.unwrap(),
+                Flushed::Persisted {
+                    last_applied: Some(log_id(u64::try_from(N).unwrap())),
+                },
+                "flush must report that it wrote the image the cadence had left behind"
+            );
+            // Dropped here: no terminate.
+        }
+        let (pending, objects) = replay_left_by(&dir).await;
+        assert_eq!(
+            pending, 0,
+            "a flushed store left {pending} log entries for the next boot to replay"
+        );
+        assert_eq!(objects, N, "the flushed image is missing applied objects");
+    }
+
+    /// `flush` writes only when something was applied since the image was
+    /// last written or loaded, and always names the position the image stands
+    /// at: a fresh store, a second flush in a row and a reopened store all
+    /// answer `AlreadyDurable`.
+    #[tokio::test]
+    async fn flush_is_idempotent_and_names_the_position_it_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let mut s = FjallStore::open(&dir).unwrap();
+        assert_eq!(
+            s.flush().await.unwrap(),
+            Flushed::AlreadyDurable { last_applied: None }
+        );
+
+        log_and_apply(&mut s, 3).await;
+        let (Flushed::Persisted { last_applied } | Flushed::AlreadyDurable { last_applied }) =
+            s.flush().await.unwrap();
+        assert_eq!(last_applied, Some(log_id(3)));
+        assert_eq!(
+            s.flush().await.unwrap(),
+            Flushed::AlreadyDurable {
+                last_applied: Some(log_id(3))
+            },
+            "a second flush with no apply in between must write nothing"
+        );
+        drop(s);
+
+        let reopened = FjallStore::open(&dir).unwrap();
+        assert_eq!(
+            reopened.flush().await.unwrap(),
+            Flushed::AlreadyDurable {
+                last_applied: Some(log_id(3))
+            },
+            "a reopened store holds exactly the image it loaded"
+        );
+    }
+
+    /// T3.3: a reopened store holds no history, so every watch resume point
+    /// below the revision it loaded is refused with the 410 a client relists
+    /// on. Resuming from exactly the loaded revision is honoured.
+    #[tokio::test]
+    async fn a_reopened_store_refuses_a_watch_below_the_revision_it_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let mut s = FjallStore::open(&dir).unwrap();
+        log_and_apply(&mut s, 3).await;
+        assert!(
+            s.watch_from(WatchOpts::live_tail(Revision::ZERO, 16))
+                .await
+                .is_ok(),
+            "before the restart the ring backs every revision"
+        );
+        let (Flushed::Persisted { last_applied } | Flushed::AlreadyDurable { last_applied }) =
+            s.flush().await.unwrap();
+        assert_eq!(last_applied, Some(log_id(3)), "the image holds all three");
+        drop(s);
+
+        let reopened = FjallStore::open(&dir).unwrap();
+        let head = reopened.current_revision().await;
+        assert_eq!(
+            head,
+            Revision(3),
+            "the flushed image holds all three writes"
+        );
+        for from in 0..head.get() {
+            assert_eq!(
+                reopened
+                    .watch_from(WatchOpts::live_tail(Revision(from), 16))
+                    .await
+                    .err(),
+                Some(WatchGone::CompactedTooOld {
+                    requested: Revision(from),
+                    compacted: head,
+                }),
+                "watch_from({from}) after a reopen must be refused: the ring did not survive"
+            );
+        }
+        assert!(
+            reopened
+                .watch_from(WatchOpts::live_tail(head, 16))
+                .await
+                .is_ok(),
+            "resuming from exactly the loaded revision is honoured"
+        );
+    }
+
+    /// An installed snapshot IS the durable image, so `flush` afterwards has
+    /// nothing to write — even when the store had unwritten applies before.
+    #[tokio::test]
+    async fn install_snapshot_leaves_nothing_for_flush_to_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = FjallStore::open(tmp.path().join("src")).unwrap();
+        log_and_apply(&mut src, 4).await;
+        let snap = src
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let mut dst = FjallStore::open(tmp.path().join("dst")).unwrap();
+        log_and_apply(&mut dst, 2).await;
+        dst.install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.flush().await.unwrap(),
+            Flushed::AlreadyDurable {
+                last_applied: snap.meta.last_log_id
+            }
+        );
+    }
+
     #[tokio::test]
     async fn apply_then_reopen_rehydrates_catalog_with_revision() {
         let dir = temp_dir("apply-reopen");
@@ -1167,7 +1847,7 @@ mod tests {
             assert_eq!(res[0].revision, 1);
         }
         let s2 = FjallStore::open(&dir).unwrap();
-        let cat = s2.current_catalog().await;
+        let cat = s2.read_catalog(ResourceCatalog::clone).await;
         assert_eq!(cat.len(), 1);
         assert!(cat.get(&key).is_some());
         assert_eq!(cat.current_revision, Revision(1));
@@ -1179,7 +1859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_build_install_round_trip_preserves_revision_and_compacted() {
+    async fn snapshot_build_install_round_trip_preserves_revision_and_floors_history_at_it() {
         let dir_a = temp_dir("snap-src");
         let dir_b = temp_dir("snap-dst");
         let _ = std::fs::remove_dir_all(&dir_a);
@@ -1192,7 +1872,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let src_cat = src.current_catalog().await;
+        let src_cat = src.read_catalog(ResourceCatalog::clone).await;
         let src_rev = src_cat.current_revision;
         assert!(src_rev.get() >= 4);
 
@@ -1207,9 +1887,24 @@ mod tests {
         dst.install_snapshot(&snap_meta, Box::new(Cursor::new(snap_bytes)))
             .await
             .unwrap();
-        let dst_cat = dst.current_catalog().await;
+        let dst_cat = dst.read_catalog(ResourceCatalog::clone).await;
         assert_eq!(dst_cat.current_revision, src_rev);
-        assert_eq!(dst_cat.compacted_revision, src_cat.compacted_revision);
+        // T3.3: the source evicted nothing, so its floor is 0 and its ring
+        // backs every revision. A snapshot carries no ring, so the
+        // destination's floor is the installed revision, and a watch below
+        // it is a 410 rather than an empty replay.
+        assert_eq!(src_cat.compacted_revision, Revision::ZERO);
+        assert_eq!(dst_cat.compacted_revision, src_rev);
+        assert_eq!(
+            dst.watch_from(WatchOpts::live_tail(Revision::ZERO, 16))
+                .await
+                .err(),
+            Some(WatchGone::CompactedTooOld {
+                requested: Revision::ZERO,
+                compacted: src_rev,
+            }),
+            "a watch from before the installed snapshot must be refused, not answered empty"
+        );
         // Per-key VersionMeta matches.
         let k = ResourceKey::namespaced("", "v1", "Pod", "default", "p5");
         assert_eq!(
@@ -1223,5 +1918,559 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// T2.1-store: a ticker parked mid-tick holds an upgraded
+    /// `Arc<FjallInner>`, and with it the data-directory lock. After
+    /// `quiesce_bookmarks`, the store is held by its owner alone, so
+    /// dropping the store frees the directory at once and it reopens.
+    #[tokio::test]
+    async fn quiesce_bookmarks_frees_the_data_dir_even_when_the_ticker_is_mid_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let store = FjallStore::open(&path).unwrap();
+
+        let apply_in_progress = store.inner.state.lock().await;
+        assert!(
+            crate::watch_backend::await_strong_count(&store.inner, 2).await,
+            "precondition: the ticker upgraded its Weak and is parked on the state lock"
+        );
+
+        assert_eq!(store.quiesce_bookmarks().await, TaskStop::Cancelled);
+        assert_eq!(
+            Arc::strong_count(&store.inner),
+            1,
+            "quiesce_bookmarks returned while the ticker still held FjallInner"
+        );
+
+        drop(apply_in_progress);
+        drop(store);
+        let reopened = FjallStore::open(&path);
+        assert!(
+            reopened.is_ok(),
+            "the data dir must be free the moment the last store handle drops: {:?}",
+            reopened.err()
+        );
+    }
+
+    // ── T3.4: the durable image is never older than a snapshot, and replay
+    //    is idempotent ──────────────────────────────────────────────────────
+
+    /// One process lifetime: dropping the runtime drops every task it spawned
+    /// (raft, the state-machine worker, the bookmark ticker) and with them
+    /// every handle on the store. Nothing is flushed — a kill.
+    fn lifetime<F: std::future::Future>(f: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(f);
+        drop(rt);
+        out
+    }
+
+    /// Close `s` for good: stop the bookmark ticker (which can hold the store
+    /// mid-tick), then drop the last handle, so the directory can be read raw.
+    async fn close(s: FjallStore) {
+        let _stopped = s.quiesce_bookmarks().await;
+        assert_eq!(Arc::strong_count(&s.inner), 1, "another handle is alive");
+        drop(s);
+    }
+
+    /// What a release before T3.4 boots from, read raw: the catalog blob's
+    /// revision and the persisted `last_applied`, with no snapshot fallback
+    /// and no check. T3.4 adds no key, so it is also exactly what a rollback
+    /// to that release reads.
+    fn image_as_a_release_before_t3_4_reads_it(
+        dir: &std::path::Path,
+    ) -> (Revision, Option<LogId<RNodeId>>) {
+        let keyspace = fjall::Config::new(dir).open().unwrap();
+        let catalog = keyspace
+            .open_partition(CATALOG_PARTITION, fjall::PartitionCreateOptions::default())
+            .unwrap();
+        let meta = keyspace
+            .open_partition(META_PARTITION, fjall::PartitionCreateOptions::default())
+            .unwrap();
+        let revision = catalog
+            .get(CATALOG_KEY)
+            .unwrap()
+            .map_or(Revision::ZERO, |b| {
+                serde_json::from_slice::<ResourceCatalog>(&b)
+                    .unwrap()
+                    .revision()
+            });
+        let last_applied = meta_get_json::<Option<LogId<RNodeId>>>(&meta, META_LAST_APPLIED)
+            .unwrap()
+            .flatten();
+        (revision, last_applied)
+    }
+
+    /// The snapshot write a release before T3.4 made: the snapshot's data,
+    /// meta and counter, and NOT the catalog blob or `last_applied`.
+    async fn build_snapshot_as_before_t3_4(s: &FjallStore) -> RSnapshotMeta {
+        let mut state = s.inner.state.lock().await;
+        let bytes = serde_json::to_vec(&state.catalog).unwrap();
+        state.snapshot_index += 1;
+        let meta = SnapshotMeta {
+            last_log_id: state.last_applied,
+            last_membership: state.last_membership.clone(),
+            snapshot_id: format!("snap-{}", state.snapshot_index),
+        };
+        let m = &s.inner.meta;
+        m.insert(
+            META_SNAPSHOT_INDEX,
+            serde_json::to_vec(&state.snapshot_index).unwrap(),
+        )
+        .unwrap();
+        m.insert(META_SNAPSHOT_META, serde_json::to_vec(&meta).unwrap())
+            .unwrap();
+        m.insert(META_SNAPSHOT_DATA, bytes).unwrap();
+        s.inner
+            .keyspace
+            .persist(fjall::PersistMode::SyncAll)
+            .unwrap();
+        meta
+    }
+
+    fn pod_key(name: &str) -> ResourceKey {
+        ResourceKey::namespaced("", "v1", "Pod", "default", name)
+    }
+
+    fn resource_version(obj: &serde_json::Value) -> Option<&str> {
+        obj.pointer("/metadata/resourceVersion")
+            .and_then(serde_json::Value::as_str)
+    }
+
+    /// (a) After `build_snapshot` the durable image IS the snapshot — even as
+    /// a release without T3.4's boot check reads it, and even though the
+    /// cadence had left the blob five applies behind.
+    #[tokio::test]
+    async fn build_snapshot_lands_the_image_it_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // ★ NEGATIVE CONTROL: the same applies with no snapshot leave the
+        // image behind, so the green below is the snapshot's doing.
+        let control = tmp.path().join("control");
+        let mut c = FjallStore::open(&control).unwrap();
+        log_and_apply(&mut c, 6).await;
+        close(c).await;
+        assert!(
+            image_as_a_release_before_t3_4_reads_it(&control).0 < Revision(6),
+            "HARNESS PRECONDITION: the cadence must leave the blob behind, or this test \
+             proves nothing"
+        );
+
+        let dir = tmp.path().join("store");
+        let mut s = FjallStore::open(&dir).unwrap();
+        log_and_apply(&mut s, 6).await;
+        let snap = s
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(snap.meta.last_log_id, Some(log_id(6)));
+        close(s).await; // no flush, no terminate
+
+        assert_eq!(
+            image_as_a_release_before_t3_4_reads_it(&dir),
+            (Revision(6), Some(log_id(6))),
+            "the durable image is older than the snapshot just built"
+        );
+        let reopened = FjallStore::open(&dir).unwrap();
+        assert_eq!(
+            reopened.image_tripwire().await.total(),
+            0,
+            "an image this tree wrote tripped the boot check"
+        );
+    }
+
+    /// (b) `install_snapshot` holds the state lock across its write, so a
+    /// flush queued behind a running apply cannot land the pre-install state
+    /// over the installed image once both have run.
+    #[tokio::test]
+    async fn install_snapshot_is_never_overwritten_by_a_flush_queued_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = FjallStore::open(tmp.path().join("src")).unwrap();
+        log_and_apply(&mut src, 4).await;
+        let snap = src
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let dir = tmp.path().join("dst");
+        let dst = FjallStore::open(&dir).unwrap();
+        let mut writer = dst.clone();
+        log_and_apply(&mut writer, 2).await; // the second apply is unwritten
+        drop(writer);
+
+        // An apply is running: both the flush and the install queue behind
+        // it, the flush first. Current-thread runtime, so each spawned task
+        // runs to its first wait before the test task resumes.
+        let apply_in_progress = dst.inner.state.lock().await;
+        let flusher = tokio::spawn({
+            let d = dst.clone();
+            async move { d.flush().await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let installer = tokio::spawn({
+            let mut d = dst.clone();
+            let meta = snap.meta.clone();
+            let data = snap.snapshot;
+            async move { d.install_snapshot(&meta, data).await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        drop(apply_in_progress);
+        let _flushed = flusher.await.unwrap().unwrap();
+        installer.await.unwrap().unwrap();
+
+        assert_eq!(dst.current_revision().await, Revision(4));
+        close(dst).await;
+        assert_eq!(
+            image_as_a_release_before_t3_4_reads_it(&dir),
+            (Revision(4), snap.meta.last_log_id),
+            "the durable image is older than the snapshot installed beside it"
+        );
+        let reopened = FjallStore::open(&dir).unwrap();
+        assert_eq!(reopened.image_tripwire().await.total(), 0);
+    }
+
+    /// (c) An entry the image already holds is skipped: no revision consumed,
+    /// no object renumbered, and the next fresh entry takes the next revision.
+    #[tokio::test]
+    async fn apply_skips_entries_the_image_already_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = FjallStore::open(tmp.path().join("store")).unwrap();
+        s.apply(vec![
+            put_entry(1, "a"),
+            put_entry(2, "b"),
+            put_entry(3, "c"),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(s.current_revision().await, Revision(3));
+
+        let again = s
+            .apply(vec![
+                put_entry(2, "b"),
+                put_entry(3, "c"),
+                put_entry(4, "d"),
+            ])
+            .await
+            .unwrap();
+        let ops: Vec<_> = again.iter().map(|r| r.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                crate::command::ResourceOp::NoOp,
+                crate::command::ResourceOp::NoOp,
+                crate::command::ResourceOp::Created
+            ],
+            "re-offered entries were applied a second time"
+        );
+        assert_eq!(
+            again[2].revision, 4,
+            "the re-offered entries consumed revisions"
+        );
+        let b = s.get_resource(&pod_key("b")).await.unwrap();
+        assert_eq!(resource_version(&b), Some("2"), "b was renumbered");
+        assert_eq!(
+            s.applied_state().await.unwrap().0,
+            Some(log_id(4)),
+            "the applied position must not move backwards over a skipped entry"
+        );
+        assert_eq!(
+            s.image_tripwire()
+                .await
+                .count(ImageInconsistency::AlreadyApplied),
+            2
+        );
+    }
+
+    /// (d) An image a release before T3.4 wrote — the snapshot ahead of the
+    /// blob — opens at the snapshot, counts the hit, and marks the blob
+    /// behind so the next flush lands it.
+    #[tokio::test]
+    async fn open_boots_from_a_snapshot_newer_than_the_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let mut s = FjallStore::open(&dir).unwrap();
+        log_and_apply(&mut s, 6).await;
+        let snap = build_snapshot_as_before_t3_4(&s).await;
+        assert_eq!(snap.last_log_id, Some(log_id(6)));
+        close(s).await;
+        let (blob_at, _) = image_as_a_release_before_t3_4_reads_it(&dir);
+        assert!(
+            blob_at < Revision(6),
+            "HARNESS PRECONDITION: the old write must leave the blob behind the snapshot"
+        );
+
+        let mut reopened = FjallStore::open(&dir).unwrap();
+        assert_eq!(reopened.current_revision().await, Revision(6));
+        assert_eq!(reopened.read_catalog(ResourceCatalog::len).await, 6);
+        let (applied, membership) = reopened.applied_state().await.unwrap();
+        assert_eq!(applied, Some(log_id(6)));
+        assert_eq!(membership, snap.last_membership);
+        let tripwire = reopened.image_tripwire().await;
+        assert_eq!(tripwire.count(ImageInconsistency::SnapshotNewerThanBlob), 1);
+        assert_eq!(tripwire.total(), 1);
+        assert_eq!(
+            reopened.flush().await.unwrap(),
+            Flushed::Persisted {
+                last_applied: Some(log_id(6))
+            },
+            "the blob is behind the adopted snapshot, so flush must land it"
+        );
+        close(reopened).await;
+        assert_eq!(
+            image_as_a_release_before_t3_4_reads_it(&dir),
+            (Revision(6), Some(log_id(6)))
+        );
+    }
+
+    const MESH_NODE: RNodeId = 1;
+    const MESH_ADDR: &str = "in-process://1";
+    const MESH_LEADERSHIP: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn put_pod(name: &str) -> ResourceCommand {
+        ResourceCommand::put(
+            pod_key(name),
+            serde_json::json!({"spec": {"image": "v1"}}),
+            Reason::Operator,
+        )
+    }
+
+    /// How [`commit_writes`] ends its lifetime.
+    #[derive(Clone, Copy)]
+    enum Stop {
+        /// `terminate`: the image lands every write.
+        Clean,
+        /// The runtime is dropped: the writes wait on the persist cadence.
+        Kill,
+    }
+
+    /// One lifetime of a live single-node mesh on `dir` that commits one Put
+    /// per name, and each acknowledgement as `(name, revision)`.
+    fn commit_writes(dir: &std::path::Path, names: &[String], stop: Stop) -> Vec<(String, u64)> {
+        lifetime(async {
+            let (mesh, _) = crate::mesh::StoreMesh::start_or_resume(
+                MESH_NODE,
+                MESH_ADDR.into(),
+                crate::network::InProcessRouter::new(),
+                crate::mesh::default_config("t3-4-writer").unwrap(),
+                dir,
+            )
+            .await
+            .unwrap();
+            assert!(mesh.wait_for_leadership(MESH_LEADERSHIP).await);
+            let mut acks = Vec::with_capacity(names.len());
+            for name in names {
+                let res = mesh.propose(put_pod(name)).await.unwrap();
+                acks.push((name.clone(), res.revision));
+            }
+            if let Stop::Clean = stop {
+                mesh.terminate().await.unwrap();
+            }
+            acks
+        })
+    }
+
+    /// One lifetime booting `dir` through the real path
+    /// (`StoreMesh::start_durable`, whose `Raft::new` replays). Every ack must
+    /// be present at the revision it was acknowledged at, and the next write
+    /// must continue the revision. Returns what the boot check counted.
+    fn boot_with_every_ack(dir: &std::path::Path, acks: &[(String, u64)]) -> ImageTripwire {
+        lifetime(async {
+            let mesh = crate::mesh::StoreMesh::start_durable(
+                MESH_NODE,
+                MESH_ADDR.into(),
+                crate::network::InProcessRouter::new(),
+                crate::mesh::default_config("t3-4-boot").unwrap(),
+                dir,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the node cannot boot: {e}"));
+            assert!(mesh.wait_for_leadership(MESH_LEADERSHIP).await);
+            for (name, revision) in acks {
+                let obj = mesh.get(&pod_key(name)).await;
+                assert_eq!(
+                    obj.as_ref().and_then(resource_version),
+                    Some(revision.to_string().as_str()),
+                    "{name} is missing, or was applied again and renumbered"
+                );
+            }
+            let head = acks.last().map_or(0, |(_, rev)| *rev);
+            assert_eq!(mesh.current_revision().await.get(), head);
+            let next = mesh.propose(put_pod("after-boot")).await.unwrap();
+            assert_eq!(next.revision, head + 1, "the revision is not continuous");
+            let tripwire = mesh.image_tripwire().await.unwrap();
+            mesh.terminate().await.unwrap();
+            tripwire
+        })
+    }
+
+    fn pod_names(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}-{i}")).collect()
+    }
+
+    /// (d), through the real boot: a node whose pre-T3.4 snapshot outran its
+    /// blob, and whose log was then purged past the blob, boots with every
+    /// acknowledged write at the revision it was acknowledged at. Before T3.4
+    /// `Raft::new` failed on the purged replay.
+    #[test]
+    fn a_node_whose_snapshot_outran_its_blob_boots_after_a_purge() {
+        const KEEP: usize = 5;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let acks = commit_writes(&dir, &pod_names("old", 30), Stop::Kill);
+
+        // The next process catches the state machine up the way a boot does,
+        // snapshots it the way a release before T3.4 did, and purges to near
+        // the head. Then it is killed too.
+        let purged = lifetime(async {
+            let mut s = FjallStore::open(&dir).unwrap();
+            let (applied, _) = s.applied_state().await.unwrap();
+            let pending = s
+                .try_get_log_entries(applied.map_or(0, |l| l.index + 1)..)
+                .await
+                .unwrap();
+            let (first, rest) = pending.split_at(1);
+            s.apply(first.to_vec()).await.unwrap(); // lands the blob here
+            s.apply(rest.to_vec()).await.unwrap(); // left to the cadence
+            let snap = build_snapshot_as_before_t3_4(&s).await;
+            assert_eq!(
+                snap.last_log_id,
+                pending.last().map(|e| e.log_id),
+                "HARNESS: the snapshot must stand at the head of the log"
+            );
+            let all = s.try_get_log_entries(..).await.unwrap();
+            let purge_upto = all[all.len() - 1 - KEEP].log_id;
+            s.save_committed(snap.last_log_id).await.unwrap();
+            s.purge(purge_upto).await.unwrap();
+            purge_upto
+        });
+        let (_, blob_applied) = image_as_a_release_before_t3_4_reads_it(&dir);
+        assert!(
+            blob_applied < Some(purged),
+            "HARNESS PRECONDITION: the purge (to {purged}) must pass the blob (at \
+             {blob_applied:?}), or the replay from it still finds its entries and this \
+             test proves nothing"
+        );
+
+        let tripwire = boot_with_every_ack(&dir, &acks);
+        assert_eq!(tripwire.count(ImageInconsistency::SnapshotNewerThanBlob), 1);
+        assert_eq!(tripwire.count(ImageInconsistency::ReplayGap), 0);
+    }
+
+    /// (c), through the real boot: an image split by a crash between two
+    /// inserts — the blob landed, `last_applied` did not, as the separate
+    /// inserts before one batch allowed — replays without applying a single
+    /// entry twice. Before T3.4 the replay re-applied every Put in the gap
+    /// and renumbered each object.
+    #[test]
+    fn a_split_image_replays_without_renumbering_a_write() {
+        const WRITES: usize = 8;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let acks = commit_writes(&dir, &pod_names("split", WRITES), Stop::Clean);
+
+        // The split: `last_applied` rolled back to the first write, the blob
+        // left holding all of them.
+        let first_write = lifetime(async {
+            let mut s = FjallStore::open(&dir).unwrap();
+            let all = s.try_get_log_entries(..).await.unwrap();
+            let first_write = all
+                .iter()
+                .find(|e| matches!(e.payload, EntryPayload::Normal(_)))
+                .unwrap()
+                .log_id;
+            s.inner
+                .meta
+                .insert(
+                    META_LAST_APPLIED,
+                    serde_json::to_vec(&Some(first_write)).unwrap(),
+                )
+                .unwrap();
+            s.inner
+                .keyspace
+                .persist(fjall::PersistMode::SyncAll)
+                .unwrap();
+            first_write
+        });
+        assert_eq!(
+            image_as_a_release_before_t3_4_reads_it(&dir),
+            (Revision(acks.last().unwrap().1), Some(first_write)),
+            "HARNESS PRECONDITION: the blob holds every write while last_applied names \
+             only the first"
+        );
+
+        let tripwire = boot_with_every_ack(&dir, &acks);
+        assert_eq!(
+            tripwire.count(ImageInconsistency::BlobAheadOfLastApplied),
+            1
+        );
+        assert_eq!(
+            tripwire.count(ImageInconsistency::AlreadyApplied),
+            u64::try_from(WRITES - 1).unwrap(),
+            "every write after the rolled-back position was re-offered and skipped"
+        );
+    }
+
+    /// (e) Shadow: a snapshot ahead of the blob whose data cannot be decoded
+    /// is counted, and the boot goes on from the blob — as the previous
+    /// release's did. `open` gains no way to fail.
+    #[tokio::test]
+    async fn an_unusable_snapshot_is_counted_and_the_boot_goes_on_from_the_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let mut s = FjallStore::open(&dir).unwrap();
+        log_and_apply(&mut s, 6).await;
+        build_snapshot_as_before_t3_4(&s).await;
+        s.inner
+            .meta
+            .insert(META_SNAPSHOT_DATA, b"not a catalog".to_vec())
+            .unwrap();
+        s.inner
+            .keyspace
+            .persist(fjall::PersistMode::SyncAll)
+            .unwrap();
+        close(s).await;
+        let (blob_at, blob_applied) = image_as_a_release_before_t3_4_reads_it(&dir);
+
+        let reopened = FjallStore::open(&dir).expect("open must not refuse the boot");
+        assert_eq!(reopened.current_revision().await, blob_at);
+        assert_eq!(reopened.inner.state.lock().await.last_applied, blob_applied);
+        assert_eq!(
+            reopened
+                .image_tripwire()
+                .await
+                .count(ImageInconsistency::SnapshotUnreadable),
+            1
+        );
+    }
+
+    /// (e) Shadow: a purge past an image no snapshot covers is the one state
+    /// neither the snapshot nor the log can rebuild. It is counted, and `open`
+    /// still succeeds — the release that makes it fatal is a later one.
+    #[tokio::test]
+    async fn a_replay_gap_is_counted_and_open_still_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let mut s = FjallStore::open(&dir).unwrap();
+        log_and_apply(&mut s, 6).await; // the blob stays at the first apply
+        s.save_committed(Some(log_id(6))).await.unwrap();
+        s.purge(log_id(4)).await.unwrap();
+        close(s).await;
+
+        let reopened = FjallStore::open(&dir).expect("open must not refuse the boot");
+        let tripwire = reopened.image_tripwire().await;
+        assert_eq!(tripwire.count(ImageInconsistency::ReplayGap), 1);
+        assert_eq!(tripwire.total(), 1);
     }
 }

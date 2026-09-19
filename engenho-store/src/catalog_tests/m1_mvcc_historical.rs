@@ -22,10 +22,11 @@
 //!   * C2 compaction reclaims HISTORY, never DATA — every live key is
 //!     still readable at the current revision afterwards.
 
-use engenho_store::command::{Reason, ResourceCommand};
-use engenho_store::revision::Revision;
-use engenho_store::state::MetaFidelity;
-use engenho_store::{ResourceCatalog, ResourceKey, ResourceValue};
+use crate::command::{Reason, ResourceCommand};
+use crate::revision::Revision;
+use crate::state::MetaFidelity;
+use crate::state::ResourceCatalog;
+use crate::{ResourceKey, ResourceValue};
 
 fn key(name: &str) -> ResourceKey {
     ResourceKey::namespaced("", "v1", "Pod", "default", name)
