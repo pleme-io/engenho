@@ -251,7 +251,7 @@ over NAR bytes (`NarHash`), over rendered artifact bytes (`evidence_hash`).
 two nodes rendering the same `Drv` must produce the same `evidence_hash`
 (verified in `oci_renderer` tests); disagreement among K or more
 emitters is `Dissent`. The
-`engenho-substrate/src/oci_renderer.rs::OciImageRenderer` is the
+`engenho-substrate-incubator/src/oci_renderer.rs::OciImageRenderer` is the
 concrete bridge (Drv → `docker-archive:` → skopeo copy → `oci-archive:`
 → registry-servable bytes).
 
