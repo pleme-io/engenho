@@ -17,7 +17,7 @@
 //!      deletionTimestamp-bearing object and so the namespace itself is
 //!      GC-removed.
 //!
-//! ## Why a raw [`Controller`] (not [`OwnedChildrenReconciler`])
+//! ## Why a raw [`Controller`] (not [`OwnedChildrenReconciler`](crate::owned_children::OwnedChildrenReconciler))
 //!
 //! Like [`crate::gc::GcController`], the cascade has NO single parent kind
 //! and does a CROSS-KIND sweep — it is "out of family" for the

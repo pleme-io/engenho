@@ -12,7 +12,7 @@
 //!    serializer.
 //! 2. **A typed AST + `Display`** for the non-serde line-oriented
 //!    formats ([`IptablesScript`], [`IpvsScript`], [`SystemdUnit`],
-//!    [`NginxConfig`]). Each is a small builder over typed pieces; the
+//!    [`NginxServerBlock`]). Each is a small builder over typed pieces; the
 //!    `Display` impl is the single render chokepoint.
 //! 3. **A typed argv builder** ([`PodmanRunArgv`]) that constructs a
 //!    `Vec<String>` from typed fields — never a `format!()` command
@@ -254,12 +254,47 @@ impl TraefikIngressRoute {
 }
 
 // =================================================================
-// NginxConfig — typed server-block AST + Display
+// NginxServerBlock — typed server-block AST + Display
 // =================================================================
+
+/// An nginx `location` matcher. The matcher's syntax is rendered here and
+/// nowhere else, so a caller hands over a path, never a directive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NginxLocation {
+    /// `location = <path>`: that path only.
+    Exact(String),
+    /// `location <path>`: that path and everything under it.
+    Prefix(String),
+}
+
+impl Display for NginxLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exact(path) => write!(f, "location = {path}"),
+            Self::Prefix(path) => write!(f, "location {path}"),
+        }
+    }
+}
+
+/// A plain-HTTP `proxy_pass` upstream, rendered `http://<host>:<port>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NginxUpstream {
+    /// The upstream host (a Service name).
+    pub host: String,
+    /// The upstream port.
+    pub port: u16,
+}
+
+impl Display for NginxUpstream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "http://{}:{}", self.host, self.port)
+    }
+}
 
 /// A typed nginx `server { … }` block. Built from typed fields +
 /// rendered through the single [`Display`] chokepoint, never via
-/// `format!()` of nginx syntax.
+/// `format!()` of nginx syntax: the `location` matcher and the
+/// `proxy_pass` target are typed values with their own `Display`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NginxServerBlock {
     /// `listen` directive value (e.g. `80` or `443 ssl`).
@@ -269,10 +304,10 @@ pub struct NginxServerBlock {
     /// Optional TLS secret basename — emits `ssl_certificate` +
     /// `ssl_certificate_key` directives under `/etc/nginx/tls/`.
     pub tls_secret: Option<String>,
-    /// `location` matcher (already includes the `=`/prefix form).
-    pub location: String,
-    /// Upstream `proxy_pass` target (`http://svc:port`).
-    pub proxy_pass: String,
+    /// The `location` matcher.
+    pub location: NginxLocation,
+    /// The upstream `proxy_pass` target.
+    pub proxy_pass: NginxUpstream,
 }
 
 impl Display for NginxServerBlock {
@@ -832,8 +867,11 @@ mod tests {
             listen: "80".to_string(),
             server_name: "podinfo.example.com".to_string(),
             tls_secret: None,
-            location: "location /".to_string(),
-            proxy_pass: "http://podinfo:80".to_string(),
+            location: NginxLocation::Prefix("/".to_string()),
+            proxy_pass: NginxUpstream {
+                host: "podinfo".to_string(),
+                port: 80,
+            },
         };
         let out = block.to_string();
         assert!(out.contains("server {"));
@@ -850,13 +888,36 @@ mod tests {
             listen: "443 ssl".to_string(),
             server_name: "x".to_string(),
             tls_secret: Some("podinfo-tls".to_string()),
-            location: "location /".to_string(),
-            proxy_pass: "http://podinfo:80".to_string(),
+            location: NginxLocation::Prefix("/".to_string()),
+            proxy_pass: NginxUpstream {
+                host: "podinfo".to_string(),
+                port: 80,
+            },
         };
         let out = block.to_string();
         assert!(out.contains("    listen 443 ssl;"));
         assert!(out.contains("    ssl_certificate     /etc/nginx/tls/podinfo-tls.crt;"));
         assert!(out.contains("    ssl_certificate_key /etc/nginx/tls/podinfo-tls.key;"));
+    }
+
+    #[test]
+    fn nginx_location_renders_each_matcher_form() {
+        assert_eq!(
+            NginxLocation::Exact("/api".to_string()).to_string(),
+            "location = /api"
+        );
+        assert_eq!(
+            NginxLocation::Prefix("/api".to_string()).to_string(),
+            "location /api"
+        );
+        assert_eq!(
+            NginxUpstream {
+                host: "podinfo".to_string(),
+                port: 9898
+            }
+            .to_string(),
+            "http://podinfo:9898"
+        );
     }
 
     // ── IptablesScript ────────────────────────────────────────

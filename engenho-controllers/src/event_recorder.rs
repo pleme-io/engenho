@@ -13,7 +13,7 @@
 //! the node is not substitutable for one whose are not.
 //!
 //! ★ THE REASON VOCABULARY IS UPSTREAM'S, NOT OURS. Every string in
-//! [`reason`] is one kubectl, operators, alerting rules and a decade of
+//! [`Reason`] is one kubectl, operators, alerting rules and a decade of
 //! runbooks already recognise. Inventing `PodDidNotStart` where upstream
 //! says `Failed` would produce events that are technically present and
 //! practically useless — worse than none, because they look right.

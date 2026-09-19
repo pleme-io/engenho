@@ -18,9 +18,9 @@
 //!
 //! ## Metrics provider
 //!
-//! Backends: `FakeMetricsProvider` (tests; serves an explicit map)
-//! and (R18b) `PrometheusMetricsProvider` (queries Prometheus's
-//! `/api/v1/query` for any `query` expression on the HPA).
+//! [`MetricsProvider`] is the seam; [`FakeMetricsProvider`] serves an
+//! explicit map for tests. Whether the daemon runs this controller, and why not, is recorded once,
+//! in engenho-runtime's dormant-controller catalog (`Dormant::Hpa`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -50,6 +50,10 @@
 //! + kikai bridge runs k3s v1.34 in production locally and supplies the
 //! operator kubectl experience while engenho catches up.
 
+// A doc link to an item that does not exist is a comment naming code that
+// is not there (plan class D). This makes `cargo doc` refuse one. Tier: a
+// gate only where rustdoc runs; plain builds and tests never read it.
+#![deny(rustdoc::broken_intra_doc_links)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
@@ -60,6 +64,10 @@ pub mod consistency_tier;
 pub mod curated_enums;
 pub mod egress;
 pub mod error;
+#[allow(
+    rustdoc::broken_intra_doc_links,
+    reason = "generated from upstream OpenAPI descriptions, whose `[x]`-style text is prose, not links"
+)]
 pub mod generated_v1_34;
 pub mod informer;
 pub mod kind;

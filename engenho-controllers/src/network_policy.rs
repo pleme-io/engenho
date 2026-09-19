@@ -2,11 +2,15 @@
 //!
 //! Typed pluggable backend for installing L3/L4 firewall rules
 //! that implement K8s NetworkPolicy semantics. Backends:
-//!   * `FakeNetworkPolicyEnforcer` (tests; tracks rules in BTreeMap)
-//!   * `CiliumNetworkPolicyAdapter` (renders CiliumNetworkPolicy CRD YAML;
-//!     production via cilium-operator hot-reload)
-//!   * `IptablesNetworkPolicyEnforcer` (R17b — direct iptables-rules
-//!     production backend; deferred)
+//!   * [`FakeNetworkPolicyEnforcer`] (tests; tracks rules in BTreeMap)
+//!   * [`ComputedNetworkPolicyEnforcer`] (computes and records the rules,
+//!     and says it installs nothing: for a host with no packet filter to
+//!     install into)
+//!   * [`CiliumNetworkPolicyAdapter`] (renders CiliumNetworkPolicy CRD YAML
+//!     into a directory, for a cilium-operator to pick up)
+//!
+//! No backend installs kernel rules itself; an iptables backend is not
+//! written.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

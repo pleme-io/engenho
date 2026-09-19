@@ -77,7 +77,7 @@ pub struct ObjectMeta {
 /// field paths that manager declared on its last apply (the
 /// [`fields_v1`](Self::fields_v1) trie). Conflict detection compares an
 /// incoming apply's fieldset against every OTHER manager's
-/// [`fields_v1`]; an unforced overlap with a differing value is a 409.
+/// [`fields_v1`](Self::fields_v1); an unforced overlap with a differing value is a 409.
 ///
 /// Wire shape: serde camelCase, `skip_serializing_if` matching upstream
 /// `metav1.ManagedFieldsEntry` so a minimal entry round-trips

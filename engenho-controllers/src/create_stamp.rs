@@ -31,7 +31,7 @@
 //!
 //! ## The `Clock` seam (unit-test determinism)
 //!
-//! The wall-clock read is injected as a [`Clock`] (`fn() -> String`) so
+//! The wall-clock read is injected as a [`CreateClock`] (`fn() -> String`) so
 //! unit tests pin a FIXED timestamp and assert exact bytes, while
 //! production uses [`wall_clock`] (`engenho_types::time::now_rfc3339_utc`).
 //! Reconcile determinism tests stay deterministic — the clock is never

@@ -12,8 +12,8 @@
 //!        b. Ingest receipt into the ledger
 //!        c. Mark per-job status (Materialized / Failed)
 //!   4. Walk the stages:
-//!        a. If ledger reports Reached → status.stages[id].phase = "Confirmed"
-//!        b. If ledger reports Dissent → status.stages[id].phase = "Dissent"
+//!        a. If ledger reports Reached → `status.stages[id].phase = "Confirmed"`
+//!        b. If ledger reports Dissent → `status.stages[id].phase = "Dissent"`
 //!        c. Else: keep Pending / Materializing
 //!   5. If every stage Confirmed → status.phase = "Complete"
 //!   6. If any stage in Dissent or Failed too many times →

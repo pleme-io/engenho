@@ -114,9 +114,8 @@ impl UserInfo {
     }
 }
 
-/// Auth configuration for a `KubeClient`. Construct via
-/// [`Self::from_kubeconfig`] (parsing) or one of the explicit
-/// constructors.
+/// Auth configuration for a `KubeClient`. Construct a variant directly:
+/// this crate has no kubeconfig parser.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum KubeAuth {
@@ -129,9 +128,9 @@ pub enum KubeAuth {
     /// request (`File` — for ServiceAccount tokens that rotate).
     BearerToken(TokenSource),
 
-    /// Mutual TLS — client cert + private key. The CA the apiserver
-    /// presents is verified against [`KubeAuth::server_ca`] of the
-    /// containing connection (separate field, not in this enum).
+    /// Mutual TLS — client cert + private key. The apiserver's serving
+    /// certificate is verified against the server CA the connection is
+    /// built with, which is not part of this enum.
     ClientCert {
         /// PEM-encoded x509 certificate (inline) or path.
         cert: BytesOrPath,

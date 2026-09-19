@@ -1,9 +1,11 @@
 //! R14 — Ingress dimension.
 //!
 //! HTTP/HTTPS routing from public hostnames to in-cluster services.
-//! Pluggable [`IngressBackend`] trait — `FakeIngressBackend` for
-//! tests, `TraefikBackend` renders Traefik IngressRoute CRDs,
-//! `NginxBackend` renders nginx.conf snippets (R14b sibling).
+//! Pluggable [`IngressBackend`] trait — [`FakeIngressBackend`] for
+//! tests, [`TraefikIngressBackend`] renders Traefik IngressRoute CRDs,
+//! [`NginxIngressBackend`] renders nginx server-block files. Whether the
+//! daemon runs this controller, and why not, is recorded once, in
+//! engenho-runtime's dormant-controller catalog (`Dormant::Ingress`).
 //!
 //! ## Reconcile rule
 //!
@@ -359,20 +361,21 @@ impl NginxIngressBackend {
     ///
     /// Builds a typed [`engenho_types::egress::NginxServerBlock`] +
     /// renders it through the block's `Display` chokepoint (★★ TYPED
-    /// EMISSION — no `format!()` of nginx syntax). The `listen` /
-    /// `location` matcher choices are domain logic.
+    /// EMISSION — no `format!()` of nginx syntax: the matcher and the
+    /// upstream are typed values). The `listen` / `location` matcher
+    /// choices are domain logic.
     #[must_use]
     pub fn render_server_block(route: &IngressRoute) -> String {
-        use engenho_types::egress::NginxServerBlock;
+        use engenho_types::egress::{NginxLocation, NginxServerBlock, NginxUpstream};
         let listen = if route.tls_secret.is_some() {
             "443 ssl"
         } else {
             "80"
         };
         let location = match route.path_type {
-            PathType::Exact => format!("location = {}", route.path),
+            PathType::Exact => NginxLocation::Exact(route.path.clone()),
             PathType::Prefix | PathType::ImplementationSpecific => {
-                format!("location {}", route.path)
+                NginxLocation::Prefix(route.path.clone())
             }
         };
         NginxServerBlock {
@@ -380,7 +383,10 @@ impl NginxIngressBackend {
             server_name: route.host.clone(),
             tls_secret: route.tls_secret.clone(),
             location,
-            proxy_pass: format!("http://{}:{}", route.backend_service, route.backend_port),
+            proxy_pass: NginxUpstream {
+                host: route.backend_service.clone(),
+                port: route.backend_port,
+            },
         }
         .to_string()
     }

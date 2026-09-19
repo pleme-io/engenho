@@ -4,27 +4,35 @@
 //!
 //!   * [`Controller`] trait — the second-site extraction of the
 //!     reconcile-loop shape (first site: `engenho-scheduler`'s
-//!     `Scheduler`). Future controllers all implement this.
+//!     `Scheduler`, which implements it too). Every controller here
+//!     implements it.
 //!   * [`replicaset::ReplicaSetController`] — first concrete
 //!     impl. Watches ReplicaSets, creates/deletes Pods so the
 //!     observed replica count matches `spec.replicas`.
+//!   * [`WatchDriver`] — the event loop that drives one controller from
+//!     store events, a requeue slot and a fallback timer. The daemon runs
+//!     each controller it spawns under one.
 //!   * [`runtime::ControllerRuntime`] — runs N controllers on a
-//!     shared tokio scheduler with per-controller intervals.
+//!     shared tokio scheduler with per-controller intervals, for
+//!     embedders and tests; the daemon does not use it.
 //!
 //! ## Why this is its own crate (not part of engenho-scheduler)
 //!
 //! The scheduler is one controller. The controllers crate is the
 //! HOME for all the others. Per the prime directive, the SHARED
-//! trait + runtime live here; engenho-scheduler keeps its
-//! `Scheduler` impl and will optionally implement [`Controller`]
-//! at R9.5 (cheap mechanical edit).
+//! trait + drivers live here; engenho-scheduler keeps its
+//! `Scheduler` and implements [`Controller`] for it.
 //!
 //! ## Owner references
 //!
 //! K8s controllers track ownership via `metadata.ownerReferences`.
-//! [`owner::set_owner_reference`] is the typed helper. Garbage
-//! collection of orphaned children is R9.7.
+//! [`owner::set_owner_reference`] is the typed helper; [`gc`] collects
+//! the dependents whose owners are gone.
 
+// A doc link to an item that does not exist is a comment naming code that
+// is not there (plan class D). This makes `cargo doc` refuse one. Tier: a
+// gate only where rustdoc runs; plain builds and tests never read it.
+#![deny(rustdoc::broken_intra_doc_links)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
