@@ -23,6 +23,7 @@ use engenho_store::watch::WatchEvent;
 use engenho_store::{ContinueToken, Revision, WatchEventKind};
 
 use crate::error::ApiError;
+use crate::watch_end::Compacted;
 
 /// Raw list/watch query string params, K8s-shaped.
 ///
@@ -730,24 +731,29 @@ pub fn bookmark_line(rev: Revision, gvk: WatchGvk<'_>, initial_events_end: bool)
     encode_ndjson(&line)
 }
 
-/// Encode an in-band 410 `Status` line carrying `rev` as the safe
-/// resume point. Used mid-stream (the response is already HTTP 200) when
-/// compaction / overflow is discovered — clients (informers) drop their
-/// cache + re-LIST from a revision >= `rev`.
+/// Encode the in-band `ERROR` line that ends a watch whose history was
+/// compacted mid-stream: `Status{code: 410, reason: "Expired"}` with
+/// kube-apiserver's `too old resource version: <requested> (<compacted>)`.
+/// The response is already HTTP 200, so the end is carried in-band; the
+/// client drops its cache and re-LISTs.
+///
+/// Takes a [`Compacted`], which only `WatchGone::CompactedTooOld` builds: an
+/// overflow is not a compaction, and ends another way
+/// ([`crate::watch_end`]).
 #[must_use]
-pub fn status_410_line(rev: Revision) -> Bytes {
-    let status = crate::error::status_object(
-        format!("too old resource version: resume from {rev}"),
+pub fn status_410_line(compacted: Compacted) -> Bytes {
+    error_line(&crate::error::status_object(
+        compacted.to_string(),
         410,
         "Expired",
-    );
-    error_line(&status)
+    ))
 }
 
 /// Encode a `Status` object as a watch line of type `ERROR`, the shape
 /// kube-apiserver uses for an in-band terminal status. Every in-band end of a
-/// watch goes through here: the mid-stream 410 above and a refused start,
-/// [`crate::watch_start::WatchRefusal::status_line`].
+/// watch goes through here: the mid-stream 410 above, the no-progress 429
+/// ([`crate::watch_end::NoProgress::status_line`]) and a refused start
+/// ([`crate::watch_start::WatchRefusal::status_line`]).
 #[must_use]
 pub(crate) fn error_line(status: &serde_json::Value) -> Bytes {
     #[derive(Serialize)]
@@ -1552,7 +1558,12 @@ mod tests {
 
     #[test]
     fn status_410_line_shape() {
-        let bytes = status_410_line(Revision(3));
+        let compacted = Compacted::try_from(engenho_store::WatchGone::CompactedTooOld {
+            requested: Revision(3),
+            compacted: Revision(6),
+        })
+        .unwrap();
+        let bytes = status_410_line(compacted);
         let s = std::str::from_utf8(&bytes).unwrap();
         let v: serde_json::Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(v.get("type").unwrap(), "ERROR");
@@ -1560,5 +1571,9 @@ mod tests {
         assert_eq!(obj.get("kind").unwrap(), "Status");
         assert_eq!(obj.get("code").unwrap(), 410);
         assert_eq!(obj.get("reason").unwrap(), "Expired");
+        assert_eq!(
+            obj.get("message").unwrap(),
+            "too old resource version: 3 (6)"
+        );
     }
 }

@@ -48,7 +48,7 @@ use engenho_kube_proto::{
     self as kube_proto, CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type,
     response_wants_protobuf,
 };
-use engenho_store::{WatchEventKind, WatchGone, WatchSignal, WatchStream};
+use engenho_store::{Revision, WatchEventKind, WatchSignal, WatchStream};
 use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::Subresource;
 use engenho_types::patch::PatchType;
@@ -61,8 +61,9 @@ use crate::health;
 use crate::openapi::ApiDoc;
 use crate::params::{
     DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, event_line,
-    gvk_ns_matches, status_410_line,
+    gvk_ns_matches,
 };
+use crate::watch_end::WatchProgress;
 use crate::watch_start::{WatchRefusal, WatchStart};
 
 /// The dispatch key for a registered handler: `(group, version, plural)`.
@@ -1244,7 +1245,10 @@ struct WatchStreamState {
     handler: Arc<dyn ResourceHandler>,
     namespace: Option<String>,
     selectors: Selectors,
-    allow_bookmarks: bool,
+    /// What the client has been sent, and whether it asked for bookmarks:
+    /// decides how the watch ends when the store stops serving it
+    /// ([`crate::watch_end`]).
+    progress: WatchProgress,
     /// Server-side deadline from `?timeoutSeconds=N`. `None` = stream
     /// until the client goes away.
     ///
@@ -1354,8 +1358,8 @@ async fn watch_response(
     // A resume point the store cannot serve (ahead of it, or compacted) is
     // refused in-band: HTTP 200 and one ERROR 410 line, never an HTTP
     // status, which kube-rs would retry at the same revision forever
-    // (crate::watch_start). Once there is a stream, any later loss is
-    // in-band too.
+    // (crate::watch_start). Once there is a stream, every end is in-band
+    // too (crate::watch_end).
     let stream = match h
         .watch_stream(namespace.as_deref(), from, p.allow_watch_bookmarks)
         .await?
@@ -1364,12 +1368,16 @@ async fn watch_response(
         WatchStart::Refused(refusal) => return refused_watch_response(&refusal),
     };
 
+    // Nothing has been read from the stream yet, so its `last_seen` is the
+    // revision it opened at: `from`, or the store's revision for a watch
+    // "from now".
+    let progress = WatchProgress::new(stream.last_seen(), p.allow_watch_bookmarks);
     let init = WatchStreamState {
         stream,
         handler: h,
         namespace,
         selectors: sel,
-        allow_bookmarks: p.allow_watch_bookmarks,
+        progress,
         deadline: p.timeout()?.map(|d| tokio::time::Instant::now() + d),
         partial,
     };
@@ -1414,34 +1422,39 @@ async fn watch_response(
                     );
                     let line =
                         event_line(ev.kind, &project_watch_object(&ev.object, st.partial), gvk);
+                    st.progress.delivered(Revision(ev.resource_version));
                     return Some((Ok::<Bytes, Infallible>(line), st));
                 }
                 Some(Ok(WatchSignal::Bookmark(rev))) => {
-                    if st.allow_bookmarks {
+                    if st.progress.bookmarks() {
                         let api_version = st.handler.api_version();
                         let gvk = WatchGvk {
                             api_version: &api_version,
                             kind: st.handler.kind(),
                         };
-                        return Some((Ok(bookmark_line(rev, gvk, false)), st));
+                        let line = bookmark_line(rev, gvk, false);
+                        st.progress.delivered(rev);
+                        return Some((Ok(line), st));
                     }
                     // Bookmarks not requested → drop + keep streaming.
                     continue;
                 }
-                Some(Err(WatchGone::CompactedTooOld { compacted, .. })) => {
-                    // Mid-stream compaction: emit an in-band 410 Status
-                    // carrying the safe resume point, then end. The next
-                    // unfold poll sees None (the WatchStream surfaces its
-                    // single terminal Err exactly once, then None) — the
-                    // 410 line is the final line of the stream.
-                    let line = status_410_line(compacted);
-                    return Some((Ok(line), st));
-                }
-                Some(Err(WatchGone::Overflow { last_seen, .. })) => {
-                    // Mid-stream loss: emit an in-band 410 Status carrying
-                    // last_seen as the safe resume point, then end. The
-                    // client re-LISTs.
-                    let line = status_410_line(last_seen);
+                Some(Err(gone)) => {
+                    // The store stopped serving this watch. How it ends
+                    // depends on why, and on what the client has been sent
+                    // (crate::watch_end): a 410 for a compaction, a bookmark
+                    // and a clean close for an overflow the client can resume
+                    // past, a 429 for one it cannot. The WatchStream
+                    // surfaces its terminal Err once and then None, so the
+                    // line returned here is the last one; with no line the
+                    // body ends now.
+                    let end = st.progress.end(&gone);
+                    let api_version = st.handler.api_version();
+                    let gvk = WatchGvk {
+                        api_version: &api_version,
+                        kind: st.handler.kind(),
+                    };
+                    let line = end.final_line(gvk)?;
                     return Some((Ok(line), st));
                 }
                 None => return None, // store dropped / clean close → end.
@@ -2237,6 +2250,9 @@ mod tests {
         namespaced: bool,
         short_names: Vec<&'static str>,
         singular: &'static str,
+        /// The one stream `watch_stream` hands out, for the tests that
+        /// drive a watch; `None` keeps the typed not-exercised error.
+        watch: std::sync::Mutex<Option<WatchStream>>,
     }
 
     impl FakeHandler {
@@ -2255,6 +2271,22 @@ mod tests {
                 namespaced,
                 short_names: Vec::new(),
                 singular: "",
+                watch: std::sync::Mutex::new(None),
+            })
+        }
+
+        /// A core-group, namespaced handler whose `watch_stream` returns
+        /// `stream` once.
+        fn arc_watching(kind: &str, plural: &str, stream: WatchStream) -> Arc<dyn ResourceHandler> {
+            Arc::new(Self {
+                group: String::new(),
+                version: "v1".into(),
+                kind: kind.into(),
+                plural: plural.into(),
+                namespaced: true,
+                short_names: Vec::new(),
+                singular: "",
+                watch: std::sync::Mutex::new(Some(stream)),
             })
         }
 
@@ -2275,6 +2307,7 @@ mod tests {
                 namespaced,
                 short_names,
                 singular,
+                watch: std::sync::Mutex::new(None),
             })
         }
     }
@@ -2344,9 +2377,10 @@ mod tests {
             _from: crate::params::ResumePoint,
             _allow_bookmarks: bool,
         ) -> Result<crate::watch_start::WatchStart, ApiError> {
-            Err(ApiError::Internal(
-                "fake handler: watch_stream not exercised".into(),
-            ))
+            let stream = self.watch.lock().ok().and_then(|mut w| w.take());
+            stream.map(WatchStart::Streaming).ok_or_else(|| {
+                ApiError::Internal("fake handler: watch_stream not exercised".into())
+            })
         }
         async fn create(
             &self,
@@ -2396,6 +2430,150 @@ mod tests {
                 "fake handler: delete_with_precondition not exercised".into(),
             ))
         }
+    }
+
+    // ── how a streaming watch ends (T3.7) ────────────────────────────────
+    //
+    // Each test drives `watch_response` over a real store `WatchStream`
+    // whose replay overflows a tiny buffer, and reads the whole body. The
+    // watch opens at revision 10; the replay is revisions 11.. and the
+    // buffer holds two, so the store delivers 11 and 12 and then reports
+    // `Overflow { last_seen: 12 }`.
+
+    /// A create of `kind` `name` at `rev`, as the store's history holds it.
+    fn created(kind: &str, name: &str, rev: u64) -> engenho_store::Change {
+        engenho_store::Change {
+            revision: Revision(rev),
+            key: engenho_store::ResourceKey::namespaced("", "v1", kind, "default", name),
+            kind: engenho_store::ChangeKind::Put,
+            value: serde_json::json!({
+                "metadata": {"name": name, "namespace": "default", "resourceVersion": rev.to_string()}
+            }),
+            prior: None,
+            version_meta: engenho_store::VersionMeta::created_at(Revision(rev)),
+        }
+    }
+
+    /// A stream opened at revision 10 over `replay`, with room for two
+    /// signals: it overflows at the third.
+    fn overflowing(replay: Vec<engenho_store::Change>) -> WatchStream {
+        let opts = engenho_store::WatchOpts {
+            from: Revision(10),
+            buffer: 2,
+            bookmark_every: std::time::Duration::ZERO,
+        };
+        let boundary = replay.last().map_or(Revision(10), |c| c.revision);
+        engenho_store::watch_backend::WatcherRegistry::new()
+            .register_captured(replay, boundary, &opts)
+    }
+
+    /// Every line a Pod watch from revision 10 sends before its body ends.
+    async fn pod_watch_lines(stream: WatchStream, bookmarks: bool) -> Vec<serde_json::Value> {
+        let h = FakeHandler::arc_watching("Pod", "pods", stream);
+        let query = if bookmarks {
+            "watch=true&resourceVersion=10&allowWatchBookmarks=true"
+        } else {
+            "watch=true&resourceVersion=10&allowWatchBookmarks=false"
+        };
+        let p: ListWatchParams = serde_urlencoded::from_str(query).unwrap();
+        let resp = watch_response(h, None, p, Selectors::default(), ResponseCodec::Json)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "every watch end is in-band");
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the watch body ended")
+        .unwrap();
+        body.split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
+
+    fn line_types(lines: &[serde_json::Value]) -> Vec<&str> {
+        lines.iter().map(|l| l["type"].as_str().unwrap()).collect()
+    }
+
+    fn line_rv(line: &serde_json::Value) -> &str {
+        line["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap()
+    }
+
+    /// Upstream's cacher ends a watcher that fell behind with a bookmark at
+    /// the last revision it dispatched and a clean close; the client resumes
+    /// from there. The `ConfigMap` at 12 was filtered out of this Pod watch,
+    /// and the bookmark still moves the client past it.
+    #[tokio::test]
+    async fn an_overflow_after_progress_ends_with_a_bookmark_at_last_seen_and_a_clean_close() {
+        let stream = overflowing(vec![
+            created("Pod", "p", 11),
+            created("ConfigMap", "c", 12),
+            created("Pod", "q", 13),
+        ]);
+        let lines = pod_watch_lines(stream, true).await;
+        assert_eq!(line_types(&lines), ["ADDED", "BOOKMARK"], "{lines:?}");
+        assert_eq!(line_rv(&lines[0]), "11");
+        assert_eq!(
+            line_rv(&lines[1]),
+            "12",
+            "the bookmark is at the store's last_seen"
+        );
+        assert_eq!(lines[1]["object"]["kind"], "Pod");
+        assert_eq!(lines[1]["object"]["apiVersion"], "v1");
+    }
+
+    /// A client that did not ask for bookmarks resumes from the last event
+    /// it was sent, so the watch just closes after it.
+    #[tokio::test]
+    async fn an_overflow_after_progress_without_bookmarks_is_a_clean_close() {
+        let stream = overflowing(vec![
+            created("Pod", "p", 11),
+            created("Pod", "q", 12),
+            created("Pod", "r", 13),
+        ]);
+        let lines = pod_watch_lines(stream, false).await;
+        assert_eq!(line_types(&lines), ["ADDED", "ADDED"], "{lines:?}");
+        assert_eq!(line_rv(&lines[1]), "12");
+    }
+
+    /// Every revision the store delivered was filtered out, and the client
+    /// asked for no bookmarks: it would resume at 10 and meet the same
+    /// overflow. The watch ends with a 429 that tells it to back off.
+    #[tokio::test]
+    async fn an_overflow_with_no_progress_ends_with_an_in_band_429() {
+        let stream = overflowing(vec![
+            created("ConfigMap", "a", 11),
+            created("ConfigMap", "b", 12),
+            created("ConfigMap", "c", 13),
+        ]);
+        let lines = pod_watch_lines(stream, false).await;
+        assert_eq!(line_types(&lines), ["ERROR"], "{lines:?}");
+        let status = &lines[0]["object"];
+        assert_eq!(status["kind"], "Status");
+        assert_eq!(status["code"], 429, "{status}");
+        assert_eq!(status["reason"], "TooManyRequests");
+        assert_eq!(
+            status["details"]["retryAfterSeconds"],
+            crate::watch_end::NO_PROGRESS_RETRY_AFTER_SECONDS
+        );
+    }
+
+    /// The same filtered history with bookmarks requested is progress: the
+    /// bookmark at the store's `last_seen` carries the client past it.
+    #[tokio::test]
+    async fn with_bookmarks_filtered_history_ends_with_a_bookmark_not_a_429() {
+        let stream = overflowing(vec![
+            created("ConfigMap", "a", 11),
+            created("ConfigMap", "b", 12),
+            created("ConfigMap", "c", 13),
+        ]);
+        let lines = pod_watch_lines(stream, true).await;
+        assert_eq!(line_types(&lines), ["BOOKMARK"], "{lines:?}");
+        assert_eq!(line_rv(&lines[0]), "12");
     }
 
     #[test]

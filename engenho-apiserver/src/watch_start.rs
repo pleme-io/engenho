@@ -13,6 +13,11 @@
 //!     silently stale.
 //!   * **compacted** (N below the floor), as the store reports it.
 //!
+//! Registration fails for nothing else. A replay too large for the watcher's
+//! buffer is reported on the stream, after what fitted has been delivered, and
+//! [`crate::watch_end`] decides how that watch ends. It is never a refusal and
+//! never a 410.
+//!
 //! ## In-band, never an HTTP status
 //!
 //! A refusal is rendered as HTTP 200 carrying one `ERROR` watch line whose
@@ -38,10 +43,11 @@
 //! it can reach a stream.
 
 use bytes::Bytes;
-use engenho_store::{Revision, WatchGone, WatchStream};
+use engenho_store::{Revision, WatchStream};
 
 use crate::error::status_object;
 use crate::params::{ResumePoint, error_line};
+use crate::watch_end::Compacted;
 
 /// What opening a watch produced.
 ///
@@ -61,7 +67,7 @@ pub enum WatchStart {
 ///
 /// The reasons are a private enum, so there are only two ways to hold one:
 /// [`Self::ahead_of`], which returns `None` for any revision the store has
-/// reached, and `From<WatchGone>`, which carries the store's own verdict.
+/// reached, and `From<Compacted>`, which carries the store's own verdict.
 /// Code outside this module cannot build a refusal for a revision the store
 /// can serve. That seal is a constructor, not a type: a handler that never
 /// calls [`Self::ahead_of`] still compiles, and the tests over
@@ -82,17 +88,8 @@ enum Refusal {
         current: Revision,
     },
     /// The client named a revision below the compaction floor.
-    #[error("too old resource version: {requested} ({compacted})")]
-    Compacted {
-        requested: Revision,
-        compacted: Revision,
-    },
-    /// The replay did not fit the watcher's buffer. The store raises this
-    /// mid-stream today, never at registration, but a registration that
-    /// reported it would still end the watch here, with `last_seen` as the
-    /// resume point.
-    #[error("watch buffer overflowed at registration; resume from {last_seen}")]
-    Overflowed { last_seen: Revision },
+    #[error(transparent)]
+    Compacted(Compacted),
 }
 
 impl WatchRefusal {
@@ -120,23 +117,16 @@ impl WatchRefusal {
     }
 }
 
-impl From<WatchGone> for WatchRefusal {
-    fn from(gone: WatchGone) -> Self {
-        Self(match gone {
-            WatchGone::CompactedTooOld {
-                requested,
-                compacted,
-            } => Refusal::Compacted {
-                requested,
-                compacted,
-            },
-            WatchGone::Overflow { last_seen, .. } => Refusal::Overflowed { last_seen },
-        })
+impl From<Compacted> for WatchRefusal {
+    fn from(compacted: Compacted) -> Self {
+        Self(Refusal::Compacted(compacted))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use engenho_store::WatchGone;
+
     use super::*;
 
     fn line_json(refusal: &WatchRefusal) -> serde_json::Value {
@@ -191,28 +181,21 @@ mod tests {
 
     #[test]
     fn a_compacted_registration_is_an_in_band_410_expired() {
-        let refusal = WatchRefusal::from(WatchGone::CompactedTooOld {
+        let compacted = Compacted::try_from(WatchGone::CompactedTooOld {
             requested: Revision(2),
             compacted: Revision(5),
-        });
+        })
+        .unwrap();
+        let refusal = WatchRefusal::from(compacted);
         let line = line_json(&refusal);
         assert_eq!(line["type"], "ERROR");
         assert_eq!(line["object"]["code"], 410);
         assert_eq!(line["object"]["reason"], "Expired");
         assert_eq!(line["object"]["message"], "too old resource version: 2 (5)");
-    }
-
-    #[test]
-    fn an_overflow_at_registration_is_an_in_band_410_with_its_resume_point() {
-        let refusal = WatchRefusal::from(WatchGone::Overflow {
-            capacity: 4,
-            last_seen: Revision(7),
-        });
-        let line = line_json(&refusal);
-        assert_eq!(line["object"]["code"], 410);
         assert_eq!(
-            line["object"]["message"],
-            "watch buffer overflowed at registration; resume from 7"
+            refusal.status_line(),
+            crate::params::status_410_line(compacted),
+            "a compaction reads the same refused at registration or met mid-stream"
         );
     }
 }

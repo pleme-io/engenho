@@ -51,6 +51,7 @@ pub mod schema_validation;
 pub mod server;
 pub mod table;
 pub mod validation;
+pub mod watch_end;
 pub mod watch_start;
 pub mod webhook_admission;
 
@@ -92,6 +93,9 @@ pub use scale::{
     Scale, ScaleMeta, ScaleSpec, ScaleStatus, label_selector_to_string, project_scale,
 };
 pub use server::{ApiServer, ServerError};
+pub use watch_end::{
+    Compacted, NO_PROGRESS_RETRY_AFTER_SECONDS, NoProgress, Progressed, WatchEnd, WatchProgress,
+};
 pub use watch_start::{WatchRefusal, WatchStart};
 pub use webhook_admission::{
     ReqwestWebhookCaller, StoreWebhookConfigSource, catalog_pluralizer, mutating_webhook_plugin,

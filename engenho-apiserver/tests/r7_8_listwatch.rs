@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_apiserver::{
-    ApiServer, ResourceHandler, ResumePoint, Selectors, StoreBackedHandler, WatchRefusal,
-    WatchStart,
+    ApiServer, Compacted, ResourceHandler, ResumePoint, Selectors, StoreBackedHandler,
+    WatchRefusal, WatchStart,
 };
 use engenho_store::{
     InProcessRouter, Revision, StoreMesh, WatchGone, WatchSignal, WatchStream, default_config,
@@ -396,15 +396,17 @@ async fn watch_replay_tail_then_live_tail_one_contiguous_range() {
 fn compacted_too_old_is_refused_with_an_in_band_410() {
     // DEFAULT_HISTORY_CAPACITY isn't reachable through the public mesh
     // boot, so per the test strategy we assert the translation arm
-    // directly: WatchGone::CompactedTooOld => WatchRefusal => the in-band
-    // 410 Expired line the router ends a refused watch with. A
+    // directly: WatchGone::CompactedTooOld => Compacted => WatchRefusal =>
+    // the in-band 410 Expired line the router ends a refused watch with. A
     // registry-backed integration in engenho-store already proves
     // watch_from(below-watermark) => CompactedTooOld. The router's rendering
     // of a refusal is proven end to end over HTTP in section 8.
-    let refusal = WatchRefusal::from(WatchGone::CompactedTooOld {
+    let compacted = Compacted::try_from(WatchGone::CompactedTooOld {
         requested: Revision(1),
         compacted: Revision(5),
-    });
+    })
+    .expect("a compaction is Compacted");
+    let refusal = WatchRefusal::from(compacted);
     let bytes = refusal.status_line();
     let line: serde_json::Value = serde_json::from_slice(bytes.trim_ascii_end()).unwrap();
     assert_in_band_410(&line);

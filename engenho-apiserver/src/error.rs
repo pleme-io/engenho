@@ -154,12 +154,17 @@ impl ApiError {
     }
 }
 
-/// A typed K8s `Status` object. The single render surface for every
-/// failure body — both the [`IntoResponse`] path (a real HTTP error)
-/// and the in-band watch-stream 410 line (`params::status_410_line`)
-/// build their JSON through this struct, never `format!()` of JSON.
+/// A typed K8s `Status` FAILURE object. The single render surface for
+/// every failure body: the [`IntoResponse`] path (a real HTTP error), the
+/// in-band watch-stream ends (`params::status_410_line`, the 429 of
+/// `watch_end::NoProgress`) and the apply-conflict 409 all build their JSON
+/// through this struct, never `format!()` of JSON.
+///
+/// `D` is the `details` block: [`NoDetails`] for the plain shape (the block
+/// is then absent, and cannot be present), [`StatusCauseDetails`] for an
+/// apply conflict, [`RetryAfterDetails`] for a 429.
 #[derive(Serialize)]
-struct K8sStatus {
+struct K8sStatus<D> {
     kind: &'static str,
     #[serde(rename = "apiVersion")]
     api_version: &'static str,
@@ -167,6 +172,41 @@ struct K8sStatus {
     code: u16,
     reason: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<D>,
+}
+
+impl<D: Serialize> K8sStatus<D> {
+    fn failure(code: u16, reason: &str, message: String, details: Option<D>) -> Self {
+        Self {
+            kind: "Status",
+            api_version: "v1",
+            status: "Failure",
+            code,
+            reason: reason.to_string(),
+            message,
+            details,
+        }
+    }
+
+    /// As a JSON value. Infallible for these concrete shapes.
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// The `details` of a plain failure `Status`: none. Uninhabited, so a plain
+/// Status can never carry a details block.
+#[derive(Serialize)]
+enum NoDetails {}
+
+/// The `metav1.StatusDetails` of a 429: how long the client should wait
+/// before it retries. client-go reads it through
+/// `apierrors.SuggestsClientDelay`.
+#[derive(Serialize)]
+struct RetryAfterDetails {
+    #[serde(rename = "retryAfterSeconds")]
+    retry_after_seconds: u32,
 }
 
 /// A typed K8s `Status` SUCCESS object — the `metav1.Status{status:"Success"}`
@@ -192,28 +232,13 @@ struct StatusDetails {
     kind: String,
 }
 
-/// A typed K8s `Status` FAILURE object carrying a `details.causes` array —
-/// the shape server-side apply returns on a field-ownership conflict
-/// (`Apply failed with N conflict(s)`, reason "Conflict", code 409, one
-/// `FieldManagerConflict` cause per conflicting field). DISTINCT from
-/// [`K8sStatus`] (which has no `details`). The `causes` array is the typed
-/// `serde_json::Value` built store-side by
+/// The `metav1.StatusDetails` block carrying `causes` — the shape
+/// server-side apply returns on a field-ownership conflict (`Apply failed
+/// with N conflict(s)`, reason "Conflict", code 409, one
+/// `FieldManagerConflict` cause per conflicting field). The `causes` array
+/// is the typed `serde_json::Value` built store-side by
 /// `engenho_store::ssa::ApplyConflicts::to_causes` — serde all the way
 /// (TYPED EMISSION; never `format!()` of the wire object).
-#[derive(Serialize)]
-struct K8sStatusWithCauses {
-    kind: &'static str,
-    #[serde(rename = "apiVersion")]
-    api_version: &'static str,
-    status: &'static str,
-    code: u16,
-    reason: String,
-    message: String,
-    details: StatusCauseDetails,
-}
-
-/// The `metav1.StatusDetails` block carrying `causes` — used by the
-/// apply-conflict 409.
 #[derive(Serialize)]
 struct StatusCauseDetails {
     causes: serde_json::Value,
@@ -255,16 +280,27 @@ pub fn delete_status_success(name: &str, kind: &str) -> serde_json::Value {
 /// kube-apiserver's long-poll watch behavior.
 #[must_use]
 pub fn status_object(message: String, code: u16, reason: &str) -> serde_json::Value {
-    let status = K8sStatus {
-        kind: "Status",
-        api_version: "v1",
-        status: "Failure",
-        code,
-        reason: reason.to_string(),
+    K8sStatus::<NoDetails>::failure(code, reason, message, None).to_value()
+}
+
+/// Build `Status{code: 429, reason: "TooManyRequests",
+/// details.retryAfterSeconds}`, the shape of upstream's
+/// `errors.NewTooManyRequests`. Crate-private: the one in-band watch 429 is
+/// `watch_end::NoProgress::status_line`.
+#[must_use]
+pub(crate) fn too_many_requests_object(
+    message: String,
+    retry_after_seconds: u32,
+) -> serde_json::Value {
+    K8sStatus::failure(
+        429,
+        "TooManyRequests",
         message,
-    };
-    // Infallible for this concrete struct.
-    serde_json::to_value(status).unwrap_or(serde_json::Value::Null)
+        Some(RetryAfterDetails {
+            retry_after_seconds,
+        }),
+    )
+    .to_value()
 }
 
 /// A protobuf-codec failure at the HTTP boundary becomes an
@@ -324,17 +360,14 @@ impl IntoResponse for ApiError {
             } else {
                 format!("Apply failed with {n} conflicts")
             };
-            let payload = K8sStatusWithCauses {
-                kind: "Status",
-                api_version: "v1",
-                status: "Failure",
-                code: code.as_u16(),
-                reason: "Conflict".to_string(),
+            let payload = K8sStatus::failure(
+                code.as_u16(),
+                "Conflict",
                 message,
-                details: StatusCauseDetails {
+                Some(StatusCauseDetails {
                     causes: causes.clone(),
-                },
-            };
+                }),
+            );
             return (code, Json(payload)).into_response();
         }
         let reason = match self {
@@ -357,14 +390,8 @@ impl IntoResponse for ApiError {
             ApiError::Internal(_) => "InternalError",
             ApiError::StorageError(_) => "ServiceUnavailable",
         };
-        let payload = K8sStatus {
-            kind: "Status",
-            api_version: "v1",
-            status: "Failure",
-            code: code.as_u16(),
-            reason: reason.to_string(),
-            message: self.to_string(),
-        };
+        let payload =
+            K8sStatus::<NoDetails>::failure(code.as_u16(), reason, self.to_string(), None);
         (code, Json(payload)).into_response()
     }
 }

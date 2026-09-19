@@ -21,6 +21,7 @@ use crate::error::ApiError;
 use crate::params::{DryRun, ResumePoint, Selectors, body_precondition};
 use crate::pod_logs::{LogQuery, PodLogReader};
 use crate::scale::{Scale, project_scale};
+use crate::watch_end::Compacted;
 use crate::watch_start::{WatchRefusal, WatchStart};
 
 /// Bookmark cadence handed to `watch_from` when the client opted into
@@ -1219,9 +1220,19 @@ impl ResourceHandler for StoreBackedHandler {
         // CompactedTooOld at registration is refused like a point ahead of
         // the store: an in-band 410, after which the client re-LISTs and
         // re-WATCHes from the fresh list rv.
+        //
+        // Registration fails for nothing else: the store reports a replay
+        // that overflows the buffer on the stream, after delivering what
+        // fitted, and `crate::watch_end` decides how that watch ends. An
+        // overflow reported here breaks that contract. It is a storage
+        // error, never a 410: a 410 would send the client to relist for a
+        // condition that is not a compaction.
         match self.store.watch_from(opts).await {
             Ok(stream) => Ok(WatchStart::Streaming(stream)),
-            Err(gone) => Ok(WatchStart::Refused(WatchRefusal::from(gone))),
+            Err(gone) => match Compacted::try_from(gone) {
+                Ok(compacted) => Ok(WatchStart::Refused(WatchRefusal::from(compacted))),
+                Err(other) => Err(ApiError::StorageError(other.to_string())),
+            },
         }
     }
 
