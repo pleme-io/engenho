@@ -3,6 +3,7 @@
 use engenho_store::StoreError;
 use shigoto_types::failure::FailureKind;
 
+use crate::contain::PanicMessage;
 use crate::meta::ShapeError;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +22,15 @@ pub enum ControllerError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    /// The tick panicked, and the driver contained it (T2.7).
+    ///
+    /// Made only by the [`crate::WatchDriver`] around a whole tick of a
+    /// [`crate::TickState::Stateless`] child — never returned from inside a
+    /// controller. A Stateful child's panic is not contained, so it never
+    /// becomes this: it ends the child.
+    #[error("reconcile tick panicked: {0}")]
+    Panicked(PanicMessage),
 }
 
 engenho_substrate::impl_error_kind! {
@@ -29,6 +39,7 @@ engenho_substrate::impl_error_kind! {
         (InvalidResource(_)) => "invalid_resource",
         (Shape(_)) => "shape",
         (Internal(_)) => "internal",
+        (Panicked(_)) => "panicked",
     }
 }
 
@@ -60,11 +71,19 @@ impl ControllerError {
     ///     shigoto: an extra retry on the growing curve is cheaper than
     ///     wedging a controller over a condition that would have cleared.
     ///   * `Store` — by [`store_class`].
+    ///   * `Panicked` — Declarative: no targeted retry. A panic is a bug
+    ///     meeting the data it trips on, and a retry a second later meets the
+    ///     same data. The next event (the data changed) or the fallback
+    ///     re-ticks it, so a panic costs one tick per fallback interval.
+    ///     Its own [`crate::TickClass::Panicked`] keeps it apart from a
+    ///     declaration that is merely malformed.
     #[must_use]
     pub const fn classify(&self) -> FailureKind {
         match self {
             Self::Store(e) => store_class(e),
-            Self::InvalidResource(_) | Self::Shape(_) => FailureKind::Declarative,
+            Self::InvalidResource(_) | Self::Shape(_) | Self::Panicked(_) => {
+                FailureKind::Declarative
+            }
             Self::Internal(_) => FailureKind::Transient,
         }
     }
@@ -107,11 +126,14 @@ impl ControllerError {
     ///     malformed; its neighbours' are not.
     ///   * `Internal` — Item. It wraps a controller's own work on one
     ///     object (a directory it provisions, a tree it copies).
+    ///   * `Panicked` — Sweep. The panic ended the whole tick, sweep and all;
+    ///     the driver makes it around the tick, never inside one.
     #[must_use]
     pub const fn scope(&self) -> ErrorScope {
         match self {
             Self::Store(e) => store_scope(e),
             Self::InvalidResource(_) | Self::Shape(_) | Self::Internal(_) => ErrorScope::Item,
+            Self::Panicked(_) => ErrorScope::Sweep,
         }
     }
 }
@@ -171,6 +193,7 @@ mod tests {
             ),
             (ControllerError::Shape(shape_error()), "shape"),
             (ControllerError::Internal("x".into()), "internal"),
+            (ControllerError::Panicked(PanicMessage::Opaque), "panicked"),
         ] {
             assert_eq!(e.kind(), k);
         }
@@ -190,9 +213,9 @@ mod tests {
                     | StoreError::InitializeFailed(_)
                     | StoreError::Fatal(_) => FailureKind::Declarative,
                 },
-                ControllerError::InvalidResource(_) | ControllerError::Shape(_) => {
-                    FailureKind::Declarative
-                }
+                ControllerError::InvalidResource(_)
+                | ControllerError::Shape(_)
+                | ControllerError::Panicked(_) => FailureKind::Declarative,
                 ControllerError::Internal(_) => FailureKind::Transient,
             };
             (e, want)
@@ -206,6 +229,7 @@ mod tests {
             row(ControllerError::InvalidResource(m())),
             row(ControllerError::Shape(shape_error())),
             row(ControllerError::Internal(m())),
+            row(ControllerError::Panicked(PanicMessage::Text(m()))),
         ]
     }
 
@@ -225,6 +249,7 @@ mod tests {
                 ControllerError::InvalidResource(_)
                 | ControllerError::Shape(_)
                 | ControllerError::Internal(_) => ErrorScope::Item,
+                ControllerError::Panicked(_) => ErrorScope::Sweep,
             };
             (e, want)
         }
@@ -232,9 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn store_errors_stop_a_sweep_and_nothing_else_does() {
+    fn store_errors_and_panics_stop_a_sweep_and_nothing_else_does() {
         let rows = every_scope();
-        assert_eq!(rows.len(), 7, "one row per variant");
+        assert_eq!(rows.len(), 8, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.scope(), want, "{e:?}");
         }
@@ -243,7 +268,7 @@ mod tests {
     #[test]
     fn every_error_variant_maps_to_its_retry_class() {
         let rows = every_variant();
-        assert_eq!(rows.len(), 7, "one row per variant");
+        assert_eq!(rows.len(), 8, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.classify(), want, "{e:?}");
         }

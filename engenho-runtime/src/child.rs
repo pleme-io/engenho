@@ -34,15 +34,22 @@
 //! * A child that dies unseen: every child's task is owned by one
 //!   [`Children`] set. [`Children::next_dead`] is how `main` learns that one
 //!   ended; it is marked [`ChildState::Dead`] and logged at ERROR. There is
-//!   no respawn — acting on a death is T2.7/T2.8's, after liveness is
-//!   visible.
+//!   no respawn.
+//!
+//! ## What a panic does (T2.7)
+//!
+//! Decided per child by its [`TickState`], which the runtime hands its
+//! driver: a Stateless driver contains a panicking tick, counts it and is
+//! re-ticked by the next event or the fallback, so its task never ends; a
+//! Stateful driver's panic ends its task, and the set above marks it Dead —
+//! for the kubelet, Dead is the park. A listener whose serve ends rebinds on
+//! a growing backoff. See [`engenho_controllers::contain`].
 //!
 //! Still only caught: a task spawned OUTSIDE this catalog (T0.4's
 //! `disallowed-methods` on every spawn path, once clippy blocks).
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::fmt;
@@ -51,7 +58,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use engenho_config::{ControllerEnable, EngenhoConfig};
-use engenho_controllers::{ControllerType, Heartbeat, KindFilter, Reads};
+pub use engenho_controllers::TickState;
+use engenho_controllers::{ControllerType, Heartbeat, KindFilter, PanicMessage, Reads};
 use tokio::task::{Id, JoinSet};
 use tracing::error;
 
@@ -109,23 +117,6 @@ pub enum Child {
     /// Lease only while the kubelet's heartbeat is young). Until then
     /// [`Child::enabled`] is `false` for it and nothing spawns it.
     NodeLease,
-}
-
-/// Whether a child's tick leaves state behind that the next tick relies on.
-///
-/// T2.7 contains a panicking tick with `catch_unwind` only for
-/// [`TickState::Stateless`] children: they re-read everything from the
-/// store each tick, so re-ticking after a panic is safe. A
-/// [`TickState::Stateful`] child is left to die (visibly) instead, because a
-/// re-tick would run over a torn map or a poisoned lock. When in doubt a
-/// child is Stateful — the wrong answer in that direction costs availability,
-/// the wrong answer in the other costs correctness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TickState {
-    /// Re-reads everything from the store every tick.
-    Stateless,
-    /// Holds in-memory state across ticks.
-    Stateful,
 }
 
 impl Driver {
@@ -529,7 +520,10 @@ impl Children {
             } else {
                 DeathCause::Cancelled
             };
-            let payload = ended.try_into_panic().ok();
+            let panic = ended
+                .try_into_panic()
+                .ok()
+                .map(|p| PanicMessage::of(p.as_ref()));
             let Some(child) = self.by_task.remove(&task) else {
                 // Every task in the set was spawned by `spawn`, which records
                 // its id first. Say so rather than guess which child it was.
@@ -545,7 +539,7 @@ impl Children {
             error!(
                 %child,
                 %cause,
-                panic = payload.as_deref().and_then(panic_text),
+                panic = panic.as_ref().map(tracing::field::display),
                 "runtime child ended; it is Dead and will not be respawned"
             );
             return DeadChild { child, cause };
@@ -593,14 +587,6 @@ impl Children {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-}
-
-/// A panic payload's message, when it is text.
-fn panic_text(payload: &(dyn Any + Send)) -> Option<&str> {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
 }
 
 #[cfg(test)]

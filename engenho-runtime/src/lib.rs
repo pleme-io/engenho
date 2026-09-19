@@ -46,6 +46,15 @@
 //! [`Runtime::next_dead_child`] reports it, marked Dead and logged at ERROR,
 //! and `main` watches for it beside its stop signal. There is no respawn.
 //!
+//! ## Panics (T2.7)
+//!
+//! A panic in a driver's tick is contained only when the catalog says the
+//! driver is [`TickState::Stateless`]: it is counted and the fallback
+//! re-ticks it. A [`TickState::Stateful`] driver's panic ends it, and it is
+//! Dead. A listener whose serve ends binds again on a growing backoff. Every
+//! panic in the process, caught or not, is counted by the hook behind
+//! [`PanicCounter`], which [`Runtime::start`] installs.
+//!
 //! ## Dormant controllers (T5.11)
 //!
 //! Every type that implements [`engenho_controllers::Controller`] is either
@@ -84,8 +93,10 @@ mod dormant;
 mod error;
 #[cfg(test)]
 mod impl_census;
+mod panics;
 #[cfg(test)]
 mod read_census;
+mod rebind;
 mod runtime;
 
 pub use child::{
@@ -95,4 +106,5 @@ pub use child::{
 pub use dormant::{Dormant, DormantReason};
 pub use error::RuntimeError;
 pub use etcd_facade::MeshEtcdStore;
+pub use panics::PanicCounter;
 pub use runtime::Runtime;

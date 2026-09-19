@@ -69,4 +69,6 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 shikumi = "0.1.0"
 tempfile = "3"
-tokio = { workspace = true }
+# `tokio::time::pause`: the listener rebind tests walk minutes of backoff in
+# virtual time. A feature of the tokio already in the graph, not a new crate.
+tokio = { workspace = true, features = ["test-util"] }

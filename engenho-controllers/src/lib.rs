@@ -35,6 +35,7 @@ pub mod build_backend_roceiro;
 mod closed_enum;
 pub mod cluster_ip;
 pub mod cni_status;
+pub mod contain;
 pub mod controller;
 pub mod crd;
 pub mod crd_conversion;
@@ -103,6 +104,7 @@ pub use attestation::{
     tameshi_attestation_webhook,
 };
 pub use build_backend_roceiro::BuildBackendRoceiro;
+pub use contain::{PanicMessage, TickState};
 pub use controller::{
     Controller, ControllerType, ReconcileOutcome, ReconcileReport, ReconcileResult,
 };
