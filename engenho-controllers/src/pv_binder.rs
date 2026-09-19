@@ -15,10 +15,30 @@
 //!      `PV.spec.claimRef → {namespace,name,uid}` of the PVC.
 //!   2. **Dynamic provision** — if no static PV matches AND the PVC's
 //!      effective StorageClass uses the local-path provisioner (or is the
-//!      cluster default SC), it CREATES a `PersistentVolume` with a
-//!      node-local `hostPath` source under `<data_dir>/local-path/<ns>-<name>`,
-//!      `capacity = request`, the SC's `reclaimPolicy`, and a `claimRef`
-//!      pre-pointing at the PVC, then binds it.
+//!      cluster default SC), it CREATES a `PersistentVolume` named
+//!      `pvc-<uid>` with a node-local `hostPath` source under
+//!      `<data_dir>/local-path/pvc-<uid>_<ns>_<name>`, `capacity = request`,
+//!      the SC's `reclaimPolicy`, and a `claimRef` pre-pointing at the PVC,
+//!      then binds it.
+//!
+//! ## Identity is the claim's uid
+//!
+//! A claim's name is reusable; its `metadata.uid` is not. Every volume a
+//! claim is given is tied to its uid ([`ClaimUid`]):
+//!
+//!   * a dynamic PV's name and directory come from [`PvName::for_claim`],
+//!     so a claim deleted and recreated under the same name gets a new PV
+//!     and a new, empty directory — never the deleted claim's data;
+//!   * a PV whose `claimRef` carries a different uid belongs to an earlier
+//!     claim of the same name and is never bound to this one;
+//!   * the PV is written create-if-absent, so a provision never overwrites
+//!     a PV that already holds its name;
+//!   * a claim with no usable uid stays Pending with a typed reason
+//!     ([`NoVolumeIdentity`]).
+//!
+//! PVs provisioned before this rule keep their names (`pvc-<ns>-<name>`):
+//! nothing renames a bound volume, and a claim whose PV was written but not
+//! yet bound finds it again through its `claimRef` uid.
 //!
 //! ## volumeBindingMode
 //!
@@ -45,12 +65,14 @@
 //! provisioned is left Pending (the K8s behavior) — never fake-Bound. There
 //! is no `todo!()` / `unimplemented!()` / `panic!()` anywhere in the path.
 
+mod identity;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use engenho_store::{
     StoreMesh,
-    command::{Reason, ResourceCommand},
+    command::{Reason, ResourceCommand, TxnCompare, TxnOp},
     resource::ResourceKey,
 };
 use engenho_types::primitives::quantity::Quantity;
@@ -64,6 +86,8 @@ use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
+
+pub use identity::{ClaimUid, LocalPathDir, NoVolumeIdentity, PvName};
 
 /// The local-path provisioner identifier. A StorageClass whose
 /// `provisioner` is this string (the rancher.io/local-path de-facto
@@ -96,6 +120,35 @@ const SNAPSHOT_NOT_READY: &str = "PVC names a VolumeSnapshot dataSource that is 
 
 /// The report note for a `WaitForFirstConsumer` claim.
 const WAIT_FOR_FIRST_CONSUMER: &str = "WaitForFirstConsumer PVC left Pending (deferred)";
+
+/// The report note for a claim whose derived PV name is already held by a
+/// PV that is not bound to it. Nothing is overwritten and nothing is
+/// provisioned into that PV's directory; the claim stays Pending.
+const PV_NAME_TAKEN: &str = "a PersistentVolume already holds the name derived from this \
+     claim's uid and is not bound to it; nothing was overwritten and the claim stays Pending";
+
+/// One claim, as a PV's `claimRef` names it.
+#[derive(Debug, Clone, Copy)]
+struct ClaimId<'a> {
+    namespace: &'a str,
+    name: &'a str,
+    uid: &'a ClaimUid,
+}
+
+/// Where a PV's `spec.claimRef` points, seen from one claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimRefTo {
+    /// No claimRef: free for any claim it matches.
+    Nobody,
+    /// This claim's namespace and name, with no uid: reserved for the claim
+    /// by name, the way an operator pre-binds a PV.
+    ThisName,
+    /// This claim's namespace, name and uid: already this claim's volume.
+    ThisClaim,
+    /// Some other claim — including an earlier claim of the same namespace
+    /// and name, told apart by its uid.
+    Other,
+}
 
 /// Everything a sweep reads once and matches each claim against.
 struct TickView {
@@ -163,7 +216,8 @@ pub struct PvBinderController {
     store: Arc<StoreMesh>,
     namespace: Option<String>,
     /// Host data root under which dynamically-provisioned local-path PVs are
-    /// backed: each PV's hostPath is `<local_path_root>/<pvc-ns>-<pvc-name>`.
+    /// backed: each PV's hostPath is
+    /// `<local_path_root>/pvc-<uid>_<pvc-ns>_<pvc-name>` ([`PvName::local_path_dir`]).
     local_path_root: String,
     /// The filesystem seam (mockable).
     env: Arc<dyn ProvisionerEnv>,
@@ -307,26 +361,57 @@ impl PvBinderController {
             .filter(|s| !s.is_empty())
     }
 
+    /// Where `pv`'s `spec.claimRef` points, seen from `claim`.
+    ///
+    /// The namespace and name must both match for the claimRef to be this
+    /// claim's. When it also carries a uid, that uid decides: a different
+    /// one is an earlier claim that happened to have the same name
+    /// (upstream's `IsVolumeBoundToClaim`). An empty uid is no uid.
+    fn claim_ref_to(pv: &Value, claim: &ClaimId<'_>) -> ClaimRefTo {
+        let Some(cr) = pv
+            .get("spec")
+            .and_then(|s| s.get("claimRef"))
+            .filter(|cr| !cr.is_null())
+        else {
+            return ClaimRefTo::Nobody;
+        };
+        let field = |k: &str| cr.get(k).and_then(Value::as_str).unwrap_or("");
+        if field("namespace") != claim.namespace || field("name") != claim.name {
+            return ClaimRefTo::Other;
+        }
+        match cr.get("uid") {
+            None | Some(Value::Null) => ClaimRefTo::ThisName,
+            Some(Value::String(uid)) if uid.is_empty() => ClaimRefTo::ThisName,
+            Some(uid) if claim.uid.is(uid) => ClaimRefTo::ThisClaim,
+            Some(_) => ClaimRefTo::Other,
+        }
+    }
+
     /// A PV is *available to bind to this PVC* iff it's `Available` AND (if it
     /// carries a `spec.claimRef`) that claimRef already points at THIS PVC
     /// (a pre-provisioned PV reserved for the claim). A PV claimRef'd to a
-    /// DIFFERENT claim is not available.
-    fn pv_claimref_compatible(pv: &Value, pvc_ns: &str, pvc_name: &str) -> bool {
-        match pv.get("spec").and_then(|s| s.get("claimRef")) {
-            None | Some(Value::Null) => true,
-            Some(cr) => {
-                let cr_ns = cr.get("namespace").and_then(|n| n.as_str()).unwrap_or("");
-                let cr_name = cr.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                cr_ns == pvc_ns && cr_name == pvc_name
-            }
+    /// DIFFERENT claim is not available, and neither is one claimRef'd to an
+    /// earlier claim of the same namespace and name: the uid tells them apart.
+    fn pv_claimref_compatible(pv: &Value, claim: &ClaimId<'_>) -> bool {
+        match Self::claim_ref_to(pv, claim) {
+            ClaimRefTo::Nobody | ClaimRefTo::ThisName | ClaimRefTo::ThisClaim => true,
+            ClaimRefTo::Other => false,
         }
+    }
+
+    /// Is `pv` big enough for `pvc`'s request? A claim with no parseable
+    /// request asks for nothing in particular (a CSI driver chose the
+    /// size); a PV with no parseable capacity satisfies no request.
+    fn holds_request(pv: &Value, pvc: &Value) -> bool {
+        Self::pvc_request_bytes(pvc)
+            .is_none_or(|req| Self::pv_capacity_bytes(pv).is_some_and(|cap| cap >= req))
     }
 
     /// Does `pv` satisfy `pvc`'s static-bind requirements? Capacity ≥ request,
     /// accessModes ⊇ requested, storageClassName equal, claimRef compatible.
     /// (volumeName pre-bind is checked by the caller — it narrows the candidate
     /// set to exactly one PV before this predicate runs.)
-    fn pv_matches_pvc(pv: &Value, pvc: &Value, pvc_ns: &str, pvc_name: &str) -> bool {
+    fn pv_matches_pvc(pv: &Value, pvc: &Value, claim: &ClaimId<'_>) -> bool {
         // Capacity: PV must offer ≥ the request. A PVC with no parseable
         // request matches nothing (left Pending).
         let Some(req) = Self::pvc_request_bytes(pvc) else {
@@ -349,7 +434,7 @@ impl PvBinderController {
             return false;
         }
         // claimRef must be unset or already point at this PVC.
-        Self::pv_claimref_compatible(pv, pvc_ns, pvc_name)
+        Self::pv_claimref_compatible(pv, claim)
     }
 
     /// The PVC's `volumeBindingMode` — resolved from its effective
@@ -394,16 +479,22 @@ impl PvBinderController {
         pvc
     }
 
-    /// Build the bound PV value: stamp `spec.claimRef` → the PVC +
-    /// `status.phase=Bound`.
-    fn bind_pv(mut pv: Value, pvc: &Value, pvc_ns: &str, pvc_name: &str) -> Value {
-        let claim_ref = json!({
+    /// The `spec.claimRef` naming `claim` — always with its uid, so the PV
+    /// can never be mistaken for a later claim of the same name.
+    fn claim_ref(claim: &ClaimId<'_>) -> Value {
+        json!({
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
-            "namespace": pvc_ns,
-            "name": pvc_name,
-            "uid": pvc.get("metadata").and_then(|m| m.get("uid")).cloned().unwrap_or(Value::Null),
-        });
+            "namespace": claim.namespace,
+            "name": claim.name,
+            "uid": claim.uid.as_str(),
+        })
+    }
+
+    /// Build the bound PV value: stamp `spec.claimRef` → the PVC +
+    /// `status.phase=Bound`.
+    fn bind_pv(mut pv: Value, claim: &ClaimId<'_>) -> Value {
+        let claim_ref = Self::claim_ref(claim);
         if let Some(spec) = pv.get_mut("spec").and_then(Value::as_object_mut) {
             spec.insert("claimRef".into(), claim_ref);
         } else if let Some(obj) = pv.as_object_mut() {
@@ -413,20 +504,18 @@ impl PvBinderController {
         pv
     }
 
-    /// Build a dynamically-provisioned local-path PV body for `pvc`. The PV is
-    /// named `pvc-<pvc-uid-or-ns-name>`; hostPath = `<root>/<ns>-<name>`;
-    /// capacity = the request; reclaimPolicy from the SC (default `Delete`);
-    /// accessModes copied from the PVC; storageClassName from the PVC's
-    /// effective class; claimRef pre-pointing at the PVC.
+    /// Build a dynamically-provisioned local-path PV body for `pvc`, named
+    /// `pv_name` and backed by `host_path` (both from [`PvName`]); capacity =
+    /// the request; reclaimPolicy from the SC (default `Delete`); accessModes
+    /// copied from the PVC; storageClassName from the PVC's effective class;
+    /// claimRef pre-pointing at the PVC.
     fn build_dynamic_pv(
-        &self,
         pvc: &Value,
-        pvc_ns: &str,
-        pvc_name: &str,
+        claim: &ClaimId<'_>,
+        pv_name: &str,
+        host_path: &str,
         sc: &Value,
-    ) -> (String, String, Value) {
-        let pv_name = format!("pvc-{pvc_ns}-{pvc_name}");
-        let host_path = format!("{}/{pvc_ns}-{pvc_name}", self.local_path_root);
+    ) -> Value {
         let capacity = pvc
             .get("spec")
             .and_then(|s| s.get("resources"))
@@ -448,14 +537,7 @@ impl PvBinderController {
             .and_then(|m| m.get("name"))
             .and_then(|n| n.as_str())
             .unwrap_or("");
-        let claim_ref = json!({
-            "apiVersion": "v1",
-            "kind": "PersistentVolumeClaim",
-            "namespace": pvc_ns,
-            "name": pvc_name,
-            "uid": pvc.get("metadata").and_then(|m| m.get("uid")).cloned().unwrap_or(Value::Null),
-        });
-        let pv = json!({
+        json!({
             "apiVersion": "v1",
             "kind": "PersistentVolume",
             "metadata": {
@@ -470,11 +552,10 @@ impl PvBinderController {
                 "persistentVolumeReclaimPolicy": reclaim,
                 "storageClassName": sc_name,
                 "hostPath": { "path": host_path },
-                "claimRef": claim_ref
+                "claimRef": Self::claim_ref(claim)
             },
             "status": { "phase": "Bound" }
-        });
-        (pv_name, host_path, pv)
+        })
     }
 
     /// The VolumeSnapshot name a PVC restores from, if any.
@@ -543,18 +624,21 @@ impl PvBinderController {
     /// does not exist if the driver call fails, and a pod that mounts it
     /// gets a mount error rather than a Pending claim.
     ///
-    /// The idempotency key is the PV NAME, derived from the claim, so a
-    /// retry after a transient failure returns the SAME volume instead of
-    /// provisioning a second disk nobody will ever delete.
+    /// The idempotency key is the PV NAME, derived from the claim's UID, so
+    /// a retry after a transient failure returns the SAME volume instead of
+    /// provisioning a second disk nobody will ever delete — and a claim
+    /// recreated under the same name is a different key, so a driver that
+    /// answers CreateVolume idempotently by name cannot hand it the deleted
+    /// claim's disk.
     async fn provision_csi(
         &self,
+        pvc_key: &ResourceKey,
         pvc: &Value,
-        pvc_ns: &str,
-        pvc_name: &str,
+        claim: &ClaimId<'_>,
+        pv_name: &str,
         sc: &Value,
         provisioner: &str,
-    ) -> Result<Effect, ControllerError> {
-        let pv_name = format!("pvc-{pvc_ns}-{pvc_name}");
+    ) -> Result<ObjectOutcome, ControllerError> {
         let requested = pvc
             .get("spec")
             .and_then(|s| s.get("resources"))
@@ -591,7 +675,7 @@ impl PvBinderController {
             .csi
             .create_volume(&CsiCreateRequest {
                 driver: provisioner.to_string(),
-                name: pv_name.clone(),
+                name: pv_name.to_string(),
                 capacity_bytes: requested,
                 parameters,
                 multi_node,
@@ -612,13 +696,6 @@ impl PvBinderController {
             .get("reclaimPolicy")
             .and_then(Value::as_str)
             .unwrap_or("Delete");
-        let claim_ref = json!({
-            "apiVersion": "v1",
-            "kind": "PersistentVolumeClaim",
-            "namespace": pvc_ns,
-            "name": pvc_name,
-            "uid": pvc.get("metadata").and_then(|m| m.get("uid")).cloned().unwrap_or(Value::Null),
-        });
         let attributes: serde_json::Map<String, Value> = created
             .volume_attributes
             .iter()
@@ -650,7 +727,7 @@ impl PvBinderController {
                     "volumeHandle": created.volume_handle,
                     "volumeAttributes": Value::Object(attributes),
                 },
-                "claimRef": claim_ref
+                "claimRef": Self::claim_ref(claim)
             },
             "status": { "phase": "Bound" }
         });
@@ -659,16 +736,53 @@ impl PvBinderController {
         // They used to be flattened to a String with the driver's refusal,
         // which made a store that could not commit look like one claim's
         // problem and let the sweep carry on writing into it.
-        let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
-        let volume = self.put(pv_key, pv).await?;
+        self.create_and_bind(pvc_key, pvc, pv_name, pv).await
+    }
 
-        let mut bound_pvc = pvc.clone();
-        if let Some(spec) = bound_pvc.get_mut("spec").and_then(Value::as_object_mut) {
-            spec.insert("volumeName".into(), json!(pv_name));
-        }
-        set_phase(&mut bound_pvc, "Bound");
-        let pvc_key = ResourceKey::namespaced("", "v1", "PersistentVolumeClaim", pvc_ns, pvc_name);
-        Ok(volume.and(self.put(pvc_key, bound_pvc).await?))
+    /// Write a freshly provisioned PV only if nothing holds its name, then
+    /// bind the claim to it.
+    ///
+    /// ★ CREATE-IF-ABSENT, NEVER PUT. The PV is written by a transaction
+    /// whose one compare is "this key does not exist" — the compare
+    /// kube-apiserver uses for every create — with an empty failure branch.
+    /// An unconditional Put here is how a recreated claim used to take over
+    /// the deleted claim's PV: same name, overwritten claimRef, same
+    /// directory underneath. A PV that already holds the name is left as it
+    /// is, and the claim is not bound this pass; a PV that is this claim's
+    /// is found on the next pass through its `claimRef` uid.
+    async fn create_and_bind(
+        &self,
+        pvc_key: &ResourceKey,
+        pvc: &Value,
+        pv_name: &str,
+        pv: Value,
+    ) -> Result<ObjectOutcome, ControllerError> {
+        let volume_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", pv_name);
+        let applied = self
+            .store
+            .propose(ResourceCommand::Txn {
+                compares: vec![TxnCompare::NotExists {
+                    key: volume_key.clone(),
+                }],
+                success: vec![TxnOp::Put {
+                    key: volume_key,
+                    value: pv,
+                }],
+                failure: Vec::new(),
+                reason: Reason::Controller,
+            })
+            .await?;
+        let volume = match Effect::of(applied.op) {
+            written @ Effect::Written(_) => written,
+            // The failure branch is empty, so a transaction that changed
+            // nothing took it: the key was already there.
+            Effect::Unchanged => return Ok(ObjectOutcome::skipped_because(PV_NAME_TAKEN)),
+            refused @ Effect::Rejected(_) => return Ok(ObjectOutcome::from(refused)),
+        };
+        let claim = self
+            .put(pvc_key.clone(), Self::bind_pvc(pvc.clone(), pv_name))
+            .await?;
+        Ok(ObjectOutcome::from(volume.and(claim)))
     }
 
     /// Write a Put for a resource value (Controller reason), and say what
@@ -716,6 +830,40 @@ fn sc_is_local_path(sc: &Value) -> bool {
 }
 
 impl PvBinderController {
+    /// The existing PV `pvc` binds to, if any. Candidates are the PVs not
+    /// already claimed this tick; a pre-bound claim (`spec.volumeName`)
+    /// narrows them to exactly that PV.
+    ///
+    /// First a PV whose claimRef carries this claim's uid, whatever its
+    /// phase: it is already this claim's volume — a provision whose PV write
+    /// landed and whose claim write did not, or an operator pre-bind by uid
+    /// (upstream's `IsVolumeBoundToClaim` arm). Then any Available PV that
+    /// matches.
+    fn static_candidate<'v>(
+        pvs: &'v [(ResourceKey, Value)],
+        pvc: &Value,
+        claim: &ClaimId<'_>,
+        pre_bound: Option<&str>,
+        claimed_this_tick: &[String],
+    ) -> Option<&'v (ResourceKey, Value)> {
+        let eligible = |key: &ResourceKey| {
+            !claimed_this_tick.contains(&key.name) && pre_bound.is_none_or(|n| key.name == n)
+        };
+        pvs.iter()
+            .find(|(key, pv)| {
+                eligible(key)
+                    && Self::claim_ref_to(pv, claim) == ClaimRefTo::ThisClaim
+                    && Self::holds_request(pv, pvc)
+            })
+            .or_else(|| {
+                pvs.iter().find(|(key, pv)| {
+                    eligible(key)
+                        && Self::pv_phase(pv) == "Available"
+                        && Self::pv_matches_pvc(pv, pvc, claim)
+                })
+            })
+    }
+
     /// Reconcile ONE claim. `?` in here leaves this claim only; whether the
     /// error then ends the sweep is decided by its scope in
     /// [`ObjectOutcome::settle`], never here.
@@ -741,34 +889,31 @@ impl PvBinderController {
         let pvc_ns = pvc_key.namespace.as_deref().unwrap_or("default");
         let pvc_name = &pvc_key.name;
 
-        // 1. STATIC BIND. Candidate set: every Available PV not already
-        //    claimed this tick. A pre-bound PVC (spec.volumeName) narrows
-        //    to exactly that PV.
-        let pre_bound = Self::pre_bound_volume(pvc);
-        let candidate = view.pvs.iter().find(|(pv_key, pv)| {
-            if claimed_this_tick.contains(&pv_key.name) {
-                return false;
-            }
-            if Self::pv_phase(pv) != "Available" {
-                return false;
-            }
-            // Pre-bind: the candidate MUST be the named PV.
-            if let Some(name) = pre_bound {
-                if pv_key.name != name {
-                    return false;
-                }
-            }
-            Self::pv_matches_pvc(pv, pvc, pvc_ns, pvc_name)
-        });
+        // 0. IDENTITY. Every volume this claim is given — found or made —
+        //    is tied to it by uid, so a claim with no usable uid has nothing
+        //    to be matched by and stays Pending, saying why.
+        let uid = match ClaimUid::of(pvc) {
+            Ok(uid) => uid,
+            Err(gap) => return Ok(ObjectOutcome::skipped_because(gap.note())),
+        };
+        let claim = ClaimId {
+            namespace: pvc_ns,
+            name: pvc_name,
+            uid: &uid,
+        };
 
+        // 1. STATIC BIND.
+        let pre_bound = Self::pre_bound_volume(pvc);
+        let candidate =
+            Self::static_candidate(&view.pvs, pvc, &claim, pre_bound, &claimed_this_tick);
         if let Some((pv_key, pv)) = candidate {
-            let pv_name = pv_key.name.clone();
-            let bound_pvc = Self::bind_pvc(pvc.clone(), &pv_name);
-            let bound_pv = Self::bind_pv(pv.clone(), pvc, pvc_ns, pvc_name);
+            let volume_name = pv_key.name.clone();
+            let bound_pvc = Self::bind_pvc(pvc.clone(), &volume_name);
+            let bound_pv = Self::bind_pv(pv.clone(), &claim);
             let claim = self.put(pvc_key.clone(), bound_pvc).await?;
             let volume = self.put(pv_key.clone(), bound_pv).await?;
-            debug!(pvc = %pvc_key.label(), pv = %pv_name, "bound PVC to existing PV");
-            claimed_this_tick.push(pv_name);
+            debug!(pvc = %pvc_key.label(), pv = %volume_name, "bound PVC to existing PV");
+            claimed_this_tick.push(volume_name);
             return Ok(ObjectOutcome::from(claim.and(volume)));
         }
 
@@ -783,6 +928,13 @@ impl PvBinderController {
             // No class + no default SC → stay Pending (no provisioner).
             return Ok(ObjectOutcome::SKIPPED);
         };
+        // The name this claim's volume gets, from its uid. If a PV already
+        // holds it and was not bound to this claim above, it is not this
+        // claim's to take: nothing is created over it, and nothing is
+        // provisioned into what may be its directory.
+        let volume = PvName::for_claim(&uid);
+        let name_taken = view.pvs.iter().any(|(k, _)| volume.names(&k.name));
+        let volume_name = volume.to_string();
         if !sc_is_local_path(sc) {
             // 2b. CSI DYNAMIC PROVISION. The class names some other
             // provisioner; if a registered CSI driver answers to that
@@ -801,10 +953,14 @@ impl PvBinderController {
             if Self::is_wait_for_first_consumer(Some(sc)) {
                 return Ok(ObjectOutcome::SKIPPED);
             }
-            return Ok(ObjectOutcome::from(
-                self.provision_csi(pvc, pvc_ns, pvc_name, sc, provisioner)
-                    .await?,
-            ));
+            // Before the driver is asked: a CreateVolume idempotent by name
+            // would hand back whatever volume holds it.
+            if name_taken {
+                return Ok(ObjectOutcome::skipped_because(PV_NAME_TAKEN));
+            }
+            return self
+                .provision_csi(pvc_key, pvc, &claim, &volume_name, sc, provisioner)
+                .await;
         }
         if Self::is_wait_for_first_consumer(Some(sc)) {
             // WaitForFirstConsumer: leave Pending until a Pod references the
@@ -823,7 +979,15 @@ impl PvBinderController {
                 UNUSABLE_REQUEST.to_string(),
             ));
         }
-        let (pv_name, host_path, dyn_pv) = self.build_dynamic_pv(pvc, pvc_ns, pvc_name, sc);
+        let host_path = match volume.local_path_dir(&self.local_path_root, pvc_ns, pvc_name) {
+            Ok(dir) => dir.to_string(),
+            Err(gap) => return Ok(ObjectOutcome::skipped_because(gap.note())),
+        };
+        // Before any host effect: the directory is named by the same uid,
+        // so a PV holding the name may be using it.
+        if name_taken {
+            return Ok(ObjectOutcome::skipped_because(PV_NAME_TAKEN));
+        }
         // The ONE host effect — create the backing dir before the PV is
         // visible so the kubelet can bind-mount it. A failure is this
         // claim's alone: the claims after it in the list still bind.
@@ -854,14 +1018,13 @@ impl PvBinderController {
                 .map_err(|e| ControllerError::Internal(["restore from snapshot: ", &e].concat()))?;
             debug!(pvc = %pvc_key.label(), snapshot = %snap_name, "restored PV data from snapshot");
         }
-        let pv_key = ResourceKey::cluster_scoped("", "v1", "PersistentVolume", &pv_name);
-        let volume = self.put(pv_key, dyn_pv).await?;
-        // Bind the PVC to the freshly-provisioned PV.
-        let bound_pvc = Self::bind_pvc(pvc.clone(), &pv_name);
-        let claim = self.put(pvc_key.clone(), bound_pvc).await?;
-        debug!(pvc = %pvc_key.label(), pv = %pv_name, "dynamically provisioned + bound local-path PV");
-        claimed_this_tick.push(pv_name);
-        Ok(ObjectOutcome::from(volume.and(claim)))
+        let dyn_pv = Self::build_dynamic_pv(pvc, &claim, &volume_name, &host_path, sc);
+        let outcome = self
+            .create_and_bind(pvc_key, pvc, &volume_name, dyn_pv)
+            .await?;
+        debug!(pvc = %pvc_key.label(), pv = %volume_name, ?outcome, "local-path provision");
+        claimed_this_tick.push(volume_name);
+        Ok(outcome)
     }
 }
 
@@ -1005,6 +1168,20 @@ mod tests {
         ResourceKey::cluster_scoped("storage.k8s.io", "v1", "StorageClass", name)
     }
 
+    fn uid(s: &str) -> ClaimUid {
+        ClaimUid::of(&json!({"metadata": {"uid": s}})).unwrap()
+    }
+
+    /// The claim `ns/c` with uid `u-c`, as the pure predicates see it.
+    fn with_claim<R>(f: impl FnOnce(&ClaimId<'_>) -> R) -> R {
+        let u = uid("u-c");
+        f(&ClaimId {
+            namespace: "ns",
+            name: "c",
+            uid: &u,
+        })
+    }
+
     fn binder(store: Arc<StoreMesh>) -> PvBinderController {
         PvBinderController::with_env(
             store,
@@ -1024,8 +1201,10 @@ mod tests {
                                   "accessModes": ["ReadWriteOnce"]}});
         let small = json!({"spec": {"capacity": {"storage": "512Mi"},
                                     "accessModes": ["ReadWriteOnce"]}});
-        assert!(PvBinderController::pv_matches_pvc(&big, &pvc, "ns", "c"));
-        assert!(!PvBinderController::pv_matches_pvc(&small, &pvc, "ns", "c"));
+        with_claim(|c| {
+            assert!(PvBinderController::pv_matches_pvc(&big, &pvc, c));
+            assert!(!PvBinderController::pv_matches_pvc(&small, &pvc, c));
+        });
     }
 
     #[test]
@@ -1035,10 +1214,12 @@ mod tests {
         // PV offers only RWO → cannot satisfy a RWX request.
         let rwo = json!({"spec": {"capacity": {"storage": "1Gi"},
                                   "accessModes": ["ReadWriteOnce"]}});
-        assert!(!PvBinderController::pv_matches_pvc(&rwo, &pvc, "ns", "c"));
         let rwx = json!({"spec": {"capacity": {"storage": "1Gi"},
                                   "accessModes": ["ReadWriteOnce", "ReadWriteMany"]}});
-        assert!(PvBinderController::pv_matches_pvc(&rwx, &pvc, "ns", "c"));
+        with_claim(|c| {
+            assert!(!PvBinderController::pv_matches_pvc(&rwo, &pvc, c));
+            assert!(PvBinderController::pv_matches_pvc(&rwx, &pvc, c));
+        });
     }
 
     #[test]
@@ -1064,11 +1245,55 @@ mod tests {
         let pvc = json!({"spec": {"resources": {"requests": {"storage": "1Gi"}}}});
         let pv = json!({"spec": {"capacity": {"storage": "1Gi"},
                                  "claimRef": {"namespace": "other", "name": "x"}}});
-        assert!(!PvBinderController::pv_matches_pvc(&pv, &pvc, "ns", "c"));
         // claimRef to THIS pvc is fine.
         let pv2 = json!({"spec": {"capacity": {"storage": "1Gi"},
                                   "claimRef": {"namespace": "ns", "name": "c"}}});
-        assert!(PvBinderController::pv_matches_pvc(&pv2, &pvc, "ns", "c"));
+        with_claim(|c| {
+            assert!(!PvBinderController::pv_matches_pvc(&pv, &pvc, c));
+            assert!(PvBinderController::pv_matches_pvc(&pv2, &pvc, c));
+        });
+    }
+
+    /// A claimRef naming this namespace and name but ANOTHER uid is an
+    /// earlier claim of the same name: never compatible. With this claim's
+    /// uid, or with none (a reservation by name), it is.
+    #[test]
+    fn a_claim_ref_uid_tells_two_claims_of_one_name_apart() {
+        let pvc = json!({"spec": {"resources": {"requests": {"storage": "1Gi"}}}});
+        let reserved = |uid: Value| {
+            json!({"spec": {"capacity": {"storage": "1Gi"},
+                            "claimRef": {"namespace": "ns", "name": "c", "uid": uid}}})
+        };
+        with_claim(|c| {
+            let earlier = reserved(json!("u-earlier"));
+            assert_eq!(
+                PvBinderController::claim_ref_to(&earlier, c),
+                ClaimRefTo::Other
+            );
+            assert!(!PvBinderController::pv_claimref_compatible(&earlier, c));
+            assert!(!PvBinderController::pv_matches_pvc(&earlier, &pvc, c));
+
+            let this = reserved(json!("u-c"));
+            assert_eq!(
+                PvBinderController::claim_ref_to(&this, c),
+                ClaimRefTo::ThisClaim
+            );
+            assert!(PvBinderController::pv_matches_pvc(&this, &pvc, c));
+
+            for by_name in [reserved(Value::Null), reserved(json!(""))] {
+                assert_eq!(
+                    PvBinderController::claim_ref_to(&by_name, c),
+                    ClaimRefTo::ThisName
+                );
+                assert!(PvBinderController::pv_matches_pvc(&by_name, &pvc, c));
+            }
+            // A uid that is not a string cannot be checked, so it is not
+            // this claim's.
+            assert_eq!(
+                PvBinderController::claim_ref_to(&reserved(json!(7)), c),
+                ClaimRefTo::Other
+            );
+        });
     }
 
     // ── live-store binding tests ─────────────────────────────────────
@@ -1205,13 +1430,18 @@ mod tests {
         let pv = store.get(&pv_key(&pv_name)).await.unwrap();
         assert_eq!(pv["status"]["phase"], "Bound");
         assert_eq!(pv["spec"]["capacity"]["storage"], "2Gi");
-        assert_eq!(pv["spec"]["hostPath"]["path"], "/data/local-path/ns1-dyn");
+        assert_eq!(pv_name, "pvc-dyn-uid", "the PV is named by the claim's uid");
+        assert_eq!(
+            pv["spec"]["hostPath"]["path"],
+            "/data/local-path/pvc-dyn-uid_ns1_dyn"
+        );
         assert_eq!(pv["spec"]["claimRef"]["name"], "dyn");
+        assert_eq!(pv["spec"]["claimRef"]["uid"], "dyn-uid");
         assert_eq!(pv["spec"]["persistentVolumeReclaimPolicy"], "Delete");
         // The host effect: the backing dir was ensured.
         assert_eq!(
             env.ensured_dirs(),
-            vec!["/data/local-path/ns1-dyn".to_string()]
+            vec!["/data/local-path/pvc-dyn-uid_ns1_dyn".to_string()]
         );
     }
 
@@ -1404,11 +1634,17 @@ mod tests {
     }
 
     async fn put_claim(store: &StoreMesh, name: &str, spec: Value) {
+        put_claim_as(store, name, json!(["uid-", name].concat()), spec).await;
+    }
+
+    /// A claim `ns1/<name>` carrying exactly `uid` (which may be null or
+    /// malformed — the store keeps whatever the body says).
+    async fn put_claim_as(store: &StoreMesh, name: &str, uid: Value, spec: Value) {
         put_op(
             store,
             pvc_key("ns1", name),
             json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
-                   "metadata": {"name": name, "namespace": "ns1", "uid": (["uid-", name].concat())},
+                   "metadata": {"name": name, "namespace": "ns1", "uid": uid},
                    "spec": spec}),
         )
         .await;
@@ -1443,7 +1679,7 @@ mod tests {
             None,
             "/data/local-path",
             Arc::new(PoisonedEnv {
-                poisoned_dir: "ns1-aaa-poisoned",
+                poisoned_dir: "_ns1_aaa-poisoned",
             }),
         );
         let outcome = c
@@ -1456,7 +1692,7 @@ mod tests {
         }
         assert_ne!(phase(&store, "aaa-poisoned").await, "Bound");
         assert!(
-            store.get(&pv_key("pvc-ns1-aaa-poisoned")).await.is_none(),
+            store.get(&pv_key("pvc-uid-aaa-poisoned")).await.is_none(),
             "no PV is written for a claim whose directory does not exist"
         );
         let sweep = outcome.sweep.expect("the binder reports through its sweep");
@@ -1509,7 +1745,7 @@ mod tests {
             None,
             "/data/local-path",
             Arc::new(PoisonedEnv {
-                poisoned_dir: "ns1-poisoned",
+                poisoned_dir: "_ns1_poisoned",
             }),
         );
         let outcome = c.tick().await.unwrap();
@@ -1552,7 +1788,7 @@ mod tests {
         assert_eq!(phase(&store, "sized").await, "Bound");
         assert_ne!(phase(&store, "sizeless").await, "Bound");
         assert!(
-            store.get(&pv_key("pvc-ns1-sizeless")).await.is_none(),
+            store.get(&pv_key("pvc-uid-sizeless")).await.is_none(),
             "no PV with a null or unparseable capacity"
         );
         let recorded = events.drain();
@@ -1569,6 +1805,393 @@ mod tests {
         assert_eq!(e.component, "persistentvolume-controller");
         // Declarative: no targeted retry; the Event is the answer.
         assert_eq!(outcome.result, crate::ReconcileResult::Done);
+    }
+
+    // ── identity is the claim's uid (T1.4) ───────────────────────────
+
+    async fn delete_claim(store: &StoreMesh, name: &str) {
+        store
+            .propose(ResourceCommand::delete(
+                pvc_key("ns1", name),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+        assert!(store.get(&pvc_key("ns1", name)).await.is_none());
+    }
+
+    /// ★ THE DEFECT. A claim is provisioned, deleted, and created again
+    /// under the same namespace and name. Its PV is not reclaimed (nothing
+    /// reclaims yet), so it is still in the store. The new claim is a new
+    /// object with a new uid, and must get a new volume: on HEAD it was
+    /// handed the same `pvc-<ns>-<name>` PV, re-Put over itself, and the
+    /// same directory with the deleted claim's data in it.
+    #[tokio::test]
+    async fn a_recreated_claim_does_not_inherit_the_deleted_claims_volume() {
+        let store = live_store().await;
+        default_local_path_class(&store).await;
+        let env = Arc::new(FakeProvisionerEnv::new());
+        let c = PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone());
+
+        put_claim_as(&store, "data", json!("uid-first"), sized()).await;
+        c.tick().await.unwrap();
+        let first = store.get(&pvc_key("ns1", "data")).await.unwrap();
+        assert_eq!(first["status"]["phase"], "Bound");
+        let first_pv_name = first["spec"]["volumeName"].as_str().unwrap().to_string();
+        let first_pv = store.get(&pv_key(&first_pv_name)).await.unwrap();
+
+        delete_claim(&store, "data").await;
+        put_claim_as(&store, "data", json!("uid-second"), sized()).await;
+        c.tick().await.unwrap();
+
+        let second = store.get(&pvc_key("ns1", "data")).await.unwrap();
+        assert_eq!(second["metadata"]["uid"], "uid-second", "a new incarnation");
+        assert_eq!(second["status"]["phase"], "Bound");
+        let second_pv_name = second["spec"]["volumeName"].as_str().unwrap();
+        assert_ne!(
+            second_pv_name, first_pv_name,
+            "the recreated claim must not bind the deleted claim's PV"
+        );
+        let second_pv = store.get(&pv_key(second_pv_name)).await.unwrap();
+        assert_ne!(
+            second_pv["spec"]["hostPath"]["path"], first_pv["spec"]["hostPath"]["path"],
+            "the recreated claim must not mount the deleted claim's directory"
+        );
+        assert_eq!(second_pv["spec"]["claimRef"]["uid"], "uid-second");
+        assert_eq!(
+            store.get(&pv_key(&first_pv_name)).await.unwrap(),
+            first_pv,
+            "the deleted claim's PV is left exactly as it was"
+        );
+        let dirs = env.ensured_dirs();
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        assert_ne!(dirs[0], dirs[1], "two claims, two directories");
+    }
+
+    /// An Available PV whose claimRef names this namespace and name but an
+    /// EARLIER uid is the earlier claim's (upstream would call it Released).
+    /// A new claim of the same name must not bind it — on HEAD the claimRef
+    /// was compared by namespace and name only.
+    #[tokio::test]
+    async fn a_pv_reserved_for_an_earlier_claim_of_the_same_name_is_not_bound() {
+        let store = live_store().await;
+        put_op(
+            &store,
+            pv_key("vol-old"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "vol-old"},
+                   "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                            "storageClassName": "manual",
+                            "claimRef": {"namespace": "ns1", "name": "data", "uid": "uid-old"}},
+                   "status": {"phase": "Available"}}),
+        )
+        .await;
+        put_claim_as(
+            &store,
+            "data",
+            json!("uid-new"),
+            json!({"accessModes": ["ReadWriteOnce"], "storageClassName": "manual",
+                   "resources": {"requests": {"storage": "1Gi"}}}),
+        )
+        .await;
+
+        binder(store.clone()).tick().await.unwrap();
+
+        assert_ne!(phase(&store, "data").await, "Bound");
+        let pv = store.get(&pv_key("vol-old")).await.unwrap();
+        assert_eq!(pv["status"]["phase"], "Available");
+        assert_eq!(pv["spec"]["claimRef"]["uid"], "uid-old");
+    }
+
+    /// A PV reserved by namespace and name alone — no uid, the way an
+    /// operator pre-binds one — still binds, and the bind records the uid.
+    #[tokio::test]
+    async fn a_pv_reserved_by_name_alone_binds_and_records_the_uid() {
+        let store = live_store().await;
+        put_op(
+            &store,
+            pv_key("vol-reserved"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "vol-reserved"},
+                   "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                            "storageClassName": "manual",
+                            "claimRef": {"namespace": "ns1", "name": "data"}},
+                   "status": {"phase": "Available"}}),
+        )
+        .await;
+        put_claim_as(
+            &store,
+            "data",
+            json!("uid-data"),
+            json!({"accessModes": ["ReadWriteOnce"], "storageClassName": "manual",
+                   "resources": {"requests": {"storage": "1Gi"}}}),
+        )
+        .await;
+
+        binder(store.clone()).tick().await.unwrap();
+
+        assert_eq!(phase(&store, "data").await, "Bound");
+        let pv = store.get(&pv_key("vol-reserved")).await.unwrap();
+        assert_eq!(pv["status"]["phase"], "Bound");
+        assert_eq!(pv["spec"]["claimRef"]["uid"], "uid-data");
+    }
+
+    /// A claim whose uid is missing, or cannot name a volume or a directory,
+    /// stays Pending: no PV, no directory, and the sweep's note says which.
+    #[tokio::test]
+    async fn a_claim_with_no_usable_uid_stays_pending_with_a_typed_reason() {
+        for (uid, gap) in [
+            (Value::Null, NoVolumeIdentity::UidAbsent),
+            (json!("../../escape"), NoVolumeIdentity::UidMalformed),
+            (json!(12), NoVolumeIdentity::UidMalformed),
+        ] {
+            let store = live_store().await;
+            default_local_path_class(&store).await;
+            put_claim_as(&store, "data", uid.clone(), sized()).await;
+            let env = Arc::new(FakeProvisionerEnv::new());
+            let c =
+                PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone());
+
+            let outcome = c.tick().await.unwrap();
+
+            assert_ne!(phase(&store, "data").await, "Bound", "{uid}");
+            assert!(
+                store
+                    .list("", "v1", "PersistentVolume", None)
+                    .await
+                    .is_empty(),
+                "no PV for a claim with uid {uid}"
+            );
+            assert!(env.ensured_dirs().is_empty(), "no directory for uid {uid}");
+            let sweep = outcome.sweep.unwrap();
+            assert_eq!((sweep.skipped(), sweep.failed()), (1, 0), "{uid}");
+            assert_eq!(sweep.note(), Some(gap.note()), "{uid}");
+        }
+    }
+
+    /// A provision whose PV write landed and whose claim write did not
+    /// leaves a PV bound to the claim by uid and the claim Pending. The next
+    /// pass binds the claim to THAT PV — it does not provision a second one
+    /// or touch the directory again. The same holds for a PV provisioned
+    /// under the old `pvc-<ns>-<name>` scheme: existing PVs keep their names.
+    #[tokio::test]
+    async fn a_pv_already_bound_to_the_claim_by_uid_is_found_not_reprovisioned() {
+        let store = live_store().await;
+        default_local_path_class(&store).await;
+        for (claim, pv_name) in [("data", "pvc-uid-data"), ("legacy", "pvc-ns1-legacy")] {
+            put_claim(&store, claim, sized()).await;
+            put_op(
+                &store,
+                pv_key(pv_name),
+                json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                       "metadata": {"name": pv_name},
+                       "spec": {"capacity": {"storage": "1Gi"},
+                                "accessModes": ["ReadWriteOnce"],
+                                "storageClassName": "local-path",
+                                "hostPath": {"path": (["/data/local-path/", claim].concat())},
+                                "claimRef": {"namespace": "ns1", "name": claim,
+                                             "uid": (["uid-", claim].concat())}},
+                       "status": {"phase": "Bound"}}),
+            )
+            .await;
+        }
+        let env = Arc::new(FakeProvisionerEnv::new());
+        let c = PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone());
+
+        c.tick().await.unwrap();
+
+        for (claim, pv_name) in [("data", "pvc-uid-data"), ("legacy", "pvc-ns1-legacy")] {
+            let pvc = store.get(&pvc_key("ns1", claim)).await.unwrap();
+            assert_eq!(pvc["status"]["phase"], "Bound", "{claim}");
+            assert_eq!(pvc["spec"]["volumeName"], pv_name, "{claim}");
+        }
+        assert_eq!(
+            store.list("", "v1", "PersistentVolume", None).await.len(),
+            2,
+            "no second PV was provisioned"
+        );
+        assert!(
+            env.ensured_dirs().is_empty(),
+            "no directory was provisioned again: {:?}",
+            env.ensured_dirs()
+        );
+    }
+
+    /// A PV that already holds the name derived from this claim's uid but is
+    /// bound to some other claim is never overwritten, and nothing is
+    /// provisioned into what may be its directory.
+    #[tokio::test]
+    async fn a_pv_holding_the_derived_name_for_another_claim_is_left_alone() {
+        let store = live_store().await;
+        default_local_path_class(&store).await;
+        let foreign = json!({"apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": "pvc-uid-data"},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"],
+                     "storageClassName": "local-path",
+                     "hostPath": {"path": "/foreign"},
+                     "claimRef": {"namespace": "ns1", "name": "other", "uid": "uid-other"}},
+            "status": {"phase": "Bound"}});
+        put_op(&store, pv_key("pvc-uid-data"), foreign).await;
+        let before = store.get(&pv_key("pvc-uid-data")).await.unwrap();
+        put_claim(&store, "data", sized()).await;
+        let env = Arc::new(FakeProvisionerEnv::new());
+        let c = PvBinderController::with_env(store.clone(), None, "/data/local-path", env.clone());
+
+        let outcome = c.tick().await.unwrap();
+
+        assert_ne!(phase(&store, "data").await, "Bound");
+        assert_eq!(store.get(&pv_key("pvc-uid-data")).await.unwrap(), before);
+        assert!(env.ensured_dirs().is_empty(), "{:?}", env.ensured_dirs());
+        assert_eq!(outcome.sweep.unwrap().note(), Some(PV_NAME_TAKEN));
+    }
+
+    /// The PV write itself is create-if-absent: a second create of the same
+    /// name — a writer that raced this one between list and write — neither
+    /// overwrites the PV nor binds the claim.
+    #[tokio::test]
+    async fn the_pv_write_is_create_if_absent() {
+        let store = live_store().await;
+        put_claim(&store, "data", sized()).await;
+        let pvc = store.get(&pvc_key("ns1", "data")).await.unwrap();
+        let c = binder(store.clone());
+        let pv = |path: &str| {
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "pvc-uid-data"},
+                   "spec": {"hostPath": {"path": path}}})
+        };
+
+        let created = c
+            .create_and_bind(&pvc_key("ns1", "data"), &pvc, "pvc-uid-data", pv("/first"))
+            .await
+            .unwrap();
+        assert!(matches!(created, ObjectOutcome::Changed(_)), "{created:?}");
+        let written = store.get(&pv_key("pvc-uid-data")).await.unwrap();
+
+        // Unbind the claim, so only the create can say whether it binds.
+        put_claim(&store, "data", sized()).await;
+        let again = c
+            .create_and_bind(&pvc_key("ns1", "data"), &pvc, "pvc-uid-data", pv("/second"))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                again,
+                ObjectOutcome::Skipped {
+                    note: Some(PV_NAME_TAKEN)
+                }
+            ),
+            "{again:?}"
+        );
+        assert_eq!(
+            store.get(&pv_key("pvc-uid-data")).await.unwrap(),
+            written,
+            "the existing PV is not overwritten"
+        );
+        assert_ne!(phase(&store, "data").await, "Bound");
+    }
+
+    /// A CSI driver that records every name it is asked to create under.
+    #[derive(Default)]
+    struct RecordingDriver {
+        names: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CsiProvisioner for RecordingDriver {
+        async fn can_provision(&self, _driver: &str) -> bool {
+            true
+        }
+        async fn create_volume(
+            &self,
+            req: &CsiCreateRequest,
+        ) -> Result<crate::csi_provisioner::CsiCreatedVolume, String> {
+            self.names.lock().unwrap().push(req.name.clone());
+            Ok(crate::csi_provisioner::CsiCreatedVolume {
+                volume_handle: ["vol-", &req.name].concat(),
+                capacity_bytes: req.capacity_bytes,
+                volume_attributes: std::collections::BTreeMap::new(),
+            })
+        }
+        async fn delete_volume(&self, _driver: &str, _handle: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    async fn csi_class(store: &StoreMesh) {
+        put_op(
+            store,
+            sc_key("csi-sc"),
+            json!({"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
+                   "metadata": {"name": "csi-sc"}, "provisioner": "csi.example.com"}),
+        )
+        .await;
+    }
+
+    fn csi_claim_spec() -> Value {
+        json!({"accessModes": ["ReadWriteOnce"], "storageClassName": "csi-sc",
+               "resources": {"requests": {"storage": "1Gi"}}})
+    }
+
+    /// A PV holding the name derived from a CSI claim's uid, bound to some
+    /// other claim: the driver is never asked, because a `CreateVolume`
+    /// idempotent by name would answer with whatever volume holds it.
+    #[tokio::test]
+    async fn a_csi_claim_whose_name_is_taken_never_reaches_the_driver() {
+        let store = live_store().await;
+        csi_class(&store).await;
+        put_op(
+            &store,
+            pv_key("pvc-uid-db"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "pvc-uid-db"},
+                   "spec": {"capacity": {"storage": "1Gi"},
+                            "csi": {"driver": "csi.example.com", "volumeHandle": "theirs"},
+                            "claimRef": {"namespace": "ns1", "name": "other", "uid": "uid-other"}},
+                   "status": {"phase": "Bound"}}),
+        )
+        .await;
+        put_claim(&store, "db", csi_claim_spec()).await;
+        let driver = Arc::new(RecordingDriver::default());
+
+        let outcome = binder(store.clone())
+            .with_csi(driver.clone())
+            .tick()
+            .await
+            .unwrap();
+
+        assert!(driver.names.lock().unwrap().is_empty());
+        assert_ne!(phase(&store, "db").await, "Bound");
+        assert_eq!(outcome.sweep.unwrap().note(), Some(PV_NAME_TAKEN));
+    }
+
+    /// A CSI driver keys `CreateVolume` idempotency on the name it is given.
+    /// A recreated claim must ask under a new name, or the driver hands it
+    /// the deleted claim's disk.
+    #[tokio::test]
+    async fn a_recreated_csi_claim_asks_the_driver_for_a_new_volume() {
+        let store = live_store().await;
+        csi_class(&store).await;
+        let csi_claim = csi_claim_spec();
+        let driver = Arc::new(RecordingDriver::default());
+        let c = binder(store.clone()).with_csi(driver.clone());
+
+        put_claim_as(&store, "db", json!("uid-db-1"), csi_claim.clone()).await;
+        c.tick().await.unwrap();
+        delete_claim(&store, "db").await;
+        put_claim_as(&store, "db", json!("uid-db-2"), csi_claim).await;
+        c.tick().await.unwrap();
+
+        assert_eq!(
+            *driver.names.lock().unwrap(),
+            vec!["pvc-uid-db-1".to_string(), "pvc-uid-db-2".to_string()]
+        );
+        let pvc = store.get(&pvc_key("ns1", "db")).await.unwrap();
+        assert_eq!(pvc["status"]["phase"], "Bound");
+        assert_eq!(pvc["spec"]["volumeName"], "pvc-uid-db-2");
+        let pv = store.get(&pv_key("pvc-uid-db-2")).await.unwrap();
+        assert_eq!(pv["spec"]["csi"]["volumeHandle"], "vol-pvc-uid-db-2");
+        assert_eq!(pv["spec"]["claimRef"]["uid"], "uid-db-2");
     }
 }
 

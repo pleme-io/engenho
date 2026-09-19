@@ -163,8 +163,8 @@ pub use plantio_pipeline::{
 };
 pub use pod_template::{NormalizedTemplate, POD_TEMPLATE_HASH_LABEL, TemplateHash};
 pub use pv_binder::{
-    ENGENHO_LOCAL_PATH_PROVISIONER, FakeProvisionerEnv, HostProvisionerEnv, LOCAL_PATH_PROVISIONER,
-    ProvisionerEnv, PvBinderController,
+    ClaimUid, ENGENHO_LOCAL_PATH_PROVISIONER, FakeProvisionerEnv, HostProvisionerEnv,
+    LOCAL_PATH_PROVISIONER, NoVolumeIdentity, ProvisionerEnv, PvBinderController, PvName,
 };
 pub use replicaset::ReplicaSetController;
 pub use roceiro::{FakeRoceiro, Roceiro, RoceiroError};
