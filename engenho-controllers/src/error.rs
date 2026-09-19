@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn store_errors_and_panics_stop_a_sweep_and_nothing_else_does() {
         let rows = every_scope();
-        assert_eq!(rows.len(), 8, "one row per variant");
+        assert_eq!(rows.len(), 9, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.scope(), want, "{e:?}");
         }
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn every_error_variant_maps_to_its_retry_class() {
         let rows = every_variant();
-        assert_eq!(rows.len(), 8, "one row per variant");
+        assert_eq!(rows.len(), 9, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.classify(), want, "{e:?}");
         }
