@@ -229,8 +229,13 @@ async fn an_absent_count_is_the_api_default_of_one() {
 }
 
 /// An owned ReplicaSet of `deployment_uid` that is NOT the current
-/// template's, carrying `replicas` (or no count).
+/// template's, carrying `replicas` (or no count). Its template is an older
+/// revision's: since T4.10 a ReplicaSet is matched by its template, not by
+/// its `pod-template-hash` label, so a stale label alone no longer makes it
+/// stale.
 fn stale_rs(name: &str, deployment_uid: &str, replicas: Option<Value>) -> Value {
+    let mut older_revision = template("web");
+    older_revision["spec"]["containers"][0]["image"] = json!("podinfo:5");
     let mut rs = json!({
         "kind": "ReplicaSet",
         "apiVersion": "apps/v1",
@@ -243,7 +248,7 @@ fn stale_rs(name: &str, deployment_uid: &str, replicas: Option<Value>) -> Value 
                 "uid": deployment_uid, "controller": true, "blockOwnerDeletion": true
             }]
         },
-        "spec": { "selector": { "matchLabels": { "app": "web" } }, "template": template("web") }
+        "spec": { "selector": { "matchLabels": { "app": "web" } }, "template": older_revision }
     });
     if let Some(replicas) = replicas {
         rs["spec"]["replicas"] = replicas;

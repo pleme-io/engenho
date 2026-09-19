@@ -3,17 +3,21 @@
 //!
 //! K8s rule:
 //!   * each Deployment owns 1..N ReplicaSets via ownerReferences
-//!   * the CURRENT ReplicaSet matches the Deployment's
-//!     `spec.template` (hashed for stability)
+//!   * the CURRENT `ReplicaSet` is the one whose `spec.template` EQUALS the
+//!     Deployment's, ignoring the `pod-template-hash` label (upstream's
+//!     `EqualIgnoreHash`, see [`crate::pod_template`]) — the hash only
+//!     names a new one
 //!   * older ReplicaSets are kept around at `replicas=0` so
 //!     `kubectl rollout undo` still works (revision history)
 //!
 //! R9.5 implementation (this file):
-//!   1. For each Deployment, compute a template hash.
+//!   1. For each Deployment, normalize its template.
 //!   2. Find owned ReplicaSets (via uid).
-//!   3. If no owned RS has the current template hash, create one.
-//!   4. Scale the new RS to `Deployment.spec.replicas`.
-//!   5. Scale older owned RSes to 0 (revision history retained).
+//!   3. Pick the current one: an owned RS running an equal template
+//!      ([`current_replicaset`]). If there is none, create one, named by the
+//!      template's hash.
+//!   4. Scale the current RS to `Deployment.spec.replicas`.
+//!   5. Scale every other owned RS to 0 (revision history retained).
 //!
 //! Skips: status updates, paused rollouts, partial-rollout
 //! strategies — those are R9.5b. The substrate's good enough to
@@ -34,6 +38,7 @@ use crate::event_recorder::Reason as EventReason;
 use crate::meta::{DefaultedInt, ObjectMeta, REPLICAS, ShapeError, warn_unreadable};
 use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
 use crate::owner::{owner_ref_for, set_owner_reference};
+use crate::pod_template::{NormalizedTemplate, POD_TEMPLATE_HASH_LABEL, TemplateHash};
 use crate::sweep::{Sweep, impl_sweep_event_sink};
 
 /// The counts a `ReplicaSet`'s controller writes into its status, which a
@@ -65,24 +70,6 @@ impl DeploymentController {
         }
     }
 
-    /// Deterministic hash of `spec.template`. Production K8s uses
-    /// a stable rsspec-hash; for R9.5 we use a BLAKE3 hex prefix
-    /// of the canonical-JSON template bytes. Good enough for
-    /// template-equality without external deps (we already pull
-    /// blake3 via engenho-revoada).
-    fn template_hash(d: &Value) -> Option<String> {
-        let template = d.get("spec").and_then(|s| s.get("template"))?;
-        let bytes = serde_json::to_vec(template).ok()?;
-        // Use a simple FNV-1a so we don't pull blake3 just for this.
-        // 8 hex chars is plenty for the typical 1-10 revision range.
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for b in &bytes {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        Some(format!("{hash:016x}").chars().take(10).collect())
-    }
-
     /// Build a ReplicaSet object from a Deployment + chosen
     /// template hash. The RS's `spec.template` is the
     /// Deployment's, and its `spec.replicas` is `replicas` — the
@@ -90,7 +77,11 @@ impl DeploymentController {
     /// here); the RS gets the deployment's labels +
     /// a `pod-template-hash` label for kubectl-rollout-friendly
     /// debugging.
-    fn build_replicaset_from(d: &Value, hash: &str, replicas: i64) -> Option<(String, Value)> {
+    fn build_replicaset_from(
+        d: &Value,
+        hash: TemplateHash,
+        replicas: i64,
+    ) -> Option<(String, Value)> {
         let d_name = d.name()?;
         // The child ReplicaSet lives in the SAME namespace as its parent
         // Deployment — never the controller's scope namespace (an
@@ -110,7 +101,7 @@ impl DeploymentController {
                 "namespace": d_namespace,
                 "labels": {
                     "app.kubernetes.io/managed-by": "engenho-deployment-controller",
-                    "pod-template-hash": hash
+                    POD_TEMPLATE_HASH_LABEL: hash.to_string()
                 }
             },
             "spec": {
@@ -120,14 +111,6 @@ impl DeploymentController {
             }
         });
         Some((rs_name, value))
-    }
-
-    fn rs_template_hash(rs: &Value) -> Option<String> {
-        rs.get("metadata")
-            .and_then(|m| m.get("labels"))
-            .and_then(|l| l.get("pod-template-hash"))
-            .and_then(|h| h.as_str())
-            .map(String::from)
     }
 
     /// The `(replicas, ready, available)` a `ReplicaSet`'s status reports
@@ -183,7 +166,7 @@ impl OwnedChildrenReconciler for DeploymentController {
         let desired_replicas = REPLICAS.read(d_value)?;
         // No template / owner-ref → nothing to do this tick (the parent
         // is freshly minted; the blanket already skipped no-uid parents).
-        let Some(desired_hash) = Self::template_hash(d_value) else {
+        let Some(template) = NormalizedTemplate::of_spec_template(d_value) else {
             return Ok(ReconcileDelta::none());
         };
         let Some(owner_ref) = owner_ref_for(d_value, "apps/v1", "Deployment") else {
@@ -192,14 +175,18 @@ impl OwnedChildrenReconciler for DeploymentController {
 
         let ns = self.namespace.as_deref();
         let mut commands = Vec::new();
+        let current = current_replicaset(&template, owned_rs);
+        let current_key = current.map(|(k, _)| k);
 
-        // Scale stale RSes to 0 (revision history retained at replicas=0).
-        // An RS's absent count is the API's 1 — the count its own
+        // Scale every owned RS but the current one to 0 (revision history
+        // retained at replicas=0) — including a second RS running an equal
+        // template, whose pods would otherwise run on top of the current
+        // one's. An RS's absent count is the API's 1 — the count its own
         // controller runs — so an absent one is still scaled down. An RS
         // whose count is malformed is left alone: its controller does
         // nothing with it either, and says so on it.
         for (rs_key, rs_value) in owned_rs {
-            if Self::rs_template_hash(rs_value).as_deref() == Some(&desired_hash) {
+            if current_key == Some(rs_key) {
                 continue;
             }
             let current_replicas = match REPLICAS.read(rs_value) {
@@ -220,9 +207,6 @@ impl OwnedChildrenReconciler for DeploymentController {
 
         // Ensure the current-template RS exists + has the right replica
         // count.
-        let current = owned_rs
-            .iter()
-            .find(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash));
         match current {
             Some((rs_key, rs_value)) => match REPLICAS.read(rs_value) {
                 Ok(current_replicas) => {
@@ -237,8 +221,11 @@ impl OwnedChildrenReconciler for DeploymentController {
                 Err(e) => warn_unreadable("deployment", &rs_key.label(), &e),
             },
             None => {
-                if let Some((rs_name, mut rs_value)) =
-                    Self::build_replicaset_from(d_value, &desired_hash, desired_replicas)
+                // The hash only NAMES the new RS. `None` is a template that
+                // cannot be serialized, which a `Value` never is.
+                if let Some((rs_name, mut rs_value)) = template
+                    .naming_hash()
+                    .and_then(|hash| Self::build_replicaset_from(d_value, hash, desired_replicas))
                 {
                     set_owner_reference(&mut rs_value, owner_ref.clone())?;
                     // Key the RS under the PARENT Deployment's namespace —
@@ -278,11 +265,11 @@ impl OwnedChildrenReconciler for DeploymentController {
         // it equals `replicas`). Source of truth = the live RS status. A
         // count that cannot be read writes no status this pass: a sum
         // with a guessed term would be reported as observed.
-        let desired_hash = Self::template_hash(d_value)?;
+        let template = NormalizedTemplate::of_spec_template(d_value)?;
         let (mut replicas, mut ready, mut available) = (0_i64, 0_i64, 0_i64);
         for (rs_key, rs) in owned_rs_after
             .iter()
-            .filter(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash))
+            .filter(|(_, r)| runs_template(r, &template))
         {
             match Self::rs_status_counts(rs) {
                 Ok((r, rd, av)) => {
@@ -307,42 +294,146 @@ impl OwnedChildrenReconciler for DeploymentController {
     }
 }
 
+/// Whether `rs` runs `template`: its own `spec.template`, normalized,
+/// equals it. The `pod-template-hash` label on either side is ignored, so
+/// this holds whatever hash the RS was named by.
+fn runs_template(rs: &Value, template: &NormalizedTemplate) -> bool {
+    NormalizedTemplate::of_spec_template(rs).as_ref() == Some(template)
+}
+
+/// The owned `ReplicaSet` that is a Deployment's current one — upstream's
+/// `FindNewReplicaSet`: an RS whose `spec.template` equals `template`,
+/// ignoring the `pod-template-hash` label. `None` when no owned RS runs it,
+/// the one case in which a new RS is created.
+///
+/// When more than one runs it (two RSes whose templates differed only in
+/// bytes, both created under the old hash matcher), the one holding the
+/// most replicas is current, and on a tie the one whose name sorts first.
+/// Upstream picks the OLDEST instead; engenho has no gradual rollout, so
+/// moving the pods from one RS to another running the same template would
+/// be pure churn, and the RS already holding them is the one to keep. A
+/// count that cannot be read ranks below every readable one.
+#[must_use]
+pub fn current_replicaset<'a>(
+    template: &NormalizedTemplate,
+    owned_rs: &'a [(ResourceKey, Value)],
+) -> Option<&'a (ResourceKey, Value)> {
+    owned_rs
+        .iter()
+        .filter(|(_, rs)| runs_template(rs, template))
+        .max_by(|(key_a, a), (key_b, b)| {
+            REPLICAS
+                .read(a)
+                .ok()
+                .cmp(&REPLICAS.read(b).ok())
+                .then_with(|| key_b.name.cmp(&key_a.name))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn template_hash_is_deterministic() {
-        let d1 = json!({"spec": {"template": {"spec": {"containers": [{"name": "x"}]}}}});
-        let d2 = d1.clone();
-        assert_eq!(
-            DeploymentController::template_hash(&d1),
-            DeploymentController::template_hash(&d2)
-        );
+    fn hash_of(d: &Value) -> TemplateHash {
+        NormalizedTemplate::of_spec_template(d)
+            .and_then(|t| t.naming_hash())
+            .expect("a Deployment with a template has a naming hash")
+    }
+
+    fn rs(
+        name: &str,
+        replicas: Option<i64>,
+        hash_label: &str,
+        template: &Value,
+    ) -> (ResourceKey, Value) {
+        let mut v = json!({
+            "metadata": {"name": name, "labels": {"pod-template-hash": hash_label}},
+            "spec": {"template": template}
+        });
+        if let Some(n) = replicas {
+            v["spec"]["replicas"] = json!(n);
+        }
+        (
+            ResourceKey::namespaced("apps", "v1", "ReplicaSet", "default", name),
+            v,
+        )
+    }
+
+    fn web(image: &str) -> Value {
+        json!({
+            "metadata": {"labels": {"app": "web"}},
+            "spec": {"containers": [{"name": "c", "image": image}]}
+        })
+    }
+
+    fn name_of(found: Option<&(ResourceKey, Value)>) -> Option<&str> {
+        found.map(|(k, _)| k.name.as_str())
     }
 
     #[test]
-    fn template_hash_changes_with_template() {
-        let d1 = json!({"spec": {"template": {"spec": {"containers": [{"image": "v1"}]}}}});
-        let d2 = json!({"spec": {"template": {"spec": {"containers": [{"image": "v2"}]}}}});
-        assert_ne!(
-            DeploymentController::template_hash(&d1),
-            DeploymentController::template_hash(&d2)
-        );
+    fn the_current_replicaset_is_found_by_template_whatever_its_hash_label() {
+        let owned = vec![
+            rs("web-old", Some(0), "aaaaaaaaaa", &web("web:1")),
+            rs(
+                "web-cur",
+                Some(3),
+                "not-a-hash-this-code-made",
+                &web("web:2"),
+            ),
+        ];
+        let t = NormalizedTemplate::of(&web("web:2"));
+        assert_eq!(name_of(current_replicaset(&t, &owned)), Some("web-cur"));
     }
 
     #[test]
-    fn template_hash_is_short_hex() {
-        let d = json!({"spec": {"template": {"spec": {}}}});
-        let h = DeploymentController::template_hash(&d).unwrap();
-        assert_eq!(h.len(), 10);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    fn a_template_no_owned_replicaset_runs_has_no_current_replicaset() {
+        let owned = vec![rs("web-old", Some(3), "aaaaaaaaaa", &web("web:1"))];
+        let t = NormalizedTemplate::of(&web("web:2"));
+        assert!(current_replicaset(&t, &owned).is_none());
     }
 
     #[test]
-    fn template_hash_none_for_missing_template() {
-        let d = json!({"spec": {"replicas": 1}});
-        assert!(DeploymentController::template_hash(&d).is_none());
+    fn a_replicaset_with_no_template_runs_no_template() {
+        let (key, mut v) = rs("web-bare", Some(3), "x", &web("web:1"));
+        v["spec"]["template"] = Value::Null;
+        let t = NormalizedTemplate::of(&Value::Null);
+        assert!(current_replicaset(&t, &[(key, v)]).is_none());
+    }
+
+    #[test]
+    fn of_two_replicasets_running_the_template_the_one_holding_the_pods_is_current() {
+        // Two RSes whose templates differ only in bytes — what the hash
+        // matcher left behind. The one running the pods stays current, so
+        // switching matchers moves no pod.
+        let mut byte_different = web("web:1");
+        byte_different["spec"]["volumes"] = json!([]);
+        let owned = vec![
+            rs("web-aaaa", Some(0), "aaaa", &web("web:1")),
+            rs("web-bbbb", Some(3), "bbbb", &byte_different),
+        ];
+        let t = NormalizedTemplate::of(&web("web:1"));
+        assert_eq!(name_of(current_replicaset(&t, &owned)), Some("web-bbbb"));
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_name_that_sorts_first_in_any_order() {
+        let a = rs("web-aaaa", Some(2), "aaaa", &web("web:1"));
+        let b = rs("web-bbbb", Some(2), "bbbb", &web("web:1"));
+        let t = NormalizedTemplate::of(&web("web:1"));
+        let forward = vec![a.clone(), b.clone()];
+        let backward = vec![b, a];
+        assert_eq!(name_of(current_replicaset(&t, &forward)), Some("web-aaaa"));
+        assert_eq!(name_of(current_replicaset(&t, &backward)), Some("web-aaaa"));
+    }
+
+    #[test]
+    fn an_absent_count_is_the_api_one_and_outranks_zero() {
+        let owned = vec![
+            rs("web-aaaa", Some(0), "aaaa", &web("web:1")),
+            rs("web-bbbb", None, "bbbb", &web("web:1")),
+        ];
+        let t = NormalizedTemplate::of(&web("web:1"));
+        assert_eq!(name_of(current_replicaset(&t, &owned)), Some("web-bbbb"));
     }
 
     #[test]
@@ -355,10 +446,11 @@ mod tests {
                 "template": {"metadata": {"labels": {"app": "podinfo"}}, "spec": {}}
             }
         });
+        let hash = hash_of(&d);
         let (name, rs) =
-            DeploymentController::build_replicaset_from(&d, "abcdef", REPLICAS.read(&d).unwrap())
+            DeploymentController::build_replicaset_from(&d, hash, REPLICAS.read(&d).unwrap())
                 .unwrap();
-        assert_eq!(name, "podinfo-abcdef");
+        assert_eq!(name, format!("podinfo-{hash}"));
         assert_eq!(rs.get("spec").unwrap().get("replicas").unwrap(), 5);
         let selector = rs.get("spec").unwrap().get("selector").unwrap();
         assert_eq!(
@@ -366,22 +458,10 @@ mod tests {
             "podinfo"
         );
         let labels = rs.get("metadata").unwrap().get("labels").unwrap();
-        assert_eq!(labels.get("pod-template-hash").unwrap(), "abcdef");
-    }
-
-    #[test]
-    fn rs_template_hash_reads_label() {
-        let rs = json!({"metadata": {"labels": {"pod-template-hash": "deadbeef01"}}});
         assert_eq!(
-            DeploymentController::rs_template_hash(&rs),
-            Some("deadbeef01".into())
+            labels.get("pod-template-hash").unwrap(),
+            &json!(hash.to_string())
         );
-    }
-
-    #[test]
-    fn rs_template_hash_none_when_label_missing() {
-        let rs = json!({"metadata": {"labels": {}}});
-        assert!(DeploymentController::rs_template_hash(&rs).is_none());
     }
 
     #[test]
@@ -402,10 +482,11 @@ mod tests {
                 }
             }
         });
+        let hash = hash_of(&d);
         let (rs_name, rs) =
-            DeploymentController::build_replicaset_from(&d, "hash01", REPLICAS.read(&d).unwrap())
+            DeploymentController::build_replicaset_from(&d, hash, REPLICAS.read(&d).unwrap())
                 .unwrap();
-        assert_eq!(rs_name, "web-hash01");
+        assert_eq!(rs_name, format!("web-{hash}"));
         assert_eq!(
             rs.get("metadata").unwrap().get("namespace").unwrap(),
             "team-a"
@@ -419,7 +500,7 @@ mod tests {
             "metadata": {"name": "web"},
             "spec": {"replicas": 1, "selector": {}, "template": {"spec": {"containers": []}}}
         });
-        let (_, rs) = DeploymentController::build_replicaset_from(&d, "h", 1).unwrap();
+        let (_, rs) = DeploymentController::build_replicaset_from(&d, hash_of(&d), 1).unwrap();
         assert_eq!(
             rs.get("metadata").unwrap().get("namespace").unwrap(),
             "default"

@@ -67,6 +67,7 @@ pub mod owner;
 pub mod pdb;
 pub mod plantio;
 pub mod plantio_pipeline;
+pub mod pod_template;
 pub mod pv_binder;
 pub mod replicaset;
 pub mod roceiro;
@@ -109,7 +110,7 @@ pub use create_stamp::{
     CreateClock, creation_timestamp_is_unset, stamp_create_timestamp, wall_clock,
 };
 pub use daemonset::DaemonSetController;
-pub use deployment::DeploymentController;
+pub use deployment::{DeploymentController, current_replicaset};
 pub use dns::{
     DEFAULT_CLUSTER_DOMAIN, DnsBackend, DnsController, DnsError, DnsEvent, DnsRecord,
     InMemoryDnsZone, SrvRecord, srv_fqdn,
@@ -160,6 +161,7 @@ pub use plantio_pipeline::{
     LedgerChoice, LedgerWrappers, NodeResolverChoice, PipelineConfig, PlantioPipeline,
     RoceiroChoice, bootstrap_pipeline,
 };
+pub use pod_template::{NormalizedTemplate, POD_TEMPLATE_HASH_LABEL, TemplateHash};
 pub use pv_binder::{
     ENGENHO_LOCAL_PATH_PROVISIONER, FakeProvisionerEnv, HostProvisionerEnv, LOCAL_PATH_PROVISIONER,
     ProvisionerEnv, PvBinderController,
