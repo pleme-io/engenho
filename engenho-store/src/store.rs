@@ -113,31 +113,36 @@ impl InMemoryStore {
     pub async fn watch_from(&self, opts: WatchOpts) -> Result<WatchStream, WatchGone> {
         // ── under the catalog lock ─────────────────────────────────
         let mut guard = self.inner.lock().await;
-        // Read replay + boundary from the catalog (immutable), then
-        // register the sender on the registry (mutable). `register_captured`
-        // enqueues the entire replay into the channel IN REVISION ORDER
-        // before the handle is reachable by `fan_change` — all under THIS
-        // lock, so the replay→live handoff is atomic AND structurally
-        // ordered (no feeder task, no second producer racing apply).
-        // Borrows are sequential (no split-borrow of the MutexGuard's
-        // Deref) and the catalog ring is NOT cloned.
-        let replay = guard
-            .catalog
-            .changes_since(opts.from)
-            .map_err(WatchGone::from)?;
-        let boundary = guard.catalog.revision();
-        Ok(guard.watchers.register_captured(replay, boundary, &opts))
+        // Reborrow the guard once so the catalog (shared) and the registry
+        // (mutable) split as two fields of one `&mut Inner`. `register`
+        // reads replay + boundary from the catalog, then enqueues the entire
+        // replay into the channel IN REVISION ORDER before the handle is
+        // reachable by `fan_change` — all under THIS lock, so the
+        // replay→live handoff is atomic AND structurally ordered (no feeder
+        // task, no second producer racing apply). The ring is NOT cloned;
+        // only the replayed changes are.
+        let inner = &mut *guard;
+        inner.watchers.register(&inner.catalog, &opts)
     }
 
-    pub async fn current_catalog(&self) -> ResourceCatalog {
-        self.inner.lock().await.catalog.clone()
+    /// Run `read` over the catalog under ONE guard and return what it
+    /// returns. The only way code outside this file gets a reference to the
+    /// catalog.
+    ///
+    /// `pub(crate)`, and it cannot be otherwise: the catalog is sealed
+    /// (T3.2b), so a public signature naming it does not compile. Whatever
+    /// `read` clones is all that is cloned; it runs under the lock `apply`
+    /// takes, so it should filter and clone, and leave rendering to the
+    /// caller after the guard drops.
+    pub(crate) async fn read_catalog<R>(&self, read: impl FnOnce(&ResourceCatalog) -> R) -> R {
+        read(&self.inner.lock().await.catalog)
     }
 
     /// The current MVCC revision, read under the lock WITHOUT cloning.
     ///
     /// ── ★ WHY A SCALAR NEEDS ITS OWN METHOD ──────────────────────────────
-    /// `current_catalog().revision()` reads one `u64` by deep-cloning the
-    /// entire [`ResourceCatalog`] first — every resource AND the 8192-entry
+    /// The removed `current_catalog().revision()` read one `u64` by
+    /// deep-cloning the entire catalog first — every resource AND the 8192-entry
     /// watch-replay ring, whose entries each carry a full post-image and a
     /// full pre-image. Measured on rio: that made establishing a single watch
     /// cost hundreds of megabytes of memcpy, and since a watch is established
@@ -150,8 +155,8 @@ impl InMemoryStore {
     /// List + revision from ONE locked look at the catalog, cloning only the
     /// MATCHED items.
     ///
-    /// ── ★ WHY THIS EXISTS RATHER THAN `current_catalog().list(…)` ─────────
-    /// `ResourceCatalog` derives `Clone` and carries `history: VecDeque<Change>`
+    /// ── ★ WHY THIS EXISTS RATHER THAN A CATALOG CLONE + `list(…)` ─────────
+    /// The catalog derives `Clone` and carries `history: VecDeque<Change>`
     /// — the watch-replay ring, 8192 entries, each holding a full resource body.
     /// Cloning the catalog to serve a LIST therefore copies the entire ring, so
     /// the cost of every read scales with the cluster's AGE and write volume
@@ -526,10 +531,10 @@ mod tests {
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].applied_index, 1);
         assert_eq!(res[0].op, crate::command::ResourceOp::Created);
-        let catalog = s.current_catalog().await;
-        assert_eq!(catalog.len(), 1);
         let key = ResourceKey::namespaced("", "v1", "Pod", "default", "podinfo");
-        assert!(catalog.get(&key).is_some());
+        let (len, held) = s.read_catalog(|c| (c.len(), c.get(&key).is_some())).await;
+        assert_eq!(len, 1);
+        assert!(held);
     }
 
     #[tokio::test]

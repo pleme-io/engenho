@@ -105,10 +105,11 @@ async fn propose_latency_on_an_empty_durable_store() {
 /// history ring is.
 ///
 /// `ResourceCatalog` carries `history: VecDeque<Change>` (capacity 8192, each
-/// entry holding a full resource body) and `current_catalog()` returns
-/// `state.catalog.clone()` — a DEEP clone. Every read and every write pays for
-/// copying the whole ring, so cost grows with cluster AGE rather than with
-/// cluster SIZE. That is why rio, with ~50 live objects, served a write in 12s
+/// entry holding a full resource body), and `current_catalog()` returned
+/// `state.catalog.clone()` — a DEEP clone. Every read and every write paid for
+/// copying the whole ring, so cost grew with cluster AGE rather than with
+/// cluster SIZE. (T3.2b removed `current_catalog()` and sealed the catalog
+/// inside the crate, so no public read can return that clone any more.) That is why rio, with ~50 live objects, served a write in 12s
 /// while this same code serves one in 12ms against an empty store, and why a
 /// daemon restart "fixes" it for a few hours.
 /// THE GATE: a LIST must not get slower as the watch-replay ring fills.

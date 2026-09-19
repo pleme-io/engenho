@@ -392,7 +392,11 @@ impl WatcherRegistry {
     ///
     /// [`WatchGone::CompactedTooOld`] when `opts.from` is below the
     /// catalog's compaction watermark.
-    pub fn register(
+    ///
+    /// `pub(crate)`: it reads a catalog, which is sealed (T3.2b). Outside
+    /// the crate, [`Self::register_captured`] takes an already-captured
+    /// replay instead.
+    pub(crate) fn register(
         &mut self,
         catalog: &ResourceCatalog,
         opts: &WatchOpts,
@@ -1337,5 +1341,120 @@ mod tests {
         );
         assert_eq!(ticker.quiesce().await, TaskStop::AlreadyStopped);
         drop(apply_in_progress);
+    }
+
+    // ── Moved from tests/r7_6_resumable_watch.rs (T3.2b) ──────────────
+    // Both drive a `ResourceCatalog` directly, which only the crate can name
+    // since the catalog was sealed.
+
+    use crate::command::{Reason, ResourceCommand};
+    use serde_json::json;
+
+    /// Registry-level mirror driving the primitive directly (no Raft, no
+    /// store): register from rev2 → replay {3,4,5}; IMMEDIATELY fan_change
+    /// rev6 (before the first poll); assert delivery is exactly 3,4,5,6.
+    /// This is the tightest reproduction of the [6,3,4,5] defect — it
+    /// FAILS with the old spawned-feeder path and PASSES with the replay
+    /// fed under the lock inside `register_captured`.
+    #[tokio::test]
+    async fn registry_nonempty_replay_then_immediate_live_is_ordered() {
+        let mut cat = ResourceCatalog::default();
+        for i in 1..=5u64 {
+            cat.apply(
+                &ResourceCommand::Put {
+                    key: pod_key(&format!("p{i}")),
+                    value: json!({"i": i}),
+                    expected: None,
+                    reason: Reason::Operator,
+                },
+                1,
+                i,
+            );
+        }
+        let mut reg = WatcherRegistry::new();
+        // Register from rev2 → replay {3,4,5} enqueued under this call.
+        let mut stream = reg
+            .register(&cat, &WatchOpts::from_revision(Revision(2)))
+            .unwrap();
+        // Live rev6 fanned BEFORE any poll (boundary == 5, so 6 > boundary).
+        cat.apply(
+            &ResourceCommand::Put {
+                key: pod_key("p6"),
+                value: json!({"i": 6}),
+                expected: None,
+                reason: Reason::Operator,
+            },
+            1,
+            6,
+        );
+        let change6 = cat.changes_since(Revision(5)).unwrap().pop().unwrap();
+        assert_eq!(change6.revision, Revision(6));
+        reg.fan_change(&change6);
+
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_secs(3), stream.next())
+                .await
+                .expect("signal before timeout")
+            {
+                Some(Ok(WatchSignal::Event(ev))) => got.push(ev.resource_version),
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(
+            got,
+            vec![3, 4, 5, 6],
+            "replay {{3,4,5}} must precede the immediate live event 6 — no reorder"
+        );
+    }
+
+    #[tokio::test]
+    async fn gone_on_compaction_registry() {
+        // Tiny history capacity forces compaction. Build the catalog
+        // directly (per the test strategy: a direct ResourceCatalog +
+        // registry unit test where no Raft is needed).
+        let mut cat = ResourceCatalog::with_history_capacity(2);
+        for i in 1..=5u64 {
+            cat.apply(
+                &ResourceCommand::Put {
+                    key: pod_key(&format!("p{i}")),
+                    value: json!({"i": i}),
+                    expected: None,
+                    reason: Reason::Operator,
+                },
+                1,
+                i,
+            );
+        }
+        // Only revs 4,5 retained → compacted at rev 3.
+        assert_eq!(cat.compacted_revision(), Revision(3));
+
+        let mut reg = WatcherRegistry::new();
+        // watch_from below the watermark → immediate typed Gone, NO channel.
+        let err = reg
+            .register(&cat, &WatchOpts::from_revision(Revision(1)))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            WatchGone::CompactedTooOld {
+                requested: Revision(1),
+                compacted: Revision(3),
+            }
+        );
+        assert_eq!(err.kind(), "compacted_too_old");
+        assert_eq!(reg.len(), 0, "rejected watch allocates no channel");
+
+        // From exactly the watermark succeeds (watermark honored); the
+        // replay (revs 4,5) is enqueued into the stream — drain it to prove
+        // exactly 2 events landed.
+        let mut stream = reg
+            .register(&cat, &WatchOpts::from_revision(Revision(3)))
+            .unwrap();
+        assert_eq!(reg.len(), 1);
+        let mut replayed = Vec::new();
+        while let Some(Ok(WatchSignal::Event(ev))) = stream.try_next() {
+            replayed.push(ev.resource_version);
+        }
+        assert_eq!(replayed, vec![4, 5]);
     }
 }

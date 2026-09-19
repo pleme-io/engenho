@@ -24,10 +24,11 @@
 //!   * The continue cursor excludes a PRE-cursor late insert (cursor
 //!     exclusion, not snapshot isolation).
 
-use engenho_store::command::{Reason, ResourceCommand, ResourceOp};
-use engenho_store::pagination::ContinueToken;
-use engenho_store::revision::Revision;
-use engenho_store::{ResourceCatalog, ResourceKey, ResourceValue};
+use crate::command::{Reason, ResourceCommand, ResourceOp};
+use crate::pagination::ContinueToken;
+use crate::revision::Revision;
+use crate::state::ResourceCatalog;
+use crate::{ResourceKey, ResourceValue};
 
 fn pod_key(name: &str) -> ResourceKey {
     ResourceKey::namespaced("", "v1", "Pod", "default", name)
@@ -50,7 +51,7 @@ fn patch_with(
     ResourceCommand::Patch {
         key,
         patch,
-        patch_type: engenho_store::command::PatchType::Merge,
+        patch_type: crate::command::PatchType::Merge,
         apply: None,
         expected,
         reason: Reason::Operator,
@@ -329,7 +330,7 @@ fn cat_with_pods(n: usize) -> ResourceCatalog {
     cat
 }
 
-fn page_names(page: &engenho_store::pagination::ListPage<'_>) -> Vec<String> {
+fn page_names(page: &crate::pagination::ListPage<'_>) -> Vec<String> {
     page.items.iter().map(|(k, _)| k.name.clone()).collect()
 }
 

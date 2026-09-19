@@ -328,8 +328,23 @@ impl ApplyOutcome {
 /// The catalog tracks `last_applied_index` (Raft log index, for
 /// read-after-write + snapshot resume) AND `current_revision` (the
 /// global MVCC counter consumers stamp resourceVersion from).
+///
+/// ── ★ SEALED (T3.2b): `pub(crate)`, and no `pub fn` may hand it out ─────
+/// The catalog carries `history`, the 8192-entry watch-replay ring whose
+/// entries each hold a full post-image AND a full pre-image. While the type
+/// was public, `current_catalog()` returned it by value, and every caller
+/// that wanted one integer (`.revision()`, `.last_applied_index`) paid a deep
+/// clone of every resource plus that ring, under the lock `apply` needs. On
+/// rio that stalled writes for tens of seconds and wedged Flux for five days.
+///
+/// So the type is crate-private and the crate root denies
+/// `private_interfaces`: a `pub fn` that returns or takes a catalog is a
+/// compile error, not a review comment. Callers outside the crate read
+/// through `StoreMesh`'s scalar and single-guard accessors, which see the
+/// catalog only by reference, under one guard, and clone only what they
+/// return.
 #[derive(Clone)]
-pub struct ResourceCatalog {
+pub(crate) struct ResourceCatalog {
     /// Keyed store: value + per-key version metadata.
     pub resources: BTreeMap<ResourceKey, (ResourceValue, VersionMeta)>,
     pub last_applied_term: u64,
@@ -486,6 +501,13 @@ impl ResourceCatalog {
     /// Used by callers that want a tighter compaction window (and by
     /// tests that force compaction with a tiny capacity).
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "a tighter compaction window is configured only by tests today (sealed by T3.2b, so dead code is now visible)"
+        )
+    )]
     pub fn with_history_capacity(history_capacity: usize) -> Self {
         Self {
             history_capacity: history_capacity.max(1),
@@ -496,6 +518,13 @@ impl ResourceCatalog {
     /// Apply a command this binary proposes, under
     /// [`ApplySemantics::CURRENT`]. A Raft log entry replays through
     /// [`Self::apply_logged`] instead, under the rules it was written with.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "production applies Raft log entries through `apply_logged`; `apply` is the test entry (sealed by T3.2b, so dead code is now visible)"
+        )
+    )]
     pub fn apply(&mut self, cmd: &ResourceCommand, term: u64, index: u64) -> ApplyOutcome {
         self.apply_under(cmd, ApplySemantics::CURRENT, term, index)
     }
@@ -1195,6 +1224,13 @@ impl ResourceCatalog {
     /// rewinding would promise history that has already been dropped.
     /// A target above `current_revision` is clamped to it: you cannot
     /// compact away revisions that do not exist yet.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no Compact command reaches the catalog yet: the etcd façade is read-only (sealed by T3.2b, so dead code is now visible)"
+        )
+    )]
     pub fn compact(&mut self, target: Revision) -> Revision {
         let target = Revision(target.get().min(self.current_revision.get()));
         if target.get() <= self.compacted_revision.get() {
@@ -1231,6 +1267,13 @@ impl ResourceCatalog {
     /// ★ VALUES ARE EXACT; METADATA CARRIES ITS OWN FIDELITY. See
     /// [`MetaFidelity`] — a guessed `mod_revision` handed to a client doing
     /// optimistic concurrency is worse than a declared floor.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "historical reads have no producer yet: the etcd façade serves no Range at a past revision (sealed by T3.2b, so dead code is now visible)"
+        )
+    )]
     pub fn state_at(
         &self,
         rev: Revision,
@@ -1302,6 +1345,13 @@ impl ResourceCatalog {
     }
 
     /// One key's state as of `rev`. See [`Self::state_at`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "historical reads have no producer yet: the etcd façade serves no Range at a past revision (sealed by T3.2b, so dead code is now visible)"
+        )
+    )]
     pub fn get_at(
         &self,
         key: &ResourceKey,
@@ -1350,18 +1400,28 @@ impl ResourceCatalog {
     /// Gone equivalent). Asking from exactly `compacted_revision` (or
     /// above) is always honored.
     pub fn changes_since(&self, rv: Revision) -> Result<Vec<Change>, CompactedTooOld> {
+        Ok(self.changes_after(rv)?.cloned().collect())
+    }
+
+    /// [`Self::changes_since`] by reference: the same window and the same
+    /// refusal, with nothing cloned. The one definition of both, so a
+    /// reader that clones only the changes it keeps (the etcd façade's
+    /// prefix filter) cannot drift from the watch replay's rule.
+    ///
+    /// # Errors
+    ///
+    /// [`CompactedTooOld`] when `rv < compacted_revision`.
+    pub(crate) fn changes_after(
+        &self,
+        rv: Revision,
+    ) -> Result<impl Iterator<Item = &Change>, CompactedTooOld> {
         if rv < self.compacted_revision {
             return Err(CompactedTooOld {
                 requested: rv,
                 compacted: self.compacted_revision,
             });
         }
-        Ok(self
-            .history
-            .iter()
-            .filter(|c| c.revision > rv)
-            .cloned()
-            .collect())
+        Ok(self.history.iter().filter(move |c| c.revision > rv))
     }
 
     /// List resources matching (group, version, kind), optionally
@@ -1369,6 +1429,13 @@ impl ResourceCatalog {
     ///
     /// Reads only the scope's own run of the map — see [`ListScope`].
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the borrowed LIST form; the stores hand out `list_at_revision`, which clones under one guard (sealed by T3.2b, so dead code is now visible)"
+        )
+    )]
     pub fn list(
         &self,
         group: &str,
@@ -1437,6 +1504,13 @@ impl ResourceCatalog {
     /// materialized map M0.1 keeps. Until then, do not claim snapshot
     /// consistency for the page series.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the borrowed page form; the stores hand out `list_page_at_revision`, which clones under one guard (sealed by T3.2b, so dead code is now visible)"
+        )
+    )]
     pub fn list_page(
         &self,
         group: &str,
@@ -1518,11 +1592,25 @@ impl ResourceCatalog {
 
     /// Total resource count (across all kinds + namespaces).
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the resource count is read by tests only (sealed by T3.2b, so dead code is now visible)"
+        )
+    )]
     pub fn len(&self) -> usize {
         self.resources.len()
     }
 
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the resource count is read by tests only (sealed by T3.2b, so dead code is now visible)"
+        )
+    )]
     pub fn is_empty(&self) -> bool {
         self.resources.is_empty()
     }

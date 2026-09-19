@@ -81,9 +81,12 @@ async fn restart_preserves_resources_and_revision() {
         assert_eq!(final_revision, 4);
 
         // Capture pre-restart per-key meta for a.
-        let cat = mesh.current_catalog().await;
-        pre_meta_a = cat.get_with_meta(&pod_key("a")).map(|(_, m)| m).unwrap();
-        assert_eq!(cat.current_revision, Revision(4));
+        pre_meta_a = mesh
+            .get_with_meta(&pod_key("a"))
+            .await
+            .map(|(_, m)| m)
+            .unwrap();
+        assert_eq!(mesh.current_revision().await, Revision(4));
 
         mesh.terminate().await.unwrap();
     }
@@ -107,11 +110,14 @@ async fn restart_preserves_resources_and_revision() {
     assert!(mesh2.get(&pod_key("b")).await.is_none(), "b stayed deleted");
 
     // Revision counter survived.
-    let cat = mesh2.current_catalog().await;
-    assert_eq!(cat.current_revision, Revision(final_revision));
+    assert_eq!(mesh2.current_revision().await, Revision(final_revision));
 
     // Per-key VersionMeta for a is byte-identical across the restart.
-    let post_meta_a = cat.get_with_meta(&pod_key("a")).map(|(_, m)| m).unwrap();
+    let post_meta_a = mesh2
+        .get_with_meta(&pod_key("a"))
+        .await
+        .map(|(_, m)| m)
+        .unwrap();
     assert_eq!(post_meta_a, pre_meta_a);
 
     // metadata.resourceVersion on a == the persisted revision string
@@ -223,9 +229,12 @@ async fn restart_preserves_high_revision_and_per_key_meta() {
             .await
             .unwrap();
         }
-        let cat = mesh.current_catalog().await;
-        assert!(cat.current_revision.get() >= 11);
-        pre_meta = cat.get_with_meta(&pod_key("hot")).map(|(_, m)| m).unwrap();
+        assert!(mesh.current_revision().await.get() >= 11);
+        pre_meta = mesh
+            .get_with_meta(&pod_key("hot"))
+            .await
+            .map(|(_, m)| m)
+            .unwrap();
         assert!(pre_meta.version >= 3);
         mesh.terminate().await.unwrap();
     }
@@ -238,9 +247,15 @@ async fn restart_preserves_high_revision_and_per_key_meta() {
     assert!(!fresh);
     assert!(mesh2.wait_for_leadership(Duration::from_secs(3)).await);
 
-    let cat = mesh2.current_catalog().await;
-    assert!(cat.current_revision.get() >= 11, "high revision survived");
-    let post_meta = cat.get_with_meta(&pod_key("hot")).map(|(_, m)| m).unwrap();
+    assert!(
+        mesh2.current_revision().await.get() >= 11,
+        "high revision survived"
+    );
+    let post_meta = mesh2
+        .get_with_meta(&pod_key("hot"))
+        .await
+        .map(|(_, m)| m)
+        .unwrap();
     assert_eq!(post_meta, pre_meta, "per-key VersionMeta survived restart");
 
     mesh2.terminate().await.unwrap();
@@ -276,12 +291,7 @@ async fn empty_store_first_boot_initializes() {
     assert_eq!(result.op, engenho_store::ResourceOp::Created);
 
     let stored = mesh.get(&pod_key("first")).await.unwrap();
-    let (_, meta) = mesh
-        .current_catalog()
-        .await
-        .get_with_meta(&pod_key("first"))
-        .map(|(v, m)| (v.clone(), m))
-        .unwrap();
+    let (_, meta) = mesh.get_with_meta(&pod_key("first")).await.unwrap();
     assert_eq!(meta, VersionMeta::created_at(Revision(1)));
     assert_eq!(
         stored

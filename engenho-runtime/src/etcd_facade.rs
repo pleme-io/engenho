@@ -73,6 +73,14 @@ pub fn registry_path(key: &ResourceKey) -> Option<String> {
     )
 }
 
+/// [`registry_path`], kept only when it lies under `prefix` — the one
+/// selection rule every read below applies (Range, history replay, and the
+/// live watch), written once so the three cannot disagree about what a
+/// prefix contains.
+fn registry_path_under(key: &ResourceKey, prefix: &str) -> Option<String> {
+    registry_path(key).filter(|path| path.starts_with(prefix))
+}
+
 /// One stored object rendered onto the etcd wire.
 ///
 /// `create_revision` / `mod_revision` / `version` come from the store's own
@@ -143,23 +151,34 @@ impl MeshEtcdStore {
 
     /// Every object whose `/registry` path starts with `prefix`.
     ///
-    /// Renders the whole catalog and filters. That is O(n) per Range and
+    /// Visits every stored object and filters. That is O(n) per Range and
     /// deliberately so at this stage: the alternative is a second index
     /// keyed by etcd path, which would be a copy of the store's own keying
     /// that could drift from it. A prefix index belongs here once a
     /// measurement says the scan hurts, not before.
+    ///
+    /// ★ ONE GUARD, AND ONLY THE MATCHES ARE CLONED (T3.2b). This used to
+    /// clone the whole catalog — every resource plus the 8192-entry
+    /// watch-replay ring — before filtering, so a `/registry/pods/` Range
+    /// paid for every Secret's history. The visitor keeps the matching
+    /// objects; rendering them onto the wire happens after the guard drops,
+    /// so the store's lock is held for a filter and a clone, not for
+    /// serialization.
     async fn kvs_under(&self, prefix: &str) -> Vec<KeyValue> {
         let Some(store) = self.live() else {
             return Vec::new();
         };
-        let catalog = store.current_catalog().await;
-        let mut out: Vec<KeyValue> = catalog
-            .resources
-            .iter()
-            .filter_map(|(key, (value, meta))| {
-                let path = registry_path(key)?;
-                path.starts_with(prefix).then(|| to_kv(path, value, meta))
+        let mut hits = Vec::new();
+        store
+            .for_each_resource(|key, value, meta| {
+                if let Some(path) = registry_path_under(key, prefix) {
+                    hits.push((path, value.clone(), meta));
+                }
             })
+            .await;
+        let mut out: Vec<KeyValue> = hits
+            .into_iter()
+            .map(|(path, value, meta)| to_kv(path, &value, &meta))
             .collect();
         // etcd returns a Range in byte order and clients paginate on it.
         // BTreeMap order is by ResourceKey, which is NOT the same ordering.
@@ -174,9 +193,10 @@ impl MeshEtcdStore {
         let Some(store) = self.live() else {
             return 0;
         };
-        // ★ Scalar read — must NOT go through `current_catalog()`, which
-        // deep-clones every resource plus the 8192-entry watch-replay ring to
-        // hand back one integer. See `MeshStore::current_revision`.
+        // ★ Scalar read. The whole-catalog read this used to avoid
+        // (`current_catalog()`, which deep-cloned every resource plus the
+        // 8192-entry watch-replay ring to hand back one integer) no longer
+        // exists: the catalog is sealed inside engenho-store (T3.2b).
         i64::try_from(store.current_revision().await.0).unwrap_or(i64::MAX)
     }
 }
@@ -200,7 +220,7 @@ impl EtcdStatusStore for MeshEtcdStore {
 
     async fn applied_index(&self) -> u64 {
         match self.live() {
-            Some(store) => store.current_catalog().await.last_applied_index,
+            Some(store) => store.last_applied_index().await,
             None => 0,
         }
     }
@@ -226,16 +246,28 @@ impl EtcdStatusStore for MeshEtcdStore {
         // store has no single file to stat. `db_size_in_use` reports the
         // same value, which is truthful: there is no free space to
         // distinguish.
+        //
+        // ★ ONE GUARD, NO RING, AND NOTHING SERIALIZED UNDER IT (T3.2b).
+        // This used to clone the whole catalog — its replay ring included —
+        // then serialize every object into a throwaway buffer. Now the guard
+        // is held only to clone the served objects (the store's contract for
+        // a visitor: filter and clone, render after), and each is then
+        // serialized into a byte COUNTER: the same number, with no buffer
+        // per object and no copy of the ring at all.
         let store = self.live()?;
-        let catalog = store.current_catalog().await;
-        let bytes: usize = catalog
-            .resources
-            .iter()
-            .filter_map(|(key, (value, _))| {
-                let path = registry_path(key)?;
-                Some(path.len() + serde_json::to_vec(value).map(|v| v.len()).unwrap_or(0))
+        let mut served = Vec::new();
+        store
+            .for_each_resource(|key, value, _| {
+                if let Some(path) = registry_path(key) {
+                    served.push((path.len(), value.clone()));
+                }
             })
-            .sum();
+            .await;
+        let bytes = served.iter().fold(0usize, |total, (path_len, value)| {
+            total
+                .saturating_add(*path_len)
+                .saturating_add(serialized_len(value))
+        });
         Some(i64::try_from(bytes).unwrap_or(i64::MAX))
     }
 }
@@ -250,20 +282,32 @@ impl EtcdWatchStore for MeshEtcdStore {
         let Some(store) = self.live() else {
             return Ok(Vec::new());
         };
-        let catalog = store.current_catalog().await;
-        let compacted = i64::try_from(catalog.compacted_revision.0).unwrap_or(0);
         // The gap case is a VALUE the caller must handle, not an empty
         // vector it could forward by accident: a client resuming below the
         // watermark has to be told where it may safely restart, or it
         // believes it is tracking a cluster it has already lost sync with.
-        if since < compacted {
-            return Err(compacted);
-        }
-        Ok(catalog
-            .history
-            .iter()
-            .filter(|c| i64::try_from(c.revision.0).unwrap_or(0) > since)
-            .filter_map(|c| change_to_event(c, prefix))
+        //
+        // A negative `since` is below every watermark, including zero.
+        let Ok(from) = u64::try_from(since).map(engenho_store::Revision) else {
+            return Err(watermark(store.compacted_revision().await));
+        };
+        // ★ ONE GUARD, AND ONLY THE MATCHING CHANGES ARE CLONED (T3.2b).
+        // This used to clone the whole catalog — every resource and the
+        // entire replay ring — to read one window of the ring. The store
+        // applies the same window and the same refusal the watch replay
+        // does; rendering happens after its guard drops.
+        let mut hits = Vec::new();
+        store
+            .for_each_change_since(from, |change| {
+                if let Some(path) = registry_path_under(&change.key, prefix) {
+                    hits.push((path, change.clone()));
+                }
+            })
+            .await
+            .map_err(|gone| watermark(gone.compacted))?;
+        Ok(hits
+            .into_iter()
+            .map(|(path, change)| change_to_event(path, &change))
             .collect())
     }
 
@@ -300,7 +344,37 @@ impl EtcdWatchStore for MeshEtcdStore {
     }
 }
 
-/// One store `Change` rendered as an etcd `Event`, if it is under `prefix`.
+/// A compaction watermark as the etcd wire carries it.
+fn watermark(compacted: engenho_store::Revision) -> i64 {
+    i64::try_from(compacted.0).unwrap_or(0)
+}
+
+/// The length of `value` serialized as JSON, counted without building the
+/// bytes — what `serde_json::to_vec(value).len()` returns, minus the buffer.
+fn serialized_len(value: &serde_json::Value) -> usize {
+    /// A writer that keeps only how much was written to it.
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // Serializing a `Value` cannot fail (every key is a string) and `Count`
+    // never errors, so the count is complete; the old `unwrap_or(0)` on
+    // `to_vec` is kept as the same fallback.
+    match serde_json::to_writer(&mut count, value) {
+        Ok(()) => count.0,
+        Err(_) => 0,
+    }
+}
+
+/// One store `Change` rendered as an etcd `Event`; the caller has already
+/// selected it by its `/registry` `path`.
 ///
 /// ★ `prev_kv` IS POPULATED HERE AND CANNOT BE ON THE LIVE PATH. `Change`
 /// carries `prior`; the live `WatchEvent` the store broadcasts does not —
@@ -310,18 +384,14 @@ impl EtcdWatchStore for MeshEtcdStore {
 /// one. A fabricated `prev_kv` is worse than an absent one: a client
 /// diffing against it would compute an empty change set and conclude
 /// nothing happened.
-fn change_to_event(change: &engenho_store::revision::Change, prefix: &str) -> Option<Event> {
+fn change_to_event(path: String, change: &engenho_store::revision::Change) -> Event {
     use engenho_store::revision::ChangeKind;
 
-    let path = registry_path(&change.key)?;
-    if !path.starts_with(prefix) {
-        return None;
-    }
     let rev = i64::try_from(change.revision.0).unwrap_or(i64::MAX);
     let meta = &change.version_meta;
     let deleted = matches!(change.kind, ChangeKind::Delete);
 
-    Some(Event {
+    Event {
         // 0 = PUT, 1 = DELETE in mvccpb.
         r#type: i32::from(deleted),
         kv: Some(KeyValue {
@@ -348,7 +418,7 @@ fn change_to_event(change: &engenho_store::revision::Change, prefix: &str) -> Op
             value: serde_json::to_vec(p).unwrap_or_default(),
             lease: 0,
         }),
-    })
+    }
 }
 
 /// One LIVE `WatchEvent` rendered as an etcd `Event`.
@@ -359,10 +429,7 @@ fn change_to_event(change: &engenho_store::revision::Change, prefix: &str) -> Op
 fn watch_event_to_event(event: &engenho_store::watch::WatchEvent, prefix: &str) -> Option<Event> {
     use engenho_store::watch::WatchEventKind;
 
-    let path = registry_path(&event.key)?;
-    if !path.starts_with(prefix) {
-        return None;
-    }
+    let path = registry_path_under(&event.key, prefix)?;
     let rev = i64::try_from(event.resource_version).unwrap_or(i64::MAX);
     let deleted = matches!(event.kind, WatchEventKind::Deleted);
 
@@ -466,6 +533,263 @@ mod tests {
         assert!(
             !role.contains("rbac.authorization.k8s.io"),
             "rbac is groupless in the keyspace: {role}"
+        );
+    }
+
+    // ── T3.2b: the reads moved onto the store's single-guard surface ──
+    //
+    // Each of these used to clone the whole catalog, replay ring included;
+    // that read no longer exists (the catalog is sealed in engenho-store).
+    // These pin that the answers did not change with it.
+
+    use engenho_store::command::{Reason, ResourceCommand};
+    use engenho_store::{InProcessRouter, Revision, default_config};
+    use serde_json::json;
+
+    async fn boot(cluster: &str) -> Arc<StoreMesh> {
+        let store = StoreMesh::start(
+            1,
+            "in-process://1".into(),
+            InProcessRouter::new(),
+            default_config(cluster).expect("config"),
+        )
+        .await
+        .expect("start");
+        store.initialize_singleton().await.expect("initialize");
+        assert!(
+            store
+                .wait_for_leadership(std::time::Duration::from_secs(5))
+                .await
+        );
+        Arc::new(store)
+    }
+
+    async fn put(store: &StoreMesh, key: ResourceKey, value: serde_json::Value) {
+        store
+            .propose(ResourceCommand::Put {
+                key,
+                value,
+                expected: None,
+                reason: Reason::Operator,
+            })
+            .await
+            .expect("propose");
+    }
+
+    fn pod(ns: &str, name: &str) -> ResourceKey {
+        ResourceKey::namespaced("", "v1", "Pod", ns, name)
+    }
+
+    /// Two pods in two namespaces, a Secret, and a kind with no registry
+    /// path (a custom resource), which every read must leave out.
+    async fn seed(store: &StoreMesh) {
+        put(store, pod("default", "web"), json!({ "spec": { "n": 1 } })).await;
+        put(
+            store,
+            pod("kube-system", "dns"),
+            json!({ "spec": { "n": "é\"" } }),
+        )
+        .await;
+        put(
+            store,
+            ResourceKey::namespaced("", "v1", "Secret", "default", "s"),
+            json!({ "data": { "k": "dg==" } }),
+        )
+        .await;
+        put(
+            store,
+            ResourceKey::cluster_scoped("example.com", "v1", "Widget", "w"),
+            json!({}),
+        )
+        .await;
+    }
+
+    #[test]
+    fn serialized_len_counts_exactly_what_to_vec_writes() {
+        for value in [
+            json!(null),
+            json!(-1.5e300),
+            json!("é\"\\\n\u{1F600}"),
+            json!([1, [2, { "k": "v" }]]),
+            json!({ "metadata": { "name": "web", "labels": { "a": "b" } },
+                    "spec": { "containers": [{ "image": "alpine" }] } }),
+        ] {
+            let bytes = serde_json::to_vec(&value).expect("a Value serializes");
+            assert_eq!(serialized_len(&value), bytes.len(), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn db_size_is_the_serialized_size_of_every_object_served() {
+        let store = boot("facade-db-size").await;
+        seed(&store).await;
+
+        let mut expected = 0usize;
+        for kind in ["Pod", "Secret"] {
+            for (key, value) in store.list("", "v1", kind, None).await {
+                let path = registry_path(&key).expect("a built-in kind");
+                expected += path.len() + serde_json::to_vec(&value).expect("json").len();
+            }
+        }
+        let facade = MeshEtcdStore::new(&store);
+        assert_eq!(
+            EtcdStatusStore::db_size(&facade).await,
+            Some(i64::try_from(expected).expect("small")),
+            "the paths and bodies of the three served objects, and not the Widget"
+        );
+        assert_eq!(
+            EtcdStatusStore::applied_index(&facade).await,
+            store.last_applied_index().await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_is_exactly_the_prefix_in_byte_order() {
+        let store = boot("facade-range").await;
+        seed(&store).await;
+        let facade = MeshEtcdStore::new(&store);
+
+        let keys = |kvs: Vec<KeyValue>| -> Vec<String> {
+            kvs.into_iter()
+                .map(|kv| String::from_utf8(kv.key).expect("utf8"))
+                .collect()
+        };
+        assert_eq!(
+            keys(EtcdReadStore::range(&facade, "/registry/pods/").await),
+            vec![
+                "/registry/pods/default/web".to_owned(),
+                "/registry/pods/kube-system/dns".to_owned(),
+            ]
+        );
+        assert_eq!(
+            keys(EtcdReadStore::range(&facade, "/registry/").await),
+            vec![
+                "/registry/pods/default/web".to_owned(),
+                "/registry/pods/kube-system/dns".to_owned(),
+                "/registry/secrets/default/s".to_owned(),
+            ],
+            "every served object, byte-ordered; the Widget has no path"
+        );
+        let web = EtcdReadStore::range(&facade, "/registry/pods/default/").await;
+        let (value, meta) = store
+            .get_with_meta(&pod("default", "web"))
+            .await
+            .expect("stored");
+        assert_eq!(
+            web,
+            vec![to_kv(
+                "/registry/pods/default/web".to_owned(),
+                &value,
+                &meta
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_is_the_window_after_since_under_the_prefix() {
+        let store = boot("facade-history").await;
+        seed(&store).await;
+        let facade = MeshEtcdStore::new(&store);
+
+        let revs = |events: Vec<Event>| -> Vec<i64> {
+            events
+                .into_iter()
+                .map(|e| e.kv.expect("a kv").mod_revision)
+                .collect()
+        };
+        // Pods are revisions 1 and 2; the Secret 3; the Widget 4.
+        assert_eq!(
+            revs(
+                EtcdWatchStore::changes_since(&facade, "/registry/", 0)
+                    .await
+                    .expect("ok")
+            ),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            revs(
+                EtcdWatchStore::changes_since(&facade, "/registry/pods/", 1)
+                    .await
+                    .expect("ok")
+            ),
+            vec![2],
+            "strictly after `since`, and only under the prefix"
+        );
+        assert_eq!(
+            revs(
+                EtcdWatchStore::changes_since(&facade, "/registry/", 4)
+                    .await
+                    .expect("ok")
+            ),
+            Vec::<i64>::new()
+        );
+        // Nothing is compacted, so the watermark is 0 — and a negative
+        // resume point is still below it. Read as "from 0" it would replay
+        // the whole window to a client that asked for something impossible.
+        assert_eq!(
+            EtcdWatchStore::changes_since(&facade, "/registry/", -1).await,
+            Err(0),
+            "a negative resume point is below even a zero watermark"
+        );
+    }
+
+    /// A resume point below the watermark is refused WITH the watermark:
+    /// negative, and below a real one after a durable reopen (T3.3 floors a
+    /// reloaded store at the revision it loaded).
+    #[tokio::test]
+    async fn a_resume_point_below_the_watermark_is_refused_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let store = StoreMesh::start_durable(
+                1,
+                "in-process://1".into(),
+                InProcessRouter::new(),
+                default_config("facade-gone").expect("config"),
+                dir.path(),
+            )
+            .await
+            .expect("start");
+            store.initialize_singleton().await.expect("initialize");
+            assert!(
+                store
+                    .wait_for_leadership(std::time::Duration::from_secs(5))
+                    .await
+            );
+            seed(&store).await;
+            store.terminate().await.expect("terminate");
+        }
+        let (store, _) = StoreMesh::start_or_resume(
+            1,
+            "in-process://1".into(),
+            InProcessRouter::new(),
+            default_config("facade-gone").expect("config"),
+            dir.path(),
+        )
+        .await
+        .expect("resume");
+        assert!(
+            store
+                .wait_for_leadership(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(store.compacted_revision().await, Revision(4));
+        let store = Arc::new(store);
+        let facade = MeshEtcdStore::new(&store);
+
+        assert_eq!(
+            EtcdWatchStore::changes_since(&facade, "/registry/", 3).await,
+            Err(4),
+            "below the reloaded watermark"
+        );
+        assert_eq!(
+            EtcdWatchStore::changes_since(&facade, "/registry/", -1).await,
+            Err(4),
+            "a negative resume point is below every watermark"
+        );
+        assert_eq!(
+            EtcdWatchStore::changes_since(&facade, "/registry/", 4).await,
+            Ok(Vec::new()),
+            "the watermark itself is servable"
         );
     }
 }

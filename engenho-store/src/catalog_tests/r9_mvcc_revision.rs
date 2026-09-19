@@ -16,9 +16,10 @@
 //!   * I6 determinism — identical command sequence ⇒ byte-identical
 //!     serde output.
 
-use engenho_store::command::{Reason, ResourceCommand};
-use engenho_store::revision::{ChangeKind, Revision};
-use engenho_store::{ResourceCatalog, ResourceKey, ResourceValue};
+use crate::command::{Reason, ResourceCommand};
+use crate::revision::{ChangeKind, Revision};
+use crate::state::ResourceCatalog;
+use crate::{ResourceKey, ResourceValue};
 use proptest::prelude::*;
 
 fn pod_key(name: &str) -> ResourceKey {
@@ -72,7 +73,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 /// Apply `op`, returning the outcome and whether the write was identical
 /// to what the key already stored — judged from the state BEFORE the
 /// apply, independently of the store's own gate.
-fn apply_op(cat: &mut ResourceCatalog, op: &Op, index: u64) -> (engenho_store::ApplyOutcome, bool) {
+fn apply_op(cat: &mut ResourceCatalog, op: &Op, index: u64) -> (crate::ApplyOutcome, bool) {
     let (Op::Put(k)
     | Op::Patch(k)
     | Op::Delete(k)
@@ -135,14 +136,13 @@ proptest! {
             let (outcome, identical) = apply_op(&mut cat, op, raft_index);
             // I7: the store's verdict matches the independent one, both ways.
             prop_assert_eq!(
-                outcome.op == engenho_store::ResourceOp::Unchanged,
+                outcome.op == crate::ResourceOp::Unchanged,
                 identical,
                 "op {:?} answered {:?}",
                 op,
                 outcome.op
             );
-            match outcome.change {
-                Some(change) => {
+            if let Some(change) = outcome.change {
                     real_mutations += 1;
                     // I1: each real mutation advances by exactly 1.
                     prop_assert_eq!(change.revision.0, prev_revision + 1);
@@ -159,19 +159,17 @@ proptest! {
                     } else {
                         prop_assert!(change.version_meta.mod_revision < change.revision);
                     }
-                }
-                None => {
+            } else {
                     // I2 + I7: a no-op or an identical write advances
                     // nothing, and leaves every stored object — its
                     // resourceVersion included — exactly as it was.
                     prop_assert!(matches!(
                         outcome.op,
-                        engenho_store::ResourceOp::NoOp | engenho_store::ResourceOp::Unchanged
+                        crate::ResourceOp::NoOp | crate::ResourceOp::Unchanged
                     ));
                     prop_assert_eq!(cat.revision().0, prev_revision);
                     prop_assert_eq!(&cat.resources, &before.resources);
                     prop_assert_eq!(&cat.history, &before.history);
-                }
             }
         }
 
@@ -221,14 +219,14 @@ fn noop_neutrality_explicit() {
         1,
         2,
     );
-    assert_eq!(o.op, engenho_store::ResourceOp::NoOp);
+    assert_eq!(o.op, crate::ResourceOp::NoOp);
     assert!(o.change.is_none());
     assert_eq!(cat.revision(), Revision(1));
     assert_eq!(cat.history.len(), 1);
 
     // delete-not-found
     let o = cat.apply(&delete_cmd(pod_key("ghost")), 1, 3);
-    assert_eq!(o.op, engenho_store::ResourceOp::NoOp);
+    assert_eq!(o.op, crate::ResourceOp::NoOp);
     assert!(o.change.is_none());
     assert_eq!(cat.revision(), Revision(1));
     assert_eq!(cat.history.len(), 1);

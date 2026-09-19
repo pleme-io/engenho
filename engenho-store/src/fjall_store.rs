@@ -690,10 +690,11 @@ impl FjallStore {
         self.inner.state.lock().await.tripwire.clone()
     }
 
-    /// Read-only snapshot of the current materialized catalog —
-    /// the durable + watch-relevant state machine copy.
-    pub async fn current_catalog(&self) -> ResourceCatalog {
-        self.inner.state.lock().await.catalog.clone()
+    /// Run `read` over the materialized catalog under ONE guard. Durable
+    /// sibling of [`crate::store::InMemoryStore::read_catalog`], whose
+    /// header says why it is `pub(crate)` and what `read` should do.
+    pub(crate) async fn read_catalog<R>(&self, read: impl FnOnce(&ResourceCatalog) -> R) -> R {
+        read(&self.inner.state.lock().await.catalog)
     }
 
     /// Stop this store's bookmark ticker and wait until it has ended, so it
@@ -712,9 +713,9 @@ impl FjallStore {
     ///
     /// Durable sibling of [`crate::store::InMemoryStore::current_revision`];
     /// that method's header carries the measurement. Short version: reading
-    /// this scalar via `current_catalog()` deep-clones the whole catalog and
-    /// its 8192-entry replay ring, which is what made establishing a watch
-    /// stall every concurrent write.
+    /// this scalar through the removed `current_catalog()` deep-cloned the
+    /// whole catalog and its 8192-entry replay ring, which is what made
+    /// establishing a watch stall every concurrent write.
     pub async fn current_revision(&self) -> crate::revision::Revision {
         self.inner.state.lock().await.catalog.revision()
     }
@@ -723,7 +724,7 @@ impl FjallStore {
     ///
     /// The durable sibling of [`crate::store::InMemoryStore::list_at_revision`];
     /// that method's header carries the measurement and the reasoning. Short
-    /// version: cloning the whole [`ResourceCatalog`] to serve a LIST also
+    /// version: cloning the whole catalog to serve a LIST also
     /// clones its 8192-entry watch-replay ring, making every read cost scale
     /// with cluster age instead of object count.
     pub async fn list_at_revision(
@@ -789,13 +790,9 @@ impl FjallStore {
         // handle is reachable by `fan_change` — all under THIS lock, so
         // the replay→live handoff is atomic AND structurally ordered (no
         // feeder task, no second producer racing apply).
-        let mut state = self.inner.state.lock().await;
-        let replay = state
-            .catalog
-            .changes_since(opts.from)
-            .map_err(WatchGone::from)?;
-        let boundary = state.catalog.revision();
-        Ok(state.watchers.register_captured(replay, boundary, &opts))
+        let mut guard = self.inner.state.lock().await;
+        let state = &mut *guard;
+        state.watchers.register(&state.catalog, &opts)
     }
 
     /// Subscribe to the LIVE-TAIL watch stream (compatibility shim over
@@ -1629,7 +1626,7 @@ mod tests {
             }
         }
         let s2 = FjallStore::open(&dir).unwrap();
-        let cat = s2.current_catalog().await;
+        let cat = s2.read_catalog(ResourceCatalog::clone).await;
         let persisted_applied = s2.inner.state.lock().await.last_applied;
 
         assert_eq!(
@@ -1678,7 +1675,7 @@ mod tests {
         let (last_applied, _) = s.applied_state().await.unwrap();
         let from = last_applied.map_or(0, |l| l.index + 1);
         let pending = s.try_get_log_entries(from..).await.unwrap().len();
-        (pending, s.current_catalog().await.len())
+        (pending, s.read_catalog(ResourceCatalog::len).await)
     }
 
     /// T2.9-store: `flush`, then the process goes away WITHOUT `terminate`.
@@ -1850,7 +1847,7 @@ mod tests {
             assert_eq!(res[0].revision, 1);
         }
         let s2 = FjallStore::open(&dir).unwrap();
-        let cat = s2.current_catalog().await;
+        let cat = s2.read_catalog(ResourceCatalog::clone).await;
         assert_eq!(cat.len(), 1);
         assert!(cat.get(&key).is_some());
         assert_eq!(cat.current_revision, Revision(1));
@@ -1875,7 +1872,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let src_cat = src.current_catalog().await;
+        let src_cat = src.read_catalog(ResourceCatalog::clone).await;
         let src_rev = src_cat.current_revision;
         assert!(src_rev.get() >= 4);
 
@@ -1890,7 +1887,7 @@ mod tests {
         dst.install_snapshot(&snap_meta, Box::new(Cursor::new(snap_bytes)))
             .await
             .unwrap();
-        let dst_cat = dst.current_catalog().await;
+        let dst_cat = dst.read_catalog(ResourceCatalog::clone).await;
         assert_eq!(dst_cat.current_revision, src_rev);
         // T3.3: the source evicted nothing, so its floor is 0 and its ring
         // backs every revision. A snapshot carries no ring, so the
@@ -2216,7 +2213,7 @@ mod tests {
 
         let mut reopened = FjallStore::open(&dir).unwrap();
         assert_eq!(reopened.current_revision().await, Revision(6));
-        assert_eq!(reopened.current_catalog().await.len(), 6);
+        assert_eq!(reopened.read_catalog(ResourceCatalog::len).await, 6);
         let (applied, membership) = reopened.applied_state().await.unwrap();
         assert_eq!(applied, Some(log_id(6)));
         assert_eq!(membership, snap.last_membership);

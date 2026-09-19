@@ -121,10 +121,14 @@ impl StoreBackend {
         }
     }
 
-    async fn current_catalog(&self) -> ResourceCatalog {
+    /// Run `read` over the backend's catalog under ONE guard — see
+    /// [`InMemoryStore::read_catalog`]. Every catalog read on
+    /// [`StoreMesh`] that is not one of the older per-backend pairs above
+    /// goes through here, so a new accessor is written once, not twice.
+    async fn read<R>(&self, read: impl FnOnce(&ResourceCatalog) -> R) -> R {
         match self {
-            Self::Memory(s) => s.current_catalog().await,
-            Self::Fjall(s) => s.current_catalog().await,
+            Self::Memory(s) => s.read_catalog(read).await,
+            Self::Fjall(s) => s.read_catalog(read).await,
         }
     }
 
@@ -468,8 +472,9 @@ impl StoreMesh {
         kind: &str,
         namespace: Option<&str>,
     ) -> (Vec<(ResourceKey, ResourceValue)>, crate::revision::Revision) {
-        // ★ NOT `current_catalog()`. That clones the whole ResourceCatalog —
-        // including its 8192-entry watch-replay history ring — so serving a
+        // ★ NOT a catalog clone (the removed `current_catalog()`). That
+        // copied the whole catalog — including its 8192-entry watch-replay
+        // history ring — so serving a
         // LIST cost time proportional to the cluster's AGE rather than to the
         // number of objects listed. Measured 2026-09-14: 4.4ms → 31.8ms as the
         // ring filled while ONE object existed, plateauing exactly at the cap;
@@ -488,8 +493,9 @@ impl StoreMesh {
     /// mutually consistent FOR THIS CALL. The range-pagination sibling of
     /// [`Self::list_at_revision`].
     ///
-    /// ★ NOT `current_catalog()`. That deep-clones every resource plus the
-    /// 8192-entry watch-replay ring, and this runs once per PAGE of every
+    /// ★ NOT a catalog clone (the removed `current_catalog()`). That
+    /// deep-cloned every resource plus the 8192-entry watch-replay ring,
+    /// and this runs once per PAGE of every
     /// informer relist: after a restart every client relists at once, so a
     /// per-page clone multiplies the cost that wedged Flux on rio by the
     /// number of pages. The page is read under one guard, over the scope's
@@ -505,8 +511,8 @@ impl StoreMesh {
     /// appear on a later page, because the next call reads the live catalog
     /// rather than reading AS OF the token's first-page revision. The
     /// `snapshot_rev` baked into the continue token is the envelope
-    /// `resourceVersion` LABEL, not a read-isolation mechanism. See
-    /// [`crate::state::ResourceCatalog::list_page`] for the destination
+    /// `resourceVersion` LABEL, not a read-isolation mechanism. See the
+    /// catalog's `list_page` (crate-private since T3.2b) for the destination
     /// (revision-indexed historical reads, deferred — needs retained
     /// historical MVCC views).
     ///
@@ -549,21 +555,101 @@ impl StoreMesh {
         (items, revision, next, remaining)
     }
 
-    /// Read-only snapshot of the whole catalog.
-    pub async fn current_catalog(&self) -> ResourceCatalog {
-        self.store.current_catalog().await
-    }
+    // ── The catalog's read surface: scalars and single-guard reads ─────
+    //
+    // ★ THERE IS NO WHOLE-CATALOG READ, AND THERE CANNOT BE ONE (T3.2b).
+    // `current_catalog()` used to hand the catalog out by value, so reading
+    // one integer — `.revision()`, `.last_applied_index` — deep-cloned every
+    // resource plus the 8192-entry watch-replay ring (two full resource
+    // bodies per entry) under the lock `apply` needs. Measured on rio: each
+    // watch establishment cost hundreds of MB of memcpy, stalling writes for
+    // tens of seconds at ~2 cores while FluxCD held dozens of watches.
+    //
+    // The catalog is now crate-private and the crate denies
+    // `private_interfaces`, so a `pub fn` returning it does not compile.
+    // What remains is the shape below: a scalar, one key, or a visitor that
+    // runs under ONE guard and clones only what the caller keeps.
 
     /// The current MVCC revision, read WITHOUT cloning the catalog.
-    ///
-    /// ★ Reach for this instead of `current_catalog().revision()`. That reads
-    /// one `u64` by deep-cloning every resource plus the 8192-entry
-    /// watch-replay ring (two full resource bodies per entry). Measured on
-    /// rio: it made each watch establishment cost hundreds of MB of memcpy
-    /// under the same lock `apply` needs, stalling writes for tens of seconds
-    /// at ~2 cores of CPU while FluxCD held dozens of watches.
     pub async fn current_revision(&self) -> crate::revision::Revision {
         self.store.current_revision().await
+    }
+
+    /// The Raft log index of the last entry applied to the catalog — the
+    /// read-after-write position [`Self::wait_for_applied`] waits on, and
+    /// what etcd's `Status` reports as `raftAppliedIndex`.
+    pub async fn last_applied_index(&self) -> u64 {
+        self.store.read(|c| c.last_applied_index).await
+    }
+
+    /// The compaction watermark: every change above it is still retained
+    /// for replay; a resume point below it is refused with
+    /// [`crate::revision::CompactedTooOld`]. A store that has just loaded
+    /// from disk or a snapshot starts with it equal to
+    /// [`Self::current_revision`] (T3.3).
+    pub async fn compacted_revision(&self) -> crate::revision::Revision {
+        self.store.read(ResourceCatalog::compacted_revision).await
+    }
+
+    /// One resource with its MVCC version metadata — [`Self::get`] plus the
+    /// `(create_revision, mod_revision, version)` triple etcd reports.
+    pub async fn get_with_meta(
+        &self,
+        key: &ResourceKey,
+    ) -> Option<(ResourceValue, crate::revision::VersionMeta)> {
+        self.store
+            .read(|c| c.get_with_meta(key).map(|(v, m)| (v.clone(), m)))
+            .await
+    }
+
+    /// Visit every stored resource, in key order, under ONE guard.
+    ///
+    /// For a reader whose selection is not a [`ListScope`] — the etcd
+    /// façade's `/registry` prefix, or its size of everything served.
+    /// Nothing is cloned for it: `visit` sees each resource by reference and
+    /// keeps what it needs.
+    ///
+    /// ★ `visit` RUNS UNDER THE LOCK `apply` TAKES. Filter and clone in it;
+    /// render after this returns. A visitor that serializes every object
+    /// holds every write for the length of that work.
+    pub async fn for_each_resource(
+        &self,
+        mut visit: impl FnMut(&ResourceKey, &ResourceValue, crate::revision::VersionMeta),
+    ) {
+        self.store
+            .read(|c| {
+                for (key, (value, meta)) in &c.resources {
+                    visit(key, value, *meta);
+                }
+            })
+            .await;
+    }
+
+    /// Visit every retained change with `revision > from`, in revision
+    /// order, under ONE guard — the watch replay's own window, without
+    /// cloning the ring to read it.
+    ///
+    /// ★ `visit` RUNS UNDER THE LOCK `apply` TAKES; see
+    /// [`Self::for_each_resource`].
+    ///
+    /// # Errors
+    ///
+    /// [`crate::revision::CompactedTooOld`] when `from` is below
+    /// [`Self::compacted_revision`]; `visit` is then never called, so a
+    /// caller cannot mistake a partial window for the whole one.
+    pub async fn for_each_change_since(
+        &self,
+        from: crate::revision::Revision,
+        mut visit: impl FnMut(&crate::revision::Change),
+    ) -> Result<(), crate::revision::CompactedTooOld> {
+        self.store
+            .read(|c| {
+                for change in c.changes_after(from)? {
+                    visit(change);
+                }
+                Ok(())
+            })
+            .await
     }
 
     /// Open a RESUMABLE, gap-free watch from `opts.from`. The
@@ -638,8 +724,7 @@ impl StoreMesh {
     pub async fn wait_for_applied(&self, target: u64, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let catalog = self.current_catalog().await;
-            if catalog.last_applied_index >= target {
+            if self.last_applied_index().await >= target {
                 return true;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
