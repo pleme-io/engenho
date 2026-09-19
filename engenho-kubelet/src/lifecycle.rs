@@ -33,6 +33,7 @@
 
 use crate::backend::Readoption;
 use crate::cri::{ExitDisposition, RunState};
+use crate::probe::{PodLifecycle, ProbeTrip};
 use engenho_types::curated_enums::PodPhase;
 use serde::{Deserialize, Serialize};
 
@@ -190,6 +191,93 @@ impl std::fmt::Display for Termination {
             Self::Observed(d) => d.fmt(f),
             Self::Unknown => f.write_str("unobserved"),
         }
+    }
+}
+
+// ── What the kubelet does with one container ─────────────────────────────
+//
+// Upstream decides this in one place, `ShouldContainerBeRestarted`
+// (pkg/kubelet/container/helpers.go:82-117), read by `computePodActions`. The
+// kubelet here asks at three sites — a container it never started, one it
+// polls running, one it polls down — so the decision is three functions, one
+// per site, each returning only the actions possible there: a site cannot be
+// handed an action that makes no sense for it.
+//
+// ★ A POD BEING DELETED STARTS NOTHING AND RESTARTS NOTHING. Upstream's first
+// check, before the policy is read. The kubelet used to consult only the
+// policy, so a crashed container of a pod waiting on its finalizers was
+// restarted — and held in CrashLoopBackOff — for as long as the pod lingered.
+
+/// Whether the kubelet starts a container of this pod that has never run.
+///
+/// Upstream: no runtime record ⇒ start it, under every policy (`Never`
+/// included); a pod being deleted starts nothing.
+#[must_use]
+pub fn starts_fresh(pod: PodLifecycle) -> bool {
+    pod == PodLifecycle::Live
+}
+
+/// What the kubelet does with a container it polled RUNNING.
+///
+/// Both stopping arms carry the [`ProbeTrip`] that earned them, and a trip is
+/// built only by the probe fold counting an observed failure past its
+/// threshold — so a running container cannot be stopped here on anything
+/// else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunningAction {
+    /// Leave it running.
+    Keep,
+    /// Stop it and start a replacement.
+    Restart(ProbeTrip),
+    /// Stop it and leave it down.
+    Kill(ProbeTrip),
+}
+
+/// The decision for a running container whose liveness or startup probe did
+/// (`Some(trip)`) or did not (`None`) fail past its threshold this tick.
+///
+/// Upstream's `computePodActions`: a failed probe KILLS the container under
+/// every policy, and it is started again only when the pod's policy is not
+/// `Never` (`shouldRestartOnFailure`). Under `Never` it used to be left
+/// running here, failing its probe for as long as it lived, where upstream
+/// stops it and the pod ends terminal. A pod being deleted is not restarted
+/// either (its liveness and startup probes are retired, so this arm is the
+/// total answer rather than a path the kubelet takes).
+#[must_use]
+pub fn running_action(
+    policy: RestartPolicy,
+    pod: PodLifecycle,
+    trip: Option<ProbeTrip>,
+) -> RunningAction {
+    match (trip, pod, policy) {
+        (None, _, _) => RunningAction::Keep,
+        (Some(trip), PodLifecycle::Terminating, _) | (Some(trip), _, RestartPolicy::Never) => {
+            RunningAction::Kill(trip)
+        }
+        (Some(trip), PodLifecycle::Live, RestartPolicy::Always | RestartPolicy::OnFailure) => {
+            RunningAction::Restart(trip)
+        }
+    }
+}
+
+/// What the kubelet does with a container it polled DOWN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownAction {
+    /// Start a replacement (once the crash backoff allows).
+    Restart,
+    /// It stays down: report the exit, and the pod's phase follows from it.
+    Latch,
+}
+
+/// The decision for a container that is down, having ended with `exit`.
+///
+/// Upstream's order: a pod being deleted never restarts; then the policy
+/// decides ([`RestartPolicy::should_restart`]).
+#[must_use]
+pub fn down_action(policy: RestartPolicy, pod: PodLifecycle, exit: Termination) -> DownAction {
+    match pod {
+        PodLifecycle::Live if policy.should_restart(exit) => DownAction::Restart,
+        PodLifecycle::Live | PodLifecycle::Terminating => DownAction::Latch,
     }
 }
 

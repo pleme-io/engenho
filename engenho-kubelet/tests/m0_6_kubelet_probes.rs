@@ -303,6 +303,59 @@ async fn liveness_failure_does_not_restart_under_never() {
     teardown(store, kubelet).await;
 }
 
+// ── 3b — …but a failed liveness probe still STOPS it under Never ──────────
+
+/// Upstream's `computePodActions` (oracle row `actions/liveness failure under
+/// Never: kill, do not restart`): a failed liveness probe kills the container
+/// under EVERY policy, and `Never` only means it is not started again. It used
+/// to be left running under `Never`, failing its probe, with the pod reported
+/// Running for as long as the process lived.
+#[tokio::test]
+async fn a_failed_liveness_probe_stops_the_container_under_never() {
+    use engenho_kubelet::backend::FakeEvent;
+    let store = boot_store("probes-liveness-never-kill").await;
+    let backend = Arc::new(FakeBackend::new());
+    let net = Arc::new(FakeNetProber::new());
+    let clock = TestClock::new();
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A")
+        .with_net_prober(net.clone())
+        .with_clock(clock.as_clock());
+
+    let container = json!({
+        "name": "main",
+        "image": "busybox",
+        "livenessProbe": {
+            "exec": { "command": ["false"] },
+            "periodSeconds": 1,
+            "failureThreshold": 1
+        }
+    });
+    put_pod_container(&store, "p1", container, "Never").await;
+    backend.set_default_exec(ExecOutcome::failure(1)).await;
+
+    kubelet.tick().await.unwrap();
+    for _ in 0..3 {
+        clock.advance(Duration::from_millis(1100));
+        kubelet.tick().await.unwrap();
+    }
+    let events = backend.events().await;
+    assert!(
+        events.iter().any(|e| matches!(e, FakeEvent::Stop(_))),
+        "the container that failed its liveness probe was stopped: {events:?}"
+    );
+    assert_eq!(count_starts(&events), 1, "and not started again");
+    let pod = store.get(&pod_key("p1")).await.expect("pod present");
+    assert!(
+        matches!(
+            pod.pointer("/status/phase").and_then(Value::as_str),
+            Some("Succeeded" | "Failed")
+        ),
+        "a Never pod whose container was stopped ends terminal, not Running: {pod}"
+    );
+
+    teardown(store, kubelet).await;
+}
+
 // ── 4 — STARTUP gates liveness (no premature restart) ─────────────────────
 
 #[tokio::test]

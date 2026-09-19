@@ -59,6 +59,7 @@ use crate::lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, LostPod, RestartPolicy, StartedAs,
     StoredContainer, StoredRun, Termination, reconcile_pod_phase,
 };
+use crate::lifecycle::{DownAction, RunningAction};
 use crate::pod_volume::{
     MountSource, PodVolumeSource, PodmanVolumeMaterializer, VolumeMaterializer, VolumeResolveError,
     VolumeTeardown, container_mounts, pod_volumes, teardown_obligation, teardowns_of,
@@ -361,6 +362,23 @@ impl std::fmt::Display for BackOffRestarting<'_> {
     }
 }
 
+/// The event text for a running container stopped because its liveness or
+/// startup probe failed, and that will not be started again.
+struct KilledOnProbe<'a> {
+    container: &'a str,
+    trip: crate::probe::ProbeTrip,
+}
+
+impl std::fmt::Display for KilledOnProbe<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Stopping container {}: {}; it will not be restarted",
+            self.container, self.trip
+        )
+    }
+}
+
 /// The event text for a container the start path brought up, by how it
 /// relates to the run the stored status recorded ([`StartedAs`]).
 struct StartedEvent<'a> {
@@ -413,10 +431,13 @@ struct ContainerRecord {
     /// Per-container probe specs + runtime counters (liveness/readiness/
     /// startup). Default = all-None = no probes = behavior-preserving.
     probes: ContainerProbes,
-    /// When this container was (re)started. Feeds `uptime_before_exit`, which
-    /// is what lets a container that stayed up long enough earn a clean slate
-    /// instead of inheriting an old crash's penalty.
-    started_at: Option<Instant>,
+    /// The container's crash-loop penalty: `None` until its first restart
+    /// after an exit, then upstream's backoff entry, advanced by each
+    /// exit-driven restart and wiped by a run longer than
+    /// [`crate::backoff::RESET_AFTER`]. It is NOT derived from
+    /// `restart_count`, which never goes down — see
+    /// [`crate::backoff::CrashBackoff`].
+    crash_backoff: Option<crate::backoff::CrashBackoff>,
     /// The resolved volume mounts this container was STARTED with.
     ///
     /// ── ★ WHY THE RECORD REMEMBERS THEM ──────────────────────────────
@@ -1755,7 +1776,10 @@ impl Kubelet {
     ///
     /// A terminal pod never does: its containers are not started again.
     fn awaits_app_start(pod: &Value, lp: &LocalPod) -> bool {
-        if Self::pod_already_terminal(pod) {
+        // A terminal pod, or one being deleted, starts no missing container:
+        // it is observed as it is.
+        if Self::pod_already_terminal(pod) || !crate::lifecycle::starts_fresh(PodLifecycle::of(pod))
+        {
             return false;
         }
         pod.pointer("/spec/containers")
@@ -2678,6 +2702,12 @@ impl Kubelet {
                 match self.readopt(key, value, report).await? {
                     Readopted::Start => {}
                     Readopted::Settled | Readopted::Held => return Ok(()),
+                }
+                // A pod being deleted starts nothing (upstream's first check,
+                // before the policy is read).
+                if !crate::lifecycle::starts_fresh(PodLifecycle::of(value)) {
+                    debug!(pod = %key.label(), "pod is being deleted; not starting it");
+                    return Ok(());
                 }
                 self.start_bound_pod(key, value, report, soonest_requeue)
                     .await
@@ -3625,7 +3655,9 @@ impl Kubelet {
                                 .get(&cname)
                                 .cloned()
                                 .unwrap_or_default(),
-                            started_at: Some(now),
+                            // A first start owes nothing: the penalty starts
+                            // at the first exit-driven restart.
+                            crash_backoff: None,
                             terminated_at: None,
                             // Remember what this container was started with,
                             // so a restart can be given the same mounts.
@@ -3915,9 +3947,16 @@ impl Kubelet {
     /// M0.2 exit-code path's start-then-remove only worked under FakeBackend,
     /// which doesn't enforce name uniqueness — surfaced live by the liveness
     /// restart bar.)
+    ///
+    /// `crash_backoff` is the penalty the replacement carries, recorded only
+    /// once it has started: the entry the crash gate advanced for an
+    /// exit-driven restart, the record's own for a probe-driven one. A restart
+    /// that never started leaves the penalty where it was, so a replacement
+    /// held on its start curve or waiting on the old container's stop is not
+    /// charged a crash each tick it waits.
     // The args are the precise restart inputs (key/value/namespace/cname/spec +
-    // old id + old restart count); threading them as one struct would add a
-    // single-use type for no clarity gain.
+    // old id + old restart count + the penalty to record); threading them as
+    // one struct would add a single-use type for no clarity gain.
     #[allow(clippy::too_many_arguments)]
     async fn restart_container(
         &self,
@@ -3928,6 +3967,7 @@ impl Kubelet {
         spec: &ContainerSpec,
         old_container_id: &str,
         old_restart_count: u32,
+        crash_backoff: Option<crate::backoff::CrashBackoff>,
     ) -> Relaunch {
         let permit = match self.start_permit(key, cname).await {
             Ok(permit) => permit,
@@ -3983,13 +4023,58 @@ impl Kubelet {
                 rec.mounts.clone_from(&restart_spec.mounts);
                 rec.container_id.clone_from(&new_status.container_id);
                 rec.restart_count = new_count;
-                rec.started_at = Some(now);
+                rec.crash_backoff = crash_backoff;
                 rec.terminated_at = None;
                 // Fresh startup window + zeroed probe counters on restart.
                 rec.probes.reset(now);
             }
         }
         Relaunch::Started(new_status)
+    }
+
+    /// Stop a running container whose liveness or startup probe failed, and
+    /// that will not be started again ([`RunningAction::Kill`]). `true` once
+    /// the runtime took the stop.
+    ///
+    /// ── ★ A FAILED PROBE STOPS THE CONTAINER UNDER EVERY POLICY ─────────────
+    /// Upstream kills it and, under `Never`, does not start it again: the next
+    /// poll finds it down, the policy latches the exit, and the pod ends
+    /// terminal. This used to skip the trip under `Never`, leaving a container
+    /// that had failed its liveness probe running — and the pod Running — for
+    /// as long as it lived. The stop is idempotent, so a tick that finds it
+    /// still stopping asks again.
+    async fn stop_for_probe(
+        &self,
+        key: &ResourceKey,
+        cname: &str,
+        container_id: &str,
+        trip: crate::probe::ProbeTrip,
+    ) -> bool {
+        match self.backend.stop(container_id).await {
+            Ok(()) => {
+                self.emit(
+                    key,
+                    engenho_controllers::event_recorder::Reason::Killing,
+                    KilledOnProbe {
+                        container: cname,
+                        trip,
+                    }
+                    .to_string(),
+                )
+                .await;
+                true
+            }
+            Err(cause) => {
+                warn!(
+                    pod = %key.label(),
+                    container = %cname,
+                    %trip,
+                    error = %cause,
+                    "a container that failed its probe could not be stopped"
+                );
+                false
+            }
+        }
     }
 
     /// Poll one container, split into [`Polled::Running`] / [`Polled::Down`]
@@ -4097,46 +4182,47 @@ impl Kubelet {
                     self.report_blindness(key, cname, &outcome, &mut pod_blind)
                         .await;
 
-                    if let Some(trip) = outcome.trip
-                        && restart_policy != RestartPolicy::Never
+                    match crate::lifecycle::running_action(restart_policy, lifecycle, outcome.trip)
                     {
-                        // Liveness/startup OBSERVED failures past threshold →
-                        // restart THIS container via the existing restart
-                        // machinery (restartPolicy:Never suppresses it — K8s
-                        // semantics).
-                        debug!(pod = %key.label(), container = %cname, %trip, "probe tripped");
-                        match self
-                            .restart_container(
-                                key,
-                                value,
-                                namespace,
-                                cname,
-                                spec,
-                                &record.container_id,
-                                record.restart_count,
-                            )
-                            .await
-                        {
-                            Relaunch::Started(new_status) => {
-                                if let Some(ip) = &new_status.pod_ip {
-                                    pod_ip.get_or_insert_with(|| ip.clone());
-                                }
-                                // A freshly-restarted container is not-ready
-                                // until its probes re-pass (startup gate / first
-                                // readiness success).
-                                observations.push(ContainerObservation {
-                                    name: cname.clone(),
-                                    state: ContainerState::Running,
-                                    container_id: Some(new_status.container_id.clone()),
-                                    restart_count: record.restart_count + 1,
-                                    ready: false,
-                                    // App container: the init-kind field is
-                                    // meaningless here and stays Regular.
-                                    kind: crate::lifecycle::InitKind::Regular,
-                                    ever_started: true,
-                                });
-                                report.objects_changed += 1;
-                                self.emit(
+                        RunningAction::Restart(trip) => {
+                            // Liveness/startup OBSERVED failures past threshold →
+                            // restart THIS container via the existing restart
+                            // machinery. A probe-driven restart carries the
+                            // container's crash penalty over unchanged.
+                            debug!(pod = %key.label(), container = %cname, %trip, "probe tripped");
+                            match self
+                                .restart_container(
+                                    key,
+                                    value,
+                                    namespace,
+                                    cname,
+                                    spec,
+                                    &record.container_id,
+                                    record.restart_count,
+                                    record.crash_backoff,
+                                )
+                                .await
+                            {
+                                Relaunch::Started(new_status) => {
+                                    if let Some(ip) = &new_status.pod_ip {
+                                        pod_ip.get_or_insert_with(|| ip.clone());
+                                    }
+                                    // A freshly-restarted container is not-ready
+                                    // until its probes re-pass (startup gate / first
+                                    // readiness success).
+                                    observations.push(ContainerObservation {
+                                        name: cname.clone(),
+                                        state: ContainerState::Running,
+                                        container_id: Some(new_status.container_id.clone()),
+                                        restart_count: record.restart_count + 1,
+                                        ready: false,
+                                        // App container: the init-kind field is
+                                        // meaningless here and stays Regular.
+                                        kind: crate::lifecycle::InitKind::Regular,
+                                        ever_started: true,
+                                    });
+                                    report.objects_changed += 1;
+                                    self.emit(
                                     key,
                                     engenho_controllers::event_recorder::Reason::Unhealthy,
                                     format!(
@@ -4145,91 +4231,116 @@ impl Kubelet {
                                     ),
                                 )
                                 .await;
-                                debug!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    restart_count = record.restart_count + 1,
-                                    "kubelet restarted container (probe verdict)"
-                                );
-                            }
-                            Relaunch::Held(held) => {
-                                // The replacement's last start failed and its
-                                // curve still owes a wait; the running
-                                // container was left alone.
-                                debug!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    remaining_s = held.remaining.as_secs(),
-                                    "probe-driven restart backing off"
-                                );
-                                Self::accumulate_requeue(soonest_requeue, held.remaining);
-                                observations.push(ContainerObservation {
-                                    name: cname.clone(),
-                                    state: ContainerState::Running,
-                                    container_id: Some(record.container_id.clone()),
-                                    restart_count: record.restart_count,
-                                    ready: outcome.ready,
-                                    kind: crate::lifecycle::InitKind::Regular,
-                                    ever_started: true,
-                                });
-                                report.objects_skipped += 1;
-                            }
-                            Relaunch::Failed(failed) => {
-                                Self::accumulate_requeue(
-                                    soonest_requeue,
-                                    failed.cost.next_attempt_in,
-                                );
-                                warn!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    error = %failed,
-                                    "probe-driven restart failed; retrying on the start curve"
-                                );
-                                observations.push(ContainerObservation {
-                                    name: cname.clone(),
-                                    state: ContainerState::Running,
-                                    container_id: Some(record.container_id.clone()),
-                                    restart_count: record.restart_count,
-                                    ready: outcome.ready,
-                                    kind: crate::lifecycle::InitKind::Regular,
-                                    ever_started: true,
-                                });
-                                report.objects_skipped += 1;
-                            }
-                            Relaunch::OldNotCleared(cause) => {
-                                log_old_not_cleared(key, cname, &cause);
-                                if matches!(cause, KubeletError::NotReaped { .. }) {
-                                    // Its stop is in flight; the replacement
-                                    // follows as soon as it is reaped.
-                                    Self::accumulate_requeue(soonest_requeue, MIN_PROBE_REQUEUE);
+                                    debug!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        restart_count = record.restart_count + 1,
+                                        "kubelet restarted container (probe verdict)"
+                                    );
                                 }
-                                // Still up, and being stopped for the probe it
-                                // failed: not ready.
-                                observations.push(ContainerObservation {
-                                    name: cname.clone(),
-                                    state: ContainerState::Running,
-                                    container_id: Some(record.container_id.clone()),
-                                    restart_count: record.restart_count,
-                                    ready: false,
-                                    kind: crate::lifecycle::InitKind::Regular,
-                                    ever_started: true,
-                                });
-                                report.objects_skipped += 1;
+                                Relaunch::Held(held) => {
+                                    // The replacement's last start failed and its
+                                    // curve still owes a wait; the running
+                                    // container was left alone.
+                                    debug!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        remaining_s = held.remaining.as_secs(),
+                                        "probe-driven restart backing off"
+                                    );
+                                    Self::accumulate_requeue(soonest_requeue, held.remaining);
+                                    observations.push(ContainerObservation {
+                                        name: cname.clone(),
+                                        state: ContainerState::Running,
+                                        container_id: Some(record.container_id.clone()),
+                                        restart_count: record.restart_count,
+                                        ready: outcome.ready,
+                                        kind: crate::lifecycle::InitKind::Regular,
+                                        ever_started: true,
+                                    });
+                                    report.objects_skipped += 1;
+                                }
+                                Relaunch::Failed(failed) => {
+                                    Self::accumulate_requeue(
+                                        soonest_requeue,
+                                        failed.cost.next_attempt_in,
+                                    );
+                                    warn!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        error = %failed,
+                                        "probe-driven restart failed; retrying on the start curve"
+                                    );
+                                    observations.push(ContainerObservation {
+                                        name: cname.clone(),
+                                        state: ContainerState::Running,
+                                        container_id: Some(record.container_id.clone()),
+                                        restart_count: record.restart_count,
+                                        ready: outcome.ready,
+                                        kind: crate::lifecycle::InitKind::Regular,
+                                        ever_started: true,
+                                    });
+                                    report.objects_skipped += 1;
+                                }
+                                Relaunch::OldNotCleared(cause) => {
+                                    log_old_not_cleared(key, cname, &cause);
+                                    if matches!(cause, KubeletError::NotReaped { .. }) {
+                                        // Its stop is in flight; the replacement
+                                        // follows as soon as it is reaped.
+                                        Self::accumulate_requeue(
+                                            soonest_requeue,
+                                            MIN_PROBE_REQUEUE,
+                                        );
+                                    }
+                                    // Still up, and being stopped for the probe it
+                                    // failed: not ready.
+                                    observations.push(ContainerObservation {
+                                        name: cname.clone(),
+                                        state: ContainerState::Running,
+                                        container_id: Some(record.container_id.clone()),
+                                        restart_count: record.restart_count,
+                                        ready: false,
+                                        kind: crate::lifecycle::InitKind::Regular,
+                                        ever_started: true,
+                                    });
+                                    report.objects_skipped += 1;
+                                }
                             }
                         }
-                    } else {
-                        // No restart this tick → readiness sources from the
-                        // probe verdict (REPLACING the hard-`true`). A no-probe
-                        // container's outcome.ready == is_running (true here).
-                        observations.push(ContainerObservation {
-                            name: cname.clone(),
-                            state: ContainerState::Running,
-                            container_id: Some(record.container_id.clone()),
-                            restart_count: record.restart_count,
-                            ready: outcome.ready,
-                            kind: crate::lifecycle::InitKind::Regular,
-                            ever_started: true,
-                        });
+                        RunningAction::Kill(trip) => {
+                            if self
+                                .stop_for_probe(key, cname, &record.container_id, trip)
+                                .await
+                            {
+                                report.objects_changed += 1;
+                            } else {
+                                report.objects_skipped += 1;
+                            }
+                            // Up this instant and being stopped: not ready.
+                            observations.push(ContainerObservation {
+                                name: cname.clone(),
+                                state: ContainerState::Running,
+                                container_id: Some(record.container_id.clone()),
+                                restart_count: record.restart_count,
+                                ready: false,
+                                kind: crate::lifecycle::InitKind::Regular,
+                                ever_started: true,
+                            });
+                        }
+                        RunningAction::Keep => {
+                            // No restart this tick → readiness sources from the
+                            // probe verdict (REPLACING the hard-`true`). A no-probe
+                            // container's outcome.ready == is_running (true here).
+                            observations.push(ContainerObservation {
+                                name: cname.clone(),
+                                state: ContainerState::Running,
+                                container_id: Some(record.container_id.clone()),
+                                restart_count: record.restart_count,
+                                ready: outcome.ready,
+                                kind: crate::lifecycle::InitKind::Regular,
+                                ever_started: true,
+                            });
+                        }
                     }
                 }
                 Ok(Polled::Down {
@@ -4256,91 +4367,86 @@ impl Kubelet {
                     // The stamp is taken here, on the FIRST tick that sees
                     // the exit, so the delay is measured from the exit and
                     // not from whenever the operator happened to look.
-                    let backoff = if restart_policy.should_restart(exit) {
-                        let (since_exit, uptime) = {
+                    //
+                    // ★ THE PENALTY IS THE RECORD'S ENTRY, NOT ITS RESTART
+                    // COUNT: see `CrashBackoff`. A Terminating pod restarts
+                    // nothing (`down_action`), so it is never held either.
+                    let gate = match crate::lifecycle::down_action(restart_policy, lifecycle, exit)
+                    {
+                        DownAction::Latch => None,
+                        DownAction::Restart => Some({
                             let mut local = self.local.lock().await;
                             let rec = local.get_mut(key).and_then(|p| p.containers.get_mut(cname));
-                            match rec {
-                                Some(r) => {
-                                    let exited = *r.terminated_at.get_or_insert(now);
-                                    let uptime = r.started_at.map_or(Duration::ZERO, |st| {
-                                        exited.saturating_duration_since(st)
-                                    });
-                                    (now.saturating_duration_since(exited), uptime)
-                                }
-                                None => (Duration::ZERO, Duration::ZERO),
-                            }
-                        };
-                        crate::backoff::decide(record.restart_count, since_exit, uptime)
-                    } else {
-                        // Not restartable at all — the terminal-latch branch
-                        // below owns it. `Restart` here is never acted on.
-                        crate::backoff::BackoffDecision::Restart
+                            let (entry, finished) = match rec {
+                                Some(r) => (r.crash_backoff, *r.terminated_at.get_or_insert(now)),
+                                None => (record.crash_backoff, now),
+                            };
+                            crate::backoff::crash_gate(entry, finished, now)
+                        }),
                     };
 
-                    if let crate::backoff::BackoffDecision::Wait { remaining } = backoff {
-                        // Ask to be re-ticked when the hold expires rather
-                        // than relying on the next periodic sweep: a 5-minute
-                        // cap with a 30-second sweep would restart up to
-                        // 4m30s late, and the lateness grows with the delay.
-                        let soon = soonest_requeue.get_or_insert(remaining);
-                        *soon = (*soon).min(remaining);
-                        debug!(
-                            pod = %key.label(),
-                            container = %cname,
-                            restart_count = record.restart_count,
-                            remaining_secs = remaining.as_secs(),
-                            "container held in CrashLoopBackOff"
-                        );
-                        // ★ THE EVENT THAT WAS MISSING. A pod at 149
-                        // restarts said nothing; this is the line that
-                        // would have explained it without reading podman.
-                        self.emit(
-                            key,
-                            engenho_controllers::event_recorder::Reason::BackOff,
-                            BackOffRestarting {
-                                container: cname,
-                                remaining,
-                                prior_restarts: record.restart_count,
-                            }
-                            .to_string(),
-                        )
-                        .await;
-                        observations.push(ContainerObservation::backing_off(
-                            cname,
-                            &record.container_id,
-                            backoff
-                                .waiting_reason()
-                                .unwrap_or(crate::backoff::CRASH_LOOP_BACK_OFF),
-                            record.restart_count,
-                        ));
-                        continue;
-                    }
-
-                    if restart_policy.should_restart(exit) {
-                        match self
-                            .restart_container(
+                    match gate {
+                        Some(held @ crate::backoff::CrashGate::Hold { remaining }) => {
+                            // Ask to be re-ticked when the hold expires rather
+                            // than relying on the next periodic sweep: a 5-minute
+                            // cap with a 30-second sweep would restart up to
+                            // 4m30s late, and the lateness grows with the delay.
+                            let soon = soonest_requeue.get_or_insert(remaining);
+                            *soon = (*soon).min(remaining);
+                            debug!(
+                                pod = %key.label(),
+                                container = %cname,
+                                restart_count = record.restart_count,
+                                remaining_secs = remaining.as_secs(),
+                                "container held in CrashLoopBackOff"
+                            );
+                            // ★ THE EVENT THAT WAS MISSING. A pod at 149
+                            // restarts said nothing; this is the line that
+                            // would have explained it without reading podman.
+                            self.emit(
                                 key,
-                                value,
-                                namespace,
-                                cname,
-                                spec,
-                                &record.container_id,
-                                record.restart_count,
-                            )
-                            .await
-                        {
-                            Relaunch::Started(new_status) => {
-                                if let Some(ip) = &new_status.pod_ip {
-                                    pod_ip.get_or_insert_with(|| ip.clone());
+                                engenho_controllers::event_recorder::Reason::BackOff,
+                                BackOffRestarting {
+                                    container: cname,
+                                    remaining,
+                                    prior_restarts: record.restart_count,
                                 }
-                                observations.push(ContainerObservation::running(
+                                .to_string(),
+                            )
+                            .await;
+                            observations.push(ContainerObservation::backing_off(
+                                cname,
+                                &record.container_id,
+                                held.waiting_reason()
+                                    .unwrap_or(crate::backoff::CRASH_LOOP_BACK_OFF),
+                                record.restart_count,
+                            ));
+                        }
+                        Some(crate::backoff::CrashGate::Go(penalty)) => {
+                            match self
+                                .restart_container(
+                                    key,
+                                    value,
+                                    namespace,
                                     cname,
-                                    &new_status.container_id,
-                                    record.restart_count + 1,
-                                ));
-                                report.objects_changed += 1;
-                                self.emit(
+                                    spec,
+                                    &record.container_id,
+                                    record.restart_count,
+                                    Some(penalty),
+                                )
+                                .await
+                            {
+                                Relaunch::Started(new_status) => {
+                                    if let Some(ip) = &new_status.pod_ip {
+                                        pod_ip.get_or_insert_with(|| ip.clone());
+                                    }
+                                    observations.push(ContainerObservation::running(
+                                        cname,
+                                        &new_status.container_id,
+                                        record.restart_count + 1,
+                                    ));
+                                    report.objects_changed += 1;
+                                    self.emit(
                                     key,
                                     engenho_controllers::event_recorder::Reason::Started,
                                     format!(
@@ -4349,92 +4455,98 @@ impl Kubelet {
                                     ),
                                 )
                                 .await;
-                                debug!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    restart_count = record.restart_count + 1,
-                                    "kubelet restarted exited container (restartPolicy)"
-                                );
-                            }
-                            Relaunch::Held(held) => {
-                                // The exit has served its crash backoff, but
-                                // the replacement's last START failed and its
-                                // start curve still owes a wait. Same render
-                                // and the same event as the crash hold above.
-                                Self::accumulate_requeue(soonest_requeue, held.remaining);
-                                debug!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    remaining_s = held.remaining.as_secs(),
-                                    consecutive_failures = held.consecutive_failures,
-                                    "replacement start backing off"
-                                );
-                                self.emit(
-                                    key,
-                                    engenho_controllers::event_recorder::Reason::BackOff,
-                                    BackOffRestarting {
-                                        container: cname,
-                                        remaining: held.remaining,
-                                        prior_restarts: record.restart_count,
-                                    }
-                                    .to_string(),
-                                )
-                                .await;
-                                observations.push(ContainerObservation::backing_off(
-                                    cname,
-                                    &record.container_id,
-                                    crate::backoff::CRASH_LOOP_BACK_OFF,
-                                    record.restart_count,
-                                ));
-                            }
-                            Relaunch::Failed(failed) => {
-                                // Restart failed — report the terminated state
-                                // this tick; the retry waits on the start
-                                // curve. Never silent.
-                                Self::accumulate_requeue(
-                                    soonest_requeue,
-                                    failed.cost.next_attempt_in,
-                                );
-                                warn!(
-                                    pod = %key.label(),
-                                    container = %cname,
-                                    error = %failed,
-                                    "container restart failed; retrying on the start curve"
-                                );
-                                observations.push(ContainerObservation::terminated(
-                                    cname,
-                                    &record.container_id,
-                                    exit,
-                                    record.restart_count,
-                                ));
-                                report.objects_skipped += 1;
-                            }
-                            Relaunch::OldNotCleared(cause) => {
-                                // The exit stands as observed; the restart
-                                // waits until the old container is gone.
-                                log_old_not_cleared(key, cname, &cause);
-                                if matches!(cause, KubeletError::NotReaped { .. }) {
-                                    Self::accumulate_requeue(soonest_requeue, MIN_PROBE_REQUEUE);
+                                    debug!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        restart_count = record.restart_count + 1,
+                                        "kubelet restarted exited container (restartPolicy)"
+                                    );
                                 }
-                                observations.push(ContainerObservation::terminated(
-                                    cname,
-                                    &record.container_id,
-                                    exit,
-                                    record.restart_count,
-                                ));
-                                report.objects_skipped += 1;
+                                Relaunch::Held(held) => {
+                                    // The exit has served its crash backoff, but
+                                    // the replacement's last START failed and its
+                                    // start curve still owes a wait. Same render
+                                    // and the same event as the crash hold above.
+                                    Self::accumulate_requeue(soonest_requeue, held.remaining);
+                                    debug!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        remaining_s = held.remaining.as_secs(),
+                                        consecutive_failures = held.consecutive_failures,
+                                        "replacement start backing off"
+                                    );
+                                    self.emit(
+                                        key,
+                                        engenho_controllers::event_recorder::Reason::BackOff,
+                                        BackOffRestarting {
+                                            container: cname,
+                                            remaining: held.remaining,
+                                            prior_restarts: record.restart_count,
+                                        }
+                                        .to_string(),
+                                    )
+                                    .await;
+                                    observations.push(ContainerObservation::backing_off(
+                                        cname,
+                                        &record.container_id,
+                                        crate::backoff::CRASH_LOOP_BACK_OFF,
+                                        record.restart_count,
+                                    ));
+                                }
+                                Relaunch::Failed(failed) => {
+                                    // Restart failed — report the terminated state
+                                    // this tick; the retry waits on the start
+                                    // curve. Never silent.
+                                    Self::accumulate_requeue(
+                                        soonest_requeue,
+                                        failed.cost.next_attempt_in,
+                                    );
+                                    warn!(
+                                        pod = %key.label(),
+                                        container = %cname,
+                                        error = %failed,
+                                        "container restart failed; retrying on the start curve"
+                                    );
+                                    observations.push(ContainerObservation::terminated(
+                                        cname,
+                                        &record.container_id,
+                                        exit,
+                                        record.restart_count,
+                                    ));
+                                    report.objects_skipped += 1;
+                                }
+                                Relaunch::OldNotCleared(cause) => {
+                                    // The exit stands as observed; the restart
+                                    // waits until the old container is gone.
+                                    log_old_not_cleared(key, cname, &cause);
+                                    if matches!(cause, KubeletError::NotReaped { .. }) {
+                                        Self::accumulate_requeue(
+                                            soonest_requeue,
+                                            MIN_PROBE_REQUEUE,
+                                        );
+                                    }
+                                    observations.push(ContainerObservation::terminated(
+                                        cname,
+                                        &record.container_id,
+                                        exit,
+                                        record.restart_count,
+                                    ));
+                                    report.objects_skipped += 1;
+                                }
                             }
                         }
-                    } else {
-                        // restartPolicy:Never (or OnFailure+zero) → terminal
-                        // latch. Leave the local entry; later ticks keep
-                        // reporting the terminal phase (idempotent-skip).
-                        observations.push(ContainerObservation::terminated(
-                            cname,
-                            &record.container_id,
-                            exit,
-                            record.restart_count,
-                        ));
+                        None => {
+                            // restartPolicy:Never (or OnFailure+zero), or a pod
+                            // being deleted → terminal latch. Leave the local
+                            // entry; later ticks keep reporting the terminal phase
+                            // (idempotent-skip).
+                            observations.push(ContainerObservation::terminated(
+                                cname,
+                                &record.container_id,
+                                exit,
+                                record.restart_count,
+                            ));
+                        }
                     }
                 }
                 Err(cause) => {
@@ -4597,9 +4709,9 @@ impl Kubelet {
                 // native sidecar; engenho does not yet (see `LocalPod`).
                 probes: ContainerProbes::default(),
                 // Init containers are not subject to CrashLoopBackOff here:
-                // the init sequence has its own ordering, and stamping a
-                // start it does not read would be a field nobody consults.
-                started_at: None,
+                // the init sequence has its own ordering, and an entry it does
+                // not read would be a field nobody consults.
+                crash_backoff: None,
                 terminated_at: None,
                 mounts: spec.mounts.clone(),
             },

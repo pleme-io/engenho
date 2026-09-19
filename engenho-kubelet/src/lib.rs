@@ -90,7 +90,8 @@ pub use csi_materializer::{
 pub use error::KubeletError;
 pub use kubelet::{Kubelet, SaRefreshReport, TestClock};
 pub use lifecycle::{
-    ContainerObservation, ContainerState, ContainerStatusOut, RestartPolicy, reconcile_pod_phase,
+    ContainerObservation, ContainerState, ContainerStatusOut, DownAction, RestartPolicy,
+    RunningAction, down_action, reconcile_pod_phase, running_action, starts_fresh,
 };
 pub use pod_volume::{
     BindSource, FakeVolumeMaterializer, MaterializedDir, MountSource, NoServiceAccountProjection,

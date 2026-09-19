@@ -37,10 +37,11 @@
 //! forever: a pod naming a `ConfigMap` that never appears kept an otherwise
 //! idle kubelet ticking once a second for as long as the pod existed.
 //!
-//! ★ PURE, AND CLOCK-INJECTED. Every decision is a function of
-//! `(restart_count, last_exit, now)`, so the whole curve is testable
-//! without sleeping — the same `TestClock` discipline the probe engine
-//! already uses.
+//! ★ PURE, AND CLOCK-INJECTED. Every decision is a function of the
+//! container's [`CrashBackoff`] entry, when it exited and `now`, so the whole
+//! curve is testable without sleeping — the same `TestClock` discipline the
+//! probe engine already uses. The entry is upstream's (`flowcontrol.Backoff`),
+//! not the restart count: see [`CrashBackoff`] for why that matters.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -100,45 +101,128 @@ impl BackoffDecision {
     }
 }
 
-/// The delay owed after `restart_count` prior restarts.
+/// The delay owed after `repeats` consecutive failures: the start curve's
+/// reading of [`CRASH`] ([`decide_start`], [`StartLedger`]).
 ///
-/// `0` prior restarts ⇒ no delay: the FIRST restart is immediate, matching
-/// upstream (no backoff entry exists yet). Backoff is a response to
-/// repetition, not to a single exit. Every later restart reads [`CRASH`]:
+/// `0` ⇒ no delay: the FIRST attempt is immediate. Backoff is a response to
+/// repetition, not to a single failure. Every later one reads [`CRASH`]:
 /// 10 s, 20 s, 40 s … capped at 300 s, and a huge count saturates at the cap
 /// rather than wrapping to a short delay, because `Curve::delay` does.
+///
+/// A container that RAN and exited is paced by its [`CrashBackoff`] entry
+/// instead, never by its restart count.
 #[must_use]
-pub const fn delay_for(restart_count: u32) -> Duration {
-    match restart_count.checked_sub(1) {
+pub const fn delay_for(repeats: u32) -> Duration {
+    match repeats.checked_sub(1) {
         None => Duration::ZERO,
         Some(step) => CRASH.delay(step),
     }
 }
 
-/// Decide whether to restart now.
+// ── THE CRASH ENTRY: what a container that keeps exiting owes ──────────────
+
+/// One container's crash-loop penalty: upstream's `flowcontrol.Backoff`
+/// entry for the container (`backoffEntry{backoff, lastUpdate}`).
 ///
-/// `since_exit` is how long ago the container terminated; `uptime_before_exit`
-/// is how long it had been running. All durations are supplied by the
-/// caller's clock so this stays pure.
-#[must_use]
-pub fn decide(
-    restart_count: u32,
-    since_exit: Duration,
-    uptime_before_exit: Duration,
-) -> BackoffDecision {
-    // A container that stayed up long enough has earned a clean slate.
-    // Checked BEFORE the delay so a recovered container is never penalised
-    // for an old crash. Strictly longer than RESET_AFTER, as upstream.
-    if uptime_before_exit > RESET_AFTER {
-        return BackoffDecision::Restart;
+/// ★ THE PENALTY IS ITS OWN STATE, NOT THE RESTART COUNT. It used to be read
+/// off `restartCount` (`delay_for(restart_count)`), and a restart count never
+/// goes down. A container that earned its reset by running past
+/// [`RESET_AFTER`] was restarted at once, as it should be, and then its NEXT
+/// short crash owed `delay_for(restartCount)`: five minutes for any container
+/// that had crashed six times in its life, where upstream owes ten seconds.
+/// Upstream's reset re-initialises the entry, and so does [`crash_gate`].
+///
+/// ★ THE WAIT IS A STEP ON [`CRASH`], NEVER A FREE DURATION, so an entry that
+/// owes a wait off the curve cannot be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrashBackoff {
+    /// The wait the container's next crash owes, as a step on [`CRASH`]
+    /// (upstream `backoff`). A step past the cap saturates at it.
+    pub step: u32,
+    /// When the kubelet last let the container go (upstream `lastUpdate`,
+    /// stamped by `Next` just before the start).
+    pub last_update: Instant,
+}
+
+impl CrashBackoff {
+    /// The wait a crash owes under this entry.
+    #[must_use]
+    pub const fn owed(self) -> Duration {
+        CRASH.delay(self.step)
     }
-    BackoffDecision::after(delay_for(restart_count), since_exit)
+
+    /// Does the exit that finished at `finished_at` wipe this entry? Upstream's
+    /// kubelet `HasExpiredFunc` (kubelet.go:1004-1006): the container ran for
+    /// MORE than [`RESET_AFTER`] from the entry's `lastUpdate` to its exit.
+    ///
+    /// Measured to the exit, never to now: a short run followed by an hour of
+    /// idle wall-clock is not forgiveness.
+    #[must_use]
+    pub fn forgiven_by(self, finished_at: Instant) -> bool {
+        finished_at.saturating_duration_since(self.last_update) > RESET_AFTER
+    }
+}
+
+/// What the crash-loop gate says about a container that exited and that its
+/// restart policy restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a Go carries the entry the container must record once it restarts"]
+pub enum CrashGate {
+    /// Held in `CrashLoopBackOff` (upstream `IsInBackOffSince`). The entry is
+    /// unchanged.
+    Hold {
+        /// How much longer until the restart is allowed.
+        remaining: Duration,
+    },
+    /// Restart now. Carries the entry the container has from this restart on
+    /// (upstream `Next`): record it once the replacement has started.
+    Go(CrashBackoff),
+}
+
+impl CrashGate {
+    /// The `status.containerStatuses[].state.waiting.reason` to publish:
+    /// [`CRASH_LOOP_BACK_OFF`] while held, `None` when restarting.
+    #[must_use]
+    pub fn waiting_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Hold { .. } => Some(CRASH_LOOP_BACK_OFF),
+            Self::Go(_) => None,
+        }
+    }
+}
+
+/// Upstream's `doBackOff` (kuberuntime_manager.go:1607-1638) for one exit.
+///
+/// `entry` is the container's penalty so far (`None` before its first
+/// restart), `finished_at` when the exit happened, `now` the caller's clock.
+///
+/// - An entry the exit [forgives](CrashBackoff::forgiven_by) is as good as
+///   none.
+/// - With a live entry, the container is held while `now - finished_at` is
+///   STRICTLY less than what the entry owes.
+/// - Otherwise it goes, and the entry it goes with is the base of the curve
+///   when it had none (or it was forgiven), the next step when it had one.
+///
+/// So the first crash restarts at once and the second owes 10 s, as
+/// upstream: backoff answers repetition, not a single exit.
+pub fn crash_gate(entry: Option<CrashBackoff>, finished_at: Instant, now: Instant) -> CrashGate {
+    let live = entry.filter(|e| !e.forgiven_by(finished_at));
+    if let Some(e) = live
+        && let Some(remaining) = still_owed(e.owed(), now.saturating_duration_since(finished_at))
+    {
+        return CrashGate::Hold { remaining };
+    }
+    CrashGate::Go(CrashBackoff {
+        step: live.map_or(0, |e| e.step.saturating_add(1)),
+        last_update: now,
+    })
 }
 
 /// The same curve, for a container that has never started at all.
 ///
-/// [`decide`] answers "this container RAN and exited"; its reset rule keys on
-/// uptime, which a container that never started does not have. A start that
+/// [`crash_gate`] answers "this container RAN and exited"; its reset rule
+/// keys on how long it ran, which a container that never started did not. A
+/// start that
 /// FAILS — an unpullable image, a backend that cannot run the image at all —
 /// is the other half of the same question and had no backoff whatsoever.
 ///
@@ -418,12 +502,46 @@ mod tests {
 
     const S: fn(u64) -> Duration = Duration::from_secs;
 
+    /// `seconds` after `base`, for writing upstream's rows in their units.
+    fn at(base: Instant, seconds: u64) -> Instant {
+        base + S(seconds)
+    }
+
+    /// The entry a container is left with once `crashes` short runs have each
+    /// been restarted as soon as allowed. A run lasts `ran`, and each restart
+    /// waits exactly what it owes.
+    fn after_short_crashes(base: Instant, crashes: u32, ran: Duration) -> (CrashBackoff, Instant) {
+        let mut entry = None;
+        let mut started = base;
+        for _ in 0..crashes {
+            let finished = started + ran;
+            let owed = entry.map_or(Duration::ZERO, CrashBackoff::owed);
+            let now = finished + owed;
+            match crash_gate(entry, finished, now) {
+                CrashGate::Go(next) => entry = Some(next),
+                CrashGate::Hold { remaining } => {
+                    panic!("served its wait, still held {remaining:?}")
+                }
+            }
+            started = now;
+        }
+        (entry.expect("at least one crash"), started)
+    }
+
     #[test]
     fn the_first_restart_is_immediate() {
         // Backoff answers repetition, not a single exit. A pod that exits
         // once must not wait 10s to come back.
+        let t0 = Instant::now();
         assert_eq!(delay_for(0), Duration::ZERO);
-        assert_eq!(decide(0, S(0), S(1)), BackoffDecision::Restart);
+        assert_eq!(
+            crash_gate(None, t0, t0),
+            CrashGate::Go(CrashBackoff {
+                step: 0,
+                last_update: t0
+            }),
+            "no entry yet: restart now, and the next crash owes the base"
+        );
     }
 
     #[test]
@@ -441,50 +559,124 @@ mod tests {
     }
 
     /// The upstream oracle row `backoff/kubelet default schedule 10s..300s`
-    /// (container-restart.json): the wait after each of eight crashes.
+    /// (container-restart.json): what the entry owes after each of eight
+    /// restarts, none of them forgiven.
     #[test]
     fn eight_crashes_owe_upstreams_exact_schedule() {
-        let owed: Vec<u64> = (1..=8).map(|n| delay_for(n).as_secs()).collect();
+        let t0 = Instant::now();
+        let owed: Vec<u64> = (1..=8)
+            .map(|n| after_short_crashes(t0, n, S(1)).0.owed().as_secs())
+            .collect();
         assert_eq!(owed, [10, 20, 40, 80, 160, 300, 300, 300]);
     }
 
     #[test]
-    fn a_large_restart_count_saturates_rather_than_overflowing() {
+    fn a_large_step_saturates_rather_than_overflowing() {
         // The overflow bug would appear only after ~30 crashes — exactly
         // when backoff matters most — and would present as a hot loop.
-        for n in [30u32, 31, 32, 33, 1_000, u32::MAX] {
-            assert_eq!(delay_for(n), S(300), "restart_count {n} must cap");
+        let t0 = Instant::now();
+        for step in [30u32, 31, 32, 33, 1_000, u32::MAX] {
+            let entry = CrashBackoff {
+                step,
+                last_update: t0,
+            };
+            assert_eq!(entry.owed(), S(300), "step {step} must cap");
+            let CrashGate::Go(next) = crash_gate(Some(entry), t0, at(t0, 300)) else {
+                panic!("the capped wait was served");
+            };
+            assert_eq!(next.owed(), S(300), "step {step} must stay capped");
         }
+        assert_eq!(delay_for(u32::MAX), S(300));
     }
 
     #[test]
     fn waiting_reports_crashloopbackoff_verbatim() {
         // kubectl prints this in STATUS; alerting rules match on it.
-        let d = decide(3, S(1), S(1));
-        assert_eq!(d.waiting_reason(), Some("CrashLoopBackOff"));
+        let t0 = Instant::now();
+        let held = crash_gate(
+            Some(CrashBackoff {
+                step: 2,
+                last_update: t0,
+            }),
+            at(t0, 1),
+            at(t0, 2),
+        );
+        assert_eq!(held.waiting_reason(), Some("CrashLoopBackOff"));
+        let went = crash_gate(None, t0, t0);
+        assert_eq!(went.waiting_reason(), None);
         assert_eq!(BackoffDecision::Restart.waiting_reason(), None);
     }
 
     #[test]
     fn the_remaining_time_is_reported_not_just_the_fact_of_waiting() {
-        match decide(2, S(5), S(1)) {
-            BackoffDecision::Wait { remaining } => assert_eq!(remaining, S(15)),
-            other => panic!("expected a wait, got {other:?}"),
-        }
-        // And once the delay has elapsed it restarts.
-        assert_eq!(decide(2, S(20), S(1)), BackoffDecision::Restart);
-        assert_eq!(decide(2, S(21), S(1)), BackoffDecision::Restart);
+        let t0 = Instant::now();
+        let twenty = Some(CrashBackoff {
+            step: 1,
+            last_update: t0,
+        });
+        let finished = at(t0, 1);
+        assert_eq!(
+            crash_gate(twenty, finished, finished + S(5)),
+            CrashGate::Hold { remaining: S(15) }
+        );
+        // Served means `now - finished >= owed`: upstream holds only while
+        // strictly less.
+        assert!(matches!(
+            crash_gate(twenty, finished, finished + S(20)),
+            CrashGate::Go(_)
+        ));
+        assert!(matches!(
+            crash_gate(twenty, finished, finished + S(21)),
+            CrashGate::Go(_)
+        ));
+    }
+
+    /// ★ THE RESET RE-INITIALISES THE PENALTY. A container at the 5-minute
+    /// cap that then runs past `RESET_AFTER` is restarted at once — and its
+    /// next short crash owes 10 s, as upstream's re-initialised entry does,
+    /// not the 5 minutes its lifetime restart count would.
+    #[test]
+    fn a_forgiven_container_owes_the_base_again_not_its_old_penalty() {
+        let t0 = Instant::now();
+        let (capped, started) = after_short_crashes(t0, 7, S(1));
+        assert_eq!(capped.owed(), S(300), "seven short crashes reach the cap");
+
+        // It stays up for eleven minutes, then dies: restarted at once.
+        let finished = started + S(660);
+        let CrashGate::Go(fresh) = crash_gate(Some(capped), finished, finished) else {
+            panic!("a container that ran past RESET_AFTER is restarted at once");
+        };
+        assert_eq!(
+            fresh.owed(),
+            S(10),
+            "the forgiven entry starts from the base"
+        );
+
+        // Its next crash, a second into the replacement, is held 10 s.
+        let crashed = finished + S(1);
+        assert_eq!(
+            crash_gate(Some(fresh), crashed, crashed),
+            CrashGate::Hold { remaining: S(10) }
+        );
     }
 
     #[test]
     fn a_container_that_stayed_up_long_enough_is_forgiven() {
         // Without the reset, a pod that crashed once at boot would still be
         // waiting five minutes to restart a week later.
-        assert_eq!(decide(10, Duration::ZERO, S(601)), BackoffDecision::Restart);
+        let t0 = Instant::now();
+        let capped = Some(CrashBackoff {
+            step: 5,
+            last_update: t0,
+        });
+        assert!(matches!(
+            crash_gate(capped, at(t0, 601), at(t0, 601)),
+            CrashGate::Go(CrashBackoff { step: 0, .. })
+        ));
         // Well short of the threshold is NOT forgiven.
         assert!(matches!(
-            decide(10, Duration::ZERO, S(599)),
-            BackoffDecision::Wait { .. }
+            crash_gate(capped, at(t0, 599), at(t0, 599)),
+            CrashGate::Hold { .. }
         ));
     }
 
@@ -493,15 +685,20 @@ mod tests {
     /// (kubelet.go:1004-1006, `> 600*time.Second`).
     #[test]
     fn exactly_ten_minutes_up_is_not_forgiven_and_a_nanosecond_more_is() {
-        assert_eq!(
-            decide(10, Duration::ZERO, S(600)),
-            BackoffDecision::Wait { remaining: S(300) },
+        let t0 = Instant::now();
+        let capped = CrashBackoff {
+            step: 5,
+            last_update: t0,
+        };
+        assert!(
+            !capped.forgiven_by(at(t0, 600)),
             "a container that ran exactly 600s keeps its backoff"
         );
         assert_eq!(
-            decide(10, Duration::ZERO, S(600) + Duration::from_nanos(1)),
-            BackoffDecision::Restart
+            crash_gate(Some(capped), at(t0, 600), at(t0, 600)),
+            CrashGate::Hold { remaining: S(300) }
         );
+        assert!(capped.forgiven_by(at(t0, 600) + Duration::from_nanos(1)));
     }
 
     /// The upstream oracle row `do-backoff/long idle wall-clock does NOT
@@ -509,13 +706,17 @@ mod tests {
     /// forgiveness. The reset keys on how long the container RAN.
     #[test]
     fn idle_wall_clock_after_a_short_run_is_not_forgiveness() {
+        let t0 = Instant::now();
+        let one_sixty = Some(CrashBackoff {
+            step: 4,
+            last_update: t0,
+        });
         // It is restarted (the owed wait is long past) …
-        assert_eq!(decide(5, S(3_600), S(30)), BackoffDecision::Restart);
-        // … but a short run after that still owes the next, longer step.
-        assert_eq!(
-            decide(6, Duration::ZERO, S(30)),
-            BackoffDecision::Wait { remaining: S(300) }
-        );
+        let CrashGate::Go(next) = crash_gate(one_sixty, at(t0, 30), at(t0, 3_630)) else {
+            panic!("the owed wait was served an hour ago");
+        };
+        // … but it goes with the next, longer step.
+        assert_eq!(next.owed(), S(300));
     }
 
     #[test]
@@ -523,11 +724,14 @@ mod tests {
         // cid 2026-08-29: a container exiting every 180s, restarted 160
         // times, reported Running the whole way. With backoff it enters
         // CrashLoopBackOff and kubectl says so.
-        let d = decide(160, S(1), S(180));
+        let t0 = Instant::now();
+        let (entry, started) = after_short_crashes(t0, 160, S(180));
+        let finished = started + S(180);
+        let d = crash_gate(Some(entry), finished, finished + S(1));
         assert_eq!(d.waiting_reason(), Some("CrashLoopBackOff"));
-        // 180s uptime is well under the 600s forgiveness threshold, so the
-        // restart count keeps mattering — which is the point.
-        assert!(matches!(d, BackoffDecision::Wait { .. }));
+        // 180s runs are well under the 600s forgiveness threshold, so the
+        // penalty keeps mattering — which is the point.
+        assert!(matches!(d, CrashGate::Hold { .. }));
     }
 
     // ── decide_start: the never-started half of the same curve ─────────
