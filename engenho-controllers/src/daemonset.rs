@@ -200,7 +200,11 @@ impl OwnedChildrenReconciler for DaemonSetController {
             |c| c.to_owned(),
         );
 
-        // The nodes already covered by an owned pod.
+        // The nodes already covered by an owned pod. A Terminating pod
+        // still covers its node: its replacement would take the same name
+        // (`{ds}-{node}`), so it waits for the old one to go. Upstream
+        // names daemon pods by hash and replaces at once. Deleting a
+        // Terminating pod again is left out by the blanket (I3).
         let covered: std::collections::BTreeSet<String> = owned
             .iter()
             .filter_map(|(_, p)| Self::pod_node(p).map(String::from))

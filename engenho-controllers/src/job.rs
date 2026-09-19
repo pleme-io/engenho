@@ -584,6 +584,9 @@ impl CronJobController {
         );
         let owned = self.owned_jobs(cj_uid, job_ns).await;
         let active = CronJobController::active_jobs(&owned);
+        // What the Replace deletes did: a Job removed or stamped Terminating
+        // is a change made for this CronJob.
+        let mut replaced = Effect::Unchanged;
         match policy {
             ConcurrencyPolicy::Forbid if !active.is_empty() => {
                 // A prior run is still active → skip, but record the skip.
@@ -593,10 +596,16 @@ impl CronJobController {
             }
             ConcurrencyPolicy::Replace => {
                 // Delete every active owned Job before creating the new one.
-                for (k, _) in &active {
-                    self.store
+                // A Job already Terminating was deleted before and waits on
+                // its finalizers: deleting it again is the store's NoOp, so
+                // it is left alone (I3). It still counts as active for
+                // Forbid, since its pods may still run.
+                for (k, _) in active.iter().filter(|(_, job)| !job.is_terminating()) {
+                    let applied = self
+                        .store
                         .propose(ResourceCommand::delete(k.clone(), Reason::Controller))
                         .await?;
+                    replaced = replaced.and(Effect::of(applied.op));
                 }
             }
             ConcurrencyPolicy::Allow | ConcurrencyPolicy::Forbid => {}
@@ -627,7 +636,9 @@ impl CronJobController {
         let status = self
             .patch_last_schedule(cj_key, due, Some(active_ref))
             .await?;
-        Ok(CronTickOutcome::Fired(Effect::of(created.op).and(status)))
+        Ok(CronTickOutcome::Fired(
+            replaced.and(Effect::of(created.op)).and(status),
+        ))
     }
 
     /// Patch the CronJob's `status.lastScheduleTime` (always) and — when a

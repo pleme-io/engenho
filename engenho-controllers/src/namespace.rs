@@ -29,9 +29,10 @@
 //! Each child delete is a normal `ResourceCommand::Delete`. If a CHILD
 //! object itself bears finalizers, the store's gate gives IT the
 //! Terminating treatment (deletionTimestamp set, kept until its
-//! finalizers clear) — so the cascade is finalizer-aware end to end. The
-//! controller re-ticks (WatchDriver fallback) until the namespace is
-//! actually empty.
+//! finalizers clear) — so the cascade is finalizer-aware end to end. A
+//! child already Terminating is not deleted again (I3): it waits on its
+//! finalizers, and a second delete is the store's `NoOp`. The controller
+//! re-ticks (`WatchDriver` fallback) until the namespace is actually empty.
 //!
 //! ## Scope (v1)
 //!
@@ -55,6 +56,7 @@ use tracing::{debug, info};
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
+use crate::meta::ObjectMeta;
 use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::status::write_status_cas;
 
@@ -99,14 +101,6 @@ impl NamespaceController {
             .unwrap_or_default()
     }
 
-    /// `true` iff `ns` is Terminating (has `metadata.deletionTimestamp`).
-    fn is_terminating(ns: &Value) -> bool {
-        ns.get("metadata")
-            .and_then(|m| m.get("deletionTimestamp"))
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty())
-    }
-
     /// Sweep one Terminating namespace: delete every namespaced object in
     /// it, set `status.phase = Terminating`, and — when empty — clear the
     /// `kubernetes` finalizer (which removes the namespace via the store's
@@ -142,8 +136,16 @@ impl NamespaceController {
                 .store
                 .list(d.group, d.version, d.kind, Some(ns_name))
                 .await;
-            for (key, _value) in objs {
+            for (key, value) in objs {
                 remaining += 1;
+                // Already Terminating: its delete was accepted and its own
+                // finalizers hold it. Deleting it again is the store's
+                // NoOp, one Raft entry per tick for as long as the finalizer
+                // holds, so it is left alone. It still counts as remaining:
+                // the namespace waits for it to go.
+                if value.is_terminating() {
+                    continue;
+                }
                 debug!(
                     namespace = ns_name,
                     child = %key.label(),
@@ -237,13 +239,7 @@ impl Controller for NamespaceController {
         for (key, ns_obj) in namespaces {
             // Only act on Terminating namespaces that still hold the
             // kubernetes finalizer (the ones we own the teardown of).
-            if !Self::is_terminating(&ns_obj) {
-                continue;
-            }
-            if !Self::finalizers_of(&ns_obj)
-                .iter()
-                .any(|f| f == KUBERNETES_FINALIZER)
-            {
+            if !ns_obj.is_terminating() || !ns_obj.has_finalizer(KUBERNETES_FINALIZER) {
                 continue;
             }
             let ns_name = &key.name;

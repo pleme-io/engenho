@@ -313,6 +313,10 @@ impl OwnedChildrenReconciler for StatefulSetController {
             |c| c.to_owned(),
         );
 
+        // Every owned pod, Terminating ones included: an ordinal is an
+        // identity, and a Terminating `{sts}-{n}` still holds it until its
+        // finalizers clear (upstream waits too). Deleting a Terminating pod
+        // again on scale-down is left out by the blanket (I3).
         let existing_ordinals: std::collections::BTreeSet<usize> = owned
             .iter()
             .filter_map(|(k, _)| Self::ordinal_of(&k.name, sts_name))

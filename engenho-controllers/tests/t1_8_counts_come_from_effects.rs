@@ -85,9 +85,9 @@ fn orphan_pod(name: &str, finalizers: &[&str]) -> Value {
 ///
 /// Since store T3.6 every delete carries a clock, so gc's first delete of a
 /// finalizer-bearing orphan stamps `deletionTimestamp` (Terminating): a real
-/// change, counted once. Every later delete of that object, for as long as
-/// the finalizer holds, is the store's `NoOp`. That repeat used to count as a
-/// change on every tick.
+/// change, counted once. A later delete of that object, for as long as the
+/// finalizer holds, would be the store's `NoOp`; that repeat used to count as
+/// a change on every tick. gc no longer proposes it at all (I3).
 #[tokio::test]
 async fn a_write_the_store_answered_noop_is_not_a_change() {
     let store = boot("t1-8-gc-noop").await;
@@ -114,8 +114,9 @@ async fn a_write_the_store_answered_noop_is_not_a_change() {
         "both deletes landed: one removal, one Terminating stamp"
     );
 
-    // The next tick deletes the Terminating orphan again. The store answers
-    // NoOp and leaves it exactly as it was, so nothing is counted.
+    // The next tick leaves the Terminating orphan to its finalizer: gc
+    // proposes no second delete (I3, `i3_terminating_children.rs` pins the
+    // Raft log), and nothing is counted.
     let again = gc.tick().await.expect("gc tick");
     assert_eq!(store.get(&held).await.expect("held"), terminating);
     assert_eq!(

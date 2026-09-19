@@ -65,6 +65,39 @@
 //! accessors in [`crate::meta`], so a wrong shape is an error naming the
 //! field in the PARENT (`spec.template.metadata.ownerReferences`), never a
 //! panic and never a silent skip.
+//!
+//! ## A Terminating child is left alone (I3)
+//!
+//! Since a delete carries its clock (store T3.6), a child with finalizers
+//! goes Terminating instead of vanishing, and stays in the store until its
+//! finalizers clear. Every writer in the family names its children
+//! deterministically (`{rs}-{n}`, `{sts}-{ordinal}`, `{ds}-{node}`,
+//! `{job}-{n}`, `{deployment}-{hash}`), so the name a writer wants can be
+//! held by a Terminating object: this parent's own child on its way out, or
+//! a previous incarnation's (a parent deleted and recreated under the same
+//! name while its children waited on finalizers).
+//!
+//! The blanket proposes no `Put` and no `Delete` to a key whose object is
+//! Terminating ([`ChildWrite::of`]), whichever writer asked:
+//!
+//!   * a `Put` would REPLACE it: the new body carries no
+//!     `deletionTimestamp`, so the store would store a live object where a
+//!     Terminating one stood, clearing a stamp upstream never lets anything
+//!     clear, and reusing a name its finalizers still hold;
+//!   * a `Delete` is the store's `NoOp`, proposed again on every tick for as
+//!     long as the finalizer holds: one Raft entry per child per tick for
+//!     nothing.
+//!
+//! A `Patch` still goes through: a patch is how a Terminating object's
+//! finalizers are released, and a writer that scales a Terminating child
+//! converges after one write.
+//!
+//! Tier: enforced at this one propose site for every
+//! [`OwnedChildrenReconciler`], present and future, so a writer cannot opt
+//! out of it; a raw [`Controller`] that proposes on its own (gc, namespace,
+//! cronjob) applies [`ObjectMeta::is_terminating`] itself. Which children a
+//! writer COUNTS is still its own decision: a `ReplicaSet` counts only its
+//! live pods (see [`live_children`]).
 
 use async_trait::async_trait;
 use engenho_store::{StoreMesh, command::ResourceCommand, resource::ResourceKey};
@@ -83,6 +116,66 @@ use crate::sweep::{ObjectOutcome, Sweep};
 
 /// The parent field a templated child is cloned from.
 pub const TEMPLATE: &[&str] = &["spec", "template"];
+
+/// The owned children that are not Terminating: the ones a writer counts
+/// toward its desired set, and the only ones it chooses among to evict.
+///
+/// A Terminating child still holds its NAME: a writer allocating a name
+/// for a new child reads every owned child, not just these.
+pub fn live_children(
+    owned: &[(ResourceKey, Value)],
+) -> impl Iterator<Item = &(ResourceKey, Value)> {
+    owned.iter().filter(|(_, child)| !child.is_terminating())
+}
+
+/// What the blanket does with one child command, decided from the object
+/// the store holds at the command's key when it is about to propose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildWrite {
+    /// A `Put` to an empty key: a create. The blanket freezes the child's
+    /// `metadata.creationTimestamp` into it before proposing.
+    Create,
+    /// Proposed as written.
+    Propose,
+    /// The key holds a Terminating object and the command is a `Put` or a
+    /// `Delete`: not proposed (see the module docs). The object is left to
+    /// its finalizers; the writer asks again on a later tick, once it is
+    /// gone.
+    LeaveTerminating,
+}
+
+impl ChildWrite {
+    /// The decision for `command` given `live`, the object the store holds
+    /// at [`child_write_target`]`(command)` (`None`: the key is empty, or the
+    /// command has no single target).
+    #[must_use]
+    pub fn of(command: &ResourceCommand, live: Option<&Value>) -> Self {
+        let terminating = live.is_some_and(ObjectMeta::is_terminating);
+        match command {
+            ResourceCommand::Put { .. } | ResourceCommand::Delete { .. } if terminating => {
+                Self::LeaveTerminating
+            }
+            ResourceCommand::Put { .. } if live.is_none() => Self::Create,
+            ResourceCommand::Put { .. }
+            | ResourceCommand::Delete { .. }
+            | ResourceCommand::Patch { .. }
+            | ResourceCommand::Txn { .. } => Self::Propose,
+        }
+    }
+}
+
+/// The key the blanket reads before proposing `command`: the target of a
+/// `Put` or a `Delete`, the two commands [`ChildWrite::of`] can leave
+/// unproposed. `None` for a `Patch` (always proposed) and a `Txn` (no
+/// single target). Exhaustive with no wildcard, so a new command variant
+/// does not compile until it is placed.
+#[must_use]
+pub const fn child_write_target(command: &ResourceCommand) -> Option<&ResourceKey> {
+    match command {
+        ResourceCommand::Put { key, .. } | ResourceCommand::Delete { key, .. } => Some(key),
+        ResourceCommand::Patch { .. } | ResourceCommand::Txn { .. } => None,
+    }
+}
 
 /// A Pod cloned from `parent`'s `spec.template`: `kind`/`apiVersion`
 /// stamped, `metadata.name` set to `name`, `metadata.namespace` to
@@ -406,10 +499,25 @@ async fn reconcile_parent<T: OwnedChildrenReconciler + ?Sized>(
     // a child delete the store answered NoOp (already gone) is no change.
     let mut effect = Effect::Unchanged;
     for mut command in delta.commands {
-        if let ResourceCommand::Put { key, value, .. } = &mut command
-            && store.get(key).await.is_none()
-        {
-            stamp_create_timestamp(value, this.create_clock());
+        let live = match child_write_target(&command) {
+            Some(key) => store.get(key).await,
+            None => None,
+        };
+        match ChildWrite::of(&command, live.as_ref()) {
+            ChildWrite::LeaveTerminating => {
+                tracing::debug!(
+                    parent = %parent_key.label(),
+                    child = %child_write_target(&command).map(ResourceKey::label).unwrap_or_default(),
+                    "child is Terminating; left to its finalizers"
+                );
+                continue;
+            }
+            ChildWrite::Create => {
+                if let ResourceCommand::Put { value, .. } = &mut command {
+                    stamp_create_timestamp(value, this.create_clock());
+                }
+            }
+            ChildWrite::Propose => {}
         }
         effect = effect.and(Effect::of(store.propose(command).await?.op));
     }
@@ -667,5 +775,99 @@ mod tests {
     fn reconcile_delta_none_is_empty() {
         let d = ReconcileDelta::none();
         assert!(d.commands.is_empty());
+    }
+
+    // ── a Terminating child is left alone (I3) ───────────────────────────
+
+    fn child_key() -> ResourceKey {
+        ResourceKey::namespaced("", "v1", "Pod", "ns", "rs-0")
+    }
+
+    fn live_child() -> Value {
+        json!({"metadata": {"name": "rs-0", "finalizers": ["example.com/hold"]}})
+    }
+
+    fn terminating_child() -> Value {
+        json!({"metadata": {
+            "name": "rs-0",
+            "finalizers": ["example.com/hold"],
+            "deletionTimestamp": "2026-09-19T00:00:00Z"
+        }})
+    }
+
+    /// One command of each kind at the child's key.
+    fn every_command() -> [ResourceCommand; 4] {
+        [
+            ResourceCommand::put(child_key(), live_child(), Reason::Controller),
+            ResourceCommand::delete(child_key(), Reason::Controller),
+            ResourceCommand::patch(
+                child_key(),
+                json!({"metadata": {"finalizers": []}}),
+                Reason::Controller,
+            ),
+            ResourceCommand::Txn {
+                compares: Vec::new(),
+                success: Vec::new(),
+                failure: Vec::new(),
+                reason: Reason::Controller,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_put_or_delete_to_a_terminating_child_is_not_proposed() {
+        let [put, delete, patch, txn] = every_command();
+        let terminating = terminating_child();
+        assert_eq!(
+            ChildWrite::of(&put, Some(&terminating)),
+            ChildWrite::LeaveTerminating,
+            "a Put would replace a Terminating object with a live one"
+        );
+        assert_eq!(
+            ChildWrite::of(&delete, Some(&terminating)),
+            ChildWrite::LeaveTerminating,
+            "a second delete of a Terminating object is the store's NoOp"
+        );
+        assert_eq!(
+            ChildWrite::of(&patch, Some(&terminating)),
+            ChildWrite::Propose,
+            "a patch is how a Terminating object's finalizers are released"
+        );
+        assert_eq!(ChildWrite::of(&txn, None), ChildWrite::Propose);
+    }
+
+    #[test]
+    fn a_live_or_absent_child_is_written_as_asked() {
+        let [put, delete, patch, _] = every_command();
+        let live = live_child();
+        assert_eq!(ChildWrite::of(&put, None), ChildWrite::Create);
+        assert_eq!(ChildWrite::of(&put, Some(&live)), ChildWrite::Propose);
+        assert_eq!(ChildWrite::of(&delete, Some(&live)), ChildWrite::Propose);
+        assert_eq!(ChildWrite::of(&delete, None), ChildWrite::Propose);
+        assert_eq!(ChildWrite::of(&patch, Some(&live)), ChildWrite::Propose);
+    }
+
+    #[test]
+    fn only_a_put_or_a_delete_names_a_key_to_read() {
+        let [put, delete, patch, txn] = every_command();
+        assert_eq!(child_write_target(&put), Some(&child_key()));
+        assert_eq!(child_write_target(&delete), Some(&child_key()));
+        assert_eq!(child_write_target(&patch), None);
+        assert_eq!(child_write_target(&txn), None);
+    }
+
+    #[test]
+    fn live_children_leaves_out_the_terminating_ones() {
+        let owned = vec![
+            (child_key(), terminating_child()),
+            (
+                ResourceKey::namespaced("", "v1", "Pod", "ns", "rs-1"),
+                json!({"metadata": {"name": "rs-1"}}),
+            ),
+        ];
+        let live: Vec<&str> = live_children(&owned)
+            .map(|(k, _)| k.name.as_str())
+            .collect();
+        assert_eq!(live, ["rs-1"]);
     }
 }

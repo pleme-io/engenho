@@ -91,6 +91,17 @@ pub trait ObjectMeta {
     /// absent, `null` or empty: an empty stamp is no stamp.
     fn deletion_timestamp(&self) -> Option<&str>;
 
+    /// Whether the object is Terminating: a delete was accepted and its
+    /// finalizers hold it (a [`Self::deletion_timestamp`] is present).
+    ///
+    /// A Terminating object is on its way out. A controller never writes
+    /// it again as a child: re-creating over it would clear a
+    /// `deletionTimestamp` nothing may clear, and deleting it again is the
+    /// store's `NoOp`, one Raft entry per tick.
+    fn is_terminating(&self) -> bool {
+        self.deletion_timestamp().is_some()
+    }
+
     /// Whether `metadata.finalizers` names `finalizer`. An absent, `null`
     /// or non-list field names none.
     fn has_finalizer(&self, finalizer: &str) -> bool;
@@ -607,7 +618,9 @@ mod tests {
             json!({}),
         ] {
             assert_eq!(unstamped.deletion_timestamp(), None, "{unstamped}");
+            assert!(!unstamped.is_terminating(), "{unstamped}");
         }
+        assert!(json!({"metadata": {"deletionTimestamp": ts}}).is_terminating());
     }
 
     #[test]

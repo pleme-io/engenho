@@ -82,7 +82,7 @@ pub enum OwnerState {
 
 /// The state of a live owner object whose uid matched.
 fn state_of_live_owner(owner: &Value) -> OwnerState {
-    if owner.deletion_timestamp().is_some() && owner.has_finalizer(FOREGROUND_DELETION) {
+    if owner.is_terminating() && owner.has_finalizer(FOREGROUND_DELETION) {
         OwnerState::WaitingForDependents
     } else {
         OwnerState::Solid
@@ -268,7 +268,7 @@ impl Candidate {
         }
         Some(Self {
             uid: value.uid()?.to_owned(),
-            being_deleted: value.deletion_timestamp().is_some(),
+            being_deleted: value.is_terminating(),
             key,
         })
     }
@@ -322,7 +322,7 @@ pub async fn collect(
     if live.uid() != Some(item.uid.as_str()) {
         return Ok(Collected::ItemGone);
     }
-    if live.deletion_timestamp().is_some() {
+    if live.is_terminating() {
         return Ok(Collected::BeingDeleted);
     }
     let references = match owner_references(&live) {
