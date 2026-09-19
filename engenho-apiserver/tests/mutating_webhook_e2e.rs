@@ -114,7 +114,9 @@ async fn mutating_webhook_injects_sidecar_into_persisted_pod() {
     // Pod handler (admission-dispatched) + a plain MWC handler so we can apply
     // the config object into the store via the API.
     let pod_handler: Arc<dyn ResourceHandler> = Arc::new(
-        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain),
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true)
+            .expect("Pod is cataloged")
+            .with_admission(chain),
     );
     let mwc_handler: Arc<dyn ResourceHandler> = Arc::new(
         StoreBackedHandler::for_kind(store.clone(), "MutatingWebhookConfiguration")
@@ -202,7 +204,9 @@ async fn no_webhook_config_means_plain_pod_unchanged() {
     ));
     let chain = Arc::new(AdmissionChain::new(vec![plugin], AdmissionMode::FailClosed));
     let handler: Arc<dyn ResourceHandler> = Arc::new(
-        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain),
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true)
+            .expect("Pod is cataloged")
+            .with_admission(chain),
     );
     let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), vec![handler], None)
         .await
@@ -241,7 +245,9 @@ async fn failure_policy_fail_rejects_pod_when_webhook_errors() {
     ));
     let chain = Arc::new(AdmissionChain::new(vec![plugin], AdmissionMode::FailClosed));
     let pod_handler: Arc<dyn ResourceHandler> = Arc::new(
-        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).with_admission(chain),
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true)
+            .expect("Pod is cataloged")
+            .with_admission(chain),
     );
     let mwc_handler: Arc<dyn ResourceHandler> = Arc::new(
         StoreBackedHandler::for_kind(store.clone(), "MutatingWebhookConfiguration").unwrap(),

@@ -431,6 +431,29 @@ pub trait ResourceHandler: Send + Sync + 'static {
     }
 }
 
+/// The admission actions that carry an object body — the domain of
+/// [`StoreBackedHandler::admit_object`]. [`AdmissionAction::Delete`] has no
+/// arm here: a delete carries no body, so it is reviewed by
+/// [`StoreBackedHandler::admit_delete`], which returns no object. Routing a
+/// delete through the object path, and then having to assert an object came
+/// back, is therefore not expressible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectAction {
+    /// A create (POST) or full replace (PUT).
+    Put,
+    /// A partial update (PATCH of any algorithm).
+    Patch,
+}
+
+impl From<ObjectAction> for AdmissionAction {
+    fn from(action: ObjectAction) -> Self {
+        match action {
+            ObjectAction::Put => Self::Put,
+            ObjectAction::Patch => Self::Patch,
+        }
+    }
+}
+
 /// Default implementation backed by [`StoreMesh`]. Handles every
 /// kind uniformly — the kind-specific intelligence (defaulters,
 /// validators, finalizers) is left to controllers + admission
@@ -628,42 +651,77 @@ impl StoreBackedHandler {
         self
     }
 
-    /// Run the admission chain for `action` on `key` and return the body
-    /// to actually propose (possibly mutated). `None` admission, or an
-    /// empty chain, returns `body` unchanged. A `Deny` becomes a typed
+    /// Run the admission chain over a write that CARRIES an object and return
+    /// the object to actually propose (possibly mutated). No chain, or an
+    /// empty one, returns `body` unchanged. A `Deny` becomes a typed
     /// [`ApiError::Forbidden`] (HTTP 403).
+    ///
+    /// The body goes in as a `Value` and comes out as a `Value`: there is no
+    /// `Option` for a caller to re-check, so "an object write whose admitted
+    /// body vanished" has no code path. `action` is an [`ObjectAction`], which
+    /// has no `Delete` arm — a delete cannot be routed through here and asked
+    /// for an object back.
     ///
     /// `user_info` is the AUTHENTICATED identity threaded from the request's
     /// `Extension<UserInfo>` (the authenticator chain's output) — it lands on
     /// `AdmissionRequest.user_info` so a webhook can policy-decide on WHO is
     /// acting, not just WHAT. Authorize-ALL is retained: identity is carried
     /// for webhooks, but no authn-driven deny is added here.
-    ///
-    /// For Delete the body is `None`; the chain still runs (so a policy
-    /// can block deletes) and the returned value is ignored by the
-    /// caller.
-    async fn admit(
+    async fn admit_object(
         &self,
-        action: AdmissionAction,
+        action: ObjectAction,
         key: &ResourceKey,
-        body: Option<Value>,
+        body: Value,
         user_info: &UserInfo,
-    ) -> Result<Option<Value>, ApiError> {
+    ) -> Result<Value, ApiError> {
         let Some(chain) = &self.admission else {
             return Ok(body);
         };
-        let current = self.store.get(key).await;
-        let request = AdmissionRequest {
-            action,
-            key: key.clone(),
-            value: body.clone(),
-            current,
-            user_info: user_info.clone(),
-        };
+        let request = self
+            .admission_request(action.into(), key, Some(body.clone()), user_info)
+            .await;
         match chain.review(request).await {
             AdmissionDecision::Allow => Ok(body),
-            AdmissionDecision::Mutate(v) => Ok(Some(v)),
+            AdmissionDecision::Mutate(v) => Ok(v),
             AdmissionDecision::Deny(reason) => Err(ApiError::Forbidden(reason)),
+        }
+    }
+
+    /// Run the admission chain over a DELETE of `key`. A delete has no body,
+    /// so the review carries `value: None` and the only outcome that matters
+    /// is whether the chain denies: `Deny` → typed [`ApiError::Forbidden`]
+    /// (HTTP 403); `Allow` and `Mutate` both admit, and a `Mutate` value is
+    /// discarded because there is no body for it to rewrite. The chain always
+    /// runs when one is attached, so a policy can block deletes.
+    async fn admit_delete(&self, key: &ResourceKey, user_info: &UserInfo) -> Result<(), ApiError> {
+        let Some(chain) = &self.admission else {
+            return Ok(());
+        };
+        let request = self
+            .admission_request(AdmissionAction::Delete, key, None, user_info)
+            .await;
+        match chain.review(request).await {
+            AdmissionDecision::Allow | AdmissionDecision::Mutate(_) => Ok(()),
+            AdmissionDecision::Deny(reason) => Err(ApiError::Forbidden(reason)),
+        }
+    }
+
+    /// The ONE [`AdmissionRequest`] shape both admit paths hand the chain:
+    /// the live object as `current` (absent for a create), the proposed
+    /// `value` (absent for a delete), and the authenticated identity.
+    async fn admission_request(
+        &self,
+        action: AdmissionAction,
+        key: &ResourceKey,
+        value: Option<Value>,
+        user_info: &UserInfo,
+    ) -> AdmissionRequest {
+        AdmissionRequest {
+            action,
+            key: key.clone(),
+            value,
+            current: self.store.get(key).await,
+            user_info: user_info.clone(),
         }
     }
 
@@ -674,26 +732,28 @@ impl StoreBackedHandler {
     /// `Endpoints` and wrong plurals for any irregular kind); the curated
     /// catalog plural is used verbatim, so the `+s` bug class cannot recur.
     ///
-    /// The `namespaced` argument is asserted against the catalog scope —
-    /// mismatched callers get `None` rather than a silently mis-scoped
-    /// handler. Returns `None` for an uncataloged kind.
+    /// The `namespaced` argument is checked against the catalog scope — a
+    /// caller whose scope disagrees gets `None` rather than a handler scoped
+    /// by a claim the catalog contradicts. An uncataloged kind, or a kind
+    /// that exists only in a named group, is also `None`. Neither case
+    /// panics: the answer is a value the caller must match on.
     ///
     /// Retained for the existing core-kind test harnesses; new code should
     /// prefer [`Self::for_kind`] (which reads the scope from the catalog)
     /// or [`crate::handlers_from_catalog`] (the full cataloged set).
     #[must_use]
-    pub fn for_core_kind(store: Arc<StoreMesh>, kind: &str, namespaced: bool) -> Self {
+    pub fn for_core_kind(store: Arc<StoreMesh>, kind: &str, namespaced: bool) -> Option<Self> {
         let d = RESOURCE_CATALOG
             .iter()
-            .find(|d| d.kind == kind && d.group.is_empty())
-            .unwrap_or_else(|| {
-                panic!("for_core_kind: {kind:?} is not a cataloged core/v1 kind — add a KIND_CATALOG row + regenerate")
-            });
-        debug_assert_eq!(
-            d.namespaced, namespaced,
-            "for_core_kind: caller scope ({namespaced}) disagrees with catalog scope for {kind}"
-        );
-        Self::new(store, d.group, d.version, d.kind, d.plural, d.namespaced)
+            .find(|d| d.kind == kind && d.group.is_empty() && d.namespaced == namespaced)?;
+        Some(Self::new(
+            store,
+            d.group,
+            d.version,
+            d.kind,
+            d.plural,
+            d.namespaced,
+        ))
     }
 
     /// Construct a handler for `kind` by looking its descriptor up in the
@@ -1318,9 +1378,8 @@ impl ResourceHandler for StoreBackedHandler {
         // A Mutate replaces the body; a Deny short-circuits with 403. The
         // authenticated identity travels into AdmissionRequest.user_info.
         let mut body = self
-            .admit(AdmissionAction::Put, &key, Some(body), user_info)
-            .await?
-            .expect("admit(Put, Some(_)) preserves Some on Allow/Mutate");
+            .admit_object(ObjectAction::Put, &key, body, user_info)
+            .await?;
         // ── creationTimestamp stamp (DETERMINISM boundary clock read). ──
         // Inject `metadata.creationTimestamp` (if absent) from ONE typed
         // RFC3339 render at the apiserver boundary — the frozen string
@@ -1418,9 +1477,8 @@ impl ResourceHandler for StoreBackedHandler {
         // Mutate replaces the body, a Deny short-circuits with 403. The
         // authenticated identity travels into AdmissionRequest.user_info.
         let mut body = self
-            .admit(AdmissionAction::Put, &key, Some(body), user_info)
-            .await?
-            .expect("admit(Put, Some(_)) preserves Some on Allow/Mutate");
+            .admit_object(ObjectAction::Put, &key, body, user_info)
+            .await?;
         // A namespaced object's metadata.namespace ALWAYS reflects the ns it
         // lives in (same invariant the create path stamps).
         if let Some(ns) = namespace {
@@ -1487,9 +1545,8 @@ impl ResourceHandler for StoreBackedHandler {
         // Admission runs at the API boundary BEFORE the store proposal. The
         // authenticated identity travels into AdmissionRequest.user_info.
         let patch = self
-            .admit(AdmissionAction::Patch, &key, Some(patch), user_info)
-            .await?
-            .expect("admit(Patch, Some(_)) preserves Some on Allow/Mutate");
+            .admit_object(ObjectAction::Patch, &key, patch, user_info)
+            .await?;
         // Precondition from the (post-admission) patch body's
         // metadata.resourceVersion (absent → unconditional). Only a
         // merge/strategic body is an object carrying metadata; a json-patch
@@ -1654,9 +1711,7 @@ impl ResourceHandler for StoreBackedHandler {
         // a policy can block deletes. The Delete body is None; any Mutate
         // value is ignored (delete has no body to rewrite). The authenticated
         // identity travels into AdmissionRequest.user_info.
-        let _ = self
-            .admit(AdmissionAction::Delete, &key, None, user_info)
-            .await?;
+        self.admit_delete(&key, user_info).await?;
         // Read the LIVE object BEFORE proposing the delete — this is the
         // body the K8s DELETE wire returns. The store's `ApplyResult`
         // carries only op+revision (NOT the removed object — see

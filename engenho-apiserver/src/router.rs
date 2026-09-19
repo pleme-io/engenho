@@ -1468,6 +1468,22 @@ async fn watch_response(
 // exists today — a `Some(subresource)` returns a typed `NotFound` (no stub
 // Ok), reserved for the status/scale follow-up.
 
+/// A subresource resolved against its kind's catalog, carried TOGETHER with
+/// the instance name it addresses. A subresource always targets one object,
+/// so the name is part of the resolved value rather than a separate
+/// `Option` on [`crate::coords::ResourceCoords`] that every dispatch arm
+/// would have to re-check. `name` is a `&str`, not an `Option`, so a target
+/// without a name cannot be represented. The type is private to this module
+/// and [`resolve_subresource`] is the one place that builds it; that part is
+/// convention inside the module, not something the compiler enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubresourceTarget<'a> {
+    /// Which catalog-declared subresource the request addresses.
+    subresource: Subresource,
+    /// The object the subresource belongs to.
+    name: &'a str,
+}
+
 /// Resolve `coords.subresource` against the resolved handler's catalog-
 /// declared subresource set. The router NEVER special-cases a kind by name:
 /// the handler's `descriptor.subresources` (sourced from `RESOURCE_CATALOG`)
@@ -1475,27 +1491,29 @@ async fn watch_response(
 ///
 ///   * `None`               → `Ok(None)` (the base-object verb path).
 ///   * `Some("status")` + the kind declares `Subresource::Status`
-///                          → `Ok(Some(Subresource::Status))`.
+///                          → `Ok(Some(target))` with `Subresource::Status`.
 ///   * `Some("scale")`  + the kind declares `Subresource::Scale`
-///                          → `Ok(Some(Subresource::Scale))`.
+///                          → `Ok(Some(target))` with `Subresource::Scale`.
 ///   * anything else, or a declared-absent subresource
 ///                          → a typed K8s `Status` 404 (no stub Ok, no panic).
 ///
 /// `name` is required for a subresource (a subresource always targets an
-/// instance) — a collection-path subresource is a typed `BadRequest`.
-fn resolve_subresource(
-    coords: &crate::coords::ResourceCoords,
+/// instance) — a collection-path subresource is a typed `BadRequest`. The
+/// name is returned inside the [`SubresourceTarget`], so a caller holding a
+/// resolved subresource holds its name too.
+fn resolve_subresource<'a>(
+    coords: &'a crate::coords::ResourceCoords,
     h: &Arc<dyn ResourceHandler>,
-) -> Result<Option<Subresource>, ApiError> {
+) -> Result<Option<SubresourceTarget<'a>>, ApiError> {
     let Some(sub) = coords.subresource.as_deref() else {
         return Ok(None);
     };
-    if coords.name.is_none() {
+    let Some(name) = coords.name.as_deref() else {
         return Err(ApiError::BadRequest(format!(
             "subresource {sub:?} requires a resource name (instance path)"
         )));
-    }
-    let parsed = match sub {
+    };
+    let subresource = match sub {
         "status" if h.subresources().contains(&Subresource::Status) => Subresource::Status,
         "scale" if h.subresources().contains(&Subresource::Scale) => Subresource::Scale,
         "log" if h.subresources().contains(&Subresource::Log) => Subresource::Log,
@@ -1507,7 +1525,7 @@ fn resolve_subresource(
             )));
         }
     };
-    Ok(Some(parsed))
+    Ok(Some(SubresourceTarget { subresource, name }))
 }
 
 /// Default token lifetime when a `TokenRequest` names none — one hour, the
@@ -1549,19 +1567,19 @@ fn clamp_token_lifetime(requested: i64) -> i64 {
 ///
 /// It also made RBAC decorative. The authorizer, the Roles and the bindings
 /// all worked; nothing could ever present a non-admin identity to be judged.
+///
+/// `name` is the service account the resolved [`SubresourceTarget`] addresses —
+/// taken from the target rather than re-read from the coordinates, so there
+/// is no "token request that names no service account" branch to write.
 async fn do_token_request(
     state: &RouterState,
     h: &Arc<dyn ResourceHandler>,
-    coords: &crate::coords::ResourceCoords,
+    namespace: Option<&str>,
+    name: &str,
     headers: &HeaderMap,
     raw: &Bytes,
 ) -> Result<Response, ApiError> {
-    let Some(name) = coords.name.as_deref() else {
-        return Err(ApiError::BadRequest(
-            "the token subresource requires a ServiceAccount name".into(),
-        ));
-    };
-    let Some(namespace) = coords.namespace.as_deref() else {
+    let Some(namespace) = namespace else {
         return Err(ApiError::BadRequest(
             "the token subresource is namespaced; no namespace in the request path".into(),
         ));
@@ -1807,12 +1825,11 @@ async fn resource_get_or_list(
     // kind's handler), then dispatch on the typed subresource resolved from
     // the catalog.
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    if let Some(sub) = resolve_subresource(&coords, &h)? {
-        // A subresource always targets an instance — `name` is present
-        // (resolve_subresource enforces it).
-        let name = coords.name.as_deref().expect("subresource requires a name");
+    if let Some(SubresourceTarget { subresource, name }) = resolve_subresource(&coords, &h)? {
+        // A subresource always targets an instance — the resolved target
+        // carries that instance's name.
         let codec = ResponseCodec::from_headers(&headers)?;
-        return match sub {
+        return match subresource {
             Subresource::Status => {
                 do_get_status(&h, coords.namespace.as_deref(), name, codec).await
             }
@@ -1884,11 +1901,20 @@ async fn resource_create(
     // the typed BadRequest below.
     if let Some(sub) = &coords.subresource {
         let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-        if matches!(
-            resolve_subresource(&coords, &h),
-            Ok(Some(Subresource::Token))
-        ) {
-            return do_token_request(&state, &h, &coords, &headers, &raw).await;
+        if let Ok(Some(SubresourceTarget {
+            subresource: Subresource::Token,
+            name,
+        })) = resolve_subresource(&coords, &h)
+        {
+            return do_token_request(
+                &state,
+                &h,
+                coords.namespace.as_deref(),
+                name,
+                &headers,
+                &raw,
+            )
+            .await;
         }
         return Err(ApiError::BadRequest(format!(
             "the {sub:?} subresource does not support create (POST)"
@@ -1928,7 +1954,9 @@ async fn resource_put(
         ApiError::BadRequest("PUT requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    match resolve_subresource(&coords, &h)? {
+    // The target's name IS `name` (both read `coords.name`); only the variant
+    // is needed here because the main-object arm needs the name as well.
+    match resolve_subresource(&coords, &h)?.map(|t| t.subresource) {
         Some(Subresource::Status) => {
             do_put_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
         }
@@ -1980,7 +2008,8 @@ async fn resource_patch(
         ApiError::BadRequest("PATCH requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    match resolve_subresource(&coords, &h)? {
+    // As in `resource_put`: the target's name is `name`, needed by every arm.
+    match resolve_subresource(&coords, &h)?.map(|t| t.subresource) {
         Some(Subresource::Status) => {
             do_patch_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
         }
@@ -2879,5 +2908,105 @@ mod request_info_coverage {
                 "{method} {uri}"
             );
         }
+    }
+}
+
+/// T4.8 — a resolved subresource carries the instance name it targets, so no
+/// dispatch arm re-reads `coords.name` and asserts it is present.
+#[cfg(test)]
+mod subresource_target {
+    use super::*;
+    use crate::coords::ResourceCoords;
+
+    /// The cataloged Pod handler (declares `status` + `log`, not `token`).
+    /// `resolve_subresource` reads only the descriptor, so the store is never
+    /// touched — it exists because a handler cannot be built without one.
+    async fn pod_handler() -> Arc<dyn ResourceHandler> {
+        let cfg = engenho_store::default_config("router-subresource-target").expect("store config");
+        let store = engenho_store::StoreMesh::start(
+            1,
+            "in-process://1".into(),
+            engenho_store::InProcessRouter::new(),
+            cfg,
+        )
+        .await
+        .expect("store starts");
+        Arc::new(
+            crate::handler::StoreBackedHandler::for_kind(Arc::new(store), "Pod")
+                .expect("Pod is cataloged"),
+        )
+    }
+
+    fn pod_coords(name: Option<&str>, subresource: Option<&str>) -> ResourceCoords {
+        ResourceCoords {
+            group: None,
+            version: Some("v1".into()),
+            namespace: Some("default".into()),
+            plural: "pods".into(),
+            name: name.map(Into::into),
+            subresource: subresource.map(Into::into),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_subresource_resolves_together_with_its_instance_name() {
+        let h = pod_handler().await;
+        let coords = pod_coords(Some("web-0"), Some("status"));
+        match resolve_subresource(&coords, &h) {
+            Ok(Some(target)) => assert_eq!(
+                target,
+                SubresourceTarget {
+                    subresource: Subresource::Status,
+                    name: "web-0",
+                }
+            ),
+            Ok(None) => panic!("pods/web-0/status resolved to the base object"),
+            Err(e) => panic!("pods/web-0/status is served: {e:?}"),
+        }
+        let coords = pod_coords(Some("web-1"), Some("log"));
+        assert!(matches!(
+            resolve_subresource(&coords, &h),
+            Ok(Some(SubresourceTarget {
+                subresource: Subresource::Log,
+                name: "web-1",
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_subresource_is_the_base_object_path() {
+        let h = pod_handler().await;
+        assert!(matches!(
+            resolve_subresource(&pod_coords(Some("web-0"), None), &h),
+            Ok(None)
+        ));
+        assert!(matches!(
+            resolve_subresource(&pod_coords(None, None), &h),
+            Ok(None)
+        ));
+    }
+
+    /// A subresource with no instance name never becomes a target — this is
+    /// the state the GET dispatch's old `expect` assumed away.
+    #[tokio::test]
+    async fn a_subresource_without_an_instance_name_is_a_bad_request() {
+        let h = pod_handler().await;
+        let coords = pod_coords(None, Some("status"));
+        let resolved = resolve_subresource(&coords, &h);
+        assert!(
+            matches!(resolved, Err(ApiError::BadRequest(_))),
+            "a collection-path subresource is a typed 400: {resolved:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subresource_the_kind_does_not_declare_is_not_found() {
+        let h = pod_handler().await;
+        let coords = pod_coords(Some("web-0"), Some("token"));
+        let resolved = resolve_subresource(&coords, &h);
+        assert!(
+            matches!(resolved, Err(ApiError::NotFound(_))),
+            "Pod does not serve /token: {resolved:?}"
+        );
     }
 }

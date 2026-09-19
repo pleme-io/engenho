@@ -53,16 +53,13 @@ async fn boot_tls_server() -> (String, String, ApiServer, tempfile::TempDir) {
     .unwrap();
 
     // A couple of handlers so /api discovery has content.
-    let pod: Arc<dyn ResourceHandler> = Arc::new(StoreBackedHandler::for_core_kind(
-        store.clone(),
-        "Pod",
-        true,
-    ));
-    let ns: Arc<dyn ResourceHandler> = Arc::new(StoreBackedHandler::for_core_kind(
-        store.clone(),
-        "Namespace",
-        false,
-    ));
+    let pod: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).expect("Pod is cataloged"),
+    );
+    let ns: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_core_kind(store.clone(), "Namespace", false)
+            .expect("Namespace is cataloged"),
+    );
 
     let server = ApiServer::start(
         "127.0.0.1:0".parse().unwrap(),

@@ -44,16 +44,13 @@ async fn boot_store() -> Arc<StoreMesh> {
 
 async fn boot_store_and_server() -> (Arc<StoreMesh>, ApiServer) {
     let store = boot_store().await;
-    let pod_handler: Arc<dyn ResourceHandler> = Arc::new(StoreBackedHandler::for_core_kind(
-        store.clone(),
-        "Pod",
-        true,
-    ));
-    let cm_handler: Arc<dyn ResourceHandler> = Arc::new(StoreBackedHandler::for_core_kind(
-        store.clone(),
-        "ConfigMap",
-        true,
-    ));
+    let pod_handler: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).expect("Pod is cataloged"),
+    );
+    let cm_handler: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_core_kind(store.clone(), "ConfigMap", true)
+            .expect("ConfigMap is cataloged"),
+    );
     let server = ApiServer::start(
         "127.0.0.1:0".parse().unwrap(),
         vec![pod_handler, cm_handler],
@@ -391,7 +388,8 @@ async fn compacted_too_old_maps_to_gone_410() {
     // and an rv ahead of the server is tolerated as MostRecent at M0.1
     // (documented) — it must NOT 410.
     let store = boot_store().await;
-    let h = StoreBackedHandler::for_core_kind(store.clone(), "Pod", true);
+    let h =
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).expect("Pod is cataloged");
     assert!(
         h.watch_stream(Some("default"), ResumePoint::MostRecent, true)
             .await
@@ -625,7 +623,8 @@ async fn watch_stream_disables_bookmarks_when_not_requested() {
     // carries ZERO cadence → no bookmark ever. Prove via the handler
     // seam that no bookmark signal arrives.
     let store = boot_store().await;
-    let h = StoreBackedHandler::for_core_kind(store.clone(), "Pod", true);
+    let h =
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).expect("Pod is cataloged");
     let mut stream = h
         .watch_stream(Some("default"), ResumePoint::MostRecent, false)
         .await
@@ -736,7 +735,8 @@ async fn malformed_resource_version_is_400() {
 #[tokio::test]
 async fn handler_list_at_returns_items_and_current_revision() {
     let store = boot_store().await;
-    let h = StoreBackedHandler::for_core_kind(store.clone(), "Pod", true);
+    let h =
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).expect("Pod is cataloged");
 
     for n in ["x", "y"] {
         store

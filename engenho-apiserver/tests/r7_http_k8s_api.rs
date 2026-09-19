@@ -19,21 +19,17 @@ async fn boot_store_and_server() -> (Arc<StoreMesh>, ApiServer) {
     store.initialize_singleton().await.unwrap();
     assert!(store.wait_for_leadership(Duration::from_secs(3)).await);
 
-    let pod_handler: Arc<dyn ResourceHandler> = Arc::new(StoreBackedHandler::for_core_kind(
-        store.clone(),
-        "Pod",
-        true,
-    ));
-    let cm_handler: Arc<dyn ResourceHandler> = Arc::new(StoreBackedHandler::for_core_kind(
-        store.clone(),
-        "ConfigMap",
-        true,
-    ));
-    let ns_handler: Arc<dyn ResourceHandler> = Arc::new(StoreBackedHandler::for_core_kind(
-        store.clone(),
-        "Namespace",
-        false,
-    ));
+    let pod_handler: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_core_kind(store.clone(), "Pod", true).expect("Pod is cataloged"),
+    );
+    let cm_handler: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_core_kind(store.clone(), "ConfigMap", true)
+            .expect("ConfigMap is cataloged"),
+    );
+    let ns_handler: Arc<dyn ResourceHandler> = Arc::new(
+        StoreBackedHandler::for_core_kind(store.clone(), "Namespace", false)
+            .expect("Namespace is cataloged"),
+    );
     // apps/v1 Deployment — used by the DELETE protobuf round-trip test
     // (its GVK resolves cleanly in the kube-proto pool, unlike Status).
     let deploy_handler: Arc<dyn ResourceHandler> = Arc::new(
