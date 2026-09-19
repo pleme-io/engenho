@@ -102,6 +102,14 @@
 //! names its type through the compiler; that no controller type is in
 //! neither is a test over the workspace's source — a CI gate, not a type.
 //!
+//! ## The census (T0.10)
+//!
+//! [`census`] runs one named check from a closed catalog, with no side
+//! effects, over a running apiserver (LIST) or over a copy of a node's data
+//! directory (booted privately; the directory given is never written), and
+//! reports what it matched with counts by kind and reason. Each check calls
+//! the function the rule it gates ships. `engenho census` is its CLI.
+//!
 //! ## Boot order (strict)
 //!
 //! 1. `config.validate()`
@@ -125,6 +133,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod census;
 pub mod etcd_facade;
 
 mod child;

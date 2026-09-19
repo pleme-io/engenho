@@ -20,6 +20,12 @@
 //!   kubeconfig for the persisted cluster CA to stdout. Use this to
 //!   re-emit a kubeconfig after the daemon is up, or to point kubectl at
 //!   a non-loopback address.
+//! * `engenho census --predicate <name> --kubeconfig <path>` or
+//!   `engenho census --predicate <name> --data-dir <dir>` — run one named
+//!   check from the census catalog (plan T0.10) over a running apiserver or
+//!   over a copy of a node's data directory, read-only, and print what it
+//!   matched with counts by kind and reason. `engenho census --list` prints
+//!   the catalog. See [`engenho_runtime::census`].
 //! * `engenho --help` / `-h` / `help` — print the usage summary.
 //! * `engenho --version` / `-V` / `version` — print the version.
 //!
@@ -47,6 +53,7 @@ use engenho_apiserver::load_or_generate_ca;
 use engenho_config::{ConfigTier, EngenhoConfig, TieredConfig, render_provenance};
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_runtime::Runtime;
+use engenho_runtime::census::{self, ApiSource, Catalog, DataDirSource, Predicate};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -58,7 +65,13 @@ use tracing_subscriber::EnvFilter;
 /// actually dispatched by [`Command::parse`], which closes the other
 /// direction: a verb added to the match arms without a row here fails
 /// the suite rather than becoming silently undiscoverable.
-const SUBCOMMAND_NAMES: [&str; 4] = ["daemon", "kubeconfig", "config-show", "config-diff"];
+const SUBCOMMAND_NAMES: [&str; 5] = [
+    "daemon",
+    "kubeconfig",
+    "config-show",
+    "config-diff",
+    "census",
+];
 
 /// The parsed top-level command. Splitting the argv classification out of
 /// `main` keeps it unit-testable without booting the daemon or touching
@@ -78,6 +91,8 @@ enum Command {
     ConfigShow(Option<String>),
     /// `config-diff <from> <to>` — unified diff between two resolved tiers.
     ConfigDiff(String, String),
+    /// `census …` — one named census check, or the catalog.
+    Census(CensusCommand),
     /// `--help` / `-h` / `help` — print usage to stdout and exit 0.
     Help,
     /// `--version` / `-V` / `version` — print the version to stdout and exit 0.
@@ -92,6 +107,7 @@ impl Command {
     /// * `kubeconfig …` → [`Command::Kubeconfig`] with the remaining args
     /// * `config-show [tier]` → [`Command::ConfigShow`]
     /// * `config-diff <from> <to>` → [`Command::ConfigDiff`]
+    /// * `census …` → [`Command::Census`]
     /// * `--help` / `-h` / `help` → [`Command::Help`]
     /// * `--version` / `-V` / `version` → [`Command::Version`]
     /// * anything else → an error naming the supported verbs
@@ -102,6 +118,7 @@ impl Command {
             Some("--version" | "-V" | "version") => Ok(Command::Version),
             Some("kubeconfig") => Ok(Command::Kubeconfig(args.collect())),
             Some("config-show") => Ok(Command::ConfigShow(args.next())),
+            Some("census") => Ok(Command::Census(CensusCommand::parse(args)?)),
             Some("config-diff") => match (args.next(), args.next()) {
                 (Some(from), Some(to)) => Ok(Command::ConfigDiff(from, to)),
                 _ => Err(anyhow::anyhow!(
@@ -247,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Kubeconfig(flags) => run_kubeconfig(flags.into_iter()),
         Command::ConfigShow(tier) => run_config_show(tier),
         Command::ConfigDiff(from, to) => run_config_diff(&from, &to),
+        Command::Census(census) => run_census(census).await,
         Command::Help => {
             print!("{}", help_text());
             Ok(())
@@ -449,6 +467,184 @@ fn run_config_diff(from: &str, to: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `engenho census …`, parsed: the catalog, or one predicate over one
+/// source. The predicate is a catalog row by construction — `--predicate`
+/// is looked up, never evaluated.
+#[derive(Debug, PartialEq, Eq)]
+enum CensusCommand {
+    /// `--list`: print the catalog.
+    List,
+    /// `--predicate <name>` over one source.
+    Run {
+        /// The catalog row to run.
+        predicate: Predicate,
+        /// Where to read.
+        source: CensusSource,
+    },
+}
+
+/// Where a census reads: exactly one of the two, so "both" and "neither"
+/// are parse errors, not run-time choices.
+#[derive(Debug, PartialEq, Eq)]
+enum CensusSource {
+    /// `--kubeconfig <path>`: LIST through the apiserver it names.
+    Apiserver(PathBuf),
+    /// `--data-dir <dir>`: a copy of a stopped node's data directory.
+    DataDir(PathBuf),
+}
+
+/// Why `engenho census …` could not be parsed.
+#[derive(Debug, PartialEq, Eq)]
+enum CensusUsage {
+    /// A flag that takes a value came last.
+    MissingValue(&'static str),
+    /// `--predicate` named no catalog row.
+    UnknownPredicate(String),
+    /// A flag the census does not take.
+    UnknownFlag(String),
+    /// A flag given twice.
+    Repeated(&'static str),
+    /// No `--predicate` and no `--list`.
+    NoPredicate,
+    /// Neither `--kubeconfig` nor `--data-dir`.
+    NoSource,
+    /// Both `--kubeconfig` and `--data-dir`.
+    TwoSources,
+    /// `--list` with another flag.
+    ListTakesNothing,
+}
+
+impl fmt::Display for CensusUsage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingValue(flag) => write!(f, "census: {flag} needs a value"),
+            Self::UnknownPredicate(name) => {
+                write!(f, "census: no predicate {name:?} in the catalog (")?;
+                for (i, p) in Predicate::ALL.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(p.name())?;
+                }
+                f.write_str(") — run `engenho census --list`")
+            }
+            Self::UnknownFlag(flag) => write!(
+                f,
+                "census: unknown flag {flag:?} (supported: --predicate, --kubeconfig, --data-dir, --list)"
+            ),
+            Self::Repeated(flag) => write!(f, "census: {flag} given twice"),
+            Self::NoPredicate => {
+                f.write_str("census: name a check with --predicate <name>, or run `census --list`")
+            }
+            Self::NoSource => f.write_str(
+                "census: name a source: --kubeconfig <path> (a running apiserver) or \
+                 --data-dir <dir> (a copy of a stopped node's data directory)",
+            ),
+            Self::TwoSources => {
+                f.write_str("census: --kubeconfig and --data-dir are two sources; name one")
+            }
+            Self::ListTakesNothing => f.write_str("census: --list takes no other flag"),
+        }
+    }
+}
+
+impl std::error::Error for CensusUsage {}
+
+impl CensusCommand {
+    /// Parse the arguments after `census`.
+    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, CensusUsage> {
+        let mut list = false;
+        let mut predicate: Option<Predicate> = None;
+        let mut kubeconfig: Option<PathBuf> = None;
+        let mut data_dir: Option<PathBuf> = None;
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--list" => list = true,
+                "--predicate" => {
+                    let name = args
+                        .next()
+                        .ok_or(CensusUsage::MissingValue("--predicate"))?;
+                    let p =
+                        Predicate::from_name(&name).ok_or(CensusUsage::UnknownPredicate(name))?;
+                    if predicate.replace(p).is_some() {
+                        return Err(CensusUsage::Repeated("--predicate"));
+                    }
+                }
+                "--kubeconfig" => {
+                    let path = args
+                        .next()
+                        .ok_or(CensusUsage::MissingValue("--kubeconfig"))?;
+                    if kubeconfig.replace(PathBuf::from(path)).is_some() {
+                        return Err(CensusUsage::Repeated("--kubeconfig"));
+                    }
+                }
+                "--data-dir" => {
+                    let path = args.next().ok_or(CensusUsage::MissingValue("--data-dir"))?;
+                    if data_dir.replace(PathBuf::from(path)).is_some() {
+                        return Err(CensusUsage::Repeated("--data-dir"));
+                    }
+                }
+                _ => return Err(CensusUsage::UnknownFlag(flag)),
+            }
+        }
+        match (list, predicate, kubeconfig, data_dir) {
+            (true, None, None, None) => Ok(Self::List),
+            (true, ..) => Err(CensusUsage::ListTakesNothing),
+            (false, None, ..) => Err(CensusUsage::NoPredicate),
+            (false, Some(_), None, None) => Err(CensusUsage::NoSource),
+            (false, Some(_), Some(_), Some(_)) => Err(CensusUsage::TwoSources),
+            (false, Some(predicate), Some(path), None) => Ok(Self::Run {
+                predicate,
+                source: CensusSource::Apiserver(path),
+            }),
+            (false, Some(predicate), None, Some(dir)) => Ok(Self::Run {
+                predicate,
+                source: CensusSource::DataDir(dir),
+            }),
+        }
+    }
+}
+
+/// `engenho census …` — print the catalog, or run one predicate over one
+/// source and print its report. Read-only either way: an apiserver is only
+/// listed, and a data directory is copied before its store is booted.
+///
+/// A census that ran prints its report and exits 0 whatever it counted —
+/// zero matches is a finding. One that could not read its source exits
+/// non-zero and prints nothing on stdout.
+async fn run_census(command: CensusCommand) -> anyhow::Result<()> {
+    let (predicate, source) = match command {
+        CensusCommand::List => {
+            print!("{Catalog}");
+            return Ok(());
+        }
+        CensusCommand::Run { predicate, source } => (predicate, source),
+    };
+    // Diagnostics go to stderr, so stdout carries the report alone.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .init();
+    let report = match source {
+        CensusSource::Apiserver(kubeconfig) => {
+            let source = ApiSource::from_kubeconfig(&kubeconfig).await?;
+            census::run(predicate, &source).await?
+        }
+        CensusSource::DataDir(dir) => {
+            let source = DataDirSource::open(&dir).await?;
+            let report = census::run(predicate, &source).await;
+            let closed = source.close().await;
+            let report = report?;
+            closed?;
+            report
+        }
+    };
+    print!("{report}");
+    Ok(())
+}
+
 /// The usage summary printed by `engenho --help`.
 ///
 /// Kept as a pure function returning a `String` so a test can assert on
@@ -476,6 +672,11 @@ SUBCOMMANDS:
                               provenance. TIER overrides $ENGENHO_TIER.
     config-diff <FROM> <TO>   Unified diff between two resolved config tiers.
                               Tiers: bare | discovered | default | <yaml-path>
+    census --predicate <NAME> (--kubeconfig <PATH> | --data-dir <DIR>)
+                              Count the live objects a planned rule would
+                              refuse, read-only, over a running apiserver or a
+                              copy of a stopped node's data directory.
+                              `census --list` prints every predicate.
 
 OPTIONS:
     -h, --help                Print this message.
@@ -494,7 +695,9 @@ Docs: https://github.com/pleme-io/engenho
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, StopCause, StopSignals};
+    use super::{
+        CensusCommand, CensusSource, CensusUsage, Command, Predicate, StopCause, StopSignals,
+    };
 
     fn parse(argv: &[&str]) -> anyhow::Result<Command> {
         Command::parse(argv.iter().map(|s| (*s).to_string()))
@@ -724,5 +927,88 @@ mod tests {
     fn config_diff_requires_two_args() {
         assert!(parse(&["config-diff", "bare"]).is_err());
         assert!(parse(&["config-diff"]).is_err());
+    }
+
+    fn census(argv: &[&str]) -> Result<CensusCommand, CensusUsage> {
+        CensusCommand::parse(argv.iter().map(|s| (*s).to_string()))
+    }
+
+    /// `census` dispatches to the census; each predicate runs over exactly
+    /// one named source, whichever order the flags come in.
+    #[test]
+    fn census_takes_one_catalog_predicate_over_one_source() {
+        assert_eq!(
+            parse(&["census", "--list"]).unwrap(),
+            Command::Census(CensusCommand::List)
+        );
+        for p in Predicate::ALL {
+            assert_eq!(
+                census(&["--predicate", p.name(), "--data-dir", "/copy"]).unwrap(),
+                CensusCommand::Run {
+                    predicate: *p,
+                    source: CensusSource::DataDir("/copy".into()),
+                }
+            );
+        }
+        assert_eq!(
+            census(&["--kubeconfig", "/kc", "--predicate", "node-overcommitted"]).unwrap(),
+            CensusCommand::Run {
+                predicate: Predicate::NodeOvercommitted,
+                source: CensusSource::Apiserver("/kc".into()),
+            }
+        );
+    }
+
+    /// A predicate outside the catalog is refused, and the refusal names the
+    /// catalog: there is no string the census would evaluate instead.
+    #[test]
+    fn census_refuses_a_predicate_outside_the_catalog() {
+        let err = census(&["--predicate", "spec.replicas > 3", "--data-dir", "/d"]).unwrap_err();
+        assert_eq!(
+            err,
+            CensusUsage::UnknownPredicate("spec.replicas > 3".into())
+        );
+        let msg = err.to_string();
+        for p in Predicate::ALL {
+            assert!(msg.contains(p.name()), "the refusal omits {p}: {msg}");
+        }
+    }
+
+    /// Neither source, both sources, a missing value, an unknown flag, a
+    /// repeated flag and `--list` with company are each their own refusal.
+    #[test]
+    fn census_refuses_every_malformed_invocation() {
+        let p = "deployment-would-roll";
+        for (argv, want) in [
+            (vec!["--predicate", p], CensusUsage::NoSource),
+            (
+                vec!["--predicate", p, "--kubeconfig", "/k", "--data-dir", "/d"],
+                CensusUsage::TwoSources,
+            ),
+            (vec!["--data-dir", "/d"], CensusUsage::NoPredicate),
+            (vec![], CensusUsage::NoPredicate),
+            (
+                vec!["--predicate"],
+                CensusUsage::MissingValue("--predicate"),
+            ),
+            (
+                vec!["--predicate", p, "--data-dir"],
+                CensusUsage::MissingValue("--data-dir"),
+            ),
+            (
+                vec!["--predicate", p, "--predicate", p, "--data-dir", "/d"],
+                CensusUsage::Repeated("--predicate"),
+            ),
+            (
+                vec!["--frobnicate"],
+                CensusUsage::UnknownFlag("--frobnicate".into()),
+            ),
+            (
+                vec!["--list", "--data-dir", "/d"],
+                CensusUsage::ListTakesNothing,
+            ),
+        ] {
+            assert_eq!(census(&argv).unwrap_err(), want, "argv {argv:?}");
+        }
     }
 }

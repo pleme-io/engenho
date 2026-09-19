@@ -1221,6 +1221,11 @@ fn build_backend(config: &EngenhoConfig) -> Result<Arc<dyn ContainerRuntime>, Ru
     )?)
 }
 
+/// The directory under `data_dir` a durable node keeps its store in. The
+/// census ([`crate::census::DataDirSource`]) reads a node's store from the
+/// same place.
+pub(crate) const STORE_DIR: &str = "store";
+
 /// Bring up the store spine — durable or ephemeral per config.
 async fn boot_store(config: &EngenhoConfig) -> Result<Arc<StoreMesh>, RuntimeError> {
     let cfg = default_config(&config.cluster.name)?;
@@ -1229,7 +1234,7 @@ async fn boot_store(config: &EngenhoConfig) -> Result<Arc<StoreMesh>, RuntimeErr
     let listen = "in-process://1".to_string();
 
     if config.runtime.durable {
-        let store_path = config.runtime.data_dir.join("store");
+        let store_path = config.runtime.data_dir.join(STORE_DIR);
         let (mesh, fresh) = StoreMesh::start_or_resume(1, listen, router, cfg, store_path).await?;
         info!(fresh, "durable store opened");
         Ok(Arc::new(mesh))
