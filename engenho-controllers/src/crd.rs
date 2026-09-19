@@ -45,6 +45,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 /// Resource scope.
@@ -470,11 +471,12 @@ impl Controller for CrdController {
                 let needs_register = reg.get(key) != Some(entry);
                 if needs_register {
                     // An in-process handler-table insert that cannot fail
-                    // (the sink returns nothing to read): the call is the
-                    // effect. Not a store write.
+                    // and returns nothing to read. Not a store write: the
+                    // controller's own record of what it registered answers
+                    // whether the table changed.
                     self.sink.register_crd(CrdHandlerSpec::from(entry));
-                    reg.insert(key.clone(), entry.clone());
-                    report.objects_changed += 1;
+                    let previous = reg.insert(key.clone(), entry.clone());
+                    report.record(Effect::answered(previous.as_ref() != Some(entry)));
                     if let Some(crd_key) = crd_for_key.get(key) {
                         crds_to_establish.insert(crd_key.clone());
                     }
@@ -495,7 +497,7 @@ impl Controller for CrdController {
             for key in stale {
                 let removed = self.sink.unregister_crd(&key.0, &key.1, &key.2);
                 reg.remove(&key);
-                report.objects_changed += usize::from(removed);
+                report.record(Effect::answered(removed));
             }
         }
 
@@ -544,6 +546,9 @@ mod tests {
     struct RecordingSink {
         registered: Mutex<Vec<CrdHandlerSpec>>,
         unregistered: Mutex<Vec<(String, String, String)>>,
+        /// The handler table lost the entry on its own (a restart, a
+        /// sibling's unregister): `unregister_crd` finds nothing to remove.
+        already_gone: bool,
     }
 
     impl DynamicHandlerSink for RecordingSink {
@@ -556,7 +561,7 @@ mod tests {
                 version.to_string(),
                 plural.to_string(),
             ));
-            true
+            !self.already_gone
         }
     }
 
@@ -794,12 +799,71 @@ mod tests {
             .await
             .unwrap();
 
-        ctrl.tick().await.unwrap();
-        ctrl.tick().await.unwrap(); // second tick: nothing new.
+        let first = ctrl.tick().await.unwrap();
+        let second = ctrl.tick().await.unwrap(); // nothing new.
         assert_eq!(
             sink.registered.lock().unwrap().len(),
             1,
             "re-tick does not re-register the unchanged CRD"
+        );
+        assert_eq!(first.objects_changed, 1, "the new handler is a change");
+        assert_eq!(second.objects_changed, 0, "a re-tick changes nothing");
+    }
+
+    /// The count after deleting a registered CRD, against a sink that
+    /// either still holds the handler or has already lost it.
+    async fn changed_by_unregister(sink: Arc<RecordingSink>) -> usize {
+        use engenho_store::{ResourceKey, command::ResourceCommand};
+        let store = ephemeral_store().await;
+        let ctrl = CrdController::new(store.clone(), sink.clone());
+        let crd_key = ResourceKey::cluster_scoped(
+            "apiextensions.k8s.io",
+            "v1",
+            "CustomResourceDefinition",
+            "widgets.example.com",
+        );
+        store
+            .propose(ResourceCommand::Put {
+                key: crd_key.clone(),
+                value: single_version_crd(),
+                expected: None,
+                reason: Reason::Operator,
+            })
+            .await
+            .unwrap();
+        ctrl.tick().await.unwrap();
+        store
+            .propose(ResourceCommand::delete(crd_key, Reason::Operator))
+            .await
+            .unwrap();
+        let outcome = ctrl.tick().await.unwrap();
+        assert_eq!(
+            sink.unregistered.lock().unwrap().len(),
+            1,
+            "unregister was called"
+        );
+        assert!(ctrl.registered_entries().is_empty(), "bookkeeping cleared");
+        outcome.objects_changed
+    }
+
+    /// An unregister is counted by the sink's answer, not by the call: a
+    /// handler that was already gone is not a change.
+    #[tokio::test]
+    async fn an_unregister_that_found_nothing_is_not_a_change() {
+        let present = Arc::new(RecordingSink::default());
+        assert_eq!(
+            changed_by_unregister(present).await,
+            1,
+            "positive control: removing a live handler is a change"
+        );
+        let gone = Arc::new(RecordingSink {
+            already_gone: true,
+            ..RecordingSink::default()
+        });
+        assert_eq!(
+            changed_by_unregister(gone).await,
+            0,
+            "the sink removed nothing, so nothing changed"
         );
     }
 

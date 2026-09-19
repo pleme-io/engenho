@@ -29,11 +29,22 @@
 //!     one, so a sweep cannot report an object as changed without an
 //!     `Effect` that said a write landed.
 //!
-//! Tier-honest: in a controller that runs through [`crate::Sweep`], a
-//! change nobody observed is a compile error (no `Landed`, no `Changed`).
-//! In the legacy counter path `ReconcileReport::objects_changed` is still a
-//! public field, which the kubelet and the scheduler write directly; there a
-//! bare `+= 1` is caught only by review.
+//! Tier-honest, by path:
+//!
+//!   * **Sweep** ([`crate::Sweep`]): reporting an object `Changed` without a
+//!     `Landed` is a compile error. A `Landed` is minted only by a named
+//!     constructor that says where the answer came from ([`Effect::of`],
+//!     [`Effect::applied`], [`Effect::answered`]); passing one a made-up
+//!     answer (`answered(true)`, `applied(Ok(()))`) compiles and is caught
+//!     only by review.
+//!   * **Legacy counter** (`ReconcileReport` built by hand):
+//!     `objects_changed` is still a public field, because the kubelet and
+//!     the scheduler (outside this crate) still write it directly. A bare
+//!     write anywhere in the workspace's `src/` is CI-caught, not a type:
+//!     `tests/t1_8_counts_come_from_effects.rs` allows only
+//!     [`crate::ReconcileReport::record`] and the sweep conversion, and holds
+//!     the not-yet-migrated kubelet and scheduler sites to a ceiling. When
+//!     those reach zero the field goes private and that gate is deleted.
 
 use std::fmt;
 
@@ -56,9 +67,10 @@ pub enum Effect {
     Rejected(Refusal),
 }
 
-/// Proof that a write landed. Its field is private: [`Effect::of`] and
-/// [`Effect::applied`] are the only ways to get one, so holding a `Landed`
-/// means an observed write said so.
+/// Proof that a write landed. Its field is private: [`Effect::of`],
+/// [`Effect::applied`] and [`Effect::answered`] are the only ways to get
+/// one, and each names the answer it read (a store op, a backend result, a
+/// table's reply). Holding a `Landed` means one of those said so.
 ///
 /// A sweep outcome of `Changed` is built from an effect:
 ///
@@ -143,6 +155,21 @@ impl Effect {
         result.map(|()| Self::Written(Landed(())))
     }
 
+    /// What an in-process table answered about a call: `true` means the
+    /// call changed it.
+    ///
+    /// For a table that reports whether it changed, such as
+    /// `HashMap::insert`'s previous value or a sink's `unregister` saying a
+    /// handler was there. The argument must be that answer, not the
+    /// caller's expectation of it.
+    pub const fn answered(changed: bool) -> Self {
+        if changed {
+            Self::Written(Landed(()))
+        } else {
+            Self::Unchanged
+        }
+    }
+
     /// The effect of two writes made for the same object: it changed if
     /// either landed; otherwise it was refused if either was refused (the
     /// first refusal is kept); otherwise nothing changed.
@@ -220,6 +247,12 @@ mod tests {
     fn a_backend_error_is_returned_and_never_landed() {
         assert!(Effect::applied(Ok::<(), &str>(())).unwrap().landed());
         assert_eq!(Effect::applied(Err::<(), _>("rule busy")), Err("rule busy"));
+    }
+
+    #[test]
+    fn a_table_that_answered_no_change_is_unchanged() {
+        assert_eq!(Effect::answered(true), Effect::Written(Landed(())));
+        assert_eq!(Effect::answered(false), Effect::Unchanged);
     }
 
     #[test]

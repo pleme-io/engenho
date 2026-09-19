@@ -10,7 +10,14 @@
 //!
 //! Each has a positive control in the same test, so a controller that stops
 //! counting altogether fails too.
+//!
+//! * **E3** a gate, not a type: no source file in the workspace writes
+//!   `objects_changed` except through `ReconcileReport::record` and the sweep
+//!   conversion, and the sites not yet migrated stay under a ceiling.
 
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -174,4 +181,161 @@ async fn a_backend_removal_that_failed_is_not_a_change() {
         refused.report.objects_changed, 0,
         "a removal the enforcer refused is not a change"
     );
+}
+
+// ── E3: the legacy counter path, gated ──────────────────────────────────
+
+/// The only lines in any workspace `src/` that may write
+/// `ReconcileReport::objects_changed`: the field itself, the one increment
+/// in `record` (which reads an `Effect`), and the sweep conversion (whose
+/// count is of `Changed(Landed)` outcomes).
+const ALLOWED: [(&str, &str); 3] = [
+    (
+        "engenho-controllers/src/controller.rs",
+        "pub objects_changed: usize,",
+    ),
+    (
+        "engenho-controllers/src/controller.rs",
+        "Effect::Written(_) => self.objects_changed += 1,",
+    ),
+    (
+        "engenho-controllers/src/sweep.rs",
+        "objects_changed: s.changed,",
+    ),
+];
+
+/// Bare writes that predate T1.8, in crates outside the controllers lane.
+/// Each file may keep at most this many; a new one fails the gate. Lower a
+/// ceiling when a site moves to `record(Effect)`. At zero everywhere the
+/// field goes private, which makes this whole gate a compile error, and
+/// this test is deleted.
+const NOT_YET_MIGRATED: [(&str, usize); 3] = [
+    ("engenho-kubelet/src/kubelet.rs", 8),
+    ("engenho-kubelet/src/csi_materializer.rs", 2),
+    ("engenho-scheduler/src/scheduler.rs", 1),
+];
+
+const FIELD: &str = "objects_changed";
+
+/// True iff this line assigns the field, compound-assigns it, or sets it
+/// in a struct literal. Reads (`, `, `)`, `==`, `>=`) are not writes. Text
+/// after `//` is ignored, so a write that follows a `//` inside a string
+/// literal on the same line is missed: this is a text gate over
+/// rustfmt-shaped code, not a parser.
+fn writes_the_field(line: &str) -> bool {
+    let code = line.split("//").next().unwrap_or_default();
+    code.match_indices(FIELD).any(|(at, _)| {
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        let before = code[..at].chars().next_back();
+        let rest = &code[at + FIELD.len()..];
+        if before.is_some_and(ident) || rest.chars().next().is_some_and(ident) {
+            return false;
+        }
+        let rest = rest.trim_start();
+        ["+=", "-=", "*="].iter().any(|op| rest.starts_with(op))
+            || (rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>"))
+            || (rest.starts_with(':') && !rest.starts_with("::"))
+    })
+}
+
+fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).expect("readable source dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            rust_sources(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Every bare write of the field under each crate's `src/`, keyed by the
+/// file's workspace-relative path, as `line: text`.
+fn bare_writes(root: &Path) -> BTreeMap<String, Vec<String>> {
+    let mut crates: Vec<PathBuf> = fs::read_dir(root)
+        .expect("workspace root")
+        .map(|e| e.expect("dir entry").path().join("src"))
+        .filter(|src| src.is_dir())
+        .collect();
+    crates.sort();
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for src in crates {
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        for file in files {
+            let rel = file
+                .strip_prefix(root)
+                .expect("under the root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = fs::read_to_string(&file).expect("utf-8 source");
+            for (n, line) in text.lines().enumerate() {
+                let trimmed = line.trim();
+                let allowed = ALLOWED
+                    .iter()
+                    .any(|&(path, ok)| path == rel && ok == trimmed);
+                if writes_the_field(line) && !allowed {
+                    found
+                        .entry(rel.clone())
+                        .or_default()
+                        .push(format!("{}: {trimmed}", n + 1));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn the_gate_reads_writes_and_not_reads() {
+    for write in [
+        "report.objects_changed += 1;",
+        "report.objects_changed = 3;",
+        "objects_changed: report.bound.len(),",
+        "self.objects_changed -= 1;",
+    ] {
+        assert!(writes_the_field(write), "{write}");
+    }
+    for read in [
+        "assert_eq!(out.objects_changed, 1);",
+        "if self.objects_changed > 0 || x {",
+        "assert!(out.objects_changed >= 2);",
+        "changed = self.objects_changed,",
+        "x.objects_changed == 0",
+        "// report.objects_changed += 1;",
+        "report.objects_changed_total += 1;",
+        "my_objects_changed = 2;",
+    ] {
+        assert!(!writes_the_field(read), "{read}");
+    }
+}
+
+/// E3. Every count in the workspace goes through an `Effect`, except the
+/// ceilinged sites above. CI-caught, not a type: `objects_changed` is still
+/// a public field.
+#[test]
+fn no_count_in_the_workspace_bypasses_effect() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crate sits in the workspace root");
+    let found = bare_writes(root);
+
+    // Positive control: the gate sees the ceilinged sites, so an empty
+    // result means "no bypass", not "read nothing".
+    assert!(
+        found.contains_key("engenho-kubelet/src/kubelet.rs"),
+        "the gate must see the kubelet's known writes; found {found:#?}"
+    );
+
+    let ceilings: BTreeMap<&str, usize> = NOT_YET_MIGRATED.into_iter().collect();
+    for (file, sites) in &found {
+        let ceiling = ceilings.get(file.as_str()).copied().unwrap_or(0);
+        assert!(
+            sites.len() <= ceiling,
+            "{file} writes objects_changed without an Effect ({} sites, at most {ceiling} \
+             allowed); count it with ReconcileReport::record(Effect::..):\n{}",
+            sites.len(),
+            sites.join("\n"),
+        );
+    }
 }

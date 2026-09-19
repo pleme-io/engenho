@@ -273,12 +273,13 @@ mod tests {
     fn outcome_from_report_defaults_to_done() {
         // Every legacy `Ok(report)` site becomes `Ok(report.into())`
         // with result = Done (identical behavior).
-        let outcome: ReconcileOutcome = ReconcileReport {
+        let mut report = ReconcileReport {
             objects_examined: 3,
-            objects_changed: 2,
             ..Default::default()
-        }
-        .into();
+        };
+        report.record(Effect::of(engenho_store::command::ResourceOp::Created));
+        report.record(Effect::of(engenho_store::command::ResourceOp::Patched));
+        let outcome: ReconcileOutcome = report.into();
         assert_eq!(outcome.result, ReconcileResult::Done);
         // Deref reaches the report fields directly.
         assert_eq!(outcome.objects_examined, 3);
